@@ -1,0 +1,41 @@
+"""Domain thresholds and numeric constants from the PRD calculations."""
+
+# Medicare reimbursement (PRD §3.6, §2.6)
+MEDICARE_COINSURANCE_RATE = 0.20
+MEDICARE_ANNUAL_DEDUCTIBLE_CENTS = 25700
+MEDICARE_ANNUAL_DIABETIC_SHOE_PAIR_LIMIT = 1
+MEDICARE_ANNUAL_INSERT_LIMIT = 3
+
+# HCPCS codes (PRD §3.1)
+HCPCS_DIABETIC_SHOE = "A5500"
+HCPCS_INSERT_A5512 = "A5512"
+HCPCS_INSERT_A5513 = "A5513"
+
+# Loyalty multipliers by tier (PRD §3.4)
+LOYALTY_MULTIPLIER = {
+    "BRONZE": 1.00,
+    "SILVER": 1.25,
+    "GOLD": 1.50,
+}
+# Loyalty tier thresholds (PRD §3.2)
+SILVER_MIN_BALANCE = 500
+GOLD_MIN_BALANCE = 2000
+
+# Returns (PRD §3.5)
+RETURN_WINDOW_DAYS = 30
+RESTOCKING_FEE_RATE = 0.15
+
+# Foot measurement / pediatric fitting (PRD §3.2)
+PEDIATRIC_TOE_ALLOWANCE_MM = 14
+ADULT_TOE_ALLOWANCE_MM = 12
+MONDO_STEP_MM = 5
+PEDIATRIC_AGE_THRESHOLD_YEARS = 13
+
+# Scheduling (PRD §3.3)
+FITTER_CLEANUP_BUFFER_MIN = 15
+
+# Certification (PRD §3.6)
+CERT_VISIT_WINDOW_MONTHS = 6
+
+# Default logical clock (PRD §2.5)
+DEFAULT_CLOCK_ISO = "2026-07-01T00:00:00Z"

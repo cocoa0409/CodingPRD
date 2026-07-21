@@ -1,0 +1,33 @@
+"""Domain thresholds — numeric constants from the PRD calculations & global rules."""
+
+# Table-session charge (PRD 3.3)
+PEAK_START_HOUR = 18
+PEAK_END_HOUR = 24
+PEAK_MULTIPLIER = 1.5
+MIN_BILLED_MINUTES = 30
+
+# Tournament handicap (PRD 3.5)
+HANDICAP_SPOT_CAP = 3
+MIN_TOURNAMENT_ENTRIES = 4
+
+# Food & beverage tax (PRD 3.4)
+FNB_TAX_PCT = 0.0875
+
+# Event quote (PRD 3.7)
+EVENT_TABLE_HOUR_RATE_CENTS = 4000
+EVENT_DEPOSIT_PCT = 0.25
+
+# Membership lifecycle (PRD 3.1, 2.5)
+CYCLE_DAYS = 30
+NO_SHOW_GRACE_MINUTES = 15
+NO_SHOW_SUSPEND_THRESHOLD = 3
+CHECKIN_EARLY_MINUTES = 15
+TURNOVER_BUFFER_MINUTES = 10
+
+# Logical clock default (PRD 2.5)
+DEFAULT_CLOCK_UTC = "2026-07-01T00:00:00Z"
+
+# Pagination (PRD 2.3)
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100

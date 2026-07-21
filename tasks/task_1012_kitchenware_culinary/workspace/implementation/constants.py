@@ -1,0 +1,66 @@
+"""Domain constants for the Kitchenware & Culinary Store API."""
+from decimal import Decimal
+
+# ---- Roles ----
+ROLE_ADMIN = "PlatformAdmin"
+ROLE_ASSOCIATE = "StoreAssociate"
+ROLE_MEMBER = "Member"
+KNOWN_ROLES = {ROLE_ADMIN, ROLE_ASSOCIATE, ROLE_MEMBER}
+
+# ---- Auth headers ----
+HEADER_USER_ID = "X-User-ID"
+HEADER_USER_ROLE = "X-User-Role"
+
+# ---- Logical clock default ----
+DEFAULT_CLOCK = "2026-07-01T00:00:00Z"
+
+# ---- Pagination ----
+PAGE_LIMIT_DEFAULT = 10
+PAGE_LIMIT_MIN = 1
+PAGE_LIMIT_MAX = 100
+PAGE_OFFSET_DEFAULT = 0
+
+# ---- Enums ----
+STORE_STATES = {"CA", "OR", "NY"}
+STORE_STATUSES = {"OPEN", "CLOSED"}
+SKU_CATEGORIES = {"COOKWARE", "KNIVES", "COFFEE", "APPLIANCE", "TABLETOP"}
+SKU_STATUSES = {"ACTIVE", "DISCONTINUED"}
+FULFILLMENT_TYPES = {"BOPIS", "SHIP_FROM_STORE", "IN_STORE"}
+CLASS_STATIONS = {"DEMO_KITCHEN", "HEARTH_BAR"}
+SERVICE_TYPES = {"KNIFE_SHARPENING", "COFFEE_SERVICE"}
+RETURN_REASONS = {"DEFECTIVE", "UNWANTED", "WRONG_ITEM"}
+REFUND_DESTINATIONS = {"ORIGINAL", "WALLET"}
+REGISTRY_EVENTS = {"WEDDING", "HOUSEWARMING", "BIRTHDAY"}
+
+# ---- Loyalty tiers ----
+TIER_STANDARD = "STANDARD"
+TIER_SILVER = "SILVER"
+TIER_GOLD = "GOLD"
+
+# ---- Pricing / points ----
+TIER_DISCOUNT_PCT = {
+    TIER_STANDARD: Decimal("0.00"),
+    TIER_SILVER: Decimal("0.05"),
+    TIER_GOLD: Decimal("0.10"),
+}
+TAX_RATE = {
+    "CA": Decimal("0.0875"),
+    "OR": Decimal("0.00"),
+    "NY": Decimal("0.08"),
+}
+POINTS_MULT = {
+    TIER_STANDARD: Decimal("1.00"),
+    TIER_SILVER: Decimal("1.25"),
+    TIER_GOLD: Decimal("1.50"),
+}
+DISCOUNT_CAP_CENTS = 20000
+POINTS_PER_CENT_DIVISOR = 100
+
+# ---- Tier thresholds ----
+SILVER_THRESHOLD_CENTS = 50000
+GOLD_THRESHOLD_CENTS = 150000
+
+# ---- Time windows ----
+RETURN_WINDOW_DAYS = 30
+SERVICE_BUFFER_MINUTES = 30
+SPEND_WINDOW_DAYS = 365

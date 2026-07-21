@@ -1,0 +1,1051 @@
+scenario: |
+  1016. Vitamin & Supplement Store (GNC style): SKU & regimen/goal, loyalty &
+  auto-ship subscription, practitioner-line & recommendation, expiration/lot &
+  recall, bundle/stack, return, DSHEA labeling, inventory
+
+domain_name: vitamin-supplement-store
+api_prefix: /
+
+# Root-level flat topology: every resource collection is a top-level path
+# ("/products", "/customers", "/orders", ...). api_prefix is "/" so the whole
+# surface is peer collections linked by explicit foreign keys — not a nested
+# ownership tree.
+
+complexity_profile:
+  primary_archetype: quota_allocation           # finite lot inventory reserved / committed / released across expiration-ordered lots
+  secondary_archetype: compliance_audit         # DSHEA labeling, practitioner-line authorization, lot recall with cascading corrections
+  complexity_layers:
+    - cascading_side_effects                    # recall -> lot -> allocations -> order lines -> order/customer recompute
+    - dual_variant_calculation                  # order provisional-vs-final subtotal; return full-vs-unwanted refund
+    - derived_field_reconciliation              # lot reserved/available, customer points_balance/tier, order totals
+    - optimistic_concurrency                    # OCC on Subscription.version for auto-ship order generation
+    - rate_threshold_triggers                   # loyalty tier thresholds, auto-ship cadence discount tiers
+
+  entity_topology: flat                         # peer entities linked by FK fields, no nested URL ownership tree
+  state_machine_shape: cyclic                   # Lot AVAILABLE<->QUARANTINED and Subscription ACTIVE<->PAUSED are the dominant loops
+  relationship_patterns:
+    - one_to_many                               # Product->Lot, Order->OrderLine, Customer->Subscription/Order
+    - cross_aggregate                           # OrderLine allocates from Lot; Order gated by Customer/Recommendation state
+    - polymorphic: false
+  role_model: peer_roles                        # StoreOperator owns catalog/inventory/fulfilment; Customer owns own orders/subs/returns; Practitioner owns recommendations
+  consistency_model: immediate                  # every cascade resolves synchronously inside the triggering request
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — emitted verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Product / SKU display name" }
+      - { name: form, type: enum, source: input, description: "Dosage form", constraints: "CAPSULE | TABLET | POWDER | GUMMY | LIQUID" }
+      - { name: regimen_goals, type: array, source: input, description: "Regimen/goal tags this SKU targets", constraints: "each element in {IMMUNITY, SLEEP, ENERGY, JOINT, DIGESTION}" }
+      - { name: is_practitioner_line, type: boolean, source: input, default: false, description: "True if this SKU may only be purchased under a valid practitioner Recommendation" }
+      - { name: dshea_claim_type, type: enum, source: input, description: "DSHEA structure/function labeling classification", constraints: "STRUCTURE_FUNCTION | NONE (a request value of DISEASE is rejected with ERR_DSHEA_DISEASE_CLAIM — never stored)" }
+      - { name: requires_fda_disclaimer, type: boolean, source: computed, description: "= (dshea_claim_type == STRUCTURE_FUNCTION); the FDA 'This statement has not been evaluated...' disclaimer flag" }
+      - { name: unit_price_cents, type: integer, source: input, description: "List price per unit in integer cents" }
+
+  - name: Lot
+    parent: Product
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: system, description: "FK -> Product.id; owning SKU (from path)" }
+      - { name: lot_number, type: string, source: input, description: "Manufacturer lot / batch number" }
+      - { name: expiration_date, type: datetime, source: input, description: "Lot expiry instant (ISO 8601 UTC)" }
+      - { name: quantity_received, type: integer, source: input, description: "Units booked into this lot at receipt (immutable)" }
+      - { name: quantity_on_hand, type: integer, source: computed, description: "Physical units still in the lot; initialized to quantity_received, decremented when a fulfilled allocation ships out; a restocked UNWANTED return increments it" }
+      - { name: quantity_reserved, type: integer, source: computed, default: 0, description: "= sum of quantity over this lot's Allocations in status RESERVED" }
+      - { name: quantity_available, type: integer, source: computed, description: "= quantity_on_hand - quantity_reserved" }
+      - { name: status, type: enum, source: system, description: "Lifecycle", constraints: "AVAILABLE | QUARANTINED | RECALLED | EXPIRED" }
+      - { name: recall_reason, type: string, source: system, default: null, description: "Reason captured on the AVAILABLE/QUARANTINED -> RECALLED transition; null otherwise" }
+      - { name: recall_severity, type: enum, source: system, default: null, description: "FDA recall class captured on recall", constraints: "CLASS_I | CLASS_II | CLASS_III | null" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Customer email (login identity)" }
+      - { name: full_name, type: string, source: input, description: "Customer full name" }
+      - { name: status, type: enum, source: system, description: "Account status", constraints: "ACTIVE | SUSPENDED" }
+      - { name: lifetime_points_earned, type: integer, source: computed, default: 0, description: "Cumulative settled loyalty points ever earned; drives loyalty_tier; NOT decremented by returns (tier is sticky)" }
+      - { name: points_balance, type: integer, source: computed, default: 0, description: "Spendable loyalty points; += points_earned on order fulfilment, -= points held on redemption at place, += reversal on cancel/return-refund" }
+      - { name: loyalty_tier, type: enum, source: computed, description: "= tier(lifetime_points_earned)", constraints: "BRONZE | SILVER | GOLD" }
+
+  - name: Practitioner
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Practitioner full name" }
+      - { name: license_number, type: string, source: input, description: "Practitioner license number" }
+
+  - name: Recommendation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: practitioner_id, type: string, source: system, description: "FK -> Practitioner.id; issuing practitioner (from X-User-ID)" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; authorized customer" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the practitioner-line SKU authorized" }
+      - { name: issued_at, type: datetime, source: system, description: "Logical clock instant at creation; start of the validity interval" }
+      - { name: expires_at, type: datetime, source: input, description: "End of the validity interval (exclusive); interval is [issued_at, expires_at)" }
+      - { name: max_units, type: integer, source: input, description: "Total units of product this authorization covers" }
+      - { name: consumed_units, type: integer, source: computed, default: 0, description: "= sum of quantity over FULFILLED order lines that drew on this authorization" }
+      - { name: status, type: enum, source: system, description: "Lifecycle", constraints: "ISSUED | EXHAUSTED | EXPIRED | REVOKED" }
+
+  - name: Bundle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Bundle / stack display name" }
+      - { name: component_product_ids, type: array, source: input, description: "Product ids that make up this stack (each element references Product.id)" }
+      - { name: discount_pct, type: number, source: input, description: "Fractional stack discount applied to a line whose product is a component, e.g. 0.15" }
+
+  - name: Subscription
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; owner (from X-User-ID)" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; the auto-ship SKU" }
+      - { name: quantity_per_cycle, type: integer, source: input, description: "Units shipped each cycle" }
+      - { name: cadence_days, type: integer, source: input, description: "Ship cadence in days", constraints: "must be one of {30, 60, 90}" }
+      - { name: first_ship_date, type: datetime, source: input, description: "First scheduled ship instant" }
+      - { name: next_ship_date, type: datetime, source: computed, description: "Next scheduled ship instant; initialized to first_ship_date, advanced by cadence_days on each generate-order" }
+      - { name: autoship_discount_pct, type: number, source: computed, description: "= AUTOSHIP_DISCOUNT[cadence_days]; the per-line discount applied to this subscription's auto-ship orders" }
+      - { name: status, type: enum, source: system, description: "Lifecycle", constraints: "ACTIVE | PAUSED | CANCELLED" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; buyer (from X-User-ID)" }
+      - { name: subscription_id, type: string, source: input, default: null, description: "FK -> Subscription.id; set only for AUTOSHIP orders, null for one-off orders" }
+      - { name: order_type, type: enum, source: input, default: ONE_OFF, description: "Order kind", constraints: "ONE_OFF | AUTOSHIP" }
+      - { name: points_redeemed, type: integer, source: input, default: 0, description: "Loyalty points the buyer applies; 1 point = POINT_REDEMPTION_VALUE_CENTS (= 1) cent" }
+      - { name: status, type: enum, source: system, description: "Lifecycle", constraints: "DRAFT | PLACED | FULFILLED | CANCELLED" }
+      - { name: provisional_subtotal_cents, type: integer, source: computed, default: null, description: "Snapshot of sum(line_total_cents) captured at DRAFT->PLACED (all lines fully allocated at place)" }
+      - { name: final_subtotal_cents, type: integer, source: computed, default: null, description: "Recomputed at PLACED->FULFILLED as sum over lines of net_unit_price_cents*(quantity-short_quantity); diverges from provisional when a recall shorted a line" }
+      - { name: redemption_cents, type: integer, source: computed, default: 0, description: "= points_redeemed * POINT_REDEMPTION_VALUE_CENTS (POINT_REDEMPTION_VALUE_CENTS = 1)" }
+      - { name: total_cents, type: integer, source: computed, default: null, description: "Amount charged: (final_subtotal_cents if FULFILLED else provisional_subtotal_cents) - redemption_cents" }
+      - { name: points_earned, type: integer, source: computed, default: 0, description: "Loyalty points; provisional value computed at PLACED on provisional_subtotal, settled at FULFILLED on final_subtotal" }
+
+  - name: OrderLine
+    parent: Order
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; owning order (from path)" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; SKU on this line" }
+      - { name: bundle_id, type: string, source: input, default: null, description: "FK -> Bundle.id; the stack this line participates in, or null" }
+      - { name: quantity, type: integer, source: input, description: "Units ordered on this line" }
+      - { name: gross_unit_price_cents, type: integer, source: computed, description: "= product.unit_price_cents snapshot at line creation" }
+      - { name: net_unit_price_cents, type: integer, source: computed, description: "= round_half_up(gross_unit_price_cents*(1-bundle_discount_pct)*(1-applicable_purchase_discount_pct)); see order_line_pricing" }
+      - { name: line_total_cents, type: integer, source: computed, description: "= net_unit_price_cents * quantity (set at place)" }
+      - { name: lot_allocations, type: array, source: computed, default: [], description: "FEFO allocation records: list of {lot_id, quantity, status in {RESERVED,CONSUMED,RELEASED}} filled at place" }
+      - { name: short_quantity, type: integer, source: computed, default: 0, description: "Units that can no longer ship because a recall RELEASED their allocation; increased by the recall cascade" }
+
+  - name: Return
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; the fulfilled order being returned against" }
+      - { name: order_line_id, type: string, source: input, description: "FK -> OrderLine.id; the specific line being returned" }
+      - { name: quantity, type: integer, source: input, description: "Units returned (<= the line's fulfilled quantity)" }
+      - { name: reason, type: enum, source: input, description: "Return reason", constraints: "DEFECT | UNWANTED | RECALL | EXPIRED" }
+      - { name: status, type: enum, source: system, description: "Lifecycle", constraints: "REQUESTED | APPROVED | REJECTED | REFUNDED" }
+      - { name: refund_cents, type: integer, source: computed, default: null, description: "Money refunded, computed at refund; see return_refund (dual-variant)" }
+      - { name: points_reversed, type: integer, source: computed, default: null, description: "Loyalty points clawed back at refund" }
+      - { name: restock, type: boolean, source: computed, default: null, description: "Whether returned units were added back to the source lot's quantity_on_hand" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Lot
+    initial_state: AVAILABLE
+    terminal_states: [RECALLED, EXPIRED]
+    transitions:
+      - from: AVAILABLE
+        to: QUARANTINED
+        trigger: "POST /lots/{id}/state {to_status: QUARANTINED}"
+        actor: StoreOperator
+        preconditions: ["Lot.status == AVAILABLE"]
+        side_effects: ["Lot no longer allocatable while QUARANTINED (excluded from FEFO candidate set); existing RESERVED allocations are unaffected"]
+      - from: QUARANTINED
+        to: AVAILABLE
+        trigger: "POST /lots/{id}/state {to_status: AVAILABLE}"
+        actor: StoreOperator
+        preconditions: ["Lot.status == QUARANTINED"]
+        side_effects: ["Lot re-enters the FEFO candidate set"]
+        note: "Cyclic AVAILABLE<->QUARANTINED loop (non-linear machine, rule non_linear_state_machine)"
+      - from: AVAILABLE
+        to: RECALLED
+        trigger: "POST /lots/{id}/state {to_status: RECALLED, reason, severity}"
+        actor: StoreOperator
+        preconditions: ["Lot.status == AVAILABLE"]
+        side_effects:
+          - "Set recall_reason, recall_severity"
+          - "Cascade: every Allocation on this lot in status RESERVED -> RELEASED"
+          - "Each RELEASED allocation increments its OrderLine.short_quantity by the allocation quantity (line can no longer ship those units)"
+          - "Each affected OrderLine's parent Order is left with an unchanged provisional_subtotal_cents; the shortfall is realized in final_subtotal_cents at fulfilment"
+          - "Lot.quantity_reserved decreases by the sum of released allocation quantities"
+      - from: QUARANTINED
+        to: RECALLED
+        trigger: "POST /lots/{id}/state {to_status: RECALLED, reason, severity}"
+        actor: StoreOperator
+        preconditions: ["Lot.status == QUARANTINED"]
+        side_effects: ["Same recall cascade as AVAILABLE -> RECALLED"]
+      - from: AVAILABLE
+        to: EXPIRED
+        trigger: "POST /_jobs/run-expiry-sweep (system, when expiration_date <= clock now)"
+        actor: system
+        preconditions: ["Lot.status == AVAILABLE", "expiration_date <= current logical clock"]
+        side_effects: ["Lot excluded from FEFO candidate set permanently"]
+      - from: QUARANTINED
+        to: EXPIRED
+        trigger: "POST /_jobs/run-expiry-sweep (system, when expiration_date <= clock now)"
+        actor: system
+        preconditions: ["Lot.status == QUARANTINED", "expiration_date <= current logical clock"]
+        side_effects: []
+
+  - entity: Customer
+    initial_state: ACTIVE
+    terminal_states: [SUSPENDED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /customers/{id}/suspend"
+        actor: StoreOperator
+        preconditions: ["Customer.status == ACTIVE"]
+        side_effects:
+          - "Cascade (depth-1): every Subscription of this customer in status ACTIVE -> PAUSED"
+          - "Cascade (depth-2): for each such Subscription, any of its AUTOSHIP Orders still in DRAFT -> CANCELLED"
+          - "Cascade (depth-3): each cancelled Order releases its lines' RESERVED allocations back to their lots (quantity_reserved decreases)"
+
+  - entity: Recommendation
+    initial_state: ISSUED
+    terminal_states: [EXHAUSTED, EXPIRED, REVOKED]
+    transitions:
+      - from: ISSUED
+        to: EXHAUSTED
+        trigger: "system, on order fulfilment when consumed_units reaches max_units"
+        actor: system
+        preconditions: ["Recommendation.status == ISSUED", "consumed_units == max_units after this fulfilment"]
+        side_effects: ["Authorization can no longer back a practitioner-line purchase"]
+      - from: ISSUED
+        to: EXPIRED
+        trigger: "POST /_jobs/run-expiry-sweep (system, when expires_at <= clock now)"
+        actor: system
+        preconditions: ["Recommendation.status == ISSUED", "expires_at <= current logical clock"]
+        side_effects: ["Authorization can no longer back a practitioner-line purchase"]
+      - from: ISSUED
+        to: REVOKED
+        trigger: "POST /recommendations/{id}/revoke  (or cascade from POST /practitioners/{id}/suspend)"
+        actor: Practitioner
+        preconditions: ["Recommendation.status == ISSUED"]
+        side_effects: ["Authorization can no longer back a practitioner-line purchase"]
+        note: "Fork from ISSUED into three terminal branches with distinct trigger/actor sets (non-linear branching machine)"
+
+  - entity: Subscription
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /subscriptions/{id}/state {to_status: PAUSED}  (or cascade from customer suspend)"
+        actor: Customer
+        preconditions: ["Subscription.status == ACTIVE"]
+        side_effects: ["generate-order is refused while PAUSED"]
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/state {to_status: ACTIVE}"
+        actor: Customer
+        preconditions: ["Subscription.status == PAUSED"]
+        side_effects: []
+        note: "Cyclic ACTIVE<->PAUSED loop (non-linear machine, rule non_linear_state_machine)"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/state {to_status: CANCELLED}"
+        actor: Customer
+        preconditions: ["Subscription.status == ACTIVE"]
+        side_effects: []
+      - from: PAUSED
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/state {to_status: CANCELLED}"
+        actor: Customer
+        preconditions: ["Subscription.status == PAUSED"]
+        side_effects: []
+
+  - entity: Order
+    initial_state: DRAFT
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: PLACED
+        trigger: "POST /orders/{id}/place"
+        actor: Customer
+        preconditions:
+          - "Order has >= 1 OrderLine (ERR_INVALID_QUANTITY when empty)"
+          - "Customer.status == ACTIVE (ERR_CUSTOMER_SUSPENDED) — cross-entity dependency"
+          - "For every line whose product.is_practitioner_line: an ISSUED, non-expired Recommendation for (customer_id, product_id) with (consumed_units + line.quantity) <= max_units exists (ERR_PRACTITIONER_AUTH_REQUIRED) — cross-entity dependency"
+          - "FEFO allocation across the product's AVAILABLE, non-expired lots fully covers each line (ERR_INSUFFICIENT_INVENTORY)"
+          - "points_redeemed <= customer.points_balance AND redemption_cents <= provisional_subtotal_cents (ERR_INSUFFICIENT_POINTS)"
+        side_effects:
+          - "Run fefo_allocation for each line -> creates RESERVED allocations; each lot.quantity_reserved increases"
+          - "Compute order_line_pricing per line (net_unit_price_cents, line_total_cents)"
+          - "Set provisional_subtotal_cents = sum(line_total_cents); redemption_cents; total_cents; points_earned (provisional)"
+          - "Hold redemption: customer.points_balance -= points_redeemed"
+      - from: PLACED
+        to: FULFILLED
+        trigger: "POST /orders/{id}/fulfill"
+        actor: StoreOperator
+        preconditions: ["Order.status == PLACED"]
+        side_effects:
+          - "Each RESERVED allocation -> CONSUMED; its lot.quantity_on_hand -= allocation.quantity and lot.quantity_reserved -= allocation.quantity"
+          - "Recompute final_subtotal_cents = sum(net_unit_price_cents*(quantity-short_quantity)); total_cents"
+          - "Settle points_earned on final_subtotal (loyalty_points_earned settled variant); customer.points_balance += points_earned; customer.lifetime_points_earned += points_earned; recompute loyalty_tier"
+          - "For practitioner-line lines: recommendation.consumed_units += line.quantity; if it reaches max_units -> Recommendation ISSUED->EXHAUSTED"
+          - "If AUTOSHIP: subscription.next_ship_date already advanced at generate-order (no-op here)"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel"
+        actor: Customer
+        preconditions: ["Order.status == DRAFT"]
+        side_effects: ["No allocations exist yet (allocation happens at place) -> nothing to release"]
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /orders/{id}/cancel  (or cascade from customer suspend on DRAFT autoship orders)"
+        actor: Customer
+        preconditions: ["Order.status == PLACED"]
+        side_effects:
+          - "Compensation: every RESERVED allocation -> RELEASED; its lot.quantity_reserved -= allocation.quantity (restores lot.quantity_available)"
+          - "Refund held redemption: customer.points_balance += points_redeemed"
+          - "No points were settled at PLACED, so no earned points to claw back"
+
+  - entity: Return
+    initial_state: REQUESTED
+    terminal_states: [REJECTED, REFUNDED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /returns/{id}/state {to_status: APPROVED}"
+        actor: StoreOperator
+        preconditions: ["Return.status == REQUESTED"]
+        side_effects: []
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /returns/{id}/state {to_status: REJECTED}"
+        actor: StoreOperator
+        preconditions: ["Return.status == REQUESTED"]
+        side_effects: []
+      - from: APPROVED
+        to: REFUNDED
+        trigger: "POST /returns/{id}/state {to_status: REFUNDED}"
+        actor: StoreOperator
+        preconditions: ["Return.status == APPROVED"]
+        side_effects:
+          - "Compute return_refund (dual-variant on reason): set refund_cents, points_reversed, restock"
+          - "customer.points_balance -= points_reversed (compensating claw-back of earned points)"
+          - "If restock == true AND source lot.status == AVAILABLE: lot.quantity_on_hand += quantity"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: autoship-order-generate-stale-subscription
+    parent_entity: Subscription
+    write_endpoint: "POST /subscriptions/{id}/generate-order"
+    occ_field: "expected_subscription_version"
+    description: |
+      Generating the next auto-ship Order against a Subscription whose version
+      has advanced since the client last observed it is rejected. Auto-ship
+      generation legitimately succeeds from the ACTIVE state and is not blocked
+      by any state precondition, so a writer holding a stale subscription view
+      would otherwise create a duplicate cycle order; OCC on Subscription.version
+      reduces this to a stale-version check. The winning generation advances
+      next_ship_date and bumps the version, so the stale request fails.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: fefo_allocation
+    trigger: "DRAFT -> PLACED (POST /orders/{id}/place), per line"
+    algorithm: waterfall_allocation
+    formula: |
+      candidates = Lots where product_id == line.product_id
+                        AND status == AVAILABLE
+                        AND expiration_date > clock_now
+      order candidates by (expiration_date ASC, created_at ASC)   # first-expire-first-out; created_at tie-break, never id
+      remaining = line.quantity
+      for lot in candidates:
+        take = min(remaining, lot.quantity_available)
+        if take > 0:
+          create Allocation{lot_id: lot.id, quantity: take, status: RESERVED}
+          lot.quantity_reserved += take
+          remaining -= take
+        if remaining == 0: break
+      if remaining > 0:   # candidate pool exhausted
+        reject whole order with ERR_INSUFFICIENT_INVENTORY (atomic: no allocation persists)
+    input_set: "AVAILABLE, non-expired lots of the line's product only; QUARANTINED / RECALLED / EXPIRED excluded"
+    constants: {}
+    precision: "integer units"
+
+  - name: order_line_pricing
+    trigger: "DRAFT -> PLACED, per line"
+    algorithm: tiered_pricing
+    formula: |
+      applicable_purchase_discount_pct =
+        (order.order_type == AUTOSHIP) ? subscription.autoship_discount_pct
+                                       : LOYALTY_PURCHASE_DISCOUNT[customer.loyalty_tier]
+      bundle_discount_pct =
+        (line.bundle_id != null AND line.product_id in bundle.component_product_ids)
+          ? bundle.discount_pct : 0.0
+      # ROUNDING ORDER IS PINNED: round the per-UNIT discounted price to whole cents
+      # (round_half_up) FIRST, THEN multiply by quantity. This differs from
+      # rounding the line total after multiplying (per-line rounding) and the two
+      # orders can disagree by cents.
+      net_unit_price_cents = round_half_up(
+          gross_unit_price_cents * (1 - bundle_discount_pct) * (1 - applicable_purchase_discount_pct))
+      line_total_cents = net_unit_price_cents * line.quantity
+    input_set: "the line's product, its bundle (if any), the buyer's tier or the subscription cadence discount"
+    constants:
+      LOYALTY_PURCHASE_DISCOUNT: { BRONZE: 0.00, SILVER: 0.05, GOLD: 0.10 }
+      AUTOSHIP_DISCOUNT: { 30: 0.05, 60: 0.08, 90: 0.10 }
+    precision: "round_half_up to whole cents, applied per unit BEFORE multiplying by quantity"
+
+  - name: order_subtotal
+    trigger: "provisional at DRAFT->PLACED; final at PLACED->FULFILLED"
+    algorithm: aggregation
+    formula: |
+      provisional_subtotal_cents = sum(line.line_total_cents for all lines)          # at place; every line fully allocated
+      final_subtotal_cents       = sum(line.net_unit_price_cents * (line.quantity - line.short_quantity) for all lines)  # at fulfil
+      total_cents = (FULFILLED ? final_subtotal_cents : provisional_subtotal_cents) - redemption_cents
+    input_set: "all OrderLines of the order"
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: provisional
+        when: "captured at DRAFT->PLACED, before any post-place recall"
+        difference: "uses full ordered quantity per line (short_quantity is 0 at place)"
+      - name: final
+        when: "recomputed at PLACED->FULFILLED"
+        difference: "subtracts short_quantity per line, so a recall between place and fulfil makes final < provisional"
+
+  - name: loyalty_points_earned
+    trigger: "provisional at DRAFT->PLACED; settled at PLACED->FULFILLED"
+    algorithm: weighted_scoring
+    formula: |
+      base_source = (FULFILLED ? final_subtotal_cents : provisional_subtotal_cents)   # merchandise value, BEFORE points redemption
+      base_points = floor(base_source / POINTS_PER_DOLLAR_CENTS)
+      earn_multiplier = TIER_EARN_MULTIPLIER[customer.loyalty_tier]
+                        + (order.order_type == AUTOSHIP ? AUTOSHIP_EARN_BONUS : 0.0)
+      points_earned = min(floor(base_points * earn_multiplier), POINTS_PER_ORDER_CAP)
+    input_set: "order subtotal (>=3 interacting inputs: subtotal, tier multiplier, order_type bonus), capped"
+    constants:
+      POINTS_PER_DOLLAR_CENTS: 100
+      TIER_EARN_MULTIPLIER: { BRONZE: 1.0, SILVER: 1.25, GOLD: 1.5 }
+      AUTOSHIP_EARN_BONUS: 0.25
+      POINTS_PER_ORDER_CAP: 2000
+    precision: "floor to integer points after multiplying"
+    variants:
+      - name: provisional
+        when: "at place, on provisional_subtotal"
+        difference: "written to points_earned but NOT credited to points_balance"
+      - name: settled
+        when: "at fulfil, on final_subtotal"
+        difference: "credited to points_balance and lifetime_points_earned; differs from provisional when a recall shorted lines"
+
+  - name: loyalty_tier
+    trigger: "on customer.lifetime_points_earned change (order fulfilment) and on _inject/loyalty_state"
+    algorithm: threshold
+    formula: |
+      if lifetime_points_earned >= TIER_GOLD_THRESHOLD:   loyalty_tier = GOLD
+      elif lifetime_points_earned >= TIER_SILVER_THRESHOLD: loyalty_tier = SILVER
+      else:                                                  loyalty_tier = BRONZE
+    input_set: "customer.lifetime_points_earned"
+    constants:
+      TIER_SILVER_THRESHOLD: 500
+      TIER_GOLD_THRESHOLD: 1000
+    precision: "inclusive >= at each threshold (1000 lifetime points is GOLD, 999 is SILVER)"
+
+  - name: autoship_discount
+    trigger: "subscription creation; used by order_line_pricing on AUTOSHIP orders"
+    algorithm: threshold
+    formula: |
+      autoship_discount_pct = AUTOSHIP_DISCOUNT[cadence_days]   # cadence_days already constrained to {30,60,90}
+    input_set: "subscription.cadence_days"
+    constants:
+      AUTOSHIP_DISCOUNT: { 30: 0.05, 60: 0.08, 90: 0.10 }
+    precision: "exact fractional rate"
+
+  - name: return_refund
+    trigger: "APPROVED -> REFUNDED (POST /returns/{id}/state {to_status: REFUNDED})"
+    algorithm: aggregation
+    formula: |
+      line = OrderLine(return.order_line_id)
+      gross_refund_cents = line.net_unit_price_cents * return.quantity   # value of returned units at price paid
+      # points attributable to the returned merchandise, proportional to the order's settled points
+      points_reversed = floor(order.points_earned * gross_refund_cents / order.final_subtotal_cents)
+      if return.reason in {DEFECT, RECALL, EXPIRED}:   # FULL variant
+        refund_cents = gross_refund_cents
+        restock = false
+      else:                                            # UNWANTED variant
+        refund_cents = round_half_up(gross_refund_cents * (1 - RESTOCK_FEE_PCT))
+        restock = (source lot.status == AVAILABLE)
+    input_set: "the returned line, the parent order's settled points/subtotal, the reason"
+    constants:
+      RESTOCK_FEE_PCT: 0.15
+    precision: "round_half_up to whole cents for the UNWANTED variant; points floored"
+    variants:
+      - name: full
+        when: "reason in {DEFECT, RECALL, EXPIRED}"
+        difference: "refund_cents = gross value, no restocking fee, units NOT restocked"
+      - name: unwanted
+        when: "reason == UNWANTED"
+        difference: "refund_cents = gross * (1 - 0.15) rounded, units restocked when the lot is still AVAILABLE"
+
+  - name: recommendation_consumption
+    trigger: "order fulfilment, per practitioner-line line"
+    algorithm: aggregation
+    formula: |
+      consumed_units = sum(line.quantity for FULFILLED order lines of (customer_id, product_id) backed by this authorization)
+      if consumed_units == max_units: status -> EXHAUSTED   # boundary: inclusive equality
+    input_set: "FULFILLED order lines drawing on the recommendation"
+    constants: {}
+    precision: "integer units; EXHAUSTED at consumed_units == max_units exactly"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "The role is permitted to invoke this endpoint per the RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "For Customer/Practitioner entity-backed writes, X-User-ID owns the target resource (order/subscription/return owner; recommendation issuer)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "customer-owned and practitioner-owned mutation endpoints"
+  - priority: 4
+    category: existence
+    check: "Every path id and body FK references an existing resource, left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "Target resource is in a state that admits the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-changing endpoints (place, fulfill, cancel, lot/subscription/return state, revoke, generate-order)"
+  - priority: 6
+    category: business_safety
+    check: "dshea_claim_type of DISEASE is never accepted (DSHEA prohibits disease claims)"
+    error_id: ERR_DSHEA_DISEASE_CLAIM
+    http_status: 422
+    applies_to: "POST /products"
+  - priority: 7
+    category: business_safety
+    check: "A practitioner-line product line requires an ISSUED, non-expired Recommendation for (customer, product) with enough remaining units"
+    error_id: ERR_PRACTITIONER_AUTH_REQUIRED
+    http_status: 403
+    applies_to: "POST /orders/{id}/place"
+  - priority: 8
+    category: business_safety
+    check: "A line cannot allocate from a lot that is QUARANTINED/RECALLED/EXPIRED (only AVAILABLE, non-expired lots are sellable)"
+    error_id: ERR_LOT_NOT_SELLABLE
+    http_status: 409
+    applies_to: "POST /orders/{id}/place (surfaces only when no AVAILABLE lot can serve)"
+  - priority: 9
+    category: business_referential
+    check: "The buying customer must be ACTIVE"
+    error_id: ERR_CUSTOMER_SUSPENDED
+    http_status: 409
+    applies_to: "POST /orders/{id}/place, POST /subscriptions, POST /orders"
+  - priority: 10
+    category: business_referential
+    check: "If a line supplies bundle_id, the line's product must be a component of that bundle"
+    error_id: ERR_BUNDLE_PRODUCT_MISMATCH
+    http_status: 422
+    applies_to: "POST /orders/{id}/lines"
+  - priority: 11
+    category: business_constraint
+    check: "quantity / quantity_per_cycle / return quantity must be >= 1"
+    error_id: ERR_INVALID_QUANTITY
+    http_status: 422
+    applies_to: "POST /orders/{id}/lines, POST /subscriptions, POST /returns, POST /orders/{id}/place (empty order)"
+  - priority: 12
+    category: business_constraint
+    check: "cadence_days must be one of {30, 60, 90}"
+    error_id: ERR_INVALID_CADENCE
+    http_status: 422
+    applies_to: "POST /subscriptions"
+  - priority: 13
+    category: business_temporal
+    check: "A new Recommendation's [issued_at, expires_at) interval must not overlap an existing ISSUED Recommendation for the same (customer, product); half-open, so touching endpoints are allowed"
+    error_id: ERR_RECOMMENDATION_OVERLAP
+    http_status: 409
+    applies_to: "POST /recommendations"
+  - priority: 14
+    category: business_temporal
+    check: "A new Subscription's first_ship_date must be >= SUBSCRIPTION_BUFFER_DAYS (= 7) days away from the next_ship_date of any existing ACTIVE/PAUSED subscription for the same (customer, product); strictly-within-buffer is rejected, exactly-buffer apart is accepted"
+    error_id: ERR_SUBSCRIPTION_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /subscriptions"
+  - priority: 15
+    category: business_constraint
+    check: "Insufficient AVAILABLE, non-expired inventory across the product's lots to cover a line"
+    error_id: ERR_INSUFFICIENT_INVENTORY
+    http_status: 409
+    applies_to: "POST /orders/{id}/place"
+  - priority: 16
+    category: business_constraint
+    check: "Return quantity must not exceed the line's fulfilled (non-shorted) quantity"
+    error_id: ERR_RETURN_QUANTITY_EXCEEDS
+    http_status: 422
+    applies_to: "POST /returns"
+  - priority: 17
+    category: business_fiscal
+    check: "points_redeemed must not exceed customer.points_balance and redemption_cents must not exceed the subtotal"
+    error_id: ERR_INSUFFICIENT_POINTS
+    http_status: 409
+    applies_to: "POST /orders/{id}/place"
+  - priority: 18
+    category: business_constraint
+    check: "expected_subscription_version must equal the subscription's current version (OCC)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /subscriptions/{id}/generate-order"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Product ----
+  - method: POST
+    path: "/products"
+    description: "Create a Product/SKU. requires_fda_disclaimer is computed; a dshea_claim_type of DISEASE is rejected."
+    roles: [StoreOperator]
+    code: 201
+    input: [name, form, regimen_goals, "is_practitioner_line?", dshea_claim_type, unit_price_cents]
+    output: Product
+    side_effects: ["requires_fda_disclaimer = (dshea_claim_type == STRUCTURE_FUNCTION)"]
+  - method: GET
+    path: "/products/{id}"
+    description: "Fetch a Product"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+
+  # ---- Lot ----
+  - method: POST
+    path: "/products/{id}/lots"
+    description: "Receive a new inventory Lot for a product"
+    roles: [StoreOperator]
+    code: 201
+    input: [lot_number, expiration_date, quantity_received]
+    output: Lot
+    side_effects: ["status=AVAILABLE; quantity_on_hand=quantity_received; quantity_reserved=0; quantity_available=quantity_received"]
+  - method: GET
+    path: "/products/{id}/lots"
+    description: "List a product's lots (reverse lookup for Lot.product_id)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["status?"]
+    output: Lot[]
+    side_effects: []
+  - method: GET
+    path: "/lots/{id}"
+    description: "Fetch a Lot"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Lot
+    side_effects: []
+  - method: POST
+    path: "/lots/{id}/state"
+    description: "Drive a Lot state transition: QUARANTINE, release back to AVAILABLE, or RECALL (recall requires reason+severity and runs the recall cascade)"
+    roles: [StoreOperator]
+    code: 200
+    input: [to_status, "reason?", "severity?"]
+    output: Lot
+    side_effects: ["Per Lot state machine, including the RECALLED cascade over allocations/order lines"]
+
+  # ---- Customer ----
+  - method: POST
+    path: "/customers"
+    description: "Onboard a Customer"
+    roles: [StoreOperator]
+    code: 201
+    input: [email, full_name]
+    output: Customer
+    side_effects: ["status=ACTIVE; lifetime_points_earned=0; points_balance=0; loyalty_tier=BRONZE"]
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a Customer"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+  - method: POST
+    path: "/customers/{id}/suspend"
+    description: "Suspend a Customer; cascades to pause active subscriptions and cancel their draft auto-ship orders"
+    roles: [StoreOperator]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: ["ACTIVE->SUSPENDED; subscription pause cascade; draft autoship order cancel cascade; allocation release cascade"]
+
+  # ---- Practitioner ----
+  - method: POST
+    path: "/practitioners"
+    description: "Onboard a Practitioner"
+    roles: [StoreOperator]
+    code: 201
+    input: [full_name, license_number]
+    output: Practitioner
+    side_effects: []
+  - method: GET
+    path: "/practitioners/{id}"
+    description: "Fetch a Practitioner"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Practitioner
+    side_effects: []
+
+  # ---- Recommendation ----
+  - method: POST
+    path: "/recommendations"
+    description: "A Practitioner issues a purchase authorization for a customer+product (practitioner_id from X-User-ID; issued_at = clock now)"
+    roles: [Practitioner]
+    code: 201
+    input: [customer_id, product_id, expires_at, max_units]
+    output: Recommendation
+    side_effects: ["status=ISSUED; issued_at=clock now; consumed_units=0"]
+  - method: GET
+    path: "/recommendations/{id}"
+    description: "Fetch a Recommendation"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Recommendation
+    side_effects: []
+  - method: GET
+    path: "/recommendations"
+    description: "List recommendations, filtered (reverse lookup for practitioner_id, customer_id, product_id FKs)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["practitioner_id?", "customer_id?", "product_id?", "status?"]
+    output: Recommendation[]
+    side_effects: []
+  - method: POST
+    path: "/recommendations/{id}/revoke"
+    description: "Practitioner revokes an ISSUED recommendation"
+    roles: [Practitioner]
+    code: 200
+    input: []
+    output: Recommendation
+    side_effects: ["ISSUED->REVOKED"]
+
+  # ---- Bundle ----
+  - method: POST
+    path: "/bundles"
+    description: "Create a Bundle/stack"
+    roles: [StoreOperator]
+    code: 201
+    input: [name, component_product_ids, discount_pct]
+    output: Bundle
+    side_effects: []
+  - method: GET
+    path: "/bundles/{id}"
+    description: "Fetch a Bundle"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Bundle
+    side_effects: []
+
+  # ---- Subscription ----
+  - method: POST
+    path: "/subscriptions"
+    description: "Customer creates an auto-ship Subscription (customer_id from X-User-ID; autoship_discount_pct/next_ship_date computed)"
+    roles: [Customer]
+    code: 201
+    input: [product_id, quantity_per_cycle, cadence_days, first_ship_date]
+    output: Subscription
+    side_effects: ["status=ACTIVE; next_ship_date=first_ship_date; autoship_discount_pct=AUTOSHIP_DISCOUNT[cadence_days]"]
+  - method: GET
+    path: "/subscriptions/{id}"
+    description: "Fetch a Subscription"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Subscription
+    side_effects: []
+  - method: GET
+    path: "/subscriptions"
+    description: "List subscriptions, filtered (reverse lookup for customer_id, product_id FKs)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["customer_id?", "product_id?", "status?"]
+    output: Subscription[]
+    side_effects: []
+  - method: POST
+    path: "/subscriptions/{id}/state"
+    description: "Customer drives a subscription transition: pause, resume (ACTIVE), or cancel"
+    roles: [Customer]
+    code: 200
+    input: [to_status]
+    output: Subscription
+    side_effects: ["Per Subscription state machine"]
+  - method: POST
+    path: "/subscriptions/{id}/generate-order"
+    description: "Generate the current-cycle auto-ship Order (DRAFT) for an ACTIVE subscription; OCC-guarded on the subscription version"
+    roles: [Customer]
+    code: 201
+    input: [expected_subscription_version]
+    output: Order
+    side_effects:
+      - "Create a DRAFT AUTOSHIP Order (order_type=AUTOSHIP, subscription_id set) with one OrderLine {product_id, quantity: quantity_per_cycle}"
+      - "Advance subscription.next_ship_date by cadence_days"
+      - "increments Subscription.version by 1"
+
+  # ---- Order & OrderLine ----
+  - method: POST
+    path: "/orders"
+    description: "Customer opens a one-off DRAFT Order (customer_id from X-User-ID)"
+    roles: [Customer]
+    code: 201
+    input: ["points_redeemed?"]
+    output: Order
+    side_effects: ["status=DRAFT; order_type=ONE_OFF; subscription_id=null"]
+  - method: GET
+    path: "/orders/{id}"
+    description: "Fetch an Order"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: GET
+    path: "/orders"
+    description: "List orders, filtered (reverse lookup for customer_id, subscription_id FKs)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["customer_id?", "subscription_id?", "status?"]
+    output: Order[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/lines"
+    description: "Add an OrderLine to a DRAFT order"
+    roles: [Customer]
+    code: 201
+    input: [product_id, quantity, "bundle_id?"]
+    output: OrderLine
+    side_effects: ["gross_unit_price_cents snapshot from product.unit_price_cents"]
+  - method: GET
+    path: "/orders/{id}/lines"
+    description: "List an order's lines (reverse lookup for OrderLine.order_id)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: OrderLine[]
+    side_effects: []
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "Fetch a single OrderLine"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+  - method: GET
+    path: "/order-lines"
+    description: "List order lines, filtered (reverse lookup for OrderLine.product_id, bundle_id FKs)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["product_id?", "bundle_id?"]
+    output: OrderLine[]
+    side_effects: []
+  - method: POST
+    path: "/orders/{id}/place"
+    description: "Place a DRAFT order: FEFO-allocate, price, run all place-time validations, hold redeemed points"
+    roles: [Customer]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["Per Order DRAFT->PLACED transition"]
+  - method: POST
+    path: "/orders/{id}/fulfill"
+    description: "Fulfill a PLACED order: consume allocations, settle points, advance recommendation consumption"
+    roles: [StoreOperator]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["Per Order PLACED->FULFILLED transition"]
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "Cancel a DRAFT or PLACED order (releases allocations and refunds held points when PLACED)"
+    roles: [Customer, StoreOperator]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["Per Order cancel transitions"]
+
+  # ---- Return ----
+  - method: POST
+    path: "/returns"
+    description: "Customer requests a return against a fulfilled order line"
+    roles: [Customer]
+    code: 201
+    input: [order_id, order_line_id, quantity, reason]
+    output: Return
+    side_effects: ["status=REQUESTED"]
+  - method: GET
+    path: "/returns/{id}"
+    description: "Fetch a Return"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: []
+    output: Return
+    side_effects: []
+  - method: GET
+    path: "/returns"
+    description: "List returns, filtered (reverse lookup for order_id, order_line_id FKs)"
+    roles: [StoreOperator, Customer, Practitioner]
+    code: 200
+    input: ["order_id?", "order_line_id?", "status?"]
+    output: Return[]
+    side_effects: []
+  - method: POST
+    path: "/returns/{id}/state"
+    description: "StoreOperator drives a return transition: approve, reject, or refund (refund computes return_refund and reverses points/restocks)"
+    roles: [StoreOperator]
+    code: 200
+    input: [to_status]
+    output: Return
+    side_effects: ["Per Return state machine, including refund-time compensation"]
+
+  # ---- Test-driving endpoints (/_ namespace) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-07-01T00:00:00Z; before any set, the clock reads exactly this default (never wall-clock)."
+    roles: [StoreOperator]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["Logical clock advanced; does NOT auto-run expiry (call /_jobs/run-expiry-sweep to materialize EXPIRED states)"]
+  - method: POST
+    path: "/_jobs/run-expiry-sweep"
+    description: "Materialize expiry: AVAILABLE/QUARANTINED Lots with expiration_date <= clock -> EXPIRED; ISSUED Recommendations with expires_at <= clock -> EXPIRED"
+    roles: [StoreOperator]
+    code: 200
+    input: []
+    output: null
+    side_effects: ["Lot and Recommendation EXPIRED transitions"]
+  - method: POST
+    path: "/_inject/loyalty_state"
+    description: "Seed a customer's loyalty accumulators (no business endpoint sets these directly since they are computed); recomputes loyalty_tier"
+    roles: [StoreOperator]
+    code: 200
+    input: [customer_id, "lifetime_points_earned?", "points_balance?"]
+    output: Customer
+    side_effects: ["Set lifetime_points_earned/points_balance; recompute loyalty_tier; increments Customer.version by 1"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid auth headers" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted for this operation" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Entity-backed caller does not own the target resource" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path id or body FK references a non-existent resource" }
+  - { id: ERR_VALIDATION, http: 422, condition: "Missing required field, wrong type, or invalid enum value" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Resource not in a state that admits the requested transition" }
+  - { id: ERR_DSHEA_DISEASE_CLAIM, http: 422, condition: "Product created with dshea_claim_type = DISEASE (prohibited under DSHEA)" }
+  - { id: ERR_PRACTITIONER_AUTH_REQUIRED, http: 403, condition: "Practitioner-line product ordered without a valid ISSUED, non-expired, non-exhausted Recommendation" }
+  - { id: ERR_LOT_NOT_SELLABLE, http: 409, condition: "Allocation attempted from a QUARANTINED/RECALLED/EXPIRED lot" }
+  - { id: ERR_CUSTOMER_SUSPENDED, http: 409, condition: "Buying customer is SUSPENDED" }
+  - { id: ERR_BUNDLE_PRODUCT_MISMATCH, http: 422, condition: "Line supplies bundle_id but its product is not a bundle component" }
+  - { id: ERR_INVALID_QUANTITY, http: 422, condition: "quantity / quantity_per_cycle / return quantity < 1, or placing an order with no lines" }
+  - { id: ERR_INVALID_CADENCE, http: 422, condition: "cadence_days not in {30,60,90}" }
+  - { id: ERR_INSUFFICIENT_INVENTORY, http: 409, condition: "AVAILABLE non-expired lots cannot cover a line" }
+  - { id: ERR_RECOMMENDATION_OVERLAP, http: 409, condition: "New recommendation interval overlaps an existing ISSUED one for the same (customer, product)" }
+  - { id: ERR_SUBSCRIPTION_WINDOW_CONFLICT, http: 409, condition: "New subscription first_ship_date is strictly within SUBSCRIPTION_BUFFER_DAYS (= 7) days of an existing active subscription's next_ship_date for the same (customer, product)" }
+  - { id: ERR_RETURN_QUANTITY_EXCEEDS, http: 422, condition: "Return quantity exceeds the line's fulfilled quantity" }
+  - { id: ERR_INSUFFICIENT_POINTS, http: 409, condition: "points_redeemed exceeds points_balance, or redemption exceeds subtotal" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_subscription_version does not match current Subscription.version (OCC)" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: StoreOperator
+    description: "Store back-office operator: owns catalog (products/bundles), inventory (lots, quarantine/recall), customer & practitioner onboarding, order fulfilment, and return adjudication."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /products"
+      - "POST /products/{id}/lots"
+      - "POST /lots/{id}/state (quarantine/release/recall)"
+      - "POST /customers"
+      - "POST /customers/{id}/suspend"
+      - "POST /practitioners"
+      - "POST /bundles"
+      - "POST /orders/{id}/fulfill"
+      - "POST /returns/{id}/state (approve/reject/refund)"
+      - "POST /_clock/set_current_utc"
+      - "POST /_jobs/run-expiry-sweep"
+      - "POST /_inject/loyalty_state"
+    shared_operations:
+      - "POST /orders/{id}/cancel (shared with Customer)"
+      - "All GET reads"
+  - name: Customer
+    description: "A shopper acting as themselves. X-User-ID equals the Customer.id they own; may only mutate their own orders, subscriptions, and returns."
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /orders"
+      - "POST /orders/{id}/lines"
+      - "POST /orders/{id}/place"
+      - "POST /subscriptions"
+      - "POST /subscriptions/{id}/state"
+      - "POST /subscriptions/{id}/generate-order"
+      - "POST /returns"
+    shared_operations:
+      - "POST /orders/{id}/cancel (shared with StoreOperator)"
+      - "All GET reads"
+  - name: Practitioner
+    description: "A licensed practitioner. X-User-ID equals the Practitioner.id; issues and revokes purchase authorizations (recommendations)."
+    identity: "entity_backed:Practitioner"
+    exclusive_operations:
+      - "POST /recommendations"
+      - "POST /recommendations/{id}/revoke"
+    shared_operations:
+      - "All GET reads"

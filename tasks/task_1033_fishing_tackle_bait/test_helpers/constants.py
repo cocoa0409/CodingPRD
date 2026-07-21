@@ -1,0 +1,57 @@
+"""Domain thresholds — numeric constants from the PRD's business rules."""
+
+# Loyalty tier thresholds (PRD 2.9)
+SILVER_MIN = 500
+GOLD_MIN = 2000
+
+TIER_MULTIPLIER = {"BRONZE": 1.00, "SILVER": 1.10, "GOLD": 1.25}
+TIER_DISCOUNT_PCT = {"BRONZE": 0.00, "SILVER": 0.05, "GOLD": 0.10}
+
+# Charter pricing (PRD 3.5)
+CHARTER_INCLUDED_ANGLERS = 2
+EQUIPMENT_RENTAL_PER_ANGLER_CENTS = 2500
+SEASONAL_SURCHARGE_MULT = 1.20
+PEAK_MONTHS = [5, 6, 7, 8]
+DEPOSIT_PCT = 0.25
+CHARTER_BUFFER_MINUTES = 60
+
+# Loyalty accrual (PRD 3.6)
+POINTS_PER_DOLLAR = 1
+LOYALTY_SEASONAL_BONUS_PCT = 0.10
+
+# Sale tax (PRD 3.6)
+TAX_BPS = 800
+
+# Bait tanks (PRD 3.4)
+SECONDS_PER_DAY = 86400
+LOW_STOCK_PCT = 0.10
+
+# Special orders (PRD 3.2)
+SPECIAL_ORDER_DEPOSIT_PCT = 0.50
+RESTOCK_FEE_PCT = 0.20
+
+# License pricing / duration / min-age (PRD 3.3)
+LICENSE_PRICE_CENTS = {
+    "RESIDENT_ANNUAL": 5200,
+    "NONRESIDENT_ANNUAL": 12000,
+    "ONE_DAY": 1500,
+    "SENIOR": 2600,
+}
+LICENSE_DURATION_DAYS = {
+    "RESIDENT_ANNUAL": 365,
+    "NONRESIDENT_ANNUAL": 365,
+    "ONE_DAY": 1,
+    "SENIOR": 365,
+}
+LICENSE_MIN_AGE = {
+    "RESIDENT_ANNUAL": 16,
+    "NONRESIDENT_ANNUAL": 16,
+    "ONE_DAY": 16,
+    "SENIOR": 65,
+}
+
+# Tournament defaults (PRD 3.7)
+DEFAULT_BAG_LIMIT = 5
+
+# Clock default (PRD 2.5)
+CLOCK_STARTUP_DEFAULT = "2026-07-01T00:00:00Z"

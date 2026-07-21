@@ -1,0 +1,42 @@
+"""Domain thresholds — numeric constants drawn from the PRD's pricing and
+loyalty rules. Generic NON_EXISTENT_UUID comes from the framework."""
+
+# Stock / availability
+LOW_STOCK_THRESHOLD = 3
+
+# Registry completion
+COMPLETION_THRESHOLD = 0.80
+COMPLETION_DISCOUNT_PCT = 0.15
+REGISTRY_COMPLETION_BONUS = 250
+
+# Order pricing
+LOYALTY_TIER_PCT = {"BRONZE": 0.00, "SILVER": 0.05, "GOLD": 0.10, "PLATINUM": 0.15}
+MAX_DISCOUNT_PCT = 0.25
+
+# Loyalty tiers (cents thresholds)
+LOYALTY_TIER_THRESHOLDS_CENTS = {"BRONZE": 0, "SILVER": 50000, "GOLD": 150000, "PLATINUM": 400000}
+
+# Consignor payout
+SEASON_SPLIT = {"IN_SEASON": 0.60, "OFF_SEASON": 0.50}
+CONDITION_BONUS = 0.05
+PROCESSING_FEE_PCT = 0.03
+PROCESSING_FEE_CAP_CENTS = 200
+
+# Trade-in valuation
+TRADE_IN_BASE_PCT = 0.30
+CONDITION_FACTOR = {"LIKE_NEW": 1.00, "GOOD": 0.70, "FAIR": 0.40}
+CONDITION_CAP_CENTS = {"LIKE_NEW": 2500, "GOOD": 1500, "FAIR": 800}
+
+# Store defaults & pickup
+DEFAULT_OPEN_MINUTE = 540
+DEFAULT_CLOSE_MINUTE = 1200
+DEFAULT_PICKUP_STATION_COUNT = 2
+PICKUP_BUFFER_MIN = 15
+
+# Pagination defaults
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MIN_LIMIT = 1
+PAGINATION_MAX_LIMIT = 100
+
+# Logical clock startup default
+CLOCK_STARTUP_DEFAULT = "2026-07-01T00:00:00Z"

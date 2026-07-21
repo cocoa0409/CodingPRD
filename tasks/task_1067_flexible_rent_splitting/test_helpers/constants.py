@@ -1,0 +1,43 @@
+"""Domain thresholds — numeric constants from the PRD's calculation and validation rules."""
+
+# Underwriting risk-score weights and tiers (PRD §3.2)
+W_RATIO = 0.5
+W_SPLIT = 0.2
+W_DELINQ = 0.3
+INCOME_LIMIT_PCT = 0.5
+LIMIT_MULT = {"LOW": 3, "MEDIUM": 2, "HIGH": 1}
+DECLINE_SCORE_THRESHOLD = 50
+MIN_RATIO = 1.5
+RISK_BAND_LOW_MIN = 75
+RISK_BAND_MEDIUM_MIN = 50
+
+# Installment layout (PRD §3.4)
+SPLIT_STEP_DAYS = {2: 14, 3: 10, 4: 7}
+MIN_SPLIT_COUNT = 2
+MAX_SPLIT_COUNT = 4
+MIN_INSTALLMENT_GAP_DAYS = 5
+MAX_DEFER_DAYS = 25
+
+# Flex fee (PRD §3.7)
+MEMBERSHIP_FEE_BY_BAND = {"LOW": 1500, "MEDIUM": 2500, "HIGH": 4000}
+PER_EXTRA_SPLIT_FEE_CENTS = 500
+DEFER_DAILY_BPS = 30
+
+# Delinquency / late fees (PRD §3.8, §3.9)
+GRACE_DAYS = 5
+LATE_FEE_FLAT_CENTS = 2500
+LATE_FEE_ROUND_CENTS = 1000
+SETTLEMENT_ADMIN_FEE_CENTS = 1500
+PROMISE_MAX_DAYS = 14
+RECOVERY_MIN_DAYS = 30
+
+# Repayment (PRD §3.6)
+MAX_ATTEMPTS = 3
+
+# Common test values
+DEFAULT_FULL_RENT_CENTS = 120000
+DEFAULT_PORTION_CENTS = 100000
+DEFAULT_INCOME_CENTS = 300000
+
+# Startup logical-clock default (PRD §2.5)
+CLOCK_DEFAULT = "2026-07-01T00:00:00Z"
