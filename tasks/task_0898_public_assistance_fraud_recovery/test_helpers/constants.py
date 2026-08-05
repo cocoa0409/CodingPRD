@@ -1,0 +1,30 @@
+"""Domain thresholds — numeric constants from the PRD calculations and rules."""
+
+PROGRAM_WEIGHT = {"SNAP": 30, "TANF": 20, "MEDICAID": 40}
+SOURCE_WEIGHT = {"HOTLINE": 10, "DATA_MATCH": 25, "CASEWORKER": 15, "PUBLIC": 5}
+
+# Establishment thresholds by claim type (integer cents).
+ESTABLISHMENT_THRESHOLD_IPV_CENTS = 0
+ESTABLISHMENT_THRESHOLD_NONIPV_CENTS = 12500
+
+# Interest.
+INTEREST_MONTHLY_RATE = 0.01
+PAYMENT_DUE_DAYS = 30
+
+# Recoupment rates and floors.
+RECOUPMENT_RATE_IPV = 0.20
+RECOUPMENT_RATE_NONIPV = 0.10
+FLOOR_IPV_CENTS = 2000
+FLOOR_NONIPV_CENTS = 1000
+
+# Disqualification penalties.
+FIRST_OFFENSE_MONTHS = 12
+SECOND_OFFENSE_MONTHS = 24
+
+# Pagination.
+PAGINATION_LIMIT_MIN = 1
+PAGINATION_LIMIT_MAX = 100
+PAGINATION_LIMIT_DEFAULT = 10
+
+# Logical clock default at server startup.
+CLOCK_DEFAULT_UTC = "2026-05-01T00:00:00Z"

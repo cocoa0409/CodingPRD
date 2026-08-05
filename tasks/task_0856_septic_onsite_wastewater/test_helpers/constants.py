@@ -1,0 +1,111 @@
+"""Numeric thresholds and defaults stated by the register's rules."""
+
+# The logical clock before any client has moved it.
+DEFAULT_CLOCK_UTC = "2026-05-01T00:00:00Z"
+DEFAULT_CLOCK_RENDERED = "2026-05-01T00:00:00.000Z"
+
+THRESHOLDS = {
+    # Parcel hydraulic allowance
+    "LOT_SQFT_PER_GPD": 20,
+    "PARCEL_FLOW_CAP_GPD": 1500,
+    # Water quality
+    "NITRATE_MCL_MG_L": 10.0,
+    # Soil loading tiers (upper bounds, inclusive)
+    "TIER_1_MAX_MIN_PER_IN": 5,
+    "TIER_2_MAX_MIN_PER_IN": 15,
+    "TIER_3_MAX_MIN_PER_IN": 30,
+    "TIER_4_MAX_MIN_PER_IN": 60,
+    "MAX_PERCOLATION_RATE_MIN_PER_IN": 120,
+    "MIN_LIMITING_LAYER_DEPTH_IN": 18,
+    # Design sizing
+    "FLOW_PER_BEDROOM_GPD": 120,
+    "MIN_BILLABLE_BEDROOMS": 2,
+    "SHALLOW_SOIL_THRESHOLD_IN": 36,
+    "SHALLOW_SOIL_MULTIPLIER": 1.20,
+    "MIN_DRAINFIELD_SQFT": 150,
+    "MAX_DRAINFIELD_SQFT": 4000,
+    # Setbacks
+    "SANDY_SETBACK_SURCHARGE_FT": 25,
+    # Permit fee
+    "PERMIT_BASE_REVIEW_CENTS": 45000,
+    "PERMIT_FLOW_RATE_CENTS_PER_GPD": 65,
+    "PERMIT_VARIANCE_CENTS": 15000,
+    "STATE_SURCHARGE_RATE": 0.045,
+    "COUNTY_TECH_FEE_RATE": 0.0225,
+    "COMBINED_FEE_MULTIPLIER": 1.0675,
+    # Scheduling
+    "TRAVEL_BUFFER_MINUTES": 45,
+    # Pumping
+    "TANK_GAL_PER_PERSON_TIER_1": 500,
+    "TANK_GAL_PER_PERSON_TIER_2": 300,
+    "TANK_GAL_PER_PERSON_TIER_3": 200,
+    "TANK_GAL_PER_PERSON_TIER_4": 125,
+    "PUMPING_DUE_SOON_DAYS": 90,
+    # Risk scoring
+    "WATER_FLAG_POINTS": 40,
+    "REPAIR_ORDER_POINTS": 25,
+    "REPAIR_ORDER_POINT_CAP": 2,
+    "DELINQUENT_POINTS": 20,
+    "REVOKED_POINTS": 35,
+    "ELEVATED_RISK_POINTS": 25,
+    "HIGH_RISK_POINTS": 60,
+    # Repair enforcement
+    "REPAIR_DEADLINE_DAYS_IMMINENT_HAZARD": 10,
+    "REPAIR_DEADLINE_DAYS_URGENT": 30,
+    "REPAIR_DEADLINE_DAYS_ROUTINE": 90,
+    "REPAIR_EXTENSION_DAYS": 30,
+    "MAX_REPAIR_EXTENSIONS": 2,
+    # Transfer certificates
+    "TRANSFER_BASE_FEE_CENTS": 18500,
+    "FIELD_VERIFICATION_FEE_CENTS": 9500,
+    "RECORDS_RESEARCH_FEE_CENTS": 4000,
+    "EXPEDITE_TIER_1_CENTS": 20000,
+    "EXPEDITE_TIER_2_CENTS": 30000,
+    "EXPEDITE_RATE_LOW": 0.30,
+    "EXPEDITE_RATE_MID": 0.20,
+    "EXPEDITE_RATE_HIGH": 0.15,
+    # Validity terms
+    "SITE_EVAL_VALIDITY_YEARS": 5,
+    "OPERATING_PERMIT_TERM_YEARS": 5,
+    "TRANSFER_CERT_VALIDITY_DAYS": 180,
+}
+
+SETBACK_BASE_FT = {
+    "CONVENTIONAL": 100,
+    "MOUND": 100,
+    "ATU": 75,
+    "DRIP": 75,
+}
+
+SYSTEM_TYPE_AREA_MULTIPLIER = {
+    "CONVENTIONAL": 1.00,
+    "MOUND": 1.25,
+    "ATU": 0.75,
+    "DRIP": 0.85,
+}
+
+SYSTEM_TYPE_SURCHARGE_CENTS = {
+    "CONVENTIONAL": 0,
+    "MOUND": 30000,
+    "ATU": 42500,
+    "DRIP": 27500,
+}
+
+TEST_DEFAULTS = {
+    # A 40000 sqft lot: max_design_flow_gpd is capped at 1500.
+    "LOT_SIZE_SQFT": 40000,
+    "EVALUATED_ON": "2026-04-15T00:00:00Z",
+    "DEPTH_TO_LIMITING_LAYER_IN": 48,
+    # 132 elapsed minutes over 6 inches of drop = 22.00 min/in -> 0.60 gpd/sqft.
+    "PERC_ELAPSED_MINUTES": 132,
+    "PERC_DROP_INCHES": 6,
+    "TANK_CAPACITY_GAL": 1000,
+    "BEDROOMS": 3,
+    "HOUSEHOLD_SIZE": 4,
+    # The fee for a 3-bedroom CONVENTIONAL design with no variance line item.
+    "STANDARD_PERMIT_FEE_CENTS": 73018,
+    "BOND_AMOUNT_CENTS": 5000000,
+    "PERMIT_VALID_FROM": "2026-05-01T00:00:00Z",
+    "PERMIT_VALID_UNTIL": "2027-05-01T00:00:00Z",
+    "LICENSE_EXPIRES_ON": "2035-01-01T00:00:00Z",
+}

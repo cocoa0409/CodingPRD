@@ -1,0 +1,1630 @@
+scenario: "Municipal Combined Utility Billing: account & meter (water/sewer/electric/refuse), consolidated bill & rate calculation, budget billing & levelization, deposit & final-bill/move, delinquency & shutoff/moratorium, assistance & payment arrangement, adjustment (leak/estimate), lien transfer to tax"
+domain_name: "municipal-combined-utility-billing"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: pricing_engine
+  secondary_archetype: ledger_reconciliation
+  complexity_layers:
+    - dual_variant_calculation
+    - cascading_side_effects
+    - rate_threshold_triggers
+    - optimistic_concurrency
+  entity_topology: hybrid
+  # Account is the aggregate root; Meter/Bill/Payment/etc. are peer children linked by
+  # account_id FK. MeterReading nests under Meter; Adjustment nests under Bill.
+  state_machine_shape: parallel
+  # Bill carries two independent state axes (payment_status x collection_status); Account
+  # is cyclic (DELINQUENT<->ACTIVE); PaymentArrangement is cyclic (ACTIVE<->DEFAULTED);
+  # Adjustment is branching (REQUESTED -> {APPROVED, REJECTED}).
+  relationship_patterns:
+    - one_to_many          # Account -> Meter/Bill/Payment/Deposit/...
+    - cross_aggregate      # ShutoffOrder execution depends on MoratoriumWindow state
+  role_model: segregation_of_duties
+  # Adjustment requester (AssistanceCaseworker) MUST NOT be its approver (Supervisor);
+  # peer operational roles otherwise own distinct resource types.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# 1.1 ENTITY-RELATIONSHIP TABLE
+# =====================================================================
+entities:
+  - name: RateSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - name: service_type
+        type: enum
+        source: input
+        description: "Which utility this schedule prices."
+        constraints: "one of WATER, SEWER, ELECTRIC, REFUSE"
+      - name: unit
+        type: enum
+        source: input
+        description: "Metering unit for tier boundaries."
+        constraints: "one of GALLON, KWH, FLAT"
+      - name: fixed_charge_cents
+        type: integer
+        source: input
+        description: "Flat monthly service charge in cents, added before line rounding."
+        constraints: ">= 0"
+      - name: tiers
+        type: array
+        source: input
+        description: "Ordered marginal blocks [{upper_bound_units: int|null, rate_cents_per_1000: int}]; last tier MUST have upper_bound_units null. Empty for FLAT/SEWER schedules."
+        default: "[]"
+      - name: sewer_rate_cents_per_1000
+        type: integer
+        source: input
+        description: "SEWER-only volumetric rate applied to the account's WATER consumption; null for non-SEWER schedules."
+        default: null
+      - name: sewer_cap_units
+        type: integer
+        source: input
+        description: "SEWER-only cap on billable water gallons; null for non-SEWER schedules."
+        default: null
+      - name: effective_date
+        type: datetime
+        source: input
+        description: "Date this schedule becomes effective (ISO 8601 UTC)."
+      - name: active
+        type: boolean
+        source: input
+        description: "Whether the schedule is selectable when generating bills."
+        default: true
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_holder_name
+        type: string
+        source: input
+        description: "Legal name of the account holder."
+      - name: service_address
+        type: string
+        source: input
+        description: "Premise service address (used as tax parcel key on lien transfer)."
+      - name: occupant_type
+        type: enum
+        source: input
+        description: "Customer class."
+        constraints: "one of RESIDENTIAL, COMMERCIAL"
+      - name: prior_annual_charges_cents
+        type: integer
+        source: input
+        description: "Trailing-12-month total charges, seed for budget-billing levelization."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state. Starts ACTIVE."
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, DELINQUENT, SHUTOFF, FINALED, LIEN_TRANSFERRED"
+      - name: assistance_program
+        type: enum
+        source: computed
+        description: "Active assistance program, null when none. Set by POST /accounts/{id}/assistance."
+        default: null
+        constraints: "one of LIHEAP, LIFELINE, SENIOR, or null"
+      - name: assistance_discount_pct
+        type: number
+        source: computed
+        description: "Fractional discount applied to a bill's pre-discount total when an assistance program is active."
+        default: 0
+      - name: current_balance_cents
+        type: integer
+        source: computed
+        description: "Sum over the account's non-VOID bills of (total_due_cents - amount_paid_cents), plus any levelization true-up charge, minus applied deposit credit. Recomputed on every bill/payment/adjustment/finalize side effect."
+        default: 0
+      - name: delinquent_balance_cents
+        type: integer
+        source: computed
+        description: "Sum over the account's bills whose collection_status is DELINQUENT of (total_due_cents - amount_paid_cents). Drives shutoff and lien eligibility."
+        default: 0
+      - name: deposit_on_hand_cents
+        type: integer
+        source: computed
+        description: "Sum of Deposit.amount_cents for this account with status HELD."
+        default: 0
+      - name: move_out_date
+        type: datetime
+        source: computed
+        description: "Set when the account is finalized; null otherwise."
+        default: null
+
+  - name: Meter
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account this service line belongs to."
+      - name: service_type
+        type: enum
+        source: input
+        description: "Utility this meter measures."
+        constraints: "one of WATER, SEWER, ELECTRIC, REFUSE"
+      - name: estimated_monthly_units
+        type: integer
+        source: input
+        description: "Fallback consumption used when the latest reading in a billing run is ESTIMATED (or when no ACTUAL delta exists)."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE while billable; REMOVED after account finalize."
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, REMOVED"
+
+  - name: MeterReading
+    parent: Meter
+    common_fields: false
+    fields:
+      - name: meter_id
+        type: string
+        source: input
+        description: "FK -> Meter.id; the meter this reading belongs to."
+      - name: read_date
+        type: datetime
+        source: input
+        description: "Date the read was taken (ISO 8601 UTC)."
+      - name: reading_value
+        type: integer
+        source: input
+        description: "Cumulative index value on the meter dial at read_date."
+        constraints: ">= 0"
+      - name: read_type
+        type: enum
+        source: input
+        description: "ACTUAL field read vs ESTIMATED. Drives estimated-vs-actual bill variant."
+        constraints: "one of ACTUAL, ESTIMATED"
+
+  - name: Bill
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the billed account."
+      - name: period_start
+        type: datetime
+        source: input
+        description: "Inclusive start of the service period (half-open interval start)."
+      - name: period_end
+        type: datetime
+        source: input
+        description: "Exclusive end of the service period (half-open interval end)."
+      - name: due_date
+        type: datetime
+        source: computed
+        description: "period_end + NET_DUE_DAYS; delinquency clock anchor."
+      - name: budget_billed
+        type: boolean
+        source: input
+        description: "When true, total_due_cents is the budget-billing monthly amount and the actual charge is deferred; requires an ACTIVE BudgetBillingPlan on the account."
+        default: false
+      - name: read_basis
+        type: enum
+        source: computed
+        description: "ACTUAL when every metered line used an ACTUAL reading delta; ESTIMATED when any metered line fell back to estimated_monthly_units."
+        default: "ACTUAL"
+        constraints: "one of ACTUAL, ESTIMATED"
+      - name: line_charges
+        type: array
+        source: computed
+        description: "Per-service rounded line charges [{service_type, consumption_units, charge_cents}]."
+        default: "[]"
+      - name: pre_discount_total_cents
+        type: integer
+        source: computed
+        description: "Sum of the rounded per-service line charges (round-per-line then sum)."
+        default: 0
+      - name: assistance_credit_cents
+        type: integer
+        source: computed
+        description: "round(account.assistance_discount_pct * pre_discount_total_cents); 0 when no assistance."
+        default: 0
+      - name: actual_charges_cents
+        type: integer
+        source: computed
+        description: "pre_discount_total_cents - assistance_credit_cents; the true metered cost regardless of budget billing."
+        default: 0
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "For a normal bill equals actual_charges_cents; for a budget_billed bill equals the plan's monthly_budget_cents."
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: "Cumulative applied payment plus applied deposit plus applied adjustment credit against this bill."
+        default: 0
+      - name: payment_status
+        type: enum
+        source: computed
+        description: "Payment axis. Independent of collection_status."
+        default: "UNPAID"
+        constraints: "one of UNPAID, PARTIAL, PAID"
+      - name: collection_status
+        type: enum
+        source: computed
+        description: "Collections axis. Independent of payment_status."
+        default: "CURRENT"
+        constraints: "one of CURRENT, DELINQUENT, IN_LIEN"
+
+  - name: Payment
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the paying account."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Payment amount in cents."
+        constraints: "> 0"
+      - name: payment_date
+        type: datetime
+        source: input
+        description: "Date tendered; defaults to current clock when omitted."
+        default: null
+      - name: method
+        type: enum
+        source: input
+        description: "Tender method."
+        constraints: "one of CASH, CARD, ACH, CHECK"
+      - name: allocation
+        type: array
+        source: computed
+        description: "Waterfall allocation [{bill_id, applied_cents}] oldest-bill-first."
+        default: "[]"
+      - name: status
+        type: enum
+        source: computed
+        description: "POSTED on create; REVERSED after reversal."
+        default: "POSTED"
+        constraints: "one of POSTED, REVERSED"
+
+  - name: BudgetBillingPlan
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the enrolled account."
+      - name: plan_year
+        type: integer
+        source: input
+        description: "Levelization plan year."
+      - name: monthly_budget_cents
+        type: integer
+        source: computed
+        description: "round(account.prior_annual_charges_cents / 12) at enrollment (round_half_up)."
+        default: 0
+      - name: cumulative_budgeted_cents
+        type: integer
+        source: computed
+        description: "Running sum of monthly_budget_cents charged across budget_billed bills."
+        default: 0
+      - name: cumulative_actual_cents
+        type: integer
+        source: computed
+        description: "Running sum of actual_charges_cents across budget_billed bills."
+        default: 0
+      - name: deferred_balance_cents
+        type: integer
+        source: computed
+        description: "cumulative_actual_cents - cumulative_budgeted_cents at true-up; positive = customer owes, negative = credit."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE while enrolled; TRUED_UP after levelization; CANCELLED if withdrawn."
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, TRUED_UP, CANCELLED"
+
+  - name: Deposit
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account holding the deposit."
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Deposit amount collected, in cents."
+        constraints: "> 0"
+      - name: reason
+        type: enum
+        source: input
+        description: "Why the deposit was required."
+        constraints: "one of NEW_SERVICE, DELINQUENCY, COMMERCIAL"
+      - name: applied_cents
+        type: integer
+        source: computed
+        description: "Portion of the deposit applied to the final bill at finalize."
+        default: 0
+      - name: refunded_cents
+        type: integer
+        source: computed
+        description: "Portion refunded to the customer at finalize."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "HELD until finalize; then APPLIED (fully or partially applied, remainder refunded) or REFUNDED (fully refunded)."
+        default: "HELD"
+        constraints: "one of HELD, APPLIED, REFUNDED"
+
+  - name: PaymentArrangement
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account on the arrangement."
+      - name: total_arranged_cents
+        type: integer
+        source: input
+        description: "Delinquent amount spread over installments."
+        constraints: "> 0"
+      - name: installment_count
+        type: integer
+        source: input
+        description: "Number of monthly installments."
+        constraints: ">= 2"
+      - name: installment_amount_cents
+        type: integer
+        source: computed
+        description: "round(total_arranged_cents / installment_count) (round_half_up)."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE on create; DEFAULTED on a missed installment; back to ACTIVE on reinstate; SUPERSEDED when a newer arrangement replaces it."
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, DEFAULTED, SUPERSEDED"
+
+  - name: Adjustment
+    parent: Bill
+    common_fields: true
+    fields:
+      - name: bill_id
+        type: string
+        source: input
+        description: "FK -> Bill.id; the bill being adjusted."
+      - name: adjustment_type
+        type: enum
+        source: input
+        description: "LEAK (leak relief credit), ESTIMATE_CORRECTION (re-bill estimated to actual), GOODWILL (flat courtesy credit)."
+        constraints: "one of LEAK, ESTIMATE_CORRECTION, GOODWILL"
+      - name: relief_method
+        type: enum
+        source: input
+        description: "LEAK-only variant selector: SEWER_RELIEF credits sewer volumetric on the excess; TIER_REPRICE reprices excess gallons down to the lowest water tier."
+        default: null
+        constraints: "one of SEWER_RELIEF, TIER_REPRICE, or null"
+      - name: baseline_units
+        type: integer
+        source: input
+        description: "Normal (non-leak) consumption baseline; excess = current WATER consumption - baseline_units."
+        default: 0
+      - name: goodwill_amount_cents
+        type: integer
+        source: input
+        description: "GOODWILL-only requested flat credit amount."
+        default: 0
+      - name: credit_cents
+        type: integer
+        source: computed
+        description: "Computed credit amount (see leak_adjustment_credit); applied to the bill on approval."
+        default: 0
+      - name: requested_by
+        type: string
+        source: system
+        description: "X-User-ID of the AssistanceCaseworker who requested it (SoD subject)."
+      - name: approved_by
+        type: string
+        source: system
+        description: "X-User-ID of the Supervisor who approved/rejected it; MUST differ from requested_by."
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "REQUESTED on create; APPROVED (credit applied) or REJECTED (no effect)."
+        default: "REQUESTED"
+        constraints: "one of REQUESTED, APPROVED, REJECTED"
+
+  - name: ShutoffOrder
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account subject to shutoff."
+      - name: scheduled_date
+        type: datetime
+        source: input
+        description: "Planned execution date; checked against moratorium windows at execute time."
+      - name: reason
+        type: enum
+        source: input
+        description: "Why shutoff was ordered."
+        default: "DELINQUENCY"
+        constraints: "one of DELINQUENCY, ARRANGEMENT_DEFAULT"
+      - name: origin
+        type: enum
+        source: computed
+        description: "MANUAL when created via endpoint; CASCADE when auto-created by an arrangement default."
+        default: "MANUAL"
+        constraints: "one of MANUAL, CASCADE"
+      - name: status
+        type: enum
+        source: computed
+        description: "SCHEDULED on create; EXECUTED after field execution; CANCELLED if withdrawn or superseded by payment."
+        default: "SCHEDULED"
+        constraints: "one of SCHEDULED, EXECUTED, CANCELLED"
+
+  - name: LienTransfer
+    parent: Account
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; the account whose arrears transfer to the tax roll."
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Snapshot of account.delinquent_balance_cents at initiation."
+        default: 0
+      - name: tax_parcel_ref
+        type: string
+        source: input
+        description: "Tax roll parcel reference to receive the lien."
+      - name: status
+        type: enum
+        source: computed
+        description: "PENDING on create; CERTIFIED after eligibility re-check; TRANSFERRED when posted to tax."
+        default: "PENDING"
+        constraints: "one of PENDING, CERTIFIED, TRANSFERRED"
+
+  - name: MoratoriumWindow
+    parent: null
+    common_fields: true
+    fields:
+      - name: account_id
+        type: string
+        source: input
+        description: "FK -> Account.id; null when scope is SYSTEM. When set, the moratorium applies only to this account."
+        default: null
+      - name: scope
+        type: enum
+        source: input
+        description: "SYSTEM (all accounts) or ACCOUNT (single account_id)."
+        constraints: "one of SYSTEM, ACCOUNT"
+      - name: start_date
+        type: datetime
+        source: input
+        description: "Inclusive first day shutoffs are prohibited (closed interval start)."
+      - name: end_date
+        type: datetime
+        source: input
+        description: "Inclusive last day shutoffs are prohibited (closed interval end)."
+      - name: reason
+        type: enum
+        source: input
+        description: "Basis for the moratorium."
+        constraints: "one of WEATHER, MEDICAL, LEGISLATIVE"
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE while enforced (windows are created ACTIVE and remain enforced through their date range)."
+        default: "ACTIVE"
+        constraints: "one of ACTIVE"
+
+# =====================================================================
+# 1.2 STATE MACHINE TABLE
+# =====================================================================
+state_machines:
+  - entity: Account
+    initial_state: ACTIVE
+    terminal_states: [FINALED, LIEN_TRANSFERRED]
+    transitions:
+      - from: ACTIVE
+        to: DELINQUENT
+        trigger: "POST /bills/{id}/mark-delinquent (bill grace exhausted) or cascade from PaymentArrangement default"
+        actor: CollectionsOfficer
+        preconditions: ["account.status == ACTIVE", "at least one bill flips to collection_status DELINQUENT"]
+        side_effects:
+          - "recompute account.delinquent_balance_cents"
+      - from: DELINQUENT
+        to: ACTIVE
+        trigger: "POST /accounts/{id}/payments clearing the delinquent balance to 0"
+        actor: Customer
+        preconditions: ["account.status == DELINQUENT", "account.delinquent_balance_cents becomes 0 after allocation"]
+        side_effects:
+          - "any SCHEDULED ShutoffOrder for the account transitions to CANCELLED"
+          - "affected bills collection_status DELINQUENT -> CURRENT"
+      - from: DELINQUENT
+        to: SHUTOFF
+        trigger: "POST /shutoff-orders/{id}/execute"
+        actor: MeterTech
+        preconditions: ["account.status == DELINQUENT", "no ACTIVE MoratoriumWindow covers scheduled_date", "shutoff_order.status == SCHEDULED"]
+        side_effects:
+          - "account WATER/ELECTRIC meters status ACTIVE -> REMOVED"
+      - from: SHUTOFF
+        to: ACTIVE
+        trigger: "POST /accounts/{id}/payments clearing delinquent balance"
+        actor: Customer
+        preconditions: ["account.status == SHUTOFF", "account.delinquent_balance_cents becomes 0 after allocation"]
+        side_effects: ["meters status REMOVED -> ACTIVE (service restored)"]
+      - from: ACTIVE
+        to: FINALED
+        trigger: "POST /accounts/{id}/finalize"
+        actor: BillingSpecialist
+        preconditions: ["account.status IN {ACTIVE, DELINQUENT, SHUTOFF}"]
+        side_effects:
+          - "a final Bill is generated for outstanding balance"
+          - "HELD deposits are applied to the final bill then refunded (see deposit_settlement)"
+          - "account.move_out_date set to current clock"
+          - "meters status -> REMOVED"
+        note: "Same FINALED transition is reachable from DELINQUENT and SHUTOFF."
+      - from: DELINQUENT
+        to: LIEN_TRANSFERRED
+        trigger: "POST /lien-transfers/{id}/certify then transfer"
+        actor: CollectionsOfficer
+        preconditions: ["account.status IN {DELINQUENT, SHUTOFF}", "lien_transfer.status == CERTIFIED", "account.delinquent_balance_cents >= LIEN_MIN_ARREARS_CENTS"]
+        side_effects:
+          - "delinquent bills collection_status DELINQUENT -> IN_LIEN"
+          - "lien_transfer.status -> TRANSFERRED"
+
+  - entity: Bill
+    initial_state: UNPAID
+    terminal_states: []
+    note: "Parallel dimensions: payment_status {UNPAID,PARTIAL,PAID} evolves independently of collection_status {CURRENT,DELINQUENT,IN_LIEN}."
+    transitions:
+      - from: UNPAID
+        to: PARTIAL
+        trigger: "POST /accounts/{id}/payments allocating < remaining balance to this bill"
+        actor: Customer
+        preconditions: ["bill.payment_status == UNPAID", "0 < applied_cents < (total_due_cents - amount_paid_cents)"]
+        side_effects: ["increment bill.amount_paid_cents", "recompute account.current_balance_cents"]
+      - from: PARTIAL
+        to: PAID
+        trigger: "POST /accounts/{id}/payments allocating remaining balance"
+        actor: Customer
+        preconditions: ["bill.payment_status == PARTIAL", "applied_cents == remaining balance"]
+        side_effects: ["bill.amount_paid_cents == total_due_cents"]
+      - from: UNPAID
+        to: PAID
+        trigger: "POST /accounts/{id}/payments allocating full balance to an unpaid bill"
+        actor: Customer
+        preconditions: ["bill.payment_status == UNPAID", "applied_cents == total_due_cents"]
+        side_effects: ["bill.amount_paid_cents == total_due_cents"]
+      - from: PAID
+        to: PARTIAL
+        trigger: "POST /payments/{id}/reverse (compensating action)"
+        actor: BillingSpecialist
+        preconditions: ["payment being reversed had applied_cents against this bill", "payment.status == POSTED"]
+        side_effects: ["decrement bill.amount_paid_cents by the reversed allocation", "recompute account.current_balance_cents"]
+      - from: CURRENT
+        to: DELINQUENT
+        trigger: "POST /bills/{id}/mark-delinquent"
+        actor: CollectionsOfficer
+        preconditions: ["bill.collection_status == CURRENT", "bill.payment_status != PAID", "current_clock - bill.due_date >= DELINQUENCY_GRACE_DAYS days"]
+        side_effects: ["account transitions toward DELINQUENT", "recompute account.delinquent_balance_cents"]
+      - from: DELINQUENT
+        to: CURRENT
+        trigger: "payment clears the bill balance"
+        actor: system
+        preconditions: ["bill.collection_status == DELINQUENT", "bill balance becomes 0"]
+        side_effects: ["recompute account.delinquent_balance_cents"]
+      - from: DELINQUENT
+        to: IN_LIEN
+        trigger: "lien transfer certified and transferred"
+        actor: system
+        preconditions: ["bill.collection_status == DELINQUENT", "parent lien_transfer.status -> TRANSFERRED"]
+        side_effects: ["bill is frozen against further payment allocation"]
+
+  - entity: PaymentArrangement
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED]
+    note: "Cyclic: ACTIVE -> DEFAULTED -> ACTIVE (reinstatement loop)."
+    transitions:
+      - from: ACTIVE
+        to: DEFAULTED
+        trigger: "POST /payment-arrangements/{id}/record-missed"
+        actor: CollectionsOfficer
+        preconditions: ["arrangement.status == ACTIVE"]
+        side_effects:
+          - "account.status ACTIVE -> DELINQUENT (link 1 of default cascade)"
+          - "account's UNPAID/PARTIAL bills collection_status CURRENT -> DELINQUENT (link 2)"
+          - "a CASCADE ShutoffOrder is auto-created SCHEDULED for the account (link 3)"
+      - from: DEFAULTED
+        to: ACTIVE
+        trigger: "POST /payment-arrangements/{id}/reinstate"
+        actor: AssistanceCaseworker
+        preconditions: ["arrangement.status == DEFAULTED"]
+        side_effects: ["any SCHEDULED CASCADE ShutoffOrder created by the default is CANCELLED", "account.status DELINQUENT -> ACTIVE if delinquent_balance covered by arrangement"]
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /accounts/{id}/payment-arrangements creating a replacement (OCC on account.version)"
+        actor: AssistanceCaseworker
+        preconditions: ["a newer arrangement is created for the same account", "expected_account_version matches account.version"]
+        side_effects: ["prior ACTIVE arrangement -> SUPERSEDED", "increments Account.version by 1"]
+
+  - entity: Adjustment
+    initial_state: REQUESTED
+    terminal_states: [APPROVED, REJECTED]
+    note: "Branching fork with divergent side effects per branch."
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /adjustments/{id}/approve"
+        actor: Supervisor
+        preconditions: ["adjustment.status == REQUESTED", "X-User-ID (approver) != adjustment.requested_by (SoD)"]
+        side_effects:
+          - "compute credit_cents per leak_adjustment_credit"
+          - "bill.amount_paid_cents += credit_cents (credit applied)"
+          - "recompute account.current_balance_cents"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /adjustments/{id}/reject"
+        actor: Supervisor
+        preconditions: ["adjustment.status == REQUESTED", "X-User-ID (approver) != adjustment.requested_by (SoD)"]
+        side_effects: ["no financial effect; adjustment.credit_cents remains 0"]
+
+  - entity: ShutoffOrder
+    initial_state: SCHEDULED
+    terminal_states: [EXECUTED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: EXECUTED
+        trigger: "POST /shutoff-orders/{id}/execute"
+        actor: MeterTech
+        preconditions:
+          - "shutoff_order.status == SCHEDULED"
+          - "account.status == DELINQUENT"
+          - "no ACTIVE MoratoriumWindow (SYSTEM, or ACCOUNT for this account) covers scheduled_date inclusively"
+        side_effects: ["account.status DELINQUENT -> SHUTOFF", "WATER/ELECTRIC meters -> REMOVED"]
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "system: payment clearing the delinquent balance (POST /accounts/{id}/payments) or arrangement reinstate (POST /payment-arrangements/{id}/reinstate)"
+        actor: system
+        preconditions: ["shutoff_order.status == SCHEDULED"]
+        side_effects: ["none"]
+
+  - entity: LienTransfer
+    initial_state: PENDING
+    terminal_states: [TRANSFERRED]
+    transitions:
+      - from: PENDING
+        to: CERTIFIED
+        trigger: "POST /lien-transfers/{id}/certify"
+        actor: CollectionsOfficer
+        preconditions:
+          - "lien_transfer.status == PENDING"
+          - "account.status IN {DELINQUENT, SHUTOFF}"
+          - "account.delinquent_balance_cents >= LIEN_MIN_ARREARS_CENTS"
+        side_effects: ["snapshot amount_cents = account.delinquent_balance_cents"]
+      - from: CERTIFIED
+        to: TRANSFERRED
+        trigger: "POST /lien-transfers/{id}/certify with finalize=true (same endpoint, second call), or automatic on certify"
+        actor: CollectionsOfficer
+        preconditions: ["lien_transfer.status == CERTIFIED", "account.status IN {DELINQUENT, SHUTOFF}"]
+        side_effects:
+          - "account.status -> LIEN_TRANSFERRED"
+          - "delinquent bills collection_status -> IN_LIEN"
+
+  - entity: Deposit
+    initial_state: HELD
+    terminal_states: [APPLIED, REFUNDED]
+    transitions:
+      - from: HELD
+        to: APPLIED
+        trigger: "POST /accounts/{id}/finalize (final bill has outstanding balance)"
+        actor: BillingSpecialist
+        preconditions: ["deposit.status == HELD", "final bill outstanding balance > 0"]
+        side_effects: ["applied_cents = min(amount_cents, final_balance)", "refunded_cents = amount_cents - applied_cents", "bill.amount_paid_cents += applied_cents"]
+      - from: HELD
+        to: REFUNDED
+        trigger: "POST /accounts/{id}/finalize (no outstanding balance)"
+        actor: BillingSpecialist
+        preconditions: ["deposit.status == HELD", "final bill outstanding balance == 0"]
+        side_effects: ["refunded_cents = amount_cents", "applied_cents = 0"]
+
+  - entity: BudgetBillingPlan
+    initial_state: ACTIVE
+    terminal_states: [TRUED_UP, CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: TRUED_UP
+        trigger: "POST /budget-billing-plans/{id}/true-up"
+        actor: BillingSpecialist
+        preconditions: ["plan.status == ACTIVE"]
+        side_effects:
+          - "deferred_balance_cents = cumulative_actual_cents - cumulative_budgeted_cents"
+          - "account.current_balance_cents += deferred_balance_cents (charge if positive, credit if negative)"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "account finalize while plan ACTIVE"
+        actor: system
+        preconditions: ["plan.status == ACTIVE", "account being finalized"]
+        side_effects: ["deferred_balance settled into the final bill"]
+
+# ---------------------------------------------------------------------
+# 1.2.1 CONCURRENCY RULES
+# ---------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: arrangement-create-stale-account
+    parent_entity: Account
+    write_endpoint: "POST /accounts/{id}/payment-arrangements"
+    occ_field: "expected_account_version"
+    description: |
+      Creating a PaymentArrangement against an Account whose version has advanced
+      since the caseworker last observed it is rejected. A new arrangement
+      legitimately supersedes the prior ACTIVE arrangement (prior -> SUPERSEDED),
+      so a caseworker acting on a stale account view — one that predates another
+      writer's supersede — would silently discard an arrangement it never saw.
+      OCC on account.version reduces this to a stale-version check.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# 1.3 CALCULATION RULES TABLE
+# =====================================================================
+calculations:
+  - name: water_tier_charge
+    trigger: "computed per WATER/ELECTRIC line during POST /accounts/{id}/bills"
+    algorithm: tiered_pricing
+    formula: |
+      # Marginal block pricing. tiers ordered ascending by upper_bound_units,
+      # last tier upper_bound_units == null (unbounded).
+      vol_raw = 0
+      lower = 0
+      for (upper, rate) in tiers:            # rate is cents per 1000 units
+          u = upper if upper is not null else +inf
+          block = max(0, min(consumption, u) - lower)
+          vol_raw += (block / 1000) * rate
+          lower = u
+          if consumption <= u: break
+      line_charge = round_half_up(fixed_charge_cents + vol_raw)   # ROUND ONCE PER LINE
+    input_set: "consumption for a single ACTIVE meter; WATER/ELECTRIC only"
+    constants:
+      WATER_TIERS: "[{6000,315},{12000,500},{null,800}] cents per 1000 gallons (test schedule)"
+      ELECTRIC_TIERS: "[{500,12000},{null,18000}] cents per 1000 kWh (test schedule)"
+    precision: "cents, round_half_up, one rounding at the line level"
+
+  - name: sewer_charge
+    trigger: "computed for the SEWER line during POST /accounts/{id}/bills"
+    algorithm: threshold
+    formula: |
+      water_cons = consumption of the account's ACTIVE WATER meter (0 if none)
+      billable = min(water_cons, sewer_cap_units)
+      vol_raw = (billable / 1000) * sewer_rate_cents_per_1000
+      sewer_line = round_half_up(fixed_charge_cents + vol_raw)
+    input_set: "the account's WATER consumption for this bill period"
+    constants:
+      SEWER_RATE: "250 cents per 1000 gallons (test schedule)"
+      SEWER_CAP_UNITS: "10000 gallons (test schedule)"
+    precision: "cents, round_half_up at the line level"
+
+  - name: consolidated_bill_total
+    trigger: "POST /accounts/{id}/bills"
+    algorithm: aggregation
+    formula: |
+      # Determine per-meter consumption first:
+      for each ACTIVE meter:
+        readings = meter readings sorted by (read_date ASC, created_at ASC)
+        if metered (WATER/ELECTRIC):
+          latest = readings[-1]
+          if latest.read_type == ESTIMATED or len(readings) == 0:
+              consumption = meter.estimated_monthly_units   # ESTIMATED variant
+              read_basis_line = ESTIMATED
+          else:
+              prev = readings[-2].reading_value if len(readings) >= 2 else 0
+              consumption = latest.reading_value - prev      # ACTUAL variant
+              read_basis_line = ACTUAL
+        SEWER: consumption := account WATER consumption (see sewer_charge)
+        REFUSE: consumption := 0 (flat)
+      line_charges = [ per-service rounded line via water_tier_charge / sewer_charge / REFUSE fixed ]
+      pre_discount_total_cents = SUM(line.charge_cents)          # round-per-line THEN sum
+      assistance_credit_cents  = round_half_up(account.assistance_discount_pct * pre_discount_total_cents)
+      actual_charges_cents     = pre_discount_total_cents - assistance_credit_cents
+      bill.read_basis = ESTIMATED if any metered line used estimated fallback else ACTUAL
+      if bill.budget_billed:   total_due_cents = plan.monthly_budget_cents   # actual deferred
+      else:                    total_due_cents = actual_charges_cents
+    input_set: "all ACTIVE meters on the account at generation time"
+    constants:
+      ROUNDING_ORDER: "round each service line to cents, THEN sum lines (never sum-then-round)"
+      NET_DUE_DAYS: 20
+    precision: "cents, round_half_up"
+    variants:
+      - name: actual_read
+        when: "latest reading on each metered meter is ACTUAL"
+        difference: "consumption = latest.reading_value - prev; bill.read_basis = ACTUAL"
+      - name: estimated_read
+        when: "latest reading is ESTIMATED (or no reading exists)"
+        difference: "consumption = meter.estimated_monthly_units, ignoring the dial value; bill.read_basis = ESTIMATED; total differs from the ACTUAL variant"
+
+  - name: leak_adjustment_credit
+    trigger: "POST /adjustments/{id}/approve"
+    algorithm: tiered_pricing
+    formula: |
+      if adjustment_type == GOODWILL:
+          credit_cents = goodwill_amount_cents
+      elif adjustment_type == ESTIMATE_CORRECTION:
+          credit_cents = max(0, bill.actual_charges_cents - recomputed_actual_charges_cents)
+      elif adjustment_type == LEAK:
+          excess = max(0, current_water_consumption - baseline_units)
+          if relief_method == SEWER_RELIEF:
+              credit_cents = round_half_up(SEWER_RATE * excess / 1000)
+          elif relief_method == TIER_REPRICE:
+              # charge the top `excess` gallons at the tiers they actually fell into,
+              # then reprice them all at the lowest water tier rate; credit = difference.
+              actual_on_excess = round_half_up( charge over gallons (baseline_units .. current] using WATER_TIERS )
+              repriced         = round_half_up( (excess / 1000) * WATER_TIER1_RATE )
+              credit_cents     = actual_on_excess - repriced
+    input_set: "the WATER consumption of the adjusted bill and the requested baseline_units / goodwill amount"
+    constants:
+      SEWER_RATE: 250
+      WATER_TIER1_RATE: 315
+    precision: "cents, round_half_up"
+    variants:
+      - name: sewer_relief
+        when: "relief_method == SEWER_RELIEF"
+        difference: "credit = sewer volumetric rate on the excess only"
+      - name: tier_reprice
+        when: "relief_method == TIER_REPRICE"
+        difference: "credit = (excess charged at actual marginal tiers) - (excess repriced at tier1); differs from sewer_relief for the same excess"
+
+  - name: budget_billing_amount
+    trigger: "POST /accounts/{id}/budget-billing-plan (enrollment)"
+    algorithm: forward_looking
+    formula: |
+      monthly_budget_cents = round_half_up(account.prior_annual_charges_cents / 12)
+    input_set: "account.prior_annual_charges_cents at enrollment"
+    constants: {}
+    precision: "cents, round_half_up"
+
+  - name: levelization_true_up
+    trigger: "POST /budget-billing-plans/{id}/true-up"
+    algorithm: chronological
+    formula: |
+      # cumulative_budgeted_cents and cumulative_actual_cents were accrued in
+      # bill creation order across each budget_billed bill:
+      #   on each budget_billed bill: cumulative_budgeted += monthly_budget_cents
+      #                               cumulative_actual   += bill.actual_charges_cents
+      deferred_balance_cents = cumulative_actual_cents - cumulative_budgeted_cents
+      account.current_balance_cents += deferred_balance_cents
+    input_set: "all budget_billed bills accrued on the plan, in creation order"
+    constants: {}
+    precision: "cents, exact integer difference"
+
+  - name: payment_allocation
+    trigger: "POST /accounts/{id}/payments"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = amount_cents
+      candidates = account bills with payment_status IN {UNPAID, PARTIAL} and collection_status != IN_LIEN
+      order candidates by (period_end ASC, created_at ASC)   # oldest first; created_at tie-break, never id
+      for bill in candidates:
+          due = bill.total_due_cents - bill.amount_paid_cents
+          take = min(remaining, due)
+          bill.amount_paid_cents += take
+          remaining -= take
+          record allocation {bill_id, applied_cents: take}
+          if remaining == 0: break
+      if remaining > 0 after all candidates: reject ERR_PAYMENT_EXCEEDS_BALANCE
+    input_set: "open bills for the account"
+    constants: {}
+    precision: "cents; deterministic oldest-first, created_at tie-break"
+
+  - name: deposit_settlement
+    trigger: "POST /accounts/{id}/finalize"
+    algorithm: waterfall_allocation
+    formula: |
+      final_balance = account outstanding after final bill generated
+      for each HELD deposit (created_at ASC):
+          applied  = min(deposit.amount_cents, final_balance)
+          refunded = deposit.amount_cents - applied
+          final_balance -= applied
+          deposit.status = APPLIED if applied > 0 else REFUNDED
+      # Conservation invariant: deposit.amount_cents == applied + refunded for every deposit.
+    input_set: "HELD deposits for the finalized account"
+    constants: {}
+    precision: "cents, exact integer"
+
+  - name: delinquent_balance
+    trigger: "recomputed on mark-delinquent, payment, adjustment, arrangement default"
+    algorithm: aggregation
+    formula: |
+      delinquent_balance_cents = SUM over bills where collection_status == DELINQUENT
+                                 of (total_due_cents - amount_paid_cents)
+    input_set: "bills with collection_status == DELINQUENT"
+    constants:
+      DELINQUENCY_GRACE_DAYS: 21
+      LIEN_MIN_ARREARS_CENTS: 10000
+    precision: "cents, exact integer"
+
+# =====================================================================
+# 1.4 VALIDATION RULES TABLE (ordered by priority)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and well-formed"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /_clock/set_current_utc"
+  - priority: 2
+    category: auth
+    check: "role permitted for this endpoint per RBAC matrix"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "path-referenced Account exists"
+    error_id: ERR_ACCOUNT_NOT_FOUND
+    http_status: 404
+    applies_to: "all /accounts/{id}/* endpoints"
+  - priority: 3
+    category: existence
+    check: "path-referenced Meter exists"
+    error_id: ERR_METER_NOT_FOUND
+    http_status: 404
+    applies_to: "/meters/{id}/*"
+  - priority: 3
+    category: existence
+    check: "path-referenced Bill exists"
+    error_id: ERR_BILL_NOT_FOUND
+    http_status: 404
+    applies_to: "/bills/{id}/*"
+  - priority: 3
+    category: existence
+    check: "path-referenced Adjustment / Arrangement / ShutoffOrder / LienTransfer / Plan exists"
+    error_id: ERR_RESOURCE_NOT_FOUND
+    http_status: 404
+    applies_to: "/adjustments/{id}/*, /payment-arrangements/{id}/*, /shutoff-orders/{id}/*, /lien-transfers/{id}/*, /budget-billing-plans/{id}/*"
+  - priority: 4
+    category: state
+    check: "target resource is in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 4
+    category: state
+    check: "Account is ACTIVE/DELINQUENT/SHUTOFF (not FINALED/LIEN_TRANSFERRED) for mutating operations"
+    error_id: ERR_ACCOUNT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /accounts/{id}/bills, /payments, /meters, /budget-billing-plan"
+  - priority: 4
+    category: state
+    check: "bill is not already PAID when marking delinquent"
+    error_id: ERR_BILL_ALREADY_PAID
+    http_status: 409
+    applies_to: "POST /bills/{id}/mark-delinquent"
+  - priority: 5
+    category: business_safety
+    check: "adjustment approver X-User-ID differs from adjustment.requested_by (segregation of duties)"
+    error_id: ERR_SOD_VIOLATION
+    http_status: 403
+    applies_to: "POST /adjustments/{id}/approve, /adjustments/{id}/reject"
+  - priority: 5
+    category: business_safety
+    check: "no ACTIVE MoratoriumWindow covers the shutoff scheduled_date at execute time"
+    error_id: ERR_MORATORIUM_ACTIVE
+    http_status: 403
+    applies_to: "POST /shutoff-orders/{id}/execute"
+  - priority: 6
+    category: business_referential
+    check: "budget_billed bill requires an ACTIVE BudgetBillingPlan on the account"
+    error_id: ERR_NO_ACTIVE_PLAN
+    http_status: 409
+    applies_to: "POST /accounts/{id}/bills"
+  - priority: 6
+    category: business_referential
+    check: "shutoff execution requires the account to still be DELINQUENT with delinquent_balance > 0"
+    error_id: ERR_NO_DELINQUENT_BALANCE
+    http_status: 409
+    applies_to: "POST /shutoff-orders/{id}/execute, POST /accounts/{id}/shutoff-orders"
+  - priority: 6
+    category: business_referential
+    check: "lien certify requires delinquent_balance >= LIEN_MIN_ARREARS_CENTS"
+    error_id: ERR_INSUFFICIENT_ARREARS
+    http_status: 409
+    applies_to: "POST /lien-transfers/{id}/certify, POST /accounts/{id}/lien-transfers"
+  - priority: 7
+    category: business_temporal
+    check: "new Bill service period [period_start, period_end) must not overlap an existing non-VOID bill for the account (half-open; adjacency allowed)"
+    error_id: ERR_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /accounts/{id}/bills"
+  - priority: 7
+    category: business_temporal
+    check: "new SYSTEM MoratoriumWindow [start_date, end_date] must not overlap OR touch an existing ACTIVE SYSTEM window (closed interval; adjacency IS a conflict)"
+    error_id: ERR_MORATORIUM_OVERLAP
+    http_status: 409
+    applies_to: "POST /moratorium-windows"
+  - priority: 8
+    category: business_constraint
+    check: "a new ACTUAL reading_value must be >= the meter's latest reading_value (no dial regression)"
+    error_id: ERR_READING_REGRESSION
+    http_status: 422
+    applies_to: "POST /meters/{id}/readings"
+  - priority: 8
+    category: business_constraint
+    check: "enum fields carry a permitted member; installment_count >= 2; amounts positive"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all create endpoints"
+  - priority: 9
+    category: business_fiscal
+    check: "payment amount must not exceed the account's total open balance after waterfall"
+    error_id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http_status: 422
+    applies_to: "POST /accounts/{id}/payments"
+  - priority: 9
+    category: business_fiscal
+    check: "OCC expected_account_version must equal current account.version on arrangement create"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /accounts/{id}/payment-arrangements"
+
+# =====================================================================
+# 1.5 API ENDPOINT TABLE
+# =====================================================================
+endpoints:
+  - method: POST
+    path: "/rate-schedules"
+    description: "Create a rate schedule for a utility."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [service_type, unit, fixed_charge_cents, "tiers?", "sewer_rate_cents_per_1000?", "sewer_cap_units?", effective_date, "active?"]
+    output: RateSchedule
+    side_effects: []
+  - method: GET
+    path: "/rate-schedules/{id}"
+    description: "Fetch a rate schedule."
+    roles: [BillingSpecialist, CollectionsOfficer, AssistanceCaseworker, MeterTech, Supervisor]
+    code: 200
+    input: []
+    output: RateSchedule
+    side_effects: []
+
+  - method: POST
+    path: "/accounts"
+    description: "Open a utility account (starts ACTIVE)."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [account_holder_name, service_address, occupant_type, "prior_annual_charges_cents?"]
+    output: Account
+    side_effects: ["account.status = ACTIVE", "version = 1"]
+  - method: GET
+    path: "/accounts/{id}"
+    description: "Fetch an account with computed balances."
+    roles: [BillingSpecialist, CollectionsOfficer, AssistanceCaseworker, MeterTech, Supervisor, Customer]
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: GET
+    path: "/accounts"
+    description: "List accounts (paginated)."
+    roles: [BillingSpecialist, CollectionsOfficer, AssistanceCaseworker]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Account[]
+    side_effects: []
+  - method: POST
+    path: "/accounts/{id}/assistance"
+    description: "Enroll the account in an assistance program (sets discount)."
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: [program, discount_pct]
+    output: Account
+    side_effects: ["set account.assistance_program, account.assistance_discount_pct", "increments Account.version by 1"]
+  - method: POST
+    path: "/accounts/{id}/finalize"
+    description: "Move-out finalize: generate final bill, settle deposits, remove meters."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [period_start, period_end]
+    output: Bill
+    side_effects:
+      - "generate a final Bill from the account's ACTIVE meters for the final period [consolidated_bill_total] (link 1)"
+      - "apply HELD deposits to the final bill then refund remainder (link 2) [deposit_settlement]"
+      - "issue refund Payment when deposit exceeds final balance (link 3)"
+      - "cancel ACTIVE BudgetBillingPlan settling deferred_balance into final bill"
+      - "account.status -> FINALED; move_out_date set; meters -> REMOVED"
+      - "increments Account.version by 1"
+
+  - method: POST
+    path: "/accounts/{id}/meters"
+    description: "Add a service meter to an account."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [service_type, "estimated_monthly_units?"]
+    output: Meter
+    side_effects: ["meter.status = ACTIVE"]
+  - method: GET
+    path: "/accounts/{id}/meters"
+    description: "List meters for an account (FK reverse-reachability for Meter.account_id)."
+    roles: [BillingSpecialist, MeterTech, CollectionsOfficer, AssistanceCaseworker]
+    code: 200
+    input: []
+    output: Meter[]
+    side_effects: []
+  - method: GET
+    path: "/meters/{id}"
+    description: "Fetch a meter."
+    roles: [BillingSpecialist, MeterTech]
+    code: 200
+    input: []
+    output: Meter
+    side_effects: []
+  - method: POST
+    path: "/meters/{id}/readings"
+    description: "Record a meter reading."
+    roles: [MeterTech]
+    code: 201
+    input: [read_date, reading_value, read_type]
+    output: MeterReading
+    side_effects: ["append reading; ACTUAL reading must not regress the dial"]
+  - method: GET
+    path: "/meters/{id}/readings"
+    description: "List readings for a meter (FK reverse-reachability for MeterReading.meter_id)."
+    roles: [BillingSpecialist, MeterTech]
+    code: 200
+    input: []
+    output: MeterReading[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/bills"
+    description: "Generate a consolidated bill for a service period."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [period_start, period_end, "budget_billed?"]
+    output: Bill
+    side_effects:
+      - "compute line_charges, pre_discount_total_cents, assistance_credit_cents, actual_charges_cents, total_due_cents [consolidated_bill_total]"
+      - "set due_date = period_end + NET_DUE_DAYS; payment_status=UNPAID; collection_status=CURRENT"
+      - "reject on period overlap [ERR_PERIOD_OVERLAP]"
+      - "if budget_billed: accrue plan.cumulative_budgeted_cents += monthly_budget_cents, plan.cumulative_actual_cents += actual_charges_cents"
+      - "recompute account.current_balance_cents"
+  - method: GET
+    path: "/bills/{id}"
+    description: "Fetch a bill."
+    roles: [BillingSpecialist, CollectionsOfficer, AssistanceCaseworker, Customer]
+    code: 200
+    input: []
+    output: Bill
+    side_effects: []
+  - method: GET
+    path: "/accounts/{id}/bills"
+    description: "List bills for an account (FK reverse-reachability for Bill.account_id)."
+    roles: [BillingSpecialist, CollectionsOfficer, AssistanceCaseworker, Customer]
+    code: 200
+    input: ["collection_status?", "payment_status?"]
+    output: Bill[]
+    side_effects: []
+  - method: POST
+    path: "/bills/{id}/mark-delinquent"
+    description: "Mark a past-grace unpaid bill delinquent (bubbles account to DELINQUENT)."
+    roles: [CollectionsOfficer]
+    code: 200
+    input: []
+    output: Bill
+    side_effects:
+      - "requires current_clock - due_date >= DELINQUENCY_GRACE_DAYS [boundary]"
+      - "bill.collection_status CURRENT -> DELINQUENT"
+      - "account.status -> DELINQUENT; recompute delinquent_balance_cents"
+
+  - method: POST
+    path: "/accounts/{id}/payments"
+    description: "Record a payment; waterfall-allocate oldest bill first."
+    roles: [BillingSpecialist, Customer]
+    code: 201
+    input: [amount_cents, method, "payment_date?"]
+    output: Payment
+    side_effects:
+      - "waterfall-allocate [payment_allocation]"
+      - "update bill.amount_paid_cents / payment_status; clear collection_status when balance 0"
+      - "if delinquent_balance -> 0: cancel SCHEDULED shutoff, account DELINQUENT/SHUTOFF -> ACTIVE"
+      - "recompute account.current_balance_cents"
+  - method: GET
+    path: "/accounts/{id}/payments"
+    description: "List payments for an account (FK reverse-reachability for Payment.account_id)."
+    roles: [BillingSpecialist, CollectionsOfficer, Customer]
+    code: 200
+    input: []
+    output: Payment[]
+    side_effects: []
+  - method: POST
+    path: "/payments/{id}/reverse"
+    description: "Reverse a posted payment (compensating action)."
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: Payment
+    side_effects:
+      - "payment.status POSTED -> REVERSED"
+      - "unwind each allocation: bill.amount_paid_cents -= applied_cents; recompute payment_status"
+      - "recompute account.current_balance_cents (receivable restored to pre-payment value)"
+
+  - method: POST
+    path: "/accounts/{id}/budget-billing-plan"
+    description: "Enroll account in budget billing; compute monthly_budget_cents."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [plan_year]
+    output: BudgetBillingPlan
+    side_effects: ["monthly_budget_cents = round(account.prior_annual_charges_cents / 12) [budget_billing_amount]", "plan.status = ACTIVE"]
+  - method: GET
+    path: "/accounts/{id}/budget-billing-plan"
+    description: "List budget billing plans for an account (FK reverse-reachability for BudgetBillingPlan.account_id)."
+    roles: [BillingSpecialist, CollectionsOfficer, Customer]
+    code: 200
+    input: []
+    output: BudgetBillingPlan[]
+    side_effects: []
+  - method: POST
+    path: "/budget-billing-plans/{id}/true-up"
+    description: "Levelize: reconcile cumulative actual vs budgeted into deferred_balance."
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: BudgetBillingPlan
+    side_effects:
+      - "deferred_balance_cents = cumulative_actual_cents - cumulative_budgeted_cents [levelization_true_up]"
+      - "plan.status ACTIVE -> TRUED_UP; account.current_balance_cents += deferred_balance_cents"
+
+  - method: POST
+    path: "/accounts/{id}/deposits"
+    description: "Collect a deposit (HELD)."
+    roles: [BillingSpecialist]
+    code: 201
+    input: [amount_cents, reason]
+    output: Deposit
+    side_effects: ["deposit.status = HELD; recompute account.deposit_on_hand_cents"]
+  - method: GET
+    path: "/accounts/{id}/deposits"
+    description: "List deposits for an account (FK reverse-reachability for Deposit.account_id)."
+    roles: [BillingSpecialist, CollectionsOfficer]
+    code: 200
+    input: []
+    output: Deposit[]
+    side_effects: []
+
+  - method: POST
+    path: "/accounts/{id}/payment-arrangements"
+    description: "Create a payment arrangement; supersedes any prior ACTIVE arrangement (OCC on account.version)."
+    roles: [AssistanceCaseworker]
+    code: 201
+    input: [total_arranged_cents, installment_count, expected_account_version]
+    output: PaymentArrangement
+    side_effects:
+      - "installment_amount_cents = round(total_arranged_cents / installment_count)"
+      - "prior ACTIVE arrangement -> SUPERSEDED"
+      - "arrangement.status = ACTIVE"
+      - "increments Account.version by 1"
+  - method: GET
+    path: "/accounts/{id}/payment-arrangements"
+    description: "List payment arrangements for an account (FK reverse-reachability for PaymentArrangement.account_id)."
+    roles: [AssistanceCaseworker, CollectionsOfficer, Customer]
+    code: 200
+    input: ["status?"]
+    output: PaymentArrangement[]
+    side_effects: []
+  - method: POST
+    path: "/payment-arrangements/{id}/record-missed"
+    description: "Record a missed installment; default triggers the shutoff cascade."
+    roles: [CollectionsOfficer]
+    code: 200
+    input: []
+    output: PaymentArrangement
+    side_effects:
+      - "arrangement.status ACTIVE -> DEFAULTED (link 1)"
+      - "account.status -> DELINQUENT (link 2)"
+      - "account UNPAID/PARTIAL bills collection_status CURRENT -> DELINQUENT (link 3 driven by account delinquency)"
+      - "auto-create CASCADE ShutoffOrder SCHEDULED"
+  - method: POST
+    path: "/payment-arrangements/{id}/reinstate"
+    description: "Reinstate a defaulted arrangement (cyclic back to ACTIVE)."
+    roles: [AssistanceCaseworker]
+    code: 200
+    input: []
+    output: PaymentArrangement
+    side_effects: ["arrangement.status DEFAULTED -> ACTIVE", "cancel SCHEDULED CASCADE ShutoffOrder from the default", "account.status DELINQUENT -> ACTIVE when arrangement covers arrears"]
+
+  - method: POST
+    path: "/bills/{id}/adjustments"
+    description: "Request a bill adjustment (leak/estimate/goodwill). Requester recorded for SoD."
+    roles: [AssistanceCaseworker]
+    code: 201
+    input: [adjustment_type, "relief_method?", "baseline_units?", "goodwill_amount_cents?"]
+    output: Adjustment
+    side_effects: ["adjustment.status = REQUESTED", "requested_by = X-User-ID"]
+  - method: GET
+    path: "/bills/{id}/adjustments"
+    description: "List adjustments for a bill (FK reverse-reachability for Adjustment.bill_id)."
+    roles: [AssistanceCaseworker, BillingSpecialist, Supervisor]
+    code: 200
+    input: []
+    output: Adjustment[]
+    side_effects: []
+  - method: POST
+    path: "/adjustments/{id}/approve"
+    description: "Approve an adjustment; compute and apply credit. Approver != requester (SoD)."
+    roles: [Supervisor]
+    code: 200
+    input: []
+    output: Adjustment
+    side_effects:
+      - "reject if X-User-ID == requested_by [ERR_SOD_VIOLATION]"
+      - "compute credit_cents [leak_adjustment_credit]"
+      - "adjustment.status REQUESTED -> APPROVED; bill.amount_paid_cents += credit_cents; recompute account.current_balance_cents"
+  - method: POST
+    path: "/adjustments/{id}/reject"
+    description: "Reject an adjustment (no financial effect). Approver != requester (SoD)."
+    roles: [Supervisor]
+    code: 200
+    input: []
+    output: Adjustment
+    side_effects: ["reject if X-User-ID == requested_by [ERR_SOD_VIOLATION]", "adjustment.status REQUESTED -> REJECTED"]
+
+  - method: POST
+    path: "/accounts/{id}/shutoff-orders"
+    description: "Schedule a shutoff for a delinquent account."
+    roles: [CollectionsOfficer]
+    code: 201
+    input: [scheduled_date, "reason?"]
+    output: ShutoffOrder
+    side_effects: ["requires account.status == DELINQUENT and delinquent_balance > 0", "shutoff_order.status = SCHEDULED; origin = MANUAL"]
+  - method: GET
+    path: "/accounts/{id}/shutoff-orders"
+    description: "List shutoff orders for an account (FK reverse-reachability for ShutoffOrder.account_id)."
+    roles: [CollectionsOfficer, MeterTech]
+    code: 200
+    input: ["status?"]
+    output: ShutoffOrder[]
+    side_effects: []
+  - method: POST
+    path: "/shutoff-orders/{id}/execute"
+    description: "Execute a scheduled shutoff (blocked by moratorium)."
+    roles: [MeterTech]
+    code: 200
+    input: []
+    output: ShutoffOrder
+    side_effects:
+      - "reject if an ACTIVE MoratoriumWindow covers scheduled_date [ERR_MORATORIUM_ACTIVE]"
+      - "reject if account no longer DELINQUENT [ERR_NO_DELINQUENT_BALANCE]"
+      - "shutoff_order.status SCHEDULED -> EXECUTED; account.status DELINQUENT -> SHUTOFF; meters -> REMOVED"
+
+  - method: POST
+    path: "/accounts/{id}/lien-transfers"
+    description: "Initiate a lien transfer of arrears to the tax roll."
+    roles: [CollectionsOfficer]
+    code: 201
+    input: [tax_parcel_ref]
+    output: LienTransfer
+    side_effects: ["requires delinquent_balance >= LIEN_MIN_ARREARS_CENTS", "amount_cents = account.delinquent_balance_cents; status = PENDING"]
+  - method: GET
+    path: "/accounts/{id}/lien-transfers"
+    description: "List lien transfers for an account (FK reverse-reachability for LienTransfer.account_id)."
+    roles: [CollectionsOfficer, BillingSpecialist]
+    code: 200
+    input: ["status?"]
+    output: LienTransfer[]
+    side_effects: []
+  - method: POST
+    path: "/lien-transfers/{id}/certify"
+    description: "Certify then post the lien to tax; account -> LIEN_TRANSFERRED."
+    roles: [CollectionsOfficer]
+    code: 200
+    input: []
+    output: LienTransfer
+    side_effects:
+      - "reject if account.status not IN {DELINQUENT, SHUTOFF} [ERR_INVALID_STATE]"
+      - "reject if delinquent_balance < LIEN_MIN_ARREARS_CENTS [ERR_INSUFFICIENT_ARREARS]"
+      - "status PENDING -> CERTIFIED -> TRANSFERRED; account.status -> LIEN_TRANSFERRED; delinquent bills -> IN_LIEN"
+
+  - method: POST
+    path: "/moratorium-windows"
+    description: "Create a shutoff moratorium window (SYSTEM or ACCOUNT scope)."
+    roles: [CollectionsOfficer]
+    code: 201
+    input: [scope, start_date, end_date, reason, "account_id?"]
+    output: MoratoriumWindow
+    side_effects: ["reject SYSTEM window overlapping/touching an existing ACTIVE SYSTEM window [ERR_MORATORIUM_OVERLAP]", "status = ACTIVE"]
+  - method: GET
+    path: "/accounts/{id}/moratorium-windows"
+    description: "List moratorium windows scoped to an account (FK reverse-reachability for MoratoriumWindow.account_id)."
+    roles: [CollectionsOfficer, MeterTech]
+    code: 200
+    input: ["status?"]
+    output: MoratoriumWindow[]
+    side_effects: []
+  - method: GET
+    path: "/moratorium-windows/{id}"
+    description: "Fetch a moratorium window."
+    roles: [CollectionsOfficer, MeterTech]
+    code: 200
+    input: []
+    output: MoratoriumWindow
+    side_effects: []
+
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving logical clock setter. Server startup default is 2026-05-01T00:00:00Z; the clock reads exactly this default until first set and never falls back to wall-clock time."
+    roles: [BillingSpecialist, CollectionsOfficer, MeterTech, AssistanceCaseworker, Supervisor]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["set logical clock used by due_date, delinquency grace, and moratorium coverage checks"]
+
+# =====================================================================
+# 1.6 ERROR CODE CATALOG
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing or malformed auth headers"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for the endpoint"
+  - id: ERR_ACCOUNT_NOT_FOUND
+    http: 404
+    condition: "referenced account does not exist"
+  - id: ERR_METER_NOT_FOUND
+    http: 404
+    condition: "referenced meter does not exist"
+  - id: ERR_BILL_NOT_FOUND
+    http: 404
+    condition: "referenced bill does not exist"
+  - id: ERR_RATE_SCHEDULE_NOT_FOUND
+    http: 404
+    condition: "referenced rate schedule does not exist"
+  - id: ERR_RESOURCE_NOT_FOUND
+    http: 404
+    condition: "referenced adjustment/arrangement/shutoff/lien/plan does not exist"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "requested transition invalid from the resource's current state"
+  - id: ERR_ACCOUNT_NOT_ACTIVE
+    http: 409
+    condition: "account is FINALED or LIEN_TRANSFERRED and cannot accept the mutation"
+  - id: ERR_BILL_ALREADY_PAID
+    http: 409
+    condition: "cannot mark a PAID bill delinquent"
+  - id: ERR_BILL_NOT_DELINQUENT
+    http: 409
+    condition: "operation requires a bill in DELINQUENT collection status"
+  - id: ERR_NOT_YET_DELINQUENT
+    http: 409
+    condition: "mark-delinquent before DELINQUENCY_GRACE_DAYS have elapsed past due_date"
+  - id: ERR_SOD_VIOLATION
+    http: 403
+    condition: "adjustment approver X-User-ID equals the requester (segregation of duties)"
+  - id: ERR_MORATORIUM_ACTIVE
+    http: 403
+    condition: "shutoff execution blocked by an ACTIVE moratorium window covering scheduled_date"
+  - id: ERR_NO_ACTIVE_PLAN
+    http: 409
+    condition: "budget_billed bill requested without an ACTIVE BudgetBillingPlan"
+  - id: ERR_NO_DELINQUENT_BALANCE
+    http: 409
+    condition: "shutoff scheduled/executed without a positive delinquent balance"
+  - id: ERR_INSUFFICIENT_ARREARS
+    http: 409
+    condition: "lien transfer/certify below LIEN_MIN_ARREARS_CENTS"
+  - id: ERR_PERIOD_OVERLAP
+    http: 409
+    condition: "new bill service period overlaps an existing non-VOID bill (half-open)"
+  - id: ERR_MORATORIUM_OVERLAP
+    http: 409
+    condition: "new SYSTEM moratorium overlaps or touches an existing ACTIVE SYSTEM window (closed interval)"
+  - id: ERR_READING_REGRESSION
+    http: 422
+    condition: "new ACTUAL reading value is below the meter's latest reading value"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "missing required field, bad enum, non-positive amount, or installment_count < 2"
+  - id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http: 422
+    condition: "payment amount exceeds the account's total open balance"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_account_version does not match current account.version (OCC)"
+  - id: ERR_DEPOSIT_ALREADY_SETTLED
+    http: 409
+    condition: "deposit already APPLIED or REFUNDED"
+
+# =====================================================================
+# 1.7 RBAC MATRIX
+# =====================================================================
+roles:
+  - name: BillingSpecialist
+    description: "Opens accounts, adds meters, generates bills, records payments, manages deposits, budget billing, finalize."
+    identity: opaque
+    exclusive_operations:
+      - "POST /accounts"
+      - "POST /rate-schedules"
+      - "POST /accounts/{id}/meters"
+      - "POST /accounts/{id}/bills"
+      - "POST /accounts/{id}/finalize"
+      - "POST /accounts/{id}/deposits"
+      - "POST /accounts/{id}/budget-billing-plan"
+      - "POST /budget-billing-plans/{id}/true-up"
+      - "POST /payments/{id}/reverse"
+    shared_operations:
+      - "POST /accounts/{id}/payments"
+      - "GET reads"
+  - name: MeterTech
+    description: "Records meter reads and executes field shutoffs."
+    identity: opaque
+    exclusive_operations:
+      - "POST /meters/{id}/readings"
+      - "POST /shutoff-orders/{id}/execute"
+    shared_operations:
+      - "GET meters/readings/shutoff-orders/moratorium-windows"
+  - name: CollectionsOfficer
+    description: "Manages delinquency, shutoff scheduling, moratoria, lien transfers, arrangement defaults."
+    identity: opaque
+    exclusive_operations:
+      - "POST /bills/{id}/mark-delinquent"
+      - "POST /accounts/{id}/shutoff-orders"
+      - "POST /accounts/{id}/lien-transfers"
+      - "POST /lien-transfers/{id}/certify"
+      - "POST /moratorium-windows"
+      - "POST /payment-arrangements/{id}/record-missed"
+    shared_operations:
+      - "GET reads"
+  - name: AssistanceCaseworker
+    description: "Enrolls assistance, creates/reinstates payment arrangements, requests bill adjustments (SoD requester)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /accounts/{id}/assistance"
+      - "POST /accounts/{id}/payment-arrangements"
+      - "POST /payment-arrangements/{id}/reinstate"
+      - "POST /bills/{id}/adjustments"
+    shared_operations:
+      - "GET reads"
+  - name: Supervisor
+    description: "Approves or rejects adjustments; must differ from the requester (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /adjustments/{id}/approve"
+      - "POST /adjustments/{id}/reject"
+    shared_operations:
+      - "GET /bills/{id}/adjustments"
+  - name: Customer
+    description: "Account holder: views own account/bills and pays."
+    identity: "entity_backed:Account"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /accounts/{id}/payments (own account)"
+      - "GET own account/bills/payments/arrangements/plan"

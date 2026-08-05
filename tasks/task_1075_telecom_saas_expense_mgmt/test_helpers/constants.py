@@ -1,0 +1,30 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Expected-amount reconciliation (PRD §3.4)
+SAAS_PLATFORM_FEE_CENTS = 5000
+CYCLE_DAYS = 30
+TIER_LADDER = {100: 0.15, 50: 0.10, 10: 0.05, 0: 0.00}
+
+# Chargeback allocation (PRD §3.6)
+WEIGHT_SUM_REQUIRED = 100.00
+
+# Rightsizing savings (PRD §3.3)
+ANNUAL_MONTHS = 12
+
+# Utilization eligibility gate for DOWNGRADE_SEATS (PRD §3.3)
+UTILIZATION_THRESHOLD_PCT = 70.00
+
+# Dispute negotiation cap (PRD §3.5)
+MAX_DISPUTE_ROUNDS = 2
+
+# Logical clock startup default (PRD §3.1)
+CLOCK_STARTUP_DEFAULT = "2026-05-01T00:00:00Z"
+
+THRESHOLDS = {
+    "SAAS_PLATFORM_FEE_CENTS": SAAS_PLATFORM_FEE_CENTS,
+    "CYCLE_DAYS": CYCLE_DAYS,
+    "WEIGHT_SUM_REQUIRED": WEIGHT_SUM_REQUIRED,
+    "ANNUAL_MONTHS": ANNUAL_MONTHS,
+    "UTILIZATION_THRESHOLD_PCT": UTILIZATION_THRESHOLD_PCT,
+    "MAX_DISPUTE_ROUNDS": MAX_DISPUTE_ROUNDS,
+}

@@ -1,0 +1,88 @@
+"""Error catalogue (PRD §5) and the exception type every rung raises."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_HTTP[error_id]
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_ENUM": 400,
+    "ERR_PATIENT_NOT_FOUND": 404,
+    "ERR_COVERAGE_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_SESSION_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_REFERENCE_NOT_FOUND": 404,
+    "ERR_PATIENT_DISCHARGED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_PLAN_NOT_ACTIVE": 409,
+    "ERR_CREDENTIAL_EXPIRED": 422,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_SUPERVISION_REQUIRED": 422,
+    "ERR_SESSION_OUTSIDE_AUTH_WINDOW": 422,
+    "ERR_ROOM_CONFLICT": 409,
+    "ERR_THERAPIST_CONFLICT": 409,
+    "ERR_THERAPIST_DAILY_CAP_EXCEEDED": 409,
+    "ERR_AUTH_VISITS_EXHAUSTED": 409,
+    "ERR_REASSESSMENT_REQUIRED": 422,
+    "ERR_MASTERY_NOT_MET": 422,
+    "ERR_COMPLIANCE_BELOW_THRESHOLD": 422,
+    "ERR_LOAN_OUTSTANDING": 409,
+    "ERR_KIT_STOCK_DEPLETED": 409,
+    "ERR_DUPLICATE_CLAIM": 409,
+    "ERR_SESSION_NOT_BILLABLE": 422,
+    "ERR_VISION_FREQUENCY_LIMIT": 422,
+    "ERR_REAUTH_REASSESSMENT_STALE": 422,
+    "ERR_REFERRAL_ATTEMPT_LIMIT": 409,
+    "ERR_TAPER_GATE_NOT_MET": 422,
+    "ERR_DISCHARGE_CRITERIA_NOT_MET": 422,
+    "ERR_APPEAL_LIMIT_REACHED": 409,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be one of the seven declared roles.",
+    "ERR_UNAUTHORIZED": "The caller's role is not authorized for this endpoint.",
+    "ERR_VALIDATION": "The request body or query is missing a required field, is badly typed, or is out of range.",
+    "ERR_INVALID_ENUM": "An enum-valued field carries a value outside its declared set.",
+    "ERR_PATIENT_NOT_FOUND": "No Patient exists with the supplied id.",
+    "ERR_COVERAGE_NOT_FOUND": "No Coverage exists with the supplied id.",
+    "ERR_ASSESSMENT_NOT_FOUND": "No Assessment exists with the supplied id.",
+    "ERR_PLAN_NOT_FOUND": "No TherapyPlan exists with the supplied id.",
+    "ERR_SESSION_NOT_FOUND": "No TherapySession exists with the supplied id.",
+    "ERR_CLAIM_NOT_FOUND": "No Claim exists with the supplied id.",
+    "ERR_REFERENCE_NOT_FOUND": "A referenced row does not exist.",
+    "ERR_PATIENT_DISCHARGED": "The patient's clinical record is frozen; this endpoint is inside the clinical write gate.",
+    "ERR_STALE_VERSION": "The supplied expected version does not match the parent row's current version.",
+    "ERR_INVALID_STATE": "The requested transition is not declared from the row's current state.",
+    "ERR_PLAN_NOT_ACTIVE": "The therapy plan this request depends on is not ACTIVE.",
+    "ERR_CREDENTIAL_EXPIRED": "The therapist's credential has expired for the instant in question.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting user may not perform this operation on a row they originated.",
+    "ERR_SUPERVISION_REQUIRED": "An assistant-run session needs a documented, unexpired supervising optometrist.",
+    "ERR_SESSION_OUTSIDE_AUTH_WINDOW": "The requested start date falls outside the authorization window.",
+    "ERR_ROOM_CONFLICT": "The room is already booked over this interval once the turnover buffer is applied.",
+    "ERR_THERAPIST_CONFLICT": "The clinician already has an overlapping booking.",
+    "ERR_THERAPIST_DAILY_CAP_EXCEEDED": "The clinician's scheduled minutes for that date would exceed the daily cap.",
+    "ERR_AUTH_VISITS_EXHAUSTED": "The authorization has no visits remaining.",
+    "ERR_REASSESSMENT_REQUIRED": "A current signed reassessment is required to enter this phase.",
+    "ERR_MASTERY_NOT_MET": "The current phase has not reached its required mastery count.",
+    "ERR_COMPLIANCE_BELOW_THRESHOLD": "Home compliance is below the phase-advance threshold.",
+    "ERR_LOAN_OUTSTANDING": "The patient still holds equipment that has not been returned.",
+    "ERR_KIT_STOCK_DEPLETED": "Insufficient stock on hand, or an invalid quantity for a serialized item.",
+    "ERR_DUPLICATE_CLAIM": "A claim already exists for this session or assessment.",
+    "ERR_SESSION_NOT_BILLABLE": "The named session is not BILLABLE, or the named assessment is not SIGNED.",
+    "ERR_VISION_FREQUENCY_LIMIT": "The vision plan's frequency limit has not elapsed since the last paid service.",
+    "ERR_REAUTH_REASSESSMENT_STALE": "The cited reassessment is not a current signed reassessment for this patient.",
+    "ERR_REFERRAL_ATTEMPT_LIMIT": "The referral has exhausted its attempts and has been abandoned.",
+    "ERR_TAPER_GATE_NOT_MET": "The taper gate on adherence and acuity gain is not satisfied.",
+    "ERR_DISCHARGE_CRITERIA_NOT_MET": "The precondition attached to the supplied discharge reason does not hold.",
+    "ERR_APPEAL_LIMIT_REACHED": "The claim has reached its appeal cap.",
+}

@@ -1,0 +1,88 @@
+"""Error catalogue (36 codes) and the exception type carrying them."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_HTTP[error_id]
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_OWNER": 403,
+    "ERR_PATIENT_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_ARCH_NOT_FOUND": 404,
+    "ERR_LAB_CASE_NOT_FOUND": 404,
+    "ERR_PROSTHESIS_NOT_FOUND": 404,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_ACCOUNT_DELINQUENT": 403,
+    "ERR_REFERENCE_NOT_FOUND": 404,
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_ENUM": 422,
+    "ERR_STALE_VERSION": 412,
+    "ERR_TERMINAL_STATE": 409,
+    "ERR_REMAKE_FINAL_DENIED": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_CROSS_ENTITY_STATE": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_LAB_CASE_EXPIRED": 409,
+    "ERR_MILESTONE_SEQUENCE": 422,
+    "ERR_RETAKE_LIMIT_EXCEEDED": 409,
+    "ERR_TRYIN_LIMIT_EXCEEDED": 409,
+    "ERR_QC_RESEND_LIMIT_EXCEEDED": 409,
+    "ERR_ARCH_OCCUPIED": 409,
+    "ERR_LAB_SLOT_CONFLICT": 409,
+    "ERR_REMAKE_LIMIT_EXCEEDED": 409,
+    "ERR_WARRANTY_CONSUMED": 409,
+    "ERR_WARRANTY_EXPIRED": 422,
+    "ERR_SERVICE_NOT_ELIGIBLE": 422,
+    "ERR_SERVICE_FREQUENCY_LIMIT": 422,
+    "ERR_COB_RANK_CONFLICT": 409,
+    "ERR_WAITING_PERIOD": 422,
+    "ERR_FREQUENCY_LIMIT": 422,
+    "ERR_PREDETERMINATION_REQUIRED": 422,
+    "ERR_ANNUAL_MAX_EXHAUSTED": 422,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or name no declared role.",
+    "ERR_FORBIDDEN_ROLE": "The calling role is not authorised for this endpoint.",
+    "ERR_NOT_OWNER": "The caller does not own the targeted resource.",
+    "ERR_PATIENT_NOT_FOUND": "No patient exists with that identifier.",
+    "ERR_CASE_NOT_FOUND": "No prosthesis case exists with that identifier.",
+    "ERR_ARCH_NOT_FOUND": "No case arch exists with that identifier.",
+    "ERR_LAB_CASE_NOT_FOUND": "No lab case exists with that identifier.",
+    "ERR_PROSTHESIS_NOT_FOUND": "No prosthesis exists with that identifier.",
+    "ERR_RESOURCE_NOT_FOUND": "No resource exists with that identifier.",
+    "ERR_ACCOUNT_DELINQUENT": "The patient has a delinquent or defaulted payment plan.",
+    "ERR_REFERENCE_NOT_FOUND": "A referenced resource in the request body does not exist.",
+    "ERR_VALIDATION": "The request failed schema or range validation.",
+    "ERR_INVALID_ENUM": "A field carries a value outside its declared member set.",
+    "ERR_STALE_VERSION": "The supplied expected version does not match the current version.",
+    "ERR_TERMINAL_STATE": "The target resource is already in a terminal state.",
+    "ERR_REMAKE_FINAL_DENIED": "The arch is finally denied for remakes.",
+    "ERR_INVALID_STATE": "The target resource is not in a declared origin state for this transition.",
+    "ERR_CROSS_ENTITY_STATE": "A related resource is not in the required state.",
+    "ERR_SEGREGATION_OF_DUTIES": "The decider may not be the requester.",
+    "ERR_LAB_CASE_EXPIRED": "The lab case is past its shelf life.",
+    "ERR_MILESTONE_SEQUENCE": "The try-in milestone is out of the required sequence.",
+    "ERR_RETAKE_LIMIT_EXCEEDED": "The impression retake ceiling has been reached.",
+    "ERR_TRYIN_LIMIT_EXCEEDED": "The try-in adjustment ceiling has been reached.",
+    "ERR_QC_RESEND_LIMIT_EXCEEDED": "The QC resend ceiling has been reached.",
+    "ERR_ARCH_OCCUPIED": "The arch already holds an open lab case or is inside the turnaround buffer.",
+    "ERR_LAB_SLOT_CONFLICT": "The laboratory bench line is occupied for the requested interval.",
+    "ERR_REMAKE_LIMIT_EXCEEDED": "The remake ceiling for this arch has been reached.",
+    "ERR_WARRANTY_CONSUMED": "The appliance warranty is already consumed or voided.",
+    "ERR_WARRANTY_EXPIRED": "The appliance warranty window has closed.",
+    "ERR_SERVICE_NOT_ELIGIBLE": "The service type is not eligible for this prosthesis type.",
+    "ERR_SERVICE_FREQUENCY_LIMIT": "The service frequency limit has not yet elapsed.",
+    "ERR_COB_RANK_CONFLICT": "The patient already holds a coverage at that coordination-of-benefits rank.",
+    "ERR_WAITING_PERIOD": "The coverage waiting period has not elapsed.",
+    "ERR_FREQUENCY_LIMIT": "The replacement frequency window has not elapsed.",
+    "ERR_PREDETERMINATION_REQUIRED": "A live approved predetermination is required for this case.",
+    "ERR_ANNUAL_MAX_EXHAUSTED": "The coverage annual maximum is exhausted.",
+}
