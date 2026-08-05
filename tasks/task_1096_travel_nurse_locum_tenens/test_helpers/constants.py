@@ -1,0 +1,34 @@
+"""Domain thresholds — numeric constants from the PRD calculations and conventions."""
+
+THRESHOLDS = {
+    "STANDARD_TERM_WEEKS": 13,
+    "MAX_TERM_WEEKS": 26,
+    "MIN_TERM_WEEKS": 1,
+    "DEFAULT_WEEKLY_GUARANTEED_HOURS": 36,
+    "WEEKLY_OT_THRESHOLD_HOURS": 40,
+    "DAILY_OT_THRESHOLD_HOURS": 12,
+    "OT_MULTIPLIER": 1.5,
+    "CALLBACK_MULTIPLIER": 2.0,
+    "MAX_WEEKLY_HOURS": 84,
+    "MAX_DAILY_HOURS": 24,
+    "STIPEND_FULL_WEEK_MIN_HOURS": 32,
+    "STIPEND_DAYS_PER_WEEK": 7,
+    "STIPEND_WEEKLY_CAP_CENTS": 250000,
+    "EMPLOYER_BURDEN_PCT": 0.185,
+    "MARGIN_FLOOR_PCT": 0.22,
+    "CANCELLATION_NOTICE_DAYS": 30,
+    "TRAVEL_GAP_DAYS": 2,
+    "DEFAULT_MAX_CONCURRENT_TRAVELERS": 2,
+    "EXTENSION_MAX_ROUNDS": 3,
+    "PACKET_MAX_REVISION_ROUNDS": 3,
+    "REQUIRED_CREDENTIAL_TYPE_COUNT": 5,
+}
+
+DEFAULT_CLOCK_UTC = "2026-05-01T00:00:00Z"
+DEFAULT_CLOCK_TIMESTAMP = "2026-05-01T00:00:00.000Z"
+
+# Pagination envelope defaults.
+PAGINATION = {"default_limit": 10, "min_limit": 1, "max_limit": 100, "default_offset": 0}
+
+# A syntactically valid UUID that resolves to nothing.
+UNKNOWN_UUID = "11111111-2222-4333-8444-555555555555"

@@ -1,0 +1,444 @@
+# Public Pool & Spa Health Permit API — Product Requirements Document
+
+## 1. Introduction
+
+Municipal health authorities license and police every aquatic venue open to the public — competition pools, hotel and apartment pools, semi-public club pools, and spas. Today that work is spread across paper permit files, spreadsheet water-chemistry logs, a clipboard inspection form, and a phone line for illness complaints. Nothing links them: an inspector can close a pool for a diarrheal accident without the permit clerk knowing, a permit can be issued to a venue that has an uncorrected imminent-hazard violation on file, and a recreational-water-illness cluster can build for two weeks before anyone notices that three separate callers described the same pool.
+
+This document specifies the Public Pool & Spa Health Permit API: a single system of record that carries an aquatic venue from plan review, through classification and permitting, into continuous operation under water-chemistry monitoring, inspection, staffing and signage requirements, and out again through closure, remediation and reopening. The system's organising idea is the **operating posture** — a derived, always-current verdict on whether a venue may legally admit bathers. Posture is never set by hand. It is recomputed from the venue's closure orders, permits, season window, drain-safety certification, open violations, posted signage and lifeguard coverage every time any of those change, and it is the gate that the rest of the product hangs off.
+
+Two design constraints run through everything that follows. First, **money and demerit points are conserved quantities**: every fee movement is an append-only ledger posting and the operator's balance is always exactly the sum of those postings, and every demerit point that a correction removes from a facility's open total is restored bit-for-bit if the correction is later rejected. Second, **time is a server-controlled logical clock**, so that permit terms, remediation windows, certification expiry and illness-cluster windows are all reproducible under test rather than dependent on wall-clock drift.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Actors, Identity Headers and Role-Based Access Control
+
+Every request to the API carries two headers: `X-User-Role`, naming the acting role, and `X-User-ID`, naming the acting principal. The five recognised roles are `Anonymous`, `Operator`, `Inspector`, `PlanReviewer` and `HealthAuthorityAdmin`. `X-User-ID` is required and must be a non-empty string for every role other than `Anonymous`; for `Anonymous` it is ignored when supplied and not required when absent. A request whose `X-User-Role` header is missing, blank, or a string outside the five recognised roles, or whose `X-User-ID` is missing or empty on any non-`Anonymous` role, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A request that authenticates but whose role is not among the roles listed for the target endpoint in Section 4 is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+Role identities differ in kind, and the difference matters for ownership checks:
+
+- When `X-User-Role` is `Operator`, `X-User-ID` is the `id` of the acting Operator record. Ownership checks on any resource that references an operator compare the resource's owning operator to `X-User-ID` — directly through `operator_id` on a facility or a ledger posting, and transitively through the owning facility for permits, plan reviews, closure orders, staff assignments, compliance artifacts, water readings and violations. A mismatch is `ERR_NOT_RESOURCE_OWNER` (HTTP 403).
+- When `X-User-Role` is `Anonymous`, `X-User-ID` is an opaque public identifier not tied to any persisted entity; the server neither records nor compares it.
+- When `X-User-Role` is `Inspector`, `X-User-ID` is an opaque field-inspector identifier not tied to any persisted entity. The server records it — as `inspector_user_id` on an inspection the inspector creates, as `ordered_by_user_id` on a closure order the inspector raises, and as `reopen_decided_by_user_id` on a reopen decision — but it is never compared against any entity's `id`.
+- When `X-User-Role` is `PlanReviewer`, `X-User-ID` is an opaque plan-review-engineer identifier not tied to any persisted entity. The server records it as `reviewer_user_id` and `decided_by_user_id` on the plan review, and the permit-issuance four-eyes rule compares a later admin's `X-User-ID` against the stored `decided_by_user_id`, but it is never compared against any entity's `id`.
+- When `X-User-Role` is `HealthAuthorityAdmin`, `X-User-ID` is an opaque health-authority-officer identifier not tied to any persisted entity. The server records it as `issued_by_user_id` on a permit it issues, as `ordered_by_user_id` on a closure order it raises, and as `reopen_decided_by_user_id` on a reopen decision, but it is never compared against any entity's `id`.
+
+`Anonymous` exists so that a member of the public can register an operator account and file a complaint without credentials. `Operator` is the permit holder: it owns facilities, files plan reviews and permit applications, logs water chemistry, posts signage and drain certifications, schedules staff, corrects violations, requests reopening and pays fees. `Inspector` schedules and conducts inspections, records and verifies violations, orders closures, decides reopen requests and triages complaints. `PlanReviewer` is the only role that may advance a plan review and may touch nothing else that mutates state. `HealthAuthorityAdmin` reviews and issues permits, finalizes and voids inspections, drives the enforcement axis, voids closure orders, closes complaints, and controls the logical clock.
+
+Two four-eyes rules constrain who may act even when the role is correct. The `X-User-ID` deciding a reopen request must differ from the `ordered_by_user_id` recorded on that closure order, and the `X-User-ID` issuing a permit must differ from the `decided_by_user_id` recorded on the plan review that permit relies on. Either breach is `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). The reopen rule applies to the approve and deny decisions only; an administrative void of an order issued in error is exempt.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination and List Ordering
+
+Every list endpoint accepts two optional query parameters. `limit` defaults to 10, has a minimum of 1 and a maximum of 100. `offset` defaults to 0 and has a minimum of 0. A `limit` below 1 or above 100, or a negative `offset`, is a payload error and is rejected with `ERR_VALIDATION` (HTTP 400).
+
+List responses populate `limit`, `offset`, `total_count` and `has_more` in `meta` alongside the standard request identifiers. `total_count` is the number of rows that match the endpoint's filters *before* `limit` and `offset` are applied; `has_more` is true exactly when `offset` plus the number of rows actually returned is still less than `total_count`.
+
+Rows in every list are ordered by `created_at` ascending. When two rows share a `created_at` value — which happens routinely, because the logical clock does not advance on its own — they remain in the order in which the requests created them; the row `id` never participates in ordering. A list whose filters match nothing returns an empty array with `total_count` 0 and `has_more` false, not an error.
+
+### 2.4. The Logical Clock
+
+The server maintains a logical UTC clock rather than reading wall-clock time. Before any client sets it, the clock reads exactly `2026-05-01T00:00:00Z`, and it never falls back to wall-clock time under any circumstance. A `HealthAuthorityAdmin` may move the clock by supplying a `to_iso8601` instant to the clock-control capability described in Section 4; the response body carries a single `current_utc` field holding the newly effective instant. Moving the clock has no immediate write side effect on stored rows, but because compliance-artifact status, drain-safety posture and operating posture are all evaluated against the clock, the next read of any facility reflects the new instant.
+
+Every datetime the API emits is rendered ISO 8601 UTC with exactly three fractional-second digits and a trailing `Z` — for example `2026-05-01T00:00:00.000Z`. This applies uniformly to server-stamped instants and to client-supplied instants echoed back: a client that submits `2026-05-04T09:00:00Z` reads it back as `2026-05-04T09:00:00.000Z`. Every server-stamped instant in the system is rendered from the logical clock through this one shared renderer, including `created_at`, `updated_at`, `ordered_at`, `issued_at`, `posted_at`, `reported_at`, `started_at`, `submitted_at`, `finalized_at`, `corrected_at`, `verified_at`, `decided_at`, `reopen_requested_at` and `reopen_decided_at`. Date-only values — every field whose name ends in `_date` or `_on` — are plain `YYYY-MM-DD` strings with no time component.
+
+### 2.5. Common Resource Properties and Record Versioning
+
+Every stored resource carries a server-minted `id` that is a UUID string with no type prefix, and a `created_at` timestamp stamped from the logical clock at insertion. Most resources additionally carry an `updated_at` timestamp, refreshed from the logical clock on every mutation, and an integer `version` that starts at 1 when the row is created and increments by exactly 1 on every mutation of that row.
+
+Two record types are append-only observations rather than living records and therefore carry only `id` and `created_at`: a water-chemistry reading and a fee-ledger posting. Neither has an `updated_at` field and neither has a `version` field; once written they are never mutated or deleted.
+
+`version` is the visible trace of the cascade machinery described below. A single request that recomputes a facility's derived fields increments that facility's `version` even when the recomputation lands on the same posture value — the version reflects that a write occurred, not that an observable value changed.
+
+### 2.6. Order of Evaluation and the Error Precedence Ladder
+
+When a single request could fail several checks at once, the outcome is deterministic: checks run in the fixed order below and the first failure decides the response. Implementations must not reorder them, because a test that arranges two simultaneous faults asserts the earlier code.
+
+1. **Authentication.** `X-User-Role` present and recognised, `X-User-ID` present and non-empty for non-`Anonymous` roles → `ERR_UNAUTHENTICATED` (401). Applies to every endpoint.
+2. **Authorization.** The acting role appears in the endpoint's authorized-role list → `ERR_UNAUTHORIZED` (403). Applies to every endpoint.
+3. **Path existence.** Each `{id}` segment of the request path resolves to a stored row, checked strictly left to right; the first unresolved segment decides the error. The candidates are `ERR_OPERATOR_NOT_FOUND`, `ERR_FACILITY_NOT_FOUND`, `ERR_PERMIT_NOT_FOUND`, `ERR_PLAN_REVIEW_NOT_FOUND`, `ERR_INSPECTION_NOT_FOUND`, `ERR_VIOLATION_NOT_FOUND`, `ERR_CLOSURE_ORDER_NOT_FOUND`, `ERR_COMPLAINT_NOT_FOUND`, `ERR_STAFF_ASSIGNMENT_NOT_FOUND` and `ERR_LEDGER_ENTRY_NOT_FOUND`, each HTTP 404. Applies to every endpoint that has a path parameter.
+4. **Request payload.** Required body fields present, declared types honoured, enum values inside their declared sets, numeric fields inside their declared bounds, `limit` within 1 to 100 and `offset` at least 0, and unknown `action`, `decision` or `outcome` values rejected. This step also enforces the conditional payload rules: a facility declared seasonal requires both season dates and a facility declared non-seasonal forbids them; a complaint of type `RWI_ILLNESS` requires `symptom_onset_date` and an `illness_case_count` of at least 1 while any other complaint type forbids both; and a payment requires `amount_cents` of at least 1. All of these are `ERR_VALIDATION` (400) and apply to every endpoint.
+5. **Compliance-artifact field shape.** A posted artifact must carry exactly the fields its own `artifact_type` requires and none belonging to the other type → `ERR_ARTIFACT_FIELDS_MISMATCH` (422), on `POST /facilities/{id}/compliance-artifacts` only.
+6. **Body foreign-key existence.** Foreign keys supplied in the request body resolve to stored rows, checked in the order `facility_id`, then `plan_review_id`, then `prior_inspection_id`, then `linked_inspection_id`, then `verification_reading_id`, yielding `ERR_FACILITY_NOT_FOUND`, `ERR_PLAN_REVIEW_NOT_FOUND`, `ERR_INSPECTION_NOT_FOUND` or `ERR_READING_NOT_FOUND` (all 404). This guards `POST /facilities`, `POST /plan-reviews`, `POST /permits`, `POST /inspections`, `POST /closure-orders`, `POST /complaints`, `POST /complaints/{id}/transition`, `POST /staff-assignments` and `POST /closure-orders/{id}/reopen-request`.
+7. **Plan-review/facility consistency.** The referenced plan review belongs to the same facility as the permit application → `ERR_PLAN_REVIEW_FACILITY_MISMATCH` (409), on `POST /permits`.
+8. **Inspection cross-reference consistency.** The referenced prior inspection belongs to the same facility as the new reinspection and its `workflow_status` is `FINALIZED`; the referenced linked inspection belongs to the same facility as the complaint and has `inspection_type` equal to `COMPLAINT` → `ERR_PRIOR_INSPECTION_MISMATCH` (409), on `POST /inspections` and `POST /complaints/{id}/transition`.
+9. **Verification-reading consistency.** The verification reading supplied on a reopen request belongs to the closure order's facility → `ERR_READING_FACILITY_MISMATCH` (409), on `POST /closure-orders/{id}/reopen-request`.
+10. **Ownership.** When the acting role is `Operator`, `X-User-ID` equals the operator that owns the target → `ERR_NOT_RESOURCE_OWNER` (403). This guards `POST /facilities`, `PATCH /facilities/{id}`, `POST /operators/{id}/payments`, `POST /plan-reviews`, `POST /plan-reviews/{id}/revisions`, `POST /permits`, `POST /permits/{id}/transition`, `POST /facilities/{id}/water-readings`, `POST /facilities/{id}/compliance-artifacts`, `POST /staff-assignments`, `POST /staff-assignments/{id}/cancel`, `POST /violations/{id}/correct`, `POST /closure-orders` and `POST /closure-orders/{id}/reopen-request`.
+11. **Facility optimistic concurrency** → `ERR_STALE_FACILITY_VERSION` (412), on `POST /closure-orders`.
+12. **Plan-review optimistic concurrency** → `ERR_STALE_PLAN_REVIEW_VERSION` (412), on `POST /plan-reviews/{id}/revisions`.
+13. **Permit state precondition**, including the guard that expiry requires the clock date to be strictly past `term_end_date` → `ERR_INVALID_PERMIT_STATE` (409), on `POST /permits/{id}/transition`.
+14. **Plan-review state precondition**; a revision additionally requires `CORRECTIONS_REQUIRED` → `ERR_INVALID_PLAN_REVIEW_STATE` (409), on `POST /plan-reviews/{id}/transition` and `POST /plan-reviews/{id}/revisions`.
+15. **Inspection workflow state precondition**, including that the acting inspector is the one who created the inspection for the start and submit actions, and that violations may only be appended while `workflow_status` is `IN_PROGRESS` → `ERR_INVALID_INSPECTION_STATE` (409), on `POST /inspections/{id}/transition` and `POST /inspections/{id}/violations`.
+16. **Enforcement state precondition**: the action is declared for the current `enforcement_status`, `workflow_status` is `FINALIZED`, `result` is `CONDITIONAL` or `FAIL` for a notice, and no violation of the inspection is still `OPEN` for a clear → `ERR_INVALID_ENFORCEMENT_STATE` (409), on `POST /inspections/{id}/enforcement`.
+17. **Closure state precondition**: a reopen request needs `OPEN`, an approve or deny needs `REOPEN_REQUESTED`, a void needs `OPEN` → `ERR_INVALID_CLOSURE_STATE` (409), on `POST /closure-orders/{id}/reopen-request` and `POST /closure-orders/{id}/reopen-decision`.
+18. **Violation state precondition**: correction requires `OPEN` status and a `FINALIZED` parent inspection, verification requires `CORRECTED` → `ERR_INVALID_VIOLATION_STATE` (409), on `POST /violations/{id}/correct` and `POST /violations/{id}/verify`.
+19. **Complaint state precondition**, with the extra requirement that starting an investigation needs a non-null `linked_inspection_id` → `ERR_INVALID_COMPLAINT_STATE` (409), on `POST /complaints/{id}/transition`.
+20. **Assignment still scheduled** → `ERR_ASSIGNMENT_ALREADY_CANCELLED` (409), on `POST /staff-assignments/{id}/cancel`.
+21. **Segregation of duties** → `ERR_SEGREGATION_OF_DUTIES` (403), on `POST /closure-orders/{id}/reopen-decision` (approve and deny only) and on `POST /permits/{id}/transition` with the issue action.
+22. **Drain-safety gate on issuance** → `ERR_VGB_NONCOMPLIANT` (409), on `POST /permits/{id}/transition` with the issue action.
+23. **Open qualifying violations** → `ERR_OPEN_CRITICAL_VIOLATIONS` (409), on `POST /permits/{id}/transition` with the issue or reinstate action and on `POST /closure-orders/{id}/reopen-decision` with an approve decision.
+24. **Facility not closed** → `ERR_FACILITY_CLOSED` (409), on `POST /staff-assignments`.
+25. **Verification reading not an imminent hazard** → `ERR_IMMINENT_HEALTH_HAZARD` (409), on `POST /closure-orders/{id}/reopen-decision` with an approve decision.
+26. **Verification reading fully in range** → `ERR_WATER_NOT_IN_RANGE` (409), same endpoint and decision.
+27. **Remediation window elapsed** → `ERR_REMEDIATION_INCOMPLETE` (409), same endpoint and decision.
+28. **Verification reading fresh** → `ERR_VERIFICATION_READING_STALE` (409), on `POST /closure-orders/{id}/reopen-request`.
+29. **Inspection window conflict** → `ERR_INSPECTION_WINDOW_CONFLICT` (409), on `POST /inspections`.
+30. **Routine inspection inside the season** → `ERR_OUT_OF_SEASON` (409), on `POST /inspections`.
+31. **Shift length** → `ERR_SHIFT_TOO_LONG` (422), on `POST /staff-assignments`.
+32. **Certification currency** → `ERR_CERTIFICATION_EXPIRED` (409), on `POST /staff-assignments`.
+33. **Staff shift overlap** → `ERR_STAFF_SHIFT_OVERLAP` (409), on `POST /staff-assignments`.
+34. **Seasonal term length** → `ERR_SEASON_TERM_TOO_LONG` (422), on `POST /permits`.
+35. **Permit term overlap** → `ERR_PERMIT_TERM_OVERLAP` (409), on `POST /permits`.
+36. **Renewal window open** → `ERR_RENEWAL_WINDOW_NOT_OPEN` (409), on `POST /permits`.
+37. **Plan review approved** → `ERR_PLAN_REVIEW_NOT_APPROVED` (409), on `POST /permits` (a facility requiring plan review must supply `plan_review_id`) and on `POST /permits/{id}/transition` with the issue action (that review's status must be `APPROVED`).
+38. **Revision rounds remaining** → `ERR_PLAN_REVIEW_ROUNDS_EXHAUSTED` (409), on `POST /plan-reviews/{id}/revisions` and on `POST /plan-reviews/{id}/transition` with the request-corrections action.
+39. **Reinspection prior reference** → `ERR_INSPECTION_TYPE_REQUIRES_PRIOR` (422), on `POST /inspections`.
+40. **Outstanding fees** → `ERR_OUTSTANDING_FEES` (402), on `POST /permits/{id}/transition` with the issue action.
+41. **Refund eligibility** → `ERR_REFUND_NOT_ELIGIBLE` (409), on `POST /permits/{id}/transition` with the revoke action when a refund is requested.
+
+### 2.7. Optimistic Concurrency on Facility and Plan-Review Writes
+
+Two write operations are guarded by optimistic concurrency, and both use the same shape: the client sends the `version` it last observed on a parent record, and the server rejects the write if that parent has moved on.
+
+Ordering a closure requires `expected_facility_version` as a non-optional field in the request body of `POST /closure-orders`, carrying the client's last observed `version` of the target facility. If it does not equal the facility's current `version`, the request is rejected with `ERR_STALE_FACILITY_VERSION` and HTTP 412. This check exists because stacking a second closure order for a different reason on an already-closed venue is a legitimate product operation that a plain state precondition would happily allow — the version pin is what makes the writer prove it was looking at the current compliance picture.
+
+Filing a plan revision requires `expected_plan_review_version` as a non-optional field in the request body of `POST /plan-reviews/{id}/revisions`, carrying the client's last observed `version` of the review named in the path. If it does not equal that review's current `version`, the request is rejected with `ERR_STALE_PLAN_REVIEW_VERSION` and HTTP 412. Again, filing a superseding revision is legitimately repeatable while the review sits in `CORRECTIONS_REQUIRED`, so status alone cannot separate a fresh revision from one written against a stale view.
+
+No other endpoint accepts a version field. Endpoints not named in this subsection neither require nor honour an expected-version input.
+
+### 2.8. Money, the Fee Ledger and Rounding
+
+All monetary amounts in this system are integer cents. No floating-point value is ever stored for money. Where a computation produces a fractional cent, it is rounded half up — that is, a value exactly halfway between two whole cents rounds away from zero to the larger magnitude. Round-half-up is the only rounding mode used anywhere in this specification; where a formula calls for a whole number in some other unit, the rule is stated explicitly at the point of use.
+
+Fee movements are recorded as append-only ledger postings. Each posting carries the `operator_id` whose balance it moves, an optional `permit_id` naming the permit the charge or refund belongs to, an `entry_type`, a signed `amount_cents`, a `posted_at` instant stamped from the logical clock, and an optional free-text `reference_note`. The six entry types are `PERMIT_FEE`, `LATE_PENALTY`, `PLAN_REVIEW_FEE`, `REINSPECTION_FEE`, `PAYMENT` and `REFUND`. The first four are charges and post positive amounts; `PAYMENT` and `REFUND` are credits and post negative amounts. `PLAN_REVIEW_FEE`, `REINSPECTION_FEE` and `PAYMENT` postings carry a null `permit_id`. No posting is ever mutated or deleted once written.
+
+An operator's `fee_balance_cents` is the sum of `amount_cents` over every ledger posting whose `operator_id` is that operator, with no status filter and no time filter — the whole append-only history is always in scope. It is initialised to 0 when the operator registers and recomputed immediately after every posting. This is a conserved quantity: issuing a permit posts the assessed subtotal and, when the application was late, the penalty; revoking that permit with a refund posts a single credit of exactly the negated sum of that permit's own charge postings, returning the balance to its pre-issuance value with zero drift.
+
+### 2.9. The Operating Posture Gate
+
+Whether a venue may admit bathers is never stored as an editable flag. `operating_posture` and its companion `posture_reason` are derived from the venue's whole compliance picture and recomputed after every mutation that could affect them: permit transitions, closure-order creation and decision, water readings, inspection finalization and voiding, violation correction and verification, staff-assignment creation and cancellation, compliance-artifact posting, facility amendment, and movement of the logical clock. `CLOSED` outranks `RESTRICTED`, which outranks `OPEN`.
+
+The derivation walks nine clauses in a fixed order, and **the first clause that matches wins**; no clause may be short-circuited out of order. Clauses one through four yield `CLOSED`, clauses five through eight yield `RESTRICTED`, and clause nine yields `OPEN`:
+
+1. The facility has at least one closure order whose status is `OPEN` or `REOPEN_REQUESTED` → `CLOSED` with reason `CLOSURE_ORDER_OPEN`.
+2. The facility has no permit records at all → `CLOSED` with reason `PERMIT_MISSING`.
+3. The facility has permit records but none whose status is `ISSUED` → `CLOSED` with reason `PERMIT_NOT_ACTIVE`.
+4. The facility is seasonal and the logical-clock date falls outside the inclusive range from `season_start_date` to `season_end_date` → `CLOSED` with reason `OUT_OF_SEASON`.
+5. The logical-clock date has reached or passed the drain-safety enforcement start date of `2026-06-01` and the facility's `vgb_compliance_status` is anything other than `COMPLIANT` → `RESTRICTED` with reason `VGB_NONCOMPLIANT`.
+6. The facility has at least one violation whose own status is `OPEN`, whose severity is `CRITICAL` or `IMMINENT_HEALTH_HAZARD`, and whose parent inspection is for this facility and currently in `FINALIZED` → `RESTRICTED` with reason `CRITICAL_VIOLATION_OPEN`.
+7. At least one signage type in the facility's `required_signage_types` has no compliance artifact of type `SIGNAGE` for this facility with that `signage_type` and status `ACTIVE` → `RESTRICTED` with reason `SIGNAGE_INCOMPLETE`.
+8. The facility's `lifeguard_required` is true and there is no staff assignment for this facility with status `SCHEDULED`, `role_type` of `LIFEGUARD`, and a shift interval covering the current logical clock instant — the interval is half-open, so a shift covers the clock when `shift_start_at` is at or before it and `shift_end_at` is strictly after it → `RESTRICTED` with reason `LIFEGUARD_COVERAGE_MISSING`.
+9. Otherwise → `OPEN` with reason `NONE`.
+
+A brand-new venue therefore reads `CLOSED` with reason `PERMIT_MISSING` the moment it is registered, because clause 2 fires before any of the softer restrictions can be evaluated.
+
+### 2.10. Cascades, Compensation and Conserved Demerit Points
+
+Many operations in this system touch more than one record. Where they do, the secondary effects are part of the contract, not an implementation detail, and each subsection of Section 3 states them for the operation it describes. Three patterns recur.
+
+First, **posture recomputation propagates upward**. Any write to a closure order, permit, violation, staff assignment, compliance artifact or water reading that can change a facility's posture triggers a recomputation of that facility's `operating_posture`, `posture_reason` and `active_permit_id`, and increments the facility's `version` by 1. `active_permit_id` is a derived pointer, not a declared foreign key: it names the permit for this facility whose status is `ISSUED`, choosing the one with the greatest `term_start_date` and tie-breaking on the greatest `created_at`, or null when no such permit exists.
+
+Second, **compensating actions restore exact values**. A facility's `open_demerit_points` is the sum of `points_assessed` over every violation whose own status is `OPEN` and whose parent inspection belongs to that facility and is currently in `FINALIZED`. Correcting a violation removes exactly that violation's `points_assessed` from the total; a rejected verification puts exactly the same number back, so the facility's total returns bit-for-bit to its pre-correction value. Likewise, finalizing an inspection adds the whole sum of its open violations and voiding that same inspection removes exactly that sum, restoring the pre-finalize value.
+
+Third, **snapshots resist later drift**. A permit records `classification_at_issue` at the moment of issuance, and amending the facility's class afterwards leaves both that snapshot and the permit's `assessed_fee_cents` untouched.
+
+### 2.11. Nested Reads and Sub-Resource Paths
+
+Several collections are addressed as sub-resources of a facility or an inspection — a facility's water readings, compliance artifacts and staff assignments; an inspection's violations. For those paths the parent segment is resolved first, left to right, so a request naming a facility that does not exist fails with `ERR_FACILITY_NOT_FOUND` before any filter or body field is examined, and a request naming a missing inspection fails with `ERR_INSPECTION_NOT_FOUND` on the same principle. Once the parent resolves, the listing is scoped to that parent alone; there is no cross-parent leakage even for a `HealthAuthorityAdmin`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Operators, Venues and the Classification Derivation
+
+Everything in the system hangs off an **Operator** — the legal entity that will hold the permit. Registering one is the single operation available to an unauthenticated member of the public that creates a durable record: the caller supplies a `legal_name` between 1 and 200 characters, a `contact_email` that must be non-empty and must contain an at-sign, and optionally a `phone`, which defaults to null when omitted. The response carries the new operator's `id`, and that value is what the `Operator` role must send thereafter as its `X-User-ID`. A freshly registered operator has `fee_balance_cents` of 0.
+
+Operators settle what they owe by recording a payment against their own account. A payment names an `amount_cents` of at least 1 — anything lower is a payload failure — and may carry a `reference_note`. It posts a ledger entry with `entry_type` of `PAYMENT`, a null `permit_id`, and an `amount_cents` equal to the negation of the amount paid, then refreshes the operator's `fee_balance_cents`. Ledger history can be read one posting at a time, or listed and narrowed by `operator_id`, by `permit_id` or by `entry_type`, with the usual `limit` and `offset` paging.
+
+A **Facility** is one aquatic venue. Registering it requires the owning `operator_id`, a `name` of 1 to 200 characters, a `facility_class` drawn from `CLASS_A_COMPETITION`, `CLASS_B_PUBLIC`, `CLASS_C_SEMI_PUBLIC` and `SPA`, a `surface_area_sqft` strictly greater than zero, a `water_volume_gallons` of zero or more, a `max_depth_feet` strictly greater than zero, and a `drain_count` of at least 1. Four optional inputs shape the rest of the record: `features`, defaulting to the empty list, whose elements must be a duplicate-free subset of `SLIDE`, `DIVING_BOARD`, `WAVE_GENERATOR`, `SPA_JETS` and `SPLASH_PAD`; `is_seasonal`, defaulting to false; the pair `season_start_date` and `season_end_date`, both defaulting to null; and `requires_plan_review`, defaulting to false. When `is_seasonal` is true both season dates are mandatory and `season_end_date` must be on or after `season_start_date`; when it is false both must be absent or null. Violating either shape is a payload failure. A venue may be amended later — its `name`, `facility_class`, `surface_area_sqft`, `water_volume_gallons`, `max_depth_feet`, `drain_count`, `features`, `is_seasonal`, `season_start_date`, `season_end_date` and `requires_plan_review` are all individually optional on an amendment — and every derived field is recomputed from the new values while the facility's `version` climbs by 1.
+
+The **classification derivation** runs at registration, on every amendment, and again whenever the operating posture is recomputed. It reads nothing but the facility's own input fields. First, `water_type` is set to `SPA` when `facility_class` is `SPA` and to `POOL` for all three of the other classes. Second, `max_bather_load` is the water surface area divided by the per-bather allowance for that water type and rounded down to a whole number of bathers: the allowance is 10 square feet per bather for a spa and 20 square feet per bather for a pool. Third, `lifeguard_required` is true exactly when the class is either `CLASS_A_COMPETITION` or `CLASS_B_PUBLIC` **and** the computed `max_bather_load` is at least 50; semi-public pools and spas never require a lifeguard, regardless of size. Fourth, `required_signage_types` is assembled as an ordered list: for a spa it begins with `SPA_TEMP_WARNING`, `EMERGENCY_PHONE`, `DIARRHEA_NOTICE`, and for a pool with `DEPTH_MARKERS`, `EMERGENCY_PHONE`, `DIARRHEA_NOTICE`; then, when and only when `lifeguard_required` is false, `NO_LIFEGUARD_WARNING` is appended as the final element. A 900-square-foot public pool, for instance, admits 45 bathers, falls below the 50-bather threshold, needs no lifeguard, and therefore must post four signs rather than three.
+
+Three further facility fields are derived from records outside the facility row and are described where those records are: `vgb_compliance_status`, taking one of `COMPLIANT`, `EXPIRED` or `NONCOMPLIANT`, comes from the venue's drain certifications; `open_demerit_points`, defaulting to 0, comes from its outstanding violations; and `operating_posture` with `posture_reason` and `active_permit_id` come from the nine-clause gate in Section 2.9. A newly registered venue therefore reads `vgb_compliance_status` of `NONCOMPLIANT` — there is no certification on file yet — and `operating_posture` of `CLOSED` with `posture_reason` of `PERMIT_MISSING`. Facilities can be listed and narrowed by `operator_id`, by `facility_class`, or by `operating_posture`.
+
+### 3.2. The Plan Review Pipeline
+
+Construction and alteration work at a venue goes through plan review before the health authority will license the result. An operator opens a review against its own facility by supplying the `facility_id`, a `project_type` of `NEW_CONSTRUCTION`, `ALTERATION` or `EQUIPMENT_REPLACEMENT`, and optionally a free-text `drawing_reference` naming the drawing set. The row is created in `SUBMITTED` with `revision_round` of 0, `supersedes_plan_review_id` of null, and `submitted_on` set to the logical-clock date. Submission is not free: it immediately posts a ledger entry of `entry_type` `PLAN_REVIEW_FEE` for a positive 25000 cents — two hundred and fifty dollars — against the owning operator with a null `permit_id`, and refreshes that operator's `fee_balance_cents`.
+
+A `PlanReviewer` is the only role that can move a review forward, and does so through four named actions. Starting the review advances `SUBMITTED → UNDER_REVIEW` and records the reviewer's `X-User-ID` as `reviewer_user_id`. From `UNDER_REVIEW` the review forks three ways, and the three branches differ materially:
+
+- **Requesting corrections** advances `UNDER_REVIEW → CORRECTIONS_REQUIRED` and stores the reviewer's `correction_notes` from the request body. It is permitted only while the review's `revision_round` is strictly below 3; a review already sitting at round 3 has exhausted its correction rounds and the request is rejected with `ERR_PLAN_REVIEW_ROUNDS_EXHAUSTED`, leaving the reviewer with only the two terminal decisions.
+- **Approving** advances `UNDER_REVIEW → APPROVED`, sets `decided_at` to the logical clock, records the approving `X-User-ID` as `decided_by_user_id`, and clears `correction_notes` back to null.
+- **Disapproving** advances `UNDER_REVIEW → DISAPPROVED` and likewise sets `decided_at` and `decided_by_user_id` — but it also cascades: every permit application that relies on this review and is currently in `DRAFT`, `SUBMITTED` or `UNDER_REVIEW` is moved to `DENIED`. Unlike approval, disapproval does not clear `correction_notes`.
+
+`APPROVED`, `DISAPPROVED` and `SUPERSEDED` are terminal; nothing moves out of them.
+
+The corrections branch rejoins the pipeline through a **revision**, which is a new row rather than an edit. Filing one against a review in `CORRECTIONS_REQUIRED` requires `expected_plan_review_version` matching that review's current `version`, and may carry a fresh `drawing_reference`. The superseded review moves `CORRECTIONS_REQUIRED → SUPERSEDED` and its `version` increments by 1, while a brand-new review is created in `SUBMITTED` carrying the same `facility_id` and `project_type`, a `supersedes_plan_review_id` pointing at the review it replaces, and a `revision_round` one greater than that review's. A second `PLAN_REVIEW_FEE` posting of a positive 25000 cents is charged for the new row and the operator's balance refreshed. A revision that would carry `revision_round` past 3 is rejected with `ERR_PLAN_REVIEW_ROUNDS_EXHAUSTED`; in practice the pipeline allows an initial submission at round 0 plus three revisions. Reviews can be listed and narrowed by `facility_id`, by `supersedes_plan_review_id` — which is how a client walks a revision chain — or by `status`.
+
+### 3.3. Permit Application, Fee Assessment and Issuance
+
+An operator applies for a permit on its own facility by naming the `facility_id`, a `permit_type` of either `ANNUAL` or `SEASONAL`, the intended `term_start_date`, and — when the venue's `requires_plan_review` is true — the `plan_review_id` of the review the application relies on. That plan review must be filed for the same facility, or the application is rejected with `ERR_PLAN_REVIEW_FACILITY_MISMATCH`; and a facility that requires plan review with no `plan_review_id` on the application is rejected with `ERR_PLAN_REVIEW_NOT_APPROVED`. For a venue that does not require plan review the field is optional and defaults to null.
+
+Four temporal rules gate the application. A `SEASONAL` application requires the facility to be seasonal and its declared season — counted inclusively from `season_start_date` to `season_end_date` — to run no longer than 183 days; otherwise `ERR_SEASON_TERM_TOO_LONG`. The requested term may not intersect the term of any other permit of the same facility whose status is `SUBMITTED`, `UNDER_REVIEW` or `ISSUED`; both ends of both intervals are inclusive, so two terms that merely touch on a single shared day already conflict, and the application is rejected with `ERR_PERMIT_TERM_OVERLAP`. The `term_start_date` may be at most 60 days after the logical-clock date — an application filed further ahead than that is `ERR_RENEWAL_WINDOW_NOT_OPEN`. And the application is stamped with `applied_on`, the logical-clock date at row creation.
+
+Three values are computed at application time and frozen thereafter. `term_end_date` is, for an annual permit, the day 364 days after `term_start_date`, giving a 365-day term counted inclusively; for a seasonal permit it is simply the facility's `season_end_date` as it stands at application time. `term_days` is the inclusive day count of the resulting term — the number of days from `term_start_date` to `term_end_date` counting both endpoints. `is_late_application` is true when `applied_on` falls strictly after `term_start_date`, meaning the operator filed after the term had already begun. The permit is created in `DRAFT` with `assessed_fee_cents` of 0 and `fee_variant` of null; neither is populated before issuance.
+
+From `DRAFT` the operator submits the application, advancing `DRAFT → SUBMITTED`. A `HealthAuthorityAdmin` picks it up, advancing `SUBMITTED → UNDER_REVIEW`, and from there either denies it, advancing `UNDER_REVIEW → DENIED` with the denial `reason` reflected only in the response message and never written to `suspension_reason`, or issues it, advancing `UNDER_REVIEW → ISSUED`. Issuance is the most heavily guarded transition in the system. Beyond the state precondition, five conditions must hold: the issuing `X-User-ID` must differ from the `decided_by_user_id` of the referenced plan review whenever a `plan_review_id` is present, or the request fails the four-eyes rule with `ERR_SEGREGATION_OF_DUTIES`; once the logical-clock date has reached or passed 1 June 2026 the facility's `vgb_compliance_status` must be exactly `COMPLIANT`, or `ERR_VGB_NONCOMPLIANT`; the facility must carry no violation whose own status is `OPEN` and whose severity is `CRITICAL` or `IMMINENT_HEALTH_HAZARD` on a `FINALIZED` inspection, or `ERR_OPEN_CRITICAL_VIOLATIONS`; when the facility's `requires_plan_review` is true the referenced review's `status` must be `APPROVED`, or `ERR_PLAN_REVIEW_NOT_APPROVED`; and the operator's `fee_balance_cents` must be exactly 0 at that instant, or `ERR_OUTSTANDING_FEES` with HTTP 402. That last rule is the reason plan-review fees matter: an operator who has not settled the 25000-cent review charge cannot be issued the permit that review unlocked.
+
+**Fee assessment** runs exactly once, at issuance, and writes `assessed_fee_cents` and `fee_variant`. Its steps run in a pinned order. Step one takes the base fee from the facility's class **as it stands at the instant of issuance** — 45000 cents for `CLASS_A_COMPETITION`, 30000 cents for `CLASS_B_PUBLIC`, 18000 cents for `CLASS_C_SEMI_PUBLIC` and 12000 cents for `SPA` — and simultaneously snapshots that class into `classification_at_issue`, pinning the tier against any later reclassification. Step two computes the volume surcharge on the gallons above a free allowance: subtract 25000 gallons from the facility's `water_volume_gallons` and treat a negative result as zero, divide the remainder by 10000 and round that quotient **up** to a whole number of surcharge units, then multiply by 2500 cents per unit. A venue holding 25000 gallons or fewer therefore pays no volume surcharge, while one holding 45001 gallons pays for three units. Step three sums the feature surcharges over the facility's `features` — 5000 cents for `SLIDE`, 7500 for `DIVING_BOARD`, 12000 for `WAVE_GENERATOR`, 4000 for `SPA_JETS` and 3000 for `SPLASH_PAD` — and these are never prorated.
+
+Step four selects between the two fee variants. For an `ANNUAL` permit, `fee_variant` is `FULL_TERM` and the subtotal is simply the base plus the volume surcharge plus the feature surcharges, all charged in full for the 365-day term. For a `SEASONAL` permit, `fee_variant` is `SEASONAL_PRORATED` and a proration factor is formed by dividing the permit's `term_days` by 365; the base is multiplied by that factor and rounded half up to whole cents, the volume surcharge is multiplied by the same factor and **separately** rounded half up to whole cents, and those two rounded components are then added to the un-prorated feature surcharges. Rounding each prorated component before summing is normative and is not interchangeable with rounding the sum: a 30000-cent base plus a 10000-cent volume surcharge over a 92-day season yields 7562 plus 2521, or 10083 cents, where rounding after summing would yield 10082. Step five applies the late penalty to the post-proration subtotal: when `is_late_application` is true the penalty is one quarter of the subtotal, rounded half up to whole cents; otherwise it is zero. `assessed_fee_cents` is the subtotal plus that penalty.
+
+Issuance then writes `issued_at` from the logical clock and `issued_by_user_id` from the acting `X-User-ID`, posts a ledger entry of `entry_type` `PERMIT_FEE` against this permit for the positive subtotal, posts a **second, separate** entry of `entry_type` `LATE_PENALTY` for the positive penalty when and only when the application was late, refreshes the operator's `fee_balance_cents`, and recomputes the facility's `operating_posture`, `posture_reason` and `active_permit_id`, bumping the facility's `version`. Permits can be read individually or listed and narrowed by `facility_id`, by `plan_review_id`, by `status` or by `permit_type`.
+
+### 3.4. Suspension, Reinstatement, Revocation, Expiry and Refunds
+
+A permit does not simply run to term. `ISSUED → SUSPENDED → ISSUED` is a true cycle that may repeat any number of times, and two terminal exits — revocation and expiry — are reachable from either of those two states.
+
+Suspending an issued permit sets `suspension_reason` to `ADMINISTRATIVE` when an administrator takes the action deliberately, and to `IMMINENT_HEALTH_HAZARD` when the suspension arrives instead through the inspection enforcement cascade described in Section 3.6. Either way the facility's `operating_posture` is recomputed — with no `ISSUED` permit remaining, clause 3 of the posture gate fires and the venue reads `CLOSED` with `posture_reason` of `PERMIT_NOT_ACTIVE` — along with `posture_reason` and `active_permit_id`, and the facility's `version` climbs by 1. `issued_at` and `issued_by_user_id` are preserved across suspension; they are not cleared and not restamped.
+
+Reinstating carries the permit `SUSPENDED → ISSUED` and closes the cycle, but only when the venue is genuinely fit to reopen: the facility must have no closure order in `OPEN` or `REOPEN_REQUESTED`, and no violation whose own status is `OPEN` and whose severity is `IMMINENT_HEALTH_HAZARD` on a `FINALIZED` inspection. That second guard rejects with `ERR_OPEN_CRITICAL_VIOLATIONS` — note that it is narrower than the issuance guard, which also counts merely `CRITICAL` findings. On success `suspension_reason` is cleared back to null and the facility's posture fields and `version` are refreshed.
+
+Revocation is available from `ISSUED` and from `SUSPENDED`, and both edges behave identically. The acting administrator may set `refund_eligible` on the request. When it is true, two conditions must hold: the permit's `refunded` flag must still be false, and the logical-clock date must be on or before the day 30 days after `term_start_date`. A request that fails either is rejected with `ERR_REFUND_NOT_ELIGIBLE`. When the refund is honoured, a single ledger entry of `entry_type` `REFUND` is posted against this permit for the negation of the sum of that permit's own `PERMIT_FEE` and `LATE_PENALTY` postings, `refunded` is set to true, and the operator's `fee_balance_cents` is refreshed — returning the balance to exactly its pre-issuance value. Revocation without a refund posts nothing. In both cases the facility's `operating_posture`, `posture_reason` and `active_permit_id` are recomputed and its `version` incremented.
+
+Expiry is likewise reachable from both `ISSUED` and `SUSPENDED` with identical behaviour, and carries one temporal guard: the logical-clock date must be strictly past the permit's `term_end_date`. An expiry requested on or before the last day of the term is rejected as an invalid permit state. Expiry recomputes the facility's posture fields and bumps its `version` but touches no ledger entry. `DENIED`, `REVOKED` and `EXPIRED` are terminal; nothing leaves them.
+
+### 3.5. Inspections: Scheduling, Conduct, Scoring and Voiding
+
+An inspection record carries **two independent state axes on the same row**. The `workflow_status` axis tracks the visit itself and runs `SCHEDULED`, `IN_PROGRESS`, `SUBMITTED`, `FINALIZED` and `VOIDED`. The `enforcement_status` axis, described in Section 3.6, tracks what the health authority did about the findings and runs `NONE`, `NOTICE_ISSUED`, `ESCALATED` and `CLEARED`. Neither axis constrains the other's storage: an inspection can sit at `FINALIZED` on the workflow axis and `NONE` on the enforcement axis indefinitely.
+
+An `Inspector` schedules a visit by naming the `facility_id`, an `inspection_type` of `ROUTINE`, `REINSPECTION`, `COMPLAINT` or `PREOPERATIONAL`, and the planned `scheduled_start_at` and `scheduled_end_at` instants, where the end must be strictly after the start. A reinspection additionally names the `prior_inspection_id` of the finalized visit whose findings are being re-checked; every other inspection type must leave that field null, and getting this wrong either way is rejected with `ERR_INSPECTION_TYPE_REQUIRES_PRIOR` (HTTP 422). When a prior inspection is named, it must belong to the same facility and its `workflow_status` must be `FINALIZED`, or the request is rejected with `ERR_PRIOR_INSPECTION_MISMATCH`. The row is created in `SCHEDULED` with `enforcement_status` initialised to `NONE` and `inspector_user_id` taken from the acting `X-User-ID`; that field is immutable thereafter.
+
+Two scheduling rules protect the field calendar. **Visits are spaced by a one-hour buffer.** A new visit conflicts with any other inspection of the same facility whose `workflow_status` is `SCHEDULED`, `IN_PROGRESS`, `SUBMITTED` or `FINALIZED` — voided inspections are ignored — when the new start is at or before that other visit's end extended forward by 60 minutes **and** the new end is at or after that other visit's start pulled back by 60 minutes. Both comparisons are inclusive, so a visit that begins exactly 60 minutes after another one ends still conflicts, and the request is rejected with `ERR_INSPECTION_WINDOW_CONFLICT`. **Routine visits respect the season.** For an `inspection_type` of `ROUTINE` at a facility whose `is_seasonal` is true, the date part of `scheduled_start_at` must fall inside the inclusive range from `season_start_date` to `season_end_date`; otherwise `ERR_OUT_OF_SEASON`. The other three inspection types are not season-gated.
+
+The inspector who created the row is the only one who may start it or submit it; any other inspector attempting either action is rejected with `ERR_INVALID_INSPECTION_STATE`. Starting advances `SCHEDULED → IN_PROGRESS` and stamps `started_at` from the logical clock. Submitting advances `IN_PROGRESS → SUBMITTED`, stamps `submitted_at`, and closes the finding list — no further violation may be appended after that point. Finalizing is an administrator's act, advancing `SUBMITTED → FINALIZED` and stamping `finalized_at`.
+
+**Scoring** runs exactly once, at finalization, and writes `critical_demerits`, `noncritical_demerits`, `score` and `result`. It considers every violation of this inspection whose own status is not `VOIDED`, in whatever correction state it currently holds. The critical subtotal is the sum of `points_assessed` over the findings whose `severity` is `IMMINENT_HEALTH_HAZARD` or `CRITICAL`; the noncritical subtotal is the same sum over the findings whose `severity` is `NONCRITICAL`. Each subtotal is then capped: `critical_demerits` is the smaller of the critical subtotal and 40, and `noncritical_demerits` is the smaller of the noncritical subtotal and 20. The `score` is 100 less both capped subtotals, floored at zero so it never goes negative.
+
+The `result` grade is decided by three tests applied in order. If the inspection carries any finding at all with `severity` of `IMMINENT_HEALTH_HAZARD`, or the score is below 70, the result is `FAIL`. Otherwise, if the score is below 85, or the inspection carries at least one finding with `severity` of `CRITICAL` whose `corrected_on_site` is false, the result is `CONDITIONAL`. Otherwise the result is `PASS`. Note the asymmetry deliberately built into the second test: a critical finding that the inspector saw fixed before leaving does not by itself drag a high-scoring visit down to conditional, but one left uncorrected does. When the result is `CONDITIONAL` or `FAIL`, `reinspection_due_on` is set to the date 10 days after the date part of `finalized_at`; when the result is `PASS` it stays null.
+
+Finalization then cascades in four hops. **Hop one:** the facility's `open_demerit_points` is recomputed and now includes every still-open violation of this inspection, because the parent is `FINALIZED` for the first time; the facility's `version` climbs by 1. **Hop two:** when the result is `FAIL`, the enforcement axis moves `NONE → NOTICE_ISSUED` automatically, and a ledger entry of `entry_type` `REINSPECTION_FEE` for a positive 15000 cents with a null `permit_id` is posted against the owning operator, refreshing `fee_balance_cents`. **Hop three:** that automatic notice, when the inspection carries at least one violation with `severity` of `IMMINENT_HEALTH_HAZARD` whose own status is `OPEN`, moves the facility's `ISSUED` permit to `SUSPENDED` with `suspension_reason` of `IMMINENT_HEALTH_HAZARD`. **Hop four:** that suspension in turn recomputes the facility's posture to `CLOSED` with `posture_reason` of `PERMIT_NOT_ACTIVE`, bumping the facility's `version` a second time within the same request. A single failing inspection with an imminent hazard therefore charges a reinspection fee, issues a notice, suspends the permit and closes the venue in one atomic operation.
+
+Voiding is available from every non-voided workflow state — `SCHEDULED`, `IN_PROGRESS`, `SUBMITTED` and `FINALIZED` all move to `VOIDED` — and all four edges behave the same way: `voided_at` is stamped from the logical clock and every child violation of the inspection moves to `VOIDED`. Voiding a *finalized* inspection additionally compensates: `score`, `result`, `critical_demerits`, `noncritical_demerits` and `reinspection_due_on` are left exactly as they were computed, preserving the record of what was scored, but because the inspection is no longer `FINALIZED` its findings drop out of the facility's `open_demerit_points` sum, restoring the exact pre-finalization value and bumping the facility's `version`. And an enforcement axis sitting at `NOTICE_ISSUED` or `ESCALATED` moves to `CLEARED`; an axis at `NONE` stays at `NONE`. Inspections can be read individually or listed and narrowed by `facility_id`, by `prior_inspection_id`, by `inspection_type`, by `workflow_status` or by `enforcement_status`.
+
+### 3.6. Findings, Corrections and the Enforcement Axis
+
+A **Violation** is a single health-code finding appended to an in-progress inspection by the inspector who owns it. It carries the parent `inspection_id`, a `code` of 1 to 32 characters naming the health-code item — `WQ-101`, say — a `severity` of `IMMINENT_HEALTH_HAZARD`, `CRITICAL` or `NONCRITICAL`, a non-empty `description` narrating the observed condition, and an optional `corrected_on_site` flag defaulting to false. Findings may only be appended while the parent's `workflow_status` is `IN_PROGRESS`; an attempt outside that window is `ERR_INVALID_INSPECTION_STATE`.
+
+`points_assessed` is computed at row creation and frozen forever after. The base severity weights are 25 points for `IMMINENT_HEALTH_HAZARD`, 10 for `CRITICAL` and 3 for `NONCRITICAL`. When `corrected_on_site` is true **and** the severity is anything other than `IMMINENT_HEALTH_HAZARD`, the base weight is halved and rounded half up — so a critical finding fixed on the spot is worth 5 points and a noncritical one 2 points. An imminent hazard is never discounted: it is worth its full 25 points even if the inspector watched it being corrected.
+
+Violations run a cyclic lifecycle of their own. A new finding starts at `OPEN`. The operator that owns the facility asserts a fix, advancing `OPEN → CORRECTED`, but only once the parent inspection has reached `FINALIZED` — a correction filed against a still-open inspection is `ERR_INVALID_VIOLATION_STATE`. The correction stamps `corrected_at` from the logical clock, may carry an explanatory `correction_note` in the request body, and recomputes the facility's `open_demerit_points`, from which this row's `points_assessed` now drops out because its status is no longer `OPEN`; the facility's `version` climbs by 1.
+
+An `Inspector` then verifies the claim by supplying an `outcome`. An `outcome` of `VERIFIED` advances `CORRECTED → VERIFIED`, stamps `verified_at`, and leaves `open_demerit_points` untouched, since the row had already left the open sum. An `outcome` of `REJECTED` sends the row back `CORRECTED → OPEN`, increments `rejection_count` by 1, leaves `corrected_at` at its previous value rather than clearing it, and compensates the facility total: exactly this row's `points_assessed` re-enters `open_demerit_points`, restoring the value it held before the correction, and the facility's `version` climbs again. This `OPEN → CORRECTED → OPEN` cycle repeats as often as verification keeps failing. `VERIFIED` and `VOIDED` are the terminal states; a finding also reaches `VOIDED` from either `OPEN` or `CORRECTED` when its parent inspection is voided, at which point it leaves every demerit sum. Findings can be listed per inspection and narrowed by `status`.
+
+The **enforcement axis** is driven separately, by a `HealthAuthorityAdmin`, and every one of its edges is guarded on the workflow axis having reached `FINALIZED`. An administrator may attach a free-text `note` to any enforcement action.
+
+- **Issuing a notice** moves `NONE → NOTICE_ISSUED` and additionally requires the inspection's `result` to be `CONDITIONAL` or `FAIL`; a notice on a passing inspection is `ERR_INVALID_ENFORCEMENT_STATE`. When the inspection carries a violation with `severity` of `IMMINENT_HEALTH_HAZARD` whose status is `OPEN`, the facility's permit in `ISSUED` moves to `SUSPENDED` with `suspension_reason` of `IMMINENT_HEALTH_HAZARD`, which recomputes the facility's `operating_posture` and `posture_reason` and bumps its `version`. This is the same effect the finalize cascade produces automatically for a failing inspection; issuing the notice by hand is how a *conditional* result gets there.
+- **Escalating** moves `NOTICE_ISSUED → ESCALATED` and requires that at least one violation of this inspection still has status `OPEN`. It creates a closure order for the facility in `OPEN` with `closure_reason` of `PERMIT_ACTION` and `ordered_by_role` of `HealthAuthorityAdmin`, which drives the facility's `operating_posture` to `CLOSED` with `posture_reason` of `CLOSURE_ORDER_OPEN` and bumps its `version`.
+- **Clearing** moves either `NOTICE_ISSUED → CLEARED` or `ESCALATED → CLEARED`, with identical behaviour on both edges and no side effects. It requires that no violation of this inspection is still `OPEN`; otherwise `ERR_INVALID_ENFORCEMENT_STATE`. `CLEARED` is terminal on this axis.
+
+### 3.7. Water Chemistry, Closure Orders and the Reopen Protocol
+
+Operators log routine water chemistry and inspectors log field samples against the same facility-scoped collection. A reading carries `sampled_at`, the instant the sample was drawn, which must not be later than the logical clock; a `source` of `OPERATOR_LOG`, `INSPECTOR_FIELD` or `REOPEN_VERIFICATION`; `free_chlorine_ppm` and `combined_chloramine_ppm`, both at least zero; a `ph` between 0 and 14; a `water_temp_f` of at least zero; and an optional `cyanuric_acid_ppm` that defaults to 0 and must be at least zero. Readings are append-only observations: they have no `updated_at` and no `version`, and they are never edited.
+
+**Classification** happens before the row is persisted and writes `compliance_status` and `out_of_range_parameters`. The limit set is selected by the parent facility's `water_type`. The free-chlorine floor is 2.0 parts per million for a spa and 1.0 for a pool; the free-chlorine ceiling is 10.0 for both; combined chloramine may not exceed 0.4; pH must sit between 7.0 and 7.8; cyanuric acid may not exceed 90 parts per million; and water temperature may not exceed 104.0 degrees Fahrenheit at a spa or 95.0 at a pool. Every breached limit contributes a code to `out_of_range_parameters`, and the codes are emitted in this fixed order regardless of which breaches occurred: `FREE_CHLORINE_LOW` when free chlorine is strictly below its floor, `FREE_CHLORINE_HIGH` when it is strictly above 10.0, `COMBINED_CHLORAMINE_HIGH` when combined chloramine is strictly above 0.4, `PH_LOW` when pH is strictly below 7.0, `PH_HIGH` when pH is strictly above 7.8, `CYANURIC_ACID_HIGH` when cyanuric acid is strictly above 90, and `TEMP_HIGH` when the temperature is strictly above its ceiling. When nothing is breached the array is empty.
+
+Separately from that list, a reading is judged an imminent hazard when free chlorine is strictly below 1.0 parts per million at a spa or strictly below 0.5 at a pool, or when pH is strictly below 6.5, or when pH is strictly above 8.2. `compliance_status` is then `IMMINENT_HAZARD` if that hazard test fires, otherwise `OUT_OF_RANGE` if `out_of_range_parameters` is non-empty, otherwise `IN_RANGE`. All comparisons are strict at the boundary, which produces three pinned behaviours worth stating plainly: a pool reading of exactly 1.0 parts per million free chlorine is `IN_RANGE`; a reading of exactly 7.8 pH is `IN_RANGE`; and a pool reading of exactly 0.5 parts per million free chlorine is **not** an imminent hazard — it is `OUT_OF_RANGE` carrying `FREE_CHLORINE_LOW`. No rounding is applied to the submitted decimals before comparing.
+
+A reading classified `IMMINENT_HAZARD` closes the venue by itself. The system creates a closure order for the facility in `OPEN` with `closure_reason` of `WATER_CHEMISTRY`, `triggering_reading_id` pointing back at this reading, `ordered_by_user_id` set to the literal string `system`, and `ordered_by_role` of `system`; the reading's own `triggered_closure_order_id` is set to that new order's id. The auto-creation is suppressed when the facility already has a closure order in `OPEN` or `REOPEN_REQUESTED`, in which case `triggered_closure_order_id` stays null — the venue is already shut and a second order adds nothing. Readings can be listed per facility and narrowed by `compliance_status`.
+
+**Closure orders** may also be raised by hand, by an `Inspector`, a `HealthAuthorityAdmin`, or the venue's own `Operator`. A manual order names the `facility_id`, a `closure_reason`, the `expected_facility_version` described in Section 2.7, and optionally a free-text `note`. The nine reasons and the remediation duration each one carries are fixed: `FECAL_FORMED` 30 minutes, `FECAL_DIARRHEAL` 765 minutes (twelve and three-quarter hours), `VOMIT` 30 minutes, `BLOOD` 30 minutes, `CHEMICAL` 60 minutes, `WATER_CHEMISTRY` 30 minutes, `EQUIPMENT` 60 minutes, `RWI_OUTBREAK` 1440 minutes (a full day), and `PERMIT_ACTION` 0 minutes. At creation the order stamps `ordered_at` from the logical clock, records `ordered_by_user_id` and `ordered_by_role` from the acting principal, sets `remediation_variant` to `FIXED_TABLE`, sets `required_remediation_minutes` to the table value for the reason, and sets `earliest_reopen_at` to `ordered_at` advanced by that many minutes.
+
+Creating an order cascades twice. The facility's `operating_posture` is recomputed to `CLOSED` with `posture_reason` of `CLOSURE_ORDER_OPEN`, and on every manual creation the facility's `version` increments by 1 **whether or not the posture value actually changed** — a second order stacked on an already-closed venue still bumps the version. Then every staff assignment of that facility whose status is `SCHEDULED` and whose shift overlaps the closure window is cancelled with `cancel_reason` of `FACILITY_CLOSED` and `cancelled_at` stamped from the logical clock; a shift overlaps when its `shift_start_at` is strictly before the order's `earliest_reopen_at` and its `shift_end_at` is strictly after the order's `ordered_at`.
+
+**Reopening** is a two-step, cyclic protocol. The owning operator files a request against an order in `OPEN`, supplying the `verification_reading_id` of a fresh water reading and optionally the two treatment fields, `treatment_free_chlorine_ppm` and `treatment_ph`, recording the hyperchlorination level and pH held during remediation. The named reading must exist, must belong to this closure order's facility — otherwise `ERR_READING_FACILITY_MISMATCH` — and must be fresh: its `sampled_at` may be no more than 60 minutes before the logical clock and may not lie in the future, or the request is rejected with `ERR_VERIFICATION_READING_STALE`. On success the order moves `OPEN → REOPEN_REQUESTED`, `reopen_requested_at` is stamped, `verification_reading_id` is stored (overwriting whatever a previous request left there), the treatment fields are stored when supplied, and the facility's posture is recomputed — still `CLOSED` — with its `version` incremented.
+
+The request also **recomputes the remediation window**, and this is where the two remediation variants diverge. The contact-time variant applies when the order's `closure_reason` is `FECAL_DIARRHEAL` or `RWI_OUTBREAK` **and** the request supplied both a `treatment_free_chlorine_ppm` strictly greater than zero and a non-null `treatment_ph`. In that case `remediation_variant` becomes `CT_COMPUTED`: a contact-time target of 15300 parts-per-million-minutes is taken, multiplied by 1.5 when `treatment_ph` is strictly greater than 7.5 and left unmultiplied otherwise, then divided by the treatment chlorine level and rounded **up** to a whole number of minutes; `required_remediation_minutes` is the larger of that quotient and a 30-minute floor. Whenever either condition fails — the reason is not contact-time-eligible, or one of the treatment fields is missing or the chlorine level is not above zero — `remediation_variant` stays or reverts to `FIXED_TABLE` and `required_remediation_minutes` returns to the published table value for the reason. In both variants `earliest_reopen_at` is recomputed as `ordered_at` advanced by the new duration; it is always measured from `ordered_at`, never from `reopen_requested_at`. The practical effect is large: a diarrheal closure hyperchlorinated to 40 parts per million at pH 7.2 needs 383 minutes rather than the table's 765, so the same order reaches its reopen window hours earlier.
+
+An `Inspector` or a `HealthAuthorityAdmin` then supplies a `decision` of `APPROVE`, `DENY` or `VOID`. Approving and denying both require the order to be in `REOPEN_REQUESTED` and both enforce the four-eyes rule — the deciding `X-User-ID` must differ from `ordered_by_user_id`. Approving carries four further guards, checked in this order: the facility must have no violation whose own status is `OPEN` and whose severity is `IMMINENT_HEALTH_HAZARD` on a `FINALIZED` inspection, or `ERR_OPEN_CRITICAL_VIOLATIONS`; the stored verification reading must not be classified `IMMINENT_HAZARD`, or `ERR_IMMINENT_HEALTH_HAZARD`; it must be classified exactly `IN_RANGE`, so an `OUT_OF_RANGE` reading draws `ERR_WATER_NOT_IN_RANGE`; and the logical clock must have reached or passed `earliest_reopen_at`, or `ERR_REMEDIATION_INCOMPLETE`. On success the order moves `REOPEN_REQUESTED → CLEARED`, `cleared_at` and `reopen_decided_at` are stamped from the logical clock, `reopen_decided_by_user_id` records the deciding principal, any `reopen_denial_reason` left by an earlier denial is cleared back to null, and the facility's posture is recomputed with its `version` incremented.
+
+Denying returns the order `REOPEN_REQUESTED → OPEN`, increments `denial_count` by 1, stores the supplied `denial_reason` into `reopen_denial_reason` — one of `REMEDIATION_INCOMPLETE`, `WATER_NOT_IN_RANGE` or `VIOLATIONS_OPEN` — and stamps `reopen_decided_at` and `reopen_decided_by_user_id`. Crucially, a denial leaves `required_remediation_minutes`, `remediation_variant` and `earliest_reopen_at` exactly as the preceding request computed them; the operator may request again with a fresh verification reading, closing the `OPEN → REOPEN_REQUESTED → OPEN` cycle as many times as necessary. Voiding is the administrative rescission of an order raised in error: only a `HealthAuthorityAdmin` may use it, it requires the order to be in `OPEN`, it is exempt from the four-eyes rule, and it moves the order `OPEN → VOIDED` while stamping `reopen_decided_at` and `reopen_decided_by_user_id` and recomputing the facility posture. `CLEARED` and `VOIDED` are terminal. Every reopen decision increments the facility's `version` by 1. Closure orders can be read individually or listed and narrowed by `facility_id`, by `triggering_reading_id` or by `status`.
+
+### 3.8. Staffing, Signage and Drain Safety
+
+Lifeguard and attendant coverage is scheduled as **staff assignments** against a venue by its operator. Each names the `facility_id`, a `staff_ref` of 1 to 64 characters holding the individual's certification or licence number, a non-empty `staff_name` for display, a `role_type` of `LIFEGUARD` or `ATTENDANT`, the `certification_expires_on` date on which that individual's certification lapses (inclusive — the last day it is valid), and the `shift_start_at` and `shift_end_at` instants. The shift interval is half-open: it includes its start and excludes its end.
+
+Four rules govern scheduling. A shift may not be booked at a venue whose `operating_posture` is `CLOSED`, which is rejected with `ERR_FACILITY_CLOSED`. The shift's end must be strictly after its start and the shift may run no longer than 720 minutes — twelve hours — with any breach reported as `ERR_SHIFT_TOO_LONG` (HTTP 422). The individual's `certification_expires_on` must be on or after the date part of `shift_start_at`, or `ERR_CERTIFICATION_EXPIRED`. And the same person, identified by an identical `staff_ref`, may not hold two `SCHEDULED` shifts that overlap: two shifts overlap when the new start is strictly before the other's end and the other's start is strictly before the new end, so back-to-back shifts that merely touch — where one begins at the exact instant the other ends — do **not** conflict, while any genuine intersection is rejected with `ERR_STAFF_SHIFT_OVERLAP`. Note the contrast with inspection scheduling, which uses buffered, inclusive intervals: staffing uses unbuffered, half-open ones.
+
+A new assignment is created in `SCHEDULED` with `cancel_reason` and `cancelled_at` both null, and it recomputes the facility's `operating_posture` — potentially lifting a `LIFEGUARD_COVERAGE_MISSING` restriction — while incrementing the facility's `version` by 1. The operator may cancel a shift that is still `SCHEDULED`, moving it `SCHEDULED → CANCELLED` with `cancel_reason` of `OPERATOR_REQUEST` and `cancelled_at` stamped from the logical clock, again recomputing the posture and bumping the version; cancelling one already in `CANCELLED` is `ERR_ASSIGNMENT_ALREADY_CANCELLED`. The only other route into `CANCELLED` is the closure cascade of Section 3.7, which sets `cancel_reason` to `FACILITY_CLOSED` instead. `CANCELLED` is terminal. A venue's shifts can be listed and narrowed by `status` and by `role_type`.
+
+**Compliance artifacts** are the venue's paper trail, and one record type carries two quite different payloads. An `artifact_type` of `SIGNAGE` documents a posted sign and requires a `signage_type` — one of `DEPTH_MARKERS`, `EMERGENCY_PHONE`, `DIARRHEA_NOTICE`, `NO_LIFEGUARD_WARNING` or `SPA_TEMP_WARNING` — while forbidding `drain_cover_model` and `sva_system_type`. An `artifact_type` of `DRAIN_CERTIFICATION` documents a Virginia Graeme Baker suction-outlet certification and requires both a `drain_cover_model` naming the certified cover's manufacturer model and an `sva_system_type` naming the secondary entrapment-avoidance system — one of `SVRS`, `GRAVITY_DRAIN_SYSTEM`, `UNBLOCKABLE_DRAIN`, `MULTIPLE_MAIN_DRAINS` or `NONE` — while forbidding `signage_type`. Carrying a field belonging to the other type, or omitting one its own type requires, is rejected with `ERR_ARTIFACT_FIELDS_MISMATCH` (HTTP 422). Every artifact also carries `effective_on`, the date the sign went up or the certification was issued, which may not be later than the logical-clock date.
+
+`expires_on` is computed as the inclusive last valid day: 365 days after `effective_on` for a sign, and 1825 days — five years — after `effective_on` for a drain certification. `status` is derived and resolved in a fixed order: it is `SUPERSEDED` once a later artifact sharing the same facility, `artifact_type` and `signage_type` key has been created; otherwise `EXPIRED` when the logical-clock date is strictly after `expires_on`; otherwise `ACTIVE`. Posting an artifact marks the previous artifact carrying the same key as `SUPERSEDED`, recomputes the facility's `vgb_compliance_status`, `operating_posture` and `posture_reason`, and increments the facility's `version` by 1. Artifacts can be listed per venue and narrowed by `artifact_type` and by `status`.
+
+**Drain-safety posture** is derived from those certifications and from the venue's `drain_count`. Every artifact of type `DRAIN_CERTIFICATION` belonging to the facility is considered, regardless of its own `status`, and the logical-clock date supplies the reference point. When the facility has no drain certification at all, `vgb_compliance_status` is `NONCOMPLIANT`. Otherwise the *governing* certification is the one with the greatest `effective_on`, tie-broken by the greatest `created_at`. If the logical-clock date is strictly after that governing certification's `expires_on`, the status is `EXPIRED`. Otherwise, if the venue has fewer than 2 submerged suction outlets and the governing certification's `sva_system_type` is `NONE` — a single unprotected drain, the exact configuration the federal rule was written to eliminate — the status is `NONCOMPLIANT`. In every other case it is `COMPLIANT`. The posture is refreshed whenever an artifact is posted, whenever the venue is amended, whenever the logical clock moves, and whenever the operating posture is recomputed.
+
+Enforcement of drain safety has a start date, and that date is `2026-06-01`. Until the logical-clock date reaches 1 June 2026 a non-compliant venue is neither restricted nor blocked from permitting; from that date onward, a `vgb_compliance_status` other than `COMPLIANT` restricts the venue under clause 5 of the posture gate and blocks permit issuance with `ERR_VGB_NONCOMPLIANT`.
+
+### 3.9. Complaints and Recreational-Water-Illness Surveillance
+
+Anyone may file a complaint — a member of the public with no credentials, the venue's own operator, or an inspector who takes a report in the field. A complaint names the `facility_id`, a `complaint_type` of `RWI_ILLNESS`, `INJURY`, `WATER_QUALITY`, `SANITATION` or `SAFETY_EQUIPMENT`, and a non-empty `narrative` describing the problem, and may carry an optional `reporter_contact` string. Three further fields belong exclusively to illness reports: `symptom_onset_date`, the date symptoms began, which is required for `RWI_ILLNESS` and must be absent or null for every other type and may not be later than the logical-clock date; `illness_case_count`, the number of ill persons, which must be at least 1 for `RWI_ILLNESS` and must be 0 or absent otherwise, defaulting to 0; and `pathogen_suspected`, an optional organism drawn from `CRYPTOSPORIDIUM`, `GIARDIA`, `LEGIONELLA`, `PSEUDOMONAS`, `NOROVIRUS`, `ECOLI` and `UNKNOWN`, meaningful only for illness reports and defaulting to null. Mismatching those conditional fields is a payload failure. Every complaint stamps `reported_at` from the logical clock at creation.
+
+**Risk scoring** runs exactly once, at creation, and writes `risk_variant`, `cluster_case_count`, `risk_score` and `escalated`. For any `complaint_type` other than `RWI_ILLNESS` the outcome is fixed and trivial: `risk_variant` is null, `cluster_case_count` is 0, `risk_score` is 0 and `escalated` is false.
+
+For an illness report the scorer first looks for peers — other complaints at the same facility, excluding this one, whose `complaint_type` is also `RWI_ILLNESS`, whose `status` is neither `UNSUBSTANTIATED` nor `CLOSED`, and whose `reported_at` falls within the 14-day window ending at this complaint's `reported_at`, with both ends of that window inclusive. Finding no peer selects the **single-report** variant: `risk_variant` is `SINGLE_REPORT`, `cluster_case_count` is this complaint's own `illness_case_count`, and the pathogen pool holds only this complaint's `pathogen_suspected`. Finding at least one peer selects the **cluster-aggregate** variant: `risk_variant` is `CLUSTER_AGGREGATE`, `cluster_case_count` is this complaint's `illness_case_count` plus the sum of every peer's, and the pathogen pool holds this complaint's `pathogen_suspected` together with every peer's.
+
+Three components then combine. The **case component** is the cluster case count multiplied by 12 points per case, capped at 60 points. The **pathogen component** is the greatest weight found anywhere in the pathogen pool, where the weights are 30 for `CRYPTOSPORIDIUM`, 20 for `GIARDIA`, 35 for `LEGIONELLA`, 15 for `PSEUDOMONAS`, 25 for `NOROVIRUS`, 25 for `ECOLI` and 5 for `UNKNOWN`, and a null suspected pathogen contributes a weight of 0. The **recency component** is 10 points when the number of days between `symptom_onset_date` and the date part of `reported_at` is at most 7, and 0 points otherwise. `risk_score` is the sum of the three components, capped at 100. `escalated` is true exactly when `risk_score` reaches or exceeds 60. All of these are whole numbers; no rounding is involved anywhere.
+
+The two variants are what make surveillance work. An identical complaint body that scores 44 points on its own can score 83 inside a cluster — the case counts add up before the 60-point cap bites and the pathogen weight rises to the worst organism anyone reported — and thereby crosses the escalation threshold that the single-report reading would never reach. When `escalated` comes out true, the system immediately opens a closure order for the facility in `OPEN` with `closure_reason` of `RWI_OUTBREAK`, `ordered_by_user_id` set to the literal string `system` and `ordered_by_role` of `system`, which drives the venue's `operating_posture` to `CLOSED` and bumps its `version`. That order carries the standard 1440-minute remediation window for its reason.
+
+Investigation is an inspector's workflow. **Triage** moves the complaint `RECEIVED → TRIAGED` and stores `linked_inspection_id` when the inspector supplies one; the referenced inspection must have `inspection_type` of `COMPLAINT` and belong to the same facility as the complaint, or the request is rejected with `ERR_PRIOR_INSPECTION_MISMATCH`. **Starting the investigation** moves `TRIAGED → INVESTIGATING` and requires `linked_inspection_id` to be non-null — a complaint triaged without an inspection attached cannot advance, and the attempt draws `ERR_INVALID_COMPLAINT_STATE`. From `INVESTIGATING` the complaint forks two ways with symmetric treatment: **substantiating** moves `INVESTIGATING → SUBSTANTIATED` and **unsubstantiating** moves `INVESTIGATING → UNSUBSTANTIATED`, both requiring that the linked inspection's `workflow_status` has reached `FINALIZED` and both storing the investigator's conclusion into `finding` from the request body. Finally a `HealthAuthorityAdmin` **closes** the matter from either branch, moving `SUBSTANTIATED → CLOSED` or `UNSUBSTANTIATED → CLOSED` with identical behaviour and no side effects. `CLOSED` is terminal. Complaints can be read individually or listed and narrowed by `facility_id`, by `linked_inspection_id`, by `complaint_type` or by `status`.
+
+Note the feedback loop the surveillance rules create: an unsubstantiated or closed complaint drops out of the peer set for future cluster scoring, so resolving a report correctly also stops it inflating the risk score of the next one filed at that venue.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted at the server root. Creating a new resource returns HTTP 201 with the created object in `data`; every read, list, transition and other modification returns HTTP 200 with the affected object in `data`. Request bodies, response payloads and side effects are not repeated here — they are specified in the Section 3 narratives, which readers must consult to reconstruct the full contract of any row below.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/_clock/set_current_utc` | Set the server's logical UTC clock. | HealthAuthorityAdmin |
+| POST | `/operators` | Register a permit-holding operator. | Anonymous |
+| GET | `/operators/{id}` | Read one operator, including the live fee balance aggregate. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/operators/{id}/payments` | Record a payment against outstanding health-authority fees. | Operator |
+| GET | `/fee-ledger-entries/{id}` | Read one ledger posting. | Operator, HealthAuthorityAdmin |
+| GET | `/fee-ledger-entries` | List ledger postings, filtered by operator, permit or entry type. | Operator, HealthAuthorityAdmin |
+| POST | `/facilities` | Register an aquatic venue and derive its classification-driven fields. | Operator |
+| GET | `/facilities/{id}` | Read one facility with every derived field refreshed against the current clock. | Operator, Inspector, PlanReviewer, HealthAuthorityAdmin |
+| GET | `/facilities` | List facilities, filtered by owning operator, class or current posture. | Operator, Inspector, HealthAuthorityAdmin |
+| PATCH | `/facilities/{id}` | Amend venue attributes; every derived field is recomputed. | Operator |
+| POST | `/plan-reviews` | Submit a construction or alteration plan set for review. | Operator |
+| POST | `/plan-reviews/{id}/revisions` | File a corrected plan set superseding the review named in the path. | Operator |
+| GET | `/plan-reviews/{id}` | Read one plan review. | Operator, PlanReviewer, HealthAuthorityAdmin |
+| GET | `/plan-reviews` | List plan reviews, filtered by facility, superseded review or status. | Operator, PlanReviewer, HealthAuthorityAdmin |
+| POST | `/plan-reviews/{id}/transition` | Advance a plan review: START_REVIEW, REQUEST_CORRECTIONS, APPROVE or DISAPPROVE. | PlanReviewer |
+| POST | `/permits` | File an annual or seasonal permit application for a facility. | Operator |
+| GET | `/permits/{id}` | Read one permit. | Operator, Inspector, HealthAuthorityAdmin |
+| GET | `/permits` | List permits, filtered by facility, plan review, status or type. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/permits/{id}/transition` | Drive the permit lifecycle: SUBMIT (Operator); START_REVIEW, ISSUE, DENY, SUSPEND, REINSTATE, REVOKE, EXPIRE (HealthAuthorityAdmin). | Operator, HealthAuthorityAdmin |
+| POST | `/inspections` | Schedule a site visit under the buffered window-conflict rule. | Inspector |
+| GET | `/inspections/{id}` | Read one inspection with both state axes and the scoring fields. | Operator, Inspector, HealthAuthorityAdmin |
+| GET | `/inspections` | List inspections, filtered by facility, prior inspection, type or either state axis. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/inspections/{id}/transition` | Move the workflow axis: START, SUBMIT (Inspector); FINALIZE, VOID (HealthAuthorityAdmin). | Inspector, HealthAuthorityAdmin |
+| POST | `/inspections/{id}/enforcement` | Move the enforcement axis: ISSUE_NOTICE, ESCALATE or CLEAR. | HealthAuthorityAdmin |
+| POST | `/inspections/{id}/violations` | Append a finding to an in-progress inspection. | Inspector |
+| GET | `/inspections/{id}/violations` | List the findings recorded on one inspection. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/violations/{id}/correct` | Assert that a finding has been corrected. | Operator |
+| POST | `/violations/{id}/verify` | Verify a corrected finding: VERIFIED closes it, REJECTED reopens it. | Inspector |
+| POST | `/facilities/{id}/water-readings` | Log a water-chemistry reading and classify it. | Operator, Inspector |
+| GET | `/facilities/{id}/water-readings` | List a facility's readings. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/closure-orders` | Order a venue closed, guarded by optimistic concurrency on the facility. | Inspector, HealthAuthorityAdmin, Operator |
+| GET | `/closure-orders/{id}` | Read one closure order including its effective remediation window. | Operator, Inspector, HealthAuthorityAdmin |
+| GET | `/closure-orders` | List closure orders, filtered by facility, triggering reading or status. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/closure-orders/{id}/reopen-request` | Request reopening with a fresh verification reading and optional treatment data. | Operator |
+| POST | `/closure-orders/{id}/reopen-decision` | Decide a reopen request (APPROVE, DENY) or void an order in error (VOID). | Inspector, HealthAuthorityAdmin |
+| POST | `/staff-assignments` | Schedule a lifeguard or attendant shift at a venue. | Operator |
+| GET | `/facilities/{id}/staff-assignments` | List the shifts scheduled at one venue. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/staff-assignments/{id}/cancel` | Cancel a scheduled shift at the operator's request. | Operator |
+| POST | `/facilities/{id}/compliance-artifacts` | Post a required sign or file a VGB drain-safety certification. | Operator |
+| GET | `/facilities/{id}/compliance-artifacts` | List a venue's signage postings and drain certifications. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/complaints` | File a public complaint or recreational-water-illness report. | Anonymous, Operator, Inspector |
+| GET | `/complaints/{id}` | Read one complaint with its risk scoring. | Operator, Inspector, HealthAuthorityAdmin |
+| GET | `/complaints` | List complaints, filtered by facility, linked inspection, type or status. | Operator, Inspector, HealthAuthorityAdmin |
+| POST | `/complaints/{id}/transition` | Advance a complaint: TRIAGE, START_INVESTIGATION, SUBSTANTIATE, UNSUBSTANTIATE (Inspector) or CLOSE (HealthAuthorityAdmin). | Inspector, HealthAuthorityAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_OPERATOR_NOT_FOUND` | 404 |
+| `ERR_FACILITY_NOT_FOUND` | 404 |
+| `ERR_PERMIT_NOT_FOUND` | 404 |
+| `ERR_PLAN_REVIEW_NOT_FOUND` | 404 |
+| `ERR_INSPECTION_NOT_FOUND` | 404 |
+| `ERR_VIOLATION_NOT_FOUND` | 404 |
+| `ERR_CLOSURE_ORDER_NOT_FOUND` | 404 |
+| `ERR_COMPLAINT_NOT_FOUND` | 404 |
+| `ERR_STAFF_ASSIGNMENT_NOT_FOUND` | 404 |
+| `ERR_READING_NOT_FOUND` | 404 |
+| `ERR_LEDGER_ENTRY_NOT_FOUND` | 404 |
+| `ERR_VALIDATION` | 400 |
+| `ERR_ARTIFACT_FIELDS_MISMATCH` | 422 |
+| `ERR_PLAN_REVIEW_FACILITY_MISMATCH` | 409 |
+| `ERR_PRIOR_INSPECTION_MISMATCH` | 409 |
+| `ERR_READING_FACILITY_MISMATCH` | 409 |
+| `ERR_STALE_FACILITY_VERSION` | 412 |
+| `ERR_STALE_PLAN_REVIEW_VERSION` | 412 |
+| `ERR_INVALID_PERMIT_STATE` | 409 |
+| `ERR_INVALID_PLAN_REVIEW_STATE` | 409 |
+| `ERR_INVALID_INSPECTION_STATE` | 409 |
+| `ERR_INVALID_ENFORCEMENT_STATE` | 409 |
+| `ERR_INVALID_CLOSURE_STATE` | 409 |
+| `ERR_INVALID_VIOLATION_STATE` | 409 |
+| `ERR_INVALID_COMPLAINT_STATE` | 409 |
+| `ERR_ASSIGNMENT_ALREADY_CANCELLED` | 409 |
+| `ERR_VGB_NONCOMPLIANT` | 409 |
+| `ERR_OPEN_CRITICAL_VIOLATIONS` | 409 |
+| `ERR_FACILITY_CLOSED` | 409 |
+| `ERR_IMMINENT_HEALTH_HAZARD` | 409 |
+| `ERR_WATER_NOT_IN_RANGE` | 409 |
+| `ERR_REMEDIATION_INCOMPLETE` | 409 |
+| `ERR_VERIFICATION_READING_STALE` | 409 |
+| `ERR_INSPECTION_WINDOW_CONFLICT` | 409 |
+| `ERR_OUT_OF_SEASON` | 409 |
+| `ERR_SHIFT_TOO_LONG` | 422 |
+| `ERR_CERTIFICATION_EXPIRED` | 409 |
+| `ERR_STAFF_SHIFT_OVERLAP` | 409 |
+| `ERR_SEASON_TERM_TOO_LONG` | 422 |
+| `ERR_PERMIT_TERM_OVERLAP` | 409 |
+| `ERR_RENEWAL_WINDOW_NOT_OPEN` | 409 |
+| `ERR_PLAN_REVIEW_NOT_APPROVED` | 409 |
+| `ERR_PLAN_REVIEW_ROUNDS_EXHAUSTED` | 409 |
+| `ERR_INSPECTION_TYPE_REQUIRES_PRIOR` | 422 |
+| `ERR_OUTSTANDING_FEES` | 402 |
+| `ERR_REFUND_NOT_ELIGIBLE` | 409 |

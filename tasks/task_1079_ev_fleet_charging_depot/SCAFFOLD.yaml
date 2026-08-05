@@ -1,0 +1,1472 @@
+scenario: "1079. EV-Fleet & Charging-Depot Management: vehicle & charger/depot, charge-scheduling & load-mgmt, energy cost & demand-charge, driver/route readiness (SOC), maintenance & uptime, telematics, billing/reimbursement, reporting"
+domain_name: "ev-fleet-charging-depot"
+api_prefix: "/fleet"
+
+complexity_profile:
+  primary_archetype: "Quota / allocation"          # finite depot power pool reserved/committed/released across charging sessions
+  secondary_archetype: "Temporal windowing"        # charger/vehicle booking intervals with adjacency & buffer semantics
+  complexity_layers:
+    - optimistic_concurrency                        # OCC on Depot.version for shared-pool reservation races (load + reimbursement budget)
+    - cascading_side_effects                        # depth-3 cascades from work-order-open and charger-fault
+    - dual_variant_calculation                      # estimated-vs-final energy cost (session) and estimated-vs-final reimbursement (driver)
+    - rate_threshold_triggers                       # SOC-readiness threshold, depot capacity boundary, tiered demand charge
+
+  entity_topology: flat                             # peer entities linked by FK; no nesting except telemetry event log
+  state_machine_shape: branching                    # ChargeSession forks; MaintenanceWorkOrder cycles; RouteAssignment reverts
+  relationship_patterns:
+    - one_to_many                                   # Depot 1:N Charger/Vehicle/Driver; Vehicle 1:N ChargeSession/TelemetryReading
+    - cross_aggregate                               # ChargeSession references Depot + Charger + Vehicle across aggregates
+    - polymorphic                                   # MaintenanceWorkOrder targets a Charger XOR a Vehicle
+  role_model: peer_roles                            # FleetManager / DepotOperator / MaintenanceTech / Driver / FinanceManager own disjoint operations; SoD on claim pay
+  consistency_model: immediate                      # all mutations + cascades atomic within the request
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =====================================================================
+# §1.1 ENTITY-RELATIONSHIP TABLE
+# =====================================================================
+entities:
+  - name: Depot
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Depot display name."
+      - name: max_load_kw
+        type: number
+        source: input
+        description: "Physical circuit limit (kW). Sum of power_kw across SCHEDULED+ACTIVE sessions may not exceed this."
+        constraints: "> 0"
+      - name: contracted_capacity_kw
+        type: number
+        source: input
+        description: "Utility contracted demand threshold (kW) used by the tiered demand-charge formula. Independent of max_load_kw."
+        constraints: "> 0"
+      - name: demand_rate_cents_per_kw
+        type: integer
+        source: input
+        description: "Base demand rate (cents per kW) applied up to contracted_capacity_kw."
+        constraints: ">= 0"
+      - name: overage_rate_cents_per_kw
+        type: integer
+        source: input
+        description: "Overage demand rate (cents per kW) applied to peak above contracted_capacity_kw."
+        constraints: ">= 0"
+      - name: reimbursement_budget_cents
+        type: integer
+        source: input
+        description: "Monthly home-charging reimbursement budget (cents) for this depot's drivers."
+        constraints: ">= 0"
+      - name: tariff_windows
+        type: array
+        source: input
+        description: "Ordered array of Time-of-Use windows: [{period, start_hour_utc, end_hour_utc, rate_cents_per_kwh}]. Windows partition the 24h UTC day (each hour 0..23 covered by exactly one window); start inclusive, end exclusive; a window may wrap (start_hour_utc > end_hour_utc)."
+      - name: reserved_load_kw
+        type: number
+        source: computed
+        description: "LEDGER: sum of power_kw over this depot's ChargeSessions with status IN {SCHEDULED, ACTIVE}. Debited on schedule, credited on cancel/complete/interrupt. Invariant target for compensating_invariant/reserved_power."
+        default: 0
+      - name: reimbursement_committed_cents
+        type: integer
+        source: computed
+        description: "LEDGER: sum of committed_amount_cents over this depot's ReimbursementClaims with status IN {SUBMITTED, APPROVED}. Invariant target for compensating_invariant/reimbursement_money."
+        default: 0
+  - name: Charger
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot this charger belongs to."
+      - name: name
+        type: string
+        source: input
+        description: "Charger display name / stall label."
+      - name: connector_type
+        type: enum
+        source: input
+        description: "Physical connector."
+        constraints: "one of {CCS, CHADEMO, J1772, NACS}"
+      - name: max_power_kw
+        type: number
+        source: input
+        description: "Maximum charge power (kW) this charger can deliver."
+        constraints: "> 0"
+      - name: service_status
+        type: enum
+        source: computed
+        description: "OPERATIONAL when no open charger work order; DOWN while a charger MaintenanceWorkOrder is non-terminal. Flipped by work-order side effects."
+        default: "OPERATIONAL"
+        constraints: "one of {OPERATIONAL, DOWN}"
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the home depot of this vehicle."
+      - name: vin
+        type: string
+        source: input
+        description: "Vehicle identification number (display id)."
+      - name: connector_type
+        type: enum
+        source: input
+        description: "Onboard charge port; must match Charger.connector_type to schedule a session."
+        constraints: "one of {CCS, CHADEMO, J1772, NACS}"
+      - name: battery_capacity_kwh
+        type: number
+        source: input
+        description: "Usable battery capacity (kWh); converts SOC percentage deltas to energy."
+        constraints: "> 0"
+      - name: efficiency_kwh_per_km
+        type: number
+        source: input
+        description: "Energy consumption per km; reference only."
+        constraints: "> 0"
+      - name: current_soc_pct
+        type: number
+        source: input
+        description: "Current state of charge (0..100). Seeded at creation; overwritten by the latest TelemetryReading and by session completion."
+        constraints: "0 <= x <= 100"
+      - name: odometer_km
+        type: number
+        source: computed
+        description: "Latest odometer reading from telemetry."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "IN_SERVICE normally; GROUNDED while a vehicle MaintenanceWorkOrder is non-terminal. Flipped by work-order side effects."
+        default: "IN_SERVICE"
+        constraints: "one of {IN_SERVICE, GROUNDED}"
+      - name: readiness_status
+        type: enum
+        source: computed
+        description: "READY iff status == IN_SERVICE AND current_soc_pct >= MIN_READY_SOC_PCT; else NOT_READY. Recomputed on telemetry, session complete/interrupt, and status change."
+        default: "NOT_READY"
+        constraints: "one of {READY, NOT_READY}"
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot whose reimbursement budget funds this driver's claims."
+      - name: name
+        type: string
+        source: input
+        description: "Driver name."
+      - name: email
+        type: string
+        source: input
+        description: "Driver email (display)."
+      - name: home_tariff_cents_per_kwh
+        type: integer
+        source: input
+        description: "Driver's residential electricity rate (cents per kWh) used to price home-charging reimbursement."
+        constraints: ">= 0"
+  - name: ChargeSession
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot whose load pool this session reserves against."
+      - name: charger_id
+        type: string
+        source: input
+        description: "FK -> Charger.id; the charger occupied by this session."
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle being charged."
+      - name: scheduled_start
+        type: datetime
+        source: input
+        description: "Reserved window start (ISO 8601 UTC), inclusive."
+      - name: scheduled_end
+        type: datetime
+        source: input
+        description: "Reserved window end (ISO 8601 UTC), exclusive for charger conflict, inclusive for vehicle conflict."
+      - name: target_soc_pct
+        type: number
+        source: input
+        description: "Intended SOC at completion (0..100); drives estimated energy."
+        constraints: "0 <= x <= 100"
+      - name: power_kw
+        type: number
+        source: input
+        description: "Charge power reserved for this session (kW). Must be <= Charger.max_power_kw. Reserved against Depot.reserved_load_kw."
+        constraints: "> 0"
+      - name: start_soc_pct
+        type: number
+        source: computed
+        description: "Vehicle.current_soc_pct captured at start transition."
+      - name: end_soc_pct
+        type: number
+        source: computed
+        description: "SOC recorded at complete (input) or set equal to start_soc_pct on interrupt."
+      - name: actual_start
+        type: datetime
+        source: computed
+        description: "Actual charging start instant (logical clock at start, or provided actual_start)."
+      - name: actual_end
+        type: datetime
+        source: computed
+        description: "Actual charging end instant (logical clock at complete, or provided actual_end)."
+      - name: energy_kwh_delivered
+        type: number
+        source: computed
+        description: "(end_soc_pct - start_soc_pct)/100 * Vehicle.battery_capacity_kwh; computed at complete. 0 on interrupt."
+        default: 0
+      - name: estimated_cost_cents
+        type: integer
+        source: computed
+        description: "Provisional cost computed at schedule (estimated_variant of session_energy_cost)."
+        default: 0
+      - name: final_cost_cents
+        type: integer
+        source: computed
+        description: "Final metered cost computed at complete (final_variant of session_energy_cost)."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state."
+        default: "SCHEDULED"
+        constraints: "one of {SCHEDULED, ACTIVE, COMPLETED, CANCELLED, INTERRUPTED}"
+  - name: TelemetryReading
+    parent: null
+    common_fields: false
+    fields:
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle that emitted this reading."
+      - name: soc_pct
+        type: number
+        source: input
+        description: "Reported SOC (0..100). Overwrites Vehicle.current_soc_pct."
+        constraints: "0 <= x <= 100"
+      - name: odometer_km
+        type: number
+        source: input
+        description: "Reported odometer (km). Overwrites Vehicle.odometer_km."
+        constraints: ">= 0"
+      - name: reading_time
+        type: datetime
+        source: input
+        description: "Instant of the reading (ISO 8601 UTC). Defaults to the logical clock if omitted."
+        default: "logical clock current time"
+  - name: MaintenanceWorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: asset_type
+        type: enum
+        source: input
+        description: "Which asset kind this order maintains."
+        constraints: "one of {CHARGER, VEHICLE}"
+      - name: charger_id
+        type: string
+        source: input
+        description: "FK -> Charger.id; set (and required) iff asset_type == CHARGER, else null."
+        default: null
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; set (and required) iff asset_type == VEHICLE, else null."
+        default: null
+      - name: issue
+        type: string
+        source: input
+        description: "Free-text description of the fault."
+      - name: severity
+        type: enum
+        source: input
+        description: "Severity band."
+        constraints: "one of {LOW, MEDIUM, HIGH}"
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state (cyclic between IN_PROGRESS and ON_HOLD)."
+        default: "OPEN"
+        constraints: "one of {OPEN, IN_PROGRESS, ON_HOLD, RESOLVED, CLOSED}"
+      - name: opened_at
+        type: datetime
+        source: computed
+        description: "Logical clock instant at creation."
+      - name: resolved_at
+        type: datetime
+        source: computed
+        description: "Logical clock instant when status entered RESOLVED."
+        default: null
+      - name: downtime_minutes
+        type: integer
+        source: computed
+        description: "floor((resolved_at - opened_at) in minutes); computed when RESOLVED. Uptime reporting metric."
+        default: 0
+  - name: RouteAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot operating this route."
+      - name: vehicle_id
+        type: string
+        source: input
+        description: "FK -> Vehicle.id; the vehicle nominated for the route."
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver nominated for the route."
+      - name: route_name
+        type: string
+        source: input
+        description: "Route label."
+      - name: distance_km
+        type: number
+        source: input
+        description: "Planned route distance (km)."
+        constraints: "> 0"
+      - name: required_soc_pct
+        type: number
+        source: input
+        description: "Minimum SOC the vehicle must hold to be assignable to this route (0..100)."
+        constraints: "0 <= x <= 100"
+      - name: scheduled_departure
+        type: datetime
+        source: input
+        description: "Planned departure instant (ISO 8601 UTC)."
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state (revertible PLANNED<->ASSIGNED)."
+        default: "PLANNED"
+        constraints: "one of {PLANNED, ASSIGNED, COMPLETED, CANCELLED}"
+  - name: ReimbursementClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the claimant. Must equal X-User-ID of the acting Driver."
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the depot whose reimbursement budget funds this claim."
+      - name: period_month
+        type: string
+        source: input
+        description: "Billing month 'YYYY-MM' the home charging occurred in."
+      - name: kwh_claimed
+        type: number
+        source: input
+        description: "kWh the driver claims to have charged at home."
+        constraints: "> 0"
+      - name: odometer_start
+        type: number
+        source: input
+        description: "Odometer at period start (km); reference only."
+      - name: odometer_end
+        type: number
+        source: input
+        description: "Odometer at period end (km); reference only."
+      - name: metered_kwh_verified
+        type: number
+        source: computed
+        description: "Verified kWh entered by FinanceManager at review; drives final amount."
+        default: null
+      - name: committed_amount_cents
+        type: integer
+        source: computed
+        description: "Amount currently committed against Depot.reimbursement_committed_cents: equals estimated_amount_cents while SUBMITTED, final_amount_cents while APPROVED, 0 once REJECTED/PAID."
+        default: 0
+      - name: estimated_amount_cents
+        type: integer
+        source: computed
+        description: "Provisional amount at submit (estimated_variant of claim_reimbursement)."
+        default: 0
+      - name: final_amount_cents
+        type: integer
+        source: computed
+        description: "Final amount at approve (final_variant of claim_reimbursement)."
+        default: 0
+      - name: approved_by_user_id
+        type: string
+        source: computed
+        description: "X-User-ID of the FinanceManager who APPROVED; compared against payer for segregation of duties."
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state."
+        default: "SUBMITTED"
+        constraints: "one of {SUBMITTED, APPROVED, REJECTED, PAID}"
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: depot_id
+        type: string
+        source: input
+        description: "FK -> Depot.id; the billed depot."
+      - name: period_month
+        type: string
+        source: input
+        description: "Billed month 'YYYY-MM'. Unique per depot."
+      - name: energy_subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of final_cost_cents (each already cents-rounded) over depot's COMPLETED sessions whose actual_end falls in period_month (round-then-sum; see invoice_energy_subtotal)."
+        default: 0
+      - name: peak_demand_kw
+        type: number
+        source: computed
+        description: "Peak concurrent power (kW) in the period; see invoice_demand_charge input_set."
+        default: 0
+      - name: demand_charge_cents
+        type: integer
+        source: computed
+        description: "Tiered demand charge over peak_demand_kw (see invoice_demand_charge)."
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "energy_subtotal_cents + demand_charge_cents."
+        default: 0
+      - name: status
+        type: enum
+        source: computed
+        description: "Lifecycle state."
+        default: "DRAFT"
+        constraints: "one of {DRAFT, ISSUED, PAID}"
+
+# =====================================================================
+# §1.2 STATE MACHINE TABLE
+# =====================================================================
+state_machines:
+  - entity: ChargeSession
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED, INTERRUPTED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /fleet/charge-sessions/{id}/start"
+        actor: DepotOperator
+        preconditions:
+          - "session.status == SCHEDULED else ERR_SESSION_NOT_SCHEDULED"
+          - "Charger(session.charger_id).service_status == OPERATIONAL else ERR_CHARGER_DOWN  # cross_entity_state_dependency: ChargeSession->Charger"
+        side_effects:
+          - "set start_soc_pct = Vehicle(session.vehicle_id).current_soc_pct"
+          - "set actual_start = provided actual_start or logical clock now"
+        note: "Branch 1 of the SCHEDULED fork (the other branch is CANCELLED)."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /fleet/charge-sessions/{id}/cancel"
+        actor: DepotOperator
+        preconditions:
+          - "session.status == SCHEDULED else ERR_SESSION_NOT_SCHEDULED"
+        side_effects:
+          - "credit Depot.reserved_load_kw -= session.power_kw  (compensating_invariant/reserved_power)"
+        note: "Branch 2 of the SCHEDULED fork; releases the reservation with no energy delivered."
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /fleet/charge-sessions/{id}/complete"
+        actor: DepotOperator
+        preconditions:
+          - "session.status == ACTIVE else ERR_SESSION_NOT_ACTIVE"
+          - "end_soc_pct >= start_soc_pct else ERR_VALIDATION"
+        side_effects:
+          - "set end_soc_pct = input end_soc_pct; set actual_end = provided actual_end or logical clock now"
+          - "compute energy_kwh_delivered = (end_soc_pct - start_soc_pct)/100 * Vehicle.battery_capacity_kwh"
+          - "compute final_cost_cents = session_energy_cost.final_variant"
+          - "set Vehicle.current_soc_pct = end_soc_pct; recompute Vehicle.readiness_status"
+          - "credit Depot.reserved_load_kw -= session.power_kw  (compensating_invariant/reserved_power)"
+        note: "Branch A of the ACTIVE fork. Raises SOC; may flip vehicle readiness READY."
+      - from: ACTIVE
+        to: INTERRUPTED
+        trigger: "system: charger MaintenanceWorkOrder opened on session.charger_id (cascade from POST /fleet/work-orders asset_type=CHARGER)"
+        actor: system
+        preconditions:
+          - "session.status == ACTIVE"
+        side_effects:
+          - "set end_soc_pct = start_soc_pct; energy_kwh_delivered = 0; final_cost_cents = 0"
+          - "set actual_end = logical clock now"
+          - "credit Depot.reserved_load_kw -= session.power_kw  (compensating_invariant/reserved_power)"
+          - "recompute Vehicle.readiness_status"
+        note: "Branch B of the ACTIVE fork; divergent side effects from COMPLETED (no cost, no SOC gain)."
+
+  - entity: MaintenanceWorkOrder
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: IN_PROGRESS
+        trigger: "POST /fleet/work-orders/{id}/transition {target_status: IN_PROGRESS}"
+        actor: MaintenanceTech
+        preconditions:
+          - "wo.status == OPEN else ERR_WORK_ORDER_INVALID_TRANSITION"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: ON_HOLD
+        trigger: "POST /fleet/work-orders/{id}/transition {target_status: ON_HOLD}"
+        actor: MaintenanceTech
+        preconditions:
+          - "wo.status == IN_PROGRESS else ERR_WORK_ORDER_INVALID_TRANSITION"
+        side_effects: []
+        note: "Cycle edge (forward). Asset remains DOWN/GROUNDED while on hold."
+      - from: ON_HOLD
+        to: IN_PROGRESS
+        trigger: "POST /fleet/work-orders/{id}/transition {target_status: IN_PROGRESS}"
+        actor: MaintenanceTech
+        preconditions:
+          - "wo.status == ON_HOLD else ERR_WORK_ORDER_INVALID_TRANSITION"
+        side_effects: []
+        note: "Cycle edge (back). IN_PROGRESS<->ON_HOLD forms the non-linear loop (non_linear_state_machine)."
+      - from: IN_PROGRESS
+        to: RESOLVED
+        trigger: "POST /fleet/work-orders/{id}/transition {target_status: RESOLVED}"
+        actor: MaintenanceTech
+        preconditions:
+          - "wo.status == IN_PROGRESS else ERR_WORK_ORDER_INVALID_TRANSITION"
+        side_effects:
+          - "set resolved_at = logical clock now; downtime_minutes = floor((resolved_at - opened_at)/60s)"
+          - "if asset_type==CHARGER: no other charger work order non-terminal => Charger.service_status = OPERATIONAL"
+          - "if asset_type==VEHICLE: no other vehicle work order non-terminal => Vehicle.status = IN_SERVICE; recompute Vehicle.readiness_status"
+      - from: RESOLVED
+        to: CLOSED
+        trigger: "POST /fleet/work-orders/{id}/transition {target_status: CLOSED}"
+        actor: MaintenanceTech
+        preconditions:
+          - "wo.status == RESOLVED else ERR_WORK_ORDER_INVALID_TRANSITION"
+        side_effects: []
+
+  - entity: RouteAssignment
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: ASSIGNED
+        trigger: "POST /fleet/route-assignments/{id}/assign"
+        actor: DepotOperator
+        preconditions:
+          - "route.status == PLANNED else ERR_ROUTE_NOT_PLANNED"
+          - "Vehicle(route.vehicle_id).status != GROUNDED else ERR_VEHICLE_GROUNDED  # business_safety"
+          - "Vehicle(route.vehicle_id).readiness_status == READY else ERR_VEHICLE_NOT_READY  # cross_entity_state_dependency: RouteAssignment->Vehicle"
+          - "Vehicle(route.vehicle_id).current_soc_pct >= route.required_soc_pct else ERR_SOC_BELOW_ROUTE_REQUIREMENT  # boundary_precision (>=)"
+        side_effects: []
+        note: "Forward edge of the PLANNED<->ASSIGNED revert loop."
+      - from: ASSIGNED
+        to: PLANNED
+        trigger: "POST /fleet/route-assignments/{id}/unassign OR system revert when the assigned Vehicle becomes NOT_READY"
+        actor: DepotOperator
+        preconditions:
+          - "route.status == ASSIGNED else ERR_ROUTE_NOT_ASSIGNED"
+        side_effects: []
+        note: "Revert edge; also fired as a cascade side effect (see work-order and charger-fault cascades)."
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "POST /fleet/route-assignments/{id}/complete"
+        actor: DepotOperator
+        preconditions:
+          - "route.status == ASSIGNED else ERR_ROUTE_NOT_ASSIGNED"
+        side_effects: []
+        note: "Terminal completion of the route."
+
+  - entity: ReimbursementClaim
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, PAID]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /fleet/reimbursement-claims/{id}/review {decision: APPROVE, metered_kwh_verified}"
+        actor: FinanceManager
+        preconditions:
+          - "claim.status == SUBMITTED else ERR_CLAIM_NOT_SUBMITTED"
+        side_effects:
+          - "set metered_kwh_verified = input; final_amount_cents = claim_reimbursement.final_variant"
+          - "adjust Depot.reimbursement_committed_cents by (final_amount_cents - estimated_amount_cents); set committed_amount_cents = final_amount_cents"
+          - "set approved_by_user_id = X-User-ID"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /fleet/reimbursement-claims/{id}/review {decision: REJECT}"
+        actor: FinanceManager
+        preconditions:
+          - "claim.status == SUBMITTED else ERR_CLAIM_NOT_SUBMITTED"
+        side_effects:
+          - "credit Depot.reimbursement_committed_cents -= committed_amount_cents; set committed_amount_cents = 0  (compensating_invariant/reimbursement_money)"
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /fleet/reimbursement-claims/{id}/pay"
+        actor: FinanceManager
+        preconditions:
+          - "claim.status == APPROVED else ERR_CLAIM_NOT_APPROVED"
+          - "X-User-ID != claim.approved_by_user_id else ERR_SEGREGATION_OF_DUTIES  # segregation_of_duties"
+        side_effects:
+          - "credit Depot.reimbursement_committed_cents -= committed_amount_cents; set committed_amount_cents = 0 (money leaves committed once paid out)"
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /fleet/invoices/{id}/issue"
+        actor: FinanceManager
+        preconditions:
+          - "invoice.status == DRAFT else ERR_INVOICE_NOT_DRAFT"
+        side_effects: []
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /fleet/invoices/{id}/pay"
+        actor: FinanceManager
+        preconditions:
+          - "invoice.status == ISSUED else ERR_INVOICE_NOT_ISSUED"
+        side_effects: []
+
+# Auto/system transitions not on a single entity's own lifecycle are documented
+# in §1.3 cascades and in the endpoint side_effects (Charger.service_status and
+# Vehicle.status are computed enums flipped by MaintenanceWorkOrder open/resolve).
+
+# =====================================================================
+# §1.2.1 CONCURRENCY RULES  (OCC on Depot.version — shared-pool reservation races)
+# =====================================================================
+concurrency_rules:
+  - rule_id: session-create-stale-depot
+    parent_entity: Depot
+    write_endpoint: "POST /fleet/charge-sessions"
+    occ_field: "expected_depot_version"
+    description: |
+      Scheduling a ChargeSession reserves power against the shared Depot load
+      pool. A create whose expected_depot_version is older than the Depot's
+      current version is rejected: the client's view of reserved_load_kw is
+      stale because another session reservation has already advanced the depot
+      (its power legitimately fits under max_load_kw, so no state precondition
+      would catch the double-commit — only the version check does).
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: claim-submit-stale-depot
+    parent_entity: Depot
+    write_endpoint: "POST /fleet/reimbursement-claims"
+    occ_field: "expected_depot_version"
+    description: |
+      Submitting a ReimbursementClaim commits its estimated amount against the
+      shared Depot reimbursement budget. A submit whose expected_depot_version
+      is older than the Depot's current version is rejected: another claim has
+      already advanced reimbursement_committed_cents, so the client's remaining
+      budget view is stale. Both claims fit under budget in isolation, so only
+      the version check prevents the over-commit.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =====================================================================
+# §1.3 CALCULATION RULES TABLE
+# =====================================================================
+calculations:
+  - name: session_energy_cost
+    trigger: "estimated_variant on POST /fleet/charge-sessions (schedule); final_variant on POST /fleet/charge-sessions/{id}/complete"
+    algorithm: tiered_pricing
+    formula: |
+      # Helper: rate_at(hour) = rate_cents_per_kwh of the depot tariff_window whose
+      #   [start_hour_utc, end_hour_utc) covers `hour` (a wrapping window covers
+      #   hours >= start OR < end). Every hour 0..23 is covered by exactly one window.
+      #
+      # estimated_variant (at schedule; provisional):
+      est_energy_kwh = max(0, (target_soc_pct - Vehicle.current_soc_pct)/100 * Vehicle.battery_capacity_kwh)
+      estimated_cost_cents = round_half_up(est_energy_kwh * rate_at(hour(scheduled_start)))
+      #   -> ONE tariff rate: the window covering scheduled_start's hour.
+      #
+      # final_variant (at complete; metered):
+      final_energy_kwh = (end_soc_pct - start_soc_pct)/100 * Vehicle.battery_capacity_kwh
+      total_s = (actual_end - actual_start) in seconds
+      if total_s <= 0:
+          final_cost_cents = round_half_up(final_energy_kwh * rate_at(hour(actual_start)))
+      else:
+          # energy delivered at constant power over [actual_start, actual_end); allocate
+          # energy to each tariff window proportional to the seconds the interval spends in it.
+          final_cost_cents = round_half_up(
+              sum over covered windows w of:
+                  final_energy_kwh * (overlap_seconds(w, [actual_start, actual_end)) / total_s) * rate_w
+          )
+    input_set: "estimated: single-window rate at scheduled_start. final: TOU allocation across all windows overlapping [actual_start, actual_end)."
+    constants: {}
+    precision: "0 decimals (whole cents), round_half_up"
+    variants:
+      - name: estimated_variant
+        when: "session schedule (provisional)"
+        difference: "uses target_soc_pct - current SOC and the single tariff rate at scheduled_start's hour"
+      - name: final_variant
+        when: "session complete (metered/final)"
+        difference: "uses actual end_soc - start_soc and time-weighted TOU allocation across the actual interval; diverges from estimate whenever actual SOC delta, actual interval, or spanned windows differ"
+
+  - name: claim_reimbursement
+    trigger: "estimated_variant on POST /fleet/reimbursement-claims (submit); final_variant on POST /fleet/reimbursement-claims/{id}/review APPROVE"
+    algorithm: aggregation
+    formula: |
+      # estimated_variant (submit): priced from driver-claimed kWh
+      estimated_amount_cents = round_half_up(kwh_claimed * Driver.home_tariff_cents_per_kwh)
+      # final_variant (approve): priced from finance-verified metered kWh
+      final_amount_cents = round_half_up(metered_kwh_verified * Driver.home_tariff_cents_per_kwh)
+    input_set: "estimated from driver's kwh_claimed; final from FinanceManager's metered_kwh_verified. Same tariff, different quantity source."
+    constants: {}
+    precision: "0 decimals (whole cents), round_half_up"
+    variants:
+      - name: estimated_variant
+        when: "claim submit (provisional commit against budget)"
+        difference: "quantity = kwh_claimed (self-reported)"
+      - name: final_variant
+        when: "claim approve"
+        difference: "quantity = metered_kwh_verified (audited); diverges whenever verified != claimed"
+
+  - name: invoice_demand_charge
+    trigger: "POST /fleet/invoices (generate)"
+    algorithm: threshold
+    formula: |
+      # peak_demand_kw: over the set S = depot's ChargeSessions with status==COMPLETED
+      # and actual_end in period_month, evaluate concurrent load at each session's
+      # actual_start instant: conc(t) = sum(power_kw of T in S where actual_start_T <= t < actual_end_T).
+      # peak_demand_kw = max over s in S of conc(actual_start_s); 0 if S empty.
+      demand_charge_cents = round_half_up(
+          demand_rate_cents_per_kw * min(peak_demand_kw, contracted_capacity_kw)
+        + overage_rate_cents_per_kw * max(0, peak_demand_kw - contracted_capacity_kw)
+      )
+    input_set: "COMPLETED sessions at depot whose actual_end month == period_month."
+    constants: {}
+    precision: "0 decimals (whole cents), round_half_up. peak evaluated on half-open [actual_start, actual_end)."
+    variants: []
+
+  - name: invoice_energy_subtotal
+    trigger: "POST /fleet/invoices (generate)"
+    algorithm: aggregation
+    formula: |
+      # ROUND-THEN-SUM (pinned): each session's final_cost_cents is already a whole-cent
+      # integer stamped at completion; sum those integers directly. Do NOT recompute a
+      # fractional per-session cost and sum before rounding.
+      energy_subtotal_cents = sum(S.final_cost_cents for S in depot COMPLETED sessions with actual_end month == period_month)
+      total_cents = energy_subtotal_cents + demand_charge_cents
+    input_set: "COMPLETED sessions at depot whose actual_end month == period_month."
+    constants: {}
+    precision: "integer cents; round order = round-per-session-then-sum (fixed)."
+    variants: []
+
+  - name: vehicle_readiness
+    trigger: "on Vehicle create; recompute on telemetry, session complete, session interrupt, and Vehicle.status change (work-order open/resolve)"
+    algorithm: threshold
+    formula: |
+      readiness_status = READY if (status == IN_SERVICE and current_soc_pct >= MIN_READY_SOC_PCT) else NOT_READY
+    input_set: "single Vehicle row."
+    constants:
+      MIN_READY_SOC_PCT: 80
+    precision: "boundary is inclusive: current_soc_pct == 80 with IN_SERVICE => READY"
+    variants: []
+
+  - name: depot_reserved_load
+    trigger: "maintained incrementally on session schedule (+power_kw) and cancel/complete/interrupt (-power_kw)"
+    algorithm: aggregation
+    formula: |
+      reserved_load_kw == sum(C.power_kw for C in depot ChargeSessions where C.status in {SCHEDULED, ACTIVE})
+    input_set: "depot ChargeSessions with status in {SCHEDULED, ACTIVE}."
+    constants: {}
+    precision: "kW as number; invariant must hold exactly after every mutation."
+    variants: []
+
+  - name: depot_reimbursement_committed
+    trigger: "maintained on claim submit (+estimated), approve (delta to final), reject/pay (-committed)"
+    algorithm: aggregation
+    formula: |
+      reimbursement_committed_cents == sum(K.committed_amount_cents for K in depot ReimbursementClaims where K.status in {SUBMITTED, APPROVED})
+    input_set: "depot ReimbursementClaims with status in {SUBMITTED, APPROVED}."
+    constants: {}
+    precision: "integer cents; invariant must hold exactly after every mutation."
+    variants: []
+
+  - name: charger_slot_geometry
+    trigger: "POST /fleet/charge-sessions (schedule) — charger temporal conflict check"
+    algorithm: interval_merge
+    formula: |
+      # Charger exclusivity with a mandatory cooldown buffer between consecutive sessions.
+      # Existing = charger's ChargeSessions with status in {SCHEDULED, ACTIVE}.
+      # Reject (ERR_CHARGER_TIME_CONFLICT) if for any existing E, the buffered half-open
+      # windows overlap:  [new.scheduled_start, new.scheduled_end)  intersects
+      #                   [E.scheduled_start - BUF, E.scheduled_end + BUF)
+      # where BUF = COOLDOWN_BUFFER_MINUTES. Exactly-adjacent windows separated by >= BUF
+      # are allowed; a gap of exactly BUF is allowed (buffer is inclusive of the gap).
+    input_set: "charger's sessions with status in {SCHEDULED, ACTIVE}."
+    constants:
+      COOLDOWN_BUFFER_MINUTES: 30
+    precision: "half-open intervals; buffer applied symmetrically to existing sessions."
+    variants: []
+
+  - name: vehicle_slot_geometry
+    trigger: "POST /fleet/charge-sessions (schedule) — vehicle temporal conflict check"
+    algorithm: interval_merge
+    formula: |
+      # Vehicle exclusivity, NO buffer, CLOSED intervals (endpoints inclusive).
+      # Existing = vehicle's ChargeSessions with status in {SCHEDULED, ACTIVE}.
+      # Reject (ERR_VEHICLE_TIME_CONFLICT) if for any existing E:
+      #   new.scheduled_start <= E.scheduled_end  AND  E.scheduled_start <= new.scheduled_end
+      # (closed-interval overlap: touching endpoints DO collide, unlike the charger rule).
+    input_set: "vehicle's sessions with status in {SCHEDULED, ACTIVE}."
+    constants: {}
+    precision: "closed intervals; a shared boundary instant counts as an overlap."
+    variants: []
+
+  - name: workorder_downtime
+    trigger: "on MaintenanceWorkOrder transition to RESOLVED"
+    algorithm: aggregation
+    formula: |
+      downtime_minutes = floor((resolved_at - opened_at) in seconds / 60)
+    input_set: "single MaintenanceWorkOrder row."
+    constants: {}
+    precision: "integer minutes, floor."
+    variants: []
+
+# =====================================================================
+# §1.4 VALIDATION RULES TABLE  (ordered by priority; lower number wins)
+# =====================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except unauthenticated errors are impossible on GET without headers too (headers required on all)"
+  - priority: 2
+    category: auth
+    check: "acting role is permitted for this endpoint per §1.7; a Driver acting on a ReimbursementClaim must have X-User-ID == claim.driver_id"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "every id in the path and every FK referenced in the body exists (validated left-to-right: path first, then body FKs in declaration order)"
+    error_id: "ERR_<RESOURCE>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path ids or FK inputs"
+  - priority: 4
+    category: business_constraint
+    check: "required fields present; enum values legal; numeric ranges (soc 0..100, power_kw>0); work-order asset_type matches provided id field (CHARGER=>charger_id, VEHICLE=>vehicle_id)"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all writes"
+    note: "asset_type/id mismatch => ERR_ASSET_TARGET_INVALID (422)."
+  - priority: 5
+    category: state
+    check: "target resource is in a state that permits the requested transition (SCHEDULED for start/cancel; ACTIVE for complete; PLANNED for assign; ASSIGNED for unassign/complete; SUBMITTED for review; APPROVED for pay; DRAFT for issue; ISSUED for invoice pay; work-order transition legality)"
+    error_id: "ERR_*_NOT_* / ERR_INVALID_STATE / ERR_WORK_ORDER_INVALID_TRANSITION"
+    http_status: 409
+    applies_to: "all action/transition endpoints"
+  - priority: 6
+    category: business_safety
+    check: "route assign: Vehicle.status != GROUNDED"
+    error_id: ERR_VEHICLE_GROUNDED
+    http_status: 409
+    applies_to: "POST /fleet/route-assignments/{id}/assign"
+    note: "SAFETY: outranks readiness/SOC and fiscal checks. Pairs with priority 5 state (ERR_ROUTE_NOT_PLANNED) => state wins."
+  - priority: 7
+    category: business_referential
+    check: "session schedule: Charger.connector_type == Vehicle.connector_type (else ERR_CONNECTOR_INCOMPATIBLE); power_kw <= Charger.max_power_kw (else ERR_POWER_EXCEEDS_CHARGER)"
+    error_id: "ERR_CONNECTOR_INCOMPATIBLE / ERR_POWER_EXCEEDS_CHARGER"
+    http_status: 422
+    applies_to: "POST /fleet/charge-sessions"
+  - priority: 8
+    category: state
+    check: "route assign readiness gate: Vehicle.readiness_status == READY (cross-entity)"
+    error_id: ERR_VEHICLE_NOT_READY
+    http_status: 409
+    applies_to: "POST /fleet/route-assignments/{id}/assign"
+  - priority: 9
+    category: business_temporal
+    check: "session schedule: charger_slot_geometry (buffered half-open) then vehicle_slot_geometry (closed) — charger conflict checked before vehicle conflict"
+    error_id: "ERR_CHARGER_TIME_CONFLICT / ERR_VEHICLE_TIME_CONFLICT"
+    http_status: 409
+    applies_to: "POST /fleet/charge-sessions"
+    note: "TEMPORAL outranks fiscal (priority 11). Pairs with priority 11 fiscal => temporal wins."
+  - priority: 10
+    category: business_constraint
+    check: "route assign SOC gate: Vehicle.current_soc_pct >= route.required_soc_pct (boundary >=)"
+    error_id: ERR_SOC_BELOW_ROUTE_REQUIREMENT
+    http_status: 409
+    applies_to: "POST /fleet/route-assignments/{id}/assign"
+  - priority: 11
+    category: business_fiscal
+    check: "session schedule: Depot.reserved_load_kw + power_kw <= Depot.max_load_kw (boundary <=); claim submit: Depot.reimbursement_committed_cents + estimated_amount_cents <= Depot.reimbursement_budget_cents"
+    error_id: "ERR_DEPOT_CAPACITY_EXCEEDED / ERR_REIMBURSEMENT_BUDGET_EXCEEDED"
+    http_status: 409
+    applies_to: "POST /fleet/charge-sessions, POST /fleet/reimbursement-claims"
+  - priority: 12
+    category: state
+    check: "SoD: claim pay actor X-User-ID != claim.approved_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /fleet/reimbursement-claims/{id}/pay"
+  - priority: 13
+    category: business_constraint
+    check: "OCC: expected_depot_version == Depot.version (checked last, after all domain validations pass, before commit)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /fleet/charge-sessions, POST /fleet/reimbursement-claims"
+  - priority: 14
+    category: business_constraint
+    check: "uniqueness: at most one Invoice per (depot_id, period_month)"
+    error_id: ERR_DUPLICATE_INVOICE
+    http_status: 409
+    applies_to: "POST /fleet/invoices"
+
+# =====================================================================
+# §1.5 API ENDPOINT TABLE
+# =====================================================================
+endpoints:
+  # ---- logical clock (test-driving) ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server logical clock. Startup default is 2026-05-01T00:00:00Z; before any set call the clock reads exactly that default and never falls back to wall-clock time."
+    roles: [FleetManager]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock advanced/rewound to to_iso8601"]
+
+  # ---- Depot ----
+  - method: POST
+    path: "/fleet/depots"
+    description: "Create a depot with its load limit, demand-charge parameters, reimbursement budget, and TOU tariff windows."
+    roles: [FleetManager]
+    code: 201
+    input: [name, max_load_kw, contracted_capacity_kw, demand_rate_cents_per_kw, overage_rate_cents_per_kw, reimbursement_budget_cents, tariff_windows]
+    output: Depot
+    side_effects: ["reserved_load_kw=0; reimbursement_committed_cents=0; version=1"]
+  - method: GET
+    path: "/fleet/depots/{id}"
+    description: "Fetch a depot (includes live reserved_load_kw and reimbursement_committed_cents ledgers)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: Depot
+    side_effects: []
+  - method: GET
+    path: "/fleet/depots"
+    description: "List depots (paginated)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Depot[]
+    side_effects: []
+
+  # ---- Charger ----
+  - method: POST
+    path: "/fleet/chargers"
+    description: "Register a charger under a depot."
+    roles: [FleetManager]
+    code: 201
+    input: [depot_id, name, connector_type, max_power_kw]
+    output: Charger
+    side_effects: ["service_status=OPERATIONAL"]
+  - method: GET
+    path: "/fleet/chargers/{id}"
+    description: "Fetch a charger."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: Charger
+    side_effects: []
+  - method: GET
+    path: "/fleet/chargers"
+    description: "List chargers; filter by depot_id (reverse-reachability for Charger.depot_id)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "limit?", "offset?"]
+    output: Charger[]
+    side_effects: []
+
+  # ---- Vehicle ----
+  - method: POST
+    path: "/fleet/vehicles"
+    description: "Register a vehicle at its home depot."
+    roles: [FleetManager]
+    code: 201
+    input: [depot_id, vin, connector_type, battery_capacity_kwh, efficiency_kwh_per_km, current_soc_pct]
+    output: Vehicle
+    side_effects: ["status=IN_SERVICE; odometer_km=0; readiness_status computed via vehicle_readiness"]
+  - method: GET
+    path: "/fleet/vehicles/{id}"
+    description: "Fetch a vehicle (includes current_soc_pct, status, readiness_status)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/fleet/vehicles"
+    description: "List vehicles; filter by depot_id (reverse-reachability for Vehicle.depot_id)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/vehicles/{id}/telemetry"
+    description: "Ingest a telematics reading; overwrites SOC/odometer and recomputes readiness (may cascade to route revert)."
+    roles: [DepotOperator]
+    code: 201
+    input: ["soc_pct", "odometer_km", "reading_time?"]
+    output: TelemetryReading
+    side_effects:
+      - "set Vehicle.current_soc_pct = soc_pct; Vehicle.odometer_km = odometer_km"
+      - "recompute Vehicle.readiness_status (vehicle_readiness)"
+      - "if readiness flips to NOT_READY and vehicle has an ASSIGNED RouteAssignment => revert that route ASSIGNED->PLANNED (cascade)"
+  - method: GET
+    path: "/fleet/vehicles/{id}/telemetry"
+    description: "List a vehicle's telemetry readings (reverse-reachability for TelemetryReading.vehicle_id)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TelemetryReading[]
+    side_effects: []
+
+  # ---- Driver ----
+  - method: POST
+    path: "/fleet/drivers"
+    description: "Create a driver funded by a depot's reimbursement budget."
+    roles: [FleetManager]
+    code: 201
+    input: [depot_id, name, email, home_tariff_cents_per_kwh]
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/fleet/drivers/{id}"
+    description: "Fetch a driver."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+  - method: GET
+    path: "/fleet/drivers"
+    description: "List drivers; filter by depot_id (reverse-reachability for Driver.depot_id)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "limit?", "offset?"]
+    output: Driver[]
+    side_effects: []
+
+  # ---- ChargeSession ----
+  - method: POST
+    path: "/fleet/charge-sessions"
+    description: "Schedule a charging session; reserves depot load, runs connector/power/temporal/capacity checks and OCC on Depot.version; computes estimated_cost_cents."
+    roles: [DepotOperator]
+    code: 201
+    input: [depot_id, charger_id, vehicle_id, scheduled_start, scheduled_end, target_soc_pct, power_kw, expected_depot_version]
+    output: ChargeSession
+    side_effects:
+      - "status=SCHEDULED; compute estimated_cost_cents (session_energy_cost.estimated_variant)"
+      - "debit Depot.reserved_load_kw += power_kw (depot_reserved_load)"
+      - "increments Depot.version by 1"
+  - method: GET
+    path: "/fleet/charge-sessions/{id}"
+    description: "Fetch a charge session."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: ChargeSession
+    side_effects: []
+  - method: GET
+    path: "/fleet/charge-sessions"
+    description: "List charge sessions; filter by depot_id/charger_id/vehicle_id/status (reverse-reachability for those FKs)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "charger_id?", "vehicle_id?", "status?", "limit?", "offset?"]
+    output: ChargeSession[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/charge-sessions/{id}/start"
+    description: "Begin charging (SCHEDULED->ACTIVE); requires charger OPERATIONAL; captures start_soc_pct and actual_start."
+    roles: [DepotOperator]
+    code: 200
+    input: ["actual_start?"]
+    output: ChargeSession
+    side_effects: ["set start_soc_pct from Vehicle.current_soc_pct; set actual_start"]
+  - method: POST
+    path: "/fleet/charge-sessions/{id}/complete"
+    description: "Finish charging (ACTIVE->COMPLETED); computes final_cost_cents, updates vehicle SOC/readiness, releases reserved load."
+    roles: [DepotOperator]
+    code: 200
+    input: ["end_soc_pct", "actual_end?"]
+    output: ChargeSession
+    side_effects:
+      - "compute energy_kwh_delivered, final_cost_cents (session_energy_cost.final_variant)"
+      - "set Vehicle.current_soc_pct=end_soc_pct; recompute readiness"
+      - "credit Depot.reserved_load_kw -= power_kw"
+  - method: POST
+    path: "/fleet/charge-sessions/{id}/cancel"
+    description: "Cancel a scheduled session (SCHEDULED->CANCELLED); releases reserved load."
+    roles: [DepotOperator]
+    code: 200
+    input: []
+    output: ChargeSession
+    side_effects: ["credit Depot.reserved_load_kw -= power_kw"]
+
+  # ---- MaintenanceWorkOrder ----
+  - method: POST
+    path: "/fleet/work-orders"
+    description: "Open a maintenance work order on a charger or a vehicle; downs/grounds the asset and cascades."
+    roles: [DepotOperator, MaintenanceTech]
+    code: 201
+    input: ["asset_type", "charger_id?", "vehicle_id?", "issue", "severity"]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status=OPEN; opened_at=clock now"
+      - "asset_type=CHARGER: Charger.service_status=DOWN; each ACTIVE session on it => INTERRUPTED (releases depot load) (cascade)"
+      - "asset_type=VEHICLE: Vehicle.status=GROUNDED; readiness=NOT_READY; ASSIGNED route on it => reverted PLANNED (cascade)"
+  - method: GET
+    path: "/fleet/work-orders/{id}"
+    description: "Fetch a work order (includes downtime_minutes once RESOLVED)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: MaintenanceWorkOrder
+    side_effects: []
+  - method: GET
+    path: "/fleet/work-orders"
+    description: "List work orders; filter by charger_id/vehicle_id/status (reverse-reachability for those FKs)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["charger_id?", "vehicle_id?", "status?", "limit?", "offset?"]
+    output: MaintenanceWorkOrder[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/work-orders/{id}/transition"
+    description: "Advance a work order (OPEN->IN_PROGRESS->{ON_HOLD<->IN_PROGRESS}->RESOLVED->CLOSED); RESOLVED restores the asset."
+    roles: [MaintenanceTech]
+    code: 200
+    input: [target_status]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "on RESOLVED: set resolved_at, downtime_minutes; restore Charger.service_status=OPERATIONAL or Vehicle.status=IN_SERVICE (recompute readiness) if no other non-terminal work order on the asset"
+
+  # ---- RouteAssignment ----
+  - method: POST
+    path: "/fleet/route-assignments"
+    description: "Create a planned route nominating a vehicle and driver."
+    roles: [FleetManager, DepotOperator]
+    code: 201
+    input: [depot_id, vehicle_id, driver_id, route_name, distance_km, required_soc_pct, scheduled_departure]
+    output: RouteAssignment
+    side_effects: ["status=PLANNED"]
+  - method: GET
+    path: "/fleet/route-assignments/{id}"
+    description: "Fetch a route assignment."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+  - method: GET
+    path: "/fleet/route-assignments"
+    description: "List route assignments; filter by depot_id/vehicle_id/driver_id/status (reverse-reachability for those FKs)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "vehicle_id?", "driver_id?", "status?", "limit?", "offset?"]
+    output: RouteAssignment[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/route-assignments/{id}/assign"
+    description: "Assign the route (PLANNED->ASSIGNED) after safety, readiness, and SOC gates on the nominated vehicle."
+    roles: [DepotOperator]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+  - method: POST
+    path: "/fleet/route-assignments/{id}/unassign"
+    description: "Revert an assigned route (ASSIGNED->PLANNED)."
+    roles: [DepotOperator]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+  - method: POST
+    path: "/fleet/route-assignments/{id}/complete"
+    description: "Complete an assigned route (ASSIGNED->COMPLETED)."
+    roles: [DepotOperator]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+
+  # ---- ReimbursementClaim ----
+  - method: POST
+    path: "/fleet/reimbursement-claims"
+    description: "Driver submits a home-charging reimbursement claim; commits estimated amount against depot budget with OCC on Depot.version."
+    roles: [Driver]
+    code: 201
+    input: [driver_id, depot_id, period_month, kwh_claimed, odometer_start, odometer_end, expected_depot_version]
+    output: ReimbursementClaim
+    side_effects:
+      - "status=SUBMITTED; estimated_amount_cents (claim_reimbursement.estimated_variant); committed_amount_cents=estimated_amount_cents"
+      - "debit Depot.reimbursement_committed_cents += estimated_amount_cents"
+      - "increments Depot.version by 1"
+  - method: GET
+    path: "/fleet/reimbursement-claims/{id}"
+    description: "Fetch a reimbursement claim."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: []
+  - method: GET
+    path: "/fleet/reimbursement-claims"
+    description: "List reimbursement claims; filter by driver_id/depot_id/status (reverse-reachability for those FKs)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["driver_id?", "depot_id?", "status?", "limit?", "offset?"]
+    output: ReimbursementClaim[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/reimbursement-claims/{id}/review"
+    description: "FinanceManager approves (with verified kWh) or rejects a SUBMITTED claim."
+    roles: [FinanceManager]
+    code: 200
+    input: ["decision", "metered_kwh_verified?"]
+    output: ReimbursementClaim
+    side_effects:
+      - "APPROVE: final_amount_cents (claim_reimbursement.final_variant); adjust Depot.reimbursement_committed_cents by (final-estimated); set approved_by_user_id"
+      - "REJECT: release committed (Depot.reimbursement_committed_cents -= committed_amount_cents)"
+  - method: POST
+    path: "/fleet/reimbursement-claims/{id}/pay"
+    description: "FinanceManager pays an APPROVED claim; payer must differ from approver (SoD)."
+    roles: [FinanceManager]
+    code: 200
+    input: []
+    output: ReimbursementClaim
+    side_effects: ["status=PAID; Depot.reimbursement_committed_cents -= committed_amount_cents"]
+
+  # ---- Invoice ----
+  - method: POST
+    path: "/fleet/invoices"
+    description: "Generate a depot's monthly invoice: energy subtotal (round-then-sum), tiered demand charge, total."
+    roles: [FleetManager]
+    code: 201
+    input: [depot_id, period_month]
+    output: Invoice
+    side_effects: ["compute energy_subtotal_cents, peak_demand_kw, demand_charge_cents, total_cents; status=DRAFT"]
+  - method: GET
+    path: "/fleet/invoices/{id}"
+    description: "Fetch an invoice."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: GET
+    path: "/fleet/invoices"
+    description: "List invoices; filter by depot_id/status (reverse-reachability for Invoice.depot_id)."
+    roles: [FleetManager, DepotOperator, MaintenanceTech, Driver, FinanceManager]
+    code: 200
+    input: ["depot_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/fleet/invoices/{id}/issue"
+    description: "Issue a draft invoice (DRAFT->ISSUED)."
+    roles: [FinanceManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: POST
+    path: "/fleet/invoices/{id}/pay"
+    description: "Mark an issued invoice paid (ISSUED->PAID)."
+    roles: [FinanceManager]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+# =====================================================================
+# §1.6 ERROR CODE CATALOG
+# =====================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "missing/unknown X-User-Role or missing X-User-ID header"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "role not permitted for the operation, or Driver acting on a claim whose driver_id != X-User-ID"
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "missing required field, illegal enum, or out-of-range numeric (soc, power_kw, etc.)"
+  - id: ERR_ASSET_TARGET_INVALID
+    http: 422
+    condition: "work-order asset_type does not match the provided id field (CHARGER requires charger_id, VEHICLE requires vehicle_id, and not both)"
+  - id: ERR_DEPOT_NOT_FOUND
+    http: 404
+    condition: "referenced depot id does not exist"
+  - id: ERR_CHARGER_NOT_FOUND
+    http: 404
+    condition: "referenced charger id does not exist"
+  - id: ERR_VEHICLE_NOT_FOUND
+    http: 404
+    condition: "referenced vehicle id does not exist"
+  - id: ERR_DRIVER_NOT_FOUND
+    http: 404
+    condition: "referenced driver id does not exist"
+  - id: ERR_SESSION_NOT_FOUND
+    http: 404
+    condition: "referenced charge session id does not exist"
+  - id: ERR_WORK_ORDER_NOT_FOUND
+    http: 404
+    condition: "referenced work order id does not exist"
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "referenced route assignment id does not exist"
+  - id: ERR_CLAIM_NOT_FOUND
+    http: 404
+    condition: "referenced reimbursement claim id does not exist"
+  - id: ERR_INVOICE_NOT_FOUND
+    http: 404
+    condition: "referenced invoice id does not exist"
+  - id: ERR_SESSION_NOT_SCHEDULED
+    http: 409
+    condition: "start/cancel on a session not in SCHEDULED"
+  - id: ERR_SESSION_NOT_ACTIVE
+    http: 409
+    condition: "complete on a session not in ACTIVE"
+  - id: ERR_CHARGER_DOWN
+    http: 409
+    condition: "start requires the charger to be OPERATIONAL"
+  - id: ERR_CONNECTOR_INCOMPATIBLE
+    http: 422
+    condition: "session charger.connector_type != vehicle.connector_type"
+  - id: ERR_POWER_EXCEEDS_CHARGER
+    http: 422
+    condition: "session power_kw > charger.max_power_kw"
+  - id: ERR_CHARGER_TIME_CONFLICT
+    http: 409
+    condition: "session buffered half-open window overlaps another SCHEDULED/ACTIVE session on the same charger"
+  - id: ERR_VEHICLE_TIME_CONFLICT
+    http: 409
+    condition: "session closed window overlaps another SCHEDULED/ACTIVE session on the same vehicle"
+  - id: ERR_DEPOT_CAPACITY_EXCEEDED
+    http: 409
+    condition: "reserved_load_kw + power_kw > depot.max_load_kw"
+  - id: ERR_REIMBURSEMENT_BUDGET_EXCEEDED
+    http: 409
+    condition: "reimbursement_committed_cents + estimated_amount_cents > depot.reimbursement_budget_cents"
+  - id: ERR_ROUTE_NOT_PLANNED
+    http: 409
+    condition: "assign on a route not in PLANNED"
+  - id: ERR_ROUTE_NOT_ASSIGNED
+    http: 409
+    condition: "unassign/complete on a route not in ASSIGNED"
+  - id: ERR_VEHICLE_GROUNDED
+    http: 409
+    condition: "assign requires the vehicle not be GROUNDED"
+  - id: ERR_VEHICLE_NOT_READY
+    http: 409
+    condition: "assign requires vehicle.readiness_status == READY"
+  - id: ERR_SOC_BELOW_ROUTE_REQUIREMENT
+    http: 409
+    condition: "assign requires vehicle.current_soc_pct >= route.required_soc_pct"
+  - id: ERR_CLAIM_NOT_SUBMITTED
+    http: 409
+    condition: "review on a claim not in SUBMITTED"
+  - id: ERR_CLAIM_NOT_APPROVED
+    http: 409
+    condition: "pay on a claim not in APPROVED"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "claim pay actor X-User-ID equals approved_by_user_id"
+  - id: ERR_WORK_ORDER_INVALID_TRANSITION
+    http: 409
+    condition: "work-order target_status is not a legal next state from the current status"
+  - id: ERR_INVOICE_NOT_DRAFT
+    http: 409
+    condition: "issue on an invoice not in DRAFT"
+  - id: ERR_INVOICE_NOT_ISSUED
+    http: 409
+    condition: "pay on an invoice not in ISSUED"
+  - id: ERR_DUPLICATE_INVOICE
+    http: 409
+    condition: "an invoice already exists for (depot_id, period_month)"
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_depot_version != depot.version on session-create or claim-submit"
+
+# =====================================================================
+# §1.7 RBAC MATRIX
+# =====================================================================
+roles:
+  - name: FleetManager
+    description: "Fleet administrator: provisions depots, chargers, vehicles, drivers, routes; generates invoices; owns the logical clock."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fleet/depots"
+      - "POST /fleet/chargers"
+      - "POST /fleet/vehicles"
+      - "POST /fleet/drivers"
+      - "POST /fleet/invoices"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /fleet/route-assignments (with DepotOperator)"
+      - "all GET reads"
+  - name: DepotOperator
+    description: "Runs the depot floor: schedules/starts/completes/cancels charging sessions, ingests telemetry, opens work orders, assigns routes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fleet/charge-sessions"
+      - "POST /fleet/charge-sessions/{id}/start"
+      - "POST /fleet/charge-sessions/{id}/complete"
+      - "POST /fleet/charge-sessions/{id}/cancel"
+      - "POST /fleet/vehicles/{id}/telemetry"
+      - "POST /fleet/route-assignments/{id}/assign"
+      - "POST /fleet/route-assignments/{id}/unassign"
+      - "POST /fleet/route-assignments/{id}/complete"
+    shared_operations:
+      - "POST /fleet/work-orders (with MaintenanceTech)"
+      - "POST /fleet/route-assignments (with FleetManager)"
+      - "all GET reads"
+  - name: MaintenanceTech
+    description: "Services assets: creates and advances maintenance work orders."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fleet/work-orders/{id}/transition"
+    shared_operations:
+      - "POST /fleet/work-orders (with DepotOperator)"
+      - "all GET reads"
+  - name: Driver
+    description: "Fleet driver: submits and views own home-charging reimbursement claims and routes."
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /fleet/reimbursement-claims"
+    shared_operations:
+      - "all GET reads"
+  - name: FinanceManager
+    description: "Finance: reviews/pays reimbursement claims (SoD: payer != approver) and issues/pays invoices."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fleet/reimbursement-claims/{id}/review"
+      - "POST /fleet/reimbursement-claims/{id}/pay"
+      - "POST /fleet/invoices/{id}/issue"
+      - "POST /fleet/invoices/{id}/pay"
+    shared_operations:
+      - "all GET reads"

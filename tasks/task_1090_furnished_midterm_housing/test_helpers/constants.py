@@ -1,0 +1,35 @@
+"""Domain thresholds — numeric constants from the PRD calculations (§3.4, §3.5)."""
+
+# Booking rent (§3.3, §3.6)
+DAYS_PER_MONTH_CONVENTION = 30
+
+# Platform fee tiers and clamps (§3.4)
+FEE_RATE_TIER1 = 0.12   # term 30..59 days
+FEE_RATE_TIER2 = 0.10   # term 60..89 days
+FEE_RATE_TIER3 = 0.08   # term >= 90 days
+UTILITIES_SURCHARGE_RATE = 0.02
+MIN_FEE_CENTS = 5000
+MAX_FEE_CENTS = 200000
+
+# Occupancy tax (§3.4)
+TAX_EXEMPT_MIN_DAYS = 30
+OCCUPANCY_TAX_RATE = 0.14
+
+# COI minimum coverage (§3.5)
+COI_MIN_COVERAGE_CENTS = 5000000
+
+# Unit input defaults (§3.2)
+DEFAULT_MIN_TERM_DAYS = 30
+DEFAULT_MAX_TERM_DAYS = 90
+DEFAULT_TURNOVER_BUFFER_DAYS = 2
+
+# Logical clock startup value (§2.11)
+CLOCK_STARTUP = "2026-05-01T00:00:00Z"
+
+THRESHOLDS = {
+    "DAYS_PER_MONTH_CONVENTION": DAYS_PER_MONTH_CONVENTION,
+    "MIN_FEE_CENTS": MIN_FEE_CENTS,
+    "MAX_FEE_CENTS": MAX_FEE_CENTS,
+    "TAX_EXEMPT_MIN_DAYS": TAX_EXEMPT_MIN_DAYS,
+    "COI_MIN_COVERAGE_CENTS": COI_MIN_COVERAGE_CENTS,
+}

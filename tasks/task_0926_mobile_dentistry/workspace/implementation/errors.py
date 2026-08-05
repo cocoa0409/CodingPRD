@@ -1,0 +1,88 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_HTTP_STATUS[error_id]
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_ENUM": 400,
+    "ERR_CONSENT_REGIME_FIELDS": 400,
+    "ERR_PERIOD_FROZEN": 409,
+    "ERR_SITE_ON_HOLD": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_PROCEDURE_TAINTED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SEGREGATION_OF_DUTIES": 422,
+    "ERR_UNIT_QUARANTINED": 409,
+    "ERR_UNIT_CALIBRATION_EXPIRED": 409,
+    "ERR_SPORE_RESULT_PENDING": 409,
+    "ERR_CREDENTIAL_LAPSED": 409,
+    "ERR_LICENSE_STATE_MISMATCH": 422,
+    "ERR_SUPERVISION_NOT_PERMITTED": 422,
+    "ERR_TELEDENTISTRY_REVIEW_WINDOW": 422,
+    "ERR_CONSENT_MISSING": 422,
+    "ERR_CONSENT_REVOKED": 409,
+    "ERR_CONSENT_EXPIRED": 409,
+    "ERR_CAPACITY_DETERMINATION_REQUIRED": 422,
+    "ERR_CONSENT_TIER_INSUFFICIENT": 422,
+    "ERR_SURFACE_INELIGIBLE": 422,
+    "ERR_VARNISH_INTERVAL": 422,
+    "ERR_VARNISH_CAP_EXCEEDED": 422,
+    "ERR_UNIT_DOUBLE_BOOKED": 409,
+    "ERR_STAFF_DOUBLE_BOOKED": 409,
+    "ERR_CHAIR_CAPACITY_EXCEEDED": 422,
+    "ERR_REFERRAL_NOT_DUE": 422,
+    "ERR_REFERRAL_CAP_REACHED": 409,
+    "ERR_COVERAGE_UNVERIFIED": 422,
+    "ERR_SLIDING_FEE_MISSING": 422,
+    "ERR_MEDICAID_BALANCE_BILL": 422,
+    "ERR_REPORT_STALE": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or name an unknown role.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this endpoint.",
+    "ERR_NOT_FOUND": "The requested resource does not exist.",
+    "ERR_VALIDATION": "The request payload failed validation.",
+    "ERR_INVALID_ENUM": "An enumerated field carries a value outside its declared set.",
+    "ERR_CONSENT_REGIME_FIELDS": "The consent payload does not satisfy its regime's field requirements.",
+    "ERR_PERIOD_FROZEN": "The programme period covering this entity is frozen.",
+    "ERR_SITE_ON_HOLD": "The site is suspended or the window intersects an active hold.",
+    "ERR_INVALID_STATE": "The requested transition is not declared from the current state.",
+    "ERR_PROCEDURE_TAINTED": "The encounter carries a tainted procedure.",
+    "ERR_STALE_VERSION": "The supplied expected version does not match the parent's current version.",
+    "ERR_SEGREGATION_OF_DUTIES": "The indicator reader may not be the staff member who ran the load.",
+    "ERR_UNIT_QUARANTINED": "The assigned portable unit is quarantined.",
+    "ERR_UNIT_CALIBRATION_EXPIRED": "The assigned portable unit's calibration has expired.",
+    "ERR_SPORE_RESULT_PENDING": "A biological indicator is still inside its incubation window.",
+    "ERR_CREDENTIAL_LAPSED": "A staff member this request relies on does not hold an active credential.",
+    "ERR_LICENSE_STATE_MISMATCH": "A staff member's licence state does not match the site's state code.",
+    "ERR_SUPERVISION_NOT_PERMITTED": "The supervision matrix does not permit this combination.",
+    "ERR_TELEDENTISTRY_REVIEW_WINDOW": "The teledentistry review instant is absent or outside the review window.",
+    "ERR_CONSENT_MISSING": "The cited consent does not belong to this patient and site.",
+    "ERR_CONSENT_REVOKED": "The cited consent is revoked or superseded.",
+    "ERR_CONSENT_EXPIRED": "The cited consent has expired.",
+    "ERR_CAPACITY_DETERMINATION_REQUIRED": "The patient's capacity determination has not been made.",
+    "ERR_CONSENT_TIER_INSUFFICIENT": "The consent's scope tier does not authorise this procedure.",
+    "ERR_SURFACE_INELIGIBLE": "The sealant tooth or surface is ineligible.",
+    "ERR_VARNISH_INTERVAL": "The minimum varnish interval has not elapsed.",
+    "ERR_VARNISH_CAP_EXCEEDED": "The per-period varnish cap has been reached.",
+    "ERR_UNIT_DOUBLE_BOOKED": "The portable unit is already committed to another visit.",
+    "ERR_STAFF_DOUBLE_BOOKED": "An assigned staff member is already committed to another visit.",
+    "ERR_CHAIR_CAPACITY_EXCEEDED": "The visit does not have enough remaining chair minutes.",
+    "ERR_REFERRAL_NOT_DUE": "The referral re-send waiting period has not elapsed.",
+    "ERR_REFERRAL_CAP_REACHED": "The referral attempt cap has been reached.",
+    "ERR_COVERAGE_UNVERIFIED": "The encounter's coverage is not verified.",
+    "ERR_SLIDING_FEE_MISSING": "The patient's annual household income is required for a sliding-fee determination.",
+    "ERR_MEDICAID_BALANCE_BILL": "A manual patient responsibility override is prohibited for Medicaid coverage.",
+    "ERR_REPORT_STALE": "A stale programme report must be regenerated before submission.",
+}
