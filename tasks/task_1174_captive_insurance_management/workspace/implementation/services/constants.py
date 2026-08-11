@@ -1,0 +1,174 @@
+"""Domain constants: regulatory schedules, thresholds, haircut tables."""
+from __future__ import annotations
+
+DOMICILES = ["VERMONT", "BERMUDA", "CAYMAN", "GUERNSEY", "LUXEMBOURG"]
+
+# Regulator-published minimum capital (cents) per domicile.
+CAPITAL_MINIMUM_REQUIRED = {
+    "VERMONT": 25000000,
+    "BERMUDA": 12000000,
+    "CAYMAN": 10000000,
+    "GUERNSEY": 10000000,
+    "LUXEMBOURG": 3700000,
+}
+
+# Regulator review period (days) per domicile; review_deadline = filed_at + days.
+JURISDICTION_REVIEW_DAYS = {
+    "VERMONT": 30,
+    "BERMUDA": 45,
+    "CAYMAN": 60,
+    "GUERNSEY": 60,
+    "LUXEMBOURG": 90,
+}
+
+FILING_TYPES = ["INITIAL_FORMATION", "ANNUAL_RENEWAL", "AMENDMENT", "REDOMESTICATION"]
+
+# Filing fee schedule (cents) keyed by jurisdiction then filing type.
+_FILING_BASE = {
+    "VERMONT": 600000,
+    "BERMUDA": 750000,
+    "CAYMAN": 850000,
+    "GUERNSEY": 700000,
+    "LUXEMBOURG": 900000,
+}
+_FILING_FACTOR = {
+    "INITIAL_FORMATION": 1.0,
+    "ANNUAL_RENEWAL": 0.5,
+    "AMENDMENT": 0.25,
+    "REDOMESTICATION": 0.75,
+}
+
+TAX_CLASSIFICATIONS = ["MICRO_CAPTIVE_831B", "STANDARD_831A", "NON_ELECTING"]
+
+LINES_OF_BUSINESS = [
+    "GENERAL_LIABILITY",
+    "WORKERS_COMP",
+    "PROPERTY",
+    "PROFESSIONAL_LIABILITY",
+    "CYBER",
+    "D_AND_O",
+]
+
+COLLATERAL_TYPES = [
+    "LETTER_OF_CREDIT",
+    "TRUST_ACCOUNT",
+    "SURETY_BOND",
+    "CASH_ESCROW",
+    "INVESTMENT_SECURITIES",
+]
+
+# Standard haircut schedule per collateral type.
+HAIRCUTS = {
+    "LETTER_OF_CREDIT": 0.05,
+    "TRUST_ACCOUNT": 0.02,
+    "SURETY_BOND": 0.10,
+    "CASH_ESCROW": 0.00,
+    "INVESTMENT_SECURITIES": 0.15,
+}
+# MICRO_CAPTIVE_831B captives use haircuts at 1.5x the standard rate.
+CONSERVATIVE_HAIRCUT_MULTIPLIER = 1.5
+
+EXPOSURE_BASES = ["REVENUE", "HEADCOUNT", "PAYROLL", "ASSET_VALUE", "SQUARE_FOOTAGE"]
+
+ALLOCATION_METHODS = ["EXPOSURE_PRO_RATA", "EQUAL_SHARE", "MANUAL", "RISK_WEIGHTED"]
+
+RESERVE_TYPES = ["CASE_RESERVE", "IBNR_RESERVE", "LAE_RESERVE", "UNALLOCATED_EXPENSE"]
+
+ACTUARIAL_METHODS = [
+    "CHAIN_LADDER",
+    "BORNHUETTER_FERGUSON",
+    "EXPECTED_LOSS_RATIO",
+    "BERQUIST_SHERMAN",
+]
+
+FEE_STRUCTURES = ["FLAT_FEE", "PER_CLAIM", "PERCENTAGE_OF_SAVINGS"]
+
+MEETING_TYPES = ["ANNUAL", "QUARTERLY", "SPECIAL", "EMERGENCY"]
+
+POSITION_TYPES = [
+    "PREMIUM_DEDUCTIBILITY",
+    "RISK_DISTRIBUTION",
+    "MICRO_CAPTIVE_ELECTION",
+    "ARM_LENGTH_PRICING",
+    "EXCISE_TAX_EXEMPTION",
+]
+
+REPORTING_POSITIONS = [
+    "MORE_LIKELY_THAN_NOT",
+    "SUBSTANTIAL_AUTHORITY",
+    "REASONABLE_BASIS",
+    "NO_POSITION",
+]
+
+AUDIT_ACTION_TYPES = [
+    "STATE_CHANGE",
+    "CALCULATION_RUN",
+    "FILING_SUBMITTED",
+    "CERTIFICATION",
+    "GOVERNANCE_ACTION",
+    "TAX_POSITION_CHANGE",
+]
+
+# Solvency thresholds (PRD 2.8).
+SOLVENCY_WARNING_THRESHOLD = 150
+SOLVENCY_BREACH_THRESHOLD = 100
+
+# Premium allocation (PRD 3.5).
+MAX_ALLOCATION_PCT = 0.50
+RISK_WEIGHT_MIN = 0.1
+RISK_WEIGHT_MAX = 5.0
+
+# Actuarial reserves (PRD 3.7).
+DEFAULT_MARGIN_PCT = 0.20
+MIN_RESERVE_FLOOR = 10000
+CONFIDENCE_LEVEL_MIN = 50
+CONFIDENCE_LEVEL_MAX = 95
+CONFIDENCE_LEVEL_DEFAULT = 75
+# Chain-ladder age-to-age development factors per line of business.
+DEVELOPMENT_FACTORS = {
+    "GENERAL_LIABILITY": 1.60,
+    "WORKERS_COMP": 1.40,
+    "PROPERTY": 1.20,
+    "PROFESSIONAL_LIABILITY": 1.70,
+    "CYBER": 1.30,
+    "D_AND_O": 1.50,
+}
+DEFAULT_EXPECTED_LOSS_RATIO = 0.65
+
+# Risk distribution analysis (PRD 3.10).
+MIN_INSURED_ENTITIES = 12
+MIN_THIRD_PARTY_PCT = 30
+MAX_CONCENTRATION_PCT = 50
+MICRO_CAPTIVE_PREMIUM_LIMIT = 265000000
+
+# Annual statement / RBC (PRD 3.8).
+RBC_ACL_BASE = 50000000
+ANNUAL_STATEMENT_FILING_DAYS = 150
+
+# Board meetings (PRD 3.9).
+QUORUM_REQUIRED = 3
+
+# Fronting (PRD 3.4).
+FRONTING_FEE_MIN = 0.01
+FRONTING_FEE_MAX = 0.15
+# Collateral required by the fronting carrier: ceded share of the program's
+# aggregate limit.
+COLLATERAL_REQUIRED_BASIS = "AGGREGATE_LIMIT_CEDED"
+
+# TPA oversight (PRD 3.6).
+TPA_SUSPENSION_PERFORMANCE_SCORE = 60
+TPA_SUSPENSION_SLA_PCT = 80
+
+# Governance (PRD 2.9).
+GOVERNANCE_SCORE_INITIAL = 100
+GOVERNANCE_SCORE_CAP = 100
+GOVERNANCE_SCORE_SUSPENSION_FLOOR = 40
+
+# Claims (PRD 3.6).
+CLAIM_TERMINAL_STATES = ["SETTLED", "DENIED", "CLOSED_WITHOUT_PAYMENT"]
+
+
+def filing_fee_cents(jurisdiction: str, filing_type: str) -> int:
+    base = _FILING_BASE.get(jurisdiction, 600000)
+    factor = _FILING_FACTOR.get(filing_type, 1.0)
+    return int(round(base * factor))

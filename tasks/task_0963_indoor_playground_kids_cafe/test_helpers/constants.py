@@ -1,0 +1,51 @@
+"""Domain thresholds — numeric constants from PRD §2 and §3 rules."""
+
+THRESHOLDS = {
+    # Visit pricing (PRD §3.4 provisional block price, §3.5 final tiered price)
+    "FIRST_BLOCK_CENTS": 1200,
+    "EXTRA_BLOCK_CENTS": 900,
+    "BLOCK_MINUTES": 60,
+    "TIER1_CENTS_PER_MIN": 20,
+    "TIER2_CENTS_PER_MIN": 15,
+    "TIER3_CENTS_PER_MIN": 10,
+    "TIER1_MINUTES": 60,
+    "TIER2_MINUTES": 120,
+    "MEMBER_VISIT_DISCOUNT_PCT": 0.10,
+    "EVACUATION_CHARGE_PCT": 0.50,
+    # Slot quota (PRD §2.9, §3.3)
+    "RESERVATION_QUOTA_PCT": 0.7,
+    # Check-in window / no-show grace (PRD §3.5)
+    "CHECKIN_WINDOW_BEFORE_MINUTES": 10,
+    "CHECKIN_WINDOW_AFTER_MINUTES": 15,
+    # Party booking (PRD §3.7)
+    "PEAK_SURCHARGE_PCT": 0.15,
+    "MAX_PARTY_DISCOUNT_PCT": 0.25,
+    "MIN_DEPOSIT_CENTS": 5000,
+    "DEPOSIT_PCT": 0.20,
+    "CLEANUP_BUFFER_MINUTES": 30,
+    "RESCHEDULE_CUTOFF_HOURS": 48,
+    "HELD_EXPIRY_HOURS": 24,
+    # Waiver (PRD §3.1)
+    "WAIVER_VALIDITY_DAYS": 365,
+    # Loyalty (PRD §3.9)
+    "CENTS_PER_POINT": 100,
+    "MULTIPLIER_BRONZE": 1,
+    "MULTIPLIER_SILVER": 2,
+    "MULTIPLIER_GOLD": 3,
+    "SILVER_THRESHOLD": 1000,
+    "GOLD_THRESHOLD": 5000,
+    "SLOT_CLOSE_COMPENSATION_POINTS": 200,
+}
+
+TEST_DEFAULTS = {
+    "CLOCK_START": "2026-06-01T08:00:00Z",
+    "SLOT_DATE": "2026-06-06",
+    "SLOT_START": "2026-06-06T14:00:00Z",
+    "SLOT_END": "2026-06-06T15:30:00Z",
+    "CHECKIN_TIME": "2026-06-06T14:05:00Z",
+    "CHECKOUT_TIME": "2026-06-06T15:00:00Z",
+    "CHILD_BIRTH_DATE": "2020-01-15",
+    "WEEKDAY_PARTY_START": "2026-06-08T10:00:00Z",   # Monday
+    "SATURDAY_PARTY_START": "2026-06-06T10:00:00Z",  # Saturday
+    "SUNDAY_PARTY_START": "2026-06-07T10:00:00Z",    # Sunday
+}

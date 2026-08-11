@@ -1,0 +1,53 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+# Build pricing (PRD §3.4)
+TIER1_MIN_CENTS = 200_000          # 5% tier at or above 200,000 cents
+TIER2_MIN_CENTS = 500_000          # 10% tier at or above 500,000 cents
+TIER1_RATE = 0.05
+TIER2_RATE = 0.10
+LOYALTY_RATE = 0.05
+LOYALTY_MIN_BUILDS = 2
+RATE_CAP = 0.15
+FITTING_FEE_REBATE_CENTS = 7_500
+
+# Repair quotes (PRD §3.5)
+SERVICE_BASE_CENTS = {"REGRIP": 1_800, "RESHAFT": 6_500, "LOFT_LIE_ADJUST": 2_500}
+RUSH_RATE = 0.35
+RUSH_MIN_FEE_CENTS = 1_500
+RUSH_HOURS = 24
+STANDARD_HOURS = 72
+DEPOSIT_RATE = 0.5
+
+# Trade-in valuation (PRD §3.6)
+BOOK_VALUE_CENTS = {
+    "DRIVER": 29_999,
+    "FAIRWAY": 21_999,
+    "HYBRID": 17_999,
+    "IRON_SET": 44_999,
+    "WEDGE": 8_999,
+    "PUTTER": 14_999,
+}
+GRADE_MULT = {"A": 0.60, "B": 0.45, "C": 0.30, "D": 0.15}
+COMP_FACTOR = 0.8
+OFFER_EXPIRY_HOURS = 168
+LISTING_MARKUP = 1.4
+
+# Warranty windows (PRD §3.7)
+SPEC_FULL_DAYS = 90
+SPEC_PARTIAL_DAYS = 365
+TICKET_FULL_DAYS = 30
+APPEAL_CAP = 2
+
+# Scheduling (PRD §3.1, §3.2)
+DEFAULT_CLEANUP_BUFFER_MINUTES = 15
+EARLY_CANCEL_REFUND_HOURS = 24
+
+# Logical clock (PRD §2.5)
+CLOCK_STARTUP_DEFAULT = "2026-05-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "SESSION_START": "2026-05-10T10:00:00Z",
+    "SESSION_END": "2026-05-10T11:00:00Z",
+    "CLOCK_SET": "2026-05-10T09:00:00Z",
+    "LABOR_CENTS": 15_000,
+}

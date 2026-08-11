@@ -1,0 +1,681 @@
+# Diaper & Baby-Essentials Subscription API — Product Requirements Document
+
+## 1. Introduction
+
+New parents do not want to think about diapers. They want a box of the right size to arrive before the last one runs out, they want the size to follow the baby up the growth curve without anybody filling in a form, and — when a rash appears and the pediatrician says "no fragrance" — they want the next box to change without a phone call. This document specifies the back-end service behind that promise: a subscription commerce platform for diapers and baby essentials that plans recurring boxes from a declared consumption rate, resolves each box to concrete catalog SKUs at the child's current size band, prices the box through a four-position credit stack, dispatches it, and rewards the household with loyalty points when it actually lands.
+
+Two commercially distinct businesses run on this one platform, and the specification deliberately keeps them on a single derivation ladder. **Pipeline R** is the recurring subscription cycle: a household activates a subscription, the server generates cycles on cadence, allocates packs, freezes the cycle at a cutoff instant, charges, dispatches and delivers. **Pipeline G** is the registry and gift business: an expectant parent publishes a baby registry, third parties buy gifts against its items, and the registry owner claims each gift either as spendable store credit or as a physically shipped item. Both pipelines price a pack the same way, screen the same allergens, stack credits in the same order, pay the same shipping formula and drive the same shipment state machine. They diverge on five points that the reader must hold in mind throughout: cutoff semantics, who may request a refund, whether proration and a restock fee apply, whether loyalty points are earned, and whether auto-resize touches the order at all.
+
+The operational context is unforgiving in two directions. Money and points form ledgers that must balance at every observable instant — a credit's face value must always equal what has been spent plus what remains plus what has been forfeited, and a loyalty wallet's balance must always equal the sum of its ledger movements, even when a clawback drives it below zero. At the same time, safety is not negotiable: a child flagged as severely sensitive to a material must never be allocated a SKU carrying that material, whichever pipeline the box came from. Where those pressures collide with a customer's convenience — a skip, a pause, a manual size override — this document pins the precedence explicitly rather than leaving it to the implementer's judgement.
+
+---
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Identity, Roles and Access Control
+
+Every request to this API carries two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, naming the role that principal is acting as. Six roles exist and their spelling is exact: `Anonymous`, `AccountHolder`, `RegistryOwner`, `GiftPurchaser`, `SupportAgent` and `OpsAdmin`. A request that omits `X-User-Role` is rejected with `ERR_UNAUTHENTICATED` (HTTP 401), as is a request that omits `X-User-ID` while naming any role other than `Anonymous` — the anonymous self-registration and verification paths are the only two places where a caller has no identity yet. A request whose `X-User-Role` is not one of the six names above is rejected with `ERR_UNKNOWN_ROLE`, also HTTP 401. Once the header pair is accepted, the acting role must appear in the role list the endpoint declares in section 4; when it does not, the request is refused with `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+Three of the six roles are backed by a persisted entity, and for them `X-User-ID` is a resource identifier rather than an opaque label. When `X-User-Role` is `AccountHolder`, `X-User-ID` is the `id` of the acting `Account`; ownership checks on any resource that references an `Account` compare the resource's owning account reference to `X-User-ID`, walking up through the child, subscription, cycle, cycle line, pause record, credit, loyalty wallet or refund as necessary, and a mismatch is `ERR_NOT_ACCOUNT_OWNER` (HTTP 403). When `X-User-Role` is `RegistryOwner`, `X-User-ID` is likewise the `id` of the acting `Account`, and it is compared against the addressed registry's `owner_account_id` — including when the addressed resource is a registry item or a gift order that hangs beneath that registry; a mismatch is `ERR_NOT_REGISTRY_OWNER` (HTTP 403). When `X-User-Role` is `GiftPurchaser`, `X-User-ID` is again the `id` of the acting `Account`, compared against the addressed gift order's `purchaser_account_id`; a mismatch is `ERR_NOT_GIFT_PURCHASER` (HTTP 403).
+
+The remaining three roles are opaque. When `X-User-Role` is `Anonymous`, `X-User-ID` is an opaque visitor identifier not tied to any persisted entity, and the server never compares it to any entity's `id`. When `X-User-Role` is `SupportAgent`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server records it — as `approved_by_user_id` on a `Refund` when that operator approves a refund — but never compares it to an entity `id`. When `X-User-Role` is `OpsAdmin`, `X-User-ID` is likewise an opaque operator identifier; it is recorded as `settled_by_user_id` when that operator settles a refund, and is otherwise not matched against any stored identifier.
+
+Two role restrictions are sharper than the generic role list and are evaluated before it, so that the refusal names the actual problem. A `GiftPurchaser` is confined to the registry-and-gift business: any attempt on a subscription, cycle, cycle-line, child or pause-record endpoint is rejected with `ERR_GIFT_PURCHASER_SCOPE` (HTTP 403) rather than the generic role error. Catalog writes — creating or updating a plan, creating or updating a SKU, and adjusting SKU stock — belong exclusively to `OpsAdmin`, and a `SupportAgent` (or anyone else) attempting one is rejected with `ERR_CATALOG_WRITE_FORBIDDEN` (HTTP 403). Both of these run ahead of the generic `ERR_FORBIDDEN_ROLE` check.
+
+Finally, the platform enforces segregation of duties on money leaving the business. A `SupportAgent` approves a refund; an `OpsAdmin` or a second `SupportAgent` settles it. The `X-User-ID` performing the settlement must differ from the `approved_by_user_id` recorded at approval, and an attempt to settle a refund one has personally approved is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination and List Ordering
+
+Every list endpoint accepts two optional query parameters. `limit` controls page size: it defaults to 10 when omitted, may not be smaller than 1 and may not be larger than 100. `offset` controls the starting position: it defaults to 0 and may not be negative. A `limit` outside the range from 1 to 100 inclusive, or an `offset` below 0, is rejected with `ERR_INVALID_PAGINATION` (HTTP 400) — list endpoints carry no request body, so pagination faults never surface as the body-oriented range error.
+
+List results are ordered by `created_at` ascending unless a specific workflow in section 3 pins a different order for an internal computation. The `meta` block of a list response carries `limit`, `offset`, `total_count` and `has_more`; `total_count` reports the number of rows matching the filters before the page window is applied, and `has_more` is true exactly when rows remain beyond the current window. Filter parameters named in section 4 combine conjunctively — supplying two filters narrows the result to rows matching both.
+
+### 2.4. Resource Identity, Timestamps and Versioning
+
+Every resource carries a server-minted `id` that is a UUID string with no type prefix — the client never supplies one and never infers a type from its shape. Every resource also carries `created_at`, an ISO 8601 UTC timestamp with three fractional digits recording the instant of creation.
+
+Most resources additionally carry `updated_at`, an ISO 8601 UTC timestamp refreshed on every mutation, and `version`, an integer that begins at 1 on creation and increments by exactly 1 on every mutation of that resource. Four record types are append-only observations rather than living resources, and they carry only `id` and `created_at` — for `AllergenFlag`, `ResizeEvent`, `SkipRecord`, `PointsLedgerEntry` and `SubstitutionEvent`, both `updated_at` and `version` are absent from the stored row and from the response payload. Every other entity — `Account`, `Child`, `Plan`, `Sku`, `Subscription`, `Cycle`, `CycleLine`, `PauseRecord`, `Registry`, `RegistryItem`, `GiftOrder`, `Credit`, `Shipment`, `LoyaltyAccount`, `Referral` and `Refund` — carries the full quartet.
+
+Two rules about `version` matter for the cascades described later. First, the increment is a property of the resource that changed, not of the request: when one call mutates a cycle, its subscription and the account's loyalty wallet, all three versions advance by 1. Second, the value a mutation response reports is the value *after* that mutation's own increment — a client that reads `version` from the body of a successful write holds a fresh value it can immediately present to an optimistic-concurrency check.
+
+### 2.5. The Logical Clock
+
+This service never reads wall-clock time for business decisions. It maintains a logical clock that begins at exactly `2026-05-01T00:00:00Z` and only ever moves when an operator sets it. Every temporal rule in this document — cutoff comparisons, expiry sweeps, rolling windows, claim windows, dispatch spacing — is evaluated against that logical clock, and the clock never falls back to real time. An operator sets it by supplying a `to_iso8601` instant, and the endpoint responds with the new `current_utc` value.
+
+Instant arithmetic preserves the time-of-day component: adding seven days to `2026-05-01T09:15:00.000Z` yields `2026-05-08T09:15:00.000Z`. Calendar-date arithmetic — pause intervals in particular — operates on the date portion alone. Where a window's lower bound is described as "the trailing N days", the bound is inclusive: a row created exactly N days before the logical clock is inside the window.
+
+### 2.6. The Nine-Gate Write Order and Error Precedence
+
+Every mutating request walks the same nine gates in the same fixed order, and the error returned is always the error of the *earliest* gate the request violates. Within a single gate, the rule with the lower priority number wins. The gates, in order, are:
+
+1. **Authentication** — `X-User-Role` and `X-User-ID` are present and well-formed (validation rungs 1 and 2).
+2. **Role authorisation** — the acting role may call this endpoint at all (rungs 3, 4 and 5, in that order: the gift-purchaser scope rule first, the catalog-write rule second, the generic role list last).
+3. **Existence** — every resource named in the path exists, then every foreign key named in the body exists (rungs 6 and 7).
+4. **Shape** — required fields present, formats parseable, enum members declared, numeric ranges respected (rungs 8, 9, 10 and 11, in that order).
+5. **Ownership** — the acting identity is authorised on this specific instance, including the pipeline-specific refund-actor rules and segregation of duties (rungs 12 through 17).
+6. **Optimistic concurrency** — the supplied expected parent version matches the parent's current `version` (rungs 18 and 19).
+7. **Lifecycle** — the resource's state machine admits this transition from its current state (rungs 20 through 34).
+8. **Temporal** — cutoffs, windows, interval overlaps and expiries measured against the logical clock (rungs 35 through 44).
+9. **Policy and fiscal capacity** — domain policy first (allergen safety, then caps and allowances, then referential coherence), fiscal capacity last (rungs 45 through 71, in ascending priority order).
+
+The consequence a reader must internalise is that a request which is wrong in two ways reports the earlier gate. A malformed date on a request whose parent resource does not exist returns the not-found error, because existence precedes shape. A skip attempted by a stranger on a paused subscription returns the ownership error, because ownership precedes policy. An expired gift claim on an already-refunded gift returns the gift-order state error, because lifecycle precedes temporal.
+
+One rung, and only one, breaks the rule that a rejected request leaves the database untouched; it is called out explicitly in section 3.6 where it lives.
+
+### 2.7. Optimistic Concurrency on Parent Versions
+
+Two write endpoints are guarded by optimistic concurrency control on a parent resource's `version`, and both require the version field as a mandatory, non-optional input.
+
+Requesting a manual stage resize on a subscription requires `expected_subscription_version`, carrying the client's last observed `version` of that `Subscription`. If the subscription's current `version` differs from the supplied value, the resize is rejected with `ERR_STALE_SUBSCRIPTION_VERSION` (HTTP 412) and no `ResizeEvent` row is written. This is deliberate product design rather than a lock: a second manual resize is perfectly legitimate — the cap is two automatic resizes per ninety days and a manual resize supersedes whatever stage the previous one set — so a writer whose view of the subscription has gone stale must be told its stage baseline is out of date rather than be allowed to overwrite a change it never saw.
+
+Creating a gift order against a registry item requires `expected_registry_item_version`, carrying the client's last observed `version` of that `RegistryItem`. If the item's current `version` differs, the create is rejected with `ERR_STALE_REGISTRY_ITEM_VERSION` (HTTP 412). Several purchasers buying different slices of a multi-quantity item is entirely normal, so the stale purchaser's view of the remaining quantity is invalidated by version rather than by quantity arithmetic.
+
+No other endpoint accepts a version field, and no other endpoint may be refused for a version mismatch.
+
+### 2.8. Money, Points and Rounding
+
+All monetary amounts in this system are integers denominated in cents; there is no floating-point currency anywhere in a stored field or a response body. Wherever a computation produces a fractional cent, it is rounded half up to a whole cent — a value ending in exactly one half rounds away from zero. Where a formula rounds more than once, the order of rounding is pinned in the calculation's own description in section 3 and is never rearranged; rounding per line and then summing is not the same as summing and then rounding, and the specification says which one applies at each site.
+
+Loyalty points are integers. Point-to-cent conversion is deliberately trivial: one point is worth exactly 1 cent. Where a points computation divides, it floors — it never rounds — and where it multiplies by a tier factor it floors again after the multiplication.
+
+One derived percentage escapes the integer rule: a registry's `completion_pct` is a fractional number rounded half up to four decimal places.
+
+### 2.9. Ledger Conservation
+
+Four conservation identities hold at every instant an observer can read the system, and any implementation that can break one has a defect regardless of which tests happen to exercise it.
+
+A credit's face value is conserved: for every `Credit` row, `issued_cents` always equals `consumed_cents` plus `remaining_cents` plus `forfeited_cents`. Charging a cycle moves cents from `remaining_cents` into `consumed_cents`; settling a refund on a restorable credit moves them back; revoking or expiring a credit moves whatever remains into `forfeited_cents`. `issued_cents` itself is never mutated after issuance.
+
+The points ledger is conserved: a `LoyaltyAccount`'s `points_balance` always equals the sum of `delta_points` across every `PointsLedgerEntry` whose `loyalty_account_id` names that wallet. Confirming a delivery writes an earning entry; settling a refund writes a clawback entry. The balance is permitted to go negative after a clawback and no floor is applied.
+
+Registry units are conserved: a `RegistryItem`'s `fulfilled_quantity` always equals the sum of `quantity` over the gift orders on that item whose `status` is `PAID`, `CLAIMED_CREDIT`, `CLAIMED_ITEM` or `FULFILLED`. Paying a gift increments it; refunding a gift decrements it. The item's `requested_quantity` is never mutated by gift activity, and `fulfilled_quantity` never exceeds `requested_quantity`.
+
+Cycle cash is conserved: a `Cycle`'s `charged_cash_cents` always equals its `retained_cash_cents` plus the sum of `refunded_cash_cents` across every settled refund on that cycle. Charging sets `charged_cash_cents` and `retained_cash_cents` to the same value; settling a refund moves cash out of `retained_cash_cents` and into the refund's `refunded_cash_cents`. A restock fee is not a separate bucket — it simply stays inside `retained_cash_cents`.
+
+### 2.10. Nested Resources and Existence Resolution
+
+Several endpoints address a resource through its parent — a registry's items, a subscription's pauses, a child's sensitivities. Path parameters are resolved strictly left to right, and the leftmost segment that fails to resolve decides the error. Addressing an item beneath a registry that does not exist returns `ERR_REGISTRY_NOT_FOUND`; addressing a non-existent item beneath a registry that does exist returns `ERR_REGISTRY_ITEM_NOT_FOUND`.
+
+The mapping from resource type to not-found error is uniform: a missing `Account` yields `ERR_ACCOUNT_NOT_FOUND`, a `Child` `ERR_CHILD_NOT_FOUND`, an `AllergenFlag` `ERR_ALLERGEN_FLAG_NOT_FOUND`, a `Plan` `ERR_PLAN_NOT_FOUND`, a `Sku` `ERR_SKU_NOT_FOUND`, a `Subscription` `ERR_SUBSCRIPTION_NOT_FOUND`, a `Cycle` `ERR_CYCLE_NOT_FOUND`, a `CycleLine` `ERR_CYCLE_LINE_NOT_FOUND`, a `ResizeEvent` `ERR_RESIZE_EVENT_NOT_FOUND`, a `SkipRecord` `ERR_SKIP_RECORD_NOT_FOUND`, a `PauseRecord` `ERR_PAUSE_RECORD_NOT_FOUND`, a `Registry` `ERR_REGISTRY_NOT_FOUND`, a `RegistryItem` `ERR_REGISTRY_ITEM_NOT_FOUND`, a `GiftOrder` `ERR_GIFT_ORDER_NOT_FOUND`, a `Credit` `ERR_CREDIT_NOT_FOUND`, a `Shipment` `ERR_SHIPMENT_NOT_FOUND`, a `LoyaltyAccount` `ERR_LOYALTY_ACCOUNT_NOT_FOUND`, a `Referral` `ERR_REFERRAL_NOT_FOUND`, a `Refund` `ERR_REFUND_NOT_FOUND`, and a `SubstitutionEvent` `ERR_SUBSTITUTION_EVENT_NOT_FOUND`. All are HTTP 404.
+
+Foreign keys supplied in a request *body* are checked only after every path identifier has resolved, and among themselves they are checked in the order the endpoint declares its inputs. The body-foreign-key rung applies to creating a child, creating a subscription, creating a registry, adding a registry item, creating a gift order, issuing a credit and creating a referral, and it uses the same per-type error mapping.
+
+### 2.11. Request Shape Rules
+
+A field that section 4 lists without a trailing question mark is required; if it is absent or explicitly null, the request is rejected with `ERR_MISSING_FIELD` (HTTP 400). A field that fails to parse — a calendar date that is not in `YYYY-MM-DD` form, an instant that does not end in `Z`, a non-whole number where an integer is expected, a non-boolean where a boolean is expected — is rejected with `ERR_INVALID_FORMAT` (HTTP 400).
+
+Enum membership is checked next, and the set of fields routed to `ERR_INVALID_ENUM` (HTTP 422) is closed and exhaustive. Exactly these fields route there: a SKU's `stage`, a SKU's `line`, a SKU's `status`, a plan's `status`, an allergen flag's `allergen_tag`, an allergen flag's `severity`, a shipment's `service_level`, a gift order's `claim_mode`, a refund's `reason`, a child's `stage` when supplied on an update, and the `target_stage` field of a manual resize request. No other field routes to that error; anything else that fails a value test routes either to the numeric-range error or to its own domain rung.
+
+Numeric range violations return `ERR_VALUE_OUT_OF_RANGE` (HTTP 422). The declared ranges are: `pack_count` from 1 to 12 inclusive; `consumption_rate_per_day` from 1 to 14 inclusive; `weight_grams` from 500 to 59999 inclusive; `cadence_override_days` from 14 to 56 inclusive; `requested_quantity` from 1 to 20 inclusive; a gift order's `quantity` at least 1; and `promo_discount_pct` from 0 to 0.25 inclusive. A SKU's `pack_size_units` runs from 1 to 200 inclusive and its `pack_price_cents` may not be negative. Pagination bounds are stated in section 2.3 and report their own error.
+
+### 2.12. The Two Pipelines and Where They Diverge
+
+Pipeline R and Pipeline G share the pack-pricing formula, the credit-stacking order, the allergen screen, the shipping formula and the shipment state machine. Everything else that follows in section 3 is written pipeline by pipeline, but five divergences are worth stating once, up front, because each of them is a place where an implementer who generalises from one pipeline will get the other one wrong.
+
+**Cutoff.** A Pipeline-R cycle has a cutoff instant 48 hours before its planned ship date, and the cycle locks there. Pipeline G has no cutoff whatsoever: a gift shipment is dispatchable the moment the gift is claimed.
+
+**Refund actor.** A Pipeline-R refund is requested by the owning `AccountHolder` (or by `OpsAdmin` on their behalf) and approved by a `SupportAgent`. A Pipeline-G refund may originate only from the `GiftPurchaser` who paid for the gift.
+
+**Proration.** A Pipeline-R cancellation refund is prorated against elapsed time and reduced by a restock fee when the box has already left the warehouse. A Pipeline-G refund returns the paid face value in full, with no proration and no restock fee, whether or not the gift shipment has moved.
+
+**Points.** Only Pipeline-R deliveries earn loyalty points. A gifted item that reaches the doorstep earns exactly zero points and writes no ledger entry at all.
+
+**Auto-resize.** Automatic size changes apply only to Pipeline-R cycles. A gifted item ships the exact SKU named on the registry item and is never resized.
+
+---
+
+## 3. Business Logic & Workflows
+
+### 3.1. Households: Registration, Verification, Suspension and Closure
+
+A household enters the platform by registering an account with an `email` and a `full_name`. The e-mail must contain an at-sign and must be unique across all accounts; a second registration reusing an existing address is refused with `ERR_DUPLICATE_EMAIL` (HTTP 409). Two further inputs are optional at registration. `payment_method_on_file` is a boolean declaring whether a card is stored, and it defaults to false when omitted — a household that never sets it true can still be served, but can never be charged a non-zero amount. `referred_by_code` carries the referral code of whoever recommended the service and defaults to null when the household signed up organically.
+
+Registration is a busy moment on the server. The new `Account` is persisted in `PENDING_VERIFICATION`, the initial value of its `status`. The server mints a `verification_token` and returns it on the created resource — this is the only time the token is handed out. It also mints the account's own shareable `referral_code`, which is what *other* people will later present as their `referred_by_code`. Finally it creates a companion loyalty wallet: a `LoyaltyAccount` in tier `BRONZE` with a `points_balance` of 0, whose identifier is stored on the account as `loyalty_account_id`. Anyone may register; the operation is open to `Anonymous` and to `OpsAdmin`.
+
+Verification consumes the token. The caller supplies `verification_token`; if it does not equal the value stored on the account, the request is rejected with `ERR_INVALID_VERIFICATION_TOKEN` (HTTP 422). On success the account moves `PENDING_VERIFICATION → ACTIVE` and the stored `verification_token` is set to null, so the same token can never be replayed. If the account was created with a `referred_by_code` that resolves to some other account's `referral_code`, verification also creates a `Referral` row in `PENDING`, recording `referrer_account_id` (the owner of the code), `referee_account_id` (the newly verified account), the presented `code`, and an `expires_at` 120 days after the referral is created. Three policy rungs guard that creation and they are the same three that guard an explicitly created referral: a referral whose `referrer_account_id` equals its `referee_account_id` is refused with `ERR_SELF_REFERRAL` (HTTP 422); a referral that would mirror an existing one — where a `Referral` already exists whose referrer is this referee and whose referee is this referrer — is refused with `ERR_RECIPROCAL_REFERRAL` (HTTP 422); and a referrer who already holds five or more `Referral` rows in *any* status created within the trailing 365 days is refused with `ERR_REFERRAL_CAP_EXCEEDED` (HTTP 409). The cap is enforced at creation, never at vesting. On the verification path the asymmetry matters: when the cap is already reached, the referral is simply not created and the verification itself still succeeds with 200 OK; on the explicit creation path the sixth referral is a hard 409.
+
+Support operators may suspend and reinstate accounts, and the pair is a genuine cycle — an account may be suspended and reinstated repeatedly. Suspension requires the account to be `ACTIVE` and carries a `reason`, which is stored on `suspended_reason`; the account moves `ACTIVE → SUSPENDED`. While suspended, no cycle of that household may be charged. Reinstatement requires the account to be `SUSPENDED`, moves it `SUSPENDED → ACTIVE`, and clears `suspended_reason` back to null. Any operation that requires a live household — creating a subscription, activating one, charging a cycle, creating a registry, creating a gift order — checks that the owning account's `status` is `ACTIVE` and otherwise returns `ERR_ACCOUNT_NOT_ACTIVE` (HTTP 409).
+
+Closure is terminal. An account may be closed from `ACTIVE` by its own `AccountHolder` or from `SUSPENDED` by a `SupportAgent`, and in both directions the precondition is the same: no `Subscription` of that account may be in `lifecycle_state` `ACTIVE` or `PAUSED`. An account that still has one is refused with `ERR_ACCOUNT_HAS_ACTIVE_SUBSCRIPTIONS` (HTTP 409). Both closure paths carry an identical side-effect set: the account's `status` becomes `CLOSED`; every `Child` of the account has `archived` set to true, which permanently excludes those children from cycle allocation; and every `Credit` of the account whose `status` is `AVAILABLE` or `PARTIALLY_CONSUMED` is driven to `REVOKED`, moving its `remaining_cents` into `forfeited_cents`.
+
+Beyond the lifecycle, an account exposes two computed money fields. `available_credit_cents` is the sum of `remaining_cents` over the account's credits whose `status` is `AVAILABLE` or `PARTIALLY_CONSUMED` *and* whose `expires_at` is strictly after the logical clock — a credit whose expiry instant equals the clock exactly is excluded. It is recomputed on every credit status change and reported on every account read. `next_charge_estimate_cents` looks forward instead: it finds the earliest cycle across all of the household's non-cancelled subscriptions whose `status` is `PLANNED` or `ALLOCATED`, ordering candidates by `window_start` ascending and breaking ties by `created_at` ascending, and reports that cycle's `total_due_cents`. When no such cycle exists the estimate is 0.
+
+A dedicated credit summary read exposes the household's whole position at once: `available_credit_cents`, `gift_credit_cents` (the remaining value of gift-derived credits), `referral_credit_cents` (the remaining value of the referral, goodwill and short-fill credits), the wallet's `points_balance` and `tier`, and `next_charge_estimate_cents`. That read accepts an optional `include_credits` flag which selects between two variants of the estimate. When `include_credits` is omitted or true — the optimistic variant, and the same one stored on the account itself — the estimate assumes every currently available credit and the whole points balance will still apply at charge time, and reports the target cycle's `total_due_cents`. When `include_credits` is supplied as false — the conservative variant — every credit and the points balance are ignored entirely and the estimate reports the target cycle's `subtotal_cents` plus its `shipping_cents`. The two answers differ whenever the household holds any usable credit.
+
+Account attributes remain editable after registration: an `AccountHolder` or a `SupportAgent` may revise `full_name` and `payment_method_on_file`. Support and operations staff may also browse accounts, filtering by `status`, by `email` or by `loyalty_account_id`.
+
+### 3.2. Children, the Size Ladder, and Sensitivity Screening
+
+A child profile is created beneath a household with `account_id`, a `name`, a `birth_date` given as a calendar date in `YYYY-MM-DD` form, and a `weight_grams` measurement. Weight is an integer in grams and must be at least 500 and at most 59999. Two optional booleans complete the profile: `stage_pinned`, which defaults to false, and `hypoallergenic_required`, which also defaults to false. The system additionally maintains `archived` on every child, false at creation and set true only when the owning household closes.
+
+**The size ladder.** Sizes form an ordered ladder of ten bands, and the exact string values are `NEWBORN`, `S1`, `S2`, `S3`, `S4`, `S5`, `S6`, `PULL_UP_2T3T`, `PULL_UP_3T4T` and `PULL_UP_4T5T`, in that order. Each band owns a weight range whose lower bound is inclusive and whose upper bound is exclusive:
+
+- `NEWBORN` covers weights from 0 grams up to (but not including) 4500 grams.
+- `S1` covers 4500 up to 6400 grams.
+- `S2` covers 6400 up to 8200 grams.
+- `S3` covers 8200 up to 11000 grams.
+- `S4` covers 11000 up to 14000 grams.
+- `S5` covers 14000 up to 17000 grams.
+- `S6` covers 17000 up to 20000 grams.
+- `PULL_UP_2T3T` covers 20000 up to 23000 grams.
+- `PULL_UP_3T4T` covers 23000 up to 26000 grams.
+- `PULL_UP_4T5T` covers 26000 up to 60000 grams.
+
+Because upper bounds are exclusive, a weight sitting exactly on a boundary belongs to the upper band: 6400 grams resolves to `S2`, not `S1`.
+
+At creation the child's `stage` is simply the band the supplied weight falls into, with no further adjustment. Afterwards the ladder becomes conservative. When a new weight is recorded, the server first resolves the raw band the weight belongs to. If that band is the band the child is already in, the stage does not change. Otherwise the server moves the child exactly one position along the ladder in the direction of the raw band — upward if the raw band sits later in the order, downward if it sits earlier — and never more than one position, however many bands the new weight leapt across. A child in `S2` weighed at 15000 grams (raw band `S5`) therefore moves to `S3`, not `S5`. The stage axis is bidirectional and re-entrant: `S2 → S3 → S2` is a perfectly legal sequence of measurements, and because of the clamp a non-adjacent jump is never performed.
+
+**Recording a weight.** Submitting a new `weight_grams` for a child is available to the owning `AccountHolder` and to `OpsAdmin`, and it returns the updated child. The measurement is refused outright when the child is archived, with `ERR_CHILD_ARCHIVED` (HTTP 409). On acceptance the server stores the new weight, recomputes the stage under the clamping rule above, and — when the stage would change — proposes an automatic resize by writing a `ResizeEvent` whose `origin` is `AUTO`. That event records the `subscription_id` it belongs to, the `child_id` whose weight produced it, the `from_stage` and `to_stage` of the proposal, and the `measured_weight_grams` that triggered it, which equals the child's weight at proposal time.
+
+Two guards sit on that automatic path and their asymmetry is deliberate. A pinned stage is a customer preference: when `stage_pinned` is true, the weight *is* still recorded and the call still succeeds, but the child's `stage` is left untouched and the `ResizeEvent` is written in status `REJECTED` with `reject_reason` set to `STAGE_PINNED`. An exhausted cap, by contrast, is a policy limit: automatic resizes are permitted at most twice within the trailing 90 days, and a third one rejects the whole request with `ERR_RESIZE_CAP_EXCEEDED` (HTTP 409) — the weight is not recorded, the stage is unchanged and no `ResizeEvent` row is written at all. A measurement that would not change the stage never consults the cap rung. The count that feeds the cap is maintained on the subscription as `auto_resize_count_in_period`: the number of `ResizeEvent` rows on that subscription whose `origin` is `AUTO` and whose `status` is `APPLIED_CURRENT` or `APPLIED_NEXT`, created at or after the instant 90 days before the logical clock. Rejected events do not count, and manual resizes are deliberately excluded so that a customer can always override a size by hand.
+
+**Requesting a resize by hand.** An `AccountHolder` may propose a stage directly against a subscription by supplying a `target_stage` together with `expected_subscription_version`. The target must sit exactly one position away from the child's current stage in the ladder; a stage further away is rejected with `ERR_NON_ADJACENT_STAGE` (HTTP 422), and no `ResizeEvent` is persisted. If the child's `stage_pinned` is true, the manual request is refused with `ERR_STAGE_PINNED` (HTTP 409) — this is the one place that error code is returned, since the weight-measurement path swallows the same condition into a rejected event instead. A successful manual request writes a `ResizeEvent` with `origin` `MANUAL`, sets the child's `stage` to `target_stage`, and advances the subscription's `version`. Manual resizes are never counted against the two-per-90-days automatic cap. Because a rejection at either the non-adjacency rung or the automatic cap rung throws away the whole request, `STAGE_PINNED` is by construction the only value `reject_reason` can ever hold; in every other status the field is null.
+
+**Where a resize lands.** Whether automatic or manual, a proposal must decide which cycle it affects, and the answer is recorded as the event's `status` and `target_cycle_id`. The server assembles the subscription's cycles whose `status` is `PLANNED`, `ALLOCATED`, `CUTOFF_LOCKED`, `DISPATCHED` or `DELIVERED`, ordered by `window_start` ascending with `created_at` ascending as the tie-break, and takes the first of them as the *current* cycle. If a current cycle exists, its status is `PLANNED` or `ALLOCATED`, and the logical clock is strictly before that cycle's `cutoff_at`, the proposal lands as `APPLIED_CURRENT` with `target_cycle_id` naming that cycle — and the cycle is re-allocated at the new stage, rebuilding its `CycleLine` rows and recomputing `subtotal_cents` and `total_due_cents`. If instead the clock has reached the current cycle's `cutoff_at`, or that cycle is already `CUTOFF_LOCKED`, the proposal lands as `APPLIED_NEXT`: the current cycle is left completely untouched and `target_cycle_id` names the first candidate after it whose status is `PLANNED`, or null when there is none. If the current cycle is already `DISPATCHED` or `DELIVERED`, the outcome is the same `APPLIED_NEXT` landing, with `target_cycle_id` null whenever no planned cycle exists yet — and `reject_reason` stays null, because this is not a rejection. When no candidate cycle exists at all, the event is `APPLIED_NEXT` with a null `target_cycle_id`. In every `APPLIED_NEXT` case the new stage simply takes effect at the next generation or allocation. Automatic size changes are a Pipeline-R concern only; a gifted item ships the SKU the registry named and is never resized.
+
+Resize events are readable individually and listable, filterable by `subscription_id`, `child_id`, `target_cycle_id`, `origin` and `status`.
+
+**Sensitivities.** A child may carry any number of `AllergenFlag` records. Each names the `child_id` it belongs to, an `allergen_tag` drawn from `FRAGRANCE`, `LATEX`, `LOTION`, `DYE`, `CHLORINE` and `ALOE`, a `severity` of either `MILD` or `SEVERE`, and an optional free-text `note` that defaults to null. Flags may be added by the owning `AccountHolder` or by a `SupportAgent`, and adding one to an archived child is refused with `ERR_CHILD_ARCHIVED`. Flags are listable by `child_id` and by `severity`, and either role may delete one. Deletion is deliberately one-way in its effects: removing a sensitivity does not revert any cycle line that was already substituted because of it.
+
+The screen those flags drive is shared by both pipelines and is stated once here. A candidate SKU carries a set of allergen tags. Gather the tags the child is flagged `SEVERE` against and the tags the child is flagged `MILD` against — all flag rows count, since flags have no status of their own. If the SKU carries any tag the child is severely sensitive to, the SKU is ineligible, on either product line. Otherwise, if the SKU carries any tag the child is mildly sensitive to *and* the SKU's `line` is `STANDARD`, the SKU is ineligible. In every other case the SKU is eligible. In short: a severe flag is fatal on both lines, while a mild flag is survivable on the hypoallergenic line and fatal on the standard one. The identical screen runs when a Pipeline-R cycle is allocated, when a cycle line is substituted, when a cycle line is re-screened, and when a Pipeline-G gift is claimed as a shipped item; a SKU that fails it is refused with `ERR_ALLERGEN_BLOCKED` (HTTP 422).
+
+Two further product-line rules sit immediately behind the allergen screen. A child whose `hypoallergenic_required` is true must never receive a SKU whose `line` is `STANDARD`, and an attempt to do so is refused with `ERR_HYPOALLERGENIC_REQUIRED` (HTTP 422); that rule guards all three of the same operations the allergen screen guards — a cycle allocation, a line substitution and a gift claimed as a shipped item. Conversely, a subscription whose plan sets `allows_hypoallergenic` to false must never receive a SKU whose `line` is `HYPOALLERGENIC`, and an attempt to do so is refused with `ERR_HYPOALLERGENIC_NOT_ALLOWED` (HTTP 422); that second rule guards allocation and substitution, and has no gift-claim analogue because a gift is bought against a registry rather than a plan.
+
+A child profile stays editable: the owning `AccountHolder` may revise `name`, `stage_pinned` and `hypoallergenic_required`, and may set `stage` directly. Children are listable, filterable by `account_id` and by `stage`, and readable by the household, by a `RegistryOwner`, and by support and operations staff.
+
+### 3.3. Catalog Stewardship: Plans, SKUs and Stock
+
+The catalog is `OpsAdmin` territory and nobody else's; every write below is refused for any other role with `ERR_CATALOG_WRITE_FORBIDDEN`, ahead of the generic role check.
+
+**Plans.** A `Plan` bundles the commercial terms a subscription inherits. It carries a `code` unique across the catalog, a human-readable `name`, a `default_pack_count` between 1 and 12 inclusive that is assigned to any subscription which omits its own pack count, a `promo_discount_pct` expressing a promotional discount as a fraction which defaults to 0 and may not exceed 0.25, and an `allows_hypoallergenic` boolean that defaults to true and, when false, forbids the plan's subscriptions from ever receiving a hypoallergenic SKU. A plan's `status` starts at `ACTIVE` and the only other member is `RETIRED`. A creation reusing an existing `code` is refused with `ERR_DUPLICATE_CODE` (HTTP 409). Operators may later revise `name`, `promo_discount_pct`, `allows_hypoallergenic` and `status`; plans are readable by every role and listable with a `status` filter.
+
+**SKUs.** A `Sku` is a concrete purchasable pack. It carries a `code` unique across the SKU catalog, a `name`, the `stage` it serves drawn from the ten-band ladder, a product `line` that is either `STANDARD` or `HYPOALLERGENIC`, a `pack_size_units` count of diaper units per pack that defaults to 60 and must lie between 1 and 200 inclusive, and a `pack_price_cents` base price that may not be negative and is stated *before* any line surcharge. It also carries `allergen_tags`, an array of the materials present in the pack, defaulting to an empty array and screened against the receiving child's sensitivity flags. Stock is tracked as `stock_packs`, which defaults to 0 and is decremented whenever packs are allocated or gifted out. A SKU's `status` starts at `ACTIVE` and its only other member is `DISCONTINUED`. Duplicate codes are refused with `ERR_DUPLICATE_CODE`. Operators may later revise `name`, `pack_price_cents`, `allergen_tags` and `status` — and the price is worth flagging, because the gift pipeline re-reads it at claim time. SKUs are readable by every role and listable with `stage`, `line` and `status` filters.
+
+**Pricing a pack.** One formula prices a pack everywhere in the system, in both pipelines. The effective per-pack price is the SKU's `pack_price_cents` plus a surcharge of 350 cents when the SKU's `line` is `HYPOALLERGENIC`, and plus nothing when the line is `STANDARD`. That value becomes a cycle line's `unit_price_cents`, and it is the same unit used to value a gift order.
+
+**Stock adjustments.** Operators move stock by submitting a signed `delta_packs`. The SKU's `stock_packs` becomes the old value plus the delta, floored at 0 — a negative adjustment larger than the stock on hand leaves 0 rather than a negative number. A negative adjustment has a consequence beyond the catalog: any cycle line sitting on a cycle whose `status` is `PLANNED` or `ALLOCATED` that can no longer be filled from the remaining stock is pushed from `ALLOCATED` into `SUBSTITUTION_PENDING`, joining the substitution queue described in section 3.6. Lines on cycles that have already locked at cutoff or moved beyond are never disturbed by a stock adjustment.
+
+### 3.4. Subscriptions: Cadence, Activation, Pause and Resume
+
+A `Subscription` binds a household, a plan and a child together. Creating one requires `account_id`, `plan_id`, `child_id` and a declared `consumption_rate_per_day`, and optionally `pack_count`. The consumption rate is the number of diaper units the household expects to get through in a day, and must be at least 1 and at most 14. `pack_count` is the number of packs shipped per cycle and must lie between 1 and 12 inclusive; when it is omitted the server copies the plan's `default_pack_count` into it. Creation requires the owning account to be `ACTIVE` and the child not to be archived, and it enforces referential coherence: the child's own `account_id` must equal the `account_id` supplied for the subscription, and a mismatch is refused with `ERR_CHILD_ACCOUNT_MISMATCH` (HTTP 422). The new subscription is persisted in `lifecycle_state` `DRAFT` and `billing_state` `CURRENT`.
+
+**Two independent axes.** A subscription tracks its life on `lifecycle_state`, whose members are `DRAFT`, `ACTIVE`, `PAUSED` and `CANCELLED`, and its money on `billing_state`, whose members are `CURRENT`, `PAST_DUE` and `DELINQUENT`. The axes move independently — a `PAUSED` subscription can perfectly well be `PAST_DUE` — and section 3.7 describes the billing axis in full. `CANCELLED` is terminal on the lifecycle axis and admits no transition whatsoever; any attempt to move a subscription whose current `lifecycle_state` is not in the target transition's from-set is refused with `ERR_SUBSCRIPTION_STATE_INVALID` (HTTP 409).
+
+**Deriving the cadence.** The interval between boxes is stored as `cadence_interval_days` and is derived rather than supplied. The server multiplies `pack_count` by 60 — the assumed number of units in a pack for cadence purposes — divides by `consumption_rate_per_day`, and rounds the quotient half up to a whole number of days. That derived figure is then clamped into the permitted band: no shorter than 14 days and no longer than 56 days. Note carefully that the divisor uses the assumed 60 units per pack and *not* the `pack_size_units` of whatever SKU eventually gets allocated; cadence is a planning figure computed from the subscription alone. The derivation re-runs on creation, on activation, and on any update that touches `pack_count` or `consumption_rate_per_day`.
+
+A household that wants a fixed rhythm may pin one. Setting a manual override stores `cadence_override_days`, which must be between 14 and 56 inclusive, and immediately sets `cadence_interval_days` to that same value. While an override is in force, derivation is suppressed entirely: changing `pack_count` or `consumption_rate_per_day` leaves `cadence_interval_days` exactly where the override put it. Clearing the override sets `cadence_override_days` back to null and immediately re-derives the interval from the consumption rate. `cadence_override_days` is null by default, and a forward-looking cadence read reports the current `cadence_interval_days`, the current `anchor_date`, the projected `next_window_start`, `next_window_end` and `next_cutoff_at`, and an `override_active` boolean saying whether a manual override is presently pinned.
+
+**Activation.** A `DRAFT` subscription becomes live when its household — or an operator acting for them — activates it. The preconditions are that the subscription is in `DRAFT`, the owning account's `status` is `ACTIVE`, the child is not archived, and no *other* subscription for the same account-and-child pair is in `lifecycle_state` `ACTIVE` or `PAUSED`; that last one is refused with `ERR_DUPLICATE_ACTIVE_SUBSCRIPTION` (HTTP 409). Activation moves the subscription `DRAFT → ACTIVE` and sets `anchor_date` — the instant from which the next cycle window opens — to the logical clock at the moment of activation plus 7 days of lead time. It also recomputes `cadence_interval_days` and sets `free_shipping_eligible` from the household's loyalty tier, which is true exactly when that tier is `SILVER` or `GOLD` and false otherwise. The seven-day lead exists so that the first generated cycle's cutoff, which sits 48 hours before its ship date, is still in the future at the moment of activation.
+
+A subscription also surfaces `next_charge_cents`, the total due of the earliest non-terminal cycle on that subscription, or 0 when no such cycle exists, and `cancelled_at`, an instant that stays null until the subscription is cancelled. Subscriptions are readable by the household and by staff, and listable with filters on `account_id`, `plan_id`, `child_id`, `lifecycle_state` and `billing_state`.
+
+**Pausing.** A household may pause a live subscription by supplying a `start_date` and an `end_date`, both calendar dates. Pause intervals are closed at both ends: both the start day and the end day belong to the interval, so a pause where `end_date` equals `start_date` is a valid one-day pause. Four checks guard the request, in this order. The `start_date` may not be earlier than the logical clock's calendar date, or the request is refused with `ERR_PAUSE_START_IN_PAST` (HTTP 422). The `end_date` may not be earlier than `start_date`, or the request is refused with `ERR_PAUSE_INTERVAL_INVALID` (HTTP 422). The requested interval may not share a single calendar day with any existing `PauseRecord` of the same subscription whose `status` is `SCHEDULED` or `ACTIVE` — two pauses conflict exactly when they overlap on at least one day, so strictly adjacent pauses, where an existing pause ends the day before the new one starts, are permitted; a conflict is refused with `ERR_PAUSE_OVERLAP` (HTTP 409). Finally the household's pause budget must hold: the subscription's `cumulative_pause_days` plus the projected length of the new pause, counted inclusively as the number of days from `start_date` to `end_date` plus one, may not exceed 90; a projected total of exactly 90 is admitted and 91 is refused with `ERR_PAUSE_BUDGET_EXCEEDED` (HTTP 409).
+
+An accepted pause creates a `PauseRecord` carrying its `subscription_id`, the `start_date` and `end_date`, a `status`, an `actual_end_date` that stays null until the pause really ends, and a `consumed_days` count. When the `start_date` is today the record is created directly in `ACTIVE` and the subscription moves `ACTIVE → PAUSED`; when the start date is in the future the record is created in `SCHEDULED` and the subscription's `lifecycle_state` is left alone until the daily batch promotes the record on its start date. A `SCHEDULED` record may be cancelled outright by its household, moving it `SCHEDULED → CANCELLED`; that path charges nothing against the pause budget, since `consumed_days` stays 0. Cancelling a record that is not `SCHEDULED` is refused with `ERR_PAUSE_STATE_INVALID` (HTTP 409).
+
+`consumed_days` is what the budget actually counts, and it is computed per record: an `ENDED` record consumes the inclusive number of days from its `start_date` to its `actual_end_date`; an `ACTIVE` record consumes the inclusive number of days from its `start_date` to today; a `SCHEDULED` or `CANCELLED` record consumes nothing. The subscription's `cumulative_pause_days` is the sum of `consumed_days` across all of its pause records.
+
+**Resuming.** Ending a pause early is the household's own call. Resuming requires the subscription to be `PAUSED` and exactly one of its pause records to be `ACTIVE`. That record moves `ACTIVE → ENDED`, its `actual_end_date` is set to today and its `consumed_days` recomputed, the subscription moves `PAUSED → ACTIVE`, and `cumulative_pause_days` is recomputed. The cadence anchor is then pushed forward by the days actually consumed — the inclusive count from `start_date` to `actual_end_date` — added to the existing `anchor_date`, preserving its time-of-day component. A household that resumes mid-pause therefore shifts its schedule by the days it really took off, not by the length it originally scheduled. The `ACTIVE ↔ PAUSED` pair is a genuine cycle bounded only by the 90-day cumulative budget. Pause records are readable individually and listable, filterable by `subscription_id` and by `status`.
+
+### 3.5. The Recurring Cycle: Generation, Allocation, Cutoff and Skip
+
+**Generating a cycle.** Operators generate the next box for a live subscription. The cycle's coverage window is half-open: `window_start` takes the subscription's current `anchor_date`, `window_end` is `window_start` plus `cadence_interval_days` days, and the window covers every instant from the start up to but not including the end. The planned dispatch instant, `ship_date`, is set equal to `window_start`, and the cutoff instant `cutoff_at` is set to `ship_date` minus 48 hours. Immediately after the cycle is written, the subscription's `anchor_date` advances to the new `window_end`, so the anchor always means "where the next cycle will start". Each cycle also receives a `sequence_number`, the 1-based ordinal of that cycle within its subscription, assigned at generation. A new cycle is persisted with `status` `PLANNED` and `payment_status` `UNCHARGED`, and `stage_at_allocation` null.
+
+Two rungs guard generation. A subscription whose `billing_state` is `DELINQUENT` may not generate a cycle at all and is refused with `ERR_SUBSCRIPTION_DELINQUENT` (HTTP 409). And the generated window may not strictly overlap the window of any existing cycle of the same subscription whose `status` is not `SKIPPED`, `RETURNED` or `CANCELLED`: two windows conflict exactly when the new start is before the existing end *and* the existing start is before the new end, so windows that merely touch — where the new `window_start` equals an existing `window_end` — never conflict. An overlap is refused with `ERR_CYCLE_WINDOW_OVERLAP` (HTTP 409). Note how different this geometry is from the closed-closed day intervals used for pauses: touching pauses would conflict, touching cycle windows do not.
+
+**The fulfilment axis.** A cycle's `status` runs over `PLANNED`, `ALLOCATED`, `CUTOFF_LOCKED`, `DISPATCHED`, `DELIVERED`, `SKIPPED`, `RETURNED` and `CANCELLED`; `RETURNED` and `CANCELLED` are terminal and admit no further transition. Any attempt whose from-state is not in the target transition's declared set is refused with `ERR_CYCLE_STATE_INVALID` (HTTP 409). Cycles are readable individually and listable, filterable by `subscription_id`, by `status` and by `payment_status`.
+
+**Allocating.** Allocation is where a planned cycle becomes a concrete list of packs, and it is `OpsAdmin` work. It requires the cycle to be `PLANNED`, the subscription to be `ACTIVE`, and the child not to be archived. It begins by freezing `stage_at_allocation` to the child's current `stage` — that frozen value is what the box was built for, whatever the child's stage does later, and it stays null while the cycle is still `PLANNED`.
+
+The selector then assembles candidate SKUs. A SKU is a candidate when its `status` is `ACTIVE`, its `stage` equals the child's current stage, its `stock_packs` is at least 1, it passes the allergen screen for that child, it is not `STANDARD` when the child's `hypoallergenic_required` is true, and it is not `HYPOALLERGENIC` when the plan's `allows_hypoallergenic` is false. Candidates are ranked by ascending `pack_price_cents` first; ties are broken by descending `pack_size_units`; remaining ties are broken by ascending `created_at`. A SKU's `id` is never used as a sort key anywhere in this system.
+
+Packs are then drawn down the ranking in a waterfall. Starting with a remaining requirement equal to the subscription's `pack_count`, the server walks the candidates in rank order and takes from each the smaller of the remaining requirement and that SKU's `stock_packs`. Each positive take creates a `CycleLine` naming its `cycle_id` and `sku_id`, with `quantity_packs` set to the take and `status` `ALLOCATED`, and decrements the SKU's `stock_packs` by that amount. The walk stops as soon as the remaining requirement reaches zero. If the candidates are exhausted while a requirement remains, the entire allocation fails with `ERR_SKU_OUT_OF_STOCK` (HTTP 409) and *no* cycle line is persisted — a partial allocation is never stored.
+
+Diagnosing an empty candidate pool is done by the earliest rung that explains it, and the ordering matters because all four errors are plausible at once. If at least one SKU at the child's stage was excluded solely by the allergen screen, the refusal is `ERR_ALLERGEN_BLOCKED`. If it was excluded solely by the child's `hypoallergenic_required` flag, the refusal is `ERR_HYPOALLERGENIC_REQUIRED`. If it was excluded solely because the plan sets `allows_hypoallergenic` to false, the refusal is `ERR_HYPOALLERGENIC_NOT_ALLOWED`. Only when no `ACTIVE` SKU exists at the child's stage at all does the refusal become `ERR_NO_ELIGIBLE_SKU` (HTTP 409).
+
+With lines in place, each line's `unit_price_cents` is set to the effective per-pack price of its SKU and its `line_total_cents` to `quantity_packs` multiplied by `unit_price_cents`, computed exactly as integers per line. The cycle's `subtotal_cents` is then the sum of `line_total_cents` across the cycle's lines whose `status` is `ALLOCATED` or `SUBSTITUTED`; a short-filled line is included in that sum but contributes zero, because its line total has been zeroed. The cycle's `shipping_cents` and `total_due_cents` are computed as described in section 3.7, and the cycle moves `PLANNED → ALLOCATED`. A line also carries `substitution_attempts`, starting at 0, and `short_filled_units`, also starting at 0. Cycle lines are readable individually and listable, filterable by `cycle_id`, by `sku_id` and by `status`.
+
+**Locking at cutoff.** Once the logical clock has reached a cycle's `cutoff_at` — the comparison is inclusive, so the exact cutoff instant qualifies — an operator locks the cycle, moving it `ALLOCATED → CUTOFF_LOCKED`. Attempting the lock strictly before the cutoff is refused with `ERR_CUTOFF_NOT_REACHED` (HTTP 409). After the lock, no skip and no current-cycle resize may target that cycle, and its lines are no longer re-screened for allergens.
+
+**Skipping.** A household may skip an upcoming box while it is still `PLANNED` or `ALLOCATED` and the logical clock is strictly before `cutoff_at`; at or after the cutoff the skip is refused with `ERR_PAST_CUTOFF` (HTTP 409). Skip allowance is rationed: a household may skip twice inside a rolling 180-day window. The allowance remaining is two minus the number of `SkipRecord` rows on that subscription whose `status` is `APPLIED` and whose `created_at` is at or after the instant 180 days before the logical clock; a skip is admitted only while at least one unit of allowance remains, and otherwise refused with `ERR_SKIP_ALLOWANCE_EXHAUSTED` (HTTP 409). A paused subscription may not skip either, and that refusal is `ERR_SKIP_WHILE_PAUSED` (HTTP 409). The order of those two checks is pinned and observable: the allowance rung is evaluated first, so a paused subscription that still has allowance left reports `ERR_SKIP_WHILE_PAUSED`, while a paused subscription whose allowance is exhausted reports `ERR_SKIP_ALLOWANCE_EXHAUSTED`.
+
+An accepted skip moves the cycle `PLANNED → SKIPPED` or `ALLOCATED → SKIPPED`, and creates a `SkipRecord` naming its `subscription_id` and `cycle_id` in status `APPLIED`, capturing `anchor_before` — the subscription's `anchor_date` immediately before the skip — and `anchor_after`, the value immediately after. Skipping *advances* the schedule rather than shortening the subscription: `anchor_after` is `anchor_before` plus exactly one `cadence_interval_days`, and the subscription's `anchor_date` moves there. Any stock the cycle had already taken is returned to the SKUs it came from, and when the skipped cycle had been allocated, every `CycleLine` of that cycle is deleted along with the stock return.
+
+A skip may be withdrawn while the clock is still strictly before `cutoff_at` and the record is still `APPLIED`; past the cutoff the withdrawal is likewise refused with `ERR_PAST_CUTOFF`. Withdrawal moves the cycle `SKIPPED → PLANNED`, making the fulfilment axis re-entrant, moves the record `APPLIED → REVOKED`, which immediately restores one unit of allowance inside the rolling window, and rewinds the subscription's `anchor_date` to the record's `anchor_before` exactly. With two skips already applied a third is refused; withdrawing one of them restores the allowance to one straight away. Skip records are readable individually and listable, filterable by `subscription_id`, `cycle_id` and `status`.
+
+### 3.6. When an Allocation Stops Working: Re-screening, Substitution and Short Fill
+
+An allocation is only correct for as long as the facts behind it hold. Two things can invalidate it before the box leaves: a new sensitivity appears on the child, or the stock behind a line evaporates. A cycle line therefore has its own axis — `ALLOCATED`, `SUBSTITUTION_PENDING`, `SUBSTITUTED` and `SHORT_FILLED`, the last of which is terminal — and any operation whose from-state does not match is refused with `ERR_LINE_STATE_INVALID` (HTTP 409).
+
+**The re-screen cascade.** Adding a sensitivity to a child is the head of a five-hop chain. Hop one: the new `AllergenFlag` row exists on the child. Hop two: because that flag now exists, every cycle line whose SKU no longer passes the allergen screen moves `ALLOCATED → SUBSTITUTION_PENDING` — but only on cycles whose `status` is `PLANNED` or `ALLOCATED`. A cycle that has locked at cutoff or moved beyond is never re-screened; the box is already committed. A line that was previously substituted can be caught by a later flag too, moving `SUBSTITUTED → SUBSTITUTION_PENDING`, and that transition does not consult the attempt cap — a line can always be re-flagged. Operators may also re-screen a single line on demand, which moves it from `ALLOCATED` or `SUBSTITUTED` into `SUBSTITUTION_PENDING` when its SKU no longer passes, and leaves it alone when it still does.
+
+**The three-rung ladder.** Resolving a pending line is `OpsAdmin` work and runs a fixed ladder. The rungs are tried in order and the *first* rung with a non-empty candidate set wins; the top-ranked candidate of that winning rung becomes the substitute, and no later rung is consulted.
+
+Rung one looks for the same size in the same product line at a different pack size: an `ACTIVE` SKU whose `stage` equals the outgoing SKU's stage, whose `line` equals the outgoing SKU's line, whose `pack_size_units` differs from the outgoing SKU's, whose `stock_packs` is at least the line's `quantity_packs`, and which passes the allergen screen for the child.
+
+Rung two looks for the same size on the hypoallergenic line: an `ACTIVE` SKU whose `stage` equals the outgoing SKU's stage, whose `line` is `HYPOALLERGENIC`, whose `stock_packs` is at least the line's `quantity_packs`, which passes the allergen screen, and — critically — only when the subscription's plan sets `allows_hypoallergenic` to true.
+
+Rung three looks one size up in the same product line: an `ACTIVE` SKU whose `stage` sits exactly one position later in the size ladder than the outgoing SKU's stage, whose `line` equals the outgoing SKU's line, whose `stock_packs` is at least the line's `quantity_packs`, and which passes the allergen screen. The ladder never looks a size *down*.
+
+Within whichever rung wins, candidates are ranked exactly as the allocation selector ranks them: ascending `pack_price_cents`, then descending `pack_size_units`, then ascending `created_at`, and never by identifier.
+
+A successful run creates a `SubstitutionEvent` recording the `cycle_line_id` it ran for, the `from_sku_id` that became unusable, the `to_sku_id` selected, the `ladder_rung` that produced the winner as 1, 2 or 3, an `outcome` of `SUBSTITUTED`, a `price_delta_cents` equal to the incoming SKU's effective per-pack price minus the outgoing SKU's effective per-pack price (a signed figure, computed on the same surcharge-inclusive basis as any other pack price), and a `reason` of either `OUT_OF_STOCK` or `ALLERGEN_RESCREEN` depending on what pushed the line into the queue. The line itself is repointed at the winning `sku_id`, its `substitution_attempts` is incremented, and its `unit_price_cents` and `line_total_cents` are recomputed. That is hop three of the cascade. Hop four follows because the line total changed: the cycle's `subtotal_cents`, `shipping_cents` and `total_due_cents` are recomputed. Hop five follows because the total changed: the household's `next_charge_estimate_cents` is recomputed. The line finishes in `SUBSTITUTED`.
+
+**The attempt cap.** A line may run the ladder at most three times. The cap is checked when the substitution is attempted, not when the line is flagged: a line whose `substitution_attempts` has reached 3 simply sits in `SUBSTITUTION_PENDING`, and every further substitution attempt is refused with `ERR_SUBSTITUTION_CAP_EXCEEDED` (HTTP 409). The `SUBSTITUTED → SUBSTITUTION_PENDING → SUBSTITUTED` loop is therefore a capped retry loop in which the third run is the last permitted one.
+
+**Short fill.** When all three rungs come back empty, the line is short-filled — and this is a successful 200 OK outcome, not an error. A `SubstitutionEvent` is written with `outcome` `SHORT_FILLED`, `ladder_rung` 0, a null `to_sku_id` and a `price_delta_cents` of 0. The line's `short_filled_units` is set to the units the household will not receive, namely its `quantity_packs` multiplied by the outgoing SKU's `pack_size_units`; its `quantity_packs` is then set to 0 and its `line_total_cents` to 0. The household is compensated in full: a `Credit` of `credit_type` `SHORT_FILL` is issued for 100 percent of the line's pre-zeroing value — its `quantity_packs` multiplied by its `unit_price_cents`, rounded half up to whole cents — with `remaining_cents` equal to that face value, `refundable` true and `expires_at` 365 days after the logical clock. The cycle's `subtotal_cents` and `total_due_cents` are then recomputed and the line settles in `SHORT_FILLED`, from which it never moves again.
+
+Substitution events are readable individually and listable, filterable by `cycle_line_id`, by `from_sku_id`, by `to_sku_id`, by `outcome` and by `reason`.
+
+### 3.7. Pricing the Box and Taking the Money
+
+Pricing a cycle is a nine-step derivation with a pinned evaluation order, and the order is the whole point: shipping depends on the pre-credit subtotal, and a promotional discount computed later must never be allowed to reach back and change a shipping decision already made.
+
+**Step one — the subtotal.** The cycle's `subtotal_cents` is the sum of `line_total_cents` over the cycle's lines whose `status` is `ALLOCATED` or `SUBSTITUTED`, as described in section 3.5.
+
+**Step two — shipping.** The cycle's `shipping_cents` is decided from three inputs that interact non-linearly. First the server counts total units in the box: for each line whose `status` is `ALLOCATED` or `SUBSTITUTED`, its `quantity_packs` multiplied by its SKU's `pack_size_units`, summed across the cycle. Then: if the subscription's `free_shipping_eligible` is true, shipping is 0. Otherwise, if `subtotal_cents` is at least 4900 cents, shipping is 0 — a subtotal of exactly 4900 does qualify for free shipping. Otherwise shipping is a base of 599 cents, plus a heavy surcharge of 250 cents when the total unit count is strictly greater than 240 — a box of exactly 240 units attracts no surcharge. Shipping is decided from the pre-credit, pre-discount subtotal and is never revisited after any discount is applied.
+
+**Step three — the base.** The base against which credits are measured is `subtotal_cents` plus `shipping_cents`.
+
+**Step four — gift credit, stack position one.** The pool is the household's credits whose `credit_type` is `GIFT`, whose `status` is `AVAILABLE` or `PARTIALLY_CONSUMED`, and whose `expires_at` is strictly after the logical clock, ordered by `expires_at` ascending and then by `created_at` ascending — never by identifier. `gift_credit_applied_cents` is the smaller of the pool's total `remaining_cents` and the base. The cap here is the whole base, so gift credit alone can zero a cycle out.
+
+**Step five — referral, goodwill and short-fill credit, stack position two.** The pool is the household's credits whose `credit_type` is `REFERRAL`, `GOODWILL` or `SHORT_FILL`, with the same status and expiry filters and the same ordering. This position is capped at 50 percent of the base, computed as the base multiplied by 0.50 and rounded half up to whole cents. `referral_credit_applied_cents` is the smallest of three quantities: the pool's total `remaining_cents`, the base minus the gift credit already applied, and that cap. The cap deliberately reads the *original* base rather than the post-gift remainder, which is precisely what makes the ordering of the stack observable from outside.
+
+**Step six — loyalty redemption, stack position three.** Let the running remainder be the base minus the gift credit applied minus the referral credit applied. This position is capped at 30 percent of that remainder, computed as the remainder multiplied by 0.30 and rounded half up to whole cents. The wallet's `points_balance` is the available point supply, and one point converts to exactly 1 cent. If the balance is below the redemption floor of 500 points, nothing is redeemed: both `loyalty_redemption_applied_cents` and `loyalty_points_redeemed` are 0. Otherwise the amount applied is the smallest of the cap, the running remainder, and the balance converted to cents; the points burned are that amount divided by the cent value of a point. The floor is then applied a *second* time, to the points actually burned: if that figure is below 500, the redemption is abandoned and both fields are 0 again. A wallet holding 600 points facing a cap of 3 cents therefore redeems nothing at all. A negative `points_balance` naturally yields nothing under the first floor test.
+
+**Step seven — the amount after loyalty.** The running amount is the base minus the gift credit, minus the referral credit, minus the loyalty redemption.
+
+**Step eight — the promotional discount, stack position four and last.** The discount is computed per line and then summed, and the order of those two operations is pinned. For each line whose `status` is `ALLOCATED` or `SUBSTITUTED`, multiply its `line_total_cents` by the plan's `promo_discount_pct` and round half up to whole cents; sum those per-line figures. `promo_discount_cents` is the smaller of that sum and the amount after loyalty. To see why the order matters, consider two lines of 1010 cents each on a plan with a `promo_discount_pct` of 0.15: rounding per line gives 152 cents twice, for 304; summing first and rounding once would give 303. This specification pins 304.
+
+**Step nine — the total.** `total_due_cents` is the amount after loyalty minus `promo_discount_cents`, floored at 0. Because step two is never re-run after step eight, a promotional discount can never re-introduce a shipping charge that step two waived, and can never remove one it levied. Every intermediate value is an integer number of cents. A pricing preview read returns this whole breakdown without mutating anything: `subtotal_cents`, `shipping_cents`, `gift_credit_applied_cents`, `referral_credit_applied_cents`, `loyalty_redemption_applied_cents`, `loyalty_points_redeemed`, `promo_discount_cents`, `total_due_cents` and `points_earn_base_cents`.
+
+**Charging.** An `OpsAdmin` charges a cycle whose `payment_status` is `UNCHARGED` and whose `status` is `ALLOCATED` or `CUTOFF_LOCKED`; the owning account must be `ACTIVE`. A cycle already charged is refused with `ERR_CYCLE_PAYMENT_STATE_INVALID` (HTTP 409). The charge runs the whole nine-step derivation, consumes the credits it applied, writes a redemption entry to the points ledger when points were burned, and then splits on the residual. When `total_due_cents` evaluates to 0, the cycle moves `UNCHARGED → FULLY_COVERED` with `charged_cash_cents` and `retained_cash_cents` both set to 0. When it evaluates above 0, the cycle moves `UNCHARGED → CHARGED` with `charged_cash_cents` and `retained_cash_cents` both set to that amount — and the account must have `payment_method_on_file` true.
+
+That last requirement is the single declared exception to the rule that a rejected request leaves no trace. When `total_due_cents` is above 0 and the account has no payment method on file, the request fails with `ERR_NO_PAYMENT_METHOD` (HTTP 402) — *and* the subscription's `billing_state` moves `CURRENT → PAST_DUE`, incrementing the subscription's `version`, before the rejection is emitted. Nothing else moves: the cycle stays `UNCHARGED`, no credit is consumed and no points are touched. Every other rung in this specification leaves the database completely untouched when it rejects.
+
+The billing axis recovers through the same endpoint. A charge that succeeds on a subscription whose `billing_state` is `PAST_DUE` — which requires `payment_method_on_file` to have become true — moves it `PAST_DUE → CURRENT`. A charge that succeeds on a `DELINQUENT` subscription likewise moves it `DELINQUENT → CURRENT`. The descent into delinquency is a batch matter: when a `PAST_DUE` subscription still has an `UNCHARGED` cycle whose `ship_date` is more than 14 days before the logical clock, the daily batch moves it `PAST_DUE → DELINQUENT`, which blocks any further cycle generation.
+
+**Naming the credits explicitly.** The charge accepts an optional `credit_ids` list. When it is omitted, the server selects credits itself under the pooling rules above and silently ignores rows that have expired, so no expiry error is possible on that path. When it *is* supplied, the server consumes exactly the named credits in the declared stack order and validates them: a named credit whose `expires_at` is at or before the logical clock is refused with `ERR_CREDIT_EXPIRED` (HTTP 409), and a named credit whose `status` is neither `AVAILABLE` nor `PARTIALLY_CONSUMED` is refused with `ERR_CREDIT_NOT_AVAILABLE` (HTTP 409).
+
+**The credit ledger.** A `Credit` records the `account_id` that may spend it, its `credit_type` — one of `GIFT`, `REFERRAL`, `GOODWILL` and `SHORT_FILL` — and, where applicable, its origin: `source_gift_order_id` names the gift a `GIFT` credit came from and is null otherwise, and `source_referral_id` names the referral a `REFERRAL` credit came from and is null otherwise. Its money is split four ways and, as section 2.9 pins, the four always reconcile: `issued_cents` is the face value at issuance and is never mutated; `consumed_cents` is what has been spent against cycles; `remaining_cents` is what is still spendable; `forfeited_cents` is what has been lost to expiry or revocation. A `refundable` boolean decides whether a settled refund can ever restore the credit: it is false for `GIFT` credit, which is never restored, and true for `REFERRAL`, `GOODWILL` and `SHORT_FILL`. Expiry is type-dependent: a `GIFT` credit's `expires_at` sits 730 days after issuance, while every other type expires 365 days after issuance. A support operator may issue a credit directly by naming `account_id` and `issued_cents`, which must be greater than zero, with an optional `credit_type` that defaults to `GOODWILL`; such a credit is `refundable` and expires in 365 days, and issuing it recomputes the household's `available_credit_cents`. Credits are readable individually and listable, filterable by `account_id`, `source_gift_order_id`, `source_referral_id`, `credit_type` and `status`. The platform additionally carries a declared credit auto-apply threshold of 1000 cents; no rung in this specification rejects or alters a charge on account of it.
+
+A credit's `status` starts at `AVAILABLE` and moves as it is spent. Consuming part of it while it remains within its expiry moves it `AVAILABLE → PARTIALLY_CONSUMED`; consuming the whole of it moves it `AVAILABLE → CONSUMED` with `remaining_cents` at 0 and `consumed_cents` equal to `issued_cents`; exhausting the remainder of a partially consumed credit moves it `PARTIALLY_CONSUMED → CONSUMED`. Restoration runs the axis backwards, and only for refundable credits: settling a refund that gives cents back moves a credit `CONSUMED → PARTIALLY_CONSUMED`, and a restoration that brings `consumed_cents` all the way back to 0 moves it `PARTIALLY_CONSUMED → AVAILABLE` with `remaining_cents` restored to `issued_cents`. Gift credit, being non-refundable, can never take those back-edges. Two terminal exits remain. When the logical clock reaches or passes `expires_at`, a credit in `AVAILABLE` or `PARTIALLY_CONSUMED` is expired — moving its `remaining_cents` into `forfeited_cents`, zeroing the remainder and settling in `EXPIRED`. A support operator may instead revoke a credit in either of those two states, with the identical money movement and a final `status` of `REVOKED`; revoking a partially consumed credit additionally reverses whatever consumption it had recorded against a cycle whose `status` is `PLANNED` or `ALLOCATED`. Attempting to revoke, expire or apply a credit that is in none of the two spendable states is refused with `ERR_CREDIT_NOT_AVAILABLE`, and attempting the operator-driven expiry on a credit whose `expires_at` is still strictly in the future is refused with `ERR_CREDIT_NOT_YET_EXPIRED` (HTTP 409).
+
+### 3.8. Out of the Warehouse: Dispatch, Carriage, Delivery and the Loyalty Cascade
+
+**Dispatch.** A cycle leaves the warehouse only from `CUTOFF_LOCKED`, and only when its `payment_status` is `FULLY_COVERED` or `CHARGED`; a cycle whose payment axis is anywhere else is refused with `ERR_CYCLE_PAYMENT_STATE_INVALID`, the same code the charge path uses. One further rule protects the household's doorstep: no other shipment for the same account that is not already `RETURNED` may have a `dispatched_at` within 12 hours of the logical clock. The comparison is strict in both directions — a gap of exactly 12 hours is allowed, while 11 hours and 59 minutes is refused with `ERR_SHIPMENT_SPACING_VIOLATION` (HTTP 409). The rule is symmetric around the moment of dispatch and counts across both pipelines: a gift shipment blocks a cycle shipment and a cycle shipment blocks a gift shipment. This is a point-plus-buffer geometry and should not be confused with the interval geometries used for pauses and cycle windows.
+
+Dispatch creates a `Shipment` in status `CREATED`, with its `cycle_id` set to the dispatching cycle, its `gift_order_id` null, its `account_id` set to the subscription's household, and its `dispatched_at` set to the logical clock. An optional `service_level` may be supplied, defaulting to `STANDARD`, with `EXPEDITED` as the only alternative. The cycle then moves `CUTOFF_LOCKED → DISPATCHED` and its own `dispatched_at` is stamped with the logical clock.
+
+**Carriage.** A shipment walks `CREATED → PICKED → IN_TRANSIT → DELIVERED`, with `RETURNED` as its terminal state, and every step is `OpsAdmin` work. Any step whose from-state does not match is refused with `ERR_SHIPMENT_STATE_INVALID` (HTTP 409). Handing the shipment to the carrier sets its `eta_days`: 1 day when `service_level` is `EXPEDITED`, and 3 days otherwise. Carriage may go wrong twice: a shipment `IN_TRANSIT` may be moved to `EXCEPTION`, incrementing its `exception_count`, and may then be retried back `EXCEPTION → IN_TRANSIT`. The retry loop is capped at 2 exceptions — a third exception on a shipment whose `exception_count` has already reached 2 is refused with `ERR_SHIPMENT_RETRY_CAP_EXCEEDED` (HTTP 409) rather than the generic state error, because the from-state `IN_TRANSIT` is itself perfectly valid. Confirming carrier delivery moves the shipment `IN_TRANSIT → DELIVERED` and stamps its `delivered_at`; when the shipment carries a `gift_order_id`, that confirmation also drives the gift order from `CLAIMED_ITEM` to `FULFILLED`. A shipment may be marked returned from `EXCEPTION` or from `DELIVERED`, settling in `RETURNED`. Shipments are readable individually and listable, filterable by `account_id`, `cycle_id`, `gift_order_id` and `status`.
+
+**Delivery and the six-hop cascade.** Confirming delivery on a cycle is where the platform pays the household back, and it is the deepest causal chain in the system. Each hop happens *because of* the hop before it, not because the delivery call listed it.
+
+Hop one: the cycle moves `DISPATCHED → DELIVERED` and its `delivered_at` is stamped with the logical clock.
+
+Hop two: because the cycle became `DELIVERED`, a `PointsLedgerEntry` is written with `entry_type` `EARN`. Its `delta_points` is the cycle's `points_earned`, computed from an earn base and the household's tier. The earn base, exposed as `points_earn_base_cents`, is the cycle's `subtotal_cents` minus its `gift_credit_applied_cents` minus its `promo_discount_cents`, floored at 0 — taken after gift credit and after the promotional discount but *before* referral credit and *before* loyalty redemption, and never including `shipping_cents`. It deliberately skips the two middle positions of the credit stack. The tier read is the tier as it stands at the moment of the delivery confirmation, before this cascade's own re-evaluation writes a new one; its multiplier is 1.00 for `BRONZE`, 1.25 for `SILVER` and 1.50 for `GOLD`. `points_earned` is then the earn base divided by 100 cents and floored to a whole number of points, that result multiplied by the tier multiplier, and the product floored again. The entry records the `earn_base_cents` it was computed from and the `tier_multiplier_applied` in force, carries `expires_at` 540 days after its creation, names the producing `cycle_id`, and belongs to the wallet named by `loyalty_account_id`. The wallet's `points_balance` and `trailing_earned_points` rise accordingly.
+
+Hop three: because `trailing_earned_points` changed, the wallet's tier is re-evaluated. The trailing figure is the sum of `delta_points` over that wallet's `EARN` entries created at or after the instant 365 days before the logical clock — earning entries only; redemptions, expiries and clawbacks never move a tier. The tier is `GOLD` when that figure is at least 6000 points, `SILVER` when it is at least 2000, and `BRONZE` otherwise, with both thresholds inclusive. In this cascade the evaluation is upgrade-only: if the computed tier ranks below the stored `tier`, the stored tier is left exactly as it was. The wallet's `tier_evaluated_at` records the instant of the evaluation and is null until the first one.
+
+Hop four: because the tier entered `SILVER` or `GOLD`, every subscription of that household whose `lifecycle_state` is `ACTIVE` or `PAUSED` has `free_shipping_eligible` set to true.
+
+Hop five: because `free_shipping_eligible` flipped to true, the earliest cycle of that subscription whose `status` is `PLANNED` or `ALLOCATED` has its `shipping_cents` recomputed to 0 and its `total_due_cents` recomputed accordingly.
+
+Hop six: because that cycle's `total_due_cents` changed, the household's `next_charge_estimate_cents` is recomputed.
+
+Separately from those six hops, delivery may vest a referral. If a `Referral` exists whose `referee_account_id` is this household, whose `status` is `PENDING`, and this is the first cycle of that household ever to reach `DELIVERED`, the referral vests as described in section 3.11.
+
+Nothing in this cascade has a Pipeline-G counterpart. A gifted item that reaches the doorstep moves its gift order `CLAIMED_ITEM → FULFILLED` and awards exactly zero loyalty points, writing no ledger entry at all; the `points_earned` field simply has no gift analogue.
+
+### 3.9. The Registry and Gift Business
+
+**Publishing a registry.** A `Registry` is created in `DRAFT` by naming `owner_account_id` — the identity that will edit and claim — a `child_id` the registry is for, and a `title`. Its `status` runs over `DRAFT`, `OPEN`, `CLOSED` and `ARCHIVED`, with `ARCHIVED` terminal, and any attempt whose from-state does not match is refused with `ERR_REGISTRY_STATE_INVALID` (HTTP 409). Publishing moves it `DRAFT → OPEN` and requires at least one item to already be listed; publishing an empty registry is refused with `ERR_REGISTRY_EMPTY` (HTTP 409). The owner may rename a registry by supplying a new `title`.
+
+Closing moves the registry `OPEN → CLOSED` and recomputes `inflight_gift_count`, the number of gift orders on that registry whose `status` is `PAID`, `CLAIMED_CREDIT` or `CLAIMED_ITEM`. Closing with gifts in flight is entirely legal: gifts already paid or claimed are neither cancelled nor invalidated and remain claimable. Only *new* purchases are blocked, and a create or a payment against a registry that is not `OPEN` is refused with `ERR_REGISTRY_CLOSED` (HTTP 409). A closed registry may be reopened, moving `CLOSED → OPEN` and incrementing `reopen_count` — but at most once; a second reopen is refused with `ERR_REGISTRY_REOPEN_CAP` (HTTP 409). Archiving moves the registry `CLOSED → ARCHIVED` and requires `inflight_gift_count` to be exactly 0; archiving with a gift still in flight is refused with `ERR_REGISTRY_HAS_INFLIGHT_GIFTS` (HTTP 409).
+
+A registry's `completion_pct` is the sum of `fulfilled_quantity` across all of its items divided by the sum of `requested_quantity` across all of its items, with no status filter on either sum, rounded half up to four decimal places; when nothing is requested at all the value is 0. It is recomputed whenever items are added, changed or removed and whenever gift activity moves a fulfilled quantity. A summary read reports `item_count`, `requested_units`, `fulfilled_units`, `completion_pct` and `inflight_gift_count` for the registry as a whole. Registries are readable by the owner, by gift purchasers browsing for something to buy, by the household and by staff, and are listable with `owner_account_id`, `child_id` and `status` filters.
+
+**Listing items.** A `RegistryItem` names its `registry_id`, the `sku_id` requested and a `requested_quantity` between 1 and 20 inclusive. The named SKU must be `ACTIVE`; listing a discontinued one is refused with `ERR_SKU_DISCONTINUED` (HTTP 409). An item's `fulfilled_quantity` starts at 0 and its `status` starts at `REQUESTED`, moving to `PARTIALLY_FULFILLED` and `FULFILLED` as gifts are paid for. The owner may revise `requested_quantity` on an item, and may delete an item that carries no gift activity — an item with at least one gift order in any status other than `REFUNDED` is refused with `ERR_REGISTRY_ITEM_HAS_GIFTS` (HTTP 409). Because both of those operations address the item through its registry, the item must actually belong to the registry named in the path; a mismatch is refused with `ERR_REGISTRY_ITEM_MISMATCH` (HTTP 422). Items are readable and listable, filterable by `registry_id`, `sku_id` and `status`.
+
+**Reserving a gift.** A third party reserves a gift by naming the `registry_item_id`, their own `purchaser_account_id`, a `quantity` of at least 1, the `expected_registry_item_version` the optimistic-concurrency rule demands, and an optional `gift_message` that defaults to null and is shown to the registry owner. Four policy checks apply beyond the shape and concurrency rules. The registry must be `OPEN`. The item must not already be `FULFILLED`, or the reservation is refused with `ERR_REGISTRY_ITEM_FULFILLED` (HTTP 409). The quantity may not exceed the item's `requested_quantity` minus its `fulfilled_quantity`, or the reservation is refused with `ERR_GIFT_QUANTITY_EXCEEDS_REMAINING` (HTTP 422). And an owner may not gift to their own registry: a purchaser whose account is the registry's `owner_account_id` is refused with `ERR_SELF_GIFT_FORBIDDEN` (HTTP 403). The reservation is persisted with `status` `PENDING_PAYMENT`, `paid_cents` 0, `claim_mode` null, `paid_at` null and `claimed_at` null, and the registry item's `version` is advanced.
+
+**Paying.** The purchaser pays, moving the gift `PENDING_PAYMENT → PAID`. `paid_cents` is set to the gift's `quantity` multiplied by the effective per-pack price of the SKU *as it stands at the moment of payment* — the same base price plus 350-cent hypoallergenic surcharge formula used everywhere else — and `paid_at` is stamped with the logical clock. The item's `fulfilled_quantity` increases by the gift's `quantity`, which drives the item's own axis: a partial coverage moves it `REQUESTED → PARTIALLY_FULFILLED`, a single gift covering the whole request moves it `REQUESTED → FULFILLED`, and a later gift that brings the fulfilled quantity up to the requested quantity moves it `PARTIALLY_FULFILLED → FULFILLED`. Every one of those transitions recomputes the registry's `completion_pct`. A gift's `status` axis treats `REFUNDED` as terminal, and any operation whose from-state does not match is refused with `ERR_GIFT_ORDER_STATE_INVALID` (HTTP 409). Gift orders are readable and listable, filterable by `registry_item_id`, `purchaser_account_id` and `status`.
+
+**Claiming — the branch point.** Only the `RegistryOwner` may claim, and only within 60 days of `paid_at`, inclusive of the boundary day; a later attempt is refused with `ERR_GIFT_CLAIM_WINDOW_EXPIRED` (HTTP 409). The owner supplies a `claim_mode` of either `CREDIT` or `ITEM`, and the two branches carry genuinely different side-effect sets.
+
+On the `CREDIT` branch the gift moves `PAID → CLAIMED_CREDIT`. `paid_cents` is left exactly as payment set it — a later price change on the SKU has no effect on it or on what is issued. A `Credit` of `credit_type` `GIFT` is created on the owner's account with `issued_cents` equal to `paid_cents`, `refundable` false and `expires_at` 730 days after the logical clock, and the owner's `available_credit_cents` is recomputed. No shipment is ever created on this branch. The gift's `claim_mode` is recorded as `CREDIT` and `claimed_at` is stamped.
+
+On the `ITEM` branch the gift moves `PAID → CLAIMED_ITEM`. The gifted SKU must still hold at least the gift's `quantity` in `stock_packs`, or the claim is refused with `ERR_SKU_OUT_OF_STOCK`; and it must pass the allergen screen for the registry's child, or the claim is refused with `ERR_ALLERGEN_BLOCKED` — the same screen, and the same hypoallergenic-required rule, that guards a subscription allocation. `paid_cents` is *rewritten* using the SKU price in force at claim time, so a price change between payment and claim is observable on the gift order. Stock is decremented by the gift's `quantity`, and a one-off `Shipment` is created in `CREATED` with `gift_order_id` set, `cycle_id` null and `account_id` set to the registry's `owner_account_id`, honouring the optional `service_level` input in the same way a cycle dispatch does. That shipment is subject to the same 12-hour account spacing rule as a cycle dispatch. It is emphatically not a subscription cycle: it has no cutoff, it is dispatchable the instant it is claimed, it is never auto-resized, and it never earns a point. The gift's `claim_mode` is recorded as `ITEM` and `claimed_at` is stamped.
+
+The two branches also finish differently. A gift claimed as an item reaches `CLAIMED_ITEM → FULFILLED` when its shipment is confirmed delivered. A gift claimed as credit reaches `CLAIMED_CREDIT → FULFILLED` when a charge fully consumes the derived `GIFT` credit — that is, when that credit's own `status` reaches `CONSUMED`.
+
+**Refunding a gift.** Only the `GiftPurchaser` who paid may refund a gift. The registry owner can see the operation — it is deliberately listed among the roles so that the refusal is an explicit business decision rather than a routing accident — but is rejected with `ERR_PIPELINE_G_REFUND_ACTOR` (HTTP 403), as is any other identity. A gift may be refunded from `PAID`, from `CLAIMED_CREDIT`, from `CLAIMED_ITEM` or from `FULFILLED`, and the refund is always for the full paid face value: Pipeline G never prorates and never charges a restock fee.
+
+Refunding a gift that is still merely `PAID` runs three hops. Hop one: the gift moves `PAID → REFUNDED` and a `Refund` is created in `REQUESTED` with `reason` `GIFT_REFUND`, `requested_cents` equal to `paid_cents` and `restock_fee_cents` 0. Hop two: because the gift was refunded, the item's `fulfilled_quantity` is decremented by the refunded quantity, driving the item `FULFILLED → PARTIALLY_FULFILLED` when some coverage survives, or `PARTIALLY_FULFILLED → REQUESTED` when the fulfilled quantity falls to 0. Hop three: because the item left its fulfilled state, the registry's `completion_pct` and `inflight_gift_count` are recomputed.
+
+Refunding a gift already claimed as credit is the deeper chain and it runs five hops. Hop one: the gift moves `CLAIMED_CREDIT → REFUNDED`. Hop two: because the gift was refunded, the derived `GIFT` credit moves to `REVOKED`, its `remaining_cents` moving into `forfeited_cents`. Hop three: because that credit was revoked while a planned cycle had already consumed part of it, that cycle's `gift_credit_applied_cents` is reversed and its `total_due_cents` recomputed upward. Hop four: because the total rose above 0, the cycle's payment axis moves `FULLY_COVERED → UNCHARGED` — the back-edge that makes the payment axis re-entrant — and this applies to cycles whose `status` is `PLANNED` or `ALLOCATED`. Hop five: because the cycle became `UNCHARGED`, the household's `next_charge_estimate_cents` is recomputed. The item's `fulfilled_quantity` is decremented exactly as in the simpler case.
+
+Refunding a gift already claimed as an item requires that the linked shipment has not reached `DELIVERED`. The gift moves `CLAIMED_ITEM → REFUNDED`, the linked shipment is driven to `RETURNED`, the SKU's `stock_packs` is returned, and the item's `fulfilled_quantity` is decremented.
+
+### 3.10. Unwinding: Cancellation, Returns, Refunds and Settlement
+
+**Cancelling a subscription.** A household — or an operator acting for them — may cancel from `ACTIVE` or from `PAUSED`; the two paths carry identical consequences apart from the extra housekeeping the paused path needs, and both are refused on a subscription already `CANCELLED`, which is terminal. Cancelling from `PAUSED` first drives the subscription's `ACTIVE` pause record to `ENDED` with `actual_end_date` set to today. Then, on both paths: the subscription's `lifecycle_state` becomes `CANCELLED` and `cancelled_at` is stamped with the logical clock; every cycle of that subscription whose `status` is `PLANNED`, `ALLOCATED` or `CUTOFF_LOCKED` is driven to `CANCELLED`, returning any stock those cycles had taken; and, for the most recent cycle whose `status` is `CUTOFF_LOCKED` or `DISPATCHED` and whose `payment_status` is `CHARGED`, a `Refund` is opened in `REQUESTED` with `requested_cents` computed by the cancellation formula below.
+
+**The cancellation refund formula.** The amount depends on whether the box has left the warehouse, and the two variants are genuinely different arithmetic. When the cycle's `status` is `PLANNED`, `ALLOCATED` or `CUTOFF_LOCKED`, the refund is the whole of the cycle's `charged_cash_cents` — no proration, and `restock_fee_cents` is 0. When the cycle's `status` is `DISPATCHED` or `DELIVERED`, the refund is prorated by the portion of the cycle the household has *not* yet used and then reduced by a restock fee of 600 cents, floored at 0, and `restock_fee_cents` records that 600. The used fraction is the number of whole days elapsed since the cycle's `dispatched_at` — that is, the difference between the logical clock and `dispatched_at` in seconds, divided by 86400 and floored — divided by the subscription's `cadence_interval_days` at the moment of the cancellation, then clamped to lie between 0 and 1 inclusive. The refund is the cycle's `charged_cash_cents` multiplied by one minus that used fraction, rounded half up to whole cents *before* the 600-cent restock fee is subtracted, with the result floored at 0. A Pipeline-G gift refund uses neither variant, as section 3.9 states: it returns the gift's `paid_cents` in full with `restock_fee_cents` 0, whether or not the gift shipment has moved.
+
+**Returning a box.** An operator or the household may mark a `DISPATCHED` or `DELIVERED` cycle as returned. The cycle moves to `RETURNED`, the linked shipment is driven to `RETURNED`, and a `Refund` is opened in `REQUESTED` with `reason` `RETURN` and `requested_cents` computed under the dispatched variant of the formula above.
+
+**Opening a refund directly.** A refund may also be opened against a cycle without disturbing its fulfilment state, by supplying a `reason`. The valid members of `reason` are `CANCEL`, `RETURN`, `GIFT_REFUND` and `GOODWILL`, but an `AccountHolder` opening a Pipeline-R request may cite only `CANCEL` or `RETURN`: the Pipeline-G reason `GIFT_REFUND` and the operator reason `GOODWILL` are reserved for `OpsAdmin`, and an `AccountHolder` citing either is refused with `ERR_PIPELINE_R_REFUND_ACTOR` (HTTP 403). The created `Refund` carries `requested_cents` from the same cancellation formula.
+
+**The refund record.** A `Refund` names the `account_id` receiving the money, and exactly one of `cycle_id` (set for Pipeline R, null for gifts) or `gift_order_id` (set for Pipeline G, null for cycles). It carries the `reason`, the `requested_cents` computed at request time, a `refunded_cash_cents` that stays 0 until settlement, the `restock_fee_cents` described above, a `points_clawed_back` count, a `credits_restored_cents` figure, an `approved_by_user_id` that is null while the refund is merely requested, and a `settled_by_user_id` that is null until settlement. Its `status` runs `REQUESTED`, `APPROVED`, `SETTLED` and `DENIED`, with `SETTLED` and `DENIED` terminal; any operation whose from-state does not match is refused with `ERR_REFUND_STATE_INVALID` (HTTP 409). Refunds are readable and listable, filterable by `account_id`, `cycle_id`, `gift_order_id` and `status`.
+
+**Approval and denial.** A `SupportAgent` approves a `REQUESTED` refund, moving it `REQUESTED → APPROVED` and recording their own `X-User-ID` as `approved_by_user_id`. The same role may instead deny it, moving it `REQUESTED → DENIED`, after which no money, no points and no credits move at all.
+
+**Settlement.** Settling is the money-moving step and it is performed by an `OpsAdmin` or a second `SupportAgent`. Three preconditions apply: the refund must be `APPROVED`, and the cycle's payment axis must admit the transition the settlement drives — a cycle whose `payment_status` is not `CHARGED` or `PARTIALLY_REFUNDED` is refused with `ERR_CYCLE_PAYMENT_STATE_INVALID`; the settling `X-User-ID` must differ from `approved_by_user_id`, or the request is refused with `ERR_SEGREGATION_OF_DUTIES`; and the `requested_cents` may not exceed the cycle's `retained_cash_cents` for a Pipeline-R refund, or the gift's `paid_cents` for a Pipeline-G refund, or the request is refused with `ERR_REFUND_EXCEEDS_CHARGE` (HTTP 422).
+
+A settlement does five things. It sets `refunded_cash_cents` to `requested_cents`, moves the refund to `SETTLED` and records `settled_by_user_id`. It decrements the cycle's `retained_cash_cents` by the refunded cash, which drives the cycle's payment axis: from `CHARGED` the cycle moves to `PARTIALLY_REFUNDED` when the refunded cash is less than `charged_cash_cents` and straight to `REFUNDED` when the two are equal, and a later refund that exhausts what remains moves it `PARTIALLY_REFUNDED → REFUNDED`; reaching `REFUNDED` sets `retained_cash_cents` to 0. It writes exactly one `PointsLedgerEntry` with `entry_type` `CLAWBACK`, naming the refunded `cycle_id`, whose `delta_points` is the cycle's `loyalty_points_redeemed` minus its `points_earned` — a single signed movement that restores the redemption and removes the earning in one entry — and it records the cycle's `points_earned` on the refund as `points_clawed_back`. The wallet's `points_balance` is permitted to go negative as a result and no floor is applied. It restores credits: for every credit that contributed to the refunded cycle, a credit whose `refundable` is true has the exact cents it contributed moved back out of `consumed_cents` into `remaining_cents`, walking its status back toward `AVAILABLE`, and those cents are accumulated into the refund's `credits_restored_cents`; a credit whose `refundable` is false — which means every `GIFT` credit — restores nothing, its cents staying in `consumed_cents` permanently, and it is excluded from `credits_restored_cents` entirely. Gift credit consumed by a cycle that is later refunded is simply lost to the customer. And finally, when the refunded cycle is the cycle that vested a referral, that referral is clawed back as described in section 3.11.
+
+### 3.11. Referrals, Loyalty Maintenance and the Daily Batch
+
+**Referrals.** A `Referral` links two households: `referrer_account_id`, the account whose `referral_code` was presented, and `referee_account_id`, the newly signed-up account. It stores the `code` that was presented — the same string as the referrer's own `referral_code` — a `status` running over `PENDING`, `VESTED`, `CLAWED_BACK` and `EXPIRED` with the last two terminal, a `credit_cents` amount that stays 0 until vesting, a `vested_at` instant and a `vesting_cycle_id` that are both null while pending, and an `expires_at` sitting 120 days after the referral's creation. Section 3.1 describes the implicit creation that happens at account verification; an operator may also create one explicitly by naming `referrer_account_id`, `referee_account_id` and `code`, and that path is guarded by the same three policy rungs — the self-referral rung, the reciprocal-referral rung, and the cap of five referrals in any status within the trailing 365 days. Referrals are readable and listable, filterable by `referrer_account_id`, `referee_account_id`, `vesting_cycle_id` and `status`.
+
+Vesting is tied to actual delivery, never to signup and never to dispatch. A `PENDING` referral vests when a cycle belonging to a subscription of the referee's account reaches `DELIVERED`, provided no earlier cycle of that account has ever reached `DELIVERED` — it is the referee's *first* real delivery that counts — and provided the logical clock is at or before the referral's `expires_at`; a vesting attempted past that instant is `ERR_REFERRAL_WINDOW_EXPIRED` (HTTP 409). The vesting transition additionally declares the referrer must have fewer than five referrals vested within the trailing 365 days; the specification nevertheless pins that the five-per-365-days cap is enforced at referral *creation* rather than at vesting, so that it is observable as a rejection on the sixth referral created, and a referral that already exists always vests when its referee's first cycle delivers.
+
+Vesting sets `status` to `VESTED`, stamps `vested_at` with the logical clock, records `vesting_cycle_id` as the delivering cycle, and sets `credit_cents`. That amount is normally 1500 cents. During a promotional window it doubles to 3000 cents: the window is half-open, running from `2026-11-01T00:00:00Z` inclusive up to `2026-12-01T00:00:00Z` exclusive, and it is measured against the *vesting* instant, not the signup instant — a referral created before the window that delivers inside it earns the doubled amount. Vesting then issues a `Credit` of `credit_type` `REFERRAL` on the *referrer's* account, with `refundable` true, `expires_at` 365 days after the logical clock, and `source_referral_id` naming the referral, and recomputes the referrer's `available_credit_cents`.
+
+A vested referral is clawed back when the cycle that vested it is refunded: settling a refund whose `cycle_id` equals the referral's `vesting_cycle_id` moves the referral `VESTED → CLAWED_BACK`, revokes the derived `REFERRAL` credit — moving its `remaining_cents` into `forfeited_cents` — and recomputes the referrer's `available_credit_cents`. A referral that never delivers lapses instead: an operator may expire a `PENDING` referral once the logical clock is strictly past its `expires_at`, moving it `PENDING → EXPIRED` with no credit ever issued. Requesting that lapse on a referral that is not `PENDING` is refused with `ERR_REFERRAL_STATE_INVALID` (HTTP 409), and requesting it before `expires_at` has passed is refused with `ERR_REFERRAL_WINDOW_EXPIRED`.
+
+**Redeeming points by hand.** A household may burn points directly into spendable credit. The request names a `points` figure, which must be at least the redemption floor of 500 points — exactly 500 is accepted, and fewer is refused with `ERR_REDEMPTION_BELOW_FLOOR` (HTTP 422) — and may not exceed the wallet's `points_balance`, or the request is refused with `ERR_INSUFFICIENT_POINTS` (HTTP 402). The redemption writes a `PointsLedgerEntry` with `entry_type` `REDEEM` and a `delta_points` equal to the negation of the points burned, and issues a `GOODWILL` `Credit` worth the points multiplied by the 1-cent value of a point. Manual redemptions are not tied to any cycle, so the entry's `cycle_id` is null.
+
+**The points ledger.** Every movement in a wallet is a `PointsLedgerEntry` naming its `loyalty_account_id`, optionally the `cycle_id` that produced it, an `entry_type` of `EARN`, `REDEEM`, `EXPIRE` or `CLAWBACK`, and a signed `delta_points` — positive for earning, negative for redemption, expiry and clawback. Earning entries additionally carry the `earn_base_cents` they were computed from, the `tier_multiplier_applied` at the time, and an `expires_at` 540 days after creation; on every non-earning entry those first two are 0 and `expires_at` is null. Entries are readable and listable, filterable by `loyalty_account_id`, `cycle_id` and `entry_type`.
+
+**Expiring points.** Earning lots expire 540 days after they are written, and the sweep is first-in-first-out. The wallet's earning lots are ordered by `expires_at` ascending and then by `created_at` ascending — never by identifier — and every consumption, whether a redemption or a clawback, is charged against lots in that same order. For each lot whose `expires_at` is at or before the logical clock and which has not already been swept, the server computes the portion of that lot which was never consumed, and, when that portion is positive, writes a `PointsLedgerEntry` with `entry_type` `EXPIRE`, a `delta_points` equal to the negation of the unconsumed portion, and a null `cycle_id`. Operators may run this sweep for a single wallet on demand.
+
+**Re-evaluating a tier.** Operators may also re-evaluate a wallet's tier on demand, and this is the only path in the whole system that can move a tier *downward*. It applies the same trailing-365-day earning computation and the same `SILVER` threshold of 2000 points and `GOLD` threshold of 6000 points described in section 3.8, but applies the result in both directions: a wallet whose earning lots have aged past 365 days is downgraded here and only here. The re-evaluation also recomputes `free_shipping_eligible` on every non-cancelled subscription of that household, which is true exactly when the resulting tier is `SILVER` or `GOLD`. Loyalty wallets are readable individually and listable, filterable by `account_id` and by `tier`.
+
+**The daily batch.** A single operator-driven batch job advances every time-driven rule at once, and reports what it did: `expired_credits`, `expired_points`, `expired_referrals`, `activated_pauses`, `ended_pauses` and `delinquent_subscriptions`. It expires every credit whose `expires_at` the logical clock has reached, moving it from `AVAILABLE` or `PARTIALLY_CONSUMED` to `EXPIRED`. It runs the points expiry sweep across wallets. It moves every `PENDING` referral whose `expires_at` has passed to `EXPIRED`. It promotes each `SCHEDULED` pause record whose `start_date` the logical clock's date has reached to `ACTIVE`, setting the owning subscription's `lifecycle_state` to `PAUSED`, and it ends each `ACTIVE` pause record whose `end_date` the clock has passed, moving it to `ENDED` with its `actual_end_date` and `consumed_days` recorded, returning the subscription to `ACTIVE` and advancing its `anchor_date` by the days consumed. And it moves every `PAST_DUE` subscription that still has an `UNCHARGED` cycle more than 14 days past its `ship_date` to `DELINQUENT`.
+
+**Driving the clock.** Because every temporal rule reads the logical clock rather than wall time, an operator-only capability sets that clock by supplying a `to_iso8601` instant and receives the new `current_utc` in return. Before the first such call the clock reads exactly `2026-05-01T00:00:00Z`.
+
+
+---
+
+## 4. Endpoint Definitions
+
+The table below is a routing summary only: it names each operation, its URL and the roles permitted to call it, and deliberately does not restate request bodies, response bodies or side effects — those are reconstructed from the narratives in section 3. Creating a new resource returns HTTP 201; every other successful operation, including state transitions, computed reads and deletions, returns HTTP 200. Every endpoint is mounted at the service root.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | `/_clock/set_current_utc` | Sets the server's logical clock. Before the first call the logical clock reads exactly 2026-05-01T00:00:00Z; it NEVER falls back to real wall-clock time. | OpsAdmin |
+| POST | `/_ops/run-daily-jobs` | Runs the daily batch: activates and ends due pauses, expires credits, expires points lots, expires lapsed referrals, and marks PAST_DUE subscriptions DELINQUENT. | OpsAdmin |
+| POST | `/accounts` | Registers a household account in PENDING_VERIFICATION and mints its verification token, referral code and loyalty wallet. | Anonymous, OpsAdmin |
+| GET | `/accounts/{id}` | Reads one account, including the computed available_credit_cents and next_charge_estimate_cents. | AccountHolder, RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| GET | `/accounts` | Lists accounts with pagination and filters. | SupportAgent, OpsAdmin |
+| PATCH | `/accounts/{id}` | Updates mutable account attributes. | AccountHolder, SupportAgent |
+| POST | `/accounts/{id}/verify` | Consumes the verification token and activates the account; creates the PENDING Referral when referred_by_code was supplied. | Anonymous |
+| POST | `/accounts/{id}/suspend` | Suspends an active account. | SupportAgent |
+| POST | `/accounts/{id}/reinstate` | Returns a suspended account to ACTIVE. | SupportAgent |
+| POST | `/accounts/{id}/close` | Closes an account, archiving its children and revoking its credits. | AccountHolder, SupportAgent |
+| GET | `/accounts/{id}/credit-summary` | Computed read of the account's credit and loyalty position; include_credits selects the optimistic or conservative next_charge_estimate variant. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/children` | Creates a child profile; stage is derived from weight_grams at creation with no clamping. | AccountHolder, OpsAdmin |
+| GET | `/children/{id}` | Reads one child profile. | AccountHolder, RegistryOwner, SupportAgent, OpsAdmin |
+| GET | `/children` | Lists children, filterable by owning account. | AccountHolder, RegistryOwner, SupportAgent, OpsAdmin |
+| PATCH | `/children/{id}` | Updates a child profile, including pinning the stage and toggling the hypoallergenic requirement. | AccountHolder |
+| POST | `/children/{id}/weight-measurements` | Records a new measured weight and runs the AUTO resize pipeline. Returns the updated Child. | AccountHolder, OpsAdmin |
+| POST | `/children/{id}/allergen-flags` | Adds a sensitivity to a child and re-screens every re-screenable CycleLine. | AccountHolder, SupportAgent |
+| GET | `/allergen-flags/{id}` | Reads one allergen flag. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/allergen-flags` | Lists allergen flags, filterable by child. | AccountHolder, SupportAgent, OpsAdmin |
+| DELETE | `/allergen-flags/{id}` | Removes a sensitivity. Already-substituted lines are NOT reverted. | AccountHolder, SupportAgent |
+| POST | `/plans` | Creates a catalog plan. | OpsAdmin |
+| GET | `/plans/{id}` | Reads one plan. | AccountHolder, RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| GET | `/plans` | Lists plans. | AccountHolder, RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| PATCH | `/plans/{id}` | Updates a catalog plan. | OpsAdmin |
+| POST | `/skus` | Creates a catalog SKU. | OpsAdmin |
+| GET | `/skus/{id}` | Reads one SKU. | AccountHolder, RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| GET | `/skus` | Lists SKUs, filterable by stage and line. | AccountHolder, RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| PATCH | `/skus/{id}` | Updates a catalog SKU, including its price — which the Pipeline-G at_claim_price variant re-reads. | OpsAdmin |
+| POST | `/skus/{id}/stock-adjustments` | Adds or removes packs from a SKU's stock. A negative adjustment that drops stock below an allocated line's quantity pushes that line into SUBSTITUTION_PENDING. | OpsAdmin |
+| POST | `/subscriptions` | Creates a subscription in DRAFT and derives its cadence from the declared consumption rate. | AccountHolder, OpsAdmin |
+| GET | `/subscriptions/{id}` | Reads one subscription with both state axes and every derived money field. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/subscriptions` | Lists subscriptions, filterable by account, plan, child and lifecycle state. | AccountHolder, SupportAgent, OpsAdmin |
+| PATCH | `/subscriptions/{id}` | Updates pack count or consumption rate; recomputes cadence ONLY when no manual override is in force. | AccountHolder |
+| POST | `/subscriptions/{id}/activate` | Moves a DRAFT subscription to ACTIVE and sets its cadence anchor to the logical clock plus CYCLE_LEAD_DAYS (7) days. | AccountHolder, OpsAdmin |
+| POST | `/subscriptions/{id}/cadence-override` | Pins a manual cadence, SUPPRESSING recomputation from the consumption rate until cleared. | AccountHolder |
+| DELETE | `/subscriptions/{id}/cadence-override` | Clears the manual cadence override and immediately re-derives the interval from the consumption rate. | AccountHolder |
+| POST | `/subscriptions/{id}/resizes` | Requests a MANUAL stage resize. OCC-guarded on the subscription's version. | AccountHolder |
+| POST | `/subscriptions/{id}/pauses` | Schedules or starts a pause on the subscription. | AccountHolder |
+| POST | `/subscriptions/{id}/resume` | Ends the active pause mid-cycle and shifts the cadence anchor by the days actually consumed. | AccountHolder |
+| POST | `/subscriptions/{id}/cancel` | Cancels the subscription, cancels its non-terminal cycles and opens a prorated refund when a charged cycle exists. | AccountHolder, OpsAdmin |
+| POST | `/subscriptions/{id}/cycles` | Generates the next cycle from the current anchor and cadence. | OpsAdmin |
+| GET | `/subscriptions/{id}/cadence-projection` | Computed read projecting the next cycle window and cutoff from the current anchor and cadence. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/cycles/{id}` | Reads one cycle with both state axes and the full money breakdown. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/cycles` | Lists cycles, filterable by subscription and either state axis. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/cycles/{id}/allocate` | Runs the SKU selector and waterfall allocation, then prices the cycle end to end. | OpsAdmin |
+| POST | `/cycles/{id}/lock` | Locks the cycle at cutoff; after this no skip and no current-cycle resize may target it. | OpsAdmin |
+| POST | `/cycles/{id}/charge` | Applies the four-step credit stack and captures the residual cash. When credit_ids is supplied the server consumes exactly those credits in the declared stack order instead of selecting them itself, and rejects any that are expired or not AVAILABLE/PARTIALLY_CONSUMED. | OpsAdmin |
+| POST | `/cycles/{id}/dispatch` | Creates the Pipeline-R shipment and dispatches the cycle, subject to the 12-hour account spacing buffer. | OpsAdmin |
+| POST | `/cycles/{id}/deliver` | Confirms delivery and fires the depth-6 loyalty cascade plus referral vesting. | OpsAdmin |
+| POST | `/cycles/{id}/skip` | Skips the cycle, consuming one skip allowance and advancing the cadence anchor by one full interval. | AccountHolder |
+| DELETE | `/cycles/{id}/skip` | Revokes a skip before cutoff, restoring the allowance and rewinding the anchor exactly. | AccountHolder |
+| POST | `/cycles/{id}/return` | Marks a dispatched or delivered cycle returned and opens a prorated refund. | AccountHolder, OpsAdmin |
+| POST | `/cycles/{id}/refund-requests` | Opens a Pipeline-R refund against the cycle without changing its fulfillment state. | AccountHolder, OpsAdmin |
+| GET | `/cycles/{id}/pricing-preview` | Computed read returning the full credit-stack breakdown without mutating anything. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/cycle-lines/{id}` | Reads one allocation line. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/cycle-lines` | Lists allocation lines, filterable by cycle and SKU. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/cycle-lines/{id}/substitute` | Runs the three-rung substitution ladder on a pending line; short-fills when every rung is empty. | OpsAdmin |
+| POST | `/cycle-lines/{id}/rescreen` | Re-runs the allergen screen on one line and moves it to SUBSTITUTION_PENDING when its SKU no longer passes. | OpsAdmin |
+| GET | `/resize-events/{id}` | Reads one resize event, including where it landed and why it was rejected. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/resize-events` | Lists resize events, filterable by subscription, child and target cycle. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/skip-records/{id}` | Reads one skip record with its anchor before/after pair. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/skip-records` | Lists skip records, filterable by subscription and cycle. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/pause-records/{id}` | Reads one pause record. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/pause-records` | Lists pause records, filterable by subscription. | AccountHolder, SupportAgent, OpsAdmin |
+| DELETE | `/pause-records/{id}` | Cancels a SCHEDULED pause before it starts; consumes no pause budget. | AccountHolder |
+| POST | `/registries` | Creates a baby registry in DRAFT owned by the RegistryOwner identity. | RegistryOwner, AccountHolder |
+| GET | `/registries/{id}` | Reads one registry; visible to gift purchasers so they can shop it. | RegistryOwner, GiftPurchaser, AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/registries` | Lists registries, filterable by owner and child. | RegistryOwner, GiftPurchaser, AccountHolder, SupportAgent, OpsAdmin |
+| PATCH | `/registries/{id}` | Renames a registry. | RegistryOwner |
+| POST | `/registries/{id}/open` | Publishes a registry so third parties may buy gifts against it. | RegistryOwner |
+| POST | `/registries/{id}/close` | Closes the registry to new purchases; gifts already paid or claimed stay live. | RegistryOwner |
+| POST | `/registries/{id}/reopen` | Reopens a closed registry; permitted at most once. | RegistryOwner |
+| POST | `/registries/{id}/archive` | Archives a closed registry once no gift is in flight. | RegistryOwner |
+| GET | `/registries/{id}/summary` | Computed read of registry fulfilment progress. | RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| POST | `/registries/{id}/items` | Adds a requested SKU to the registry. | RegistryOwner |
+| GET | `/registry-items/{id}` | Reads one registry item with its fulfilled quantity. | RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| GET | `/registry-items` | Lists registry items, filterable by registry and SKU. | RegistryOwner, GiftPurchaser, SupportAgent, OpsAdmin |
+| PATCH | `/registries/{id}/items/{item_id}` | Changes the requested quantity on an item; the item must belong to the registry in the path. | RegistryOwner |
+| DELETE | `/registries/{id}/items/{item_id}` | Removes an item that has no gift activity. | RegistryOwner |
+| POST | `/gift-orders` | A third party reserves a gift against a registry item. OCC-guarded on the registry item's version. | GiftPurchaser |
+| GET | `/gift-orders/{id}` | Reads one gift order. | GiftPurchaser, RegistryOwner, SupportAgent, OpsAdmin |
+| GET | `/gift-orders` | Lists gift orders, filterable by registry item and purchaser. | GiftPurchaser, RegistryOwner, SupportAgent, OpsAdmin |
+| POST | `/gift-orders/{id}/pay` | Captures payment at the SKU price in force NOW and advances the registry item's fulfilment. | GiftPurchaser |
+| POST | `/gift-orders/{id}/claim` | The registry owner claims the gift either as spendable CREDIT or as a shipped ITEM. The two branches carry different side effects. | RegistryOwner |
+| POST | `/gift-orders/{id}/refund` | The purchaser refunds the gift in full; Pipeline G never prorates and never charges a restock fee. RegistryOwner is listed so the refusal at validation priority 16 is an explicit business decision rather than a routing 403. | GiftPurchaser, RegistryOwner |
+| POST | `/credits` | Issues a goodwill credit to an account. | SupportAgent |
+| GET | `/credits/{id}` | Reads one credit with its four-bucket money split. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/credits` | Lists credits, filterable by account and origin. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/credits/{id}/revoke` | Revokes the unspent remainder of a credit. | SupportAgent |
+| POST | `/credits/{id}/expire` | Expires a credit whose expires_at has passed. | OpsAdmin |
+| GET | `/shipments/{id}` | Reads one shipment; cycle_id is set for Pipeline R and gift_order_id for Pipeline G. | AccountHolder, RegistryOwner, SupportAgent, OpsAdmin |
+| GET | `/shipments` | Lists shipments, filterable by account, cycle and gift order. | AccountHolder, RegistryOwner, SupportAgent, OpsAdmin |
+| POST | `/shipments/{id}/pick` | Picks the shipment in the warehouse. | OpsAdmin |
+| POST | `/shipments/{id}/transit` | Hands the shipment to the carrier and sets its ETA. | OpsAdmin |
+| POST | `/shipments/{id}/exception` | Records a carrier exception; permitted at most twice per shipment. | OpsAdmin |
+| POST | `/shipments/{id}/retry` | Returns an exception shipment to transit. | OpsAdmin |
+| POST | `/shipments/{id}/deliver` | Confirms carrier delivery; a gift shipment drives GiftOrder CLAIMED_ITEM -> FULFILLED. | OpsAdmin |
+| POST | `/shipments/{id}/return` | Marks a shipment returned. | OpsAdmin |
+| GET | `/loyalty-accounts/{id}` | Reads one loyalty wallet with its tier and trailing earn total. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/loyalty-accounts` | Lists loyalty wallets, filterable by account. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/loyalty-accounts/{id}/redemptions` | Burns points into an account-level credit, subject to the 500-point floor. | AccountHolder |
+| POST | `/loyalty-accounts/{id}/expire-points` | Runs the FIFO expiry sweep for one wallet. | OpsAdmin |
+| POST | `/loyalty-accounts/{id}/reevaluate-tier` | Re-evaluates the tier in BOTH directions; this is the only path that can DOWNGRADE a tier. | OpsAdmin |
+| GET | `/points-ledger-entries/{id}` | Reads one points movement. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/points-ledger-entries` | Lists points movements, filterable by wallet, cycle and entry type. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/referrals` | Creates a referral link explicitly (the same row the verify endpoint creates implicitly). | OpsAdmin |
+| GET | `/referrals/{id}` | Reads one referral with its vesting cycle and credit amount. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/referrals` | Lists referrals, filterable by referrer, referee and vesting cycle. | AccountHolder, SupportAgent, OpsAdmin |
+| POST | `/referrals/{id}/expire` | Lapses a referral whose 120-day vesting window has passed without a delivery. | OpsAdmin |
+| GET | `/refunds/{id}` | Reads one refund with its money, points and credit-restoration breakdown. | AccountHolder, GiftPurchaser, SupportAgent, OpsAdmin |
+| GET | `/refunds` | Lists refunds, filterable by account, cycle and gift order. | AccountHolder, GiftPurchaser, SupportAgent, OpsAdmin |
+| POST | `/refunds/{id}/approve` | Approves a requested refund and records the approving identity. | SupportAgent |
+| POST | `/refunds/{id}/settle` | Settles an approved refund. The settling identity MUST differ from the approving identity. | OpsAdmin, SupportAgent |
+| POST | `/refunds/{id}/deny` | Denies a requested refund; nothing moves. | SupportAgent |
+| GET | `/substitution-events/{id}` | Reads one substitution ladder run, including which rung won. | AccountHolder, SupportAgent, OpsAdmin |
+| GET | `/substitution-events` | Lists substitution ladder runs, filterable by line and by either SKU side. | AccountHolder, SupportAgent, OpsAdmin |
+
+---
+
+## 5. Error Code Catalogue
+
+Every error response carries one of the identifiers below in the `error_id` field of its envelope, with the HTTP status shown. Trigger conditions are not repeated here; each one is stated in the section 2 or section 3 narrative that governs the rule it guards.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNKNOWN_ROLE` | 401 |
+| `ERR_FORBIDDEN_ROLE` | 403 |
+| `ERR_CATALOG_WRITE_FORBIDDEN` | 403 |
+| `ERR_GIFT_PURCHASER_SCOPE` | 403 |
+| `ERR_NOT_ACCOUNT_OWNER` | 403 |
+| `ERR_NOT_REGISTRY_OWNER` | 403 |
+| `ERR_NOT_GIFT_PURCHASER` | 403 |
+| `ERR_PIPELINE_R_REFUND_ACTOR` | 403 |
+| `ERR_PIPELINE_G_REFUND_ACTOR` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_SELF_GIFT_FORBIDDEN` | 403 |
+| `ERR_ACCOUNT_NOT_FOUND` | 404 |
+| `ERR_CHILD_NOT_FOUND` | 404 |
+| `ERR_ALLERGEN_FLAG_NOT_FOUND` | 404 |
+| `ERR_PLAN_NOT_FOUND` | 404 |
+| `ERR_SKU_NOT_FOUND` | 404 |
+| `ERR_SUBSCRIPTION_NOT_FOUND` | 404 |
+| `ERR_CYCLE_NOT_FOUND` | 404 |
+| `ERR_CYCLE_LINE_NOT_FOUND` | 404 |
+| `ERR_RESIZE_EVENT_NOT_FOUND` | 404 |
+| `ERR_SKIP_RECORD_NOT_FOUND` | 404 |
+| `ERR_PAUSE_RECORD_NOT_FOUND` | 404 |
+| `ERR_REGISTRY_NOT_FOUND` | 404 |
+| `ERR_REGISTRY_ITEM_NOT_FOUND` | 404 |
+| `ERR_GIFT_ORDER_NOT_FOUND` | 404 |
+| `ERR_CREDIT_NOT_FOUND` | 404 |
+| `ERR_SHIPMENT_NOT_FOUND` | 404 |
+| `ERR_LOYALTY_ACCOUNT_NOT_FOUND` | 404 |
+| `ERR_REFERRAL_NOT_FOUND` | 404 |
+| `ERR_REFUND_NOT_FOUND` | 404 |
+| `ERR_SUBSTITUTION_EVENT_NOT_FOUND` | 404 |
+| `ERR_MISSING_FIELD` | 400 |
+| `ERR_INVALID_FORMAT` | 400 |
+| `ERR_INVALID_ENUM` | 422 |
+| `ERR_VALUE_OUT_OF_RANGE` | 422 |
+| `ERR_INVALID_PAGINATION` | 400 |
+| `ERR_DUPLICATE_EMAIL` | 409 |
+| `ERR_DUPLICATE_CODE` | 409 |
+| `ERR_STALE_SUBSCRIPTION_VERSION` | 412 |
+| `ERR_STALE_REGISTRY_ITEM_VERSION` | 412 |
+| `ERR_INVALID_VERIFICATION_TOKEN` | 422 |
+| `ERR_ACCOUNT_NOT_ACTIVE` | 409 |
+| `ERR_ACCOUNT_HAS_ACTIVE_SUBSCRIPTIONS` | 409 |
+| `ERR_SUBSCRIPTION_DELINQUENT` | 409 |
+| `ERR_SUBSCRIPTION_STATE_INVALID` | 409 |
+| `ERR_CHILD_ARCHIVED` | 409 |
+| `ERR_CYCLE_STATE_INVALID` | 409 |
+| `ERR_CYCLE_PAYMENT_STATE_INVALID` | 409 |
+| `ERR_LINE_STATE_INVALID` | 409 |
+| `ERR_REGISTRY_STATE_INVALID` | 409 |
+| `ERR_REGISTRY_EMPTY` | 409 |
+| `ERR_REGISTRY_CLOSED` | 409 |
+| `ERR_REGISTRY_ITEM_FULFILLED` | 409 |
+| `ERR_REGISTRY_ITEM_HAS_GIFTS` | 409 |
+| `ERR_GIFT_ORDER_STATE_INVALID` | 409 |
+| `ERR_SHIPMENT_STATE_INVALID` | 409 |
+| `ERR_SHIPMENT_RETRY_CAP_EXCEEDED` | 409 |
+| `ERR_CREDIT_NOT_AVAILABLE` | 409 |
+| `ERR_CREDIT_NOT_YET_EXPIRED` | 409 |
+| `ERR_REFERRAL_STATE_INVALID` | 409 |
+| `ERR_REFUND_STATE_INVALID` | 409 |
+| `ERR_PAUSE_STATE_INVALID` | 409 |
+| `ERR_PAST_CUTOFF` | 409 |
+| `ERR_CUTOFF_NOT_REACHED` | 409 |
+| `ERR_PAUSE_START_IN_PAST` | 422 |
+| `ERR_PAUSE_INTERVAL_INVALID` | 422 |
+| `ERR_PAUSE_OVERLAP` | 409 |
+| `ERR_CYCLE_WINDOW_OVERLAP` | 409 |
+| `ERR_SHIPMENT_SPACING_VIOLATION` | 409 |
+| `ERR_GIFT_CLAIM_WINDOW_EXPIRED` | 409 |
+| `ERR_CREDIT_EXPIRED` | 409 |
+| `ERR_REFERRAL_WINDOW_EXPIRED` | 409 |
+| `ERR_ALLERGEN_BLOCKED` | 422 |
+| `ERR_HYPOALLERGENIC_REQUIRED` | 422 |
+| `ERR_HYPOALLERGENIC_NOT_ALLOWED` | 422 |
+| `ERR_NON_ADJACENT_STAGE` | 422 |
+| `ERR_STAGE_PINNED` | 409 |
+| `ERR_RESIZE_CAP_EXCEEDED` | 409 |
+| `ERR_SKIP_ALLOWANCE_EXHAUSTED` | 409 |
+| `ERR_SKIP_WHILE_PAUSED` | 409 |
+| `ERR_PAUSE_BUDGET_EXCEEDED` | 409 |
+| `ERR_SUBSTITUTION_CAP_EXCEEDED` | 409 |
+| `ERR_REGISTRY_REOPEN_CAP` | 409 |
+| `ERR_REGISTRY_HAS_INFLIGHT_GIFTS` | 409 |
+| `ERR_GIFT_QUANTITY_EXCEEDS_REMAINING` | 422 |
+| `ERR_SELF_REFERRAL` | 422 |
+| `ERR_RECIPROCAL_REFERRAL` | 422 |
+| `ERR_REFERRAL_CAP_EXCEEDED` | 409 |
+| `ERR_DUPLICATE_ACTIVE_SUBSCRIPTION` | 409 |
+| `ERR_CHILD_ACCOUNT_MISMATCH` | 422 |
+| `ERR_REGISTRY_ITEM_MISMATCH` | 422 |
+| `ERR_SKU_DISCONTINUED` | 409 |
+| `ERR_NO_ELIGIBLE_SKU` | 409 |
+| `ERR_SKU_OUT_OF_STOCK` | 409 |
+| `ERR_REDEMPTION_BELOW_FLOOR` | 422 |
+| `ERR_INSUFFICIENT_POINTS` | 402 |
+| `ERR_NO_PAYMENT_METHOD` | 402 |
+| `ERR_REFUND_EXCEEDS_CHARGE` | 422 |

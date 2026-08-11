@@ -1,0 +1,85 @@
+"""Error catalog: error_id -> HTTP status, plus the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERROR_STATUS = {
+    # auth
+    "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER": 400,
+    "ERR_INSUFFICIENT_PERMISSIONS": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_NOT_ASSIGNED_TECH": 403,
+    # existence
+    "ERR_HOUSEHOLD_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_PRODUCT_NOT_FOUND": 404,
+    "ERR_SUBSCRIPTION_NOT_FOUND": 404,
+    "ERR_COOP_SITE_NOT_FOUND": 404,
+    "ERR_VISIT_NOT_FOUND": 404,
+    "ERR_ENGAGEMENT_NOT_FOUND": 404,
+    "ERR_ROUTE_NOT_FOUND": 404,
+    "ERR_STOP_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_TIME_RANGE": 400,
+    # state
+    "ERR_ACCOUNT_SUSPENDED": 409,
+    "ERR_SUBSCRIPTION_NOT_ACTIVE": 409,
+    "ERR_PERIOD_NOT_ENDED": 409,
+    "ERR_VISIT_NOT_ASSIGNABLE": 409,
+    "ERR_VISIT_NOT_SCHEDULED": 409,
+    "ERR_VISIT_NOT_ON_SITE": 409,
+    "ERR_VISIT_NOT_CANCELLABLE": 409,
+    "ERR_ENGAGEMENT_NOT_QUOTED": 409,
+    "ERR_ENGAGEMENT_NOT_CONFIRMED": 409,
+    "ERR_ENGAGEMENT_NOT_CANCELLABLE": 409,
+    "ERR_ROUTE_NOT_PLANNED": 409,
+    "ERR_ROUTE_NOT_PUBLISHED": 409,
+    "ERR_STOP_NOT_PENDING": 409,
+    "ERR_ORDER_NOT_DRAFT": 409,
+    "ERR_INVOICE_NOT_DRAFT": 409,
+    "ERR_INVOICE_NOT_ISSUED": 409,
+    "ERR_INVOICE_NOT_DISPUTED": 409,
+    "ERR_INVALID_STATE": 409,
+    # concurrency
+    "ERR_STALE_VERSION": 412,
+    # business referential/safety
+    "ERR_COOP_NOT_INSTALLED": 409,
+    "ERR_COOP_ALREADY_INSTALLED": 409,
+    "ERR_FULFILLMENT_VISIT_INVALID": 409,
+    "ERR_PREDATOR_GRADE_INSUFFICIENT": 409,
+    # business temporal
+    "ERR_SCHEDULE_IN_PAST": 409,
+    "ERR_ENGAGEMENT_DATE_OVERLAP": 409,
+    "ERR_SEASONAL_WINDOW_OVERLAP": 409,
+    "ERR_TECH_SCHEDULE_CONFLICT": 409,
+    "ERR_STOP_TIME_CONFLICT": 409,
+    "ERR_INVOICE_PERIOD_OVERLAP": 409,
+    # business constraint
+    "ERR_ROUTE_CAPACITY_FULL": 409,
+    "ERR_RESCHEDULE_LIMIT_REACHED": 409,
+    "ERR_ORDER_EMPTY": 409,
+    "ERR_ENGAGEMENT_DURATION_INVALID": 400,
+    "ERR_SUBSCRIPTION_ALREADY_EXISTS": 409,
+    "ERR_ROUTE_NOT_EMPTY": 409,
+    "ERR_STOPS_OUTSTANDING": 409,
+    "ERR_NO_ROUTE_AVAILABLE": 409,
+    "ERR_INVALID_ADJUSTMENT": 422,
+    "ERR_INVOICE_EMPTY": 409,
+    # business fiscal
+    "ERR_CREDIT_LIMIT_EXCEEDED": 402,
+    "ERR_INSUFFICIENT_WALLET_CREDIT": 402,
+}
+
+
+def fail(error_id, message=""):
+    status = ERROR_STATUS.get(error_id, 400)
+    raise ApiError(error_id, status, message or error_id)

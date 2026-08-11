@@ -1,0 +1,1079 @@
+scenario: "build task harder than expert level difficulty. 954. Toy Rental & Rotation Subscription: age/developmental catalog, rotation cadence & swap, sanitization & missing-piece, damage/loss fee, wishlist & hold, buy-out, pause/cancel, shipping"
+
+domain_name: toy-rental-rotation
+api_prefix: /toy-rental
+
+complexity_profile:
+  primary_archetype: quota_allocation      # finite ToyCopy pool competed for via wishlist holds and box slots
+  secondary_archetype: temporal_windowing  # pause windows, hold-expiry windows, loan windows with sanitization buffers
+  complexity_layers:
+    - optimistic_concurrency               # OCC on Subscription.version and RotationBox.version
+    - cascading_side_effects               # swap -> copy release -> hold promotion; inspect -> fee -> ledger -> suspension
+    - dual_variant_calculation             # calendar vs rolling age months; projected vs finalized late fee
+    - ops_run_checkpoint                   # POST /ops/allocation-runs sweeps holds, expires stale holds, auto-resumes pauses
+  entity_topology: hybrid                  # Member->Subscription->RotationBox->BoxItem tree + flat CatalogItem/ToyCopy + junction WishlistEntry
+  state_machine_shape: cyclic              # Subscription ACTIVE<->PAUSED; ToyCopy rental loop; FeeAssessment dispute loop; BoxItem parallel axes
+  relationship_patterns:
+    - one_to_many
+    - many_to_many                         # WishlistEntry joins Member x CatalogItem with lifecycle
+    - self_referential                     # BoxItem.swapped_from_item_id
+    - cross_aggregate                      # BoxItem -> ToyCopy; FeeAssessment -> BoxItem / RotationBox
+  role_model: peer_roles                   # Member vs OperationsManager vs CustomerService vs PlatformAdmin own disjoint operations
+  consistency_model: immediate             # every mutation + cascade visible in the same request's response
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - { name: email, type: string, source: input, description: "Login email; unique across all members", constraints: "unique; duplicate create -> ERR_EMAIL_TAKEN" }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: password, type: string, source: input, description: "Account password; write-only, never echoed in responses" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUSPENDED | CLOSED; SUSPENDED auto-toggles on wallet threshold crossings", default: ACTIVE }
+      - { name: wallet_credit_cents, type: integer, source: computed, description: "Store-credit balance; ALWAYS equals SUM(CreditLedgerEntry.amount_cents) for this member; negative means debt", default: 0 }
+
+  - name: ChildProfile
+    parent: Member
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; owning member" }
+      - { name: name, type: string, source: input, description: "Child first name or label" }
+      - { name: birthdate, type: string, source: input, description: "ISO 8601 date YYYY-MM-DD; must not be after the current logical clock date" }
+      - { name: age_months, type: integer, source: computed, description: "Whole CALENDAR months between birthdate and current logical clock date (canonical variant for gates)" }
+      - { name: developmental_stage, type: enum, source: computed, description: "INFANT (age_months 0-11) | TODDLER (12-35) | PRESCHOOLER (36-59) | EARLY_SCHOOL (60+); derived from calendar age_months" }
+
+  - name: SubscriptionPlan
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Plan display name" }
+      - { name: monthly_fee_cents, type: integer, source: input, description: "Monthly subscription price (billing itself is out of scope)" }
+      - { name: toys_per_box, type: integer, source: input, description: "Maximum BoxItems (loan_status != SWAPPED_OUT/CANCELLED) per RotationBox", constraints: ">= 1" }
+      - { name: swap_allowance_per_cycle, type: integer, source: input, description: "Swaps allowed per box; swap allowed while box.swap_count < allowance", constraints: ">= 0" }
+      - { name: max_holds, type: integer, source: input, description: "Max HELD wishlist entries a member may hold at one time for sweep eligibility", constraints: ">= 0" }
+      - { name: rotation_cadence_days, type: integer, source: input, description: "Days between a box CLOSED and the next cycle becoming due", constraints: ">= 1" }
+      - { name: rental_period_days, type: integer, source: input, description: "Days between box delivery and due_date", constraints: ">= 1" }
+      - { name: buyout_discount_pct, type: number, source: input, description: "Fractional discount off retail for buy-out, e.g. 0.10", constraints: "0 <= p < 1" }
+
+  - name: Subscription
+    parent: Member
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; owning member" }
+      - { name: plan_id, type: string, source: input, description: "FK -> SubscriptionPlan.id; current plan (changeable via PATCH plan)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | PAUSED | CANCELLED", default: ACTIVE }
+      - { name: next_cycle_due_at, type: datetime, source: computed, description: "Earliest logical-clock instant a new RotationBox may be created; initialized to created_at; shifted by pause consumption; reset on box CLOSED / outbound loss" }
+      - { name: pause_windows, type: array, source: system, description: "Append-only list of {start_date, end_date, consumed_days, closed} half-open [start_date, end_date) pause windows", default: [] }
+      - { name: current_pause_end, type: datetime, source: system, description: "End instant of the currently active pause window; null when not PAUSED", default: null }
+      - { name: paused_days_used_365d, type: integer, source: computed, description: "Sum of consumed_days over pause_windows with start_date within the trailing 365 days of the logical clock", default: 0 }
+      - { name: cancel_reason, type: string, source: input, description: "Optional reason captured at cancel", default: null }
+
+  - name: CatalogItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: title, type: string, source: input, description: "Toy title" }
+      - { name: description, type: string, source: input, description: "Free-text description", default: "" }
+      - { name: min_age_months, type: integer, source: input, description: "Minimum child age in whole calendar months (INCLUSIVE lower bound)", constraints: ">= 0 and <= max_age_months" }
+      - { name: max_age_months, type: integer, source: input, description: "Maximum child age in whole calendar months (INCLUSIVE upper bound)" }
+      - { name: developmental_stages, type: array, source: input, description: "Array of INFANT | TODDLER | PRESCHOOLER | EARLY_SCHOOL this toy targets (browse filter facet)" }
+      - { name: piece_count, type: integer, source: input, description: "Number of pieces in the complete toy; basis for missing-piece fees", constraints: ">= 1" }
+      - { name: retail_value_cents, type: integer, source: input, description: "Retail price; basis for buy-out price", constraints: "> 0" }
+      - { name: replacement_value_cents, type: integer, source: input, description: "Replacement cost; basis for loss/damage/missing-piece fees and late-fee cap", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | RETIRED", default: ACTIVE }
+
+  - name: ToyCopy
+    parent: CatalogItem
+    common_fields: true
+    fields:
+      - { name: catalog_item_id, type: string, source: system, description: "FK -> CatalogItem.id; the catalog toy this is a physical copy of" }
+      - { name: barcode, type: string, source: input, description: "Unique physical barcode", constraints: "unique; duplicate -> ERR_VALIDATION" }
+      - { name: condition_grade, type: enum, source: input, description: "NEW | GOOD | FAIR | WORN; minted grade; at inspection degrades to the worse of current vs condition_returned", default: NEW }
+      - { name: status, type: enum, source: system, description: "AVAILABLE | RESERVED | OUT_ON_LOAN | RETURNED | SANITIZING | QUARANTINED | LOST | SOLD | RETIRED", default: AVAILABLE }
+      - { name: reserved_member_id, type: string, source: system, description: "FK -> Member.id; member holding the reservation/hold when status == RESERVED; null otherwise", default: null }
+      - { name: sanitization_started_at, type: datetime, source: system, description: "Logical-clock instant the copy entered SANITIZING", default: null }
+      - { name: last_sanitized_at, type: datetime, source: system, description: "Logical-clock instant sanitization last completed; null for never-sanitized NEW copies", default: null }
+      - { name: sanitization_cycle_count, type: integer, source: system, description: "Number of completed sanitization cycles", default: 0 }
+
+  - name: WishlistEntry
+    parent: Member
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; owning member" }
+      - { name: catalog_item_id, type: string, source: input, description: "FK -> CatalogItem.id; wished toy" }
+      - { name: rank, type: integer, source: input, description: "Member-chosen priority; lower is earlier; sweep tie-break after rank is created_at ASC" }
+      - { name: status, type: enum, source: system, description: "WAITING | HELD | FULFILLED | EXPIRED | CANCELLED", default: WAITING }
+      - { name: held_copy_id, type: string, source: system, description: "FK -> ToyCopy.id; copy reserved by this hold while HELD; null otherwise", default: null }
+      - { name: hold_expires_at, type: datetime, source: system, description: "Logical-clock instant the hold lapses (promotion time + HOLD_WINDOW_HOURS); accept requires clock strictly before this", default: null }
+
+  - name: RotationBox
+    parent: Subscription
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id; owning subscription" }
+      - { name: cycle_number, type: integer, source: system, description: "1-based sequence of boxes for the subscription in creation order" }
+      - { name: status, type: enum, source: system, description: "PLANNED | SHIPPED | DELIVERED | RETURNING | RECEIVED | INSPECTED | CLOSED | CANCELLED", default: PLANNED }
+      - { name: swap_count, type: integer, source: system, description: "Swaps performed on this box; gated by plan.swap_allowance_per_cycle", default: 0 }
+      - { name: delivered_at, type: datetime, source: system, description: "Outbound DELIVERED event occurred_at", default: null }
+      - { name: due_date, type: datetime, source: system, description: "delivered_at + plan.rental_period_days", default: null }
+      - { name: received_at, type: datetime, source: system, description: "Return DELIVERED event occurred_at", default: null }
+      - { name: projected_late_fee_cents, type: integer, source: computed, description: "Forward-looking late fee for a DELIVERED box as of the current logical clock; 0 when not DELIVERED or not yet late", default: 0 }
+
+  - name: BoxItem
+    parent: RotationBox
+    common_fields: true
+    fields:
+      - { name: rotation_box_id, type: string, source: system, description: "FK -> RotationBox.id; containing box" }
+      - { name: toy_copy_id, type: string, source: input, description: "FK -> ToyCopy.id; physical copy in the slot" }
+      - { name: swapped_from_item_id, type: string, source: system, description: "FK -> BoxItem.id; the item this one replaced via swap; null when not swap-created", default: null }
+      - { name: loan_status, type: enum, source: system, description: "PENDING_RETURN | RETURNED | LOST_REPORTED | KEPT_BUYOUT | SWAPPED_OUT | CANCELLED", default: PENDING_RETURN }
+      - { name: resolution_status, type: enum, source: system, description: "NONE | FEE_ASSESSED | RESOLVED; independent axis from loan_status", default: NONE }
+      - { name: condition_returned, type: enum, source: system, description: "GOOD | FAIR | WORN recorded at inspection; null until inspected", default: null }
+      - { name: damage_severity, type: enum, source: system, description: "NONE | MINOR | MODERATE | SEVERE recorded at inspection", default: null }
+      - { name: missing_piece_count, type: integer, source: system, description: "Missing pieces recorded at inspection", default: 0 }
+      - { name: buyout_price_cents, type: integer, source: computed, description: "Computed buy-out price at buy-out time; null until KEPT_BUYOUT", default: null }
+      - { name: wallet_applied_cents, type: integer, source: computed, description: "Wallet credit consumed by the buy-out; null until KEPT_BUYOUT", default: null }
+      - { name: net_charge_cents, type: integer, source: computed, description: "buyout_price_cents - wallet_applied_cents charged to card; null until KEPT_BUYOUT", default: null }
+
+  - name: FeeAssessment
+    parent: Subscription
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id; billed subscription" }
+      - { name: box_item_id, type: string, source: system, description: "FK -> BoxItem.id; source item for DAMAGE | MISSING_PIECES | LOSS fees; null for LATE_RETURN", default: null }
+      - { name: rotation_box_id, type: string, source: system, description: "FK -> RotationBox.id; source box (all fee types)", default: null }
+      - { name: fee_type, type: enum, source: system, description: "DAMAGE | MISSING_PIECES | LOSS | LATE_RETURN" }
+      - { name: amount_cents, type: integer, source: computed, description: "Computed per inspection_fee_aggregation / late_return_fee / replacement value for LOSS", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "INVOICED | PAID | WAIVED | DISPUTED", default: INVOICED }
+      - { name: dispute_rounds, type: integer, source: system, description: "Number of INVOICED->DISPUTED cycles consumed; dispute allowed while < MAX_DISPUTE_ROUNDS", default: 0 }
+
+  - name: Shipment
+    parent: RotationBox
+    common_fields: true
+    fields:
+      - { name: rotation_box_id, type: string, source: system, description: "FK -> RotationBox.id; box being shipped" }
+      - { name: direction, type: enum, source: system, description: "OUTBOUND (to member) | RETURN (from member)" }
+      - { name: carrier, type: string, source: input, description: "Carrier name supplied at ship/initiate-return" }
+      - { name: tracking_number, type: string, source: input, description: "Tracking number supplied at ship/initiate-return" }
+      - { name: status, type: enum, source: system, description: "LABEL_CREATED | IN_TRANSIT | DELIVERED | EXCEPTION | LOST_IN_TRANSIT", default: LABEL_CREATED }
+      - { name: events, type: array, source: system, description: "Append-only list of {event_type, occurred_at} carrier events in recorded order", default: [] }
+
+  - name: CreditLedgerEntry
+    parent: Member
+    common_fields: false
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; owning member" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed amount; positive credits the member, negative debits", constraints: "!= 0" }
+      - { name: reason, type: enum, source: system, description: "PROMO_CREDIT | SUPPORT_ADJUSTMENT | FEE_CHARGE | FEE_SETTLED_CARD | FEE_SETTLED_WALLET | WALLET_DEBIT | FEE_WAIVER | BUYOUT_CREDIT_APPLIED" }
+      - { name: note, type: string, source: input, description: "Optional operator note on manual adjustments", default: "" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Member
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: any CreditLedgerEntry append that leaves Member.wallet_credit_cents < -5000 (SUSPENSION_THRESHOLD_CENTS)"
+        actor: system
+        preconditions:
+          - "recomputed wallet_credit_cents < -5000 (boundary: exactly -5000 stays ACTIVE)"
+        side_effects:
+          - "Member.status := SUSPENDED; member-gated operations now fail ERR_MEMBER_SUSPENDED until recovery"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system: any CreditLedgerEntry append that leaves Member.wallet_credit_cents >= -5000"
+        actor: system
+        preconditions:
+          - "recomputed wallet_credit_cents >= -5000"
+        side_effects:
+          - "Member.status := ACTIVE"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /toy-rental/members/{id}/close"
+        actor: CustomerService
+        preconditions:
+          - "no RotationBox of any subscription of this member in {PLANNED, SHIPPED, DELIVERED, RETURNING, RECEIVED, INSPECTED} (ERR_MEMBER_HAS_OPEN_BOX)"
+          - "no FeeAssessment of this member in {INVOICED, DISPUTED} (ERR_FEES_OUTSTANDING)"
+        side_effects:
+          - "all WishlistEntry of this member in {WAITING, HELD} -> CANCELLED; each HELD entry's copy RESERVED -> AVAILABLE (reserved_member_id := null) then targeted sweep re-promotes the next eligible WAITING entry"
+      - from: SUSPENDED
+        to: CLOSED
+        trigger: "POST /toy-rental/members/{id}/close"
+        actor: CustomerService
+        preconditions:
+          - "no RotationBox of any subscription of this member in {PLANNED, SHIPPED, DELIVERED, RETURNING, RECEIVED, INSPECTED} (ERR_MEMBER_HAS_OPEN_BOX)"
+          - "no FeeAssessment of this member in {INVOICED, DISPUTED} (ERR_FEES_OUTSTANDING)"
+        side_effects:
+          - "same wishlist-cancellation cascade as ACTIVE -> CLOSED"
+
+  - entity: CatalogItem
+    initial_state: ACTIVE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "POST /toy-rental/catalog-items/{id}/retire"
+        actor: PlatformAdmin
+        preconditions:
+          - "CatalogItem.status == ACTIVE (else ERR_INVALID_STATE)"
+        side_effects:
+          - "new WishlistEntry creation for this item rejected with ERR_CATALOG_ITEM_RETIRED; existing entries and copies unaffected"
+
+  - entity: Subscription
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /toy-rental/subscriptions/{id}/pause with start_date <= current logical clock date"
+        actor: Member
+        preconditions:
+          - "Subscription.status == ACTIVE (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+          - "Member.status == ACTIVE (ERR_MEMBER_SUSPENDED)"
+          - "pause_allowance: paused_days_used_365d + duration_days <= 60 (ERR_PAUSE_ALLOWANCE_EXCEEDED)"
+          - "new half-open window [start_date, start_date + duration_days) overlaps no existing pause_windows entry (ERR_PAUSE_WINDOW_OVERLAP); adjacency (start_date == prior end_date) is allowed"
+        side_effects:
+          - "append {start_date, end_date: start_date + duration_days, consumed_days: null, closed: false} to pause_windows; current_pause_end := end_date; recompute paused_days_used_365d"
+          - "cascade: every RotationBox in PLANNED of this subscription -> CANCELLED; its PENDING_RETURN BoxItems -> CANCELLED; each released ToyCopy RESERVED -> AVAILABLE triggers a targeted allocation sweep for that copy's catalog item"
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /toy-rental/subscriptions/{id}/pause with start_date > current logical clock date (scheduled pause; no state change)"
+        actor: Member
+        preconditions:
+          - "same allowance and overlap checks as immediate pause"
+        side_effects:
+          - "append window to pause_windows; subscription remains ACTIVE until the window is activated by an ops run"
+          - "increments Subscription.version by 1"
+        note: "self-transition records the future window; state flips to PAUSED via ops-run activation"
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "system: POST /toy-rental/ops/allocation-runs activates a scheduled window whose start_date <= clock date"
+        actor: system
+        preconditions:
+          - "exists open pause_windows entry with start_date <= clock date and Subscription.status == ACTIVE"
+        side_effects:
+          - "current_pause_end := window end_date; same PLANNED-box cancellation cascade as member-initiated pause"
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /toy-rental/subscriptions/{id}/resume (early) OR system ops-run when clock >= current_pause_end (auto-resume)"
+        actor: Member | system
+        preconditions:
+          - "Subscription.status == PAUSED (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+          - "member-initiated resume also requires Member.status == ACTIVE (ERR_MEMBER_SUSPENDED)"
+        side_effects:
+          - "close the active window: consumed_days := (min(clock_date, end_date) - start_date) in whole days; closed := true"
+          - "next_cycle_due_at := next_cycle_due_at + consumed_days days (cadence clock frozen during pause)"
+          - "current_pause_end := null; recompute paused_days_used_365d; increments Subscription.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /toy-rental/subscriptions/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Subscription.status in {ACTIVE, PAUSED} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "all WishlistEntry of the member in {WAITING, HELD} -> CANCELLED; HELD copies released (RESERVED -> AVAILABLE) with targeted sweep"
+          - "RotationBox in PLANNED -> CANCELLED with copy-release cascade; boxes past PLANNED continue their lifecycle to CLOSED; fees remain payable"
+      - from: PAUSED
+        to: CANCELLED
+        trigger: "POST /toy-rental/subscriptions/{id}/cancel"
+        actor: Member
+        preconditions:
+          - "Subscription.status in {ACTIVE, PAUSED} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "same cascade as ACTIVE -> CANCELLED; the open pause window is discarded"
+
+  - entity: ToyCopy
+    initial_state: AVAILABLE
+    terminal_states: [LOST, SOLD, RETIRED]
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/items (box slot fill), POST /toy-rental/wishlist-entries/{id}/accept-hold, or allocation sweep promotion"
+        actor: Member | system
+        preconditions:
+          - "ToyCopy.status == AVAILABLE (else ERR_COPY_NOT_AVAILABLE)"
+          - "sanitization valid: condition_grade == NEW with last_sanitized_at null (factory-sealed), OR last_sanitized_at within SANITIZATION_VALIDITY_DAYS (30) of the logical clock (else ERR_NEEDS_RESANITIZATION)"
+        side_effects:
+          - "reserved_member_id := reserving member"
+      - from: RESERVED
+        to: AVAILABLE
+        trigger: "swap release, hold expiry, wishlist cancel of a HELD entry, PLANNED-box cancellation cascade"
+        actor: Member | system
+        preconditions:
+          - "ToyCopy.status == RESERVED"
+        side_effects:
+          - "reserved_member_id := null; targeted allocation sweep for this copy's catalog item: promote best eligible WAITING WishlistEntry (copy -> RESERVED again under that member) or leave AVAILABLE when no eligible entry"
+      - from: RESERVED
+        to: OUT_ON_LOAN
+        trigger: "POST /toy-rental/rotation-boxes/{id}/ship (cascade per boxed item)"
+        actor: OperationsManager
+        preconditions:
+          - "ToyCopy.status == RESERVED and the copy occupies a slot of the shipping box"
+        side_effects:
+          - "reserved_member_id := null (loan now tracked via BoxItem)"
+      - from: OUT_ON_LOAN
+        to: RETURNED
+        trigger: "POST /toy-rental/shipments/{id}/events DELIVERED on the RETURN shipment (cascade per item)"
+        actor: OperationsManager
+        preconditions:
+          - "ToyCopy.status == OUT_ON_LOAN"
+        side_effects: []
+      - from: OUT_ON_LOAN
+        to: LOST
+        trigger: "POST /toy-rental/box-items/{id}/report-lost, or return shipment LOST_IN_TRANSIT cascade"
+        actor: Member | OperationsManager
+        preconditions:
+          - "ToyCopy.status == OUT_ON_LOAN"
+        side_effects:
+          - "LOSS FeeAssessment created against the BoxItem (amount = CatalogItem.replacement_value_cents)"
+      - from: OUT_ON_LOAN
+        to: SOLD
+        trigger: "POST /toy-rental/box-items/{id}/buyout"
+        actor: Member
+        preconditions:
+          - "ToyCopy.status == OUT_ON_LOAN"
+        side_effects:
+          - "buyout_price and buyout_wallet_application calculations run; BUYOUT_CREDIT_APPLIED ledger entry when wallet_applied_cents > 0"
+      - from: RETURNED
+        to: SANITIZING
+        trigger: "POST /toy-rental/rotation-boxes/{id}/inspect with disposition RESTOCK"
+        actor: OperationsManager
+        preconditions:
+          - "ToyCopy.status == RETURNED"
+        side_effects:
+          - "sanitization_started_at := logical clock; condition_grade := worse(current grade, BoxItem.condition_returned) on the scale NEW > GOOD > FAIR > WORN"
+      - from: RETURNED
+        to: QUARANTINED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/inspect with disposition QUARANTINE"
+        actor: OperationsManager
+        preconditions:
+          - "ToyCopy.status == RETURNED"
+        side_effects:
+          - "copy leaves the rental pool until retired"
+      - from: SANITIZING
+        to: AVAILABLE
+        trigger: "POST /toy-rental/copies/{id}/complete-sanitization"
+        actor: OperationsManager
+        preconditions:
+          - "ToyCopy.status == SANITIZING (else ERR_INVALID_STATE)"
+          - "logical clock >= sanitization_started_at + SANITIZATION_MIN_HOURS (24h mandatory buffer between loans; else ERR_SANITIZATION_BUFFER_ACTIVE)"
+        side_effects:
+          - "last_sanitized_at := clock; sanitization_cycle_count += 1"
+          - "targeted allocation sweep: best eligible WAITING WishlistEntry for this catalog item -> HELD and copy -> RESERVED under that member; copy stays AVAILABLE when no eligible entry"
+      - from: AVAILABLE
+        to: RETIRED
+        trigger: "POST /toy-rental/copies/{id}/retire"
+        actor: PlatformAdmin
+        preconditions:
+          - "ToyCopy.status in {AVAILABLE, QUARANTINED} (else ERR_INVALID_STATE)"
+        side_effects: []
+      - from: QUARANTINED
+        to: RETIRED
+        trigger: "POST /toy-rental/copies/{id}/retire"
+        actor: PlatformAdmin
+        preconditions:
+          - "ToyCopy.status in {AVAILABLE, QUARANTINED} (else ERR_INVALID_STATE)"
+        side_effects: []
+
+  - entity: WishlistEntry
+    initial_state: WAITING
+    terminal_states: [FULFILLED, EXPIRED, CANCELLED]
+    transitions:
+      - from: WAITING
+        to: HELD
+        trigger: "allocation sweep (targeted on copy release, or global via POST /toy-rental/ops/allocation-runs)"
+        actor: system
+        preconditions:
+          - "an AVAILABLE, sanitization-valid ToyCopy of WishlistEntry.catalog_item_id exists"
+          - "member has a Subscription with status == ACTIVE"
+          - "member's count of HELD entries < plan.max_holds"
+          - "exists a ChildProfile of the member with min_age_months <= child.age_months <= max_age_months (calendar variant)"
+          - "selection: among eligible WAITING entries for the catalog item, lowest rank wins; tie -> earliest created_at"
+        side_effects:
+          - "held_copy_id := chosen copy (copies scanned in created_at ASC order); hold_expires_at := clock + HOLD_WINDOW_HOURS (72h); copy AVAILABLE -> RESERVED with reserved_member_id := entry member"
+      - from: HELD
+        to: FULFILLED
+        trigger: "POST /toy-rental/wishlist-entries/{id}/accept-hold"
+        actor: Member
+        preconditions:
+          - "WishlistEntry.status == HELD (else ERR_INVALID_STATE)"
+          - "logical clock < hold_expires_at (ERR_HOLD_EXPIRED at or after expiry)"
+          - "target RotationBox.status == PLANNED, belongs to this member's ACTIVE subscription, and has a free slot (ERR_SLOT_CAPACITY_EXCEEDED)"
+          - "held copy still RESERVED to this member; age gate re-checked (ERR_AGE_INCOMPATIBLE)"
+        side_effects:
+          - "creates a BoxItem in the target box with toy_copy_id := held_copy_id (copy remains RESERVED, now backing the box slot); increments RotationBox.version by 1"
+      - from: HELD
+        to: EXPIRED
+        trigger: "system: POST /toy-rental/ops/allocation-runs when hold_expires_at <= logical clock"
+        actor: system
+        preconditions:
+          - "WishlistEntry.status == HELD and hold_expires_at <= clock"
+        side_effects:
+          - "held copy RESERVED -> AVAILABLE (reserved_member_id := null) then targeted sweep promotes the next eligible WAITING entry"
+      - from: WAITING
+        to: CANCELLED
+        trigger: "POST /toy-rental/wishlist-entries/{id}/cancel or subscription/member cancel cascade"
+        actor: Member | system
+        preconditions:
+          - "WishlistEntry.status in {WAITING, HELD} (else ERR_INVALID_STATE)"
+        side_effects: []
+      - from: HELD
+        to: CANCELLED
+        trigger: "POST /toy-rental/wishlist-entries/{id}/cancel or subscription/member cancel cascade"
+        actor: Member | system
+        preconditions:
+          - "WishlistEntry.status in {WAITING, HELD} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "held copy RESERVED -> AVAILABLE then targeted sweep for the next eligible WAITING entry"
+
+  - entity: RotationBox
+    initial_state: PLANNED
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: SHIPPED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/ship"
+        actor: OperationsManager
+        preconditions:
+          - "RotationBox.status == PLANNED (else ERR_INVALID_STATE)"
+          - "count of BoxItems with loan_status == PENDING_RETURN >= 1 (ERR_BOX_EMPTY)"
+        side_effects:
+          - "creates Shipment direction OUTBOUND status LABEL_CREATED with carrier/tracking_number"
+          - "each slotted ToyCopy RESERVED -> OUT_ON_LOAN"
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /toy-rental/shipments/{id}/events DELIVERED on the OUTBOUND shipment"
+        actor: OperationsManager
+        preconditions:
+          - "outbound Shipment.status == IN_TRANSIT and event_type == DELIVERED"
+        side_effects:
+          - "delivered_at := occurred_at; due_date := occurred_at + plan.rental_period_days"
+      - from: DELIVERED
+        to: RETURNING
+        trigger: "POST /toy-rental/rotation-boxes/{id}/initiate-return"
+        actor: Member
+        preconditions:
+          - "RotationBox.status == DELIVERED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "creates Shipment direction RETURN status LABEL_CREATED"
+      - from: RETURNING
+        to: RECEIVED
+        trigger: "POST /toy-rental/shipments/{id}/events DELIVERED on the RETURN shipment"
+        actor: OperationsManager
+        preconditions:
+          - "return Shipment.status == IN_TRANSIT and event_type == DELIVERED"
+        side_effects:
+          - "received_at := occurred_at; each slotted ToyCopy OUT_ON_LOAN -> RETURNED"
+          - "finalized late fee: days_late := max(0, received_at - due_date) in whole days; if days_late > 0 create FeeAssessment LATE_RETURN (amount per late_return_fee FINALIZED variant) status INVOICED + FEE_CHARGE ledger append + wallet recompute (suspension cascade may fire)"
+      - from: RETURNING
+        to: INSPECTED
+        trigger: "POST /toy-rental/shipments/{id}/events LOST_IN_TRANSIT on the RETURN shipment"
+        actor: OperationsManager
+        preconditions:
+          - "return Shipment.status == IN_TRANSIT and event_type == LOST_IN_TRANSIT"
+        side_effects:
+          - "every BoxItem still PENDING_RETURN -> LOST_REPORTED with resolution_status FEE_ASSESSED; per item a LOSS FeeAssessment (replacement_value_cents) INVOICED + ledger charge; copies -> LOST"
+      - from: RECEIVED
+        to: INSPECTED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/inspect (auto when the call leaves no PENDING_RETURN item uninspected)"
+        actor: OperationsManager
+        preconditions:
+          - "RotationBox.status == RECEIVED (or already INSPECTED for follow-up calls; compound gate: transition fires once every PENDING_RETURN item has an inspection record)"
+        side_effects:
+          - "per inspected item: loan_status -> RETURNED; condition_returned / damage_severity / missing_piece_count recorded; copy RETURNED -> SANITIZING (RESTOCK) or QUARANTINED; copy grade degrades"
+          - "per-item fees per inspection_fee_aggregation: DAMAGE when damage_severity != NONE; MISSING_PIECES when missing_piece_count > 0; per-item cap = replacement_value_cents with DAMAGE ranked first; each fee INVOICED + FEE_CHARGE ledger append + wallet recompute (suspension cascade may fire)"
+      - from: SHIPPED
+        to: CANCELLED
+        trigger: "POST /toy-rental/shipments/{id}/events LOST_IN_TRANSIT on the OUTBOUND shipment"
+        actor: OperationsManager
+        preconditions:
+          - "outbound Shipment.status == IN_TRANSIT and event_type == LOST_IN_TRANSIT"
+        side_effects:
+          - "slotted copies OUT_ON_LOAN... RESERVED -> LOST; no member fees; subscription.next_cycle_due_at := clock + rotation_cadence_days"
+      - from: INSPECTED
+        to: CLOSED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/close"
+        actor: OperationsManager
+        preconditions:
+          - "RotationBox.status == INSPECTED (else ERR_INVALID_STATE)"
+          - "every FeeAssessment with rotation_box_id == this box in {PAID, WAIVED} (ERR_FEES_OUTSTANDING)"
+        side_effects:
+          - "subscription.next_cycle_due_at := logical clock + plan.rotation_cadence_days; increments Subscription.version by 1"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "cascade from subscription pause/cancel or member close"
+        actor: system
+        preconditions:
+          - "RotationBox.status == PLANNED"
+        side_effects:
+          - "PENDING_RETURN BoxItems -> CANCELLED; reserved copies -> AVAILABLE with targeted sweep"
+
+  - entity: BoxItem
+    initial_state: PENDING_RETURN
+    terminal_states: [RETURNED, LOST_REPORTED, KEPT_BUYOUT, SWAPPED_OUT, CANCELLED]
+    note: "loan_status axis; resolution_status (NONE | FEE_ASSESSED | RESOLVED) is an independent second axis evolving on the same row"
+    transitions:
+      - from: PENDING_RETURN
+        to: SWAPPED_OUT
+        trigger: "POST /toy-rental/box-items/{id}/swap"
+        actor: Member
+        preconditions:
+          - "BoxItem.loan_status == PENDING_RETURN and RotationBox.status == PLANNED (else ERR_INVALID_STATE)"
+          - "Member.status == ACTIVE (ERR_MEMBER_SUSPENDED)"
+          - "box.swap_count < plan.swap_allowance_per_cycle (ERR_SWAP_ALLOWANCE_EXCEEDED; boundary: swap_count == allowance - 1 is the last legal swap)"
+          - "new copy AVAILABLE and sanitization-valid, or RESERVED to this member (else ERR_COPY_NOT_AVAILABLE / ERR_NEEDS_RESANITIZATION)"
+          - "age gate on the new copy's catalog item (ERR_AGE_INCOMPATIBLE)"
+        side_effects:
+          - "creates replacement BoxItem (loan_status PENDING_RETURN, swapped_from_item_id := this item) with the new copy RESERVED; box.swap_count += 1; increments RotationBox.version by 1"
+          - "old copy RESERVED -> AVAILABLE then targeted sweep may promote a WAITING WishlistEntry (transitive cascade: swap -> copy release -> hold promotion)"
+      - from: PENDING_RETURN
+        to: RETURNED
+        trigger: "POST /toy-rental/rotation-boxes/{id}/inspect"
+        actor: OperationsManager
+        preconditions:
+          - "RotationBox.status in {RECEIVED, INSPECTED}"
+        side_effects:
+          - "inspection fields recorded; fees per inspection_fee_aggregation; resolution_status := FEE_ASSESSED when any fee created else RESOLVED"
+      - from: PENDING_RETURN
+        to: LOST_REPORTED
+        trigger: "POST /toy-rental/box-items/{id}/report-lost (member) or return-shipment LOST_IN_TRANSIT cascade"
+        actor: Member | OperationsManager
+        preconditions:
+          - "BoxItem.loan_status == PENDING_RETURN (else ERR_INVALID_STATE)"
+          - "member path also requires RotationBox.status in {DELIVERED, RETURNING} (else ERR_INVALID_STATE)"
+        side_effects:
+          - "LOSS FeeAssessment INVOICED (amount = replacement_value_cents) + FEE_CHARGE ledger append; resolution_status := FEE_ASSESSED; copy OUT_ON_LOAN -> LOST"
+      - from: PENDING_RETURN
+        to: KEPT_BUYOUT
+        trigger: "POST /toy-rental/box-items/{id}/buyout"
+        actor: Member
+        preconditions:
+          - "BoxItem.loan_status == PENDING_RETURN and RotationBox.status in {DELIVERED, RETURNING} (else ERR_INVALID_STATE)"
+          - "Member.status == ACTIVE (ERR_MEMBER_SUSPENDED)"
+        side_effects:
+          - "buyout_price then buyout_wallet_application run; buyout_price_cents / wallet_applied_cents / net_charge_cents recorded; copy OUT_ON_LOAN -> SOLD; resolution_status := RESOLVED"
+      - from: PENDING_RETURN
+        to: CANCELLED
+        trigger: "cascade from RotationBox PLANNED -> CANCELLED"
+        actor: system
+        preconditions:
+          - "RotationBox.status == PLANNED"
+        side_effects:
+          - "reserved copy released -> AVAILABLE with targeted sweep"
+
+  - entity: FeeAssessment
+    initial_state: INVOICED
+    terminal_states: [PAID, WAIVED]
+    transitions:
+      - from: INVOICED
+        to: PAID
+        trigger: "POST /toy-rental/fees/{id}/pay"
+        actor: Member
+        preconditions:
+          - "FeeAssessment.status == INVOICED (else ERR_FEE_NOT_INVOICED)"
+          - "payment_source == WALLET_CREDIT requires wallet_credit_cents >= amount_cents (ERR_WALLET_INSUFFICIENT); CARD always succeeds"
+        side_effects:
+          - "CARD: append FEE_SETTLED_CARD +amount_cents; WALLET_CREDIT: append FEE_SETTLED_WALLET +amount_cents AND WALLET_DEBIT -amount_cents (net wallet effect 0 for the pair beyond the earlier charge)"
+          - "wallet recompute may toggle Member suspension; owning BoxItem.resolution_status -> RESOLVED when all its fees are terminal"
+      - from: INVOICED
+        to: WAIVED
+        trigger: "POST /toy-rental/fees/{id}/waive"
+        actor: CustomerService
+        preconditions:
+          - "FeeAssessment.status in {INVOICED, DISPUTED} (else ERR_FEE_NOT_INVOICED)"
+        side_effects:
+          - "append FEE_WAIVER +amount_cents (compensates the FEE_CHARGE); wallet recompute; owning BoxItem.resolution_status -> RESOLVED when all its fees terminal"
+      - from: INVOICED
+        to: DISPUTED
+        trigger: "POST /toy-rental/fees/{id}/dispute"
+        actor: Member
+        preconditions:
+          - "FeeAssessment.status == INVOICED (else ERR_FEE_NOT_INVOICED)"
+          - "dispute_rounds < MAX_DISPUTE_ROUNDS (2) (ERR_DISPUTE_LIMIT_REACHED)"
+        side_effects:
+          - "dispute_rounds += 1"
+      - from: DISPUTED
+        to: INVOICED
+        trigger: "POST /toy-rental/fees/{id}/resolve-dispute with outcome UPHELD"
+        actor: CustomerService
+        preconditions:
+          - "FeeAssessment.status == DISPUTED (else ERR_FEE_NOT_INVOICED)"
+        side_effects: []
+      - from: DISPUTED
+        to: WAIVED
+        trigger: "POST /toy-rental/fees/{id}/resolve-dispute with outcome OVERTURNED"
+        actor: CustomerService
+        preconditions:
+          - "FeeAssessment.status == DISPUTED (else ERR_FEE_NOT_INVOICED)"
+        side_effects:
+          - "append FEE_WAIVER +amount_cents; wallet recompute; owning BoxItem.resolution_status -> RESOLVED when all its fees terminal"
+
+  - entity: Shipment
+    initial_state: LABEL_CREATED
+    terminal_states: [DELIVERED, LOST_IN_TRANSIT]
+    transitions:
+      - from: LABEL_CREATED
+        to: IN_TRANSIT
+        trigger: "POST /toy-rental/shipments/{id}/events with event_type IN_TRANSIT"
+        actor: OperationsManager
+        preconditions:
+          - "Shipment.status in {LABEL_CREATED, EXCEPTION} and event_type == IN_TRANSIT (else ERR_INVALID_STATE)"
+        side_effects:
+          - "append {event_type, occurred_at} to events"
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: "POST /toy-rental/shipments/{id}/events with event_type DELIVERED"
+        actor: OperationsManager
+        preconditions:
+          - "Shipment.status == IN_TRANSIT and event_type == DELIVERED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "append event; direction OUTBOUND: box SHIPPED -> DELIVERED; direction RETURN: box RETURNING -> RECEIVED with copies -> RETURNED and late-fee finalization"
+      - from: IN_TRANSIT
+        to: EXCEPTION
+        trigger: "POST /toy-rental/shipments/{id}/events with event_type EXCEPTION"
+        actor: OperationsManager
+        preconditions:
+          - "Shipment.status == IN_TRANSIT and event_type == EXCEPTION (else ERR_INVALID_STATE)"
+        side_effects:
+          - "append event"
+      - from: EXCEPTION
+        to: IN_TRANSIT
+        trigger: "POST /toy-rental/shipments/{id}/events with event_type IN_TRANSIT (recovery loop)"
+        actor: OperationsManager
+        preconditions:
+          - "Shipment.status in {LABEL_CREATED, EXCEPTION} and event_type == IN_TRANSIT (else ERR_INVALID_STATE)"
+        side_effects:
+          - "append event"
+      - from: IN_TRANSIT
+        to: LOST_IN_TRANSIT
+        trigger: "POST /toy-rental/shipments/{id}/events with event_type LOST_IN_TRANSIT"
+        actor: OperationsManager
+        preconditions:
+          - "Shipment.status == IN_TRANSIT and event_type == LOST_IN_TRANSIT (else ERR_INVALID_STATE)"
+        side_effects:
+          - "append event; direction OUTBOUND: box -> CANCELLED, copies -> LOST, next_cycle_due_at reset; direction RETURN: box -> INSPECTED, items -> LOST_REPORTED with LOSS fees, copies -> LOST"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: subscription-plan-change-stale-version
+    parent_entity: Subscription
+    write_endpoint: "PATCH /toy-rental/subscriptions/{id}/plan"
+    occ_field: expected_subscription_version
+    description: |
+      Changing a Subscription's plan with an expected_subscription_version that
+      no longer matches Subscription.version is rejected: another write (box
+      creation, pause/resume, an earlier plan change) has advanced the
+      subscription since the caller last observed it, so the caller's view of
+      the plan terms is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: rotation-box-create-stale-subscription-version
+    parent_entity: Subscription
+    write_endpoint: "POST /toy-rental/subscriptions/{id}/rotation-boxes"
+    occ_field: expected_subscription_version
+    description: |
+      Creating the next RotationBox requires the caller's observed
+      Subscription.version to match; a stale version means the cadence anchor,
+      plan terms, or pause state changed since the caller last read the
+      subscription, so the create is rejected instead of building a box on
+      outdated cycle terms.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: box-item-add-stale-box-version
+    parent_entity: RotationBox
+    write_endpoint: "POST /toy-rental/rotation-boxes/{id}/items"
+    occ_field: expected_rotation_box_version
+    description: |
+      Adding a BoxItem against a RotationBox whose version has advanced since
+      the caller last observed it is rejected: the caller's slot view no longer
+      reflects the box contents (a prior add or swap mutated it), so the write
+      is refused rather than silently appending to a changed box.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: developmental_stage_assignment
+    trigger: "ChildProfile read (age_months, developmental_stage fields) and age-eligibility gates; the browse variant runs on GET /toy-rental/catalog-items?child_id="
+    algorithm: threshold
+    formula: |
+      VARIANT calendar (CANONICAL — ChildProfile fields and all hard gates):
+        age_months = whole calendar months between birthdate and logical clock date
+          (a month completes on the same day-of-month; clamp to month end when
+          the target month is shorter)
+      VARIANT rolling_30_day (catalog browse suggestion only):
+        age_months = floor(calendar days between birthdate and clock date / 30)
+      Stage bands (both variants): INFANT 0-11, TODDLER 12-35,
+        PRESCHOOLER 36-59, EARLY_SCHOOL >= 60.
+      Gate rule: a catalog item fits a child iff
+        min_age_months <= age_months(calendar) <= max_age_months (both inclusive).
+    input_set: "ChildProfile.birthdate + logical clock; CatalogItem age range"
+    constants:
+      STAGE_BAND_TODDLER_MIN: 12
+      STAGE_BAND_PRESCHOOLER_MIN: 36
+      STAGE_BAND_EARLY_SCHOOL_MIN: 60
+    precision: "whole months; no rounding"
+    variants:
+      - name: calendar
+        when: "ChildProfile.age_months / developmental_stage and every eligibility gate (item add, accept-hold, sweep)"
+        difference: "counts whole calendar months; a child born 2025-05-02 reads 11 at clock 2026-05-01"
+      - name: rolling_30_day
+        when: "GET /toy-rental/catalog-items?child_id=... suggestion filter only"
+        difference: "floor(days/30); the same child reads 12 at clock 2026-05-01, so the browse list can suggest an item the hard gate still rejects"
+
+  - name: late_return_fee
+    trigger: "projected variant: every RotationBox read while status == DELIVERED; finalized variant: RETURNING -> RECEIVED transition"
+    algorithm: forward_looking
+    formula: |
+      days_late = max(0, <evaluation instant> - due_date) in whole days
+      raw = days_late * LATE_FEE_PER_DAY_CENTS
+      cap = SUM(replacement_value_cents of CatalogItems of all box items whose
+                 loan_status is PENDING_RETURN or RETURNED at evaluation time)
+      fee = min(raw, cap)
+      PROJECTED variant: evaluation instant = current logical clock; exposed as
+        RotationBox.projected_late_fee_cents; 0 when status != DELIVERED.
+      FINALIZED variant: evaluation instant = received_at; creates the
+        LATE_RETURN FeeAssessment when fee > 0.
+    input_set: "RotationBox.due_date / received_at / clock; box items' catalog replacement values"
+    constants:
+      LATE_FEE_PER_DAY_CENTS: 150
+    precision: "integer cents; whole-day granularity (floor of elapsed time in days)"
+    variants:
+      - name: projected
+        when: "box still DELIVERED; answers 'what would the late fee be right now'"
+        difference: "uses the moving logical clock, so it grows daily and typically differs from the finalized amount"
+      - name: finalized
+        when: "return shipment DELIVERED"
+        difference: "frozen at received_at; identical inputs up to receipt produce a different number than any earlier projection"
+
+  - name: buyout_price
+    trigger: "POST /toy-rental/box-items/{id}/buyout"
+    algorithm: tiered_pricing
+    formula: |
+      gross = retail_value_cents * (1 - plan.buyout_discount_pct)
+      depreciation = GRADE_DEPRECIATION[copy.condition_grade at buy-out time]
+      months_rented = whole calendar months between box.delivered_at date and
+        the logical clock date
+      rental_credit = min(months_rented * RENTAL_CREDIT_PCT_PER_MONTH * retail_value_cents,
+                          RENTAL_CREDIT_CAP_PCT * retail_value_cents)
+      price = max(round_half_up(gross * depreciation) - round_half_up(rental_credit),
+                  MIN_BUYOUT_FLOOR_CENTS)
+    input_set: "CatalogItem.retail_value_cents; plan.buyout_discount_pct; copy.condition_grade; box.delivered_at; logical clock"
+    constants:
+      GRADE_DEPRECIATION: { NEW: 1.0, GOOD: 0.85, FAIR: 0.70, WORN: 0.55 }
+      RENTAL_CREDIT_PCT_PER_MONTH: 0.04
+      RENTAL_CREDIT_CAP_PCT: 0.30
+      MIN_BUYOUT_FLOOR_CENTS: 499
+    precision: "integer cents; round_half_up applied to (gross*depreciation) and to rental_credit BEFORE subtraction"
+
+  - name: buyout_wallet_application
+    trigger: "POST /toy-rental/box-items/{id}/buyout, immediately after buyout_price"
+    algorithm: constraint_propagation
+    formula: |
+      Circular-looking dependency (wallet reduces charge; charge consumes
+      wallet) — evaluation order is pinned:
+        1. price = buyout_price result
+        2. wallet0 = Member.wallet_credit_cents read ONCE at transaction start
+        3. wallet_applied_cents = min(max(wallet0, 0), price - MIN_NET_CHARGE_CENTS)
+           (negative wallet applies nothing; at least MIN_NET_CHARGE_CENTS always
+           goes to card)
+        4. net_charge_cents = price - wallet_applied_cents  (charged to card)
+        5. if wallet_applied_cents > 0: append BUYOUT_CREDIT_APPLIED
+           (-wallet_applied_cents) and recompute wallet (suspension check runs)
+    input_set: "buyout_price result; Member.wallet_credit_cents"
+    constants:
+      MIN_NET_CHARGE_CENTS: 100
+    precision: "integer cents"
+
+  - name: inspection_fee_aggregation
+    trigger: "POST /toy-rental/rotation-boxes/{id}/inspect (per inspected item)"
+    algorithm: aggregation
+    formula: |
+      Per item (ROUNDING ORDER PINNED — round each component per item, then sum
+      components; a sum-then-round order yields different cents and is WRONG):
+        damage_component   = round_half_up(replacement_value_cents * DAMAGE_RATE[damage_severity])   when damage_severity != NONE else 0
+        missing_component  = round_half_up(replacement_value_cents * missing_piece_count / piece_count) when missing_piece_count > 0 else 0
+      Per-item cap: if damage_component + missing_component > replacement_value_cents,
+        the MISSING_PIECES fee is reduced so the two sum exactly to
+        replacement_value_cents (DAMAGE ranks first and is never capped).
+      Emits: FeeAssessment DAMAGE (damage_component) when > 0;
+             FeeAssessment MISSING_PIECES (missing_component) when > 0.
+      Box-level total is the plain integer sum of emitted fee amounts (no
+      further rounding).
+    input_set: "inspected BoxItems of the box; CatalogItem.replacement_value_cents / piece_count"
+    constants:
+      DAMAGE_RATE: { MINOR: 0.15, MODERATE: 0.35, SEVERE: 0.75 }
+    precision: "integer cents; round_half_up per component per item, then sum"
+
+  - name: wishlist_allocation_selector
+    trigger: "targeted sweep whenever a ToyCopy becomes AVAILABLE (swap release, hold expiry/cancel release, sanitization completion, PLANNED-box cancel cascade); global sweep in POST /toy-rental/ops/allocation-runs"
+    algorithm: waterfall_allocation
+    formula: |
+      Candidate set per AVAILABLE, sanitization-valid copy (copies scanned in
+      created_at ASC order):
+        WishlistEntry.status == WAITING
+        AND entry.catalog_item_id == copy.catalog_item_id
+        AND entry member has a Subscription with status == ACTIVE
+        AND count(member's entries with status == HELD) < plan.max_holds
+        AND exists ChildProfile of member passing the calendar age gate
+      Ranking: entry.rank ASC; ties broken by entry.created_at ASC.
+      Winner -> HELD (copy RESERVED to that member, hold_expires_at = clock +
+      HOLD_WINDOW_HOURS). Empty candidate set -> copy remains AVAILABLE.
+    input_set: "WAITING WishlistEntries; AVAILABLE copies; subscriptions; child profiles"
+    constants:
+      HOLD_WINDOW_HOURS: 72
+    precision: "n/a"
+
+  - name: pause_allowance
+    trigger: "POST /toy-rental/subscriptions/{id}/pause"
+    algorithm: chronological
+    formula: |
+      window_start_365 = clock_date - 365 days
+      used = SUM(consumed_days of pause_windows with start_date >= window_start_365;
+                 for the currently open window count days elapsed so far;
+                 scheduled (not yet active) windows count their full duration_days)
+      request legal iff used + duration_days <= MAX_PAUSE_DAYS_PER_365
+        (boundary: exactly 60 is legal; 61 rejected)
+    input_set: "Subscription.pause_windows within the trailing 365 days"
+    constants:
+      MAX_PAUSE_DAYS_PER_365: 60
+    precision: "whole days"
+
+  - name: rotation_cadence_schedule
+    trigger: "Subscription create; box CLOSED; outbound shipment LOST_IN_TRANSIT; pause resume/auto-resume"
+    algorithm: projection
+    formula: |
+      create:                    next_cycle_due_at = created_at (first box immediately due)
+      box CLOSED or outbound lost: next_cycle_due_at = clock + plan.rotation_cadence_days
+      pause resume/auto-resume:  next_cycle_due_at += consumed_days of the closed window
+      A box create is legal iff clock >= next_cycle_due_at (ERR_BOX_CYCLE_NOT_DUE)
+      AND no sibling box exists in {PLANNED, SHIPPED, DELIVERED, RETURNING,
+      RECEIVED, INSPECTED} (ERR_PREVIOUS_BOX_OPEN).
+    input_set: "Subscription timestamps; pause_windows; sibling RotationBox states"
+    precision: "datetime, second granularity"
+
+  - name: wallet_balance_reconciliation
+    trigger: "every CreditLedgerEntry append"
+    algorithm: aggregation
+    formula: |
+      INVARIANT: Member.wallet_credit_cents == SUM(CreditLedgerEntry.amount_cents
+      WHERE member_id == Member.id) — recomputed after every append; the field
+      is never written directly.
+      SUSPENSION CHECK (same trigger): wallet < -SUSPENSION_THRESHOLD_CENTS ->
+      Member ACTIVE -> SUSPENDED; wallet >= -SUSPENSION_THRESHOLD_CENTS ->
+      SUSPENDED -> ACTIVE. Boundary: exactly -5000 is NOT suspended.
+    input_set: "all CreditLedgerEntry rows of the member"
+    constants:
+      SUSPENSION_THRESHOLD_CENTS: 5000
+    precision: "integer cents"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present; role is a declared role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Caller role is in the endpoint's roles list", error_id: ERR_UNAUTHORIZED_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Path resources exist, validated left-to-right (member before child, box before item, etc.)", error_id: ERR_MEMBER_NOT_FOUND, http_status: 404, applies_to: "all parameterized endpoints; per-resource ids map to ERR_PLAN_NOT_FOUND / ERR_SUBSCRIPTION_NOT_FOUND / ERR_CATALOG_ITEM_NOT_FOUND / ERR_COPY_NOT_FOUND / ERR_WISHLIST_ENTRY_NOT_FOUND / ERR_BOX_NOT_FOUND / ERR_BOX_ITEM_NOT_FOUND / ERR_FEE_NOT_FOUND / ERR_SHIPMENT_NOT_FOUND" }
+  - { priority: 4, category: auth, check: "Entity-backed ownership: Member caller's X-User-ID equals the owning member of the target resource (member path id, subscription.member_id, box via subscription, item via box, entry.member_id, fee via subscription)", error_id: ERR_FORBIDDEN_OWNERSHIP, http_status: 403, applies_to: "all Member-role endpoints" }
+  - { priority: 5, category: state, check: "Target entity in a legal from-state for the requested transition (per state machine); includes Member SUSPENDED gate on member mutations, Subscription ACTIVE gate, box PLANNED gate for item add/swap, fee INVOICED gate, copy AVAILABLE gate", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all mutating endpoints; specific states surface domain ids: ERR_MEMBER_SUSPENDED, ERR_SUBSCRIPTION_NOT_ACTIVE, ERR_COPY_NOT_AVAILABLE, ERR_FEE_NOT_INVOICED, ERR_MEMBER_HAS_OPEN_BOX, ERR_PREVIOUS_BOX_OPEN" }
+  - { priority: 5, category: state, check: "OCC: expected_<parent>_version body field equals the parent's current version", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "PATCH /toy-rental/subscriptions/{id}/plan; POST /toy-rental/subscriptions/{id}/rotation-boxes; POST /toy-rental/rotation-boxes/{id}/items" }
+  - { priority: 6, category: business_safety, check: "Age/developmental gate: exists a ChildProfile of the member with min_age_months <= age_months(calendar) <= max_age_months for the catalog item", error_id: ERR_AGE_INCOMPATIBLE, http_status: 422, applies_to: "POST /toy-rental/rotation-boxes/{id}/items; POST /toy-rental/box-items/{id}/swap; POST /toy-rental/wishlist-entries/{id}/accept-hold" }
+  - { priority: 6, category: business_safety, check: "Sanitization validity: copy is factory-sealed NEW (never sanitized) or last_sanitized_at within 30 days of the logical clock", error_id: ERR_NEEDS_RESANITIZATION, http_status: 422, applies_to: "POST /toy-rental/rotation-boxes/{id}/items; POST /toy-rental/box-items/{id}/swap; POST /toy-rental/wishlist-entries/{id}/accept-hold" }
+  - { priority: 7, category: business_temporal, check: "Cadence due: logical clock >= subscription.next_cycle_due_at", error_id: ERR_BOX_CYCLE_NOT_DUE, http_status: 422, applies_to: "POST /toy-rental/subscriptions/{id}/rotation-boxes" }
+  - { priority: 7, category: business_temporal, check: "Pause windows are half-open [start_date, end_date); a new window overlapping any existing window is rejected; pure adjacency (start == prior end) is legal", error_id: ERR_PAUSE_WINDOW_OVERLAP, http_status: 409, applies_to: "POST /toy-rental/subscriptions/{id}/pause" }
+  - { priority: 7, category: business_temporal, check: "Hold acceptance: logical clock strictly before hold_expires_at", error_id: ERR_HOLD_EXPIRED, http_status: 409, applies_to: "POST /toy-rental/wishlist-entries/{id}/accept-hold" }
+  - { priority: 7, category: business_temporal, check: "Sanitization buffer: logical clock >= sanitization_started_at + 24h before a copy may re-enter AVAILABLE (mandatory gap between consecutive loan intervals)", error_id: ERR_SANITIZATION_BUFFER_ACTIVE, http_status: 422, applies_to: "POST /toy-rental/copies/{id}/complete-sanitization" }
+  - { priority: 8, category: business_constraint, check: "Uniqueness: member email (register), one non-CANCELLED subscription per member, one {WAITING, HELD} wishlist entry per (member, catalog_item), copy barcode", error_id: ERR_EMAIL_TAKEN, http_status: 409, applies_to: "POST /toy-rental/members/register; POST /toy-rental/members/{id}/subscriptions -> ERR_SUBSCRIPTION_ACTIVE_EXISTS; POST /toy-rental/members/{id}/wishlist-entries -> ERR_WISHLIST_DUPLICATE; barcode duplicate -> ERR_VALIDATION (400)" }
+  - { priority: 8, category: business_constraint, check: "Box slot capacity: count of BoxItems with loan_status == PENDING_RETURN < plan.toys_per_box", error_id: ERR_SLOT_CAPACITY_EXCEEDED, http_status: 422, applies_to: "POST /toy-rental/rotation-boxes/{id}/items; POST /toy-rental/wishlist-entries/{id}/accept-hold" }
+  - { priority: 8, category: business_constraint, check: "Swap allowance: box.swap_count < plan.swap_allowance_per_cycle", error_id: ERR_SWAP_ALLOWANCE_EXCEEDED, http_status: 422, applies_to: "POST /toy-rental/box-items/{id}/swap" }
+  - { priority: 8, category: business_constraint, check: "Pause allowance: paused_days_used_365d + duration_days <= 60", error_id: ERR_PAUSE_ALLOWANCE_EXCEEDED, http_status: 422, applies_to: "POST /toy-rental/subscriptions/{id}/pause" }
+  - { priority: 8, category: business_constraint, check: "No sibling open box before creating the next cycle box", error_id: ERR_PREVIOUS_BOX_OPEN, http_status: 409, applies_to: "POST /toy-rental/subscriptions/{id}/rotation-boxes" }
+  - { priority: 8, category: business_constraint, check: "Ship requires at least one slotted item", error_id: ERR_BOX_EMPTY, http_status: 422, applies_to: "POST /toy-rental/rotation-boxes/{id}/ship" }
+  - { priority: 9, category: business_referential, check: "Wishlist create targets an ACTIVE catalog item", error_id: ERR_CATALOG_ITEM_RETIRED, http_status: 422, applies_to: "POST /toy-rental/members/{id}/wishlist-entries" }
+  - { priority: 9, category: business_referential, check: "Copy not RESERVED to a different member", error_id: ERR_COPY_NOT_AVAILABLE, http_status: 409, applies_to: "POST /toy-rental/rotation-boxes/{id}/items; POST /toy-rental/box-items/{id}/swap" }
+  - { priority: 10, category: business_fiscal, check: "Wallet-funded payment: wallet_credit_cents >= fee.amount_cents", error_id: ERR_WALLET_INSUFFICIENT, http_status: 422, applies_to: "POST /toy-rental/fees/{id}/pay with payment_source WALLET_CREDIT" }
+  - { priority: 10, category: business_fiscal, check: "Dispute rounds remaining: dispute_rounds < 2", error_id: ERR_DISPUTE_LIMIT_REACHED, http_status: 422, applies_to: "POST /toy-rental/fees/{id}/dispute" }
+  - { priority: 10, category: business_fiscal, check: "All fees of a box settled before close; all fees settled and no open boxes before member close", error_id: ERR_FEES_OUTSTANDING, http_status: 422, applies_to: "POST /toy-rental/rotation-boxes/{id}/close; POST /toy-rental/members/{id}/close" }
+  - { priority: 11, category: existence, check: "Request body shape: required fields present, no unknown or computed/system fields supplied, enums in range, min_age_months <= max_age_months, birthdate not after clock date", error_id: ERR_VALIDATION, http_status: 400, applies_to: "all endpoints with a body" }
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- Members / children / wallet ----
+  - { method: POST, path: "/toy-rental/members/register", description: "Register a new member account", roles: [Anonymous], code: 201, input: [email, full_name, password], output: Member, side_effects: ["Member created status ACTIVE, wallet_credit_cents 0"] }
+  - { method: GET, path: "/toy-rental/members/{id}", description: "Read a member (self or staff)", roles: [Member, CustomerService, PlatformAdmin], code: 200, input: [], output: Member, side_effects: [] }
+  - { method: POST, path: "/toy-rental/members/{id}/close", description: "Close a member account once boxes and fees are settled", roles: [CustomerService], code: 200, input: [], output: Member, side_effects: ["Member -> CLOSED; wishlist cancellation cascade with held-copy release and targeted sweep"] }
+  - { method: POST, path: "/toy-rental/members/{id}/children", description: "Add a child profile", roles: [Member], code: 201, input: [name, birthdate], output: ChildProfile, side_effects: ["age_months and developmental_stage computed from the logical clock"] }
+  - { method: GET, path: "/toy-rental/members/{id}/children", description: "List a member's children", roles: [Member, CustomerService], code: 200, input: ["limit?", "offset?"], output: "ChildProfile[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/members/{id}/wallet/adjustments", description: "Manual wallet adjustment (promo credit or support adjustment)", roles: [CustomerService], code: 201, input: [amount_cents, reason, "note?"], output: CreditLedgerEntry, side_effects: ["append CreditLedgerEntry (PROMO_CREDIT or SUPPORT_ADJUSTMENT); wallet_balance_reconciliation recompute incl. suspension toggle"] }
+  - { method: GET, path: "/toy-rental/members/{id}/wallet/ledger", description: "List wallet ledger entries", roles: [Member, CustomerService], code: 200, input: ["limit?", "offset?"], output: "CreditLedgerEntry[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/members/{id}/reserved-copies", description: "List copies currently RESERVED to this member", roles: [Member, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "ToyCopy[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/members/{id}/subscriptions", description: "Start a subscription on a plan (one non-CANCELLED subscription per member)", roles: [Member], code: 201, input: [plan_id], output: Subscription, side_effects: ["Subscription ACTIVE; next_cycle_due_at := created_at"] }
+  - { method: GET, path: "/toy-rental/members/{id}/subscriptions", description: "List a member's subscriptions", roles: [Member, CustomerService], code: 200, input: ["limit?", "offset?"], output: "Subscription[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/members/{id}/wishlist-entries", description: "Add a catalog item to the member's wishlist", roles: [Member], code: 201, input: [catalog_item_id, rank], output: WishlistEntry, side_effects: ["entry WAITING"] }
+  - { method: GET, path: "/toy-rental/members/{id}/wishlist-entries", description: "List a member's wishlist entries", roles: [Member], code: 200, input: ["status?", "limit?", "offset?"], output: "WishlistEntry[]", side_effects: [] }
+
+  # ---- Plans ----
+  - { method: POST, path: "/toy-rental/subscription-plans", description: "Create a subscription plan", roles: [PlatformAdmin], code: 201, input: [name, monthly_fee_cents, toys_per_box, swap_allowance_per_cycle, max_holds, rotation_cadence_days, rental_period_days, buyout_discount_pct], output: SubscriptionPlan, side_effects: [] }
+  - { method: GET, path: "/toy-rental/subscription-plans", description: "List plans", roles: [Member, CustomerService, PlatformAdmin], code: 200, input: ["limit?", "offset?"], output: "SubscriptionPlan[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/subscription-plans/{id}", description: "Read a plan", roles: [Member, CustomerService, PlatformAdmin], code: 200, input: [], output: SubscriptionPlan, side_effects: [] }
+  - { method: GET, path: "/toy-rental/subscription-plans/{id}/subscriptions", description: "List subscriptions on a plan", roles: [CustomerService, PlatformAdmin], code: 200, input: ["limit?", "offset?"], output: "Subscription[]", side_effects: [] }
+
+  # ---- Subscriptions ----
+  - { method: GET, path: "/toy-rental/subscriptions/{id}", description: "Read a subscription", roles: [Member, OperationsManager, CustomerService], code: 200, input: [], output: Subscription, side_effects: [] }
+  - { method: PATCH, path: "/toy-rental/subscriptions/{id}/plan", description: "Change plan (OCC-guarded)", roles: [Member], code: 200, input: [plan_id, expected_subscription_version], output: Subscription, side_effects: ["plan_id updated; increments Subscription.version by 1; new plan terms apply to future boxes only"] }
+  - { method: POST, path: "/toy-rental/subscriptions/{id}/pause", description: "Pause immediately (start_date <= clock) or schedule a future pause window", roles: [Member], code: 200, input: [start_date, duration_days], output: Subscription, side_effects: ["window appended; immediate pause: status PAUSED + PLANNED-box cancellation cascade with copy release and targeted sweep; increments Subscription.version by 1"] }
+  - { method: POST, path: "/toy-rental/subscriptions/{id}/resume", description: "Resume early from an active pause", roles: [Member], code: 200, input: [], output: Subscription, side_effects: ["window closed with consumed_days; next_cycle_due_at shifted; increments Subscription.version by 1"] }
+  - { method: POST, path: "/toy-rental/subscriptions/{id}/cancel", description: "Cancel the subscription (terminal)", roles: [Member], code: 200, input: ["reason?"], output: Subscription, side_effects: ["status CANCELLED; wishlist + PLANNED-box cancellation cascade with copy release and targeted sweep; increments Subscription.version by 1"] }
+  - { method: POST, path: "/toy-rental/subscriptions/{id}/rotation-boxes", description: "Create the next rotation box (cadence-due + OCC-guarded)", roles: [Member], code: 201, input: [expected_subscription_version], output: RotationBox, side_effects: ["RotationBox PLANNED with next cycle_number; increments Subscription.version by 1"] }
+  - { method: GET, path: "/toy-rental/subscriptions/{id}/rotation-boxes", description: "List boxes of a subscription", roles: [Member, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "RotationBox[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/subscriptions/{id}/fees", description: "List fees of a subscription", roles: [Member, CustomerService], code: 200, input: ["status?", "limit?", "offset?"], output: "FeeAssessment[]", side_effects: [] }
+
+  # ---- Catalog / copies ----
+  - { method: POST, path: "/toy-rental/catalog-items", description: "Create a catalog toy", roles: [PlatformAdmin], code: 201, input: [title, "description?", min_age_months, max_age_months, developmental_stages, piece_count, retail_value_cents, replacement_value_cents], output: CatalogItem, side_effects: [] }
+  - { method: GET, path: "/toy-rental/catalog-items", description: "List catalog toys; child_id filter applies the rolling_30_day age variant for suggestions", roles: [Member, OperationsManager, PlatformAdmin], code: 200, input: ["developmental_stage?", "child_id?", "status?", "limit?", "offset?"], output: "CatalogItem[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/catalog-items/{id}", description: "Read a catalog toy", roles: [Member, OperationsManager, PlatformAdmin], code: 200, input: [], output: CatalogItem, side_effects: [] }
+  - { method: POST, path: "/toy-rental/catalog-items/{id}/retire", description: "Retire a catalog toy", roles: [PlatformAdmin], code: 200, input: [], output: CatalogItem, side_effects: ["status RETIRED"] }
+  - { method: POST, path: "/toy-rental/catalog-items/{id}/copies", description: "Mint a physical copy", roles: [PlatformAdmin], code: 201, input: [barcode, "condition_grade?"], output: ToyCopy, side_effects: ["ToyCopy AVAILABLE"] }
+  - { method: GET, path: "/toy-rental/catalog-items/{id}/copies", description: "List copies of a catalog toy", roles: [OperationsManager, PlatformAdmin], code: 200, input: ["status?", "limit?", "offset?"], output: "ToyCopy[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/catalog-items/{id}/wishlist-entries", description: "List wishlist demand for a catalog toy", roles: [OperationsManager, PlatformAdmin], code: 200, input: ["status?", "limit?", "offset?"], output: "WishlistEntry[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/copies/{id}", description: "Read a copy", roles: [Member, OperationsManager, PlatformAdmin], code: 200, input: [], output: ToyCopy, side_effects: [] }
+  - { method: POST, path: "/toy-rental/copies/{id}/complete-sanitization", description: "Finish sanitization after the mandatory 24h buffer", roles: [OperationsManager], code: 200, input: [], output: ToyCopy, side_effects: ["SANITIZING -> AVAILABLE; last_sanitized_at := clock; cycle count +1; targeted allocation sweep"] }
+  - { method: POST, path: "/toy-rental/copies/{id}/retire", description: "Retire an AVAILABLE or QUARANTINED copy", roles: [PlatformAdmin], code: 200, input: [], output: ToyCopy, side_effects: ["status RETIRED"] }
+  - { method: GET, path: "/toy-rental/copies/{id}/wishlist-entries", description: "List wishlist entries currently holding this copy", roles: [OperationsManager], code: 200, input: ["limit?", "offset?"], output: "WishlistEntry[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/copies/{id}/box-items", description: "List box slots this copy has occupied", roles: [OperationsManager], code: 200, input: ["limit?", "offset?"], output: "BoxItem[]", side_effects: [] }
+
+  # ---- Wishlist holds ----
+  - { method: POST, path: "/toy-rental/wishlist-entries/{id}/cancel", description: "Cancel a WAITING or HELD entry", roles: [Member], code: 200, input: [], output: WishlistEntry, side_effects: ["HELD cancel releases the copy -> AVAILABLE with targeted sweep"] }
+  - { method: POST, path: "/toy-rental/wishlist-entries/{id}/accept-hold", description: "Accept a HELD entry straight into a PLANNED box slot", roles: [Member], code: 200, input: [rotation_box_id], output: WishlistEntry, side_effects: ["entry FULFILLED; BoxItem created from held copy; increments RotationBox.version by 1"] }
+
+  # ---- Rotation boxes / items ----
+  - { method: GET, path: "/toy-rental/rotation-boxes/{id}", description: "Read a box (includes projected_late_fee_cents while DELIVERED)", roles: [Member, OperationsManager], code: 200, input: [], output: RotationBox, side_effects: [] }
+  - { method: POST, path: "/toy-rental/rotation-boxes/{id}/items", description: "Add an AVAILABLE or self-RESERVED copy to a PLANNED box (OCC-guarded)", roles: [Member], code: 201, input: [toy_copy_id, expected_rotation_box_version], output: BoxItem, side_effects: ["copy AVAILABLE -> RESERVED (reserved_member_id := caller); increments RotationBox.version by 1"] }
+  - { method: GET, path: "/toy-rental/rotation-boxes/{id}/items", description: "List box items", roles: [Member, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "BoxItem[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/rotation-boxes/{id}/ship", description: "Ship a PLANNED box (creates the outbound shipment)", roles: [OperationsManager], code: 201, input: [carrier, tracking_number], output: Shipment, side_effects: ["box PLANNED -> SHIPPED; slotted copies RESERVED -> OUT_ON_LOAN"] }
+  - { method: POST, path: "/toy-rental/rotation-boxes/{id}/initiate-return", description: "Member starts the return (creates the return shipment)", roles: [Member], code: 201, input: [carrier, tracking_number], output: Shipment, side_effects: ["box DELIVERED -> RETURNING"] }
+  - { method: GET, path: "/toy-rental/rotation-boxes/{id}/shipments", description: "List shipments of a box", roles: [Member, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "Shipment[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/rotation-boxes/{id}/inspect", description: "Record per-item inspection outcomes (condition, damage, missing pieces, disposition)", roles: [OperationsManager], code: 200, input: [items], output: RotationBox, side_effects: ["per-item loan_status -> RETURNED + fees per inspection_fee_aggregation; copies -> SANITIZING/QUARANTINED with grade degradation; box RECEIVED -> INSPECTED once all items inspected"] }
+  - { method: POST, path: "/toy-rental/rotation-boxes/{id}/close", description: "Close an INSPECTED box once all its fees are settled", roles: [OperationsManager], code: 200, input: [], output: RotationBox, side_effects: ["box INSPECTED -> CLOSED; subscription.next_cycle_due_at := clock + rotation_cadence_days; increments Subscription.version by 1"] }
+  - { method: GET, path: "/toy-rental/rotation-boxes/{id}/fees", description: "List fees tied to a box", roles: [Member, CustomerService, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "FeeAssessment[]", side_effects: [] }
+
+  # ---- Box items ----
+  - { method: GET, path: "/toy-rental/box-items/{id}", description: "Read a box item", roles: [Member, OperationsManager], code: 200, input: [], output: BoxItem, side_effects: [] }
+  - { method: GET, path: "/toy-rental/box-items/{id}/fees", description: "List fees tied to a box item", roles: [Member, CustomerService], code: 200, input: ["limit?", "offset?"], output: "FeeAssessment[]", side_effects: [] }
+  - { method: GET, path: "/toy-rental/box-items/{id}/swaps", description: "List items swapped out in favor of this item's chain (children by swapped_from_item_id)", roles: [Member, OperationsManager], code: 200, input: ["limit?", "offset?"], output: "BoxItem[]", side_effects: [] }
+  - { method: POST, path: "/toy-rental/box-items/{id}/swap", description: "Swap this slotted copy for another while the box is PLANNED", roles: [Member], code: 201, input: [new_toy_copy_id], output: BoxItem, side_effects: ["old item -> SWAPPED_OUT; new item created; box.swap_count += 1; increments RotationBox.version by 1; old copy released -> AVAILABLE with targeted sweep (cascade may promote a WAITING wishlist entry)"] }
+  - { method: POST, path: "/toy-rental/box-items/{id}/buyout", description: "Buy out the slotted copy", roles: [Member], code: 200, input: [], output: BoxItem, side_effects: ["item -> KEPT_BUYOUT; copy -> SOLD; buyout_price + buyout_wallet_application run; BUYOUT_CREDIT_APPLIED ledger append when wallet_applied_cents > 0"] }
+  - { method: POST, path: "/toy-rental/box-items/{id}/report-lost", description: "Member reports the slotted copy lost", roles: [Member], code: 200, input: ["note?"], output: BoxItem, side_effects: ["item -> LOST_REPORTED; copy -> LOST; LOSS FeeAssessment INVOICED + FEE_CHARGE ledger append + wallet recompute"] }
+
+  # ---- Shipments ----
+  - { method: POST, path: "/toy-rental/shipments/{id}/events", description: "Record a carrier event", roles: [OperationsManager], code: 200, input: [event_type, occurred_at], output: Shipment, side_effects: ["status transition per machine; box cascade on DELIVERED / LOST_IN_TRANSIT (direction-dependent)"] }
+
+  # ---- Fees ----
+  - { method: POST, path: "/toy-rental/fees/{id}/pay", description: "Pay an INVOICED fee by card or wallet credit", roles: [Member], code: 200, input: [payment_source], output: FeeAssessment, side_effects: ["settlement ledger entries; wallet recompute; item resolution_status may become RESOLVED"] }
+  - { method: POST, path: "/toy-rental/fees/{id}/waive", description: "Waive an INVOICED or DISPUTED fee", roles: [CustomerService], code: 200, input: ["reason?"], output: FeeAssessment, side_effects: ["FEE_WAIVER ledger append; wallet recompute; item resolution may become RESOLVED"] }
+  - { method: POST, path: "/toy-rental/fees/{id}/dispute", description: "Dispute an INVOICED fee (max 2 rounds)", roles: [Member], code: 200, input: ["reason?"], output: FeeAssessment, side_effects: ["status DISPUTED; dispute_rounds += 1"] }
+  - { method: POST, path: "/toy-rental/fees/{id}/resolve-dispute", description: "Resolve a dispute: UPHELD returns to INVOICED, OVERTURNED waives", roles: [CustomerService], code: 200, input: [outcome], output: FeeAssessment, side_effects: ["UPHELD -> INVOICED; OVERTURNED -> WAIVED + FEE_WAIVER ledger append + wallet recompute"] }
+
+  # ---- Ops checkpoint / clock ----
+  - { method: POST, path: "/toy-rental/ops/allocation-runs", description: "Ops-run checkpoint: global allocation sweep (promote WAITING -> HELD on AVAILABLE sanitization-valid copies), expire HELD entries at/past hold_expires_at (releasing + re-sweeping the copy), activate due scheduled pause windows, auto-resume pauses at/past current_pause_end", roles: [OperationsManager], code: 200, input: [], output: "{ promoted_count: integer, expired_count: integer, resumed_count: integer, promoted_entry_ids: string[] }", side_effects: ["entry promotions/expirations with copy releases; pause activation/auto-resume with next_cycle_due_at shifts"] }
+  - { method: POST, path: "/toy-rental/_clock/set_current_utc", description: "Set the logical clock (test-driving endpoint). Startup default when never called: exactly 2026-05-01T00:00:00Z; the server MUST NOT fall back to wall-clock time.", roles: [PlatformAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: ["logical clock advanced/positioned"] }
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or invalid X-User-Role / X-User-ID headers" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "Caller role not in the endpoint's roles list" }
+  - { id: ERR_FORBIDDEN_OWNERSHIP, http: 403, condition: "Member caller does not own the target resource" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body: missing required field, unknown/computed field supplied, enum out of range, min_age_months > max_age_months, birthdate after clock date, duplicate barcode" }
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "Member id does not exist" }
+  - { id: ERR_PLAN_NOT_FOUND, http: 404, condition: "SubscriptionPlan id does not exist" }
+  - { id: ERR_SUBSCRIPTION_NOT_FOUND, http: 404, condition: "Subscription id does not exist" }
+  - { id: ERR_CATALOG_ITEM_NOT_FOUND, http: 404, condition: "CatalogItem id does not exist" }
+  - { id: ERR_COPY_NOT_FOUND, http: 404, condition: "ToyCopy id does not exist" }
+  - { id: ERR_WISHLIST_ENTRY_NOT_FOUND, http: 404, condition: "WishlistEntry id does not exist" }
+  - { id: ERR_BOX_NOT_FOUND, http: 404, condition: "RotationBox id does not exist" }
+  - { id: ERR_BOX_ITEM_NOT_FOUND, http: 404, condition: "BoxItem id does not exist" }
+  - { id: ERR_FEE_NOT_FOUND, http: 404, condition: "FeeAssessment id does not exist" }
+  - { id: ERR_SHIPMENT_NOT_FOUND, http: 404, condition: "Shipment id does not exist" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Generic transition precondition failure (wrong from-state, terminal-state mutation, duplicate trigger)" }
+  - { id: ERR_MEMBER_SUSPENDED, http: 409, condition: "Member is SUSPENDED; member-gated mutations (box create, item add, swap, buyout, report-lost, wishlist create, accept-hold, pause, resume) are blocked" }
+  - { id: ERR_SUBSCRIPTION_NOT_ACTIVE, http: 409, condition: "Subscription not ACTIVE where ACTIVE is required (box create, pause, resume from non-PAUSED)" }
+  - { id: ERR_COPY_NOT_AVAILABLE, http: 409, condition: "Copy not AVAILABLE, or RESERVED to a different member" }
+  - { id: ERR_FEE_NOT_INVOICED, http: 409, condition: "Fee not in INVOICED (pay/dispute) or not in INVOICED/DISPUTED (waive/resolve)" }
+  - { id: ERR_HOLD_EXPIRED, http: 409, condition: "Accept-hold at or after hold_expires_at" }
+  - { id: ERR_MEMBER_HAS_OPEN_BOX, http: 409, condition: "Member close blocked by a box in PLANNED..INSPECTED" }
+  - { id: ERR_PREVIOUS_BOX_OPEN, http: 409, condition: "Next box create blocked by a sibling box in PLANNED..INSPECTED" }
+  - { id: ERR_AGE_INCOMPATIBLE, http: 422, condition: "No child of the member passes the calendar age gate for the catalog item" }
+  - { id: ERR_NEEDS_RESANITIZATION, http: 422, condition: "Copy sanitization stale (>30 days) and not factory-sealed NEW" }
+  - { id: ERR_BOX_CYCLE_NOT_DUE, http: 422, condition: "Logical clock earlier than subscription.next_cycle_due_at" }
+  - { id: ERR_PAUSE_WINDOW_OVERLAP, http: 409, condition: "New pause window overlaps an existing window (half-open; adjacency allowed)" }
+  - { id: ERR_SANITIZATION_BUFFER_ACTIVE, http: 422, condition: "complete-sanitization before sanitization_started_at + 24h" }
+  - { id: ERR_EMAIL_TAKEN, http: 409, condition: "Duplicate member email at register" }
+  - { id: ERR_SUBSCRIPTION_ACTIVE_EXISTS, http: 409, condition: "Member already has a non-CANCELLED subscription" }
+  - { id: ERR_WISHLIST_DUPLICATE, http: 409, condition: "Duplicate {WAITING, HELD} wishlist entry for the same catalog item" }
+  - { id: ERR_SLOT_CAPACITY_EXCEEDED, http: 422, condition: "Box already holds plan.toys_per_box slotted items" }
+  - { id: ERR_SWAP_ALLOWANCE_EXCEEDED, http: 422, condition: "box.swap_count == plan.swap_allowance_per_cycle" }
+  - { id: ERR_PAUSE_ALLOWANCE_EXCEEDED, http: 422, condition: "paused_days_used_365d + duration_days > 60" }
+  - { id: ERR_BOX_EMPTY, http: 422, condition: "Ship requested with zero slotted items" }
+  - { id: ERR_CATALOG_ITEM_RETIRED, http: 422, condition: "Wishlist create against a RETIRED catalog item" }
+  - { id: ERR_WALLET_INSUFFICIENT, http: 422, condition: "WALLET_CREDIT payment with wallet_credit_cents < fee.amount_cents" }
+  - { id: ERR_DISPUTE_LIMIT_REACHED, http: 422, condition: "dispute_rounds == 2" }
+  - { id: ERR_FEES_OUTSTANDING, http: 422, condition: "Box close or member close with fees still INVOICED or DISPUTED" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent's current version (OCC)" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated caller; may only register"
+    identity: opaque
+    exclusive_operations: ["POST /toy-rental/members/register"]
+    shared_operations: []
+  - name: Member
+    description: "Subscribing parent; owns member/subscription/wishlist/box/fee resources"
+    identity: "entity_backed:Member"
+    exclusive_operations: ["children management", "subscription pause/resume/cancel/plan-change", "wishlist create/cancel/accept-hold", "rotation-box create", "box item add/swap/buyout/report-lost", "initiate-return", "fee pay/dispute"]
+    shared_operations: ["read own resources (member, children, subscriptions, boxes, items, fees, ledger, shipments)", "browse catalog and plans"]
+  - name: OperationsManager
+    description: "Warehouse operator; ships, inspects, sanitizes, runs allocation checkpoints"
+    identity: opaque
+    exclusive_operations: ["ship", "initiate inspection", "close box", "shipment events", "complete-sanitization", "POST /toy-rental/ops/allocation-runs"]
+    shared_operations: ["read subscriptions/boxes/items/shipments/copies", "list copies, box-items, wishlist demand, reserved copies"]
+  - name: CustomerService
+    description: "Support agent; wallet adjustments, fee waivers, dispute resolution, member close"
+    identity: opaque
+    exclusive_operations: ["POST /toy-rental/members/{id}/wallet/adjustments", "POST /toy-rental/fees/{id}/waive", "POST /toy-rental/fees/{id}/resolve-dispute", "POST /toy-rental/members/{id}/close"]
+    shared_operations: ["read members/children/subscriptions/fees/ledger/boxes"]
+  - name: PlatformAdmin
+    description: "Platform operator; plans, catalog, copies, clock"
+    identity: opaque
+    exclusive_operations: ["POST /toy-rental/subscription-plans", "catalog item create/retire", "copy mint/retire", "POST /toy-rental/_clock/set_current_utc"]
+    shared_operations: ["read members/plans/catalog/copies"]

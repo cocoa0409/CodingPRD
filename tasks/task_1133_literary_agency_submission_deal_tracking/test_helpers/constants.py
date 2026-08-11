@@ -1,0 +1,41 @@
+"""Domain thresholds and calculation constants from the PRD (sections 2 and 3)."""
+
+# PRD 3.2 — slush triage score weights
+W_GENRE_FICTION = 40
+W_GENRE_NONFICTION = 30
+W_GENRE_YA = 25
+W_GENRE_MEMOIR = 10
+W_LENGTH_SWEET = 40      # word_count in [70000, 120000]
+W_LENGTH_OK = 20         # word_count in [50000, 69999] or [120001, 150000]
+W_LENGTH_OFF = 5         # otherwise
+W_AUTHOR_CLIENT = 20
+W_AUTHOR_PROSPECT = 10
+W_AUTHOR_FORMER = 0
+
+# PRD 3.3 — manuscript lifecycle gates
+EVAL_SCORE_ACCEPT_THRESHOLD = 70
+REVISION_ROUND_CAP = 2
+
+# PRD 3.6 — auction ranking weights
+FRONTLIST_ROYALTY_WEIGHT_CENTS = 100000
+FRONTLIST_RIGHTS_PENALTY_CENTS = 2500000
+BACKLIST_ROYALTY_WEIGHT_CENTS = 60000
+BACKLIST_RIGHTS_PENALTY_CENTS = 1000000
+
+# PRD 3.8 — royalty reconciliation
+TIER_THRESHOLD_HARDCOVER = 5000
+TIER_THRESHOLD_TRADE = 7500
+ESCALATOR_NET = 0.025
+ESCALATOR_RETAIL = 0.0125
+AUDIT_TOLERANCE_CENTS = 500
+
+# PRD 3.7 — advance waterfall fractions
+FRAC_SIGNING = 0.50
+FRAC_DELIVERY = 0.25
+
+# PRD 3.5 — editor exclusivity half-open window width, in periods
+EDITOR_EXCLUSIVITY_WINDOW_PERIODS = 2
+
+# Common test defaults
+DEFAULT_COMMISSION_PCT = 0.15
+DEFAULT_SLUSH_CAPACITY = 50

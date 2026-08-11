@@ -1,0 +1,295 @@
+# Affordable Housing Waitlist & Lottery Administration API — Product Requirements Document
+
+## 1. Introduction
+
+Affordable housing developers who receive public funding carry an unusual burden: the moment a new development opens its application period, every step — the outreach plan, the preference categories honored, the lottery that ranks hopeful households, the income certification that proves eligibility, the offers extended against a finite pool of units, and the periodic purge that keeps the waitlist honest — is subject to funding-agency scrutiny. This document specifies the Affordable Housing Waitlist & Lottery Administration API, the system of record an affordable housing developer uses to administer that entire pipeline for a portfolio of properties.
+
+The API governs the full lifecycle: announcing an application period with a documented marketing plan; accepting and reviewing household applications; verifying preference claims for local residents, veterans, and households needing accessible units; running a deterministic, seeded lottery that produces an auditable ranked waitlist; certifying household income against area-median-income limits; matching ranked households to suitably sized units and managing offers, refusals, and expirations; purging stale entries and reopening the list when it is exhausted; and filing aggregate compliance reports that a funding-agency auditor can acknowledge or return for correction. Because lottery operators and income certifiers must never be the same hands on the same campaign, segregation of duties is a first-class constraint, and because applicants, clerks, officers, and auditors all share the same data, every mutation is versioned and every time-dependent rule reads a single logical clock.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the system-wide rules, contracts, and invariants that apply to every endpoint of the API.
+
+### 2.1. User and Role-Based Access Control
+
+All interactions with the API are identified through two HTTP headers: `X-User-ID`, which identifies the acting user, and `X-User-Role`, which names their operational capacity. The system recognizes exactly eight roles, spelled precisely as follows: `HousingDeveloper`, `MarketingCoordinator`, `ApplicationClerk`, `ComplianceOfficer`, `LotteryAdministrator`, `FundingAgencyAuditor`, `Applicant`, and `Anonymous`. A request whose `X-User-Role` header is missing or does not name one of these roles, or whose `X-User-ID` is missing where one is required (that is, for any role other than `Anonymous`), is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A request whose role is not on the endpoint's authorized list, that violates an action-level role mapping, or — for an `Applicant` caller — whose `X-User-ID` does not own the addressed resource is rejected with `ERR_UNAUTHORIZED_ROLE` (HTTP 403).
+
+The `Applicant` role is entity-backed: when `X-User-Role` is `Applicant`, `X-User-ID` is the `id` of the acting `Applicant` record, and every ownership check on a resource that traces back to an applicant — an application, a preference claim, an income certification's applicant-facing step, a waitlist entry, an offer — compares the resource's owning applicant reference to `X-User-ID`. The remaining seven roles are opaque operator identities not tied to any persisted entity: `HousingDeveloper` (property, unit, and configuration setup; campaign lifecycle operations other than announcement; purges; expiry sweeps; administrative entry removal; clock control), `MarketingCoordinator` (owns the application-period announcement and marketing plan), `ApplicationClerk` (reviews applications and decides preference claims), `ComplianceOfficer` (certifies income and files compliance reports), `LotteryAdministrator` (runs lotteries and generates offers), `FundingAgencyAuditor` (acknowledges or returns submitted reports), and `Anonymous` (the unauthenticated public caller, permitted only to register an applicant). For these opaque roles the server may record `X-User-ID` on audit fields — for example `sealed_by`, `executed_by`, `published_by`, `certified_by`, `decided_by`, or `submitted_by` — but never compares it to any entity's `id`.
+
+Beyond endpoint-level authorization, individual actions within an endpoint carry their own role mapping. A campaign announcement may only be performed by a `MarketingCoordinator`; opening, closing, and reopening a campaign only by a `HousingDeveloper`; verifying or denying a preference claim only by an `ApplicationClerk`, while appealing a denied claim only by the owning `Applicant`; requesting documents, certifying, or denying an income certification only by a `ComplianceOfficer`, while submitting documents only by the owning `Applicant`; submitting a compliance report only by a `ComplianceOfficer`, while acknowledging or returning one only by a `FundingAgencyAuditor`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. The `limit` parameter caps the number of items returned; it defaults to 10 when omitted, with a minimum of 1 and a maximum of 100. The `offset` parameter states how many items to skip and defaults to 0. Unless otherwise specified, every list endpoint returns resources sorted by `created_at` in ascending order. Paginated list responses carry `limit`, `offset`, `total_count`, and `has_more` in the `meta` object of the envelope.
+
+### 2.4. Common Resource Properties
+
+Every resource in this system — properties, units, occupancy standards, AMI limits, campaigns, applicants, applications, preference claims, income certifications, lottery runs, waitlist entries, offers, purge runs, and compliance reports — carries a standard set of system-managed fields:
+
+- `id` (string): a unique, server-minted identifier formatted as a UUID, with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits recording when the resource was created.
+- `updated_at` (string): an ISO 8601 UTC timestamp refreshed on every modification of the resource.
+- `version` (integer): a system-managed integer that increments by exactly 1 on every mutation of the resource.
+
+"Mutation" is read broadly. Explicit client-driven transitions increment `version` and refresh `updated_at`, but so do automatic cascades: when an offer is created and a unit flips from `AVAILABLE` to `RESERVED`, the unit's `version` increments; when a refusal removes a waitlist entry, the entry's `version` increments; when a published lottery flips its campaign from `CLOSED` to `LOTTERY_COMPLETED`, the campaign's `version` increments. Derived counters are recomputed as part of the same mutation that invalidated them, never lazily.
+
+### 2.5. The Logical Clock
+
+Every time-dependent rule in the system — application windows, offer deadlines, certification validity, purge deadlines, reporting windows — reads a single server-side logical clock; the server never falls back to wall-clock time. At server startup, before any clock operation has been issued, the logical clock reads exactly `2026-05-01T00:00:00.000Z` — the same instant rendered in the three-fractional-digit format of §2.4, which is how the clock's value is serialized wherever it appears (for example in `current_utc` and in every clock-stamped field). A `HousingDeveloper` may advance the clock through an administrative capability that accepts a `to_iso8601` instant and returns the resulting `current_utc`. Advancing the clock never fires automatic transitions by itself: offers do not expire, purges do not execute, and windows do not close merely because time passed — every sweep is an explicit operation described in §3.
+
+### 2.6. Optimistic Concurrency Control on Campaign-Writing Operations
+
+Two operations that write against an `ApplicationCampaign` are protected by optimistic concurrency control: creating a lottery run for a campaign, and scheduling a purge run for a campaign. Each requires the request to carry `expected_campaign_version`, a non-optional field holding the campaign `version` the client last observed. If that value does not equal the campaign's current `version` at the moment the write is attempted, the request is rejected with `ERR_STALE_VERSION` (HTTP 412). A prior successful lottery-run creation already advances the campaign's `version`, so a second creation carrying the older version is stale even where product semantics would otherwise let a new run supersede a draft; likewise, a purge scheduled from a stale view of the waitlist is rejected rather than allowed to purge a list the client never saw. No endpoint other than these two accepts a version field; all other mutations rely on state-machine preconditions.
+
+### 2.7. Money, Counts, and Rounding Precision
+
+All monetary amounts are integer cents — never floating-point dollars. Income certification annualizes each income source to whole dollars first, rounding each source half-up to a whole dollar before any summation takes place, and only then sums the per-source figures and restates the total in integer cents; the provisional screen at application submit performs no rounding at all, comparing the declared integer-cent figure directly. Percentages of area median income and compliance rates are integer basis points — ten-thousandths of a whole — rounded half-up to the nearest basis point. Lottery and waitlist ranks are dense integers starting at 1 with no gaps. Datetime comparisons (deadlines, windows, purge cutoffs) are exact to the precision of the stored timestamps.
+
+### 2.8. Derived Counters and Cross-Entity Consistency
+
+Several entities expose counters that are always recomputed from the underlying rows, never independently settable. A property exposes `units_total` (the count of its unit rows), `units_available_count`, `units_reserved_count`, `units_leased_count`, and `units_out_of_service_count`, each tallying units in the corresponding status; a freshly created property starts with all of these at zero. A campaign exposes `applications_received_count` (its applications in `SUBMITTED`, `UNDER_REVIEW`, `NEEDS_INFO`, or `VERIFIED` status), `waitlist_active_count` (its waitlist entries in `RANKED` or `OFFERED` status), `entries_leased_count` (its entries in `LEASED` status), and `reopen_count` (the number of times the campaign has been reopened from `PURGED`). Every event that could change one of these tallies — an application submitted, rejected, or withdrawn; an entry leased, removed, or voided; a unit reserved, released, or leased — recomputes the affected counters as part of the same mutation, so a reader always sees a consistent cross-entity picture.
+
+### 2.9. Segregation of Duties Between Lottery and Certification
+
+Public-funding rules forbid the same operator from both running a campaign's lottery and certifying income on that campaign. The system enforces this in both directions with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). A `ComplianceOfficer` certifying an income certification is rejected if their `X-User-ID` appears as `sealed_by`, `executed_by`, or `published_by` of any lottery run belonging to the same campaign. Conversely, a `LotteryAdministrator` sealing, executing, or publishing a lottery run is rejected if their `X-User-ID` appears as `certified_by` of any income certification in the same campaign.
+
+### 2.10. Validation Pipeline and Check Ordering
+
+When several checks could reject the same request, they are evaluated in a fixed priority order so the surfaced error is deterministic:
+
+1. **Authentication** — the `X-User-Role` header must be present and name a declared role, and `X-User-ID` must be present where required; failures yield `ERR_UNAUTHENTICATED`.
+2. **Authorization** — the role must appear in the endpoint's authorized list, the action-level role mapping must hold, and an `Applicant` caller's `X-User-ID` must own the addressed resource; failures yield `ERR_UNAUTHORIZED_ROLE`.
+3. **Request shape** — required fields present, enums valid, datetimes ISO 8601, integers integral; failures yield `ERR_INVALID_REQUEST`.
+4. **Existence** — every identifier in the path and body must resolve to an existing entity, validated left-to-right, so the first unresolvable identifier determines the failure; failures yield `ERR_NOT_FOUND`.
+5. **Optimistic concurrency** — on the two campaign-writing operations named in §2.6, `expected_campaign_version` must equal the campaign's current `version`; failures yield `ERR_STALE_VERSION`.
+6. **State-machine preconditions** — the requested transition must be listed for the entity's current state, a campaign must be `OPEN` to accept an application (`ERR_CAMPAIGN_NOT_OPEN`), no non-`VOIDED` lottery run may already exist for the campaign when a run is created (`ERR_ACTIVE_LOTTERY_EXISTS`), and an application must be `VERIFIED` before an income certification opens for it (`ERR_APPLICATION_NOT_VERIFIED`); all other state violations yield the generic `ERR_INVALID_STATE`.
+7. **Segregation of duties** — the bidirectional lottery-versus-certification exclusion of §2.9; failures yield `ERR_SEGREGATION_OF_DUTIES`.
+8. **Clock rules** — temporal gates such as window boundaries, offer deadlines, certification validity, and purge deadlines, each surfacing its own error as described in §3.
+9. **Uniqueness and shape rules** — one non-terminal application per applicant per campaign (`ERR_DUPLICATE_APPLICATION`), one preference claim per category per application (`ERR_DUPLICATE_CLAIM`), configuration-row uniqueness (`ERR_CONFIG_CONFLICT`), household-size bounds (`ERR_HOUSEHOLD_SIZE_INVALID`), non-empty claim evidence (`ERR_PREFERENCE_EVIDENCE_REQUIRED`), zero pending claims at verification completion (`ERR_PREFERENCE_CLAIMS_PENDING`), the two-channel minimum at announcement (`ERR_MARKETING_PLAN_INSUFFICIENT`), and document coverage at certification (`ERR_CERT_DOCS_INCOMPLETE`).
+10. **Referenced configuration** — the AMI limit row required to certify must exist (`ERR_AMI_LIMIT_NOT_DEFINED`), and a report may only be submitted once the campaign has lottery results (`ERR_REPORT_INCOMPLETE_DATA`).
+11. **Income ceiling** — certified income must not exceed the target-tier limit; failures yield `ERR_OVER_INCOME`.
+12. **Interval overlap** — campaign application windows on the same property must not overlap (`ERR_CAMPAIGN_WINDOW_OVERLAP`), and declared report periods on the same campaign must not overlap (`ERR_REPORT_PERIOD_OVERLAP`).
+
+Within a single operation that raises checks from several of these stages — certification is the canonical example — the lower-numbered stage's error masks the higher-numbered ones.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Property Portfolio and Unit Configuration
+
+Everything begins with the development itself. A `HousingDeveloper` registers a property by supplying its `name`, `address_line`, `city`, and two-letter `state_code`; the new property's derived unit counters all start at zero. Units are then added one at a time against a `property_id`, each with a `unit_number` unique within its property, a `bedroom_count` of `STUDIO`, `ONE_BR`, `TWO_BR`, or `THREE_BR`, a rent-restriction `ami_tier` of `AMI_30`, `AMI_50`, `AMI_60`, or `AMI_80`, and an optional `accessibility_feature` of `NONE`, `MOBILITY`, or `HEARING_VISION` that defaults to `NONE` when omitted. Every unit is born `AVAILABLE`, and its creation immediately recomputes the property's `units_total` and `units_available_count`. Units may be listed filtered by `property_id`, `status`, or `bedroom_count`.
+
+A unit's `status` moves among `AVAILABLE`, `RESERVED`, `LEASED`, and `OUT_OF_SERVICE`. Reservation and leasing are driven entirely by the offer lifecycle of §3.6 — there is no direct way to reserve a unit — but a `HousingDeveloper` may take an `AVAILABLE` unit out of service, provided no `PENDING` offer references it (otherwise the attempt is rejected with `ERR_INVALID_STATE`), moving it to `OUT_OF_SERVICE`; the inverse action returns an `OUT_OF_SERVICE` unit to `AVAILABLE`. Each of these moves recomputes the affected property counters and increments the unit's `version`.
+
+Two configuration tables per property govern later matching decisions, and each enforces its own uniqueness. An occupancy standard states, for a `property_id` and `bedroom_count`, the inclusive household-size band the unit size admits: `min_occupants` of at least 1 and `max_occupants` of at least `min_occupants`. Its system-maintained `uniqueness_scope` records that only one row may exist per property and bedroom-count pairing; a duplicate is rejected with `ERR_CONFIG_CONFLICT`. An AMI limit row states, for a `property_id`, a `household_size` between 1 and 12 inclusive, and an `ami_tier`, the `annual_limit_cents` — the maximum annual household income for that combination, a positive integer number of cents. Here `uniqueness_scope` records one row per property, household size, and tier triple, and duplicates are likewise rejected with `ERR_CONFIG_CONFLICT`. Occupancy standards may be listed filtered by `property_id`; AMI limit rows by `property_id`, `household_size`, or `ami_tier`.
+
+### 3.2. Campaign Authoring, Announcement, and the Application Window
+
+An application campaign is the umbrella under which one property's leasing push runs. A `HousingDeveloper` authors one against a `property_id` with a `name`, the half-open application window bounded by `application_open_at` and `application_close_at` (an applicant may submit at the open instant itself, but not at the close instant), a `marketing_channels` array drawn from `COMMUNITY_MEETING`, `LOCAL_NEWSPAPER`, `SOCIAL_MEDIA`, `HOUSING_AUTHORITY_WEBSITE`, and `MAILERS`, a free-text `marketing_plan_summary`, and an optional `target_ami_tier` that defaults to `AMI_60` and names the tier the campaign will certify incomes against. A new campaign starts in `DRAFT`. Because double-booked application periods would confuse the public, a campaign's window is checked against every sibling campaign on the same property whose status is anything other than `PURGED`: two half-open windows overlap when the first opens before the other closes and the other opens before the first closes — so a window opening exactly as another closes does not overlap — and any overlap is rejected with `ERR_CAMPAIGN_WINDOW_OVERLAP`.
+
+From `DRAFT`, a `MarketingCoordinator` announces the campaign, moving it to `ANNOUNCED`; the outreach plan must name at least two marketing channels, and an announcement carrying fewer is rejected with `ERR_MARKETING_PLAN_INSUFFICIENT`. Once announced, a `HousingDeveloper` opens the campaign, moving it from `ANNOUNCED` to `OPEN`, but only once the logical clock has reached `application_open_at`; an early opening is rejected with `ERR_APPLICATION_WINDOW_NOT_OPEN`. Closing is the mirror image: from `OPEN` to `CLOSED`, allowed only once the logical clock has reached `application_close_at`, with an early close rejected as `ERR_INVALID_STATE`. Later states of the campaign — `LOTTERY_COMPLETED`, `LEASING`, `PURGE_SCHEDULED`, and `PURGED` — are reached only through the lottery, offer, and purge machinery of §3.5 through §3.7, each of which increments the campaign's `version` as it flips the state. Campaigns may be listed filtered by `property_id` or `status`, and a fetched campaign exposes its derived `applications_received_count`, `waitlist_active_count`, `entries_leased_count`, and `reopen_count` alongside its configured fields.
+
+### 3.3. Application Intake, Screening, and Preference Claims
+
+Before anyone can apply, the head of household must be registered: an `Anonymous` caller creates an applicant record with a `full_name` and contact `email`. The returned `id` becomes the applicant's identity for everything that follows — staff roles may fetch any applicant record, while an `Applicant` caller may fetch only their own.
+
+While a campaign is `OPEN`, an `Applicant` submits an application carrying their `applicant_id` (which must equal their `X-User-ID`), the target `campaign_id`, a `household_size` between 1 and 12 inclusive (outside that band the submission is rejected with `ERR_HOUSEHOLD_SIZE_INVALID`), and a `self_reported_annual_income_cents` declaring gross annual income as a non-negative integer number of cents. Three gates stand in front of acceptance, evaluated in the pipeline order of §2.10: the campaign's status must be `OPEN`, else `ERR_CAMPAIGN_NOT_OPEN`; the logical clock must not yet have reached `application_close_at`, else `ERR_APPLICATION_WINDOW_CLOSED`; and the same applicant must not already hold a non-terminal application — one in `SUBMITTED`, `UNDER_REVIEW`, `NEEDS_INFO`, or `VERIFIED` — in this campaign, else `ERR_DUPLICATE_APPLICATION`. A rejected or withdrawn household may therefore apply again, but an active one may not.
+
+Acceptance mints two things. The server assigns a `confirmation_code`, the household's lottery ticket string that later feeds the seeded draw. It also runs the provisional eligibility screen: the campaign's `target_ami_tier` and the application's `household_size` select a single AMI limit row for the campaign's property; if no such row exists the `provisional_determination` is `UNASSESSED`, otherwise the declared income is compared to that row's `annual_limit_cents`, and because the boundary is inclusive, income exactly equal to the limit yields `PROVISIONALLY_ELIGIBLE` while anything above yields `PROVISIONALLY_OVER_INCOME`. The new application lands in `SUBMITTED` status, and the campaign's `applications_received_count` is recomputed. Applications may be listed filtered by `campaign_id`, `applicant_id`, or `status`, with an `Applicant` caller seeing only their own records.
+
+Review is a cycle, not a gate. An `ApplicationClerk` begins review, moving the application from `SUBMITTED` to `UNDER_REVIEW`; requests more information, moving it from `UNDER_REVIEW` to `NEEDS_INFO` (the request may carry an optional free-text `note`); and the owning applicant answers, moving it from `NEEDS_INFO` back to `UNDER_REVIEW` — an answer from anyone other than the owning applicant is rejected with `ERR_UNAUTHORIZED_ROLE`. From `UNDER_REVIEW` the clerk either completes verification or rejects. Completion requires that no preference claim of the application still sits in `PENDING` — one that does triggers `ERR_PREFERENCE_CLAIMS_PENDING` — and stamps `verified_at` while recomputing `verified_preference_categories` from the application's verified claims, leaving the application `VERIFIED`. Rejection moves the application to `REJECTED` with the payload's `rejection_reason` recorded. The household may also walk away: from `SUBMITTED`, `UNDER_REVIEW`, or `NEEDS_INFO` the owning applicant may withdraw, moving the application to terminal `WITHDRAWN`. Both rejection and withdrawal recompute the campaign's received counter.
+
+Preference claims run alongside review. The owning applicant files a claim against an `application_id`, naming a `category` of `LOCAL_RESIDENT`, `VETERAN`, or `ACCESSIBILITY` and supplying an `evidence_ref` document reference; an empty or missing reference is rejected with `ERR_PREFERENCE_EVIDENCE_REQUIRED`, and a second claim of the same category on the same application with `ERR_DUPLICATE_CLAIM`. A claim is born `PENDING`. An `ApplicationClerk` then verifies or denies it — but only while the parent application is still in `SUBMITTED`, `UNDER_REVIEW`, or `NEEDS_INFO`; a decision attempted once the application has left those states is rejected with `ERR_INVALID_STATE`. Verification stamps `decided_at` and `decided_by` and recomputes the parent application's `verified_preference_categories`. Denial requires a `denial_reason` in the payload (absent, the request fails with `ERR_INVALID_REQUEST`) and records the same decision stamps. Denial is not the end: the owning applicant may appeal a `DENIED` claim back to `PENDING` by supplying a `new_evidence_ref`, which replaces the stored `evidence_ref` and clears the `denial_reason`, again only while the parent application remains in one of the three reviewable states. Claims may be listed filtered by `application_id`, `status`, or `category`.
+
+### 3.4. Income Certification and the Documentation Cycle
+
+A verified application earns the right to prove its income. A `ComplianceOfficer` opens an income certification against an `application_id`; the application must be `VERIFIED`, otherwise the attempt is rejected with `ERR_APPLICATION_NOT_VERIFIED`, and at most one certification not in terminal `DENIED` status may exist per application — a second live one is rejected with `ERR_INVALID_STATE`. The certification opens in `INITIATED`.
+
+What follows is a documentation cycle between officer and household. The officer requests documents, moving the certification from `INITIATED` to `DOCS_REQUESTED`, with a payload `required_docs` listing the income source types that must be evidenced; an empty or missing list is rejected with `ERR_INVALID_REQUEST`. The owning applicant submits documents, moving from `DOCS_REQUESTED` to `DOCS_RECEIVED`, with a non-empty `income_sources` array whose entries each name a `source_type`, an `amount_per_period_cents`, and a `periods_per_year`; the submitted entries are appended to the certification record. If the paperwork is insufficient, the officer requests documents again — from `DOCS_RECEIVED` back to `DOCS_REQUESTED` — and the new `required_docs` list replaces the old one. This loop may repeat as many times as the review demands.
+
+Certification is the decisive act, and its four checks are evaluated in a fixed order, so an earlier failure masks later ones. First, segregation of duties: the certifying officer's `X-User-ID` must not appear as `sealed_by`, `executed_by`, or `published_by` of any lottery run of the same campaign, else `ERR_SEGREGATION_OF_DUTIES`. Second, documentation coverage: every source type named in `required_docs` must be covered by at least one submitted `income_sources` entry, else `ERR_CERT_DOCS_INCOMPLETE`. Third, configuration: an AMI limit row must exist for the property, the application's `household_size`, and the campaign's `target_ami_tier`, else `ERR_AMI_LIMIT_NOT_DEFINED`. Fourth, the income ceiling: the certified income must not exceed that row's `annual_limit_cents` — the boundary is inclusive, so income exactly equal to the limit passes — else `ERR_OVER_INCOME`.
+
+The certified income figure itself is computed with a pinned rounding order. Each submitted income source is annualized independently: its per-period amount in cents is multiplied by its number of periods per year, converted to dollars, and rounded half-up to a whole dollar. Only then are the per-source whole-dollar figures summed, and the total is restated in integer cents as `certified_annual_income_cents`. Consider two sources, one paying 100020 cents per period across 12 periods and another paying 50020 cents across 12 periods: the first annualizes to 12002.40 dollars and rounds to 12002 whole dollars, the second to 6002.40 dollars and rounds to 6002, and the certified total is 18004 dollars, stored as 1800400 cents. Summing the exact amounts first and rounding once would produce 18005 dollars — that is not the specified behavior. Alongside the income figure, `ami_percentage_bp` records the certified income as a share of the tier limit in basis points: the certified cents are multiplied by ten thousand, divided by the limit, and rounded half-up to an integer. A successful certification stamps `determination` as `ELIGIBLE`, records `certified_at` and the officer's `X-User-ID` as `certified_by`, and sets `valid_until` to exactly 180 days after `certified_at` — the horizon over which the certification remains acceptable for offers. The officer may instead deny the certification from `DOCS_RECEIVED`, supplying a `denial_reason` and landing the record in terminal `DENIED`. Certifications may be listed filtered by `application_id` or `status`.
+
+### 3.5. The Sealed Lottery and Rank Assignment
+
+When the application window has closed, a `LotteryAdministrator` creates a lottery run against the `CLOSED` campaign, supplying the `campaign_id` and an operator-chosen `seed` string that makes the draw deterministic and reproducible for auditors. Creation carries the optimistic-concurrency obligation of §2.6 — a stale `expected_campaign_version` is rejected with `ERR_STALE_VERSION` — and the campaign must currently be `CLOSED` with no other lottery run of the same campaign still alive in `DRAFT`, `SEALED`, `EXECUTED`, or `PUBLISHED` status; a live sibling run triggers `ERR_ACTIVE_LOTTERY_EXISTS`. The run is born in `DRAFT`, and its creation itself advances the campaign's `version` by 1.
+
+Sealing freezes the field. The administrator seals the run — provided their `X-User-ID` is not the `certified_by` of any income certification in this campaign, else `ERR_SEGREGATION_OF_DUTIES` — moving it from `DRAFT` to `SEALED`, recording `sealed_by` and `sealed_at`, and snapshotting the campaign's applications in `VERIFIED` status at that exact instant: the frozen set of those applications is the snapshot, and `eligible_application_count` records its size. Execution then draws: the same segregation check applies again, and on success the run moves from `SEALED` to `EXECUTED`, stamps `executed_by` and `executed_at`, and generates one waitlist entry per snapshotted application — drawn exclusively from the frozen seal-time snapshot, so an application verified after sealing is not included — each born in `RANKED` status and stamped with its `lottery_run_id`, `campaign_id`, and `application_id`; `entries_generated` records how many were created.
+
+Three rankings are assigned at execution, each in prose-precise terms. The base rank comes from a seeded hash draw with no wall-clock randomness and no participation of any record identifier: for each snapshotted application, the server computes the SHA-256 hex digest of the UTF-8 string formed by the `seed`, a colon, and the application's `confirmation_code`; applications are ordered by that digest compared lexicographically ascending, with the application's `created_at` ascending breaking any theoretical hash tie, and `base_rank` is the 1-based position in that order. The preference tier is a combinatorial read of the application's verified claims: tier 1 if any claim is currently `VERIFIED` in the `LOCAL_RESIDENT` category, otherwise tier 2 for a verified `VETERAN` claim, otherwise tier 3 for a verified `ACCESSIBILITY` claim, otherwise tier 4 — a claim denied and appealed back counts only if it is actually `VERIFIED` at execution time. The effective rank then orders the snapshot by `preference_tier` ascending, then `base_rank` ascending, then the application's `created_at` ascending, and `effective_rank` is the 1-based position in that final order. Both rank fields are dense integers from 1 to the snapshot size.
+
+Publication is what the public sees. The administrator publishes the run — the segregation check applies a third time — moving it from `EXECUTED` to `PUBLISHED`, recording `published_by` and `published_at`, and flipping the campaign automatically from `CLOSED` to `LOTTERY_COMPLETED` with a campaign `version` increment. A run may instead be voided from `DRAFT`, `SEALED`, `EXECUTED`, or `PUBLISHED`, always requiring a `void_reason` in the payload (its absence fails with `ERR_INVALID_REQUEST`), landing in terminal `VOIDED`. Voiding a `DRAFT` or `SEALED` run touches nothing else. Voiding an `EXECUTED` run cascades: every entry of the run in `RANKED` or `OFFERED` status is removed with `removal_reason` `LOTTERY_VOIDED` and `removed_at` stamped; every `PENDING` offer of those entries is voided without incrementing any `refusal_count`, and the units those offers held return from `RESERVED` to `AVAILABLE`; entries already `LEASED` remain `LEASED` — the cascade deliberately stops at a signed lease — and the campaign counters are recomputed. Voiding a `PUBLISHED` run performs the same cascade and additionally flips the campaign from `LOTTERY_COMPLETED` or `LEASING` back to `CLOSED`. Lottery runs may be listed filtered by `campaign_id` or `status`.
+
+### 3.6. Offer Generation, Response, and the Refusal Cycle
+
+With a published lottery in hand, the `LotteryAdministrator` generates offers for a `campaign_id` in a single batch. The campaign must have a `PUBLISHED` run; without one the request is rejected with `ERR_INVALID_STATE`. The batch walks the property's `AVAILABLE` units in a fixed order — `created_at` ascending, then `unit_number` ascending — and for each unit independently selects one entry from the campaign's still-`RANKED` entries. The evaluation order is pinned: eligibility first, accessibility boost second, ranking last.
+
+Eligibility has four strands, all evaluated per unit and entry. Occupancy: an occupancy-standard row must exist for the unit's property and `bedroom_count`, and the applicant's `household_size` must fall within its `min_occupants` and `max_occupants` inclusive at both ends; if the row itself is missing, the unit is skipped entirely and receives no offer at all. Income: an AMI limit row must exist for the unit's property, the household size, and the unit's own `ami_tier`, and the household's `certified_annual_income_cents` must not exceed its `annual_limit_cents` — inclusive again; if that row is missing, the entry is simply ineligible for that unit. Certification: the application must hold an income certification in `CERTIFIED` status whose `valid_until` has not yet passed relative to the logical clock. Exclusion on retry: the entry must have no prior `DECLINED` or `EXPIRED` offer for this very unit — a household that already refused this unit is never offered it again. If no entry survives for a unit, the unit stays `AVAILABLE` and the batch moves on; an empty pool is a non-event, not an error. Among survivors, an accessibility boost applies when the unit's `accessibility_feature` is anything other than `NONE` and the application's `verified_preference_categories` include `ACCESSIBILITY`; the chosen entry is the boosted one if any exist, then the lowest `effective_rank`, then the earliest `created_at` among ties. The created offer records its `campaign_id`, `entry_id`, and `unit_id`, stamps `offered_at` with the current logical instant, and sets `response_deadline` exactly 10 days later; the entry flips from `RANKED` to `OFFERED`, the unit from `AVAILABLE` to `RESERVED` with property counters recomputed, and — on the first generation batch of the campaign — the campaign itself flips from `LOTTERY_COMPLETED` to `LEASING`. The batch response reports `generated_count`, the list of `generated_offer_ids`, and `units_considered`.
+
+An offer is answered by the household it was made to: the owning `Applicant` responds with an `action` of `ACCEPT` or `DECLINE`. In both cases the logical clock must not have passed the offer's `response_deadline` — a response exactly at the deadline is still accepted, while one past it is rejected with `ERR_OFFER_EXPIRED`. Acceptance additionally requires that the application's income certification be `CERTIFIED` with `valid_until` still in the future, else `ERR_CERTIFICATION_EXPIRED`. An accepted offer stamps `responded_at` and lands in terminal `ACCEPTED`; its entry moves from `OFFERED` to `LEASED`, which bumps the campaign's `entries_leased_count` and recomputes `waitlist_active_count`; and its unit moves from `RESERVED` to `LEASED` with property counters recomputed. A declined offer also stamps `responded_at` and lands in terminal `DECLINED`; the entry's `refusal_count` increments by 1, and if the incremented count has reached the maximum of 2 allowed refusals the entry is removed outright — `REMOVED` with `removal_reason` `MAX_REFUSALS`, `removed_at` stamped, and `waitlist_active_count` recomputed — otherwise the entry falls back to `RANKED` to await another offer; either way the unit returns from `RESERVED` to `AVAILABLE`.
+
+Offers that nobody answers are swept. A `HousingDeveloper` triggers the expiry sweep, which walks every `PENDING` offer whose `response_deadline` is strictly before the logical clock — processed in `offered_at` ascending order — and moves each to terminal `EXPIRED` with exactly the same refusal cascade as a decline: `refusal_count` increments, the two-refusal ceiling applies, and the unit is released. The sweep reports how many offers it expired in `expired_count`. A voided offer, by contrast, is not a refusal: when a lottery void voids a `PENDING` offer, no `refusal_count` increments, though the unit is still released. Offers may be listed filtered by `campaign_id`, `unit_id`, `entry_id`, or `status`.
+
+Two further removal paths exist outside the offer cycle, both landing an entry in terminal `REMOVED`. A `HousingDeveloper` may administratively remove an entry currently in `RANKED`, supplying a `removal_reason` of `ADMIN_REMOVED`; removing an entry in any other status is rejected with `ERR_INVALID_STATE`. And the purge machinery of §3.7 removes unconfirmed entries with `removal_reason` `PURGED`. Waitlist entries — the only discovery channel for the lottery's output, since entries are created by execution rather than by any client-facing create — may be listed filtered by `campaign_id`, `lottery_run_id`, `application_id`, or `status`, with an `Applicant` caller seeing only their own.
+
+### 3.7. Waitlist Purges, Confirmation of Interest, and Reopening
+
+A waitlist that never sheds stale households becomes fiction, so a `LEASING` campaign can be purged. A `HousingDeveloper` schedules a purge run against the `campaign_id`, optionally overriding `notice_response_days` — the number of days entrants are given to confirm continued interest, defaulting to 30 — and carrying the `expected_campaign_version` guard of §2.6, with a stale value rejected as `ERR_STALE_VERSION`. Scheduling lands the purge in `SCHEDULED` and flips the campaign from `LEASING` to `PURGE_SCHEDULED`, incrementing the campaign's `version`.
+
+Notices go out when the developer sends them: the purge moves from `SCHEDULED` to `NOTICES_SENT`, `notice_sent_at` is stamped with the current logical instant, and `response_deadline` is computed as exactly `notice_response_days` days after that stamp. During the notice window, each affected household answers for itself: the owning applicant confirms continued interest on their entry, which requires a purge of the entry's campaign to currently sit in `NOTICES_SENT` — confirming at any other time is rejected with `ERR_INVALID_STATE` — and stamps the entry's `last_confirmed_at`, a `RANKED`-to-`RANKED` self-transition that still increments the entry's `version`.
+
+Execution is the purge's bite, and it is gated on time: the logical clock must have reached `response_deadline`, else the execution is rejected with `ERR_PURGE_NOT_EXECUTABLE`. On execution the purge examines every entry of the campaign currently in `RANKED` status — entries that are `OFFERED` or `LEASED` are never purge-selected — and removes each one whose `last_confirmed_at` is either absent or strictly earlier than `notice_sent_at`, stamping `removal_reason` `PURGED` and `removed_at`. The boundary is exact: a confirmation stamped at precisely `notice_sent_at` preserves the entry, because only a strictly earlier timestamp condemns it. The purge records how many entries it removed in `entries_removed_count` and stamps `executed_at`, then the campaign recomputes `waitlist_active_count` and branches on the result: if the purge emptied the active waitlist — the count is zero — the campaign moves from `PURGE_SCHEDULED` to `PURGED`; otherwise it returns from `PURGE_SCHEDULED` to `LEASING`. A purge may instead be cancelled from either `SCHEDULED` or `NOTICES_SENT`, landing in terminal `CANCELLED` and returning the campaign to `LEASING` in both cases. Purge runs may be listed filtered by `campaign_id` or `status`.
+
+A purged campaign is not necessarily a dead one. From `PURGED`, a `HousingDeveloper` reopens the campaign, carrying `new_application_open_at` and `new_application_close_at` for the fresh window; the new close must fall after the new open, else the request fails with `ERR_INVALID_REQUEST`, and the new window must clear the same half-open overlap check against sibling campaigns on the property, else `ERR_CAMPAIGN_WINDOW_OVERLAP`. A successful reopen replaces `application_open_at` and `application_close_at` with the new window, moves the campaign back to `OPEN`, and increments `reopen_count` by 1.
+
+### 3.8. Compliance Reporting to the Funding Agency
+
+The funding agency's window into the program is the compliance report, created by a `ComplianceOfficer` against a `campaign_id` with a declared `period_start`, `period_end`, and a `period_mode` selecting one of two aggregation window variants. Under `CALENDAR_QUARTER` the declared period must describe exactly one calendar quarter — `period_start` on the first day of a quarter at 00:00:00Z and `period_end` on the last day of that same quarter; a misaligned declaration is rejected with `ERR_INVALID_REQUEST` — and the effective aggregation window runs from the quarter's start inclusive to three months later exclusive, a half-open window. Under `ROLLING_90_DAY` the effective window slides: it opens 90 days before `period_end` at 00:00:00Z and closes on `period_end` at 23:59:59.999Z, both ends inclusive. Because the two variants draw their boundaries differently, the same underlying events can yield different counts under different modes. Declared periods on the same campaign must not collide: treated as closed intervals, two periods overlap when each starts on or before the other ends, and any overlap with an existing report in `SUBMITTED` or `ACKNOWLEDGED` status is rejected with `ERR_REPORT_PERIOD_OVERLAP`.
+
+Creation computes the aggregates immediately, leaving the report in `DRAFT`. Eight counts are tallied, each keyed on the event timestamp named for it and counting only events inside the effective window: `applications_received_count` on application `created_at`; `applications_verified_count` on application `verified_at`; `preference_claims_decided_count` on claim `decided_at`; `preference_claims_verified_count` on claim `decided_at` where the claim's status is `VERIFIED`; `lottery_runs_executed_count` on run `executed_at`; `offers_made_count` on offer `created_at`; `offers_accepted_count` on offer `responded_at` where the offer's status is `ACCEPTED`; and `entries_removed_count` on entry `removed_at`. Two rates derive from them, each in integer basis points rounded half-up: `preference_verification_rate_bp` multiplies verified claims by ten thousand and divides by decided claims, and `lease_up_rate_bp` multiplies accepted offers by ten thousand and divides by offers made; when a denominator is zero the corresponding rate is 0, never an error.
+
+Submission is a gate with teeth. A `ComplianceOfficer` submits the report only when the campaign has at least one lottery run in `PUBLISHED` status and the campaign itself sits in `LOTTERY_COMPLETED`, `LEASING`, `PURGE_SCHEDULED`, or `PURGED`; failing either condition is rejected with `ERR_REPORT_INCOMPLETE_DATA`. A successful submit stamps `submitted_by` and `submitted_at` and moves the report from `DRAFT` to `SUBMITTED`. The `FundingAgencyAuditor` then either acknowledges the report — terminal `ACKNOWLEDGED` — or returns it for correction with a mandatory `return_reason` (its absence fails with `ERR_INVALID_REQUEST`), moving it to `RETURNED`. A returned report may be resubmitted under the same submission preconditions, and resubmission recomputes every aggregate against the effective window at the resubmission instant, refreshes `submitted_by` and `submitted_at`, and clears the `return_reason`. Reports may be listed filtered by `campaign_id` or `status`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return a `201 Created` status code. Operations that modify an existing resource — including all state-transition, advance, respond, sweep, and confirmation actions — return a `200 OK` status code. The table below is a summary only; the complete request and response semantics of each operation are defined by the narratives of §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/properties` | Create a property | HousingDeveloper |
+| GET | `/properties/{id}` | Get a property with derived unit counters | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/units` | Create a unit | HousingDeveloper |
+| GET | `/units` | List units | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/units/{id}` | Get a unit | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/units/{id}/service` | Place a unit out of service or return it to service | HousingDeveloper |
+| POST | `/occupancy-standards` | Define an occupancy range for a bedroom count at a property | HousingDeveloper |
+| GET | `/occupancy-standards` | List occupancy standards | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/occupancy-standards/{id}` | Get one occupancy standard | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/ami-limits` | Define an AMI income limit row | HousingDeveloper |
+| GET | `/ami-limits` | List AMI limit rows | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/ami-limits/{id}` | Get one AMI limit row | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/campaigns` | Create a campaign | HousingDeveloper |
+| GET | `/campaigns` | List campaigns | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/campaigns/{id}` | Get a campaign with derived counters | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/campaigns/{id}/transition` | Announce, open, close, or reopen a campaign | HousingDeveloper, MarketingCoordinator |
+| POST | `/applicants` | Register an applicant (head of household) | Anonymous |
+| GET | `/applicants/{id}` | Get an applicant (staff any; applicant self only) | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/applications` | Submit an application to an open campaign | Applicant |
+| GET | `/applications` | List applications (an applicant sees only their own) | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| GET | `/applications/{id}` | Get an application | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/applications/{id}/withdraw` | Withdraw a non-terminal application | Applicant |
+| POST | `/applications/{id}/review` | Begin review, request info, submit info, complete verification, or reject | ApplicationClerk, Applicant |
+| POST | `/preference-claims` | File a preference claim with evidence | Applicant |
+| GET | `/preference-claims` | List preference claims | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| GET | `/preference-claims/{id}` | Get a preference claim | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/preference-claims/{id}/transition` | Verify, deny, or appeal a preference claim | ApplicationClerk, Applicant |
+| POST | `/income-certifications` | Open an income certification for a verified application | ComplianceOfficer |
+| GET | `/income-certifications` | List income certifications | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| GET | `/income-certifications/{id}` | Get an income certification | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/income-certifications/{id}/advance` | Request docs, submit docs, certify, or deny a certification | ComplianceOfficer, Applicant |
+| POST | `/lottery-runs` | Create a lottery run for a closed campaign | LotteryAdministrator |
+| GET | `/lottery-runs` | List lottery runs | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/lottery-runs/{id}` | Get a lottery run | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/lottery-runs/{id}/transition` | Seal, execute, publish, or void a lottery run | LotteryAdministrator |
+| GET | `/waitlist-entries` | List waitlist entries (the only discovery channel for lottery output) | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| GET | `/waitlist-entries/{id}` | Get a waitlist entry | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/waitlist-entries/{id}/confirm-interest` | Confirm continued interest during an active purge notice window | Applicant |
+| POST | `/waitlist-entries/{id}/remove` | Administratively remove a ranked entry | HousingDeveloper |
+| POST | `/offers/generate` | Generate a batch of offers for a campaign | LotteryAdministrator |
+| GET | `/offers` | List offers | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| GET | `/offers/{id}` | Get an offer | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor, Applicant |
+| POST | `/offers/{id}/respond` | Accept or decline an offer | Applicant |
+| POST | `/offers/expire-due` | Sweep and expire all past-deadline pending offers | HousingDeveloper |
+| POST | `/purge-runs` | Schedule a waitlist purge for a leasing campaign | HousingDeveloper |
+| GET | `/purge-runs` | List purge runs | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/purge-runs/{id}` | Get a purge run | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/purge-runs/{id}/advance` | Send notices, execute, or cancel a purge run | HousingDeveloper |
+| POST | `/compliance-reports` | Create a compliance report | ComplianceOfficer |
+| GET | `/compliance-reports` | List compliance reports | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| GET | `/compliance-reports/{id}` | Get a compliance report | HousingDeveloper, MarketingCoordinator, ApplicationClerk, ComplianceOfficer, LotteryAdministrator, FundingAgencyAuditor |
+| POST | `/compliance-reports/{id}/transition` | Submit, acknowledge, or return a compliance report | ComplianceOfficer, FundingAgencyAuditor |
+| POST | `/_clock/set_current_utc` | Set the logical clock (startup default is exactly 2026-05-01T00:00:00.000Z) | HousingDeveloper |
+
+## 5. Error Code Catalogue
+
+The table below enumerates every error identifier and its HTTP status. The conditions that raise each error are defined in the narratives of §2 and §3.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED_ROLE` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_NOT_FOUND` | 404 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_CAMPAIGN_NOT_OPEN` | 409 |
+| `ERR_ACTIVE_LOTTERY_EXISTS` | 409 |
+| `ERR_APPLICATION_NOT_VERIFIED` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_APPLICATION_WINDOW_NOT_OPEN` | 422 |
+| `ERR_APPLICATION_WINDOW_CLOSED` | 422 |
+| `ERR_OFFER_EXPIRED` | 409 |
+| `ERR_CERTIFICATION_EXPIRED` | 409 |
+| `ERR_PURGE_NOT_EXECUTABLE` | 409 |
+| `ERR_DUPLICATE_APPLICATION` | 409 |
+| `ERR_DUPLICATE_CLAIM` | 409 |
+| `ERR_CONFIG_CONFLICT` | 409 |
+| `ERR_CAMPAIGN_WINDOW_OVERLAP` | 409 |
+| `ERR_REPORT_PERIOD_OVERLAP` | 409 |
+| `ERR_HOUSEHOLD_SIZE_INVALID` | 422 |
+| `ERR_PREFERENCE_EVIDENCE_REQUIRED` | 422 |
+| `ERR_PREFERENCE_CLAIMS_PENDING` | 409 |
+| `ERR_MARKETING_PLAN_INSUFFICIENT` | 422 |
+| `ERR_CERT_DOCS_INCOMPLETE` | 422 |
+| `ERR_AMI_LIMIT_NOT_DEFINED` | 422 |
+| `ERR_OVER_INCOME` | 422 |
+| `ERR_REPORT_INCOMPLETE_DATA` | 422 |

@@ -1,0 +1,72 @@
+"""Domain thresholds — numeric constants named by the PRD's pricing and rule prose."""
+
+# Logical clock (PRD §2.5): startup default before any clock call.
+DEFAULT_CLOCK_ISO = "2026-05-01T00:00:00Z"
+
+# Visit pricing (PRD §3.5): list rates per visit type, in integer cents.
+BASE_RATE_CENTS = {
+    "COOP_CLEANING": 8000,
+    "FLOCK_HEALTH_CHECK": 6000,
+    "PREDATOR_PROOFING": 12000,
+    "SETUP_INSTALL": 25000,
+}
+
+# Zone multipliers (PRD §3.5).
+ZONE_MULTIPLIER = {
+    "URBAN": 1.0,
+    "SUBURBAN": 1.15,
+    "RURAL": 1.30,
+}
+
+# Flock-tier fee boundaries (PRD §3.5): 0 for <=6, 1500 for 7..12,
+# 3000 for 13..20, 3000 + 250 per hen beyond 20.
+FLOCK_TIER_BOUNDARY_1 = 6
+FLOCK_TIER_BOUNDARY_2 = 12
+FLOCK_TIER_BOUNDARY_3 = 20
+FLOCK_FEE_TIER_2_CENTS = 1500
+FLOCK_FEE_TIER_3_CENTS = 3000
+FLOCK_FEE_PER_EXTRA_HEN_CENTS = 250
+
+# Standard durations and overtime (PRD §3.5).
+STANDARD_DURATION_MINUTES = {
+    "COOP_CLEANING": 60,
+    "FLOCK_HEALTH_CHECK": 45,
+    "PREDATOR_PROOFING": 90,
+    "SETUP_INSTALL": 180,
+}
+OVERTIME_BLOCK_MINUTES = 15
+OVERTIME_BLOCK_FEE_CENTS = 700
+
+# Sitting pricing (PRD §3.6).
+DAILY_RATE_CENTS = 5000
+FREE_NOTICE_HOURS = 72
+REDUCED_NOTICE_HOURS = 24
+REDUCED_FEE_PCT = 0.25
+LATE_FEE_PCT = 0.50
+MAX_ENGAGEMENT_NIGHTS = 30
+STOP_DURATION_MINUTES = 60
+
+# Buffered scheduling (PRD §3.5 assign, §3.6 selector, §3.7 stop add).
+TRAVEL_BUFFER_MINUTES = 30
+
+# Visit reschedule loop bound (PRD §3.5).
+MAX_RESCHEDULE_COUNT = 2
+
+# Invoice composition (PRD §3.9).
+TAX_RATE = 0.0825
+DUE_DAYS = 14
+
+# Fiscal gates (PRD §3.8, §3.1).
+CREDIT_LIMIT_CENTS = 20000
+
+THRESHOLDS = {
+    "FLOCK_TIER_BOUNDARY_1": FLOCK_TIER_BOUNDARY_1,
+    "FLOCK_TIER_BOUNDARY_2": FLOCK_TIER_BOUNDARY_2,
+    "FLOCK_TIER_BOUNDARY_3": FLOCK_TIER_BOUNDARY_3,
+    "FREE_NOTICE_HOURS": FREE_NOTICE_HOURS,
+    "REDUCED_NOTICE_HOURS": REDUCED_NOTICE_HOURS,
+    "MAX_ENGAGEMENT_NIGHTS": MAX_ENGAGEMENT_NIGHTS,
+    "TRAVEL_BUFFER_MINUTES": TRAVEL_BUFFER_MINUTES,
+    "MAX_RESCHEDULE_COUNT": MAX_RESCHEDULE_COUNT,
+    "CREDIT_LIMIT_CENTS": CREDIT_LIMIT_CENTS,
+}

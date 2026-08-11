@@ -1,0 +1,944 @@
+# =============================================================================
+# SCAFFOLD.yaml — Task 1166: Inpatient Coding & DRG Assignment (hospital HIM)
+# §1.0–§1.7 seed tables. Difficulty design (§1.8) and corner design (§1.9) live
+# in SCAFFOLD_DIFFICULTY_DESIGN.yaml / SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  1166. Inpatient Coding & DRG Assignment (hospital HIM coding department): chart
+  completeness & coding queue prioritization, principal diagnosis selection &
+  sequencing rules, present-on-admission indicator assignment, DRG grouping &
+  complication/comorbidity capture, coding audit sample & accuracy scoring,
+  discharged-not-final-billed backlog management, coder productivity & credential
+  requirements, rebill after post-payment audit
+
+domain_name: inpatient-coding-drg-assignment
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: compliance_audit          # coding audit, segregation of duties, timely filing, POA/HAC compliance
+  secondary_archetype: workflow_orchestration  # chart -> coding queue -> grouping -> bill -> review/rebill pipeline
+  complexity_layers:
+    - optimistic_concurrency        # OCC on CodedCase.version (regroup) and Bill.version (rebill create)
+    - cascading_side_effects        # finding-apply -> dx -> regroup -> bill; accept -> chart -> bill
+    - dual_variant_calculation      # MS_DRG vs AP_DRG severity; code-based vs financial accuracy
+    - ops_run_checkpoint            # DNFB sweep advances backlog epoch, recomputes queue priorities
+    - derived_field_reconciliation  # coder.workload_units, bill.expected_reimbursement_cents, chart.open_deficiency_count
+  entity_topology: flat                        # peer collections joined by FK fields; no nested write paths
+  state_machine_shape: cyclic                  # assignment rework loop; bill review/rebill loop
+  relationship_patterns:
+    - one_to_many                              # account->chart->lines; audit->findings
+    - cross_aggregate                          # assignment links Chart x Coder; finding links Audit x CodedCase
+    - self_referential                         # DiagnosisLine.manifestation_of_id (etiology/manifestation pairing)
+  role_model: segregation_of_duties            # coder != auditor on same subject; rebill requester != approver
+  consistency_model: immediate                 # every mutation + cascade visible in the same request's response
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: PatientAccount
+    parent: null
+    common_fields: true
+    fields:
+      - { name: mrn, type: string, source: input, description: "Medical record number; unique across all accounts" }
+      - { name: admit_at, type: datetime, source: input, description: "Admission timestamp (ISO 8601 UTC)" }
+      - { name: discharge_at, type: datetime, source: input, description: "Discharge timestamp; set by discharge action; null while ADMITTED" }
+      - { name: patient_class, type: enum, source: input, description: "INPATIENT | OBSERVATION" }
+      - { name: financial_class, type: enum, source: input, description: "MEDICARE | MEDICAID | COMMERCIAL | SELF_PAY" }
+      - { name: discharge_disposition, type: enum, source: input, description: "HOME | SNF | REHAB | EXPIRED | AMA; set at discharge" }
+      - { name: total_charges_cents, type: integer, source: input, description: "Total posted charges in cents; >= 0; feeds outlier cost estimate" }
+      - { name: status, type: enum, source: system, description: "ADMITTED -> DISCHARGED" }
+      - { name: dnfb_flag, type: boolean, source: computed, default: false, description: "True after a DnfbSweep flags this account (discharged >= threshold days, no FINAL_BILLED+ bill)" }
+      - { name: dnfb_flagged_at, type: datetime, source: computed, description: "Sweep as_of at which dnfb_flag was set; null while unflagged" }
+
+  - name: Chart
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> PatientAccount.id; one chart per account (unique)" }
+      - { name: acuity, type: enum, source: input, description: "MEDICAL_LOW | MEDICAL_HIGH | SURGICAL; drives credential requirement and workload weight" }
+      - { name: status, type: enum, source: system, description: "OPEN -> READY_FOR_CODING -> IN_CODING -> SUBMITTED -> CODED" }
+      - { name: open_deficiency_count, type: integer, source: computed, default: 0, description: "Count of ChartDeficiency rows on this chart with status OPEN" }
+
+  - name: ChartDeficiency
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chart_id, type: string, source: input, description: "FK -> Chart.id" }
+      - { name: type, type: enum, source: input, description: "MISSING_H_AND_P | MISSING_DISCHARGE_SUMMARY | MISSING_SIGNATURE | MISSING_OP_REPORT" }
+      - { name: due_at, type: datetime, source: input, description: "Provider completion deadline" }
+      - { name: status, type: enum, source: system, description: "OPEN -> RESOLVED" }
+      - { name: resolved_at, type: datetime, source: system, description: "Set when resolved; null while OPEN" }
+
+  - name: DiagnosisLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chart_id, type: string, source: input, description: "FK -> Chart.id" }
+      - { name: icd_code, type: string, source: input, description: "ICD-10-CM code; codes starting with 'R' or 'Z' may not be principal" }
+      - { name: poa, type: enum, source: input, description: "Present-on-admission indicator: Y | N | U | W | EXEMPT; poa=U forbidden when cc_level is CC or MCC" }
+      - { name: sequence, type: integer, source: input, description: "Sequencing order among ACTIVE lines on the chart; unique per chart; >= 1" }
+      - { name: is_principal, type: boolean, source: input, default: false, description: "True marks the principal diagnosis; exactly one ACTIVE principal required at submit" }
+      - { name: cc_level, type: enum, source: input, default: "NONE", description: "Complication/comorbidity level of this code: NONE | CC | MCC" }
+      - { name: is_manifestation, type: boolean, source: input, default: false, description: "True for manifestation codes in an etiology/manifestation pair" }
+      - { name: manifestation_of_id, type: string, source: input, description: "FK -> DiagnosisLine.id; required when is_manifestation=true; referenced line is the etiology on the same chart" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | VOID (set via PATCH status=VOID)" }
+
+  - name: ProcedureLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chart_id, type: string, source: input, description: "FK -> Chart.id" }
+      - { name: pcs_code, type: string, source: input, description: "ICD-10-PCS procedure code" }
+      - { name: is_or, type: boolean, source: input, default: false, description: "True = operating-room procedure; any ACTIVE OR procedure puts the case in the surgical partition" }
+      - { name: performed_at, type: datetime, source: input, description: "Procedure timestamp" }
+
+  - name: Coder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employee_no, type: string, source: input, description: "Unique employee number" }
+      - { name: full_name, type: string, source: input, description: "Display name" }
+      - { name: credential, type: enum, source: input, description: "CCA (rank 1) | CCS (rank 2) | RHIT (rank 3) | RHIA (rank 4)" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | INACTIVE (via PATCH)" }
+      - { name: workload_units, type: integer, source: computed, default: 0, description: "Sum of acuity weights (LOW=1, HIGH=2, SURGICAL=3) over this coder's ASSIGNED + IN_PROGRESS assignments" }
+      - { name: accepted_count, type: integer, source: computed, default: 0, description: "Number of this coder's assignments that reached ACCEPTED" }
+      - { name: accepted_weighted_units, type: number, source: computed, default: 0, description: "Sum of acuity weights over ACCEPTED assignments; productivity numerator" }
+      - { name: productivity_units_per_day, type: number, source: computed, default: 0, description: "= accepted_weighted_units / 30 (30-day productivity basis), 2 decimal places round_half_up" }
+      - { name: accuracy_running, type: number, source: computed, description: "accuracy_code_based of the coder's most recently COMPLETED audit; null until first audit" }
+      - { name: credential_review_required, type: boolean, source: computed, default: false, description: "Set true when a completed audit yields accuracy_code_based < 0.9500; cleared false when >= 0.9500" }
+
+  - name: CodingAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chart_id, type: string, source: input, description: "FK -> Chart.id; at most one non-terminal assignment per chart" }
+      - { name: coder_id, type: string, source: input, description: "FK -> Coder.id; null while QUEUED; required at ASSIGNED" }
+      - { name: status, type: enum, source: system, description: "QUEUED -> ASSIGNED -> IN_PROGRESS -> SUBMITTED -> ACCEPTED; SUBMITTED -> RETURNED -> IN_PROGRESS (rework cycle); ASSIGNED -> QUEUED (release)" }
+      - { name: priority_score, type: integer, source: computed, description: "Queue priority per calculations.queue_priority_score; recomputed at create and on DNFB sweep" }
+      - { name: due_at, type: datetime, source: input, description: "Coding due timestamp" }
+      - { name: assigned_at, type: datetime, source: system, description: "When coder_id was attached" }
+      - { name: started_at, type: datetime, source: system, description: "When work began (IN_PROGRESS entered)" }
+      - { name: submitted_at, type: datetime, source: system, description: "Last submit timestamp" }
+      - { name: accepted_at, type: datetime, source: system, description: "Set on ACCEPTED; used for audit sampling windows" }
+      - { name: returned_count, type: integer, source: computed, default: 0, description: "Number of SUBMITTED -> RETURNED rework cycles" }
+      - { name: return_reason, type: string, source: input, description: "Required on return action; null otherwise" }
+
+  - name: CodedCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: chart_id, type: string, source: system, description: "FK -> Chart.id; exactly one coded case per chart; created at assignment submit" }
+      - { name: principal_dx_id, type: string, source: system, description: "FK -> DiagnosisLine.id; the ACTIVE principal line used for grouping" }
+      - { name: grouper_variant, type: enum, source: system, default: "MS_DRG", description: "MS_DRG | AP_DRG; switchable via regroup while GROUPED" }
+      - { name: base_partition, type: enum, source: computed, description: "SURGICAL if any ACTIVE procedure with is_or=true else MEDICAL" }
+      - { name: severity_level, type: enum, source: computed, description: "MS_DRG: WITHOUT_CC_MCC | WITH_CC | WITH_MCC; AP_DRG: SOI_1 | SOI_2 | SOI_3 | SOI_4" }
+      - { name: relative_weight, type: number, source: computed, description: "Weight from the variant's weight table keyed by severity_level; 4 decimal places" }
+      - { name: expected_reimbursement_cents, type: integer, source: computed, description: "Per calculations.expected_reimbursement; recomputed at group/regroup/finding-apply" }
+      - { name: status, type: enum, source: system, description: "GROUPED -> LOCKED (locked when the bill is finalized)" }
+
+  - name: Bill
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> PatientAccount.id; one bill per account (unique)" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> READY -> FINAL_BILLED -> PAID -> POST_PAYMENT_REVIEW -> REBILL_REQUIRED -> REBILLED | back to PAID on rebill cancel" }
+      - { name: expected_reimbursement_cents, type: integer, source: computed, description: "Mirror of the chart's CodedCase.expected_reimbursement_cents; refreshed at READY entry and on every regroup/finding-apply while status is DRAFT or READY" }
+      - { name: billed_amount_cents, type: integer, source: computed, description: "Set at finalize = expected_reimbursement_cents; immutable afterwards" }
+      - { name: paid_amount_cents, type: integer, source: input, description: "Payer payment recorded via record-payment" }
+      - { name: net_receivable_cents, type: integer, source: computed, description: "= billed_amount_cents - paid_amount_cents while PAID; + approved rebill delta when REBILLED" }
+      - { name: finalized_at, type: datetime, source: system, description: "Set at finalize" }
+      - { name: paid_at, type: datetime, source: input, description: "Set via record-payment; timely-filing window = paid_at + 120 days" }
+
+  - name: DnfbSweep
+    parent: null
+    common_fields: true
+    fields:
+      - { name: threshold_days, type: integer, source: input, default: 3, description: "DNFB aging threshold in days; account flagged when days_since_discharge >= threshold_days" }
+      - { name: as_of, type: datetime, source: input, description: "Sweep reference instant; defaults to the logical clock" }
+      - { name: flagged_count, type: integer, source: computed, description: "Accounts newly flagged by this sweep" }
+      - { name: flagged_account_ids, type: array, source: computed, description: "Ids of accounts flagged by this sweep, ordered days_since_discharge DESC, tie expected_reimbursement_cents DESC, tie account created_at ASC" }
+      - { name: total_outstanding_cents, type: integer, source: computed, description: "Sum of expected_reimbursement_cents over flagged accounts' bills (0 when no bill)" }
+
+  - name: CodingAudit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: auditor_id, type: string, source: system, description: "FK -> Coder.id; taken from X-User-ID of the Auditor creating the audit; must differ from subject_coder_id; credential rank must be >= CCS" }
+      - { name: subject_coder_id, type: string, source: input, description: "FK -> Coder.id; the coder whose cases are sampled" }
+      - { name: window_start, type: datetime, source: input, description: "Sampling window start (inclusive)" }
+      - { name: window_end, type: datetime, source: input, description: "Sampling window end (exclusive); must be > window_start" }
+      - { name: sample_size, type: integer, source: input, description: "Max sampled cases; >= 1" }
+      - { name: sampled_case_ids, type: array, source: computed, description: "Subject's coded cases accepted in [window_start, window_end), ordered expected_reimbursement_cents DESC, tie CodedCase.created_at ASC, limit sample_size" }
+      - { name: status, type: enum, source: system, description: "IN_REVIEW -> COMPLETED" }
+      - { name: applied_findings_count, type: integer, source: computed, default: 0, description: "Findings resolved APPLY" }
+      - { name: accuracy_code_based, type: number, source: computed, description: "Set at complete per calculations.coder_accuracy_score (code_count variant); 4 decimal places" }
+      - { name: accuracy_financial, type: number, source: computed, description: "Set at complete per calculations.coder_accuracy_score (financial variant); 4 decimal places" }
+
+  - name: AuditFinding
+    parent: null
+    common_fields: true
+    fields:
+      - { name: audit_id, type: string, source: input, description: "FK -> CodingAudit.id" }
+      - { name: coded_case_id, type: string, source: input, description: "FK -> CodedCase.id; must be in the audit's sampled_case_ids" }
+      - { name: finding_type, type: enum, source: input, description: "PRINCIPAL_RESEQUENCE | POA_CORRECTION | CC_MCC_ADDED | CC_MCC_REMOVED | PROCEDURE_ADDED" }
+      - { name: target_diagnosis_id, type: string, source: input, description: "FK -> DiagnosisLine.id; line being corrected (POA_CORRECTION / CC_MCC_REMOVED / PRINCIPAL_RESEQUENCE); null for additive findings" }
+      - { name: corrected_poa, type: enum, source: input, description: "Replacement POA for POA_CORRECTION" }
+      - { name: corrected_icd_code, type: string, source: input, description: "New code for CC_MCC_ADDED / PRINCIPAL_RESEQUENCE" }
+      - { name: corrected_cc_level, type: enum, source: input, description: "CC level for the corrected/added code" }
+      - { name: delta_reimbursement_cents, type: integer, source: computed, description: "Signed expected-reimbursement delta produced by APPLY; 0 for DISMISSED" }
+      - { name: status, type: enum, source: system, description: "OPEN -> APPLIED | DISMISSED" }
+
+  - name: PostPaymentReview
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bill_id, type: string, source: input, description: "FK -> Bill.id; bill must be PAID" }
+      - { name: payer_ref, type: string, source: input, description: "External payer review reference" }
+      - { name: claimed_delta_cents, type: integer, source: input, description: "Payer-claimed over/underpayment (signed); the rebill delta must match it" }
+      - { name: status, type: enum, source: system, description: "OPEN -> CLOSED_REBILL (auto when a rebill request is created) | CLOSED_NO_CHANGE (via close)" }
+
+  - name: RebillRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: review_id, type: string, source: input, description: "FK -> PostPaymentReview.id; review must be OPEN" }
+      - { name: delta_cents, type: integer, source: input, description: "Signed adjustment; must equal the review's claimed_delta_cents" }
+      - { name: requested_by, type: string, source: system, description: "X-User-ID of the BillingClerk creator; the approving ComplianceOfficer must be a different user id" }
+      - { name: decided_by, type: string, source: system, description: "X-User-ID of the ComplianceOfficer who approved/cancelled" }
+      - { name: status, type: enum, source: system, description: "PENDING -> APPROVED | CANCELLED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: PatientAccount
+    initial_state: ADMITTED
+    terminal_states: [DISCHARGED]
+    transitions:
+      - from: ADMITTED
+        to: DISCHARGED
+        trigger: "POST /patient-accounts/{id}/discharge"
+        actor: CodingManager
+        preconditions:
+          - "account.status == ADMITTED"
+          - "discharge_at > admit_at"
+        side_effects:
+          - "If the account's Chart has open_deficiency_count == 0: Chart OPEN -> READY_FOR_CODING"
+
+  - entity: Chart
+    initial_state: OPEN
+    terminal_states: [CODED]
+    transitions:
+      - from: OPEN
+        to: READY_FOR_CODING
+        trigger: "system (account discharged OR last OPEN deficiency resolved, whichever happens last)"
+        actor: system
+        preconditions:
+          - "PatientAccount.status == DISCHARGED"
+          - "chart.open_deficiency_count == 0"
+        side_effects: []
+      - from: READY_FOR_CODING
+        to: IN_CODING
+        trigger: "POST /assignments/{id}/start (first start on this chart)"
+        actor: Coder
+        preconditions:
+          - "assignment.status == ASSIGNED and assignment.chart_id == chart.id"
+        side_effects: []
+      - from: IN_CODING
+        to: SUBMITTED
+        trigger: "POST /assignments/{id}/submit"
+        actor: Coder
+        preconditions:
+          - "assignment.status == IN_PROGRESS and assignment.chart_id == chart.id"
+        side_effects:
+          - "Create CodedCase for this chart (grouper_variant=MS_DRG) per calculations.drg_grouping + calculations.expected_reimbursement"
+      - from: SUBMITTED
+        to: CODED
+        trigger: "POST /assignments/{id}/accept"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == SUBMITTED and assignment.chart_id == chart.id"
+        side_effects:
+          - "If a Bill exists for the account with status DRAFT: Bill DRAFT -> READY and Bill.expected_reimbursement_cents := CodedCase.expected_reimbursement_cents (bubble-up cascade depth 2)"
+      - from: SUBMITTED
+        to: IN_CODING
+        trigger: "POST /assignments/{id}/return (rework)"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == SUBMITTED and assignment.chart_id == chart.id"
+        side_effects: []
+
+  - entity: ChartDeficiency
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /deficiencies/{id}/resolve"
+        actor: CodingManager
+        preconditions:
+          - "deficiency.status == OPEN"
+        side_effects:
+          - "Chart.open_deficiency_count -= 1"
+          - "If chart.open_deficiency_count == 0 and PatientAccount.status == DISCHARGED: Chart OPEN -> READY_FOR_CODING"
+
+  - entity: DiagnosisLine
+    initial_state: ACTIVE
+    terminal_states: [VOID]
+    transitions:
+      - from: ACTIVE
+        to: VOID
+        trigger: "PATCH /diagnosis-lines/{id} with status=VOID"
+        actor: Coder
+        preconditions:
+          - "chart.status == IN_CODING"
+          - "caller is the coder of the chart's IN_PROGRESS or RETURNED assignment"
+        side_effects: []
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "PATCH /diagnosis-lines/{id} (poa / sequence / is_principal / cc_level edits)"
+        actor: Coder
+        preconditions:
+          - "chart.status == IN_CODING"
+        side_effects: []
+
+  - entity: Coder
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: INACTIVE
+        trigger: "PATCH /coders/{id} status=INACTIVE"
+        actor: CodingManager
+        preconditions: []
+        side_effects: []
+      - from: INACTIVE
+        to: ACTIVE
+        trigger: "PATCH /coders/{id} status=ACTIVE"
+        actor: CodingManager
+        preconditions: []
+        side_effects: []
+
+  - entity: CodingAssignment
+    initial_state: ASSIGNED
+    terminal_states: [ACCEPTED]
+    transitions:
+      - from: ASSIGNED
+        to: IN_PROGRESS
+        trigger: "POST /assignments/{id}/start"
+        actor: Coder
+        preconditions:
+          - "caller X-User-ID == assignment.coder_id"
+          - "Coder.status == ACTIVE (else ERR_CODER_INACTIVE)"
+          - "coder credential rank >= chart requirement: MEDICAL_LOW>=CCA, MEDICAL_HIGH>=CCS, SURGICAL>=RHIT (else ERR_CODER_CREDENTIAL_INSUFFICIENT; priority 6, checked before the workload rule)"
+          - "coder has no other assignment in IN_PROGRESS (aggregate capacity 1; else ERR_WORKLOAD_OVERLAP, priority 8)"
+        side_effects:
+          - "If chart.status == READY_FOR_CODING: Chart -> IN_CODING"
+          - "assignment.started_at := clock"
+      - from: RETURNED
+        to: IN_PROGRESS
+        trigger: "POST /assignments/{id}/start (rework re-entry)"
+        actor: Coder
+        preconditions:
+          - "same as ASSIGNED -> IN_PROGRESS"
+        side_effects:
+          - "chart already IN_CODING; no chart transition"
+      - from: IN_PROGRESS
+        to: SUBMITTED
+        trigger: "POST /assignments/{id}/submit"
+        actor: Coder
+        preconditions:
+          - "caller X-User-ID == assignment.coder_id"
+          - "exactly one ACTIVE DiagnosisLine with is_principal=true (else ERR_PRINCIPAL_DX_REQUIRED)"
+          - "principal icd_code does not start with 'R' or 'Z' (else ERR_INVALID_PRINCIPAL_CODE)"
+          - "no duplicate sequence among ACTIVE lines (else ERR_DUPLICATE_SEQUENCE)"
+          - "every ACTIVE manifestation line has sequence > its etiology line's sequence (else ERR_MANIFESTATION_ORDER)"
+        side_effects:
+          - "Chart IN_CODING -> SUBMITTED"
+          - "Create CodedCase (status GROUPED, grouper_variant MS_DRG) per calculations.drg_grouping and calculations.expected_reimbursement"
+          - "assignment.submitted_at := clock"
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /assignments/{id}/accept"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == SUBMITTED"
+        side_effects:
+          - "Chart SUBMITTED -> CODED (cascade hop 1)"
+          - "If Bill exists with status DRAFT: Bill DRAFT -> READY, Bill.expected_reimbursement_cents := CodedCase.expected_reimbursement_cents (cascade hop 2)"
+          - "Coder.workload_units -= chart acuity weight; Coder.accepted_count += 1; Coder.accepted_weighted_units += chart acuity weight; recompute productivity_units_per_day"
+          - "assignment.accepted_at := clock"
+      - from: SUBMITTED
+        to: RETURNED
+        trigger: "POST /assignments/{id}/return"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == SUBMITTED"
+          - "return_reason non-empty"
+        side_effects:
+          - "Chart SUBMITTED -> IN_CODING"
+          - "assignment.returned_count += 1"
+      - from: ASSIGNED
+        to: QUEUED
+        trigger: "POST /assignments/{id}/release"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == ASSIGNED"
+        side_effects:
+          - "Coder.workload_units -= chart acuity weight (compensation of the assign debit)"
+          - "assignment.coder_id := null"
+      - from: QUEUED
+        to: ASSIGNED
+        trigger: "POST /assignments/{id}/assign"
+        actor: CodingManager
+        preconditions:
+          - "assignment.status == QUEUED"
+          - "target coder credential rank >= chart requirement"
+        side_effects:
+          - "Coder.workload_units += chart acuity weight"
+          - "assignment.assigned_at := clock"
+
+  - entity: CodedCase
+    initial_state: GROUPED
+    terminal_states: [LOCKED]
+    transitions:
+      - from: GROUPED
+        to: GROUPED
+        trigger: "POST /coded-cases/{id}/regroup (OCC: expected_coded_case_version) or audit-finding APPLY cascade"
+        actor: CodingManager
+        preconditions:
+          - "case.status == GROUPED"
+          - "expected_coded_case_version == case.version (else ERR_STALE_VERSION 412)"
+        side_effects:
+          - "Recompute severity_level / relative_weight / expected_reimbursement_cents per calculations.drg_grouping (+ variant switch when grouper_variant given)"
+          - "case.version += 1"
+          - "If Bill exists with status DRAFT or READY: Bill.expected_reimbursement_cents := new expected_reimbursement_cents"
+      - from: GROUPED
+        to: LOCKED
+        trigger: "POST /bills/{id}/finalize"
+        actor: BillingClerk
+        preconditions:
+          - "bill.status == READY and chart.status == CODED"
+        side_effects: []
+
+  - entity: Bill
+    initial_state: DRAFT
+    terminal_states: [REBILLED]
+    transitions:
+      - from: DRAFT
+        to: READY
+        trigger: "system (chart reaches CODED via assignment accept) or POST /bills when chart already CODED at creation"
+        actor: system
+        preconditions:
+          - "chart.status == CODED"
+        side_effects:
+          - "Bill.expected_reimbursement_cents := CodedCase.expected_reimbursement_cents"
+      - from: READY
+        to: FINAL_BILLED
+        trigger: "POST /bills/{id}/finalize"
+        actor: BillingClerk
+        preconditions:
+          - "chart.status == CODED (else ERR_CHART_NOT_CODED)"
+        side_effects:
+          - "Bill.billed_amount_cents := expected_reimbursement_cents (immutable thereafter)"
+          - "Bill.finalized_at := clock"
+          - "CodedCase GROUPED -> LOCKED"
+      - from: FINAL_BILLED
+        to: PAID
+        trigger: "POST /bills/{id}/record-payment"
+        actor: BillingClerk
+        preconditions:
+          - "bill.status == FINAL_BILLED"
+        side_effects:
+          - "Bill.net_receivable_cents := billed_amount_cents - paid_amount_cents"
+      - from: PAID
+        to: POST_PAYMENT_REVIEW
+        trigger: "POST /bills/{id}/post-payment-reviews"
+        actor: BillingClerk
+        preconditions:
+          - "bill.status == PAID"
+        side_effects:
+          - "bill.version += 1"
+      - from: POST_PAYMENT_REVIEW
+        to: REBILL_REQUIRED
+        trigger: "POST /rebill-requests (OCC: expected_bill_version)"
+        actor: BillingClerk
+        preconditions:
+          - "review.status == OPEN"
+          - "delta_cents == review.claimed_delta_cents (else ERR_REBILL_DELTA_MISMATCH)"
+          - "clock <= bill.paid_at + 120 days (else ERR_TIMELY_FILING_EXPIRED)"
+          - "expected_bill_version == bill.version (else ERR_STALE_VERSION 412)"
+        side_effects:
+          - "Create RebillRequest PENDING"
+          - "PostPaymentReview OPEN -> CLOSED_REBILL"
+          - "bill.version += 1"
+      - from: POST_PAYMENT_REVIEW
+        to: PAID
+        trigger: "POST /post-payment-reviews/{id}/close (outcome NO_CHANGE)"
+        actor: BillingClerk
+        preconditions:
+          - "review.status == OPEN"
+        side_effects: []
+      - from: REBILL_REQUIRED
+        to: REBILLED
+        trigger: "POST /rebill-requests/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "rebill.status == PENDING"
+          - "approver X-User-ID != rebill.requested_by (else ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "RebillRequest PENDING -> APPROVED"
+          - "Bill.net_receivable_cents := billed_amount_cents - paid_amount_cents + delta_cents"
+      - from: REBILL_REQUIRED
+        to: PAID
+        trigger: "POST /rebill-requests/{id}/cancel (compensating action)"
+        actor: ComplianceOfficer
+        preconditions:
+          - "rebill.status == PENDING"
+        side_effects:
+          - "RebillRequest PENDING -> CANCELLED"
+          - "Bill.net_receivable_cents restored to billed_amount_cents - paid_amount_cents (invariant: create+cancel leaves net_receivable_cents unchanged)"
+
+  - entity: CodingAudit
+    initial_state: IN_REVIEW
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: IN_REVIEW
+        to: COMPLETED
+        trigger: "POST /audits/{id}/complete"
+        actor: Auditor
+        preconditions:
+          - "caller X-User-ID == audit.auditor_id"
+          - "no AuditFinding on this audit with status OPEN (else ERR_OPEN_FINDINGS_REMAIN)"
+        side_effects:
+          - "Compute accuracy_code_based and accuracy_financial per calculations.coder_accuracy_score"
+          - "Subject Coder.accuracy_running := accuracy_code_based"
+          - "Subject Coder.credential_review_required := (accuracy_code_based < 0.9500)"
+
+  - entity: AuditFinding
+    initial_state: OPEN
+    terminal_states: [APPLIED, DISMISSED]
+    transitions:
+      - from: OPEN
+        to: APPLIED
+        trigger: "POST /audit-findings/{id}/resolve with resolution=APPLY"
+        actor: Auditor
+        preconditions:
+          - "audit.status == IN_REVIEW"
+          - "the case's account bill (if any) has status DRAFT or READY (pre-bill audit only; else ERR_INVALID_STATE)"
+        side_effects:
+          - "Hop 1: mutate the target DiagnosisLine (poa flip / void for CC_MCC_REMOVED / principal reselect) or append a new line (CC_MCC_ADDED / PROCEDURE_ADDED)"
+          - "Hop 2: recompute the CodedCase (severity_level, relative_weight, expected_reimbursement_cents; version += 1) caused by the line mutation"
+          - "Hop 3: if a Bill exists with status DRAFT or READY, Bill.expected_reimbursement_cents := new expected value, caused by the case recompute"
+          - "Hop 4: Audit.applied_findings_count += 1; finding.delta_reimbursement_cents := new_expected - old_expected"
+      - from: OPEN
+        to: DISMISSED
+        trigger: "POST /audit-findings/{id}/resolve with resolution=DISMISS"
+        actor: Auditor
+        preconditions:
+          - "audit.status == IN_REVIEW"
+        side_effects:
+          - "No mutation to lines, case, bill, or coder; finding.delta_reimbursement_cents := 0"
+
+  - entity: PostPaymentReview
+    initial_state: OPEN
+    terminal_states: [CLOSED_REBILL, CLOSED_NO_CHANGE]
+    transitions:
+      - from: OPEN
+        to: CLOSED_REBILL
+        trigger: "system (rebill request created against this review)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: CLOSED_NO_CHANGE
+        trigger: "POST /post-payment-reviews/{id}/close"
+        actor: BillingClerk
+        preconditions:
+          - "review.status == OPEN"
+        side_effects:
+          - "Bill POST_PAYMENT_REVIEW -> PAID"
+
+  - entity: RebillRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /rebill-requests/{id}/approve"
+        actor: ComplianceOfficer
+        preconditions:
+          - "approver X-User-ID != rebill.requested_by (segregation of duties)"
+        side_effects:
+          - "Bill REBILL_REQUIRED -> REBILLED; net_receivable_cents adjusted by delta_cents"
+      - from: PENDING
+        to: CANCELLED
+        trigger: "POST /rebill-requests/{id}/cancel"
+        actor: ComplianceOfficer
+        preconditions: []
+        side_effects:
+          - "Bill REBILL_REQUIRED -> PAID; net_receivable_cents restored (compensation)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: regroup-stale-coded-case
+    parent_entity: CodedCase
+    write_endpoint: "POST /coded-cases/{id}/regroup"
+    occ_field: expected_coded_case_version
+    description: |
+      Regrouping a CodedCase whose version has advanced since the client last
+      observed it is rejected. This captures the case where another writer has
+      just regrouped the case (e.g. an audit-finding APPLY legitimately
+      recomputed the grouping) and the current writer's view of the case is
+      therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: rebill-create-stale-bill
+    parent_entity: Bill
+    write_endpoint: "POST /rebill-requests"
+    occ_field: expected_bill_version
+    description: |
+      Creating a RebillRequest against a Bill whose version has advanced since
+      the client last observed it is rejected. This captures the case where
+      another writer has just moved the bill (e.g. created a rebill that
+      legitimately supersedes the client's plan) and the current writer's view
+      of the bill is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: queue_priority_score
+    trigger: "CodingAssignment creation; every DnfbSweep recomputes non-terminal assignments on flagged accounts' charts"
+    algorithm: threshold
+    formula: |
+      days = floor((clock - account.discharge_at) / 86400s)
+      base = 10 if days <= 2; 40 if 3 <= days <= 5; 70 if 6 <= days <= 10; 100 if days >= 11
+      amount_w = min(30, floor(account.total_charges_cents / 100000))
+      acuity_w = { MEDICAL_LOW: 0, MEDICAL_HIGH: 10, SURGICAL: 20 }[chart.acuity]
+      dnfb_boost = 25 if account.dnfb_flag else 0
+      priority_score = min(150, base + amount_w + acuity_w + dnfb_boost)
+    input_set: "The assignment's chart and account; account must be DISCHARGED (chart READY implies discharged)"
+    constants:
+      TIER_MAX_POINTS: 100
+      AMOUNT_CAP: 30
+      AMOUNT_CHUNK_CENTS: 100000
+      DNFB_BOOST: 25
+      SCORE_CAP: 150
+    precision: "integer; no rounding"
+
+  - name: drg_grouping
+    trigger: "assignment submit (creates CodedCase), coded-case regroup, audit-finding APPLY"
+    algorithm: weighted_scoring
+    formula: |
+      base_partition = SURGICAL if any ACTIVE ProcedureLine on the chart has is_or == true else MEDICAL
+      principal = the single ACTIVE DiagnosisLine with is_principal == true
+      eligible_secondaries = ACTIVE DiagnosisLines on the chart where
+          is_principal == false AND cc_level != NONE AND poa != 'N'
+      MS_DRG variant:
+        severity_level = WITH_MCC if any eligible is MCC
+                         else WITH_CC if any eligible is CC
+                         else WITHOUT_CC_MCC
+        relative_weight = MS_WEIGHT[severity_level]
+      AP_DRG variant:
+        soi_points = sum(2 per eligible MCC, 1 per eligible CC)
+        severity_level = SOI_4 if soi_points >= 4; SOI_3 if == 3; SOI_2 if 1..2; SOI_1 if 0
+        relative_weight = AP_WEIGHT[severity_level]
+    input_set: "ACTIVE DiagnosisLine and ProcedureLine rows on the chart at grouping time; POA='N' lines excluded from CC/MCC capture (hospital-acquired conditions do not raise severity)"
+    constants:
+      MS_WEIGHT: { WITHOUT_CC_MCC: 1.0000, WITH_CC: 1.4000, WITH_MCC: 2.1000 }
+      AP_WEIGHT: { SOI_1: 0.9000, SOI_2: 1.2000, SOI_3: 1.8000, SOI_4: 2.5000 }
+    precision: "relative_weight: 4 decimal places exactly as tabled"
+    variants:
+      - name: ms_drg
+        when: "grouper_variant == MS_DRG (default at submit)"
+        difference: "Severity is the single highest eligible CC/MCC level; counts of CC/MCC do not accumulate"
+      - name: ap_drg
+        when: "grouper_variant == AP_DRG (via regroup)"
+        difference: "Severity accumulates 2 points per MCC + 1 per CC into SOI tiers; identical line data yields a different severity, weight, and expected reimbursement than ms_drg"
+
+  - name: expected_reimbursement
+    trigger: "immediately after drg_grouping (submit / regroup / finding-apply)"
+    algorithm: tiered_pricing
+    formula: |
+      drg_payment_cents      = round_half_up(BASE_RATE_CENTS * relative_weight, 0)
+      cost_estimate_cents    = round_half_up(account.total_charges_cents * COST_CHARGE_RATIO, 0)
+      outlier_threshold      = drg_payment_cents + OUTLIER_FIXED_LOSS_CENTS
+      outlier_payment_cents  = round_half_up(max(0, cost_estimate_cents - outlier_threshold) * OUTLIER_SHARE, 0)
+      expected_reimbursement_cents = drg_payment_cents + outlier_payment_cents
+      # PINNED ROUNDING ORDER: each component is rounded to whole cents FIRST,
+      # then the rounded components are summed. Summing unrounded components
+      # and rounding once at the end is a different (forbidden) order.
+    input_set: "The CodedCase.relative_weight just computed and the account's total_charges_cents"
+    constants:
+      BASE_RATE_CENTS: 650000
+      COST_CHARGE_RATIO: 0.30
+      OUTLIER_FIXED_LOSS_CENTS: 500000
+      OUTLIER_SHARE: 0.80
+    precision: "whole cents; round_half_up per component, then sum (order pinned above)"
+
+  - name: coder_accuracy_score
+    trigger: "POST /audits/{id}/complete"
+    algorithm: aggregation
+    formula: |
+      sampled = audit.sampled_case_ids
+      total_lines = count of ACTIVE DiagnosisLine + ProcedureLine rows on the sampled cases' charts (at complete time)
+      incorrect_lines = count of AuditFinding rows on this audit with status APPLIED
+      delta_sum = sum(|finding.delta_reimbursement_cents|) over APPLIED findings
+      corrected_expected_sum = sum(CodedCase.expected_reimbursement_cents) over sampled cases at complete time
+      code_count variant:   accuracy_code_based = round_half_up(1 - incorrect_lines / total_lines, 4)
+      financial variant:    accuracy_financial  = round_half_up(1 - min(1, delta_sum / corrected_expected_sum), 4)
+    input_set: "Only findings with status APPLIED (DISMISSED excluded); only ACTIVE lines on sampled cases at complete time"
+    constants:
+      ACCURACY_FLAG_THRESHOLD: 0.9500   # credential_review_required iff accuracy_code_based < 0.9500 (strictly)
+    precision: "4 decimal places, round_half_up"
+    variants:
+      - name: code_count
+        when: "always computed; stored on audit.accuracy_code_based and copied to coder.accuracy_running"
+        difference: "Line-count accuracy; ignores dollar impact"
+      - name: financial
+        when: "always computed; stored on audit.accuracy_financial"
+        difference: "Dollar-weighted accuracy over corrected expected reimbursement; identical findings yield a different score than code_count"
+
+  - name: dnfb_aging_scan
+    trigger: "POST /dnfb-sweeps"
+    algorithm: chronological
+    formula: |
+      as_of = input as_of if given else logical clock
+      candidates = PatientAccounts with status == DISCHARGED whose Bill is absent
+                   or has status in { DRAFT, READY }
+      days(account) = (as_of - account.discharge_at) / 86400s   (exact, fractional)
+      flagged = [ a for a in candidates if days(a) >= threshold_days ]   # boundary: exactly threshold_days IS flagged
+      ordering for flagged_account_ids: days DESC, tie -> bill.expected_reimbursement_cents DESC (0 if no bill), tie -> account.created_at ASC
+      total_outstanding_cents = sum of expected_reimbursement_cents over flagged accounts' bills (0 when no bill)
+    input_set: "DISCHARGED accounts without a FINAL_BILLED/PAID/POST_PAYMENT_REVIEW/REBILL_REQUIRED/REBILLED bill"
+    constants:
+      DEFAULT_THRESHOLD_DAYS: 3
+    precision: "days compared as exact fractional values against integer threshold (>=)"
+
+  - name: coder_productivity
+    trigger: "assignment accept (recompute for that coder); read on GET /coders/{id}"
+    algorithm: aggregation
+    formula: |
+      accepted_weighted_units = sum(acuity weight) over this coder's ACCEPTED assignments
+          where acuity weight = { MEDICAL_LOW: 1, MEDICAL_HIGH: 2, SURGICAL: 3 }[chart.acuity]
+      productivity_units_per_day = round_half_up(accepted_weighted_units / 30, 2)
+      workload_units = sum(acuity weight) over this coder's ASSIGNED + IN_PROGRESS assignments
+    input_set: "Assignments with coder_id == this coder; ACCEPTED set for productivity, ASSIGNED+IN_PROGRESS set for workload"
+    constants:
+      PRODUCTIVITY_BASIS_DAYS: 30
+    precision: "productivity_units_per_day: 2 decimal places, round_half_up"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role header present and names a declared role; X-User-ID present", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role is permitted for this endpoint per §1.5 roles", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "PatientAccount referenced by path/body exists", error_id: ERR_ACCOUNT_NOT_FOUND, http_status: 404, applies_to: "POST /patient-accounts/{id}/discharge, POST /charts, POST /bills, GET /patient-accounts/{id}" }
+  - { priority: 3, category: existence, check: "Chart referenced exists", error_id: ERR_CHART_NOT_FOUND, http_status: 404, applies_to: "POST /deficiencies, POST /diagnosis-lines, POST /procedure-lines, POST /assignments, GET /charts/{id}" }
+  - { priority: 3, category: existence, check: "Coder referenced exists", error_id: ERR_CODER_NOT_FOUND, http_status: 404, applies_to: "POST /assignments, POST /assignments/{id}/assign, PATCH /coders/{id}, GET /coders/{id}, POST /audits (subject_coder_id)" }
+  - { priority: 3, category: existence, check: "Assignment referenced exists", error_id: ERR_ASSIGNMENT_NOT_FOUND, http_status: 404, applies_to: "POST /assignments/{id}/{start,submit,accept,return,release,assign}, GET /assignments/{id}" }
+  - { priority: 3, category: existence, check: "Bill referenced exists", error_id: ERR_BILL_NOT_FOUND, http_status: 404, applies_to: "POST /bills/{id}/{finalize,record-payment,post-payment-reviews}, GET /bills/{id}" }
+  - { priority: 3, category: existence, check: "CodedCase referenced exists", error_id: ERR_CODED_CASE_NOT_FOUND, http_status: 404, applies_to: "GET /coded-cases/{id}, POST /coded-cases/{id}/regroup, POST /audits/{id}/findings (coded_case_id)" }
+  - { priority: 3, category: existence, check: "CodingAudit / AuditFinding referenced exists", error_id: ERR_AUDIT_NOT_FOUND, http_status: 404, applies_to: "POST /audits/{id}/{findings,complete}, GET /audits/{id}, POST /audit-findings/{id}/resolve (audit of finding)" }
+  - { priority: 3, category: existence, check: "AuditFinding referenced exists", error_id: ERR_FINDING_NOT_FOUND, http_status: 404, applies_to: "POST /audit-findings/{id}/resolve, GET /audit-findings/{id}" }
+  - { priority: 3, category: existence, check: "PostPaymentReview referenced exists", error_id: ERR_REVIEW_NOT_FOUND, http_status: 404, applies_to: "POST /post-payment-reviews/{id}/close, POST /rebill-requests (review_id)" }
+  - { priority: 3, category: existence, check: "RebillRequest referenced exists", error_id: ERR_REBILL_NOT_FOUND, http_status: 404, applies_to: "POST /rebill-requests/{id}/{approve,cancel}, GET /rebill-requests/{id}" }
+  - { priority: 3, category: existence, check: "ChartDeficiency / DiagnosisLine / ProcedureLine / DnfbSweep referenced exists", error_id: ERR_INVALID_REQUEST, http_status: 404, applies_to: "single-resource GETs and actions on those entities" }
+  - { priority: 4, category: state, check: "Target resource is in a state that allows this transition (per §1.2 from-states); covers submit-from-RETURNED, finalize-from-DRAFT, resolve-from-APPLIED, payment-on-REBILLED, etc.", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all action endpoints" }
+  - { priority: 4, category: state, check: "Chart is READY_FOR_CODING when an assignment is created for it", error_id: ERR_CHART_NOT_READY, http_status: 409, applies_to: "POST /assignments" }
+  - { priority: 4, category: state, check: "Chart is CODED when its bill is finalized", error_id: ERR_CHART_NOT_CODED, http_status: 409, applies_to: "POST /bills/{id}/finalize" }
+  - { priority: 4, category: state, check: "Coder is ACTIVE when starting an assignment", error_id: ERR_CODER_INACTIVE, http_status: 409, applies_to: "POST /assignments/{id}/start" }
+  - { priority: 5, category: state, check: "OCC: expected_<parent>_version equals the parent's current version", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /coded-cases/{id}/regroup, POST /rebill-requests" }
+  - { priority: 6, category: business_safety, check: "Coder credential rank >= chart acuity requirement (LOW:CCA, HIGH:CCS, SURGICAL:RHIT); also auditor credential rank >= CCS at audit creation", error_id: ERR_CODER_CREDENTIAL_INSUFFICIENT, http_status: 422, applies_to: "POST /assignments, POST /assignments/{id}/assign, POST /assignments/{id}/start, POST /audits" }
+  - { priority: 6, category: business_safety, check: "Auditor may not audit self: X-User-ID != subject_coder_id", error_id: ERR_SELF_AUDIT_FORBIDDEN, http_status: 403, applies_to: "POST /audits" }
+  - { priority: 6, category: business_safety, check: "poa=U is forbidden on lines with cc_level CC or MCC", error_id: ERR_POA_INVALID_FOR_CODE, http_status: 422, applies_to: "POST /diagnosis-lines, PATCH /diagnosis-lines/{id}" }
+  - { priority: 6, category: business_safety, check: "Rebill approver differs from rebill requester (segregation of duties)", error_id: ERR_SEGREGATION_OF_DUTIES, http_status: 403, applies_to: "POST /rebill-requests/{id}/approve" }
+  - { priority: 7, category: business_constraint, check: "Required input fields present; enum fields take declared members; window_start < window_end; sample_size >= 1", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all" }
+  - { priority: 7, category: business_constraint, check: "At submit: exactly one ACTIVE principal diagnosis exists", error_id: ERR_PRINCIPAL_DX_REQUIRED, http_status: 422, applies_to: "POST /assignments/{id}/submit" }
+  - { priority: 7, category: business_constraint, check: "Principal icd_code does not start with 'R' or 'Z' (symptom/external codes cannot be principal)", error_id: ERR_INVALID_PRINCIPAL_CODE, http_status: 422, applies_to: "POST /assignments/{id}/submit" }
+  - { priority: 7, category: business_constraint, check: "sequence unique among ACTIVE lines on the chart (checked at line create and re-checked at submit)", error_id: ERR_DUPLICATE_SEQUENCE, http_status: 422, applies_to: "POST /diagnosis-lines, PATCH /diagnosis-lines/{id}, POST /assignments/{id}/submit" }
+  - { priority: 7, category: business_constraint, check: "Every ACTIVE manifestation line sequences after its etiology line (manifestation.sequence > manifestation_of.sequence)", error_id: ERR_MANIFESTATION_ORDER, http_status: 422, applies_to: "POST /assignments/{id}/submit" }
+  - { priority: 7, category: business_constraint, check: "At most one non-terminal (QUEUED/ASSIGNED/IN_PROGRESS/SUBMITTED/RETURNED) assignment per chart", error_id: ERR_ASSIGNMENT_EXISTS, http_status: 409, applies_to: "POST /assignments" }
+  - { priority: 7, category: business_constraint, check: "Auto-assignment finds at least one ACTIVE coder meeting the credential requirement", error_id: ERR_NO_ELIGIBLE_CODER, http_status: 422, applies_to: "POST /assignments (coder_id omitted)" }
+  - { priority: 7, category: business_constraint, check: "Finding's coded_case_id is in the audit's sampled_case_ids", error_id: ERR_CASE_NOT_IN_SAMPLE, http_status: 422, applies_to: "POST /audits/{id}/findings" }
+  - { priority: 8, category: business_temporal, check: "Coder may hold at most one IN_PROGRESS assignment (aggregate capacity 1 over started_at..due_at occupation)", error_id: ERR_WORKLOAD_OVERLAP, http_status: 409, applies_to: "POST /assignments/{id}/start" }
+  - { priority: 8, category: business_temporal, check: "Audit windows for the same subject coder do not overlap; half-open [window_start, window_end): adjacency (start == other.end) is allowed", error_id: ERR_AUDIT_WINDOW_OVERLAP, http_status: 409, applies_to: "POST /audits" }
+  - { priority: 8, category: business_temporal, check: "Rebill created within timely-filing window: clock <= bill.paid_at + 120 days (exactly at deadline is allowed)", error_id: ERR_TIMELY_FILING_EXPIRED, http_status: 422, applies_to: "POST /rebill-requests" }
+  - { priority: 9, category: business_referential, check: "Audit has no OPEN findings at completion", error_id: ERR_OPEN_FINDINGS_REMAIN, http_status: 409, applies_to: "POST /audits/{id}/complete" }
+  - { priority: 10, category: business_fiscal, check: "Rebill delta_cents equals the review's claimed_delta_cents", error_id: ERR_REBILL_DELTA_MISMATCH, http_status: 422, applies_to: "POST /rebill-requests" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- logical clock (test-driving; default startup time 2026-05-01T00:00:00Z)
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the logical clock. Before any call, the clock reads exactly 2026-05-01T00:00:00Z and never falls back to wall-clock time.", roles: [CodingManager], code: 200, input: [to_iso8601], output: { current_utc: datetime }, side_effects: [] }
+
+  # ---- PatientAccount
+  - { method: POST, path: "/patient-accounts", description: "Register an inpatient account (status ADMITTED)", roles: [CodingManager], code: 201, input: [mrn, admit_at, patient_class, financial_class, total_charges_cents], output: PatientAccount, side_effects: [] }
+  - { method: GET, path: "/patient-accounts/{id}", description: "Fetch one account", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: PatientAccount, side_effects: [] }
+  - { method: GET, path: "/patient-accounts", description: "List accounts; dnfb_only=true returns the DNFB backlog ordered per calculations.dnfb_aging_scan", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["status?", "dnfb_only?", "limit?", "offset?"], output: "PatientAccount[]", side_effects: [] }
+  - { method: POST, path: "/patient-accounts/{id}/discharge", description: "Discharge the account; may auto-advance its chart to READY_FOR_CODING", roles: [CodingManager], code: 200, input: [discharge_at, discharge_disposition], output: PatientAccount, side_effects: ["Chart OPEN -> READY_FOR_CODING if open_deficiency_count == 0"] }
+
+  # ---- Chart
+  - { method: POST, path: "/charts", description: "Open a coding chart for an account (one per account)", roles: [CodingManager], code: 201, input: [account_id, acuity], output: Chart, side_effects: [] }
+  - { method: GET, path: "/charts/{id}", description: "Fetch one chart", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: Chart, side_effects: [] }
+  - { method: GET, path: "/charts", description: "List charts", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["account_id?", "status?", "limit?", "offset?"], output: "Chart[]", side_effects: [] }
+
+  # ---- ChartDeficiency
+  - { method: POST, path: "/deficiencies", description: "Log a chart deficiency (chart must exist)", roles: [CodingManager], code: 201, input: [chart_id, type, due_at], output: ChartDeficiency, side_effects: ["Chart.open_deficiency_count += 1"] }
+  - { method: GET, path: "/deficiencies/{id}", description: "Fetch one deficiency", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: ChartDeficiency, side_effects: [] }
+  - { method: GET, path: "/deficiencies", description: "List deficiencies", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["chart_id?", "status?", "limit?", "offset?"], output: "ChartDeficiency[]", side_effects: [] }
+  - { method: POST, path: "/deficiencies/{id}/resolve", description: "Resolve an OPEN deficiency; resolving the last one after discharge readies the chart", roles: [CodingManager], code: 200, input: [], output: ChartDeficiency, side_effects: ["Chart.open_deficiency_count -= 1", "maybe Chart OPEN -> READY_FOR_CODING"] }
+
+  # ---- DiagnosisLine / ProcedureLine
+  - { method: POST, path: "/diagnosis-lines", description: "Add a diagnosis line while the chart is IN_CODING (caller must be the assigned coder)", roles: [Coder], code: 201, input: [chart_id, icd_code, poa, sequence, "is_principal?", "cc_level?", "is_manifestation?", "manifestation_of_id?"], output: DiagnosisLine, side_effects: [] }
+  - { method: GET, path: "/diagnosis-lines/{id}", description: "Fetch one diagnosis line", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: DiagnosisLine, side_effects: [] }
+  - { method: GET, path: "/diagnosis-lines", description: "List diagnosis lines", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["chart_id?", "status?", "manifestation_of_id?", "limit?", "offset?"], output: "DiagnosisLine[]", side_effects: [] }
+  - { method: PATCH, path: "/diagnosis-lines/{id}", description: "Edit poa/sequence/is_principal/cc_level or void the line (chart IN_CODING, assigned coder only)", roles: [Coder], code: 200, input: ["poa?", "sequence?", "is_principal?", "cc_level?", "status?"], output: DiagnosisLine, side_effects: [] }
+  - { method: POST, path: "/procedure-lines", description: "Add a procedure line while the chart is IN_CODING", roles: [Coder], code: 201, input: [chart_id, pcs_code, "is_or?", performed_at], output: ProcedureLine, side_effects: [] }
+  - { method: GET, path: "/procedure-lines/{id}", description: "Fetch one procedure line", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: ProcedureLine, side_effects: [] }
+  - { method: GET, path: "/procedure-lines", description: "List procedure lines", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["chart_id?", "limit?", "offset?"], output: "ProcedureLine[]", side_effects: [] }
+
+  # ---- Coder
+  - { method: POST, path: "/coders", description: "Onboard a coder with credential", roles: [CodingManager], code: 201, input: [employee_no, full_name, credential], output: Coder, side_effects: [] }
+  - { method: GET, path: "/coders/{id}", description: "Fetch coder incl. workload_units, accuracy_running, productivity", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: Coder, side_effects: [] }
+  - { method: PATCH, path: "/coders/{id}", description: "Update status and/or credential", roles: [CodingManager], code: 200, input: ["status?", "credential?"], output: Coder, side_effects: [] }
+
+  # ---- CodingAssignment (queue)
+  - { method: POST, path: "/assignments", description: "Queue a chart for coding. coder_id omitted -> auto-select: eligible = ACTIVE coders meeting the credential requirement; rank workload_units ASC; tie created_at ASC; empty pool -> ERR_NO_ELIGIBLE_CODER", roles: [CodingManager], code: 201, input: [chart_id, "coder_id?", due_at], output: CodingAssignment, side_effects: ["Coder.workload_units += acuity weight", "compute priority_score"] }
+  - { method: GET, path: "/assignments/{id}", description: "Fetch one assignment", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: CodingAssignment, side_effects: [] }
+  - { method: GET, path: "/assignments", description: "List assignments (coding queue)", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["chart_id?", "coder_id?", "status?", "limit?", "offset?"], output: "CodingAssignment[]", side_effects: [] }
+  - { method: POST, path: "/assignments/{id}/assign", description: "Assign a QUEUED assignment to a coder", roles: [CodingManager], code: 200, input: [coder_id], output: CodingAssignment, side_effects: ["Coder.workload_units += acuity weight"] }
+  - { method: POST, path: "/assignments/{id}/start", description: "Coder starts work (ASSIGNED or RETURNED -> IN_PROGRESS)", roles: [Coder], code: 200, input: [], output: CodingAssignment, side_effects: ["Chart -> IN_CODING on first start"] }
+  - { method: POST, path: "/assignments/{id}/submit", description: "Submit coded chart; validates sequencing rules and creates the grouped CodedCase", roles: [Coder], code: 200, input: [], output: CodingAssignment, side_effects: ["Chart IN_CODING -> SUBMITTED", "create CodedCase (MS_DRG)"] }
+  - { method: POST, path: "/assignments/{id}/accept", description: "Manager accepts submitted coding (terminal); cascades to chart and bill", roles: [CodingManager], code: 200, input: [], output: CodingAssignment, side_effects: ["Chart SUBMITTED -> CODED", "Bill DRAFT -> READY if bill exists", "coder stats update"] }
+  - { method: POST, path: "/assignments/{id}/return", description: "Manager returns submitted coding for rework (cycle back to RETURNED)", roles: [CodingManager], code: 200, input: [return_reason], output: CodingAssignment, side_effects: ["Chart SUBMITTED -> IN_CODING", "returned_count += 1"] }
+  - { method: POST, path: "/assignments/{id}/release", description: "Release an ASSIGNED assignment back to the queue (compensates the assign)", roles: [CodingManager], code: 200, input: [], output: CodingAssignment, side_effects: ["Coder.workload_units -= acuity weight", "coder_id := null"] }
+
+  # ---- CodedCase
+  - { method: GET, path: "/coded-cases/{id}", description: "Fetch one coded case", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: CodedCase, side_effects: [] }
+  - { method: GET, path: "/coded-cases", description: "List coded cases (discovery channel for the case created at submit)", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["chart_id?", "principal_dx_id?", "limit?", "offset?"], output: "CodedCase[]", side_effects: [] }
+  - { method: POST, path: "/coded-cases/{id}/regroup", description: "Recompute grouping (optionally switching grouper_variant); OCC-guarded", roles: [CodingManager, Auditor], code: 200, input: [expected_coded_case_version, "grouper_variant?"], output: CodedCase, side_effects: ["increments CodedCase.version by 1", "refresh Bill.expected_reimbursement_cents while bill DRAFT/READY"] }
+
+  # ---- Bill
+  - { method: POST, path: "/bills", description: "Create the account's bill (READY immediately if chart already CODED, else DRAFT)", roles: [BillingClerk], code: 201, input: [account_id], output: Bill, side_effects: ["maybe Bill DRAFT -> READY"] }
+  - { method: GET, path: "/bills/{id}", description: "Fetch one bill", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: Bill, side_effects: [] }
+  - { method: GET, path: "/bills", description: "List bills", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["account_id?", "status?", "limit?", "offset?"], output: "Bill[]", side_effects: [] }
+  - { method: POST, path: "/bills/{id}/finalize", description: "Final-bill a READY bill; locks the coded case", roles: [BillingClerk], code: 200, input: [], output: Bill, side_effects: ["billed_amount_cents := expected_reimbursement_cents", "CodedCase GROUPED -> LOCKED"] }
+  - { method: POST, path: "/bills/{id}/record-payment", description: "Record payer remittance (FINAL_BILLED -> PAID)", roles: [BillingClerk], code: 200, input: [paid_amount_cents, paid_at], output: Bill, side_effects: ["net_receivable_cents := billed - paid"] }
+
+  # ---- DNFB ops-run checkpoint
+  - { method: POST, path: "/dnfb-sweeps", description: "Run a DNFB backlog sweep: flag aged discharged-not-final-billed accounts and recompute queue priorities (dnfb_boost)", roles: [CodingManager], code: 201, input: ["threshold_days?", "as_of?"], output: DnfbSweep, side_effects: ["set PatientAccount.dnfb_flag/dnfb_flagged_at", "recompute priority_score of non-terminal assignments on flagged accounts' charts"] }
+  - { method: GET, path: "/dnfb-sweeps/{id}", description: "Fetch a sweep result", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: DnfbSweep, side_effects: [] }
+
+  # ---- CodingAudit / AuditFinding
+  - { method: POST, path: "/audits", description: "Open a coding audit on a subject coder; auditor = caller (must be ACTIVE, credential >= CCS, != subject); sampling executes synchronously", roles: [Auditor], code: 201, input: [subject_coder_id, window_start, window_end, sample_size], output: CodingAudit, side_effects: ["compute sampled_case_ids"] }
+  - { method: GET, path: "/audits/{id}", description: "Fetch one audit", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: CodingAudit, side_effects: [] }
+  - { method: GET, path: "/audits", description: "List audits", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["auditor_id?", "subject_coder_id?", "status?", "limit?", "offset?"], output: "CodingAudit[]", side_effects: [] }
+  - { method: POST, path: "/audits/{id}/findings", description: "Record a finding against a sampled coded case", roles: [Auditor], code: 201, input: [coded_case_id, finding_type, "target_diagnosis_id?", "corrected_poa?", "corrected_icd_code?", "corrected_cc_level?"], output: AuditFinding, side_effects: [] }
+  - { method: GET, path: "/audit-findings/{id}", description: "Fetch one finding", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: AuditFinding, side_effects: [] }
+  - { method: GET, path: "/audit-findings", description: "List findings", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["audit_id?", "coded_case_id?", "target_diagnosis_id?", "status?", "limit?", "offset?"], output: "AuditFinding[]", side_effects: [] }
+  - { method: POST, path: "/audit-findings/{id}/resolve", description: "APPLY (run the correction cascade) or DISMISS an OPEN finding", roles: [Auditor], code: 200, input: [resolution], output: AuditFinding, side_effects: ["APPLY: line mutation -> case regroup -> bill expected refresh -> audit/coder stats"] }
+  - { method: POST, path: "/audits/{id}/complete", description: "Complete the audit; computes both accuracy variants and updates the subject coder", roles: [Auditor], code: 200, input: [], output: CodingAudit, side_effects: ["compute accuracy_code_based + accuracy_financial", "update Coder.accuracy_running / credential_review_required"] }
+
+  # ---- PostPaymentReview / RebillRequest
+  - { method: POST, path: "/bills/{id}/post-payment-reviews", description: "Open a payer post-payment review on a PAID bill", roles: [BillingClerk], code: 201, input: [payer_ref, claimed_delta_cents], output: PostPaymentReview, side_effects: ["Bill PAID -> POST_PAYMENT_REVIEW"] }
+  - { method: GET, path: "/post-payment-reviews/{id}", description: "Fetch one review", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: PostPaymentReview, side_effects: [] }
+  - { method: GET, path: "/post-payment-reviews", description: "List reviews", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["bill_id?", "status?", "limit?", "offset?"], output: "PostPaymentReview[]", side_effects: [] }
+  - { method: POST, path: "/post-payment-reviews/{id}/close", description: "Close a review with no change; bill returns to PAID", roles: [BillingClerk], code: 200, input: [], output: PostPaymentReview, side_effects: ["Bill POST_PAYMENT_REVIEW -> PAID"] }
+  - { method: POST, path: "/rebill-requests", description: "Create a rebill against an OPEN review; OCC-guarded on the bill; timely-filing enforced", roles: [BillingClerk], code: 201, input: [review_id, delta_cents, expected_bill_version], output: RebillRequest, side_effects: ["increments Bill.version by 1", "Bill POST_PAYMENT_REVIEW -> REBILL_REQUIRED", "PostPaymentReview OPEN -> CLOSED_REBILL"] }
+  - { method: GET, path: "/rebill-requests/{id}", description: "Fetch one rebill request", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: [], output: RebillRequest, side_effects: [] }
+  - { method: GET, path: "/rebill-requests", description: "List rebill requests", roles: [CodingManager, Coder, Auditor, BillingClerk, ComplianceOfficer], code: 200, input: ["review_id?", "status?", "limit?", "offset?"], output: "RebillRequest[]", side_effects: [] }
+  - { method: POST, path: "/rebill-requests/{id}/approve", description: "Approve a PENDING rebill (approver != requester); bill becomes REBILLED", roles: [ComplianceOfficer], code: 200, input: [], output: RebillRequest, side_effects: ["Bill REBILL_REQUIRED -> REBILLED", "net_receivable_cents adjusted by delta"] }
+  - { method: POST, path: "/rebill-requests/{id}/cancel", description: "Cancel a PENDING rebill (compensating action); bill returns to PAID with net_receivable unchanged", roles: [ComplianceOfficer], code: 200, input: [], output: RebillRequest, side_effects: ["Bill REBILL_REQUIRED -> PAID", "net_receivable_cents restored"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/unknown X-User-Role or missing X-User-ID" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for the endpoint, or non-owner coder touching another coder's assignment/lines" }
+  - { id: ERR_ACCOUNT_NOT_FOUND, http: 404, condition: "Referenced PatientAccount does not exist" }
+  - { id: ERR_CHART_NOT_FOUND, http: 404, condition: "Referenced Chart does not exist" }
+  - { id: ERR_CODER_NOT_FOUND, http: 404, condition: "Referenced Coder does not exist" }
+  - { id: ERR_ASSIGNMENT_NOT_FOUND, http: 404, condition: "Referenced CodingAssignment does not exist" }
+  - { id: ERR_BILL_NOT_FOUND, http: 404, condition: "Referenced Bill does not exist" }
+  - { id: ERR_CODED_CASE_NOT_FOUND, http: 404, condition: "Referenced CodedCase does not exist" }
+  - { id: ERR_AUDIT_NOT_FOUND, http: 404, condition: "Referenced CodingAudit does not exist" }
+  - { id: ERR_FINDING_NOT_FOUND, http: 404, condition: "Referenced AuditFinding does not exist" }
+  - { id: ERR_REVIEW_NOT_FOUND, http: 404, condition: "Referenced PostPaymentReview does not exist" }
+  - { id: ERR_REBILL_NOT_FOUND, http: 404, condition: "Referenced RebillRequest does not exist" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, invalid enum member, malformed timestamp, window_start >= window_end, sample_size < 1" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Transition not allowed from the resource's current state (generic state-precondition failure)" }
+  - { id: ERR_CHART_NOT_READY, http: 409, condition: "Assignment created for a chart not in READY_FOR_CODING (deficiencies open or account not discharged)" }
+  - { id: ERR_CHART_NOT_CODED, http: 409, condition: "Bill finalize attempted while the chart is not CODED" }
+  - { id: ERR_CODER_INACTIVE, http: 409, condition: "Start attempted by/for an INACTIVE coder" }
+  - { id: ERR_CODER_CREDENTIAL_INSUFFICIENT, http: 422, condition: "Coder credential rank below the chart acuity requirement, or auditor below CCS" }
+  - { id: ERR_SELF_AUDIT_FORBIDDEN, http: 403, condition: "Auditor's own coder id equals subject_coder_id" }
+  - { id: ERR_POA_INVALID_FOR_CODE, http: 422, condition: "poa=U on a line with cc_level CC or MCC" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Rebill approver X-User-ID equals rebill.requested_by" }
+  - { id: ERR_PRINCIPAL_DX_REQUIRED, http: 422, condition: "Submit without exactly one ACTIVE principal diagnosis" }
+  - { id: ERR_INVALID_PRINCIPAL_CODE, http: 422, condition: "Principal code starts with 'R' or 'Z'" }
+  - { id: ERR_DUPLICATE_SEQUENCE, http: 422, condition: "Duplicate sequence among ACTIVE diagnosis lines on the chart" }
+  - { id: ERR_MANIFESTATION_ORDER, http: 422, condition: "Manifestation line sequenced before or equal to its etiology line" }
+  - { id: ERR_ASSIGNMENT_EXISTS, http: 409, condition: "A non-terminal assignment already exists for the chart" }
+  - { id: ERR_NO_ELIGIBLE_CODER, http: 422, condition: "Auto-assignment pool empty (no ACTIVE coder meeting the credential requirement)" }
+  - { id: ERR_CASE_NOT_IN_SAMPLE, http: 422, condition: "Finding references a coded case outside the audit's sampled_case_ids" }
+  - { id: ERR_WORKLOAD_OVERLAP, http: 409, condition: "Coder already holds an IN_PROGRESS assignment (capacity 1)" }
+  - { id: ERR_AUDIT_WINDOW_OVERLAP, http: 409, condition: "New audit window overlaps an existing audit window for the same subject coder (half-open intervals; adjacency allowed)" }
+  - { id: ERR_TIMELY_FILING_EXPIRED, http: 422, condition: "Rebill created after bill.paid_at + 120 days" }
+  - { id: ERR_OPEN_FINDINGS_REMAIN, http: 409, condition: "Audit completion attempted with OPEN findings" }
+  - { id: ERR_REBILL_DELTA_MISMATCH, http: 422, condition: "Rebill delta_cents differs from the review's claimed_delta_cents" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent's current version (OCC)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CodingManager
+    description: "HIM coding manager: registers accounts, manages charts/deficiencies/coders, runs the queue and DNFB sweeps, accepts or returns submitted coding"
+    identity: opaque
+    exclusive_operations: ["POST /patient-accounts", "POST /patient-accounts/{id}/discharge", "POST /charts", "POST /deficiencies", "POST /deficiencies/{id}/resolve", "POST /coders", "PATCH /coders/{id}", "POST /assignments", "POST /assignments/{id}/assign", "POST /assignments/{id}/accept", "POST /assignments/{id}/return", "POST /assignments/{id}/release", "POST /dnfb-sweeps", "POST /_clock/set_current_utc"]
+    shared_operations: ["all GET endpoints", "POST /coded-cases/{id}/regroup"]
+  - name: Coder
+    description: "Credentialed coding specialist; acts on own assignments and their charts' lines (X-User-ID == Coder.id == assignment.coder_id)"
+    identity: "entity_backed:Coder"
+    exclusive_operations: ["POST /diagnosis-lines", "PATCH /diagnosis-lines/{id}", "POST /procedure-lines", "POST /assignments/{id}/start", "POST /assignments/{id}/submit"]
+    shared_operations: ["all GET endpoints"]
+  - name: Auditor
+    description: "Coding auditor (a credentialed coder with rank >= CCS); runs pre-bill audits and applies findings; may not audit self"
+    identity: "entity_backed:Coder"
+    exclusive_operations: ["POST /audits", "POST /audits/{id}/findings", "POST /audit-findings/{id}/resolve", "POST /audits/{id}/complete"]
+    shared_operations: ["all GET endpoints", "POST /coded-cases/{id}/regroup"]
+  - name: BillingClerk
+    description: "Billing office clerk: creates/finalizes bills, records payments, opens post-payment reviews, requests rebills"
+    identity: opaque
+    exclusive_operations: ["POST /bills", "POST /bills/{id}/finalize", "POST /bills/{id}/record-payment", "POST /bills/{id}/post-payment-reviews", "POST /post-payment-reviews/{id}/close", "POST /rebill-requests"]
+    shared_operations: ["all GET endpoints"]
+  - name: ComplianceOfficer
+    description: "Compliance officer: approves or cancels rebill requests; must not be the requesting clerk (segregation of duties)"
+    identity: opaque
+    exclusive_operations: ["POST /rebill-requests/{id}/approve", "POST /rebill-requests/{id}/cancel"]
+    shared_operations: ["all GET endpoints"]

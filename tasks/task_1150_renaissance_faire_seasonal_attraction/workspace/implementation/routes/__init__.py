@@ -1,0 +1,38 @@
+"""Route blueprints."""
+from routes import (
+    seasons,
+    faire_days,
+    performers,
+    cast_contracts,
+    rehearsal_slots,
+    vendors,
+    vendor_applications,
+    booth_assignments,
+    food_permits,
+    ticket_orders,
+    tickets,
+    rain_checks,
+    volunteer_shifts,
+    conduct_cases,
+    build_tasks,
+    clock,
+)
+
+ALL_BLUEPRINTS = [
+    seasons.bp,
+    faire_days.bp,
+    performers.bp,
+    cast_contracts.bp,
+    rehearsal_slots.bp,
+    vendors.bp,
+    vendor_applications.bp,
+    booth_assignments.bp,
+    food_permits.bp,
+    ticket_orders.bp,
+    tickets.bp,
+    rain_checks.bp,
+    volunteer_shifts.bp,
+    conduct_cases.bp,
+    build_tasks.bp,
+    clock.bp,
+]

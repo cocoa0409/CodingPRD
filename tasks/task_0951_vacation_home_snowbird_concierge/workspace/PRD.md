@@ -1,0 +1,977 @@
+# Vacation-Home & Snowbird Concierge API — Product Requirements Document
+
+## 1. Introduction
+
+Owners of seasonal second homes face a problem that neither a property manager nor an alarm company solves on its own: for eight or nine months of the year nobody walks through the front door. Pipes freeze, roofs leak, packages pile up on the porch, alarms trip for no reason, and a hurricane forms four hundred miles offshore while the owner is fifteen hundred miles away. The Vacation-Home & Snowbird Concierge platform is the operational system of record for a concierge firm that fills that gap — it schedules and logs property-watch visits, drives seasonal close-down and spring re-opening, manages the winterization checklist, dispatches vetted trade vendors against findings, tracks physical keys and lockbox codes, coordinates short-term-rental turnovers, holds mail, triages security incidents, and — when a named storm enters the region — runs a completely separate emergency pipeline with its own deadlines, its own approval ceiling and its own surcharge schedule.
+
+Two structurally different pipelines run through this system and they share one numbered decision ladder. **Pipeline R**, the routine subscription watch, runs from a scheduled visit through checklist completion, findings, an optional work order, and monthly subscription billing that consumes a per-cycle included-visit entitlement, with anything beyond the entitlement priced as an overage. **Pipeline S**, the storm response, runs from a named storm event with escalating advisory tiers through a pre-storm secure sweep measured against a landfall-ETA deadline, a post-storm damage assessment measured against an all-clear SLA, emergency vendor dispatch under a raised approval ceiling, and a per-incident surcharge that sits entirely outside the subscription entitlement. The two pipelines share the labour, vendor, work-order and invoice rungs of the ladder. They diverge on five axes, and the divergences are deliberate: authorization order (Pipeline R needs Owner approval above the owner ceiling; Pipeline S auto-approves below the emergency ceiling and never consults the Owner at all), deadline arithmetic (Pipeline S subtracts a tier-selected lead from the landfall ETA and adds a fixed SLA to the all-clear instant; Pipeline R has no deadline arithmetic whatsoever), surcharge tiers (Pipeline S multiplies net service by a tier-selected percentage; Pipeline R never does), entitlement applicability (a Pipeline S visit never consumes an entitlement unit no matter how many remain), and key-custody prerequisites, where the storm pipeline is described as able to dispatch with no key issuance at all and an access-blocked marker on the assignment — a divergence whose exact scope is left as an explicitly open point in §2.13.
+
+Money is the second organising concern. Every amount in the system is an integer number of cents, every score is a decimal with an explicitly pinned number of places, and several of the arithmetic chains in this document have a **pinned evaluation order** whose alternative reading produces a different, wrong number. Where that is the case the document says so in the sentence that defines the chain. Implementers should treat the ordering statements as part of the contract, not as commentary.
+
+## 2. Global Specifications & System-Wide Principles
+
+Everything in this section applies to every endpoint in the system unless a later section explicitly narrows it. The API is mounted under the `/property-care` prefix.
+
+### 2.1. Operators, Roles and Identity Binding
+
+Every request must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, naming the role that principal is acting under. If either header is absent or empty the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If `X-User-Role` carries a string that is not one of the eight declared role names, the request is rejected with `ERR_UNKNOWN_ROLE` (also HTTP 401). Once the headers are accepted, the role must appear in the endpoint's own authorized-role list; if it does not, the request is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+The eight roles, spelled exactly as they must appear in the header, are `PlatformAdmin`, `Owner`, `AccountManager`, `Dispatcher`, `FieldTech`, `Vendor`, `StormCoordinator` and `Auditor`.
+
+**`PlatformAdmin`** is the platform operator. It owns configuration — service plans, checklist templates and the logical clock — and acts as a superset of `AccountManager` and `Dispatcher` across the operational surface. It is deliberately **not** permitted to approve a routine work order in the Owner's place on business grounds, to accept or decline a vendor assignment, to complete a visit, or to drive the storm advisory ladder; where the endpoint tables below omit `PlatformAdmin`, that omission is intentional. Its exclusive capabilities are setting the logical clock, publishing a service plan and retiring one.
+
+**`Owner`** is the homeowner client. An Owner approves routine work orders against a per-owner ceiling, declares away periods, requests visits, drives the owner-in-residence occupancy branch, dismisses findings, extends and releases mail holds, pays invoices, and is the only role that may dispute an invoice. An Owner cannot dispatch, cannot touch vendors or keys, and has no authority at all on the storm pipeline.
+
+**`AccountManager`** is the commercial operator: subscriptions, billing cycles, invoices and the delinquency ladder. It exclusively owns subscription activation, pause, resume, tier change, cancellation, delinquency marking and clearing, billing-cycle closure, invoice issuing, dispute resolution, invoice voiding, and the appending of a completed work order's cost to an invoice. It cannot approve a work order, cannot dispatch a vendor and cannot perform a visit.
+
+**`Dispatcher`** is the field-operations coordinator: the seasonal axis, vendor onboarding and eligibility, work-order creation and dispatch, key custody and access grants, findings triage and incident handling. It exclusively owns seasonal transitions, vendor suspension, reinstatement and eligibility refresh, work-order dispatch, code rotation, key issuance, key return, overdue marking and loss declaration, access-grant creation, activation and revocation, assignment withdrawal, finding triage and monitoring, and visit conversion into a turnover inspection. It cannot approve a work order it created and cannot perform the visit itself.
+
+**`FieldTech`** is the technician who physically performs the visit. Arrival and visit completion are exclusive to this role. It shares departure, finding recording, winterization steps, turnover advance and inspection failure, package logging and the post-storm damage assessment with other roles. It cannot create a work order, cannot dispatch and cannot touch billing.
+
+**`Vendor`** is the external contractor. Accepting an offer, declining one, starting on-site work and finishing on-site work are exclusive to this role; recording work-order actuals is shared with `Dispatcher`.
+
+**`StormCoordinator`** is the emergency-operations lead. Declaring a storm, driving the advisory ladder, recording landfall, declaring all-clear, closing a storm event and closing a storm response are exclusive to it. It approves and rejects `STORM`-pipeline work orders that the Owner is never asked about, and cannot approve a `ROUTINE` work order.
+
+**`Auditor`** is a read-only compliance observer. It holds read access to every collection and every single-resource read in the system and holds no write permission anywhere; every non-read request under this role is rejected with `ERR_ROLE_NOT_PERMITTED`.
+
+Identity binding differs by role, and it is what ties `X-User-ID` to resource ownership. When `X-User-Role` is `Owner`, `X-User-ID` is the `id` of the acting `Owner` row; ownership checks on any resource that references an owner compare the resource's owning foreign key to `X-User-ID` — directly for a property (through its `owner_id`), and transitively for an invoice (through `Invoice.owner_id`), an away period (through `AwayPeriod.owner_id`) and a work order (through its property's owner). A mismatch is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403). When `X-User-Role` is `Vendor`, `X-User-ID` is the `id` of the acting `Vendor` row, and every assignment-scoped action compares `VendorAssignment.vendor_id` to `X-User-ID`; a mismatch is rejected with `ERR_NOT_ASSIGNED_VENDOR` (HTTP 403). The same check guards the recording of work-order actuals.
+
+When `X-User-Role` is `PlatformAdmin`, `AccountManager`, `Dispatcher`, `FieldTech`, `StormCoordinator` or `Auditor`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it where a rule says so — as `tech_user_id` on a visit at departure, as `approved_by_user_id` on a work order at approval, as `created_by_user_id` on a work order at creation, as `swept_by_user_id` on a storm response when the secure sweep completes, and as `assessed_by_user_id` when the damage assessment is signed — but it never compares that identifier to any entity's `id`.
+
+One authorization rule is not about ownership but about **segregation of duties**: the `X-User-ID` signing a post-storm damage assessment must differ from the `swept_by_user_id` already recorded on that storm response. If the two are equal the request is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). A second role-band rule concerns the approval fork: an `Owner` attempting to approve a work order whose pipeline is `STORM`, or a `StormCoordinator` attempting to approve one whose pipeline is `ROUTINE`, is rejected with `ERR_WORK_ORDER_PIPELINE_MISMATCH` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination, Sort Order and Collection Filters
+
+Every list endpoint accepts `limit` and `offset` as query-string parameters. `limit` defaults to 10, has a minimum of 1 and a maximum of 100; `offset` defaults to 0 and has a minimum of 0. A `limit` outside the inclusive range from 1 to 100, or a negative `offset`, is rejected with `ERR_PAGINATION_INVALID` (HTTP 400). List responses carry `limit`, `offset`, `total_count` and `has_more` inside `meta`, where `total_count` is the size of the filtered set before the page window is applied and `has_more` is true exactly when more rows remain beyond the window. Unless a subsection below states otherwise, every list endpoint returns rows sorted by `created_at` ascending.
+
+Collections also accept domain filters, and each filter is an exact-match predicate on the named field. Owners may be filtered by `status`. Properties may be filtered by `owner_id`, `state_code`, `seasonal_state` and `occupancy_state`. Service plans may be filtered by `tier` and `status`. Subscriptions may be filtered by `property_id`, `service_plan_id` and `status`. Billing cycles may be filtered by `subscription_id` and `status`. Away periods may be filtered by `property_id` and `owner_id`. Checklist templates may be filtered by `visit_type` and `status`. Visits expose every foreign key as a filter — `property_id`, `checklist_template_id`, `away_period_id`, `storm_response_id`, `rental_turnover_id`, `billing_cycle_id` — plus `status` and `visit_type`. Findings may be filtered by `visit_id`, `property_id`, `status` and `severity`. Vendors may be filtered by `trade`, `status` and `emergency_capable`. Work orders may be filtered by `finding_id`, `property_id`, `storm_event_id`, `key_asset_id`, `status` and `pipeline`. Vendor assignments may be filtered by `work_order_id`, `vendor_id` and `status`. Key assets may be filtered by `property_id` and `key_type`. Key issuances may be filtered by `key_asset_id`, `vendor_id`, `vendor_assignment_id` and `status`. Access grants may be filtered by `key_asset_id`, `vendor_id`, `key_issuance_id` and `status`. Winterization records may be filtered by `property_id`, `visit_id` and `status`. Rental turnovers may be filtered by `property_id` and `status`. Mail holds may be filtered by `property_id` and `status`. Security incidents may be filtered by `property_id`, `visit_id`, `status` and `incident_type`. Storm events may be filtered by `region_state_code` and `status`. Storm responses may be filtered by `storm_event_id`, `property_id`, `subscription_id` and `status`. Invoices may be filtered by `billing_cycle_id`, `property_id`, `owner_id` and `status`. Invoice lines may be filtered by `invoice_id`, `visit_id`, `work_order_id`, `security_incident_id`, `mail_hold_id`, `line_type` and `status`.
+
+### 2.4. Common Resource Properties and the Version Counter
+
+Every persisted resource carries a server-minted `id` that is a UUID string with no type prefix, and a `created_at` timestamp in ISO 8601 UTC with three fractional digits. Every entity in this system also carries `updated_at`, in the same format, refreshed on every mutation of the row, and `version`, an integer that starts at 1 when the row is created and increases as the row is mutated. There is no entity in this system that omits `updated_at` or `version`.
+
+The `version` counter is the substrate for optimistic concurrency (see §2.9), and its increment discipline must be stated precisely rather than left to intuition. **A version increments once per request per mutated row, not once per field written and not once per cascade hop.** A single request that mutates a property, the winterization record beneath it and a finding on it advances three separate counters by exactly one each. A request that writes six fields on one property advances that property's counter by exactly one. Where a rule below says "increments `Property.version` by 1", that is the whole of the increment for that request; a second sentence in the same rule that also touches the property does not add a second increment.
+
+**The response body carries post-mutation values.** Whatever a mutation writes — including the version bump, the refreshed `updated_at`, and every derived field re-computed as a consequence — is reflected in the resource object returned in `data`. A client that reads back the `version` from a successful mutation response is holding a value it can immediately use as the expected-version input of a subsequent concurrency-guarded write; it must never receive a pre-mutation snapshot.
+
+### 2.5. The Logical Clock
+
+The system runs on a logical clock, never on wall-clock time. Before any call that sets it, the clock reads exactly `2026-05-01T00:00:00Z`, and it never falls back to real time. An administrative capability sets it to a supplied instant carried in a `to_iso8601` field; the response reports the new value as `current_utc`. Setting the clock mutates no entity, but every subsequent deadline, expiry, window and age comparison in the system reads the new value. The clock is monotonic: an attempt to set it to an instant strictly earlier than its current value is rejected with `ERR_CLOCK_REGRESSION` (HTTP 400). A read-only capability returns the current value as `current_utc` without changing it.
+
+Every phrase in this document of the form "the logical clock", "at the moment of", "already elapsed" or "still in the future" refers to this clock and to no other source of time.
+
+### 2.6. Money, Rounding and Derived Precision
+
+All monetary amounts are **integer cents**. All rounding in this system is round-half-up applied to the absolute value with the sign preserved — that is, half away from zero, so that a value of 87.5 rounds to 88 and a value of −87.5 rounds to −88. Where a rule multiplies an integer amount by a percentage, the product is rounded once, at the point the rule names, and the rounded integer is what flows into the next step; no intermediate value is carried forward as a floating-point quantity.
+
+Two derived quantities are decimals rather than cents and carry **one decimal place**, rounded by the same half-away-from-zero rule: the property freeze-risk score and the finding escalation score, along with the two completion percentages (checklist completion and winterization completeness). Storm surcharge percentages and the invoice-level storm surcharge percentage are fractions carried at two decimal places.
+
+Several rounding **orders** are pinned, and each is stated where the calculation is defined: per-leg rounding in the tier-change proration, per-line rounding in the invoice tax sum, and rounding of the storm surcharge after the entitlement offset has been applied. Each of these has an alternative reading that differs by whole cents, so the order is part of the contract.
+
+### 2.7. The Write-Gate Ladder and the Per-Endpoint Gate Subsequence
+
+Every write in this system is filtered through a **total order of ten gates**. The gates are evaluated strictly in ascending gate number, the **first gate that fails determines both the `error_id` and the HTTP status**, and no later gate is evaluated at all. This is why a request that is simultaneously malformed and aimed at a parent that does not exist returns the 404 from the existence gate and never the 400 from the payload gate — payload validation is deliberately last.
+
+The ten gates, in order:
+
+1. **G1 — AUTH.** `X-User-Role` and `X-User-ID` are present, and `X-User-Role` is one of the eight declared roles.
+2. **G2 — ROLE AND SCOPE.** The acting role is listed in the endpoint's authorized roles; then, for the two entity-backed roles, `X-User-ID` must match the owning foreign key of the target resource — an `Owner` against the property's `owner_id` chain, a `Vendor` against `VendorAssignment.vendor_id`.
+3. **G3 — EXISTENCE.** Path ids are resolved left to right in path order; then body foreign keys are resolved in the order the fields are listed in the endpoint's request body. The first id that fails to resolve decides the 404.
+4. **G4 — OCC VERSION.** Where an endpoint declares an expected-version field, that value must equal the parent's current `version` integer.
+5. **G5 — TARGET STATE.** The target entity's own current state must be a declared source state for the requested transition, together with those transition preconditions that reference only the target entity.
+6. **G6 — PROPERTY SEASONAL.** The property's `seasonal_state` permits the operation. This band is evaluated **before** occupancy because the seasonal axis is the slower-moving one and its violations cannot be recovered inside the request.
+7. **G7 — PROPERTY OCCUPANCY.** The property's `occupancy_state` permits the operation.
+8. **G8 — RESOURCE ELIGIBILITY.** Two sub-bands in a declared internal order: **G8a vendor eligibility** (status, certificate-of-insurance expiry, licence expiry, emergency capability, rating floor) is evaluated **in full before** **G8b key custody** (outstanding overdue issuances, pending rekey, access-grant validity).
+9. **G9 — ENTITLEMENT.** Subscription status, billing-cycle status and the included-visit entitlement balance.
+10. **G10 — PAYLOAD.** Field-level validation: required fields present, JSON types, enum membership, numeric ranges, interval well-formedness, and array membership against a declared code set.
+
+The numbered validation ladder in §2.8 is a **refinement** of this order: every rung belongs to exactly one gate, and rung numbers never cross a gate boundary out of order. Each endpoint applies only the gate subsequence listed for it below; gates absent from an endpoint's subsequence are not evaluated for that endpoint at all.
+
+| Method and Path | Gate subsequence | Success status | Request body / query fields |
+|---|---|---|---|
+| `POST /property-care/_clock/set_current_utc` | G1, G2, G10 | 200 | `to_iso8601` |
+| `GET /property-care/_clock` | G1, G2 | 200 | — none — |
+| `POST /property-care/owners` | G1, G2, G10 | 201 | `full_name`, `email`, `phone`, `primary_residence_state`, `snowbird_flag` (optional), `notification_preference` (optional), `approval_ceiling_override_cents` (optional) |
+| `GET /property-care/owners` | G1, G2 | 200 | `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/owners/{id}` | G1, G2, G3 | 200 | — none — |
+| `PATCH /property-care/owners/{id}` | G1, G2, G3, G10 | 200 | `phone` (optional), `notification_preference` (optional), `approval_ceiling_override_cents` (optional), `snowbird_flag` (optional) |
+| `POST /property-care/properties` | G1, G2, G3, G10 | 201 | `owner_id`, `label`, `address_line`, `state_code`, `travel_distance_miles`, `freeze_setpoint_f` (optional), `rental_program_enrolled` (optional) |
+| `GET /property-care/properties` | G1, G2 | 200 | `owner_id` (optional), `state_code` (optional), `seasonal_state` (optional), `occupancy_state` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/properties/{id}` | G1, G2, G3 | 200 | — none — |
+| `PATCH /property-care/properties/{id}` | G1, G2, G3, G10 | 200 | `label` (optional), `travel_distance_miles` (optional), `freeze_setpoint_f` (optional), `rental_program_enrolled` (optional) |
+| `POST /property-care/properties/{id}/seasonal-transitions` | G1, G2, G3, G5, G6, G7, G10 | 200 | `action` |
+| `POST /property-care/properties/{id}/occupancy-transitions` | G1, G2, G3, G5, G6, G7, G10 | 200 | `to_state` |
+| `GET /property-care/properties/{id}/risk-posture` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/service-plans` | G1, G2, G10 | 201 | `tier`, `monthly_fee_cents`, `included_visit_units`, `covered_visit_types`, `entitlement_rollover_policy` (optional), `storm_guarantee_included` (optional), `status` (optional) |
+| `GET /property-care/service-plans` | G1, G2 | 200 | `tier` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/service-plans/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/service-plans/{id}/retire` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/subscriptions` | G1, G2, G3, G10 | 201 | `property_id`, `service_plan_id`, `started_on` |
+| `GET /property-care/subscriptions` | G1, G2 | 200 | `property_id` (optional), `service_plan_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/subscriptions/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/activate` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/pause` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/resume` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/tier-changes` | G1, G2, G3, G4, G5, G9, G10 | 200 | `service_plan_id`, `expected_subscription_version` |
+| `POST /property-care/subscriptions/{id}/cancel` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/mark-delinquent` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/clear-delinquency` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/subscriptions/{id}/billing-cycles` | G1, G2, G3, G5, G9, G10 | 201 | `period_start` |
+| `GET /property-care/billing-cycles` | G1, G2 | 200 | `subscription_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/billing-cycles/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/billing-cycles/{id}/close` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/away-periods` | G1, G2, G3, G10 | 201 | `property_id`, `owner_id`, `start_at`, `end_at`, `cadence_days` |
+| `GET /property-care/away-periods` | G1, G2 | 200 | `property_id` (optional), `owner_id` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/away-periods/{id}` | G1, G2, G3 | 200 | — none — |
+| `PATCH /property-care/away-periods/{id}/cadence` | G1, G2, G3, G10 | 200 | `cadence_days` |
+| `POST /property-care/checklist-templates` | G1, G2, G10 | 201 | `visit_type`, `version_label`, `item_codes`, `critical_item_codes` (optional), `default_finding_category` (optional), `status` (optional) |
+| `GET /property-care/checklist-templates` | G1, G2 | 200 | `visit_type` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/checklist-templates/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/visits` | G1, G2, G3, G6, G7, G9, G10 | 201 | `property_id`, `checklist_template_id`, `visit_type`, `trigger_source`, `scheduled_start_at`, `scheduled_end_at`, `away_period_id` (optional), `storm_response_id` (optional), `rental_turnover_id` (optional) |
+| `GET /property-care/visits` | G1, G2 | 200 | `property_id` (optional), `checklist_template_id` (optional), `away_period_id` (optional), `storm_response_id` (optional), `rental_turnover_id` (optional), `billing_cycle_id` (optional), `status` (optional), `visit_type` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/visits/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/visits/{id}/depart` | G1, G2, G3, G5, G6, G7 | 200 | — none — |
+| `POST /property-care/visits/{id}/arrive` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/visits/{id}/complete` | G1, G2, G3, G5, G9, G10 | 200 | `completed_item_codes`, `failed_item_codes`, `interior_temp_f` (optional) |
+| `POST /property-care/visits/{id}/defer` | G1, G2, G3, G5, G10 | 200 | `defer_reason` |
+| `POST /property-care/visits/{id}/reschedule` | G1, G2, G3, G5, G10 | 200 | `scheduled_start_at`, `scheduled_end_at` |
+| `POST /property-care/visits/{id}/convert-to-turnover` | G1, G2, G3, G5, G10 | 200 | `rental_turnover_id` |
+| `POST /property-care/visits/{id}/abort` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/visits/{id}/findings` | G1, G2, G3, G5, G10 | 201 | `item_code`, `severity`, `category`, `description` |
+| `GET /property-care/findings` | G1, G2 | 200 | `visit_id` (optional), `property_id` (optional), `status` (optional), `severity` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/findings/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/findings/{id}/triage` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/findings/{id}/monitor` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/findings/{id}/dismiss` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/vendors` | G1, G2, G10 | 201 | `legal_name`, `trade`, `coi_expires_at`, `license_expires_at`, `hourly_rate_cents`, `rating`, `billing_mode` (optional), `emergency_capable` (optional) |
+| `GET /property-care/vendors` | G1, G2 | 200 | `trade` (optional), `status` (optional), `emergency_capable` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/vendors/{id}` | G1, G2, G3 | 200 | — none — |
+| `PATCH /property-care/vendors/{id}/credentials` | G1, G2, G3, G5, G10 | 200 | `coi_expires_at` (optional), `license_expires_at` (optional), `rating` (optional), `hourly_rate_cents` (optional) |
+| `POST /property-care/vendors/{id}/suspend` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/vendors/{id}/reinstate` | G1, G2, G3, G5, G8 | 200 | — none — |
+| `POST /property-care/vendors/{id}/refresh-eligibility` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/findings/{id}/work-orders` | G1, G2, G3, G4, G5, G10 | 201 | `work_type`, `estimated_labour_hours`, `estimated_parts_cents`, `expected_finding_version`, `storm_event_id` (optional), `key_asset_id` (optional) |
+| `GET /property-care/work-orders` | G1, G2 | 200 | `finding_id` (optional), `property_id` (optional), `storm_event_id` (optional), `key_asset_id` (optional), `status` (optional), `pipeline` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/work-orders/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/work-orders/{id}/submit` | G1, G2, G3, G5, G10 | 200 | `estimated_labour_hours` (optional), `estimated_parts_cents` (optional) |
+| `POST /property-care/work-orders/{id}/approve` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/work-orders/{id}/reject` | G1, G2, G3, G5, G10 | 200 | `rejection_reason` |
+| `POST /property-care/work-orders/{id}/dispatch` | G1, G2, G3, G5, G7, G8, G10 | 200 | `window_start_at`, `window_end_at` |
+| `POST /property-care/work-orders/{id}/complete` | G1, G2, G3, G5, G10 | 200 | `actual_labour_hours`, `actual_parts_cents` |
+| `POST /property-care/work-orders/{id}/invoice` | G1, G2, G3, G5, G10 | 200 | `invoice_id` |
+| `GET /property-care/vendor-assignments` | G1, G2 | 200 | `work_order_id` (optional), `vendor_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/vendor-assignments/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/vendor-assignments/{id}/accept` | G1, G2, G3, G5, G8 | 200 | — none — |
+| `POST /property-care/vendor-assignments/{id}/decline` | G1, G2, G3, G5, G10 | 200 | `decline_reason` (optional) |
+| `POST /property-care/vendor-assignments/{id}/start-work` | G1, G2, G3, G5, G7, G8 | 200 | — none — |
+| `POST /property-care/vendor-assignments/{id}/finish-work` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/vendor-assignments/{id}/withdraw` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/properties/{id}/key-assets` | G1, G2, G3, G10 | 201 | `key_type`, `label`, `copies_total`, `current_code` (optional) |
+| `GET /property-care/key-assets` | G1, G2 | 200 | `property_id` (optional), `key_type` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/key-assets/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/key-assets/{id}/rotate-code` | G1, G2, G3, G4, G5, G10 | 200 | `new_code`, `expected_key_asset_version` |
+| `POST /property-care/key-assets/{id}/issuances` | G1, G2, G3, G8, G10 | 201 | `vendor_id`, `vendor_assignment_id` (optional), `copies_issued` (optional) |
+| `GET /property-care/key-issuances` | G1, G2 | 200 | `key_asset_id` (optional), `vendor_id` (optional), `vendor_assignment_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/key-issuances/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/key-issuances/{id}/return` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/key-issuances/{id}/mark-overdue` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/key-issuances/{id}/declare-lost` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/key-assets/{id}/access-grants` | G1, G2, G3, G4, G8, G10 | 201 | `vendor_id`, `window_start_at`, `window_end_at`, `expected_key_asset_version`, `key_issuance_id` (optional) |
+| `GET /property-care/access-grants` | G1, G2 | 200 | `key_asset_id` (optional), `vendor_id` (optional), `key_issuance_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/access-grants/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/access-grants/{id}/activate` | G1, G2, G3, G5, G8 | 200 | — none — |
+| `POST /property-care/access-grants/{id}/revoke` | G1, G2, G3, G5, G10 | 200 | `revoke_reason` |
+| `POST /property-care/properties/{id}/winterization-records` | G1, G2, G3, G10 | 201 | `visit_id` (optional) |
+| `GET /property-care/winterization-records` | G1, G2 | 200 | `property_id` (optional), `visit_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/winterization-records/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/winterization-records/{id}/steps` | G1, G2, G3, G5, G10 | 200 | `step_code`, `thermostat_f` (optional) |
+| `POST /property-care/winterization-records/{id}/reopen` | G1, G2, G3, G5, G10 | 200 | `reopen_reason` |
+| `POST /property-care/properties/{id}/rental-turnovers` | G1, G2, G3, G10 | 201 | `checkout_at`, `checkin_at`, `guest_reference` |
+| `GET /property-care/rental-turnovers` | G1, G2 | 200 | `property_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/rental-turnovers/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/rental-turnovers/{id}/advance` | G1, G2, G3, G5, G7, G10 | 200 | `to_status` |
+| `POST /property-care/rental-turnovers/{id}/fail-inspection` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/properties/{id}/mail-holds` | G1, G2, G3, G10 | 201 | `start_on`, `end_on`, `forwarding_address` (optional) |
+| `GET /property-care/mail-holds` | G1, G2 | 200 | `property_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/mail-holds/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/mail-holds/{id}/log-packages` | G1, G2, G3, G5, G10 | 200 | `package_delta` |
+| `POST /property-care/mail-holds/{id}/forward` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/mail-holds/{id}/extend` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/mail-holds/{id}/release` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/properties/{id}/security-incidents` | G1, G2, G3, G10 | 201 | `incident_type`, `severity`, `visit_id` (optional) |
+| `GET /property-care/security-incidents` | G1, G2 | 200 | `property_id` (optional), `visit_id` (optional), `status` (optional), `incident_type` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/security-incidents/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/security-incidents/{id}/acknowledge` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/security-incidents/{id}/investigate` | G1, G2, G3, G5, G10 | 200 | `checklist_template_id` (optional), `scheduled_start_at` (optional), `scheduled_end_at` (optional) |
+| `POST /property-care/security-incidents/{id}/escalate` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/security-incidents/{id}/resolve` | G1, G2, G3, G5, G10 | 200 | `resolution_note` |
+| `POST /property-care/security-incidents/{id}/reclassify-false-alarm` | G1, G2, G3, G5, G10 | 200 | `resolution_note` (optional) |
+| `POST /property-care/storm-events` | G1, G2, G10 | 201 | `name`, `region_state_code`, `landfall_eta_at` |
+| `GET /property-care/storm-events` | G1, G2 | 200 | `region_state_code` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/storm-events/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/storm-events/{id}/advisory` | G1, G2, G3, G5, G10 | 200 | `to_status` |
+| `POST /property-care/storm-events/{id}/landfall` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/storm-events/{id}/all-clear` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/storm-events/{id}/close` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/storm-events/{id}/responses` | G1, G2, G3, G10 | 201 | `property_id` |
+| `GET /property-care/storm-responses` | G1, G2 | 200 | `storm_event_id` (optional), `property_id` (optional), `subscription_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/storm-responses/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/storm-responses/{id}/schedule-sweep` | G1, G2, G3, G5, G6, G7, G10 | 200 | `checklist_template_id`, `scheduled_start_at` |
+| `POST /property-care/storm-responses/{id}/assessments` | G1, G2, G3, G4, G5, G10 | 200 | `damage_level`, `expected_storm_response_version` |
+| `POST /property-care/storm-responses/{id}/close` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/billing-cycles/{id}/invoices` | G1, G2, G3, G9 | 201 | — none — |
+| `GET /property-care/invoices` | G1, G2 | 200 | `billing_cycle_id` (optional), `property_id` (optional), `owner_id` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/invoices/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/invoices/{id}/lines` | G1, G2, G3, G5, G10 | 201 | `line_type`, `description`, `amount_cents`, `taxable` (optional), `visit_id` (optional), `work_order_id` (optional), `security_incident_id` (optional), `mail_hold_id` (optional) |
+| `GET /property-care/invoice-lines` | G1, G2 | 200 | `invoice_id` (optional), `visit_id` (optional), `work_order_id` (optional), `security_incident_id` (optional), `mail_hold_id` (optional), `line_type` (optional), `status` (optional), `limit` (optional), `offset` (optional) |
+| `GET /property-care/invoice-lines/{id}` | G1, G2, G3 | 200 | — none — |
+| `POST /property-care/invoice-lines/{id}/void` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/invoices/{id}/issue` | G1, G2, G3, G5, G9 | 200 | — none — |
+| `POST /property-care/invoices/{id}/pay` | G1, G2, G3, G5, G9, G10 | 200 | `amount_cents` |
+| `POST /property-care/invoices/{id}/dispute` | G1, G2, G3, G5 | 200 | `resolution_note` (optional) |
+| `POST /property-care/invoices/{id}/resolve-dispute` | G1, G2, G3, G5 | 200 | — none — |
+| `POST /property-care/invoices/{id}/void` | G1, G2, G3, G5 | 200 | — none — |
+
+A path parameter written as `{id}` in the table above is the `id` of the resource named by the segment immediately preceding it. Where a path nests one resource inside another, the outer id is resolved first and the inner second, and the first one that does not resolve produces `ERR_RESOURCE_NOT_FOUND` (HTTP 404).
+
+Success statuses follow one rule with an explicit list of exceptions: **a request that mints a new resource answers 201, and every other successful request answers 200.** The twenty-two creating requests are owner registration, property registration, service-plan publication, subscription creation, the opening of the next billing cycle, away-period declaration, checklist-template publication, visit scheduling, finding recording, vendor onboarding, work-order creation against a finding, key-asset registration, key issuance, access-grant creation, winterization-record opening, rental-turnover booking, mail-hold opening, security-incident reporting, storm-event declaration, storm-response enrolment, draft-invoice opening and invoice-line appending. Every remaining write, including every state transition and every administrative action, answers 200 with the mutated resource in `data`.
+
+### 2.8. The Numbered Validation Ladder
+
+Inside the gate order sits a single numbered ladder of sixty-eight rungs, shared by both pipelines. Rungs are evaluated in ascending number and **the first rung that fails decides the response**; nothing after it is evaluated. Six rung numbers carry two rows each because the same position in the order applies to two disjoint families of endpoints with different error identifiers; in those cases the two rows can never both apply to one request, so their relative order is not observable.
+
+**Gate G1 — authentication.**
+
+1. Both the `X-User-Role` and `X-User-ID` headers are present and non-empty, on every endpoint. Otherwise `ERR_UNAUTHENTICATED`, HTTP 401.
+2. `X-User-Role` names one of the eight declared roles, on every endpoint. Otherwise `ERR_UNKNOWN_ROLE`, HTTP 401.
+
+**Gate G2 — role and scope.**
+
+3. The acting role appears in the endpoint's declared role list, on every endpoint. Otherwise `ERR_ROLE_NOT_PERMITTED`, HTTP 403.
+4. When the acting role is `Owner`, `X-User-ID` equals the `owner_id` of the property the request targets, or of the invoice, away period, or work-order's property it targets. This applies to every endpoint whose role list includes `Owner`. Otherwise `ERR_NOT_RESOURCE_OWNER`, HTTP 403.
+5. When the acting role is `Vendor`, `X-User-ID` equals the `vendor_id` of the targeted assignment. This applies to every assignment-scoped action — accepting, declining, starting work, finishing work and withdrawing — and additionally to the recording of work-order actuals. Otherwise `ERR_NOT_ASSIGNED_VENDOR`, HTTP 403.
+6. The `X-User-ID` signing a post-storm assessment differs from the `swept_by_user_id` recorded on that storm response. This applies only to assessment sign-off. Otherwise `ERR_SEGREGATION_OF_DUTIES`, HTTP 403.
+
+**Gate G3 — existence.**
+
+7. The first path id resolves to an existing row of its declared entity. This applies to every endpoint that has a path parameter. Otherwise `ERR_RESOURCE_NOT_FOUND`, HTTP 404.
+8. A body field `owner_id` resolves to an existing owner. This applies to property registration and away-period declaration. Otherwise `ERR_OWNER_NOT_FOUND`, HTTP 404.
+9. A body field `property_id` resolves to an existing property. This applies to subscription creation, away-period declaration, visit scheduling and storm-response enrolment. Otherwise `ERR_PROPERTY_NOT_FOUND`, HTTP 404.
+10. A body field `service_plan_id` resolves to an existing service plan. This applies to subscription creation and to scheduling a plan tier change. Otherwise `ERR_SERVICE_PLAN_NOT_FOUND`, HTTP 404.
+11. A body field `checklist_template_id` resolves to an existing checklist template. This applies to visit scheduling. Otherwise `ERR_TEMPLATE_NOT_FOUND`, HTTP 404.
+12. A body field `vendor_id` resolves to an existing vendor. This applies to key issuance and access-grant creation. Otherwise `ERR_VENDOR_NOT_FOUND`, HTTP 404.
+13. A body field `invoice_id`, or the invoice targeted by a work-order invoicing call, resolves to an existing invoice. This applies to work-order invoicing and to invoice-line appending. Otherwise `ERR_INVOICE_NOT_FOUND`, HTTP 404.
+14. Every optional foreign key supplied in the body resolves, checked **in the order the fields are listed in that endpoint's request body**. The optional keys covered by this rung are `away_period_id`, `rental_turnover_id`, `storm_response_id`, `key_asset_id`, `key_issuance_id`, `visit_id`, `security_incident_id`, `mail_hold_id` and `work_order_id`. This rung applies on every endpoint. Otherwise `ERR_LINKED_RESOURCE_NOT_FOUND`, HTTP 404.
+
+**Gate G4 — optimistic concurrency.**
+
+15. `expected_finding_version` equals the finding's current `version`, on work-order creation against a finding. Otherwise `ERR_STALE_FINDING_VERSION`, HTTP 412.
+16. `expected_subscription_version` equals the subscription's current `version`, on a plan tier change. Otherwise `ERR_STALE_SUBSCRIPTION_VERSION`, HTTP 412.
+17. `expected_key_asset_version` equals the key asset's current `version`, on access-grant creation and on code rotation. Otherwise `ERR_STALE_KEY_ASSET_VERSION`, HTTP 412.
+
+**Gate G5 — target state.**
+
+18. The target entity's current status is a declared source state for the requested transition. This applies to every action endpoint that drives a state machine. Otherwise `ERR_INVALID_STATE_TRANSITION`, HTTP 409.
+19. The target entity is not already in a terminal state of its machine. This applies to every action endpoint that drives a state machine. Otherwise `ERR_ALREADY_TERMINAL`, HTTP 409.
+20. A visit being completed has both `departed_at` and `arrived_at` recorded. Otherwise `ERR_VISIT_NOT_ARRIVED`, HTTP 409.
+21. A finding being triaged has a parent visit whose status is `COMPLETED`. Otherwise `ERR_PARENT_VISIT_NOT_COMPLETED`, HTTP 409.
+22. A finding moving from `MONITORING` back to `TRIAGED` has a later completed visit on the same property whose `completed_at` is strictly greater than the finding's `triaged_at`. Otherwise `ERR_NO_RECHECK_VISIT`, HTTP 409.
+23. A finding being dismissed has no work order whose status lies outside the pair `REJECTED` and `VOID`. Otherwise `ERR_FINDING_HAS_LIVE_WORK_ORDER`, HTTP 409.
+24. A finding moving from `TRIAGED` to `MONITORING` has a severity of `LOW` or `MEDIUM`. Otherwise `ERR_SEVERITY_TOO_HIGH_TO_MONITOR`, HTTP 409.
+25. A work order being dispatched has a `dispatch_attempt_count` strictly less than three. Otherwise `ERR_DISPATCH_ATTEMPTS_EXHAUSTED`, HTTP 409.
+26. A rental turnover failing inspection has a `reclean_attempt_count` strictly less than two. Otherwise `ERR_RECLEAN_ATTEMPTS_EXHAUSTED`, HTTP 409.
+27. A mail hold being extended has an `extension_count` strictly less than two. Otherwise `ERR_HOLD_EXTENSIONS_EXHAUSTED`, HTTP 409.
+28. A storm-response assessment is accepted only while the parent storm event is in status `ALL_CLEAR`. Otherwise `ERR_STORM_NOT_ALL_CLEAR`, HTTP 409.
+29. A storm event being closed has every one of its responses in status `ASSESSED` or `CLOSED`. Otherwise `ERR_STORM_RESPONSES_OPEN`, HTTP 409.
+30. Two disjoint rows share this position. On invoice voiding, the invoice has `amount_paid_cents` equal to zero, otherwise `ERR_INVOICE_ALREADY_PAID`, HTTP 409. On billing-cycle closure, no visit bound to that cycle is in status `EN_ROUTE` or `IN_PROGRESS`, otherwise `ERR_CYCLE_HAS_LIVE_VISIT`, HTTP 409.
+
+**Gate G6 — property seasonal axis.**
+
+31. A visit whose `visit_type` is `SEASONAL_CLOSE` requires the property's `seasonal_state` to be `CLOSING`. This applies both at visit scheduling and again at departure. Otherwise `ERR_SEASONAL_STATE_FORBIDS_VISIT`, HTTP 409.
+32. A visit whose `visit_type` is `SEASONAL_OPEN` requires `seasonal_state` to be `OPENING`, checked at scheduling and again at departure. Otherwise `ERR_SEASONAL_STATE_FORBIDS_VISIT`, HTTP 409.
+33. A visit whose `visit_type` is `TURNOVER_INSPECT` requires `seasonal_state` to be `OPEN`, checked at scheduling and again at departure. Otherwise `ERR_SEASONAL_STATE_FORBIDS_VISIT`, HTTP 409.
+34. Beginning a seasonal close requires that no rental turnover on the property is in status `CHECKOUT`, `CLEANING`, `INSPECTION` or `READY`. This applies to seasonal transitions. Otherwise `ERR_TURNOVER_IN_FLIGHT`, HTTP 409.
+35. Completing winterization requires the property's newest winterization record to be in status `COMPLETE`, meaning all four required steps are recorded. This applies to seasonal transitions. Otherwise `ERR_WINTERIZATION_INCOMPLETE`, HTTP 409.
+36. Beginning a spring open requires that no key issuance on any key asset of the property is in status `OVERDUE` or `LOST`. This applies to seasonal transitions. Otherwise `ERR_KEY_CUSTODY_BLOCKS_OPEN`, HTTP 409.
+37. Completing a spring open requires a completed visit of type `SEASONAL_OPEN` whose `completed_at` is at or after the `created_at` of the newest winterization record. This applies to seasonal transitions. Otherwise `ERR_NO_SEASONAL_OPEN_VISIT`, HTTP 409.
+
+**Gate G7 — property occupancy axis.**
+
+38. A visit whose `visit_type` is `ROUTINE_WATCH` requires the property's `occupancy_state` to be `VACANT`, checked at scheduling and again at departure. Otherwise `ERR_OCCUPANCY_FORBIDS_VISIT`, HTTP 409.
+39. A visit whose `visit_type` is `TURNOVER_INSPECT` requires `occupancy_state` to be either `VACANT` or `CONTRACTOR_ONSITE`, checked at scheduling and again at departure. Otherwise `ERR_OCCUPANCY_FORBIDS_VISIT`, HTTP 409.
+40. A visit whose `visit_type` is `STORM_SECURE` requires `occupancy_state` to be anything other than `RENTAL_OCCUPIED`, checked at scheduling and again at departure. Otherwise `ERR_OCCUPANCY_FORBIDS_VISIT`, HTTP 409.
+41. Moving occupancy to `RENTAL_OCCUPIED` requires `rental_program_enrolled` to be true and `seasonal_state` to be `OPEN`. This applies to occupancy transitions. Otherwise `ERR_RENTAL_NOT_ENROLLED`, HTTP 409.
+42. Moving occupancy to `OWNER_IN_RESIDENCE` requires `seasonal_state` to be `OPEN` or `OPENING`. This applies to occupancy transitions. Otherwise `ERR_SEASONAL_STATE_FORBIDS_OCCUPANCY`, HTTP 409.
+
+**Gate G8a — vendor eligibility, evaluated in full before G8b.**
+
+43. The selected or targeted vendor has status `ELIGIBLE`. This applies to work-order dispatch and to assignment acceptance. Otherwise `ERR_VENDOR_NOT_ELIGIBLE`, HTTP 409.
+44. The vendor's `coi_expires_at` is strictly after the logical clock. This applies to work-order dispatch and to assignment acceptance. Otherwise `ERR_VENDOR_COI_EXPIRED`, HTTP 409.
+45. The vendor's `license_expires_at` is strictly after the logical clock. This applies to work-order dispatch and to assignment acceptance. Otherwise `ERR_VENDOR_LICENSE_EXPIRED`, HTTP 409.
+46. On the `STORM` pipeline the selected vendor has `emergency_capable` true. This applies to work-order dispatch. Otherwise `ERR_VENDOR_NOT_EMERGENCY_CAPABLE`, HTTP 409.
+47. The vendor-selection procedure returns a non-empty candidate set. This applies to work-order dispatch. Otherwise `ERR_NO_ELIGIBLE_VENDOR`, HTTP 409.
+48. The accepting vendor holds no other assignment in status `ACCEPTED` or `WORKING` whose closed window overlaps this one. This applies to assignment acceptance. Otherwise `ERR_VENDOR_WINDOW_CONFLICT`, HTTP 409.
+
+**Gate G8b — key custody, evaluated only after every G8a rung has passed.**
+
+49. The vendor holds no key issuance in status `OVERDUE` or `LOST`. This applies to key issuance and to assignment acceptance. Otherwise `ERR_VENDOR_KEY_OVERDUE`, HTTP 409.
+50. The key asset has a `copies_on_hand` at least equal to the requested `copies_issued`, and its `rekey_pending_flag` is false. This applies to key issuance. Otherwise `ERR_KEY_COPIES_UNAVAILABLE`, HTTP 409.
+51. Activating an access grant requires the count of `ACTIVE` grants on the key to be strictly less than the key's `copies_total`. This applies to grant activation. Otherwise `ERR_ACCESS_CAPACITY_EXCEEDED`, HTTP 409.
+52. Activating or using an access grant requires its `rotation_index_at_grant` to equal the key's current `code_rotation_count`, and requires the logical clock to lie inside the grant's closed window. This applies to grant activation and to a vendor starting on-site work. Otherwise `ERR_ACCESS_GRANT_INVALID`, HTTP 409.
+
+**Gate G9 — entitlement and subscription fiscal state.**
+
+53. The property has a subscription whose status is anything other than `CANCELLED`. This applies to visit scheduling and to opening a draft invoice on a billing cycle. Otherwise `ERR_NO_ACTIVE_SUBSCRIPTION`, HTTP 409.
+54. The property's `travel_zone` is not `OUT_OF_AREA`. This applies to subscription activation and to visit scheduling. Otherwise `ERR_PROPERTY_OUT_OF_AREA`, HTTP 409.
+55. A subscription being resumed has a non-null `paused_at`, and a subscription being paused has an `OPEN` current cycle. This applies to pause and to resume. Otherwise `ERR_NO_OPEN_CYCLE`, HTTP 409.
+56. Marking a subscription delinquent requires at least one issued invoice with a positive `balance_due_cents` whose `issued_at` plus twenty-one days is at or before the logical clock. Otherwise `ERR_NOT_YET_DELINQUENT`, HTTP 409.
+57. Clearing delinquency requires that no issued invoice on the subscription's cycles carries a positive `balance_due_cents`. Otherwise `ERR_BALANCE_STILL_OUTSTANDING`, HTTP 409.
+58. Two disjoint rows share this position. On invoice issuing, the invoice has at least one `ACTIVE` line and the subscription's status is not `CANCELLED`, otherwise `ERR_INVOICE_HAS_NO_LINES`, HTTP 409. On payment, the supplied `amount_cents` is strictly greater than zero and the invoice is not already `PAID`, otherwise `ERR_PAYMENT_AMOUNT_INVALID`, HTTP 409.
+
+**Gate G10 — payload, deliberately last.**
+
+59. Every field the endpoint declares as required is present in the body, on every endpoint. Otherwise `ERR_MISSING_REQUIRED_FIELD`, HTTP 400.
+60. Every supplied field carries the declared JSON type, on every endpoint. Otherwise `ERR_INVALID_FIELD_TYPE`, HTTP 400.
+61. Every supplied enum-typed field holds a declared member of that enum. This rung routes **exactly and only** the following request fields, and no other field routes to this error identifier: `visit_type`, `trigger_source`, `defer_reason`, `severity`, `category`, `incident_type`, `key_type`, `line_type`, `tier`, `entitlement_rollover_policy`, `billing_mode`, `trade`, `work_type`, `damage_level`, `reopen_reason`, `notification_preference`, `to_state`, `to_status`, `action`, `step_code`, `disposition` and `revoke_reason`. Otherwise `ERR_INVALID_ENUM_VALUE`, HTTP 400.
+62. Every numeric field lies inside its declared range, on every endpoint: `travel_distance_miles` at least 0; `freeze_setpoint_f` at least 40 and at most 80; `rating` at least 0 and at most 5; `cadence_days` at least 3 and at most 30; `copies_total` at least 1; `copies_issued` at least 1; `hourly_rate_cents` strictly greater than 0; `monthly_fee_cents` strictly greater than 0; `included_visit_units` at least 0; `estimated_labour_hours` at least 0; `estimated_parts_cents` at least 0. Otherwise `ERR_VALUE_OUT_OF_RANGE`, HTTP 400.
+63. On visit completion, `completed_item_codes` and `failed_item_codes` share no member, every member of both appears in the bound template's `item_codes`, and the two arrays' combined length equals the template's `required_item_count`. Otherwise `ERR_CHECKLIST_MISMATCH`, HTTP 400.
+64. Every supplied interval is well formed, on every endpoint that accepts one: `scheduled_end_at` strictly after `scheduled_start_at`; `window_end_at` strictly after `window_start_at`; `end_at` strictly after `start_at`; `end_on` strictly after `start_on`; `checkin_at` strictly after `checkout_at`. Otherwise `ERR_INTERVAL_MALFORMED`, HTTP 400.
+65. A visit's scheduled window does not overlap any padded rental-turnover window of the same property. This applies to visit scheduling and to rescheduling. Otherwise `ERR_TURNOVER_WINDOW_OVERLAP`, HTTP 409.
+66. A mail-hold creation yields a `hold_days` of at most thirty, and an extension keeps `hold_days` at most sixty. Otherwise `ERR_HOLD_TOO_LONG`, HTTP 400.
+67. Two disjoint rows share this position. On away-period declaration, the period spans at most two hundred and forty days and its `owner_id` equals the property's `owner_id`, otherwise `ERR_AWAY_PERIOD_INVALID`, HTTP 400. On visit scheduling, the bound template's `visit_type` equals the submitted `visit_type` and the template's `status` is `ACTIVE`, otherwise `ERR_TEMPLATE_TYPE_MISMATCH`, HTTP 400.
+68. Three disjoint rows share this final position. On owner registration and service-plan publication, an owner's `email` is unique across owners and a plan's `covered_visit_types` is a non-empty subset of the entitlement-consuming visit types, otherwise `ERR_UNIQUENESS_VIOLATION`, HTTP 409. On invoice-line appending, a line whose `line_type` is `ENTITLEMENT_OFFSET` or `GUARANTEE_CREDIT` carries an `amount_cents` at or below zero and every other line type carries an `amount_cents` at or above zero, otherwise `ERR_LINE_SIGN_INVALID`, HTTP 400. On winterization steps, the `step_code` is a member of the four required steps, the one optional step, or the literal `ALL_REQUIRED`, and a `THERMOSTAT_SET` step supplies `thermostat_f`, otherwise `ERR_WINTERIZATION_STEP_INVALID`, HTTP 400.
+
+### 2.9. Un-numbered Gates
+
+Twenty-eight further rejections exist that the ladder above does not assign a rung number to. Each belongs to a named gate band, and each fires on the condition stated here. They are grouped by band, and within a band they are evaluated together with that band's numbered rungs.
+
+Inside **G5, target state**, all with HTTP 409: `ERR_PLAN_RETIRED` when a subscription is activated onto, or tier-changed onto, a service plan whose `status` is `RETIRED`; `ERR_SUBSCRIPTION_CANCELLED` when an operation requires a subscription that is not `CANCELLED` and the subscription is cancelled; `ERR_VISIT_IN_FLIGHT` when a subscription is cancelled while a visit on its property is `EN_ROUTE` or `IN_PROGRESS`; `ERR_APPROVAL_REQUIRED` when a work order is dispatched while still `PENDING_APPROVAL`; `ERR_STORM_CEILING_EXCEEDED` when a `STORM`-pipeline work order whose `total_cents` exceeds 250000 is put to a `StormCoordinator` for approval; `ERR_ISSUANCE_NOT_OVERDUE` when overdue-marking is attempted before the issuance's `return_deadline_at` plus six hours has elapsed; `ERR_LOST_THRESHOLD_NOT_MET` when a loss is declared while `overdue_days` is below seven; `ERR_STEP_ALREADY_RECORDED` when a winterization step already recorded as done is submitted again; `ERR_TURNOVER_STAGE_INVALID` when a turnover advance targets a stage that is not the declared successor of the current stage; `ERR_NO_TURNOVER_OVERLAP` when a conversion to a turnover inspection is attempted for a visit whose window does not overlap the turnover's padded window; `ERR_PACKAGES_OUTSTANDING` when a mail hold is released while its `package_count` is greater than zero; `ERR_MAIL_HOLD_NOT_STARTED` when packages are logged before the logical clock reaches `start_on`; `ERR_INCIDENT_NOT_ALARM_CLASS` when a false-alarm reclassification is attempted on an incident whose `incident_type` is `WATER_LEAK` or `VANDALISM`; `ERR_SEVERITY_TOO_LOW_TO_ESCALATE` when escalation is attempted on a `LOW` or `MEDIUM` incident; `ERR_STORM_REGION_MISMATCH` when a sweep is scheduled for a property whose `state_code` differs from the storm event's `region_state_code`; `ERR_INVOICE_NOT_DRAFT` when a line is appended to an invoice whose status is not `DRAFT`; `ERR_LINE_ALREADY_VOID` when an already-void line is voided again; and `ERR_VISIT_TYPE_NOT_COVERED` when an entitlement-consuming visit type is scheduled that is absent from the in-force plan's `covered_visit_types` and the property has no other billing route.
+
+Inside **G6, seasonal**, with HTTP 409: `ERR_PROPERTY_HAS_OPEN_STORM_HOLD` when a seasonal transition is attempted while the property's `storm_hold_flag` is true.
+
+Inside **G8a, vendor eligibility**, with HTTP 409: `ERR_VENDOR_RATING_BELOW_FLOOR` when a vendor is reinstated with a `rating` below 3.0.
+
+Inside **G8b, key custody**, both with HTTP 409: `ERR_KEY_REKEY_PENDING` when an issuance is requested on a key whose `rekey_pending_flag` is true; and `ERR_GRANT_WINDOW_NOT_OPEN` when the logical clock lies outside the grant's closed window.
+
+Inside **G9, entitlement**, with HTTP 409: `ERR_ENTITLEMENT_EXHAUSTED` when an operation that explicitly requires a remaining entitlement unit finds `entitlement_remaining_units` at zero.
+
+Inside **G10, payload**, all with HTTP 400: `ERR_THERMOSTAT_BELOW_MINIMUM` when a `THERMOSTAT_SET` step supplies a `thermostat_f` below 50 on the `ALL_REQUIRED` shortcut; `ERR_FORWARDING_ADDRESS_MISSING` when a mail hold is forwarded while `forwarding_address` is null; `ERR_LANDFALL_ETA_IN_PAST` when a storm event is declared with a `landfall_eta_at` at or before the logical clock; `ERR_PAGINATION_INVALID` when `limit` falls outside the inclusive range one to one hundred or `offset` is negative; and `ERR_CLOCK_REGRESSION` when the logical clock is set to an instant strictly before its current value.
+
+### 2.10. Optimistic Concurrency Control
+
+Three writes in this system are guarded by optimistic concurrency, because each of them legitimately **supersedes** something the client may not have observed. Each guarded endpoint declares an expected-version field as a **required, non-optional** input, and the value must equal the parent entity's current `version` integer at the moment the request is evaluated. Endpoints not listed here take no version field at all.
+
+**Work-order creation against a finding** requires `expected_finding_version` carrying the client's last observed `version` of that `Finding`. If any writer has advanced the finding's version since the client last read it, the create is rejected with `ERR_STALE_FINDING_VERSION` and HTTP 412. The reason the guard exists is that a newly created work order voids any prior `DRAFT` work order on the same finding, so a writer holding a stale view of the finding would silently discard work it never saw. On success the finding's `version` increments by exactly one, once for the request, and the finding row returned by any subsequent read carries the post-mutation value.
+
+**Scheduling a plan tier change** requires `expected_subscription_version` carrying the client's last observed `version` of that `Subscription`. A mismatch is rejected with `ERR_STALE_SUBSCRIPTION_VERSION` and HTTP 412. The guard exists because a tier change supersedes any pending tier change and re-derives the open cycle's entitlement grant, so a stale writer would overwrite an entitlement re-derivation it never observed. On success the subscription's `version` increments by exactly one for the request — not once per affected field and not once per cascade hop into the billing cycle — and the mutated subscription returned in `data` carries that post-mutation value.
+
+**Access-grant creation on a key asset** requires `expected_key_asset_version` carrying the client's last observed `version` of that `KeyAsset`. A mismatch is rejected with `ERR_STALE_KEY_ASSET_VERSION` and HTTP 412. The guard exists because grant creation on a `LOCKBOX` key rotates the code and invalidates every grant stamped with an earlier rotation index, so a stale writer would hand out a code snapshot the rotation has already retired. The same expected-version field, the same comparison and the same error identifier also guard explicit code rotation. On success the key asset's `version` increments by exactly one for the request, however many grants that one request invalidates.
+
+In all three cases the count is the same: **one increment per mutated row per request.** A request that mutates the guarded parent and also mutates children advances the parent's counter once and each child's counter once.
+
+### 2.11. Conservation Invariants
+
+Eleven identities must hold after every mutation. They are the safety net that catches an arithmetic chain implemented in the wrong order.
+
+**Entitlement unit conservation.** Inside one billing cycle, `entitlement_granted_units` plus `entitlement_carried_in_units`, minus `entitlement_consumed_units`, minus `entitlement_remaining_units`, is always zero. There is no compensating action that restores a consumed unit: voiding the `ENTITLEMENT_OFFSET` line on the invoice removes the money but does not return the unit, and the identity therefore holds at every instant regardless.
+
+**Entitlement rollover conservation.** Once a cycle reaches `CLOSED`, its `entitlement_remaining_units` equals `entitlement_carried_out_units` plus `entitlement_expired_units`. Opening the next cycle immediately afterwards sets that cycle's `entitlement_carried_in_units` to exactly the closed cycle's `entitlement_carried_out_units`.
+
+**Invoice line-sum conservation.** An invoice's `subtotal_cents` equals the sum of `amount_cents` over its `ACTIVE` lines whose `line_type` is not `GUARANTEE_CREDIT`, plus the invoice's `storm_surcharge_cents`, plus the sum of `amount_cents` over its `ACTIVE` `GUARANTEE_CREDIT` lines. Appending a line and then voiding it restores `subtotal_cents`, `tax_cents` and `total_cents` to their pre-add values exactly.
+
+**Key copy conservation.** For every key asset, `copies_total` equals `copies_on_hand` plus `copies_issued_outstanding` plus `copies_lost`. Issuing copies and then recording their return returns `copies_on_hand` and `copies_issued_outstanding` to their pre-issuance values.
+
+**Visit billing exclusivity.** For every visit in status `COMPLETED`, exactly one of two things is true: either `entitlement_applied` is true and there is no `ACTIVE` `VISIT_OVERAGE` line naming that visit, or `entitlement_applied` is false and there is exactly one such line. A completed visit is never both entitlement-consuming and overage-billed, and never neither.
+
+**Storm guarantee conservation.** The sum of `guarantee_credit_cents` over storm responses equals the sum, over `ACTIVE` `GUARANTEE_CREDIT` lines on the invoices of the responded properties, of the negated `amount_cents`. A response that reaches `SECURED_LATE` issues zero and appends no credit line at all, so the owner's `total_cents` is exactly the no-guarantee total.
+
+**Work-order cost conservation.** A work order's `total_cents` equals `labour_cost_cents` plus `parts_cost_cents` plus `markup_cents` plus `storm_surcharge_cents`. Invoicing it creates exactly one `ACTIVE` line whose `line_type` is `WORK_ORDER` and whose `amount_cents` equals that total; voiding that line and re-invoicing reproduces the same amount.
+
+**Access-grant count conservation.** A key asset's `active_grant_count` equals the number of grants on it in status `ACTIVE`. A code rotation invalidates every grant whose `rotation_index_at_grant` is strictly less than the new `code_rotation_count` and re-derives `active_grant_count` inside the same request.
+
+**Turnover absorption neutrality.** After a watch visit is converted into a turnover inspection, `entitlement_applied` is false, the billing cycle's `entitlement_consumed_units` is unchanged, and there is exactly one `ACTIVE` `VISIT_OVERAGE` line for that visit whose `amount_cents` is half the scheduled base visit fee. Deferring instead of converting leaves both the entitlement counter and the invoice untouched.
+
+**False-alarm ledger conservation.** The sum of `amount_cents` over `ACTIVE` `FALSE_ALARM_FEE` lines on a property's invoices equals the sum of `false_alarm_fee_cents` over that property's incidents in status `FALSE_ALARM` whose `reported_at` falls inside the rolling 365-day window. Reclassifying an incident back out of `FALSE_ALARM` is not a declared transition, so the ledger is append-only.
+
+**Proration day conservation.** For a tier change, the used-day count plus the remaining-day count is always thirty, and the cycle's `prorated_fee_cents` is the sum of the two independently rounded legs. A tier change followed by a change back on the same day reproduces the original plan's entitlement grant, but not necessarily the original `prorated_fee_cents`, because each leg rounds independently.
+
+### 2.12. Two Pipelines Through One Ladder
+
+A work order's `pipeline` is a derived discriminator, not an input: it reads `STORM` when the work order carries a `storm_event_id`, and `ROUTINE` otherwise. That single field selects the approval ceiling, the surcharge branch and the key-custody prerequisite, and it is worth restating the five divergences precisely because everything else about the two pipelines is shared.
+
+First, **authorization order**. On the routine pipeline the ceiling is the acting owner's `approval_ceiling_override_cents` when that value is present, and 50000 cents otherwise, and the approver must be the `Owner` role. On the storm pipeline the ceiling is a flat 250000 cents, the owner override is structurally not consulted at all, and the approver is the `StormCoordinator`. Second, **deadline arithmetic**. The storm pipeline computes a pre-storm deadline by subtracting a tier-selected lead from the landfall ETA, and a post-storm deadline by adding a fixed SLA to the all-clear instant; the routine pipeline has no deadline arithmetic anywhere. Third, **surcharge tiers**. A storm work order multiplies its pre-surcharge cost by a tier-selected percentage frozen at dispatch; a routine work order never applies a surcharge and its `storm_surcharge_cents` is always zero. Fourth, **entitlement applicability**. A visit bound to a storm response never consumes an entitlement unit regardless of how many units remain. Fifth, **key custody**. The system-level description of the two pipelines states that the storm pipeline may dispatch with `access_blocked_flag` true and no key issuance while the routine pipeline may not — but the key-selection rule that actually stamps that flag is written without any pipeline distinction and says the dispatch still succeeds either way. This divergence is therefore carried forward as an open point (see F12) rather than resolved here.
+
+### 2.13. Open Friction Points
+
+The specification contains a number of places where two clauses pull in different directions or where a stated rule has no derivable trigger. These are recorded here rather than silently resolved, because a wrong resolution written as fact is worse than a named question. In each case the text says what **is** determined and what **is not**.
+
+**F1 — the storm-response assessment carries an expected version with no declared rejection code.** Signing a post-storm damage assessment requires `expected_storm_response_version` as a required input, and the assessment endpoint's gate subsequence includes the optimistic-concurrency band. *Determined:* the field is required; a mismatch against the storm response's current `version` must reject the request inside the concurrency band, before any target-state rung is evaluated; and on success the storm response's `version` increments by exactly one. *Not determined:* which `error_id` the rejection carries. No storm-response staleness code appears in the error catalogue, and the three declared concurrency rules cover only findings, subscriptions and key assets. The implementer must adjudicate, and should note that the other three concurrency rejections all answer HTTP 412.
+
+**F2 — invoice lines that the conservation invariants require but no side effect creates.** The visit-billing-exclusivity invariant asserts that a completed visit with `entitlement_applied` false has exactly one `ACTIVE` `VISIT_OVERAGE` line, and the turnover-absorption-neutrality invariant asserts the same for a converted visit. The storm-guarantee invariant likewise ties `guarantee_credit_cents` to `ACTIVE` `GUARANTEE_CREDIT` lines, and the entitlement-unit invariant speaks of an `ENTITLEMENT_OFFSET` line as the thing a compensating void would remove. *Determined:* the amounts themselves — `billable_amount_cents` on the visit and `guarantee_credit_cents` on the storm response — are computed and stored by the transitions that produce them. *Not determined:* whether those transitions also append the corresponding invoice line automatically, or whether the line is appended later by an operator through the line-appending capability. No visit transition, no storm-response transition and no entitlement rule declares an invoice-line side effect for `VISIT_OVERAGE`, `GUARANTEE_CREDIT` or `ENTITLEMENT_OFFSET`, yet the invariants speak of those lines existing. The three line types that *are* appended automatically by a declared side effect are `SUBSCRIPTION_FEE` at draft-invoice opening, `WORK_ORDER` at work-order invoicing, `FALSE_ALARM_FEE` at false-alarm reclassification and `MAIL_DISPOSITION` on the forward edge from `ACTIVE`. The implementer must adjudicate and be consistent.
+
+**F3 — the rekey-pending condition has two competing codes.** Rung 50 bundles two conditions under one identifier: it requires both a sufficient `copies_on_hand` and a false `rekey_pending_flag`, and names `ERR_KEY_COPIES_UNAVAILABLE` as the rejection. Separately, `ERR_KEY_REKEY_PENDING` exists with the condition "an issuance is requested on a key with `rekey_pending_flag` true". *Determined:* an issuance on a key with a pending rekey is refused. *Not determined:* which of the two identifiers it carries.
+
+**F4 — access-grant validity versus grant window.** Rung 52 bundles a stale rotation index and a clock outside the grant's closed window under `ERR_ACCESS_GRANT_INVALID`. Separately, `ERR_GRANT_WINDOW_NOT_OPEN` exists with the condition "the logical clock lies outside the grant's closed window". *Determined:* both situations are refused. *Not determined:* which identifier the out-of-window case carries.
+
+**F5 — dispatch of a still-pending work order.** Rung 18 would answer `ERR_INVALID_STATE_TRANSITION` for a dispatch attempted from `PENDING_APPROVAL`, because the only declared source state for dispatch is `APPROVED`. `ERR_APPROVAL_REQUIRED` exists with exactly that condition. *Determined:* the dispatch is refused with HTTP 409. *Not determined:* which of the two identifiers.
+
+**F6 — invoice issuing against a cancelled subscription.** Rung 58 bundles "at least one `ACTIVE` line" and "the subscription is not `CANCELLED`" under `ERR_INVOICE_HAS_NO_LINES`, while `ERR_SUBSCRIPTION_CANCELLED` exists as its own code. *Determined:* issuing on a cancelled subscription is refused. *Not determined:* which identifier.
+
+**F7 — the credential rungs at vendor reinstatement.** Reinstatement requires an unexpired certificate of insurance, an unexpired licence and a rating of at least 3.0, and the reinstatement endpoint's gate subsequence includes the vendor-eligibility band. *Determined:* the three preconditions; and that a rating below the floor answers `ERR_VENDOR_RATING_BELOW_FLOOR`. *Not determined:* whether an expired certificate or licence at reinstatement answers `ERR_VENDOR_COI_EXPIRED` and `ERR_VENDOR_LICENSE_EXPIRED` — the catalogue conditions for those two codes are endpoint-agnostic and would cover it, but rungs 44 and 45 scope themselves to dispatch and acceptance only.
+
+**F8 — the mail-forward invoice line on the overflow branch.** Forwarding a hold from `ACTIVE` runs the forward fee variant **and** appends a `MAIL_DISPOSITION` line to the property's draft invoice when one exists. Forwarding a hold from `OVERFLOW` runs the same fee variant but its declared side-effect list stops there, with no line append. *Determined:* both branches compute `disposition_fee_cents` identically. *Not determined:* whether the missing append on the overflow branch is deliberate asymmetry or an omission.
+
+**F9 — two rules with no derivable trigger.** `ERR_VISIT_TYPE_NOT_COVERED` fires when an entitlement-consuming visit type is scheduled that is absent from the plan's `covered_visit_types` "and the property has no other billing route" — but the entitlement rule simply falls through to overage pricing whenever the type is not covered, so a second billing route always exists. `ERR_ENTITLEMENT_EXHAUSTED` fires when "an operation that explicitly requires a remaining entitlement unit" finds zero remaining — but no endpoint declares such a requirement; visit completion falls through to overage instead. *Determined:* nothing forces either rejection on any declared path. *Not determined:* whether either is reachable at all.
+
+**F10 — an unreachable owner status.** `Owner.status` is declared with the two members `ACTIVE` and `INACTIVE`, and registration sets it to `ACTIVE`. No transition, endpoint or side effect anywhere writes `INACTIVE`. *Determined:* the enum's membership, and that owners may be filtered by `status`. *Not determined:* how an owner ever becomes inactive.
+
+**F11 — the freeze-risk fields of a freshly registered property.** `freeze_risk_score` is declared with a default of 0.0 and `risk_posture` with a default of `NORMAL`, yet property registration is declared to run both derivations, and a brand-new property has no temperature reading, a `winterization_completeness_pct` of 0.0 and an `occupancy_state` of `VACANT` — which the weighted formula turns into 25.0 plus 15.0, that is 40.0, and therefore a posture of `ELEVATED`. *Determined:* the formula, its three terms and the banding thresholds. *Not determined:* whether a newly registered property is read back as 0.0 and `NORMAL` (the declared column defaults) or as 40.0 and `ELEVATED` (the result of the derivation the registration is declared to run).
+
+**F12 — whether the routine pipeline may dispatch with no key.** The pipeline description asserts that the storm pipeline may dispatch with `access_blocked_flag` true and no key issuance and that the routine pipeline may not. The key-selection rule, which is the only place the flag is written, contains no pipeline condition at all: when no key asset of the property has `rekey_pending_flag` false and `copies_on_hand` at least one, no key issuance and no access grant are created, the new assignment is stamped `access_blocked_flag` true, and the dispatch itself succeeds. *Determined:* what happens on the storm pipeline, and the exact candidate filter and ranking of key selection. *Not determined:* whether a routine dispatch against a property with no eligible key is refused — and if so, with which error identifier, since no code in the catalogue names that condition — or whether it likewise succeeds with the flag stamped.
+
+**F13 — the ordering of un-numbered gates against numbered rungs.** §2.9 pins each un-numbered rejection to a gate band, and the band ordering is total. *Determined:* the band each un-numbered gate belongs to, and therefore its position relative to every rung of a different band. *Not determined:* its position relative to the numbered rungs of its **own** band, in the rare cases where two of them could fire on the same request.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Homeowners, Homes and the Two Independent Property Axes
+
+A homeowner client is registered with a `full_name`, an `email`, a `phone` and a `primary_residence_state` holding the two-uppercase-letter code of the owner's *other*, non-vacation residence. Two optional switches shape everything that follows. `snowbird_flag`, false unless supplied, declares that this owner migrates seasonally and unlocks cadence-driven absence scheduling. `notification_preference`, defaulting to `EMAIL` and otherwise taking `SMS` or `BOTH`, selects the channel used for incident notification. A third optional input, `approval_ceiling_override_cents`, replaces the platform-wide work-order approval ceiling for this owner alone; when it is left null the platform default of 50000 cents applies, and when supplied it must be zero or greater. Registration always stamps `status` to `ACTIVE` — the enum's other member is `INACTIVE` — and `lifetime_credit_balance_cents` to zero. An owner's `email` must be unique across all owners and must contain an at-sign; a duplicate is rejected with `ERR_UNIQUENESS_VIOLATION`. Later, an operator may revise `phone`, `notification_preference`, `approval_ceiling_override_cents` and `snowbird_flag`; each such revision advances the owner's `version` by one.
+
+`lifetime_credit_balance_cents` is never written directly. It is the sum of the absolute values of `amount_cents` over every `ACTIVE` invoice line whose `line_type` is `GUARANTEE_CREDIT` on invoices carrying this owner's `owner_id`, and it is re-derived whenever such a line is created or voided.
+
+A vacation home is registered against an `owner_id` with a human `label` such as "Naples Beach House", an `address_line`, a two-uppercase-letter `state_code` — the code later matched against a storm event's region — and a `travel_distance_miles`, the road distance in miles from the concierge depot, which must be zero or greater. Two optional inputs complete the row: `freeze_setpoint_f`, the minimum interior temperature in Fahrenheit the home must hold, defaulting to 55 and constrained to the inclusive range from 40 to 80; and `rental_program_enrolled`, false unless supplied, marking the home as participating in short-term rental turnovers. The same four attributes — `label`, `travel_distance_miles`, `freeze_setpoint_f` and `rental_program_enrolled` — are the only ones an operator may later revise, and each revision advances the property's `version` by one.
+
+**Travel zone.** `travel_zone` is derived from `travel_distance_miles` whenever that distance is written, at registration and again on revision, and every comparison is inclusive at the upper edge. A distance of at most 10 miles is `Z1`; otherwise a distance of at most 25 miles is `Z2`; otherwise a distance of at most 60 miles is `Z3`; otherwise the zone is `OUT_OF_AREA`. Ten miles exactly is `Z1` and 10.1 is `Z2`; 25.0 is `Z2`; 60.0 is `Z3` and 60.1 is `OUT_OF_AREA`. The zone carries a flat travel surcharge used later in visit pricing: nothing at all in `Z1`, 1500 cents in `Z2`, 3800 cents in `Z3`. An `OUT_OF_AREA` property cannot hold an active subscription, so the surcharge table never needs a fourth entry.
+
+**The two axes.** Every home carries two lifecycle states that evolve completely independently of one another on the same row. `seasonal_state` starts at `OPEN` and runs as a closed cycle through `CLOSING`, `WINTERIZED` and `OPENING` back to `OPEN`. `occupancy_state` starts at `VACANT` and is star-shaped: every occupied state is entered from `VACANT` and returns to `VACANT`. Certain visit types are legal only in specific *combinations* of the two, which is why the seasonal band of the gate order is evaluated strictly before the occupancy band — the seasonal axis moves slowly and its violations cannot be repaired inside a request, whereas an occupancy conflict often can be.
+
+The occupancy axis has six edges. An owner moves the home from `VACANT` to `OWNER_IN_RESIDENCE`, permitted only while `seasonal_state` is `OPEN` or `OPENING`; the move defers every scheduled `ROUTINE_WATCH` visit on the property, stamping each with a `defer_reason` of `OWNER_IN_RESIDENCE`, and advances the property's `version` by one. The owner returns the home from `OWNER_IN_RESIDENCE` to `VACANT` with no precondition at all; the return re-derives the freeze-risk score and posture, because the vacancy weight now applies again, and advances `version` by one. A dispatcher moves the home from `VACANT` to `RENTAL_OCCUPIED`, permitted only when `rental_program_enrolled` is true and `seasonal_state` is exactly `OPEN`, advancing `version` by one; the reverse edge from `RENTAL_OCCUPIED` to `VACANT` has no precondition, re-derives the freeze-risk score and posture, and advances `version` by one. The remaining pair is driven not by an occupancy request but by vendor activity: a vendor starting on-site work moves the home from `VACANT` to `CONTRACTOR_ONSITE`, permitted when the assignment's work order names this property, advancing `version` by one; and a vendor finishing on-site work moves it from `CONTRACTOR_ONSITE` back to `VACANT`, permitted only when no other assignment on the property is still `WORKING`, re-deriving the freeze-risk score and posture and advancing `version` by one. A move to `RENTAL_OCCUPIED` that fails its enrolment or seasonal precondition is rejected with `ERR_RENTAL_NOT_ENROLLED`; a move to `OWNER_IN_RESIDENCE` attempted while the home is `CLOSING` or `WINTERIZED` is rejected with `ERR_SEASONAL_STATE_FORBIDS_OCCUPANCY`.
+
+**Freeze risk.** Three independent terms feed a weighted score, recomputed whenever a visit records an interior temperature, whenever the occupancy axis moves, and on every winterization step, reopen and seasonal transition. The first term reads `last_interior_temp_f`, the most recent interior reading stamped from a completing visit alongside the `last_temp_reading_at` instant of that reading; if no reading exists the term is 0.0, and otherwise the shortfall is the property's `freeze_setpoint_f` minus that reading, floored at zero, multiplied by 6.0, and then capped at 60.0. The second term reads `winterization_completeness_pct`: if that percentage is 100.0 or greater the term is 0.0, and otherwise it is 25.0 multiplied by one minus the percentage divided by one hundred. The third term is 15.0 when `occupancy_state` is exactly `VACANT`, and 0.0 in every other occupancy state. The three terms are added, the sum is rounded to one decimal place, and `freeze_risk_score` is the smaller of that rounded sum and 100.0. Worked: a setpoint of 55 with a reading of 48, a winterization completeness of 50.0 percent and a vacant home gives a shortfall of 7.0, a first term of 42.0 after the cap comparison, a second term of 12.5, a third term of 15.0, and a score of 69.5.
+
+Immediately after every score run, `risk_posture` is banded from it: a score of at least 60.0 is `CRITICAL`, otherwise a score of at least 30.0 is `ELEVATED`, otherwise the posture is `NORMAL`. Both comparisons include the boundary, so exactly 30.0 is `ELEVATED` and exactly 60.0 is `CRITICAL`.
+
+**The other derived property fields.** `winterization_completeness_pct` mirrors the `completeness_pct` of the property's winterization record with the greatest `created_at`; where two records share that instant the one with the greater `completed_step_count` wins; a property with no winterization record at all reads 0.0. `false_alarm_count_window` counts the property's incidents in status `FALSE_ALARM` whose `reported_at` lies within 365 days of the logical clock. `open_critical_finding_count` counts the property's findings whose `severity` is `CRITICAL` and whose `status` is one of `OPEN`, `TRIAGED`, `WORK_ORDERED` or `MONITORING`, and is re-derived on every finding creation, triage, dismissal and work-order transition. `storm_hold_flag` is true while at least one storm response for this property sits in `SECURE_SWEEP_SCHEDULED`, `SECURED`, `SECURED_LATE`, `MISSED_DEADLINE`, `AWAITING_ALL_CLEAR` or `ASSESSMENT_DUE`; a seasonal transition attempted while the flag is true is rejected with `ERR_PROPERTY_HAS_OPEN_STORM_HOLD`. A dedicated computed read exposes the risk decomposition as an object carrying `freeze_risk_score`, `risk_posture`, `winterization_completeness_pct`, `open_critical_finding_count`, `false_alarm_count_window` and `last_interior_temp_f`.
+
+### 3.2. Plans, Subscriptions, Billing Cycles and the Entitlement Ledger
+
+A service plan is published with a `tier` of `BASIC`, `STANDARD` or `PREMIUM`, a strictly positive `monthly_fee_cents`, an `included_visit_units` count of zero or more, and a non-empty `covered_visit_types` array. The reference tiers are a basic plan at 9986 cents a month granting two included visits, a standard plan at 19986 cents granting four, and a premium plan at 34944 cents granting eight. `entitlement_rollover_policy` defaults to `EXPIRE` and otherwise takes `CARRY_CAPPED`; it is the discriminator for what happens to unspent units at cycle close. `storm_guarantee_included`, false unless supplied, marks the plan as carrying the storm-readiness guarantee that can earn a credit. `status` defaults to `ACTIVE` and otherwise takes `RETIRED`. Every member of `covered_visit_types` must also be one of the three entitlement-consuming visit types — `ROUTINE_WATCH`, `SEASONAL_CLOSE` and `SEASONAL_OPEN` — and an empty array or a member outside that set is rejected with `ERR_UNIQUENESS_VIOLATION`. Retiring a plan sets its `status` to `RETIRED` so that no new subscription may reference it; subscriptions already in force keep the plan.
+
+A subscription binds a `property_id` to a `service_plan_id` from a `started_on` instant, and is born in `PENDING_ACTIVATION`. No billing cycle exists until activation. Activation requires the plan's `status` to be `ACTIVE` — a retired plan is rejected with `ERR_PLAN_RETIRED` — and requires the property's `travel_zone` to be anything other than `OUT_OF_AREA`, an out-of-area property being rejected with `ERR_PROPERTY_OUT_OF_AREA`. Activation creates the first billing cycle with `cycle_index` 1, a `period_start` equal to the subscription's `started_on` and a `status` of `OPEN`; sets `current_cycle_id` to that cycle's id; sets the cycle's `entitlement_granted_units` to the plan's `included_visit_units`, its `entitlement_carried_in_units` to zero and its `entitlement_remaining_units` equal to the grant; and sets the cycle's `prorated_fee_cents` to the plan's `monthly_fee_cents`.
+
+A billing cycle's `period_end` is its `period_start` plus thirty days, exclusive. Its ledger carries `entitlement_granted_units`, `entitlement_carried_in_units`, `entitlement_consumed_units`, `entitlement_remaining_units` — always the grant plus the carry-in minus the consumption — and, once closed, `entitlement_expired_units` and `entitlement_carried_out_units`, both of which read zero while the cycle is not `CLOSED`. `closed_at` records the closing instant. A cycle's `cycle_index` is a one-based ordinal assigned in ascending `period_start` order within its subscription.
+
+**Pause and resume.** Pausing an active subscription requires `current_cycle_id` to be non-null and that cycle to be `OPEN`; a missing open cycle is rejected with `ERR_NO_OPEN_CYCLE`. The pause stamps `paused_at` to the logical clock and reprorates the open cycle under the mid-cycle-pause branch: the paused-day count is the whole days from `paused_at` to the earlier of the logical clock and the cycle's `period_end`, taken as the floor of the elapsed seconds divided by 86400, then clamped to at least zero and at most thirty; and `prorated_fee_cents` becomes the plan's `monthly_fee_cents` multiplied by thirty minus that paused-day count, divided by thirty, rounded once to whole cents. If a draft invoice exists on that cycle, its `ACTIVE` subscription-fee line has its `amount_cents` rewritten to the new prorated figure and the invoice's `gross_service_cents`, `subtotal_cents`, `tax_cents` and `total_cents` are recomputed. Finally, every visit on the property in status `SCHEDULED` whose `scheduled_start_at` falls at or after `paused_at` and strictly before the cycle's `period_end` is deferred with a `defer_reason` of `SUBSCRIPTION_PAUSED`.
+
+Resuming requires `paused_at` to be non-null, and a resume attempted without one is likewise rejected with `ERR_NO_OPEN_CYCLE`. The resume stamps `resumed_at` to the logical clock, adds the whole days of the closed pause interval to `cumulative_paused_days` — the floor of that one interval's seconds divided by 86400, never below zero, accumulated interval by interval rather than by summing seconds across pauses and flooring once at the end — and reprorates the open cycle under the same mid-cycle-pause branch. **The resume deliberately does not un-defer the visits the pause deferred**; those must be rescheduled explicitly.
+
+**Tier changes.** Scheduling a plan tier change supplies the new `service_plan_id` together with `expected_subscription_version`, and it takes effect on the open cycle immediately while also superseding any value already sitting in `pending_tier_change_plan_id`. The proration for a tier change is a different shape from the pause branch. The used-day count is the whole days from the cycle's `period_start` to the logical clock, taken as the floor of elapsed seconds divided by 86400 and clamped to at least zero and at most thirty; the remaining-day count is thirty minus that. **The rounding order is pinned: each leg is rounded to whole cents on its own and only then are the two legs added.** The first leg is the old plan's `monthly_fee_cents` multiplied by the used-day count and divided by thirty, rounded; the second is the new plan's `monthly_fee_cents` multiplied by the remaining-day count and divided by thirty, rounded; `prorated_fee_cents` is their sum. Worked: a change from the standard tier at 19986 to the premium tier at 34944 with seven used days rounds 4663.4 to 4663 and 26790.4 to 26790, for 31453 — where summing first and rounding once would have produced 31454, a one-cent divergence.
+
+The same request re-derives the open cycle's entitlement, and **that order is pinned too**: the cycle's `entitlement_granted_units` is replaced by the new plan's `included_visit_units` first; `entitlement_remaining_units` is then re-derived as the new grant plus `entitlement_carried_in_units` minus `entitlement_consumed_units`; and only then is a floor of zero applied to the result. Applying the floor to the grant instead would stop a downgrade from ever pushing the remaining count below what has already been consumed. The subscription's `version` advances by one.
+
+**Delinquency.** Marking a subscription delinquent requires at least one invoice on its cycles in status `ISSUED` with a positive `balance_due_cents` whose `issued_at` plus twenty-one days is at or before the logical clock — the threshold is inclusive, so exactly twenty-one days after issue already qualifies. The mark stamps `delinquent_since` to the logical clock and applies a late fee to every qualifying issued invoice: `late_fee_cents` becomes that invoice's `balance_due_cents` multiplied by 0.015 and rounded to whole cents, and the invoice's `total_cents` and `balance_due_cents` are recomputed. Worked: a balance of 85271 at day twenty-one yields 1279.065, rounded to 1279. An invoice that does not qualify keeps a `late_fee_cents` of zero. Clearing delinquency requires that no issued invoice on the subscription's cycles still carries a positive balance, and simply clears `delinquent_since` back to null.
+
+**Cancellation.** A subscription may be cancelled from `ACTIVE`, from `PAUSED` or from `DELINQUENT`, and in all three cases the precondition is the same: no visit on the property may be `EN_ROUTE` or `IN_PROGRESS`, a live visit being rejected with `ERR_VISIT_IN_FLIGHT`. Cancellation stamps `cancelled_at` to the logical clock and force-closes the open cycle with `entitlement_carried_out_units` driven to zero regardless of the plan's rollover policy. From the `ACTIVE` source state the cycle passes through `OPEN` to `CLOSING` to `CLOSED` inside the same request, running the rollover with the carry-out forced to zero, and `current_cycle_id` is cleared to null. From `PAUSED` and from `DELINQUENT` the cycle likewise reaches `CLOSED` with `entitlement_carried_out_units` forced to zero. `CANCELLED` is terminal.
+
+**Closing a cycle and opening the next.** Closing a billing cycle moves it from `OPEN` to `CLOSING` and, inside the same request, from `CLOSING` to `CLOSED`; `CLOSING` is transient within the call. The first leg requires that no visit bound to the cycle is `EN_ROUTE` or `IN_PROGRESS` and freezes `entitlement_consumed_units` and `entitlement_remaining_units`. The second leg requires every invoice on the cycle to be in one of `ISSUED`, `PAID`, `PARTIALLY_PAID`, `VOID` or `DRAFT`; it runs the rollover, sets `closed_at` to the logical clock, and clears the subscription's `current_cycle_id` when it pointed at this cycle. The rollover itself is discriminated by the in-force plan's `entitlement_rollover_policy`. Under `EXPIRE` the whole remainder is destroyed: `entitlement_carried_out_units` is zero and `entitlement_expired_units` is the remainder, and the next cycle's carry-in is zero regardless of how large the remainder was. Under `CARRY_CAPPED` the carry-out is the smaller of the remainder and two, and only the excess is destroyed. The two branches diverge whenever any remainder exists at all.
+
+Opening the next cycle for a subscription supplies a `period_start`. The new cycle's `cycle_index` is the previous maximum plus one; its `entitlement_carried_in_units` is set to the closed cycle's `entitlement_carried_out_units` exactly; its `entitlement_granted_units` is set from the in-force plan, applying `pending_tier_change_plan_id` when one is present; and the subscription's `current_cycle_id` is pointed at it.
+
+### 3.3. Absence Windows, Checklist Templates and Scheduling a Visit
+
+A snowbird absence is declared as an away period naming a `property_id` and an `owner_id`, an inclusive `start_at`, an exclusive `end_at` and a requested `cadence_days` between watch visits, which must be at least 3 and at most 30. The declared `owner_id` must equal the property's own `owner_id`, and the window may span at most 240 days; either violation is rejected with `ERR_AWAY_PERIOD_INVALID`. An away period has no state machine of its own — its `derived_status` is read from the logical clock on every read, and is `PLANNED` while the clock is strictly before `start_at`, `IN_EFFECT` while the clock is at or after `start_at` and strictly before `end_at`, and `ENDED` once the clock reaches `end_at`.
+
+`projected_visit_count` is a forward-looking figure and it is computed differently on the initial declaration than on a later revision. At declaration, the away-day count is the whole days between `start_at` and `end_at`, taken as the floor of the elapsed seconds divided by 86400, and the projection is the floor of that away-day count divided by `cadence_days`. Worked: a ninety-day absence at a cadence of fourteen projects six visits. On a mid-period revision the calculation is anchored differently: the anchor instant is the later of the logical clock and `start_at`; the remaining-day count is the whole days from that anchor to `end_at`, again by flooring seconds divided by 86400; and the new projection is `scheduled_visit_count` plus the floor of the remaining-day count divided by the new `cadence_days`. Worked: thirty days into the same absence with two visits already on the books, revised to a cadence of seven, the remaining-day count is sixty and the projection becomes two plus eight, which is ten. A revision is **non-retroactive**: already-scheduled visits are never cancelled or re-timed, and instead are counted into the new projection. Each revision advances `cadence_revision_count` by one. `scheduled_visit_count` itself counts the visits bound to this away period whose status is `SCHEDULED`, `EN_ROUTE`, `IN_PROGRESS` or `COMPLETED`.
+
+A checklist template is published for one `visit_type` with an author-supplied `version_label` such as "2026.1" and a non-empty `item_codes` array whose members are unique. `critical_item_codes`, optional, is a subset of `item_codes` naming the items whose failure automatically raises a critical finding. `default_finding_category`, defaulting to `OTHER`, is the `category` stamped on every finding auto-created from a failed critical item of this template, and takes any of `PLUMBING`, `HVAC`, `ELECTRICAL`, `STRUCTURAL`, `SECURITY`, `PEST`, `LANDSCAPE` or `OTHER`. `status` defaults to `ACTIVE` and otherwise takes `RETIRED`. `required_item_count` is not supplied; it is set to the length of `item_codes` at publication. The seven `visit_type` members are `ROUTINE_WATCH`, `SEASONAL_CLOSE`, `SEASONAL_OPEN`, `TURNOVER_INSPECT`, `STORM_SECURE`, `STORM_ASSESS` and `ALARM_RESPONSE`.
+
+Scheduling a visit names a `property_id`, a `checklist_template_id`, a `visit_type`, a `trigger_source`, and the inclusive `scheduled_start_at` and exclusive `scheduled_end_at` of the planned window; the end must be strictly after the start. Three optional links may be supplied: an `away_period_id` naming the cadence window that produced the visit, a `storm_response_id` set only on the storm pipeline, and a `rental_turnover_id` when the visit is bound to a turnover. `trigger_source` takes `SCHEDULED`, `OWNER_REQUESTED`, `ALARM_TRIGGERED` or `STORM`, and it is the discriminator for the base fee. The bound template's own `visit_type` must equal the submitted `visit_type` and the template must be `ACTIVE`; otherwise the request is rejected with `ERR_TEMPLATE_TYPE_MISMATCH`. A new visit is born `SCHEDULED`, with `entitlement_applied` false, `billable_amount_cents` zero, `after_hours_flag` false, `deferral_count` zero, `checklist_completion_pct` 0.0, empty `completed_item_codes` and `failed_item_codes`, and a null `billing_cycle_id`, `departed_at`, `arrived_at`, `completed_at`, `tech_user_id`, `interior_temp_f` and `defer_reason`.
+
+**Turnover overlap at scheduling.** Every scheduling and rescheduling request is checked against every rental turnover of the property whose status is neither `CHECKIN` nor `CANCELLED`. Each such turnover is padded by ninety minutes on both sides: the padded low edge is its `checkout_at` less ninety minutes and the padded high edge is its `checkin_at` plus ninety minutes. The overlap test is **half-open and strict**: the visit collides when its `scheduled_start_at` is strictly before the padded high edge **and** its `scheduled_end_at` is strictly after the padded low edge. Touching endpoints therefore do not collide — a visit ending exactly at the padded low edge does not overlap, and one starting exactly at the padded high edge does not overlap either. A collision at scheduling or rescheduling is rejected with `ERR_TURNOVER_WINDOW_OVERLAP`, HTTP 409.
+
+### 3.4. Executing a Visit, and the Cascade that Completion Fires
+
+A technician departs, which advances the visit from `SCHEDULED` to `EN_ROUTE`. Departure is the point at which the seasonal and occupancy bands are **re-evaluated** — they are not checked only at scheduling — and it stamps `departed_at` and copies the acting `X-User-ID` into `tech_user_id`. Arrival advances the visit from `EN_ROUTE` to `IN_PROGRESS`, requires `departed_at` to be non-null, stamps `arrived_at` to the logical clock, and freezes `after_hours_flag`. That flag reads the UTC hour field of `arrived_at` alone, ignoring minutes and seconds, and is true when the hour is 22 or later or strictly earlier than 6: an arrival at 21:59 is not after hours, one at 22:00 is, one at 05:59 is, and one at 06:00 is not.
+
+Completion carries `completed_item_codes` and `failed_item_codes` — the checklist items marked pass and fail — and an optional `interior_temp_f` reading, null when the visit type does not read temperature. The two arrays must be disjoint, every member of each must appear in the bound template's `item_codes`, and their combined length must equal the template's `required_item_count`; any violation is `ERR_CHECKLIST_MISMATCH`. Completion is refused with `ERR_VISIT_NOT_ARRIVED` if either `departed_at` or `arrived_at` is missing. Because the combined length is forced to equal `required_item_count`, `checklist_completion_pct` — one hundred multiplied by the combined length of the two arrays and divided by `required_item_count`, rounded to one decimal place — always lands on exactly 100.0 for a successful completion. A read of a completed visit also exposes a duration in whole minutes, the floor of the seconds between `arrived_at` and `completed_at` divided by sixty, and zero when either instant is missing.
+
+Completion is the deepest cascade in the system, and it runs in a fixed order.
+
+**Hop one.** The visit becomes `COMPLETED`, `completed_at` is stamped, and `billing_cycle_id` is stamped with the `OPEN` cycle of the property's subscription — null when no such cycle exists.
+
+**Then the entitlement decision, before any pricing.** The visit consumes one entitlement unit exactly when *all* of the following hold: an `OPEN` billing cycle exists on the property's subscription; that subscription's `status` is `ACTIVE`; the visit's `trigger_source` is `SCHEDULED`; the visit's `visit_type` appears in the in-force plan's `covered_visit_types`; the visit's `visit_type` is one of `ROUTINE_WATCH`, `SEASONAL_CLOSE` or `SEASONAL_OPEN`; the visit's `storm_response_id` is null; and the cycle's `entitlement_remaining_units` is at least one. The boundary is inclusive, so a cycle with exactly one unit left still consumes. When all of that holds, `entitlement_applied` is set true, the cycle's `entitlement_consumed_units` rises by one and its `entitlement_remaining_units` falls by one. Otherwise `entitlement_applied` is set false and no counter moves. **Consumption order is pinned**: units are consumed strictly in ascending visit `completed_at`, and where two visits share a `completed_at` the one with the smaller `created_at` consumes first. No other ordering key is consulted.
+
+**Then the price.** The base fee is discriminated by `trigger_source`. A `SCHEDULED` visit has a base of 6500 cents and no expedite component, and this is the only branch that can ever consume entitlement. Any other trigger source has a base of 11000 cents, with an expedite component of 2500 cents added only when the trigger source is exactly `OWNER_REQUESTED` and zero for `ALARM_TRIGGERED` and `STORM`. The travel surcharge is the flat figure for the property's `travel_zone`. `billable_amount_cents` then follows one of two structurally different branches, discriminated by `entitlement_applied`. On the **entitled** branch the base fee and the expedite component are both waived and the billable amount is the travel surcharge alone; the after-hours multiplier is structurally absent from that expression, because there is no base for it to multiply. On the **overage** branch the after-hours multiplier of 1.35 is applied **to the base fee only** — never to the expedite component and never to the travel surcharge — when `after_hours_flag` is true, with the product rounded to whole cents; the multiplied-or-plain base, the expedite component and the travel surcharge are then added as flat addends. Worked: a scheduled visit in `Z2`, not after hours, on the overage branch, is 6500 plus nothing plus 1500, which is 8000. The same visit on the entitled branch is 1500. An owner-requested visit in `Z3` arriving after hours is 11000 multiplied by 1.35 and rounded to 14850, plus 2500, plus 3800, which is 21150.
+
+**Hop two.** For every code that appears in `failed_item_codes` and also in the template's `critical_item_codes`, a finding is created with `severity` `CRITICAL`, `status` `OPEN`, a `category` equal to the template's `default_finding_category`, and a `description` that is exactly the literal text "Auto-created from failed critical checklist item " followed by the item code. These are processed **in the order the codes appear in the template's `item_codes`**, not in the order they appear in `failed_item_codes`.
+
+**Hops three and four, on the storm pipeline only.** A critical finding raised on a `STORM_ASSESS` visit is auto-triaged to `TRIAGED` and produces a work order with `work_type` `STORM_MITIGATION`, the storm event bound through `storm_event_id`, an `estimated_labour_hours` of 2.0 and an `estimated_parts_cents` of 25000, submitted straight to `PENDING_APPROVAL`. That storm-pipeline work order, if its `total_cents` is at or below 250000, auto-approves with `approved_by_user_id` set to the literal string "system" and auto-dispatches over the window running from the logical clock to twenty-four hours later, creating a vendor assignment in `OFFERED`.
+
+**Hops five through eight.** The new assignment creates a key issuance on the key asset chosen by the key-selection rule; the issuance creates an access grant; the grant rotates the lockbox code, advancing the key's `code_rotation_count`; and the rotation invalidates every access grant whose `rotation_index_at_grant` is strictly less than the new rotation count.
+
+**The remaining completion effects.** When `interior_temp_f` is supplied, the property's `last_interior_temp_f` and `last_temp_reading_at` are stamped from it and the freeze-risk score and posture are re-derived. A temperature breach is detected by a **strict** comparison: the reading is a breach when it is strictly less than the property's `freeze_setpoint_f` minus a tolerance band of 3 degrees. With a setpoint of 55 the trip point is 52.0, so 52.0 is not a breach and 51.9 is. A breach creates a security incident with `incident_type` `FREEZE_ALARM`, `severity` `HIGH` and `status` `REPORTED`. When the visit's `visit_type` is `STORM_SECURE`, the bound storm response has its `secured_at` and `swept_by_user_id` stamped and is settled to `SECURED` or `SECURED_LATE` by the timeliness rule. When the visit's `visit_type` is `SEASONAL_CLOSE` and a winterization record for the property sits in `NOT_STARTED`, `PARTIAL` or `REOPENED`, that record's `visit_id` is bound to this visit.
+
+**The three ways out that are not completion.** A dispatcher may **defer** a scheduled visit, moving it from `SCHEDULED` to `DEFERRED` and supplying a `defer_reason` from `TURNOVER_OVERLAP`, `OWNER_IN_RESIDENCE`, `WEATHER`, `ACCESS_BLOCKED` or `SUBSCRIPTION_PAUSED`; deferral advances `deferral_count` by one and records the reason, leaves `billable_amount_cents` at zero and consumes no entitlement unit. A visit in `DEFERRED` is returned to `SCHEDULED` by rescheduling, which supplies a fresh `scheduled_start_at` and `scheduled_end_at`, re-runs the turnover-overlap test against the new window, and clears `defer_reason` back to null. A dispatcher may **convert** a scheduled visit into a rental turnover's inspection, supplying the `rental_turnover_id`; the target turnover must be in `CLEANING` or `INSPECTION` and the visit's window must overlap that turnover's padded window, an absent overlap being rejected with `ERR_NO_TURNOVER_OVERLAP`. Conversion sets the visit's `rental_turnover_id`, points the turnover's `absorbed_visit_id` at this visit, leaves `entitlement_applied` false, and books an absorption charge of half the scheduled base fee — 6500 multiplied by 0.50, rounded, which is 3250 — into `billable_amount_cents`. The visit reaches the terminal state `CONVERTED`. The deferral and conversion branches are the two arms of one fork over an overlapping visit: entitlement is untouched in both, and they differ purely in money — nothing moves on the deferred arm, 3250 cents moves on the converted arm, and only the deferred arm leaves the visit re-schedulable. Finally, a dispatcher may **abort** a visit from `SCHEDULED`, from `EN_ROUTE` or from `IN_PROGRESS`, with no precondition on any of the three edges; in all three cases `billable_amount_cents` stays at zero and no entitlement unit is consumed. `COMPLETED`, `CONVERTED` and `ABORTED` are all terminal.
+
+A finding may also be recorded manually against a visit, supplying an `item_code` that must appear in the visit's template `item_codes`, a `severity`, a `category` and a free-text `description`. The new finding is born `OPEN` with `property_id` copied from the visit, and the property's `open_critical_finding_count` is re-derived.
+
+### 3.5. Findings, Triage and the Work-Order Cost Chain
+
+A finding carries the `visit_id` of the visit that surfaced it, the `property_id` copied from that visit, the `item_code` it relates to, a `severity` of `LOW`, `MEDIUM`, `HIGH` or `CRITICAL`, a trade `category`, a free-text `description`, an `escalation_score` that starts at 0.0, a `monitor_recheck_count` of zero, null `triaged_at` and `dismissed_at`, and a `status` that starts at `OPEN`. `visit_id` is null in exactly one situation: a finding synthesised when a lost key is declared on a property that has no completed visit yet.
+
+Triage moves a finding from `OPEN` to `TRIAGED` and requires the parent visit to be `COMPLETED`, an incomplete parent being rejected with `ERR_PARENT_VISIT_NOT_COMPLETED`. It stamps `triaged_at` and computes `escalation_score`, a weighted figure with three terms. The severity term is 5.0 for `LOW`, 15.0 for `MEDIUM`, 30.0 for `HIGH` and 50.0 for `CRITICAL`. The recheck term is 8.0 multiplied by `monitor_recheck_count`, capped at 24.0. The posture term reads the property's current `risk_posture` and is 0.0 for `NORMAL`, 10.0 for `ELEVATED` and 20.0 for `CRITICAL`. The three are added, rounded to one decimal place, and `escalation_score` is the smaller of that rounded sum and 100.0.
+
+From `TRIAGED` the finding forks three ways. It may be **parked** in `MONITORING`, which is permitted only when `severity` is `LOW` or `MEDIUM` — a `HIGH` or `CRITICAL` finding is rejected with `ERR_SEVERITY_TOO_HIGH_TO_MONITOR` — and creates no work order. It may be **dismissed**, which requires that no work order on it sits outside the pair `REJECTED` and `VOID`; a live work order is rejected with `ERR_FINDING_HAS_LIVE_WORK_ORDER`. Dismissal stamps `dismissed_at` and re-derives the property's `open_critical_finding_count`; `DISMISSED` is terminal. Or it may move to `WORK_ORDERED` by having a work order created against it. A monitored finding may return to `TRIAGED`, but only when a later completed visit exists on the same property whose `completed_at` is strictly greater than the finding's `triaged_at`; without one the re-triage is rejected with `ERR_NO_RECHECK_VISIT`. The return advances `monitor_recheck_count` by one and re-runs the escalation score, which is why the recheck term exists at all. A monitored finding may also be dismissed directly, under the same live-work-order precondition and with the same two side effects as dismissal from `TRIAGED`.
+
+Creating a work order against a triaged finding supplies a `work_type` of `REPAIR`, `REKEY`, `WINTERIZE_FIX`, `STORM_MITIGATION` or `CLEANING`, an `estimated_labour_hours` of zero or more, an `estimated_parts_cents` of zero or more, and the concurrency guard `expected_finding_version`. Two optional links may be supplied: a `storm_event_id`, which is what makes the work order a storm-pipeline work order, and a `key_asset_id`, set only on a rekey. The finding moves from `TRIAGED` to `WORK_ORDERED`; any prior work order on the same finding still in `DRAFT` moves to `VOID` and produces no invoice line; the new work order is created in `DRAFT`, has `finding_id` bound and `property_id` copied from the finding, records the acting `X-User-ID` as `created_by_user_id`, starts with a `dispatch_attempt_count` of zero and a null `approved_by_user_id`, `rejection_reason`, `actual_labour_hours` and `actual_parts_cents`, and is **immediately submitted to `PENDING_APPROVAL` inside the same request**, running the whole cost chain; and the finding's `version` advances by one.
+
+**The cost chain, in its pinned order.** The markup tier reads like a function of the total while the total is a function of the markup, and the specification breaks the apparent circularity by fixing this sequence.
+
+*Step one, labour.* The hour count is `actual_labour_hours` when that value has been recorded and `estimated_labour_hours` otherwise. The rate is the `hourly_rate_cents` of the vendor on this work order's assignment in status `ACCEPTED`, `WORKING` or `FINISHED`, and 8500 cents per hour when no such assignment exists yet. `labour_cost_cents` is the hour count multiplied by the rate, rounded to whole cents. Worked: 3.5 hours at 8500 is 29750.
+
+*Step two, parts.* `parts_cost_cents` is `actual_parts_cents` once the work order has reached `COMPLETED` or beyond, and `estimated_parts_cents` before that.
+
+*Step three, the base.* The base is `labour_cost_cents` plus `parts_cost_cents`.
+
+*Step four, markup.* Two discriminators apply. The first is the bound vendor's `billing_mode`, treated as `MANAGED` when no vendor is bound yet: `MANAGED` starts at 18 percent of the base and `PASS_THROUGH` starts at 5 percent. The second is the value tier, and **the tier is selected on the base — labour plus parts, before any markup — never on `total_cents`**, even though the tier reads colloquially as the work order's value. When the base is at or above 100000 cents, 3 percentage points of relief are subtracted from the percentage. The percentage is applied to the base and rounded to whole cents, and `markup_cents` is the smaller of that rounded figure and a cap of 60000 cents. Worked: a base of 41750 on a managed vendor below the volume tier gives 7515.0, rounded to 7515. A base of 120000 on a managed vendor at or above the tier gives a percentage of 0.15 and a markup of 18000. On the same base the two billing modes differ by 13 percent of the base, and the volume relief can push a pass-through vendor to 2 percent while a managed vendor lands at 15.
+
+*Step five, the storm surcharge.* On a `ROUTINE` work order `storm_surcharge_cents` is always zero. On a `STORM` work order the pre-surcharge amount is `labour_cost_cents` plus `parts_cost_cents` plus `markup_cents` — **the basis includes the markup**; applying the percentage to labour and parts only is the tempting wrong reading — and `storm_surcharge_cents` is that pre-surcharge amount multiplied by the work order's `surcharge_pct_applied`, rounded to whole cents.
+
+*Step six, the total.* `total_cents` is the base plus `markup_cents` plus `storm_surcharge_cents`. Worked routine: 3.5 hours at 8500 gives 29750 labour, plus 12000 parts, for a base of 41750; markup 7515; surcharge zero; total 49265. Worked storm at the imminent tier of 0.35: the same base gives markup 7515, a pre-surcharge amount of 49265, a surcharge of 17242.75 rounded to 17243, and a total of 66508.
+
+**The approval fork.** `approval_ceiling_cents` is discriminated by `pipeline`. On `ROUTINE` it is the owner's `approval_ceiling_override_cents` when that value is present and 50000 cents otherwise, and the approver must be the `Owner`. On `STORM` it is a flat 250000 cents, the owner override is structurally not consulted, and the approver is the `StormCoordinator`. `approval_required` is true exactly when `total_cents` is **strictly greater** than `approval_ceiling_cents`: a total of exactly 50000 against the default ceiling does not require approval, and 50001 does. When `approval_required` comes out false the work order **continues to `APPROVED` inside the same submitting request**, with `approved_by_user_id` set to the literal string "system".
+
+An owner approving a routine work order must be the property's owner; approval simply records the acting `X-User-ID` in `approved_by_user_id`. A storm coordinator approving a storm work order may do so only while `total_cents` is at or below 250000 — a larger total is rejected with `ERR_STORM_CEILING_EXCEEDED` — and the Owner rung is not consulted at all on that pipeline. Rejection requires a `rejection_reason` and returns the parent finding from `WORK_ORDERED` to `TRIAGED`. A rejected work order may be re-submitted, which moves it from `REJECTED` back to `DRAFT`, but only when `estimated_labour_hours` or `estimated_parts_cents` differs from the rejected values; the re-submission clears `rejection_reason` and re-runs the cost calculations. Submission from `DRAFT` requires the parent finding to be in `WORK_ORDERED`.
+
+Once the vendor has finished, recording the actuals moves the work order from `IN_PROGRESS` to `COMPLETED`. It requires the accepted assignment to be `FINISHED` and requires both `actual_labour_hours` and `actual_parts_cents` to be supplied, and it re-runs labour, markup, storm surcharge and total from the actuals. On a `REKEY` work order it additionally clears the key asset's `rekey_pending_flag` to false; `copies_total` and `copies_lost` are both left exactly as they were, so `copies_on_hand` stays reduced by the lost copies. Invoicing a completed work order supplies an `invoice_id` whose invoice must be in `DRAFT`, creates one `ACTIVE` invoice line with `line_type` `WORK_ORDER` and an `amount_cents` equal to the work order's `total_cents`, and re-derives the invoice's `storm_surcharge_pct`, `gross_service_cents`, `storm_surcharge_cents`, `subtotal_cents`, `tax_cents` and `total_cents`. `INVOICED` and `VOID` are the two terminal states.
+
+### 3.6. Vendors: Eligibility, Selection, Dispatch and On-Site Work
+
+A contractor is onboarded with a `legal_name`, a `trade` of `PLUMBING`, `HVAC`, `ELECTRICAL`, `GENERAL`, `SECURITY`, `LOCKSMITH` or `LANDSCAPE`, a `coi_expires_at` certificate-of-insurance expiry instant, a `license_expires_at` trade-licence expiry instant, a strictly positive `hourly_rate_cents`, and a `rating` on a zero-to-five scale. `billing_mode` defaults to `MANAGED` and otherwise takes `PASS_THROUGH`; `emergency_capable`, false unless supplied, is what admits the vendor to storm dispatch. A new vendor is born `ONBOARDING`, with `outstanding_key_count` zero and `last_eligibility_evaluated_at` null. `outstanding_key_count` counts that vendor's key issuances in status `ISSUED` or `OVERDUE` and is re-derived on every issuance transition.
+
+The vendor lifecycle has two re-entrant loops. Reinstatement promotes an `ONBOARDING` or a `SUSPENDED` vendor to `ELIGIBLE`, and both edges carry the same three preconditions: `coi_expires_at` strictly after the logical clock, `license_expires_at` strictly after the logical clock, and a `rating` of at least 3.0. A rating below the floor is rejected with `ERR_VENDOR_RATING_BELOW_FLOOR`. Both edges stamp `last_eligibility_evaluated_at`. Suspension moves an `ELIGIBLE` vendor to `SUSPENDED` with no precondition, and it is deliberately **not retroactive**: assignments already `ACCEPTED` or `WORKING` are untouched and only new offers are blocked. An eligibility refresh drops an `ELIGIBLE` vendor to `LAPSED` when either `coi_expires_at` or `license_expires_at` is at or before the logical clock, stamping `last_eligibility_evaluated_at` and leaving completed work untouched. A credentials update — which may revise any of `coi_expires_at`, `license_expires_at`, `rating` and `hourly_rate_cents` — returns a `LAPSED` vendor to `ELIGIBLE` when the submitted expiries are both strictly after the logical clock, stamps `last_eligibility_evaluated_at`, and advances the vendor's `version` by one.
+
+**Selection.** Dispatch selects a vendor rather than being told one. The required trade is derived from the finding's `category` by a fixed map: `PLUMBING` needs a `PLUMBING` vendor, `HVAC` needs `HVAC`, `ELECTRICAL` needs `ELECTRICAL`, `SECURITY` needs `SECURITY`, `LANDSCAPE` needs `LANDSCAPE`, and each of `STRUCTURAL`, `PEST` and `OTHER` needs a `GENERAL` vendor. The candidate pool is every vendor whose `status` is `ELIGIBLE`, whose `trade` equals the required trade, whose `coi_expires_at` and `license_expires_at` are both strictly after the logical clock, whose `rating` is at least 3.0 compared at one decimal place, who — on the `STORM` pipeline only — has `emergency_capable` true, who is not in the exclusion set of vendors that have already declined an offer on this work order, and who holds no key issuance in status `OVERDUE` or `LOST`. The pool is ranked by `rating` descending, then by `hourly_rate_cents` ascending, then by `created_at` ascending; `created_at` ascending is the final tie-break and `id` is never consulted. When the pool comes out empty no assignment is created, `dispatch_attempt_count` is **not** incremented, the work order stays `APPROVED`, and the request fails with `ERR_NO_ELIGIBLE_VENDOR`, HTTP 409.
+
+Dispatch itself supplies the `window_start_at` and `window_end_at` of the intended on-site window and requires `dispatch_attempt_count` to be strictly less than three. It advances `dispatch_attempt_count` by one, creates a vendor assignment in `OFFERED` for the selected vendor with `offered_at` stamped to the logical clock and `coi_valid_at_offer` snapshotting whether the vendor's `coi_expires_at` was strictly after the clock at that instant — a later lapse never retro-invalidates completed work — and, on the storm pipeline, freezes both the storm response's `surcharge_pct_at_dispatch` and the work order's `surcharge_pct_applied`. The same request then runs key selection: the candidate keys are the property's key assets whose `rekey_pending_flag` is false and whose `copies_on_hand` is at least one, ranked with `LOCKBOX` keys before `PHYSICAL` keys and then by `created_at` ascending, with `created_at` again the final tie-break and `id` never consulted. When that pool is empty no key issuance and no access grant are created, the new assignment is stamped with `access_blocked_flag` true, **and the dispatch itself still succeeds**.
+
+**The assignment lifecycle.** A vendor accepts an offer, which requires the vendor's `status` to be `ELIGIBLE`, requires that the vendor holds no key issuance in status `OVERDUE` or `LOST`, and requires that the window does not overlap another assignment of the same vendor. That overlap test is a **closed-interval exclusive occupancy check with no buffer and a capacity of exactly one**: a conflict exists when some other assignment of the same vendor, in status `ACCEPTED` or `WORKING`, has a `window_start_at` at or before this assignment's `window_end_at` and a `window_start_at` of this assignment at or before that other assignment's `window_end_at`. A conflict is rejected with `ERR_VENDOR_WINDOW_CONFLICT`. Acceptance stamps `accepted_at`.
+
+A vendor declines an offer with an optional `decline_reason`, and the decline has three consequences beyond recording the reason: the parent work order returns from `DISPATCHED` to `APPROVED` so it can be re-dispatched, with `dispatch_attempt_count` deliberately **not** decremented; any key issuance created for this assignment still in `ISSUED` moves to `RETURNED` and its access grant is `INVALIDATED` with an `invalidated_reason` of `ASSIGNMENT_WITHDRAWN`; and the declining vendor joins the exclusion set consumed by the selector on the next dispatch. `DECLINED` is terminal.
+
+A vendor starts on-site work, which requires an access grant for this vendor on the property's key to be in `PENDING` or `ACTIVE` with the logical clock inside its window, inclusive at both ends. Starting work moves the assignment from `ACCEPTED` to `WORKING`, moves that access grant from `PENDING` to `ACTIVE`, moves the parent work order from `DISPATCHED` to `IN_PROGRESS`, and moves the property's occupancy from `VACANT` to `CONTRACTOR_ONSITE`. Finishing work moves the assignment from `WORKING` to the terminal `FINISHED`, stamps `finished_at`, and returns the property's occupancy from `CONTRACTOR_ONSITE` to `VACANT` when no other assignment on that property is still `WORKING`. A dispatcher may instead withdraw an accepted assignment, moving it to the terminal `WITHDRAWN`; withdrawal invalidates every access grant belonging to that assignment's key issuance with an `invalidated_reason` of `ASSIGNMENT_WITHDRAWN` and returns the parent work order from `DISPATCHED` to `APPROVED`.
+
+### 3.7. Keys, Lockbox Codes and Access Custody
+
+A key asset is registered against a property with a `key_type` of `PHYSICAL` or `LOCKBOX`, a human `label` such as "Front door lockbox", a `copies_total` of at least one, and an optional `current_code`. Physical keys are handed over; lockbox keys are code-based and rotate. Registration sets `copies_on_hand` equal to `copies_total` and `code_rotation_count` to zero. `copies_total` doubles as the aggregate concurrency capacity for simultaneous access windows on the key. `current_code` is null for physical keys.
+
+The copy ledger is re-derived on every issuance transition and is a strict identity: `copies_issued_outstanding` is the sum of `copies_issued` over the key's issuances in status `ISSUED` or `OVERDUE`; `copies_lost` is the same sum over issuances in status `LOST` or `REKEY_ORDERED`; and `copies_on_hand` is `copies_total` minus those two. `copies_on_hand` may legitimately reach zero, but an issuance that would drive it negative is refused.
+
+**Issuance.** Handing key copies to a vendor supplies the `vendor_id`, an optional `vendor_assignment_id` naming the assignment that justified the issuance — null for standing issuances — and an optional `copies_issued` count of at least one, defaulting to one. Two custody gates apply, and they are the two key-custody rungs: the vendor must hold no key issuance in status `OVERDUE` or `LOST`, otherwise `ERR_VENDOR_KEY_OVERDUE`; and the key must have a `copies_on_hand` at least equal to the requested `copies_issued` with `rekey_pending_flag` false, otherwise `ERR_KEY_COPIES_UNAVAILABLE`. Issuance stamps `issued_at` to the logical clock, computes `return_deadline_at` as `issued_at` plus a window that is 24 hours for a `LOCKBOX` key and 48 hours for a `PHYSICAL` key, sets `status` to `ISSUED` and `overdue_days` to zero, and re-derives the key's `copies_issued_outstanding` and `copies_on_hand`.
+
+Returning a key on time moves the issuance from `ISSUED` to the terminal `RETURNED`, and is permitted only while the logical clock is at or before `return_deadline_at`. It stamps `returned_at` and re-derives `copies_issued_outstanding`, `copies_on_hand` and the vendor's `outstanding_key_count`. Marking an issuance overdue moves it from `ISSUED` to `OVERDUE` and is permitted only once the logical clock is strictly past `return_deadline_at` plus a grace of 6 hours; an earlier attempt is rejected with `ERR_ISSUANCE_NOT_OVERDUE`. The overdue mark blocks any further issuance to that vendor until the issuance leaves `OVERDUE`, and it computes `overdue_days`. That day count is zero while the clock is at or before `return_deadline_at`, and is otherwise the **ceiling** of the seconds since the deadline divided by 86400 — one second past the deadline is already one overdue day. The six-hour grace window gates the *transition* into `OVERDUE` and is deliberately **not** subtracted from the day count. Returning from `OVERDUE` moves the issuance to the terminal `RETURNED_LATE` with no precondition, stamping `returned_at` and re-deriving the same ledger fields.
+
+**Loss and rekey.** Declaring an overdue key lost requires `overdue_days` to be at least 7, an earlier attempt being rejected with `ERR_LOST_THRESHOLD_NOT_MET`. The declaration moves the issuance to `LOST`, re-derives the key's `copies_lost` and `copies_on_hand`, and invalidates every access grant carrying this issuance's id with an `invalidated_reason` of `KEY_LOST`. Inside the same request the issuance continues from `LOST` to the terminal `REKEY_ORDERED`, permitted only when the key's `rekey_pending_flag` is currently false. That continuation sets `rekey_pending_flag` true and raises remediation: a finding with `severity` `HIGH`, `category` `SECURITY` and `status` `TRIAGED`, bound to the property's completed visit with the greatest `completed_at` or carrying a null `visit_id` when the property has no completed visit at all; and a work order with `work_type` `REKEY` in `PENDING_APPROVAL` whose `estimated_labour_hours` is 1.0 and whose `estimated_parts_cents` is 32500. That work order then runs the ordinary labour, markup and total chain, so its total is **not** simply 32500.
+
+**Access grants.** A grant is created against a key asset for a `vendor_id` over an inclusive `window_start_at` to `window_end_at`, with an optional `key_issuance_id` naming the issuance the grant accompanies — null for code-only grants — and the concurrency guard `expected_key_asset_version`. A new grant is born `PENDING`. On a `LOCKBOX` key the creation **rotates the code first**, so the grant carries the post-rotation snapshot: `code_rotation_count` advances by one; `current_code` is rewritten to the previous code's integer value plus one, rendered as a four-character zero-padded decimal string, so that "1111" becomes "1112", and to the literal "0001" when the previous code was null or was not numeric; `rotation_index_at_grant` and `code_snapshot` are stamped from the post-rotation values; every other grant whose `rotation_index_at_grant` is strictly less than the new count is moved to `INVALIDATED` with an `invalidated_reason` of `CODE_ROTATION`; and the key asset's `version` advances by one.
+
+An explicit rotation supplies an explicit `new_code` together with `expected_key_asset_version`. It advances `code_rotation_count` by one, rewrites `current_code` to the supplied value, invalidates every grant in `PENDING` or `ACTIVE` whose `rotation_index_at_grant` is strictly less than the new count with an `invalidated_reason` of `CODE_ROTATION`, re-derives `active_grant_count`, and advances the key asset's `version` by one. An `ACTIVE` grant invalidated this way also decrements `active_grant_count` by one, while a `PENDING` grant invalidated this way does not, because a pending grant was never counted.
+
+Activating a grant moves it from `PENDING` to `ACTIVE` and carries three preconditions. The logical clock must lie inside the closed window running from `window_start_at` to `window_end_at`, inclusive at both ends. The grant's `rotation_index_at_grant` must equal the key's current `code_rotation_count`; a stale index is rejected with `ERR_ACCESS_GRANT_INVALID`. And the count of `ACTIVE` grants on the key must be strictly less than the key's `copies_total`, an excess being rejected with `ERR_ACCESS_CAPACITY_EXCEEDED`. The capacity rule itself is a **closed-interval aggregate** test — deliberately a different geometry from the half-open turnover test: the concurrent count is the number of grants on the same key, excluding the candidate itself, whose `status` is `PENDING` or `ACTIVE` and whose window satisfies both "that grant's `window_start_at` is at or before the candidate's `window_end_at`" and "the candidate's `window_start_at` is at or before that grant's `window_end_at`". **Touching endpoints do collide here**: a grant ending at 12:00 and one starting at 12:00 are concurrent. Activation is allowed while that concurrent count is strictly below `copies_total`, and it advances `active_grant_count` by one.
+
+Revoking a grant supplies a `revoke_reason`. With a reason of `OPERATOR` the grant moves from `ACTIVE` to the terminal `REVOKED` with no precondition. With a reason of `WINDOW_ELAPSED` it moves from `ACTIVE` to the terminal `EXPIRED`, permitted only once the logical clock is strictly past `window_end_at`. Both edges decrement `active_grant_count` by one. `INVALIDATED` is the third terminal state, reached only through a code rotation, a key loss or an assignment withdrawal, and `invalidated_reason` records which of the three it was: `CODE_ROTATION`, `KEY_LOST` or `ASSIGNMENT_WITHDRAWN`. A key asset's `active_grant_count` is at all times exactly the number of `ACTIVE` grants on it.
+
+### 3.8. Seasonal Close, Winterization and Spring Open
+
+The seasonal axis is a closed cycle driven by a single capability that takes an `action`. `BEGIN_CLOSE` moves the property from `OPEN` to `CLOSING`. It requires `occupancy_state` to be `VACANT` and requires that no rental turnover on the property sits in `CHECKOUT`, `CLEANING`, `INSPECTION` or `READY`, an in-flight turnover being rejected with `ERR_TURNOVER_IN_FLIGHT`. It creates a winterization record for the property in status `NOT_STARTED` and advances `Property.version` by one.
+
+`ABORT_CLOSE` returns the property from `CLOSING` to `OPEN` and requires the newest winterization record to be in `NOT_STARTED` or `PARTIAL`. It moves that record to `REOPENED` with a `reopen_reason` of `SPRING_OPEN`, re-derives `winterization_completeness_pct`, and advances `Property.version` by one.
+
+`COMPLETE_WINTERIZATION` moves the property from `CLOSING` to `WINTERIZED`. It requires the newest winterization record to be in status `COMPLETE` — anything less is rejected with `ERR_WINTERIZATION_INCOMPLETE` — and requires `occupancy_state` to be `VACANT`. It sets `winterization_completeness_pct` to 100.0, re-derives `freeze_risk_score` and `risk_posture`, and advances `Property.version` by one.
+
+`BEGIN_OPEN` moves the property from `WINTERIZED` to `OPENING`. It requires that no key issuance on any key asset of the property is `OVERDUE` or `LOST`, a custody problem being rejected with `ERR_KEY_CUSTODY_BLOCKS_OPEN`. It moves the newest winterization record from `COMPLETE` to `REOPENED` with a `reopen_reason` of `SPRING_OPEN`, re-derives `winterization_completeness_pct` from that reopened record, re-derives `freeze_risk_score` and `risk_posture`, and advances `Property.version` by one.
+
+`COMPLETE_OPEN` closes the cycle from `OPENING` back to `OPEN`. It requires at least one visit on the property with `visit_type` `SEASONAL_OPEN` and status `COMPLETED` whose `completed_at` is at or after the newest winterization record's `created_at`; without one the request is rejected with `ERR_NO_SEASONAL_OPEN_VISIT`. Its only effect is to advance `Property.version` by one. The seasonal axis has no terminal state.
+
+A winterization record may also be opened outside the seasonal-close flow, optionally naming the `visit_id` it belongs to. Either way it is born `NOT_STARTED` with a `completeness_pct` of 0.0, `completed_step_count` zero, `water_shutoff_done`, `lines_drained_done`, `valve_tagged_done` and `antifreeze_added_done` all false, and `thermostat_set_f`, `completed_at` and `reopen_reason` all null.
+
+**Steps.** A step submission supplies a `step_code` and, for the thermostat step, a `thermostat_f` value. The four required step codes are `WATER_SHUTOFF`, `LINES_DRAINED`, `THERMOSTAT_SET` and `VALVE_TAGGED`; the single optional code is `ANTIFREEZE_ADDED`; and the literal `ALL_REQUIRED` is a shortcut. Anything else, or a `THERMOSTAT_SET` step with no `thermostat_f`, is rejected with `ERR_WINTERIZATION_STEP_INVALID`. `completed_step_count` counts the four required steps recorded as done: one for `water_shutoff_done`, one for `lines_drained_done`, one for `valve_tagged_done`, and one for the thermostat step **only when `thermostat_set_f` is non-null and at least 50** — a `THERMOSTAT_SET` step submitted with a `thermostat_f` of 49 records the value but does not increase the count, while 50 exactly does. `antifreeze_added_done` is deliberately not counted at all. `completeness_pct` is one hundred multiplied by `completed_step_count` and divided by four, rounded to one decimal place, so one of four is 25.0 and three of four is 75.0.
+
+The record's own state follows the count. From `NOT_STARTED` a step that leaves the count at least one and strictly below four moves the record to `PARTIAL`. From `PARTIAL` a further step keeps it in `PARTIAL` while the resulting count is still strictly below four, and requires that the submitted step is not already recorded as done — a repeat is rejected with `ERR_STEP_ALREADY_RECORDED`. A step that brings the count to exactly four moves the record from `PARTIAL` to `COMPLETE`, stamps `completed_at` and sets `completeness_pct` to 100.0. The `ALL_REQUIRED` shortcut moves a record straight from `NOT_STARTED` to `COMPLETE`, requires a `thermostat_f` of at least 50 — a lower value is rejected with `ERR_THERMOSTAT_BELOW_MINIMUM` — and records all four required steps at once, stamping `completed_at` and setting `completeness_pct` to 100.0. Every step submission re-derives the property's `winterization_completeness_pct`, `freeze_risk_score` and `risk_posture`.
+
+Reopening a `COMPLETE` record requires a `reopen_reason` of `FREEZE_ALARM`, `SPRING_OPEN`, `RENTAL_TURNOVER` or `INSPECTION_FAIL`. It moves the record to `REOPENED`, clears the four required step flags to false, clears `thermostat_set_f` and `completed_at` to null, recomputes `completeness_pct` to 0.0, and re-derives the property's `winterization_completeness_pct`, `freeze_risk_score` and `risk_posture`. A step submitted against a `REOPENED` record that leaves the count at least one and strictly below four returns it to `PARTIAL`, recomputing `completed_step_count` and `completeness_pct`. The winterization machine has no terminal state.
+
+### 3.9. Rental Turnovers, Mail Holds and Security Incidents
+
+**Turnovers.** A rental turnover is booked against a property with a guest `checkout_at`, the next guest's `checkin_at` — which must be strictly after the checkout — and a `guest_reference` naming the outgoing booking. It is born `BOOKED`, with `clean_started_at`, `inspect_started_at`, `ready_at` and `absorbed_visit_id` all null and `reclean_attempt_count` zero. A single advance capability takes a `to_status` and drives the stage machine; an advance that targets a stage which is not the declared successor of the current one is rejected with `ERR_TURNOVER_STAGE_INVALID`.
+
+`CHECKOUT` is reachable from `BOOKED` once the logical clock is at or after `checkout_at`, and it flips the property's `occupancy_state` from `RENTAL_OCCUPIED` to `VACANT` when it was `RENTAL_OCCUPIED`. `CLEANING` is reachable from `CHECKOUT` with no precondition and stamps `clean_started_at`. `INSPECTION` is reachable from `CLEANING` with no precondition and stamps `inspect_started_at`. `READY` is reachable from `INSPECTION` with no precondition and stamps `ready_at`. `CHECKIN` is reachable from `READY` once the logical clock is at or after `checkin_at`, and it flips the property's `occupancy_state` from `VACANT` to `RENTAL_OCCUPIED`; it is terminal. `CANCELLED` is reachable from `BOOKED` alone, with no precondition; any visit bound to this turnover and still `SCHEDULED` **keeps its schedule** and only the link is cleared. `CANCELLED` is likewise terminal. Failing an inspection is a separate capability that sends the turnover back from `INSPECTION` to `CLEANING`, requires `reclean_attempt_count` to be strictly less than two — a third attempt is rejected with `ERR_RECLEAN_ATTEMPTS_EXHAUSTED` — advances `reclean_attempt_count` by one, and clears `inspect_started_at` back to null.
+
+**Mail holds.** A hold is opened against a property with an inclusive `start_on`, an exclusive `end_on` that must be strictly later, and an optional `forwarding_address`. `hold_days` is the whole days between the two, taken as the floor of the elapsed seconds divided by 86400. A creation whose `hold_days` exceeds 30 is rejected with `ERR_HOLD_TOO_LONG`, and so is an extension whose resulting `hold_days` would exceed 60. A new hold is born `REQUESTED`, with `package_count`, `overflow_events`, `extension_count` and `disposition_fee_cents` all zero.
+
+Package logging supplies a signed `package_delta`, positive on accumulation and negative on collection, and the new count is the previous `package_count` plus the delta, floored at zero so the count can never go negative. Overflow is reached when the new count is **at or above** six, so exactly six packages is already an overflow. A logging call with a `package_delta` of exactly zero moves the hold from `REQUESTED` to `ACTIVE`, permitted only once the logical clock is at or after `start_on`; an earlier attempt is rejected with `ERR_MAIL_HOLD_NOT_STARTED`, and no fee is assessed. A positive delta that brings the count to at least six moves the hold from `ACTIVE` to `OVERFLOW` and advances `overflow_events` by one; **no security incident and no finding is created — overflow is a billing and scheduling signal only**. A negative delta that brings the count back below six moves the hold from `OVERFLOW` to `ACTIVE`, reducing `package_count` by the collected amount.
+
+The disposition fee has two structurally different branches selected by the `disposition` chosen. On the **forward** branch the fee is an affine function of packages: a base of 1800 cents plus 250 cents for every package in `package_count`, so a forward with six packages costs 3300 cents and the fee grows without bound as packages accumulate. On the **hold-extension** branch the fee is purely multiplicative in extensions with no base at all: 900 cents multiplied by `extension_count`, so a hold extended twice carries 1800 cents, and because extensions are capped at two the branch is capped at 1800. The two branches read entirely different fields.
+
+Extending a hold requires `extension_count` to be strictly below two, an exhausted hold being rejected with `ERR_HOLD_EXTENSIONS_EXHAUSTED`. The extension adds 15 days to `end_on`, advances `extension_count` by one, and runs the hold-extension fee branch. Forwarding a hold requires a non-null `forwarding_address`, a missing one being rejected with `ERR_FORWARDING_ADDRESS_MISSING`. Forwarding is reachable from `ACTIVE` and from `OVERFLOW`, and on both edges it runs the forward fee branch and writes `disposition_fee_cents`; on the `ACTIVE` edge it additionally appends an `ACTIVE` invoice line with `line_type` `MAIL_DISPOSITION` to the property's draft invoice when one exists, and the declared effects of the `OVERFLOW` edge stop at the fee. `FORWARDED` is terminal. Releasing a hold is reachable from `ACTIVE` and requires `package_count` to be exactly zero, outstanding packages being rejected with `ERR_PACKAGES_OUTSTANDING`; `disposition_fee_cents` stays at whatever the extension ladder left it. `RELEASED` is terminal.
+
+**Security incidents.** An incident is reported against a property with an `incident_type` of `ALARM_INTRUSION`, `ALARM_SMOKE`, `FREEZE_ALARM`, `WATER_LEAK`, `VANDALISM` or `UNAUTHORIZED_ACCESS`, a `severity`, and an optional `visit_id` naming the visit that detected it — null for externally reported alarms. It is born `REPORTED`, with `reported_at` stamped to the logical clock, `escalation_count` zero, `triggered_visit_id` and `resolution_note` null, `false_alarm_sequence` null and `false_alarm_fee_cents` zero.
+
+Acknowledgement moves the incident from `REPORTED` to `ACKNOWLEDGED` with no precondition and no billing effect. Investigation moves it from `ACKNOWLEDGED` to `INVESTIGATING`, and on that first pass an incident whose `incident_type` is `ALARM_INTRUSION`, `ALARM_SMOKE` or `FREEZE_ALARM` forces an `ALARM_RESPONSE` visit with a `trigger_source` of `ALARM_TRIGGERED`, whose id is written into `triggered_visit_id`; the request may supply the `checklist_template_id`, `scheduled_start_at` and `scheduled_end_at` for that visit. Escalation moves the incident from `INVESTIGATING` to `ESCALATED`, requires a `severity` of `HIGH` or `CRITICAL` — a lower severity is rejected with `ERR_SEVERITY_TOO_LOW_TO_ESCALATE` — and advances `escalation_count` by one. Investigation is also the return edge from `ESCALATED` back to `INVESTIGATING`, and on that and every later pass **no additional visit is created**. Resolution is reachable from `INVESTIGATING` and from `ESCALATED`, requires a `resolution_note`, assesses no fee, and reaches the terminal `RESOLVED` on both edges.
+
+Reclassification as a false alarm is reachable from `INVESTIGATING` and from `ESCALATED`, and the two edges carry identical effects. It is permitted only when `incident_type` is `ALARM_INTRUSION`, `ALARM_SMOKE`, `FREEZE_ALARM` or `UNAUTHORIZED_ACCESS`; a `WATER_LEAK` or `VANDALISM` incident is rejected with `ERR_INCIDENT_NOT_ALARM_CLASS`. An optional `resolution_note` may be supplied. The reclassification first sets `false_alarm_sequence`: the peer set is the property's incidents in status `FALSE_ALARM` whose `reported_at` lies within the trailing 365 days of the logical clock, ordered by `reported_at` ascending and then by `created_at` ascending — `id` is never consulted — and the sequence is this incident's one-based index inside that set once it has joined it. It then computes `false_alarm_fee_cents` from that sequence, and **the municipal ladder is deliberately not monotone**: the first occurrence costs nothing, the second costs 5000 cents, the third costs 15000 cents, the fourth **drops** to 10000 cents because it falls under a different citation class, and the fifth and every later occurrence costs 25000 cents. Interpolating, or assuming the schedule only rises, produces the wrong fee. The reclassification then re-derives the property's `false_alarm_count_window`; appends an `ACTIVE` invoice line with `line_type` `FALSE_ALARM_FEE` and an `amount_cents` equal to `false_alarm_fee_cents` to the property's draft invoice when one exists **and the fee is strictly greater than zero**; and re-derives that invoice's `gross_service_cents`, `subtotal_cents`, `tax_cents` and `total_cents`. `FALSE_ALARM` is terminal, so a reclassification is never undone and the fee ledger is append-only.
+
+### 3.10. Storm Response
+
+A storm event is declared with a `name` such as "Hurricane Delta", a two-uppercase-letter `region_state_code` and a forecast `landfall_eta_at`, which must be strictly after the logical clock — an ETA already in the past is rejected with `ERR_LANDFALL_ETA_IN_PAST`. It is born `FORECAST`, with `landfall_recorded_at` and `all_clear_at` null and `downgrade_count` zero. `response_count` counts the storm responses bound to it. Only properties whose `state_code` matches `region_state_code` may receive a response.
+
+**`derived_tier` versus `status`.** The event carries an operator-driven `status` and a clock-driven `derived_tier`, and the two may legitimately disagree once an operator has downgraded. `derived_tier` reads the hours from the logical clock to `landfall_eta_at`, which may be negative after landfall, and **every boundary is strict on the upper side**: more than 48 hours out is `FORECAST`; otherwise more than 24 hours out is `WATCH`; otherwise more than 6 hours out is `WARNING`; otherwise the tier is `IMMINENT`. Exactly 48.0 hours out is therefore `WATCH`, exactly 24.0 is `WARNING`, and exactly 6.0 is `IMMINENT`.
+
+**The advisory ladder.** A single advisory capability takes a `to_status`. `FORECAST` to `WATCH`, `WATCH` to `WARNING`, `WARNING` to `WATCH` and `WARNING` to `IMMINENT` all require the logical clock to be strictly before `landfall_eta_at`. The move to `WATCH` from `FORECAST` creates no responses automatically. The move to `WARNING` leaves every `PENDING` response's status untouched and **deadlines are not recomputed on an advisory change**. The downgrade from `WARNING` back to `WATCH` — an operator's response to a forecast track moving away — advances `downgrade_count` by one, and already-scheduled secure sweeps keep their deadline: a downgrade never extends a deadline. The move to `IMMINENT` is the point from which storm work orders may auto-approve under the 250000-cent emergency ceiling.
+
+Landfall moves the event from `IMMINENT` to `LANDFALL` with no precondition. It stamps `landfall_recorded_at`, moves every response in `SECURE_SWEEP_SCHEDULED` whose `secure_sweep_deadline_at` is earlier than the logical clock and whose `secured_at` is still null to `MISSED_DEADLINE`, and then moves every response in `SECURED`, `SECURED_LATE` or `MISSED_DEADLINE` to `AWAITING_ALL_CLEAR`. All-clear moves the event from `LANDFALL` to `ALL_CLEAR`, stamps `all_clear_at`, and moves every response in `AWAITING_ALL_CLEAR` to `ASSESSMENT_DUE` while writing its `assessment_deadline_at`.
+
+There is a **secondary-landfall edge** back from `ALL_CLEAR` to `LANDFALL`, for a stalled system that re-intensifies after the all-clear. It rewrites `landfall_recorded_at` to the logical clock and clears `all_clear_at` back to null; responses already in `ASSESSMENT_DUE` keep that status and keep their `assessment_deadline_at` and are **not** rewound. This is the only path that can leave a response in `ASSESSMENT_DUE` while its parent event is not `ALL_CLEAR`, and it is precisely what makes the "storm not all clear" rung reachable. Closing the event moves it from `ALL_CLEAR` to the terminal `CLOSED`, requires every response to be in `ASSESSED` or `CLOSED` — an open response is rejected with `ERR_STORM_RESPONSES_OPEN` — moves every `ASSESSED` response to `CLOSED`, and clears `storm_hold_flag` on every responded property that has no other open response.
+
+**Responses.** Enrolling a property supplies its `property_id`. The response is born `PENDING` with `secured_at`, `assessed_at`, `swept_by_user_id`, `assessed_by_user_id`, `damage_level` and `secure_sweep_visit_id` all null, `guarantee_credit_cents` zero, `sweep_on_time` false and `surcharge_pct_at_dispatch` 0.0, and it binds `subscription_id` to the property's subscription when one exists in `ACTIVE`, `PAUSED` or `DELINQUENT`, and null when none does.
+
+Scheduling the secure sweep supplies a `checklist_template_id` and a `scheduled_start_at`. It requires the parent event to be in `WATCH`, `WARNING` or `IMMINENT`, and requires the property's `state_code` to equal the event's `region_state_code` — a mismatch is rejected with `ERR_STORM_REGION_MISMATCH`. It writes `secure_sweep_deadline_at` under the pre-storm branch, **anchored on the landfall ETA and subtracting a tier-selected lead**: 48 hours at the `FORECAST` tier, 36 at `WATCH`, 18 at `WARNING` and 2 at `IMMINENT`, with the tier read at the moment of scheduling and the deadline then frozen — it is never recomputed. It creates a visit with `visit_type` `STORM_SECURE` and `trigger_source` `STORM`, with `storm_response_id` bound and a scheduled window whose `scheduled_end_at` equals `secure_sweep_deadline_at`, points `secure_sweep_visit_id` at it, sets the property's `storm_hold_flag` true, and moves the response to `SECURE_SWEEP_SCHEDULED`.
+
+The post-storm deadline uses a **different anchor field and the opposite direction**: `assessment_deadline_at` is `all_clear_at` **plus** a fixed 72-hour SLA, with no tier lookup at all, and it stays null until the event reaches `ALL_CLEAR`. Anchoring the post-storm SLA on landfall instead of all-clear is the single most tempting wrong reading and produces a deadline earlier than the assessment could physically begin.
+
+**Sweep settlement and the guarantee.** When the bound secure-sweep visit completes, timeliness is decided by comparing `secured_at` with `secure_sweep_deadline_at`, **inclusive at the boundary**: securing at exactly the deadline instant is on time. On time, the response moves from `SECURE_SWEEP_SCHEDULED` to `SECURED`, stamping `secured_at` and `swept_by_user_id`, and runs the earned branch of the guarantee. Late, it moves to `SECURED_LATE`, stamping the same two fields, and runs the forfeited branch, writing a `guarantee_credit_cents` of zero. The earned branch applies only when the sweep was on time **and** the in-force plan's `storm_guarantee_included` is true. Its basis is the sum of `storm_surcharge_cents` over the work orders bound to the same `storm_event_id` and the same `property_id` whose status is `COMPLETED` or `INVOICED`. When that basis is exactly zero the credit is a flat 15000 cents; otherwise the credit is the smaller of 15000 cents and half the basis, rounded to whole cents. Worked: on time with the guarantee and no completed storm work order gives 15000; with a basis of 40000 the credit is the smaller of 15000 and 20000, which is 15000; with a basis of 20000 it is the smaller of 15000 and 10000, which is 10000; and a sweep late by one second gives zero. The forfeited branch collapses to the literal zero and appends no credit line at all, which is exactly why a forfeited invoice total is strictly larger than an earned one.
+
+**The surcharge percentage.** At the instant the first storm-pipeline work order for a response is dispatched, the percentage is read from the event's current tier — 0.0 at `FORECAST`, 0.10 at `WATCH`, 0.20 at `WARNING` and 0.35 at `IMMINENT` — and frozen onto both the response's `surcharge_pct_at_dispatch` and the work order's `surcharge_pct_applied`. A later advisory downgrade **never lowers an already-frozen percentage**. A `ROUTINE` work order carries a `surcharge_pct_applied` of 0.0.
+
+**Assessment and closure.** Signing the post-storm assessment supplies a `damage_level` of `NONE`, `MINOR`, `MODERATE` or `SEVERE`, together with `expected_storm_response_version`. It moves the response from `ASSESSMENT_DUE` to `ASSESSED`, and carries two preconditions beyond the state check: the expected version must equal the response's current `version`, and the acting `X-User-ID` must differ from `swept_by_user_id`, an identical signer being rejected with `ERR_SEGREGATION_OF_DUTIES`. An assessment attempted while the parent event is not `ALL_CLEAR` is rejected with `ERR_STORM_NOT_ALL_CLEAR`. Signing stamps `assessed_at`, `assessed_by_user_id` and `damage_level`, and advances the response's `version` by exactly one. Closing an assessed response moves it to the terminal `CLOSED` with no precondition and clears the property's `storm_hold_flag` when no other open response exists for that property. The three transitions into `AWAITING_ALL_CLEAR` — from `SECURED`, from `SECURED_LATE` and from `MISSED_DEADLINE` — all fire on landfall, all have no precondition, and all perform no arithmetic whatever; the `MISSED_DEADLINE` entry itself, which fires on landfall when the deadline has passed and `secured_at` is still null, leaves `guarantee_credit_cents` at zero.
+
+### 3.11. Invoicing, Tax, Payment and Delinquency
+
+A draft invoice is opened against a billing cycle. It copies `property_id` and `owner_id` from the cycle's subscription, is born `DRAFT` with `amount_paid_cents` zero, `dispute_count` zero and `issued_at` and `paid_at` null, and it seeds exactly one `ACTIVE` line whose `line_type` is `SUBSCRIPTION_FEE` and whose `amount_cents` is the cycle's `prorated_fee_cents`. A cycle that has never been paused and never had a tier change carries a `prorated_fee_cents` exactly equal to the plan's `monthly_fee_cents`, so on that ordinary path the seeded line is simply the monthly fee. Opening the invoice then runs the full total pipeline.
+
+Further lines are appended one at a time with a `line_type`, a human `description`, a signed `amount_cents`, an optional `taxable` flag defaulting to true, and up to four optional links naming the thing the line bills: `visit_id`, `work_order_id`, `security_incident_id` and `mail_hold_id`. The nine line types are `SUBSCRIPTION_FEE`, `VISIT_OVERAGE`, `TRAVEL_SURCHARGE`, `WORK_ORDER`, `FALSE_ALARM_FEE`, `MAIL_DISPOSITION`, `REKEY_FEE`, `ENTITLEMENT_OFFSET` and `GUARANTEE_CREDIT`. Sign is constrained by type: an `ENTITLEMENT_OFFSET` or a `GUARANTEE_CREDIT` line carries an `amount_cents` at or below zero and every other type carries one at or above zero, a violation being rejected with `ERR_LINE_SIGN_INVALID`. Lines may be appended only while the invoice is `DRAFT`; an append against any other status is rejected with `ERR_INVOICE_NOT_DRAFT`. Each new line is born with a `status` of `ACTIVE` and receives a one-based `sequence_index` assigned in ascending `created_at` order, and that index is what pins the per-line rounding sequence. A line's `status` takes only `ACTIVE` or `VOID`, and `VOID` lines are excluded from every invoice aggregate.
+
+**Per-line tax.** A line's `tax_cents` is its `amount_cents` multiplied by a tax rate of 0.07 and rounded to whole cents when `taxable` is true and its `status` is `ACTIVE`, and zero otherwise. **The rounding order is pinned: tax rounds per line and only then is summed.** Worked: two `ACTIVE` taxable lines of 1250 each round 87.5 to 88 twice, for 176 — where taxing the 2500 sum in one step and rounding once would give 175. A negative line rounds half away from zero, so −1250 yields −88.
+
+**The nine-step total.** The invoice total is recomputed on every mutation that changes the `ACTIVE` line set, and again on issuing and on dispute resolution. The `ACTIVE` lines are walked in ascending `sequence_index`; `VOID` lines are excluded from every step.
+
+1. `gross_service_cents` is the sum of `amount_cents` over the `ACTIVE` lines whose `line_type` is one of `SUBSCRIPTION_FEE`, `VISIT_OVERAGE`, `TRAVEL_SURCHARGE`, `WORK_ORDER`, `FALSE_ALARM_FEE`, `MAIL_DISPOSITION` or `REKEY_FEE`.
+2. `entitlement_offset_cents` is the sum of `amount_cents` over the `ACTIVE` `ENTITLEMENT_OFFSET` lines, and is therefore zero or negative.
+3. The net service figure is `gross_service_cents` plus `entitlement_offset_cents`.
+4. `storm_surcharge_cents` is that net service figure multiplied by the invoice's `storm_surcharge_pct` and rounded to whole cents. **The order matters: the surcharge multiplies the net service, after the entitlement offset has been subtracted.** Applying it to `gross_service_cents` instead yields a strictly larger total whenever an `ENTITLEMENT_OFFSET` line exists.
+5. `guarantee_credit_cents` is the sum of `amount_cents` over the `ACTIVE` `GUARANTEE_CREDIT` lines, and is therefore zero or negative.
+6. `subtotal_cents` is the net service figure plus `storm_surcharge_cents` plus `guarantee_credit_cents`.
+7. `tax_cents` is the sum of the already-rounded per-line `tax_cents` over the `ACTIVE` lines, plus the invoice-level `storm_surcharge_cents` multiplied by 0.07 and rounded to whole cents.
+8. `late_fee_cents` is zero unless the delinquency rule has applied a fee to this invoice.
+9. `total_cents` is `subtotal_cents` plus `tax_cents` plus `late_fee_cents`, and `balance_due_cents` is `total_cents` minus `amount_paid_cents`.
+
+`storm_surcharge_pct` at the invoice level is the maximum `surcharge_pct_applied` over the work orders behind this invoice's `ACTIVE` `WORK_ORDER` lines whose `pipeline` is `STORM`, and 0.0 when that pool is empty. It is a single numeric maximum, so when two work orders tie the value is identical and no tie-break is observable. It is re-derived when a work order is invoiced and on every subsequent total run.
+
+**Issuing and paying.** Issuing a draft invoice requires the parent billing cycle to be in `OPEN`, `CLOSING` or `CLOSED`, requires the subscription's status to be anything other than `CANCELLED`, and requires at least one `ACTIVE` line; an empty line set is rejected with `ERR_INVOICE_HAS_NO_LINES`. Issuing recomputes every step of the total, freezes the line set, stamps `issued_at`, and moves the invoice to `ISSUED`. A payment supplies an `amount_cents` that must be strictly greater than zero against an invoice that is not already `PAID`, a violation being rejected with `ERR_PAYMENT_AMOUNT_INVALID`. A payment strictly between zero and `balance_due_cents` moves an `ISSUED` invoice to `PARTIALLY_PAID`, raising `amount_paid_cents` and recomputing `balance_due_cents`. A payment at or above `balance_due_cents` moves an `ISSUED` invoice straight to `PAID`, setting `amount_paid_cents` to `total_cents`, `balance_due_cents` to zero and `paid_at` to the logical clock; the same threshold moves a `PARTIALLY_PAID` invoice to `PAID`, setting `balance_due_cents` to zero and `paid_at` to the logical clock.
+
+**Disputes and voids.** Only the owner named by the invoice's `owner_id` may dispute an issued invoice, optionally attaching a `resolution_note`; the dispute advances `dispute_count` by one and moves the invoice from `ISSUED` to `DISPUTED`. Resolving a dispute returns the invoice from `DISPUTED` to `ISSUED` with no precondition and recomputes every step of the total over the current `ACTIVE` line set. Voiding an issued invoice requires `amount_paid_cents` to be exactly zero — a part-paid invoice is rejected with `ERR_INVOICE_ALREADY_PAID` — and moves every `ACTIVE` line to `VOID`; voiding a draft invoice has no such precondition and likewise voids every `ACTIVE` line, with the totals recomputed to zero. `PAID` and `VOID` are the two terminal invoice states.
+
+Voiding a single line is the compensating action behind the line-sum identity: the line's `status` becomes `VOID`, its `tax_cents` is set to zero, and the full total pipeline is re-run, restoring the pre-append `subtotal_cents`, `tax_cents` and `total_cents` exactly. Voiding a line that is already `VOID` is rejected with `ERR_LINE_ALREADY_VOID`.
+
+## 4. Endpoint Definitions
+
+Every path below is mounted under the `/property-care` prefix. **A request that mints a new resource answers 201 Created; every other successful request answers 200 OK**, returning the mutated resource in `data`. The gate subsequence, the request body and the success status of each endpoint are given in §2.7; the behaviour behind each one is in §3. Path parameters resolve left to right, and the first that fails to resolve produces a 404.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| `POST` | `/property-care/_clock/set_current_utc` | Sets the server's logical clock. Before any call to this endpoint the logical clock reads exactly CLOCK_DEFAULT_UTC = 2026-05-01T00:00:00Z and never falls back to real wall-clock time. | `PlatformAdmin` |
+| `GET` | `/property-care/_clock` | Reads the logical clock. | `PlatformAdmin`, `Auditor`, `AccountManager`, `Dispatcher`, `StormCoordinator` |
+| `POST` | `/property-care/owners` | Registers a homeowner client. | `PlatformAdmin`, `AccountManager` |
+| `GET` | `/property-care/owners` | Lists owners. | `PlatformAdmin`, `AccountManager`, `Auditor` |
+| `GET` | `/property-care/owners/{id}` | Reads one owner. | `PlatformAdmin`, `AccountManager`, `Auditor`, `Owner` |
+| `PATCH` | `/property-care/owners/{id}` | Updates mutable owner attributes, including the per-owner work-order approval ceiling. | `PlatformAdmin`, `AccountManager` |
+| `POST` | `/property-care/properties` | Registers a vacation home. | `PlatformAdmin`, `AccountManager` |
+| `GET` | `/property-care/properties` | Lists properties, optionally filtered by owner. | `PlatformAdmin`, `AccountManager`, `Dispatcher`, `FieldTech`, `StormCoordinator`, `Auditor`, `Owner` |
+| `GET` | `/property-care/properties/{id}` | Reads one property, including both state axes and the derived freeze-risk fields. | `PlatformAdmin`, `AccountManager`, `Dispatcher`, `FieldTech`, `StormCoordinator`, `Auditor`, `Owner`, `Vendor` |
+| `PATCH` | `/property-care/properties/{id}` | Updates mutable property attributes. | `PlatformAdmin`, `AccountManager`, `Dispatcher` |
+| `POST` | `/property-care/properties/{id}/seasonal-transitions` | Drives the seasonal axis: BEGIN_CLOSE, ABORT_CLOSE, COMPLETE_WINTERIZATION, BEGIN_OPEN, COMPLETE_OPEN. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/properties/{id}/occupancy-transitions` | Drives the occupancy axis independently of the seasonal axis. | `Owner`, `Dispatcher`, `PlatformAdmin` |
+| `GET` | `/property-care/properties/{id}/risk-posture` | Computed read exposing the freeze-risk decomposition. | `PlatformAdmin`, `AccountManager`, `Dispatcher`, `FieldTech`, `StormCoordinator`, `Auditor`, `Owner` |
+| `POST` | `/property-care/service-plans` | Publishes a subscription plan tier. | `PlatformAdmin` |
+| `GET` | `/property-care/service-plans` | Lists plan tiers. | `PlatformAdmin`, `AccountManager`, `Auditor`, `Owner` |
+| `GET` | `/property-care/service-plans/{id}` | Reads one plan tier. | `PlatformAdmin`, `AccountManager`, `Auditor`, `Owner` |
+| `POST` | `/property-care/service-plans/{id}/retire` | Retires a plan tier so no new subscription may reference it. | `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions` | Creates a subscription in PENDING_ACTIVATION. | `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/subscriptions` | Lists subscriptions, filterable by property or plan. | `AccountManager`, `PlatformAdmin`, `Dispatcher`, `Auditor`, `Owner` |
+| `GET` | `/property-care/subscriptions/{id}` | Reads one subscription. | `AccountManager`, `PlatformAdmin`, `Dispatcher`, `Auditor`, `Owner` |
+| `POST` | `/property-care/subscriptions/{id}/activate` | Activates the subscription and opens cycle 1. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/pause` | Pauses the subscription mid-cycle and reprorates the open cycle. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/resume` | Resumes a paused subscription. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/tier-changes` | Changes the in-force plan tier and re-derives the open cycle's entitlement. Optimistic-concurrency guarded. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/cancel` | Cancels the subscription and force-closes the open cycle with zero carry-out. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/mark-delinquent` | Marks the subscription delinquent and applies late fees to every qualifying issued invoice. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/clear-delinquency` | Returns a delinquent subscription to ACTIVE. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/subscriptions/{id}/billing-cycles` | Opens the next billing cycle for a subscription, carrying in the previous cycle's carried_out units. | `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/billing-cycles` | Lists billing cycles, filterable by subscription. | `AccountManager`, `PlatformAdmin`, `Auditor`, `Owner` |
+| `GET` | `/property-care/billing-cycles/{id}` | Reads one billing cycle with its full entitlement ledger. | `AccountManager`, `PlatformAdmin`, `Auditor`, `Owner` |
+| `POST` | `/property-care/billing-cycles/{id}/close` | Closes a cycle, running the entitlement rollover policy. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/away-periods` | Declares a snowbird absence window that drives watch cadence. | `Owner`, `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/away-periods` | Lists away periods, filterable by property or owner. | `Owner`, `AccountManager`, `PlatformAdmin`, `Dispatcher`, `Auditor` |
+| `GET` | `/property-care/away-periods/{id}` | Reads one away period with its derived status and projection. | `Owner`, `AccountManager`, `PlatformAdmin`, `Dispatcher`, `Auditor` |
+| `PATCH` | `/property-care/away-periods/{id}/cadence` | Revises the visit cadence mid-period without retro-voiding already-scheduled visits. | `Owner`, `AccountManager`, `Dispatcher` |
+| `POST` | `/property-care/checklist-templates` | Publishes a checklist template for a visit type. | `PlatformAdmin`, `Dispatcher` |
+| `GET` | `/property-care/checklist-templates` | Lists checklist templates. | `PlatformAdmin`, `Dispatcher`, `FieldTech`, `Auditor` |
+| `GET` | `/property-care/checklist-templates/{id}` | Reads one checklist template. | `PlatformAdmin`, `Dispatcher`, `FieldTech`, `Auditor` |
+| `POST` | `/property-care/visits` | Schedules a visit of any type on either pipeline. | `Dispatcher`, `AccountManager`, `PlatformAdmin`, `Owner`, `StormCoordinator` |
+| `GET` | `/property-care/visits` | Lists visits with every foreign key exposed as a filter. | `Dispatcher`, `AccountManager`, `PlatformAdmin`, `FieldTech`, `Owner`, `StormCoordinator`, `Auditor` |
+| `GET` | `/property-care/visits/{id}` | Reads one visit with its checklist result and billing outcome. | `Dispatcher`, `AccountManager`, `PlatformAdmin`, `FieldTech`, `Owner`, `StormCoordinator`, `Auditor` |
+| `POST` | `/property-care/visits/{id}/depart` | Marks the technician en route; the seasonal and occupancy gates are re-evaluated here, not only at scheduling. | `FieldTech`, `Dispatcher` |
+| `POST` | `/property-care/visits/{id}/arrive` | Marks arrival and freezes the after-hours flag. | `FieldTech` |
+| `POST` | `/property-care/visits/{id}/complete` | Completes the visit, submits the checklist, prices the visit and fires the deepest cascade in the system. | `FieldTech` |
+| `POST` | `/property-care/visits/{id}/defer` | Defers a scheduled visit; billing-neutral branch of the turnover fork. | `Dispatcher`, `AccountManager` |
+| `POST` | `/property-care/visits/{id}/reschedule` | Returns a deferred visit to SCHEDULED at a new window. | `Dispatcher`, `AccountManager` |
+| `POST` | `/property-care/visits/{id}/convert-to-turnover` | Absorbs an overlapping watch visit into a rental turnover inspection; the charged branch of the turnover fork. | `Dispatcher` |
+| `POST` | `/property-care/visits/{id}/abort` | Aborts a visit from SCHEDULED, EN_ROUTE or IN_PROGRESS with no billing consequence. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/visits/{id}/findings` | Records a finding against a completed visit. | `FieldTech`, `Dispatcher` |
+| `GET` | `/property-care/findings` | Lists findings, filterable by visit or property. | `Dispatcher`, `FieldTech`, `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `GET` | `/property-care/findings/{id}` | Reads one finding. | `Dispatcher`, `FieldTech`, `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `POST` | `/property-care/findings/{id}/triage` | Triages an OPEN finding, or re-triages one returning from MONITORING. | `Dispatcher` |
+| `POST` | `/property-care/findings/{id}/monitor` | Parks a low or medium finding in MONITORING. | `Dispatcher` |
+| `POST` | `/property-care/findings/{id}/dismiss` | Dismisses a finding. | `Dispatcher`, `Owner` |
+| `POST` | `/property-care/vendors` | Onboards a contractor. | `Dispatcher`, `PlatformAdmin` |
+| `GET` | `/property-care/vendors` | Lists vendors. | `Dispatcher`, `PlatformAdmin`, `AccountManager`, `StormCoordinator`, `Auditor` |
+| `GET` | `/property-care/vendors/{id}` | Reads one vendor with its credential expiry and outstanding key count. | `Dispatcher`, `PlatformAdmin`, `AccountManager`, `StormCoordinator`, `Auditor`, `Vendor` |
+| `PATCH` | `/property-care/vendors/{id}/credentials` | Renews or shortens the certificate-of-insurance and licence expiry instants; a renewal returns a LAPSED vendor to ELIGIBLE. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/vendors/{id}/suspend` | Suspends a vendor; already accepted or working assignments are untouched. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/vendors/{id}/reinstate` | Promotes an ONBOARDING or SUSPENDED vendor to ELIGIBLE after a credential check. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/vendors/{id}/refresh-eligibility` | Re-evaluates the vendor against the logical clock; an ELIGIBLE vendor whose COI or licence has expired drops to LAPSED. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/findings/{id}/work-orders` | Creates a work order against a triaged finding. Optimistic-concurrency guarded on the parent Finding because a new work order supersedes any prior DRAFT. | `Dispatcher`, `StormCoordinator` |
+| `GET` | `/property-care/work-orders` | Lists work orders with every foreign key exposed as a filter. | `Dispatcher`, `StormCoordinator`, `AccountManager`, `PlatformAdmin`, `Owner`, `Vendor`, `Auditor` |
+| `GET` | `/property-care/work-orders/{id}` | Reads one work order with its full cost decomposition. | `Dispatcher`, `StormCoordinator`, `AccountManager`, `PlatformAdmin`, `Owner`, `Vendor`, `Auditor` |
+| `POST` | `/property-care/work-orders/{id}/submit` | Submits or re-submits a work order for approval; auto-approves when the total is at or below the ceiling. | `Dispatcher`, `StormCoordinator` |
+| `POST` | `/property-care/work-orders/{id}/approve` | Approves a pending work order. On the ROUTINE pipeline the approver must be the Owner; on the STORM pipeline it is the StormCoordinator and the Owner rung is not consulted. | `Owner`, `StormCoordinator`, `PlatformAdmin` |
+| `POST` | `/property-care/work-orders/{id}/reject` | Rejects a pending work order and returns the finding to TRIAGED. | `Owner`, `StormCoordinator`, `PlatformAdmin` |
+| `POST` | `/property-care/work-orders/{id}/dispatch` | Selects a vendor and creates the offer, then chains a key issuance, an access grant and a code rotation. | `Dispatcher`, `StormCoordinator` |
+| `POST` | `/property-care/work-orders/{id}/complete` | Records actuals and recomputes the cost chain. | `Vendor`, `Dispatcher` |
+| `POST` | `/property-care/work-orders/{id}/invoice` | Appends the work order's total to a draft invoice. | `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/vendor-assignments` | Lists vendor assignments, filterable by work order or vendor. | `Dispatcher`, `StormCoordinator`, `Vendor`, `PlatformAdmin`, `Auditor`, `AccountManager` |
+| `GET` | `/property-care/vendor-assignments/{id}` | Reads one vendor assignment. | `Dispatcher`, `StormCoordinator`, `Vendor`, `PlatformAdmin`, `Auditor`, `AccountManager` |
+| `POST` | `/property-care/vendor-assignments/{id}/accept` | Vendor accepts the offer; the vendor-eligibility sub-gate runs in full before the key-custody sub-gate. | `Vendor` |
+| `POST` | `/property-care/vendor-assignments/{id}/decline` | Vendor declines the offer, returning the work order to APPROVED for re-dispatch. | `Vendor` |
+| `POST` | `/property-care/vendor-assignments/{id}/start-work` | Vendor starts on site; requires a valid access grant and flips the property's occupancy axis. | `Vendor` |
+| `POST` | `/property-care/vendor-assignments/{id}/finish-work` | Vendor finishes on site. | `Vendor` |
+| `POST` | `/property-care/vendor-assignments/{id}/withdraw` | Dispatcher withdraws an accepted assignment. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/properties/{id}/key-assets` | Registers a physical key or lockbox for a property. | `Dispatcher`, `PlatformAdmin` |
+| `GET` | `/property-care/key-assets` | Lists key assets, filterable by property. | `Dispatcher`, `PlatformAdmin`, `FieldTech`, `Auditor`, `Owner` |
+| `GET` | `/property-care/key-assets/{id}` | Reads one key asset with its copy ledger and rotation index. | `Dispatcher`, `PlatformAdmin`, `FieldTech`, `Auditor`, `Owner` |
+| `POST` | `/property-care/key-assets/{id}/rotate-code` | Rotates a lockbox code and invalidates every grant stamped with an earlier rotation index. Optimistic-concurrency guarded. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/key-assets/{id}/issuances` | Issues key copies to a vendor with a computed return deadline. | `Dispatcher`, `PlatformAdmin` |
+| `GET` | `/property-care/key-issuances` | Lists key issuances, filterable by key, vendor or assignment. | `Dispatcher`, `PlatformAdmin`, `Vendor`, `Auditor`, `FieldTech` |
+| `GET` | `/property-care/key-issuances/{id}` | Reads one key issuance with its overdue arithmetic. | `Dispatcher`, `PlatformAdmin`, `Vendor`, `Auditor`, `FieldTech` |
+| `POST` | `/property-care/key-issuances/{id}/return` | Records a key return; on time from ISSUED, late from OVERDUE. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/key-issuances/{id}/mark-overdue` | Flags an issuance overdue once the grace window has elapsed; blocks further issuance to the vendor. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/key-issuances/{id}/declare-lost` | Declares an overdue key lost and orders a rekey. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/key-assets/{id}/access-grants` | Issues a time-windowed access grant. On a LOCKBOX key the creation rotates the code first, so the new grant carries the post-rotation snapshot and every earlier grant is invalidated. Optimistic-concurrency guarded. | `Dispatcher`, `PlatformAdmin` |
+| `GET` | `/property-care/access-grants` | Lists access grants, filterable by key, vendor or issuance. | `Dispatcher`, `PlatformAdmin`, `Vendor`, `Auditor`, `FieldTech` |
+| `GET` | `/property-care/access-grants/{id}` | Reads one access grant. | `Dispatcher`, `PlatformAdmin`, `Vendor`, `Auditor`, `FieldTech` |
+| `POST` | `/property-care/access-grants/{id}/activate` | Activates a pending grant inside its window and under the key's aggregate concurrency capacity. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/access-grants/{id}/revoke` | Revokes an active grant, or expires it once the window has elapsed. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/properties/{id}/winterization-records` | Opens a winterization record outside the seasonal-close flow. | `Dispatcher`, `FieldTech`, `PlatformAdmin` |
+| `GET` | `/property-care/winterization-records` | Lists winterization records, filterable by property or visit. | `Dispatcher`, `FieldTech`, `PlatformAdmin`, `Auditor`, `Owner` |
+| `GET` | `/property-care/winterization-records/{id}` | Reads one winterization record with its per-step flags. | `Dispatcher`, `FieldTech`, `PlatformAdmin`, `Auditor`, `Owner` |
+| `POST` | `/property-care/winterization-records/{id}/steps` | Records one winterization step, or all four at once with step_code ALL_REQUIRED. | `FieldTech`, `Dispatcher` |
+| `POST` | `/property-care/winterization-records/{id}/reopen` | Reopens a complete record, clearing every required step flag. | `Dispatcher`, `PlatformAdmin` |
+| `POST` | `/property-care/properties/{id}/rental-turnovers` | Books a rental turnover window. | `Dispatcher`, `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/rental-turnovers` | Lists rental turnovers, filterable by property. | `Dispatcher`, `AccountManager`, `PlatformAdmin`, `FieldTech`, `Auditor`, `Owner` |
+| `GET` | `/property-care/rental-turnovers/{id}` | Reads one rental turnover. | `Dispatcher`, `AccountManager`, `PlatformAdmin`, `FieldTech`, `Auditor`, `Owner` |
+| `POST` | `/property-care/rental-turnovers/{id}/advance` | Advances the turnover stage: CHECKOUT, CLEANING, INSPECTION, READY, CHECKIN or CANCELLED. | `Dispatcher`, `FieldTech`, `PlatformAdmin` |
+| `POST` | `/property-care/rental-turnovers/{id}/fail-inspection` | Sends the turnover back to CLEANING; capped at two re-clean attempts. | `FieldTech`, `Dispatcher` |
+| `POST` | `/property-care/properties/{id}/mail-holds` | Opens a mail hold for a property. | `Dispatcher`, `AccountManager`, `Owner`, `PlatformAdmin` |
+| `GET` | `/property-care/mail-holds` | Lists mail holds, filterable by property. | `Dispatcher`, `AccountManager`, `Owner`, `PlatformAdmin`, `FieldTech`, `Auditor` |
+| `GET` | `/property-care/mail-holds/{id}` | Reads one mail hold. | `Dispatcher`, `AccountManager`, `Owner`, `PlatformAdmin`, `FieldTech`, `Auditor` |
+| `POST` | `/property-care/mail-holds/{id}/log-packages` | Logs a package delta; positive on accumulation, negative on collection. Drives the ACTIVE / OVERFLOW loop. | `FieldTech`, `Dispatcher` |
+| `POST` | `/property-care/mail-holds/{id}/forward` | Forwards accumulated mail and bills the affine forwarding fee. | `Dispatcher`, `AccountManager` |
+| `POST` | `/property-care/mail-holds/{id}/extend` | Extends the hold by MAIL_HOLD_EXTENSION_DAYS (15) and bills the linear extension fee. | `Dispatcher`, `AccountManager`, `Owner` |
+| `POST` | `/property-care/mail-holds/{id}/release` | Releases the hold once no packages remain. | `Dispatcher`, `AccountManager`, `Owner` |
+| `POST` | `/property-care/properties/{id}/security-incidents` | Reports a security, alarm or freeze incident. | `Dispatcher`, `FieldTech`, `Owner`, `PlatformAdmin` |
+| `GET` | `/property-care/security-incidents` | Lists security incidents, filterable by property or visit. | `Dispatcher`, `FieldTech`, `Owner`, `PlatformAdmin`, `AccountManager`, `Auditor` |
+| `GET` | `/property-care/security-incidents/{id}` | Reads one security incident with its false-alarm sequence and fee. | `Dispatcher`, `FieldTech`, `Owner`, `PlatformAdmin`, `AccountManager`, `Auditor` |
+| `POST` | `/property-care/security-incidents/{id}/acknowledge` | Acknowledges a reported incident. | `Dispatcher` |
+| `POST` | `/property-care/security-incidents/{id}/investigate` | Opens or reopens an investigation; the first pass on an alarm-class incident forces an ALARM_RESPONSE visit. | `Dispatcher` |
+| `POST` | `/property-care/security-incidents/{id}/escalate` | Escalates a high or critical incident. | `Dispatcher`, `StormCoordinator` |
+| `POST` | `/property-care/security-incidents/{id}/resolve` | Resolves an incident with no fee. | `Dispatcher` |
+| `POST` | `/property-care/security-incidents/{id}/reclassify-false-alarm` | Reclassifies an incident as a false alarm and applies the non-monotone municipal fee ladder. | `Dispatcher`, `AccountManager` |
+| `POST` | `/property-care/storm-events` | Declares a named storm with a forecast landfall ETA. | `StormCoordinator`, `PlatformAdmin` |
+| `GET` | `/property-care/storm-events` | Lists storm events. | `StormCoordinator`, `PlatformAdmin`, `Dispatcher`, `AccountManager`, `Auditor`, `FieldTech` |
+| `GET` | `/property-care/storm-events/{id}` | Reads one storm event, including the tier derived from the logical clock. | `StormCoordinator`, `PlatformAdmin`, `Dispatcher`, `AccountManager`, `Auditor`, `FieldTech`, `Owner` |
+| `POST` | `/property-care/storm-events/{id}/advisory` | Sets the advisory status, including the WARNING to WATCH downgrade. | `StormCoordinator` |
+| `POST` | `/property-care/storm-events/{id}/landfall` | Records landfall; settles every unswept response to MISSED_DEADLINE and moves the rest to AWAITING_ALL_CLEAR. | `StormCoordinator` |
+| `POST` | `/property-care/storm-events/{id}/all-clear` | Declares all-clear, the anchor for every post-storm assessment SLA. | `StormCoordinator` |
+| `POST` | `/property-care/storm-events/{id}/close` | Closes the storm event once every response is assessed. | `StormCoordinator` |
+| `POST` | `/property-care/storm-events/{id}/responses` | Enrols a property in a storm response. | `StormCoordinator`, `Dispatcher` |
+| `GET` | `/property-care/storm-responses` | Lists storm responses, filterable by storm event, property or subscription. | `StormCoordinator`, `Dispatcher`, `PlatformAdmin`, `AccountManager`, `FieldTech`, `Auditor`, `Owner` |
+| `GET` | `/property-care/storm-responses/{id}` | Reads one storm response with both deadline instants. | `StormCoordinator`, `Dispatcher`, `PlatformAdmin`, `AccountManager`, `FieldTech`, `Auditor`, `Owner` |
+| `POST` | `/property-care/storm-responses/{id}/schedule-sweep` | Computes the pre-storm secure-sweep deadline from the landfall ETA and the tier at scheduling time, and creates the sweep visit. | `StormCoordinator`, `Dispatcher` |
+| `POST` | `/property-care/storm-responses/{id}/assessments` | Signs off the post-storm damage assessment. Segregation of duties: the signer must differ from the technician who performed the secure sweep. Optimistic-concurrency guarded. | `FieldTech`, `StormCoordinator` |
+| `POST` | `/property-care/storm-responses/{id}/close` | Closes an assessed response. | `StormCoordinator` |
+| `POST` | `/property-care/billing-cycles/{id}/invoices` | Opens a draft invoice for a billing cycle and seeds the subscription-fee line. | `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/invoices` | Lists invoices, filterable by cycle, property or owner. | `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `GET` | `/property-care/invoices/{id}` | Reads one invoice with every step of the total pipeline exposed. | `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `POST` | `/property-care/invoices/{id}/lines` | Appends a line to a draft invoice. | `AccountManager`, `PlatformAdmin` |
+| `GET` | `/property-care/invoice-lines` | Lists invoice lines with every foreign key exposed as a filter. | `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `GET` | `/property-care/invoice-lines/{id}` | Reads one invoice line. | `AccountManager`, `PlatformAdmin`, `Owner`, `Auditor` |
+| `POST` | `/property-care/invoice-lines/{id}/void` | Voids a line; the compensating action for the line-sum conservation invariant. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/invoices/{id}/issue` | Issues a draft invoice and freezes the line set. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/invoices/{id}/pay` | Records a payment. | `AccountManager`, `PlatformAdmin`, `Owner` |
+| `POST` | `/property-care/invoices/{id}/dispute` | Owner disputes an issued invoice. | `Owner` |
+| `POST` | `/property-care/invoices/{id}/resolve-dispute` | Returns a disputed invoice to ISSUED and recomputes the total over the current line set. | `AccountManager`, `PlatformAdmin` |
+| `POST` | `/property-care/invoices/{id}/void` | Voids an unpaid invoice and every line on it. | `AccountManager`, `PlatformAdmin` |
+
+## 5. Error Code Catalogue
+
+The trigger condition for each identifier below is stated in §2 or §3 next to the rule it guards.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNKNOWN_ROLE` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_NOT_ASSIGNED_VENDOR` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_WORK_ORDER_PIPELINE_MISMATCH` | 403 |
+| `ERR_RESOURCE_NOT_FOUND` | 404 |
+| `ERR_OWNER_NOT_FOUND` | 404 |
+| `ERR_PROPERTY_NOT_FOUND` | 404 |
+| `ERR_SERVICE_PLAN_NOT_FOUND` | 404 |
+| `ERR_TEMPLATE_NOT_FOUND` | 404 |
+| `ERR_VENDOR_NOT_FOUND` | 404 |
+| `ERR_INVOICE_NOT_FOUND` | 404 |
+| `ERR_LINKED_RESOURCE_NOT_FOUND` | 404 |
+| `ERR_STALE_FINDING_VERSION` | 412 |
+| `ERR_STALE_SUBSCRIPTION_VERSION` | 412 |
+| `ERR_STALE_KEY_ASSET_VERSION` | 412 |
+| `ERR_INVALID_STATE_TRANSITION` | 409 |
+| `ERR_ALREADY_TERMINAL` | 409 |
+| `ERR_VISIT_NOT_ARRIVED` | 409 |
+| `ERR_PARENT_VISIT_NOT_COMPLETED` | 409 |
+| `ERR_NO_RECHECK_VISIT` | 409 |
+| `ERR_FINDING_HAS_LIVE_WORK_ORDER` | 409 |
+| `ERR_SEVERITY_TOO_HIGH_TO_MONITOR` | 409 |
+| `ERR_DISPATCH_ATTEMPTS_EXHAUSTED` | 409 |
+| `ERR_RECLEAN_ATTEMPTS_EXHAUSTED` | 409 |
+| `ERR_HOLD_EXTENSIONS_EXHAUSTED` | 409 |
+| `ERR_STORM_NOT_ALL_CLEAR` | 409 |
+| `ERR_STORM_RESPONSES_OPEN` | 409 |
+| `ERR_INVOICE_ALREADY_PAID` | 409 |
+| `ERR_CYCLE_HAS_LIVE_VISIT` | 409 |
+| `ERR_PLAN_RETIRED` | 409 |
+| `ERR_SUBSCRIPTION_CANCELLED` | 409 |
+| `ERR_VISIT_IN_FLIGHT` | 409 |
+| `ERR_APPROVAL_REQUIRED` | 409 |
+| `ERR_STORM_CEILING_EXCEEDED` | 409 |
+| `ERR_ISSUANCE_NOT_OVERDUE` | 409 |
+| `ERR_LOST_THRESHOLD_NOT_MET` | 409 |
+| `ERR_STEP_ALREADY_RECORDED` | 409 |
+| `ERR_TURNOVER_STAGE_INVALID` | 409 |
+| `ERR_NO_TURNOVER_OVERLAP` | 409 |
+| `ERR_PACKAGES_OUTSTANDING` | 409 |
+| `ERR_MAIL_HOLD_NOT_STARTED` | 409 |
+| `ERR_INCIDENT_NOT_ALARM_CLASS` | 409 |
+| `ERR_SEVERITY_TOO_LOW_TO_ESCALATE` | 409 |
+| `ERR_STORM_REGION_MISMATCH` | 409 |
+| `ERR_INVOICE_NOT_DRAFT` | 409 |
+| `ERR_LINE_ALREADY_VOID` | 409 |
+| `ERR_VISIT_TYPE_NOT_COVERED` | 409 |
+| `ERR_SEASONAL_STATE_FORBIDS_VISIT` | 409 |
+| `ERR_TURNOVER_IN_FLIGHT` | 409 |
+| `ERR_WINTERIZATION_INCOMPLETE` | 409 |
+| `ERR_KEY_CUSTODY_BLOCKS_OPEN` | 409 |
+| `ERR_NO_SEASONAL_OPEN_VISIT` | 409 |
+| `ERR_PROPERTY_HAS_OPEN_STORM_HOLD` | 409 |
+| `ERR_OCCUPANCY_FORBIDS_VISIT` | 409 |
+| `ERR_RENTAL_NOT_ENROLLED` | 409 |
+| `ERR_SEASONAL_STATE_FORBIDS_OCCUPANCY` | 409 |
+| `ERR_VENDOR_NOT_ELIGIBLE` | 409 |
+| `ERR_VENDOR_COI_EXPIRED` | 409 |
+| `ERR_VENDOR_LICENSE_EXPIRED` | 409 |
+| `ERR_VENDOR_NOT_EMERGENCY_CAPABLE` | 409 |
+| `ERR_NO_ELIGIBLE_VENDOR` | 409 |
+| `ERR_VENDOR_WINDOW_CONFLICT` | 409 |
+| `ERR_VENDOR_RATING_BELOW_FLOOR` | 409 |
+| `ERR_VENDOR_KEY_OVERDUE` | 409 |
+| `ERR_KEY_COPIES_UNAVAILABLE` | 409 |
+| `ERR_KEY_REKEY_PENDING` | 409 |
+| `ERR_ACCESS_CAPACITY_EXCEEDED` | 409 |
+| `ERR_ACCESS_GRANT_INVALID` | 409 |
+| `ERR_GRANT_WINDOW_NOT_OPEN` | 409 |
+| `ERR_NO_ACTIVE_SUBSCRIPTION` | 409 |
+| `ERR_PROPERTY_OUT_OF_AREA` | 409 |
+| `ERR_NO_OPEN_CYCLE` | 409 |
+| `ERR_NOT_YET_DELINQUENT` | 409 |
+| `ERR_BALANCE_STILL_OUTSTANDING` | 409 |
+| `ERR_INVOICE_HAS_NO_LINES` | 409 |
+| `ERR_PAYMENT_AMOUNT_INVALID` | 409 |
+| `ERR_ENTITLEMENT_EXHAUSTED` | 409 |
+| `ERR_MISSING_REQUIRED_FIELD` | 400 |
+| `ERR_INVALID_FIELD_TYPE` | 400 |
+| `ERR_INVALID_ENUM_VALUE` | 400 |
+| `ERR_VALUE_OUT_OF_RANGE` | 400 |
+| `ERR_CHECKLIST_MISMATCH` | 400 |
+| `ERR_INTERVAL_MALFORMED` | 400 |
+| `ERR_TURNOVER_WINDOW_OVERLAP` | 409 |
+| `ERR_HOLD_TOO_LONG` | 400 |
+| `ERR_AWAY_PERIOD_INVALID` | 400 |
+| `ERR_TEMPLATE_TYPE_MISMATCH` | 400 |
+| `ERR_UNIQUENESS_VIOLATION` | 409 |
+| `ERR_LINE_SIGN_INVALID` | 400 |
+| `ERR_WINTERIZATION_STEP_INVALID` | 400 |
+| `ERR_THERMOSTAT_BELOW_MINIMUM` | 400 |
+| `ERR_FORWARDING_ADDRESS_MISSING` | 400 |
+| `ERR_LANDFALL_ETA_IN_PAST` | 400 |
+| `ERR_PAGINATION_INVALID` | 400 |
+| `ERR_CLOCK_REGRESSION` | 400 |

@@ -1,0 +1,960 @@
+# =============================================================================
+# Task 1180 — Residential Yard Waste & Composting Program (municipal)
+# Seed tables: entities, state machines, calculations, validations,
+# endpoints, errors, RBAC. §1.8 / §1.9 live in sibling files.
+# =============================================================================
+
+scenario: |
+  1180. Residential Yard Waste & Composting Program (municipal yard waste
+  program): cart/subscription signup & seasonal service window, collection
+  route & acceptable material rules, contamination inspection &
+  tagging/rejection, seasonal surge (leaf/holiday tree) collection events,
+  processing facility tonnage & compost giveback to residents, fee structure
+  & opt-in vs universal service, missed pickup & service credit, education &
+  outreach campaign
+
+domain_name: residential-yard-waste-composting
+api_prefix: ""
+
+# Logical clock: POST /_clock/set_current_utc drives all date/time-dependent
+# behavior. Server startup default (before any set call) is exactly
+# 2026-05-01T00:00:00Z — never the real wall clock.
+
+complexity_profile:
+  primary_archetype: temporal_windowing      # season windows, booking windows, route windows, delivery windows
+  secondary_archetype: quota_allocation      # surge slots, compost inventory, route stop/tonnage capacity
+  complexity_layers:
+    - rate_threshold_triggers                # contamination strikes >= max suspends subscription
+    - optimistic_concurrency                 # OCC on Household.version / SurgeEvent.version
+    - derived_field_reconciliation           # credit ledger balance, entitlement, inventory, zone status
+    - scheduled_actions                      # clock-driven season/event/status transitions
+  entity_topology: flat                      # peer resources joined by FK references, no nested URLs
+  state_machine_shape: cyclic                # Subscription ACTIVE<->SUSPENDED, PickupTicket SCHEDULED<->MISSED_REPORTED, OutreachCampaign ACTIVE<->PAUSED
+  relationship_patterns:
+    - one_to_many                            # household->subscriptions, subscription->carts/tickets, event->bookings
+    - cross_aggregate                        # deliveries reference routes across zones; claims draw on delivery-derived inventory
+  role_model: segregation_of_duties          # missed-pickup validator (RouteSupervisor) cannot approve own credit (BillingClerk)
+  consistency_model: immediate               # all side effects visible in the mutating request's response
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (flat topology; all ids server-minted UUIDs)
+# =============================================================================
+entities:
+  - name: ServiceZone
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Zone display name" }
+      - { name: service_model, type: enum, source: input, description: "OPT_IN (residents pay per season) | UNIVERSAL (base service covered by utility billing)", constraints: "OPT_IN | UNIVERSAL" }
+      - { name: season_start_date, type: string, source: input, description: "ISO date YYYY-MM-DD; season window start (inclusive)" }
+      - { name: season_end_date, type: string, source: input, description: "ISO date YYYY-MM-DD; season window end (inclusive)" }
+      - { name: base_seasonal_fee_cents, type: integer, source: input, description: "Season base fee; billed only for OPT_IN subscriptions" }
+      - { name: universal_flat_credit_cents, type: integer, source: input, description: "Flat missed-pickup credit used for UNIVERSAL zones" }
+      - { name: max_strikes_per_season, type: integer, source: input, default: 3, description: "TAGGED_REJECTED inspections at or above this count suspend the subscription" }
+      - { name: status, type: enum, source: computed, description: "Derived from logical clock: clock_date < season_start_date -> OPEN_ENROLLMENT; season_start_date <= clock_date <= season_end_date -> IN_SEASON; clock_date > season_end_date -> OFF_SEASON", constraints: "OPEN_ENROLLMENT | IN_SEASON | OFF_SEASON" }
+
+  - name: Household
+    parent: null
+    common_fields: true
+    fields:
+      - { name: address_line, type: string, source: input, description: "Street address of the residence" }
+      - { name: zone_id, type: string, source: input, description: "FK -> ServiceZone.id; zone the address belongs to" }
+      - { name: credit_balance_cents, type: integer, source: computed, description: "Sum of ServiceCredit.amount_cents with status GRANTED for this household (see service_credit_balance)" }
+      - { name: compost_entitlement_gallons, type: number, source: computed, description: "Season compost entitlement in gallons, 2dp (see compost_entitlement)" }
+
+  - name: Subscription
+    parent: null
+    common_fields: true
+    fields:
+      - { name: household_id, type: string, source: input, description: "FK -> Household.id; subscribing household" }
+      - { name: season_year, type: integer, source: input, description: "Season label year (e.g. 2026); uniqueness scope for ERR_DUPLICATE_SUBSCRIPTION" }
+      - { name: service_model, type: enum, source: system, description: "Snapshot of zone.service_model at creation (pinned; later zone edits never retro-change existing subscriptions)", constraints: "OPT_IN | UNIVERSAL" }
+      - { name: status, type: enum, source: system, description: "PENDING_PAYMENT | ACTIVE | SUSPENDED | CANCELLED | EXPIRED" }
+      - { name: base_fee_cents, type: integer, source: computed, description: "Model-aware, proration-aware base fee (see subscription_seasonal_fee)" }
+      - { name: cart_fees_cents, type: integer, source: computed, description: "Sum of cart size surcharges + extra-cart fees over non-RETRIEVED carts" }
+      - { name: surcharge_cents, type: integer, source: system, description: "Accumulator: += 2000 on each contamination suspension" }
+      - { name: total_due_cents, type: integer, source: computed, description: "base_fee_cents + cart_fees_cents + surcharge_cents" }
+      - { name: paid_cents, type: integer, source: system, description: "Accumulates cash paid plus credits applied" }
+      - { name: strikes_this_season, type: integer, source: computed, description: "Count of TAGGED_REJECTED ContaminationInspections on this subscription's tickets; reset to 0 by cure" }
+      - { name: suspended_reason, type: enum, source: system, description: "Null unless SUSPENDED; only producer is strike threshold", constraints: "CONTAMINATION_STRIKES | null" }
+
+  - name: Cart
+    parent: null
+    common_fields: true
+    fields:
+      - { name: household_id, type: string, source: input, description: "FK -> Household.id" }
+      - { name: subscription_id, type: string, source: input, description: "FK -> Subscription.id" }
+      - { name: size_gallons, type: enum, source: input, description: "Cart size tier", constraints: "35 | 64 | 96" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | DELIVERED | RETRIEVAL_SCHEDULED | RETRIEVED" }
+      - { name: delivered_at, type: datetime, source: system, description: "Set when delivered; null until then" }
+      - { name: surcharge_cents, type: integer, source: computed, description: "Size surcharge per season: 35->0, 64->1500, 96->3000" }
+
+  - name: CollectionRoute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> ServiceZone.id" }
+      - { name: weekday, type: enum, source: input, description: "Weekly collection weekday", constraints: "MONDAY | TUESDAY | WEDNESDAY | THURSDAY | FRIDAY | SATURDAY | SUNDAY" }
+      - { name: effective_start_date, type: string, source: input, description: "Route active window start (inclusive); half-open window [start, end)" }
+      - { name: effective_end_date, type: string, source: input, description: "Route active window end (exclusive for overlap; must be <= zone season_end_date)" }
+      - { name: max_stops, type: integer, source: input, description: "Max tickets per service_date on this route" }
+      - { name: max_tonnage_lbs, type: integer, source: input, description: "Max projected tonnage per service_date (200 lbs avg per ticket)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | PUBLISHED | ARCHIVED (system-archived when clock_date > effective_end_date)", constraints: "DRAFT | PUBLISHED | ARCHIVED" }
+
+  - name: PickupTicket
+    parent: null
+    common_fields: true
+    fields:
+      - { name: subscription_id, type: string, source: input, description: "FK -> Subscription.id" }
+      - { name: route_id, type: string, source: input, description: "FK -> CollectionRoute.id" }
+      - { name: service_date, type: string, source: input, description: "ISO date of the scheduled pickup; must fall inside zone season window and match route weekday" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | COMPLETED | MISSED_REPORTED | MISSED | REJECTED_CONTAMINATION | SKIPPED" }
+      - { name: weight_lbs, type: integer, source: system, description: "Recorded at completion; must be > 0" }
+      - { name: completed_at, type: datetime, source: system, description: "Set on completion; null until then" }
+      - { name: missed_reported_by, type: string, source: system, description: "Household id that reported the miss; cleared when invalidated" }
+      - { name: missed_validated_by, type: string, source: system, description: "RouteSupervisor X-User-ID that validated the miss" }
+
+  - name: ContaminationInspection
+    parent: null
+    common_fields: false
+    fields:
+      - { name: pickup_ticket_id, type: string, source: input, description: "FK -> PickupTicket.id; exactly one inspection per ticket" }
+      - { name: result, type: enum, source: input, description: "PASSED | TAGGED_WARNING | TAGGED_REJECTED", constraints: "PASSED | TAGGED_WARNING | TAGGED_REJECTED" }
+      - { name: violation_codes, type: array, source: input, description: "Required non-empty when result is TAGGED_*; must be empty when PASSED", constraints: "items: PLASTIC_BAG | FOOD_WASTE | DIRT_ROCK | HAZARDOUS | NON_YARD_MATERIAL" }
+      - { name: notes, type: string, source: input, description: "Optional inspector notes" }
+      - { name: inspector_user_id, type: string, source: system, description: "FieldInspector X-User-ID" }
+
+  - name: SurgeEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> ServiceZone.id" }
+      - { name: event_type, type: enum, source: input, description: "LEAF_SURGE | HOLIDAY_TREE" }
+      - { name: service_date, type: string, source: input, description: "ISO date of the surge collection" }
+      - { name: booking_window_start, type: datetime, source: input, description: "Bookings open at this instant (inclusive)" }
+      - { name: booking_window_end, type: datetime, source: input, description: "Bookings close at this instant (exclusive)" }
+      - { name: capacity_slots, type: integer, source: input, description: "Total bookable slots" }
+      - { name: reserved_slots, type: integer, source: computed, description: "Count of bookings with status CONFIRMED; invariant: capacity_slots == reserved_slots + available_slots" }
+      - { name: status, type: enum, source: computed, description: "Derived from clock: clock < booking_window_start -> SCHEDULED; window_start <= clock < window_end -> OPEN; window_end <= clock < service_date+1d -> CLOSED; else COMPLETED", constraints: "SCHEDULED | OPEN | CLOSED | COMPLETED" }
+
+  - name: SurgeBooking
+    parent: null
+    common_fields: true
+    fields:
+      - { name: surge_event_id, type: string, source: input, description: "FK -> SurgeEvent.id" }
+      - { name: household_id, type: string, source: input, description: "FK -> Household.id" }
+      - { name: quantity_bundles, type: integer, source: input, description: "Bags (leaf) or trees (holiday); 1..10" }
+      - { name: status, type: enum, source: system, description: "CONFIRMED | WAITLISTED | CANCELLED | NO_SHOW" }
+
+  - name: ProcessingFacility
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility name" }
+      - { name: daily_receiving_capacity_lbs, type: integer, source: input, description: "Max accepted gross lbs per calendar day" }
+      - { name: safety_contamination_item_limit, type: integer, source: input, description: "Max contaminated items allowed in an ACCEPTED load" }
+      - { name: status, type: enum, source: system, description: "OPEN | CLOSED; initial OPEN; toggled via PATCH", constraints: "OPEN | CLOSED" }
+      - { name: season_accepted_lbs, type: integer, source: computed, description: "Sum of accepted_weight_lbs over ACCEPTED deliveries" }
+
+  - name: FacilityDelivery
+    parent: null
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: input, description: "FK -> ProcessingFacility.id" }
+      - { name: route_id, type: string, source: input, description: "FK -> CollectionRoute.id; load origin route (pins zone attribution)" }
+      - { name: delivery_date, type: string, source: input, description: "ISO date of the bay appointment" }
+      - { name: window_start, type: datetime, source: input, description: "Bay window start (must be on delivery_date)" }
+      - { name: window_end, type: datetime, source: input, description: "Bay window end; must be > window_start and on delivery_date" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | ACCEPTED | REJECTED" }
+      - { name: gross_weight_lbs, type: integer, source: input, description: "Recorded at receive; null until received" }
+      - { name: contaminated_item_count, type: integer, source: input, description: "Recorded at receive; null until received" }
+      - { name: accepted_weight_lbs, type: integer, source: computed, description: "= gross_weight_lbs when ACCEPTED else 0" }
+
+  - name: CompostGivebackEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> ServiceZone.id" }
+      - { name: event_date, type: string, source: input, description: "ISO date; claims allowed only on this date (status OPEN)" }
+      - { name: per_household_cap_gallons, type: integer, source: input, description: "Max cumulative gallons one household may claim at this event" }
+      - { name: initial_inventory_gallons, type: integer, source: computed, description: "Computed once at creation: floor(zone ACCEPTED delivery lbs in season x 0.025) — see giveback_inventory_derivation" }
+      - { name: remaining_gallons, type: integer, source: computed, description: "initial_inventory_gallons - sum of FULFILLED claim gallons; restored on claim void" }
+      - { name: status, type: enum, source: computed, description: "Derived from clock: clock_date < event_date -> SCHEDULED; == event_date -> OPEN; > event_date -> CLOSED", constraints: "SCHEDULED | OPEN | CLOSED" }
+
+  - name: CompostClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: giveback_event_id, type: string, source: input, description: "FK -> CompostGivebackEvent.id" }
+      - { name: household_id, type: string, source: input, description: "FK -> Household.id" }
+      - { name: gallons, type: integer, source: input, description: "Whole gallons requested; >= 1" }
+      - { name: status, type: enum, source: system, description: "FULFILLED | VOIDED" }
+      - { name: entitlement_snapshot_gallons, type: number, source: computed, description: "Household compost_entitlement_gallons at claim time (2dp)" }
+
+  - name: ServiceCredit
+    parent: null
+    common_fields: false
+    fields:
+      - { name: household_id, type: string, source: system, description: "FK -> Household.id; from the missed ticket's subscription" }
+      - { name: subscription_id, type: string, source: system, description: "FK -> Subscription.id" }
+      - { name: missed_pickup_ticket_id, type: string, source: system, description: "FK -> PickupTicket.id" }
+      - { name: amount_cents, type: integer, source: computed, description: "PRORATED (opt-in) or FLAT (universal) — see missed_pickup_credit_amount" }
+      - { name: status, type: enum, source: system, description: "PENDING_APPROVAL | GRANTED | APPLIED | VOIDED" }
+      - { name: validated_by, type: string, source: system, description: "RouteSupervisor X-User-ID who validated the missed pickup" }
+      - { name: approved_by, type: string, source: system, description: "BillingClerk X-User-ID who granted; MUST differ from validated_by (segregation of duties)" }
+
+  - name: OutreachCampaign
+    parent: null
+    common_fields: true
+    fields:
+      - { name: zone_id, type: string, source: input, description: "FK -> ServiceZone.id; optional — null means citywide" }
+      - { name: channel, type: enum, source: input, description: "MAIL | DOOR_TAG | EMAIL | SOCIAL" }
+      - { name: topic, type: enum, source: input, description: "ACCEPTABLE_MATERIALS | SEASON_START | CONTAMINATION_PREVENTION | COMPOST_GIVEBACK" }
+      - { name: budget_cents, type: integer, source: input, description: "Campaign budget ceiling" }
+      - { name: audience_size, type: integer, source: input, description: "Planned impressions" }
+      - { name: cost_per_impression_cents, type: integer, source: input, description: "Unit cost" }
+      - { name: end_date, type: string, source: input, description: "ISO date; system marks COMPLETED when clock_date > end_date" }
+      - { name: spent_cents, type: integer, source: computed, description: "Set at launch: audience_size x cost_per_impression_cents; must be <= budget_cents" }
+      - { name: status, type: enum, source: system, description: "DRAFT | ACTIVE | PAUSED | COMPLETED | CANCELLED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ServiceZone
+    initial_state: OPEN_ENROLLMENT
+    terminal_states: []
+    note: "status is computed from the logical clock on every read/write; no stored transitions"
+    transitions:
+      - { from: OPEN_ENROLLMENT, to: IN_SEASON, trigger: "system: clock_date reaches season_start_date", actor: system, preconditions: [], side_effects: [] }
+      - { from: IN_SEASON, to: OFF_SEASON, trigger: "system: clock_date passes season_end_date", actor: system, preconditions: [], side_effects: ["subscriptions of households in this zone in PENDING_PAYMENT/ACTIVE/SUSPENDED -> EXPIRED"] }
+      - { from: OFF_SEASON, to: OPEN_ENROLLMENT, trigger: "PATCH /service-zones/{id} setting a new future season window", actor: ProgramAdmin, preconditions: ["current status OFF_SEASON (window fields immutable otherwise, ERR_INVALID_STATE)"], side_effects: [] }
+
+  - entity: Subscription
+    initial_state: PENDING_PAYMENT
+    terminal_states: [CANCELLED, EXPIRED]
+    transitions:
+      - from: PENDING_PAYMENT
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/pay"
+        actor: Resident
+        preconditions:
+          - "status == PENDING_PAYMENT (else ERR_INVALID_STATE)"
+          - "payment covers full outstanding: paid_cents + applied_credits + cash == total_due_cents; if total_due_cents - paid_cents <= 0 -> ERR_PAYMENT_NOT_REQUIRED"
+        side_effects:
+          - "when use_credit_balance=true: household GRANTED ServiceCredits (oldest created_at first) -> APPLIED until due covered; household.credit_balance_cents decremented per applied credit"
+          - "paid_cents += payment"
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/pay (top-up after cart fees accrue)"
+        actor: Resident
+        preconditions: ["total_due_cents - paid_cents > 0 (else ERR_PAYMENT_NOT_REQUIRED)"]
+        side_effects: ["same credit-application order as initial pay", "paid_cents += payment"]
+        note: "self-loop top-up; state unchanged"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: contamination_strike_assessment — a TAGGED_REJECTED inspection raises strikes_this_season to >= zone.max_strikes_per_season"
+        actor: system
+        preconditions: ["strikes_this_season >= zone.max_strikes_per_season"]
+        side_effects:
+          - "surcharge_cents += 2000 (reinstatement surcharge assessed at suspension)"
+          - "suspended_reason = CONTAMINATION_STRIKES"
+          - "all this subscription's PickupTickets with status SCHEDULED and service_date > clock_date -> SKIPPED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /subscriptions/{id}/cure"
+        actor: Resident
+        preconditions:
+          - "status == SUSPENDED (else ERR_INVALID_STATE)"
+          - "payment_cents >= total_due_cents - paid_cents (covers reinstatement surcharge and any unpaid cart fees)"
+        side_effects: ["strikes_this_season reset to 0", "suspended_reason = null", "paid_cents += payment_cents"]
+        note: "cycle ACTIVE -> SUSPENDED -> ACTIVE is repeatable within a season"
+      - from: PENDING_PAYMENT
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Resident
+        preconditions: []
+        side_effects: []
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Resident
+        preconditions: []
+        side_effects:
+          - "this household's SurgeBookings with status CONFIRMED or WAITLISTED for events in the subscription's zone -> CANCELLED"
+          - "each cancelled CONFIRMED booking releases its slot: SurgeEvent.reserved_slots -= 1"
+          - "each freed slot triggers surge_slot_allocation: earliest-created WAITLISTED booking (created_at ASC, tie quantity_bundles ASC) -> CONFIRMED, reserved_slots += 1"
+          - "carts with status DELIVERED -> RETRIEVAL_SCHEDULED"
+          - "PickupTickets SCHEDULED with service_date > clock_date -> SKIPPED"
+      - from: SUSPENDED
+        to: CANCELLED
+        trigger: "POST /subscriptions/{id}/cancel"
+        actor: Resident
+        preconditions: []
+        side_effects: ["same cascades as ACTIVE -> CANCELLED"]
+      - from: PENDING_PAYMENT
+        to: EXPIRED
+        trigger: "system: clock_date > zone.season_end_date"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: clock_date > zone.season_end_date"
+        actor: system
+        preconditions: []
+        side_effects: ["carts DELIVERED -> RETRIEVAL_SCHEDULED", "no SCHEDULED tickets can remain (all service dates are within season)"]
+      - from: SUSPENDED
+        to: EXPIRED
+        trigger: "system: clock_date > zone.season_end_date"
+        actor: system
+        preconditions: []
+        side_effects: ["carts DELIVERED -> RETRIEVAL_SCHEDULED"]
+
+  - entity: Cart
+    initial_state: REQUESTED
+    terminal_states: [RETRIEVED]
+    transitions:
+      - from: REQUESTED
+        to: DELIVERED
+        trigger: "POST /carts/{id}/deliver"
+        actor: RouteSupervisor
+        preconditions: ["status == REQUESTED (else ERR_INVALID_STATE)"]
+        side_effects: ["delivered_at = clock", "subscription.cart_fees_cents recomputed (delivered cart counts toward fees)"]
+      - from: DELIVERED
+        to: RETRIEVAL_SCHEDULED
+        trigger: "system: owning subscription -> CANCELLED or EXPIRED"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RETRIEVAL_SCHEDULED
+        to: RETRIEVED
+        trigger: "system: clock_date > zone.season_end_date + 14 days"
+        actor: system
+        preconditions: []
+        side_effects: ["subscription.cart_fees_cents recomputed (RETRIEVED cart excluded)"]
+
+  - entity: CollectionRoute
+    initial_state: DRAFT
+    terminal_states: [ARCHIVED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /routes/{id}/publish"
+        actor: ProgramAdmin
+        preconditions: ["status == DRAFT (else ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: PUBLISHED
+        to: ARCHIVED
+        trigger: "system: clock_date > effective_end_date (applied lazily on any access)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: PickupTicket
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, MISSED, REJECTED_CONTAMINATION, SKIPPED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /pickup-tickets/{id}/complete"
+        actor: Driver
+        preconditions:
+          - "ticket.status == SCHEDULED (else ERR_TICKET_NOT_SCHEDULED)"
+          - "ticket.subscription.status == ACTIVE (else ERR_SUBSCRIPTION_NOT_ACTIVE)"
+          - "weight_lbs > 0 (else ERR_INVALID_REQUEST)"
+        side_effects: ["completed_at = clock", "household.compost_entitlement_gallons recomputed (compost_entitlement)"]
+      - from: SCHEDULED
+        to: MISSED_REPORTED
+        trigger: "POST /pickup-tickets/{id}/report-missed"
+        actor: Resident
+        preconditions:
+          - "ticket.status == SCHEDULED (else ERR_TICKET_NOT_SCHEDULED)"
+          - "service_date <= clock_date (else ERR_TICKET_NOT_YET_DUE)"
+          - "acting Resident owns the ticket's household (else ERR_RESIDENT_NOT_OWNER)"
+        side_effects: ["missed_reported_by = household id"]
+      - from: MISSED_REPORTED
+        to: MISSED
+        trigger: "POST /pickup-tickets/{id}/validate-missed { validated: true }"
+        actor: RouteSupervisor
+        preconditions: ["ticket.status == MISSED_REPORTED (else ERR_INVALID_STATE)"]
+        side_effects:
+          - "create ServiceCredit: status PENDING_APPROVAL, amount per missed_pickup_credit_amount, validated_by = acting supervisor X-User-ID"
+          - "missed_validated_by = acting supervisor X-User-ID"
+      - from: MISSED_REPORTED
+        to: SCHEDULED
+        trigger: "POST /pickup-tickets/{id}/validate-missed { validated: false }"
+        actor: RouteSupervisor
+        preconditions: ["ticket.status == MISSED_REPORTED (else ERR_INVALID_STATE)"]
+        side_effects: ["missed_reported_by = null"]
+        note: "invalidation loops the ticket back to SCHEDULED (cycle)"
+      - from: SCHEDULED
+        to: REJECTED_CONTAMINATION
+        trigger: "system: ContaminationInspection created with result TAGGED_REJECTED (POST /contamination-inspections)"
+        actor: system
+        preconditions: []
+        side_effects: ["subscription.strikes_this_season += 1", "contamination_strike_assessment runs; on threshold breach subscription ACTIVE -> SUSPENDED (cascade hop 2)"]
+      - from: SCHEDULED
+        to: SKIPPED
+        trigger: "system: owning subscription -> SUSPENDED / CANCELLED / EXPIRED, for service_date > clock_date"
+        actor: system
+        preconditions: []
+        side_effects: ["route per-date booked stop count decremented (frees capacity, cascade hop 3)"]
+
+  - entity: SurgeEvent
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED]
+    note: "status is computed from the logical clock on every read/write"
+    transitions:
+      - { from: SCHEDULED, to: OPEN, trigger: "system: clock reaches booking_window_start", actor: system, preconditions: [], side_effects: [] }
+      - { from: OPEN, to: CLOSED, trigger: "system: clock reaches booking_window_end", actor: system, preconditions: [], side_effects: [] }
+      - { from: CLOSED, to: COMPLETED, trigger: "system: clock_date > service_date", actor: system, preconditions: [], side_effects: ["CONFIRMED bookings -> NO_SHOW"] }
+
+  - entity: SurgeBooking
+    initial_state: CONFIRMED
+    terminal_states: [CANCELLED, NO_SHOW]
+    transitions:
+      - from: null
+        to: CONFIRMED
+        trigger: "POST /surge-bookings (capacity available: reserved_slots < capacity_slots)"
+        actor: Resident
+        preconditions: ["event OPEN", "household subscription ACTIVE", "no outstanding balance", "no same-day booking"]
+        side_effects: ["SurgeEvent.reserved_slots += 1", "SurgeEvent.version += 1"]
+        note: "creation outcome state is computed by surge_slot_allocation"
+      - from: null
+        to: WAITLISTED
+        trigger: "POST /surge-bookings (reserved_slots == capacity_slots)"
+        actor: Resident
+        preconditions: ["same as CONFIRMED creation"]
+        side_effects: ["SurgeEvent.version += 1"]
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /surge-bookings/{id}/cancel"
+        actor: Resident
+        preconditions: ["status in {CONFIRMED, WAITLISTED} (else ERR_INVALID_STATE)", "acting Resident owns household_id (else ERR_RESIDENT_NOT_OWNER)"]
+        side_effects: ["SurgeEvent.reserved_slots -= 1", "surge_slot_allocation promotes earliest WAITLISTED booking (created_at ASC, tie quantity_bundles ASC) -> CONFIRMED, reserved_slots += 1", "SurgeEvent.version += 1"]
+      - from: WAITLISTED
+        to: CANCELLED
+        trigger: "POST /surge-bookings/{id}/cancel"
+        actor: Resident
+        preconditions: ["same as above"]
+        side_effects: ["SurgeEvent.version += 1"]
+      - from: WAITLISTED
+        to: CONFIRMED
+        trigger: "system: slot released by a cancellation (surge_slot_allocation)"
+        actor: system
+        preconditions: ["event still OPEN", "reserved_slots < capacity_slots after release"]
+        side_effects: ["SurgeEvent.reserved_slots += 1"]
+      - from: CONFIRMED
+        to: NO_SHOW
+        trigger: "system: event -> COMPLETED (clock_date > service_date)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: ProcessingFacility
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - { from: OPEN, to: CLOSED, trigger: "PATCH /facilities/{id} { status: CLOSED }", actor: ProgramAdmin, preconditions: ["status == OPEN (else ERR_INVALID_STATE)"], side_effects: [] }
+      - { from: CLOSED, to: OPEN, trigger: "PATCH /facilities/{id} { status: OPEN }", actor: ProgramAdmin, preconditions: ["status == CLOSED (else ERR_INVALID_STATE)"], side_effects: [] }
+
+  - entity: FacilityDelivery
+    initial_state: SCHEDULED
+    terminal_states: [ACCEPTED, REJECTED]
+    transitions:
+      - from: SCHEDULED
+        to: ACCEPTED
+        trigger: "POST /facility-deliveries/{id}/receive { outcome: ACCEPT }"
+        actor: RouteSupervisor
+        preconditions:
+          - "delivery.status == SCHEDULED (else ERR_INVALID_STATE)"
+          - "SAFETY: contaminated_item_count <= facility.safety_contamination_item_limit (else ERR_LOAD_SAFETY_LIMIT_EXCEEDED)"
+          - "CAPACITY: facility accepted lbs on delivery_date + gross_weight_lbs <= facility.daily_receiving_capacity_lbs (else ERR_FACILITY_CAPACITY_EXCEEDED)"
+          - "REFERENTIAL: delivery.route.status == PUBLISHED at receive time (else ERR_ROUTE_NOT_PUBLISHED)"
+        side_effects: ["accepted_weight_lbs = gross_weight_lbs", "facility.season_accepted_lbs += gross_weight_lbs"]
+      - from: SCHEDULED
+        to: REJECTED
+        trigger: "POST /facility-deliveries/{id}/receive { outcome: REJECT }"
+        actor: RouteSupervisor
+        preconditions: ["delivery.status == SCHEDULED (else ERR_INVALID_STATE)"]
+        side_effects: ["accepted_weight_lbs = 0"]
+        note: "operator-declared rejection bypasses safety/capacity checks (no load enters the facility)"
+
+  - entity: CompostGivebackEvent
+    initial_state: SCHEDULED
+    terminal_states: [CLOSED]
+    note: "status is computed from the logical clock on every read/write"
+    transitions:
+      - { from: SCHEDULED, to: OPEN, trigger: "system: clock_date == event_date", actor: system, preconditions: [], side_effects: [] }
+      - { from: OPEN, to: CLOSED, trigger: "system: clock_date > event_date", actor: system, preconditions: [], side_effects: [] }
+
+  - entity: CompostClaim
+    initial_state: FULFILLED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: FULFILLED
+        to: VOIDED
+        trigger: "POST /compost-claims/{id}/void"
+        actor: BillingClerk
+        preconditions: ["status == FULFILLED (else ERR_INVALID_STATE)"]
+        side_effects: ["giveback event remaining_gallons += claim.gallons (inventory restored)", "household entitlement consumption released"]
+
+  - entity: ServiceCredit
+    initial_state: PENDING_APPROVAL
+    terminal_states: [APPLIED, VOIDED]
+    transitions:
+      - from: PENDING_APPROVAL
+        to: GRANTED
+        trigger: "POST /service-credits/{id}/approve"
+        actor: BillingClerk
+        preconditions:
+          - "status == PENDING_APPROVAL (else ERR_INVALID_STATE)"
+          - "SEGREGATION OF DUTIES: acting BillingClerk X-User-ID != credit.validated_by (else ERR_SEGREGATION_OF_DUTIES)"
+        side_effects: ["approved_by = acting clerk X-User-ID", "household.credit_balance_cents += amount_cents", "Household.version += 1"]
+      - from: GRANTED
+        to: APPLIED
+        trigger: "system: POST /subscriptions/{id}/pay with use_credit_balance=true consumes GRANTED credits of the household, oldest created_at first"
+        actor: system
+        preconditions: []
+        side_effects: ["household.credit_balance_cents -= amount_cents", "subscription.paid_cents += amount_cents", "Household.version += 1"]
+      - from: GRANTED
+        to: VOIDED
+        trigger: "POST /service-credits/{id}/void"
+        actor: BillingClerk
+        preconditions: ["status == GRANTED (else ERR_INVALID_STATE)"]
+        side_effects: ["household.credit_balance_cents -= amount_cents", "Household.version += 1"]
+
+  - entity: OutreachCampaign
+    initial_state: DRAFT
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /outreach-campaigns/{id}/launch"
+        actor: OutreachCoordinator
+        preconditions:
+          - "status == DRAFT (else ERR_INVALID_STATE)"
+          - "FISCAL: audience_size x cost_per_impression_cents <= budget_cents (else ERR_CAMPAIGN_BUDGET_EXCEEDED)"
+        side_effects: ["spent_cents = audience_size x cost_per_impression_cents"]
+      - { from: ACTIVE, to: PAUSED, trigger: "PATCH /outreach-campaigns/{id} { status: PAUSED }", actor: OutreachCoordinator, preconditions: ["status == ACTIVE (else ERR_INVALID_STATE)"], side_effects: [] }
+      - { from: PAUSED, to: ACTIVE, trigger: "PATCH /outreach-campaigns/{id} { status: ACTIVE }", actor: OutreachCoordinator, preconditions: ["status == PAUSED (else ERR_INVALID_STATE)"], side_effects: [] }
+      - { from: ACTIVE, to: COMPLETED, trigger: "system: clock_date > end_date", actor: system, preconditions: [], side_effects: [] }
+      - { from: PAUSED, to: COMPLETED, trigger: "system: clock_date > end_date", actor: system, preconditions: [], side_effects: [] }
+      - { from: DRAFT, to: CANCELLED, trigger: "PATCH /outreach-campaigns/{id} { status: CANCELLED }", actor: OutreachCoordinator, preconditions: ["status in {DRAFT, ACTIVE, PAUSED} (else ERR_INVALID_STATE)"], side_effects: [] }
+      - { from: ACTIVE, to: CANCELLED, trigger: "PATCH /outreach-campaigns/{id} { status: CANCELLED }", actor: OutreachCoordinator, preconditions: [], side_effects: [] }
+      - { from: PAUSED, to: CANCELLED, trigger: "PATCH /outreach-campaigns/{id} { status: CANCELLED }", actor: OutreachCoordinator, preconditions: [], side_effects: [] }
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: subscription-create-stale-household
+    parent_entity: Household
+    write_endpoint: "POST /subscriptions"
+    occ_field: expected_household_version
+    description: |
+      Creating a Subscription against a Household whose version has advanced
+      since the client last observed it is rejected. The new subscription
+      legitimately supersedes the client's stale view of household enrollment
+      state (e.g., another subscription for a different season_year was just
+      created, or a credit approval changed the household), so the client must
+      re-read the household before creating.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: surge-booking-stale-event
+    parent_entity: SurgeEvent
+    write_endpoint: "POST /surge-bookings"
+    occ_field: expected_surge_event_version
+    description: |
+      Creating a SurgeBooking against a SurgeEvent whose version has advanced
+      since the client last observed it is rejected. Every booking creation or
+      cancellation mutates the event (reserved_slots and version), so a stale
+      expected version means the client decided from out-of-date capacity and
+      must re-read the event before booking.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: subscription_seasonal_fee
+    trigger: "Subscription creation (base); Cart create / cart -> RETRIEVED (cart_fees recompute); suspension (surcharge)"
+    algorithm: tiered_pricing
+    formula: |
+      total_season_weeks = ceil((zone.season_end_date - zone.season_start_date).days / 7)
+      # base fee — service-model branch + mid-season proration branch
+      if subscription.service_model == "UNIVERSAL":
+          base_fee_cents = 0                      # base covered by utility billing
+      else:                                       # OPT_IN
+          if signup_date <= zone.season_start_date:
+              base_fee_cents = zone.base_seasonal_fee_cents
+          else:
+              full_weeks_remaining = floor((zone.season_end_date - signup_date).days / 7)
+              base_fee_cents = floor(zone.base_seasonal_fee_cents * full_weeks_remaining / total_season_weeks)
+      # cart fees — tiered size surcharge + extra-cart fee; carts ordered by created_at ASC;
+      # first cart exempt from extra-cart fee; RETRIEVED carts excluded
+      active_carts = [c for c in subscription.carts if c.status != "RETRIEVED"]  # order: created_at ASC
+      cart_fees_cents = sum(SIZE_SURCHARGE[c.size_gallons] for c in active_carts)
+                      + EXTRA_CART_FEE_CENTS * max(0, len(active_carts) - 1)
+      surcharge_cents = REINSTATEMENT_SURCHARGE_CENTS * suspensions_this_season  # system accumulator
+      total_due_cents = base_fee_cents + cart_fees_cents + surcharge_cents
+    input_set: "the subscription, its zone (season window, base fee), its carts with status != RETRIEVED"
+    constants:
+      SIZE_SURCHARGE_CENTS_35: 0
+      SIZE_SURCHARGE_CENTS_64: 1500
+      SIZE_SURCHARGE_CENTS_96: 3000
+      EXTRA_CART_FEE_CENTS: 2500
+      REINSTATEMENT_SURCHARGE_CENTS: 2000
+    precision: "integer cents; floor() for proration"
+    variants:
+      - name: opt_in_billed
+        when: "zone.service_model == OPT_IN"
+        difference: "base fee billed to the resident (prorated on mid-season signup)"
+      - name: universal_bundled
+        when: "zone.service_model == UNIVERSAL"
+        difference: "base_fee_cents = 0 (utility-billed); cart fees and surcharges still billed; identical cart config yields a different total_due_cents than opt_in_billed"
+
+  - name: missed_pickup_credit_amount
+    trigger: "POST /pickup-tickets/{id}/validate-missed with validated=true (ServiceCredit creation)"
+    algorithm: aggregation
+    formula: |
+      if subscription.service_model == "OPT_IN":
+          amount_cents = floor(subscription.base_fee_cents / total_season_weeks)
+          # total_season_weeks = ceil((zone.season_end_date - zone.season_start_date).days / 7)
+      else:  # UNIVERSAL
+          amount_cents = zone.universal_flat_credit_cents
+    input_set: "the validated MISSED ticket's subscription (base_fee_cents, service_model) and its zone (window, flat credit)"
+    constants: {}
+    precision: "integer cents; floor() for prorated variant"
+    variants:
+      - name: prorated_opt_in
+        when: "subscription.service_model == OPT_IN"
+        difference: "credit = floor(base_fee_cents / total_season_weeks) — depends on fee actually charged"
+      - name: flat_universal
+        when: "subscription.service_model == UNIVERSAL"
+        difference: "credit = zone.universal_flat_credit_cents — independent of any fee; identical missed-pickup event yields a different amount than prorated_opt_in"
+
+  - name: compost_entitlement
+    trigger: "PickupTicket -> COMPLETED (recompute for the ticket's household)"
+    algorithm: aggregation
+    formula: |
+      # PINNED ROUNDING ORDER (mode b): round EACH pickup to 2dp FIRST, then sum.
+      # The alternative order (sum lbs, then convert) is documented and MUST NOT be used:
+      # it yields different gallons for identical data (e.g., 133+67 lbs -> 5.01 vs 5.00).
+      entitlement = 0
+      for t in household_tickets_this_season where t.status == "COMPLETED":   # REJECTED_CONTAMINATION / SKIPPED / MISSED excluded
+          gal_i = round_half_up(t.weight_lbs * COMPOST_YIELD_RATIO / COMPOST_LBS_PER_GALLON, 2)
+          entitlement += gal_i
+      household.compost_entitlement_gallons = entitlement   # kept at 2 decimal places
+    input_set: "PickupTickets of all the household's subscriptions for the current zone season with status COMPLETED only"
+    constants:
+      COMPOST_YIELD_RATIO: 0.5
+      COMPOST_LBS_PER_GALLON: 20
+    precision: "2 decimal places per pickup, round_half_up; sum of rounded values"
+    variants:
+      - name: per_pickup_rounding
+        when: "CANONICAL — always"
+        difference: "round_half_up each ticket's gallons to 2dp, then sum"
+      - name: aggregate_rounding
+        when: "FORBIDDEN alternative, documented for divergence checks"
+        difference: "sum all lbs first, then convert once (0.025 gal/lb); e.g. 133+67 lbs -> 5.00 instead of 5.01"
+
+  - name: giveback_inventory_derivation
+    trigger: "POST /giveback-events (initial inventory, computed once at creation); CompostClaim create/void (remaining_gallons)"
+    algorithm: aggregation
+    formula: |
+      zone_accepted_lbs = sum(d.accepted_weight_lbs for d in FacilityDelivery
+                              where d.status == "ACCEPTED"
+                                and d.route.zone_id == event.zone_id
+                                and zone.season_start_date <= d.delivery_date <= zone.season_end_date)
+      initial_inventory_gallons = floor(zone_accepted_lbs * COMPOST_YIELD_RATIO / COMPOST_LBS_PER_GALLON)
+      remaining_gallons = initial_inventory_gallons - sum(c.gallons for c in event.claims where c.status == "FULFILLED")
+    input_set: "ACCEPTED FacilityDeliveries whose route belongs to the event's zone, delivery_date inside the zone season window"
+    constants:
+      COMPOST_YIELD_RATIO: 0.5
+      COMPOST_LBS_PER_GALLON: 20
+    precision: "integer gallons; floor() at derivation"
+
+  - name: contamination_strike_assessment
+    trigger: "ContaminationInspection created with result TAGGED_REJECTED"
+    algorithm: threshold
+    formula: |
+      strikes = count(i for i in subscription inspections via tickets where i.result == "TAGGED_REJECTED")
+      subscription.strikes_this_season = strikes
+      if strikes >= zone.max_strikes_per_season and subscription.status == "ACTIVE":
+          suspend subscription   # boundary: strikes == max EXACTLY triggers; max-1 does not
+    input_set: "TAGGED_REJECTED inspections only; PASSED and TAGGED_WARNING never increment"
+    constants: {}
+    precision: "integer count; >= comparison"
+
+  - name: route_capacity_check
+    trigger: "POST /pickup-tickets (before creating the ticket)"
+    algorithm: threshold
+    formula: |
+      existing = count(t for t in route tickets where t.service_date == service_date
+                       and t.status in {SCHEDULED, COMPLETED, MISSED_REPORTED, MISSED, REJECTED_CONTAMINATION})
+      # SKIPPED tickets are excluded (freed capacity)
+      if existing >= route.max_stops:                        # == max_stops rejects; max_stops-1 allows
+          reject ERR_ROUTE_CAPACITY_EXCEEDED
+      projected_lbs = (existing + 1) * AVG_TICKET_WEIGHT_LBS
+      if projected_lbs > route.max_tonnage_lbs:              # == max_tonnage_lbs allows; +1 lb over rejects
+          reject ERR_ROUTE_TONNAGE_EXCEEDED
+    input_set: "tickets of the route on the same service_date excluding SKIPPED"
+    constants:
+      AVG_TICKET_WEIGHT_LBS: 200
+    precision: "integer counts; >= for stops, > for tonnage"
+
+  - name: surge_slot_allocation
+    trigger: "POST /surge-bookings (initial placement); POST /surge-bookings/{id}/cancel (promotion)"
+    algorithm: waterfall_allocation
+    formula: |
+      on create:
+          if event.reserved_slots < event.capacity_slots: booking.status = CONFIRMED; reserved_slots += 1
+          else: booking.status = WAITLISTED                 # over-capacity is NOT an error
+      on cancel of a CONFIRMED booking:
+          reserved_slots -= 1
+          candidates = [b for b in event.bookings if b.status == "WAITLISTED"]
+          candidates.sort(key = (created_at ASC, quantity_bundles ASC))   # deterministic; no id tie-break
+          while reserved_slots < event.capacity_slots and candidates:
+              promote candidates.pop(0) -> CONFIRMED; reserved_slots += 1
+      invariant: event.capacity_slots == event.reserved_slots + available_slots at all times
+    input_set: "bookings of the event; CONFIRMED occupy slots, WAITLISTED queued"
+    constants: {}
+    precision: "integer slots"
+
+  - name: service_credit_balance
+    trigger: "ServiceCredit approve / apply / void (household.credit_balance_cents recompute)"
+    algorithm: aggregation
+    formula: |
+      household.credit_balance_cents = sum(c.amount_cents for c in household credits where c.status == "GRANTED")
+      # INVARIANT (Rule 9): approve followed by void of the same credit leaves the balance unchanged.
+    input_set: "ServiceCredits of the household with status GRANTED only (PENDING_APPROVAL, APPLIED, VOIDED excluded)"
+    constants: {}
+    precision: "integer cents"
+
+  - name: campaign_spend
+    trigger: "POST /outreach-campaigns/{id}/launch"
+    algorithm: aggregation
+    formula: |
+      spent_cents = audience_size * cost_per_impression_cents
+      require spent_cents <= budget_cents   # == budget allowed; +1 cent over rejects (ERR_CAMPAIGN_BUDGET_EXCEEDED)
+    input_set: "the campaign's own input fields"
+    constants: {}
+    precision: "integer cents"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority — first failure wins)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present; role is a declared role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "acting role is in the endpoint's roles list", error_id: ERR_UNAUTHORIZED_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: auth, check: "Resident ownership: X-User-ID equals the target resource's household_id (subscriptions pay/cancel/cure, carts create, report-missed, surge bookings create/cancel, compost claims create, household/subscription reads)", error_id: ERR_RESIDENT_NOT_OWNER, http_status: 403, applies_to: "resident-scoped endpoints" }
+  - { priority: 4, category: existence, check: "path parameters resolve to existing resources, left to right; resource-specific ids: ERR_ZONE_NOT_FOUND, ERR_SUBSCRIPTION_NOT_FOUND, ERR_TICKET_NOT_FOUND, ERR_SURGE_EVENT_NOT_FOUND, ERR_FACILITY_NOT_FOUND, ERR_GIVEBACK_EVENT_NOT_FOUND, else generic ERR_NOT_FOUND", error_id: ERR_HOUSEHOLD_NOT_FOUND, http_status: 404, applies_to: "all" }
+  - { priority: 5, category: business_constraint, check: "request shape: required fields present, types correct, enum members valid, ranges valid (gallons >= 1, quantity_bundles 1..10, weight_lbs > 0, window_end > window_start, violation_codes non-empty iff result TAGGED_*, ticket service_date weekday == route weekday, route window inside zone season window, unknown fields rejected)", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all" }
+  - { priority: 6, category: existence, check: "body foreign keys resolve to existing resources", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all (uses the FK-specific 404 ids of priority 4 where declared)" }
+  - { priority: 7, category: state, check: "target resource in a valid state: subscription ACTIVE where required (ticket create/complete, booking create -> ERR_SUBSCRIPTION_NOT_ACTIVE); ticket SCHEDULED (complete/report-missed/inspect -> ERR_TICKET_NOT_SCHEDULED); ticket MISSED_REPORTED (validate-missed -> ERR_INVALID_STATE); surge event OPEN (book -> ERR_SURGE_EVENT_NOT_OPEN); giveback event OPEN (claim -> ERR_GIVEBACK_EVENT_NOT_OPEN); delivery SCHEDULED (receive -> ERR_INVALID_STATE); campaign DRAFT (launch -> ERR_INVALID_STATE); credit PENDING_APPROVAL (approve) / GRANTED (void) / claim FULFILLED (void) / cart REQUESTED (deliver) / route DRAFT (publish) / OCC expected_*_version match (ERR_STALE_VERSION); zone window fields PATCHable only when OFF_SEASON; campaign non-status fields PATCHable only in DRAFT", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "stateful endpoints" }
+  - { priority: 8, category: business_safety, check: "receive ACCEPT: contaminated_item_count <= facility.safety_contamination_item_limit", error_id: ERR_LOAD_SAFETY_LIMIT_EXCEEDED, http_status: 422, applies_to: ["POST /facility-deliveries/{id}/receive"] }
+  - { priority: 9, category: business_constraint, check: "uniqueness/capacity/quota: one non-terminal subscription per (household, season_year) (ERR_DUPLICATE_SUBSCRIPTION); <= 2 carts in REQUESTED/DELIVERED per household (ERR_CART_LIMIT_EXCEEDED); route (zone,weekday) half-open window overlap (ERR_ROUTE_WINDOW_OVERLAP); route stop/tonnage capacity (ERR_ROUTE_CAPACITY_EXCEEDED / ERR_ROUTE_TONNAGE_EXCEEDED); one booking per household per service_date (ERR_SURGE_BOOKING_DAY_CONFLICT); one inspection per ticket (ERR_DUPLICATE_INSPECTION); delivery buffered bay-window overlap (ERR_DELIVERY_WINDOW_OVERLAP); facility daily capacity on receive ACCEPT (ERR_FACILITY_CAPACITY_EXCEEDED); claim entitlement/cap/inventory quota in this order (ERR_ENTITLEMENT_EXCEEDED -> ERR_PER_HOUSEHOLD_CAP_EXCEEDED -> ERR_INSUFFICIENT_INVENTORY); credit approver != validator (ERR_SEGREGATION_OF_DUTIES)", error_id: ERR_DUPLICATE_SUBSCRIPTION, http_status: 409, applies_to: "per-check endpoints" }
+  - { priority: 10, category: business_temporal, check: "season/window timing: subscription signup only while zone OPEN_ENROLLMENT or IN_SEASON (ERR_ENROLLMENT_WINDOW_CLOSED); ticket service_date inside zone season window (ERR_TICKET_DATE_OUT_OF_SEASON); report-missed only when service_date <= clock_date (ERR_TICKET_NOT_YET_DUE)", error_id: ERR_ENROLLMENT_WINDOW_CLOSED, http_status: 422, applies_to: "dated endpoints" }
+  - { priority: 11, category: business_referential, check: "cross-entity reference state: route PUBLISHED at ticket creation, delivery creation, and delivery receive (ERR_ROUTE_NOT_PUBLISHED); facility OPEN at delivery creation (ERR_FACILITY_NOT_OPEN)", error_id: ERR_ROUTE_NOT_PUBLISHED, http_status: 409, applies_to: ["POST /pickup-tickets", "POST /facility-deliveries", "POST /facility-deliveries/{id}/receive"] }
+  - { priority: 12, category: business_fiscal, check: "money gates last: booking create requires no household subscription with total_due_cents > paid_cents (ERR_OUTSTANDING_BALANCE); campaign launch spend <= budget (ERR_CAMPAIGN_BUDGET_EXCEEDED)", error_id: ERR_OUTSTANDING_BALANCE, http_status: 402, applies_to: ["POST /surge-bookings", "POST /outreach-campaigns/{id}/launch"] }
+
+# =============================================================================
+# §1.5 API Endpoint Table (flat paths; `?` marks optional input)
+# =============================================================================
+endpoints:
+  # ---- ServiceZone ----
+  - { method: POST, path: "/service-zones", description: "Create a service zone", roles: [ProgramAdmin], code: 201, input: [name, service_model, season_start_date, season_end_date, base_seasonal_fee_cents, universal_flat_credit_cents, "max_strikes_per_season?"], output: ServiceZone, side_effects: [] }
+  - { method: GET, path: "/service-zones", description: "List zones", roles: [Anonymous, Resident, Driver, FieldInspector, RouteSupervisor, BillingClerk, ProgramAdmin, OutreachCoordinator], code: 200, input: ["service_model?", "status?", "limit?", "offset?"], output: "ServiceZone[]", side_effects: [] }
+  - { method: GET, path: "/service-zones/{id}", description: "Get one zone", roles: [Anonymous, Resident, Driver, FieldInspector, RouteSupervisor, BillingClerk, ProgramAdmin, OutreachCoordinator], code: 200, input: [], output: ServiceZone, side_effects: [] }
+  - { method: PATCH, path: "/service-zones/{id}", description: "Update zone fee/window/strike config; season_start_date/season_end_date only when OFF_SEASON", roles: [ProgramAdmin], code: 200, input: ["base_seasonal_fee_cents?", "universal_flat_credit_cents?", "season_start_date?", "season_end_date?", "max_strikes_per_season?"], output: ServiceZone, side_effects: ["increments ServiceZone.version by 1"] }
+
+  # ---- Household ----
+  - { method: POST, path: "/households", description: "Register a household (self-service); created id becomes the Resident's X-User-ID", roles: [Anonymous], code: 201, input: [address_line, zone_id], output: Household, side_effects: [] }
+  - { method: GET, path: "/households", description: "List households", roles: [ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: ["zone_id?", "limit?", "offset?"], output: "Household[]", side_effects: [] }
+  - { method: GET, path: "/households/{id}", description: "Get one household (Resident: own only)", roles: [Resident, ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: [], output: Household, side_effects: [] }
+
+  # ---- Subscription ----
+  - { method: POST, path: "/subscriptions", description: "Season signup; computes subscription_seasonal_fee; UNIVERSAL auto-activates, OPT_IN starts PENDING_PAYMENT", roles: [Resident], code: 201, input: [household_id, season_year, expected_household_version], output: Subscription, side_effects: ["increments Household.version by 1", "OCC: expected_household_version must equal Household.version (ERR_STALE_VERSION)"] }
+  - { method: GET, path: "/subscriptions", description: "List subscriptions", roles: [Resident, ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: ["household_id?", "status?", "season_year?", "limit?", "offset?"], output: "Subscription[]", side_effects: [] }
+  - { method: GET, path: "/subscriptions/{id}", description: "Get one subscription", roles: [Resident, ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: [], output: Subscription, side_effects: [] }
+  - { method: POST, path: "/subscriptions/{id}/pay", description: "Pay full outstanding due (cash minus applied credits); activates when covered", roles: [Resident], code: 200, input: ["use_credit_balance?"], output: Subscription, side_effects: ["applies GRANTED credits (oldest created_at first) -> APPLIED when use_credit_balance=true", "paid_cents updated", "status -> ACTIVE when covered"] }
+  - { method: POST, path: "/subscriptions/{id}/cancel", description: "Cancel subscription; cascades to bookings, carts, future tickets", roles: [Resident, ProgramAdmin], code: 200, input: [], output: Subscription, side_effects: ["SurgeBookings CONFIRMED/WAITLISTED -> CANCELLED", "slot release triggers surge_slot_allocation promotion", "carts DELIVERED -> RETRIEVAL_SCHEDULED", "future SCHEDULED tickets -> SKIPPED"] }
+  - { method: POST, path: "/subscriptions/{id}/cure", description: "Cure a contamination suspension by paying outstanding (incl. 2000 reinstatement surcharge)", roles: [Resident], code: 200, input: [payment_cents], output: Subscription, side_effects: ["strikes_this_season reset to 0", "paid_cents += payment_cents", "status SUSPENDED -> ACTIVE"] }
+
+  # ---- Cart ----
+  - { method: POST, path: "/carts", description: "Request a cart for a subscription (max 2 active per household)", roles: [Resident], code: 201, input: [household_id, subscription_id, size_gallons], output: Cart, side_effects: ["subscription.cart_fees_cents recomputed"] }
+  - { method: GET, path: "/carts", description: "List carts", roles: [Resident, ProgramAdmin, RouteSupervisor], code: 200, input: ["household_id?", "subscription_id?", "status?", "limit?", "offset?"], output: "Cart[]", side_effects: [] }
+  - { method: GET, path: "/carts/{id}", description: "Get one cart", roles: [Resident, ProgramAdmin, RouteSupervisor], code: 200, input: [], output: Cart, side_effects: [] }
+  - { method: POST, path: "/carts/{id}/deliver", description: "Mark cart delivered", roles: [RouteSupervisor], code: 200, input: [], output: Cart, side_effects: ["delivered_at = clock"] }
+
+  # ---- CollectionRoute ----
+  - { method: POST, path: "/routes", description: "Create route; rejects overlapping half-open window for same (zone, weekday) among non-ARCHIVED routes", roles: [ProgramAdmin], code: 201, input: [zone_id, weekday, effective_start_date, effective_end_date, max_stops, max_tonnage_lbs], output: CollectionRoute, side_effects: [] }
+  - { method: GET, path: "/routes", description: "List routes", roles: [ProgramAdmin, RouteSupervisor, Resident, Driver, FieldInspector, BillingClerk, OutreachCoordinator], code: 200, input: ["zone_id?", "weekday?", "status?", "limit?", "offset?"], output: "CollectionRoute[]", side_effects: [] }
+  - { method: GET, path: "/routes/{id}", description: "Get one route", roles: [ProgramAdmin, RouteSupervisor, Resident, Driver, FieldInspector, BillingClerk, OutreachCoordinator], code: 200, input: [], output: CollectionRoute, side_effects: [] }
+  - { method: POST, path: "/routes/{id}/publish", description: "Publish a DRAFT route", roles: [ProgramAdmin], code: 200, input: [], output: CollectionRoute, side_effects: [] }
+
+  # ---- PickupTicket ----
+  - { method: POST, path: "/pickup-tickets", description: "Schedule a pickup; enforces season window, route PUBLISHED, stop & tonnage capacity", roles: [RouteSupervisor], code: 201, input: [subscription_id, route_id, service_date], output: PickupTicket, side_effects: ["route_capacity_check runs"] }
+  - { method: GET, path: "/pickup-tickets", description: "List pickup tickets", roles: [Resident, Driver, FieldInspector, RouteSupervisor, ProgramAdmin, BillingClerk], code: 200, input: ["subscription_id?", "route_id?", "service_date?", "status?", "limit?", "offset?"], output: "PickupTicket[]", side_effects: [] }
+  - { method: GET, path: "/pickup-tickets/{id}", description: "Get one ticket", roles: [Resident, Driver, FieldInspector, RouteSupervisor, ProgramAdmin, BillingClerk], code: 200, input: [], output: PickupTicket, side_effects: [] }
+  - { method: POST, path: "/pickup-tickets/{id}/complete", description: "Record completed pickup with scale weight", roles: [Driver], code: 200, input: [weight_lbs], output: PickupTicket, side_effects: ["household.compost_entitlement_gallons recomputed"] }
+  - { method: POST, path: "/pickup-tickets/{id}/report-missed", description: "Resident reports a missed pickup (on/after service_date)", roles: [Resident], code: 200, input: [], output: PickupTicket, side_effects: ["status -> MISSED_REPORTED"] }
+  - { method: POST, path: "/pickup-tickets/{id}/validate-missed", description: "Supervisor validates (creates PENDING_APPROVAL ServiceCredit) or invalidates (ticket back to SCHEDULED)", roles: [RouteSupervisor], code: 200, input: [validated], output: PickupTicket, side_effects: ["validated=true -> ServiceCredit PENDING_APPROVAL created per missed_pickup_credit_amount", "validated=false -> ticket -> SCHEDULED"] }
+
+  # ---- ContaminationInspection ----
+  - { method: POST, path: "/contamination-inspections", description: "Record setout inspection; TAGGED_REJECTED rejects the ticket, increments strikes, may suspend subscription (cascade)", roles: [FieldInspector], code: 201, input: [pickup_ticket_id, result, violation_codes, "notes?"], output: ContaminationInspection, side_effects: ["TAGGED_REJECTED -> ticket REJECTED_CONTAMINATION, strikes += 1, contamination_strike_assessment", "on suspension: future SCHEDULED tickets -> SKIPPED, route capacity freed"] }
+  - { method: GET, path: "/contamination-inspections", description: "List inspections", roles: [FieldInspector, RouteSupervisor, ProgramAdmin, Resident, BillingClerk], code: 200, input: ["pickup_ticket_id?", "result?", "limit?", "offset?"], output: "ContaminationInspection[]", side_effects: [] }
+  - { method: GET, path: "/contamination-inspections/{id}", description: "Get one inspection", roles: [FieldInspector, RouteSupervisor, ProgramAdmin, Resident, BillingClerk], code: 200, input: [], output: ContaminationInspection, side_effects: [] }
+
+  # ---- SurgeEvent ----
+  - { method: POST, path: "/surge-events", description: "Create a seasonal surge collection event (leaf / holiday tree)", roles: [ProgramAdmin], code: 201, input: [zone_id, event_type, service_date, capacity_slots, booking_window_start, booking_window_end], output: SurgeEvent, side_effects: [] }
+  - { method: GET, path: "/surge-events", description: "List surge events", roles: [Anonymous, Resident, Driver, FieldInspector, RouteSupervisor, BillingClerk, ProgramAdmin, OutreachCoordinator], code: 200, input: ["zone_id?", "event_type?", "status?", "limit?", "offset?"], output: "SurgeEvent[]", side_effects: [] }
+  - { method: GET, path: "/surge-events/{id}", description: "Get one surge event (reserved_slots current)", roles: [Anonymous, Resident, Driver, FieldInspector, RouteSupervisor, BillingClerk, ProgramAdmin, OutreachCoordinator], code: 200, input: [], output: SurgeEvent, side_effects: [] }
+
+  # ---- SurgeBooking ----
+  - { method: POST, path: "/surge-bookings", description: "Book a surge slot; CONFIRMED if capacity remains else WAITLISTED", roles: [Resident], code: 201, input: [surge_event_id, household_id, quantity_bundles, expected_surge_event_version], output: SurgeBooking, side_effects: ["surge_slot_allocation runs", "increments SurgeEvent.version by 1", "OCC: expected_surge_event_version must equal SurgeEvent.version (ERR_STALE_VERSION)"] }
+  - { method: GET, path: "/surge-bookings", description: "List surge bookings", roles: [Resident, ProgramAdmin, RouteSupervisor], code: 200, input: ["surge_event_id?", "household_id?", "status?", "limit?", "offset?"], output: "SurgeBooking[]", side_effects: [] }
+  - { method: GET, path: "/surge-bookings/{id}", description: "Get one surge booking", roles: [Resident, ProgramAdmin, RouteSupervisor], code: 200, input: [], output: SurgeBooking, side_effects: [] }
+  - { method: POST, path: "/surge-bookings/{id}/cancel", description: "Cancel a booking; releases slot and promotes earliest waitlisted booking", roles: [Resident], code: 200, input: [], output: SurgeBooking, side_effects: ["CONFIRMED cancel -> reserved_slots -= 1 -> surge_slot_allocation promotion", "increments SurgeEvent.version by 1"] }
+
+  # ---- ProcessingFacility ----
+  - { method: POST, path: "/facilities", description: "Register a composting facility", roles: [ProgramAdmin], code: 201, input: [name, daily_receiving_capacity_lbs, safety_contamination_item_limit], output: ProcessingFacility, side_effects: [] }
+  - { method: GET, path: "/facilities", description: "List facilities", roles: [ProgramAdmin, RouteSupervisor], code: 200, input: ["status?", "limit?", "offset?"], output: "ProcessingFacility[]", side_effects: [] }
+  - { method: GET, path: "/facilities/{id}", description: "Get one facility (season_accepted_lbs current)", roles: [ProgramAdmin, RouteSupervisor], code: 200, input: [], output: ProcessingFacility, side_effects: [] }
+  - { method: PATCH, path: "/facilities/{id}", description: "Toggle OPEN/CLOSED or adjust limits", roles: [ProgramAdmin], code: 200, input: ["status?", "daily_receiving_capacity_lbs?", "safety_contamination_item_limit?"], output: ProcessingFacility, side_effects: ["increments ProcessingFacility.version by 1"] }
+
+  # ---- FacilityDelivery ----
+  - { method: POST, path: "/facility-deliveries", description: "Schedule a bay appointment; rejects buffered-window overlap on same facility+date", roles: [RouteSupervisor], code: 201, input: [facility_id, route_id, delivery_date, window_start, window_end], output: FacilityDelivery, side_effects: [] }
+  - { method: GET, path: "/facility-deliveries", description: "List deliveries", roles: [RouteSupervisor, ProgramAdmin], code: 200, input: ["facility_id?", "route_id?", "delivery_date?", "status?", "limit?", "offset?"], output: "FacilityDelivery[]", side_effects: [] }
+  - { method: GET, path: "/facility-deliveries/{id}", description: "Get one delivery", roles: [RouteSupervisor, ProgramAdmin], code: 200, input: [], output: FacilityDelivery, side_effects: [] }
+  - { method: POST, path: "/facility-deliveries/{id}/receive", description: "Weigh and accept/reject a load; safety limit, daily capacity, and route-still-PUBLISHED checks on ACCEPT", roles: [RouteSupervisor], code: 200, input: [outcome, gross_weight_lbs, contaminated_item_count], output: FacilityDelivery, side_effects: ["ACCEPT -> accepted_weight_lbs = gross, facility.season_accepted_lbs += gross"] }
+
+  # ---- CompostGivebackEvent ----
+  - { method: POST, path: "/giveback-events", description: "Create a compost giveback event; initial inventory derived from zone ACCEPTED tonnage", roles: [ProgramAdmin], code: 201, input: [zone_id, event_date, per_household_cap_gallons], output: CompostGivebackEvent, side_effects: ["giveback_inventory_derivation runs"] }
+  - { method: GET, path: "/giveback-events", description: "List giveback events", roles: [Resident, ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: ["zone_id?", "status?", "limit?", "offset?"], output: "CompostGivebackEvent[]", side_effects: [] }
+  - { method: GET, path: "/giveback-events/{id}", description: "Get one giveback event (remaining_gallons current)", roles: [Resident, ProgramAdmin, BillingClerk, RouteSupervisor], code: 200, input: [], output: CompostGivebackEvent, side_effects: [] }
+
+  # ---- CompostClaim ----
+  - { method: POST, path: "/compost-claims", description: "Claim giveback compost; entitlement, per-household cap, and inventory quota enforced in that order", roles: [Resident], code: 201, input: [giveback_event_id, household_id, gallons], output: CompostClaim, side_effects: ["event.remaining_gallons -= gallons"] }
+  - { method: GET, path: "/compost-claims", description: "List claims", roles: [Resident, BillingClerk, ProgramAdmin], code: 200, input: ["giveback_event_id?", "household_id?", "status?", "limit?", "offset?"], output: "CompostClaim[]", side_effects: [] }
+  - { method: GET, path: "/compost-claims/{id}", description: "Get one claim", roles: [Resident, BillingClerk, ProgramAdmin], code: 200, input: [], output: CompostClaim, side_effects: [] }
+  - { method: POST, path: "/compost-claims/{id}/void", description: "Void a claim; restores event inventory and household entitlement", roles: [BillingClerk], code: 200, input: [], output: CompostClaim, side_effects: ["event.remaining_gallons += claim.gallons"] }
+
+  # ---- ServiceCredit ----
+  - { method: GET, path: "/service-credits", description: "List credits", roles: [Resident, BillingClerk, RouteSupervisor, ProgramAdmin], code: 200, input: ["household_id?", "subscription_id?", "missed_pickup_ticket_id?", "status?", "limit?", "offset?"], output: "ServiceCredit[]", side_effects: [] }
+  - { method: GET, path: "/service-credits/{id}", description: "Get one credit", roles: [Resident, BillingClerk, RouteSupervisor, ProgramAdmin], code: 200, input: [], output: ServiceCredit, side_effects: [] }
+  - { method: POST, path: "/service-credits/{id}/approve", description: "Grant a validated credit; approver must differ from validator (segregation of duties)", roles: [BillingClerk], code: 200, input: [], output: ServiceCredit, side_effects: ["household.credit_balance_cents += amount_cents", "increments Household.version by 1"] }
+  - { method: POST, path: "/service-credits/{id}/void", description: "Void a GRANTED credit; balance decremented (compensation)", roles: [BillingClerk], code: 200, input: [], output: ServiceCredit, side_effects: ["household.credit_balance_cents -= amount_cents", "increments Household.version by 1"] }
+
+  # ---- OutreachCampaign ----
+  - { method: POST, path: "/outreach-campaigns", description: "Create an education/outreach campaign (DRAFT)", roles: [OutreachCoordinator], code: 201, input: ["zone_id?", channel, topic, budget_cents, audience_size, cost_per_impression_cents, end_date], output: OutreachCampaign, side_effects: [] }
+  - { method: GET, path: "/outreach-campaigns", description: "List campaigns", roles: [OutreachCoordinator, ProgramAdmin], code: 200, input: ["zone_id?", "status?", "limit?", "offset?"], output: "OutreachCampaign[]", side_effects: [] }
+  - { method: GET, path: "/outreach-campaigns/{id}", description: "Get one campaign", roles: [OutreachCoordinator, ProgramAdmin], code: 200, input: [], output: OutreachCampaign, side_effects: [] }
+  - { method: POST, path: "/outreach-campaigns/{id}/launch", description: "Launch a DRAFT campaign; computes spend, enforces budget", roles: [OutreachCoordinator], code: 200, input: [], output: OutreachCampaign, side_effects: ["campaign_spend runs", "spent_cents set"] }
+  - { method: PATCH, path: "/outreach-campaigns/{id}", description: "Pause/resume/cancel via status; budget fields editable only in DRAFT", roles: [OutreachCoordinator], code: 200, input: ["status?", "budget_cents?", "audience_size?", "cost_per_impression_cents?", "end_date?"], output: OutreachCampaign, side_effects: ["increments OutreachCampaign.version by 1"] }
+
+  # ---- Test-driving: logical clock ----
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the logical clock (ISO8601 UTC). Server startup default before any set call is exactly 2026-05-01T00:00:00Z; never falls back to wall-clock time.", roles: [ProgramAdmin], code: 200, input: [to_iso8601], output: null, side_effects: ["all clock-derived statuses (zone, surge event, giveback event) and system transitions (expiry, archival, retrieval, no-show) re-evaluated lazily on subsequent access"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "missing/unknown X-User-Role or X-User-ID" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "role not in endpoint's roles list" }
+  - { id: ERR_RESIDENT_NOT_OWNER, http: 403, condition: "Resident X-User-ID does not match the resource's household_id" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "missing required field, bad type/enum/range, unknown field, or malformed window/weekday pairing" }
+  - { id: ERR_HOUSEHOLD_NOT_FOUND, http: 404, condition: "household id does not exist" }
+  - { id: ERR_ZONE_NOT_FOUND, http: 404, condition: "zone id does not exist" }
+  - { id: ERR_SUBSCRIPTION_NOT_FOUND, http: 404, condition: "subscription id does not exist" }
+  - { id: ERR_TICKET_NOT_FOUND, http: 404, condition: "pickup ticket id does not exist" }
+  - { id: ERR_SURGE_EVENT_NOT_FOUND, http: 404, condition: "surge event id does not exist" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "any other referenced resource (cart, route, booking, delivery, claim, credit, campaign, inspection, facility, giveback event) does not exist" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent's current version (OCC)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "generic invalid-from-state rejection (terminal lockdown, wrong precondition state, immutable-field edits)" }
+  - { id: ERR_SUBSCRIPTION_NOT_ACTIVE, http: 409, condition: "operation requires an ACTIVE subscription (ticket create/complete, cart create, booking create) and it is SUSPENDED/CANCELLED/EXPIRED/PENDING_PAYMENT" }
+  - { id: ERR_TICKET_NOT_SCHEDULED, http: 409, condition: "complete/report-missed/inspect requires ticket SCHEDULED" }
+  - { id: ERR_SURGE_EVENT_NOT_OPEN, http: 409, condition: "booking requires event status OPEN (booking window)" }
+  - { id: ERR_GIVEBACK_EVENT_NOT_OPEN, http: 409, condition: "claim requires giveback event status OPEN (on event_date)" }
+  - { id: ERR_DUPLICATE_SUBSCRIPTION, http: 409, condition: "household already has a non-terminal subscription for the same season_year" }
+  - { id: ERR_CART_LIMIT_EXCEEDED, http: 409, condition: "household already has 2 carts in REQUESTED/DELIVERED" }
+  - { id: ERR_ROUTE_WINDOW_OVERLAP, http: 409, condition: "route half-open window [start,end) overlaps another non-ARCHIVED route for the same (zone, weekday); adjacency (end == start) is allowed" }
+  - { id: ERR_ROUTE_CAPACITY_EXCEEDED, http: 409, condition: "existing non-SKIPPED tickets for route+date >= max_stops" }
+  - { id: ERR_ROUTE_TONNAGE_EXCEEDED, http: 409, condition: "(existing+1) x 200 lbs > max_tonnage_lbs" }
+  - { id: ERR_SURGE_BOOKING_DAY_CONFLICT, http: 409, condition: "household already holds a CONFIRMED/WAITLISTED booking for the same service_date" }
+  - { id: ERR_DUPLICATE_INSPECTION, http: 409, condition: "ticket already has a contamination inspection" }
+  - { id: ERR_DELIVERY_WINDOW_OVERLAP, http: 409, condition: "delivery bay window (expanded +/-30 min buffer) overlaps another delivery at the same facility on the same date; buffer-edge touch is allowed" }
+  - { id: ERR_FACILITY_NOT_OPEN, http: 409, condition: "delivery creation requires facility status OPEN" }
+  - { id: ERR_FACILITY_CAPACITY_EXCEEDED, http: 409, condition: "receive ACCEPT would push facility accepted lbs for the date above daily_receiving_capacity_lbs" }
+  - { id: ERR_INSUFFICIENT_INVENTORY, http: 409, condition: "claim gallons > event.remaining_gallons" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 409, condition: "credit approver X-User-ID equals credit.validated_by" }
+  - { id: ERR_ROUTE_NOT_PUBLISHED, http: 409, condition: "route must be PUBLISHED at ticket creation, delivery creation, and delivery receive" }
+  - { id: ERR_LOAD_SAFETY_LIMIT_EXCEEDED, http: 422, condition: "receive ACCEPT with contaminated_item_count > facility.safety_contamination_item_limit" }
+  - { id: ERR_ENROLLMENT_WINDOW_CLOSED, http: 422, condition: "subscription signup while zone status is OFF_SEASON" }
+  - { id: ERR_TICKET_DATE_OUT_OF_SEASON, http: 422, condition: "ticket service_date outside zone season window" }
+  - { id: ERR_TICKET_NOT_YET_DUE, http: 422, condition: "report-missed before the ticket's service_date" }
+  - { id: ERR_ENTITLEMENT_EXCEEDED, http: 422, condition: "claim gallons > household remaining compost entitlement" }
+  - { id: ERR_PER_HOUSEHOLD_CAP_EXCEEDED, http: 422, condition: "claim would push household's cumulative gallons at the event above per_household_cap_gallons" }
+  - { id: ERR_OUTSTANDING_BALANCE, http: 402, condition: "booking blocked: household has a subscription with total_due_cents > paid_cents" }
+  - { id: ERR_CAMPAIGN_BUDGET_EXCEEDED, http: 402, condition: "launch spend (audience_size x cost_per_impression_cents) > budget_cents" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "Unauthenticated public caller (self-registration, public zone/event discovery)"
+    identity: opaque
+    exclusive_operations: ["POST /households"]
+    shared_operations: ["GET /service-zones", "GET /service-zones/{id}", "GET /surge-events", "GET /surge-events/{id}"]
+  - name: Resident
+    description: "A household account; acts only on its own household's resources"
+    identity: "entity_backed:Household"
+    exclusive_operations: ["POST /subscriptions", "POST /subscriptions/{id}/pay", "POST /subscriptions/{id}/cure", "POST /carts", "POST /pickup-tickets/{id}/report-missed", "POST /surge-bookings", "POST /surge-bookings/{id}/cancel", "POST /compost-claims"]
+    shared_operations: ["GET read endpoints for own resources", "POST /subscriptions/{id}/cancel (shared with ProgramAdmin)"]
+  - name: Driver
+    description: "Collection truck operator; records completed pickups and weights"
+    identity: opaque
+    exclusive_operations: ["POST /pickup-tickets/{id}/complete"]
+    shared_operations: ["GET /pickup-tickets", "GET /pickup-tickets/{id}", "GET /routes"]
+  - name: FieldInspector
+    description: "Curbside contamination inspector"
+    identity: opaque
+    exclusive_operations: ["POST /contamination-inspections"]
+    shared_operations: ["GET /contamination-inspections", "GET /pickup-tickets"]
+  - name: RouteSupervisor
+    description: "Validates missed pickups (step 1 of credit issuance), delivers carts, schedules tickets and facility deliveries, weighs loads"
+    identity: opaque
+    exclusive_operations: ["POST /pickup-tickets", "POST /pickup-tickets/{id}/validate-missed", "POST /carts/{id}/deliver", "POST /facility-deliveries", "POST /facility-deliveries/{id}/receive"]
+    shared_operations: ["GET endpoints for routes, tickets, inspections, credits, deliveries, facilities"]
+  - name: BillingClerk
+    description: "Approves/voids service credits (step 2 of credit issuance — MUST differ from the validating supervisor) and voids compost claims"
+    identity: opaque
+    exclusive_operations: ["POST /service-credits/{id}/approve", "POST /service-credits/{id}/void", "POST /compost-claims/{id}/void"]
+    shared_operations: ["GET /service-credits", "GET /compost-claims", "GET /households"]
+  - name: ProgramAdmin
+    description: "Program administrator: zones, routes, surge events, facilities, giveback events, logical clock"
+    identity: opaque
+    exclusive_operations: ["POST /service-zones", "PATCH /service-zones/{id}", "POST /routes", "POST /routes/{id}/publish", "POST /surge-events", "POST /facilities", "PATCH /facilities/{id}", "POST /giveback-events", "POST /_clock/set_current_utc"]
+    shared_operations: ["all GET endpoints", "POST /subscriptions/{id}/cancel"]
+  - name: OutreachCoordinator
+    description: "Education & outreach campaign owner (segregated from program administration)"
+    identity: opaque
+    exclusive_operations: ["POST /outreach-campaigns", "POST /outreach-campaigns/{id}/launch", "PATCH /outreach-campaigns/{id}"]
+    shared_operations: ["GET /outreach-campaigns", "GET /service-zones"]

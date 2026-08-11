@@ -1,0 +1,58 @@
+"""Error taxonomy: every error_id from SCAFFOLD.yaml 1.6 / PRD section 5."""
+
+ERRORS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_FORBIDDEN_OWNERSHIP": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_CUSTOMER_NOT_FOUND": 404,
+    "ERR_TANK_NOT_FOUND": 404,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_LEASE_NOT_FOUND": 404,
+    "ERR_AMENDMENT_NOT_FOUND": 404,
+    "ERR_ALLOCATION_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_MOVEMENT_NOT_FOUND": 404,
+    "ERR_SAMPLE_NOT_FOUND": 404,
+    "ERR_CUSTODY_TRANSFER_NOT_FOUND": 404,
+    "ERR_STATEMENT_NOT_FOUND": 404,
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_LEASE_NOT_ACTIVE": 409,
+    "ERR_TANK_NOT_AVAILABLE": 409,
+    "ERR_RESOURCE_UNAVAILABLE": 409,
+    "ERR_GAUGE_MISSING": 409,
+    "ERR_GAUGE_SEQUENCE_INVALID": 409,
+    "ERR_CUSTODY_NOT_CERTIFIED": 409,
+    "ERR_AMENDMENT_STALE_BASE": 409,
+    "ERR_VAPOR_PERMIT_REQUIRED": 409,
+    "ERR_PERMIT_WINDOW_INSUFFICIENT": 409,
+    "ERR_QUALITY_NOT_PASSED": 409,
+    "ERR_RETAIN_PERIOD_ACTIVE": 409,
+    "ERR_PRODUCT_MISMATCH": 422,
+    "ERR_WINDOW_INVALID": 422,
+    "ERR_ALLOCATION_PERIOD_INVALID": 422,
+    "ERR_RESOURCE_TYPE_MISMATCH": 422,
+    "ERR_STATEMENT_EXISTS": 409,
+    "ERR_WINDOW_CONFLICT": 409,
+    "ERR_WINDOW_LAPSED": 409,
+    "ERR_STATEMENT_PERIOD_NOT_ENDED": 409,
+    "ERR_ALLOCATION_CAPACITY_EXCEEDED": 409,
+    "ERR_NO_ACTIVE_ALLOCATION": 409,
+    "ERR_VOLUME_EXCEEDS_ALLOCATION": 422,
+    "ERR_STALE_VERSION": 412,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message):
+        if error_id not in ERRORS:
+            raise KeyError("unknown error id: %s" % error_id)
+        self.error_id = error_id
+        self.http_status = ERRORS[error_id]
+        self.message = message
+        super().__init__(message)
+
+
+def err(error_id, message):
+    return ApiError(error_id, message)

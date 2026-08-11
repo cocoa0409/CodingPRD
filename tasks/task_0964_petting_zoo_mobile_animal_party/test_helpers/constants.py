@@ -1,0 +1,82 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules (§3)."""
+
+THRESHOLDS = {
+    # Compliance screening (PRD §3.4 / §3.6)
+    "CONFIRM_GATE_SCORE": 60,
+    "BASE_SCORE": 100,
+    "LARGE_ANIMAL_LOAD": 15,
+    "MEDIUM_ANIMAL_LOAD": 10,
+    "SMALL_ANIMAL_LOAD": 5,
+    "INDOOR_LOAD": 10,
+    "NO_WATER_LOAD": 8,
+    "STATION_SHORTFALL_LOAD": 5,
+    "GUEST_PRESSURE_STEP": 10,
+    "GUEST_PRESSURE_FREE": 30,
+    "CALM_ANIMAL_BONUS": 2,
+    "CALM_BONUS_CAP": 10,
+    # Handwash / staffing (PRD §3.4)
+    "GUESTS_PER_STATION": 20,
+    "REPTILE_EXTRA_STATION": 1,
+    "PETTING_ANIMALS_PER_HANDLER": 4,
+    "CHILDREN_PER_STAFF": 8,
+    # Pricing (PRD §3.4)
+    "WEEKEND_MULTIPLIER": 1.15,
+    "INSTITUTIONAL_DISCOUNT_RATE": 0.15,
+    "LIABILITY_SURCHARGE_RATE": 0.03,
+    "PONY_RIDE_FLAT_CENTS": 12000,
+    "PONY_RIDE_INCLUDED_MIN": 60,
+    "PONY_RIDE_OVERAGE_PER_MIN": 200,
+    "REPTILE_SHOW_FLAT_CENTS": 15000,
+    "REPTILE_SHOW_INCLUDED_MIN": 45,
+    "REPTILE_SHOW_OVERAGE_PER_MIN": 250,
+    "DEPOSIT_RATE": 0.30,
+    # Travel and setup (PRD §3.4)
+    "ZONE_A_BASE_CENTS": 5000,
+    "ZONE_A_INCLUDED_MI": 25,
+    "ZONE_B_BASE_CENTS": 9000,
+    "ZONE_B_INCLUDED_MI": 50,
+    "ZONE_C_BASE_CENTS": 14000,
+    "ZONE_C_INCLUDED_MI": 100,
+    "OVERAGE_RATE_CENTS_PER_MI": 85,
+    "TRAILER_CAPACITY_ANIMALS": 6,
+    "TRAILER_FEE_CENTS": 3000,
+    "HARD_SURFACE_MULTIPLIER": 1.25,
+    # Guest tiers (PRD §3.4)
+    "GUEST_TIER_50_CENTS": 1500,
+    "GUEST_TIER_100_CENTS": 3500,
+    "GUEST_TIER_OVER_100_CENTS": 6000,
+    # Cancellation (PRD §3.7)
+    "TIER_FULL_HOURS": 168,
+    "TIER_THREE_QUARTER_HOURS": 72,
+    "TIER_HALF_HOURS": 24,
+    "PERMIT_NONRECOVERABLE_CENTS": 2500,
+    "COMPLIANCE_PENALTY_RATE": 0.20,
+    # Capacity / temporal (PRD §3.3, §3.5, §3.7)
+    "DAILY_CAPACITY_MINUTES": 480,
+    "DEFAULT_REST_BUFFER_HOURS": 4,
+    "PERMIT_LEAD_HOURS": 336,
+    "ASSESSMENT_FRESH_HOURS": 24,
+    "MIN_BOOKING_LEAD_HOURS": 48,
+    # Insurance minimums (PRD §3.6)
+    "INSURANCE_MIN_PRIVATE_CENTS": 500000,
+    "INSURANCE_MIN_INSTITUTIONAL_CENTS": 1000000,
+}
+
+TEST_DEFAULTS = {
+    # Standard logical-clock anchor used by most scenarios
+    "CLOCK_START": "2026-05-10T00:00:00Z",
+    # Standard venue: Greenfield Park (OUTDOOR / GRASS / ZONE_A / 10mi)
+    "VENUE_NAME": "Greenfield Park",
+    "VENUE_ADDRESS": "1 Meadow Ln",
+    # Standard goat: SMALL tier3 8000c with PASS cert to 2026-07-01
+    "GOAT_FEE_CENTS": 8000,
+    "SHEEP_FEE_CENTS": 9000,
+    "CERT_VALID_UNTIL": "2026-07-01T00:00:00Z",
+    "CERT_EXAM_DATE": "2026-05-09T00:00:00Z",
+    # Standard event window: Wednesday 2026-06-17 14:00-16:00 UTC
+    "EVENT_START": "2026-06-17T14:00:00Z",
+    "EVENT_END": "2026-06-17T16:00:00Z",
+    # Quoted price of the standard goat fixture (PRD §3.4 eight-step pricing)
+    "GOAT_QUOTED_TOTAL_CENTS": 16240,
+    "GOAT_DEPOSIT_CENTS": 4872,
+}
