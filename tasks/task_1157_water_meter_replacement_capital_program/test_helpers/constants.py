@@ -1,0 +1,74 @@
+"""Domain thresholds — numeric constants from PRD Section 3 rules."""
+
+THRESHOLDS = {
+    # Regulatory notice
+    "DEFAULT_NOTICE_DAYS": 3,
+    # Swap
+    "FACTORY_INITIAL_READ_MAX_CCF": 1,
+    # No-access escalation
+    "NO_ACCESS_STRIKE_THRESHOLD": 3,
+    # AMI communication verification
+    "AMI_MIN_READS": 4,
+    "COMM_WINDOW_HOURS": 72,
+    "RSSI_MIN_DBM": -95,
+    # Bench test metrology
+    "KNOWN_LOW_CCF": 2.0,
+    "KNOWN_MID_CCF": 20.0,
+    "KNOWN_HIGH_CCF": 30.0,
+    "WEIGHTED_PASS_MIN_PCT": 98.5,
+    "WEIGHTED_PASS_MAX_PCT": 101.5,
+    "LOW_FLOW_FLOOR_PCT": 95.0,
+    "LOW_FLOW_CEIL_PCT": 105.0,
+    # Complaint adjudication
+    "COMPLAINT_MIN_VARIANCE_PCT": 25.0,
+    "MANDATORY_BENCH_VARIANCE_PCT": 50.0,
+    # Quality score
+    "AUDIT_FAIL_PENALTY_BP": 400,
+    "SCORE_WINDOW_SIZE": 20,
+    "SUSPEND_BELOW_BP": 9200,
+    "BONUS_ELIGIBLE_BP": 9800,
+    "SCORE_PERFECT_BP": 10000,
+    # Invoice settlement
+    "BONUS_PCT": 0.02,
+    "PENALTY_PER_FAIL_PCT": 0.01,
+    "PENALTY_CAP_PCT": 0.10,
+    "RETAINAGE_PCT_STANDARD": 0.05,
+    "RETAINAGE_PCT_SUSPENDED": 0.10,
+    # Audit sampling cadence
+    "SAMPLED_AUDIT_EVERY_N": 5,
+    # Budget posture
+    "TIGHT_PCT": 0.10,
+}
+
+TEST_DEFAULTS = {
+    "PROGRAM_NAME": "AMI-2027",
+    "FISCAL_YEAR": "FY2027",
+    "BUDGET_TOTAL_CENTS": 5000000,
+    "TARGET_METER_COUNT": 2400,
+    "RATE_PER_CCF_CENTS": 450,
+    "DEFAULT_UNIT_ALLOWANCE_CENTS": 20000,
+    "NOTICE_DAYS": 3,
+    "CONTRACTOR_NAME": "AquaWorks",
+    "CREW_CAPACITY_PER_WINDOW": 2,
+    "UNIT_PRICE_CENTS": 18500,
+    "AVG_DAILY_USAGE_CCF": 2.0,
+    "LAST_BILLED_READ_VALUE": 1000,
+    "LAST_BILLED_READ_AT": "2026-04-15T00:00:00Z",
+    "LEGACY_INSTALLED_AT": "2026-04-16T00:00:00Z",
+    "WAVE1_WINDOW_START": "2026-05-01T00:00:00Z",
+    "WAVE1_WINDOW_END": "2026-06-01T00:00:00Z",
+    "WAVE_CAPACITY": 10,
+    "SWAP_FINAL_READ": 1060,
+    "SWAP_INITIAL_READ": 0,
+    "DELIVERED_AT": "2026-05-02T10:00:00Z",
+    "SWAP_CLOCK": "2026-05-06T09:00:00Z",
+    "SLOT_DATE": "2026-05-06",
+    "READ_AT": "2026-05-06T09:30:00Z",
+    "INVOICE_PERIOD_START": "2026-05-01T00:00:00Z",
+    "INVOICE_PERIOD_END": "2026-06-01T00:00:00Z",
+    "BILLING_PERIOD_START": "2026-05-01T00:00:00Z",
+    "BILLING_PERIOD_END": "2026-06-01T00:00:00Z",
+}
+
+# A well-formed UUID that never resolves to a stored resource.
+NON_EXISTENT_ID = "8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"

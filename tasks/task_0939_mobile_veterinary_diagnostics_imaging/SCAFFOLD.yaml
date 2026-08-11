@@ -1,0 +1,4337 @@
+scenario: "939. Mobile Veterinary Diagnostics & Imaging: referral & appointment, mobile-unit route & clinic scheduling, study acquisition & specialist read, report turnaround, equipment & tech, per-study billing to clinic, STAT/emergency, QC"
+domain_name: "mobile-veterinary-diagnostics-imaging"
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Nineteen peer entities linked by explicit foreign keys; every collection is
+  # addressed at the API root (`/studies/{study_id}`), never nested. Ownership is
+  # expressed by FK fields, not by URL nesting.
+
+  state_machine_shape: parallel
+  # Study alone carries four independent axes (workflow_status, qc_status,
+  # tat_status, billing_status). Route/RouteStop/Referral/ReadAssignment/Report
+  # each add cycles or re-entry edges on top.
+
+  relationship_patterns:
+    - one_to_many          # Route -> RouteStop, Appointment -> Study, Invoice -> ChargeLine
+    - self_referential     # Study.repeat_of_study_id, RouteStop.bumped_by_stop_id, Report.supersedes_report_id
+    - cross_aggregate      # Study.equipment_id crosses the Route aggregate into the Equipment aggregate
+    - polymorphic          # Notification.study_id is nullable; a notification may be clinic-scoped only
+
+  role_model: segregation_of_duties
+  # The specialist who authored a Report may never be its PeerReview reviewer,
+  # and the FieldTech who acquired a Study is the only actor who may run its
+  # image QC — but never the equipment QC that would retroactively quarantine
+  # his own acquisitions if he is not certified on that modality.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# Global constants — EVERY named constant used anywhere in this scaffold has a
+# declared value here. Nothing downstream may invent a value.
+# ---------------------------------------------------------------------------
+global_constants:
+  CLOCK_DEFAULT_UTC: "2026-05-01T00:00:00Z"      # logical-clock startup value (a Friday)
+  TIMEZONE: "UTC"                                 # all instants and minute-of-day values are UTC; no local-time conversion anywhere
+  MINUTES_PER_DAY: 1440
+  ROUNDING_MODE: "round_half_up"
+  CURRENCY_MINOR_UNIT: "cents"
+
+  DEFAULT_BUSINESS_OPEN_MINUTE: 480               # 08:00 UTC
+  DEFAULT_BUSINESS_CLOSE_MINUTE: 1020             # 17:00 UTC
+  DEFAULT_BUSINESS_DAYS: [0, 1, 2, 3, 4]          # 0 = Monday ... 6 = Sunday
+
+  ROUTE_MAX_STOPS_DEFAULT: 3                      # MobileUnit.max_stops default
+  ROUTE_MAX_SHIFT_MINUTES_DEFAULT: 300            # MobileUnit.max_shift_minutes default
+  ROUTE_STOP_BUFFER_MINUTES: 10                   # mandatory idle buffer between the end of one stop's service and the start of the next stop's drive
+  MIN_STOP_SERVICE_MINUTES: 15
+  STAT_STOP_SERVICE_MINUTES: 30                   # service minutes forced onto a STAT-priority stop
+
+  TRIP_FEE_CENTS: 12500                           # one trip fee per RouteStop, allocated across the stop's billable studies
+  LIST_PRICE_CENTS_BY_MODALITY:
+    RADIOGRAPHY: 18000
+    ULTRASOUND: 26000
+    CT: 52000
+    ECHO: 34000
+  BLOCK_RATE_CENTS_BY_MODALITY:
+    RADIOGRAPHY: 14000
+    ULTRASOUND: 20000
+    CT: 42000
+    ECHO: 27000
+  STAT_SURCHARGE_CENTS: 4500
+  ADMIN_FEE_PCT: 3                                # percent, applied per charge line, rounded per line before summing
+
+  ROUTINE_TAT_TARGET_BUSINESS_MINUTES: 240
+  STAT_TAT_TARGET_WALLCLOCK_MINUTES: 60
+  TAT_BREACH_COMPARATOR: ">"                      # accrued > target breaches; accrued == target does NOT
+
+  EQUIPMENT_USAGE_CAP_BETWEEN_QC: 3               # acquisitions allowed on one Equipment between passing QC checks
+  CALIBRATION_VALIDITY_DAYS: 30                   # maximum span accepted for a calibration window
+
+  READ_ATTEMPT_CAP: 3                             # ReadAssignment attempts per Study
+  SPECIALIST_MAX_OPEN_READS: 2
+  STAT_READ_WEIGHT: 2
+  ROUTINE_READ_WEIGHT: 1
+
+  ADDENDUM_WINDOW_DAYS: 14
+  REPEAT_CAP_PER_STUDY: 2
+
+  CANCEL_FREE_LEAD_MINUTES: 1440
+  CANCEL_PARTIAL_LEAD_MINUTES: 240
+  CANCEL_PARTIAL_PCT: 50
+  CANCEL_LATE_PCT: 100
+  CANCEL_DISPATCHED_PCT: 100
+  NO_SHOW_PCT: 100
+
+  PEER_REVIEW_SCORE_MIN: 1
+  PEER_REVIEW_SCORE_MAX: 5
+  PEER_REVIEW_DISCORDANT_SCORE_MAX: 2             # score <= 2 => DISCORDANT, score >= 3 => CONCUR
+
+  MODALITY_ENUM: [RADIOGRAPHY, ULTRASOUND, CT, ECHO]
+  SPECIES_ENUM: [CANINE, FELINE, EQUINE, BOVINE, EXOTIC]
+
+# ---------------------------------------------------------------------------
+# Ordered write-gate precedence. These gates are evaluated at ladder rungs 8-12
+# (after auth/authz/existence/schema/enum/OCC, before every rung >= 13) and, in
+# the stated order, PRE-EMPT all later rungs: when a gate fires, no rung >= 13
+# is evaluated at all, so its error never surfaces.
+# ---------------------------------------------------------------------------
+write_gate_precedence:
+  order:
+    - id: G1_INVOICE_FINALIZED_FREEZE
+      ladder_priority: 8
+      error_id: ERR_INVOICE_FINALIZED
+      guards: |
+        any write that would create, reverse, or re-price a ChargeLine
+        belonging to an Invoice whose status == FINALIZED. This bites hardest
+        on cascades: POST /qc-checks with result == FAIL is REJECTED outright
+        with ERR_INVOICE_FINALIZED when any study inside its retroactive blast
+        radius still carries ACTIVE charge lines on a FINALIZED invoice. A
+        billing freeze therefore blocks a safety action — the freeze is
+        absolute and there is no override path.
+    - id: G2_CLINIC_BILLING_HOLD
+      ladder_priority: 9
+      error_id: ERR_CLINIC_BILLING_HOLD
+      guards: "POST /referrals, POST /appointments, POST /studies, POST /studies/{study_id}/escalate-stat, POST /studies/{study_id}/repeat when the owning Clinic.billing_hold_status == HOLD"
+    - id: G3_UNIT_OUT_OF_SERVICE
+      ladder_priority: 10
+      error_id: ERR_UNIT_OUT_OF_SERVICE
+      guards: "POST /routes/{route_id}/stops, POST /routes/{route_id}/publish, POST /routes/{route_id}/dispatch when the Route's MobileUnit.service_status != IN_SERVICE"
+    - id: G4_EQUIPMENT_CALIBRATION
+      ladder_priority: 11
+      error_id_order: [ERR_EQUIPMENT_QUARANTINED, ERR_EQUIPMENT_CALIBRATION_LAPSED]
+      guards: "POST /studies/{study_id}/acquire when the named Equipment.calibration_status != VALID; QUARANTINED is reported in preference to EXPIRED/UNCALIBRATED"
+    - id: G5_ROUTE_FROZEN
+      ladder_priority: 12
+      error_id: ERR_ROUTE_FROZEN
+      guards: "any write against a Route or any of its RouteStops once Route.status == COMPLETED"
+  note: |
+    Gate order is absolute and independent of how many gates a single request trips.
+    A request that trips G2 and G4 together always reports ERR_CLINIC_BILLING_HOLD.
+
+# ---------------------------------------------------------------------------
+# Conservation invariants — each must hold after EVERY request, including
+# cascaded side effects.
+# ---------------------------------------------------------------------------
+conservation_invariants:
+  - id: INV_MONEY_INVOICE_TOTAL
+    quantity: money
+    formula: |
+      Invoice.total_cents ==
+        sum(ChargeLine.amount_cents
+            for ChargeLine where invoice_id == Invoice.id and status == 'ACTIVE')
+    note: "REVERSED lines keep their amount_cents but are excluded from the sum."
+  - id: INV_BLOCK_CONSERVATION
+    quantity: count
+    formula: |
+      ClinicContract.block_purchased_studies ==
+        ClinicContract.block_consumed_studies + ClinicContract.block_remaining_studies
+      AND
+      ClinicContract.block_consumed_studies ==
+        -1 * sum(BlockLedgerEntry.delta_studies
+                 for BlockLedgerEntry where contract_id == ClinicContract.id)
+  - id: INV_ROUTE_TIME_PARTITION
+    quantity: time
+    formula: |
+      Route.shift_end_minute - Route.shift_start_minute ==
+        Route.planned_occupied_minutes + Route.slack_minutes
+      where planned_occupied_minutes ==
+        sum(RouteStop.drive_minutes_from_prev + RouteStop.service_minutes
+            for RouteStop where route_id == Route.id
+            and status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED})
+  - id: INV_TAT_PARTITION
+    quantity: time
+    formula: "Study.tat_elapsed_minutes == Study.tat_accrued_minutes + Study.tat_paused_minutes"
+  - id: INV_STUDY_DISPOSITION_COUNT
+    quantity: count
+    formula: |
+      Appointment.ordered_studies_count ==
+        Appointment.pending_studies_count
+        + Appointment.acquired_studies_count
+        + Appointment.cancelled_studies_count
+        + Appointment.not_performed_studies_count
+  - id: INV_SINGLE_LIVE_REPORT
+    quantity: count
+    formula: |
+      count(Report where study_id == S and status == 'PUBLISHED') <= 1
+    note: "Publishing a new Report supersedes the previously PUBLISHED one on the same Study."
+
+entities:
+  - name: Clinic
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: referring veterinary clinic name
+      - name: address_zone
+        type: string
+        source: input
+        description: coarse geographic zone label used only for human readability; never a decision input
+      - name: status
+        type: enum
+        source: input
+        description: clinic lifecycle status
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED}"
+      - name: billing_hold_status
+        type: enum
+        source: system
+        description: billing posture; HOLD blocks intake writes via gate G2
+        default: CLEAR
+        constraints: "one of {CLEAR, HOLD}; set only by POST /clinics/{clinic_id}/billing-hold"
+      - name: business_open_minute
+        type: integer
+        source: input
+        description: minute-of-day (UTC) at which the clinic's business window opens
+        default: 480
+        constraints: "0 <= business_open_minute < business_close_minute <= 1440"
+      - name: business_close_minute
+        type: integer
+        source: input
+        description: minute-of-day (UTC) at which the clinic's business window closes
+        default: 1020
+        constraints: "business_open_minute < business_close_minute <= 1440"
+      - name: business_days
+        type: array
+        source: input
+        description: weekday indices on which the business window is open (0 = Monday .. 6 = Sunday)
+        default: [0, 1, 2, 3, 4]
+        constraints: "non-empty array of distinct integers in 0..6"
+
+  - name: ClinicContract
+    parent: null
+    common_fields: true
+    fields:
+      - name: clinic_id
+        type: string
+        source: input
+        description: "FK -> Clinic.id; the clinic this contract prices"
+      - name: kind
+        type: enum
+        source: input
+        description: pricing discriminator selecting which study-price formula variant applies
+        constraints: "one of {PREPAID_BLOCK, PER_STUDY_LIST}"
+      - name: block_purchased_studies
+        type: integer
+        source: system
+        description: cumulative studies purchased into the prepaid block; 0 for PER_STUDY_LIST contracts
+        default: 0
+      - name: block_consumed_studies
+        type: integer
+        source: computed
+        description: cumulative studies drawn from the block; equals -1 * sum of this contract's BlockLedgerEntry.delta_studies
+        default: 0
+      - name: block_remaining_studies
+        type: integer
+        source: computed
+        description: block_purchased_studies - block_consumed_studies
+        default: 0
+      - name: valid_from
+        type: datetime
+        source: input
+        description: contract window start, inclusive
+      - name: valid_until
+        type: datetime
+        source: input
+        description: contract window end, exclusive
+      - name: suspended
+        type: boolean
+        source: input
+        description: operator flag that forces status to SUSPENDED while inside the validity window
+        default: false
+      - name: status
+        type: enum
+        source: computed
+        description: "EXPIRED when logical clock >= valid_until or clock < valid_from; else SUSPENDED when suspended == true; else ACTIVE"
+        constraints: "one of {ACTIVE, SUSPENDED, EXPIRED}"
+
+  - name: MobileUnit
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: van / mobile unit call sign
+      - name: service_status
+        type: enum
+        source: input
+        description: operational posture; anything other than IN_SERVICE trips gate G3
+        default: IN_SERVICE
+        constraints: "one of {IN_SERVICE, OUT_OF_SERVICE, MAINTENANCE}"
+      - name: max_stops
+        type: integer
+        source: input
+        description: hard ceiling on the number of non-cancelled, non-bumped stops a single Route on this unit may carry
+        default: 3
+        constraints: "integer >= 1"
+      - name: max_shift_minutes
+        type: integer
+        source: input
+        description: hard ceiling on (shift_end_minute - shift_start_minute) for any Route on this unit
+        default: 300
+        constraints: "integer >= 60"
+
+  - name: Equipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: assigned_unit_id
+        type: string
+        source: input
+        description: "FK -> MobileUnit.id; nullable — an unassigned modality unit sits in the depot"
+        default: null
+      - name: modality
+        type: enum
+        source: input
+        description: imaging modality this equipment produces
+        constraints: "one of {RADIOGRAPHY, ULTRASOUND, CT, ECHO}"
+      - name: serial_label
+        type: string
+        source: input
+        description: human-readable asset label
+      - name: calibration_valid_from
+        type: datetime
+        source: system
+        description: start of the current calibration window, inclusive; null until first calibration
+        default: null
+      - name: calibration_valid_until
+        type: datetime
+        source: system
+        description: end of the current calibration window, exclusive; null until first calibration
+        default: null
+      - name: calibration_status
+        type: enum
+        source: computed
+        description: "QUARANTINED while quarantined_at is not null; else UNCALIBRATED when calibration_valid_from is null; else EXPIRED when clock < valid_from or clock >= valid_until; else VALID"
+        constraints: "one of {UNCALIBRATED, VALID, EXPIRED, QUARANTINED}"
+      - name: usage_count_since_qc
+        type: integer
+        source: system
+        description: acquisitions performed on this equipment since the last PASS QcCheck; reset to 0 by a PASS QcCheck and by recalibration
+        default: 0
+      - name: last_passing_qc_at
+        type: datetime
+        source: system
+        description: instant of the most recent PASS QcCheck; null when none has ever passed
+        default: null
+      - name: quarantined_at
+        type: datetime
+        source: system
+        description: instant of the FAIL QcCheck that quarantined this equipment; cleared to null by POST /equipment/{equipment_id}/calibrate
+        default: null
+
+  - name: Technician
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: field technician name
+      - name: certified_modalities
+        type: array
+        source: input
+        description: modalities this technician may acquire on and may run equipment QC for
+        constraints: "non-empty array of distinct members of {RADIOGRAPHY, ULTRASOUND, CT, ECHO}"
+      - name: status
+        type: enum
+        source: input
+        description: employment posture
+        default: ACTIVE
+        constraints: "one of {ACTIVE, INACTIVE}"
+
+  - name: Specialist
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: reading specialist (radiologist / cardiologist) name
+      - name: modality_privileges
+        type: array
+        source: input
+        description: modalities this specialist is privileged to read
+        constraints: "non-empty array of distinct members of {RADIOGRAPHY, ULTRASOUND, CT, ECHO}"
+      - name: species_privileges
+        type: array
+        source: input
+        description: species this specialist is privileged to read
+        constraints: "non-empty array of distinct members of {CANINE, FELINE, EQUINE, BOVINE, EXOTIC}"
+      - name: stat_eligible
+        type: boolean
+        source: input
+        description: whether this specialist may be assigned STAT-priority studies
+        default: false
+      - name: status
+        type: enum
+        source: input
+        description: credentialing posture
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED, INACTIVE}"
+      - name: open_read_count
+        type: integer
+        source: computed
+        description: count of this specialist's ReadAssignment rows with status in {OFFERED, ACCEPTED}
+        default: 0
+      - name: workload_score
+        type: integer
+        source: computed
+        description: weighted open-read load; see calculations.specialist_workload_score
+        default: 0
+
+  - name: Route
+    parent: null
+    common_fields: true
+    fields:
+      - name: mobile_unit_id
+        type: string
+        source: input
+        description: "FK -> MobileUnit.id; the van running this day route"
+      - name: technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; the field technician staffing this route"
+      - name: service_date
+        type: string
+        source: input
+        description: "calendar date of the route, format YYYY-MM-DD, interpreted in UTC"
+      - name: shift_start_minute
+        type: integer
+        source: input
+        description: minute-of-day (UTC) the shift begins
+        constraints: "0 <= shift_start_minute < shift_end_minute <= 1440"
+      - name: shift_end_minute
+        type: integer
+        source: input
+        description: minute-of-day (UTC) the shift ends
+        constraints: "shift_start_minute < shift_end_minute <= 1440; the window may legally be longer than MobileUnit.max_shift_minutes — the unit cap binds only inside calculations.route_capacity_feasibility"
+      - name: status
+        type: enum
+        source: system
+        description: route lifecycle
+        default: DRAFT
+        constraints: "one of {DRAFT, PUBLISHED, DISPATCHED, COMPLETED}"
+      - name: stop_count
+        type: integer
+        source: computed
+        description: count of this route's RouteStop rows with status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}
+        default: 0
+      - name: planned_occupied_minutes
+        type: integer
+        source: computed
+        description: sum of (drive_minutes_from_prev + service_minutes) over counted stops; see calculations.route_occupied_minutes variant PLANNED
+        default: 0
+      - name: actual_occupied_minutes
+        type: integer
+        source: computed
+        description: sum of (drive_minutes_from_prev + actual_service_minutes) over stops with status SERVICED; see calculations.route_occupied_minutes variant ACTUAL
+        default: 0
+      - name: slack_minutes
+        type: integer
+        source: computed
+        description: (shift_end_minute - shift_start_minute) - planned_occupied_minutes
+        default: 0
+      - name: published_at
+        type: datetime
+        source: system
+        description: instant of DRAFT -> PUBLISHED
+        default: null
+      - name: dispatched_at
+        type: datetime
+        source: system
+        description: instant of PUBLISHED -> DISPATCHED
+        default: null
+      - name: completed_at
+        type: datetime
+        source: system
+        description: instant of DISPATCHED -> COMPLETED
+        default: null
+
+  - name: RouteStop
+    parent: null
+    common_fields: true
+    fields:
+      - name: route_id
+        type: string
+        source: input
+        description: "FK -> Route.id; the route this stop belongs to"
+      - name: clinic_id
+        type: string
+        source: input
+        description: "FK -> Clinic.id; the clinic visited at this stop"
+      - name: bumped_by_stop_id
+        type: string
+        source: system
+        description: "FK -> RouteStop.id; nullable — set on a BUMPED stop to the STAT stop whose insertion displaced it"
+        default: null
+      - name: sequence
+        type: integer
+        source: computed
+        description: 1-based position of this stop on its route, assigned by ascending planned_arrival_minute over stops with status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}; recomputed on every stop insert, bump, or cancel
+      - name: planned_arrival_minute
+        type: integer
+        source: input
+        description: minute-of-day (UTC) the unit is scheduled to arrive
+        constraints: "Route.shift_start_minute <= planned_arrival_minute and planned_arrival_minute + service_minutes <= Route.shift_end_minute"
+      - name: service_minutes
+        type: integer
+        source: input
+        description: on-site minutes reserved for this stop
+        constraints: "integer >= MIN_STOP_SERVICE_MINUTES (15); forced to STAT_STOP_SERVICE_MINUTES (30) when stop_priority == STAT"
+      - name: drive_minutes_from_prev
+        type: integer
+        source: input
+        description: drive minutes from the previous stop (or from the depot for the first stop)
+        constraints: "integer >= 0"
+      - name: stop_priority
+        type: enum
+        source: input
+        description: whether this stop is a routine scheduled visit or a STAT insertion
+        default: ROUTINE
+        constraints: "one of {ROUTINE, STAT}"
+      - name: status
+        type: enum
+        source: system
+        description: stop lifecycle
+        default: PLANNED
+        constraints: "one of {PLANNED, EN_ROUTE, ARRIVED, SERVICED, BUMPED, CANCELLED}"
+      - name: trip_fee_cents
+        type: integer
+        source: system
+        description: the single trip fee attached to this stop, allocated across its billable studies
+        default: 12500
+      - name: arrived_at
+        type: datetime
+        source: system
+        description: instant of EN_ROUTE -> ARRIVED
+        default: null
+      - name: departed_at
+        type: datetime
+        source: system
+        description: instant of ARRIVED -> SERVICED
+        default: null
+      - name: actual_service_minutes
+        type: integer
+        source: computed
+        description: whole minutes between arrived_at and departed_at; 0 while departed_at is null
+        default: 0
+      - name: cancel_reason
+        type: string
+        source: input
+        description: free-text reason recorded on cancel or bump
+        default: null
+
+  - name: Referral
+    parent: null
+    common_fields: true
+    fields:
+      - name: clinic_id
+        type: string
+        source: input
+        description: "FK -> Clinic.id; the referring clinic"
+      - name: patient_name
+        type: string
+        source: input
+        description: animal patient name
+      - name: species
+        type: enum
+        source: input
+        description: patient species; drives specialist species-privilege matching
+        constraints: "one of {CANINE, FELINE, EQUINE, BOVINE, EXOTIC}"
+      - name: study_kind
+        type: enum
+        source: input
+        description: pipeline discriminator — MOBILE studies are acquired by a travelling tech at a route stop; TELERAD studies are uploaded by the clinic itself
+        constraints: "one of {MOBILE, TELERAD}"
+      - name: requested_modality
+        type: enum
+        source: input
+        description: modality requested by the referring clinician
+        constraints: "one of {RADIOGRAPHY, ULTRASOUND, CT, ECHO}"
+      - name: priority
+        type: enum
+        source: input
+        description: clinical priority at intake
+        default: ROUTINE
+        constraints: "one of {ROUTINE, STAT}"
+      - name: clinical_history
+        type: string
+        source: input
+        description: free-text clinical history; may be absent at submission and supplied later on resume/resubmit
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: referral lifecycle
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, ACCEPTED, RETURNED, REJECTED, SCHEDULED}"
+      - name: return_reason
+        type: string
+        source: input
+        description: reason recorded when the scheduler returns the referral to the clinic for more information
+        default: null
+      - name: reject_reason
+        type: string
+        source: input
+        description: reason recorded when the scheduler rejects the referral outright
+        default: null
+
+  - name: Appointment
+    parent: null
+    common_fields: true
+    fields:
+      - name: referral_id
+        type: string
+        source: input
+        description: "FK -> Referral.id; the referral this appointment realises"
+      - name: route_stop_id
+        type: string
+        source: input
+        description: "FK -> RouteStop.id; nullable — MOBILE appointments MUST carry one, TELERAD appointments MUST NOT"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: appointment lifecycle
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED_BY_CLINIC, CANCELLED_BY_PROVIDER, NO_SHOW}"
+      - name: ordered_studies_count
+        type: integer
+        source: computed
+        description: count of all Study rows with this appointment_id, including repeats created by cascade
+        default: 0
+      - name: pending_studies_count
+        type: integer
+        source: computed
+        description: count of this appointment's studies with workflow_status in {ORDERED, REPEAT_PENDING}
+        default: 0
+      - name: acquired_studies_count
+        type: integer
+        source: computed
+        description: count of this appointment's studies with workflow_status in {ACQUIRED, ASSIGNED, READ_IN_PROGRESS, PRELIM_REPORTED, FINALIZED}
+        default: 0
+      - name: cancelled_studies_count
+        type: integer
+        source: computed
+        description: count of this appointment's studies with workflow_status == CANCELLED
+        default: 0
+      - name: not_performed_studies_count
+        type: integer
+        source: computed
+        description: count of this appointment's studies with workflow_status == NOT_PERFORMED
+        default: 0
+      - name: cancel_reason
+        type: string
+        source: input
+        description: reason recorded on cancellation or no-show
+        default: null
+      - name: cancelled_at
+        type: datetime
+        source: system
+        description: instant the appointment left SCHEDULED / IN_PROGRESS for a cancellation state
+        default: null
+
+  - name: Study
+    parent: null
+    common_fields: true
+    fields:
+      - name: appointment_id
+        type: string
+        source: input
+        description: "FK -> Appointment.id; the appointment under which this study was ordered"
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; nullable — set at acquisition for MOBILE studies, always null for TELERAD studies"
+        default: null
+      - name: technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; nullable — set at acquisition for MOBILE studies, always null for TELERAD studies"
+        default: null
+      - name: repeat_of_study_id
+        type: string
+        source: system
+        description: "FK -> Study.id; nullable — set on a replacement study to the study it repeats"
+        default: null
+      - name: study_kind
+        type: enum
+        source: computed
+        description: copied from the parent Referral.study_kind at creation and immutable thereafter
+        constraints: "one of {MOBILE, TELERAD}"
+      - name: species
+        type: enum
+        source: computed
+        description: copied from the parent Referral.species at creation
+        constraints: "one of {CANINE, FELINE, EQUINE, BOVINE, EXOTIC}"
+      - name: modality
+        type: enum
+        source: input
+        description: modality of this specific study; need not equal Referral.requested_modality
+        constraints: "one of {RADIOGRAPHY, ULTRASOUND, CT, ECHO}"
+      - name: body_region
+        type: string
+        source: input
+        description: anatomic region imaged
+      - name: priority
+        type: enum
+        source: computed
+        description: current clinical priority; initialised from Referral.priority, raised to STAT by escalate-stat and never lowered
+        constraints: "one of {ROUTINE, STAT}"
+      - name: priority_source
+        type: enum
+        source: system
+        description: discriminator selecting the turnaround anchor variant
+        default: NATIVE
+        constraints: "one of {NATIVE, UPGRADED}; NATIVE means the priority was set at order time, UPGRADED means escalate-stat raised it"
+      - name: workflow_status
+        type: enum
+        source: system
+        description: primary workflow axis
+        default: ORDERED
+        constraints: "one of {ORDERED, ACQUIRED, ASSIGNED, READ_IN_PROGRESS, PRELIM_REPORTED, FINALIZED, REPEAT_PENDING, CANCELLED, NOT_PERFORMED}"
+      - name: qc_status
+        type: enum
+        source: system
+        description: image-quality axis, independent of workflow_status
+        default: PENDING_QC
+        constraints: "one of {PENDING_QC, ACCEPTED, REPEAT_REQUIRED, NON_DIAGNOSTIC}"
+      - name: tat_status
+        type: enum
+        source: system
+        description: turnaround-clock axis, independent of workflow_status and qc_status
+        default: ACCRUING
+        constraints: "one of {ACCRUING, PAUSED, MET, BREACHED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: billing axis, independent of the other three
+        default: UNBILLED
+        constraints: "one of {UNBILLED, POSTED, REVERSED, NON_BILLABLE}"
+      - name: image_count
+        type: integer
+        source: system
+        description: number of images captured at acquisition or upload
+        default: 0
+      - name: acquired_at
+        type: datetime
+        source: system
+        description: instant of acquire (MOBILE) or upload (TELERAD)
+        default: null
+      - name: escalated_at
+        type: datetime
+        source: system
+        description: logical-clock instant at which POST /studies/{study_id}/escalate-stat raised this study to STAT; null for NATIVE-priority studies
+        default: null
+      - name: tat_anchor_at
+        type: datetime
+        source: computed
+        description: instant the turnaround clock is measured from; see calculations.tat_anchor_at
+      - name: tat_target_minutes
+        type: integer
+        source: computed
+        description: turnaround budget in accrual-mode minutes; see calculations.tat_target_minutes
+      - name: tat_deadline_at
+        type: datetime
+        source: computed
+        description: wall-clock instant at which accrued turnaround would reach tat_target_minutes; see calculations.tat_deadline_at
+      - name: tat_elapsed_minutes
+        type: integer
+        source: computed
+        description: accrual-mode minutes between tat_anchor_at and the logical clock now
+        default: 0
+      - name: tat_paused_minutes
+        type: integer
+        source: computed
+        description: accrual-mode minutes spent inside PAUSED windows, closed and open
+        default: 0
+      - name: tat_accrued_minutes
+        type: integer
+        source: computed
+        description: tat_elapsed_minutes - tat_paused_minutes
+        default: 0
+      - name: pause_started_at
+        type: datetime
+        source: system
+        description: instant the currently open pause began; null when tat_status != PAUSED
+        default: null
+      - name: hold_reason
+        type: enum
+        source: input
+        description: why the clock is paused on the clinic
+        default: null
+        constraints: "null or one of {MISSING_HISTORY, ADDENDUM_QUESTION}"
+      - name: repeat_cause
+        type: enum
+        source: input
+        description: why this study is a repeat; decides billability
+        default: null
+        constraints: "null or one of {QC_FAILURE, EQUIPMENT_QUARANTINE, CLINICIAN_EXTRA_VIEWS}"
+      - name: repeat_count
+        type: integer
+        source: system
+        description: how many replacement studies this study has spawned
+        default: 0
+      - name: read_attempt_count
+        type: integer
+        source: system
+        description: number of ReadAssignment rows ever created for this study
+        default: 0
+      - name: price_basis
+        type: enum
+        source: computed
+        description: which price formula variant applied; see calculations.study_base_price_cents
+        default: null
+        constraints: "null or one of {BLOCK_RATE, LIST_PRICE, NON_BILLABLE}"
+      - name: base_price_cents
+        type: integer
+        source: computed
+        description: modality price before trip share, STAT surcharge and admin fee
+        default: 0
+      - name: trip_share_cents
+        type: integer
+        source: computed
+        description: this study's allocated share of its stop's trip fee; always 0 for TELERAD
+        default: 0
+      - name: stat_surcharge_cents
+        type: integer
+        source: computed
+        description: STAT_SURCHARGE_CENTS when priority == STAT, else 0
+        default: 0
+      - name: admin_fee_cents
+        type: integer
+        source: computed
+        description: per-line administrative fee; see calculations.study_admin_fee_cents
+        default: 0
+      - name: total_price_cents
+        type: integer
+        source: computed
+        description: base_price_cents + trip_share_cents + stat_surcharge_cents + admin_fee_cents
+        default: 0
+      - name: cancellation_fee_cents
+        type: integer
+        source: computed
+        description: fee assessed when this study is cancelled or its appointment no-shows; see calculations.cancellation_fee_cents
+        default: 0
+      - name: cancel_reason
+        type: string
+        source: input
+        description: reason recorded on cancel or not-performed
+        default: null
+
+  - name: ReadAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; the study offered for reading"
+      - name: specialist_id
+        type: string
+        source: input
+        description: "FK -> Specialist.id; the specialist the read is offered to"
+      - name: attempt_number
+        type: integer
+        source: system
+        description: 1-based attempt index; equals the owning Study.read_attempt_count after this assignment was created
+      - name: status
+        type: enum
+        source: system
+        description: assignment lifecycle
+        default: OFFERED
+        constraints: "one of {OFFERED, ACCEPTED, DECLINED, HANDED_BACK, COMPLETED, REVOKED}"
+      - name: offered_at
+        type: datetime
+        source: system
+        description: instant the assignment was created
+      - name: responded_at
+        type: datetime
+        source: system
+        description: instant of accept / decline / hand-back / revoke
+        default: null
+      - name: decline_reason
+        type: string
+        source: input
+        description: reason recorded on decline or hand-back
+        default: null
+
+  - name: Report
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; the study this report reads"
+      - name: author_specialist_id
+        type: string
+        source: system
+        description: "FK -> Specialist.id; taken from the acting Specialist's X-User-ID at creation"
+      - name: supersedes_report_id
+        type: string
+        source: system
+        description: "FK -> Report.id; nullable — set at publish to the report that was PUBLISHED on the same study immediately before"
+        default: null
+      - name: kind
+        type: enum
+        source: input
+        description: report tier
+        constraints: "one of {PRELIMINARY, FINAL, ADDENDUM}"
+      - name: report_version
+        type: integer
+        source: system
+        description: 1-based ordinal among all Report rows on the same study, assigned at creation in created_at ascending order
+      - name: status
+        type: enum
+        source: system
+        description: report lifecycle
+        default: DRAFT
+        constraints: "one of {DRAFT, PUBLISHED, SUPERSEDED, RETRACTED}"
+      - name: findings
+        type: string
+        source: input
+        description: report body text
+      - name: published_at
+        type: datetime
+        source: system
+        description: instant of DRAFT -> PUBLISHED
+        default: null
+      - name: retracted_at
+        type: datetime
+        source: system
+        description: instant of PUBLISHED -> RETRACTED
+        default: null
+      - name: retract_reason
+        type: string
+        source: input
+        description: reason recorded on retraction
+        default: null
+
+  - name: QcCheck
+    parent: null
+    common_fields: false
+    fields:
+      - name: equipment_id
+        type: string
+        source: input
+        description: "FK -> Equipment.id; the modality unit checked"
+      - name: performed_by_technician_id
+        type: string
+        source: input
+        description: "FK -> Technician.id; the technician who ran the check"
+      - name: result
+        type: enum
+        source: input
+        description: check outcome
+        constraints: "one of {PASS, FAIL}"
+      - name: note
+        type: string
+        source: input
+        description: free-text observation
+        default: null
+      - name: performed_at
+        type: datetime
+        source: system
+        description: logical-clock instant the check was recorded
+      - name: affected_study_count
+        type: integer
+        source: computed
+        description: number of studies retroactively flagged REPEAT_REQUIRED by this check; always 0 for a PASS
+        default: 0
+
+  - name: PeerReview
+    parent: null
+    common_fields: true
+    fields:
+      - name: report_id
+        type: string
+        source: input
+        description: "FK -> Report.id; the published report sampled for peer review"
+      - name: reviewer_specialist_id
+        type: string
+        source: input
+        description: "FK -> Specialist.id; the reviewing specialist, who must differ from the report author"
+      - name: status
+        type: enum
+        source: system
+        description: peer-review lifecycle
+        default: SAMPLED
+        constraints: "one of {SAMPLED, CONCUR, DISCORDANT}"
+      - name: score
+        type: integer
+        source: input
+        description: agreement score 1..5; decides the terminal status
+        default: null
+        constraints: "null while SAMPLED; integer in 1..5 once submitted"
+      - name: outcome_note
+        type: string
+        source: input
+        description: reviewer commentary
+        default: null
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: clinic_id
+        type: string
+        source: input
+        description: "FK -> Clinic.id; the billed clinic"
+      - name: period_start
+        type: string
+        source: input
+        description: "invoice period start date, YYYY-MM-DD, inclusive"
+      - name: period_end
+        type: string
+        source: input
+        description: "invoice period end date, YYYY-MM-DD, inclusive"
+      - name: status
+        type: enum
+        source: system
+        description: invoice lifecycle
+        default: OPEN
+        constraints: "one of {OPEN, FINALIZED}"
+      - name: total_cents
+        type: integer
+        source: computed
+        description: live sum of ACTIVE charge lines while OPEN; frozen snapshot once FINALIZED — see calculations.invoice_total_cents
+        default: 0
+      - name: finalized_total_cents
+        type: integer
+        source: system
+        description: snapshot of total_cents taken at finalization; null while OPEN
+        default: null
+      - name: finalized_at
+        type: datetime
+        source: system
+        description: instant of OPEN -> FINALIZED
+        default: null
+      - name: posted_study_count
+        type: integer
+        source: computed
+        description: count of distinct Study ids carrying at least one ACTIVE ChargeLine on this invoice
+        default: 0
+
+  - name: ChargeLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: invoice_id
+        type: string
+        source: input
+        description: "FK -> Invoice.id; the invoice this line sits on"
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; every charge line belongs to exactly one study"
+      - name: kind
+        type: enum
+        source: system
+        description: charge line type
+        constraints: "one of {STUDY_READ, TRIP_FEE_SHARE, STAT_SURCHARGE, ADMIN_FEE, CANCELLATION_FEE}"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: line amount in cents
+      - name: status
+        type: enum
+        source: system
+        description: line lifecycle
+        default: ACTIVE
+        constraints: "one of {ACTIVE, REVERSED}"
+      - name: reversal_reason
+        type: string
+        source: system
+        description: reason recorded when the line is reversed by a cascade
+        default: null
+
+  - name: BlockLedgerEntry
+    parent: null
+    common_fields: false
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> ClinicContract.id; the prepaid-block contract this entry moves"
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; the study that caused the draw or refund"
+      - name: delta_studies
+        type: integer
+        source: system
+        description: "-1 for a draw, +1 for a refund"
+        constraints: "one of {-1, 1}"
+      - name: balance_after_studies
+        type: integer
+        source: system
+        description: ClinicContract.block_remaining_studies immediately after this entry was appended
+      - name: reason
+        type: enum
+        source: system
+        description: what produced this ledger movement
+        constraints: "one of {DRAW, REFUND_QC}"
+
+  - name: Notification
+    parent: null
+    common_fields: false
+    fields:
+      - name: clinic_id
+        type: string
+        source: input
+        description: "FK -> Clinic.id; the notified clinic"
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; nullable — stop-level notifications carry no study"
+        default: null
+      - name: kind
+        type: enum
+        source: system
+        description: notification type
+        constraints: "one of {STOP_BUMPED, APPOINTMENT_CANCELLED, STUDY_REPEAT_REQUIRED, REPORT_PUBLISHED, TAT_BREACHED, STAT_UPGRADED}"
+      - name: message
+        type: string
+        source: system
+        description: human-readable body
+
+state_machines:
+  - entity: Route
+    state_field: status
+    initial_state: DRAFT
+    terminal_states: [COMPLETED]
+    shape: "branching with revert (PUBLISHED -> DRAFT unpublish loop)"
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /routes/{route_id}/publish"
+        actor: Scheduler
+        preconditions:
+          - "Route.status == DRAFT"
+          - "MobileUnit.service_status == IN_SERVICE (gate G3)"
+          - "stop_count >= 1"
+        side_effects:
+          - "sets Route.published_at to the logical clock now"
+          - "recomputes Route.stop_count, Route.planned_occupied_minutes and Route.slack_minutes"
+          - "increments Route.version by 1"
+      - from: PUBLISHED
+        to: DRAFT
+        trigger: "POST /routes/{route_id}/unpublish"
+        actor: Scheduler
+        preconditions:
+          - "Route.status == PUBLISHED"
+          - "no RouteStop on this route has status in {EN_ROUTE, ARRIVED, SERVICED}"
+        side_effects:
+          - "clears Route.published_at to null"
+          - "increments Route.version by 1"
+        note: "This is the cycle edge that makes Route non-linear; a route may be republished any number of times."
+      - from: PUBLISHED
+        to: DISPATCHED
+        trigger: "POST /routes/{route_id}/dispatch"
+        actor: FieldTech
+        preconditions:
+          - "Route.status == PUBLISHED"
+          - "MobileUnit.service_status == IN_SERVICE (gate G3)"
+          - "acting X-User-ID == Route.technician_id"
+          - "Technician.status == ACTIVE"
+        side_effects:
+          - "sets Route.dispatched_at to now"
+          - "every RouteStop on this route with status == PLANNED moves to EN_ROUTE"
+          - "increments Route.version by 1"
+      - from: DISPATCHED
+        to: COMPLETED
+        trigger: "POST /routes/{route_id}/complete"
+        actor: FieldTech
+        preconditions:
+          - "Route.status == DISPATCHED"
+          - "no RouteStop on this route has status in {EN_ROUTE, ARRIVED}"
+        side_effects:
+          - "sets Route.completed_at to now"
+          - "recomputes Route.actual_occupied_minutes from SERVICED stops"
+          - "gate G5 becomes active: every subsequent write against this route or its stops fails ERR_ROUTE_FROZEN"
+          - "increments Route.version by 1"
+
+  - entity: RouteStop
+    state_field: status
+    initial_state: PLANNED
+    terminal_states: [SERVICED, BUMPED, CANCELLED]
+    shape: "branching — the STAT-insertion bump is a distinct exit with its own cascade"
+    transitions:
+      - from: PLANNED
+        to: EN_ROUTE
+        trigger: "system, fan-out of POST /routes/{route_id}/dispatch"
+        actor: system
+        preconditions:
+          - "owning Route.status transitions PUBLISHED -> DISPATCHED"
+        side_effects:
+          - "increments RouteStop.version by 1"
+      - from: EN_ROUTE
+        to: ARRIVED
+        trigger: "POST /route-stops/{stop_id}/arrive"
+        actor: FieldTech
+        preconditions:
+          - "RouteStop.status == EN_ROUTE"
+          - "owning Route.status == DISPATCHED"
+          - "acting X-User-ID == Route.technician_id"
+        side_effects:
+          - "sets RouteStop.arrived_at to now"
+          - "every Appointment on this stop with status == SCHEDULED moves to IN_PROGRESS"
+          - "increments RouteStop.version by 1"
+      - from: ARRIVED
+        to: SERVICED
+        trigger: "POST /route-stops/{stop_id}/depart"
+        actor: FieldTech
+        preconditions:
+          - "RouteStop.status == ARRIVED"
+          - "no Study under this stop's appointments has workflow_status == ORDERED"
+        side_effects:
+          - "sets RouteStop.departed_at to now and recomputes actual_service_minutes"
+          - "every Appointment on this stop with status == IN_PROGRESS moves to COMPLETED"
+          - "recomputes the owning Route.actual_occupied_minutes"
+          - "increments RouteStop.version by 1"
+      - from: PLANNED
+        to: BUMPED
+        trigger: "system, side effect of POST /routes/{route_id}/stops with stop_priority == STAT when a capacity ceiling would be breached"
+        actor: system
+        preconditions:
+          - "RouteStop.status == PLANNED"
+          - "RouteStop.stop_priority == ROUTINE"
+          - "this stop is the highest-ranked victim under calculations.stat_bump_victim_selection"
+        side_effects:
+          - "CASCADE HOP 1: sets bumped_by_stop_id to the newly inserted STAT stop, cancel_reason to 'BUMPED_BY_STAT_INSERTION'"
+          - "CASCADE HOP 2 (caused by hop 1): every Appointment with route_stop_id == this stop and status in {SCHEDULED, IN_PROGRESS} moves to CANCELLED_BY_PROVIDER with cancelled_at = now"
+          - "CASCADE HOP 3 (caused by hop 2): every Study under those appointments with workflow_status in {ORDERED} moves to NOT_PERFORMED, cancel_reason = 'STOP_BUMPED', cancellation_fee_cents = 0, billing_status = NON_BILLABLE"
+          - "CASCADE HOP 4 (caused by hop 3): every ACTIVE ChargeLine whose study_id is one of those studies and whose Invoice.status == OPEN moves to REVERSED with reversal_reason = 'STOP_BUMPED'"
+          - "CASCADE HOP 5 (caused by hop 4): every touched Invoice recomputes total_cents and posted_study_count"
+          - "CASCADE HOP 6 (caused by hop 2): one Notification{kind: APPOINTMENT_CANCELLED} per cancelled appointment and one Notification{kind: STOP_BUMPED} for the stop's clinic are appended"
+          - "recomputes sequence on every remaining stop of the route"
+        note: "Provider-caused cancellation: cancellation_fee_cents is 0 regardless of lead time."
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /route-stops/{stop_id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "RouteStop.status in {PLANNED, EN_ROUTE}"
+          - "owning Route.status != COMPLETED (gate G5)"
+        side_effects:
+          - "records cancel_reason"
+          - "every Appointment on this stop with status in {SCHEDULED, IN_PROGRESS} moves to CANCELLED_BY_PROVIDER"
+          - "every Study under those appointments with workflow_status == ORDERED moves to NOT_PERFORMED with cancellation_fee_cents = 0 and billing_status = NON_BILLABLE"
+          - "recomputes sequence on every remaining stop and the owning Route.stop_count / planned_occupied_minutes / slack_minutes"
+          - "appends one Notification{kind: APPOINTMENT_CANCELLED} per cancelled appointment"
+      - from: EN_ROUTE
+        to: CANCELLED
+        trigger: "POST /route-stops/{stop_id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "RouteStop.status == EN_ROUTE"
+        side_effects:
+          - "same side-effect set as PLANNED -> CANCELLED"
+          - "additionally, every Study cancelled from an EN_ROUTE stop is treated as provider-caused: cancellation_fee_cents = 0"
+
+  - entity: Referral
+    state_field: status
+    initial_state: SUBMITTED
+    terminal_states: [REJECTED, SCHEDULED]
+    shape: "cyclic — RETURNED -> SUBMITTED is a revision loop with no cap"
+    transitions:
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /referrals/{referral_id}/accept"
+        actor: Scheduler
+        preconditions:
+          - "Referral.status == SUBMITTED"
+          - "Referral.clinical_history is not null"
+          - "Clinic.status == ACTIVE"
+        side_effects:
+          - "increments Referral.version by 1"
+      - from: SUBMITTED
+        to: RETURNED
+        trigger: "POST /referrals/{referral_id}/return"
+        actor: Scheduler
+        preconditions:
+          - "Referral.status == SUBMITTED"
+        side_effects:
+          - "records return_reason and increments Referral.version by 1"
+          - "no Notification row is appended for a return"
+      - from: RETURNED
+        to: SUBMITTED
+        trigger: "POST /referrals/{referral_id}/resubmit"
+        actor: ClinicUser
+        preconditions:
+          - "Referral.status == RETURNED"
+          - "acting X-User-ID == Referral.clinic_id"
+        side_effects:
+          - "overwrites clinical_history with the supplied value and clears return_reason to null"
+        note: "This is the cycle edge; a referral may be returned and resubmitted repeatedly."
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /referrals/{referral_id}/reject"
+        actor: Scheduler
+        preconditions:
+          - "Referral.status == SUBMITTED"
+        side_effects:
+          - "records reject_reason; terminal"
+      - from: ACCEPTED
+        to: SCHEDULED
+        trigger: "system, side effect of POST /appointments"
+        actor: system
+        preconditions:
+          - "Referral.status == ACCEPTED"
+        side_effects:
+          - "increments Referral.version by 1"
+
+  - entity: Appointment
+    state_field: status
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED_BY_CLINIC, CANCELLED_BY_PROVIDER, NO_SHOW]
+    shape: "branching — four distinct terminal exits with different fee consequences"
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "system, side effect of POST /route-stops/{stop_id}/arrive"
+        actor: system
+        preconditions:
+          - "Appointment.status == SCHEDULED"
+          - "Appointment.route_stop_id == the arriving stop"
+        side_effects:
+          - "increments Appointment.version by 1"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "system, side effect of POST /route-stops/{stop_id}/depart"
+        actor: system
+        preconditions:
+          - "Appointment.status == IN_PROGRESS"
+        side_effects:
+          - "recomputes the five disposition counters"
+      - from: SCHEDULED
+        to: CANCELLED_BY_CLINIC
+        trigger: "POST /appointments/{appointment_id}/cancel by ClinicUser"
+        actor: ClinicUser
+        preconditions:
+          - "Appointment.status in {SCHEDULED, IN_PROGRESS}"
+          - "acting X-User-ID == the Referral's clinic_id"
+        side_effects:
+          - "every Study with workflow_status == ORDERED moves to NOT_PERFORMED"
+          - "each such Study's cancellation_fee_cents is computed by calculations.cancellation_fee_cents (clinic-caused variant)"
+          - "sets cancelled_at and cancel_reason"
+      - from: SCHEDULED
+        to: CANCELLED_BY_PROVIDER
+        trigger: "POST /appointments/{appointment_id}/cancel by Scheduler, or system fan-out of a stop bump/cancel"
+        actor: Scheduler
+        preconditions:
+          - "Appointment.status in {SCHEDULED, IN_PROGRESS}"
+        side_effects:
+          - "every Study with workflow_status == ORDERED moves to NOT_PERFORMED with cancellation_fee_cents = 0 and billing_status = NON_BILLABLE"
+          - "appends one Notification{kind: APPOINTMENT_CANCELLED} for the clinic"
+      - from: SCHEDULED
+        to: NO_SHOW
+        trigger: "POST /appointments/{appointment_id}/no-show"
+        actor: FieldTech
+        preconditions:
+          - "Appointment.status == SCHEDULED"
+          - "the appointment's RouteStop.status == ARRIVED"
+        side_effects:
+          - "every Study with workflow_status == ORDERED moves to NOT_PERFORMED"
+          - "each such Study's cancellation_fee_cents is set to the NO_SHOW_PCT (100) branch of calculations.cancellation_fee_cents"
+
+  - entity: Study
+    state_field: workflow_status
+    initial_state: ORDERED
+    terminal_states: [CANCELLED, NOT_PERFORMED]
+    shape: "cyclic + branching — decline/hand-back returns ASSIGNED/READ_IN_PROGRESS to ACQUIRED, and any post-acquisition state can fall back to REPEAT_PENDING"
+    transitions:
+      - from: ORDERED
+        to: ACQUIRED
+        trigger: "POST /studies/{study_id}/acquire"
+        actor: FieldTech
+        preconditions:
+          - "Study.study_kind == MOBILE (a TELERAD study fails ERR_NOT_APPLICABLE_TO_TELERAD)"
+          - "Study.workflow_status == ORDERED"
+          - "the Appointment's RouteStop.status == ARRIVED"
+          - "Equipment.calibration_status == VALID (gate G4)"
+          - "Equipment.assigned_unit_id == the stop's Route.mobile_unit_id"
+          - "Equipment.modality == Study.modality"
+          - "Equipment.usage_count_since_qc < EQUIPMENT_USAGE_CAP_BETWEEN_QC (3)"
+          - "Technician.status == ACTIVE and Study.modality in Technician.certified_modalities"
+          - "the acting technician is the owning Route.technician_id"
+        side_effects:
+          - "sets acquired_at = now, equipment_id, technician_id, image_count"
+          - "increments Equipment.usage_count_since_qc by 1"
+          - "recomputes the Appointment disposition counters"
+          - "recomputes calculations.study_trip_share_cents for every billable study at the same RouteStop"
+          - "increments Study.version by 1"
+      - from: ORDERED
+        to: ACQUIRED
+        trigger: "POST /studies/{study_id}/upload"
+        actor: ClinicUser
+        preconditions:
+          - "Study.study_kind == TELERAD (a MOBILE study fails ERR_STUDY_KIND_MISMATCH)"
+          - "Study.workflow_status == ORDERED"
+          - "acting X-User-ID == the Referral's clinic_id"
+        side_effects:
+          - "sets acquired_at = now and image_count; equipment_id and technician_id stay null"
+          - "recomputes the Appointment disposition counters"
+          - "increments Study.version by 1"
+        note: "This is the telerad edge that skips every route/equipment/technician hop."
+      - from: ACQUIRED
+        to: ASSIGNED
+        trigger: "system, side effect of POST /read-assignments"
+        actor: system
+        preconditions:
+          - "Study.workflow_status == ACQUIRED"
+          - "Study.qc_status == ACCEPTED"
+        side_effects:
+          - "increments Study.read_attempt_count by 1"
+          - "increments Study.version by 1"
+      - from: ASSIGNED
+        to: ACQUIRED
+        trigger: "system, side effect of POST /read-assignments/{assignment_id}/decline"
+        actor: system
+        preconditions:
+          - "the declined ReadAssignment.status == OFFERED"
+        side_effects:
+          - "recomputes Specialist.open_read_count and workload_score for the declining specialist"
+        note: "Cycle edge #1: a declined offer returns the study to the unassigned pool."
+      - from: ASSIGNED
+        to: READ_IN_PROGRESS
+        trigger: "system, side effect of POST /read-assignments/{assignment_id}/accept"
+        actor: system
+        preconditions:
+          - "the ReadAssignment.status == OFFERED"
+        side_effects:
+          - "increments Study.version by 1"
+      - from: READ_IN_PROGRESS
+        to: ACQUIRED
+        trigger: "system, side effect of POST /read-assignments/{assignment_id}/hand-back"
+        actor: system
+        preconditions:
+          - "the ReadAssignment.status == ACCEPTED"
+        side_effects:
+          - "every DRAFT Report authored by the handing-back specialist on this study is left untouched (drafts do not block reassignment)"
+          - "recomputes Specialist.open_read_count and workload_score"
+        note: "Cycle edge #2: an accepted-then-handed-back read returns the study to the unassigned pool."
+      - from: READ_IN_PROGRESS
+        to: PRELIM_REPORTED
+        trigger: "system, side effect of POST /reports/{report_id}/publish where Report.kind == PRELIMINARY"
+        actor: system
+        preconditions:
+          - "Study.workflow_status == READ_IN_PROGRESS"
+        side_effects:
+          - "appends a Notification{kind: REPORT_PUBLISHED} for the clinic"
+      - from: READ_IN_PROGRESS
+        to: FINALIZED
+        trigger: "system, side effect of POST /reports/{report_id}/publish where Report.kind == FINAL"
+        actor: system
+        preconditions:
+          - "Study.workflow_status in {READ_IN_PROGRESS, PRELIM_REPORTED}"
+        side_effects:
+          - "the owning ReadAssignment moves ACCEPTED -> COMPLETED"
+          - "Study.tat_status moves ACCRUING -> MET when tat_accrued_minutes <= tat_target_minutes, else ACCRUING -> BREACHED"
+          - "appends a Notification{kind: REPORT_PUBLISHED} for the clinic"
+      - from: PRELIM_REPORTED
+        to: FINALIZED
+        trigger: "system, side effect of POST /reports/{report_id}/publish where Report.kind == FINAL"
+        actor: system
+        preconditions:
+          - "Study.workflow_status == PRELIM_REPORTED"
+        side_effects:
+          - "same side-effect set as READ_IN_PROGRESS -> FINALIZED"
+          - "the previously PUBLISHED PRELIMINARY report moves PUBLISHED -> SUPERSEDED"
+      - from: ORDERED
+        to: CANCELLED
+        trigger: "POST /studies/{study_id}/cancel"
+        actor: ClinicUser
+        preconditions:
+          - "Study.workflow_status == ORDERED"
+          - "acting X-User-ID == the Referral's clinic_id"
+          - "the Appointment's RouteStop.status != SERVICED"
+        side_effects:
+          - "sets cancel_reason and computes cancellation_fee_cents by calculations.cancellation_fee_cents"
+          - "sets billing_status = NON_BILLABLE when the computed fee is 0; leaves it UNBILLED when the fee is positive, so the fee can later be posted as a CANCELLATION_FEE line"
+          - "recomputes the Appointment disposition counters"
+        note: |
+          An ORDERED study was never a member of the stop's billable set (which
+          starts at ACQUIRED), so cancelling one does NOT move any sibling's
+          trip share. The trip-share re-allocation cascade lives on the QC and
+          repeat edges instead — see the qc_status PENDING_QC -> REPEAT_REQUIRED
+          transition.
+      - from: ORDERED
+        to: NOT_PERFORMED
+        trigger: "POST /studies/{study_id}/not-performed, or system fan-out of appointment cancellation / stop bump"
+        actor: FieldTech
+        preconditions:
+          - "Study.workflow_status == ORDERED"
+        side_effects:
+          - "sets cancel_reason and billing_status = NON_BILLABLE"
+          - "recomputes trip shares for the remaining billable siblings at the same RouteStop"
+          - "recomputes the Appointment disposition counters"
+      - from: REPEAT_PENDING
+        to: NOT_PERFORMED
+        trigger: "system, side effect of POST /studies/{study_id}/repeat"
+        actor: system
+        preconditions:
+          - "Study.workflow_status == REPEAT_PENDING"
+        side_effects:
+          - "closes out the original once its replacement study exists"
+      - from: ACQUIRED
+        to: REPEAT_PENDING
+        trigger: "POST /studies/{study_id}/qc with qc_result in {REPEAT_REQUIRED, NON_DIAGNOSTIC}"
+        actor: FieldTech
+        preconditions:
+          - "Study.workflow_status == ACQUIRED"
+          - "Study.qc_status == PENDING_QC"
+        side_effects:
+          - "sets Study.qc_status to the supplied result"
+          - "appends a Notification{kind: STUDY_REPEAT_REQUIRED} for the clinic"
+      - from: FINALIZED
+        to: REPEAT_PENDING
+        trigger: "system, CASCADE HOP 2 of a FAIL QcCheck on the acquiring Equipment"
+        actor: system
+        preconditions:
+          - "Study.equipment_id == the failed Equipment"
+          - "Study.acquired_at >= COALESCE(Equipment.last_passing_qc_at, Equipment.created_at)"
+          - "Study.workflow_status not in {CANCELLED, NOT_PERFORMED, REPEAT_PENDING}"
+        side_effects:
+          - "see the Equipment calibration_status VALID -> QUARANTINED transition for the full six-hop cascade"
+        note: "The same edge exists from ACQUIRED, ASSIGNED, READ_IN_PROGRESS and PRELIM_REPORTED; FINALIZED is listed because it is the deepest and reaches the billing leg."
+
+  - entity: Study
+    state_field: qc_status
+    initial_state: PENDING_QC
+    terminal_states: [NON_DIAGNOSTIC]
+    shape: "parallel axis with a retroactive re-entry edge (ACCEPTED -> REPEAT_REQUIRED)"
+    transitions:
+      - from: PENDING_QC
+        to: ACCEPTED
+        trigger: "POST /studies/{study_id}/qc with qc_result == ACCEPTED"
+        actor: FieldTech
+        preconditions:
+          - "Study.workflow_status == ACQUIRED"
+          - "Study.qc_status == PENDING_QC"
+        side_effects:
+          - "the study becomes read-ready; POST /read-assignments may now target it"
+      - from: PENDING_QC
+        to: REPEAT_REQUIRED
+        trigger: "POST /studies/{study_id}/qc with qc_result == REPEAT_REQUIRED"
+        actor: FieldTech
+        preconditions:
+          - "Study.qc_status == PENDING_QC"
+        side_effects:
+          - "CASCADE HOP 1: Study.workflow_status moves ACQUIRED -> REPEAT_PENDING, so the study LEAVES its stop's billable set"
+          - "CASCADE HOP 2 (caused by hop 1): calculations.study_trip_share_cents is recomputed for every remaining billable sibling at the same RouteStop — their trip_share_cents RISE because the trip fee is now split fewer ways"
+          - "CASCADE HOP 3 (caused by hop 2): every ACTIVE TRIP_FEE_SHARE and ADMIN_FEE ChargeLine belonging to those siblings on an OPEN invoice is re-priced in place (status stays ACTIVE, amount_cents changes)"
+          - "CASCADE HOP 4 (caused by hop 3): every touched Invoice recomputes total_cents"
+          - "appends a Notification{kind: STUDY_REPEAT_REQUIRED} for the clinic"
+          - "recomputes the Appointment disposition counters"
+      - from: PENDING_QC
+        to: NON_DIAGNOSTIC
+        trigger: "POST /studies/{study_id}/qc with qc_result == NON_DIAGNOSTIC"
+        actor: FieldTech
+        preconditions:
+          - "Study.qc_status == PENDING_QC"
+        side_effects:
+          - "Study.workflow_status moves ACQUIRED -> REPEAT_PENDING; terminal on this axis"
+      - from: ACCEPTED
+        to: REPEAT_REQUIRED
+        trigger: "system, CASCADE HOP 2 of a FAIL QcCheck on the acquiring Equipment"
+        actor: system
+        preconditions:
+          - "Study.equipment_id == the failed Equipment and Study.acquired_at >= COALESCE(Equipment.last_passing_qc_at, Equipment.created_at)"
+        side_effects:
+          - "an already-ACCEPTED image is retroactively demoted; this is the edge that makes the qc axis non-linear"
+
+  - entity: Study
+    state_field: tat_status
+    initial_state: ACCRUING
+    terminal_states: [MET, BREACHED]
+    shape: "parallel axis with a pause loop (ACCRUING <-> PAUSED) and a non-monotone jump to BREACHED"
+    transitions:
+      - from: ACCRUING
+        to: PAUSED
+        trigger: "POST /studies/{study_id}/hold"
+        actor: Specialist
+        preconditions:
+          - "Study.tat_status == ACCRUING"
+          - "Study.workflow_status in {ACQUIRED, ASSIGNED, READ_IN_PROGRESS, PRELIM_REPORTED}"
+        side_effects:
+          - "sets pause_started_at = now and hold_reason"
+      - from: PAUSED
+        to: ACCRUING
+        trigger: "POST /studies/{study_id}/resume"
+        actor: ClinicUser
+        preconditions:
+          - "Study.tat_status == PAUSED"
+          - "acting X-User-ID == the Referral's clinic_id"
+        side_effects:
+          - "adds the accrual-mode minutes of the closed pause window to tat_paused_minutes, clears pause_started_at and hold_reason"
+        note: "Loop edge; a study may be held and resumed any number of times, and tat_paused_minutes accumulates across all of them."
+      - from: ACCRUING
+        to: BREACHED
+        trigger: "system, evaluated on every read and every mutation of the study"
+        actor: system
+        preconditions:
+          - "Study.tat_accrued_minutes > Study.tat_target_minutes"
+        side_effects:
+          - "appends one Notification{kind: TAT_BREACHED} for the clinic the first time the study enters BREACHED"
+      - from: ACCRUING
+        to: BREACHED
+        trigger: "POST /studies/{study_id}/escalate-stat"
+        actor: system
+        preconditions:
+          - "after the escalation retargets tat_anchor_at to acquired_at and tat_target_minutes to STAT_TAT_TARGET_WALLCLOCK_MINUTES (60), tat_accrued_minutes > 60"
+        side_effects:
+          - "the study is BREACHED the instant it is upgraded, without any time passing — the non-monotone edge"
+      - from: PAUSED
+        to: BREACHED
+        trigger: "POST /studies/{study_id}/escalate-stat while the clock is paused"
+        actor: system
+        preconditions:
+          - "Study.tat_status == PAUSED and the retargeted tat_accrued_minutes > tat_target_minutes"
+        side_effects:
+          - "pause_started_at is retained; the study is BREACHED and stays BREACHED after resume"
+      - from: ACCRUING
+        to: MET
+        trigger: "system, side effect of publishing a FINAL report"
+        actor: system
+        preconditions:
+          - "Study.tat_accrued_minutes <= Study.tat_target_minutes at the instant of publication"
+        side_effects:
+          - "terminal; the clock stops"
+
+  - entity: Study
+    state_field: billing_status
+    initial_state: UNBILLED
+    terminal_states: [NON_BILLABLE]
+    shape: "cyclic — POSTED -> REVERSED -> POSTED re-entry"
+    transitions:
+      - from: UNBILLED
+        to: POSTED
+        trigger: "POST /invoices/{invoice_id}/post-study"
+        actor: BillingAdmin
+        preconditions:
+          - "Study.workflow_status == FINALIZED"
+          - "Study.billing_status in {UNBILLED, REVERSED}"
+          - "Invoice.status == OPEN (gate G1)"
+        side_effects:
+          - "creates one STUDY_READ ChargeLine, one TRIP_FEE_SHARE line when trip_share_cents > 0, one STAT_SURCHARGE line when priority == STAT, and one ADMIN_FEE line"
+          - "when the clinic's contract is PREPAID_BLOCK with block_remaining_studies > 0, appends a BlockLedgerEntry{delta_studies: -1, reason: DRAW} and decrements block_remaining_studies"
+          - "recomputes Invoice.total_cents and Invoice.posted_study_count"
+          - "increments Invoice.version by 1"
+      - from: POSTED
+        to: REVERSED
+        trigger: "system, CASCADE HOP 4 of a FAIL QcCheck or of a stop bump"
+        actor: system
+        preconditions:
+          - "Study.billing_status == POSTED"
+          - "the owning Invoice.status == OPEN"
+        side_effects:
+          - "every ACTIVE ChargeLine for this study moves to REVERSED"
+          - "when a DRAW BlockLedgerEntry exists for this study, appends BlockLedgerEntry{delta_studies: +1, reason: REFUND_QC} and increments block_remaining_studies"
+      - from: REVERSED
+        to: POSTED
+        trigger: "POST /invoices/{invoice_id}/post-study on the same or a different OPEN invoice"
+        actor: BillingAdmin
+        preconditions:
+          - "Study.billing_status == REVERSED"
+          - "Study.workflow_status == FINALIZED"
+        side_effects:
+          - "creates a fresh set of ACTIVE charge lines; the REVERSED lines remain on the invoice for audit but are excluded from total_cents"
+        note: "Re-entry edge; this is what makes the billing axis non-linear."
+      - from: UNBILLED
+        to: NON_BILLABLE
+        trigger: "system, side effect of study cancellation with zero fee, of a stop bump, or of creating a repeat whose repeat_cause is QC_FAILURE or EQUIPMENT_QUARANTINE"
+        actor: system
+        preconditions:
+          - "Study.billing_status == UNBILLED"
+        side_effects:
+          - "the study can never be posted; POST /invoices/{invoice_id}/post-study fails ERR_STUDY_NON_BILLABLE"
+
+  - entity: ReadAssignment
+    state_field: status
+    initial_state: OFFERED
+    terminal_states: [DECLINED, HANDED_BACK, COMPLETED, REVOKED]
+    shape: "branching with a capped retry loop across sibling assignments"
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /read-assignments/{assignment_id}/accept"
+        actor: Specialist
+        preconditions:
+          - "ReadAssignment.status == OFFERED"
+          - "acting X-User-ID == ReadAssignment.specialist_id"
+        side_effects:
+          - "sets responded_at = now"
+          - "the Study moves ASSIGNED -> READ_IN_PROGRESS"
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /read-assignments/{assignment_id}/decline"
+        actor: Specialist
+        preconditions:
+          - "ReadAssignment.status == OFFERED"
+          - "acting X-User-ID == ReadAssignment.specialist_id"
+        side_effects:
+          - "sets responded_at and decline_reason"
+          - "the Study moves ASSIGNED -> ACQUIRED and remains read-ready"
+          - "Study.read_attempt_count is NOT decremented — the attempt is consumed"
+          - "recomputes the specialist's open_read_count and workload_score"
+      - from: ACCEPTED
+        to: HANDED_BACK
+        trigger: "POST /read-assignments/{assignment_id}/hand-back"
+        actor: Specialist
+        preconditions:
+          - "ReadAssignment.status == ACCEPTED"
+          - "acting X-User-ID == ReadAssignment.specialist_id"
+          - "no Report with this study_id and this author has status == PUBLISHED"
+        side_effects:
+          - "sets responded_at and decline_reason"
+          - "the Study moves READ_IN_PROGRESS -> ACQUIRED"
+          - "recomputes the specialist's open_read_count and workload_score"
+      - from: ACCEPTED
+        to: COMPLETED
+        trigger: "system, side effect of publishing a FINAL report on the study"
+        actor: system
+        preconditions:
+          - "ReadAssignment.status == ACCEPTED"
+        side_effects:
+          - "sets responded_at; recomputes the specialist's open_read_count and workload_score"
+      - from: OFFERED
+        to: REVOKED
+        trigger: "system, CASCADE HOP 3 of a FAIL QcCheck"
+        actor: system
+        preconditions:
+          - "ReadAssignment.status in {OFFERED, ACCEPTED}"
+          - "the owning Study moved to REPEAT_PENDING in CASCADE HOP 2"
+        side_effects:
+          - "CASCADE HOP 4 (caused by hop 3): the specialist's open_read_count and workload_score are recomputed downward"
+      - from: ACCEPTED
+        to: REVOKED
+        trigger: "system, CASCADE HOP 3 of a FAIL QcCheck"
+        actor: system
+        preconditions:
+          - "ReadAssignment.status == ACCEPTED and the owning Study moved to REPEAT_PENDING"
+        side_effects:
+          - "CASCADE HOP 4 (caused by hop 3): the specialist's open_read_count and workload_score are recomputed downward"
+
+  - entity: Report
+    state_field: status
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED, RETRACTED]
+    shape: "branching with supersession — a published report is displaced by the next publication on the same study"
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /reports/{report_id}/publish"
+        actor: Specialist
+        preconditions:
+          - "Report.status == DRAFT"
+          - "acting X-User-ID == Report.author_specialist_id"
+          - "the report sequence rule holds (PRELIMINARY needs no predecessor; FINAL needs the study in {READ_IN_PROGRESS, PRELIM_REPORTED}; ADDENDUM needs a PUBLISHED FINAL on the study)"
+          - "for ADDENDUM: now < that FINAL report's published_at + ADDENDUM_WINDOW_DAYS (14) days"
+        side_effects:
+          - "sets published_at = now and supersedes_report_id to the id of the report that was PUBLISHED on this study immediately before, or null when there was none"
+          - "the previously PUBLISHED report on this study moves PUBLISHED -> SUPERSEDED"
+          - "the Study workflow axis advances (PRELIM_REPORTED for PRELIMINARY, FINALIZED for FINAL, unchanged for ADDENDUM)"
+          - "appends a Notification{kind: REPORT_PUBLISHED} for the clinic"
+      - from: PUBLISHED
+        to: SUPERSEDED
+        trigger: "system, side effect of publishing a later report on the same study"
+        actor: system
+        preconditions:
+          - "Report.status == PUBLISHED"
+        side_effects:
+          - "no clinical content changes; the report stays readable"
+      - from: PUBLISHED
+        to: RETRACTED
+        trigger: "POST /reports/{report_id}/retract"
+        actor: Specialist
+        preconditions:
+          - "Report.status == PUBLISHED"
+          - "acting Specialist X-User-ID == Report.author_specialist_id, or the actor is PlatformAdmin"
+        side_effects:
+          - "sets retracted_at and retract_reason"
+          - "when the retracted report was the study's FINAL, the Study moves FINALIZED -> PRELIM_REPORTED if a PUBLISHED or SUPERSEDED PRELIMINARY exists on the study, else FINALIZED -> READ_IN_PROGRESS"
+          - "every PeerReview on the retracted report with status == SAMPLED is left in place and may still be submitted"
+      - from: PUBLISHED
+        to: RETRACTED
+        trigger: "system, CASCADE HOP 2b of a FAIL QcCheck"
+        actor: system
+        preconditions:
+          - "the owning Study moved to REPEAT_PENDING in CASCADE HOP 2"
+        side_effects:
+          - "sets retract_reason = 'EQUIPMENT_QUARANTINE'"
+
+  - entity: PeerReview
+    state_field: status
+    initial_state: SAMPLED
+    terminal_states: [CONCUR, DISCORDANT]
+    shape: "branching on a numeric threshold"
+    transitions:
+      - from: SAMPLED
+        to: CONCUR
+        trigger: "POST /peer-reviews/{peer_review_id}/submit with score >= 3"
+        actor: Specialist
+        preconditions:
+          - "PeerReview.status == SAMPLED"
+          - "acting X-User-ID == PeerReview.reviewer_specialist_id"
+          - "PEER_REVIEW_SCORE_MIN (1) <= score <= PEER_REVIEW_SCORE_MAX (5)"
+        side_effects:
+          - "records score and outcome_note"
+      - from: SAMPLED
+        to: DISCORDANT
+        trigger: "POST /peer-reviews/{peer_review_id}/submit with score <= PEER_REVIEW_DISCORDANT_SCORE_MAX (2)"
+        actor: Specialist
+        preconditions:
+          - "PeerReview.status == SAMPLED"
+          - "acting X-User-ID == PeerReview.reviewer_specialist_id"
+        side_effects:
+          - "records score and outcome_note"
+          - "no billing or workflow consequence — peer review is an independent quality axis"
+
+  - entity: Invoice
+    state_field: status
+    initial_state: OPEN
+    terminal_states: [FINALIZED]
+    shape: "linear with a global freeze gate"
+    transitions:
+      - from: OPEN
+        to: FINALIZED
+        trigger: "POST /invoices/{invoice_id}/finalize"
+        actor: BillingAdmin
+        preconditions:
+          - "Invoice.status == OPEN"
+        side_effects:
+          - "snapshots total_cents into finalized_total_cents and sets finalized_at = now"
+          - "gate G1 becomes active: every later write touching this invoice's charge lines — including cascaded reversals — fails ERR_INVOICE_FINALIZED"
+          - "increments Invoice.version by 1"
+
+  - entity: ChargeLine
+    state_field: status
+    initial_state: ACTIVE
+    terminal_states: [REVERSED]
+    shape: "linear, but the amount of an ACTIVE line is mutable by trip-share re-allocation"
+    transitions:
+      - from: ACTIVE
+        to: REVERSED
+        trigger: "system, cascade of a FAIL QcCheck, a stop bump, or a stop cancel"
+        actor: system
+        preconditions:
+          - "ChargeLine.status == ACTIVE"
+          - "the owning Invoice.status == OPEN (gate G1)"
+        side_effects:
+          - "records reversal_reason; the line's amount_cents is preserved but excluded from Invoice.total_cents"
+
+  - entity: Equipment
+    state_field: calibration_status
+    initial_state: UNCALIBRATED
+    terminal_states: []
+    shape: "cyclic — QUARANTINED and EXPIRED both return to VALID through recalibration"
+    transitions:
+      - from: UNCALIBRATED
+        to: VALID
+        trigger: "POST /equipment/{equipment_id}/calibrate"
+        actor: PlatformAdmin
+        preconditions:
+          - "valid_until > valid_from"
+          - "(valid_until - valid_from) <= CALIBRATION_VALIDITY_DAYS (30) days"
+        side_effects:
+          - "sets calibration_valid_from / calibration_valid_until, resets usage_count_since_qc to 0 and quarantined_at to null"
+        note: |
+          The supplied window need not contain the logical clock. Calibrating
+          with an entirely past window is accepted and leaves
+          calibration_status computing EXPIRED immediately (UNCALIBRATED ->
+          EXPIRED); only a window containing the clock yields VALID.
+      - from: VALID
+        to: EXPIRED
+        trigger: "system, evaluated against the logical clock on every read"
+        actor: system
+        preconditions:
+          - "logical clock < calibration_valid_from or logical clock >= calibration_valid_until"
+        side_effects:
+          - "gate G4 begins rejecting POST /studies/{study_id}/acquire with ERR_EQUIPMENT_CALIBRATION_LAPSED"
+      - from: EXPIRED
+        to: VALID
+        trigger: "POST /equipment/{equipment_id}/calibrate"
+        actor: PlatformAdmin
+        preconditions:
+          - "valid_until > valid_from and the window is at most 30 days"
+        side_effects:
+          - "resets usage_count_since_qc to 0"
+      - from: VALID
+        to: QUARANTINED
+        trigger: "POST /qc-checks with result == FAIL"
+        actor: FieldTech
+        preconditions:
+          - "the acting technician is certified for Equipment.modality"
+        side_effects:
+          - "CASCADE HOP 1: sets quarantined_at = now; calibration_status becomes QUARANTINED"
+          - "CASCADE HOP 2 (caused by hop 1): every Study with equipment_id == this equipment, acquired_at >= COALESCE(last_passing_qc_at, Equipment.created_at) and workflow_status not in {CANCELLED, NOT_PERFORMED, REPEAT_PENDING} — processed in created_at ASC order — moves qc_status to REPEAT_REQUIRED and workflow_status to REPEAT_PENDING"
+          - "CASCADE HOP 2b (caused by hop 2): every PUBLISHED Report on those studies moves to RETRACTED with retract_reason = 'EQUIPMENT_QUARANTINE'"
+          - "CASCADE HOP 3 (caused by hop 2): every ReadAssignment on those studies with status in {OFFERED, ACCEPTED} moves to REVOKED"
+          - "CASCADE HOP 4 (caused by hop 3): each affected Specialist recomputes open_read_count and workload_score"
+          - "CASCADE HOP 4b (caused by hop 2): every ACTIVE ChargeLine on those studies whose Invoice.status == OPEN moves to REVERSED with reversal_reason = 'EQUIPMENT_QUARANTINE', and each such Study moves billing_status POSTED -> REVERSED"
+          - "CASCADE HOP 4c (caused by hop 2): the flagged studies leave their stops' billable sets, so calculations.study_trip_share_cents is re-allocated across every surviving billable sibling at those stops and each sibling's ACTIVE TRIP_FEE_SHARE and ADMIN_FEE ChargeLine is re-priced in place — the surviving siblings get MORE expensive"
+          - "CASCADE HOP 5 (caused by hop 4b): every touched Invoice recomputes total_cents and posted_study_count"
+          - "CASCADE HOP 6 (caused by hop 4b): for each reversed study that had drawn a block unit, a BlockLedgerEntry{delta_studies: +1, reason: REFUND_QC} is appended and its ClinicContract decrements block_consumed_studies / increments block_remaining_studies"
+          - "CASCADE HOP 7 (caused by hop 2): one Notification{kind: STUDY_REPEAT_REQUIRED} per affected study is appended for its clinic"
+          - "sets QcCheck.affected_study_count to the number of studies flagged in hop 2"
+        note: "The deepest cascade in the scaffold: QcCheck -> Equipment -> Study -> ChargeLine -> Invoice, and QcCheck -> Equipment -> Study -> ChargeLine -> BlockLedgerEntry -> ClinicContract (six entity hops)."
+      - from: EXPIRED
+        to: QUARANTINED
+        trigger: "POST /qc-checks with result == FAIL on equipment whose calibration window has already lapsed"
+        actor: FieldTech
+        preconditions:
+          - "the acting technician is certified for Equipment.modality"
+        side_effects:
+          - "identical cascade to the VALID -> QUARANTINED edge"
+      - from: QUARANTINED
+        to: VALID
+        trigger: "POST /equipment/{equipment_id}/calibrate"
+        actor: PlatformAdmin
+        preconditions:
+          - "valid_until > valid_from and the window is at most 30 days"
+        side_effects:
+          - "clears quarantined_at to null and resets usage_count_since_qc to 0"
+          - "already-flagged studies are NOT un-flagged; the retroactive demotion is permanent"
+        note: "The re-entry edge that makes the equipment axis cyclic."
+      - from: VALID
+        to: VALID
+        trigger: "POST /qc-checks with result == PASS"
+        actor: FieldTech
+        preconditions:
+          - "the acting technician is certified for Equipment.modality"
+        side_effects:
+          - "sets last_passing_qc_at = now and resets usage_count_since_qc to 0"
+          - "narrows the retroactive blast radius of any future FAIL to studies acquired after this instant"
+
+  - entity: Clinic
+    state_field: billing_hold_status
+    initial_state: CLEAR
+    terminal_states: []
+    shape: "cyclic — a hold may be placed and lifted repeatedly"
+    transitions:
+      - from: CLEAR
+        to: HOLD
+        trigger: "POST /clinics/{clinic_id}/billing-hold with billing_hold_status == HOLD"
+        actor: BillingAdmin
+        preconditions:
+          - "Clinic.billing_hold_status == CLEAR"
+        side_effects:
+          - "gate G2 becomes active for this clinic's intake writes"
+          - "in-flight studies are untouched — acquisition, reading and reporting continue normally"
+      - from: HOLD
+        to: CLEAR
+        trigger: "POST /clinics/{clinic_id}/billing-hold with billing_hold_status == CLEAR"
+        actor: BillingAdmin
+        preconditions:
+          - "Clinic.billing_hold_status == HOLD"
+        side_effects:
+          - "gate G2 stops firing for this clinic"
+
+concurrency_rules:
+  - rule_id: stop-add-stale-route
+    parent_entity: Route
+    write_endpoint: "POST /routes/{route_id}/stops"
+    occ_field: "expected_route_version"
+    description: |
+      Adding a stop to a Route whose version has advanced since the client last
+      observed it is rejected. This captures the case where another writer has
+      just inserted a STAT stop that legitimately bumped a routine stop and
+      re-sequenced the route, so the current writer's view of the route's
+      remaining capacity is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: read-assign-stale-study
+    parent_entity: Study
+    write_endpoint: "POST /read-assignments"
+    occ_field: "expected_study_version"
+    description: |
+      Offering a read on a Study whose version has advanced since the client
+      last observed it is rejected. A new assignment legitimately supersedes a
+      prior offer once that offer has been declined, so the natural product
+      semantics would let the second create succeed on identical state; OCC on
+      the study's version is what makes the stale-view case deterministic.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: invoice-post-stale-invoice
+    parent_entity: Invoice
+    write_endpoint: "POST /invoices/{invoice_id}/post-study"
+    occ_field: "expected_invoice_version"
+    description: |
+      Posting a study to an Invoice whose version has advanced since the client
+      last observed it is rejected. Posting re-prices trip-fee shares across
+      every study already on the invoice, so a writer holding a stale invoice
+      view would post against an allocation that no longer exists.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: block-purchase-stale-contract
+    parent_entity: ClinicContract
+    write_endpoint: "POST /contracts/{contract_id}/block-purchase"
+    occ_field: "expected_contract_version"
+    description: |
+      Adding studies to a prepaid block on a ClinicContract whose version has
+      advanced since the client last observed it is rejected. Block draws from
+      study postings bump the contract version, so a top-up computed against a
+      stale remaining balance would over- or under-purchase.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+calculations:
+  # ---- shared mapping helpers (declared explicitly so no downstream skill guesses) ----
+  - name: business_minutes_between
+    trigger: "helper — invoked by every ROUTINE-priority turnaround computation"
+    algorithm: interval_merge
+    formula: |
+      business_minutes_between(t0, t1, clinic):
+        if t1 <= t0: return 0
+        total = 0
+        for each calendar date D from date_utc(t0) to date_utc(t1) inclusive:
+          if weekday_index(D) not in clinic.business_days:   # 0 = Monday .. 6 = Sunday
+            continue
+          win_start = D at 00:00:00Z + clinic.business_open_minute minutes
+          win_end   = D at 00:00:00Z + clinic.business_close_minute minutes
+          lo = max(t0, win_start)
+          hi = min(t1, win_end)
+          if hi > lo:
+            total = total + floor((hi - lo) in seconds / 60)
+        return total
+    input_set: "the clinic that owns the study's Referral; all instants are UTC, no timezone conversion is ever applied"
+    constants:
+      DEFAULT_BUSINESS_OPEN_MINUTE: 480
+      DEFAULT_BUSINESS_CLOSE_MINUTE: 1020
+      DEFAULT_BUSINESS_DAYS: [0, 1, 2, 3, 4]
+    precision: "whole minutes, truncated toward zero"
+
+  - name: advance_business_minutes
+    trigger: "helper — invoked by calculations.tat_deadline_at for ROUTINE studies"
+    algorithm: interval_merge
+    formula: |
+      advance_business_minutes(t0, n, clinic):
+        if n == 0: return t0
+        remaining = n
+        cursor = t0
+        loop over successive business windows at or after cursor:
+          win = the next window [D+open, D+close) with weekday_index(D) in clinic.business_days
+                and win_end > cursor
+          lo = max(cursor, win_start)
+          avail = floor((win_end - lo) in seconds / 60)
+          if avail >= remaining: return lo + remaining minutes
+          remaining = remaining - avail
+          cursor = win_end
+    input_set: "same clinic calendar as business_minutes_between"
+    precision: "whole minutes"
+
+  - name: wall_minutes_between
+    trigger: "helper — invoked by every STAT-priority turnaround computation"
+    algorithm: aggregation
+    formula: "wall_minutes_between(t0, t1) = max(0, floor((t1 - t0) in seconds / 60))"
+    input_set: "two UTC instants; the calendar is ignored entirely"
+    precision: "whole minutes, truncated toward zero"
+
+  # ---- turnaround ----
+  - name: tat_target_minutes
+    trigger: "recomputed on every read of a Study and after every mutation that can change Study.priority"
+    algorithm: threshold
+    formula: |
+      tat_target_minutes =
+        (study.priority == 'STAT')    ? STAT_TAT_TARGET_WALLCLOCK_MINUTES
+                                      : ROUTINE_TAT_TARGET_BUSINESS_MINUTES
+    input_set: "the study alone"
+    constants:
+      ROUTINE_TAT_TARGET_BUSINESS_MINUTES: 240
+      STAT_TAT_TARGET_WALLCLOCK_MINUTES: 60
+    precision: "integer minutes"
+    variants:
+      - name: routine_business_hours
+        when: "study.priority == ROUTINE"
+        difference: "240 minutes measured ONLY inside the referring clinic's business windows (business_minutes_between)"
+      - name: stat_wall_clock
+        when: "study.priority == STAT"
+        difference: "60 minutes measured on the wall clock, ignoring business hours entirely (wall_minutes_between)"
+
+  - name: tat_anchor_at
+    trigger: "recomputed on every read of a Study and on POST /studies/{study_id}/escalate-stat"
+    algorithm: projection
+    formula: |
+      tat_anchor_at =
+        (study.priority_source == 'NATIVE')
+          ? study.created_at
+          : COALESCE(study.acquired_at, study.escalated_at)
+      where study.escalated_at is the logical-clock instant at which
+      POST /studies/{study_id}/escalate-stat was applied.
+    input_set: "the study alone"
+    precision: "millisecond ISO 8601 UTC, three fractional digits"
+    variants:
+      - name: native_anchor
+        when: "study.priority_source == NATIVE (the priority was fixed at order time)"
+        difference: "the clock runs from Study.created_at — the whole order-to-report span is measured"
+      - name: upgraded_anchor
+        when: "study.priority_source == UPGRADED (escalate-stat raised the priority)"
+        difference: |
+          the clock is re-anchored to Study.acquired_at, so time already spent
+          before acquisition is discarded while the target itself shrinks
+          from 240 business minutes to 60 wall minutes. Because the shrink is
+          larger than the discard for any study acquired more than 60 wall
+          minutes ago, the upgrade can push tat_accrued_minutes above
+          tat_target_minutes with no time passing at all — the study is BREACHED
+          the instant it is upgraded. Turnaround is NOT monotone in elapsed time.
+
+  - name: tat_elapsed_minutes
+    trigger: "recomputed on every read of a Study and after every mutation of it"
+    algorithm: aggregation
+    formula: |
+      mode = (study.priority == 'STAT') ? 'WALL' : 'BUSINESS'
+      tat_elapsed_minutes =
+        (mode == 'WALL')
+          ? wall_minutes_between(tat_anchor_at, now)
+          : business_minutes_between(tat_anchor_at, now, clinic)
+      Once study.tat_status is MET or BREACHED the value freezes at whatever it
+      held at the instant of that transition and never advances again.
+    input_set: "the study, its clinic, and the logical clock"
+    precision: "integer minutes"
+    variants:
+      - name: wall_mode
+        when: "study.priority == STAT"
+        difference: "counts every minute, nights and weekends included"
+      - name: business_mode
+        when: "study.priority == ROUTINE"
+        difference: "counts only minutes inside the clinic's business windows on its business days"
+
+  - name: tat_paused_minutes
+    trigger: "recomputed on every read of a Study; incremented on POST /studies/{study_id}/resume"
+    algorithm: aggregation
+    formula: |
+      tat_paused_minutes =
+        sum over every CLOSED pause window [p_start, p_end) of
+          minutes_in_mode(p_start, p_end)
+        + (study.tat_status == 'PAUSED'
+             ? minutes_in_mode(study.pause_started_at, now)
+             : 0)
+      where minutes_in_mode uses wall_minutes_between when priority == STAT and
+      business_minutes_between otherwise — the SAME mode as tat_elapsed_minutes,
+      so the partition invariant cannot drift.
+    input_set: "every hold/resume pair recorded on the study, plus any open pause"
+    precision: "integer minutes"
+
+  - name: tat_accrued_minutes
+    trigger: "recomputed on every read of a Study"
+    algorithm: aggregation
+    formula: "tat_accrued_minutes = tat_elapsed_minutes - tat_paused_minutes"
+    input_set: "the study alone"
+    precision: "integer minutes; INV_TAT_PARTITION requires accrued + paused == elapsed exactly"
+
+  - name: tat_deadline_at
+    trigger: "recomputed on every read of a Study"
+    algorithm: projection
+    formula: |
+      tat_deadline_at =
+        (study.priority == 'STAT')
+          ? tat_anchor_at + (tat_target_minutes + tat_paused_minutes) minutes
+          : advance_business_minutes(tat_anchor_at,
+                                     tat_target_minutes + tat_paused_minutes,
+                                     clinic)
+    input_set: "the study, its clinic"
+    precision: "millisecond ISO 8601 UTC, three fractional digits"
+
+  - name: tat_breach_evaluation
+    trigger: "evaluated on every read of a Study and after every mutation of it"
+    algorithm: threshold
+    formula: |
+      if study.tat_status in {MET, BREACHED}: unchanged (both terminal)
+      else if tat_accrued_minutes > tat_target_minutes: tat_status = BREACHED
+      else: unchanged
+    input_set: "the study alone"
+    constants:
+      TAT_BREACH_COMPARATOR: ">"
+    precision: |
+      Strictly greater-than. accrued == target does NOT breach; accrued ==
+      target + 1 does. A ROUTINE study sitting at exactly 240 accrued business
+      minutes is still ACCRUING.
+
+  # ---- pricing ----
+  - name: study_base_price_cents
+    trigger: "computed on GET /studies/{study_id}/pricing and at POST /invoices/{invoice_id}/post-study"
+    algorithm: tiered_pricing
+    formula: |
+      contract = the single ClinicContract for the study's clinic whose
+                 computed status == 'ACTIVE'; when none exists the posting
+                 fails ERR_CONTRACT_NOT_ACTIVE.
+
+      if study.billing_status == 'NON_BILLABLE':
+        price_basis = 'NON_BILLABLE';  base_price_cents = 0
+      elif contract.kind == 'PREPAID_BLOCK' and contract.block_remaining_studies > 0:
+        price_basis = 'BLOCK_RATE'
+        base_price_cents = BLOCK_RATE_CENTS_BY_MODALITY[study.modality]
+      else:
+        price_basis = 'LIST_PRICE'
+        base_price_cents = LIST_PRICE_CENTS_BY_MODALITY[study.modality]
+    input_set: "the study's modality and billing_status, plus the clinic's ACTIVE contract and its live block balance"
+    constants:
+      LIST_PRICE_CENTS_BY_MODALITY: { RADIOGRAPHY: 18000, ULTRASOUND: 26000, CT: 52000, ECHO: 34000 }
+      BLOCK_RATE_CENTS_BY_MODALITY: { RADIOGRAPHY: 14000, ULTRASOUND: 20000, CT: 42000, ECHO: 27000 }
+    precision: "whole cents; the rate tables are exact, no rounding occurs here"
+    variants:
+      - name: block_rate_draw
+        when: "contract.kind == PREPAID_BLOCK and block_remaining_studies > 0"
+        difference: "charges the discounted block rate AND consumes one block unit (a DRAW BlockLedgerEntry is appended)"
+      - name: list_price_overage
+        when: "contract.kind == PER_STUDY_LIST, or contract.kind == PREPAID_BLOCK with block_remaining_studies == 0"
+        difference: |
+          charges full list price and consumes nothing. The boundary is exact:
+          a PREPAID_BLOCK contract with block_remaining_studies == 1 prices the
+          next study at the block rate; the study after it, with
+          block_remaining_studies == 0, prices at list. Identical study, two
+          different numbers, decided by a counter.
+
+  - name: study_trip_share_cents
+    trigger: "recomputed for every billable study at a RouteStop whenever that stop's billable set changes (acquire, cancel, not-performed, bump, repeat, posting)"
+    algorithm: waterfall_allocation
+    formula: |
+      if study.study_kind == 'TELERAD': return 0
+
+      stop = the RouteStop of the study's Appointment
+      B    = [ every Study S where S.appointment_id belongs to an Appointment
+               with route_stop_id == stop.id
+               AND S.workflow_status in {ACQUIRED, ASSIGNED, READ_IN_PROGRESS,
+                                          PRELIM_REPORTED, FINALIZED}
+               AND S.billing_status != 'NON_BILLABLE' ]
+             sorted by S.created_at ASC
+      n = len(B)
+      if n == 0: return 0                      # empty-set edge: no trip fee is billed at all
+      if study not in B: return 0
+
+      base      = floor(stop.trip_fee_cents / n)
+      remainder = stop.trip_fee_cents - base * n        # 0 <= remainder < n
+      i         = index of study within B (0-based)
+      return base + (1 if i < remainder else 0)
+    input_set: "the stop's billable studies only; ORDERED, CANCELLED, NOT_PERFORMED, REPEAT_PENDING and NON_BILLABLE studies are excluded"
+    constants:
+      TRIP_FEE_CENTS: 12500
+    precision: |
+      ROUNDING ORDER IS PINNED: floor the per-study share first, then hand the
+      leftover cents out one at a time in created_at ASC order. The rejected
+      alternative — round_half_up(12500 / 3) = 4167 for every study — would
+      allocate 12501 cents and break INV_MONEY_INVOICE_TOTAL against the stop's
+      single 12500-cent trip fee. n = 3 therefore yields exactly
+      [4167, 4167, 4166], never [4167, 4167, 4167].
+    variants:
+      - name: mobile_shared_trip
+        when: "study.study_kind == MOBILE"
+        difference: "one trip fee per stop, split across the stop's billable studies with a floor-plus-remainder rule"
+      - name: telerad_no_trip
+        when: "study.study_kind == TELERAD"
+        difference: "structurally zero — there is no route stop, no van and no trip to allocate"
+    note: |
+      NON-MONOTONE PRICING CHAIN. Two billable studies at a stop each carry
+      6250. Take one out of the billable set — the reachable way is a
+      REPEAT_REQUIRED image-QC verdict, which moves it to REPEAT_PENDING — and
+      the survivor's share RISES to 12500, taking its admin fee and
+      total_price_cents up with it. Removing work makes the remaining work cost
+      more, because the trip fee is no longer shared. Any implementation that
+      caches a study's trip_share_cents at acquisition time gets this wrong.
+
+  - name: study_stat_surcharge_cents
+    trigger: "computed on GET /studies/{study_id}/pricing and at posting"
+    algorithm: threshold
+    formula: "stat_surcharge_cents = (study.priority == 'STAT') ? STAT_SURCHARGE_CENTS : 0"
+    input_set: "the study's current priority, whether NATIVE or UPGRADED"
+    constants:
+      STAT_SURCHARGE_CENTS: 4500
+    precision: "whole cents"
+
+  - name: study_admin_fee_cents
+    trigger: "computed on GET /studies/{study_id}/pricing and at posting, strictly AFTER the trip share is allocated"
+    algorithm: aggregation
+    formula: |
+      admin_fee_cents = round_half_up(
+        ADMIN_FEE_PCT / 100 *
+        (base_price_cents + trip_share_cents + stat_surcharge_cents) )
+    input_set: "the three already-computed components of this one study"
+    constants:
+      ADMIN_FEE_PCT: 3
+    precision: |
+      ONE rounding, applied to the study's subtotal, using round_half_up.
+      The fee is NOT computed per component and summed, and Invoice.total_cents
+      is NOT a re-rounding of an unrounded aggregate — it is the plain sum of
+      already-rounded ChargeLine.amount_cents values.
+
+  - name: study_total_price_cents
+    trigger: "computed on GET /studies/{study_id}/pricing and at POST /invoices/{invoice_id}/post-study"
+    algorithm: constraint_propagation
+    formula: |
+      EVALUATION ORDER IS PINNED (the dependency looks circular because the
+      admin fee depends on the trip share, the trip share depends on which
+      studies at the stop are billable, and billability depends on whether a
+      study was cancelled — which is priced off the LIST table, not off the
+      contract's block rate):
+        1. resolve the clinic's ACTIVE contract and read block_remaining_studies
+        2. base_price_cents      <- study_base_price_cents
+        3. trip_share_cents      <- study_trip_share_cents   (re-derives the stop's billable set from scratch)
+        4. stat_surcharge_cents  <- study_stat_surcharge_cents
+        5. admin_fee_cents       <- study_admin_fee_cents    (over steps 2..4)
+        6. total_price_cents = base_price_cents + trip_share_cents
+                             + stat_surcharge_cents + admin_fee_cents
+      cancellation_fee_cents is NEVER part of this sum; a cancelled study is
+      priced solely by calculations.cancellation_fee_cents.
+    input_set: "one study plus its stop's billable set and its clinic's ACTIVE contract"
+    precision: "whole cents"
+
+  - name: cancellation_fee_cents
+    trigger: "computed at POST /studies/{study_id}/cancel, POST /appointments/{appointment_id}/cancel by ClinicUser, and POST /appointments/{appointment_id}/no-show"
+    algorithm: tiered_pricing
+    formula: |
+      list = LIST_PRICE_CENTS_BY_MODALITY[study.modality]     # ALWAYS the list table,
+                                                             # never the block rate — a
+                                                             # cancelled study draws no block unit
+      if cause is provider-side (stop bump, stop cancel, appointment
+         CANCELLED_BY_PROVIDER):
+        return 0
+      if study.study_kind == 'TELERAD':
+        return 0                                             # no stop, no lead time, no trip
+      if trigger is no-show:
+        return round_half_up(list * NO_SHOW_PCT / 100)        # = list
+
+      stop    = the RouteStop of the study's Appointment
+      arrival = date_utc(stop.route.service_date) at 00:00:00Z
+                + stop.planned_arrival_minute minutes
+      lead    = wall_minutes_between(now, arrival)
+
+      if stop.route.status == 'DISPATCHED':
+        others = count of Study rows at this stop, excluding this one, with
+                 workflow_status == 'ORDERED'
+        return round_half_up(list * CANCEL_DISPATCHED_PCT / 100)
+               + (others == 0 ? stop.trip_fee_cents : 0)
+      if lead >= CANCEL_FREE_LEAD_MINUTES:          return 0
+      if lead >= CANCEL_PARTIAL_LEAD_MINUTES:       return round_half_up(list * CANCEL_PARTIAL_PCT / 100)
+      return round_half_up(list * CANCEL_LATE_PCT / 100)
+    input_set: "the study's modality, its stop's scheduled arrival instant, its route's status, and the logical clock"
+    constants:
+      LIST_PRICE_CENTS_BY_MODALITY: { RADIOGRAPHY: 18000, ULTRASOUND: 26000, CT: 52000, ECHO: 34000 }
+      CANCEL_FREE_LEAD_MINUTES: 1440
+      CANCEL_PARTIAL_LEAD_MINUTES: 240
+      CANCEL_PARTIAL_PCT: 50
+      CANCEL_LATE_PCT: 100
+      CANCEL_DISPATCHED_PCT: 100
+      NO_SHOW_PCT: 100
+      TRIP_FEE_CENTS: 12500
+    precision: "whole cents, round_half_up; boundaries are inclusive on the >= side (lead == 1440 is free, lead == 1439 is 50%)"
+    variants:
+      - name: lead_time_tiers
+        when: "the study's Route.status is DRAFT or PUBLISHED (the van has not left)"
+        difference: "three tiers keyed on wall-clock lead minutes: 0% / 50% / 100% of list"
+      - name: dispatched_flat
+        when: "the study's Route.status == DISPATCHED"
+        difference: |
+          lead time is ignored entirely — 100% of list, plus the stop's ENTIRE
+          trip fee when this was the last ORDERED study at the stop. The van is
+          already out, so a cancellation 20 hours ahead of the printed arrival
+          time is billed exactly like one made two minutes ahead.
+
+  - name: repeat_billability
+    trigger: "POST /studies/{study_id}/repeat"
+    algorithm: threshold
+    formula: |
+      if repeat_cause in {'QC_FAILURE', 'EQUIPMENT_QUARANTINE'}:
+        replacement.billing_status = 'NON_BILLABLE'   # base, trip share, surcharge and admin fee all 0
+      else:                                           # repeat_cause == 'CLINICIAN_EXTRA_VIEWS'
+        replacement.billing_status = 'UNBILLED'       # priced exactly like any first-time study
+    input_set: "the repeat_cause supplied on the request, validated against the source study's qc_status and equipment state"
+    precision: "no arithmetic; a pure branch that decides whether any money is charged"
+    variants:
+      - name: provider_fault_repeat
+        when: "repeat_cause in {QC_FAILURE, EQUIPMENT_QUARANTINE}"
+        difference: "the repeat is free; it never draws a block unit and never contributes a trip share"
+      - name: clinician_requested_repeat
+        when: "repeat_cause == CLINICIAN_EXTRA_VIEWS"
+        difference: |
+          the identical verb (POST /studies/{study_id}/repeat) produces a fully
+          priced study that DOES draw a block unit and DOES join its stop's
+          trip-share allocation — thereby lowering every sibling's share.
+
+  - name: invoice_total_cents
+    trigger: "recomputed after every charge-line create, re-price or reversal; snapshotted at finalize"
+    algorithm: aggregation
+    formula: |
+      if invoice.status == 'OPEN':
+        total_cents = sum(ChargeLine.amount_cents
+                          for lines where invoice_id == invoice.id
+                          and status == 'ACTIVE')
+      else:                                   # FINALIZED
+        total_cents = invoice.finalized_total_cents
+    input_set: "ACTIVE charge lines only; REVERSED lines keep their amount but are excluded"
+    precision: "whole cents; a plain sum of already-rounded line amounts, never a re-rounding"
+    variants:
+      - name: live_open_total
+        when: "invoice.status == OPEN"
+        difference: "re-derived from the current ACTIVE line set on every read, so a cascade reversal changes it immediately"
+      - name: frozen_finalized_total
+        when: "invoice.status == FINALIZED"
+        difference: |
+          returns the snapshot taken at finalization. Gate G1 additionally
+          refuses any cascade that would have reversed a line on this invoice,
+          so the two variants can never disagree by accident — they disagree
+          only because finalization deliberately stops the clock.
+
+  # ---- route capacity, sequencing and selection ----
+  - name: route_occupied_minutes
+    trigger: "recomputed on every stop insert, bump, cancel, arrive, depart, and on route publish/complete"
+    algorithm: aggregation
+    formula: |
+      planned_occupied_minutes =
+        sum(stop.drive_minutes_from_prev + stop.service_minutes)
+        over stops with route_id == route.id
+        and status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}
+
+      actual_occupied_minutes =
+        sum(stop.drive_minutes_from_prev + stop.actual_service_minutes)
+        over stops with route_id == route.id and status == 'SERVICED'
+    input_set: "explicit status filters as written; BUMPED and CANCELLED stops are excluded from both"
+    precision: "integer minutes"
+    variants:
+      - name: planned_estimate
+        when: "always available, including while the route is still DRAFT"
+        difference: "uses the reserved service_minutes the scheduler typed in"
+      - name: actual_observed
+        when: "Route.status in {DISPATCHED, COMPLETED} and at least one stop is SERVICED"
+        difference: |
+          uses arrived_at -> departed_at wall minutes instead. A stop reserved
+          for 45 minutes but serviced in 20 gives planned 45 and actual 20 for
+          the same stop, so the two variants disagree on identical data.
+
+  - name: route_slack_minutes
+    trigger: "recomputed together with route_occupied_minutes"
+    algorithm: aggregation
+    formula: "slack_minutes = (route.shift_end_minute - route.shift_start_minute) - route.planned_occupied_minutes"
+    input_set: "the route's shift window and its counted stops"
+    precision: "integer minutes; may go negative only if a stop is inserted by a STAT bump path that exceeded the window, which the feasibility rule forbids"
+
+  - name: route_capacity_feasibility
+    trigger: "POST /routes/{route_id}/stops, evaluated before the stop row is created"
+    algorithm: constraint_propagation
+    formula: |
+      unit    = route's MobileUnit
+      window  = route.shift_end_minute - route.shift_start_minute
+      counted = stops with route_id == route.id and status in
+                {PLANNED, EN_ROUTE, ARRIVED, SERVICED}
+      n        = len(counted)
+      occupied = sum(s.drive_minutes_from_prev + s.service_minutes for s in counted)
+
+      proposed_service = (payload.stop_priority == 'STAT')
+                           ? STAT_STOP_SERVICE_MINUTES        # 30, forced, overriding the payload
+                           : payload.service_minutes
+      proposed_load    = proposed_service + payload.drive_minutes_from_prev
+
+      new_n        = n + 1
+      buffer_total = ROUTE_STOP_BUFFER_MINUTES * max(0, new_n - 1)
+      budget       = min(window, unit.max_shift_minutes)
+
+      count_ok   = (new_n <= unit.max_stops)
+      minutes_ok = (occupied + proposed_load + buffer_total <= budget)
+
+      if count_ok and minutes_ok: INSERT
+      elif payload.stop_priority == 'ROUTINE':
+        raise (not count_ok) ? ERR_ROUTE_STOP_CAP_EXCEEDED
+                             : ERR_ROUTE_SHIFT_MINUTES_EXCEEDED
+      else:                                       # STAT insertion may bump
+        repeat at most unit.max_stops times:
+          victim = calculations.stat_bump_victim_selection(route)
+          if victim is null:
+            raise (not count_ok) ? ERR_ROUTE_STOP_CAP_EXCEEDED
+                                 : ERR_ROUTE_SHIFT_MINUTES_EXCEEDED
+          bump(victim); recompute n, occupied, count_ok, minutes_ok
+          if count_ok and minutes_ok: INSERT
+    input_set: "the route's counted stops, the unit's two independent ceilings, and the proposed stop's own two minute figures"
+    constants:
+      ROUTE_MAX_STOPS_DEFAULT: 3
+      ROUTE_MAX_SHIFT_MINUTES_DEFAULT: 300
+      ROUTE_STOP_BUFFER_MINUTES: 10
+      STAT_STOP_SERVICE_MINUTES: 30
+    precision: |
+      Both ceilings use <= (a route may sit exactly on either limit). The stop
+      COUNT ceiling is tested before the MINUTES ceiling, so a request that
+      breaches both reports ERR_ROUTE_STOP_CAP_EXCEEDED.
+
+  - name: stat_bump_victim_selection
+    trigger: "invoked from calculations.route_capacity_feasibility when a STAT stop does not fit"
+    algorithm: weighted_scoring
+    formula: |
+      eligibility filter : RouteStop rows where route_id == route.id
+                           AND status == 'PLANNED'
+                           AND stop_priority == 'ROUTINE'
+      ranking expression : planned_arrival_minute DESC  (the latest routine stop
+                           of the day is sacrificed first)
+      tie-break          : created_at ASC
+      empty-set fallback : return null, which makes route_capacity_feasibility
+                           raise ERR_ROUTE_STOP_CAP_EXCEEDED or
+                           ERR_ROUTE_SHIFT_MINUTES_EXCEEDED
+    input_set: "PLANNED ROUTINE stops only; EN_ROUTE, ARRIVED, SERVICED, BUMPED, CANCELLED and STAT stops are never victims"
+    precision: "no arithmetic; a total order over entity fields, never over id"
+
+  - name: route_stop_sequence_assignment
+    trigger: "recomputed on every stop insert, bump, cancel, or arrival"
+    algorithm: chronological
+    formula: |
+      order the route's stops with status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}
+      by planned_arrival_minute ASC, tie-broken by created_at ASC, and write
+      sequence = 1, 2, 3, ... in that order. BUMPED and CANCELLED stops keep
+      whatever sequence they last held and are skipped by the renumbering.
+    input_set: "counted stops of one route"
+    precision: "1-based integers, contiguous"
+
+  - name: stop_window_conflict_detection
+    trigger: "POST /routes/{route_id}/stops"
+    algorithm: interval_merge
+    formula: |
+      interval(X) = [X.planned_arrival_minute,
+                     X.planned_arrival_minute + X.service_minutes)     # half-open
+      conflict(P, X)  iff  P.start < X.end + ROUTE_STOP_BUFFER_MINUTES
+                      AND  X.start < P.end + ROUTE_STOP_BUFFER_MINUTES
+      A proposed stop P conflicts when conflict(P, X) holds for any existing
+      stop X on the same route with status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}.
+    input_set: "one route's counted stops"
+    constants:
+      ROUTE_STOP_BUFFER_MINUTES: 10
+    precision: |
+      Half-open minute intervals expanded by a 10-minute buffer on BOTH sides.
+      A gap of exactly 10 minutes between one stop's end and the next stop's
+      start is legal; a gap of 9 is a conflict.
+
+  - name: clinic_same_date_stop_conflict
+    trigger: "POST /routes/{route_id}/stops"
+    algorithm: aggregation
+    formula: |
+      A Clinic may host at most ONE RouteStop per Route.service_date across
+      every route and every mobile unit:
+        conflict iff exists RouteStop X where X.clinic_id == payload.clinic_id
+                     AND X's Route.service_date == this Route.service_date
+                     AND X.status in {PLANNED, EN_ROUTE, ARRIVED, SERVICED}
+    input_set: "all routes on the same service_date, not just this one"
+    precision: |
+      Whole-calendar-day granularity, closed interval, NO buffer and NO minute
+      arithmetic — deliberately a different interval semantics from
+      stop_window_conflict_detection, and on a different resource entity.
+
+  # ---- equipment, reading and quality ----
+  - name: equipment_retro_blast_radius
+    trigger: "POST /qc-checks with result == FAIL"
+    algorithm: projection
+    formula: |
+      cutoff  = COALESCE(equipment.last_passing_qc_at, equipment.created_at)
+      affected = [ Study S where S.equipment_id == equipment.id
+                   AND S.acquired_at >= cutoff                 # INCLUSIVE lower bound
+                   AND S.workflow_status not in
+                       {CANCELLED, NOT_PERFORMED, REPEAT_PENDING} ]
+                 sorted by S.created_at ASC
+      QcCheck.affected_study_count = len(affected)
+    input_set: "only studies acquired on THIS equipment at or after the last PASS; a passing check therefore narrows the blast radius of every later failure"
+    precision: |
+      The lower bound is inclusive (>=). A study acquired at exactly
+      last_passing_qc_at IS swept in; a study acquired one minute earlier is
+      not. This is the boundary that separates 'the QC that cleared it' from
+      'the QC that condemned it'.
+
+  - name: equipment_usage_gate
+    trigger: "POST /studies/{study_id}/acquire"
+    algorithm: threshold
+    formula: |
+      if equipment.usage_count_since_qc >= EQUIPMENT_USAGE_CAP_BETWEEN_QC:
+        raise ERR_EQUIPMENT_QC_DUE
+      else:
+        proceed, then usage_count_since_qc += 1
+      A PASS QcCheck resets usage_count_since_qc to 0; so does recalibration.
+    input_set: "one equipment row"
+    constants:
+      EQUIPMENT_USAGE_CAP_BETWEEN_QC: 3
+    precision: |
+      Acquisitions 1, 2 and 3 succeed (counter reads 0, 1, 2 on entry); the
+      fourth is rejected because the counter reads exactly 3. The comparison is
+      >= against the cap, not >.
+
+  - name: specialist_open_read_count
+    trigger: "recomputed after every ReadAssignment create, accept, decline, hand-back, complete or revoke"
+    algorithm: aggregation
+    formula: |
+      open_read_count = count(ReadAssignment
+                              where specialist_id == specialist.id
+                              and status in {OFFERED, ACCEPTED})
+    input_set: "explicit status filter as written; DECLINED, HANDED_BACK, COMPLETED and REVOKED never count"
+    constants:
+      SPECIALIST_MAX_OPEN_READS: 2
+    precision: |
+      POST /read-assignments rejects with ERR_SPECIALIST_READ_CAPACITY when
+      open_read_count is already >= 2. A specialist holding exactly 1 open read
+      accepts a second; holding 2, the third offer is refused.
+
+  - name: specialist_workload_score
+    trigger: "recomputed together with specialist_open_read_count"
+    algorithm: weighted_scoring
+    formula: |
+      basis = (specialist.stat_eligible == true) ? 'PIPELINE' : 'COMMITTED'
+      counted = (basis == 'PIPELINE')
+                  ? ReadAssignment rows with status in {OFFERED, ACCEPTED}
+                  : ReadAssignment rows with status == 'ACCEPTED'
+      workload_score = sum over counted of
+        (owning Study.priority == 'STAT' ? STAT_READ_WEIGHT : ROUTINE_READ_WEIGHT)
+    input_set: "the specialist's assignments, filtered by the basis their stat_eligible flag selects"
+    constants:
+      STAT_READ_WEIGHT: 2
+      ROUTINE_READ_WEIGHT: 1
+    precision: "integer score"
+    variants:
+      - name: pipeline_basis
+        when: "specialist.stat_eligible == true"
+        difference: "an OFFERED-but-not-yet-accepted read already contributes; a STAT-eligible reader must answer offers fast, so the offer counts against them immediately"
+      - name: committed_basis
+        when: "specialist.stat_eligible == false"
+        difference: |
+          only ACCEPTED reads contribute. On identical data — one OFFERED
+          ROUTINE read and nothing else — the PIPELINE basis scores 1 and the
+          COMMITTED basis scores 0. Note that open_read_count is 1 in BOTH
+          cases: the capacity gate and the workload score deliberately measure
+          different things.
+
+  - name: specialist_match_check
+    trigger: "POST /read-assignments"
+    algorithm: constraint_propagation
+    formula: |
+      All four axes must hold, evaluated in this order:
+        1. specialist.status == 'ACTIVE'                    else ERR_SPECIALIST_INACTIVE
+        2. study.modality in specialist.modality_privileges else ERR_SPECIALIST_MODALITY_NOT_PRIVILEGED
+        3. study.species  in specialist.species_privileges  else ERR_SPECIALIST_SPECIES_NOT_PRIVILEGED
+        4. study.priority != 'STAT' or specialist.stat_eligible == true
+                                                           else ERR_SPECIALIST_NOT_STAT_ELIGIBLE
+    input_set: "one study and one explicitly named specialist; the server never picks a specialist itself"
+    precision: "membership tests over declared arrays; no scoring, no fallback pool"
+
+  - name: read_attempt_cap_check
+    trigger: "POST /read-assignments"
+    algorithm: threshold
+    formula: |
+      if study.read_attempt_count >= READ_ATTEMPT_CAP:
+        raise ERR_READ_ATTEMPT_CAP_EXCEEDED
+      Every ReadAssignment ever created for the study increments the counter,
+      and neither DECLINED, HANDED_BACK nor REVOKED gives the attempt back.
+    input_set: "one study"
+    constants:
+      READ_ATTEMPT_CAP: 3
+    precision: |
+      Attempts 1, 2 and 3 are created (counter reads 0, 1, 2 on entry); the
+      fourth offer is refused because the counter reads exactly 3.
+
+  - name: report_version_assignment
+    trigger: "POST /reports"
+    algorithm: chronological
+    formula: |
+      report_version = 1 + count(Report where study_id == payload.study_id)
+      counting rows in EVERY status, including DRAFT, SUPERSEDED and RETRACTED.
+      Assignment happens at creation, in created_at ASC order.
+    input_set: "all reports on one study"
+    precision: "1-based contiguous integers per study"
+
+  - name: report_sequence_rule
+    trigger: "POST /reports/{report_id}/publish"
+    algorithm: constraint_propagation
+    formula: |
+      PRELIMINARY : requires study.workflow_status == 'READ_IN_PROGRESS'
+      FINAL       : requires study.workflow_status in {READ_IN_PROGRESS, PRELIM_REPORTED}
+      ADDENDUM    : requires a Report on the same study with kind == 'FINAL'
+                    and status in {PUBLISHED, SUPERSEDED}
+                    AND now < that report's published_at + ADDENDUM_WINDOW_DAYS days
+      anything else raises ERR_REPORT_SEQUENCE_INVALID, and a late addendum
+      raises ERR_ADDENDUM_WINDOW_CLOSED.
+    input_set: "the study's workflow axis plus all reports on the study"
+    constants:
+      ADDENDUM_WINDOW_DAYS: 14
+    precision: |
+      The addendum window is strictly less-than: publishing at exactly
+      published_at + 14 days is CLOSED; publishing one minute earlier is open.
+    note: |
+      An ADDENDUM published on a study that has already been POSTED to an OPEN
+      invoice creates NO new charge line and does not re-price anything — the
+      read was already billed. If the invoice is FINALIZED the addendum still
+      publishes, because gate G1 guards charge lines, not clinical content.
+
+  - name: peer_review_outcome
+    trigger: "POST /peer-reviews/{peer_review_id}/submit"
+    algorithm: threshold
+    formula: |
+      status = (score <= PEER_REVIEW_DISCORDANT_SCORE_MAX) ? 'DISCORDANT' : 'CONCUR'
+    input_set: "the submitted score alone"
+    constants:
+      PEER_REVIEW_SCORE_MIN: 1
+      PEER_REVIEW_SCORE_MAX: 5
+      PEER_REVIEW_DISCORDANT_SCORE_MAX: 2
+    precision: "score == 2 is DISCORDANT, score == 3 is CONCUR; scores outside 1..5 raise ERR_VALIDATION"
+
+  - name: block_draw_decision
+    trigger: "POST /invoices/{invoice_id}/post-study, evaluated once per posting"
+    algorithm: threshold
+    formula: |
+      if contract.kind == 'PREPAID_BLOCK' and contract.block_remaining_studies > 0
+         and study.billing_status != 'NON_BILLABLE'
+         and the posting is a full read posting (not a cancellation-fee-only posting):
+        append BlockLedgerEntry{contract_id, study_id, delta_studies: -1,
+                                reason: 'DRAW',
+                                balance_after_studies: block_remaining_studies - 1}
+        block_consumed_studies += 1
+      Postings are processed one request at a time, so the draw order is exactly
+      the order in which POST /invoices/{invoice_id}/post-study requests arrive.
+    input_set: "one contract and one study"
+    precision: "the boundary is > 0: with block_remaining_studies == 1 the study draws; the next one, at 0, does not and is priced at list"
+
+  - name: appointment_disposition_counts
+    trigger: "recomputed after every study create, acquire, upload, cancel, not-performed, repeat, or cascade that changes a study's workflow_status"
+    algorithm: aggregation
+    formula: |
+      studies = Study rows with appointment_id == appointment.id (all of them,
+                including cascade-created repeats)
+      ordered_studies_count       = len(studies)
+      pending_studies_count       = count(workflow_status in {ORDERED, REPEAT_PENDING})
+      acquired_studies_count      = count(workflow_status in {ACQUIRED, ASSIGNED,
+                                          READ_IN_PROGRESS, PRELIM_REPORTED, FINALIZED})
+      cancelled_studies_count     = count(workflow_status == 'CANCELLED')
+      not_performed_studies_count = count(workflow_status == 'NOT_PERFORMED')
+    input_set: "every study under the appointment, no status filter on the total"
+    precision: "INV_STUDY_DISPOSITION_COUNT requires the four partitions to sum exactly to ordered_studies_count"
+
+  - name: block_balance_projection
+    trigger: "recomputed after every BlockLedgerEntry append and on POST /contracts/{contract_id}/block-purchase"
+    algorithm: projection
+    formula: |
+      block_consumed_studies  = -1 * sum(BlockLedgerEntry.delta_studies
+                                         for entries where contract_id == contract.id)
+      block_remaining_studies = block_purchased_studies - block_consumed_studies
+    input_set: "the contract's full ledger, replayed in created_at ASC order"
+    precision: "integers; INV_BLOCK_CONSERVATION requires purchased == consumed + remaining at all times"
+
+validation_ladder_note: |
+  ONE ladder, fifty rungs, evaluated strictly in ascending `priority` for every
+  request. The first rung that fails decides the response; no later rung is
+  evaluated. Rungs 8-12 are the ordered write-gate precedence block declared in
+  `write_gate_precedence:` — when any of them fires, rungs 13-50 are skipped
+  entirely, so their errors are unreachable for that request. Several rungs
+  carry more than one `error_id`; where they do, the rung states its own
+  internal order and that order is exhaustive — no other field routes to those
+  codes.
+
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers are present and X-User-Role is one of the six declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "the acting role appears in the target endpoint's `roles:` list in §1.5"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: |
+      Ownership scope for entity_backed roles, exhaustively:
+        - ClinicUser: X-User-ID must equal the Clinic id that owns the targeted
+          Referral / Appointment / Study (reached through Study -> Appointment
+          -> Referral -> clinic_id).
+        - FieldTech on POST /routes/{route_id}/dispatch, /complete,
+          POST /route-stops/{stop_id}/arrive, /depart and
+          POST /appointments/{appointment_id}/no-show: X-User-ID must equal the
+          owning Route.technician_id.
+        - FieldTech on POST /studies/{study_id}/acquire: X-User-ID must equal
+          the request body's technician_id — a technician may only acquire as
+          himself. Whether that technician also staffs the route is a SEPARATE
+          question decided at rung 24.
+        - FieldTech on POST /qc-checks: X-User-ID must equal the request body's
+          performed_by_technician_id.
+        - Specialist on POST /read-assignments/{assignment_id}/accept,
+          /decline, /hand-back: X-User-ID must equal
+          ReadAssignment.specialist_id.
+        - Specialist on POST /reports/{report_id}/publish and /retract:
+          X-User-ID must equal Report.author_specialist_id (PlatformAdmin is
+          exempt on /retract).
+        - Specialist on POST /peer-reviews/{peer_review_id}/submit: X-User-ID
+          must equal PeerReview.reviewer_specialist_id.
+        - Specialist on POST /studies/{study_id}/hold: X-User-ID must equal the
+          specialist_id of an ACCEPTED ReadAssignment on that study.
+        - POST /studies/{study_id}/qc carries NO ownership clause: any active
+          FieldTech may record an image-quality verdict, including on a TELERAD
+          study that no technician ever touched.
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "every write endpoint whose acting role is ClinicUser, FieldTech or Specialist"
+
+  - priority: 4
+    category: existence
+    check: "path-parameter resources exist, validated left-to-right, then body-referenced foreign keys exist, validated in the order they appear in the endpoint's `input:` list"
+    error_id: ERR_CLINIC_NOT_FOUND
+    http_status: 404
+    applies_to: all
+    also_raises: [ERR_CONTRACT_NOT_FOUND, ERR_EQUIPMENT_NOT_FOUND, ERR_SPECIALIST_NOT_FOUND, ERR_ROUTE_NOT_FOUND, ERR_STOP_NOT_FOUND, ERR_REFERRAL_NOT_FOUND, ERR_APPOINTMENT_NOT_FOUND, ERR_STUDY_NOT_FOUND, ERR_ASSIGNMENT_NOT_FOUND, ERR_REPORT_NOT_FOUND, ERR_INVOICE_NOT_FOUND, ERR_RECORD_NOT_FOUND]
+    note: "ERR_RECORD_NOT_FOUND covers the seven entities with no dedicated code: MobileUnit, Technician, QcCheck, PeerReview, ChargeLine, BlockLedgerEntry, Notification."
+
+  - priority: 5
+    category: business_constraint
+    check: "every required field of the endpoint's `input:` is present and correctly typed; pagination limit is in 1..100 and offset >= 0; numeric minute fields are integers in 0..1440; score is an integer"
+    error_id: ERR_VALIDATION
+    http_status: 400
+    applies_to: all
+
+  - priority: 6
+    category: business_constraint
+    check: |
+      Closed-enum membership. This list is exhaustive — no other field routes
+      to ERR_INVALID_ENUM: Clinic.status, ClinicContract.kind, MobileUnit.service_status,
+      Equipment.modality, Technician.certified_modalities[], Specialist.modality_privileges[],
+      Specialist.species_privileges[], Specialist.status, RouteStop.stop_priority,
+      Referral.species, Referral.study_kind, Referral.requested_modality,
+      Referral.priority, Study.modality, Study.hold_reason, Study.repeat_cause,
+      the qc_result body field, the billing_hold_status body field, the
+      qc-check result body field, and Report.kind.
+    error_id: ERR_INVALID_ENUM
+    http_status: 400
+    applies_to: "every endpoint whose input carries one of the listed fields"
+
+  - priority: 7
+    category: state
+    check: "the supplied expected_<parent>_version equals the parent entity's current version (see §1.2.1 concurrency_rules)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /routes/{route_id}/stops, POST /read-assignments, POST /invoices/{invoice_id}/post-study, POST /contracts/{contract_id}/block-purchase"
+
+  - priority: 8
+    category: business_fiscal
+    check: "WRITE GATE G1 — no charge line belonging to a FINALIZED invoice may be created, re-priced or reversed, whether by a direct posting or by any cascade"
+    error_id: ERR_INVOICE_FINALIZED
+    http_status: 409
+    applies_to: "POST /invoices/{invoice_id}/post-study, POST /invoices/{invoice_id}/finalize, and every cascade leg that would touch a FINALIZED invoice's lines"
+
+  - priority: 9
+    category: business_fiscal
+    check: "WRITE GATE G2 — the owning Clinic.billing_hold_status must be CLEAR for intake writes"
+    error_id: ERR_CLINIC_BILLING_HOLD
+    http_status: 409
+    applies_to: "POST /referrals, POST /appointments, POST /studies, POST /studies/{study_id}/escalate-stat, POST /studies/{study_id}/repeat"
+
+  - priority: 10
+    category: business_safety
+    check: "WRITE GATE G3 — the Route's MobileUnit.service_status must be IN_SERVICE"
+    error_id: ERR_UNIT_OUT_OF_SERVICE
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops, POST /routes/{route_id}/publish, POST /routes/{route_id}/dispatch"
+
+  - priority: 11
+    category: business_safety
+    check: |
+      WRITE GATE G4 — the named Equipment.calibration_status must be VALID.
+      Internal order is fixed: QUARANTINED is reported in preference to
+      EXPIRED and UNCALIBRATED, which both report ERR_EQUIPMENT_CALIBRATION_LAPSED.
+    error_id: ERR_EQUIPMENT_QUARANTINED
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/acquire"
+    also_raises: [ERR_EQUIPMENT_CALIBRATION_LAPSED]
+
+  - priority: 12
+    category: state
+    check: "WRITE GATE G5 — once Route.status == COMPLETED, no write against that route or any of its stops is accepted"
+    error_id: ERR_ROUTE_FROZEN
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops, POST /routes/{route_id}/publish, POST /routes/{route_id}/unpublish, POST /routes/{route_id}/dispatch, POST /routes/{route_id}/complete, POST /route-stops/{stop_id}/arrive, POST /route-stops/{stop_id}/depart, POST /route-stops/{stop_id}/cancel"
+
+  - priority: 13
+    category: business_referential
+    check: |
+      Study-kind applicability. Internal order: the mobile-only verb is checked
+      first. POST /studies/{study_id}/acquire against a TELERAD study raises
+      ERR_NOT_APPLICABLE_TO_TELERAD; POST /studies/{study_id}/upload against a
+      MOBILE study raises ERR_STUDY_KIND_MISMATCH.
+    error_id: ERR_NOT_APPLICABLE_TO_TELERAD
+    http_status: 422
+    applies_to: "POST /studies/{study_id}/acquire, POST /studies/{study_id}/upload"
+    also_raises: [ERR_STUDY_KIND_MISMATCH]
+
+  - priority: 14
+    category: business_referential
+    check: |
+      Appointment shape must match the referral's pipeline: a MOBILE referral
+      requires route_stop_id (else ERR_MOBILE_REQUIRES_ROUTE_STOP); a TELERAD
+      referral must omit it (else ERR_TELERAD_HAS_NO_ROUTE_STOP).
+    error_id: ERR_MOBILE_REQUIRES_ROUTE_STOP
+    http_status: 422
+    applies_to: "POST /appointments"
+    also_raises: [ERR_TELERAD_HAS_NO_ROUTE_STOP]
+
+  - priority: 15
+    category: business_referential
+    check: "the referring Clinic.status must be ACTIVE"
+    error_id: ERR_CLINIC_INACTIVE
+    http_status: 409
+    applies_to: "POST /referrals, POST /referrals/{referral_id}/accept, POST /appointments"
+
+  - priority: 16
+    category: business_fiscal
+    check: "the clinic must have exactly one ClinicContract whose computed status is ACTIVE"
+    error_id: ERR_CONTRACT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /invoices/{invoice_id}/post-study, POST /contracts/{contract_id}/block-purchase"
+
+  - priority: 17
+    category: state
+    check: |
+      Route / RouteStop state precondition for the requested transition, per
+      §1.2. Internal order: the Route is checked before its stop.
+    error_id: ERR_ROUTE_INVALID_STATE
+    http_status: 409
+    applies_to: "every /routes and /route-stops action endpoint"
+    also_raises: [ERR_STOP_INVALID_STATE]
+
+  - priority: 18
+    category: state
+    check: |
+      Referral / Appointment state precondition for the requested transition.
+      Internal order: the Referral is checked before the Appointment.
+    error_id: ERR_REFERRAL_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /referrals/{referral_id}/accept, /reject, /return, /resubmit, POST /appointments, POST /appointments/{appointment_id}/cancel, POST /appointments/{appointment_id}/no-show"
+    also_raises: [ERR_APPOINTMENT_INVALID_STATE]
+
+  - priority: 19
+    category: state
+    check: |
+      Study workflow precondition. Internal order: a study already in a
+      terminal workflow state (CANCELLED, NOT_PERFORMED) raises
+      ERR_STUDY_TERMINAL; any other wrong from-state raises
+      ERR_STUDY_INVALID_STATE.
+    error_id: ERR_STUDY_TERMINAL
+    http_status: 409
+    applies_to: "every /studies action endpoint"
+    also_raises: [ERR_STUDY_INVALID_STATE]
+
+  - priority: 20
+    category: state
+    check: |
+      Study parallel-axis preconditions. Internal order: (a) hold on a study
+      whose tat_status != ACCRUING and resume on a study whose tat_status !=
+      PAUSED both raise ERR_TAT_CLOCK_STATE_INVALID; (b) escalate-stat on a
+      study whose priority is already STAT raises ERR_ALREADY_STAT.
+    error_id: ERR_TAT_CLOCK_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/hold, POST /studies/{study_id}/resume, POST /studies/{study_id}/escalate-stat"
+    also_raises: [ERR_ALREADY_STAT]
+
+  - priority: 21
+    category: state
+    check: "ReadAssignment state precondition — accept and decline require OFFERED, hand-back requires ACCEPTED"
+    error_id: ERR_ASSIGNMENT_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /read-assignments/{assignment_id}/accept, /decline, /hand-back"
+
+  - priority: 22
+    category: state
+    check: |
+      Report / PeerReview state precondition. Internal order: the Report is
+      checked before the PeerReview. publish requires DRAFT, retract requires
+      PUBLISHED (else ERR_REPORT_INVALID_STATE); peer-review submit requires
+      SAMPLED and the underlying report to be in {PUBLISHED, SUPERSEDED,
+      RETRACTED} (else ERR_PEER_REVIEW_INVALID_STATE).
+    error_id: ERR_REPORT_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /reports/{report_id}/publish, POST /reports/{report_id}/retract, POST /peer-reviews, POST /peer-reviews/{peer_review_id}/submit"
+    also_raises: [ERR_PEER_REVIEW_INVALID_STATE]
+
+  - priority: 23
+    category: business_safety
+    check: |
+      Technician eligibility, two limbs with a fixed internal order.
+      (a) STATUS limb — applies on POST /routes (the technician_id supplied for
+          the route), POST /routes/{route_id}/dispatch, POST /studies/{study_id}/acquire
+          and POST /qc-checks: Technician.status != ACTIVE raises
+          ERR_TECHNICIAN_INACTIVE.
+      (b) CERTIFICATION limb — applies ONLY on POST /studies/{study_id}/acquire
+          (against Study.modality) and POST /qc-checks (against
+          Equipment.modality), never on POST /routes, because a route names no
+          modality: a technician not certified for that modality raises
+          ERR_TECHNICIAN_NOT_CERTIFIED.
+      Since Technician.status is fixed at creation and no endpoint mutates it,
+      ERR_TECHNICIAN_INACTIVE is reached by naming an INACTIVE technician on a
+      fresh request, not by deactivating one mid-flight.
+    error_id: ERR_TECHNICIAN_INACTIVE
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/acquire, POST /qc-checks, POST /routes, POST /routes/{route_id}/dispatch"
+    also_raises: [ERR_TECHNICIAN_NOT_CERTIFIED]
+
+  - priority: 24
+    category: business_safety
+    check: "the technician_id supplied in the acquire body must equal the stop's owning Route.technician_id — a certified, active technician who is simply not staffing this route is refused here, not at rung 3"
+    error_id: ERR_TECHNICIAN_NOT_ON_ROUTE
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/acquire"
+
+  - priority: 25
+    category: state
+    check: "the study's RouteStop.status must be ARRIVED before any image is acquired at it"
+    error_id: ERR_STOP_NOT_ARRIVED
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/acquire"
+
+  - priority: 26
+    category: business_referential
+    check: "Equipment.assigned_unit_id must equal the stop's Route.mobile_unit_id"
+    error_id: ERR_EQUIPMENT_NOT_ON_UNIT
+    http_status: 422
+    applies_to: "POST /studies/{study_id}/acquire"
+
+  - priority: 27
+    category: business_referential
+    check: "Equipment.modality must equal Study.modality"
+    error_id: ERR_EQUIPMENT_MODALITY_MISMATCH
+    http_status: 422
+    applies_to: "POST /studies/{study_id}/acquire"
+
+  - priority: 28
+    category: business_safety
+    check: "Equipment.usage_count_since_qc must be < EQUIPMENT_USAGE_CAP_BETWEEN_QC (3)"
+    error_id: ERR_EQUIPMENT_QC_DUE
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/acquire"
+
+  - priority: 29
+    category: business_safety
+    check: "Specialist.status must be ACTIVE"
+    error_id: ERR_SPECIALIST_INACTIVE
+    http_status: 409
+    applies_to: "POST /read-assignments, POST /peer-reviews"
+
+  - priority: 30
+    category: business_safety
+    check: "Study.modality must be a member of Specialist.modality_privileges"
+    error_id: ERR_SPECIALIST_MODALITY_NOT_PRIVILEGED
+    http_status: 422
+    applies_to: "POST /read-assignments"
+
+  - priority: 31
+    category: business_safety
+    check: "Study.species must be a member of Specialist.species_privileges"
+    error_id: ERR_SPECIALIST_SPECIES_NOT_PRIVILEGED
+    http_status: 422
+    applies_to: "POST /read-assignments"
+
+  - priority: 32
+    category: business_safety
+    check: "a STAT study may only be offered to a Specialist whose stat_eligible == true"
+    error_id: ERR_SPECIALIST_NOT_STAT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /read-assignments"
+
+  - priority: 33
+    category: business_constraint
+    check: "Study.read_attempt_count must be < READ_ATTEMPT_CAP (3)"
+    error_id: ERR_READ_ATTEMPT_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /read-assignments"
+
+  - priority: 34
+    category: business_constraint
+    check: "Specialist.open_read_count must be < SPECIALIST_MAX_OPEN_READS (2)"
+    error_id: ERR_SPECIALIST_READ_CAPACITY
+    http_status: 409
+    applies_to: "POST /read-assignments"
+
+  - priority: 35
+    category: state
+    check: "the study must be read-ready: workflow_status == ACQUIRED and qc_status == ACCEPTED"
+    error_id: ERR_STUDY_NOT_READ_READY
+    http_status: 409
+    applies_to: "POST /read-assignments"
+
+  - priority: 36
+    category: business_safety
+    check: |
+      The acting specialist must hold an ACCEPTED ReadAssignment on the study
+      being reported, OR already be the author_specialist_id of a report on that
+      study whose status is PUBLISHED, SUPERSEDED or RETRACTED. The second
+      branch exists so an ADDENDUM can be authored after the FINAL publication
+      moved the original assignment to COMPLETED; without it the addendum path
+      would be unreachable.
+    error_id: ERR_NOT_ASSIGNED_SPECIALIST
+    http_status: 403
+    applies_to: "POST /reports"
+
+  - priority: 37
+    category: business_constraint
+    check: "report sequence rule per calculations.report_sequence_rule"
+    error_id: ERR_REPORT_SEQUENCE_INVALID
+    http_status: 422
+    applies_to: "POST /reports/{report_id}/publish"
+
+  - priority: 38
+    category: business_temporal
+    check: "an ADDENDUM may be published only while now < the FINAL report's published_at + ADDENDUM_WINDOW_DAYS (14) days"
+    error_id: ERR_ADDENDUM_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /reports/{report_id}/publish"
+
+  - priority: 39
+    category: business_safety
+    check: "SEGREGATION OF DUTIES — PeerReview.reviewer_specialist_id must differ from Report.author_specialist_id"
+    error_id: ERR_PEER_REVIEW_SELF
+    http_status: 422
+    applies_to: "POST /peer-reviews"
+
+  - priority: 40
+    category: business_constraint
+    check: |
+      Stop geometry, evaluated on the EFFECTIVE service minutes: for a STAT
+      stop the payload's service_minutes is overridden to
+      STAT_STOP_SERVICE_MINUTES (30) before this rung and every later rung runs.
+      Internal order: (a) the payload's service_minutes <
+      MIN_STOP_SERVICE_MINUTES (15) raises ERR_STOP_SERVICE_MINUTES_TOO_SHORT;
+      (b) planned_arrival_minute < Route.shift_start_minute, or
+      planned_arrival_minute + effective_service_minutes >
+      Route.shift_end_minute, raises ERR_STOP_OUTSIDE_SHIFT_WINDOW.
+    error_id: ERR_STOP_SERVICE_MINUTES_TOO_SHORT
+    http_status: 422
+    applies_to: "POST /routes/{route_id}/stops"
+    also_raises: [ERR_STOP_OUTSIDE_SHIFT_WINDOW]
+
+  - priority: 41
+    category: business_temporal
+    check: "no buffer-expanded minute-interval overlap with another counted stop on the same route (calculations.stop_window_conflict_detection)"
+    error_id: ERR_STOP_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops"
+
+  - priority: 42
+    category: business_temporal
+    check: "the clinic must not already host a counted RouteStop on the same Route.service_date, across every route and unit (calculations.clinic_same_date_stop_conflict)"
+    error_id: ERR_CLINIC_STOP_ALREADY_SCHEDULED
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops"
+
+  - priority: 43
+    category: business_constraint
+    check: "route stop-count ceiling per calculations.route_capacity_feasibility; for a STAT stop this rung fires only after the bump fallback has been exhausted"
+    error_id: ERR_ROUTE_STOP_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops"
+
+  - priority: 44
+    category: business_constraint
+    check: "route shift-minutes ceiling per calculations.route_capacity_feasibility; checked strictly after the stop-count ceiling"
+    error_id: ERR_ROUTE_SHIFT_MINUTES_EXCEEDED
+    http_status: 409
+    applies_to: "POST /routes/{route_id}/stops"
+
+  - priority: 45
+    category: business_constraint
+    check: "a route must carry at least one PLANNED stop before it may be published (empty-collection edge)"
+    error_id: ERR_ROUTE_HAS_NO_STOPS
+    http_status: 422
+    applies_to: "POST /routes/{route_id}/publish"
+
+  - priority: 46
+    category: business_constraint
+    check: |
+      Repeat eligibility. Internal order: (a) Study.repeat_count >=
+      REPEAT_CAP_PER_STUDY (2) raises ERR_REPEAT_CAP_EXCEEDED; (b) the supplied
+      repeat_cause must be supported by the source study — EQUIPMENT_QUARANTINE
+      requires the study's Equipment.calibration_status == QUARANTINED,
+      QC_FAILURE requires qc_status in {REPEAT_REQUIRED, NON_DIAGNOSTIC}, and
+      CLINICIAN_EXTRA_VIEWS requires workflow_status == FINALIZED with
+      qc_status == ACCEPTED — otherwise ERR_REPEAT_CAUSE_NOT_SUPPORTED.
+    error_id: ERR_REPEAT_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /studies/{study_id}/repeat"
+    also_raises: [ERR_REPEAT_CAUSE_NOT_SUPPORTED]
+
+  - priority: 47
+    category: business_referential
+    check: |
+      Invoice scope match. Internal order: (a) the study's clinic must equal
+      Invoice.clinic_id, else ERR_CLINIC_MISMATCH; (b) the study's acquired_at
+      date (or, for a cancellation-fee-only posting, its updated_at date) must
+      fall inside [Invoice.period_start, Invoice.period_end] inclusive, else
+      ERR_STUDY_OUTSIDE_INVOICE_PERIOD.
+    error_id: ERR_CLINIC_MISMATCH
+    http_status: 422
+    applies_to: "POST /invoices/{invoice_id}/post-study"
+    also_raises: [ERR_STUDY_OUTSIDE_INVOICE_PERIOD]
+
+  - priority: 48
+    category: business_fiscal
+    check: "the study must be postable: workflow_status == FINALIZED, or cancellation_fee_cents > 0 for a fee-only posting"
+    error_id: ERR_STUDY_NOT_FINALIZED
+    http_status: 409
+    applies_to: "POST /invoices/{invoice_id}/post-study"
+
+  - priority: 49
+    category: business_fiscal
+    check: "a study whose billing_status == NON_BILLABLE may never be posted"
+    error_id: ERR_STUDY_NON_BILLABLE
+    http_status: 422
+    applies_to: "POST /invoices/{invoice_id}/post-study"
+
+  - priority: 50
+    category: business_fiscal
+    check: "a study whose billing_status == POSTED may not be posted again until its lines have been reversed"
+    error_id: ERR_STUDY_ALREADY_POSTED
+    http_status: 409
+    applies_to: "POST /invoices/{invoice_id}/post-study"
+
+endpoints:
+  # ---- Clinic ----
+  - method: POST
+    path: "/clinics"
+    description: "register a referring veterinary clinic"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["name", "address_zone", "status?", "business_open_minute?", "business_close_minute?", "business_days?"]
+    output: Clinic
+    side_effects: ["billing_hold_status initialised to CLEAR"]
+  - method: GET
+    path: "/clinics/{clinic_id}"
+    description: "read one clinic, including its business calendar and billing posture"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Clinic
+    side_effects: []
+  - method: POST
+    path: "/clinics/{clinic_id}/billing-hold"
+    description: "place or lift the clinic's billing hold (write gate G2)"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["billing_hold_status"]
+    output: Clinic
+    side_effects: ["toggles gate G2 for this clinic", "increments Clinic.version by 1"]
+
+  # ---- ClinicContract ----
+  - method: POST
+    path: "/contracts"
+    description: "create the pricing contract for a clinic"
+    roles: [BillingAdmin]
+    code: 201
+    input: ["clinic_id", "kind", "valid_from", "valid_until", "block_purchased_studies?", "suspended?"]
+    output: ClinicContract
+    side_effects: ["computes status from the logical clock and the suspended flag", "sets block_remaining_studies = block_purchased_studies"]
+  - method: GET
+    path: "/contracts/{contract_id}"
+    description: "read one contract with its live block balance"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: ClinicContract
+    side_effects: []
+  - method: GET
+    path: "/contracts"
+    description: "list contracts, filterable by clinic"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["clinic_id?", "status?", "limit?", "offset?"]
+    output: ClinicContract[]
+    side_effects: []
+  - method: POST
+    path: "/contracts/{contract_id}/block-purchase"
+    description: "top the prepaid block up by additional_studies (OCC on the contract)"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["additional_studies", "expected_contract_version"]
+    output: ClinicContract
+    side_effects: ["increases block_purchased_studies and block_remaining_studies", "increments ClinicContract.version by 1"]
+
+  # ---- MobileUnit ----
+  - method: POST
+    path: "/mobile-units"
+    description: "register a mobile imaging van"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["name", "service_status?", "max_stops?", "max_shift_minutes?"]
+    output: MobileUnit
+    side_effects: []
+  - method: GET
+    path: "/mobile-units/{unit_id}"
+    description: "read one mobile unit and its two capacity ceilings"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: MobileUnit
+    side_effects: []
+  - method: POST
+    path: "/mobile-units/{unit_id}/service-status"
+    description: "take a unit out of service or return it (write gate G3)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["service_status"]
+    output: MobileUnit
+    side_effects: ["toggles gate G3 for every route on this unit", "increments MobileUnit.version by 1"]
+
+  # ---- Equipment ----
+  - method: POST
+    path: "/equipment"
+    description: "register a modality unit; it starts UNCALIBRATED"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["modality", "serial_label", "assigned_unit_id?"]
+    output: Equipment
+    side_effects: ["calibration_status computed as UNCALIBRATED", "usage_count_since_qc = 0"]
+  - method: GET
+    path: "/equipment/{equipment_id}"
+    description: "read one modality unit with its live calibration status and usage counter"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Equipment
+    side_effects: ["recomputes calibration_status against the logical clock"]
+  - method: GET
+    path: "/equipment"
+    description: "list modality units, filterable by assigned unit"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["assigned_unit_id?", "modality?", "calibration_status?", "limit?", "offset?"]
+    output: Equipment[]
+    side_effects: []
+  - method: POST
+    path: "/equipment/{equipment_id}/assign"
+    description: "assign the modality unit to a mobile van (or detach it with a null)"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["assigned_unit_id"]
+    output: Equipment
+    side_effects: ["increments Equipment.version by 1"]
+  - method: POST
+    path: "/equipment/{equipment_id}/calibrate"
+    description: "record a calibration window; clears any quarantine and resets the usage counter"
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["calibration_valid_from", "calibration_valid_until"]
+    output: Equipment
+    side_effects: ["sets quarantined_at to null", "resets usage_count_since_qc to 0", "increments Equipment.version by 1"]
+
+  # ---- Technician ----
+  - method: POST
+    path: "/technicians"
+    description: "register a field technician with modality certifications"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["full_name", "certified_modalities", "status?"]
+    output: Technician
+    side_effects: []
+  - method: GET
+    path: "/technicians/{technician_id}"
+    description: "read one technician"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Technician
+    side_effects: []
+
+  # ---- Specialist ----
+  - method: POST
+    path: "/specialists"
+    description: "register a reading specialist with modality, species and STAT privileges"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["full_name", "modality_privileges", "species_privileges", "stat_eligible?", "status?"]
+    output: Specialist
+    side_effects: ["open_read_count and workload_score initialised to 0"]
+  - method: GET
+    path: "/specialists/{specialist_id}"
+    description: "read one specialist with the live open_read_count and workload_score"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Specialist
+    side_effects: ["recomputes open_read_count and workload_score"]
+
+  # ---- Route ----
+  - method: POST
+    path: "/routes"
+    description: "create a DRAFT day route for a mobile unit and technician"
+    roles: [Scheduler]
+    code: 201
+    input: ["mobile_unit_id", "technician_id", "service_date", "shift_start_minute", "shift_end_minute"]
+    output: Route
+    side_effects: ["stop_count = 0, planned_occupied_minutes = 0, slack_minutes = shift_end_minute - shift_start_minute"]
+  - method: GET
+    path: "/routes/{route_id}"
+    description: "read one route with its live capacity figures"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["recomputes stop_count, planned_occupied_minutes, actual_occupied_minutes and slack_minutes"]
+  - method: GET
+    path: "/routes"
+    description: "list routes, filterable by unit, technician, date and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["mobile_unit_id?", "technician_id?", "service_date?", "status?", "limit?", "offset?"]
+    output: Route[]
+    side_effects: []
+  - method: POST
+    path: "/routes/{route_id}/stops"
+    description: "insert a stop into the route; a STAT stop may bump a routine stop when a ceiling is reached (OCC on the route)"
+    roles: [Scheduler]
+    code: 201
+    input: ["clinic_id", "planned_arrival_minute", "service_minutes", "drive_minutes_from_prev", "stop_priority?", "expected_route_version"]
+    output: RouteStop
+    side_effects:
+      - "runs calculations.route_capacity_feasibility and, for STAT stops, calculations.stat_bump_victim_selection"
+      - "a bumped victim triggers the six-hop stop-bump cascade"
+      - "recomputes sequence on every counted stop and the route's occupancy figures"
+      - "increments Route.version by 1"
+  - method: POST
+    path: "/routes/{route_id}/publish"
+    description: "publish a DRAFT route"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["sets published_at", "increments Route.version by 1"]
+  - method: POST
+    path: "/routes/{route_id}/unpublish"
+    description: "return a PUBLISHED route to DRAFT"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["clears published_at", "increments Route.version by 1"]
+  - method: POST
+    path: "/routes/{route_id}/dispatch"
+    description: "dispatch the van; every PLANNED stop becomes EN_ROUTE"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["sets dispatched_at", "moves every PLANNED stop to EN_ROUTE", "increments Route.version by 1"]
+  - method: POST
+    path: "/routes/{route_id}/complete"
+    description: "close the route for the day; activates write gate G5"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: Route
+    side_effects: ["sets completed_at", "recomputes actual_occupied_minutes", "activates gate G5", "increments Route.version by 1"]
+
+  # ---- RouteStop ----
+  - method: GET
+    path: "/route-stops/{stop_id}"
+    description: "read one route stop"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: []
+  - method: GET
+    path: "/route-stops"
+    description: "list route stops, filterable by route, clinic, bumping stop and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["route_id?", "clinic_id?", "bumped_by_stop_id?", "status?", "limit?", "offset?"]
+    output: RouteStop[]
+    side_effects: []
+  - method: POST
+    path: "/route-stops/{stop_id}/arrive"
+    description: "the van arrives on site"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: ["sets arrived_at", "moves the stop's SCHEDULED appointments to IN_PROGRESS", "increments RouteStop.version by 1"]
+  - method: POST
+    path: "/route-stops/{stop_id}/depart"
+    description: "the van leaves the site"
+    roles: [FieldTech]
+    code: 200
+    input: []
+    output: RouteStop
+    side_effects: ["sets departed_at and actual_service_minutes", "completes the stop's IN_PROGRESS appointments", "recomputes Route.actual_occupied_minutes", "increments RouteStop.version by 1"]
+  - method: POST
+    path: "/route-stops/{stop_id}/cancel"
+    description: "cancel a stop; its appointments and their ORDERED studies fall away with no fee"
+    roles: [Scheduler]
+    code: 200
+    input: ["cancel_reason"]
+    output: RouteStop
+    side_effects: ["cancels the stop's appointments as CANCELLED_BY_PROVIDER", "marks their ORDERED studies NOT_PERFORMED with cancellation_fee_cents = 0", "appends Notification rows", "re-sequences the route"]
+
+  # ---- Referral ----
+  - method: POST
+    path: "/referrals"
+    description: "a clinic submits a diagnostic referral"
+    roles: [ClinicUser]
+    code: 201
+    input: ["clinic_id", "patient_name", "species", "study_kind", "requested_modality", "priority?", "clinical_history?"]
+    output: Referral
+    side_effects: ["status initialised to SUBMITTED"]
+  - method: GET
+    path: "/referrals/{referral_id}"
+    description: "read one referral"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: []
+  - method: GET
+    path: "/referrals"
+    description: "list referrals, filterable by clinic, status and pipeline kind"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["clinic_id?", "status?", "study_kind?", "limit?", "offset?"]
+    output: Referral[]
+    side_effects: []
+  - method: POST
+    path: "/referrals/{referral_id}/accept"
+    description: "the scheduler accepts a submitted referral"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: Referral
+    side_effects: ["increments Referral.version by 1"]
+  - method: POST
+    path: "/referrals/{referral_id}/reject"
+    description: "the scheduler rejects a referral outright"
+    roles: [Scheduler]
+    code: 200
+    input: ["reject_reason"]
+    output: Referral
+    side_effects: ["terminal"]
+  - method: POST
+    path: "/referrals/{referral_id}/return"
+    description: "the scheduler returns a referral to the clinic for more information"
+    roles: [Scheduler]
+    code: 200
+    input: ["return_reason"]
+    output: Referral
+    side_effects: ["records return_reason", "increments Referral.version by 1"]
+  - method: POST
+    path: "/referrals/{referral_id}/resubmit"
+    description: "the clinic supplies the missing information and resubmits"
+    roles: [ClinicUser]
+    code: 200
+    input: ["clinical_history"]
+    output: Referral
+    side_effects: ["overwrites clinical_history, clears return_reason", "increments Referral.version by 1"]
+
+  # ---- Appointment ----
+  - method: POST
+    path: "/appointments"
+    description: "schedule an accepted referral; MOBILE referrals bind to a route stop, TELERAD referrals do not"
+    roles: [Scheduler]
+    code: 201
+    input: ["referral_id", "route_stop_id?"]
+    output: Appointment
+    side_effects: ["moves the Referral ACCEPTED -> SCHEDULED", "initialises the five disposition counters to 0"]
+  - method: GET
+    path: "/appointments/{appointment_id}"
+    description: "read one appointment with its live disposition counters"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Appointment
+    side_effects: ["recomputes the five disposition counters"]
+  - method: GET
+    path: "/appointments"
+    description: "list appointments, filterable by referral, stop and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["referral_id?", "route_stop_id?", "status?", "limit?", "offset?"]
+    output: Appointment[]
+    side_effects: []
+  - method: POST
+    path: "/appointments/{appointment_id}/cancel"
+    description: "cancel an appointment; the acting role decides whether cancellation fees apply"
+    roles: [ClinicUser, Scheduler]
+    code: 200
+    input: ["cancel_reason"]
+    output: Appointment
+    side_effects: ["ClinicUser -> CANCELLED_BY_CLINIC with per-study lead-time fees; Scheduler -> CANCELLED_BY_PROVIDER with zero fees", "marks ORDERED studies NOT_PERFORMED", "recomputes trip shares for the stop's surviving billable studies"]
+  - method: POST
+    path: "/appointments/{appointment_id}/no-show"
+    description: "the technician records that the patient did not present at an ARRIVED stop"
+    roles: [FieldTech]
+    code: 200
+    input: ["cancel_reason?"]
+    output: Appointment
+    side_effects: ["marks ORDERED studies NOT_PERFORMED with a 100%-of-list no-show fee"]
+
+  # ---- Study ----
+  - method: POST
+    path: "/studies"
+    description: "order a study under an appointment"
+    roles: [ClinicUser]
+    code: 201
+    input: ["appointment_id", "modality", "body_region"]
+    output: Study
+    side_effects: ["copies study_kind, species and priority from the parent Referral", "recomputes the appointment's disposition counters"]
+  - method: GET
+    path: "/studies/{study_id}"
+    description: "read one study with all four status axes and the live turnaround figures"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Study
+    side_effects: ["recomputes tat_elapsed_minutes, tat_paused_minutes, tat_accrued_minutes, tat_deadline_at and evaluates calculations.tat_breach_evaluation"]
+  - method: GET
+    path: "/studies"
+    description: "list studies with filters on every axis, including the self-referential repeat link"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["appointment_id?", "equipment_id?", "technician_id?", "repeat_of_study_id?", "workflow_status?", "qc_status?", "tat_status?", "billing_status?", "priority?", "limit?", "offset?"]
+    output: Study[]
+    side_effects: []
+  - method: POST
+    path: "/studies/{study_id}/acquire"
+    description: "the field technician acquires images at an ARRIVED stop (MOBILE pipeline only)"
+    roles: [FieldTech]
+    code: 200
+    input: ["equipment_id", "technician_id", "image_count"]
+    output: Study
+    side_effects: ["sets acquired_at, equipment_id, technician_id, image_count", "increments Equipment.usage_count_since_qc by 1", "recomputes trip shares for the stop's billable studies", "increments Study.version by 1"]
+  - method: POST
+    path: "/studies/{study_id}/upload"
+    description: "the clinic uploads its own images (TELERAD pipeline only); no route, no van, no equipment"
+    roles: [ClinicUser]
+    code: 200
+    input: ["image_count"]
+    output: Study
+    side_effects: ["sets acquired_at and image_count; equipment_id and technician_id stay null", "increments Study.version by 1"]
+  - method: POST
+    path: "/studies/{study_id}/qc"
+    description: "record the image-quality QC verdict on the study"
+    roles: [FieldTech]
+    code: 200
+    input: ["qc_result"]
+    output: Study
+    side_effects: ["ACCEPTED makes the study read-ready; REPEAT_REQUIRED and NON_DIAGNOSTIC move the workflow axis to REPEAT_PENDING and append a Notification"]
+  - method: POST
+    path: "/studies/{study_id}/escalate-stat"
+    description: "raise a routine study to STAT; re-prices, re-anchors and re-targets the turnaround clock. Permitted from ANY non-terminal workflow_status — ORDERED, ACQUIRED, ASSIGNED, READ_IN_PROGRESS, PRELIM_REPORTED, FINALIZED and REPEAT_PENDING all admit it; only CANCELLED and NOT_PERFORMED do not."
+    roles: [ClinicUser]
+    code: 200
+    input: []
+    output: Study
+    side_effects:
+      - "sets priority = STAT, priority_source = UPGRADED, escalated_at = now"
+      - "re-anchors tat_anchor_at to acquired_at and re-targets tat_target_minutes to 60 wall minutes"
+      - "may move tat_status straight to BREACHED with no time passing"
+      - "adds STAT_SURCHARGE_CENTS to the study's price"
+      - "appends a Notification{kind: STAT_UPGRADED}"
+      - "increments Study.version by 1"
+  - method: POST
+    path: "/studies/{study_id}/cancel"
+    description: "the clinic cancels an ordered study; the fee depends on lead time and dispatch state"
+    roles: [ClinicUser]
+    code: 200
+    input: ["cancel_reason"]
+    output: Study
+    side_effects: ["computes cancellation_fee_cents", "RAISES the trip share of every surviving billable study at the same stop", "re-prices their ACTIVE charge lines and recomputes the invoice totals"]
+  - method: POST
+    path: "/studies/{study_id}/not-performed"
+    description: "the technician records that an ordered study could not be performed"
+    roles: [FieldTech]
+    code: 200
+    input: ["cancel_reason"]
+    output: Study
+    side_effects: ["billing_status = NON_BILLABLE, cancellation_fee_cents = 0", "recomputes sibling trip shares"]
+  - method: POST
+    path: "/studies/{study_id}/hold"
+    description: "the reading specialist pauses the turnaround clock pending clinic input"
+    roles: [Specialist]
+    code: 200
+    input: ["hold_reason"]
+    output: Study
+    side_effects: ["tat_status ACCRUING -> PAUSED, pause_started_at = now"]
+  - method: POST
+    path: "/studies/{study_id}/resume"
+    description: "the clinic answers and the turnaround clock resumes"
+    roles: [ClinicUser]
+    code: 200
+    input: ["clinical_history?"]
+    output: Study
+    side_effects: ["adds the closed pause window to tat_paused_minutes in the study's accrual mode", "tat_status PAUSED -> ACCRUING"]
+  - method: POST
+    path: "/studies/{study_id}/repeat"
+    description: "create a replacement study; the repeat_cause decides whether anyone pays for it"
+    roles: [ClinicUser]
+    code: 201
+    input: ["repeat_cause"]
+    output: Study
+    side_effects:
+      - "creates a new Study with repeat_of_study_id set to the source study"
+      - "billing_status = NON_BILLABLE for QC_FAILURE / EQUIPMENT_QUARANTINE, UNBILLED for CLINICIAN_EXTRA_VIEWS"
+      - "increments the source study's repeat_count"
+      - "a REPEAT_PENDING source study moves to NOT_PERFORMED"
+      - "recomputes the appointment's disposition counters"
+  - method: GET
+    path: "/studies/{study_id}/pricing"
+    description: "computed read — the full price decomposition for one study without posting it"
+    roles: [PlatformAdmin, BillingAdmin, ClinicUser]
+    code: 200
+    input: []
+    output: "{ price_basis: string, base_price_cents: integer, trip_share_cents: integer, stat_surcharge_cents: integer, admin_fee_cents: integer, total_price_cents: integer, cancellation_fee_cents: integer, billable_studies_at_stop: integer }"
+    side_effects: []
+
+  # ---- ReadAssignment ----
+  - method: POST
+    path: "/read-assignments"
+    description: "offer a read to a named specialist (OCC on the study)"
+    roles: [Scheduler]
+    code: 201
+    input: ["study_id", "specialist_id", "expected_study_version"]
+    output: ReadAssignment
+    side_effects: ["moves the study ACQUIRED -> ASSIGNED", "increments Study.read_attempt_count and Study.version by 1", "recomputes the specialist's open_read_count and workload_score"]
+  - method: GET
+    path: "/read-assignments/{assignment_id}"
+    description: "read one read-assignment"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: ReadAssignment
+    side_effects: []
+  - method: GET
+    path: "/read-assignments"
+    description: "list read-assignments, filterable by study, specialist and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["study_id?", "specialist_id?", "status?", "limit?", "offset?"]
+    output: ReadAssignment[]
+    side_effects: []
+  - method: POST
+    path: "/read-assignments/{assignment_id}/accept"
+    description: "the specialist accepts the read"
+    roles: [Specialist]
+    code: 200
+    input: []
+    output: ReadAssignment
+    side_effects: ["moves the study ASSIGNED -> READ_IN_PROGRESS"]
+  - method: POST
+    path: "/read-assignments/{assignment_id}/decline"
+    description: "the specialist declines the offer; the attempt is consumed"
+    roles: [Specialist]
+    code: 200
+    input: ["decline_reason"]
+    output: ReadAssignment
+    side_effects: ["moves the study ASSIGNED -> ACQUIRED", "read_attempt_count is NOT given back", "recomputes the specialist's open_read_count and workload_score"]
+  - method: POST
+    path: "/read-assignments/{assignment_id}/hand-back"
+    description: "the specialist hands an accepted read back"
+    roles: [Specialist]
+    code: 200
+    input: ["decline_reason"]
+    output: ReadAssignment
+    side_effects: ["moves the study READ_IN_PROGRESS -> ACQUIRED", "recomputes the specialist's open_read_count and workload_score"]
+
+  # ---- Report ----
+  - method: POST
+    path: "/reports"
+    description: "the assigned specialist drafts a report"
+    roles: [Specialist]
+    code: 201
+    input: ["study_id", "kind", "findings"]
+    output: Report
+    side_effects: ["assigns report_version per calculations.report_version_assignment", "author_specialist_id taken from X-User-ID"]
+  - method: GET
+    path: "/reports/{report_id}"
+    description: "read one report"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Report
+    side_effects: []
+  - method: GET
+    path: "/reports"
+    description: "list reports, filterable by study, author, supersession link, kind and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["study_id?", "author_specialist_id?", "supersedes_report_id?", "kind?", "status?", "limit?", "offset?"]
+    output: Report[]
+    side_effects: []
+  - method: POST
+    path: "/reports/{report_id}/publish"
+    description: "publish the report; supersedes the study's previous published report"
+    roles: [Specialist]
+    code: 200
+    input: []
+    output: Report
+    side_effects: ["sets published_at and supersedes_report_id", "supersedes the prior PUBLISHED report", "advances the study's workflow axis", "settles the turnaround axis to MET or BREACHED on a FINAL", "appends a Notification{kind: REPORT_PUBLISHED}"]
+  - method: POST
+    path: "/reports/{report_id}/retract"
+    description: "retract a published report"
+    roles: [Specialist, PlatformAdmin]
+    code: 200
+    input: ["retract_reason"]
+    output: Report
+    side_effects: ["sets retracted_at and retract_reason", "rewinds the study's workflow axis when the retracted report was its FINAL"]
+
+  # ---- QcCheck ----
+  - method: POST
+    path: "/qc-checks"
+    description: "record an equipment QC check; a FAIL quarantines the unit and retroactively condemns every study acquired since the last PASS"
+    roles: [FieldTech]
+    code: 201
+    input: ["equipment_id", "performed_by_technician_id", "result", "note?"]
+    output: QcCheck
+    side_effects:
+      - "PASS: sets Equipment.last_passing_qc_at = now and resets usage_count_since_qc to 0"
+      - "FAIL: runs the six-hop quarantine cascade declared on the Equipment VALID -> QUARANTINED transition"
+      - "sets affected_study_count"
+  - method: GET
+    path: "/qc-checks/{qc_check_id}"
+    description: "read one QC check"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: QcCheck
+    side_effects: []
+  - method: GET
+    path: "/qc-checks"
+    description: "list QC checks, filterable by equipment, technician and result"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["equipment_id?", "performed_by_technician_id?", "result?", "limit?", "offset?"]
+    output: QcCheck[]
+    side_effects: []
+
+  # ---- PeerReview ----
+  - method: POST
+    path: "/peer-reviews"
+    description: "sample a published report for peer review by a different specialist"
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["report_id", "reviewer_specialist_id"]
+    output: PeerReview
+    side_effects: ["status initialised to SAMPLED"]
+  - method: GET
+    path: "/peer-reviews/{peer_review_id}"
+    description: "read one peer review"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: PeerReview
+    side_effects: []
+  - method: GET
+    path: "/peer-reviews"
+    description: "list peer reviews, filterable by report, reviewer and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["report_id?", "reviewer_specialist_id?", "status?", "limit?", "offset?"]
+    output: PeerReview[]
+    side_effects: []
+  - method: POST
+    path: "/peer-reviews/{peer_review_id}/submit"
+    description: "the reviewer submits an agreement score"
+    roles: [Specialist]
+    code: 200
+    input: ["score", "outcome_note?"]
+    output: PeerReview
+    side_effects: ["status becomes DISCORDANT for score <= 2 and CONCUR for score >= 3"]
+
+  # ---- Invoice / ChargeLine / BlockLedgerEntry / Notification ----
+  - method: POST
+    path: "/invoices"
+    description: "open a billing period for a clinic"
+    roles: [BillingAdmin]
+    code: 201
+    input: ["clinic_id", "period_start", "period_end"]
+    output: Invoice
+    side_effects: ["status OPEN, total_cents 0"]
+  - method: GET
+    path: "/invoices/{invoice_id}"
+    description: "read one invoice with its live or frozen total"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["recomputes total_cents from ACTIVE lines while OPEN"]
+  - method: GET
+    path: "/invoices"
+    description: "list invoices, filterable by clinic and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["clinic_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: POST
+    path: "/invoices/{invoice_id}/post-study"
+    description: "post one study's charges to the invoice (OCC on the invoice)"
+    roles: [BillingAdmin]
+    code: 200
+    input: ["study_id", "expected_invoice_version"]
+    output: Invoice
+    side_effects:
+      - "creates the STUDY_READ, TRIP_FEE_SHARE, STAT_SURCHARGE and ADMIN_FEE lines, or a single CANCELLATION_FEE line for a fee-only posting"
+      - "may append a DRAW BlockLedgerEntry and decrement the contract's block balance"
+      - "moves the study's billing axis to POSTED"
+      - "recomputes total_cents and posted_study_count"
+      - "increments Invoice.version by 1"
+  - method: POST
+    path: "/invoices/{invoice_id}/finalize"
+    description: "freeze the invoice; activates write gate G1"
+    roles: [BillingAdmin]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["snapshots finalized_total_cents and sets finalized_at", "activates gate G1", "increments Invoice.version by 1"]
+  - method: GET
+    path: "/charge-lines/{charge_line_id}"
+    description: "read one charge line"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: ChargeLine
+    side_effects: []
+  - method: GET
+    path: "/charge-lines"
+    description: "list charge lines, filterable by invoice, study, kind and status"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["invoice_id?", "study_id?", "kind?", "status?", "limit?", "offset?"]
+    output: ChargeLine[]
+    side_effects: []
+  - method: GET
+    path: "/block-ledger-entries/{entry_id}"
+    description: "read one block ledger entry"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: BlockLedgerEntry
+    side_effects: []
+  - method: GET
+    path: "/block-ledger-entries"
+    description: "list block ledger entries, filterable by contract and study"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["contract_id?", "study_id?", "limit?", "offset?"]
+    output: BlockLedgerEntry[]
+    side_effects: []
+  - method: GET
+    path: "/notifications/{notification_id}"
+    description: "read one notification"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: []
+    output: Notification
+    side_effects: []
+  - method: GET
+    path: "/notifications"
+    description: "list notifications, filterable by clinic, study and kind"
+    roles: [PlatformAdmin, Scheduler, BillingAdmin, ClinicUser, FieldTech, Specialist]
+    code: 200
+    input: ["clinic_id?", "study_id?", "kind?", "limit?", "offset?"]
+    output: Notification[]
+    side_effects: []
+
+  # ---- test-driving endpoint ----
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "set the server's logical clock. Before any call to this endpoint the logical clock reads exactly 2026-05-01T00:00:00Z and MUST NOT fall back to real wall-clock time. Every deadline, calibration window, lead-time tier and business-hours accrual is evaluated against this clock."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["to_iso8601"]
+    output: "{ current_utc: string }"
+    side_effects: ["re-evaluates ClinicContract.status, Equipment.calibration_status and calculations.tat_breach_evaluation on the next read of each affected row"]
+
+errors:
+  # --- authentication / authorization ---
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing, or X-User-Role is not one of the six declared roles"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "the acting role is not listed in the target endpoint's roles"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "an entity_backed actor targets a resource that is not scoped to their own entity id (rung 3)"
+  - id: ERR_NOT_ASSIGNED_SPECIALIST
+    http: 403
+    condition: "POST /reports by a specialist who neither holds an ACCEPTED ReadAssignment on the study nor authored any PUBLISHED, SUPERSEDED or RETRACTED report on it"
+
+  # --- existence ---
+  - id: ERR_CLINIC_NOT_FOUND
+    http: 404
+    condition: "clinic_id in the path or body names no Clinic"
+  - id: ERR_CONTRACT_NOT_FOUND
+    http: 404
+    condition: "contract_id in the path names no ClinicContract"
+  - id: ERR_EQUIPMENT_NOT_FOUND
+    http: 404
+    condition: "equipment_id in the path or body names no Equipment"
+  - id: ERR_SPECIALIST_NOT_FOUND
+    http: 404
+    condition: "specialist_id in the path or body names no Specialist"
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "route_id in the path names no Route"
+  - id: ERR_STOP_NOT_FOUND
+    http: 404
+    condition: "stop_id in the path or route_stop_id in the body names no RouteStop"
+  - id: ERR_REFERRAL_NOT_FOUND
+    http: 404
+    condition: "referral_id in the path or body names no Referral"
+  - id: ERR_APPOINTMENT_NOT_FOUND
+    http: 404
+    condition: "appointment_id in the path or body names no Appointment"
+  - id: ERR_STUDY_NOT_FOUND
+    http: 404
+    condition: "study_id in the path or body names no Study"
+  - id: ERR_ASSIGNMENT_NOT_FOUND
+    http: 404
+    condition: "assignment_id in the path names no ReadAssignment"
+  - id: ERR_REPORT_NOT_FOUND
+    http: 404
+    condition: "report_id in the path or body names no Report"
+  - id: ERR_INVOICE_NOT_FOUND
+    http: 404
+    condition: "invoice_id in the path names no Invoice"
+  - id: ERR_RECORD_NOT_FOUND
+    http: 404
+    condition: "an id names no MobileUnit, Technician, QcCheck, PeerReview, ChargeLine, BlockLedgerEntry or Notification"
+
+  # --- request shape ---
+  - id: ERR_VALIDATION
+    http: 400
+    condition: "a required input field is missing or mistyped; limit outside 1..100; offset < 0; a minute field outside 0..1440; a peer-review score outside 1..5; a calibration window with valid_until <= valid_from or longer than 30 days"
+  - id: ERR_INVALID_ENUM
+    http: 400
+    condition: "a value supplied for one of the closed enums listed at ladder rung 6 is not a declared member"
+
+  # --- optimistic concurrency ---
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "the supplied expected_<parent>_version does not equal the parent entity's current version"
+
+  # --- write gates (rungs 8-12, in precedence order) ---
+  - id: ERR_INVOICE_FINALIZED
+    http: 409
+    condition: "gate G1 — a charge line on a FINALIZED invoice would be created, re-priced or reversed"
+  - id: ERR_CLINIC_BILLING_HOLD
+    http: 409
+    condition: "gate G2 — the owning Clinic.billing_hold_status == HOLD on an intake write"
+  - id: ERR_UNIT_OUT_OF_SERVICE
+    http: 409
+    condition: "gate G3 — the Route's MobileUnit.service_status is OUT_OF_SERVICE or MAINTENANCE"
+  - id: ERR_EQUIPMENT_QUARANTINED
+    http: 409
+    condition: "gate G4 — the named Equipment.calibration_status == QUARANTINED"
+  - id: ERR_EQUIPMENT_CALIBRATION_LAPSED
+    http: 409
+    condition: "gate G4 — the named Equipment.calibration_status is EXPIRED or UNCALIBRATED"
+  - id: ERR_ROUTE_FROZEN
+    http: 409
+    condition: "gate G5 — the Route.status == COMPLETED and any write against it or its stops was attempted"
+
+  # --- pipeline applicability (mobile vs telerad) ---
+  - id: ERR_NOT_APPLICABLE_TO_TELERAD
+    http: 422
+    condition: "a mobile-only verb (acquire) was invoked on a TELERAD study"
+  - id: ERR_STUDY_KIND_MISMATCH
+    http: 422
+    condition: "a telerad-only verb (upload) was invoked on a MOBILE study"
+  - id: ERR_MOBILE_REQUIRES_ROUTE_STOP
+    http: 422
+    condition: "POST /appointments for a MOBILE referral without route_stop_id"
+  - id: ERR_TELERAD_HAS_NO_ROUTE_STOP
+    http: 422
+    condition: "POST /appointments for a TELERAD referral with a route_stop_id supplied"
+
+  # --- counterparty posture ---
+  - id: ERR_CLINIC_INACTIVE
+    http: 409
+    condition: "the referring Clinic.status is SUSPENDED"
+  - id: ERR_CONTRACT_NOT_ACTIVE
+    http: 409
+    condition: "the clinic has no ClinicContract whose computed status is ACTIVE"
+  - id: ERR_TECHNICIAN_INACTIVE
+    http: 409
+    condition: "the named Technician.status is INACTIVE"
+  - id: ERR_SPECIALIST_INACTIVE
+    http: 409
+    condition: "the named Specialist.status is SUSPENDED or INACTIVE"
+
+  # --- state preconditions ---
+  - id: ERR_ROUTE_INVALID_STATE
+    http: 409
+    condition: "the Route is not in a from-state that admits the requested transition"
+  - id: ERR_STOP_INVALID_STATE
+    http: 409
+    condition: "the RouteStop is not in a from-state that admits the requested transition"
+  - id: ERR_REFERRAL_INVALID_STATE
+    http: 409
+    condition: "the Referral is not in a from-state that admits the requested transition"
+  - id: ERR_APPOINTMENT_INVALID_STATE
+    http: 409
+    condition: "the Appointment is not in a from-state that admits the requested transition"
+  - id: ERR_STUDY_TERMINAL
+    http: 409
+    condition: "the Study.workflow_status is already CANCELLED or NOT_PERFORMED"
+  - id: ERR_STUDY_INVALID_STATE
+    http: 409
+    condition: "the Study is in a non-terminal workflow state that does not admit the requested transition"
+  - id: ERR_TAT_CLOCK_STATE_INVALID
+    http: 409
+    condition: "hold was requested on a study whose tat_status != ACCRUING, or resume on one whose tat_status != PAUSED"
+  - id: ERR_ALREADY_STAT
+    http: 409
+    condition: "escalate-stat was requested on a study whose priority is already STAT"
+  - id: ERR_ASSIGNMENT_INVALID_STATE
+    http: 409
+    condition: "accept/decline requested on a ReadAssignment that is not OFFERED, or hand-back on one that is not ACCEPTED"
+  - id: ERR_REPORT_INVALID_STATE
+    http: 409
+    condition: "publish requested on a Report that is not DRAFT, or retract on one that is not PUBLISHED"
+  - id: ERR_PEER_REVIEW_INVALID_STATE
+    http: 409
+    condition: "submit requested on a PeerReview that is not SAMPLED, or a peer review was sampled from a report that was never published"
+
+  # --- acquisition-side matching ---
+  - id: ERR_TECHNICIAN_NOT_CERTIFIED
+    http: 422
+    condition: "the technician is not certified for the modality being acquired or QC-checked"
+  - id: ERR_TECHNICIAN_NOT_ON_ROUTE
+    http: 409
+    condition: "the acquiring technician is not the Route.technician_id of the stop's route"
+  - id: ERR_STOP_NOT_ARRIVED
+    http: 409
+    condition: "acquisition was attempted at a stop whose status is not ARRIVED"
+  - id: ERR_EQUIPMENT_NOT_ON_UNIT
+    http: 422
+    condition: "the equipment's assigned_unit_id is not the stop's Route.mobile_unit_id"
+  - id: ERR_EQUIPMENT_MODALITY_MISMATCH
+    http: 422
+    condition: "the equipment's modality differs from the study's modality"
+  - id: ERR_EQUIPMENT_QC_DUE
+    http: 409
+    condition: "Equipment.usage_count_since_qc has reached EQUIPMENT_USAGE_CAP_BETWEEN_QC (3)"
+
+  # --- reading-side matching ---
+  - id: ERR_SPECIALIST_MODALITY_NOT_PRIVILEGED
+    http: 422
+    condition: "the study's modality is not in the specialist's modality_privileges"
+  - id: ERR_SPECIALIST_SPECIES_NOT_PRIVILEGED
+    http: 422
+    condition: "the study's species is not in the specialist's species_privileges"
+  - id: ERR_SPECIALIST_NOT_STAT_ELIGIBLE
+    http: 422
+    condition: "a STAT study was offered to a specialist whose stat_eligible is false"
+  - id: ERR_READ_ATTEMPT_CAP_EXCEEDED
+    http: 409
+    condition: "Study.read_attempt_count has reached READ_ATTEMPT_CAP (3)"
+  - id: ERR_SPECIALIST_READ_CAPACITY
+    http: 409
+    condition: "Specialist.open_read_count has reached SPECIALIST_MAX_OPEN_READS (2)"
+  - id: ERR_STUDY_NOT_READ_READY
+    http: 409
+    condition: "the study is not both workflow_status == ACQUIRED and qc_status == ACCEPTED"
+
+  # --- reporting and quality ---
+  - id: ERR_REPORT_SEQUENCE_INVALID
+    http: 422
+    condition: "the report kind does not fit the study's current workflow state or lacks its required predecessor"
+  - id: ERR_ADDENDUM_WINDOW_CLOSED
+    http: 422
+    condition: "an ADDENDUM was published at or after the FINAL report's published_at + ADDENDUM_WINDOW_DAYS (14) days"
+  - id: ERR_PEER_REVIEW_SELF
+    http: 422
+    condition: "segregation of duties — the reviewer is the report's own author"
+
+  # --- route geometry and capacity ---
+  - id: ERR_STOP_SERVICE_MINUTES_TOO_SHORT
+    http: 422
+    condition: "service_minutes is below MIN_STOP_SERVICE_MINUTES (15)"
+  - id: ERR_STOP_OUTSIDE_SHIFT_WINDOW
+    http: 422
+    condition: "the proposed stop's [arrival, arrival + service) window is not fully inside the route's shift window"
+  - id: ERR_STOP_WINDOW_CONFLICT
+    http: 409
+    condition: "the proposed stop's buffer-expanded minute interval overlaps another counted stop on the same route"
+  - id: ERR_CLINIC_STOP_ALREADY_SCHEDULED
+    http: 409
+    condition: "the clinic already hosts a counted RouteStop on the same service_date, on any route"
+  - id: ERR_ROUTE_STOP_CAP_EXCEEDED
+    http: 409
+    condition: "the route would exceed MobileUnit.max_stops and no bump victim was available"
+  - id: ERR_ROUTE_SHIFT_MINUTES_EXCEEDED
+    http: 409
+    condition: "the route would exceed min(shift window, MobileUnit.max_shift_minutes) once the buffer allowance is included, and no bump victim was available"
+  - id: ERR_ROUTE_HAS_NO_STOPS
+    http: 422
+    condition: "publish was attempted on a route carrying zero PLANNED stops"
+
+  # --- repeats and billing ---
+  - id: ERR_REPEAT_CAP_EXCEEDED
+    http: 409
+    condition: "Study.repeat_count has reached REPEAT_CAP_PER_STUDY (2)"
+  - id: ERR_REPEAT_CAUSE_NOT_SUPPORTED
+    http: 422
+    condition: "the supplied repeat_cause is not supported by the source study's qc_status, workflow_status and equipment quarantine state"
+  - id: ERR_CLINIC_MISMATCH
+    http: 422
+    condition: "the study's clinic is not the invoice's clinic"
+  - id: ERR_STUDY_OUTSIDE_INVOICE_PERIOD
+    http: 422
+    condition: "the study's billable date falls outside the invoice's inclusive period"
+  - id: ERR_STUDY_NOT_FINALIZED
+    http: 409
+    condition: "posting was attempted on a study that is neither FINALIZED nor carrying a positive cancellation_fee_cents"
+  - id: ERR_STUDY_NON_BILLABLE
+    http: 422
+    condition: "posting was attempted on a study whose billing_status is NON_BILLABLE"
+  - id: ERR_STUDY_ALREADY_POSTED
+    http: 409
+    condition: "posting was attempted on a study whose billing_status is already POSTED"
+
+roles:
+  - name: PlatformAdmin
+    description: "operations administrator; owns the reference data — clinics, units, equipment, technicians, specialists — plus peer-review sampling and the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /clinics"
+      - "POST /mobile-units"
+      - "POST /mobile-units/{unit_id}/service-status"
+      - "POST /equipment"
+      - "POST /equipment/{equipment_id}/assign"
+      - "POST /equipment/{equipment_id}/calibrate"
+      - "POST /technicians"
+      - "POST /specialists"
+      - "POST /peer-reviews"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /reports/{report_id}/retract (shared with Specialist)"
+      - "every GET endpoint"
+
+  - name: Scheduler
+    description: "routing and intake desk; builds routes, triages referrals, books appointments and offers reads to specialists"
+    identity: opaque
+    exclusive_operations:
+      - "POST /routes"
+      - "POST /routes/{route_id}/stops"
+      - "POST /routes/{route_id}/publish"
+      - "POST /routes/{route_id}/unpublish"
+      - "POST /route-stops/{stop_id}/cancel"
+      - "POST /referrals/{referral_id}/accept"
+      - "POST /referrals/{referral_id}/reject"
+      - "POST /referrals/{referral_id}/return"
+      - "POST /appointments"
+      - "POST /read-assignments"
+    shared_operations:
+      - "POST /appointments/{appointment_id}/cancel (shared with ClinicUser; the acting role decides CANCELLED_BY_PROVIDER vs CANCELLED_BY_CLINIC and therefore whether any fee is charged)"
+      - "every GET endpoint"
+
+  - name: BillingAdmin
+    description: "revenue desk; owns contracts, blocks, invoices and the billing hold"
+    identity: opaque
+    exclusive_operations:
+      - "POST /contracts"
+      - "POST /contracts/{contract_id}/block-purchase"
+      - "POST /clinics/{clinic_id}/billing-hold"
+      - "POST /invoices"
+      - "POST /invoices/{invoice_id}/post-study"
+      - "POST /invoices/{invoice_id}/finalize"
+    shared_operations:
+      - "every GET endpoint"
+
+  - name: ClinicUser
+    description: "staff at a referring clinic; X-User-ID is the Clinic's own id"
+    identity: "entity_backed:Clinic"
+    exclusive_operations:
+      - "POST /referrals"
+      - "POST /referrals/{referral_id}/resubmit"
+      - "POST /studies"
+      - "POST /studies/{study_id}/upload"
+      - "POST /studies/{study_id}/escalate-stat"
+      - "POST /studies/{study_id}/cancel"
+      - "POST /studies/{study_id}/resume"
+      - "POST /studies/{study_id}/repeat"
+    shared_operations:
+      - "POST /appointments/{appointment_id}/cancel (shared with Scheduler)"
+      - "GET /studies/{study_id}/pricing (shared with BillingAdmin and PlatformAdmin)"
+      - "every GET endpoint"
+
+  - name: FieldTech
+    description: "travelling technician; X-User-ID is the Technician's own id. Drives the van, acquires images and runs equipment QC"
+    identity: "entity_backed:Technician"
+    exclusive_operations:
+      - "POST /routes/{route_id}/dispatch"
+      - "POST /routes/{route_id}/complete"
+      - "POST /route-stops/{stop_id}/arrive"
+      - "POST /route-stops/{stop_id}/depart"
+      - "POST /appointments/{appointment_id}/no-show"
+      - "POST /studies/{study_id}/acquire"
+      - "POST /studies/{study_id}/qc"
+      - "POST /studies/{study_id}/not-performed"
+      - "POST /qc-checks"
+    shared_operations:
+      - "every GET endpoint"
+
+  - name: Specialist
+    description: "reading radiologist / cardiologist; X-User-ID is the Specialist's own id. Reads studies, writes reports and peer-reviews other specialists' reports — never their own"
+    identity: "entity_backed:Specialist"
+    exclusive_operations:
+      - "POST /read-assignments/{assignment_id}/accept"
+      - "POST /read-assignments/{assignment_id}/decline"
+      - "POST /read-assignments/{assignment_id}/hand-back"
+      - "POST /reports"
+      - "POST /reports/{report_id}/publish"
+      - "POST /studies/{study_id}/hold"
+      - "POST /peer-reviews/{peer_review_id}/submit"
+    shared_operations:
+      - "POST /reports/{report_id}/retract (shared with PlatformAdmin)"
+      - "every GET endpoint"
+
+
+
+
+
+
+
+
+
+
+

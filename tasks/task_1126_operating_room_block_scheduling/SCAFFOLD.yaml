@@ -1,0 +1,1254 @@
+# =============================================================================
+# SCAFFOLD.yaml — task_1126_operating_room_block_scheduling
+# §1.0–§1.7 (difficulty design and corner design live in sibling files)
+# =============================================================================
+
+scenario: |
+  generate task hard than expert level! 1126. Operating Room Block Scheduling & Utilization (hospital surgical services): block allocation by service line & surgeon, release deadline & open-time reallocation, case posting with duration prediction & turnover time, add-on/emergent case bumping rules, prime-time utilization scoring & block reduction, staffing/anesthesia availability constraint, first-case on-time start tracking, block committee governance
+
+domain_name: operating-room-block-scheduling
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - ops_run_checkpoint
+  entity_topology: flat            # peer entities joined by foreign keys; no nested ownership URLs except sub-resource reads
+  state_machine_shape: cyclic      # CasePosting SCHEDULED→BUMPED→SCHEDULED; CommitteeReview OPEN→DECIDED→OPEN
+  relationship_patterns:
+    - one_to_many                  # ServiceLine→Surgeon, BlockAllocation→CasePosting, CommitteeReview→CommitteeVote
+    - cross_aggregate              # CasePosting → AnesthesiaCoverage guard; OpenTimeSlot → BlockAllocation provenance
+  role_model: segregation_of_duties # SchedulingAdmin allocates but cannot vote; CommitteeMember votes but cannot reopen; BlockCommitteeChair reopens but cannot vote
+  consistency_model: immediate     # all side effects visible in the same request's response and subsequent reads
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# Time model: a scheduling day is `date` (YYYY-MM-DD, UTC) plus integer
+# `start_minute`/`end_minute` offsets in [0,1440], half-open [start, end).
+# =============================================================================
+entities:
+  - name: ServiceLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Service line name (e.g., ORTHOPEDICS)" }
+      - { name: target_utilization_pct, type: number, source: input, description: "Prime-time utilization target percentage; scoring-run opens a committee review when prime_time_utilization_pct is strictly below this" }
+      - { name: release_deadline_hours, type: integer, source: input, default: 72, description: "Hours before block start at which unfilled block time auto-releases to open time" }
+
+  - name: Surgeon
+    parent: null
+    common_fields: true
+    fields:
+      - { name: service_line_id, type: string, source: input, description: "FK -> ServiceLine.id; surgeon's home service line" }
+      - { name: full_name, type: string, source: input, description: "Surgeon display name" }
+      - { name: duration_bias_factor, type: number, source: computed, default: 1.0, description: "Mean of actual/benchmark duration ratios over the surgeon's last 20 COMPLETED cases (chronological by actual_end_minute), rounded to 3 decimals round_half_up then clamped to [0.800, 1.250]; 1.000 while completed_cases_count < 5" }
+      - { name: completed_cases_count, type: integer, source: computed, default: 0, description: "Count of the surgeon's CasePostings in COMPLETED status" }
+      - { name: on_time_rate_pct, type: number, source: computed, default: 0.0, description: "100 * (# of surgeon's started first-cases with first_case_delay_minutes <= 10) / (# of surgeon's started first-cases), 2 decimals round_half_up; 0.00 when denominator is 0" }
+
+  - name: OperatingRoom
+    parent: null
+    common_fields: true
+    fields:
+      - { name: room_name, type: string, source: input, description: "Room identifier" }
+      - { name: is_hybrid, type: boolean, source: input, default: false, description: "Hybrid rooms add +10 minutes to every turnover gap" }
+
+  - name: BlockAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: service_line_id, type: string, source: input, description: "FK -> ServiceLine.id; owning service line" }
+      - { name: surgeon_id, type: string, source: input, description: "FK -> Surgeon.id; optional — when set, only this surgeon's cases may be scheduled; when null the block is shared across the service line", constraints: "nullable" }
+      - { name: or_id, type: string, source: input, description: "FK -> OperatingRoom.id; room the block occupies" }
+      - { name: date, type: string, source: input, description: "Scheduling date YYYY-MM-DD (UTC)" }
+      - { name: start_minute, type: integer, source: input, description: "Block start, minutes after midnight, >= 0" }
+      - { name: end_minute, type: integer, source: input, description: "Block end, minutes after midnight, > start_minute, <= 1440" }
+      - { name: original_minutes, type: integer, source: system, description: "end_minute - start_minute frozen at creation; ledger anchor for the room-minute invariant" }
+      - { name: reserved_minutes, type: integer, source: computed, description: "Minutes still block-controlled: (scheduled_end of last SCHEDULED case) - start_minute while ACTIVE; frozen to occupied span at RELEASED/REDUCED; 0 when no SCHEDULED cases" }
+      - { name: forfeited_minutes, type: integer, source: computed, default: 0, description: "Free-tail minutes below MIN_SLOT_MINUTES discarded at release/reduction (no slot created)" }
+      - { name: occupied_minutes, type: integer, source: computed, default: 0, description: "Sum over SCHEDULED cases in this block of predicted_duration_minutes plus turnover gap before every non-first case" }
+      - { name: release_deadline_at, type: datetime, source: computed, description: "ISO8601 UTC = dateT00:00:00Z + start_minute - service_line.release_deadline_hours" }
+      - { name: status, type: enum, source: system, description: "DRAFT | ACTIVE | RELEASED | REDUCED | CANCELLED", constraints: "enum: DRAFT, ACTIVE, RELEASED, REDUCED, CANCELLED" }
+
+  - name: CasePosting
+    parent: null
+    common_fields: true
+    fields:
+      - { name: surgeon_id, type: string, source: input, description: "FK -> Surgeon.id; posting surgeon (must equal X-User-ID for Surgeon role)" }
+      - { name: block_id, type: string, source: system, description: "FK -> BlockAllocation.id; null until scheduled; retained for audit when BUMPED", constraints: "nullable" }
+      - { name: or_id, type: string, source: system, description: "FK -> OperatingRoom.id; assigned at scheduling (from block or emergent request)", constraints: "nullable" }
+      - { name: date, type: string, source: system, description: "Scheduling date, assigned at scheduling", constraints: "nullable" }
+      - { name: patient_ref, type: string, source: input, description: "Opaque patient reference (no PHI)" }
+      - { name: procedure_class, type: enum, source: input, description: "Drives benchmark duration and turnover base", constraints: "enum: MINOR, STANDARD, COMPLEX" }
+      - { name: priority, type: enum, source: input, description: "ELECTIVE and ADD_ON schedule into blocks; EMERGENT schedules by room/date/desired start and may bump", constraints: "enum: ELECTIVE, ADD_ON, EMERGENT" }
+      - { name: benchmark_duration_minutes, type: integer, source: computed, description: "Benchmark variant: MINOR=45, STANDARD=90, COMPLEX=180 (surgeon-independent)" }
+      - { name: predicted_duration_minutes, type: integer, source: computed, description: "Surgeon-adjusted variant at posting time: round_half_up(benchmark * surgeon.duration_bias_factor) to integer minutes; pinned for the life of the posting" }
+      - { name: turnover_minutes, type: integer, source: computed, description: "Gap charged before this case when it is not first in its sequence: TURNOVER_BASE[procedure_class] + (10 if room.is_hybrid else 0); resolved at scheduling" }
+      - { name: scheduled_start_minute, type: integer, source: computed, description: "Packed start within block (or desired start for emergent / slot start for reallocated); null until scheduled; cleared on bump", constraints: "nullable" }
+      - { name: scheduled_end_minute, type: integer, source: computed, description: "scheduled_start_minute + predicted_duration_minutes", constraints: "nullable" }
+      - { name: actual_start_minute, type: integer, source: input, description: "Recorded by CirculatorNurse at case start" }
+      - { name: actual_end_minute, type: integer, source: input, description: "Recorded by CirculatorNurse at case completion" }
+      - { name: is_first_case_of_day, type: boolean, source: computed, description: "Derived live: true when this case has the earliest scheduled_start_minute among non-CANCELLED, non-BUMPED cases sharing or_id+date; tie-break created_at ASC" }
+      - { name: first_case_delay_minutes, type: integer, source: computed, description: "Set once at start when the case is first of its room-day: max(0, actual_start_minute - scheduled_start_minute); null otherwise", constraints: "nullable" }
+      - { name: status, type: enum, source: system, description: "POSTED | SCHEDULED | BUMPED | IN_PROGRESS | COMPLETED | CANCELLED", constraints: "enum: POSTED, SCHEDULED, BUMPED, IN_PROGRESS, COMPLETED, CANCELLED" }
+
+  - name: AnesthesiaCoverage
+    parent: null
+    common_fields: true
+    fields:
+      - { name: or_id, type: string, source: input, description: "FK -> OperatingRoom.id; covered room" }
+      - { name: date, type: string, source: input, description: "Coverage date YYYY-MM-DD" }
+      - { name: start_minute, type: integer, source: input, description: "Coverage window start (inclusive)" }
+      - { name: end_minute, type: integer, source: input, description: "Coverage window end (exclusive), > start_minute" }
+      - { name: provider_ref, type: string, source: input, description: "Anesthesia provider reference" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | WITHDRAWN", constraints: "enum: ACTIVE, WITHDRAWN" }
+
+  - name: OpenTimeSlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: block_id, type: string, source: system, description: "FK -> BlockAllocation.id; source block this slot was released/reduced from" }
+      - { name: or_id, type: string, source: system, description: "FK -> OperatingRoom.id; inherited from source block" }
+      - { name: date, type: string, source: system, description: "Inherited from source block" }
+      - { name: start_minute, type: integer, source: system, description: "Slot start (free tail start or reduction trim point)" }
+      - { name: original_minutes, type: integer, source: system, description: "Slot size at creation; ledger anchor" }
+      - { name: remaining_minutes, type: integer, source: computed, description: "Minutes still claimable; shrinks on approved reallocation" }
+      - { name: forfeited_minutes, type: integer, source: computed, default: 0, description: "Remainder below MIN_SLOT_MINUTES absorbed when an approval would leave a fragment" }
+      - { name: status, type: enum, source: system, description: "OPEN | CLAIMED | EXPIRED", constraints: "enum: OPEN, CLAIMED, EXPIRED" }
+
+  - name: ReallocationRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: slot_id, type: string, source: input, description: "FK -> OpenTimeSlot.id; requested open-time slot" }
+      - { name: surgeon_id, type: string, source: system, description: "FK -> Surgeon.id; copied from the referenced case's surgeon" }
+      - { name: case_id, type: string, source: input, description: "FK -> CasePosting.id; POSTED or BUMPED case to place into the slot" }
+      - { name: needed_minutes, type: integer, source: computed, description: "case.predicted_duration_minutes + case.turnover_minutes resolved at request creation" }
+      - { name: status, type: enum, source: system, description: "PENDING | APPROVED | REJECTED | WITHDRAWN | EXPIRED", constraints: "enum: PENDING, APPROVED, REJECTED, WITHDRAWN, EXPIRED" }
+
+  - name: UtilizationReport
+    parent: null
+    common_fields: false   # immutable snapshot: id + created_at only
+    fields:
+      - { name: service_line_id, type: string, source: system, description: "FK -> ServiceLine.id; scored service line" }
+      - { name: period_start, type: string, source: system, description: "Period start date (inclusive), = today - 7 days at scoring-run" }
+      - { name: period_end, type: string, source: system, description: "Period end date (exclusive), = today at scoring-run" }
+      - { name: allocated_prime_minutes, type: integer, source: computed, description: "Sum over the line's non-CANCELLED blocks dated in period of prime-window overlap of the block's original window" }
+      - { name: occupied_prime_minutes, type: integer, source: computed, description: "Sum over cases (status in {SCHEDULED, IN_PROGRESS, COMPLETED}) scheduled in those blocks of prime-window overlap of [scheduled_start, scheduled_end)" }
+      - { name: prime_time_utilization_pct, type: number, source: computed, description: "100 * occupied_prime / allocated_prime, 2 decimals round_half_up; 0.00 when allocated_prime == 0" }
+      - { name: raw_utilization_pct, type: number, source: computed, description: "100 * (all occupied minutes by the line's surgeons anywhere in period, incl. add-on/emergent/open-time cases) / (all original block minutes of the line in period), 2 decimals round_half_up; 0.00 when denominator == 0" }
+
+  - name: CommitteeReview
+    parent: null
+    common_fields: true
+    fields:
+      - { name: service_line_id, type: string, source: system, description: "FK -> ServiceLine.id; reviewed service line" }
+      - { name: utilization_report_id, type: string, source: system, description: "FK -> UtilizationReport.id; report that triggered the review" }
+      - { name: period_end, type: string, source: system, description: "Report period end; reduction applies to this line's ACTIVE blocks with date strictly after period_end" }
+      - { name: status, type: enum, source: system, description: "OPEN | DECIDED", constraints: "enum: OPEN, DECIDED" }
+      - { name: decision, type: enum, source: system, description: "NONE while OPEN; REDUCE or MAINTAIN once DECIDED", constraints: "enum: NONE, REDUCE, MAINTAIN" }
+      - { name: tally_reduce, type: integer, source: computed, default: 0, description: "Count of non-voided REDUCE votes" }
+      - { name: tally_maintain, type: integer, source: computed, default: 0, description: "Count of non-voided MAINTAIN votes" }
+      - { name: tally_abstain, type: integer, source: computed, default: 0, description: "Count of non-voided ABSTAIN votes" }
+
+  - name: CommitteeVote
+    parent: null
+    common_fields: false   # append-only; re-cast deletes the prior row; reopen deletes all rows of the review
+    fields:
+      - { name: review_id, type: string, source: system, description: "FK -> CommitteeReview.id; parent review" }
+      - { name: member_ref, type: string, source: system, description: "X-User-ID of the casting CommitteeMember" }
+      - { name: vote, type: enum, source: input, description: "Cast vote", constraints: "enum: REDUCE, MAINTAIN, ABSTAIN" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: BlockAllocation
+    initial_state: DRAFT
+    terminal_states: [RELEASED, REDUCED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /blocks/{blockId}/activate"
+        actor: SchedulingAdmin
+        preconditions:
+          - "status == DRAFT (ERR_BLOCK_NOT_DRAFT)"
+        side_effects:
+          - "increments BlockAllocation.version by 1"
+
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /blocks/{blockId}/cancel"
+        actor: SchedulingAdmin
+        preconditions: []
+        side_effects:
+          - "increments BlockAllocation.version by 1"
+
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /blocks/{blockId}/release (manual early release) or POST /ops/release-sweep (system, when release_deadline_at <= clock)"
+        actor: SchedulingAdmin | Surgeon | system
+        preconditions:
+          - "status == ACTIVE (ERR_BLOCK_NOT_ACTIVE)"
+          - "manual release by Surgeon requires block.surgeon_id == X-User-ID (ERR_NOT_RESOURCE_OWNER); shared blocks (surgeon_id null) are SchedulingAdmin-only"
+          - "sweep release requires release_deadline_at <= current clock"
+        side_effects:
+          - "free tail = [end of last SCHEDULED case, block.end_minute); if tail >= 30 create OpenTimeSlot OPEN with original_minutes = tail; else forfeited_minutes = tail"
+          - "reserved_minutes frozen to occupied span (0 when no SCHEDULED cases)"
+          - "each newly created slot is immediately evaluated against the PENDING ReallocationRequest pool (reallocation_selector)"
+          - "increments BlockAllocation.version by 1"
+
+      - from: ACTIVE
+        to: REDUCED
+        trigger: "system (CommitteeReview decided REDUCE; applies to the line's ACTIVE blocks with date > review.period_end)"
+        actor: system
+        preconditions:
+          - "skip rule: a block whose last SCHEDULED case ends after floor(0.9 * original) trim point stays ACTIVE (not reducible)"
+        side_effects:
+          - "end_minute := start_minute + floor(0.9 * original_minutes)"
+          - "trimmed tail [new_end, old_end): if >= 30 create OpenTimeSlot OPEN; else forfeited_minutes += tail"
+          - "reserved_minutes recomputed; each new slot immediately evaluated against PENDING request pool"
+          - "increments BlockAllocation.version by 1"
+
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /blocks/{blockId}/cancel"
+        actor: SchedulingAdmin
+        preconditions:
+          - "status == ACTIVE (ERR_BLOCK_NOT_ACTIVE)"
+        side_effects:
+          - "all SCHEDULED cases in the block -> BUMPED (scheduled_start_minute cleared, block_id retained)"
+          - "no slot expiry here: cancellable blocks (DRAFT/ACTIVE) never have sourced slots (slots are created only at release/reduction, which are terminal for the block)"
+          - "increments BlockAllocation.version by 1"
+
+  - entity: CasePosting
+    initial_state: POSTED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: POSTED
+        to: SCHEDULED
+        trigger: "POST /cases/{caseId}/schedule (block scheduling for ELECTIVE/ADD_ON; room/date/desired_start scheduling for EMERGENT)"
+        actor: Surgeon
+        preconditions:
+          - "status == POSTED (ERR_CASE_NOT_SCHEDULABLE)"
+          - "anesthesia safety: an ACTIVE AnesthesiaCoverage on the target or_id+date fully spans [case start, case end) (ERR_NO_ANESTHESIA_COVERAGE)"
+          - "block scheduling: block.status == ACTIVE (ERR_BLOCK_NOT_ACTIVE), ownership match (ERR_BLOCK_SERVICE_MISMATCH), packed end <= block.end_minute (ERR_CASE_DOES_NOT_FIT)"
+          - "surgeon padded double-booking check across all rooms on the date (ERR_SURGEON_DOUBLE_BOOKED)"
+          - "EMERGENT: at most one bump resolves the window; otherwise ERR_EMERGENT_WINDOW_BLOCKED"
+        side_effects:
+          - "sets block_id (null for emergent), or_id, date, scheduled_start_minute, scheduled_end_minute, turnover_minutes"
+          - "block.occupied_minutes recomputed; increments BlockAllocation.version by 1"
+          - "EMERGENT overlap: exactly one SCHEDULED ELECTIVE (else earliest ADD_ON) case in the room-day intersecting the needed window -> BUMPED; the victim's former block successors are NOT repacked (repacking could collide with the emergent placement); occupied_minutes recomputed on the victim's block"
+
+      - from: BUMPED
+        to: SCHEDULED
+        trigger: "POST /cases/{caseId}/reschedule"
+        actor: Surgeon
+        preconditions:
+          - "status == BUMPED (ERR_CASE_NOT_BUMPED)"
+          - "same anesthesia / block-state / ownership / fit / double-booking checks as scheduling"
+        side_effects:
+          - "same as POSTED -> SCHEDULED side_effects (minus bump logic; emergent reschedule not supported)"
+
+      - from: POSTED
+        to: SCHEDULED
+        trigger: "system (reallocation approval: winning ReallocationRequest schedules its case at slot.start_minute)"
+        actor: system
+        preconditions:
+          - "case.status == POSTED or BUMPED; anesthesia coverage spans [slot.start, slot.start + needed) (request fails eligibility otherwise at sweep time)"
+        side_effects:
+          - "case scheduled at slot.start_minute with block_id = null, or_id/date from slot"
+          - "slot.remaining_minutes -= needed_minutes; if remaining < 30 then forfeited_minutes += remaining, remaining := 0, slot -> CLAIMED"
+
+      - from: SCHEDULED
+        to: BUMPED
+        trigger: "system (emergent bump, see schedule transition) or block cancellation cascade"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "scheduled_start_minute / scheduled_end_minute cleared; block_id retained for audit"
+          - "no repack of the victim's former block successors (unlike cancellation); block.occupied_minutes recomputed; is_first_case_of_day rederived for the room-day"
+
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /cases/{caseId}/start"
+        actor: CirculatorNurse
+        preconditions:
+          - "status == SCHEDULED (ERR_CASE_NOT_SCHEDULED)"
+        side_effects:
+          - "actual_start_minute recorded"
+          - "if case is_first_case_of_day at this moment: first_case_delay_minutes = max(0, actual_start - scheduled_start)"
+          - "surgeon.on_time_rate_pct recomputed"
+
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /cases/{caseId}/complete"
+        actor: CirculatorNurse
+        preconditions:
+          - "status == IN_PROGRESS (ERR_CASE_NOT_IN_PROGRESS)"
+          - "actual_end_minute > actual_start_minute (ERR_INVALID_TIME_RANGE)"
+        side_effects:
+          - "actual_end_minute recorded"
+          - "surgeon.completed_cases_count += 1; surgeon.duration_bias_factor recomputed (window: last 20 COMPLETED cases)"
+
+      - from: POSTED
+        to: CANCELLED
+        trigger: "POST /cases/{caseId}/cancel"
+        actor: Surgeon
+        preconditions:
+          - "case.surgeon_id == X-User-ID (ERR_NOT_RESOURCE_OWNER)"
+        side_effects: []
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /cases/{caseId}/cancel"
+        actor: Surgeon
+        preconditions:
+          - "case.surgeon_id == X-User-ID (ERR_NOT_RESOURCE_OWNER)"
+        side_effects:
+          - "remaining SCHEDULED cases in the same block repacked (successor scheduled_start_minute recomputed)"
+          - "block.occupied_minutes recomputed; increments BlockAllocation.version by 1"
+          - "is_first_case_of_day rederived for the room-day"
+
+      - from: BUMPED
+        to: CANCELLED
+        trigger: "POST /cases/{caseId}/cancel"
+        actor: Surgeon
+        preconditions:
+          - "case.surgeon_id == X-User-ID (ERR_NOT_RESOURCE_OWNER)"
+        side_effects: []
+
+  - entity: AnesthesiaCoverage
+    initial_state: ACTIVE
+    terminal_states: [WITHDRAWN]
+    transitions:
+      - from: ACTIVE
+        to: WITHDRAWN
+        trigger: "POST /anesthesia-coverages/{coverageId}/withdraw"
+        actor: AnesthesiaCoordinator
+        preconditions:
+          - "status == ACTIVE (ERR_COVERAGE_NOT_ACTIVE)"
+        side_effects: []
+
+  - entity: OpenTimeSlot
+    initial_state: OPEN
+    terminal_states: [CLAIMED, EXPIRED]
+    transitions:
+      - from: OPEN
+        to: CLAIMED
+        trigger: "system (reallocation approval leaves remaining_minutes == 0 or a fragment < 30)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "forfeited_minutes += fragment when 0 < remaining < 30; remaining_minutes := 0"
+
+      - from: OPEN
+        to: EXPIRED
+        trigger: "POST /ops/release-sweep (slot.date strictly before current clock date) or source block cancellation"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "PENDING ReallocationRequests referencing this slot -> EXPIRED"
+
+  - entity: ReallocationRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED, WITHDRAWN, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "system (reallocation_selector at slot creation or release-sweep)"
+        actor: system
+        preconditions:
+          - "request is the selector winner for its slot"
+        side_effects:
+          - "referenced case scheduled at slot.start_minute (see CasePosting system transition)"
+          - "slot.remaining_minutes reduced / slot may -> CLAIMED"
+
+      - from: PENDING
+        to: WITHDRAWN
+        trigger: "POST /reallocation-requests/{requestId}/withdraw"
+        actor: Surgeon
+        preconditions:
+          - "status == PENDING (ERR_REQUEST_NOT_PENDING)"
+          - "request.surgeon_id == X-User-ID (ERR_NOT_RESOURCE_OWNER)"
+        side_effects: []
+
+      - from: PENDING
+        to: EXPIRED
+        trigger: "system (slot expiry at sweep or source block cancellation)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: CommitteeReview
+    initial_state: OPEN
+    terminal_states: [DECIDED]
+    transitions:
+      - from: OPEN
+        to: DECIDED
+        trigger: "system (immediately when tally_reduce + tally_maintain + tally_abstain >= 3)"
+        actor: system
+        preconditions:
+          - "total non-voided votes >= 3 (COMMITTEE_QUORUM)"
+        side_effects:
+          - "decision := REDUCE when tally_reduce > tally_maintain, else MAINTAIN (tie -> MAINTAIN; abstains count toward quorum only)"
+          - "when REDUCE: every ACTIVE block of the service line with date > period_end is reduced (see BlockAllocation ACTIVE->REDUCED), creating open-time slots from trimmed tails"
+          - "increments CommitteeReview.version by 1"
+
+      - from: DECIDED
+        to: OPEN
+        trigger: "POST /committee-reviews/{id}/reopen"
+        actor: BlockCommitteeChair
+        preconditions:
+          - "status == DECIDED (ERR_REVIEW_NOT_OPEN)"
+          - "decision == MAINTAIN (ERR_REVIEW_NOT_MAINTAIN_DECISION — REDUCE decisions are irreversible because block mutations already applied)"
+        side_effects:
+          - "all CommitteeVote rows of the review are deleted"
+          - "tally_reduce = tally_maintain = tally_abstain = 0; decision := NONE"
+          - "increments CommitteeReview.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only; sequential-observable conflicts live in §1.2/§1.4)
+# =============================================================================
+concurrency_rules:
+  - rule_id: service-line-config-stale-version
+    parent_entity: ServiceLine
+    write_endpoint: "PATCH /service-lines/{lineId}"
+    occ_field: expected_service_line_version
+    description: |
+      Updating a ServiceLine whose version has advanced since the client last
+      observed it is rejected. This captures the case where another writer has
+      just changed release_deadline_hours or target_utilization_pct and the
+      current writer's view of the configuration is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: review-vote-stale-version
+    parent_entity: CommitteeReview
+    write_endpoint: "POST /committee-reviews/{id}/votes"
+    occ_field: expected_review_version
+    description: |
+      Casting (or re-casting) a vote against a CommitteeReview whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another member's vote has just been recorded (advancing the
+      tally) and the current member's view of the review is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: benchmark_duration
+    trigger: "case posting (POST /cases)"
+    algorithm: aggregation
+    formula: |
+      benchmark_duration_minutes = BENCHMARK[procedure_class]
+    constants:
+      BENCHMARK: { MINOR: 45, STANDARD: 90, COMPLEX: 180 }
+    precision: "integer minutes"
+    variants:
+      - name: benchmark
+        when: "always computed; surgeon-independent reference"
+        difference: "pure procedure-class lookup; ignores surgeon history"
+      - name: surgeon_adjusted
+        when: "predicted_duration_minutes at posting"
+        difference: "benchmark * surgeon.duration_bias_factor, round_half_up to integer; diverges from benchmark whenever bias != 1.000"
+
+  - name: predicted_duration
+    trigger: "case posting (POST /cases); pinned for the life of the posting"
+    algorithm: weighted_scoring
+    formula: |
+      predicted_duration_minutes = round_half_up(BENCHMARK[procedure_class] * surgeon.duration_bias_factor)  # to integer
+    input_set: "the posting surgeon's duration_bias_factor at posting time"
+    precision: "integer minutes, round_half_up"
+    variants:
+      - name: benchmark
+        when: "stored alongside as benchmark_duration_minutes"
+        difference: "same posting, two different minute values whenever bias != 1.000"
+
+  - name: surgeon_duration_bias
+    trigger: "case completion (POST /cases/{id}/complete)"
+    algorithm: chronological
+    formula: |
+      history = surgeon's COMPLETED cases, ordered by actual_end_minute ASC then created_at ASC, last 20
+      if completed_cases_count < 5: bias = 1.000
+      else:
+        ratios = [ (actual_end - actual_start) / BENCHMARK[procedure_class] for each in history ]
+        bias = clamp( round_half_up(mean(ratios), 3), 0.800, 1.250 )
+      # rounding order is pinned: average unrounded ratios, round to 3 decimals, clamp, then multiply and round per case
+    precision: "3 decimals, round_half_up"
+    constants:
+      MIN_HISTORY: 5
+      WINDOW: 20
+      CLAMP_LO: 0.800
+      CLAMP_HI: 1.250
+
+  - name: turnover_minutes
+    trigger: "case scheduling (and repack)"
+    algorithm: aggregation
+    formula: |
+      turnover(case) = TURNOVER_BASE[case.procedure_class] + (HYBRID_BONUS if room.is_hybrid else 0)
+      turnover is charged BEFORE every non-first case in a packed sequence
+    constants:
+      TURNOVER_BASE: { MINOR: 15, STANDARD: 25, COMPLEX: 40 }
+      HYBRID_BONUS: 10
+    precision: "integer minutes"
+
+  - name: block_packing_fit
+    trigger: "case scheduling / reschedule / cancel / bump (repack)"
+    algorithm: chronological
+    formula: |
+      Sequence = the block's SCHEDULED cases ordered by scheduling sequence (creation order of their
+      current scheduling; repack preserves relative order of remaining cases).
+      start(c_1) = block.start_minute
+      start(c_i) = end(c_{i-1}) + turnover(c_i)
+      end(c_i)   = start(c_i) + c_i.predicted_duration_minutes
+      Fit check (schedule/reschedule): end(c_new_packed_last) <= block.end_minute, else ERR_CASE_DOES_NOT_FIT.
+      Fit uses the per-case rounded predicted_duration_minutes (never an unrounded sum).
+      occupied_minutes = sum(predicted) + sum(turnover before each non-first case).
+    precision: "integer minutes"
+
+  - name: release_deadline_at
+    trigger: "block creation"
+    algorithm: projection
+    formula: |
+      release_deadline_at = dateT00:00:00Z + start_minute minutes - service_line.release_deadline_hours hours
+    precision: "ISO8601 UTC, seconds"
+
+  - name: prime_window_overlap
+    trigger: "utilization scoring"
+    algorithm: interval_merge
+    formula: |
+      prime_overlap(s, e, date) =
+        0                                             if date is Saturday/Sunday
+        max(0, min(e, 1020) - max(s, 420))            otherwise
+    constants:
+      PRIME_START: 420    # 07:00
+      PRIME_END: 1020     # 17:00, exclusive
+    precision: "integer minutes"
+
+  - name: utilization_scoring
+    trigger: "POST /ops/scoring-run (per service line, period = [today-7d, today))"
+    algorithm: aggregation
+    formula: |
+      blocks     = line's blocks with period_start <= date < period_end and status != CANCELLED
+      allocated_prime = sum over blocks of prime_overlap(block.start_minute, block.original end, block.date)
+      occupied_prime  = sum over cases in those blocks with status in {SCHEDULED, IN_PROGRESS, COMPLETED}
+                        of prime_overlap(case.scheduled_start_minute, case.scheduled_end_minute, case.date)
+      prime_time_utilization_pct = allocated_prime == 0 ? 0.00 : round_half_up(100 * occupied_prime / allocated_prime, 2)
+      allocated_raw   = sum over blocks of original_minutes
+      occupied_raw    = sum over ALL cases by the line's surgeons dated in period with status in
+                        {SCHEDULED, IN_PROGRESS, COMPLETED} of (scheduled_end - scheduled_start),
+                        regardless of room, hour, priority, or block/slot origin
+      raw_utilization_pct = allocated_raw == 0 ? 0.00 : round_half_up(100 * occupied_raw / allocated_raw, 2)
+      if prime_time_utilization_pct < service_line.target_utilization_pct (strictly):
+        create CommitteeReview OPEN (skip when an OPEN review already exists for the line)
+    input_set: "status-filtered blocks and cases as above; BUMPED and CANCELLED cases excluded"
+    precision: "2 decimals, round_half_up"
+    variants:
+      - name: prime_time
+        when: "governance metric — drives committee review creation and block reduction"
+        difference: "prime-window minutes only, own blocks only, elective open-time excluded"
+      - name: raw
+        when: "reporting metric on the same UtilizationReport"
+        difference: "all hours incl. weekends/evenings, all of the line's surgeons' cases anywhere; same inputs, different result"
+
+  - name: reallocation_selector
+    trigger: "slot creation (release or reduction) and POST /ops/release-sweep for every OPEN slot with PENDING requests"
+    algorithm: waterfall_allocation
+    formula: |
+      eligible = PENDING ReallocationRequests for this slot whose
+        case.status in {POSTED, BUMPED} AND needed_minutes <= slot.remaining_minutes
+        AND an ACTIVE AnesthesiaCoverage on slot.or_id+slot.date spans [slot.start, slot.start + needed)
+      tier1 = eligible whose surgeon's service line's latest UtilizationReport.prime_time_utilization_pct
+              is strictly below that line's target_utilization_pct (lines with no report are tier1)
+      pool  = tier1 if non-empty else eligible
+      if pool empty: slot stays OPEN
+      else winner = pool ranked by (line prime_time_utilization_pct ASC, lineless first) then request.created_at ASC
+      approve winner: schedule case at slot.start; slot.remaining -= needed;
+        if remaining < 30: slot.forfeited += remaining; remaining := 0; slot -> CLAIMED
+      losers stay PENDING (no REJECTED at sweep time)
+    constants:
+      MIN_SLOT_MINUTES: 30
+    precision: "integer minutes"
+
+  - name: first_case_delay
+    trigger: "POST /cases/{id}/start"
+    algorithm: threshold
+    formula: |
+      first case of room-day = non-CANCELLED non-BUMPED case with min scheduled_start_minute
+                               for (or_id, date); tie-break created_at ASC
+      if the started case is that case: first_case_delay_minutes = max(0, actual_start - scheduled_start)
+      on-time when delay <= GRACE_MINUTES (<=, so exactly 10 is on-time)
+    constants:
+      GRACE_MINUTES: 10
+    precision: "integer minutes"
+
+  - name: surgeon_on_time_rate
+    trigger: "case start (when the case is first of its room-day)"
+    algorithm: aggregation
+    formula: |
+      rate = 100 * count(delay <= 10) / count(started first cases of this surgeon), 2 decimals round_half_up
+      0.00 when no started first cases
+    precision: "2 decimals, round_half_up"
+
+  - name: block_overlap_check
+    trigger: "block creation and activation-time integrity"
+    algorithm: interval_merge
+    formula: |
+      Reject when another block on the same or_id+date with status in {DRAFT, ACTIVE} satisfies
+      half-open overlap: a.start < b.end AND b.start < a.end.
+      Touching intervals (a.end == b.start) are allowed.
+      REDUCED/RELEASED blocks still occupy their original room window for this check.
+    error_id: ERR_BLOCK_TIME_OVERLAP
+
+  - name: surgeon_padded_overlap_check
+    trigger: "case scheduling / reschedule"
+    algorithm: interval_merge
+    formula: |
+      For the case's surgeon on the same date, across ALL rooms:
+      each existing SCHEDULED case occupies the padded interval [start, end + turnover_of_following_gap)
+      where turnover_of_following_gap = turnover(existing case) — i.e., [start, end + TURNOVER_BASE[class] (+10 hybrid)].
+      The new case occupies [new_start, new_end + new_turnover).
+      Reject when padded intervals intersect (half-open on the padded end).
+      Touching at the padded boundary (new_start == existing padded end) is allowed.
+    error_id: ERR_SURGEON_DOUBLE_BOOKED
+
+  - name: vote_quorum_tally
+    trigger: "POST /committee-reviews/{id}/votes"
+    algorithm: threshold
+    formula: |
+      tallies count non-voided votes per value; total = tally_reduce + tally_maintain + tally_abstain
+      when total >= COMMITTEE_QUORUM: review auto-DECIDED;
+      decision = REDUCE if tally_reduce > tally_maintain else MAINTAIN
+    constants:
+      COMMITTEE_QUORUM: 3
+    precision: "integer counts"
+
+  - name: block_reduction_trim
+    trigger: "CommitteeReview decided REDUCE"
+    algorithm: constraint_propagation
+    formula: |
+      for each ACTIVE block of the line with date > review.period_end:
+        trim = floor(0.9 * original_minutes)
+        skip the block (stays ACTIVE) when its last SCHEDULED case ends after start + trim
+        else: end_minute = start + trim; tail = old_end - new_end;
+              tail >= 30 -> OpenTimeSlot OPEN; tail < 30 -> forfeited_minutes += tail
+    constants:
+      REDUCTION_KEEP_PCT: 0.9
+      MIN_SLOT_MINUTES: 30
+    precision: "integer minutes (floor)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present; role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this endpoint per §1.5/§1.7"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "Ownership: Surgeon acting on own case/block/request (surgeon_id == X-User-ID); posting a case requires surgeon_id == X-User-ID"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /cases, POST /cases/{id}/schedule, /reschedule, /cancel, POST /blocks/{id}/release (Surgeon actor), POST /reallocation-requests, POST /reallocation-requests/{id}/withdraw"
+
+  - priority: 4
+    category: existence
+    check: "Path and body-referenced resources exist (path ids left-to-right, then body FKs in declared order)"
+    error_id: "ERR_{RESOURCE}_NOT_FOUND"
+    http_status: 404
+    applies_to: all
+
+  - priority: 5
+    category: existence
+    check: "Request shape: required fields present, types correct, enum members valid, minutes within [0,1440]"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+  - priority: 6
+    category: existence
+    check: "Time ranges: end_minute > start_minute (and actual_end > actual_start at completion)"
+    error_id: ERR_INVALID_TIME_RANGE
+    http_status: 400
+    applies_to: "POST /blocks, POST /anesthesia-coverages, POST /cases/{id}/complete"
+
+  - priority: 7
+    category: state
+    check: "Target resource in the correct state for the operation (block ACTIVE/DRAFT, case POSTED/BUMPED/SCHEDULED/IN_PROGRESS, slot OPEN, request PENDING, review OPEN, coverage ACTIVE)"
+    error_id: "state-specific: ERR_BLOCK_NOT_ACTIVE, ERR_BLOCK_NOT_DRAFT, ERR_CASE_NOT_SCHEDULABLE, ERR_CASE_NOT_BUMPED, ERR_CASE_NOT_SCHEDULED, ERR_CASE_NOT_IN_PROGRESS, ERR_SLOT_NOT_OPEN, ERR_REQUEST_NOT_PENDING, ERR_REVIEW_NOT_OPEN, ERR_REVIEW_NOT_MAINTAIN_DECISION, ERR_COVERAGE_NOT_ACTIVE"
+    http_status: 409
+    applies_to: "all action endpoints"
+
+  - priority: 7b
+    category: state
+    check: "Optimistic concurrency: expected_<parent>_version must equal the parent entity's current version (evaluated after state preconditions, before business rules)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "PATCH /service-lines/{lineId}, POST /committee-reviews/{id}/votes"
+
+  - priority: 8
+    category: business_safety
+    check: "Anesthesia: an ACTIVE coverage on the case's or_id+date fully spans [case start, case end + case turnover) — coverage must contain the case including its turnover gap"
+    error_id: ERR_NO_ANESTHESIA_COVERAGE
+    http_status: 409
+    applies_to: "POST /cases/{id}/schedule, POST /cases/{id}/reschedule; eligibility filter in reallocation_selector"
+
+  - priority: 9
+    category: business_constraint
+    check: "Fit and overlap: packed end <= block.end_minute (ERR_CASE_DOES_NOT_FIT); block room overlap (ERR_BLOCK_TIME_OVERLAP); surgeon padded double-booking (ERR_SURGEON_DOUBLE_BOOKED); emergent window not resolvable by a single bump (ERR_EMERGENT_WINDOW_BLOCKED)"
+    error_id: "ERR_CASE_DOES_NOT_FIT | ERR_BLOCK_TIME_OVERLAP | ERR_SURGEON_DOUBLE_BOOKED | ERR_EMERGENT_WINDOW_BLOCKED"
+    http_status: 409
+    applies_to: "POST /blocks, POST /cases/{id}/schedule, POST /cases/{id}/reschedule"
+
+  - priority: 10
+    category: business_referential
+    check: "Block-case alignment: block.surgeon_id set -> case.surgeon_id must equal it; shared block -> case surgeon's service_line_id must equal block.service_line_id"
+    error_id: ERR_BLOCK_SERVICE_MISMATCH
+    http_status: 409
+    applies_to: "POST /cases/{id}/schedule, POST /cases/{id}/reschedule"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- ServiceLine ---
+  - method: POST
+    path: "/service-lines"
+    description: "Create a service line"
+    roles: [SchedulingAdmin]
+    code: 201
+    input: [name, target_utilization_pct, "release_deadline_hours?"]
+    output: ServiceLine
+    side_effects: []
+
+  - method: GET
+    path: "/service-lines"
+    description: "List service lines"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "ServiceLine[]"
+    side_effects: []
+
+  - method: GET
+    path: "/service-lines/{lineId}"
+    description: "Get a service line"
+    roles: [Any]
+    code: 200
+    input: []
+    output: ServiceLine
+    side_effects: []
+
+  - method: PATCH
+    path: "/service-lines/{lineId}"
+    description: "Update service line configuration (OCC-guarded)"
+    roles: [SchedulingAdmin]
+    code: 200
+    input: ["target_utilization_pct?", "release_deadline_hours?", expected_service_line_version]
+    output: ServiceLine
+    side_effects: ["increments ServiceLine.version by 1", "release_deadline_at of DRAFT/ACTIVE blocks of the line recomputed"]
+
+  # --- Surgeon ---
+  - method: POST
+    path: "/surgeons"
+    description: "Register a surgeon"
+    roles: [SchedulingAdmin]
+    code: 201
+    input: [service_line_id, full_name]
+    output: Surgeon
+    side_effects: ["duration_bias_factor 1.000, completed_cases_count 0, on_time_rate_pct 0.00"]
+
+  - method: GET
+    path: "/surgeons"
+    description: "List surgeons"
+    roles: [Any]
+    code: 200
+    input: ["service_line_id?", "limit?", "offset?"]
+    output: "Surgeon[]"
+    side_effects: []
+
+  - method: GET
+    path: "/surgeons/{surgeonId}"
+    description: "Get surgeon incl. computed scorecard (duration_bias_factor, completed_cases_count, on_time_rate_pct)"
+    roles: [Any]
+    code: 200
+    input: []
+    output: Surgeon
+    side_effects: []
+
+  # --- OperatingRoom ---
+  - method: POST
+    path: "/operating-rooms"
+    description: "Create an operating room"
+    roles: [SchedulingAdmin]
+    code: 201
+    input: [room_name, "is_hybrid?"]
+    output: OperatingRoom
+    side_effects: []
+
+  - method: GET
+    path: "/operating-rooms"
+    description: "List operating rooms"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "OperatingRoom[]"
+    side_effects: []
+
+  # --- BlockAllocation ---
+  - method: POST
+    path: "/blocks"
+    description: "Create a block allocation (DRAFT); rejects room overlap among DRAFT/ACTIVE blocks on same room+date"
+    roles: [SchedulingAdmin]
+    code: 201
+    input: [service_line_id, or_id, date, start_minute, end_minute, "surgeon_id?"]
+    output: BlockAllocation
+    side_effects: ["original_minutes computed", "release_deadline_at computed from the line's release_deadline_hours"]
+
+  - method: GET
+    path: "/blocks"
+    description: "List blocks with filters"
+    roles: [Any]
+    code: 200
+    input: ["service_line_id?", "surgeon_id?", "or_id?", "date?", "status?", "limit?", "offset?"]
+    output: "BlockAllocation[]"
+    side_effects: []
+
+  - method: GET
+    path: "/blocks/{blockId}"
+    description: "Get a block"
+    roles: [Any]
+    code: 200
+    input: []
+    output: BlockAllocation
+    side_effects: []
+
+  - method: POST
+    path: "/blocks/{blockId}/activate"
+    description: "Activate a DRAFT block"
+    roles: [SchedulingAdmin]
+    code: 200
+    input: []
+    output: BlockAllocation
+    side_effects: ["status -> ACTIVE", "increments BlockAllocation.version by 1"]
+
+  - method: POST
+    path: "/blocks/{blockId}/release"
+    description: "Manual early release of an ACTIVE block; free tail becomes open time"
+    roles: [SchedulingAdmin, Surgeon]
+    code: 200
+    input: []
+    output: BlockAllocation
+    side_effects: ["status -> RELEASED", "OpenTimeSlot created when free tail >= 30 else forfeited", "new slots evaluated against PENDING reallocation pool", "increments BlockAllocation.version by 1"]
+
+  - method: POST
+    path: "/blocks/{blockId}/cancel"
+    description: "Cancel a DRAFT or ACTIVE block"
+    roles: [SchedulingAdmin]
+    code: 200
+    input: []
+    output: BlockAllocation
+    side_effects: ["status -> CANCELLED", "SCHEDULED cases -> BUMPED", "sourced OPEN slots -> EXPIRED", "their PENDING requests -> EXPIRED", "increments BlockAllocation.version by 1"]
+
+  # --- CasePosting ---
+  - method: POST
+    path: "/cases"
+    description: "Post a surgical case (surgeon posts own case)"
+    roles: [Surgeon]
+    code: 201
+    input: [surgeon_id, procedure_class, priority, "patient_ref?"]
+    output: CasePosting
+    side_effects: ["benchmark_duration_minutes and predicted_duration_minutes computed and pinned"]
+
+  - method: GET
+    path: "/cases"
+    description: "List cases with filters"
+    roles: [Any]
+    code: 200
+    input: ["surgeon_id?", "block_id?", "or_id?", "date?", "status?", "priority?", "limit?", "offset?"]
+    output: "CasePosting[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cases/{caseId}"
+    description: "Get a case"
+    roles: [Any]
+    code: 200
+    input: []
+    output: CasePosting
+    side_effects: []
+
+  - method: POST
+    path: "/cases/{caseId}/schedule"
+    description: "Schedule a POSTED case: ELECTIVE/ADD_ON via block_id (packed); EMERGENT via or_id+date+desired_start_minute (may bump)"
+    roles: [Surgeon]
+    code: 200
+    input: ["block_id?", "or_id?", "date?", "desired_start_minute?"]
+    output: CasePosting
+    side_effects: ["packed start/end computed", "block.occupied_minutes recomputed", "EMERGENT: one victim case -> BUMPED + repack, or ERR_EMERGENT_WINDOW_BLOCKED with no partial side effects"]
+
+  - method: POST
+    path: "/cases/{caseId}/reschedule"
+    description: "Reschedule a BUMPED case into an ACTIVE block"
+    roles: [Surgeon]
+    code: 200
+    input: [block_id]
+    output: CasePosting
+    side_effects: ["same packing and occupancy side effects as schedule"]
+
+  - method: POST
+    path: "/cases/{caseId}/start"
+    description: "Record actual case start (circulator)"
+    roles: [CirculatorNurse]
+    code: 200
+    input: [actual_start_minute]
+    output: CasePosting
+    side_effects: ["status -> IN_PROGRESS", "first_case_delay_minutes recorded when first of room-day", "surgeon.on_time_rate_pct recomputed"]
+
+  - method: POST
+    path: "/cases/{caseId}/complete"
+    description: "Record actual case completion (circulator)"
+    roles: [CirculatorNurse]
+    code: 200
+    input: [actual_end_minute]
+    output: CasePosting
+    side_effects: ["status -> COMPLETED", "surgeon.completed_cases_count += 1", "surgeon.duration_bias_factor recomputed"]
+
+  - method: POST
+    path: "/cases/{caseId}/cancel"
+    description: "Cancel a POSTED, SCHEDULED, or BUMPED case (owning surgeon)"
+    roles: [Surgeon]
+    code: 200
+    input: []
+    output: CasePosting
+    side_effects: ["status -> CANCELLED", "block repack + occupied_minutes recompute when cancelling a SCHEDULED case", "increments BlockAllocation.version by 1 when a block is affected"]
+
+  # --- AnesthesiaCoverage ---
+  - method: POST
+    path: "/anesthesia-coverages"
+    description: "Publish anesthesia coverage for a room-day"
+    roles: [AnesthesiaCoordinator]
+    code: 201
+    input: [or_id, date, start_minute, end_minute, provider_ref]
+    output: AnesthesiaCoverage
+    side_effects: []
+
+  - method: GET
+    path: "/anesthesia-coverages"
+    description: "List coverages"
+    roles: [Any]
+    code: 200
+    input: ["or_id?", "date?", "status?", "limit?", "offset?"]
+    output: "AnesthesiaCoverage[]"
+    side_effects: []
+
+  - method: GET
+    path: "/anesthesia-coverages/{coverageId}"
+    description: "Get a coverage"
+    roles: [Any]
+    code: 200
+    input: []
+    output: AnesthesiaCoverage
+    side_effects: []
+
+  - method: POST
+    path: "/anesthesia-coverages/{coverageId}/withdraw"
+    description: "Withdraw an ACTIVE coverage"
+    roles: [AnesthesiaCoordinator]
+    code: 200
+    input: []
+    output: AnesthesiaCoverage
+    side_effects: ["status -> WITHDRAWN"]
+
+  # --- OpenTimeSlot ---
+  - method: GET
+    path: "/open-time-slots"
+    description: "List open-time slots (created only by release/reduction)"
+    roles: [Any]
+    code: 200
+    input: ["block_id?", "or_id?", "date?", "status?", "limit?", "offset?"]
+    output: "OpenTimeSlot[]"
+    side_effects: []
+
+  - method: GET
+    path: "/open-time-slots/{slotId}"
+    description: "Get an open-time slot"
+    roles: [Any]
+    code: 200
+    input: []
+    output: OpenTimeSlot
+    side_effects: []
+
+  # --- ReallocationRequest ---
+  - method: POST
+    path: "/reallocation-requests"
+    description: "Surgeon requests open time for an own POSTED/BUMPED case; evaluated at slot creation and release-sweep"
+    roles: [Surgeon]
+    code: 201
+    input: [slot_id, case_id]
+    output: ReallocationRequest
+    side_effects: ["surgeon_id copied from case", "needed_minutes computed"]
+
+  - method: GET
+    path: "/reallocation-requests"
+    description: "List reallocation requests"
+    roles: [Any]
+    code: 200
+    input: ["slot_id?", "surgeon_id?", "case_id?", "status?", "limit?", "offset?"]
+    output: "ReallocationRequest[]"
+    side_effects: []
+
+  - method: GET
+    path: "/reallocation-requests/{requestId}"
+    description: "Get a reallocation request"
+    roles: [Any]
+    code: 200
+    input: []
+    output: ReallocationRequest
+    side_effects: []
+
+  - method: POST
+    path: "/reallocation-requests/{requestId}/withdraw"
+    description: "Withdraw a PENDING request (owning surgeon)"
+    roles: [Surgeon]
+    code: 200
+    input: []
+    output: ReallocationRequest
+    side_effects: ["status -> WITHDRAWN"]
+
+  # --- Ops-run checkpoints ---
+  - method: POST
+    path: "/ops/release-sweep"
+    description: "Ops checkpoint: release ACTIVE blocks whose release_deadline_at <= clock; expire past-date OPEN slots and their PENDING requests; run reallocation_selector over every OPEN slot"
+    roles: [SchedulingAdmin]
+    code: 200
+    input: []
+    output: { released_blocks: integer, slots_created: integer, slots_expired: integer, requests_approved: integer, requests_expired: integer }
+    side_effects: ["block releases + slot creation + selector evaluation + expiries, all immediately visible"]
+
+  - method: POST
+    path: "/ops/scoring-run"
+    description: "Ops checkpoint: compute a UtilizationReport per service line for [today-7d, today); auto-create OPEN CommitteeReview when prime_time_utilization_pct is strictly below target (dedup: skipped when an OPEN review already exists for the line)"
+    roles: [SchedulingAdmin]
+    code: 200
+    input: []
+    output: { reports_created: integer, reviews_created: integer }
+    side_effects: ["UtilizationReport rows created", "CommitteeReview rows created where deficient"]
+
+  # --- UtilizationReport (read-only sub-resource) ---
+  - method: GET
+    path: "/service-lines/{id}/utilization-reports"
+    description: "List utilization reports for a service line"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "UtilizationReport[]"
+    side_effects: []
+
+  # --- Committee governance ---
+  - method: GET
+    path: "/committee-reviews"
+    description: "List committee reviews"
+    roles: [Any]
+    code: 200
+    input: ["service_line_id?", "utilization_report_id?", "status?", "limit?", "offset?"]
+    output: "CommitteeReview[]"
+    side_effects: []
+
+  - method: GET
+    path: "/committee-reviews/{id}"
+    description: "Get a committee review"
+    roles: [Any]
+    code: 200
+    input: []
+    output: CommitteeReview
+    side_effects: []
+
+  - method: POST
+    path: "/committee-reviews/{id}/votes"
+    description: "Cast or re-cast a vote (one row per member per review; re-cast replaces the member's prior row); auto-DECIDED at quorum"
+    roles: [CommitteeMember]
+    code: 201
+    input: [vote, expected_review_version]
+    output: CommitteeReview
+    side_effects: ["tallies recomputed", "increments CommitteeReview.version by 1", "auto-decision + reduction cascade when quorum reached"]
+
+  - method: GET
+    path: "/committee-reviews/{id}/votes"
+    description: "List votes of a review"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "CommitteeVote[]"
+    side_effects: []
+
+  - method: POST
+    path: "/committee-reviews/{id}/reopen"
+    description: "Reopen a DECIDED review whose decision was MAINTAIN; clears votes and tallies"
+    roles: [BlockCommitteeChair]
+    code: 200
+    input: []
+    output: CommitteeReview
+    side_effects: ["votes deleted", "tallies zeroed", "decision -> NONE", "increments CommitteeReview.version by 1"]
+
+  # --- Test-driving clock (default time 2026-05-01T00:00:00Z) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock. Before any call, the clock reads exactly 2026-05-01T00:00:00Z and never falls back to wall-clock time."
+    roles: [SchedulingAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["logical clock advanced; no automatic sweeps run on clock change"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- Auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or role not declared" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role may not perform this operation (e.g., SchedulingAdmin voting, CommitteeMember reopening, Surgeon creating blocks)" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Entity-backed actor does not own the target (surgeon_id != X-User-ID, or shared block released by Surgeon)" }
+
+  # --- Existence ---
+  - { id: ERR_SERVICE_LINE_NOT_FOUND, http: 404, condition: "service line id does not exist" }
+  - { id: ERR_SURGEON_NOT_FOUND, http: 404, condition: "surgeon id does not exist" }
+  - { id: ERR_ROOM_NOT_FOUND, http: 404, condition: "operating room id does not exist" }
+  - { id: ERR_BLOCK_NOT_FOUND, http: 404, condition: "block id does not exist" }
+  - { id: ERR_CASE_NOT_FOUND, http: 404, condition: "case id does not exist" }
+  - { id: ERR_COVERAGE_NOT_FOUND, http: 404, condition: "anesthesia coverage id does not exist" }
+  - { id: ERR_SLOT_NOT_FOUND, http: 404, condition: "open-time slot id does not exist" }
+  - { id: ERR_REQUEST_NOT_FOUND, http: 404, condition: "reallocation request id does not exist" }
+  - { id: ERR_REVIEW_NOT_FOUND, http: 404, condition: "committee review id does not exist" }
+
+  # --- Request shape ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, type mismatch, invalid enum member, minutes outside [0,1440], or wrong scheduling payload combination (neither block_id nor emergent triple)" }
+  - { id: ERR_INVALID_TIME_RANGE, http: 400, condition: "end_minute <= start_minute (or actual_end_minute <= actual_start_minute at completion)" }
+
+  # --- State ---
+  - { id: ERR_BLOCK_NOT_DRAFT, http: 409, condition: "activate requires block status DRAFT" }
+  - { id: ERR_BLOCK_NOT_ACTIVE, http: 409, condition: "operation requires block status ACTIVE (release, cancel, schedule into block)" }
+  - { id: ERR_CASE_NOT_SCHEDULABLE, http: 409, condition: "schedule requires case status POSTED; reallocation eligibility requires POSTED or BUMPED" }
+  - { id: ERR_CASE_NOT_BUMPED, http: 409, condition: "reschedule requires case status BUMPED" }
+  - { id: ERR_CASE_NOT_SCHEDULED, http: 409, condition: "start requires case status SCHEDULED" }
+  - { id: ERR_CASE_NOT_IN_PROGRESS, http: 409, condition: "complete requires case status IN_PROGRESS" }
+  - { id: ERR_SLOT_NOT_OPEN, http: 409, condition: "reallocation request requires slot status OPEN" }
+  - { id: ERR_REQUEST_NOT_PENDING, http: 409, condition: "withdraw requires request status PENDING" }
+  - { id: ERR_REVIEW_NOT_OPEN, http: 409, condition: "vote requires review status OPEN" }
+  - { id: ERR_REVIEW_NOT_MAINTAIN_DECISION, http: 409, condition: "reopen requires a DECIDED review whose decision is MAINTAIN" }
+  - { id: ERR_COVERAGE_NOT_ACTIVE, http: 409, condition: "withdraw requires coverage status ACTIVE" }
+
+  # --- Business ---
+  - { id: ERR_NO_ANESTHESIA_COVERAGE, http: 409, condition: "no ACTIVE anesthesia coverage fully spans [case start, case end) on the room-day" }
+  - { id: ERR_CASE_DOES_NOT_FIT, http: 409, condition: "packed end (per-case rounded durations + turnovers) exceeds block end_minute" }
+  - { id: ERR_BLOCK_TIME_OVERLAP, http: 409, condition: "another DRAFT/ACTIVE block overlaps the same room-date window (half-open; touching allowed)" }
+  - { id: ERR_SURGEON_DOUBLE_BOOKED, http: 409, condition: "surgeon has another SCHEDULED case whose turnover-padded interval intersects (half-open on padded end)" }
+  - { id: ERR_EMERGENT_WINDOW_BLOCKED, http: 409, condition: "emergent window cannot be freed by bumping exactly one case (multiple overlaps, or overlap with IN_PROGRESS/EMERGENT case); rejected atomically with no bump applied" }
+  - { id: ERR_BLOCK_SERVICE_MISMATCH, http: 409, condition: "case surgeon does not match block surgeon, or (shared block) case surgeon's service line differs from block's" }
+
+  # --- Concurrency ---
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_*_version does not match the parent entity's current version (OCC)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: SchedulingAdmin
+    description: "OR scheduling administrator; owns configuration, block allocation, and ops checkpoints. Segregated from governance: cannot vote or reopen."
+    identity: opaque
+    exclusive_operations:
+      - "POST /service-lines, PATCH /service-lines/{id}"
+      - "POST /surgeons, POST /operating-rooms"
+      - "POST /blocks, POST /blocks/{id}/activate, POST /blocks/{id}/cancel"
+      - "POST /ops/release-sweep, POST /ops/scoring-run"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /blocks/{id}/release (shared with owning Surgeon)"
+      - "all GET endpoints"
+
+  - name: Surgeon
+    description: "Attending surgeon; posts and manages own cases, requests open-time reallocation, may release own surgeon-specific blocks early."
+    identity: "entity_backed:Surgeon"
+    exclusive_operations:
+      - "POST /cases (surgeon_id must equal X-User-ID)"
+      - "POST /cases/{id}/schedule, /reschedule, /cancel (own cases)"
+      - "POST /reallocation-requests, POST /reallocation-requests/{id}/withdraw (own)"
+    shared_operations:
+      - "POST /blocks/{id}/release (only when block.surgeon_id == X-User-ID)"
+      - "all GET endpoints"
+
+  - name: CirculatorNurse
+    description: "OR circulator; records actual case start and completion times."
+    identity: opaque
+    exclusive_operations:
+      - "POST /cases/{id}/start"
+      - "POST /cases/{id}/complete"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: AnesthesiaCoordinator
+    description: "Anesthesia coordinator; publishes and withdraws room-day coverage."
+    identity: opaque
+    exclusive_operations:
+      - "POST /anesthesia-coverages"
+      - "POST /anesthesia-coverages/{id}/withdraw"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: CommitteeMember
+    description: "Block committee voting member; may cast/re-cast votes. Cannot reopen reviews (chair) and cannot allocate blocks (admin)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /committee-reviews/{id}/votes"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: BlockCommitteeChair
+    description: "Committee chair; facilitates reviews. May reopen MAINTAIN-decided reviews but cannot vote (segregation of duties)."
+    identity: opaque
+    exclusive_operations:
+      - "POST /committee-reviews/{id}/reopen"
+    shared_operations:
+      - "all GET endpoints"
+
+  - name: Any
+    description: "Any authenticated role may read."
+    identity: opaque
+    shared_operations:
+      - "GET /service-lines, /service-lines/{id}, /service-lines/{id}/utilization-reports"
+      - "GET /surgeons, /surgeons/{id}, /operating-rooms"
+      - "GET /blocks, /blocks/{id}, /cases, /cases/{id}"
+      - "GET /anesthesia-coverages, /anesthesia-coverages/{id}"
+      - "GET /open-time-slots, /open-time-slots/{id}"
+      - "GET /reallocation-requests, /reallocation-requests/{id}"
+      - "GET /committee-reviews, /committee-reviews/{id}, /committee-reviews/{id}/votes"

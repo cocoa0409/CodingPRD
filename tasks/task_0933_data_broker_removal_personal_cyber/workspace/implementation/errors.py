@@ -1,0 +1,105 @@
+"""Error catalogue (PRD §5 / SCAFFOLD §1.6) -- 61 codes."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, message: str = None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS[error_id]
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_IDENTITY_UNRESOLVED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_ACCOUNT_NOT_FOUND": 404,
+    "ERR_MEMBER_NOT_FOUND": 404,
+    "ERR_PROFILE_NOT_FOUND": 404,
+    "ERR_BROKER_NOT_FOUND": 404,
+    "ERR_SCAN_NOT_FOUND": 404,
+    "ERR_EXPOSURE_NOT_FOUND": 404,
+    "ERR_REMOVAL_REQUEST_NOT_FOUND": 404,
+    "ERR_DOCUMENT_NOT_FOUND": 404,
+    "ERR_BREACH_EVENT_NOT_FOUND": 404,
+    "ERR_ALERT_NOT_FOUND": 404,
+    "ERR_FINDING_NOT_FOUND": 404,
+    "ERR_ADDON_NOT_FOUND": 404,
+    "ERR_SEAT_NOT_FOUND": 404,
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_VALIDATION": 422,
+    "ERR_INVALID_ENUM": 422,
+    "ERR_VALUE_OUT_OF_RANGE": 422,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_ACCOUNT_LEGAL_HOLD": 409,
+    "ERR_ACCOUNT_CANCELLED": 409,
+    "ERR_ACCOUNT_SUSPENDED": 409,
+    "ERR_AUTHORIZATION_REVOKED": 409,
+    "ERR_STALE_PROFILE_VERSION": 412,
+    "ERR_STALE_ADDON_VERSION": 412,
+    "ERR_STALE_ACCOUNT_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_PROFILE_NOT_ACTIVE": 409,
+    "ERR_MEMBER_NOT_ACTIVE": 409,
+    "ERR_BROKER_RETIRED": 409,
+    "ERR_ADDON_NOT_ACTIVE": 409,
+    "ERR_CYCLE_CLOSED": 409,
+    "ERR_IDENTITY_VERIFICATION_REQUIRED": 403,
+    "ERR_IDENTITY_DOCUMENT_EXPIRED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_SLA_NOT_ELAPSED": 409,
+    "ERR_RESCAN_TOO_SOON": 409,
+    "ERR_INITIAL_SCAN_ALREADY_DONE": 409,
+    "ERR_SEAT_REBIND_COOLOFF": 409,
+    "ERR_EXPOSURE_CHANNEL_BUFFER": 409,
+    "ERR_ESCALATION_CAP_REACHED": 409,
+    "ERR_SCAN_RETRY_CAP_REACHED": 409,
+    "ERR_DUPLICATE_REMOVAL_REQUEST": 409,
+    "ERR_DUPLICATE_IDENTIFIER": 409,
+    "ERR_IDENTIFIER_CAP_EXCEEDED": 409,
+    "ERR_DUPLICATE_MEMBER_EMAIL": 409,
+    "ERR_DUPLICATE_ADDON": 409,
+    "ERR_PROFILE_HAS_NO_IDENTIFIER": 409,
+    "ERR_MEMBER_CAP_EXCEEDED": 409,
+    "ERR_SEAT_CAPACITY_EXCEEDED": 409,
+    "ERR_PROFILE_QUOTA_EXCEEDED": 409,
+    "ERR_SCAN_QUOTA_EXCEEDED": 409,
+    "ERR_REMOVAL_QUOTA_EXCEEDED": 409,
+    "ERR_MEMBER_SUBCAP_EXCEEDED": 409,
+    "ERR_PLAN_DOWNGRADE_BELOW_USAGE": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing, empty or carry an unknown role.",
+    "ERR_ROLE_NOT_PERMITTED": "The supplied role is not authorized for this endpoint.",
+    "ERR_IDENTITY_UNRESOLVED": "The supplied X-User-ID does not resolve to a suitable member row.",
+    "ERR_NOT_RESOURCE_OWNER": "The caller may not address this resource.",
+    "ERR_VALIDATION": "The request body failed shape validation.",
+    "ERR_INVALID_ENUM": "An enum-typed field carries a value outside its declared member set.",
+    "ERR_VALUE_OUT_OF_RANGE": "A numeric field violates its range constraint.",
+    "ERR_INVALID_DATE_RANGE": "The supplied dates are not coherent.",
+}
+
+# Path-family -> 404 code (PRD §2.5)
+NOT_FOUND_FOR = {
+    "plan": "ERR_PLAN_NOT_FOUND",
+    "account": "ERR_ACCOUNT_NOT_FOUND",
+    "member": "ERR_MEMBER_NOT_FOUND",
+    "profile": "ERR_PROFILE_NOT_FOUND",
+    "broker": "ERR_BROKER_NOT_FOUND",
+    "scan": "ERR_SCAN_NOT_FOUND",
+    "exposure": "ERR_EXPOSURE_NOT_FOUND",
+    "removal_request": "ERR_REMOVAL_REQUEST_NOT_FOUND",
+    "document": "ERR_DOCUMENT_NOT_FOUND",
+    "breach_event": "ERR_BREACH_EVENT_NOT_FOUND",
+    "alert": "ERR_ALERT_NOT_FOUND",
+    "finding": "ERR_FINDING_NOT_FOUND",
+    "addon": "ERR_ADDON_NOT_FOUND",
+    "seat": "ERR_SEAT_NOT_FOUND",
+    "cycle": "ERR_CYCLE_NOT_FOUND",
+    "ledger_entry": "ERR_LEDGER_ENTRY_NOT_FOUND",
+}

@@ -1,0 +1,337 @@
+# Respite Care Voucher API — Product Requirements Document
+
+## 1. Introduction
+
+Family caregivers of people with chronic conditions and disabilities routinely reach a breaking point when no trusted, funded mechanism exists to step away for a few hours. State and philanthropic funders want to underwrite that relief — but only against a defensible audit trail showing that every hour was authorized against a capped grant, every visit was electronically verified, and every dollar was drawn from an accounted budget. The respite-care coordination and voucher service exists to bridge that gap: it enrolls caregivers, vets their eligibility, grants them quarterly hour allocations, issues time-boxed vouchers against those grants, matches them with credentialed providers, records electronic visit verification (EVV) at check-in and check-out, and settles claims against the program budget with a full ledger trail.
+
+The system is operated jointly by three working constituencies. Caregivers self-enroll, petition for eligibility, draw vouchers against their grant, book and rate providers, and appeal denials. Providers publish availability windows, confirm bookings, perform EVV check-in and check-out, and submit claims for payment. Coordinators and funder administrators staff the back office: coordinators review applications, manage lifecycle state, verify visits, triage and dispatch emergency requests, and run the operational clock; funder administrators own program configuration, posture, budget adjustments, claim adjudication, and reporting.
+
+Two concerns dominate the design. First, every hour and every cent must be tracked twice — once at the reservation layer (allocations, vouchers, bookings) and once at the money layer (budget ledger entries, claims, payments) — so that the books always reconcile. Second, the system runs on a deterministic logical clock (not wall time) so that expiry cascades, no-show detection, credential lapses, quarter rollovers, and report generation can all be reasoned about and tested reproducibly. Every rule below assumes that logical clock.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID` and `X-User-Role`. Both must be present, and the role must be one of the five declared roles — `Anonymous`, `Caregiver`, `Provider`, `Coordinator`, `FunderAdmin`. Missing or malformed headers are rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A role that is authenticated but not named in the endpoint's role list is rejected with `ERR_UNAUTHORIZED_ROLE` (HTTP 403). A third check applies when the acting role is entity-backed: if the `X-User-ID` does not match the resource's owning caregiver or provider field, the request is rejected with `ERR_FORBIDDEN_OWNERSHIP` (HTTP 403).
+
+Each role binds `X-User-ID` to identity differently. When `X-User-Role` is `Caregiver`, `X-User-ID` is the `id` of the acting `Caregiver`; ownership checks on any resource that references a `Caregiver` compare the resource's `caregiver_id` field to `X-User-ID`. When `X-User-Role` is `Provider`, `X-User-ID` is the `id` of the acting `Provider`; ownership checks on any resource that references a `Provider` compare the resource's `provider_id` field to `X-User-ID`. When `X-User-Role` is `Anonymous`, `Coordinator`, or `FunderAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity — the server may record it but does not compare it to any entity's `id`.
+
+The `Anonymous` role exists solely to permit self-registration of new caregivers and providers. The `Coordinator` role represents program operations staff: they review eligibility applications, drive caregiver and provider lifecycle transitions, adjust grants, revoke vouchers, verify visits, triage and dispatch emergency requests, and trigger ops-runs. The `FunderAdmin` role represents the funder's administrator: they own program configuration, posture transitions, budget adjustments, claim adjudication and payment, report-snapshot transitions, and the logical clock itself.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` defaults to 10, must be at least 1, and may not exceed 100. `offset` defaults to 0. The `meta` block of a list response always carries `limit`, `offset`, `total_count`, and `has_more`. Sort order is uniform across all list endpoints: results are ordered by `created_at` ascending.
+
+### 2.4. Common Resource Properties and the Append-Only Ledger
+
+Most persisted resources carry four system-managed fields in addition to their domain attributes. `id` is a server-minted UUID with no type prefix. `created_at` and `updated_at` are ISO 8601 UTC timestamps with three fractional digits; `updated_at` is refreshed on every mutation. `version` is an integer that starts at 1 on creation and increments by exactly 1 on every mutation of the resource — it is the optimistic-concurrency token and the audit sequence number. One entity deviates from this pattern: `BudgetLedgerEntry` is an append-only fact table and carries only `id` and `created_at`. It has no `updated_at` and no `version`, because ledger entries are never mutated after being written.
+
+### 2.5. Optimistic Concurrency Control on Budget and Grant Adjustments
+
+Two write endpoints accept an explicit OCC field so that a stale view of the parent resource can be detected before a mutation is applied. A request to create a budget adjustment against a `Program` must carry `expected_program_version`, equal to the `version` of the program the client last observed. A request to create a grant adjustment against an `Allocation` must carry `expected_allocation_version`, equal to the `version` of the allocation the client last observed. In either case, if the parent's current `version` has advanced beyond the client's supplied value, the request is rejected with `ERR_STALE_VERSION` (HTTP 412). No other endpoint takes a version field — the OCC contract is intentionally narrow and applies only to these two writes.
+
+### 2.6. The Fiscal Discipline: Caps, Encumbrance, and Ledger Reconciliation
+
+A `Program` is configured with `total_budget_cents` and maintains two running totals derived from the ledger. `encumbered_cents` is the outstanding encumbrance — the sum of provisional encumbrances held by non-terminal vouchers plus approved-but-unpaid claim amounts. `settled_cents` is the sum of `amount_cents` across all claims in `PAID` status. The difference, `unencumbered_cents`, is by definition `total_budget_cents` minus `encumbered_cents` minus `settled_cents`, and represents the budget still available to secure new obligations. Every movement of money is recorded as a `BudgetLedgerEntry` whose `entry_type` is one of `ENCUMBER`, `RELEASE`, `SETTLE`, `ADJUSTMENT`, and whose `amount_cents` is always positive — direction is implied by `entry_type`. Each entry also carries `ref_type` (a free-form label such as voucher, claim, or program), `ref_id` (the originating entity's identifier), and an optional human-readable `note`.
+
+Hours are capped at two nested scopes. The quarterly cap, `quarterly_cap_hours`, bounds reserved-plus-consumed hours for a caregiver within one fiscal quarter. The annual cap, `annual_cap_hours`, bounds the same sum across the full fiscal year. Quarters are three-calendar-month blocks anchored to the program's `fiscal_year_start`. All hour quantities are stored and compared at two decimal places; where rounding is required it is round half up.
+
+### 2.7. Rate Card, Multipliers, and Currency Precision
+
+A `Program` carries the full rate card used by claim and provisional calculations. `standard_rate_cents_per_hour` is the base hourly rate. `weekend_multiplier` (default 1.5) applies when the visit's `check_in_at` falls on a Saturday or Sunday in UTC. `evening_multiplier` (default 1.25) applies when the visit's `check_in_at` hour in UTC is at or after `evening_start_hour` (default 18) on a Monday-through-Friday. Weekend and evening multipliers never stack with each other — weekend wins over evening when both would otherwise apply. `credential_premium_multiplier` (default 1.10) applies when the billing provider's `credential_level` is `ENHANCED`. `emergency_multiplier` (default 2.0) applies when the booking's `is_emergency` flag is true. `max_overage_pct` (default 1.10) caps the payable minutes of a visit as a fraction of the booking's committed minutes. Monetary amounts are integer cents; each claim is rounded individually at creation, and downstream aggregates such as `total_paid_amount_cents` on a report snapshot sum those per-claim rounded integers rather than re-rounding a sum of unrounded values.
+
+### 2.8. Program Posture as a Gate
+
+A `Program` has a `posture` field with values `ENROLLMENT_OPEN`, `ENROLLMENT_PAUSED`, `PROGRAM_SUSPENDED`, and `CLOSED`. Posture gates child operations. Creating a caregiver or provider, or approving an eligibility application, requires `ENROLLMENT_OPEN`. Because a new caregiver or provider is not yet tied to any one program, the creation gate is evaluated against every program in the system: creation is rejected when any existing program's posture is not `ENROLLMENT_OPEN`, and passes trivially when no program exists. Creating vouchers, creating bookings, confirming or checking in to bookings, and driving claim actions are forbidden when posture is `PROGRAM_SUSPENDED` or `CLOSED`. A violation of either posture gate is rejected with `ERR_POSTURE_GATE` (HTTP 409). The full transition graph between postures, and the precondition for entering `CLOSED`, is described in §3.1.
+
+### 2.9. Validation Priority Order
+
+When a request fails more than one rule, the rejection returned is determined by a fixed priority order. From highest priority to lowest, the order is: (1) authentication (`ERR_UNAUTHENTICATED`); (2) role authorization (`ERR_UNAUTHORIZED_ROLE`); (3) entity-backed ownership (`ERR_FORBIDDEN_OWNERSHIP`); (4) request schema (`ERR_INVALID_REQUEST`); (5) path and body id resolution (the appropriate `ERR_*_NOT_FOUND`); (6) program posture (`ERR_POSTURE_GATE`); (7) generic state-machine validity (`ERR_INVALID_STATE`); (8) caregiver-active requirements for voucher, booking, and emergency creation (`ERR_CAREGIVER_NOT_ACTIVE`); (9) provider credential requirements for window, booking, confirm, and check-in (`ERR_PROVIDER_NOT_ACTIVE`); (10) the redetermination-overdue gate on voucher creation (`ERR_REDETERMINATION_OVERDUE`); (11) allocation-caregiver match on voucher creation (`ERR_ALLOCATION_CAREGIVER_MISMATCH`); (12) caregiver email uniqueness (`ERR_DUPLICATE_EMAIL`); (13) provider window overlap (`ERR_WINDOW_OVERLAP`); (14) window capacity (`ERR_WINDOW_CAPACITY_FULL`); (15) caregiver double-booking buffer (`ERR_CAREGIVER_DOUBLE_BOOKED`); (16) one survey per booking (`ERR_DUPLICATE_SURVEY`); (17) booking-end versus voucher expiry (`ERR_BOOKING_BEYOND_VOUCHER_EXPIRY`); (18) EVV check-in window (`ERR_EVV_OUTSIDE_WINDOW`); (19) claim appeal window (`ERR_APPEAL_WINDOW_CLOSED`); (20) emergency window in the future (`ERR_EMERGENCY_WINDOW_PAST`); (21) allocation sufficient hours (`ERR_INSUFFICIENT_HOURS`); (22) quarterly cap (`ERR_QUARTERLY_CAP_EXCEEDED`); (23) annual cap (`ERR_ANNUAL_CAP_EXCEEDED`); (24) budget encumbrance (`ERR_BUDGET_EXCEEDED`); (25) emergency reserve (`ERR_EMERGENCY_RESERVE_EXHAUSTED`); (26) provider selector pool (`ERR_NO_PROVIDER_AVAILABLE`); (27) voucher issuable state (`ERR_VOUCHER_NOT_ISSUABLE`); (28) booking confirmed state for check-in (`ERR_BOOKING_NOT_CONFIRMED`); (29) no already-open visit for check-in (`ERR_EVV_ALREADY_OPEN`). A request that fails several of these surfaces the error whose rule sits earliest in this list.
+
+### 2.10. The Logical Clock and the Ops-Run
+
+The server maintains a logical clock, distinct from wall-clock time. At startup the logical clock reads exactly `2026-05-01T00:00:00Z`; it never falls back to wall time. An administrator with the `FunderAdmin` role can advance the clock by posting a `to_iso8601` timestamp to the test-driving capability; the response echoes the new value as `current_utc`. Everywhere this document says "now", it refers to the logical clock. The ops-run is the mechanism by which the logical clock's passage is made visible to the system: a single ops-run sweeps voucher expiries, marks no-shows, auto-closes stale visits, lapses provider credentials, flags caregiver redeterminations, closes past availability windows, and emits a new `ReportSnapshot`. A `run_type` of `QUARTER_ROLLOVER` additionally closes allocations whose period has ended and creates next-quarter grants. Each ops-run increments the program's `ops_run_index` (which starts at 0 on program creation) by 1 and bumps `Program.version` by 1.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Program Configuration, Posture, and Budget Stewardship
+
+A `FunderAdmin` establishes a new respite program by supplying its `name`, the `fiscal_year_start` anchor (a date string of the form YYYY-MM-DD; quarters are three-calendar-month blocks from this date), `total_budget_cents`, `quarterly_cap_hours`, `annual_cap_hours`, `standard_rate_cents_per_hour`, and `emergency_reserve_hours`. Every resource that hangs off a program — allocation, voucher, ledger entry, report snapshot, and the rest — records its owning program's identifier on a `program_id` field. The optional rate-card fields — `weekend_multiplier`, `evening_multiplier`, `evening_start_hour`, `emergency_multiplier`, `credential_premium_multiplier`, `max_overage_pct`, `voucher_expiry_days`, `carryover_cap_pct`, `no_show_grace_minutes`, `auto_close_grace_hours`, and `appeal_window_days` — take their defaults from §2.7 and elsewhere when omitted. On creation the program's `posture` is `ENROLLMENT_OPEN` and `ops_run_index` is 0.
+
+Posture transitions are driven by a `FunderAdmin` posting a `target_posture` (with an optional `reason`) to the program's posture endpoint. The permitted moves are: `ENROLLMENT_OPEN` ↔ `ENROLLMENT_PAUSED` in either direction; `ENROLLMENT_OPEN` → `PROGRAM_SUSPENDED`; `ENROLLMENT_PAUSED` → `PROGRAM_SUSPENDED`; `PROGRAM_SUSPENDED` → `ENROLLMENT_OPEN`; and `ENROLLMENT_OPEN` → `CLOSED`. Each successful posture change increments `Program.version` by 1. The transition into `CLOSED` is guarded: it is permitted only when the program has no voucher in `ISSUED`, `COMMITTED`, or `REDEEMED` status; no claim in `DRAFT`, `SUBMITTED`, `APPROVED`, or `APPEALED` status; and no booking in `PENDING_CONFIRMATION`, `CONFIRMED`, or `IN_SERVICE` status. If any such live child exists, the posture change is rejected with `ERR_POSTURE_GATE`. `CLOSED` is terminal.
+
+Budget adjustments against a program are also a `FunderAdmin` operation. The request carries `delta_cents` (which may be negative), a `reason`, and the OCC field `expected_program_version`. If the program's `version` has advanced since the client last read it, the request is rejected with `ERR_STALE_VERSION` (HTTP 412). When applied, the adjustment adds `delta_cents` to `total_budget_cents` — but the resulting total must remain at least the sum of `encumbered_cents` and `settled_cents`; a delta that would drive the total below the outstanding obligations is rejected as an invalid request. Each successful adjustment appends a `BudgetLedgerEntry` of `entry_type` `ADJUSTMENT` and increments `Program.version` by 1. The ledger itself is readable by `FunderAdmin` and `Coordinator` and may be filtered by `entry_type`; entries are returned newest first, and entries sharing the same `created_at` (the logical clock may not advance between appends within a single request) are ordered most-recently-appended first.
+
+### 3.2. Caregiver Enrollment and the Eligibility Conversation
+
+A new caregiver is enrolled either self-service (role `Anonymous`) or by a `Coordinator`. The enrollment request carries `full_name`, `email`, `care_recipient_name`, and `care_recipient_condition`. The `email` must be unique across caregivers; a duplicate is rejected with `ERR_DUPLICATE_EMAIL` (HTTP 409). A new caregiver starts in `ENROLLED` status with `redetermination_due_at` null.
+
+An enrolled caregiver applies for eligibility by submitting an application carrying a `need_score` (an assessed need from 1 to 10) and optional `notes`. The application is created in `SUBMITTED` status with `revision_count` 0, `review_note` null, and `decided_at` null. From `SUBMITTED`, a `Coordinator` has four moves available, each made by posting a review decision with an `action` and an optional `note`. Posting `action` `REQUEST_INFO` moves the application to `INFO_REQUESTED` and records the note on `review_note`. Posting `action` `APPROVE` moves the application to `APPROVED` — but only when the program's posture is `ENROLLMENT_OPEN`; otherwise the decision is rejected with `ERR_POSTURE_GATE`. Posting `action` `DENY` moves the application to `DENIED`. Posting `action` `WITHDRAW` moves the application to `WITHDRAWN`. Any other from-state for one of these actions is rejected with `ERR_INVALID_STATE` (HTTP 409).
+
+An application in `INFO_REQUESTED` can be resubmitted by its owning caregiver, which returns it to `SUBMITTED` and increments `revision_count` by 1. An application in `DENIED` can be appealed by its owning caregiver, but only when the logical clock is at or before `decided_at` plus thirty days; a later appeal is rejected as outside the appeal window. An appeal moves the application to `APPEALED`. From `APPEALED`, a coordinator may again `APPROVE` (subject to the same `ENROLLMENT_OPEN` posture gate) or `DENY`, in which case the application lands in `DENIED_FINAL`. The terminal states are `APPROVED`, `DENIED_FINAL`, and `WITHDRAWN`.
+
+The `APPROVE` decision has a side effect on the caregiver. If the caregiver is currently `ENROLLED`, they move to `ACTIVE`; if they are currently `REDETERMINATION_PENDING`, they also move back to `ACTIVE`. Either way, `redetermination_due_at` is set to the logical clock time plus 365 days, and — if the caregiver does not already have an `OPEN` allocation for the current fiscal quarter — the system auto-creates one. The auto-created allocation's `granted_hours` equals the program's `quarterly_cap_hours`, its `available_hours` equals `granted_hours`, all other buckets start at 0, and its status is `OPEN`. Its `period_start` and `period_end` are derived from the program's fiscal calendar at creation time. Every approval, denial, request-for-info, resubmit, appeal, and withdraw increments the application's `version` by 1; caregiver-state side effects increment the caregiver's `version` by 1.
+
+### 3.3. Allocations and the Quarterly Grant Lifecycle
+
+An `Allocation` is a caregiver's grant for one fiscal quarter of one program. It tracks six hour buckets at two decimal places. `granted_hours` is the total grant, set at creation and adjusted only by grant adjustments. `available_hours` is the hours issuable to new vouchers. `reserved_hours` is the hours currently held by non-terminal vouchers. `consumed_hours` is the hours redeemed by verified visits. `expired_hours` is the hours forfeited by voucher expiry. `revoked_hours` is the hours clawed back by revocation or suspension. An allocation's `status` is `OPEN`, `FROZEN`, or `CLOSED`; it starts as `OPEN`.
+
+A `Coordinator` may adjust a grant by posting a grant adjustment carrying `delta_hours` (which may be negative), a `reason`, and the OCC field `expected_allocation_version`. If the allocation's `version` has advanced since the client last read it — because a voucher issue, redeem, or revoke cascade has touched it, or because a prior adjustment did — the request is rejected with `ERR_STALE_VERSION` (HTTP 412). When applied, `delta_hours` is added to both `granted_hours` and `available_hours`; the resulting `granted_hours` must remain at least the sum of `reserved_hours`, `consumed_hours`, `expired_hours`, and `revoked_hours`. A successful adjustment increments the allocation's `version` by 1.
+
+### 3.4. Issuing Vouchers against Caps and Budget
+
+A voucher is the instrument a caregiver uses to book respite hours. Either a `Caregiver` (against their own allocation) or a `Coordinator` may issue one, supplying `allocation_id`, `caregiver_id`, and `authorized_hours`. The `authorized_hours` must be a multiple of 0.25 within the range 1.00 to 80.00 inclusive — any other shape is rejected with `ERR_INVALID_REQUEST`. The issuing caregiver must be in `ACTIVE` status; a caregiver in `ENROLLED`, `SUSPENDED`, or `DISENROLLED` is rejected with `ERR_CAREGIVER_NOT_ACTIVE`, and a caregiver in `REDETERMINATION_PENDING` is rejected with the more specific `ERR_REDETERMINATION_OVERDUE`. The program's posture must be neither `PROGRAM_SUSPENDED` nor `CLOSED`, or the issue is rejected with `ERR_POSTURE_GATE`. The referenced allocation must belong to the named caregiver and must be in `OPEN` status, or the issue is rejected with `ERR_ALLOCATION_CAREGIVER_MISMATCH`.
+
+Issuance then evaluates the availability calculation in a pinned order. First, every voucher of the allocation whose `expires_at` is at or before now and whose stored status is `ISSUED` or `COMMITTED` is treated as already-forfeited for the purposes of this computation — its hours count as unavailable regardless of stored status. Second, the candidate ceiling is the allocation's `available_hours`. Third, the quarter load is the sum, across all of the caregiver's allocations sharing the same fiscal quarter, of `reserved_hours` plus `consumed_hours`. Fourth, the annual load is the same sum across all of the caregiver's allocations in the fiscal year. The maximum issuable is the smallest of three quantities: the allocation's `available_hours`, the program's `quarterly_cap_hours` minus the quarter load, and the program's `annual_cap_hours` minus the annual load. If `authorized_hours` exceeds that maximum, the rejection is chosen by which bound is binding: when `authorized_hours` exceeds `available_hours` the error is `ERR_INSUFFICIENT_HOURS`; otherwise when the quarterly cap is the binding constraint the error is `ERR_QUARTERLY_CAP_EXCEEDED`; otherwise the error is `ERR_ANNUAL_CAP_EXCEEDED`. A further fiscal check applies: the provisional encumbrance, computed as `authorized_hours` multiplied by the program's `standard_rate_cents_per_hour`, must not exceed the program's `unencumbered_cents`, or the issue is rejected with `ERR_BUDGET_EXCEEDED`.
+
+On successful issue the voucher is created in `ISSUED` status with `is_emergency` false, `committed_hours`, `consumed_hours`, `released_hours`, and `forfeited_hours` all zero, `issued_at` set to the logical clock, and `expires_at` set to `issued_at` plus the program's `voucher_expiry_days` (default 90 days). The allocation's `available_hours` is reduced by `authorized_hours` and its `reserved_hours` is increased by the same amount, and the allocation's `version` increments. A `BudgetLedgerEntry` of `entry_type` `ENCUMBER` is appended for the provisional amount, and `Program.version` increments by 1.
+
+A `Coordinator` may revoke an `ISSUED` voucher by posting to its revoke endpoint with an optional `reason`. The revocation sets the voucher's `forfeited_hours` to `authorized_hours` minus `consumed_hours`, moves the voucher to `REVOKED`, decrements the allocation's `reserved_hours` by `forfeited_hours` and increments its `revoked_hours` by the same, and appends a `RELEASE` ledger entry for the remaining provisional encumbrance. The voucher, allocation, and program each increment their `version` by 1. The same bucket and ledger effects apply when a voucher is revoked as part of a caregiver suspension or disenrollment cascade — see §3.8.
+
+### 3.5. Providers, Credentials, and Availability Windows
+
+A provider is registered either self-service (role `Anonymous`) or by a `Coordinator`. The registration request carries `name`, `credential_level` (one of `STANDARD` or `ENHANCED`), `service_zip`, and an optional `accepts_emergency` flag (default false). A new provider starts with `credential_status` `APPLIED` and `credential_expires_at` null.
+
+Credential lifecycle transitions are driven by a `Coordinator` posting a `target_status` with an optional `reason` to the provider's status-transitions endpoint. From `APPLIED`, a provider may be activated to `ACTIVE` or terminated to `TERMINATED`. From `ACTIVE`, a provider may be suspended to `SUSPENDED` or terminated to `TERMINATED`. From `SUSPENDED`, a provider may be reinstated to `ACTIVE` or terminated to `TERMINATED`. From `LAPSED`, a provider may be reinstated to `ACTIVE`. Every activation sets `credential_expires_at` to the logical clock time plus 180 days. A reinstatement from `SUSPENDED` additionally clears `suspension_reason` to null. A suspension records the supplied `reason` on `suspension_reason` — and importantly, suspension only gates new bookings and new windows; existing bookings and existing windows are not cascaded. Termination from `ACTIVE` or `SUSPENDED` is permitted only when the provider has no bookings in `PENDING_CONFIRMATION`, `CONFIRMED`, or `IN_SERVICE` status; a violation is rejected with `ERR_INVALID_STATE`. `TERMINATED` is terminal. Independently of coordinator action, an ops-run that observes `credential_expires_at` at or before now moves an `ACTIVE` provider to `LAPSED`. Every transition increments the provider's `version` by 1.
+
+A provider whose `credential_status` is `ACTIVE` may publish availability windows by posting `start_at`, `end_at`, and `capacity`. The window's interval is half-open — it covers the period from `start_at` up to but not including `end_at`. Within a single provider, windows must not overlap; touching endpoints are allowed. An overlap is rejected with `ERR_WINDOW_OVERLAP` (HTTP 409). `capacity` is the maximum number of overlapping non-cancelled bookings the window will accept and must be at least 1. A new window starts in `OPEN` status. When booking activity raises the window's maximum overlap count to its capacity, the window transitions to `FULLY_BOOKED`; when a cancellation or no-show drops the overlap count back below capacity, the window returns to `OPEN`. A provider may withdraw one of their own windows (whether `OPEN` or `FULLY_BOOKED`) by posting to its close endpoint, but only when no booking in `PENDING_CONFIRMATION`, `CONFIRMED`, or `IN_SERVICE` references it; the window then transitions to `WITHDRAWN`. An ops-run that observes a window's `end_at` at or before now moves it to `CLOSED`. Each of these transitions increments the window's `version` by 1.
+
+### 3.6. Booking a Visit: Explicit Pinning and the Auto-Matcher
+
+A booking is requested by a `Caregiver` (for themselves) or a `Coordinator`. The request carries `voucher_id`, `caregiver_id`, `match_mode`, `start_at`, `end_at`, and — depending on mode — `provider_id` and `window_id`. The `end_at` must be after `start_at`. The booking's interval is half-open: it covers the period from `start_at` up to but not including `end_at`. The booking's `committed_minutes` is the duration in whole minutes between `start_at` and `end_at`.
+
+The caregiver on the booking must be in `ACTIVE` status — otherwise the create is rejected with `ERR_CAREGIVER_NOT_ACTIVE`. The program posture must not be `PROGRAM_SUSPENDED` or `CLOSED`, or the create is rejected with `ERR_POSTURE_GATE`. The voucher must be in `ISSUED` or `COMMITTED` status with sufficient unconsumed hours: the existing `committed_hours` plus the new booking's duration must not exceed `authorized_hours` minus `consumed_hours` minus `released_hours` minus `forfeited_hours`. A violation is rejected with `ERR_VOUCHER_NOT_ISSUABLE`. The booking's `end_at` must be at or before the voucher's `expires_at`, or the create is rejected with `ERR_BOOKING_BEYOND_VOUCHER_EXPIRY`. Independently, the caregiver must not already have another non-cancelled booking too close in time: the new booking's interval padded by thirty minutes on each side must not intersect any existing non-cancelled booking interval of the same caregiver. A violation is rejected with `ERR_CAREGIVER_DOUBLE_BOOKED` (HTTP 409).
+
+In `EXPLICIT` match mode the request pins `provider_id` and `window_id`. The named provider must have `credential_status` `ACTIVE`, or the create is rejected with `ERR_PROVIDER_NOT_ACTIVE`. The named window must contain the booking's interval, and the new booking must fit within the window's remaining capacity: the overlap count is evaluated against the new booking's interval — only the window's existing non-cancelled bookings whose intervals intersect the new booking's interval participate in the count — and that count must be strictly below the window's `capacity` (so the new booking may raise the window's overlap to at most `capacity`); a violation is rejected with `ERR_WINDOW_CAPACITY_FULL`. In `AUTO` match mode the request omits `provider_id` and `window_id`, and the system runs the auto-match selector. The candidate pool is every provider with `credential_status` `ACTIVE` for whom there exists an availability window in `OPEN` or `FULLY_BOOKED` status whose interval contains the booking's interval and whose overlap count — evaluated the same way, over the window's existing non-cancelled bookings intersecting the requested interval — is below its `capacity`. The pool is ranked by `quality_score_weighted` descending with nulls last, with ties broken by provider `created_at` ascending (never by `id`). An empty pool is rejected with `ERR_NO_PROVIDER_AVAILABLE`. The selected window is the chosen provider's eligible window with the earliest `start_at`, with ties broken by window `created_at` ascending. A booking created this way has `auto_matched` true.
+
+A successful create lands the booking in `PENDING_CONFIRMATION` with `is_emergency` false and `emergency_request_id` null. On the voucher side, the voucher is left in `COMMITTED` status (transitioning from `ISSUED` when it was `ISSUED`), its `committed_hours` is increased by the booking's duration in hours, and its `version` increments by 1. On the window side, the window's overlap count increases; if the count reaches `capacity`, the window transitions from `OPEN` to `FULLY_BOOKED` and its `version` increments by 1.
+
+### 3.7. Confirmation, Cancellation, No-Show, and Check-In
+
+A booking in `PENDING_CONFIRMATION` is confirmed by its owning provider. Confirming computes the booking's `provisional_amount_cents` as the `committed_minutes` multiplied by the program's `standard_rate_cents_per_hour`, divided by 60, and rounded half up to integer cents. The booking transitions to `CONFIRMED` and its `version` increments by 1. Confirming requires the provider's `credential_status` to be `ACTIVE` and the program's posture to be neither `PROGRAM_SUSPENDED` nor `CLOSED` — violations are rejected with `ERR_PROVIDER_NOT_ACTIVE` and `ERR_POSTURE_GATE` respectively.
+
+Cancellation is available to the owning caregiver, the owning provider, or a coordinator, with an optional `reason`. A booking in either `PENDING_CONFIRMATION` or `CONFIRMED` may be cancelled; the booking transitions to `CANCELLED` and `cancel_reason` is set to the supplied reason. The cancellation releases the voucher commitment: the voucher's `committed_hours` is reduced by the booking's `committed_minutes` divided by 60, and if every booking of the voucher is now in `CANCELLED` or `NO_SHOW` status, the voucher transitions back from `COMMITTED` to `ISSUED` with its `committed_hours` reset to 0. The cancellation also releases window capacity: the window's overlap count drops, and a `FULLY_BOOKED` window whose overlap count falls below `capacity` returns to `OPEN`. Both the booking's and the voucher's `version` increment by 1.
+
+Check-in is the EVV act that starts service. It is performed by the owning provider on a booking in `CONFIRMED` status — attempting it on any other status is rejected with `ERR_BOOKING_NOT_CONFIRMED`. Check-in is permitted only when the logical clock is at or after `start_at` minus 15 minutes and at or before `end_at`; outside that window the request is rejected with `ERR_EVV_OUTSIDE_WINDOW`. There must be no `OPEN` visit record already attached to the booking; a duplicate is rejected with `ERR_EVV_ALREADY_OPEN`. The request carries a `check_in_location` geo string. A successful check-in creates a `VisitRecord` in `OPEN` status with `check_in_at` set to the logical clock time, moves the booking from `CONFIRMED` to `IN_SERVICE`, and increments the booking's `version` by 1. The new visit record's `check_out_at`, `verified_minutes`, and `payable_minutes` are null while it is open, its `tasks_completed` is an empty array, and `auto_closed` is false.
+
+If a booking in `CONFIRMED` never receives a check-in, an ops-run that observes `start_at` plus the program's `no_show_grace_minutes` (default 30) earlier than now, with no visit record present, transitions the booking to `NO_SHOW`. The voucher and window release effects are the same as a cancellation. The booking's `version` increments by 1.
+
+### 3.8. Caregiver Suspension, Reinstatement, Redetermination, and Disenrollment
+
+A `Coordinator` drives caregiver lifecycle transitions by posting a `target_status` and optional `reason` to the caregiver's status-transitions endpoint. Three moves are available. From `ENROLLED`, the caregiver may be moved directly to `DISENROLLED` with no preconditions. From `ACTIVE`, the caregiver may be moved to `SUSPENDED` or to `DISENROLLED`. From `SUSPENDED`, the caregiver may be reinstated to `ACTIVE`. Any other pairing is rejected with `ERR_INVALID_STATE`.
+
+Suspension from `ACTIVE` triggers a multi-entity cascade. Every `OPEN` allocation of the caregiver transitions to `FROZEN` and increments its `version`. Each frozen allocation's `ISSUED` vouchers transition to `REVOKED`; on each such voucher `forfeited_hours` is set to `authorized_hours` minus `consumed_hours`, the allocation's `reserved_hours` is decremented by `forfeited_hours`, its `revoked_hours` is incremented by the same, and a `RELEASE` ledger entry is appended for the remaining provisional encumbrance. Each voucher in `COMMITTED` first has its bookings in `PENDING_CONFIRMATION` or `CONFIRMED` cancelled with `cancel_reason` `SYSTEM_SUSPENSION`; each cancelled booking frees its availability-window overlap count, and a `FULLY_BOOKED` window whose count drops below capacity returns to `OPEN`. Only after those bookings are cancelled does the `COMMITTED` voucher itself transition to `REVOKED` with the same bucket and ledger effects as above. The caregiver's `version` increments by 1.
+
+Reinstatement from `SUSPENDED` to `ACTIVE` is permitted only when `redetermination_due_at` is null or lies in the future. On reinstatement every `FROZEN` allocation of the caregiver returns to `OPEN` and increments its `version`, and the caregiver's `version` increments by 1.
+
+Redetermination is driven by the ops-run, not by a coordinator. When an ops-run observes that a caregiver in `ACTIVE` has `redetermination_due_at` at or before now, the caregiver transitions to `REDETERMINATION_PENDING` and its `version` increments by 1. From `REDETERMINATION_PENDING` the only way back to `ACTIVE` is a fresh eligibility application approval — see §3.2. A caregiver in `REDETERMINATION_PENDING` may not receive new vouchers (`ERR_REDETERMINATION_OVERDUE`), and may not create bookings or emergency requests (`ERR_CAREGIVER_NOT_ACTIVE`).
+
+Disenrollment from `ACTIVE` is guarded: it is permitted only when the caregiver has no bookings in `PENDING_CONFIRMATION`, `CONFIRMED`, or `IN_SERVICE`. When applied, every `OPEN` allocation transitions to `CLOSED`, and its `ISSUED` vouchers are revoked with the same bucket and ledger effects as in suspension. The caregiver's `version` increments by 1.
+
+### 3.9. Visit Checkout, Verification, and the Claim Cascade
+
+A visit in `OPEN` is checked out by its owning provider. The check-out request may carry `tasks_completed` (an array of task codes) and `notes`. The system also auto-closes stale visits: an ops-run that observes a booking's `end_at` plus the program's `auto_close_grace_hours` (default 2 hours) earlier than now closes the visit on the provider's behalf, setting `check_out_at` to the booking's `end_at` and `auto_closed` to true.
+
+Either path computes the verified and payable minutes in a pinned order. The elapsed minutes between `check_in_at` and `check_out_at` is taken in whole minutes. `verified_minutes` is that elapsed time rounded up to the nearest 15-minute unit — that is, 15 multiplied by the round-half-up of the elapsed minutes divided by 15. `payable_minutes` is the smaller of `verified_minutes` and the floor of the booking's `committed_minutes` multiplied by the program's `max_overage_pct`. The visit transitions from `OPEN` to `SUBMITTED` and its `version` increments by 1.
+
+A coordinator then verifies or rejects the submitted visit by posting a `decision` and optional `reason` to the visit's verification-decisions endpoint. A `REJECT` decision sets the visit's `rejection_reason` to the supplied reason, moves the visit to `REJECTED`, and increments its `version`. A `VERIFY` decision moves the visit to `VERIFIED` (the terminal state of the visit machine) and fires a larger cascade. A `Claim` is created in `DRAFT` status for the visit (exactly one claim per visit); the claim records the visit on its `visit_record_id` field, carries the voucher on `voucher_id` and the billing provider on `provider_id`, takes its `provisional_amount_cents` from the booking, and computes its `amount_cents` per the final-amount calculation described in §3.10. The visit's booking transitions from `IN_SERVICE` to `COMPLETED`. The voucher transitions from `COMMITTED` to `REDEEMED`: its `consumed_hours` is increased by the verified hours, its `committed_hours` is reset to 0, and its `released_hours` is set to `authorized_hours` minus `consumed_hours` minus `forfeited_hours`. The voucher's allocation absorbs the corresponding bucket shifts when the allocation is `OPEN`: its `reserved_hours` is decremented by the voucher's `authorized_hours`, its `consumed_hours` is incremented by the verified hours, and its `available_hours` is incremented by the voucher's `released_hours`. On the budget side, the voucher's provisional encumbrance is released (a `RELEASE` ledger entry) and the claim's `amount_cents` is encumbered (an `ENCUMBER` ledger entry). The visit's `version` increments by 1.
+
+A provider whose visit has been rejected may resubmit it with corrected times. The resubmit may carry replacement `check_in_at`, `check_out_at`, and `notes`. When times are supplied they replace the originals, and `verified_minutes` and `payable_minutes` are recomputed by the same formulas. The `rejection_reason` is cleared to null, the visit moves from `REJECTED` back to `SUBMITTED`, and its `version` increments by 1.
+
+### 3.10. Claim Adjudication, Appeal, Payment, and Final Amount
+
+The final amount of a claim is computed at the moment the claim is created in `DRAFT`, in a pinned evaluation order. First, `payable_minutes` of the verified visit is the base quantity. Second, a day multiplier is chosen: if the visit's `check_in_at` falls on a Saturday or Sunday in UTC the multiplier is the program's `weekend_multiplier`; otherwise if the UTC hour of `check_in_at` is at or after the program's `evening_start_hour` the multiplier is the program's `evening_multiplier`; otherwise the multiplier is 1.0. Weekend and evening multipliers never stack — weekend wins when both would otherwise apply. Third, a credential multiplier is applied: the program's `credential_premium_multiplier` when the billing provider's `credential_level` is `ENHANCED`, else 1.0. Fourth, an emergency multiplier is applied: the program's `emergency_multiplier` when the booking's `is_emergency` is true, else 1.0. The claim's `amount_cents` is then the base minutes multiplied by the program's `standard_rate_cents_per_hour`, multiplied by all three applicable multipliers, divided by 60, and rounded half up to integer cents. This final amount differs deliberately from the provisional amount computed at booking confirmation: the provisional uses only `committed_minutes` and the standard rate, with no day, credential, or emergency multipliers and no payable-minute capping, so identical service can yield different provisional and final figures.
+
+A claim in `DRAFT` is submitted by its owning provider, transitioning it to `SUBMITTED` and incrementing its `version`. A `FunderAdmin` then adjudicates a `SUBMITTED` (or `APPEALED`) claim by posting a `decision` of `APPROVE` or `DENY` with an optional `reason`. An approval moves the claim to `APPROVED` and sets `decided_at` to the logical clock time; when the claim was in `APPEALED` rather than `SUBMITTED`, an approval additionally re-encumbers the claim's `amount_cents` (an `ENCUMBER` ledger entry, reversing the release that happened at denial) and increments `Program.version` by 1. A denial moves a `SUBMITTED` claim to `DENIED` or an `APPEALED` claim to `DENIED_FINAL`, sets `denial_reason` to the supplied reason, sets `decided_at` to the logical clock time, and appends a `RELEASE` ledger entry for the claim's `amount_cents`. Every adjudication increments the claim's `version` by 1.
+
+A claim in `DENIED` may be appealed by its owning provider, but only when the logical clock is at or before `decided_at` plus the program's `appeal_window_days` (default 30 days). A later appeal is rejected with `ERR_APPEAL_WINDOW_CLOSED`. An appeal moves the claim to `APPEALED` and increments its `version`.
+
+A claim in `APPROVED` is paid by a `FunderAdmin`. Payment appends a `SETTLE` ledger entry for `amount_cents` — which decrements the program's `encumbered_cents` by `amount_cents` and increments its `settled_cents` by the same amount — sets `paid_at` to the logical clock time, moves the claim to `PAID`, and increments both the claim's and the program's `version` by 1. If after this payment the voucher has no claim in `DRAFT`, `SUBMITTED`, `APPROVED`, or `APPEALED` status and no booking in `PENDING_CONFIRMATION`, `CONFIRMED`, or `IN_SERVICE` status, the voucher transitions from `REDEEMED` to `SETTLED`.
+
+### 3.11. Emergency Respite: Triage, Dispatch, and Reserve Accounting
+
+A caregiver in `ACTIVE` status (or a coordinator on their behalf) creates an emergency request carrying `caregiver_id`, `needed_start_at`, `needed_end_at`, and a `reason`. The `needed_start_at` must lie in the future — a request whose needed window has already begun is rejected with `ERR_EMERGENCY_WINDOW_PAST`. The system computes `requested_hours` as the interval from `needed_start_at` to `needed_end_at` in hours, at two decimal places. The new request lands in `OPEN` status with `approved_hours`, `dispatched_booking_id`, and `selected_provider_id` all null.
+
+A coordinator triages an `OPEN` request by posting `approved_hours` and an optional `note`. The same future-window rule applies at triage time: if `needed_start_at` is no longer in the future, triage is rejected with `ERR_EMERGENCY_WINDOW_PAST`. Triage is also gated by the reserve: the program's `emergency_hours_used` plus the requested `approved_hours` must not exceed the program's `emergency_reserve_hours`, or triage is rejected with `ERR_EMERGENCY_RESERVE_EXHAUSTED`. A successful triage records `approved_hours`, moves the request to `TRIAGED`, and increments its `version`.
+
+Dispatch turns a `TRIAGED` request into live coverage. The emergency dispatch selector first builds a candidate pool: providers whose `credential_status` is `ACTIVE`, whose `accepts_emergency` is true, and who have no booking in `CONFIRMED` or `IN_SERVICE` status overlapping the needed interval (treated as half-open). An empty pool is rejected with `ERR_NO_PROVIDER_AVAILABLE`. The pool is ranked by `quality_score_weighted` descending with nulls last, with ties broken by provider `created_at` ascending. Dispatch then performs four side effects. First, an emergency voucher is created in `ISSUED` status with `allocation_id` null, `is_emergency` true, `authorized_hours` equal to `approved_hours`, and `expires_at` equal to `needed_end_at`. Second, a provisional encumbrance is recorded against the program budget: `approved_hours` multiplied by `standard_rate_cents_per_hour` multiplied by `emergency_multiplier`; if this exceeds the program's `unencumbered_cents` the dispatch is rejected with `ERR_BUDGET_EXCEEDED`. Third, a booking is created directly in `CONFIRMED` status with `is_emergency` true, `window_id` null, and its start and end taken from the needed interval; the voucher moves from `ISSUED` to `COMMITTED` with `committed_hours` equal to `approved_hours`. Fourth, the program's `emergency_hours_used` is incremented by `approved_hours`. The request's `selected_provider_id` and `dispatched_booking_id` are recorded, the request transitions to `DISPATCHED`, and both the request's and the program's `version` increment by 1.
+
+A `DISPATCHED` request transitions to `FULFILLED` automatically when its dispatched booking reaches `COMPLETED`. An `OPEN` or `TRIAGED` request whose `needed_start_at` falls at or before now is moved to `EXPIRED` by an ops-run. An `OPEN` or `TRIAGED` request may also be cancelled by its owning caregiver or a coordinator, moving it to `CANCELLED`. Each of these transitions increments the request's `version` by 1.
+
+### 3.12. Satisfaction Surveys and Provider Quality Scores
+
+After a booking reaches `COMPLETED`, the owning caregiver may submit a satisfaction survey carrying a `rating` from 1 to 5, a `would_rebook` boolean, and optional `comments`. Only one survey is permitted per booking; a second attempt is rejected with `ERR_DUPLICATE_SURVEY` (HTTP 409). The survey records its `booking_id`, the authoring `caregiver_id`, and the subject `provider_id`.
+
+Each new survey immediately recomputes two quality scores on the provider. `quality_score_simple` is the unweighted mean of all the provider's survey ratings, rounded half up to two decimal places. `quality_score_weighted` is a recency-decay weighted mean: each survey's rating is weighted by 0.5 raised to the power of (whole days between the survey's `created_at` and now, divided by 30) — that is, a 30-day half-life — and the weighted score is the sum of weighted ratings divided by the sum of weights, rounded half up to two decimal places. Both fields are null when the provider has no surveys. A provider whose rating set changes gains a `version` increment of 1 as the recompute is persisted. Both scores feed the auto-match and emergency dispatch selectors described in §3.6 and §3.11.
+
+### 3.13. Ops-Runs, Quarterly Rollover, and Report Snapshots
+
+An ops-run is invoked by a `Coordinator` posting a `run_type`. A standard run performs six sweeps in no particular order. Vouchers in `ISSUED` whose `expires_at` is at or before now transition to `EXPIRED`: each sets `forfeited_hours` to `authorized_hours` minus `consumed_hours`, its allocation's `reserved_hours` is decremented by `forfeited_hours` and its `expired_hours` is incremented by the same, and a `RELEASE` ledger entry is appended for the remaining provisional encumbrance (forfeited hours multiplied by `standard_rate_cents_per_hour` per hour). Bookings in `CONFIRMED` that have passed their no-show grace without a visit record transition to `NO_SHOW` with the release effects described in §3.7. Visit records still `OPEN` past `end_at` plus `auto_close_grace_hours` are auto-closed as described in §3.9. Providers in `ACTIVE` whose `credential_expires_at` has passed transition to `LAPSED`. Caregivers in `ACTIVE` whose `redetermination_due_at` has passed transition to `REDETERMINATION_PENDING`. Availability windows whose `end_at` has passed transition to `CLOSED`. The ops-run also creates a new `ReportSnapshot` in `GENERATED` status and increments the program's `ops_run_index` and `version` by 1 each.
+
+When `run_type` is `QUARTER_ROLLOVER`, the run additionally closes ended allocations and creates next-quarter grants. Every allocation in `OPEN` or `FROZEN` status whose `period_end` is at or before now is processed in a pinned order: descending `need_score` of the caregiver's latest approved application, then ascending caregiver `created_at` (never `id`). For each, the old allocation transitions to `CLOSED` with its buckets frozen as-is. A carryover is computed as the smaller of two quantities: the program's `quarterly_cap_hours` multiplied by `carryover_cap_pct` (default 0.25), rounded half up to two decimal places; and the old allocation's `available_hours`. A new allocation is then created for the same caregiver for the next quarter with `granted_hours` equal to the program's `quarterly_cap_hours` plus the carryover, `available_hours` equal to `granted_hours`, all other buckets 0, and status `OPEN`. Rollover is skipped entirely for caregivers in `DISENROLLED` status — no new allocation is created for them.
+
+A `ReportSnapshot` captures the state of a program for one calendar month — `period_start` is the start of the calendar month containing the ops-run clock time, and `period_end` is the end of that month (exclusive). The snapshot's `utilization_projected_pct` is 100 multiplied by the sum of `consumed_hours` and `reserved_hours` across all of the program's allocations (in any status), divided by the sum of `granted_hours`, rounded half up to two decimal places; when the granted total is zero the projected percentage is 0.00. The `utilization_settled_pct` is 100 multiplied by the program's `settled_cents` divided by `total_budget_cents`, rounded half up to two decimal places. The two figures deliberately differ: projected counts reserved-not-yet-consumed hours, while settled counts only paid money. The snapshot also records `total_granted_hours`, `consumed_hours`, and `reserved_hours` (each a sum across the program's allocations), `claims_paid_count` (the number of the program's claims in `PAID` status), `total_paid_amount_cents` (the integer sum of `amount_cents` across those claims — note this sums per-claim rounded amounts and never re-rounds), `emergency_hours_used` (the program's value at snapshot time), and `ops_run_index` (the program's `ops_run_index` value once this run's own increment is applied — equal to the value the program reports immediately after the run completes).
+
+Once generated, a snapshot's lifecycle is driven by a `FunderAdmin` posting a `target_status` (and optional `note`). The full status enumeration on the snapshot is `GENERATED`, `FINALIZED`, `SUBMITTED_TO_FUNDER`, `UNDER_AMENDMENT`, and `RESUBMITTED`; the active transition graph uses the first four, and `RESUBMITTED` is reserved by the enumeration for downstream use but is not currently the target of any transition. From `GENERATED` the snapshot moves to `FINALIZED`. From `FINALIZED` it moves to `SUBMITTED_TO_FUNDER` or back into `UNDER_AMENDMENT`. From `SUBMITTED_TO_FUNDER` it moves to `UNDER_AMENDMENT`. From `UNDER_AMENDMENT` it moves back to `FINALIZED`. Each transition increments the snapshot's `version` by 1.
+
+## 4. Endpoint Definitions
+
+New resources are returned with HTTP 201; modifications to existing resources are returned with HTTP 200. All responses follow the envelope defined in §2.2.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | /respite/programs | Create a respite program with rate card, caps, and reserve | FunderAdmin |
+| GET | /respite/programs/{id} | Read program including computed budget fields | FunderAdmin, Coordinator |
+| POST | /respite/programs/{id}/posture | Program posture transition per Program state machine | FunderAdmin |
+| POST | /respite/programs/{id}/budget-adjustments | Adjust total budget (delta may be negative; total must stay >= encumbered + settled); OCC-guarded | FunderAdmin |
+| GET | /respite/programs/{id}/budget-ledger | Append-only budget ledger entries (newest first) | FunderAdmin, Coordinator |
+| GET | /respite/programs/{id}/report-snapshots | List report snapshots of the program | FunderAdmin |
+| GET | /respite/programs/{id}/allocations | List allocations of the program | Coordinator, FunderAdmin |
+| POST | /respite/programs/{id}/ops-runs | Advance the system epoch: voucher expiry, no-show, auto-close, lapse, redetermination, window close, snapshot; QUARTER_ROLLOVER additionally rolls grants | Coordinator |
+| POST | /respite/caregivers | Enroll a caregiver (self-service or coordinator-assisted) | Anonymous, Coordinator |
+| GET | /respite/caregivers/{id} | Read a caregiver | Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/caregivers/{id}/status-transitions | SUSPEND / reinstate / DISENROLL per Caregiver state machine including suspension cascade | Coordinator |
+| GET | /respite/caregivers/{id}/eligibility-applications | List a caregiver's eligibility applications | Caregiver, Coordinator |
+| GET | /respite/caregivers/{id}/allocations | List a caregiver's allocations | Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/caregivers/{id}/eligibility-applications | Submit an eligibility application | Caregiver, Coordinator |
+| GET | /respite/eligibility-applications/{id} | Read an application | Caregiver, Coordinator |
+| POST | /respite/eligibility-applications/{id}/review-decisions | Coordinator decision: REQUEST_INFO / APPROVE / DENY / WITHDRAW | Coordinator |
+| POST | /respite/eligibility-applications/{id}/resubmit | Resubmit after info request | Caregiver |
+| POST | /respite/eligibility-applications/{id}/appeal | Appeal a DENIED application within 30 days | Caregiver |
+| GET | /respite/allocations/{id} | Read an allocation with computed buckets | Caregiver, Coordinator, FunderAdmin |
+| GET | /respite/allocations | List allocations filtered by caregiver/program/status | Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/allocations/{id}/grant-adjustments | Adjust granted_hours; OCC-guarded | Coordinator |
+| POST | /respite/vouchers | Issue a voucher against an OPEN allocation (caps + budget checked) | Caregiver, Coordinator |
+| GET | /respite/vouchers/{id} | Read a voucher | Caregiver, Coordinator, FunderAdmin |
+| GET | /respite/vouchers | List vouchers filtered by allocation/caregiver/program/status | Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/vouchers/{id}/revoke | Revoke an ISSUED voucher (coordinator clawback) | Coordinator |
+| POST | /respite/providers | Register a respite provider | Anonymous, Coordinator |
+| GET | /respite/providers/{id} | Read a provider including quality scores | Provider, Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/providers/{id}/status-transitions | Credential lifecycle: ACTIVE / SUSPENDED / TERMINATED | Coordinator |
+| POST | /respite/providers/{id}/availability-windows | Publish an availability window (half-open, no provider overlap) | Provider |
+| GET | /respite/providers/{id}/availability-windows | List a provider's windows | Provider, Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/availability-windows/{id}/close | Withdraw a window with no non-terminal bookings | Provider |
+| POST | /respite/bookings | Request a booking: EXPLICIT pins provider and window; AUTO selects via the auto-match selector | Caregiver, Coordinator |
+| GET | /respite/bookings/{id} | Read a booking | Caregiver, Provider, Coordinator, FunderAdmin |
+| GET | /respite/bookings | List bookings filtered by voucher/provider/caregiver/window/emergency-request/status | Caregiver, Provider, Coordinator, FunderAdmin |
+| POST | /respite/bookings/{id}/confirm | Provider confirms a requested booking | Provider |
+| POST | /respite/bookings/{id}/cancel | Cancel a non-terminal booking; releases voucher commitment and window capacity | Caregiver, Provider, Coordinator |
+| GET | /respite/bookings/{id}/visit-records | List visit records of a booking (0-1 entries) | Caregiver, Provider, Coordinator, FunderAdmin |
+| POST | /respite/bookings/{id}/check-in | EVV check-in; creates OPEN VisitRecord and moves booking to IN_SERVICE | Provider |
+| POST | /respite/bookings/{id}/satisfaction-surveys | Caregiver rates a COMPLETED booking (one per booking) | Caregiver |
+| POST | /respite/visit-records/{id}/check-out | EVV check-out; computes verified/payable minutes | Provider |
+| GET | /respite/visit-records/{id} | Read a visit record | Caregiver, Provider, Coordinator, FunderAdmin |
+| POST | /respite/visit-records/{id}/verification-decisions | Coordinator verifies or rejects a submitted visit; VERIFY fires the claim/voucher/booking/budget cascade | Coordinator |
+| POST | /respite/visit-records/{id}/resubmit | Provider resubmits a REJECTED visit with corrected times | Provider |
+| GET | /respite/claims/{id} | Read a claim | Provider, Coordinator, FunderAdmin |
+| GET | /respite/claims | List claims filtered by provider/voucher/visit/status | Provider, Coordinator, FunderAdmin |
+| POST | /respite/claims/{id}/submit | Provider submits a DRAFT claim | Provider |
+| POST | /respite/claims/{id}/adjudicate | FunderAdmin approves or denies a SUBMITTED or APPEALED claim | FunderAdmin |
+| POST | /respite/claims/{id}/pay | Pay an APPROVED claim; settles budget; may settle the voucher | FunderAdmin |
+| POST | /respite/claims/{id}/appeal | Provider appeals a DENIED claim within the appeal window | Provider |
+| POST | /respite/emergency-requests | Caregiver requests emergency respite coverage | Caregiver, Coordinator |
+| GET | /respite/emergency-requests/{id} | Read an emergency request | Caregiver, Coordinator, FunderAdmin |
+| GET | /respite/emergency-requests | List emergency requests filtered by caregiver/status/dispatch booking/selected provider | Caregiver, Coordinator, FunderAdmin |
+| POST | /respite/emergency-requests/{id}/triage | Coordinator approves emergency hours against the reserve | Coordinator |
+| POST | /respite/emergency-requests/{id}/dispatch | Dispatch: selects provider, creates emergency voucher + CONFIRMED booking, debits reserve | Coordinator |
+| POST | /respite/emergency-requests/{id}/cancel | Cancel an OPEN or TRIAGED emergency request | Caregiver, Coordinator |
+| GET | /respite/satisfaction-surveys/{id} | Read a survey | Caregiver, Provider, Coordinator, FunderAdmin |
+| GET | /respite/satisfaction-surveys | List surveys filtered by booking/provider/caregiver | Caregiver, Provider, Coordinator, FunderAdmin |
+| GET | /respite/report-snapshots/{id} | Read a report snapshot | FunderAdmin |
+| POST | /respite/report-snapshots/{id}/transitions | FINALIZED / SUBMITTED_TO_FUNDER / UNDER_AMENDMENT per ReportSnapshot machine | FunderAdmin |
+| POST | /_clock/set_current_utc | Set the logical clock (server default 2026-05-01T00:00:00Z; never falls back to wall time) | FunderAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+|---|---|
+| ERR_UNAUTHENTICATED | 401 |
+| ERR_UNAUTHORIZED_ROLE | 403 |
+| ERR_FORBIDDEN_OWNERSHIP | 403 |
+| ERR_INVALID_REQUEST | 400 |
+| ERR_PROGRAM_NOT_FOUND | 404 |
+| ERR_CAREGIVER_NOT_FOUND | 404 |
+| ERR_APPLICATION_NOT_FOUND | 404 |
+| ERR_ALLOCATION_NOT_FOUND | 404 |
+| ERR_VOUCHER_NOT_FOUND | 404 |
+| ERR_PROVIDER_NOT_FOUND | 404 |
+| ERR_WINDOW_NOT_FOUND | 404 |
+| ERR_BOOKING_NOT_FOUND | 404 |
+| ERR_VISIT_NOT_FOUND | 404 |
+| ERR_CLAIM_NOT_FOUND | 404 |
+| ERR_EMERGENCY_NOT_FOUND | 404 |
+| ERR_SNAPSHOT_NOT_FOUND | 404 |
+| ERR_POSTURE_GATE | 409 |
+| ERR_INVALID_STATE | 409 |
+| ERR_CAREGIVER_NOT_ACTIVE | 422 |
+| ERR_REDETERMINATION_OVERDUE | 422 |
+| ERR_PROVIDER_NOT_ACTIVE | 422 |
+| ERR_ALLOCATION_CAREGIVER_MISMATCH | 422 |
+| ERR_DUPLICATE_EMAIL | 409 |
+| ERR_WINDOW_OVERLAP | 409 |
+| ERR_WINDOW_CAPACITY_FULL | 409 |
+| ERR_CAREGIVER_DOUBLE_BOOKED | 409 |
+| ERR_DUPLICATE_SURVEY | 409 |
+| ERR_VOUCHER_NOT_ISSUABLE | 422 |
+| ERR_BOOKING_BEYOND_VOUCHER_EXPIRY | 422 |
+| ERR_BOOKING_NOT_CONFIRMED | 409 |
+| ERR_EVV_OUTSIDE_WINDOW | 422 |
+| ERR_EVV_ALREADY_OPEN | 409 |
+| ERR_APPEAL_WINDOW_CLOSED | 422 |
+| ERR_EMERGENCY_WINDOW_PAST | 422 |
+| ERR_INSUFFICIENT_HOURS | 422 |
+| ERR_QUARTERLY_CAP_EXCEEDED | 422 |
+| ERR_ANNUAL_CAP_EXCEEDED | 422 |
+| ERR_BUDGET_EXCEEDED | 422 |
+| ERR_EMERGENCY_RESERVE_EXHAUSTED | 422 |
+| ERR_NO_PROVIDER_AVAILABLE | 422 |
+| ERR_STALE_VERSION | 412 |

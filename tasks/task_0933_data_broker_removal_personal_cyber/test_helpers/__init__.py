@@ -1,0 +1,26 @@
+"""Barrel export: framework generics + PRD-specific code."""
+# Framework generics (re-exported so tests have one import source)
+from prd_bench_local_runner.testing import (  # noqa: F401
+    validate_success, validate_error, validate_paginated,
+    validate_error_is_one_of, get_success_data,
+    is_valid_uuid, is_iso8601_timestamp,
+    assert_cost_precision, assert_version_incremented, assert_timestamp_format,
+    assert_race_outcome, assert_exactly_one_succeeds, assert_at_least_one_succeeds,
+    run_race, build_user_headers, NON_EXISTENT_UUID,
+)
+
+# PRD-specific
+from .types import *  # noqa: F401,F403
+from .api_client import api_client, ApiClient  # noqa: F401
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES  # noqa: F401
+from .assertions import *  # noqa: F401,F403
+from .factories import *  # noqa: F401,F403
+from .constants import *  # noqa: F401,F403
+from .test_users import (  # noqa: F401
+    TEST_USERS, ADMIN, AGENT, AGENT_BETA, AUDITOR,
+    ADMIN_USER_ID, AGENT_ALPHA_ID, AGENT_BETA_ID, AUDITOR_USER_ID,
+    make_account_owner_headers, make_member_headers, make_agent_headers,
+)
+from .fixtures import *  # noqa: F401,F403
+from . import fixtures  # noqa: F401
+from . import factories  # noqa: F401

@@ -1,0 +1,1649 @@
+# =============================================================================
+# Task 987 — Ice-Delivery & Event-Ice Service — Scaffold (§1.0–§1.7)
+# Difficulty target: beyond-expert. Flat topology, parallel order state
+# dimensions, posture-driven freezer gating, tiered pricing with pinned
+# rounding order, surge admission control with waitlist promotion, ops-run
+# checkpoint sweeps, OCC on Order/RecurringRoute, segregation of duties in
+# billing.
+# =============================================================================
+
+scenario: |
+  generate task hard than expert level! 987. Ice-Delivery & Event-Ice Service: order (block/cube/dry-ice) & volume, event & recurring (bar/restaurant) route, delivery window & cold storage, dry-ice safety/handling, pallet/bag & pricing, will-call, billing, seasonal surge
+
+domain_name: ice-delivery-event-ice
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: quota_allocation        # freezer pallets, slot pallets, surge daily cap, ventilated-lbs: finite pools reserved/committed/released
+  secondary_archetype: pricing_engine        # tiered volume pricing, surge surcharge stacking, deposit exemption, pinned rounding order
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Order.version (reprice) and RecurringRoute.version (standing-order patch)
+    - cascading_side_effects                 # cancel -> hold release -> posture recompute -> waitlist promotion -> order confirm (depth 4)
+    - dual_variant_calculation               # provisional vs final order pricing; settled vs forward-looking credit exposure
+    - ops_run_checkpoint                     # run_ops sweeps: cert expiry, slot closure, no-show, invoice overdue, waitlist expiry, route generation, promotion
+  entity_topology: flat                      # all entities top-level peers; FK references in request bodies; sub-resource GETs for reverse reachability
+  state_machine_shape: parallel              # Order carries fulfillment_status x billing_status evolving independently; other entities cyclic/compound
+  relationship_patterns:
+    - one_to_many                            # Customer->Order, Order->OrderLine, Depot->DeliverySlot, etc.
+    - cross_aggregate                        # Order references PriceBook (pinned version), DeliverySlot, DispatchRun, Invoice across aggregates
+  role_model: segregation_of_duties          # invoice issuer cannot void the same invoice; peer roles own disjoint resource families
+  consistency_model: immediate               # every mutation visible in the same response envelope
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Depot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Depot name" }
+      - { name: freezer_capacity_pallets, type: integer, source: input, description: "Total general-freezer pallet spaces; constraints: >= 1" }
+      - { name: freezer_reserved_pallets, type: integer, source: computed, description: "Sum of pallets_required over ColdStorageHold with depot_id = this depot and status IN {RESERVED, OCCUPIED}" }
+      - { name: freezer_free_pallets, type: integer, source: computed, description: "= freezer_capacity_pallets - freezer_reserved_pallets" }
+      - { name: posture, type: enum, source: computed, description: "OPEN | SURGE_CONSTRAINED | FROZEN — derived by calculation freezer_capacity_and_posture" }
+      - { name: ops_run_index, type: integer, source: system, default: 0, description: "Monotone counter incremented by each POST /depots/{id}/run-ops" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_name, type: string, source: input, description: "Customer account name" }
+      - { name: kind, type: enum, source: input, description: "BAR_RESTAURANT | EVENT_ORGANIZER" }
+      - { name: tier, type: enum, source: input, description: "STANDARD | PRIORITY — waitlist promotion rank key" }
+      - { name: credit_terms, type: enum, source: input, description: "PREPAID | NET_15 | NET_30 — invoice due-date offset" }
+      - { name: credit_limit_cents, type: integer, source: input, description: "Maximum tolerated forward-looking exposure; constraints: >= 0" }
+      - { name: credit_balance_cents, type: integer, source: computed, default: 0, description: "Wallet fed by payment overpayment and invoice-void unapplication" }
+      - { name: outstanding_exposure_cents, type: integer, source: computed, default: 0, description: "SETTLED variant of credit_exposure: sum of balance_due over invoices with status IN {ISSUED, PARTIALLY_PAID, OVERDUE}" }
+      - { name: standing, type: enum, source: computed, default: "GOOD", description: "GOOD | HOLD — HOLD iff any invoice of this customer has status OVERDUE" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: HandlerCertification
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: system, description: "FK -> Customer.id; owning customer" }
+      - { name: handler_name, type: string, source: input, description: "Certified handler full name" }
+      - { name: certificate_number, type: string, source: input, description: "External certificate identifier; unique per customer" }
+      - { name: max_dry_ice_lbs, type: integer, source: input, description: "Maximum dry-ice pounds per delivery covered by this cert; constraints: >= 1" }
+      - { name: expires_at, type: datetime, source: input, description: "Certification expiry instant (ISO 8601 UTC)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUSPENDED | EXPIRED" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: PriceBook
+    parent: null
+    common_fields: true
+    fields:
+      - { name: scope_label, type: string, source: input, description: "Human label for the book (e.g. standard-2026)" }
+      - { name: effective_from, type: datetime, source: input, description: "Instant the book becomes ACTIVE (ISO 8601 UTC)" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | ACTIVE | SUPERSEDED — exactly one ACTIVE book at any instant" }
+      - { name: lines, type: array, source: input, description: "Pricing rows: { product_form, packaging, tier_min_units, tier_max_units (null = unbounded), unit_price_cents } — flat rate per tier (whole quantity priced at the matched tier's unit_price_cents)" }
+      - { name: pallet_deposit_cents, type: integer, source: input, description: "Refundable deposit per pallet unit (packaging == PALLET); exempt from discount and surcharge" }
+      - { name: delivery_fee_cents, type: integer, source: input, description: "Flat delivery fee when post-discount merchandise subtotal is below free_delivery_threshold_cents" }
+      - { name: free_delivery_threshold_cents, type: integer, source: input, description: "Post-discount merchandise subtotal >= this value waives the delivery fee" }
+      - { name: volume_discount_tiers, type: array, source: input, description: "Discount tiers: { threshold_cents, discount_bps } applied to merchandise subtotal, highest satisfied tier wins" }
+      - { name: surge_surcharge_bps, type: integer, source: input, description: "Basis points of (merchandise_subtotal - volume_discount) charged when an ACTIVE surge window covers the event date" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: SurgeWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; depot this surge window constrains" }
+      - { name: start_date, type: string, source: input, description: "First covered date, YYYY-MM-DD inclusive" }
+      - { name: end_date, type: string, source: input, description: "Last covered date, YYYY-MM-DD inclusive (window covers dates d with start_date <= d <= end_date)" }
+      - { name: admission_policy, type: enum, source: input, description: "OPEN | RATIONED | CLOSED" }
+      - { name: daily_pallet_cap, type: integer, source: input, description: "Required when admission_policy == RATIONED: max committed pallets per depot per covered date; constraints: >= 1" }
+      - { name: status, type: enum, source: computed, description: "SCHEDULED | ACTIVE | ENDED — derived from logical clock vs start_date/end_date" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: RecurringRoute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; bar/restaurant owning the route" }
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; servicing depot" }
+      - { name: weekday, type: enum, source: input, description: "MON | TUE | WED | THU | FRI | SAT | SUN" }
+      - { name: window_start, type: string, source: input, description: "Delivery window start, HH:MM 24h; constraints: window_start < window_end" }
+      - { name: window_end, type: string, source: input, description: "Delivery window end, HH:MM 24h" }
+      - { name: standing_lines, type: array, source: input, description: "Standing order lines: { product_form, packaging, quantity_units }" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | PAUSED | TERMINATED — initial ACTIVE; PAUSED <-> ACTIVE cycle allowed" }
+      - { name: last_generated_date, type: string, source: system, description: "YYYY-MM-DD of the most recent spawned order's event_date; null until first generation" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version (OCC parent for standing-order patch)" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; ordering customer" }
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; fulfilling depot" }
+      - { name: recurring_route_id, type: string, source: system, description: "FK -> RecurringRoute.id; set when spawned by route generation, null for manual orders; constraints: nullable" }
+      - { name: channel, type: enum, source: input, description: "DELIVERY | WILL_CALL" }
+      - { name: event_date, type: string, source: input, description: "Service date YYYY-MM-DD; constraints: must be >= current logical date + 1 day at creation and re-checked at confirm" }
+      - { name: window_start, type: string, source: input, description: "Delivery/pickup window start HH:MM; constraints: window_start < window_end" }
+      - { name: window_end, type: string, source: input, description: "Delivery/pickup window end HH:MM" }
+      - { name: fulfillment_status, type: enum, source: system, description: "DRAFT | QUOTED | CONFIRMED | WAITLISTED | STAGED | READY_FOR_PICKUP | IN_TRANSIT | DELIVERED | PICKED_UP | NO_SHOW | CANCELLED" }
+      - { name: billing_status, type: enum, source: system, description: "UNBILLED | INVOICED | PAID — parallel dimension, transitions driven by invoice attach/void/payment" }
+      - { name: delivery_slot_id, type: string, source: system, description: "FK -> DeliverySlot.id; set by reserve-slot, cleared by cancel; constraints: nullable" }
+      - { name: dispatch_run_id, type: string, source: system, description: "FK -> DispatchRun.id; set by dispatch-run assign, cleared by run cancel; constraints: nullable" }
+      - { name: invoice_id, type: string, source: system, description: "FK -> Invoice.id; set when consolidated into an invoice, cleared on invoice void; constraints: nullable" }
+      - { name: price_book_id, type: string, source: system, description: "FK -> PriceBook.id; book pinned at quote time" }
+      - { name: price_book_version, type: integer, source: system, description: "Version integer of the pinned PriceBook at quote time (re-pinned by reprice)" }
+      - { name: pricing_mode, type: enum, source: system, description: "PROVISIONAL | FINAL — PROVISIONAL from quote/reprice, FINAL from confirm/promotion" }
+      - { name: pallets_required, type: integer, source: computed, description: "Sum over lines: packaging == PALLET -> quantity_units, else ceil(quantity_units / 20)" }
+      - { name: dry_ice_lbs, type: integer, source: computed, description: "Sum over DRY_ICE lines of quantity_units x unit weight (DRY_ICE,BAG = 10 lbs; DRY_ICE,PALLET = 500 lbs)" }
+      - { name: merchandise_subtotal_cents, type: integer, source: computed, description: "Sum of line_total_cents over all lines (per-line rounded)" }
+      - { name: discount_cents, type: integer, source: computed, description: "Volume discount per order_total_composition" }
+      - { name: delivery_fee_cents, type: integer, source: computed, description: "0 for WILL_CALL or when post-discount subtotal >= free_delivery_threshold_cents; else book delivery_fee_cents" }
+      - { name: surcharge_cents, type: integer, source: computed, description: "Surge surcharge per order_total_composition variant rules" }
+      - { name: deposit_cents, type: integer, source: computed, description: "Sum over PALLET lines of quantity_units x pallet_deposit_cents; exempt from discount/surcharge" }
+      - { name: total_cents, type: integer, source: computed, description: "= merchandise_subtotal_cents - discount_cents + delivery_fee_cents + surcharge_cents + deposit_cents" }
+      - { name: quoted_at, type: datetime, source: system, description: "Logical timestamp of latest quote/reprice; constraints: nullable" }
+      - { name: confirmed_at, type: datetime, source: system, description: "Logical timestamp of confirm/promotion; constraints: nullable" }
+      - { name: fulfilled_at, type: datetime, source: system, description: "Logical timestamp of DELIVERED / PICKED_UP / NO_SHOW transition; constraints: nullable" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version (OCC parent for reprice)" }
+
+  - name: OrderLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; owning order" }
+      - { name: product_form, type: enum, source: input, description: "BLOCK | CUBE | DRY_ICE" }
+      - { name: packaging, type: enum, source: input, description: "BAG | PALLET" }
+      - { name: quantity_units, type: integer, source: input, description: "Units purchased; constraints: >= 1" }
+      - { name: unit_weight_lbs, type: integer, source: computed, description: "Per-unit weight from constants: (CUBE,BAG)=7, (CUBE,PALLET)=960, (BLOCK,BAG)=25, (BLOCK,PALLET)=300, (DRY_ICE,BAG)=10, (DRY_ICE,PALLET)=500" }
+      - { name: unit_price_cents, type: integer, source: system, description: "Tier unit price snapshotted from the pinned PriceBook at quote; refreshed by reprice/confirm recompute" }
+      - { name: line_total_cents, type: integer, source: computed, description: "Per-line rounded total per order_line_pricing (dry-ice lines include 700 bps handling folded in before rounding)" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: DeliverySlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; depot operating the slot" }
+      - { name: date, type: string, source: input, description: "Service date YYYY-MM-DD; constraints: must be >= current logical date" }
+      - { name: window_start, type: string, source: input, description: "Slot window start HH:MM; constraints: window_start < window_end" }
+      - { name: window_end, type: string, source: input, description: "Slot window end HH:MM" }
+      - { name: capacity_pallets, type: integer, source: input, description: "Aggregate pallet capacity of the slot; constraints: >= 1" }
+      - { name: reserved_pallets, type: integer, source: computed, description: "Sum of pallets_required over Orders with delivery_slot_id = this slot and fulfillment_status IN {QUOTED, CONFIRMED, WAITLISTED, STAGED, IN_TRANSIT}" }
+      - { name: status, type: enum, source: computed, description: "OPEN | FULL | CLOSED — FULL iff reserved_pallets >= capacity_pallets; CLOSED by ops sweep once date < current logical date" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: ColdStorageHold
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: system, description: "FK -> Depot.id; depot holding the product (copied from order)" }
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; order this hold stages" }
+      - { name: zone, type: enum, source: system, description: "GENERAL_FREEZER | DRY_ICE_BUNKER — DRY_ICE_BUNKER iff the order has any DRY_ICE line" }
+      - { name: pallets_required, type: integer, source: system, description: "Copied from Order.pallets_required at creation" }
+      - { name: interval_start, type: datetime, source: system, description: "GENERAL_FREEZER: event_date window_start - 4h staging lead; DRY_ICE_BUNKER: event_date window_start" }
+      - { name: interval_end, type: datetime, source: system, description: "GENERAL_FREEZER: event_date window_end + 60min grace; DRY_ICE_BUNKER: event_date window_end + 90min (60min grace + 30min ventilation buffer)" }
+      - { name: status, type: enum, source: system, description: "RESERVED | OCCUPIED | RELEASED | EXPIRED" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: DispatchRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: depot_id, type: string, source: input, description: "FK -> Depot.id; depot dispatching the run" }
+      - { name: run_date, type: string, source: input, description: "Run date YYYY-MM-DD; constraints: must be >= current logical date" }
+      - { name: vehicle_label, type: string, source: input, description: "Vehicle identifier" }
+      - { name: max_pallets, type: integer, source: input, description: "Vehicle pallet capacity; constraints: >= 1" }
+      - { name: ventilated_dry_ice_cap_lbs, type: integer, source: input, description: "Ventilated compartment dry-ice capacity in lbs; constraints: >= 0" }
+      - { name: assigned_pallets, type: integer, source: computed, description: "Sum of pallets_required over assigned Orders (dispatch_run_id = this run, fulfillment_status IN {STAGED, IN_TRANSIT, DELIVERED})" }
+      - { name: assigned_dry_ice_lbs, type: integer, source: computed, description: "Sum of dry_ice_lbs over the same assigned-order set" }
+      - { name: status, type: enum, source: system, description: "PLANNED | LOCKED | IN_PROGRESS | COMPLETED | CANCELLED" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; billed customer" }
+      - { name: period_start, type: string, source: input, description: "Billing period start YYYY-MM-DD inclusive" }
+      - { name: period_end, type: string, source: input, description: "Billing period end YYYY-MM-DD exclusive; constraints: period_start < period_end" }
+      - { name: status, type: enum, source: system, description: "DRAFT | ISSUED | PARTIALLY_PAID | OVERDUE | PAID | VOID" }
+      - { name: merchandise_subtotal_cents, type: integer, source: computed, description: "Component-wise sum over attached orders' FINAL merchandise_subtotal_cents" }
+      - { name: discount_cents, type: integer, source: computed, description: "Component-wise sum over attached orders" }
+      - { name: delivery_fee_cents, type: integer, source: computed, description: "Component-wise sum over attached orders" }
+      - { name: surcharge_cents, type: integer, source: computed, description: "Component-wise sum over attached orders" }
+      - { name: deposit_cents, type: integer, source: computed, description: "Component-wise sum over attached orders" }
+      - { name: total_cents, type: integer, source: computed, description: "Component-wise sum of attached orders' total_cents" }
+      - { name: amount_paid_cents, type: integer, source: computed, description: "Sum of waterfall allocations applied to this invoice" }
+      - { name: balance_due_cents, type: integer, source: computed, description: "= total_cents - amount_paid_cents" }
+      - { name: due_date, type: string, source: system, description: "Set at issue: issue logical date + credit_terms days (PREPAID 0, NET_15 15, NET_30 30); constraints: nullable" }
+      - { name: issued_by_user_id, type: string, source: system, description: "X-User-ID of the issuing BillingClerk; constraints: nullable" }
+      - { name: voided_by_user_id, type: string, source: system, description: "X-User-ID of the voiding BillingClerk; constraints: nullable" }
+      - { name: version, type: integer, source: system, description: "Optimistic concurrency version" }
+
+  - name: Payment
+    parent: null
+    common_fields: false
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; paying customer" }
+      - { name: amount_cents, type: integer, source: input, description: "Payment amount; constraints: >= 1" }
+      - { name: method, type: enum, source: input, description: "ACH | CARD | CASH" }
+      - { name: received_at, type: datetime, source: system, description: "Logical timestamp of payment creation" }
+      - { name: applied_cents, type: integer, source: computed, description: "Total cents allocated to invoices by payment_waterfall" }
+      - { name: overpayment_cents, type: integer, source: computed, description: "= amount_cents - applied_cents; credited to Customer.credit_balance_cents" }
+      - { name: allocations, type: array, source: computed, description: "Waterfall trace: [{ invoice_id, applied_cents }] in allocation order" }
+
+  - name: WaitlistEntry
+    parent: null
+    common_fields: false
+    fields:
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; waitlisted order (at most one QUEUED entry per order)" }
+      - { name: depot_id, type: string, source: system, description: "FK -> Depot.id; depot whose surge cap is contended" }
+      - { name: requested_pallets, type: integer, source: system, description: "Copied from Order.pallets_required at queue time" }
+      - { name: status, type: enum, source: system, description: "QUEUED | PROMOTED | WITHDRAWN | EXPIRED" }
+      - { name: queued_at, type: datetime, source: system, description: "Logical timestamp of queueing" }
+      - { name: promoted_at, type: datetime, source: system, description: "Logical timestamp of promotion; constraints: nullable" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Order
+    initial_state: "fulfillment_status=DRAFT, billing_status=UNBILLED"
+    terminal_states: ["fulfillment_status=CANCELLED", "billing_status=PAID (terminal only when fulfillment in DELIVERED/PICKED_UP/NO_SHOW)"]
+    note: "Two parallel state dimensions on one row. fulfillment_status evolves via quote/confirm/stage/dispatch/pickup actions; billing_status evolves only via invoice attach/void/payment cascades. Transitions on one dimension never require a particular value of the other except where stated."
+    transitions:
+      - from: "fulfillment_status=DRAFT"
+        to: "fulfillment_status=QUOTED"
+        trigger: "POST /orders/{id}/quote"
+        actor: CustomerAgent
+        preconditions:
+          - "order has >= 1 line (guaranteed at creation; empty lines rejected with ERR_INVALID_REQUEST)"
+          - "an ACTIVE PriceBook exists at quote time (ERR_PRICE_BOOK_NOT_ACTIVE)"
+        side_effects:
+          - "pins price_book_id + price_book_version to the currently ACTIVE PriceBook"
+          - "snapshots unit_price_cents on every OrderLine from the pinned book tier"
+          - "computes merchandise_subtotal_cents/discount_cents/delivery_fee_cents/surcharge_cents/deposit_cents/total_cents per order_total_composition with pricing_mode=PROVISIONAL"
+          - "sets quoted_at to logical clock"
+      - from: "fulfillment_status=QUOTED"
+        to: "fulfillment_status=QUOTED"
+        trigger: "POST /orders/{id}/reserve-slot"
+        actor: CustomerAgent
+        preconditions:
+          - "channel == DELIVERY (WILL_CALL orders have no slot; ERR_INVALID_STATE)"
+          - "delivery_slot_id is null (re-reservation requires cancel first; ERR_INVALID_STATE)"
+          - "slot.depot_id == order.depot_id and slot.date == order.event_date (ERR_INVALID_STATE on depot/date mismatch)"
+          - "slot.status != CLOSED (ERR_INVALID_STATE)"
+          - "order [window_start, window_end) contained in slot [window_start, window_end) (ERR_WINDOW_OUTSIDE_SLOT)"
+          - "depot.posture != FROZEN (ERR_POSTURE_FROZEN)"
+          - "slot.reserved_pallets + order.pallets_required <= slot.capacity_pallets (ERR_SLOT_CAPACITY_EXCEEDED; equality admitted)"
+        side_effects:
+          - "sets order.delivery_slot_id"
+          - "slot.reserved_pallets += order.pallets_required; slot.status recomputed (OPEN -> FULL at equality)"
+          - "increments Order.version and DeliverySlot.version by 1"
+      - from: "fulfillment_status=QUOTED"
+        to: "fulfillment_status=QUOTED"
+        trigger: "POST /orders/{id}/reprice"
+        actor: CustomerAgent
+        preconditions:
+          - "expected_order_version == order.version (ERR_STALE_VERSION, 412)"
+        side_effects:
+          - "re-pins price_book_id/price_book_version to the currently ACTIVE PriceBook (ERR_PRICE_BOOK_NOT_ACTIVE if none)"
+          - "recomputes all pricing fields with pricing_mode=PROVISIONAL"
+          - "sets quoted_at; increments Order.version by 1"
+      - from: "fulfillment_status=QUOTED"
+        to: "fulfillment_status=CONFIRMED"
+        trigger: "POST /orders/{id}/confirm"
+        actor: CustomerAgent
+        preconditions:
+          - "customer.standing == GOOD (ERR_CREDIT_HOLD, 402)"
+          - "dry-ice safety: if order.dry_ice_lbs > 0, customer has a HandlerCertification with status ACTIVE, expires_at >= event window end, and max_dry_ice_lbs >= order.dry_ice_lbs (ERR_DRY_ICE_CERT_REQUIRED)"
+          - "temporal re-validation: event_date >= current logical date + 1 day (ERR_EVENT_TOO_SOON)"
+          - "channel == DELIVERY implies delivery_slot_id set (ERR_INVALID_STATE)"
+          - "bunker interval rule: if any DRY_ICE line, [window_start, window_end+90m) must not intersect any other ColdStorageHold with zone=DRY_ICE_BUNKER, same depot, status IN {RESERVED, OCCUPIED} (half-open intervals; touching endpoints admitted) (ERR_HOLD_INTERVAL_CONFLICT)"
+          - "freezer peak rule: for GENERAL_FREEZER orders, at every instant of [window_start-4h, window_end+60m) the sum of pallets_required over overlapping same-depot holds with status IN {RESERVED, OCCUPIED} plus order.pallets_required <= depot.freezer_capacity_pallets (ERR_FREEZER_CAPACITY_EXCEEDED)"
+          - "surge admission: if a SurgeWindow with depot_id = order.depot_id covers event_date and status == ACTIVE at confirm time: policy CLOSED -> ERR_SURGE_ADMISSION_CLOSED; policy RATIONED -> committed_pallets(depot, event_date) + order.pallets_required <= daily_pallet_cap else fork to WAITLISTED (committed set = orders same depot+event_date with fulfillment_status IN {CONFIRMED, STAGED, READY_FOR_PICKUP, IN_TRANSIT}); policy OPEN or no covering window -> admit"
+          - "credit: forward_looking_exposure(customer) + order.total_cents <= customer.credit_limit_cents + customer.credit_balance_cents (ERR_CREDIT_LIMIT_EXCEEDED, 402; equality admitted)"
+        side_effects:
+          - "recomputes pricing with pricing_mode=FINAL (pinned book lines + surge windows ACTIVE at confirm time)"
+          - "creates ColdStorageHold status=RESERVED with zone and interval per entity rules"
+          - "depot.freezer_reserved_pallets/freezer_free_pallets recomputed; depot.posture recomputed"
+          - "sets confirmed_at; increments Order.version and Depot.version by 1"
+      - from: "fulfillment_status=QUOTED"
+        to: "fulfillment_status=WAITLISTED"
+        trigger: "POST /orders/{id}/confirm (fork branch when a RATIONED surge window lacks headroom)"
+        actor: system
+        preconditions:
+          - "all confirm preconditions except surge headroom pass"
+        side_effects:
+          - "creates WaitlistEntry status=QUEUED with order_id, depot_id, requested_pallets"
+          - "pricing remains PROVISIONAL; no ColdStorageHold is created"
+          - "slot reservation (if any) is RETAINED"
+      - from: "fulfillment_status=WAITLISTED"
+        to: "fulfillment_status=CONFIRMED"
+        trigger: "system (waitlist promotion sweep: run_ops, or automatic when depot.posture leaves FROZEN)"
+        actor: system
+        preconditions:
+          - "selected by waitlist_promotion_selection (tier rank, queued_at ASC, event_date ASC, order.created_at ASC tie-breaks)"
+          - "posture != FROZEN; surge headroom for the entry's event_date; slot headroom if slot linked"
+        side_effects:
+          - "WaitlistEntry QUEUED -> PROMOTED with promoted_at set"
+          - "recomputes pricing with pricing_mode=FINAL against surge ACTIVE at promotion time"
+          - "creates ColdStorageHold status=RESERVED; depot fields and posture recomputed (this recompute is itself a posture-affecting mutation)"
+          - "sets confirmed_at; increments Order.version, WaitlistEntry has no version"
+      - from: "fulfillment_status=CONFIRMED"
+        to: "fulfillment_status=STAGED"
+        trigger: "POST /orders/{id}/stage"
+        actor: DepotManager
+        preconditions:
+          - "a ColdStorageHold with order_id = this order and status == RESERVED exists (ERR_INVALID_STATE)"
+        side_effects:
+          - "hold RESERVED -> OCCUPIED (depot reserved total unchanged; occupancy instant starts)"
+          - "increments Order.version and ColdStorageHold.version by 1"
+      - from: "fulfillment_status=STAGED"
+        to: "fulfillment_status=READY_FOR_PICKUP"
+        trigger: "POST /orders/{id}/mark-ready"
+        actor: DepotManager
+        preconditions:
+          - "channel == WILL_CALL (ERR_INVALID_STATE)"
+        side_effects: ["increments Order.version by 1"]
+      - from: "fulfillment_status=READY_FOR_PICKUP"
+        to: "fulfillment_status=PICKED_UP"
+        trigger: "POST /orders/{id}/confirm-pickup"
+        actor: CustomerAgent
+        preconditions:
+          - "acting customer's id == order.customer_id (ERR_FORBIDDEN)"
+          - "logical clock <= hold.interval_end (ERR_PICKUP_WINDOW_EXPIRED)"
+        side_effects:
+          - "hold OCCUPIED -> RELEASED; depot.freezer_reserved_pallets -= hold.pallets_required; posture recomputed; posture easing triggers waitlist promotion sweep"
+          - "sets fulfilled_at; increments Order.version by 1"
+      - from: "fulfillment_status=STAGED"
+        to: "fulfillment_status=IN_TRANSIT"
+        trigger: "system (POST /dispatch-runs/{id}/start on the linked run)"
+        actor: system
+        preconditions:
+          - "order.dispatch_run_id == the started run; run status LOCKED -> IN_PROGRESS"
+        side_effects:
+          - "hold OCCUPIED -> RELEASED (product left the freezer); depot fields + posture recomputed; posture easing triggers waitlist promotion sweep"
+      - from: "fulfillment_status=IN_TRANSIT"
+        to: "fulfillment_status=DELIVERED"
+        trigger: "system (POST /dispatch-runs/{id}/complete on the linked run)"
+        actor: system
+        preconditions: ["run status IN_PROGRESS -> COMPLETED"]
+        side_effects:
+          - "sets fulfilled_at — order becomes invoice-eligible (billing_status stays UNBILLED)"
+      - from: "fulfillment_status=READY_FOR_PICKUP"
+        to: "fulfillment_status=NO_SHOW"
+        trigger: "system (run_ops no-show sweep: will-call order READY_FOR_PICKUP with logical clock > hold.interval_end)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "hold OCCUPIED -> EXPIRED; depot fields + posture recomputed; posture easing triggers waitlist promotion sweep"
+          - "sets fulfilled_at — NO_SHOW orders remain billable"
+      - from: "fulfillment_status=DRAFT"
+        to: "fulfillment_status=CANCELLED"
+        trigger: "POST /orders/{id}/cancel"
+        actor: CustomerAgent
+        preconditions: []
+        side_effects: ["increments Order.version by 1"]
+      - from: "fulfillment_status=QUOTED"
+        to: "fulfillment_status=CANCELLED"
+        trigger: "POST /orders/{id}/cancel"
+        actor: CustomerAgent
+        preconditions: []
+        side_effects:
+          - "if delivery_slot_id set: clears it, slot.reserved_pallets -= pallets_required, slot.status recomputed (FULL -> OPEN possible)"
+      - from: "fulfillment_status=CONFIRMED"
+        to: "fulfillment_status=CANCELLED"
+        trigger: "POST /orders/{id}/cancel"
+        actor: CustomerAgent
+        preconditions: []
+        side_effects:
+          - "if delivery_slot_id set: clears it and slot.reserved_pallets -= pallets_required (slot FULL -> OPEN possible)"
+          - "hold RESERVED -> RELEASED: depot.freezer_reserved_pallets -= pallets_required (hop 1)"
+          - "depot.posture recomputed from the new freezer_free_pallets (hop 2 — e.g. FROZEN -> OPEN)"
+          - "posture leaving FROZEN triggers waitlist_promotion_selection (hop 3): top-ranked QUEUED entry -> PROMOTED"
+          - "promoted order WAITLISTED -> CONFIRMED with FINAL pricing, confirmed_at, and a new RESERVED hold (hop 4); depot fields/posture recomputed again"
+      - from: "fulfillment_status=WAITLISTED"
+        to: "fulfillment_status=CANCELLED"
+        trigger: "POST /orders/{id}/cancel or POST /waitlist-entries/{id}/withdraw"
+        actor: CustomerAgent
+        preconditions: []
+        side_effects:
+          - "QUEUED WaitlistEntry -> WITHDRAWN"
+          - "if delivery_slot_id set: clears it and slot.reserved_pallets -= pallets_required"
+      - from: "fulfillment_status=WAITLISTED"
+        to: "fulfillment_status=CANCELLED"
+        trigger: "system (run_ops waitlist-expiry sweep: entry QUEUED with order.event_date <= current logical date)"
+        actor: system
+        preconditions: []
+        side_effects: ["WaitlistEntry QUEUED -> EXPIRED; slot reservation released if linked"]
+      - from: "billing_status=UNBILLED"
+        to: "billing_status=INVOICED"
+        trigger: "system (POST /invoices/generate attaches the order)"
+        actor: system
+        preconditions: ["fulfillment_status IN {DELIVERED, PICKED_UP, NO_SHOW}", "fulfilled_at date within [period_start, period_end)"]
+        side_effects: ["sets order.invoice_id; increments Order.version by 1"]
+      - from: "billing_status=INVOICED"
+        to: "billing_status=UNBILLED"
+        trigger: "system (POST /invoices/{id}/void on the attached invoice)"
+        actor: system
+        preconditions: []
+        side_effects: ["clears order.invoice_id — order becomes invoice-eligible again"]
+      - from: "billing_status=INVOICED"
+        to: "billing_status=PAID"
+        trigger: "system (attached invoice reaches PAID via payment_waterfall)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: RecurringRoute
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: PAUSED
+        trigger: "POST /recurring-routes/{id}/pause"
+        actor: CustomerAgent
+        preconditions: ["acting customer owns the route (ERR_FORBIDDEN)"]
+        side_effects: ["increments RecurringRoute.version by 1"]
+      - from: PAUSED
+        to: ACTIVE
+        trigger: "POST /recurring-routes/{id}/resume"
+        actor: CustomerAgent
+        preconditions:
+          - "acting customer owns the route (ERR_FORBIDDEN)"
+          - "no other route with same customer_id+weekday in status IN {ACTIVE, PAUSED} (ERR_ROUTE_SCHEDULE_CONFLICT)"
+        side_effects: ["increments RecurringRoute.version by 1"]
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /recurring-routes/{id}/terminate"
+        actor: CustomerAgent
+        preconditions: ["acting customer owns the route (ERR_FORBIDDEN)"]
+        side_effects: ["route excluded from all future run_ops generation"]
+      - from: PAUSED
+        to: TERMINATED
+        trigger: "POST /recurring-routes/{id}/terminate"
+        actor: CustomerAgent
+        preconditions: ["acting customer owns the route (ERR_FORBIDDEN)"]
+        side_effects: ["route excluded from all future run_ops generation"]
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "system (run_ops route generation)"
+        actor: system
+        preconditions: ["next occurrence date (first date with matching weekday, > last_generated_date or >= current date if null, <= current date + 3 days) exists"]
+        side_effects:
+          - "spawns Order fulfillment_status=DRAFT, channel=DELIVERY, recurring_route_id set, event_date = occurrence date, window copied, lines copied from standing_lines"
+          - "advances last_generated_date to the occurrence date; increments RecurringRoute.version by 1"
+
+  - entity: DeliverySlot
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: FULL
+        trigger: "system (reserve-slot or any reservation mutation raising reserved_pallets to >= capacity_pallets)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: FULL
+        to: OPEN
+        trigger: "system (cancel/withdraw releasing reservation so reserved_pallets < capacity_pallets)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: CLOSED
+        trigger: "system (run_ops slot-closure sweep: date < current logical date)"
+        actor: system
+        preconditions: []
+        side_effects: ["reservations on the slot are unaffected historically; no new reserve-slot accepted"]
+      - from: FULL
+        to: CLOSED
+        trigger: "system (run_ops slot-closure sweep)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: ColdStorageHold
+    initial_state: RESERVED
+    terminal_states: [RELEASED, EXPIRED]
+    transitions:
+      - from: RESERVED
+        to: OCCUPIED
+        trigger: "system (POST /orders/{id}/stage on the held order)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RESERVED
+        to: RELEASED
+        trigger: "system (order cancel from CONFIRMED, or POST /cold-storage-holds/{id}/release)"
+        actor: "system | DepotManager"
+        preconditions: []
+        side_effects: ["depot.freezer_reserved_pallets -= pallets_required; posture recomputed; posture easing triggers promotion sweep"]
+      - from: OCCUPIED
+        to: RELEASED
+        trigger: "system (order pickup, dispatch-run start, or POST /cold-storage-holds/{id}/release)"
+        actor: "system | DepotManager"
+        preconditions: []
+        side_effects: ["depot.freezer_reserved_pallets -= pallets_required; posture recomputed; posture easing triggers promotion sweep"]
+      - from: OCCUPIED
+        to: EXPIRED
+        trigger: "system (run_ops no-show sweep for will-call holds past interval_end)"
+        actor: system
+        preconditions: ["linked order fulfillment_status == READY_FOR_PICKUP and logical clock > interval_end"]
+        side_effects: ["depot.freezer_reserved_pallets -= pallets_required; posture recomputed; promotion sweep on easing"]
+
+  - entity: DispatchRun
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: PLANNED
+        trigger: "POST /dispatch-runs/{id}/assign"
+        actor: Dispatcher
+        preconditions:
+          - "every listed order: fulfillment_status == STAGED, channel == DELIVERY, depot_id == run.depot_id, event_date == run.run_date, dispatch_run_id null (ERR_INVALID_STATE)"
+          - "sum of assigned_pallets + candidates' pallets_required <= max_pallets (ERR_RUN_CAPACITY_EXCEEDED)"
+          - "sum of assigned_dry_ice_lbs + candidates' dry_ice_lbs <= ventilated_dry_ice_cap_lbs (ERR_DRY_ICE_VENTILATION_EXCEEDED)"
+        side_effects: ["sets dispatch_run_id on all listed orders atomically (any violation rejects the whole assign; no partial links)"]
+      - from: PLANNED
+        to: LOCKED
+        trigger: "POST /dispatch-runs/{id}/lock"
+        actor: Dispatcher
+        preconditions: []
+        side_effects: ["no further assign accepted"]
+      - from: LOCKED
+        to: IN_PROGRESS
+        trigger: "POST /dispatch-runs/{id}/start"
+        actor: Dispatcher
+        preconditions: ["at least one assigned order (ERR_INVALID_STATE)"]
+        side_effects:
+          - "each assigned order STAGED -> IN_TRANSIT (hop 1)"
+          - "each such order's OCCUPIED hold -> RELEASED: depot.freezer_reserved_pallets -= pallets_required (hop 2)"
+          - "depot.posture recomputed; easing triggers promotion sweep (hop 3)"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /dispatch-runs/{id}/complete"
+        actor: Dispatcher
+        preconditions: []
+        side_effects:
+          - "each assigned order IN_TRANSIT -> DELIVERED with fulfilled_at set (hop 1)"
+          - "delivered orders become invoice-eligible; subsequent POST /invoices/generate attaches them (billing_status UNBILLED -> INVOICED) (hop 2)"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /dispatch-runs/{id}/cancel"
+        actor: Dispatcher
+        preconditions: []
+        side_effects: ["clears dispatch_run_id on all assigned orders; orders remain STAGED"]
+      - from: LOCKED
+        to: CANCELLED
+        trigger: "POST /dispatch-runs/{id}/cancel"
+        actor: Dispatcher
+        preconditions: []
+        side_effects: ["clears dispatch_run_id on all assigned orders; orders remain STAGED"]
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID, VOID]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /invoices/{id}/issue"
+        actor: BillingClerk
+        preconditions: []
+        side_effects:
+          - "sets issued_by_user_id = X-User-ID; due_date = current logical date + terms days (PREPAID 0 / NET_15 15 / NET_30 30)"
+      - from: ISSUED
+        to: PARTIALLY_PAID
+        trigger: "system (payment_waterfall partial allocation: 0 < balance_due_cents remaining)"
+        actor: system
+        preconditions: []
+        side_effects: ["amount_paid_cents/balance_due_cents recomputed; customer outstanding_exposure_cents recomputed"]
+      - from: ISSUED
+        to: PAID
+        trigger: "system (payment_waterfall full allocation: balance_due_cents == 0)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "each attached order billing_status INVOICED -> PAID"
+          - "customer standing recomputed: if no remaining OVERDUE invoice, HOLD -> GOOD; outstanding_exposure_cents recomputed"
+      - from: PARTIALLY_PAID
+        to: PAID
+        trigger: "system (payment_waterfall completes balance)"
+        actor: system
+        preconditions: []
+        side_effects: ["same as ISSUED -> PAID"]
+      - from: ISSUED
+        to: OVERDUE
+        trigger: "system (run_ops overdue sweep: current logical date > due_date and balance_due_cents > 0)"
+        actor: system
+        preconditions: []
+        side_effects: ["customer standing GOOD -> HOLD; outstanding_exposure_cents recomputed (still counted)"]
+      - from: PARTIALLY_PAID
+        to: OVERDUE
+        trigger: "system (run_ops overdue sweep)"
+        actor: system
+        preconditions: []
+        side_effects: ["customer standing GOOD -> HOLD"]
+      - from: OVERDUE
+        to: PAID
+        trigger: "system (payment_waterfall completes balance)"
+        actor: system
+        preconditions: []
+        side_effects: ["attached orders -> PAID; standing recomputed (GOOD if last OVERDUE cleared); exposure recomputed"]
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: BillingClerk
+        preconditions: ["voiding X-User-ID != issued_by_user_id when issued_by_user_id is set (ERR_SEGREGATION_OF_DUTIES, 403)"]
+        side_effects: ["attached orders billing_status INVOICED -> UNBILLED, invoice_id cleared"]
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: BillingClerk
+        preconditions: ["voiding X-User-ID != issued_by_user_id (ERR_SEGREGATION_OF_DUTIES, 403)"]
+        side_effects:
+          - "attached orders billing_status INVOICED -> UNBILLED, invoice_id cleared (hop 1)"
+          - "if amount_paid_cents > 0: customer.credit_balance_cents += amount_paid_cents; invoice amount_paid_cents reset to 0 (hop 2)"
+          - "customer standing + outstanding_exposure_cents recomputed (hop 3)"
+      - from: PARTIALLY_PAID
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: BillingClerk
+        preconditions: ["voiding X-User-ID != issued_by_user_id (ERR_SEGREGATION_OF_DUTIES, 403)"]
+        side_effects: ["same as ISSUED -> VOID"]
+      - from: OVERDUE
+        to: VOID
+        trigger: "POST /invoices/{id}/void"
+        actor: BillingClerk
+        preconditions: ["voiding X-User-ID != issued_by_user_id (ERR_SEGREGATION_OF_DUTIES, 403)"]
+        side_effects: ["same as ISSUED -> VOID; clearing the OVERDUE invoice recomputes standing to GOOD if no other OVERDUE remains"]
+
+  - entity: HandlerCertification
+    initial_state: ACTIVE
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /certifications/{id}/suspend"
+        actor: SafetyOfficer
+        preconditions: []
+        side_effects: ["increments HandlerCertification.version by 1"]
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /certifications/{id}/reinstate"
+        actor: SafetyOfficer
+        preconditions: ["expires_at >= logical clock (reinstating an expired cert is rejected, ERR_INVALID_STATE)"]
+        side_effects: ["increments HandlerCertification.version by 1"]
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system (run_ops cert-expiry sweep: expires_at < logical clock)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUSPENDED
+        to: EXPIRED
+        trigger: "system (run_ops cert-expiry sweep)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: WaitlistEntry
+    initial_state: QUEUED
+    terminal_states: [PROMOTED, WITHDRAWN, EXPIRED]
+    transitions:
+      - from: QUEUED
+        to: PROMOTED
+        trigger: "system (waitlist promotion sweep)"
+        actor: system
+        preconditions: ["selected by waitlist_promotion_selection; posture != FROZEN; surge headroom; slot headroom if linked"]
+        side_effects: ["order WAITLISTED -> CONFIRMED (see Order machine); promoted_at set"]
+      - from: QUEUED
+        to: WITHDRAWN
+        trigger: "POST /waitlist-entries/{id}/withdraw or order cancel"
+        actor: CustomerAgent
+        preconditions: ["acting customer owns the linked order (ERR_FORBIDDEN)"]
+        side_effects: ["linked order WAITLISTED -> CANCELLED when triggered via withdraw"]
+      - from: QUEUED
+        to: EXPIRED
+        trigger: "system (run_ops waitlist-expiry sweep: order.event_date <= current logical date)"
+        actor: system
+        preconditions: []
+        side_effects: ["linked order WAITLISTED -> CANCELLED; slot reservation released if linked"]
+
+  - entity: PriceBook
+    initial_state: "SCHEDULED or ACTIVE (ACTIVE iff effective_from <= logical clock at creation)"
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "system (run_ops book-activation sweep: effective_from <= logical clock)"
+        actor: system
+        preconditions: []
+        side_effects: ["previously ACTIVE book -> SUPERSEDED"]
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "system (a different book becomes ACTIVE)"
+        actor: system
+        preconditions: []
+        side_effects: ["orders already quoted keep their pinned price_book_id/price_book_version"]
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only; state preconditions live in §1.2/§1.4)
+# =============================================================================
+concurrency_rules:
+  - rule_id: order-reprice-stale-version
+    parent_entity: Order
+    write_endpoint: "POST /orders/{id}/reprice"
+    occ_field: "expected_order_version"
+    description: |
+      Repricing an Order whose version has advanced since the client last
+      observed it is rejected. This captures the case where another writer has
+      just repriced or otherwise mutated the order (each reprice legitimately
+      re-pins the book and recomputes provisional totals), so the current
+      writer's view of the order is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: route-standing-order-stale-version
+    parent_entity: RecurringRoute
+    write_endpoint: "PATCH /recurring-routes/{id}/standing-order"
+    occ_field: "expected_route_version"
+    description: |
+      Patching a RecurringRoute's standing lines whose version has advanced
+      since the client last observed it is rejected. A pause/resume cycle or a
+      prior patch legitimately advances the route version, so a writer carrying
+      an older expected_route_version is acting on a stale view.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_line_pricing
+    trigger: "order quote / reprice / confirm / promotion (any (re)compute of order pricing)"
+    algorithm: tiered_pricing
+    formula: |
+      For each OrderLine:
+        1. Select the pinned PriceBook line where line.product_form == product_form AND line.packaging == packaging.
+        2. Select the tier where tier_min_units <= quantity_units AND (tier_max_units IS NULL OR quantity_units <= tier_max_units).
+           FLAT tier rate: the entire quantity is priced at the matched tier's unit_price_cents (not marginal).
+        3. unit_price_cents := matched tier's unit_price_cents (snapshot onto the line).
+        4. If product_form == DRY_ICE:
+             line_total_cents := round_half_up(quantity_units * unit_price_cents * (1 + HANDLING_BPS / 10000))
+           Else:
+             line_total_cents := quantity_units * unit_price_cents
+        5. unit_weight_lbs from WEIGHT_LBS constant table.
+      Rounding order is pinned: each line is rounded individually BEFORE any summation.
+    input_set: "All OrderLine rows of the order (any fulfillment_status); no state filtering"
+    constants:
+      HANDLING_BPS: 700
+      WEIGHT_LBS: { "CUBE,BAG": 7, "CUBE,PALLET": 960, "BLOCK,BAG": 25, "BLOCK,PALLET": 300, "DRY_ICE,BAG": 10, "DRY_ICE,PALLET": 500 }
+    precision: "0 decimal places on cents, round_half_up, applied per line"
+
+  - name: order_total_composition
+    trigger: "order quote / reprice / confirm / promotion, after order_line_pricing"
+    algorithm: aggregation
+    formula: |
+      Evaluation order is pinned (this resolves the circular-looking fee/discount/surcharge dependency):
+        1. merchandise_subtotal_cents := SUM(line_total_cents)            # lines already rounded per order_line_pricing
+        2. discount_cents := round_half_up(merchandise_subtotal_cents * discount_bps / 10000)
+           where discount_bps comes from the highest volume_discount_tiers row whose
+           threshold_cents <= merchandise_subtotal_cents (PRE-discount subtotal), else 0.
+        3. post_discount := merchandise_subtotal_cents - discount_cents
+        4. delivery_fee_cents := 0 if channel == WILL_CALL
+                                 else 0 if post_discount >= free_delivery_threshold_cents
+                                 else delivery_fee_cents of the pinned book
+        5. surge_applicable per variant (below); if applicable:
+             surcharge_cents := round_half_up(post_discount * surge_surcharge_bps / 10000)
+           else surcharge_cents := 0
+        6. deposit_cents := SUM over lines with packaging == PALLET of quantity_units * pallet_deposit_cents
+           (deposit is EXEMPT from both discount and surcharge bases)
+        7. total_cents := post_discount + delivery_fee_cents + surcharge_cents + deposit_cents
+    input_set: "The order's own computed line totals; pinned PriceBook configuration; SurgeWindow rows covering event_date"
+    constants: {}
+    precision: "0 decimal places on cents, round_half_up at steps 2 and 5 only"
+    variants:
+      - name: PROVISIONAL
+        when: "quote and reprice (pricing_mode=PROVISIONAL)"
+        difference: "Uses the PriceBook ACTIVE at quote/reprice time; surge_applicable iff a SurgeWindow with status ACTIVE AT EVALUATION TIME covers event_date. Result stored on the order and returned in the quote/reprice response."
+      - name: FINAL
+        when: "confirm and waitlist promotion (pricing_mode=FINAL)"
+        difference: "Uses the PINNED price_book_id (even if since SUPERSEDED) for lines/discount/fee/deposit configuration; surge_applicable iff a SurgeWindow with status ACTIVE AT CONFIRM/PROMOTION TIME covers event_date. Because surge windows and book activations evolve with the logical clock between quote and confirm, PROVISIONAL and FINAL totals for identical lines legitimately differ."
+
+  - name: credit_exposure
+    trigger: "confirm (credit check variant) and customer reads / standing display (settled variant)"
+    algorithm: aggregation
+    formula: |
+      SETTLED := SUM(invoice.balance_due_cents) over invoices of the customer with status IN {ISSUED, PARTIALLY_PAID, OVERDUE}
+      PIPELINE := SUM(order.total_cents FINAL) over orders of the customer with
+                  fulfillment_status IN {CONFIRMED, WAITLISTED, STAGED, READY_FOR_PICKUP, IN_TRANSIT, DELIVERED, PICKED_UP, NO_SHOW}
+                  AND billing_status == UNBILLED
+      FORWARD_LOOKING := SETTLED + PIPELINE
+      Credit check at confirm uses FORWARD_LOOKING:
+        reject when FORWARD_LOOKING + candidate.total_cents > credit_limit_cents + credit_balance_cents
+        (equality admitted).
+      Customer.outstanding_exposure_cents stores SETTLED only.
+    input_set: "Invoices by status filter; orders by fulfillment/billing status filter — both pinned above"
+    constants: {}
+    precision: "integer cents"
+    variants:
+      - name: SETTLED
+        when: "displayed outstanding_exposure_cents and standing computation"
+        difference: "Counts only issued invoice balances; a customer with large confirmed-but-uninvoiced orders shows 0."
+      - name: FORWARD_LOOKING
+        when: "confirm credit check"
+        difference: "Adds the pipeline of uninvoiced order totals; identical customer data yields a strictly larger exposure whenever any confirmed-uninvoiced order exists, so the two variants produce different admit/reject decisions near the limit."
+
+  - name: freezer_capacity_and_posture
+    trigger: "any ColdStorageHold creation/release/expiry; depot read; run_ops"
+    algorithm: aggregation
+    formula: |
+      freezer_reserved_pallets := SUM(hold.pallets_required) over holds with depot_id = depot AND status IN {RESERVED, OCCUPIED}
+      freezer_free_pallets := freezer_capacity_pallets - freezer_reserved_pallets
+      posture := FROZEN            if freezer_free_pallets <= 0
+                 SURGE_CONSTRAINED else if freezer_free_pallets <= ceil(freezer_capacity_pallets * 0.20)
+                 OPEN              otherwise
+      Peak-overlap admission (checked at confirm for GENERAL_FREEZER orders):
+        candidate interval I = [event_date window_start - 4h, event_date window_end + 60min)
+        for every instant t in I: SUM(pallets_required over same-depot GENERAL_FREEZER holds
+            with status IN {RESERVED, OCCUPIED} whose intervals contain t) + order.pallets_required
+            <= freezer_capacity_pallets
+        Half-open intervals: two holds with end == start do NOT overlap.
+      Bunker exclusion: DRY_ICE_BUNKER holds do NOT consume freezer pallets and are excluded
+      from both sums above.
+    input_set: "ColdStorageHold rows by depot and status; SurgeWindow not consulted here"
+    constants:
+      SURGE_CONSTRAINED_THRESHOLD_PCT: 20
+    precision: "integer pallets"
+
+  - name: bunker_interval_exclusion
+    trigger: "confirm of an order with any DRY_ICE line"
+    algorithm: interval_merge
+    formula: |
+      Candidate buffered interval B = [event_date window_start, event_date window_end + 90min).
+      Reject (ERR_HOLD_INTERVAL_CONFLICT) iff B intersects any other same-depot ColdStorageHold
+      with zone == DRY_ICE_BUNKER and status IN {RESERVED, OCCUPIED}.
+      Half-open semantics: candidate.window_start == existing buffered interval_end is ADMITTED
+      (adjacency at the ventilation-buffer boundary is allowed).
+      The 90min = 60min pickup/dispatch grace + 30min ventilation buffer, both pinned constants.
+    input_set: "Same-depot DRY_ICE_BUNKER holds with status IN {RESERVED, OCCUPIED}"
+    constants:
+      GRACE_MINUTES: 60
+      VENTILATION_BUFFER_MINUTES: 30
+    precision: "minute granularity"
+
+  - name: slot_reservation_capacity
+    trigger: "reserve-slot; recomputed on any reservation mutation"
+    algorithm: threshold
+    formula: |
+      reserved_pallets := SUM(order.pallets_required) over orders with delivery_slot_id = slot
+                          AND fulfillment_status IN {QUOTED, CONFIRMED, WAITLISTED, STAGED, IN_TRANSIT}
+      Admission: reserved_pallets + candidate.pallets_required <= capacity_pallets
+      (equality admitted and flips status OPEN -> FULL).
+      status := FULL iff reserved_pallets >= capacity_pallets else OPEN (unless CLOSED by sweep).
+      Containment: order [window_start, window_end) must satisfy
+      slot.window_start <= order.window_start AND order.window_end <= slot.window_end.
+    input_set: "Orders linked to the slot, filtered by the pinned status set (DELIVERED/PICKED_UP/NO_SHOW/CANCELLED excluded)"
+    constants: {}
+    precision: "integer pallets"
+
+  - name: surge_admission
+    trigger: "confirm (admission check); promotion sweep (headroom re-check)"
+    algorithm: threshold
+    formula: |
+      covering := SurgeWindow rows with depot_id = order.depot_id, start_date <= event_date <= end_date,
+                 status == ACTIVE at evaluation time.
+      If no covering window or covering policy == OPEN: admit (surcharge still applies per pricing variant).
+      If policy == CLOSED: reject with ERR_SURGE_ADMISSION_CLOSED.
+      If policy == RATIONED:
+        committed := SUM(order.pallets_required) over orders with depot_id, event_date equal,
+                     fulfillment_status IN {CONFIRMED, STAGED, READY_FOR_PICKUP, IN_TRANSIT}
+        admit iff committed + candidate.pallets_required <= daily_pallet_cap (equality admitted);
+        else fork order to WAITLISTED and enqueue WaitlistEntry.
+    input_set: "Covering ACTIVE surge windows; committed orders by pinned status set (WAITLISTED excluded)"
+    constants: {}
+    precision: "integer pallets"
+
+  - name: waitlist_promotion_selection
+    trigger: "run_ops promotion sweep; any posture-easing mutation (hold release/expiry cascade)"
+    algorithm: waterfall_allocation
+    formula: |
+      Candidate entries: WaitlistEntry status == QUEUED for this depot, linked order
+      fulfillment_status == WAITLISTED, order.event_date > current logical date,
+      and (order.dry_ice_lbs == 0 OR a qualifying ACTIVE certification exists).
+      Ranking: customer.tier PRIORITY before STANDARD;
+               then entry.queued_at ASC;
+               then order.event_date ASC;
+               then order.created_at ASC. (id is NEVER used.)
+      Greedy promotion in rank order while headroom permits:
+        headroom(entry) := posture != FROZEN
+          AND (no ACTIVE RATIONED window covering entry.event_date
+               OR committed(entry.event_date) + entry.requested_pallets <= daily_pallet_cap)
+          AND (no slot linked OR slot.reserved_pallets + entry.requested_pallets <= slot.capacity_pallets)
+      Empty candidate set or exhausted headroom: no-op (no error).
+    input_set: "QUEUED entries for the depot with the pinned eligibility filter"
+    constants: {}
+    precision: "n/a"
+
+  - name: payment_waterfall
+    trigger: "POST /payments"
+    algorithm: waterfall_allocation
+    formula: |
+      eligible := invoices of the customer with status IN {ISSUED, PARTIALLY_PAID, OVERDUE}
+      order eligible by (due_date ASC, created_at ASC)  — deterministic, no id usage.
+      remaining := payment.amount_cents
+      for each invoice in order:
+        apply := min(remaining, invoice.balance_due_cents)
+        invoice.amount_paid_cents += apply; remaining -= apply
+        record { invoice_id, applied_cents: apply } in payment.allocations
+        invoice -> PAID if balance_due_cents == 0 else PARTIALLY_PAID
+        (OVERDUE + partial payment stays OVERDUE; OVERDUE + full payment -> PAID)
+      payment.applied_cents := amount_cents - remaining
+      payment.overpayment_cents := remaining
+      customer.credit_balance_cents += remaining
+      After the loop: customer.standing recomputed (GOOD iff no OVERDUE invoice remains);
+      outstanding_exposure_cents recomputed.
+      Integer cents throughout: no rounding remainder exists.
+    input_set: "Customer invoices filtered by status IN {ISSUED, PARTIALLY_PAID, OVERDUE}"
+    constants: {}
+    precision: "integer cents"
+
+  - name: invoice_consolidation
+    trigger: "POST /invoices/generate"
+    algorithm: chronological
+    formula: |
+      eligible orders: customer match, billing_status == UNBILLED,
+        fulfillment_status IN {DELIVERED, PICKED_UP, NO_SHOW},
+        fulfilled_at date within [period_start, period_end) (inclusive start, exclusive end).
+      If the eligible set is empty: reject ERR_NO_BILLABLE_ORDERS.
+      If any non-VOID invoice already exists for (customer_id, period_start, period_end):
+        reject ERR_INVOICE_PERIOD_CONFLICT.
+      Attachment order: fulfilled_at ASC, tie-break created_at ASC (id never used).
+      Invoice component fields := component-wise SUM over attached orders' FINAL amounts
+      (merchandise/discount/fee/surcharge/deposit/total). Each attached order:
+      billing_status UNBILLED -> INVOICED, invoice_id set.
+    input_set: "Orders by pinned status + period filter; existing invoices for duplicate detection"
+    constants: {}
+    precision: "integer cents"
+
+  - name: ops_run_sweeps
+    trigger: "POST /depots/{id}/run-ops"
+    algorithm: chronological
+    formula: |
+      Executes the following sweeps in this PINNED order (each step observes prior steps' effects):
+        1. PriceBook activation: SCHEDULED books with effective_from <= clock -> ACTIVE
+           (superseding the currently ACTIVE book).
+        2. Cert expiry: HandlerCertification ACTIVE/SUSPENDED with expires_at < clock -> EXPIRED.
+        3. Slot closure: DeliverySlot OPEN/FULL with date < current logical date -> CLOSED.
+        4. No-show: ColdStorageHold OCCUPIED with clock > interval_end and linked will-call
+           order READY_FOR_PICKUP -> hold EXPIRED + order NO_SHOW (+ posture recompute).
+        5. Invoice overdue: Invoice ISSUED/PARTIALLY_PAID with current date > due_date and
+           balance_due_cents > 0 -> OVERDUE (+ standing recompute).
+        6. Waitlist expiry: entry QUEUED with order.event_date <= current date -> EXPIRED +
+           order CANCELLED.
+        7. Route generation: per ACTIVE RecurringRoute, next occurrence (first date with
+           matching weekday, > last_generated_date [or >= current date when null],
+           <= current date + ROUTE_GENERATION_LEAD_DAYS) spawns a DRAFT order and advances
+           last_generated_date. Idempotent per date via last_generated_date.
+        8. Waitlist promotion: waitlist_promotion_selection for this depot.
+      Increments depot.ops_run_index by 1 and returns per-step id lists.
+    input_set: "All entities scoped to the path depot (routes/customers/orders may belong to other depots' customers but are filtered by route/depot linkage)"
+    constants:
+      ROUTE_GENERATION_LEAD_DAYS: 3
+    precision: "date granularity for sweeps 3,5,6,7; datetime for 1,2,4"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present; role value declared in §1.7", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role permitted for the endpoint per §1.5 roles; for entity_backed CustomerAgent, X-User-ID must equal the owning customer id (order.customer_id, route.customer_id, entry's order.customer_id)", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Request-body schema: required fields present, types match, enum values valid, unknown fields rejected, lines array non-empty, window_start < window_end, period_start < period_end", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all endpoints with a request body" }
+  - { priority: 4, category: existence, check: "Path ids exist, validated left-to-right (depot before nested segment)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all endpoints with path ids" }
+  - { priority: 5, category: existence, check: "Body-referenced FK ids exist (customer_id, depot_id, delivery_slot_id)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "POST /orders, POST /orders/{id}/reserve-slot, POST /recurring-routes, POST /surge-windows, POST /dispatch-runs, POST /invoices/generate, POST /payments, POST /customers/{id}/certifications" }
+  - { priority: 6, category: concurrency, check: "expected_<parent>_version equals current version", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /orders/{id}/reprice, PATCH /recurring-routes/{id}/standing-order" }
+  - { priority: 7, category: state, check: "Target not in a terminal state for this operation (CANCELLED order; TERMINATED route; VOID invoice — also PAID invoice for issue; CLOSED slot; RELEASED/EXPIRED hold; COMPLETED/CANCELLED run; PROMOTED/WITHDRAWN/EXPIRED entry; EXPIRED cert)", error_id: ERR_ALREADY_TERMINAL, http_status: 409, applies_to: "all state-transition endpoints" }
+  - { priority: 8, category: state, check: "Target in the required non-terminal state for this operation (quote needs DRAFT; confirm needs QUOTED; stage needs CONFIRMED; mark-ready needs STAGED will-call; confirm-pickup needs READY_FOR_PICKUP; reserve-slot/reprice need QUOTED; issue needs DRAFT invoice; assign needs PLANNED run and STAGED orders; lock PLANNED; start LOCKED; complete IN_PROGRESS; pause needs ACTIVE; resume needs PAUSED)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all state-transition endpoints except POST /invoices/{id}/void (void's state rule is split: VOID invoice -> priority 7 ALREADY_TERMINAL; PAID invoice -> priority 30 ERR_INVOICE_NOT_VOIDABLE)" }
+  - { priority: 9, category: business_safety, check: "Order with dry_ice_lbs > 0 requires a HandlerCertification of the same customer with status ACTIVE, expires_at >= event window end, max_dry_ice_lbs >= order.dry_ice_lbs", error_id: ERR_DRY_ICE_CERT_REQUIRED, http_status: 409, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 10, category: business_safety, check: "Dispatch-run assign: assigned_dry_ice_lbs + candidates <= ventilated_dry_ice_cap_lbs", error_id: ERR_DRY_ICE_VENTILATION_EXCEEDED, http_status: 409, applies_to: "POST /dispatch-runs/{id}/assign" }
+  - { priority: 11, category: business_temporal, check: "event_date >= current logical date + 1 day (checked at creation and re-checked at confirm)", error_id: ERR_EVENT_TOO_SOON, http_status: 409, applies_to: "POST /orders, POST /orders/{id}/confirm" }
+  - { priority: 12, category: business_temporal, check: "slot.date / run_date >= current logical date at creation", error_id: ERR_DELIVERY_WINDOW_PAST, http_status: 409, applies_to: "POST /delivery-slots, POST /dispatch-runs" }
+  - { priority: 13, category: business_temporal, check: "Order [window_start, window_end) contained in slot [window_start, window_end)", error_id: ERR_WINDOW_OUTSIDE_SLOT, http_status: 409, applies_to: "POST /orders/{id}/reserve-slot" }
+  - { priority: 14, category: business_temporal, check: "Dry-ice bunker exclusive buffered interval does not intersect another RESERVED/OCCUPIED bunker hold (half-open; adjacency at buffer boundary admitted)", error_id: ERR_HOLD_INTERVAL_CONFLICT, http_status: 409, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 15, category: business_temporal, check: "confirm-pickup while logical clock <= hold.interval_end", error_id: ERR_PICKUP_WINDOW_EXPIRED, http_status: 409, applies_to: "POST /orders/{id}/confirm-pickup" }
+  - { priority: 16, category: business_constraint, check: "Every line quantity_units >= 1", error_id: ERR_LINE_QUANTITY_INVALID, http_status: 400, applies_to: "POST /orders, PATCH /recurring-routes/{id}/standing-order, POST /recurring-routes" }
+  - { priority: 17, category: business_constraint, check: "depot.posture != FROZEN for new slot reservations", error_id: ERR_POSTURE_FROZEN, http_status: 409, applies_to: "POST /orders/{id}/reserve-slot" }
+  - { priority: 18, category: business_constraint, check: "slot.reserved_pallets + order.pallets_required <= slot.capacity_pallets (equality admitted)", error_id: ERR_SLOT_CAPACITY_EXCEEDED, http_status: 409, applies_to: "POST /orders/{id}/reserve-slot" }
+  - { priority: 19, category: business_constraint, check: "Freezer peak-overlap aggregate admission for GENERAL_FREEZER orders", error_id: ERR_FREEZER_CAPACITY_EXCEEDED, http_status: 409, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 20, category: business_constraint, check: "At most one RecurringRoute per (customer_id, weekday) in status IN {ACTIVE, PAUSED}", error_id: ERR_ROUTE_SCHEDULE_CONFLICT, http_status: 409, applies_to: "POST /recurring-routes, POST /recurring-routes/{id}/resume" }
+  - { priority: 21, category: business_constraint, check: "Covering ACTIVE surge window with admission_policy CLOSED rejects confirm", error_id: ERR_SURGE_ADMISSION_CLOSED, http_status: 409, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 22, category: business_constraint, check: "An ACTIVE PriceBook exists (effective_from <= clock) at quote/reprice", error_id: ERR_PRICE_BOOK_NOT_ACTIVE, http_status: 409, applies_to: "POST /orders/{id}/quote, POST /orders/{id}/reprice" }
+  - { priority: 23, category: business_constraint, check: "assign aggregate pallets <= max_pallets", error_id: ERR_RUN_CAPACITY_EXCEEDED, http_status: 409, applies_to: "POST /dispatch-runs/{id}/assign" }
+  - { priority: 24, category: business_constraint, check: "No non-VOID invoice exists for the same (customer_id, period_start, period_end)", error_id: ERR_INVOICE_PERIOD_CONFLICT, http_status: 409, applies_to: "POST /invoices/generate" }
+  - { priority: 25, category: business_constraint, check: "Eligible billable order set is non-empty", error_id: ERR_NO_BILLABLE_ORDERS, http_status: 409, applies_to: "POST /invoices/generate" }
+  - { priority: 26, category: business_fiscal, check: "customer.standing == GOOD at confirm", error_id: ERR_CREDIT_HOLD, http_status: 402, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 27, category: business_fiscal, check: "forward_looking_exposure + candidate.total_cents <= credit_limit_cents + credit_balance_cents (equality admitted)", error_id: ERR_CREDIT_LIMIT_EXCEEDED, http_status: 402, applies_to: "POST /orders/{id}/confirm" }
+  - { priority: 28, category: business_fiscal, check: "payment amount_cents >= 1", error_id: ERR_PAYMENT_AMOUNT_INVALID, http_status: 400, applies_to: "POST /payments" }
+  - { priority: 29, category: business_fiscal, check: "invoice void: voiding X-User-ID != issued_by_user_id (when set)", error_id: ERR_SEGREGATION_OF_DUTIES, http_status: 403, applies_to: "POST /invoices/{id}/void" }
+  - { priority: 30, category: business_fiscal, check: "invoice void allowed only from DRAFT/ISSUED/PARTIALLY_PAID/OVERDUE; PAID invoice cannot be voided", error_id: ERR_INVOICE_NOT_VOIDABLE, http_status: 409, applies_to: "POST /invoices/{id}/void" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: sets the logical clock. Startup default is exactly 2026-05-01T00:00:00Z; before any call the clock reads this default and never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["subsequent status derivations (SurgeWindow.status, due/overdue sweeps, lead-time checks) evaluate against the new clock"]
+
+  - method: POST
+    path: "/depots"
+    description: "Create a depot"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [name, freezer_capacity_pallets]
+    output: Depot
+    side_effects: ["freezer_reserved_pallets=0, freezer_free_pallets=capacity, posture=OPEN, ops_run_index=0"]
+
+  - method: GET
+    path: "/depots/{id}"
+    description: "Fetch a depot including computed freezer fields and posture"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: []
+    output: Depot
+    side_effects: []
+
+  - method: POST
+    path: "/depots/{id}/run-ops"
+    description: "Ops-run checkpoint: executes ops_run_sweeps in pinned order and increments ops_run_index"
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: "{ ops_run_index: integer, activated_book_ids: string[], expired_cert_ids: string[], closed_slot_ids: string[], expired_hold_ids: string[], no_show_order_ids: string[], overdue_invoice_ids: string[], expired_entry_ids: string[], generated_order_ids: string[], promoted_entry_ids: string[] }"
+    side_effects: ["runs ops_run_sweeps (8 pinned steps); increments Depot.ops_run_index and Depot.version"]
+
+  - method: POST
+    path: "/customers"
+    description: "Create a customer account"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [account_name, kind, tier, credit_terms, credit_limit_cents]
+    output: Customer
+    side_effects: ["credit_balance_cents=0, outstanding_exposure_cents=0, standing=GOOD"]
+
+  - method: GET
+    path: "/customers/{id}"
+    description: "Fetch a customer including computed balance/exposure/standing"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: []
+    output: Customer
+    side_effects: []
+
+  - method: POST
+    path: "/customers/{id}/certifications"
+    description: "Register a dry-ice handler certification for the customer"
+    roles: [SafetyOfficer]
+    code: 201
+    input: [handler_name, certificate_number, max_dry_ice_lbs, expires_at]
+    output: HandlerCertification
+    side_effects: ["status=ACTIVE"]
+
+  - method: GET
+    path: "/customers/{id}/certifications"
+    description: "List certifications of a customer (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: HandlerCertification[]
+    side_effects: []
+
+  - method: POST
+    path: "/certifications/{id}/suspend"
+    description: "Suspend a certification"
+    roles: [SafetyOfficer]
+    code: 200
+    input: []
+    output: HandlerCertification
+    side_effects: ["ACTIVE -> SUSPENDED"]
+
+  - method: POST
+    path: "/certifications/{id}/reinstate"
+    description: "Reinstate a suspended certification (expired certs rejected)"
+    roles: [SafetyOfficer]
+    code: 200
+    input: []
+    output: HandlerCertification
+    side_effects: ["SUSPENDED -> ACTIVE"]
+
+  - method: POST
+    path: "/price-books"
+    description: "Create a price book; becomes ACTIVE iff effective_from <= clock (superseding the currently ACTIVE book), else SCHEDULED"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [scope_label, effective_from, lines, pallet_deposit_cents, delivery_fee_cents, free_delivery_threshold_cents, volume_discount_tiers, surge_surcharge_bps]
+    output: PriceBook
+    side_effects: ["if activated: previously ACTIVE book -> SUPERSEDED"]
+
+  - method: GET
+    path: "/price-books"
+    description: "List price books (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PriceBook[]
+    side_effects: []
+
+  - method: POST
+    path: "/surge-windows"
+    description: "Create a surge window for a depot"
+    roles: [PlatformAdmin]
+    code: 201
+    input: [depot_id, start_date, end_date, admission_policy, "daily_pallet_cap?"]
+    output: SurgeWindow
+    side_effects: ["status derived from clock: SCHEDULED | ACTIVE | ENDED"]
+
+  - method: GET
+    path: "/depots/{id}/surge-windows"
+    description: "List surge windows of a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SurgeWindow[]
+    side_effects: []
+
+  - method: POST
+    path: "/recurring-routes"
+    description: "Create a recurring route for a bar/restaurant (initial status ACTIVE)"
+    roles: [CustomerAgent]
+    code: 201
+    input: [customer_id, depot_id, weekday, window_start, window_end, standing_lines]
+    output: RecurringRoute
+    side_effects: ["uniqueness: one ACTIVE/PAUSED route per (customer_id, weekday)"]
+
+  - method: GET
+    path: "/recurring-routes/{id}"
+    description: "Fetch a recurring route"
+    roles: [PlatformAdmin, DepotManager, CustomerAgent]
+    code: 200
+    input: []
+    output: RecurringRoute
+    side_effects: []
+
+  - method: GET
+    path: "/customers/{id}/routes"
+    description: "List recurring routes of a customer (paginated)"
+    roles: [PlatformAdmin, DepotManager, CustomerAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RecurringRoute[]
+    side_effects: []
+
+  - method: GET
+    path: "/depots/{id}/routes"
+    description: "List recurring routes served by a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RecurringRoute[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/recurring-routes/{id}/standing-order"
+    description: "Replace standing lines (OCC on expected_route_version)"
+    roles: [CustomerAgent]
+    code: 200
+    input: [standing_lines, expected_route_version]
+    output: RecurringRoute
+    side_effects: ["allowed from ACTIVE or PAUSED; increments RecurringRoute.version by 1"]
+
+  - method: POST
+    path: "/recurring-routes/{id}/pause"
+    description: "Pause a route (ACTIVE -> PAUSED)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: RecurringRoute
+    side_effects: ["increments RecurringRoute.version by 1"]
+
+  - method: POST
+    path: "/recurring-routes/{id}/resume"
+    description: "Resume a route (PAUSED -> ACTIVE; uniqueness re-checked)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: RecurringRoute
+    side_effects: ["increments RecurringRoute.version by 1"]
+
+  - method: POST
+    path: "/recurring-routes/{id}/terminate"
+    description: "Terminate a route (ACTIVE/PAUSED -> TERMINATED)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: RecurringRoute
+    side_effects: ["excluded from future run_ops generation"]
+
+  - method: POST
+    path: "/orders"
+    description: "Create an order with inline lines (initial fulfillment_status=DRAFT, billing_status=UNBILLED)"
+    roles: [CustomerAgent]
+    code: 201
+    input: [customer_id, depot_id, channel, event_date, window_start, window_end, lines]
+    output: Order
+    side_effects: ["creates OrderLine rows; event_date lead-time check (ERR_EVENT_TOO_SOON)"]
+
+  - method: GET
+    path: "/orders/{id}"
+    description: "Fetch an order with computed pricing fields"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+
+  - method: GET
+    path: "/orders"
+    description: "List orders with filters (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["customer_id?", "depot_id?", "recurring_route_id?", "price_book_id?", "delivery_slot_id?", "status?", "limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  - method: POST
+    path: "/orders/{id}/quote"
+    description: "Quote a DRAFT order: pins the ACTIVE price book and computes PROVISIONAL pricing"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["DRAFT -> QUOTED; pins price_book_id/version; snapshots line unit prices; PROVISIONAL totals"]
+
+  - method: POST
+    path: "/orders/{id}/confirm"
+    description: "Confirm a QUOTED order: FINAL pricing, freezer/surge/credit/safety admission, creates RESERVED hold; may fork to WAITLISTED under RATIONED surge"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["QUOTED -> CONFIRMED or WAITLISTED; creates ColdStorageHold RESERVED on CONFIRMED; depot posture recompute"]
+
+  - method: POST
+    path: "/orders/{id}/cancel"
+    description: "Cancel an order from DRAFT/QUOTED/CONFIRMED/WAITLISTED (compensating releases + promotion cascade)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["releases slot reservation and/or hold; waitlist entry withdrawn; posture recompute may trigger promotion sweep"]
+
+  - method: POST
+    path: "/orders/{id}/reprice"
+    description: "Re-quote a QUOTED order against the currently ACTIVE book (OCC on expected_order_version)"
+    roles: [CustomerAgent]
+    code: 200
+    input: [expected_order_version]
+    output: Order
+    side_effects: ["re-pins book; recomputes PROVISIONAL totals; increments Order.version by 1"]
+
+  - method: POST
+    path: "/orders/{id}/reserve-slot"
+    description: "Reserve delivery-slot capacity for a QUOTED DELIVERY order"
+    roles: [CustomerAgent]
+    code: 200
+    input: [delivery_slot_id]
+    output: Order
+    side_effects: ["sets delivery_slot_id; slot.reserved_pallets += pallets_required; slot OPEN->FULL at equality"]
+
+  - method: POST
+    path: "/orders/{id}/stage"
+    description: "Stage a CONFIRMED order into cold storage (hold RESERVED -> OCCUPIED)"
+    roles: [DepotManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["CONFIRMED -> STAGED; hold RESERVED -> OCCUPIED"]
+
+  - method: POST
+    path: "/orders/{id}/mark-ready"
+    description: "Mark a staged will-call order ready for pickup"
+    roles: [DepotManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["STAGED -> READY_FOR_PICKUP"]
+
+  - method: POST
+    path: "/orders/{id}/confirm-pickup"
+    description: "Customer picks up a will-call order (release hold)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["READY_FOR_PICKUP -> PICKED_UP; hold OCCUPIED -> RELEASED; posture recompute + promotion sweep"]
+
+  - method: GET
+    path: "/orders/{id}/lines"
+    description: "List lines of an order"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}/holds"
+    description: "List cold-storage holds of an order"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: ColdStorageHold[]
+    side_effects: []
+
+  - method: GET
+    path: "/orders/{id}/waitlist-entries"
+    description: "List waitlist entries of an order"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/delivery-slots"
+    description: "Create a delivery slot for a depot"
+    roles: [Dispatcher]
+    code: 201
+    input: [depot_id, date, window_start, window_end, capacity_pallets]
+    output: DeliverySlot
+    side_effects: ["status=OPEN, reserved_pallets=0"]
+
+  - method: GET
+    path: "/depots/{id}/delivery-slots"
+    description: "List delivery slots of a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["date?", "status?", "limit?", "offset?"]
+    output: DeliverySlot[]
+    side_effects: []
+
+  - method: GET
+    path: "/depots/{id}/holds"
+    description: "List cold-storage holds of a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["status?", "zone?", "limit?", "offset?"]
+    output: ColdStorageHold[]
+    side_effects: []
+
+  - method: POST
+    path: "/cold-storage-holds/{id}/release"
+    description: "Manually release a RESERVED/OCCUPIED hold (e.g. damaged stock write-off)"
+    roles: [DepotManager]
+    code: 200
+    input: []
+    output: ColdStorageHold
+    side_effects: ["RESERVED/OCCUPIED -> RELEASED; depot recompute + promotion sweep; linked order unaffected"]
+
+  - method: POST
+    path: "/dispatch-runs"
+    description: "Create a dispatch run"
+    roles: [Dispatcher]
+    code: 201
+    input: [depot_id, run_date, vehicle_label, max_pallets, ventilated_dry_ice_cap_lbs]
+    output: DispatchRun
+    side_effects: ["status=PLANNED"]
+
+  - method: GET
+    path: "/dispatch-runs/{id}"
+    description: "Fetch a dispatch run"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: []
+    output: DispatchRun
+    side_effects: []
+
+  - method: GET
+    path: "/depots/{id}/dispatch-runs"
+    description: "List dispatch runs of a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["run_date?", "status?", "limit?", "offset?"]
+    output: DispatchRun[]
+    side_effects: []
+
+  - method: POST
+    path: "/dispatch-runs/{id}/assign"
+    description: "Atomically assign STAGED delivery orders to a PLANNED run (capacity + ventilation checks)"
+    roles: [Dispatcher]
+    code: 200
+    input: [order_ids]
+    output: DispatchRun
+    side_effects: ["sets dispatch_run_id on all listed orders; any violation rejects the whole assign"]
+
+  - method: POST
+    path: "/dispatch-runs/{id}/lock"
+    description: "Lock a run (no further assignments)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchRun
+    side_effects: ["PLANNED -> LOCKED"]
+
+  - method: POST
+    path: "/dispatch-runs/{id}/start"
+    description: "Start a locked run: orders STAGED -> IN_TRANSIT, holds released"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchRun
+    side_effects: ["LOCKED -> IN_PROGRESS; per-order cascade to IN_TRANSIT + hold RELEASED + posture recompute"]
+
+  - method: POST
+    path: "/dispatch-runs/{id}/complete"
+    description: "Complete a run: orders IN_TRANSIT -> DELIVERED (invoice-eligible)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchRun
+    side_effects: ["IN_PROGRESS -> COMPLETED; per-order DELIVERED + fulfilled_at"]
+
+  - method: POST
+    path: "/dispatch-runs/{id}/cancel"
+    description: "Cancel a PLANNED/LOCKED run; orders stay STAGED and unlinked"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: DispatchRun
+    side_effects: ["PLANNED/LOCKED -> CANCELLED; clears dispatch_run_id on assigned orders"]
+
+  - method: GET
+    path: "/dispatch-runs/{id}/orders"
+    description: "List orders assigned to a run"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  - method: GET
+    path: "/depots/{id}/waitlist-entries"
+    description: "List waitlist entries of a depot (paginated)"
+    roles: [PlatformAdmin, DepotManager, Dispatcher, BillingClerk, SafetyOfficer, CustomerAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: WaitlistEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/waitlist-entries/{id}/withdraw"
+    description: "Withdraw a QUEUED entry (order WAITLISTED -> CANCELLED)"
+    roles: [CustomerAgent]
+    code: 200
+    input: []
+    output: WaitlistEntry
+    side_effects: ["QUEUED -> WITHDRAWN; order -> CANCELLED; slot reservation released if linked"]
+
+  - method: POST
+    path: "/invoices/generate"
+    description: "Consolidate a customer's billable orders for a period into a DRAFT invoice"
+    roles: [BillingClerk]
+    code: 201
+    input: [customer_id, period_start, period_end]
+    output: Invoice
+    side_effects: ["attaches eligible orders (UNBILLED -> INVOICED); component-wise totals per invoice_consolidation"]
+
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Fetch an invoice with computed amounts"
+    roles: [PlatformAdmin, BillingClerk, CustomerAgent]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+  - method: GET
+    path: "/customers/{id}/invoices"
+    description: "List invoices of a customer (paginated)"
+    roles: [PlatformAdmin, BillingClerk, CustomerAgent]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+
+  - method: POST
+    path: "/invoices/{id}/issue"
+    description: "Issue a DRAFT invoice (sets due_date from terms, records issuer)"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["DRAFT -> ISSUED; sets issued_by_user_id and due_date"]
+
+  - method: POST
+    path: "/invoices/{id}/void"
+    description: "Void a non-PAID invoice (segregation of duties; unapplies payments to customer credit; orders revert to UNBILLED)"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["-> VOID; orders UNBILLED; amount_paid moved to customer.credit_balance_cents; standing/exposure recompute"]
+
+  - method: GET
+    path: "/invoices/{id}/orders"
+    description: "List orders attached to an invoice"
+    roles: [PlatformAdmin, BillingClerk, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Order[]
+    side_effects: []
+
+  - method: POST
+    path: "/payments"
+    description: "Record a customer payment; waterfall-allocates to open invoices, overpayment to credit_balance"
+    roles: [BillingClerk]
+    code: 201
+    input: [customer_id, amount_cents, method]
+    output: Payment
+    side_effects: ["payment_waterfall across invoices; invoice/order status cascades; standing + exposure recompute"]
+
+  - method: GET
+    path: "/customers/{id}/payments"
+    description: "List payments of a customer (paginated, immutable ledger)"
+    roles: [PlatformAdmin, BillingClerk, CustomerAgent]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Payment[]
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted for the endpoint, or entity-backed caller does not own the resource" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, malformed type, invalid enum, unknown field, empty lines array, window_start >= window_end, period_start >= period_end" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id or body-referenced FK id does not exist" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the current entity version (OCC)" }
+  - { id: ERR_ALREADY_TERMINAL, http: 409, condition: "Target entity is in a terminal state for the attempted operation" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target entity is in a non-terminal state that does not permit the attempted operation" }
+  - { id: ERR_DRY_ICE_CERT_REQUIRED, http: 409, condition: "Dry-ice order lacks a qualifying ACTIVE certification (or cert suspended/insufficient max_dry_ice_lbs/expired before event window end)" }
+  - { id: ERR_DRY_ICE_VENTILATION_EXCEEDED, http: 409, condition: "Dispatch-run assign would exceed ventilated_dry_ice_cap_lbs" }
+  - { id: ERR_EVENT_TOO_SOON, http: 409, condition: "event_date < current logical date + 1 day (at create or confirm re-check)" }
+  - { id: ERR_DELIVERY_WINDOW_PAST, http: 409, condition: "slot date or run date is before the current logical date" }
+  - { id: ERR_WINDOW_OUTSIDE_SLOT, http: 409, condition: "Order window not contained within the delivery slot window" }
+  - { id: ERR_HOLD_INTERVAL_CONFLICT, http: 409, condition: "Dry-ice bunker buffered interval intersects another RESERVED/OCCUPIED bunker hold" }
+  - { id: ERR_PICKUP_WINDOW_EXPIRED, http: 409, condition: "confirm-pickup attempted after hold.interval_end" }
+  - { id: ERR_LINE_QUANTITY_INVALID, http: 400, condition: "A line has quantity_units < 1" }
+  - { id: ERR_POSTURE_FROZEN, http: 409, condition: "Depot posture FROZEN blocks new slot reservations" }
+  - { id: ERR_SLOT_CAPACITY_EXCEEDED, http: 409, condition: "Slot reservation would exceed capacity_pallets (reserved + candidate > capacity)" }
+  - { id: ERR_FREEZER_CAPACITY_EXCEEDED, http: 409, condition: "General-freezer peak-overlap aggregate would exceed freezer_capacity_pallets" }
+  - { id: ERR_ROUTE_SCHEDULE_CONFLICT, http: 409, condition: "Another route for the same customer+weekday is ACTIVE or PAUSED" }
+  - { id: ERR_SURGE_ADMISSION_CLOSED, http: 409, condition: "Covering ACTIVE surge window has admission_policy CLOSED" }
+  - { id: ERR_PRICE_BOOK_NOT_ACTIVE, http: 409, condition: "No PriceBook is ACTIVE at quote/reprice time" }
+  - { id: ERR_RUN_CAPACITY_EXCEEDED, http: 409, condition: "Assign would exceed run max_pallets" }
+  - { id: ERR_INVOICE_PERIOD_CONFLICT, http: 409, condition: "A non-VOID invoice already exists for the same customer and period" }
+  - { id: ERR_NO_BILLABLE_ORDERS, http: 409, condition: "Invoice generation found zero eligible orders" }
+  - { id: ERR_CREDIT_HOLD, http: 402, condition: "Customer standing is HOLD (an invoice is OVERDUE)" }
+  - { id: ERR_CREDIT_LIMIT_EXCEEDED, http: 402, condition: "forward_looking_exposure + candidate total exceeds credit_limit + credit_balance" }
+  - { id: ERR_PAYMENT_AMOUNT_INVALID, http: 400, condition: "Payment amount_cents < 1" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Invoice void attempted by the same BillingClerk user who issued it" }
+  - { id: ERR_INVOICE_NOT_VOIDABLE, http: 409, condition: "Void attempted on a PAID invoice" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Operator of the ice service platform; owns depots, customers, price books, surge windows, clock, and ops runs"
+    identity: opaque
+    exclusive_operations: ["POST /depots", "POST /customers", "POST /price-books", "POST /surge-windows", "POST /depots/{id}/run-ops", "POST /_clock/set_current_utc"]
+    shared_operations: ["All GET endpoints"]
+
+  - name: DepotManager
+    description: "Depot floor operator; stages orders, marks will-call ready, releases holds"
+    identity: opaque
+    exclusive_operations: ["POST /orders/{id}/stage", "POST /orders/{id}/mark-ready", "POST /cold-storage-holds/{id}/release"]
+    shared_operations: ["All GET endpoints"]
+
+  - name: Dispatcher
+    description: "Route/dispatch planner; owns delivery slots and dispatch runs"
+    identity: opaque
+    exclusive_operations: ["POST /delivery-slots", "POST /dispatch-runs", "POST /dispatch-runs/{id}/assign", "POST /dispatch-runs/{id}/lock", "POST /dispatch-runs/{id}/start", "POST /dispatch-runs/{id}/complete", "POST /dispatch-runs/{id}/cancel"]
+    shared_operations: ["All GET endpoints"]
+
+  - name: BillingClerk
+    description: "Billing operator; generates/issues/voids invoices and records payments. Segregation of duties: the clerk who issued an invoice cannot void it."
+    identity: opaque
+    exclusive_operations: ["POST /invoices/generate", "POST /invoices/{id}/issue", "POST /invoices/{id}/void", "POST /payments"]
+    shared_operations: ["GET endpoints for invoices, payments, customers, orders"]
+
+  - name: SafetyOfficer
+    description: "Dry-ice safety authority; manages handler certifications"
+    identity: opaque
+    exclusive_operations: ["POST /customers/{id}/certifications", "POST /certifications/{id}/suspend", "POST /certifications/{id}/reinstate"]
+    shared_operations: ["All GET endpoints"]
+
+  - name: CustomerAgent
+    description: "Acts on behalf of a customer account (bar/restaurant manager or event organizer); X-User-ID equals the Customer id"
+    identity: entity_backed:Customer
+    exclusive_operations: ["POST /orders", "POST /orders/{id}/quote", "POST /orders/{id}/confirm", "POST /orders/{id}/cancel", "POST /orders/{id}/reprice", "POST /orders/{id}/reserve-slot", "POST /orders/{id}/confirm-pickup", "POST /recurring-routes", "PATCH /recurring-routes/{id}/standing-order", "POST /recurring-routes/{id}/pause", "POST /recurring-routes/{id}/resume", "POST /recurring-routes/{id}/terminate", "POST /waitlist-entries/{id}/withdraw"]
+    shared_operations: ["All GET endpoints (scoped to own resources where ownership applies)"]

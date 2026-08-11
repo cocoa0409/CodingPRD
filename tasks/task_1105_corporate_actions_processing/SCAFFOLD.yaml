@@ -1,0 +1,1478 @@
+# =============================================================================
+# SCAFFOLD.yaml — Corporate Actions Processing (brokerage corporate actions desk)
+# Sections 1.0–1.7. Difficulty design and corner design live in sibling files.
+# =============================================================================
+
+scenario: |
+  1105. Corporate Actions Processing (brokerage corporate actions desk): event
+  notification ingestion & scrubbing across sources, entitlement calculation by
+  position & record date, voluntary election collection & deadline enforcement,
+  fractional share handling & cash-in-lieu, mandatory event booking
+  (split/merger/spin-off), cost basis adjustment & tax lot updates,
+  claims/compensation for missed entitlements, reconciliation with custodian
+
+domain_name: corporate-actions-desk
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency      # OCC on CorporateActionEvent.version (amendments, election submits)
+    - cascading_side_effects      # book -> entitlement -> lot -> account -> recon-break chains
+    - dual_variant_calculation    # trade-date vs settled entitlement basis; event-terms vs market-value compensation
+    - scheduled_actions           # logical clock drives record-date capture, deadlines, claim windows
+  entity_topology: flat           # peer entities joined by foreign keys; no nested ownership in URLs
+  state_machine_shape: cyclic     # event CONFIRMED->AMENDED->CONFIRMED, election SUBMITTED->WITHDRAWN->SUBMITTED
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+    - self_referential            # Entitlement.supersedes_entitlement_id; PositionLot.origin_booking_id lineage
+  role_model: segregation_of_duties  # scrubber != confirmer on the same event (same role, different user)
+  consistency_model: immediate    # every mutation (incl. cascades) visible in the same response / immediate reads
+
+# =============================================================================
+# Section 1.0: Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Section 1.1: Entity-Relationship Table (14 entities, flat topology)
+# =============================================================================
+entities:
+  - name: Security
+    parent: null
+    common_fields: true
+    fields:
+      - { name: ticker, type: string, source: input, description: "Exchange ticker symbol; unique across all securities" }
+      - { name: cusip, type: string, source: input, description: "CUSIP identifier; unique across all securities" }
+      - { name: name, type: string, source: input, description: "Issuer display name" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | SUSPENDED; new corporate action events require ACTIVE" }
+
+  - name: Account
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_number, type: string, source: input, description: "Client account number; unique" }
+      - { name: holder_name, type: string, source: input, description: "Account holder display name" }
+      - { name: opening_cash_cents, type: integer, source: input, default: 0, description: "Opening cash balance in cents at account creation" }
+      - { name: cash_balance_cents, type: integer, source: computed, description: "Current cash; initialized to opening_cash_cents; credited by bookings/claim payments, debited by booking reversals and rights exercises; may go negative (desk settles externally)" }
+      - { name: total_cost_basis_cents, type: integer, source: computed, description: "Sum of cost_basis_total_cents over OPEN PositionLots of this account" }
+      - { name: pending_entitlement_count, type: integer, source: computed, description: "Count of this account's Entitlements in PROJECTED or FIRM status" }
+      - { name: status, type: enum, source: system, default: "ACTIVE", description: "ACTIVE | FROZEN | CLOSED; non-ACTIVE accounts are skipped at booking (entitlement -> MISSED) and cannot submit elections" }
+
+  - name: PositionLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; owning account" }
+      - { name: security_id, type: string, source: input, description: "FK -> Security.id; held security" }
+      - { name: origin_booking_id, type: string, source: system, description: "FK -> Booking.id; set on lots created by a booking (merger stock, spin-off shares); null for desk-established lots", default: null }
+      - { name: quantity, type: number, source: input, description: "Share quantity, up to 4 decimal places; must be > 0 at creation" }
+      - { name: acquisition_date, type: string, source: input, description: "ISO date the lot was acquired; drives record-position basis inclusion" }
+      - { name: cost_basis_total_cents, type: integer, source: input, description: "Total tax cost basis of the lot in cents; adjusted in place by split/merger/spin-off bookings" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | FULLY_SURRENDERED (quantity reached exactly 0)" }
+
+  - name: EventSource
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Source display name (e.g., 'DTCC feed', 'Vendor X')" }
+      - { name: source_type, type: enum, source: input, description: "CUSTODIAN | VENDOR | DEPOSITORY; only CUSTODIAN sources may submit CustodianStatements" }
+      - { name: reliability_weight, type: integer, source: input, description: "Scrubbing precedence weight, integer >= 0; higher wins on conflicting terms; ties broken by earliest SourceNotification.created_at" }
+
+  - name: SourceNotification
+    parent: null
+    common_fields: false   # immutable ingest record: id + created_at only
+    fields:
+      - { name: source_id, type: string, source: input, description: "FK -> EventSource.id; originating source" }
+      - { name: security_id, type: string, source: input, description: "FK -> Security.id; security the notification describes" }
+      - { name: event_type, type: enum, source: input, description: "SPLIT | MERGER | SPIN_OFF | CASH_DIVIDEND | STOCK_DIVIDEND | RIGHTS_OFFERING" }
+      - { name: record_date, type: string, source: input, description: "ISO record date announced by the source" }
+      - { name: announced_terms, type: object, source: input, description: "Raw terms object as announced (same shape as CorporateActionEvent.terms)" }
+      - { name: status, type: enum, source: system, default: "RECEIVED", description: "RECEIVED | MATCHED (scrubbed into a golden event) | REJECTED" }
+
+  - name: CorporateActionEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: security_id, type: string, source: input, description: "FK -> Security.id; subject security" }
+      - { name: event_type, type: enum, source: input, description: "SPLIT | MERGER | SPIN_OFF | CASH_DIVIDEND | STOCK_DIVIDEND | RIGHTS_OFFERING" }
+      - { name: election_required, type: boolean, source: input, default: false, description: "true for voluntary events (MERGER cash/stock choice, RIGHTS_OFFERING exercise)" }
+      - { name: terms, type: object, source: input, description: "Golden scrubbed terms; per-type keys: SPLIT/STOCK_DIVIDEND {ratio_num, ratio_den, price_per_share_cents, fractional_policy}; MERGER {cash_per_share_cents, cash_pool_cents, new_security_id, ratio_num, ratio_den, default_option}; SPIN_OFF {spinoff_security_id, ratio_num, ratio_den, fmv_parent_cents, fmv_spin_cents, price_per_share_cents, fractional_policy}; CASH_DIVIDEND {cash_per_share_cents}; RIGHTS_OFFERING {rights_ratio_num, rights_ratio_den, subscription_price_cents, shares_offered, oversubscription_allowed}" }
+      - { name: record_date, type: string, source: input, description: "ISO record date; positions are measured as of this date" }
+      - { name: payable_date, type: string, source: input, description: "ISO payable date; must be >= record_date" }
+      - { name: election_deadline, type: string, source: input, default: null, description: "ISO datetime; required iff election_required=true; must be <= payable_date end-of-day; submissions accepted while clock <= deadline (inclusive)" }
+      - { name: compensation_pool_cents, type: integer, source: input, default: 0, description: "Desk-funded cap on total approved claim compensation for this event" }
+      - { name: compensation_pool_remaining_cents, type: integer, source: computed, description: "compensation_pool_cents minus compensation reserved by APPROVED claims; initialized to compensation_pool_cents" }
+      - { name: claim_compensation_basis, type: enum, source: input, default: "EVENT_TERMS", description: "EVENT_TERMS | MARKET_VALUE; selects the claim compensation variant" }
+      - { name: scrubbed_by_user_id, type: string, source: system, description: "X-User-ID of the EventAnalyst who created (scrubbed) the event" }
+      - { name: confirmed_by_user_id, type: string, source: system, description: "X-User-ID of the EventAnalyst who last confirmed; must differ from scrubbed_by_user_id (segregation of duties)" }
+      - { name: status, type: enum, source: system, default: "DRAFT", description: "DRAFT | CONFIRMED | AMENDED | BOOKED | COMPLETED | CANCELLED" }
+
+  - name: EventAmendment
+    parent: null
+    common_fields: false   # immutable audit record: id + created_at only
+    fields:
+      - { name: event_id, type: string, source: system, description: "FK -> CorporateActionEvent.id; amended event" }
+      - { name: amended_terms, type: object, source: input, description: "Full replacement of the event's terms object" }
+      - { name: reason, type: string, source: input, description: "Free-text amendment reason" }
+      - { name: amendment_seq, type: integer, source: computed, description: "1 + count of prior amendments on this event" }
+      - { name: applied_by_user_id, type: string, source: system, description: "X-User-ID of the applying EventAnalyst" }
+
+  - name: Entitlement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: event_id, type: string, source: system, description: "FK -> CorporateActionEvent.id; governing event" }
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id; entitled account" }
+      - { name: supersedes_entitlement_id, type: string, source: system, default: null, description: "FK -> Entitlement.id; on a replacement entitlement, points to the SUPERSEDED predecessor" }
+      - { name: calculation_basis, type: enum, source: computed, description: "TRADE_DATE_BASIS (projection at confirm/amend) | SETTLED_BASIS (firm capture at record date)" }
+      - { name: record_position_quantity, type: number, source: computed, description: "Position quantity included by the active basis variant (4dp)" }
+      - { name: entitled_shares, type: integer, source: computed, description: "Whole shares entitled under the account-aggregate projection: floor(record_position_quantity x ratio); for CASH_DIVIDEND this is 0" }
+      - { name: fractional_shares, type: number, source: computed, description: "round4(gross - floor(gross)) under the aggregate projection (4dp)" }
+      - { name: cash_in_lieu_cents, type: integer, source: computed, description: "Projected cash-in-lieu on fractional_shares per the event fractional_policy" }
+      - { name: cash_amount_cents, type: integer, source: computed, description: "Cash entitlement (CASH_DIVIDEND amount or MERGER/RIGHTS cash leg); 0 for pure share events" }
+      - { name: booked_whole_shares, type: integer, source: computed, default: null, description: "Whole shares actually credited at booking under per-lot floor-then-sum; null until SETTLED" }
+      - { name: booked_cash_in_lieu_cents, type: integer, source: computed, default: null, description: "Cash-in-lieu actually paid at booking on summed per-lot fractional parts; null until SETTLED" }
+      - { name: status, type: enum, source: system, default: "PROJECTED", description: "PROJECTED | FIRM | SETTLED | MISSED | COMPENSATED | SUPERSEDED" }
+
+  - name: Election
+    parent: null
+    common_fields: true
+    fields:
+      - { name: event_id, type: string, source: system, description: "FK -> CorporateActionEvent.id; event the election applies to" }
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; must equal the AccountHolder's X-User-ID" }
+      - { name: option_code, type: enum, source: input, description: "CASH | STOCK (MERGER); EXERCISE (RIGHTS_OFFERING); must be one of the event type's allowed options" }
+      - { name: quantity, type: integer, source: input, default: null, description: "Rights to exercise (basic + oversubscription); required for RIGHTS_OFFERING, forbidden otherwise" }
+      - { name: election_seq, type: integer, source: computed, description: "1 + count of prior elections by this account on this event (across all statuses)" }
+      - { name: submitted_at, type: string, source: system, description: "Logical-clock ISO datetime of (re)submission" }
+      - { name: status, type: enum, source: system, default: "SUBMITTED", description: "SUBMITTED | WITHDRAWN | SUPERSEDED | APPLIED | LAPSED | VOID" }
+
+  - name: Booking
+    parent: null
+    common_fields: true
+    fields:
+      - { name: event_id, type: string, source: system, description: "FK -> CorporateActionEvent.id; booked event" }
+      - { name: booked_by_user_id, type: string, source: system, description: "X-User-ID of the OperationsManager who ran the booking" }
+      - { name: booked_at, type: string, source: system, description: "Logical-clock ISO datetime of booking" }
+      - { name: total_whole_shares_credited, type: integer, source: computed, description: "Sum of whole shares credited across all SETTLED entitlements in this booking" }
+      - { name: total_cash_credited_cents, type: integer, source: computed, description: "Sum of all cash credits (dividends, merger cash legs, rights debits excluded) across this booking" }
+      - { name: total_cash_in_lieu_cents, type: integer, source: computed, description: "Sum of booked cash-in-lieu across this booking" }
+      - { name: status, type: enum, source: system, default: "POSTED", description: "POSTED | REVERSED" }
+
+  - name: BookingLine
+    parent: null
+    common_fields: false   # immutable ledger line: id + created_at only
+    fields:
+      - { name: booking_id, type: string, source: system, description: "FK -> Booking.id; parent booking" }
+      - { name: entitlement_id, type: string, source: system, description: "FK -> Entitlement.id; entitlement this line settles" }
+      - { name: position_lot_id, type: string, source: system, default: null, description: "FK -> PositionLot.id; lot mutated or created; null for pure-cash lines" }
+      - { name: line_kind, type: enum, source: system, description: "LOT_MUTATION | LOT_CREATION | CASH_CREDIT | CASH_DEBIT | CASH_IN_LIEU" }
+      - { name: quantity_delta, type: number, source: system, description: "Signed share change applied to the lot (0 for cash lines)" }
+      - { name: basis_delta_cents, type: integer, source: system, description: "Signed cost-basis change applied to the lot (0 for cash lines)" }
+      - { name: cash_delta_cents, type: integer, source: system, description: "Signed cash credited to the account (0 for lot lines)" }
+      - { name: prior_quantity, type: number, source: system, description: "Lot quantity before this line (for exact reversal restore)" }
+      - { name: prior_basis_cents, type: integer, source: system, description: "Lot basis before this line (for exact reversal restore)" }
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: event_id, type: string, source: input, description: "FK -> CorporateActionEvent.id; event claimed against" }
+      - { name: entitlement_id, type: string, source: input, description: "FK -> Entitlement.id; must belong to the same event and account; status must be MISSED or SETTLED" }
+      - { name: account_id, type: string, source: input, description: "FK -> Account.id; must equal the AccountHolder's X-User-ID" }
+      - { name: reason, type: enum, source: input, description: "MISSED_ENTITLEMENT | INCORRECT_AMOUNT | FRACTIONAL_DISPUTE" }
+      - { name: claimed_amount_cents, type: integer, source: input, description: "Amount the claimant asserts; must be > 0 and <= CLAIM_AMOUNT_CAP_CENTS (250000)" }
+      - { name: market_price_cents, type: integer, source: input, default: null, description: "Observed market price per share at filing; required when the event's claim_compensation_basis is MARKET_VALUE" }
+      - { name: compensation_cents, type: integer, source: computed, default: null, description: "Approved compensation computed per the event's basis variant; null until APPROVED" }
+      - { name: filed_by_user_id, type: string, source: system, description: "X-User-ID of the filer ('system' for auto-filed recon claims)" }
+      - { name: reviewed_by_user_id, type: string, source: system, default: null, description: "X-User-ID of the ClaimsExaminer who decided; must differ from filed_by_user_id" }
+      - { name: review_status, type: enum, source: system, default: "FILED", description: "FILED | APPROVED | DENIED (independent dimension)" }
+      - { name: payment_status, type: enum, source: system, default: "UNPAID", description: "UNPAID | PAID (independent dimension; PAID only reachable from APPROVED)" }
+
+  - name: CustodianStatement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: source_id, type: string, source: input, description: "FK -> EventSource.id; must reference a CUSTODIAN source" }
+      - { name: coverage_start_date, type: string, source: input, description: "ISO start of covered window (inclusive); closed-interval semantics" }
+      - { name: coverage_end_date, type: string, source: input, description: "ISO end of covered window (inclusive); must be >= coverage_start_date; a shared single day with another statement from the same source is an overlap conflict" }
+      - { name: lines, type: array, source: input, description: "Statement lines: { account_id, security_id, quantity, cash_cents?, event_id? }; event_id present -> entitlement reconciliation, else position reconciliation; cash_cents present -> cash reconciliation for that event" }
+      - { name: status, type: enum, source: system, default: "RECEIVED", description: "RECEIVED | RECONCILED; reconciliation runs synchronously at ingestion, so the create response shows RECONCILED" }
+
+  - name: ReconBreak
+    parent: null
+    common_fields: true
+    fields:
+      - { name: statement_id, type: string, source: system, description: "FK -> CustodianStatement.id; statement that surfaced the break" }
+      - { name: event_id, type: string, source: system, default: null, description: "FK -> CorporateActionEvent.id; set for MISSED_ENTITLEMENT and CASH_MISMATCH breaks" }
+      - { name: account_id, type: string, source: system, description: "FK -> Account.id" }
+      - { name: security_id, type: string, source: system, description: "FK -> Security.id" }
+      - { name: break_type, type: enum, source: system, description: "POSITION_MISMATCH | CASH_MISMATCH | MISSED_ENTITLEMENT" }
+      - { name: expected_quantity, type: number, source: system, description: "Internal quantity per books (4dp)" }
+      - { name: reported_quantity, type: number, source: system, description: "Quantity per custodian statement (4dp)" }
+      - { name: expected_cash_cents, type: integer, source: system, default: null, description: "Internal cash per books (CASH_MISMATCH only)" }
+      - { name: reported_cash_cents, type: integer, source: system, default: null, description: "Cash per custodian statement (CASH_MISMATCH only)" }
+      - { name: auto_claim_id, type: string, source: system, default: null, description: "FK -> Claim.id; auto-filed claim for MISSED_ENTITLEMENT breaks (null when suppressed or not applicable)" }
+      - { name: resolution, type: enum, source: system, default: null, description: "AUTO_BOOKING | MANUAL | WRITTEN_OFF; null while OPEN" }
+      - { name: resolution_note, type: string, source: input, default: null, description: "Required when resolving manually or writing off" }
+      - { name: status, type: enum, source: system, default: "OPEN", description: "OPEN | RESOLVED | WRITTEN_OFF" }
+
+# =============================================================================
+# Section 1.2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: CorporateActionEvent
+    initial_state: DRAFT
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: CONFIRMED
+        trigger: "POST /api/events/{id}/confirm"
+        actor: EventAnalyst
+        preconditions:
+          - "X-User-ID != event.scrubbed_by_user_id (segregation of duties, ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "confirmed_by_user_id := X-User-ID; version increments"
+          - "Generate PROJECTED Entitlements (TRADE_DATE_BASIS) for every account holding >= 1 OPEN PositionLot in event.security_id (record_position_quantity > 0)"
+          - "Each affected Account.pending_entitlement_count recomputed (link: entitlement -> account)"
+      - from: CONFIRMED
+        to: AMENDED
+        trigger: "POST /api/events/{id}/amendments"
+        actor: EventAnalyst
+        preconditions:
+          - "expected_event_version == event.version (OCC, ERR_STALE_EVENT_VERSION)"
+        side_effects:
+          - "EventAmendment created with amendment_seq = prior count + 1; event.terms replaced; version increments"
+          - "Every PROJECTED/FIRM Entitlement of this event -> SUPERSEDED; a replacement PROJECTED Entitlement (TRADE_DATE_BASIS recompute on new terms) is created per superseded one, linked via supersedes_entitlement_id (link: event -> entitlement)"
+          - "Each affected Account.pending_entitlement_count recomputed; Account.updated_at/version bumped (link: entitlement -> account)"
+      - from: AMENDED
+        to: CONFIRMED
+        trigger: "POST /api/events/{id}/confirm"
+        actor: EventAnalyst
+        preconditions:
+          - "X-User-ID != event.scrubbed_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "confirmed_by_user_id := X-User-ID; version increments"
+          - "note: entitlements already re-projected by the amendment; confirm does not duplicate them"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /api/events/{id}/cancel"
+        actor: EventAnalyst
+        preconditions: []
+        side_effects:
+          - "No entitlements exist yet from DRAFT; nothing to supersede"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /api/events/{id}/cancel"
+        actor: EventAnalyst
+        preconditions: []
+        side_effects:
+          - "All PROJECTED/FIRM Entitlements -> SUPERSEDED"
+          - "All SUBMITTED/WITHDRAWN Elections -> VOID"
+          - "Each affected Account.pending_entitlement_count recomputed"
+      - from: AMENDED
+        to: CANCELLED
+        trigger: "POST /api/events/{id}/cancel"
+        actor: EventAnalyst
+        preconditions: []
+        side_effects:
+          - "Same as CONFIRMED -> CANCELLED"
+      - from: CONFIRMED
+        to: BOOKED
+        trigger: "POST /api/events/{id}/book"
+        actor: OperationsManager
+        preconditions:
+          - "All non-SUPERSEDED entitlements are FIRM (ERR_ENTITLEMENTS_NOT_FIRM)"
+          - "If election_required: logical clock strictly after election_deadline (ERR_ELECTION_WINDOW_OPEN)"
+        side_effects:
+          - "Booking created (POSTED) with computed totals (link 1: event -> booking)"
+          - "Each FIRM Entitlement -> SETTLED, or -> MISSED when its Account.status != ACTIVE; the latest SUBMITTED Election per account -> APPLIED, any WITHDRAWN election -> LAPSED (link 2: booking -> entitlement/election)"
+          - "Per SETTLED entitlement the per-type booking algorithm mutates/creates PositionLots and posts BookingLines with prior_quantity/prior_basis_cents recorded (link 3: entitlement -> lots/lines)"
+          - "Each affected Account.cash_balance_cents / total_cost_basis_cents / pending_entitlement_count recomputed (link 4: lots -> account)"
+          - "Each OPEN ReconBreak of type POSITION_MISMATCH whose (account_id, security_id) now matches internal books is auto-resolved with resolution AUTO_BOOKING (link 5: account -> recon break)"
+          - "version increments"
+      - from: BOOKED
+        to: CONFIRMED
+        trigger: "system (implicit in POST /api/bookings/{id}/reverse)"
+        actor: OperationsManager
+        preconditions:
+          - "Booking POSTED; no PAID claim references an entitlement settled by this booking (ERR_BOOKING_NOT_REVERSIBLE)"
+        side_effects:
+          - "Booking -> REVERSED; every BookingLine inverted using recorded prior_quantity/prior_basis_cents (exact restore, no recompute)"
+          - "Lots created by the booking -> FULLY_SURRENDERED (quantity 0); SETTLED entitlements -> FIRM (booked_* fields nulled); MISSED entitlements unchanged"
+          - "Account cash/basis/pending counts recomputed; event version increments"
+      - from: BOOKED
+        to: COMPLETED
+        trigger: "POST /api/events/{id}/complete"
+        actor: OperationsManager
+        preconditions:
+          - "All non-SUPERSEDED entitlements in {SETTLED, COMPENSATED} (ERR_UNSETTLED_ENTITLEMENTS_EXIST)"
+          - "No OPEN ReconBreak with event_id == this event (ERR_OPEN_RECON_BREAKS_EXIST)"
+        side_effects: ["version increments"]
+
+  - entity: Entitlement
+    initial_state: PROJECTED
+    terminal_states: [SETTLED, COMPENSATED, SUPERSEDED]
+    transitions:
+      - from: PROJECTED
+        to: FIRM
+        trigger: "POST /api/events/{id}/capture-record-position"
+        actor: OperationsManager
+        preconditions:
+          - "Event CONFIRMED; logical clock >= record_date 00:00:00Z (ERR_RECORD_DATE_NOT_REACHED)"
+        side_effects:
+          - "Recomputed under SETTLED_BASIS in place: record_position_quantity / entitled_shares / fractional_shares / cash_in_lieu_cents / cash_amount_cents overwritten; calculation_basis := SETTLED_BASIS; version increments"
+      - from: FIRM
+        to: SETTLED
+        trigger: "system (during POST /api/events/{id}/book when account is ACTIVE)"
+        actor: system
+        preconditions: ["Account.status == ACTIVE"]
+        side_effects: ["booked_whole_shares / booked_cash_in_lieu_cents populated from per-lot booking"]
+      - from: FIRM
+        to: MISSED
+        trigger: "system (during book when account is not ACTIVE)"
+        actor: system
+        preconditions: ["Account.status != ACTIVE"]
+        side_effects: ["No lot mutation and no cash credit for this entitlement"]
+      - from: MISSED
+        to: COMPENSATED
+        trigger: "system (during POST /api/claims/{id}/pay)"
+        actor: system
+        preconditions: ["Claim APPROVED and being paid"]
+        side_effects: []
+      - from: PROJECTED
+        to: SUPERSEDED
+        trigger: "system (during amendment application or event cancel)"
+        actor: system
+        preconditions: []
+        side_effects: ["Replacement PROJECTED entitlement created (amendment path only), linked via supersedes_entitlement_id"]
+      - from: FIRM
+        to: SUPERSEDED
+        trigger: "system (during amendment application or event cancel)"
+        actor: system
+        preconditions: []
+        side_effects: ["Replacement PROJECTED entitlement created (amendment path only)"]
+      - from: SETTLED
+        to: FIRM
+        trigger: "system (during booking reversal)"
+        actor: system
+        preconditions: []
+        side_effects: ["booked_whole_shares / booked_cash_in_lieu_cents reset to null"]
+
+  - entity: Election
+    initial_state: SUBMITTED
+    terminal_states: [APPLIED, LAPSED, VOID, SUPERSEDED]
+    transitions:
+      - from: SUBMITTED
+        to: WITHDRAWN
+        trigger: "POST /api/elections/{id}/withdraw"
+        actor: AccountHolder
+        preconditions:
+          - "Ownership: X-User-ID == election.account_id (ERR_ACCOUNT_OWNERSHIP_MISMATCH)"
+          - "Logical clock <= event.election_deadline (ERR_ELECTION_DEADLINE_PASSED)"
+        side_effects: ["event.version increments"]
+      - from: WITHDRAWN
+        to: SUBMITTED
+        trigger: "POST /api/elections/{id}/resubmit"
+        actor: AccountHolder
+        preconditions:
+          - "Ownership (ERR_ACCOUNT_OWNERSHIP_MISMATCH)"
+          - "Event CONFIRMED (ERR_EVENT_NOT_ACCEPTING_ELECTIONS)"
+          - "Logical clock <= event.election_deadline (ERR_ELECTION_DEADLINE_PASSED)"
+        side_effects:
+          - "submitted_at refreshed; election_seq incremented"
+          - "Any other SUBMITTED election for (event_id, account_id) -> SUPERSEDED"
+          - "event.version increments"
+      - from: SUBMITTED
+        to: SUPERSEDED
+        trigger: "system (a newer election by the same account on the same event is submitted or resubmitted)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: APPLIED
+        trigger: "system (during book: latest SUBMITTED election per account is applied)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: WITHDRAWN
+        to: LAPSED
+        trigger: "system (during book: no live election, default option applied)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: VOID
+        trigger: "system (event cancelled)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: WITHDRAWN
+        to: VOID
+        trigger: "system (event cancelled)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Claim
+    initial_state: "review_status=FILED, payment_status=UNPAID (parallel dimensions)"
+    terminal_states: ["review_status in {APPROVED, DENIED}; payment_status PAID is terminal for the payment dimension"]
+    transitions:
+      - from: FILED
+        to: APPROVED
+        trigger: "POST /api/claims/{id}/decide with decision=APPROVED"
+        actor: ClaimsExaminer
+        preconditions:
+          - "review_status == FILED (ERR_CLAIM_NOT_FILED)"
+          - "X-User-ID != claim.filed_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "compensation_cents (per event.claim_compensation_basis) <= event.compensation_pool_remaining_cents (ERR_COMPENSATION_POOL_EXHAUSTED)"
+        side_effects:
+          - "compensation_cents computed and stored; reviewed_by_user_id := X-User-ID"
+          - "event.compensation_pool_remaining_cents decremented by compensation_cents (reserve at approval); event version increments"
+      - from: FILED
+        to: DENIED
+        trigger: "POST /api/claims/{id}/decide with decision=DENIED"
+        actor: ClaimsExaminer
+        preconditions:
+          - "review_status == FILED (ERR_CLAIM_NOT_FILED)"
+          - "X-User-ID != claim.filed_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects: ["reviewed_by_user_id := X-User-ID"]
+      - from: "APPROVED_x_UNPAID"
+        to: "APPROVED_x_PAID"
+        trigger: "POST /api/claims/{id}/pay"
+        actor: OperationsManager
+        preconditions:
+          - "review_status == APPROVED and payment_status == UNPAID (ERR_CLAIM_NOT_PAYABLE)"
+        side_effects:
+          - "Account.cash_balance_cents += compensation_cents; Account.updated_at/version bumped"
+          - "If claim.entitlement.status == MISSED: entitlement -> COMPENSATED"
+
+  - entity: ReconBreak
+    initial_state: OPEN
+    terminal_states: [RESOLVED, WRITTEN_OFF]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /api/recon-breaks/{id}/resolve with resolution=RESOLVED, OR system auto-resolution at booking (resolution=AUTO_BOOKING)"
+        actor: OperationsManager | system
+        preconditions:
+          - "status == OPEN (ERR_RECON_BREAK_NOT_OPEN); manual path requires resolution_note"
+        side_effects: []
+      - from: OPEN
+        to: WRITTEN_OFF
+        trigger: "POST /api/recon-breaks/{id}/resolve with resolution=WRITTEN_OFF"
+        actor: OperationsManager
+        preconditions:
+          - "status == OPEN (ERR_RECON_BREAK_NOT_OPEN); resolution_note required"
+        side_effects: []
+
+  - entity: Booking
+    initial_state: POSTED
+    terminal_states: [REVERSED]
+    transitions:
+      - from: POSTED
+        to: REVERSED
+        trigger: "POST /api/bookings/{id}/reverse"
+        actor: OperationsManager
+        preconditions:
+          - "No PAID claim references an entitlement settled by this booking (ERR_BOOKING_NOT_REVERSIBLE)"
+        side_effects: ["See CorporateActionEvent BOOKED -> CONFIRMED (full inverse cascade)"]
+
+  - entity: Account
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: FROZEN
+        trigger: "PUT /api/accounts/{id} with status=FROZEN"
+        actor: OperationsManager
+        preconditions: []
+        side_effects: []
+      - from: FROZEN
+        to: ACTIVE
+        trigger: "PUT /api/accounts/{id} with status=ACTIVE"
+        actor: OperationsManager
+        preconditions: []
+        side_effects: []
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "PUT /api/accounts/{id} with status=CLOSED"
+        actor: OperationsManager
+        preconditions:
+          - "No OPEN PositionLot with quantity > 0 and no PROJECTED/FIRM Entitlement (ERR_ACCOUNT_NOT_SETTLED)"
+        side_effects: []
+      - from: FROZEN
+        to: CLOSED
+        trigger: "PUT /api/accounts/{id} with status=CLOSED"
+        actor: OperationsManager
+        preconditions:
+          - "Same as ACTIVE -> CLOSED"
+        side_effects: []
+
+  - entity: Security
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "PUT /api/securities/{id} with status=SUSPENDED"
+        actor: DeskAdministrator
+        preconditions: []
+        side_effects: ["New CorporateActionEvent creation for this security is rejected while SUSPENDED (ERR_SECURITY_SUSPENDED)"]
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "PUT /api/securities/{id} with status=ACTIVE"
+        actor: DeskAdministrator
+        preconditions: []
+        side_effects: []
+
+  - entity: SourceNotification
+    initial_state: RECEIVED
+    terminal_states: [MATCHED, REJECTED]
+    transitions:
+      - from: RECEIVED
+        to: MATCHED
+        trigger: "system (scrubbed into a golden event by POST /api/events)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RECEIVED
+        to: REJECTED
+        trigger: "POST /api/source-notifications/{id}/reject"
+        actor: EventAnalyst
+        preconditions: []
+        side_effects: []
+
+  - entity: CustodianStatement
+    initial_state: RECEIVED
+    terminal_states: [RECONCILED]
+    transitions:
+      - from: RECEIVED
+        to: RECONCILED
+        trigger: "system (synchronous reconciliation inside POST /api/custodian-statements)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "custodian_position_reconciliation runs per line; ReconBreaks created for mismatches (link: statement -> break)"
+          - "Each MISSED_ENTITLEMENT break auto-files a Claim when the entitlement is in {MISSED, SETTLED} and no FILED claim exists for it (link: break -> claim)"
+
+  - entity: PositionLot
+    initial_state: OPEN
+    terminal_states: [FULLY_SURRENDERED]
+    transitions:
+      - from: OPEN
+        to: FULLY_SURRENDERED
+        trigger: "system (booking or reversal drives quantity to exactly 0)"
+        actor: system
+        preconditions: []
+        side_effects: ["Account.total_cost_basis_cents recomputed (lot no longer contributes)"]
+
+# =============================================================================
+# Section 1.2.1: Concurrency Rules (true races only, OCC on parent version)
+# =============================================================================
+concurrency_rules:
+  - rule_id: event-amendment-stale-version
+    parent_entity: CorporateActionEvent
+    write_endpoint: "POST /api/events/{id}/amendments"
+    occ_field: expected_event_version
+    description: |
+      Applying an amendment to an event whose version has advanced since the
+      analyst last read it is rejected. A prior amendment (or any other
+      version-bumping mutation such as confirm or an election submit) makes the
+      caller's view of the event terms stale, so the write is refused with 412.
+    error_id: ERR_STALE_EVENT_VERSION
+    http_status: 412
+  - rule_id: election-submit-stale-terms
+    parent_entity: CorporateActionEvent
+    write_endpoint: "POST /api/events/{id}/elections"
+    occ_field: expected_event_version
+    description: |
+      Submitting an election while carrying an expected_event_version that no
+      longer matches the event's current version is rejected: a new election
+      legitimately supersedes the account's prior SUBMITTED election, and the
+      submission must be made against the event terms (options, deadline) the
+      desk currently holds, not a stale copy.
+    error_id: ERR_STALE_EVENT_VERSION
+    http_status: 412
+
+# =============================================================================
+# Section 1.3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: record_position_snapshot
+    trigger: "event confirm (projection), amendment application (re-projection), capture-record-position (firm)"
+    algorithm: aggregation
+    formula: |
+      Let LOTS = OPEN PositionLots where account_id = A and security_id = event.security_id.
+      TRADE_DATE_BASIS:  include lot iff lot.acquisition_date <= record_date
+      SETTLED_BASIS:     include lot iff lot.acquisition_date <= record_date - SETTLEMENT_LAG_DAYS days
+      record_position_quantity = sum(included lot.quantity), 4dp
+    input_set: "OPEN lots of the account in the event security; the two variants differ only in the acquisition-date cutoff"
+    constants:
+      SETTLEMENT_LAG_DAYS: 2
+    precision: "4 decimal places (quantities)"
+    variants:
+      - name: TRADE_DATE_BASIS
+        when: "PROJECTED entitlement at confirm/amendment time"
+        difference: "includes lots acquired on or before record_date even if they would not have settled by record_date"
+      - name: SETTLED_BASIS
+        when: "FIRM entitlement at capture-record-position"
+        difference: "excludes lots acquired after record_date - SETTLEMENT_LAG_DAYS; identical inputs can therefore yield a smaller position than TRADE_DATE_BASIS"
+
+  - name: entitlement_share_quantity
+    trigger: "with record_position_snapshot, at confirm/amend (PROJECTED) and capture (FIRM)"
+    algorithm: forward_looking
+    formula: |
+      ratio = terms.ratio_num / terms.ratio_den           # SPLIT, STOCK_DIVIDEND, SPIN_OFF
+      gross = record_position_quantity * ratio            # exact decimal
+      entitled_shares   = floor(gross)                    # account-aggregate floor
+      fractional_shares = round4_half_up(gross - floor(gross))
+      cash_in_lieu_cents = policy_round(fractional_shares * terms.price_per_share_cents)
+      CASH_DIVIDEND: entitled_shares = 0; fractional_shares = 0;
+        cash_amount_cents = record_position_quantity(whole-floor) * terms.cash_per_share_cents
+      RIGHTS_OFFERING: entitled_shares = floor(record_position_quantity * rights_ratio);
+        cash_amount_cents = 0 (exercise cash is debited at booking, not credited)
+      MERGER projection: cash_amount_cents = 0; entitled_shares = 0
+        (merger outcomes are election-dependent; computed fully at booking)
+    input_set: "single Entitlement row being (re)projected"
+    precision: "quantities 4dp; cash in integer cents; policy_round per event.terms.fractional_policy"
+    note: "Aggregate projection is the desk estimate; booking computes actuals per lot (see cash_in_lieu_amount) and the two MAY legitimately differ on multi-lot accounts."
+
+  - name: cash_in_lieu_amount
+    trigger: "booking of SPLIT / STOCK_DIVIDEND / SPIN_OFF / MERGER stock leg"
+    algorithm: tiered_pricing
+    formula: |
+      Per-lot floor-then-sum (pinned rounding order; differs from aggregate projection):
+      1. For each OPEN lot of the account in the event security (processed in
+         acquisition_date ASC, tie-break created_at ASC):
+           exact_lot   = lot.quantity * ratio_num / ratio_den   (exact decimal)
+           whole_lot   = floor(exact_lot)
+           frac_lot    = exact_lot - whole_lot
+           lot.quantity := whole_lot (4dp)
+      2. account_fractional = round4_half_up(sum(frac_lot))
+      3. booked_whole_shares = sum(whole_lot)
+      4. booked_cash_in_lieu_cents = policy_round(account_fractional * price_per_share_cents)
+         policy_round: ROUND_HALF_UP | ROUND_DOWN | ROUND_UP per terms.fractional_policy
+    input_set: "OPEN lots of the entitled account in the event security at book time"
+    constants:
+      QUANTITY_DECIMALS: 4
+    precision: "floor per lot BEFORE summing fractions; cents rounding per fractional_policy; sum of per-lot floors is NOT floor of sum — order is pinned and load-bearing"
+    variants:
+      - name: ROUND_HALF_UP
+        when: "terms.fractional_policy == ROUND_HALF_UP"
+        difference: "0.5-cent exact cases round up (e.g., 0.5 sh x 3333c = 1666.5c -> 1667)"
+      - name: ROUND_DOWN
+        when: "terms.fractional_policy == ROUND_DOWN"
+        difference: "same input yields 1666"
+      - name: ROUND_UP
+        when: "terms.fractional_policy == ROUND_UP"
+        difference: "same input yields 1667, and any nonzero fraction yields at least 1 cent"
+
+  - name: merger_proration_allocation
+    trigger: "booking of MERGER (election_required) after the deadline"
+    algorithm: waterfall_allocation
+    formula: |
+      Inputs: terms.cash_pool_cents, terms.cash_per_share_cents, per-account
+      (applied_option, settled position shares). Evaluation order is pinned:
+      1. Classify: odd-lot account iff 0 < shares < ODD_LOT_THRESHOLD.
+      2. Odd-lot CASH elections are honored IN FULL first:
+           odd_cash = sum over odd-lot CASH electors of shares * cash_per_share_cents
+           (if odd_cash > cash_pool_cents, odd-lot electors are themselves prorated
+            by shares DESC, tie-break created_at ASC of election — pool cannot go negative)
+      3. remaining_pool = cash_pool_cents - odd_cash
+      4. roundlot_cash_elected = sum over round-lot CASH electors of shares * cash_per_share_cents
+      5. factor = min(1, floor4(remaining_pool / roundlot_cash_elected))   (0 if denominator 0)
+      6. Per round-lot CASH elector: cash_shares = floor(shares * factor);
+           cash_paid = cash_shares * cash_per_share_cents;
+           remaining shares convert to new-security shares at ratio_num/ratio_den
+           (per-lot floor + cash-in-lieu per cash_in_lieu_amount).
+      7. STOCK electors and non-electing (default_option) accounts convert fully to stock.
+      Leftover pool is retained by the desk (no redistribution pass).
+    input_set: "all FIRM entitlements of the event with their applied elections"
+    constants:
+      ODD_LOT_THRESHOLD: 100
+      FACTOR_DECIMALS: 4
+    precision: "factor floored to 4dp; cash_shares floored to integer; cents exact"
+    note: ">=3 inputs (pool, elected cash, per-account shares) with non-linear interaction: odd-lot classification, min() factor clamp, floor per account"
+
+  - name: rights_oversubscription_allocation
+    trigger: "booking of RIGHTS_OFFERING after the deadline"
+    algorithm: constraint_propagation
+    formula: |
+      Circular-looking dependency (allocation depends on pool remainder, remainder
+      depends on allocations) — the evaluation order is pinned so it is well-defined:
+      1. basic_i  = min(requested_i, entitled_rights_i) for each EXERCISE election
+      2. exercised = sum(basic_i); remainder = max(0, shares_offered - exercised)
+      3. oversubscribers = accounts with requested_i > entitled_rights_i AND
+         terms.oversubscription_allowed == true
+      4. single pass: over_i = min(requested_i - entitled_rights_i,
+                                   remainder * entitled_rights_i / sum(entitled_rights_j over oversubscribers))
+         (0 when the denominator is 0); over_i floored to integer shares
+      5. allocated_i = basic_i + over_i; cash debited = allocated_i * subscription_price_cents
+         (account cash may go negative; desk settles externally)
+      6. unallocated remainder after step 4 is retained by the issuer — exactly ONE
+         proration pass, no iterative redistribution
+    input_set: "all FIRM entitlements of the rights event with applied EXERCISE elections"
+    constants:
+      OVERSUBSCRIPTION_PASSES: 1
+    precision: "integer shares throughout"
+    note: "mode (c): steps 2 and 4 reference each other's quantities; the pinned single-pass order is the resolution"
+
+  - name: spinoff_cost_basis_split
+    trigger: "booking of SPIN_OFF"
+    algorithm: weighted_scoring
+    formula: |
+      pct = round4_half_up( fmv_spin_cents / (fmv_parent_cents + fmv_spin_cents) )  (4dp)
+      Per OPEN parent lot (acquisition_date ASC, tie-break created_at ASC):
+        spin_lot_basis  = round_half_up_cents(lot.cost_basis_total_cents * pct)
+        parent_kept     = lot.cost_basis_total_cents - spin_lot_basis   (remainder to parent)
+        lot.cost_basis_total_cents := parent_kept
+        new spin-co lot: quantity = floor(lot.quantity * ratio_num / ratio_den),
+          cost_basis_total_cents = spin_lot_basis, acquisition_date := lot.acquisition_date,
+          origin_booking_id := booking.id
+      Lots created by MERGER stock legs and RIGHTS exercises take acquisition_date = event.payable_date; SPIN_OFF lots inherit the parent lot's acquisition_date.
+      Per-lot conservation: basis_before == parent_kept + spin_lot_basis (exact, no drift)
+      Fractional spin-co shares cashed per cash_in_lieu_amount at terms.price_per_share_cents.
+    input_set: "OPEN lots of the entitled account in the parent security"
+    precision: "percentage rounded to 4dp FIRST, per-lot cents SECOND, remainder always to the parent lot — order pinned"
+
+  - name: split_cost_basis_adjustment
+    trigger: "booking of SPLIT or STOCK_DIVIDEND"
+    algorithm: aggregation
+    formula: |
+      Per lot: quantity := floor per cash_in_lieu_amount step 1;
+      cost_basis_total_cents UNCHANGED (total basis conserved; per-share basis is
+      derived, never stored); a lot reaching quantity exactly 0 -> FULLY_SURRENDERED.
+    input_set: "OPEN lots of the entitled account in the event security"
+    precision: "basis integers; quantities 4dp"
+
+  - name: claim_compensation_amount
+    trigger: "POST /api/claims/{id}/decide with decision=APPROVED"
+    algorithm: aggregation
+    formula: |
+      Let E = claim.entitlement (status MISSED or SETTLED).
+      EVENT_TERMS variant:
+        compensation = E.cash_amount_cents
+                     + E.entitled_shares * event.terms.price_per_share_cents (0 when absent)
+                     + E.cash_in_lieu_cents
+      MARKET_VALUE variant:
+        compensation = E.cash_amount_cents
+                     + E.entitled_shares * claim.market_price_cents
+                     + E.cash_in_lieu_cents
+      Same entitlement yields different compensation when terms price != filing market price.
+    input_set: "single Claim + its Entitlement + governing event terms"
+    constants:
+      CLAIM_AMOUNT_CAP_CENTS: 250000
+    precision: "integer cents"
+    variants:
+      - name: EVENT_TERMS
+        when: "event.claim_compensation_basis == EVENT_TERMS (default)"
+        difference: "values missed shares at the event's own price_per_share_cents"
+      - name: MARKET_VALUE
+        when: "event.claim_compensation_basis == MARKET_VALUE"
+        difference: "values missed shares at claim.market_price_cents supplied at filing"
+
+  - name: custodian_position_reconciliation
+    trigger: "POST /api/custodian-statements (synchronous at ingestion)"
+    algorithm: aggregation
+    formula: |
+      For each statement line (processed top-to-bottom in the submitted array):
+        POSITION (no event_id):  expected = sum(quantity) over OPEN lots of
+          (account_id, security_id); if expected != reported quantity -> POSITION_MISMATCH break
+        ENTITLEMENT (event_id):  expected = entitlement.entitled_shares for
+          (event_id, account_id) among non-SUPERSEDED entitlements; mismatch -> MISSED_ENTITLEMENT break;
+          when the entitlement status is in {MISSED, SETTLED} and no FILED claim exists
+          for it, auto-file a Claim (filed_by_user_id='system', claimed_amount_cents =
+          abs(expected - reported) valued per claim_compensation_amount EVENT_TERMS basis)
+        CASH (cash_cents + event_id): expected = sum(BookingLine.cash_delta_cents) over
+          POSTED booking lines for (event_id, account_id); mismatch -> CASH_MISMATCH break
+      Zero-tolerance: exact equality is the only non-break outcome (boundary at diff == 0).
+    input_set: "statement lines; internal OPEN lots; non-SUPERSEDED entitlements; POSTED booking lines"
+    precision: "quantities 4dp exact compare; cents integer compare"
+
+  - name: account_derived_balances
+    trigger: "any booking line application/reversal, claim payment, lot creation"
+    algorithm: aggregation
+    formula: |
+      cash_balance_cents: opening_cash_cents + sum of all applied cash deltas
+        (booking lines, rights exercise debits, claim payments, reversal inverse lines)
+      total_cost_basis_cents: sum(cost_basis_total_cents) over OPEN lots
+      pending_entitlement_count: count of entitlements in {PROJECTED, FIRM}
+      All three recomputed eagerly on every contributing mutation (immediate consistency).
+    input_set: "single account"
+    precision: "integer cents / integer count"
+
+# =============================================================================
+# Section 1.4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers must be present and non-empty"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "X-User-Role must be permitted for this endpoint per the RBAC matrix"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Request shape: required fields present, types valid, enum members valid; CorporateActionEvent terms coherent for the event_type (ratio keys present with ratio_den > 0; election_required=true requires election_deadline; election_deadline <= payable_date end-of-day; record_date <= payable_date; required per-type term keys present and non-negative); PositionLot quantity > 0 with <= 4dp; CustodianStatement coverage_start_date <= coverage_end_date"
+    error_id: "ERR_INVALID_REQUEST | ERR_INVALID_EVENT_TERMS | ERR_LOT_QUANTITY_INVALID"
+    http_status: 400
+    applies_to: "all POST/PUT endpoints"
+  - priority: 4
+    category: existence
+    check: "Referenced resources exist: path ids left-to-right, then body FKs in declared field order"
+    error_id: "ERR_SECURITY_NOT_FOUND | ERR_ACCOUNT_NOT_FOUND | ERR_POSITION_LOT_NOT_FOUND | ERR_EVENT_SOURCE_NOT_FOUND | ERR_SOURCE_NOTIFICATION_NOT_FOUND | ERR_EVENT_NOT_FOUND | ERR_ENTITLEMENT_NOT_FOUND | ERR_ELECTION_NOT_FOUND | ERR_BOOKING_NOT_FOUND | ERR_BOOKING_LINE_NOT_FOUND | ERR_CLAIM_NOT_FOUND | ERR_CUSTODIAN_STATEMENT_NOT_FOUND | ERR_RECON_BREAK_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with resource ids"
+  - priority: 5
+    category: existence
+    check: "AccountHolder ownership: X-User-ID must equal the target/body account_id (election submit, withdraw, resubmit; claim file)"
+    error_id: ERR_ACCOUNT_OWNERSHIP_MISMATCH
+    http_status: 403
+    applies_to: "POST /api/events/{id}/elections, POST /api/elections/{id}/withdraw, POST /api/elections/{id}/resubmit, POST /api/claims"
+  - priority: 6
+    category: state
+    check: "Target entity must be in the operation's required state (per-endpoint: confirm requires DRAFT|AMENDED; amend requires CONFIRMED; capture/book require CONFIRMED; complete requires BOOKED; cancel requires non-terminal; withdraw requires SUBMITTED; resubmit requires WITHDRAWN; decide requires FILED; pay requires APPROVED+UNPAID; reverse requires POSTED; resolve requires OPEN)"
+    error_id: "ERR_EVENT_NOT_CONFIRMED | ERR_EVENT_NOT_AMENDABLE | ERR_EVENT_NOT_BOOKED | ERR_EVENT_ALREADY_TERMINAL | ERR_EVENT_NOT_ACCEPTING_ELECTIONS | ERR_ELECTION_INVALID_STATE | ERR_CLAIM_NOT_FILED | ERR_CLAIM_NOT_PAYABLE | ERR_BOOKING_NOT_REVERSIBLE | ERR_RECON_BREAK_NOT_OPEN"
+    http_status: 409
+    applies_to: "state-transition endpoints"
+  - priority: 7
+    category: state
+    check: "OCC: expected_event_version must equal the event's current version"
+    error_id: ERR_STALE_EVENT_VERSION
+    http_status: 412
+    applies_to: "POST /api/events/{id}/amendments, POST /api/events/{id}/elections"
+  - priority: 8
+    category: business_safety
+    check: "Segregation of duties: event confirm user must differ from scrubbed_by_user_id; claim decide user must differ from filed_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /api/events/{id}/confirm, POST /api/claims/{id}/decide"
+  - priority: 9
+    category: business_constraint
+    check: "Security must be ACTIVE for new events (ERR_SECURITY_SUSPENDED); mandatory-type event windows [record_date, payable_date) half-open must not overlap another non-CANCELLED mandatory event on the same security — touching endpoints allowed (ERR_EVENT_WINDOW_OVERLAP); statement coverage closed intervals [start, end] from one source must not share any day (ERR_STATEMENT_COVERAGE_OVERLAP); scrub set must have >= 2 notifications from distinct sources, all RECEIVED, matching security/type/record_date, and submitted terms equal to the winning source's terms (highest reliability_weight, tie -> earliest created_at) (ERR_NOTIFICATION_SCRUB_MISMATCH); no other FILED claim on the same entitlement (ERR_DUPLICATE_OPEN_CLAIM); election submit requires Account.status == ACTIVE (ERR_ACCOUNT_NOT_ACTIVE); account close requires no OPEN lots and no PROJECTED/FIRM entitlements (ERR_ACCOUNT_NOT_SETTLED)"
+    error_id: "ERR_SECURITY_SUSPENDED | ERR_EVENT_WINDOW_OVERLAP | ERR_STATEMENT_COVERAGE_OVERLAP | ERR_NOTIFICATION_SCRUB_MISMATCH | ERR_DUPLICATE_OPEN_CLAIM | ERR_ACCOUNT_NOT_ACTIVE | ERR_ACCOUNT_NOT_SETTLED"
+    http_status: 409
+    applies_to: "POST /api/events, POST /api/custodian-statements, POST /api/claims, POST /api/events/{id}/elections, PUT /api/accounts/{id}"
+    note: "All priority-9 conflicts return 409"
+  - priority: 10
+    category: business_temporal
+    check: "capture requires clock >= record_date (ERR_RECORD_DATE_NOT_REACHED); election submit/withdraw/resubmit require clock <= election_deadline INCLUSIVE (ERR_ELECTION_DEADLINE_PASSED); booking a voluntary event requires clock strictly after election_deadline (ERR_ELECTION_WINDOW_OPEN); claim filing requires clock <= payable_date + CLAIM_WINDOW_DAYS days INCLUSIVE (ERR_CLAIM_WINDOW_EXPIRED)"
+    error_id: "ERR_RECORD_DATE_NOT_REACHED | ERR_ELECTION_DEADLINE_PASSED | ERR_ELECTION_WINDOW_OPEN | ERR_CLAIM_WINDOW_EXPIRED"
+    http_status: 422
+    applies_to: "POST /api/events/{id}/capture-record-position, POST /api/events/{id}/elections, POST /api/elections/{id}/withdraw, POST /api/elections/{id}/resubmit, POST /api/events/{id}/book, POST /api/claims"
+  - priority: 11
+    category: business_referential
+    check: "Election target event must have election_required=true (ERR_EVENT_NOT_VOLUNTARY); option_code must be allowed for the event type — MERGER: CASH|STOCK, RIGHTS_OFFERING: EXERCISE — and quantity present iff RIGHTS_OFFERING (ERR_INVALID_ELECTION_OPTION); statement source must be CUSTODIAN type (ERR_SOURCE_NOT_CUSTODIAN); claim entitlement must belong to the claim's event and account and be in {MISSED, SETTLED} (ERR_ENTITLEMENT_NOT_CLAIMABLE)"
+    error_id: "ERR_EVENT_NOT_VOLUNTARY | ERR_INVALID_ELECTION_OPTION | ERR_SOURCE_NOT_CUSTODIAN | ERR_ENTITLEMENT_NOT_CLAIMABLE"
+    http_status: 422
+    applies_to: "POST /api/events/{id}/elections, POST /api/elections/{id}/resubmit, POST /api/custodian-statements, POST /api/claims"
+    note: "ERR_INVALID_ELECTION_OPTION returns 400; the others 422"
+  - priority: 12
+    category: business_fiscal
+    check: "claimed_amount_cents <= CLAIM_AMOUNT_CAP_CENTS (250000) (ERR_CLAIM_AMOUNT_EXCEEDS_CAP); approval compensation <= event.compensation_pool_remaining_cents (ERR_COMPENSATION_POOL_EXHAUSTED); rights exercise quantity <= entitled rights when oversubscription_allowed=false (ERR_ELECTION_QUANTITY_EXCEEDS_ENTITLEMENT)"
+    error_id: "ERR_CLAIM_AMOUNT_EXCEEDS_CAP | ERR_COMPENSATION_POOL_EXHAUSTED | ERR_ELECTION_QUANTITY_EXCEEDS_ENTITLEMENT"
+    http_status: 422
+    applies_to: "POST /api/claims, POST /api/claims/{id}/decide, POST /api/events/{id}/elections"
+    note: "ERR_COMPENSATION_POOL_EXHAUSTED returns 402"
+
+# =============================================================================
+# Section 1.5: API Endpoint Table (52 endpoints)
+# =============================================================================
+endpoints:
+  # --- logical clock (test-driving; default time 2026-05-01T00:00:00Z) ---
+  - method: POST
+    path: "/api/_clock/set_current_utc"
+    description: "Set the server's logical clock. Before any call, the logical clock reads exactly 2026-05-01T00:00:00Z and MUST NOT fall back to wall-clock time. All deadline/window/record-date rules read this clock."
+    roles: [DeskAdministrator]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["Logical clock advanced; no entity mutation"]
+
+  # --- Security ---
+  - method: POST
+    path: "/api/securities"
+    description: "Register a security"
+    roles: [DeskAdministrator]
+    code: 201
+    input: [ticker, cusip, name]
+    output: Security
+    side_effects: ["status initialized ACTIVE"]
+  - method: GET
+    path: "/api/securities"
+    description: "List securities"
+    roles: &ALL_ROLES [DeskAdministrator, EventAnalyst, OperationsManager, ClaimsExaminer, AccountHolder, VendorFeed, CustodianFeed]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Security[]"
+    side_effects: []
+  - method: GET
+    path: "/api/securities/{id}"
+    description: "Get a security"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Security
+    side_effects: []
+  - method: PUT
+    path: "/api/securities/{id}"
+    description: "Suspend or reinstate a security"
+    roles: [DeskAdministrator]
+    code: 200
+    input: [status]
+    output: Security
+    side_effects: ["status transition per Security state machine; version increments"]
+
+  # --- Account ---
+  - method: POST
+    path: "/api/accounts"
+    description: "Open a client account"
+    roles: [DeskAdministrator]
+    code: 201
+    input: [account_number, holder_name, "opening_cash_cents?"]
+    output: Account
+    side_effects: ["cash_balance_cents := opening_cash_cents (default 0); total_cost_basis_cents := 0; pending_entitlement_count := 0"]
+  - method: GET
+    path: "/api/accounts"
+    description: "List accounts"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Account[]"
+    side_effects: []
+  - method: GET
+    path: "/api/accounts/{id}"
+    description: "Get an account"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Account
+    side_effects: []
+  - method: PUT
+    path: "/api/accounts/{id}"
+    description: "Freeze, unfreeze, or close an account"
+    roles: [OperationsManager]
+    code: 200
+    input: [status]
+    output: Account
+    side_effects: ["status transition per Account state machine; version increments"]
+
+  # --- PositionLot ---
+  - method: POST
+    path: "/api/position-lots"
+    description: "Establish a tax lot (desk-side position entry)"
+    roles: [DeskAdministrator]
+    code: 201
+    input: [account_id, security_id, quantity, acquisition_date, cost_basis_total_cents]
+    output: PositionLot
+    side_effects: ["Account.total_cost_basis_cents recomputed"]
+  - method: GET
+    path: "/api/position-lots"
+    description: "List position lots"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["account_id?", "security_id?", "origin_booking_id?", "status?", "limit?", "offset?"]
+    output: "PositionLot[]"
+    side_effects: []
+  - method: GET
+    path: "/api/position-lots/{id}"
+    description: "Get a position lot"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: PositionLot
+    side_effects: []
+
+  # --- EventSource ---
+  - method: POST
+    path: "/api/event-sources"
+    description: "Register an event notification source"
+    roles: [DeskAdministrator]
+    code: 201
+    input: [name, source_type, reliability_weight]
+    output: EventSource
+    side_effects: []
+  - method: GET
+    path: "/api/event-sources"
+    description: "List event sources"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["source_type?", "limit?", "offset?"]
+    output: "EventSource[]"
+    side_effects: []
+  - method: GET
+    path: "/api/event-sources/{id}"
+    description: "Get an event source"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: EventSource
+    side_effects: []
+
+  # --- SourceNotification ---
+  - method: POST
+    path: "/api/source-notifications"
+    description: "Ingest a raw event notification from a source"
+    roles: [VendorFeed]
+    code: 201
+    input: [source_id, security_id, event_type, record_date, announced_terms]
+    output: SourceNotification
+    side_effects: ["status initialized RECEIVED"]
+  - method: GET
+    path: "/api/source-notifications"
+    description: "List source notifications"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["source_id?", "security_id?", "status?", "limit?", "offset?"]
+    output: "SourceNotification[]"
+    side_effects: []
+  - method: GET
+    path: "/api/source-notifications/{id}"
+    description: "Get a source notification"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: SourceNotification
+    side_effects: []
+  - method: POST
+    path: "/api/source-notifications/{id}/reject"
+    description: "Reject a received notification as unusable"
+    roles: [EventAnalyst]
+    code: 200
+    input: []
+    output: SourceNotification
+    side_effects: ["RECEIVED -> REJECTED"]
+
+  # --- CorporateActionEvent ---
+  - method: POST
+    path: "/api/events"
+    description: "Scrub raw notifications into a golden corporate action event (DRAFT)"
+    roles: [EventAnalyst]
+    code: 201
+    input: [security_id, event_type, terms, record_date, payable_date, source_notification_ids, "election_required?", "election_deadline?", "compensation_pool_cents?", "claim_compensation_basis?"]
+    output: CorporateActionEvent
+    side_effects:
+      - "Scrub validation (priority 9): submitted terms must equal the winning notification's announced_terms (highest source reliability_weight; tie -> earliest notification created_at)"
+      - "Referenced SourceNotifications -> MATCHED"
+      - "scrubbed_by_user_id := X-User-ID; compensation_pool_remaining_cents := compensation_pool_cents"
+      - "Mandatory-type window overlap check vs non-CANCELLED events on the security (half-open [record_date, payable_date))"
+  - method: GET
+    path: "/api/events"
+    description: "List corporate action events"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["security_id?", "status?", "event_type?", "limit?", "offset?"]
+    output: "CorporateActionEvent[]"
+    side_effects: []
+  - method: GET
+    path: "/api/events/{id}"
+    description: "Get an event"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: CorporateActionEvent
+    side_effects: []
+  - method: POST
+    path: "/api/events/{id}/confirm"
+    description: "Confirm a scrubbed event (second analyst; generates PROJECTED entitlements)"
+    roles: [EventAnalyst]
+    code: 200
+    input: []
+    output: CorporateActionEvent
+    side_effects:
+      - "DRAFT|AMENDED -> CONFIRMED; confirmed_by_user_id := X-User-ID; version increments"
+      - "From DRAFT only: PROJECTED entitlements generated (TRADE_DATE_BASIS); Account.pending_entitlement_count recomputed"
+  - method: POST
+    path: "/api/events/{id}/amendments"
+    description: "Apply a terms amendment to a CONFIRMED event (OCC-guarded)"
+    roles: [EventAnalyst]
+    code: 201
+    input: [amended_terms, reason, expected_event_version]
+    output: EventAmendment
+    side_effects:
+      - "Event CONFIRMED -> AMENDED; increments CorporateActionEvent.version by 1; terms replaced"
+      - "PROJECTED/FIRM entitlements -> SUPERSEDED; replacement PROJECTED entitlements created (TRADE_DATE_BASIS); Account pending counts recomputed"
+  - method: GET
+    path: "/api/events/{id}/amendments"
+    description: "List amendments of an event"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "EventAmendment[]"
+    side_effects: []
+  - method: POST
+    path: "/api/events/{id}/cancel"
+    description: "Cancel a non-terminal event"
+    roles: [EventAnalyst]
+    code: 200
+    input: []
+    output: CorporateActionEvent
+    side_effects: ["-> CANCELLED; PROJECTED/FIRM entitlements -> SUPERSEDED; SUBMITTED/WITHDRAWN elections -> VOID; Account pending counts recomputed; version increments"]
+  - method: POST
+    path: "/api/events/{id}/capture-record-position"
+    description: "Firm up entitlements at record date under SETTLED_BASIS"
+    roles: [OperationsManager]
+    code: 200
+    input: []
+    output: CorporateActionEvent
+    side_effects: ["PROJECTED entitlements -> FIRM with SETTLED_BASIS recompute in place"]
+  - method: POST
+    path: "/api/events/{id}/book"
+    description: "Book the event: settle entitlements, apply elections, mutate lots, credit cash, auto-resolve position breaks"
+    roles: [OperationsManager]
+    code: 201
+    input: []
+    output: Booking
+    side_effects:
+      - "Event CONFIRMED -> BOOKED; version increments"
+      - "Full cascade per state machine (entitlement settle/miss, election apply/lapse, lot mutation, account recompute, break auto-resolution)"
+  - method: GET
+    path: "/api/events/{id}/bookings"
+    description: "List bookings of an event"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Booking[]"
+    side_effects: []
+  - method: POST
+    path: "/api/events/{id}/complete"
+    description: "Complete a booked event once entitlements terminal and breaks resolved"
+    roles: [OperationsManager]
+    code: 200
+    input: []
+    output: CorporateActionEvent
+    side_effects: ["BOOKED -> COMPLETED; version increments"]
+
+  # --- Booking / BookingLine ---
+  - method: GET
+    path: "/api/bookings/{id}"
+    description: "Get a booking"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Booking
+    side_effects: []
+  - method: POST
+    path: "/api/bookings/{id}/reverse"
+    description: "Reverse a posted booking (compensating action; exact restore from BookingLine prior values)"
+    roles: [OperationsManager]
+    code: 200
+    input: []
+    output: Booking
+    side_effects: ["POSTED -> REVERSED; inverse lines applied; entitlements SETTLED -> FIRM; event BOOKED -> CONFIRMED; accounts recomputed; event version increments"]
+  - method: GET
+    path: "/api/booking-lines"
+    description: "List booking lines"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["booking_id?", "position_lot_id?", "entitlement_id?", "limit?", "offset?"]
+    output: "BookingLine[]"
+    side_effects: []
+  - method: GET
+    path: "/api/booking-lines/{id}"
+    description: "Get a booking line"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: BookingLine
+    side_effects: []
+
+  # --- Election ---
+  - method: POST
+    path: "/api/events/{id}/elections"
+    description: "Submit (or supersede) a voluntary election for an account (OCC-guarded)"
+    roles: [AccountHolder]
+    code: 201
+    input: [account_id, option_code, expected_event_version, "quantity?"]
+    output: Election
+    side_effects:
+      - "New Election SUBMITTED with election_seq incremented"
+      - "Prior SUBMITTED election for (event_id, account_id) -> SUPERSEDED"
+      - "increments CorporateActionEvent.version by 1"
+  - method: POST
+    path: "/api/elections/{id}/withdraw"
+    description: "Withdraw a submitted election before the deadline"
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Election
+    side_effects: ["SUBMITTED -> WITHDRAWN; event version increments"]
+  - method: POST
+    path: "/api/elections/{id}/resubmit"
+    description: "Resubmit a withdrawn election before the deadline"
+    roles: [AccountHolder]
+    code: 200
+    input: []
+    output: Election
+    side_effects: ["WITHDRAWN -> SUBMITTED; election_seq incremented; other SUBMITTED elections for the account on the event -> SUPERSEDED; event version increments"]
+  - method: GET
+    path: "/api/elections"
+    description: "List elections"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["event_id?", "account_id?", "status?", "limit?", "offset?"]
+    output: "Election[]"
+    side_effects: []
+  - method: GET
+    path: "/api/elections/{id}"
+    description: "Get an election"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Election
+    side_effects: []
+
+  # --- Claim ---
+  - method: POST
+    path: "/api/claims"
+    description: "File a compensation claim for a missed or mis-booked entitlement"
+    roles: [AccountHolder]
+    code: 201
+    input: [event_id, entitlement_id, account_id, reason, claimed_amount_cents, "market_price_cents?"]
+    output: Claim
+    side_effects: ["review_status FILED; payment_status UNPAID; filed_by_user_id := X-User-ID"]
+  - method: GET
+    path: "/api/claims"
+    description: "List claims"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["event_id?", "entitlement_id?", "account_id?", "review_status?", "limit?", "offset?"]
+    output: "Claim[]"
+    side_effects: []
+  - method: GET
+    path: "/api/claims/{id}"
+    description: "Get a claim"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: POST
+    path: "/api/claims/{id}/decide"
+    description: "Approve (computes compensation, reserves pool) or deny a claim"
+    roles: [ClaimsExaminer]
+    code: 200
+    input: [decision]
+    output: Claim
+    side_effects: ["On APPROVED: compensation_cents computed per claim_compensation_amount variant; event.compensation_pool_remaining_cents decremented; event version increments"]
+  - method: POST
+    path: "/api/claims/{id}/pay"
+    description: "Pay an approved claim (credits account, compensates MISSED entitlement)"
+    roles: [OperationsManager]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: ["payment_status UNPAID -> PAID; Account.cash_balance_cents += compensation_cents; MISSED entitlement -> COMPENSATED"]
+
+  # --- CustodianStatement / ReconBreak ---
+  - method: POST
+    path: "/api/custodian-statements"
+    description: "Ingest a custodian statement; reconciliation runs synchronously and breaks are created"
+    roles: [CustodianFeed]
+    code: 201
+    input: [source_id, coverage_start_date, coverage_end_date, lines]
+    output: CustodianStatement
+    side_effects:
+      - "Closed-interval coverage overlap check per source (ERR_STATEMENT_COVERAGE_OVERLAP)"
+      - "status -> RECONCILED; per-line custodian_position_reconciliation creates ReconBreaks"
+      - "MISSED_ENTITLEMENT breaks auto-file Claims (filed_by_user_id 'system') when eligible"
+  - method: GET
+    path: "/api/custodian-statements"
+    description: "List custodian statements"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["source_id?", "status?", "limit?", "offset?"]
+    output: "CustodianStatement[]"
+    side_effects: []
+  - method: GET
+    path: "/api/custodian-statements/{id}"
+    description: "Get a custodian statement"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: CustodianStatement
+    side_effects: []
+  - method: GET
+    path: "/api/recon-breaks"
+    description: "List reconciliation breaks"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["statement_id?", "event_id?", "account_id?", "security_id?", "break_type?", "status?", "auto_claim_id?", "limit?", "offset?"]
+    output: "ReconBreak[]"
+    side_effects: []
+  - method: GET
+    path: "/api/recon-breaks/{id}"
+    description: "Get a recon break"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: ReconBreak
+    side_effects: []
+  - method: POST
+    path: "/api/recon-breaks/{id}/resolve"
+    description: "Manually resolve or write off an open break"
+    roles: [OperationsManager]
+    code: 200
+    input: [resolution, "resolution_note?"]
+    output: ReconBreak
+    side_effects: ["OPEN -> RESOLVED (MANUAL) or WRITTEN_OFF; resolution_note required for manual paths"]
+
+  # --- Entitlement (read-only views) ---
+  - method: GET
+    path: "/api/entitlements"
+    description: "List entitlements"
+    roles: *ALL_ROLES
+    code: 200
+    input: ["event_id?", "account_id?", "status?", "supersedes_entitlement_id?", "limit?", "offset?"]
+    output: "Entitlement[]"
+    side_effects: []
+  - method: GET
+    path: "/api/entitlements/{id}"
+    description: "Get an entitlement"
+    roles: *ALL_ROLES
+    code: 200
+    input: []
+    output: Entitlement
+    side_effects: []
+
+# =============================================================================
+# Section 1.6: Error Code Catalog (52 codes)
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or empty" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role not permitted for this endpoint" }
+  # --- shape ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Required field missing, type mismatch, invalid enum member, or missing resolution_note on manual resolve" }
+  - { id: ERR_INVALID_EVENT_TERMS, http: 400, condition: "Terms incoherent for event_type (missing ratio keys, ratio_den=0, negative price, election_deadline after payable_date, record_date after payable_date, missing per-type required keys)" }
+  - { id: ERR_LOT_QUANTITY_INVALID, http: 400, condition: "PositionLot quantity <= 0 or more than 4 decimal places" }
+  # --- not found ---
+  - { id: ERR_SECURITY_NOT_FOUND, http: 404, condition: "securityId / security_id does not exist" }
+  - { id: ERR_ACCOUNT_NOT_FOUND, http: 404, condition: "accountId / account_id does not exist" }
+  - { id: ERR_POSITION_LOT_NOT_FOUND, http: 404, condition: "lotId does not exist" }
+  - { id: ERR_EVENT_SOURCE_NOT_FOUND, http: 404, condition: "sourceId / source_id does not exist" }
+  - { id: ERR_SOURCE_NOTIFICATION_NOT_FOUND, http: 404, condition: "notificationId / notification id in source_notification_ids does not exist" }
+  - { id: ERR_EVENT_NOT_FOUND, http: 404, condition: "eventId / event_id does not exist" }
+  - { id: ERR_ENTITLEMENT_NOT_FOUND, http: 404, condition: "entitlementId / entitlement_id does not exist" }
+  - { id: ERR_ELECTION_NOT_FOUND, http: 404, condition: "electionId does not exist" }
+  - { id: ERR_BOOKING_NOT_FOUND, http: 404, condition: "bookingId / booking_id does not exist" }
+  - { id: ERR_BOOKING_LINE_NOT_FOUND, http: 404, condition: "lineId does not exist" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "claimId does not exist" }
+  - { id: ERR_CUSTODIAN_STATEMENT_NOT_FOUND, http: 404, condition: "statementId does not exist" }
+  - { id: ERR_RECON_BREAK_NOT_FOUND, http: 404, condition: "breakId does not exist" }
+  # --- ownership / state ---
+  - { id: ERR_ACCOUNT_OWNERSHIP_MISMATCH, http: 403, condition: "AccountHolder X-User-ID does not equal the account_id of the election/claim" }
+  - { id: ERR_EVENT_NOT_CONFIRMED, http: 409, condition: "capture-record-position or book requires event CONFIRMED" }
+  - { id: ERR_EVENT_NOT_AMENDABLE, http: 409, condition: "amendment requires event CONFIRMED" }
+  - { id: ERR_EVENT_NOT_BOOKED, http: 409, condition: "complete requires event BOOKED" }
+  - { id: ERR_EVENT_ALREADY_TERMINAL, http: 409, condition: "operation on COMPLETED or CANCELLED event" }
+  - { id: ERR_EVENT_NOT_ACCEPTING_ELECTIONS, http: 409, condition: "election submit/resubmit requires event status CONFIRMED" }
+  - { id: ERR_ELECTION_INVALID_STATE, http: 409, condition: "withdraw requires SUBMITTED; resubmit requires WITHDRAWN" }
+  - { id: ERR_CLAIM_NOT_FILED, http: 409, condition: "decide requires review_status FILED" }
+  - { id: ERR_CLAIM_NOT_PAYABLE, http: 409, condition: "pay requires review_status APPROVED and payment_status UNPAID" }
+  - { id: ERR_BOOKING_NOT_REVERSIBLE, http: 409, condition: "reverse requires POSTED booking and no PAID claim on its settled entitlements" }
+  - { id: ERR_RECON_BREAK_NOT_OPEN, http: 409, condition: "resolve requires OPEN break" }
+  - { id: ERR_UNSETTLED_ENTITLEMENTS_EXIST, http: 409, condition: "complete blocked: non-SUPERSEDED entitlement not in {SETTLED, COMPENSATED}" }
+  - { id: ERR_OPEN_RECON_BREAKS_EXIST, http: 409, condition: "complete blocked: OPEN ReconBreak linked to the event" }
+  - { id: ERR_ENTITLEMENTS_NOT_FIRM, http: 409, condition: "book blocked: a non-SUPERSEDED entitlement is still PROJECTED" }
+  # --- business constraint ---
+  - { id: ERR_SECURITY_SUSPENDED, http: 409, condition: "event creation on a SUSPENDED security" }
+  - { id: ERR_EVENT_WINDOW_OVERLAP, http: 409, condition: "mandatory event window [record_date, payable_date) overlaps another non-CANCELLED mandatory event on the same security; touching endpoints are allowed" }
+  - { id: ERR_STATEMENT_COVERAGE_OVERLAP, http: 409, condition: "closed coverage interval shares at least one day with another statement from the same source" }
+  - { id: ERR_NOTIFICATION_SCRUB_MISMATCH, http: 409, condition: "scrub set invalid: fewer than 2 notifications, same source twice, not RECEIVED, security/type/record_date mismatch, or terms differ from the winning source" }
+  - { id: ERR_DUPLICATE_OPEN_CLAIM, http: 409, condition: "another FILED claim already exists for the same entitlement" }
+  - { id: ERR_ACCOUNT_NOT_ACTIVE, http: 409, condition: "election submission requires Account.status == ACTIVE" }
+  - { id: ERR_ACCOUNT_NOT_SETTLED, http: 409, condition: "account close blocked by OPEN lots or PROJECTED/FIRM entitlements" }
+  # --- safety / concurrency ---
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "confirm user equals scrubbed_by_user_id, or decide user equals filed_by_user_id" }
+  - { id: ERR_STALE_EVENT_VERSION, http: 412, condition: "expected_event_version does not match the event's current version (OCC)" }
+  # --- temporal ---
+  - { id: ERR_RECORD_DATE_NOT_REACHED, http: 422, condition: "capture attempted before record_date" }
+  - { id: ERR_ELECTION_DEADLINE_PASSED, http: 422, condition: "election submit/withdraw/resubmit attempted with clock strictly after election_deadline" }
+  - { id: ERR_ELECTION_WINDOW_OPEN, http: 422, condition: "booking a voluntary event attempted at or before election_deadline" }
+  - { id: ERR_CLAIM_WINDOW_EXPIRED, http: 422, condition: "claim filed after payable_date + 30 days (inclusive window exceeded)" }
+  # --- referential / fiscal ---
+  - { id: ERR_EVENT_NOT_VOLUNTARY, http: 422, condition: "election on an event with election_required=false" }
+  - { id: ERR_INVALID_ELECTION_OPTION, http: 400, condition: "option_code not allowed for the event type, or quantity present/absent contrary to type rules" }
+  - { id: ERR_SOURCE_NOT_CUSTODIAN, http: 422, condition: "custodian statement submitted for a non-CUSTODIAN source" }
+  - { id: ERR_ENTITLEMENT_NOT_CLAIMABLE, http: 422, condition: "claim entitlement wrong event/account, or status not in {MISSED, SETTLED}" }
+  - { id: ERR_CLAIM_AMOUNT_EXCEEDS_CAP, http: 422, condition: "claimed_amount_cents > 250000 or <= 0" }
+  - { id: ERR_COMPENSATION_POOL_EXHAUSTED, http: 402, condition: "approval compensation exceeds event.compensation_pool_remaining_cents" }
+  - { id: ERR_ELECTION_QUANTITY_EXCEEDS_ENTITLEMENT, http: 422, condition: "rights exercise quantity exceeds entitled rights while oversubscription_allowed=false" }
+
+# =============================================================================
+# Section 1.7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: DeskAdministrator
+    description: "Desk setup operator: securities, accounts, lots, sources; drives the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/_clock/set_current_utc"
+      - "POST /api/securities, PUT /api/securities/{id}"
+      - "POST /api/accounts"
+      - "POST /api/position-lots"
+      - "POST /api/event-sources"
+    shared_operations: ["All GET endpoints"]
+  - name: VendorFeed
+    description: "External announcement feed pushing raw event notifications"
+    identity: opaque
+    exclusive_operations: ["POST /api/source-notifications"]
+    shared_operations: ["All GET endpoints"]
+  - name: EventAnalyst
+    description: "Corporate actions analyst: scrubs notifications into golden events, confirms, amends, cancels"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/events"
+      - "POST /api/events/{id}/confirm (must not be the event's scrubber — SoD)"
+      - "POST /api/events/{id}/amendments"
+      - "POST /api/events/{id}/cancel"
+      - "POST /api/source-notifications/{id}/reject"
+    shared_operations: ["All GET endpoints"]
+  - name: OperationsManager
+    description: "Desk operations: capture, booking, reversal, completion, account status, claim payment, break resolution"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/events/{id}/capture-record-position"
+      - "POST /api/events/{id}/book"
+      - "POST /api/events/{id}/complete"
+      - "POST /api/bookings/{id}/reverse"
+      - "PUT /api/accounts/{id}"
+      - "POST /api/claims/{id}/pay"
+      - "POST /api/recon-breaks/{id}/resolve"
+    shared_operations: ["All GET endpoints"]
+  - name: AccountHolder
+    description: "Client account holder acting on their own account (elections, claims)"
+    identity: "entity_backed:Account"
+    exclusive_operations:
+      - "POST /api/events/{id}/elections (account_id must equal X-User-ID)"
+      - "POST /api/elections/{id}/withdraw, POST /api/elections/{id}/resubmit"
+      - "POST /api/claims (account_id must equal X-User-ID)"
+    shared_operations: ["All GET endpoints"]
+  - name: ClaimsExaminer
+    description: "Independent examiner deciding claims (must not be the filer — SoD)"
+    identity: opaque
+    exclusive_operations: ["POST /api/claims/{id}/decide"]
+    shared_operations: ["All GET endpoints"]
+  - name: CustodianFeed
+    description: "Custodian system pushing position/entitlement statements"
+    identity: opaque
+    exclusive_operations: ["POST /api/custodian-statements"]
+    shared_operations: ["All GET endpoints"]
