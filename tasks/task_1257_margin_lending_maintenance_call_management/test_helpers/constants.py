@@ -1,0 +1,51 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Regulatory / house maintenance percentages (basis points)
+REG_T_INITIAL_BPS = 5000
+REG_MAINT_LONG_BPS = 2500
+REG_MAINT_SHORT_BPS = 3000
+CONC_MID_CAP_BPS = 7500
+CONC_MID_ADDON_BPS = 1000
+CONC_HIGH_ADDON_BPS = 2000
+
+# Pattern day trading
+PDT_MIN_DAY_TRADES = 4
+PDT_RATIO_NUM = 6
+PDT_MIN_EQUITY_CENTS = 2_500_000
+PDT_BP_MULTIPLIER = 4
+NON_PDT_BP_MULTIPLIER = 2
+
+# Interest accrual
+DAY_COUNT_YEAR = 360
+
+# Call deadlines (hours), keyed by call type
+CALL_DEADLINE_HOURS = {
+    "FED_REG_T": 96,
+    "MAINTENANCE": 72,
+    "HOUSE": 48,
+    "DAY_TRADE_MIN_EQUITY": 120,
+}
+
+# Logical clock default before it is ever set
+DEFAULT_CLOCK_ISO = "2026-05-01T00:00:00Z"
+
+# Approval suitability bar
+SUITABILITY_MIN_LIQUID_NET_WORTH_CENTS = 200_000
+SUITABILITY_MIN_EXPERIENCE_YEARS = 1
+
+TEST_DEFAULTS = {
+    "ANNUAL_INCOME_CENTS": 15_000_000,
+    "LIQUID_NET_WORTH_CENTS": 50_000_000,
+    "EXPERIENCE_YEARS": 5,
+    "HIGH_INCOME_CENTS": 90_000_000,
+    "HIGH_NET_WORTH_CENTS": 90_000_000,
+    "HIGH_EXPERIENCE_YEARS": 7,
+    "HOUSE_MAINT_LONG_BPS": 3000,
+    "HOUSE_MAINT_SHORT_BPS": 3500,
+    "LIQUIDITY_TIER": 1,
+    "CONCENTRATION_THRESHOLD_BPS": 6000,
+    "MARK_PRICE_CENTS": 10_000,
+}
+
+# Well-formed but never-present identifier for 404 probes
+ABSENT_UUID = "00000000-0000-0000-0000-000000000000"

@@ -1,0 +1,101 @@
+"""Barrel export: framework generics + PRD-specific helpers."""
+# Framework generics (re-exported for convenience)
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+# PRD-specific
+from .api_client import ApiClient, api_client
+from .api_errors import HTTP_STATUS_CODES, ApiErrorId
+from .assertions import (
+    assert_cure_cycle,
+    assert_cure_equipment,
+    assert_emission_permit,
+    assert_inspection,
+    assert_layup_session,
+    assert_mold,
+    assert_ply_book,
+    assert_repair,
+    assert_resin_batch,
+    assert_resin_mass_invariant,
+    assert_work_order,
+)
+from .constants import TEST_DEFAULTS, THRESHOLDS
+from .factories import (
+    STANDARD_DUE_DATE,
+    STANDARD_PASS_LOG,
+    STANDARD_PROGRAM,
+    STANDARD_WINDOW,
+    T0,
+    create_cure_cycle_payload,
+    create_cure_equipment_payload,
+    create_cure_log_payload,
+    create_emission_permit_payload,
+    create_inspection_payload,
+    create_layup_session_payload,
+    create_mold_payload,
+    create_ply_book_payload,
+    create_resin_batch_payload,
+    create_work_order_payload,
+)
+from .fixtures import (
+    create_approved_ply_book,
+    create_batch,
+    create_draft_ply_book,
+    create_mold,
+    create_oven,
+    create_permit,
+    demold,
+    record_session,
+    release_work_order,
+    run_cure,
+    schedule_cure,
+    set_clock,
+    setup_shop,
+    setup_work_order_accepted,
+    setup_work_order_awaiting_cure,
+    setup_work_order_cured,
+    setup_work_order_in_inspection,
+    setup_work_order_in_layup,
+    setup_work_order_in_repair,
+)
+from .test_users import (
+    INSPECTOR_USER_ID,
+    LAMINATOR_USER_ID,
+    TEST_USERS,
+    make_inspector_headers,
+    make_laminator_headers,
+)
+from .types import (
+    CureCycleStatus,
+    CureEquipmentStatus,
+    EmissionPermitStatus,
+    EquipmentKind,
+    InspectionMethod,
+    InspectionResult,
+    LayupSessionStatus,
+    MoldStatus,
+    PlyBookStatus,
+    RepairStatus,
+    ResinBatchStatus,
+    ResinSystem,
+    ScrapReason,
+    ToolingPhase,
+    UserRole,
+    WorkOrderStatus,
+)
