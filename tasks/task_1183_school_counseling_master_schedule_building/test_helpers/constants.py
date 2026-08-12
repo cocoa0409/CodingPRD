@@ -1,0 +1,42 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+# Tally weights
+PRIMARY_WEIGHT = 1.0
+ALTERNATE_WEIGHT = 0.5
+PREVIEW_DRAFT_PRIMARY_WEIGHT = 0.5
+PREVIEW_DRAFT_ALTERNATE_WEIGHT = 0.25
+
+# Credit pace constants (PRD §3.7)
+GRADE_PACE = {9: 6.0, 10: 12.0, 11: 18.0, 12: 22.0}
+ENGLISH_PER_YEAR = 1.0
+MATH_PER_YEAR = 1.0
+SCIENCE_PER_YEAR = 0.5
+SOCIAL_STUDIES_PER_YEAR = 0.5
+CREDIT_LOAD_CEILING = 8.0
+
+# Request caps (PRD §3.2)
+MAX_PRIMARY_REQUESTS = 8
+
+# Recovery priority weights (PRD §3.7)
+W_DEFICIENCY = 10
+W_GRADE = 2
+W_CORE_SUBJECT = 3
+
+# Counselor utilization (PRD §3.6)
+WEEKDAY_MINUTES = 360
+APPOINTMENT_BUFFER_MINUTES = 10
+
+# No-show freeze (PRD §3.6)
+FREEZE_THRESHOLD = 3
+LOOKBACK_DAYS = 90
+
+# Logical clock startup default (PRD §2.9)
+CLOCK_STARTUP_DEFAULT = "2026-05-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "PERIODS_PER_DAY": 8,
+    "MAX_STUDENTS_PER_SECTION": 32,
+    "CLASS_SIZE_TARGET": 25,
+    "SINGLETON_SECTION_CAP": 2,
+    "CHANGE_REQUEST_MAX_PER_STUDENT": 3,
+}

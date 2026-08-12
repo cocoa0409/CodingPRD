@@ -1,0 +1,47 @@
+"""Domain thresholds — numeric constants from PRD calculations (§2.7, §3)."""
+
+# Logical clock default at server startup (PRD §2.7).
+DEFAULT_CLOCK_ISO = "2026-05-01T00:00:00Z"
+
+# Recovery billing / reconciliation arithmetic (PRD §3.5, §3.6).
+PERIODS_PER_YEAR = 12
+PRO_RATA_DENOM = 10000
+DEFAULT_GROSS_UP_FLOOR_BPS = 9500
+VARIABLE_POOL_CATEGORIES = ("CAM", "UTILITIES")
+TRUE_UP_PERIOD_INDEX = 13
+
+# Escalation computation (PRD §3.3).
+CPI_LOOKUP_BPS = 250
+PCT_DENOM = 10000
+
+# Audit rights (PRD §3.9).
+AUDIT_WINDOW_DAYS = 365
+MAX_CHALLENGE_ROUNDS = 3
+ESCALATION_AUDIT_INVOCATION_DEADLINE_DAYS = 30
+
+# Delinquency threshold for billing_posture (PRD §2.8).
+DELINQUENT_AFTER_DAYS = 60
+
+# Common test data defaults.
+TEST_DEFAULTS = {
+    "PROPERTY_NAME": "P1",
+    "PROPERTY_ADDRESS": "1 Main St",
+    "TOTAL_RENTABLE_SF": 10000,
+    "FISCAL_YEAR_END_MONTH": 12,
+    "TENANT_LEGAL_NAME": "T1",
+    "SUITE": "100",
+    "LEASED_SF": 4000,
+    "COMMENCEMENT_DATE": "2026-01-01",
+    "EXPIRATION_DATE": "2026-12-31",
+    "BASE_RENT_ANNUAL_CENTS": 1200000,
+    "ESCALATION_TYPE": "NONE",
+    "RECOVERY_STRUCTURE": "NNN",
+    "PRO_RATA_SHARE_BPS": 4000,
+    "SECURITY_DEPOSIT_CENTS": 0,
+    "POOL_CATEGORY": "CAM",
+    "FISCAL_YEAR": 2026,
+    "BUDGETED_CENTS": 1200000,
+    "SCHEDULE_PERIOD_START": "2026-01-01",
+    "SCHEDULE_PERIOD_END": "2027-01-01",
+    "SCHEDULE_BASE_RENT_CENTS": 1200000,
+}

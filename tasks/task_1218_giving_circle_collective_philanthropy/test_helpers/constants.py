@@ -1,0 +1,38 @@
+"""Domain thresholds — numeric constants named in the PRD (§2.10, §3.1-§3.8)."""
+
+# Logical clock (PRD §2.4): the startup reading before any administrative set.
+CLOCK_START_ISO = "2026-05-01T00:00:00Z"
+
+# Circle configuration defaults used across setups (PRD §3.1 ranges).
+DEFAULT_ADMIN_FEE_PERCENT = 5
+DEFAULT_QUORUM_PERCENT = 50
+DEFAULT_STANDARD_MINIMUM_CENTS = 100000
+DEFAULT_LEADER_MINIMUM_CENTS = 250000
+DEFAULT_OPERATING_RESERVE_CENTS = 0
+
+# Vetting (PRD §3.4).
+VETTING_PASS_THRESHOLD = 70
+MAX_INFO_ROUNDS = 2
+
+# Voting (PRD §3.6).
+POINTS_BUDGET_PER_BALLOT = 100
+MIN_POINTS_PER_ALLOCATION = 10
+MAX_ALLOCATIONS_PER_BALLOT = 5
+VOTING_WINDOW_DAYS = 7
+
+# Award and payouts (PRD §3.7).
+MIN_AWARD_CENTS = 50000
+UPFRONT_TRANCHE_PERCENT = 70
+
+# Reporting deadlines (PRD §3.7-§3.8).
+INTERIM_REPORT_DUE_DAYS = 90
+FINAL_REPORT_DUE_DAYS = 365
+
+# Calendar rules (PRD §2.10).
+SESSION_BUFFER_MINUTES = 15
+
+# Canonical logical-clock waypoints used by the setups below.
+VISIT_START_ISO = "2026-06-10T10:00:00Z"
+VISIT_END_ISO = "2026-06-10T11:00:00Z"
+VOTING_CLOSED_CLOCK_ISO = "2026-06-18T00:00:00Z"
+INTERIM_OVERDUE_CLOCK_ISO = "2026-09-17T00:00:00Z"

@@ -1,0 +1,47 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+# Logical clock startup default (PRD §2.4).
+DEFAULT_CLOCK_ISO = "2026-05-01T00:00:00Z"
+
+# Fixed durations (PRD §2.4).
+CONSENT_WINDOW_DAYS = 14
+HOLD_DURATION_DAYS = 30
+FILL_WINDOW_DAYS = 60
+MAX_ACTIVE_HOLDS = 1
+
+# Bench strength (PRD §3.2).
+READINESS_WEIGHT = {"READY_NOW": 1.0, "READY_1_2": 0.6, "READY_3_PLUS": 0.3}
+POSITION_DECAY = 0.9
+SLATE_MAX = 5
+MAX_POSSIBLE = 4.0951  # 1.0 + 0.9 + 0.81 + 0.729 + 0.6561
+
+# Bench posture bands (PRD §2.9).
+POSTURE_ADEQUATE_MIN = 40
+POSTURE_STRONG_MIN = 70
+
+# Readiness score (PRD §3.3).
+RATING_POINTS = {"LOW": 20, "SOLID": 50, "STRONG": 80, "EXCEPTIONAL": 100}
+
+# Retention risk (PRD §3.8).
+TREND_WEIGHTS = [0.5, 0.3, 0.2]
+TENURE_RISK_MONTHS = 24
+TENURE_RISK_DELTA = 15
+HIPO_RISK_DELTA = 10
+READY_NOW_RISK_DELTA = 20
+RISK_MEDIUM_MIN = 30
+RISK_HIGH_MIN = 60
+RISK_CRITICAL_MIN = 85
+
+# Diversity measurement (PRD §3.8).
+UNDERREPRESENTED_GROUPS = ["GROUP_C", "GROUP_D"]
+TIER_WEIGHT = {"TIER_1": 3, "TIER_2": 2, "TIER_3": 1}
+
+# Slate-fill eligibility (PRD §3.4).
+ELIGIBLE_READINESS = ["READY_NOW", "READY_1_2"]
+READINESS_RANK = {"READY_NOW": 0, "READY_1_2": 1}
+
+TEST_DEFAULTS = {
+    "JOB_LEVEL": 5,
+    "HIRE_DATE": "2023-01-15",
+    "DEPARTMENT": "ENG",
+}

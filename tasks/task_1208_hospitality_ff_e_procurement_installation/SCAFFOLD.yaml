@@ -1,0 +1,1248 @@
+scenario: |
+  1208. Hospitality FF&E Procurement & Installation (hotel FF&E purchasing agent): purchase specification & brand-standard approval, vendor bid & sample approval, freight consolidation & warehouse receiving, installation schedule by floor & room turn, damage/short shipment reconciliation, attic stock & spare inventory, budget vs actual by line, owner change order
+
+domain_name: hospitality-ffe-procurement
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation      # budget vs actual by line; damage/short reconciliation
+  secondary_archetype: temporal_windowing       # installation schedule by floor & room turn
+  complexity_layers:
+    - optimistic_concurrency                    # OCC on FFEProject.version (CO apply) and POLine.version (attic transfer)
+    - cascading_side_effects                    # receiving -> line -> PO -> shipment -> freight -> budget -> project chains
+    - dual_variant_calculation                  # commitment-vs-final budget variance; cube-vs-units freight allocation
+    - derived_field_reconciliation              # committed/actual/variance/posture recomputed on every source mutation
+  entity_topology: flat                         # peer resources under /api, FK links in request bodies, sub-resource GETs for reverse reachability
+  state_machine_shape: parallel                 # PurchaseOrder runs fulfillment_status x invoice_status; plus cyclic SpecItem/DamageClaim and posture-gated project
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate                           # InstallationTask references Room x InstallationWindow x POLine; DamageClaim references POLine
+  role_model: segregation_of_duties             # change-order proposer may not approve own change order (X-User-ID tracked)
+  consistency_model: immediate                  # all cascades and recomputes visible in the same request's response
+
+# =============================================================================
+# Table 1: Entity-Relationship Table
+# common_fields: true expands to id (UUID, identity only), created_at,
+# updated_at (refreshed on every mutation incl. cascades), version (int from 1).
+# =============================================================================
+entities:
+  - name: FFEProject
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Project name" }
+      - { name: hotel_name, type: string, source: input, description: "Hotel property name" }
+      - { name: brand_program, type: enum, source: input, description: "Brand program", constraints: "MARQUEE_SELECT | MARQUEE_LUXE | INDIE_SOFT" }
+      - { name: total_budget_cents, type: integer, source: input, description: "Total owner-approved FF&E funding envelope in cents", constraints: "> 0" }
+      - { name: unallocated_contingency_cents, type: integer, source: input, default: 0, description: "Contingency not yet drawn into any budget line", constraints: ">= 0 and <= total_budget_cents" }
+      - { name: default_crew_capacity_per_floor_day, type: integer, source: input, default: 8, description: "Max summed crew_count of overlapping installation windows on one floor_number per calendar day", constraints: ">= 1" }
+      - { name: committed_cents, type: integer, source: computed, default: 0, description: "Sum of BudgetLine.committed_cents over all budget lines of this project" }
+      - { name: actual_spend_cents, type: integer, source: computed, default: 0, description: "Sum of BudgetLine.actual_cents over all budget lines of this project" }
+      - { name: sunk_fees_cents, type: integer, source: system, default: 0, description: "Sum of fee_cents over APPLIED ChangeOrders; never returned to contingency" }
+      - { name: procurement_posture, type: enum, source: computed, description: "FROZEN iff committed_cents + actual_spend_cents > total_budget_cents; else SEALED iff any InstallationWindow of this project is IN_PROGRESS; else OPEN", constraints: "OPEN | SEALED | FROZEN" }
+      - { name: status, type: enum, source: system, description: "Lifecycle state", constraints: "PLANNING | PROCUREMENT | INSTALLATION | COMPLETED | CANCELLED" }
+
+  - name: BudgetLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: category, type: enum, source: input, description: "Cost category; unique per project", constraints: "FURNITURE | LIGHTING | TEXTILES | DECOR | APPLIANCES | FREIGHT | INSTALLATION" }
+      - { name: budgeted_cents, type: integer, source: input, description: "Approved budget for this category; adjusted by APPLIED change orders", constraints: ">= 0" }
+      - { name: committed_cents, type: integer, source: computed, default: 0, description: "Sum of (extended_cents + freight_alloc_provisional_cents) over POLine whose spec category equals this category, line status != CANCELLED, and the line's PO fulfillment_status IN {ISSUED, ACKNOWLEDGED, READY_TO_SHIP, CONSOLIDATED}" }
+      - { name: actual_cents, type: integer, source: computed, default: 0, description: "Sum of actual_landed_cents over POLine whose spec category equals this category and qty_received > 0 and line status != CANCELLED" }
+      - { name: variance_commitment_cents, type: integer, source: computed, description: "= budgeted_cents - committed_cents - actual_cents (forward-looking exposure view)" }
+      - { name: variance_final_cents, type: integer, source: computed, description: "= budgeted_cents - actual_cents (reconciled view; ignores open commitments)" }
+
+  - name: SpecItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: category, type: enum, source: input, description: "Cost category; must match a BudgetLine category of the same project before any PO line is added", constraints: "FURNITURE | LIGHTING | TEXTILES | DECOR | APPLIANCES | FREIGHT | INSTALLATION" }
+      - { name: description, type: string, source: input, description: "Purchase specification text" }
+      - { name: brand_standard_ref, type: string, source: input, description: "Brand standard reference code under review" }
+      - { name: quantity_per_room, type: integer, source: input, description: "Units required per room", constraints: ">= 1" }
+      - { name: room_count, type: integer, source: input, description: "Rooms covered; adjusted by APPLIED change orders", constraints: ">= 1" }
+      - { name: total_qty, type: integer, source: computed, description: "= quantity_per_room * room_count" }
+      - { name: unit_budget_cents, type: integer, source: input, description: "Budgeted unit cost", constraints: ">= 1" }
+      - { name: required_lead_days, type: integer, source: input, default: 21, description: "Latest acceptable vendor lead time before penalty applies in bid evaluation", constraints: ">= 0" }
+      - { name: is_critical, type: boolean, source: input, default: false, description: "Critical-path item; doubles attic stock raw target" }
+      - { name: attic_target_pct, type: number, source: input, default: 0.05, description: "Fraction of installed quantity targeted as attic spares", constraints: "> 0 and <= 1" }
+      - { name: attic_min_qty, type: integer, source: input, default: 0, description: "Floor for attic target", constraints: ">= 0" }
+      - { name: attic_max_qty, type: integer, source: input, default: 9999, description: "Ceiling for attic target", constraints: ">= attic_min_qty" }
+      - { name: attic_target_qty, type: integer, source: computed, default: 0, description: "Computed by attic_target_quantity from the spec's single POLine (0 when no PO line exists); refreshed whenever line qty_installed changes" }
+      - { name: status, type: enum, source: system, description: "Brand-standard review state", constraints: "DRAFT | SUBMITTED | BRAND_APPROVED | BRAND_REJECTED | LOCKED" }
+
+  - name: VendorBid
+    parent: null
+    common_fields: true
+    fields:
+      - { name: spec_item_id, type: string, source: input, description: "FK -> SpecItem.id; spec being bid" }
+      - { name: vendor_name, type: string, source: input, description: "Vendor identity label; a PO may only draw lines from AWARDED bids whose vendor_name equals the PO vendor_name" }
+      - { name: unit_price_cents, type: integer, source: input, description: "Offered unit price", constraints: ">= 1" }
+      - { name: freight_estimate_cents, type: integer, source: input, description: "Offered freight estimate for the full spec quantity", constraints: ">= 0" }
+      - { name: lead_time_days, type: integer, source: input, description: "Offered lead time", constraints: ">= 0" }
+      - { name: sample_round, type: integer, source: system, default: 1, description: "Current sample round; increments on resubmit; hard cap SAMPLE_ROUND_MAX = 2" }
+      - { name: evaluated_cost_cents, type: integer, source: computed, description: "Computed by bid_evaluated_cost: unit_price_cents * spec.total_qty + freight_estimate_cents + lead-time penalty" }
+      - { name: status, type: enum, source: system, description: "Bid state", constraints: "SUBMITTED | SAMPLE_APPROVED | SAMPLE_REJECTED | AWARDED | ORDERED | REJECTED" }
+
+  - name: PurchaseOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: vendor_name, type: string, source: input, description: "Vendor this PO is placed with; gates line eligibility" }
+      - { name: shipment_id, type: string, source: system, description: "FK -> Shipment.id; set when attached to a consolidating shipment; null until then; cleared on shipment cancel" }
+      - { name: fulfillment_status, type: enum, source: system, description: "Fulfillment axis (independent of invoice axis)", constraints: "ISSUED | ACKNOWLEDGED | READY_TO_SHIP | CONSOLIDATED | DELIVERED | CLOSED | CANCELLED" }
+      - { name: invoice_status, type: enum, source: system, description: "Invoice axis (independent of fulfillment axis)", constraints: "UNBILLED | PARTIALLY_INVOICED | INVOICED | PAID" }
+      - { name: total_extended_cents, type: integer, source: computed, default: 0, description: "Sum of extended_cents over its non-CANCELLED lines" }
+      - { name: total_cube_m3, type: integer, source: computed, default: 0, description: "Sum of declared_cube_m3 over its non-CANCELLED lines" }
+
+  - name: POLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: purchase_order_id, type: string, source: input, description: "FK -> PurchaseOrder.id; owning PO" }
+      - { name: spec_item_id, type: string, source: input, description: "FK -> SpecItem.id; at most one non-CANCELLED line per spec item across all POs" }
+      - { name: quantity_ordered, type: integer, source: input, description: "Units ordered", constraints: ">= 1" }
+      - { name: declared_cube_m3, type: integer, source: input, description: "Declared shipping volume used for consolidation threshold and provisional freight allocation", constraints: ">= 1" }
+      - { name: unit_price_cents, type: integer, source: computed, description: "Copied from the AWARDED bid matching (spec_item_id, PO vendor_name) at line creation" }
+      - { name: extended_cents, type: integer, source: computed, description: "= quantity_ordered * unit_price_cents (integer cents; no rounding needed)" }
+      - { name: qty_received, type: integer, source: system, default: 0, description: "Cumulative units received via POSTED receiving events (minus any REVERSED event quantities)" }
+      - { name: qty_damaged_unresolved, type: integer, source: system, default: 0, description: "Received-damaged units with no RESOLVED_CREDIT / RESOLVED_REPLACEMENT claim yet" }
+      - { name: qty_damaged_credited, type: integer, source: system, default: 0, description: "Damaged units covered by a RESOLVED_CREDIT or RESOLVED_REPLACEMENT claim" }
+      - { name: qty_short, type: integer, source: system, default: 0, description: "= quantity_ordered - qty_received, finalized when the line's shipment reaches RECEIVED" }
+      - { name: qty_installable, type: integer, source: system, default: 0, description: "Units available for installation or attic transfer: qty_received - qty_damaged_unresolved - qty_damaged_credited - qty_installed - qty_attic" }
+      - { name: qty_installed, type: integer, source: system, default: 0, description: "Units consumed by COMPLETE installation tasks" }
+      - { name: qty_attic, type: integer, source: system, default: 0, description: "Units currently held as attic stock" }
+      - { name: freight_alloc_provisional_cents, type: integer, source: system, default: 0, description: "Provisional freight share assigned at shipment SEALED (declared-cube share)" }
+      - { name: freight_alloc_final_cents, type: integer, source: system, description: "Final freight share assigned at shipment RECEIVED (received-units share); null until then" }
+      - { name: damage_credit_cents, type: integer, source: system, default: 0, description: "Sum of approved_credit_cents over this line's RESOLVED_CREDIT claims" }
+      - { name: actual_landed_cents, type: integer, source: computed, default: 0, description: "= qty_received * unit_price_cents + COALESCE(freight_alloc_final_cents, freight_alloc_provisional_cents) - damage_credit_cents" }
+      - { name: status, type: enum, source: system, description: "OPEN | PARTIALLY_RECEIVED | FULLY_RECEIVED | RECONCILED | CANCELLED", constraints: "see state machine" }
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: carrier_name, type: string, source: input, description: "Carrier / consolidator name" }
+      - { name: total_cube_m3, type: integer, source: computed, default: 0, description: "Sum of total_cube_m3 over attached POs" }
+      - { name: freight_mode, type: enum, source: computed, description: "FCL when total_cube_m3 >= FCL_CUBE_THRESHOLD_M3 at seal, else LTL; null until SEALED", constraints: "FCL | LTL | null" }
+      - { name: freight_total_cents, type: integer, source: computed, description: "FCL_FLAT_FREIGHT_CENTS when FCL else LTL_RATE_PER_M3_CENTS * total_cube_m3; null until SEALED" }
+      - { name: status, type: enum, source: system, description: "PLANNED | CONSOLIDATING | SEALED | IN_TRANSIT | RECEIVED | CANCELLED", constraints: "see state machine" }
+
+  - name: ReceivingEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; shipment being received" }
+      - { name: lines, type: array, source: input, description: "Array of {po_line_id, qty_received >= 1, qty_damaged >= 0, qty_damaged <= qty_received}; every po_line_id must belong to a PO attached to this shipment" }
+      - { name: status, type: enum, source: system, description: "DRAFT | POSTED | REVERSED", constraints: "see state machine" }
+
+  - name: DamageClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: po_line_id, type: string, source: input, description: "FK -> POLine.id; line claimed against" }
+      - { name: claim_type, type: enum, source: input, description: "DAMAGE (bounded by damaged residual) | SHORTAGE (bounded by shortfall residual)", constraints: "DAMAGE | SHORTAGE" }
+      - { name: quantity, type: integer, source: input, description: "Units claimed", constraints: ">= 1" }
+      - { name: claimed_credit_cents, type: integer, source: input, description: "Credit requested", constraints: ">= 0" }
+      - { name: approved_credit_cents, type: integer, source: system, description: "Credit approved at resolution; null until RESOLVED_CREDIT" }
+      - { name: status, type: enum, source: system, description: "OPEN | SUBMITTED | DISPUTED | RESOLVED_CREDIT | RESOLVED_REPLACEMENT | DENIED | VOID", constraints: "see state machine" }
+
+  - name: Room
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: floor_number, type: integer, source: input, description: "Floor the room sits on", constraints: ">= 1" }
+      - { name: room_number, type: string, source: input, description: "Room identifier; unique per project" }
+      - { name: room_type, type: enum, source: input, description: "Room type", constraints: "GUEST_KING | GUEST_DOUBLE | SUITE | CORRIDOR | LOBBY" }
+
+  - name: InstallationWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: floor_number, type: integer, source: input, description: "Floor this window crews; capacity pooled per (project, floor_number)", constraints: ">= 1" }
+      - { name: start_date, type: string, source: input, description: "First day of work, ISO 8601 date; half-open interval start" }
+      - { name: end_date, type: string, source: input, description: "Day after last work day, ISO 8601 date; half-open interval end", constraints: "must be > start_date" }
+      - { name: crew_count, type: integer, source: input, description: "Crews booked per calendar day of the window", constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "PLANNED | RELEASED | IN_PROGRESS | COMPLETE | CANCELLED", constraints: "see state machine" }
+
+  - name: InstallationTask
+    parent: null
+    common_fields: true
+    fields:
+      - { name: window_id, type: string, source: input, description: "FK -> InstallationWindow.id; window this task runs in" }
+      - { name: room_id, type: string, source: input, description: "FK -> Room.id; room turn being installed" }
+      - { name: po_line_id, type: string, source: input, description: "FK -> POLine.id; line supplying units" }
+      - { name: quantity, type: integer, source: input, description: "Units to install in this room turn", constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | COMPLETE | CANCELLED", constraints: "see state machine" }
+
+  - name: AtticStockMovement
+    parent: null
+    common_fields: false
+    fields:
+      - { name: po_line_id, type: string, source: input, description: "FK -> POLine.id; line whose pools move" }
+      - { name: direction, type: enum, source: input, description: "IN (installable -> attic) | OUT (attic -> installable) | WRITE_OFF (attic -> destroyed)", constraints: "IN | OUT | WRITE_OFF" }
+      - { name: quantity, type: integer, source: input, description: "Units moved", constraints: ">= 1" }
+      - { name: resulting_installable, type: integer, source: system, description: "Line qty_installable immediately after this movement" }
+      - { name: resulting_attic, type: integer, source: system, description: "Line qty_attic immediately after this movement" }
+
+  - name: ChangeOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: project_id, type: string, source: input, description: "FK -> FFEProject.id; owning project" }
+      - { name: title, type: string, source: input, description: "Owner change order title" }
+      - { name: adjustments, type: array, source: input, description: "Array of {budget_line_id, delta_cents != 0}; positive delta draws from unallocated contingency, negative returns budget to contingency" }
+      - { name: proposer_user_id, type: string, source: system, description: "X-User-ID of the creator; the same user id may not approve (segregation of duties)" }
+      - { name: fee_cents, type: integer, source: system, description: "Contingency draw fee computed by contingency_draw_fee at approval; null until APPLIED" }
+      - { name: status, type: enum, source: system, description: "PROPOSED | APPLIED | REJECTED", constraints: "see state machine" }
+
+# =============================================================================
+# Table 2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: FFEProject
+    initial_state: PLANNING
+    terminal_states: [COMPLETED, CANCELLED]
+    note: "Any to_status not listed as a legal next state from the current state (including all transitions out of COMPLETED or CANCELLED) is rejected with ERR_INVALID_LIFECYCLE_TRANSITION (409)."
+    transitions:
+      - from: PLANNING
+        to: PROCUREMENT
+        trigger: "POST /api/projects/{projectId}/lifecycle-transitions {to_status: PROCUREMENT}"
+        actor: PurchasingAgent
+        preconditions:
+          - "At least one BudgetLine exists for the project (ERR_NO_BUDGET_LINES)"
+        side_effects:
+          - "Recompute procurement_posture"
+      - from: PROCUREMENT
+        to: INSTALLATION
+        trigger: "POST /api/projects/{projectId}/lifecycle-transitions {to_status: INSTALLATION}"
+        actor: PurchasingAgent
+        preconditions: []
+        side_effects:
+          - "Recompute procurement_posture"
+      - from: INSTALLATION
+        to: COMPLETED
+        trigger: "POST /api/projects/{projectId}/lifecycle-transitions {to_status: COMPLETED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "No InstallationWindow in PLANNED, RELEASED, or IN_PROGRESS (ERR_WINDOWS_OUTSTANDING)"
+          - "No DamageClaim in OPEN, SUBMITTED, or DISPUTED (ERR_OPEN_CLAIMS_REMAIN)"
+        side_effects:
+          - "All SpecItem in BRAND_APPROVED -> LOCKED"
+      - from: PLANNING
+        to: CANCELLED
+        trigger: "POST /api/projects/{projectId}/lifecycle-transitions {to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "No PurchaseOrder with fulfillment_status IN {READY_TO_SHIP, CONSOLIDATED, DELIVERED, CLOSED} (ERR_ACTIVE_POS_EXIST)"
+        side_effects:
+          - "All PurchaseOrder in ISSUED or ACKNOWLEDGED -> CANCELLED; their non-CANCELLED POLine -> CANCELLED"
+          - "Recompute committed_cents on all BudgetLine (cancelled lines drop out)"
+      - from: PROCUREMENT
+        to: CANCELLED
+        trigger: "POST /api/projects/{projectId}/lifecycle-transitions {to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "No PurchaseOrder with fulfillment_status IN {READY_TO_SHIP, CONSOLIDATED, DELIVERED, CLOSED} (ERR_ACTIVE_POS_EXIST)"
+        side_effects:
+          - "Same PO/line cancellation cascade as PLANNING -> CANCELLED"
+
+  - entity: BudgetLine
+    initial_state: null
+    terminal_states: []
+    transitions: []
+    note: "Configuration entity; budgeted_cents mutated only by APPLIED ChangeOrders; committed/actual/variance recomputed per calculations."
+
+  - entity: SpecItem
+    initial_state: DRAFT
+    terminal_states: [LOCKED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /api/spec-items/{specItemId}/submit"
+        actor: PurchasingAgent
+        preconditions:
+          - "Spec in DRAFT or BRAND_REJECTED (ERR_SPEC_NOT_SUBMITTABLE)"
+        side_effects: []
+      - from: BRAND_REJECTED
+        to: SUBMITTED
+        trigger: "POST /api/spec-items/{specItemId}/submit"
+        actor: PurchasingAgent
+        preconditions:
+          - "Spec in DRAFT or BRAND_REJECTED (ERR_SPEC_NOT_SUBMITTABLE)"
+        side_effects: []
+        note: "Resubmission closes the revision loop DRAFT->SUBMITTED->BRAND_REJECTED->SUBMITTED; loops are unbounded."
+      - from: SUBMITTED
+        to: BRAND_APPROVED
+        trigger: "POST /api/spec-items/{specItemId}/brand-review {decision: APPROVE}"
+        actor: BrandApprover
+        preconditions:
+          - "Spec in SUBMITTED (ERR_SPEC_NOT_IN_REVIEW)"
+        side_effects: []
+      - from: SUBMITTED
+        to: BRAND_REJECTED
+        trigger: "POST /api/spec-items/{specItemId}/brand-review {decision: REJECT}"
+        actor: BrandApprover
+        preconditions:
+          - "Spec in SUBMITTED (ERR_SPEC_NOT_IN_REVIEW)"
+        side_effects: []
+      - from: BRAND_APPROVED
+        to: LOCKED
+        trigger: "system (automatic when the owning project reaches COMPLETED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: VendorBid
+    initial_state: SUBMITTED
+    terminal_states: [ORDERED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: SAMPLE_APPROVED
+        trigger: "POST /api/bids/{bidId}/sample-decision {outcome: APPROVED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Bid in SUBMITTED (ERR_BID_NOT_SUBMITTED)"
+        side_effects: []
+      - from: SUBMITTED
+        to: SAMPLE_REJECTED
+        trigger: "POST /api/bids/{bidId}/sample-decision {outcome: REJECTED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Bid in SUBMITTED (ERR_BID_NOT_SUBMITTED)"
+        side_effects: []
+      - from: SAMPLE_REJECTED
+        to: SUBMITTED
+        trigger: "POST /api/bids/{bidId}/resubmit"
+        actor: Vendor
+        preconditions:
+          - "Bid in SAMPLE_REJECTED (ERR_BID_NOT_RESUBMITTABLE)"
+          - "sample_round < SAMPLE_ROUND_MAX (2) (ERR_SAMPLE_ROUNDS_EXHAUSTED)"
+        side_effects:
+          - "sample_round += 1; optional price/freight/lead fields replaced when provided; evaluated_cost_cents recomputed"
+        note: "Sample negotiation cycle SUBMITTED->SAMPLE_REJECTED->SUBMITTED, at most one resubmit (rounds 1..2)."
+      - from: SAMPLE_APPROVED
+        to: AWARDED
+        trigger: "POST /api/bids/{bidId}/award"
+        actor: PurchasingAgent
+        preconditions:
+          - "Bid in SAMPLE_APPROVED (ERR_BID_NOT_SAMPLE_APPROVED)"
+          - "Project procurement_posture == OPEN (ERR_PROJECT_PROCUREMENT_SEALED / ERR_PROJECT_BUDGET_FROZEN)"
+          - "Bid is the top-ranked eligible bid per bid_evaluated_cost: among SAMPLE_APPROVED bids for the same spec_item_id, lowest evaluated_cost_cents; tie-break earliest created_at (ERR_BID_NOT_BEST_EVALUATED)"
+        side_effects:
+          - "All other bids of the same spec_item_id in SUBMITTED or SAMPLE_APPROVED -> REJECTED"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "system (automatic when a sibling bid for the same spec_item_id is awarded)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SAMPLE_APPROVED
+        to: REJECTED
+        trigger: "system (automatic when a sibling bid for the same spec_item_id is awarded)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: AWARDED
+        to: ORDERED
+        trigger: "system (automatic when a PO line is created against this bid's spec and vendor)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: PurchaseOrder
+    initial_state: "fulfillment_status: ISSUED; invoice_status: UNBILLED (two independent axes)"
+    terminal_states: ["fulfillment_status: CLOSED or CANCELLED; invoice_status: PAID is terminal for the invoice axis"]
+    transitions:
+      - from: "fulfillment ISSUED"
+        to: "fulfillment ACKNOWLEDGED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: FULFILLMENT, to_status: ACKNOWLEDGED}"
+        actor: Vendor
+        preconditions:
+          - "fulfillment_status == ISSUED (ERR_INVALID_PO_TRANSITION)"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "fulfillment ACKNOWLEDGED"
+        to: "fulfillment READY_TO_SHIP"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: FULFILLMENT, to_status: READY_TO_SHIP}"
+        actor: Vendor
+        preconditions:
+          - "fulfillment_status == ACKNOWLEDGED (ERR_INVALID_PO_TRANSITION)"
+          - "PO has at least one non-CANCELLED line (ERR_PO_HAS_NO_LINES)"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "fulfillment READY_TO_SHIP"
+        to: "fulfillment CONSOLIDATED"
+        trigger: "system (automatic when the PO is attached to a shipment via POST /api/shipments/{shipmentId}/purchase-orders)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "shipment_id set to the shipment; purchase_order.version += 1"
+      - from: "fulfillment CONSOLIDATED"
+        to: "fulfillment DELIVERED"
+        trigger: "system (automatic when the PO's shipment reaches RECEIVED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Per line: qty_short finalized = quantity_ordered - qty_received"
+          - "purchase_order.version += 1"
+      - from: "fulfillment DELIVERED"
+        to: "fulfillment CLOSED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: FULFILLMENT, to_status: CLOSED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "fulfillment_status == DELIVERED (ERR_INVALID_PO_TRANSITION)"
+          - "invoice_status == PAID (ERR_INVOICE_NOT_PAID)"
+          - "All lines in RECONCILED or CANCELLED (ERR_LINES_NOT_RECONCILED)"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "fulfillment ISSUED"
+        to: "fulfillment CANCELLED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: FULFILLMENT, to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "fulfillment_status IN {ISSUED, ACKNOWLEDGED} (ERR_INVALID_PO_TRANSITION)"
+        side_effects:
+          - "All non-CANCELLED lines -> CANCELLED"
+          - "Recompute BudgetLine.committed_cents for affected categories (cancelled lines drop out); recompute project committed_cents and posture"
+          - "purchase_order.version += 1"
+      - from: "fulfillment ACKNOWLEDGED"
+        to: "fulfillment CANCELLED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: FULFILLMENT, to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "fulfillment_status IN {ISSUED, ACKNOWLEDGED} (ERR_INVALID_PO_TRANSITION)"
+        side_effects:
+          - "Same line-cancellation and committed recompute cascade as ISSUED -> CANCELLED"
+      - from: "invoice UNBILLED"
+        to: "invoice PARTIALLY_INVOICED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: INVOICE, to_status: PARTIALLY_INVOICED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "invoice_status == UNBILLED (ERR_INVALID_PO_TRANSITION)"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "invoice PARTIALLY_INVOICED"
+        to: "invoice INVOICED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: INVOICE, to_status: INVOICED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "invoice_status == PARTIALLY_INVOICED (ERR_INVALID_PO_TRANSITION)"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "invoice INVOICED"
+        to: "invoice PAID"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: INVOICE, to_status: PAID}"
+        actor: PurchasingAgent
+        preconditions:
+          - "invoice_status == INVOICED (ERR_INVALID_PO_TRANSITION)"
+          - "fulfillment_status IN {DELIVERED, CLOSED} (ERR_INVOICE_BEFORE_DELIVERY) — cross-axis guard"
+        side_effects: ["purchase_order.version += 1"]
+      - from: "invoice UNBILLED"
+        to: "invoice INVOICED"
+        trigger: "POST /api/purchase-orders/{purchaseOrderId}/transitions {axis: INVOICE, to_status: INVOICED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "invoice_status IN {UNBILLED, PARTIALLY_INVOICED} (ERR_INVALID_PO_TRANSITION)"
+        side_effects: ["purchase_order.version += 1"]
+    note: "The two axes evolve independently on the same row: e.g. INVOICED is legal while fulfillment is still ISSUED, and ACKNOWLEDGED while invoice is UNBILLED. Only PAID (and CLOSED) carry cross-axis guards."
+
+  - entity: POLine
+    initial_state: OPEN
+    terminal_states: [RECONCILED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: PARTIALLY_RECEIVED
+        trigger: "system (automatic when a receiving event covering this line is POSTED with cumulative qty_received < quantity_ordered)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: FULLY_RECEIVED
+        trigger: "system (automatic when a receiving event covering this line is POSTED with cumulative qty_received == quantity_ordered)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: PARTIALLY_RECEIVED
+        to: FULLY_RECEIVED
+        trigger: "system (automatic when a later POSTED event brings cumulative qty_received to quantity_ordered)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: FULLY_RECEIVED
+        to: PARTIALLY_RECEIVED
+        trigger: "system (automatic when a POSTED receiving event on this line is REVERSED and cumulative qty_received drops below quantity_ordered)"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "Receiving reversal reopens the line: FULLY_RECEIVED -> PARTIALLY_RECEIVED (or OPEN when all receipts reversed)."
+      - from: PARTIALLY_RECEIVED
+        to: OPEN
+        trigger: "system (automatic when reversal drops cumulative qty_received to 0)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: FULLY_RECEIVED
+        to: RECONCILED
+        trigger: "POST /api/po-lines/{poLineId}/reconcile"
+        actor: PurchasingAgent
+        preconditions:
+          - "Line status IN {FULLY_RECEIVED, PARTIALLY_RECEIVED} (ERR_LINE_NOT_RECEIVED)"
+          - "When status == PARTIALLY_RECEIVED, the line's shipment must be RECEIVED (shortfall final) (ERR_LINE_SHORTFALL_OPEN)"
+          - "No DamageClaim on this line in OPEN, SUBMITTED, or DISPUTED (ERR_CLAIMS_OPEN)"
+        side_effects: ["po_line.version += 1"]
+      - from: PARTIALLY_RECEIVED
+        to: RECONCILED
+        trigger: "POST /api/po-lines/{poLineId}/reconcile"
+        actor: PurchasingAgent
+        preconditions:
+          - "Same preconditions as FULLY_RECEIVED -> RECONCILED"
+        side_effects: ["po_line.version += 1"]
+      - from: OPEN
+        to: CANCELLED
+        trigger: "system (automatic when the owning PO or project is cancelled)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: PARTIALLY_RECEIVED
+        to: CANCELLED
+        trigger: "system (automatic when the owning project is cancelled; PO cancel requires no receipts in flight)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Shipment
+    initial_state: PLANNED
+    terminal_states: [RECEIVED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: CONSOLIDATING
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: CONSOLIDATING}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in PLANNED (ERR_INVALID_SHIPMENT_TRANSITION)"
+        side_effects: ["shipment.version += 1"]
+      - from: CONSOLIDATING
+        to: SEALED
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: SEALED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in CONSOLIDATING (ERR_INVALID_SHIPMENT_TRANSITION)"
+          - "At least one PO attached (ERR_SHIPMENT_EMPTY)"
+        side_effects:
+          - "freight_mode and freight_total_cents computed per freight_mode_and_allocation (FCL when total_cube_m3 >= 67)"
+          - "Provisional freight allocation: each attached PO line gets freight_alloc_provisional_cents by declared-cube share with largest-share residual reconciliation (mutates POLine -> link 1 of budget cascade)"
+          - "Recompute BudgetLine.committed_cents for affected categories; recompute project committed_cents and posture"
+          - "shipment.version += 1"
+      - from: SEALED
+        to: IN_TRANSIT
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: IN_TRANSIT}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in SEALED (ERR_INVALID_SHIPMENT_TRANSITION)"
+        side_effects: ["shipment.version += 1"]
+      - from: IN_TRANSIT
+        to: RECEIVED
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: RECEIVED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in IN_TRANSIT (ERR_INVALID_SHIPMENT_TRANSITION)"
+          - "At least one ReceivingEvent POSTED for this shipment (ERR_NO_RECEIPTS_POSTED)"
+          - "No ReceivingEvent in DRAFT for this shipment (ERR_DRAFT_EVENTS_OUTSTANDING)"
+        side_effects:
+          - "Link 1: every attached PO with fulfillment_status == CONSOLIDATED -> DELIVERED (PO mutation)"
+          - "Link 2: each DELIVERED PO finalizes its lines: qty_short = quantity_ordered - qty_received; line status FULLY_RECEIVED when qty_short == 0 else stays PARTIALLY_RECEIVED (line mutation caused by the PO delivery)"
+          - "Link 3: final freight allocation recomputed per freight_mode_and_allocation final variant (received-units share); each line's freight_alloc_final_cents set (line mutation caused by shipment receipt)"
+          - "Link 4: each mutated line's actual_landed_cents recomputed; BudgetLine.actual_cents and both variances recomputed for affected categories (budget mutation caused by line mutation)"
+          - "Link 5: project actual_spend_cents and procurement_posture recomputed (project mutation caused by budget-line mutation)"
+          - "shipment.version += 1"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in PLANNED or CONSOLIDATING (ERR_INVALID_SHIPMENT_TRANSITION)"
+        side_effects:
+          - "Attached POs: fulfillment_status CONSOLIDATED -> READY_TO_SHIP, shipment_id cleared; recompute BudgetLine.committed_cents"
+          - "shipment.version += 1"
+      - from: CONSOLIDATING
+        to: CANCELLED
+        trigger: "POST /api/shipments/{shipmentId}/transitions {to_status: CANCELLED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Shipment in PLANNED or CONSOLIDATING (ERR_INVALID_SHIPMENT_TRANSITION)"
+        side_effects:
+          - "Same detach cascade as PLANNED -> CANCELLED"
+
+  - entity: ReceivingEvent
+    initial_state: DRAFT
+    terminal_states: [POSTED, REVERSED]
+    transitions:
+      - from: DRAFT
+        to: POSTED
+        trigger: "POST /api/receiving-events/{receivingEventId}/transitions {to_status: POSTED}"
+        actor: WarehouseReceiver
+        preconditions:
+          - "Event in DRAFT (ERR_INVALID_EVENT_TRANSITION)"
+          - "Shipment in IN_TRANSIT (ERR_SHIPMENT_NOT_IN_TRANSIT)"
+          - "Per entry: cumulative qty_received over POSTED events for that line + new qty_received <= line.quantity_ordered (ERR_OVER_RECEIPT)"
+          - "Per entry: qty_damaged <= qty_received (ERR_DAMAGE_EXCEEDS_RECEIPT)"
+        side_effects:
+          - "Per entry line: qty_received += qty_received; qty_damaged_unresolved += qty_damaged; qty_installable += (qty_received - qty_damaged); line status OPEN->PARTIALLY_RECEIVED or ->FULLY_RECEIVED per cumulative total; po_line.version += 1"
+          - "Per mutated line: actual_landed_cents recomputed; BudgetLine.actual_cents recomputed (line mutation -> budget mutation)"
+          - "Project actual_spend_cents and posture recomputed (budget mutation -> project mutation)"
+          - "receiving_event.version += 1"
+      - from: POSTED
+        to: REVERSED
+        trigger: "POST /api/receiving-events/{receivingEventId}/transitions {to_status: REVERSED}"
+        actor: WarehouseReceiver
+        preconditions:
+          - "Event in POSTED (ERR_INVALID_EVENT_TRANSITION)"
+          - "Shipment still IN_TRANSIT (ERR_SHIPMENT_NOT_IN_TRANSIT)"
+          - "No DamageClaim on any covered line in SUBMITTED, DISPUTED, RESOLVED_CREDIT, RESOLVED_REPLACEMENT, or DENIED (ERR_CLAIMS_BLOCK_REVERSAL); OPEN claims are voided instead"
+          - "Per entry line: qty_installable - (qty_received - qty_damaged) >= 0 and qty_attic unaffected such that pools never go negative (ERR_REVERSAL_POOL_SHORTFALL)"
+        side_effects:
+          - "Per entry line: qty_received -= qty_received_of_event; qty_damaged_unresolved -= qty_damaged_of_event; qty_installable -= (qty_received - qty_damaged); status recomputed (FULLY_RECEIVED->PARTIALLY_RECEIVED or ->OPEN); po_line.version += 1"
+          - "OPEN DamageClaims on covered lines -> VOID"
+          - "BudgetLine.actual_cents and project actual_spend_cents/posture recomputed"
+          - "receiving_event.version += 1"
+
+  - entity: DamageClaim
+    initial_state: OPEN
+    terminal_states: [RESOLVED_CREDIT, RESOLVED_REPLACEMENT, DENIED, VOID]
+    transitions:
+      - from: OPEN
+        to: SUBMITTED
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: SUBMITTED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Claim in OPEN (ERR_INVALID_CLAIM_TRANSITION)"
+        side_effects: ["damage_claim.version += 1"]
+      - from: SUBMITTED
+        to: DISPUTED
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: DISPUTED}"
+        actor: Vendor
+        preconditions:
+          - "Claim in SUBMITTED (ERR_INVALID_CLAIM_TRANSITION)"
+        side_effects: ["damage_claim.version += 1"]
+      - from: DISPUTED
+        to: SUBMITTED
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: SUBMITTED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Claim in DISPUTED (ERR_INVALID_CLAIM_TRANSITION)"
+        side_effects: ["damage_claim.version += 1"]
+        note: "Negotiation cycle SUBMITTED -> DISPUTED -> SUBMITTED; unbounded."
+      - from: SUBMITTED
+        to: RESOLVED_CREDIT
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: RESOLVED_CREDIT, approved_credit_cents: N}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Claim in SUBMITTED (ERR_INVALID_CLAIM_TRANSITION)"
+          - "approved_credit_cents provided and >= 0 (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "Link 1: approved_credit_cents recorded; po_line.damage_credit_cents += approved_credit_cents; qty_damaged_unresolved -= claim.quantity and qty_damaged_credited += claim.quantity when claim_type == DAMAGE; po_line.actual_landed_cents recomputed (line mutation)"
+          - "Link 2: BudgetLine.actual_cents and both variances recomputed for the line's category (budget mutation caused by line mutation)"
+          - "Link 3: project actual_spend_cents and procurement_posture recomputed (project mutation caused by budget mutation)"
+          - "damage_claim.version += 1"
+      - from: SUBMITTED
+        to: RESOLVED_REPLACEMENT
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: RESOLVED_REPLACEMENT}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Claim in SUBMITTED (ERR_INVALID_CLAIM_TRANSITION)"
+        side_effects:
+          - "For claim_type == DAMAGE: qty_damaged_unresolved -= claim.quantity, qty_damaged_credited += claim.quantity (no credit_cents change)"
+          - "damage_claim.version += 1"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /api/damage-claims/{damageClaimId}/transitions {to_status: DENIED}"
+        actor: PurchasingAgent
+        preconditions:
+          - "Claim in SUBMITTED (ERR_INVALID_CLAIM_TRANSITION)"
+        side_effects: ["damage_claim.version += 1; no pool or credit changes (denial leaves units damaged and uncredited)"]
+      - from: OPEN
+        to: VOID
+        trigger: "system (automatic when a POSTED receiving event covering the line is REVERSED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Room
+    initial_state: null
+    terminal_states: []
+    transitions: []
+    note: "Configuration entity; room occupation is derived from InstallationTasks of RELEASED / IN_PROGRESS windows."
+
+  - entity: InstallationWindow
+    initial_state: PLANNED
+    terminal_states: [COMPLETE, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: RELEASED
+        trigger: "POST /api/installation-windows/{installationWindowId}/transitions {to_status: RELEASED}"
+        actor: InstallationManager
+        preconditions:
+          - "Window in PLANNED (ERR_INVALID_WINDOW_TRANSITION)"
+          - "Room half-open overlap: for every InstallationTask of this window, no other window in RELEASED or IN_PROGRESS may hold a task on the same room_id with date overlap (other.start_date < this.end_date AND this.start_date < other.end_date); adjacency (other.end_date == this.start_date or this.end_date == other.start_date) is allowed (ERR_ROOM_WINDOW_OVERLAP)"
+          - "Crew capacity: for every calendar day d in [start_date, end_date), sum of crew_count over windows of the same project and floor_number in RELEASED or IN_PROGRESS covering d, plus this window's crew_count, must be <= project.default_crew_capacity_per_floor_day (ERR_FLOOR_CREW_CAPACITY_EXCEEDED)"
+        side_effects: ["installation_window.version += 1"]
+      - from: RELEASED
+        to: IN_PROGRESS
+        trigger: "POST /api/installation-windows/{installationWindowId}/transitions {to_status: IN_PROGRESS}"
+        actor: InstallationManager
+        preconditions:
+          - "Window in RELEASED (ERR_INVALID_WINDOW_TRANSITION)"
+          - "Window has at least one InstallationTask in SCHEDULED (ERR_WINDOW_NO_TASKS)"
+          - "Aggregate stock check: for every POLine referenced by this window's SCHEDULED tasks, SUM(task.quantity over those tasks) <= that line's qty_installable (ERR_INSUFFICIENT_INSTALLABLE_STOCK)"
+        side_effects:
+          - "Project procurement_posture recomputed (first IN_PROGRESS window flips OPEN -> SEALED); project.version += 1"
+          - "installation_window.version += 1"
+      - from: IN_PROGRESS
+        to: COMPLETE
+        trigger: "POST /api/installation-windows/{installationWindowId}/transitions {to_status: COMPLETE}"
+        actor: InstallationManager
+        preconditions:
+          - "Window in IN_PROGRESS (ERR_INVALID_WINDOW_TRANSITION)"
+          - "All InstallationTasks of this window in COMPLETE or CANCELLED (ERR_TASKS_OUTSTANDING)"
+        side_effects:
+          - "Project procurement_posture recomputed (SEALED lifts when no window remains IN_PROGRESS); project.version += 1"
+          - "installation_window.version += 1"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /api/installation-windows/{installationWindowId}/transitions {to_status: CANCELLED}"
+        actor: InstallationManager
+        preconditions:
+          - "Window in PLANNED or RELEASED (ERR_INVALID_WINDOW_TRANSITION)"
+        side_effects:
+          - "All SCHEDULED tasks of this window -> CANCELLED (conditional cascade: terminal tasks untouched)"
+          - "installation_window.version += 1"
+      - from: RELEASED
+        to: CANCELLED
+        trigger: "POST /api/installation-windows/{installationWindowId}/transitions {to_status: CANCELLED}"
+        actor: InstallationManager
+        preconditions:
+          - "Window in PLANNED or RELEASED (ERR_INVALID_WINDOW_TRANSITION)"
+        side_effects:
+          - "Same task cascade as PLANNED -> CANCELLED"
+
+  - entity: InstallationTask
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETE, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETE
+        trigger: "POST /api/installation-tasks/{installationTaskId}/complete"
+        actor: InstallationManager
+        preconditions:
+          - "Task in SCHEDULED (ERR_INVALID_TASK_TRANSITION)"
+          - "Owning window IN_PROGRESS (ERR_WINDOW_NOT_IN_PROGRESS)"
+          - "Line qty_installable >= task.quantity (ERR_INSUFFICIENT_INSTALLABLE_STOCK)"
+        side_effects:
+          - "po_line.qty_installable -= quantity; po_line.qty_installed += quantity; po_line.version += 1 (line mutation)"
+          - "SpecItem.attic_target_qty recomputed for the line's spec (spec mutation caused by line mutation)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "system (automatic when the owning window is cancelled)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: ChangeOrder
+    initial_state: PROPOSED
+    terminal_states: [APPLIED, REJECTED]
+    transitions:
+      - from: PROPOSED
+        to: APPLIED
+        trigger: "POST /api/change-orders/{changeOrderId}/apply {expected_project_version: V}"
+        actor: OwnerRep
+        preconditions:
+          - "ChangeOrder in PROPOSED (ERR_CO_NOT_PROPOSED)"
+          - "Segregation of duties: X-User-ID != proposer_user_id (ERR_CHANGE_ORDER_SELF_APPROVAL)"
+          - "OCC: expected_project_version == project.version (ERR_STALE_PROJECT_VERSION)"
+          - "Funding: let POS = sum of positive delta_cents and NEG = sum of absolute values of negative delta_cents over adjustments; fee per contingency_draw_fee evaluated on pre-fee utilization; require unallocated_contingency_cents + NEG >= POS + fee_cents (ERR_CHANGE_ORDER_UNFUNDED)"
+          - "Each adjusted BudgetLine must keep budgeted_cents >= its current committed_cents + actual_cents after the delta (ERR_BUDGET_BELOW_OBLIGATIONS)"
+        side_effects:
+          - "Link 1: each adjusted BudgetLine.budgeted_cents += delta_cents; project.unallocated_contingency_cents += (NEG - POS - fee_cents); project.sunk_fees_cents += fee_cents; fee_cents stored on the ChangeOrder (budget mutation)"
+          - "Link 2: each mutated BudgetLine's variance_commitment_cents and variance_final_cents recomputed (caused by the budgeted_cents mutation)"
+          - "Link 3: project procurement_posture recomputed — a budget-raising APPLIED order can lift FROZEN (project mutation caused by budget mutation)"
+          - "project.version += 1; change_order.version += 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /api/change-orders/{changeOrderId}/reject"
+        actor: OwnerRep
+        preconditions:
+          - "ChangeOrder in PROPOSED (ERR_CO_NOT_PROPOSED)"
+          - "Segregation of duties: X-User-ID != proposer_user_id (ERR_CHANGE_ORDER_SELF_APPROVAL)"
+        side_effects: ["change_order.version += 1; no budget effects"]
+
+  - entity: AtticStockMovement
+    initial_state: null
+    terminal_states: []
+    transitions: []
+    note: "Append-only event produced by POST /api/po-lines/{poLineId}/attic-transfers; immutable, no update endpoint, no version field."
+
+# =============================================================================
+# Section 1.2.1: Concurrency Rules (true races only, resolved by OCC on the
+# parent's version; everything else is a state precondition and lives above)
+# =============================================================================
+concurrency_rules:
+  - rule_id: co-apply-stale-project
+    parent_entity: FFEProject
+    write_endpoint: "POST /api/change-orders/{changeOrderId}/apply"
+    occ_field: expected_project_version
+    description: |
+      Applying a ChangeOrder against a project whose version has advanced since
+      the approver last observed it is rejected. Since the approver's read, a
+      receiving-event post, a damage-claim resolution, or another applied change
+      order may have recomputed committed/actual totals and posture, so the
+      funding check must run against a current view; a stale expected version
+      indicates that view is out of date. Deterministic trigger: read
+      project.version, apply one change order (version advances), then apply a
+      second change order still carrying the first observed version.
+    error_id: ERR_STALE_PROJECT_VERSION
+    http_status: 412
+  - rule_id: attic-transfer-stale-line
+    parent_entity: POLine
+    write_endpoint: "POST /api/po-lines/{poLineId}/attic-transfers"
+    occ_field: expected_po_line_version
+    description: |
+      Creating an AtticStockMovement against a POLine whose version has advanced
+      since the requester last observed it is rejected. Receiving posts and
+      installation-task completions silently change qty_installable/qty_attic
+      and bump the line version, so a transfer computed from a stale pool view
+      must not apply blindly. Deterministic trigger: read line version 1, post a
+      receiving event (line version advances), then submit the transfer still
+      carrying the earlier version.
+    error_id: ERR_STALE_PO_LINE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 3: Calculation Rules Table
+# All money is integer cents; rounding is round_half_up to whole cents.
+# =============================================================================
+calculations:
+  - name: budget_line_variance
+    trigger: "Recomputed on every mutation that touches the input set: PO line add, PO cancel, shipment SEALED (provisional freight), receiving-event POST/REVERSE, damage-claim RESOLVED_CREDIT, change-order APPLIED (budgeted change)"
+    algorithm: aggregation
+    formula: |
+      committed_cents = SUM over POLine L where spec(L).category == this.category
+        AND L.status != CANCELLED
+        AND po(L).fulfillment_status IN {ISSUED, ACKNOWLEDGED, READY_TO_SHIP, CONSOLIDATED}
+        of (L.extended_cents + L.freight_alloc_provisional_cents)
+      actual_cents = SUM over POLine L where spec(L).category == this.category
+        AND L.status != CANCELLED AND L.qty_received > 0
+        of L.actual_landed_cents
+      variance_commitment_cents = budgeted_cents - committed_cents - actual_cents
+      variance_final_cents      = budgeted_cents - actual_cents
+      Project rollups: committed_cents and actual_spend_cents are the sums of the
+      line values over all BudgetLine of the project.
+    input_set: "POLine filtered by spec category, line status, and PO fulfillment window as above; states outside the sets are excluded (e.g. DELIVERED/CLOSED POs leave committed; lines with qty_received == 0 are absent from actual)"
+    precision: "integer cents; no rounding"
+    variants:
+      - name: commitment_view
+        when: "Forward-looking exposure reporting and the budget gate at PO line creation"
+        difference: "Subtracts open commitments (committed_cents) in addition to actuals; two identical datasets yield variance_commitment != variance_final whenever any PO is still open"
+      - name: final_view
+        when: "Reconciled budget-vs-actual reporting by line"
+        difference: "Ignores open commitments entirely; counts only actual_landed_cents of lines with receipts"
+
+  - name: freight_mode_and_allocation
+    trigger: "Shipment transition CONSOLIDATING -> SEALED (mode + provisional allocation) and IN_TRANSIT -> RECEIVED (final allocation)"
+    algorithm: threshold
+    formula: |
+      Mode at seal: freight_mode = FCL when total_cube_m3 >= FCL_CUBE_THRESHOLD_M3 (67), else LTL.
+      freight_total_cents = 480000 when FCL else 9000 * total_cube_m3  (LTL rate per m3).
+      PROVISIONAL allocation (at SEALED), per attached PO line L:
+        share_L = freight_total_cents * L.declared_cube_m3 / SUM(declared_cube_m3 over all lines of attached POs)
+        rounded_L = round_half_up(share_L) to integer cents
+        residual = freight_total_cents - SUM(rounded_L)
+        if residual != 0: add residual (signed) to the line with the largest raw share_L;
+          tie-break: earliest line created_at.
+      FINAL allocation (at RECEIVED): identical procedure, except
+        share_L = freight_total_cents * L.qty_received / SUM(qty_received over all lines of attached POs)
+        and the result is stored in freight_alloc_final_cents.
+      Rounding order is pinned: round EACH line first, then reconcile the residual to the
+      largest-share line. Sum-then-round is NOT the contract and yields different cents.
+      If SUM(qty_received) == 0 at RECEIVED, every freight_alloc_final_cents = 0 and the
+      freight_total is dropped from actuals (no line received anything to absorb it).
+    input_set: "All non-CANCELLED POLine of all POs attached to the shipment (PO.fulfillment_status CONSOLIDATED or DELIVERED)"
+    constants:
+      FCL_CUBE_THRESHOLD_M3: 67
+      FCL_FLAT_FREIGHT_CENTS: 480000
+      LTL_RATE_PER_M3_CENTS: 9000
+    precision: "integer cents, round_half_up per line, residual to largest raw share (tie: earliest created_at)"
+    variants:
+      - name: provisional_by_cube
+        when: "At SEALED; basis is declared_cube_m3"
+        difference: "Same shipment yields different per-line freight than the final variant whenever declared cube proportions differ from received-unit proportions"
+      - name: final_by_received_units
+        when: "At RECEIVED; basis is qty_received"
+        difference: "Overwrites freight_alloc_final_cents; actual_landed_cents and BudgetLine.actual_cents switch to the final basis at that moment"
+
+  - name: attic_target_quantity
+    trigger: "Computed for a SpecItem whenever its single POLine is created and whenever that line's qty_installed changes (installation-task completion)"
+    algorithm: constraint_propagation
+    formula: |
+      If no non-CANCELLED POLine exists for the spec: attic_target_qty = 0.
+      Else, with I = line.qty_installed, P = spec.attic_target_pct,
+      CRIT = 2 when spec.is_critical else 1:
+        raw = ceil(I * P * CRIT)
+        attic_target_qty = min(max(raw, spec.attic_min_qty), spec.attic_max_qty)
+      Nested min/max with a conditional multiplier and ceil: four inputs interact
+      non-linearly (I, P, CRIT, clamps).
+    input_set: "The spec's single non-CANCELLED POLine (uniqueness enforced by ERR_SPEC_ALREADY_ORDERED)"
+    constants:
+      CRITICAL_ATTIC_MULTIPLIER: 2
+    precision: "integer units, ceil for the raw term"
+    note: "Attic transfer IN is rejected when it would push qty_attic above attic_target_qty (ERR_ATTIC_TARGET_EXCEEDED); equality with the target is allowed."
+
+  - name: contingency_draw_fee
+    trigger: "ChangeOrder transition PROPOSED -> APPLIED, before the funding check"
+    algorithm: threshold
+    formula: |
+      Evaluation order is pinned (the fee depends on utilization, which must NOT
+      itself include the fee — compute in exactly this order):
+        1. POS = SUM(delta_cents for delta_cents > 0); NEG = SUM(-delta_cents for delta_cents < 0)
+        2. utilization u = (project.committed_cents + project.actual_spend_cents + POS)
+                           / project.total_budget_cents        # pre-fee, by contract
+        3. rate = 0.05 when u <= 0.80; 0.08 when 0.80 < u <= 0.95; else 0.12
+        4. fee_cents = round_half_up(rate * POS) to integer cents
+        5. Funding check: unallocated_contingency_cents + NEG >= POS + fee_cents
+      A circular reading (tier chosen on post-fee utilization) is rejected by this ordering.
+    input_set: "The ChangeOrder's adjustments and the project's current committed/actual/total/unallocated"
+    constants:
+      TIER1_MAX_UTILIZATION: 0.80
+      TIER1_RATE: 0.05
+      TIER2_MAX_UTILIZATION: 0.95
+      TIER2_RATE: 0.08
+      TIER3_RATE: 0.12
+    precision: "integer cents, round_half_up on the fee"
+    variants: []
+
+  - name: bid_evaluated_cost
+    trigger: "Computed whenever a VendorBid is read and at award time (after any resubmit field replacement)"
+    algorithm: weighted_scoring
+    formula: |
+      evaluated_cost_cents = unit_price_cents * spec.total_qty
+                           + freight_estimate_cents
+                           + max(0, lead_time_days - spec.required_lead_days) * LEAD_TIME_PENALTY_PER_DAY_CENTS
+      Award selector: eligible pool = bids of the spec with status SAMPLE_APPROVED;
+      rank evaluated_cost_cents ASC; tie-break bid.created_at ASC; only the top-ranked
+      bid is awardable (ERR_BID_NOT_BEST_EVALUATED for any other). The eligible pool is
+      never empty at award time: the path bid itself must be SAMPLE_APPROVED (priority-5
+      state check) before ranking is evaluated, and a SAMPLE_APPROVED bid is in the pool.
+    input_set: "The bid plus its SpecItem (total_qty, required_lead_days)"
+    constants:
+      LEAD_TIME_PENALTY_PER_DAY_CENTS: 25000
+    precision: "integer cents; no rounding"
+    variants: []
+
+  - name: procurement_posture_derivation
+    trigger: "Recomputed after every mutation of committed_cents, actual_spend_cents, or any InstallationWindow entering/leaving IN_PROGRESS"
+    algorithm: aggregation
+    formula: |
+      if committed_cents + actual_spend_cents > total_budget_cents: posture = FROZEN
+      elif any InstallationWindow of the project has status IN_PROGRESS: posture = SEALED
+      else: posture = OPEN
+      Gates (state category, priority 5):
+        POST /api/purchase-orders, POST /api/purchase-orders/{id}/lines,
+        POST /api/bids/{id}/award require posture == OPEN:
+          FROZEN -> ERR_PROJECT_BUDGET_FROZEN; SEALED -> ERR_PROJECT_PROCUREMENT_SEALED.
+        (FROZEN is checked first when both could apply.)
+    input_set: "Project aggregates and the set of its InstallationWindow with status IN_PROGRESS"
+    precision: "integer cents comparison; strictly greater-than for FROZEN (equality with total_budget_cents is NOT frozen)"
+    variants: []
+
+  - name: receiving_reconciliation
+    trigger: "ReceivingEvent DRAFT -> POSTED (cumulative receipt tracking) and Shipment IN_TRANSIT -> RECEIVED (shortfall finalization)"
+    algorithm: chronological
+    formula: |
+      Receipts accumulate in event-posting order; order affects only which event is
+      rejected for ERR_OVER_RECEIPT, never the totals:
+        line.qty_received = SUM(qty_received over POSTED, non-REVERSED events covering the line)
+        line.qty_damaged_unresolved maintained likewise for qty_damaged
+      At shipment RECEIVED, per attached line:
+        line.qty_short = quantity_ordered - qty_received   (>= 0 by the over-receipt guard)
+      Claim residuals (validation bounds for POST /api/damage-claims):
+        DAMAGE residual   = qty_damaged_unresolved
+                            - SUM(quantity of non-terminal claims of type DAMAGE on the line)
+          where non-terminal = status IN {OPEN, SUBMITTED, DISPUTED}
+        SHORTAGE residual = qty_short
+                            - SUM(quantity of non-terminal claims of type SHORTAGE on the line)
+        A claim with quantity <= residual is accepted (equality allowed);
+        quantity > residual -> ERR_CLAIM_QTY_EXCEEDS_RESIDUAL.
+    input_set: "POSTED and non-REVERSED ReceivingEvent entries for the line; non-terminal claims per type"
+    precision: "integer units"
+    variants: []
+
+# =============================================================================
+# Table 4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-ID and X-User-Role headers present; role is one of the six declared roles", error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http_status: 400, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role is listed for this endpoint (including per-target rules on transition endpoints, e.g. only Vendor may move fulfillment to ACKNOWLEDGED/READY_TO_SHIP; only PurchasingAgent may resolve claims; only OwnerRep may transition change orders)", error_id: ERR_UNAUTHORIZED_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Path resource ids exist, validated left-to-right", error_id: "ERR_PROJECT_NOT_FOUND | ERR_BUDGET_LINE_NOT_FOUND | ERR_SPEC_ITEM_NOT_FOUND | ERR_BID_NOT_FOUND | ERR_PURCHASE_ORDER_NOT_FOUND | ERR_PO_LINE_NOT_FOUND | ERR_SHIPMENT_NOT_FOUND | ERR_RECEIVING_EVENT_NOT_FOUND | ERR_DAMAGE_CLAIM_NOT_FOUND | ERR_ROOM_NOT_FOUND | ERR_INSTALLATION_WINDOW_NOT_FOUND | ERR_INSTALLATION_TASK_NOT_FOUND | ERR_CHANGE_ORDER_NOT_FOUND", http_status: 404, applies_to: "all endpoints with path ids" }
+  - { priority: 4, category: existence, check: "Body foreign-key references exist (project_id, spec_item_id, budget_line_id inside adjustments, purchase_order_id, shipment_id, window_id, room_id, po_line_id)", error_id: "same ERR_*_NOT_FOUND family as priority 3", http_status: 404, applies_to: "creation and attach endpoints" }
+  - { priority: 5, category: state, check: "Target entity state preconditions per state machine (includes procurement posture gates: FROZEN -> ERR_PROJECT_BUDGET_FROZEN, SEALED -> ERR_PROJECT_PROCUREMENT_SEALED; lifecycle gates ERR_NO_BUDGET_LINES / ERR_WINDOWS_OUTSTANDING / ERR_OPEN_CLAIMS_REMAIN / ERR_ACTIVE_POS_EXIST; per-machine ERR_INVALID_*_TRANSITION and state guards; bid-intake gate ERR_SPEC_NOT_OPEN_FOR_BIDS on POST /api/bids; attach gates ERR_SHIPMENT_NOT_CONSOLIDATING / ERR_PO_NOT_READY_TO_SHIP; receiving-event creation gate ERR_SHIPMENT_NOT_IN_TRANSIT; shipment-state ordering for attach checks the shipment before the PO)", error_id: "state family (see errors)", http_status: 409, applies_to: "all transition and gated-creation endpoints" }
+  - { priority: 6, category: state, check: "OCC: expected_<parent>_version equals the parent's current version", error_id: "ERR_STALE_PROJECT_VERSION | ERR_STALE_PO_LINE_VERSION", http_status: 412, applies_to: "POST /api/change-orders/{changeOrderId}/apply, POST /api/po-lines/{poLineId}/attic-transfers" }
+  - { priority: 7, category: business_safety, check: "Brand-standard gate: the spec of a new PO line must be BRAND_APPROVED", error_id: ERR_SPEC_NOT_BRAND_APPROVED, http_status: 409, applies_to: "POST /api/purchase-orders/{purchaseOrderId}/lines" }
+  - { priority: 8, category: business_referential, check: "Cross-entity consistency: an AWARDED/ORDERED bid exists for (spec_item_id, PO vendor_name) (ERR_NO_AWARDED_BID); attached PO's project == shipment's project and receiving-event lines belong to POs attached to that shipment and window/room/line of a task share one project and CO adjustments reference budget lines of the CO's project", error_id: "ERR_NO_AWARDED_BID | ERR_CROSS_PROJECT_REFERENCE | ERR_LINE_NOT_ON_SHIPMENT", http_status: 409, applies_to: "POST /api/purchase-orders/{id}/lines, POST /api/shipments/{id}/purchase-orders, POST /api/receiving-events, POST /api/installation-tasks, POST /api/change-orders" }
+  - { priority: 9, category: business_constraint, check: "Uniqueness, caps, and quantity residuals: one BudgetLine per (project, category) (ERR_DUPLICATE_BUDGET_CATEGORY); one Room per (project, room_number) (ERR_DUPLICATE_ROOM); at most one non-CANCELLED PO line per spec (ERR_SPEC_ALREADY_ORDERED); sample_round cap (ERR_SAMPLE_ROUNDS_EXHAUSTED); claim residual (ERR_CLAIM_QTY_EXCEEDS_RESIDUAL); pool sufficiency (ERR_INSUFFICIENT_INSTALLABLE, ERR_INSUFFICIENT_ATTIC); attic target cap (ERR_ATTIC_TARGET_EXCEEDED); receipt bounds (ERR_OVER_RECEIPT, ERR_DAMAGE_EXCEEDS_RECEIPT); reversal guards (ERR_CLAIMS_BLOCK_REVERSAL, ERR_REVERSAL_POOL_SHORTFALL); cross-axis guard (ERR_INVOICE_BEFORE_DELIVERY); CLOSE guards (ERR_INVOICE_NOT_PAID, ERR_LINES_NOT_RECONCILED); reconcile guards (ERR_LINE_NOT_RECEIVED, ERR_LINE_SHORTFALL_OPEN, ERR_CLAIMS_OPEN); PO has lines before READY_TO_SHIP (ERR_PO_HAS_NO_LINES); shipment non-empty at seal (ERR_SHIPMENT_EMPTY); window task guards (ERR_WINDOW_NO_TASKS, ERR_TASKS_OUTSTANDING, ERR_WINDOW_NOT_IN_PROGRESS). Pinned order within attic transfers: pool sufficiency (ERR_INSUFFICIENT_INSTALLABLE / ERR_INSUFFICIENT_ATTIC) is checked BEFORE the target cap (ERR_ATTIC_TARGET_EXCEEDED)", error_id: "constraint family (see errors)", http_status: 409, applies_to: "per-check endpoints" }
+  - { priority: 10, category: business_temporal, check: "Window date sanity (end_date > start_date -> ERR_INVALID_WINDOW_DATES, 422); room half-open overlap with adjacency allowed (ERR_ROOM_WINDOW_OVERLAP, 409); floor crew capacity per calendar day, sum at exactly capacity allowed (ERR_FLOOR_CREW_CAPACITY_EXCEEDED, 409)", error_id: "ERR_INVALID_WINDOW_DATES | ERR_ROOM_WINDOW_OVERLAP | ERR_FLOOR_CREW_CAPACITY_EXCEEDED", http_status: 409, applies_to: "POST /api/installation-windows, POST /api/installation-windows/{id}/transitions" }
+  - { priority: 11, category: business_fiscal, check: "Fiscal checks last: new line extended_cents must keep category committed + extended <= budgeted (ERR_BUDGET_LINE_EXCEEDED); change-order funding incl. fee (ERR_CHANGE_ORDER_UNFUNDED); adjusted lines stay >= obligations (ERR_BUDGET_BELOW_OBLIGATIONS)", error_id: "ERR_BUDGET_LINE_EXCEEDED | ERR_CHANGE_ORDER_UNFUNDED | ERR_BUDGET_BELOW_OBLIGATIONS", http_status: 402, applies_to: "POST /api/purchase-orders/{id}/lines, POST /api/change-orders/{id}/transitions" }
+
+# =============================================================================
+# Table 5 preamble: Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 5: API Endpoint Table
+# Read endpoints accept any of the six roles. All ids are path params; all other
+# inputs are JSON body fields (? = optional).
+# =============================================================================
+endpoints:
+  # --- FFEProject ---
+  - { method: POST, path: "/api/projects", description: "Create an FF&E project", roles: [PurchasingAgent], code: 201, input: [name, hotel_name, brand_program, total_budget_cents, "unallocated_contingency_cents?", "default_crew_capacity_per_floor_day?"], output: FFEProject, side_effects: ["status PLANNING, posture OPEN, aggregates 0"] }
+  - { method: GET, path: "/api/projects", description: "List projects (paginated)", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?", "status?"], output: "FFEProject[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{projectId}", description: "Get a project with computed aggregates and posture", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: FFEProject, side_effects: [] }
+  - { method: POST, path: "/api/projects/{id}/lifecycle-transitions", description: "Advance project lifecycle (PROCUREMENT | INSTALLATION | COMPLETED | CANCELLED)", roles: [PurchasingAgent], code: 200, input: [to_status], output: FFEProject, side_effects: ["per FFEProject state machine incl. cancellation cascade and spec locking"] }
+  - { method: GET, path: "/api/projects/{id}/budget-lines", description: "List budget lines of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "BudgetLine[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/spec-items", description: "List spec items of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "SpecItem[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/purchase-orders", description: "List POs of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "PurchaseOrder[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/shipments", description: "List shipments of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "Shipment[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/rooms", description: "List rooms of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "Room[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/installation-windows", description: "List installation windows of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "InstallationWindow[]", side_effects: [] }
+  - { method: GET, path: "/api/projects/{id}/change-orders", description: "List change orders of a project", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "ChangeOrder[]", side_effects: [] }
+
+  # --- BudgetLine ---
+  - { method: POST, path: "/api/budget-lines", description: "Create a budget line (unique category per project)", roles: [PurchasingAgent], code: 201, input: [project_id, category, budgeted_cents], output: BudgetLine, side_effects: ["committed/actual initialized 0; project envelope invariant checked"] }
+  - { method: GET, path: "/api/budget-lines/{budgetLineId}", description: "Get a budget line with committed/actual/variance views", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: BudgetLine, side_effects: [] }
+
+  # --- SpecItem ---
+  - { method: POST, path: "/api/spec-items", description: "Create a purchase specification", roles: [PurchasingAgent], code: 201, input: [project_id, category, description, brand_standard_ref, quantity_per_room, room_count, unit_budget_cents, "required_lead_days?", "is_critical?", "attic_target_pct?", "attic_min_qty?", "attic_max_qty?"], output: SpecItem, side_effects: ["total_qty computed; status DRAFT; attic_target_qty 0"] }
+  - { method: GET, path: "/api/spec-items/{specItemId}", description: "Get a spec item", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: SpecItem, side_effects: [] }
+  - { method: GET, path: "/api/spec-items/{id}/bids", description: "List bids for a spec", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "VendorBid[]", side_effects: [] }
+  - { method: GET, path: "/api/spec-items/{id}/po-lines", description: "List PO lines for a spec (0 or 1 given ERR_SPEC_ALREADY_ORDERED)", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "POLine[]", side_effects: [] }
+  - { method: POST, path: "/api/spec-items/{id}/submit", description: "Submit (or resubmit after brand rejection) for brand review", roles: [PurchasingAgent], code: 200, input: [], output: SpecItem, side_effects: ["DRAFT|BRAND_REJECTED -> SUBMITTED"] }
+  - { method: POST, path: "/api/spec-items/{id}/brand-review", description: "Brand-standard decision", roles: [BrandApprover], code: 200, input: [decision, "notes?"], output: SpecItem, side_effects: ["SUBMITTED -> BRAND_APPROVED | BRAND_REJECTED"] }
+
+  # --- VendorBid ---
+  - { method: POST, path: "/api/bids", description: "Submit a vendor bid against a BRAND_APPROVED spec", roles: [Vendor], code: 201, input: [spec_item_id, vendor_name, unit_price_cents, freight_estimate_cents, lead_time_days], output: VendorBid, side_effects: ["status SUBMITTED, sample_round 1, evaluated_cost_cents computed"] }
+  - { method: GET, path: "/api/bids/{bidId}", description: "Get a bid", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: VendorBid, side_effects: [] }
+  - { method: POST, path: "/api/bids/{bidId}/sample-decision", description: "Approve or reject the current sample round", roles: [PurchasingAgent], code: 200, input: [outcome], output: VendorBid, side_effects: ["SUBMITTED -> SAMPLE_APPROVED | SAMPLE_REJECTED"] }
+  - { method: POST, path: "/api/bids/{bidId}/resubmit", description: "Vendor resubmits after sample rejection (round cap 2)", roles: [Vendor], code: 200, input: ["unit_price_cents?", "freight_estimate_cents?", "lead_time_days?"], output: VendorBid, side_effects: ["SAMPLE_REJECTED -> SUBMITTED; sample_round += 1; evaluated_cost_cents recomputed"] }
+  - { method: POST, path: "/api/bids/{bidId}/award", description: "Award the spec to the top-ranked SAMPLE_APPROVED bid", roles: [PurchasingAgent], code: 200, input: [], output: VendorBid, side_effects: ["bid -> AWARDED; sibling SUBMITTED/SAMPLE_APPROVED bids of the spec -> REJECTED; posture gate OPEN"] }
+
+  # --- PurchaseOrder / POLine ---
+  - { method: POST, path: "/api/purchase-orders", description: "Create a PO for a vendor (requires posture OPEN)", roles: [PurchasingAgent], code: 201, input: [project_id, vendor_name], output: PurchaseOrder, side_effects: ["fulfillment ISSUED, invoice UNBILLED"] }
+  - { method: GET, path: "/api/purchase-orders/{purchaseOrderId}", description: "Get a PO", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: PurchaseOrder, side_effects: [] }
+  - { method: GET, path: "/api/purchase-orders/{id}/lines", description: "List lines of a PO", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "POLine[]", side_effects: [] }
+  - { method: POST, path: "/api/purchase-orders/{id}/lines", description: "Add a line priced from the awarded bid for (spec, PO vendor)", roles: [PurchasingAgent], code: 201, input: [spec_item_id, quantity_ordered, declared_cube_m3], output: POLine, side_effects: ["unit_price_cents/extended_cents computed; bid -> ORDERED; BudgetLine.committed_cents recomputed; project committed_cents + posture recomputed; purchase_order.version += 1; increments POLine count"] }
+  - { method: POST, path: "/api/purchase-orders/{id}/transitions", description: "Move one axis: FULFILLMENT -> ACKNOWLEDGED|READY_TO_SHIP|CANCELLED|CLOSED or INVOICE -> PARTIALLY_INVOICED|INVOICED|PAID", roles: [PurchasingAgent, Vendor], code: 200, input: [axis, to_status], output: PurchaseOrder, side_effects: ["per PurchaseOrder state machine incl. line cancellation cascade; purchase_order.version += 1"] }
+  - { method: GET, path: "/api/po-lines/{poLineId}", description: "Get a PO line with quantity pools and landed cost", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: POLine, side_effects: [] }
+  - { method: POST, path: "/api/po-lines/{id}/reconcile", description: "Close a fully/short-received line after claims resolve", roles: [PurchasingAgent], code: 200, input: [], output: POLine, side_effects: ["-> RECONCILED; po_line.version += 1"] }
+  - { method: POST, path: "/api/po-lines/{id}/attic-transfers", description: "Move units between installable and attic pools (OCC-guarded)", roles: [WarehouseReceiver], code: 201, input: [direction, quantity, expected_po_line_version], output: AtticStockMovement, side_effects: ["pool mutation per direction; movement row appended; po_line.version += 1"] }
+  - { method: GET, path: "/api/po-lines/{id}/attic-movements", description: "List attic movements of a line", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "AtticStockMovement[]", side_effects: [] }
+  - { method: GET, path: "/api/po-lines/{id}/damage-claims", description: "List damage/shortage claims of a line", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "DamageClaim[]", side_effects: [] }
+  - { method: GET, path: "/api/po-lines/{id}/installation-tasks", description: "List installation tasks drawing on a line", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "InstallationTask[]", side_effects: [] }
+
+  # --- Shipment / ReceivingEvent ---
+  - { method: POST, path: "/api/shipments", description: "Create a freight consolidation shipment", roles: [PurchasingAgent], code: 201, input: [project_id, carrier_name], output: Shipment, side_effects: ["status PLANNED"] }
+  - { method: GET, path: "/api/shipments/{shipmentId}", description: "Get a shipment", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: Shipment, side_effects: [] }
+  - { method: GET, path: "/api/shipments/{id}/purchase-orders", description: "List POs attached to a shipment", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "PurchaseOrder[]", side_effects: [] }
+  - { method: GET, path: "/api/shipments/{id}/receiving-events", description: "List receiving events of a shipment", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "ReceivingEvent[]", side_effects: [] }
+  - { method: POST, path: "/api/shipments/{id}/purchase-orders", description: "Attach a READY_TO_SHIP PO to a CONSOLIDATING shipment", roles: [PurchasingAgent], code: 200, input: [purchase_order_id], output: PurchaseOrder, side_effects: ["PO -> CONSOLIDATED, shipment_id set; shipment total_cube_m3 recomputed; purchase_order.version += 1"] }
+  - { method: POST, path: "/api/shipments/{id}/transitions", description: "Move shipment: CONSOLIDATING | SEALED | IN_TRANSIT | RECEIVED | CANCELLED", roles: [PurchasingAgent], code: 200, input: [to_status], output: Shipment, side_effects: ["per Shipment state machine: seal computes mode + provisional freight; RECEIVED runs the five-link delivery cascade; cancel detaches POs"] }
+  - { method: POST, path: "/api/receiving-events", description: "Record a warehouse receiving event (lines received/damaged)", roles: [WarehouseReceiver], code: 201, input: [shipment_id, lines], output: ReceivingEvent, side_effects: ["status DRAFT"] }
+  - { method: GET, path: "/api/receiving-events/{receivingEventId}", description: "Get a receiving event", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: ReceivingEvent, side_effects: [] }
+  - { method: POST, path: "/api/receiving-events/{receivingEventId}/transitions", description: "Post or reverse a receiving event", roles: [WarehouseReceiver], code: 200, input: [to_status], output: ReceivingEvent, side_effects: ["POSTED: pool and status cascade to lines, budget, project; REVERSED: compensating cascade, OPEN claims -> VOID"] }
+
+  # --- DamageClaim ---
+  - { method: POST, path: "/api/damage-claims", description: "File a damage or shortage claim bounded by the line's residual", roles: [PurchasingAgent], code: 201, input: [po_line_id, claim_type, quantity, claimed_credit_cents], output: DamageClaim, side_effects: ["status OPEN"] }
+  - { method: GET, path: "/api/damage-claims/{damageClaimId}", description: "Get a claim", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: DamageClaim, side_effects: [] }
+  - { method: POST, path: "/api/damage-claims/{damageClaimId}/transitions", description: "SUBMITTED | DISPUTED | RESOLVED_CREDIT (with approved_credit_cents) | RESOLVED_REPLACEMENT | DENIED", roles: [PurchasingAgent, Vendor], code: 200, input: [to_status, "approved_credit_cents?"], output: DamageClaim, side_effects: ["per DamageClaim state machine; RESOLVED_CREDIT runs the three-link credit cascade"] }
+
+  # --- Room / InstallationWindow / InstallationTask ---
+  - { method: POST, path: "/api/rooms", description: "Register a room (unique room_number per project)", roles: [InstallationManager], code: 201, input: [project_id, floor_number, room_number, room_type], output: Room, side_effects: [] }
+  - { method: GET, path: "/api/rooms/{roomId}", description: "Get a room", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: Room, side_effects: [] }
+  - { method: GET, path: "/api/rooms/{id}/installation-tasks", description: "List tasks scheduled on a room", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "InstallationTask[]", side_effects: [] }
+  - { method: POST, path: "/api/installation-windows", description: "Plan an installation window for a floor (half-open [start_date, end_date))", roles: [InstallationManager], code: 201, input: [project_id, floor_number, start_date, end_date, crew_count], output: InstallationWindow, side_effects: ["status PLANNED; date sanity check"] }
+  - { method: GET, path: "/api/installation-windows/{installationWindowId}", description: "Get a window", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: InstallationWindow, side_effects: [] }
+  - { method: GET, path: "/api/installation-windows/{id}/tasks", description: "List tasks of a window", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: ["limit?", "offset?"], output: "InstallationTask[]", side_effects: [] }
+  - { method: POST, path: "/api/installation-windows/{id}/transitions", description: "RELEASED | IN_PROGRESS | COMPLETE | CANCELLED with overlap, capacity, stock, and task guards", roles: [InstallationManager], code: 200, input: [to_status], output: InstallationWindow, side_effects: ["per InstallationWindow state machine incl. posture flip on IN_PROGRESS and task cancellation cascade"] }
+  - { method: POST, path: "/api/installation-tasks", description: "Schedule a room turn drawing units from a PO line", roles: [InstallationManager], code: 201, input: [window_id, room_id, po_line_id, quantity], output: InstallationTask, side_effects: ["status SCHEDULED; stock availability check (soft)"] }
+  - { method: GET, path: "/api/installation-tasks/{installationTaskId}", description: "Get a task", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: InstallationTask, side_effects: [] }
+  - { method: POST, path: "/api/installation-tasks/{installationTaskId}/complete", description: "Mark a room turn installed", roles: [InstallationManager], code: 200, input: [], output: InstallationTask, side_effects: ["-> COMPLETE; line pools debited; spec attic_target_qty recomputed; po_line.version += 1"] }
+
+  # --- ChangeOrder ---
+  - { method: POST, path: "/api/change-orders", description: "Propose an owner change order moving budget between contingency and lines", roles: [PurchasingAgent, OwnerRep], code: 201, input: [project_id, title, adjustments], output: ChangeOrder, side_effects: ["status PROPOSED; proposer_user_id recorded from X-User-ID"] }
+  - { method: GET, path: "/api/change-orders/{changeOrderId}", description: "Get a change order", roles: [PurchasingAgent, BrandApprover, Vendor, WarehouseReceiver, InstallationManager, OwnerRep], code: 200, input: [], output: ChangeOrder, side_effects: [] }
+  - { method: POST, path: "/api/change-orders/{changeOrderId}/apply", description: "Apply a PROPOSED change order (OCC on project version; proposer may not self-apply)", roles: [OwnerRep], code: 200, input: [expected_project_version], output: ChangeOrder, side_effects: ["-> APPLIED: fee_cents computed per contingency_draw_fee, budget/contingency moved, variances and posture recomputed; increments FFEProject.version by 1; change_order.version += 1"] }
+  - { method: POST, path: "/api/change-orders/{changeOrderId}/reject", description: "Reject a PROPOSED change order (proposer may not self-reject)", roles: [OwnerRep], code: 200, input: [], output: ChangeOrder, side_effects: ["-> REJECTED; change_order.version += 1; no budget effects"] }
+
+# =============================================================================
+# Table 6: Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role missing, or role not one of the six declared roles" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "Role not permitted for this endpoint or for this transition target (e.g. Vendor attempting award, PurchasingAgent attempting brand-review, PurchasingAgent attempting CO approval, Vendor attempting claim resolution)" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Malformed body: missing required field, wrong type, enum value outside the declared set, non-positive quantities, unallocated_contingency_cents > total_budget_cents, approved_credit_cents missing on RESOLVED_CREDIT" }
+  # --- not found (path and body references) ---
+  - { id: ERR_PROJECT_NOT_FOUND, http: 404, condition: "FFEProject id does not exist" }
+  - { id: ERR_BUDGET_LINE_NOT_FOUND, http: 404, condition: "BudgetLine id does not exist (path or inside change-order adjustments)" }
+  - { id: ERR_SPEC_ITEM_NOT_FOUND, http: 404, condition: "SpecItem id does not exist" }
+  - { id: ERR_BID_NOT_FOUND, http: 404, condition: "VendorBid id does not exist" }
+  - { id: ERR_PURCHASE_ORDER_NOT_FOUND, http: 404, condition: "PurchaseOrder id does not exist" }
+  - { id: ERR_PO_LINE_NOT_FOUND, http: 404, condition: "POLine id does not exist (path or inside receiving-event lines / claims / tasks)" }
+  - { id: ERR_SHIPMENT_NOT_FOUND, http: 404, condition: "Shipment id does not exist" }
+  - { id: ERR_RECEIVING_EVENT_NOT_FOUND, http: 404, condition: "ReceivingEvent id does not exist" }
+  - { id: ERR_DAMAGE_CLAIM_NOT_FOUND, http: 404, condition: "DamageClaim id does not exist" }
+  - { id: ERR_ROOM_NOT_FOUND, http: 404, condition: "Room id does not exist" }
+  - { id: ERR_INSTALLATION_WINDOW_NOT_FOUND, http: 404, condition: "InstallationWindow id does not exist" }
+  - { id: ERR_INSTALLATION_TASK_NOT_FOUND, http: 404, condition: "InstallationTask id does not exist" }
+  - { id: ERR_CHANGE_ORDER_NOT_FOUND, http: 404, condition: "ChangeOrder id does not exist" }
+  # --- state ---
+  - { id: ERR_INVALID_LIFECYCLE_TRANSITION, http: 409, condition: "to_status is not a legal next lifecycle state for the project (e.g. PLANNING -> INSTALLATION, COMPLETED -> anything)" }
+  - { id: ERR_NO_BUDGET_LINES, http: 409, condition: "PLANNING -> PROCUREMENT requires at least one BudgetLine" }
+  - { id: ERR_WINDOWS_OUTSTANDING, http: 409, condition: "INSTALLATION -> COMPLETED while a window is PLANNED, RELEASED, or IN_PROGRESS" }
+  - { id: ERR_OPEN_CLAIMS_REMAIN, http: 409, condition: "INSTALLATION -> COMPLETED while a claim is OPEN, SUBMITTED, or DISPUTED" }
+  - { id: ERR_ACTIVE_POS_EXIST, http: 409, condition: "Project cancellation while a PO is READY_TO_SHIP, CONSOLIDATED, DELIVERED, or CLOSED" }
+  - { id: ERR_SPEC_NOT_SUBMITTABLE, http: 409, condition: "Submit requires spec in DRAFT or BRAND_REJECTED" }
+  - { id: ERR_SPEC_NOT_IN_REVIEW, http: 409, condition: "brand-review requires spec in SUBMITTED" }
+  - { id: ERR_SPEC_NOT_OPEN_FOR_BIDS, http: 409, condition: "Bids are only accepted against BRAND_APPROVED specs" }
+  - { id: ERR_SPEC_NOT_BRAND_APPROVED, http: 409, condition: "Brand-standard gate: a PO line may only be added for a spec in BRAND_APPROVED status" }
+  - { id: ERR_BID_NOT_SUBMITTED, http: 409, condition: "sample-decision requires bid in SUBMITTED" }
+  - { id: ERR_BID_NOT_RESUBMITTABLE, http: 409, condition: "resubmit requires bid in SAMPLE_REJECTED" }
+  - { id: ERR_SAMPLE_ROUNDS_EXHAUSTED, http: 409, condition: "resubmit when sample_round == SAMPLE_ROUND_MAX (2)" }
+  - { id: ERR_BID_NOT_SAMPLE_APPROVED, http: 409, condition: "award requires bid in SAMPLE_APPROVED" }
+  - { id: ERR_BID_NOT_BEST_EVALUATED, http: 409, condition: "award attempted on a SAMPLE_APPROVED bid that is not the top-ranked by evaluated_cost_cents (tie-break created_at ASC)" }
+  - { id: ERR_INVALID_PO_TRANSITION, http: 409, condition: "Requested axis transition not legal from the PO's current fulfillment_status / invoice_status" }
+  - { id: ERR_PO_HAS_NO_LINES, http: 409, condition: "READY_TO_SHIP requires at least one non-CANCELLED line" }
+  - { id: ERR_INVOICE_BEFORE_DELIVERY, http: 409, condition: "invoice PAID requires fulfillment_status IN {DELIVERED, CLOSED}" }
+  - { id: ERR_INVOICE_NOT_PAID, http: 409, condition: "fulfillment CLOSED requires invoice_status == PAID" }
+  - { id: ERR_LINES_NOT_RECONCILED, http: 409, condition: "fulfillment CLOSED requires all lines RECONCILED or CANCELLED" }
+  - { id: ERR_INVALID_SHIPMENT_TRANSITION, http: 409, condition: "Shipment transition not legal from current status (e.g. seal from PLANNED, depart from CONSOLIDATING, receive from SEALED, cancel from SEALED)" }
+  - { id: ERR_SHIPMENT_NOT_CONSOLIDATING, http: 409, condition: "Attaching a PO requires shipment CONSOLIDATING" }
+  - { id: ERR_PO_NOT_READY_TO_SHIP, http: 409, condition: "Attaching requires PO fulfillment_status == READY_TO_SHIP" }
+  - { id: ERR_SHIPMENT_EMPTY, http: 409, condition: "Seal requires at least one attached PO" }
+  - { id: ERR_SHIPMENT_NOT_IN_TRANSIT, http: 409, condition: "Receiving-event post/reverse requires shipment IN_TRANSIT" }
+  - { id: ERR_NO_RECEIPTS_POSTED, http: 409, condition: "RECEIVED requires at least one POSTED receiving event" }
+  - { id: ERR_DRAFT_EVENTS_OUTSTANDING, http: 409, condition: "RECEIVED blocked while a DRAFT receiving event exists on the shipment" }
+  - { id: ERR_INVALID_EVENT_TRANSITION, http: 409, condition: "Receiving-event transition not legal from current status (e.g. re-post, reverse from DRAFT)" }
+  - { id: ERR_INVALID_CLAIM_TRANSITION, http: 409, condition: "Claim transition not legal from current status (e.g. resolve from OPEN, dispute from DISPUTED, any transition from a terminal state)" }
+  - { id: ERR_LINE_NOT_RECEIVED, http: 409, condition: "reconcile requires line FULLY_RECEIVED or PARTIALLY_RECEIVED" }
+  - { id: ERR_LINE_SHORTFALL_OPEN, http: 409, condition: "reconcile of a PARTIALLY_RECEIVED line requires its shipment RECEIVED (shortfall final)" }
+  - { id: ERR_CLAIMS_OPEN, http: 409, condition: "reconcile blocked by claims in OPEN, SUBMITTED, or DISPUTED on the line" }
+  - { id: ERR_INVALID_WINDOW_TRANSITION, http: 409, condition: "Window transition not legal from current status (e.g. start from PLANNED, complete from RELEASED, cancel from IN_PROGRESS)" }
+  - { id: ERR_WINDOW_NO_TASKS, http: 409, condition: "IN_PROGRESS requires at least one SCHEDULED task" }
+  - { id: ERR_TASKS_OUTSTANDING, http: 409, condition: "COMPLETE requires all tasks COMPLETE or CANCELLED" }
+  - { id: ERR_INVALID_TASK_TRANSITION, http: 409, condition: "complete requires task SCHEDULED" }
+  - { id: ERR_WINDOW_NOT_IN_PROGRESS, http: 409, condition: "Task completion requires its window IN_PROGRESS" }
+  - { id: ERR_CO_NOT_PROPOSED, http: 409, condition: "Change-order transition requires status PROPOSED (covers re-apply of APPLIED and approve-after-REJECTED)" }
+  - { id: ERR_CHANGE_ORDER_SELF_APPROVAL, http: 403, condition: "X-User-ID equals proposer_user_id on an APPLIED or REJECTED decision (segregation of duties)" }
+  - { id: ERR_PROJECT_PROCUREMENT_SEALED, http: 409, condition: "Posture gate: installation has started (SEALED); new POs, PO lines, and bid awards are blocked" }
+  - { id: ERR_PROJECT_BUDGET_FROZEN, http: 409, condition: "Posture gate: committed + actual > total_budget_cents (FROZEN); spend mutations blocked until an APPLIED change order restores headroom" }
+  # --- referential / constraint ---
+  - { id: ERR_NO_AWARDED_BID, http: 409, condition: "No AWARDED or ORDERED bid exists for (spec_item_id, PO vendor_name)" }
+  - { id: ERR_CROSS_PROJECT_REFERENCE, http: 409, condition: "Referenced entities belong to different projects (PO vs shipment, task window vs room vs line, CO vs budget line)" }
+  - { id: ERR_LINE_NOT_ON_SHIPMENT, http: 409, condition: "Receiving-event entry names a line whose PO is not attached to this shipment" }
+  - { id: ERR_DUPLICATE_BUDGET_CATEGORY, http: 409, condition: "A BudgetLine with this category already exists for the project" }
+  - { id: ERR_DUPLICATE_ROOM, http: 409, condition: "A Room with this room_number already exists for the project" }
+  - { id: ERR_SPEC_ALREADY_ORDERED, http: 409, condition: "A non-CANCELLED PO line already exists for this spec item" }
+  # --- temporal ---
+  - { id: ERR_INVALID_WINDOW_DATES, http: 422, condition: "end_date <= start_date on window creation" }
+  - { id: ERR_ROOM_WINDOW_OVERLAP, http: 409, condition: "Another RELEASED/IN_PROGRESS window already books one of this window's task rooms over an intersecting half-open date range" }
+  - { id: ERR_FLOOR_CREW_CAPACITY_EXCEEDED, http: 409, condition: "Summed crew_count over overlapping RELEASED/IN_PROGRESS windows on the same project+floor_number plus this window would exceed default_crew_capacity_per_floor_day (exceeds = strictly greater; equality allowed)" }
+  # --- quantity / pool ---
+  - { id: ERR_OVER_RECEIPT, http: 422, condition: "Cumulative received for a line would exceed quantity_ordered" }
+  - { id: ERR_DAMAGE_EXCEEDS_RECEIPT, http: 422, condition: "qty_damaged > qty_received within one receiving-event entry" }
+  - { id: ERR_CLAIM_QTY_EXCEEDS_RESIDUAL, http: 422, condition: "Claim quantity exceeds the type-specific residual (damaged or shortfall minus non-terminal claims); equality with the residual is allowed" }
+  - { id: ERR_INSUFFICIENT_INSTALLABLE, http: 422, condition: "Attic transfer IN quantity exceeds line qty_installable" }
+  - { id: ERR_INSUFFICIENT_ATTIC, http: 422, condition: "Attic transfer OUT or WRITE_OFF quantity exceeds line qty_attic" }
+  - { id: ERR_ATTIC_TARGET_EXCEEDED, http: 422, condition: "Attic transfer IN would raise qty_attic above the spec's attic_target_qty; equality allowed" }
+  - { id: ERR_INSUFFICIENT_INSTALLABLE_STOCK, http: 409, condition: "Task creation / window start / task completion finds line qty_installable < task quantity" }
+  - { id: ERR_CLAIMS_BLOCK_REVERSAL, http: 409, condition: "Receiving-event reversal blocked by a claim in SUBMITTED, DISPUTED, RESOLVED_CREDIT, RESOLVED_REPLACEMENT, or DENIED on a covered line" }
+  - { id: ERR_REVERSAL_POOL_SHORTFALL, http: 409, condition: "Reversal would drive a line pool negative (units already installed or moved to attic)" }
+  # --- fiscal ---
+  - { id: ERR_BUDGET_LINE_EXCEEDED, http: 402, condition: "New line's extended_cents would push the category's committed + extended above budgeted_cents (strictly greater rejects; equality allowed)" }
+  - { id: ERR_CHANGE_ORDER_UNFUNDED, http: 402, condition: "unallocated_contingency_cents + NEG < POS + fee_cents at approval" }
+  - { id: ERR_BUDGET_BELOW_OBLIGATIONS, http: 402, condition: "A negative adjustment would drop a budget line below its committed_cents + actual_cents" }
+  # --- concurrency ---
+  - { id: ERR_STALE_PROJECT_VERSION, http: 412, condition: "expected_project_version != project.version on change-order apply" }
+  - { id: ERR_STALE_PO_LINE_VERSION, http: 412, condition: "expected_po_line_version != po_line.version on attic transfer" }
+
+# =============================================================================
+# Table 7: RBAC Permission Matrix (all roles are opaque operator identities)
+# =============================================================================
+roles:
+  - name: PurchasingAgent
+    description: "Hotel FF&E purchasing agent; owns the procure-to-install pipeline"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/projects; POST /api/projects/{id}/lifecycle-transitions"
+      - "POST /api/budget-lines"
+      - "POST /api/spec-items; POST /api/spec-items/{id}/submit"
+      - "POST /api/bids/{id}/sample-decision; POST /api/bids/{id}/award"
+      - "POST /api/purchase-orders; POST /api/purchase-orders/{id}/lines"
+      - "POST /api/po-lines/{id}/reconcile"
+      - "POST /api/shipments; POST /api/shipments/{id}/purchase-orders; POST /api/shipments/{id}/transitions"
+      - "POST /api/damage-claims"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/purchase-orders/{id}/transitions (invoice axis and fulfillment CANCELLED/CLOSED only)"
+      - "POST /api/damage-claims/{id}/transitions (SUBMITTED, RESOLVED_CREDIT, RESOLVED_REPLACEMENT, DENIED targets only)"
+      - "POST /api/change-orders (propose)"
+  - name: BrandApprover
+    description: "Brand-standard reviewer; approves or rejects submitted specs"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/spec-items/{id}/brand-review"
+    shared_operations:
+      - "All GET endpoints"
+  - name: Vendor
+    description: "External supplier; bids, acknowledges POs, disputes claims"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/bids; POST /api/bids/{id}/resubmit"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/purchase-orders/{id}/transitions (fulfillment ACKNOWLEDGED/READY_TO_SHIP only)"
+      - "POST /api/damage-claims/{id}/transitions (DISPUTED target only)"
+  - name: WarehouseReceiver
+    description: "Consolidation warehouse staff; posts receiving events and manages attic stock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/receiving-events; POST /api/receiving-events/{id}/transitions"
+      - "POST /api/po-lines/{id}/attic-transfers"
+    shared_operations:
+      - "All GET endpoints"
+  - name: InstallationManager
+    description: "Field installation lead; manages rooms, windows, and room-turn tasks"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/rooms"
+      - "POST /api/installation-windows; POST /api/installation-windows/{id}/transitions"
+      - "POST /api/installation-tasks; POST /api/installation-tasks/{id}/complete"
+    shared_operations:
+      - "All GET endpoints"
+  - name: OwnerRep
+    description: "Hotel owner representative; decides change orders (may not decide own proposal)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/change-orders/{id}/apply; POST /api/change-orders/{id}/reject"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/change-orders (propose)"
