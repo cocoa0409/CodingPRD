@@ -1,0 +1,1024 @@
+scenario: "1237. Teleradiology Read Distribution (vRad style teleradiology): study routing by modality, subspecialty & state licensure, turnaround-time target by priority (STAT/routine), radiologist worklist balancing & fatigue limits, preliminary vs final read & discrepancy reconciliation, critical result communication & documentation, credentialing by proxy at client hospitals, after-hours coverage & volume-based pricing"
+
+domain_name: "teleradiology-read-distribution"
+api_prefix: "/telerad"
+
+complexity_profile:
+  primary_archetype: quota_allocation        # radiologist reading capacity is a finite pool: reserved on assignment, committed on sign, released on release/cancel
+  secondary_archetype: compliance_audit      # critical-result communication documentation, discrepancy reconciliation, credentialing-by-proxy gates
+  complexity_layers:
+    - selector_policy                        # auto-assignment picks one radiologist from an eligibility-filtered, ranked candidate pool
+    - dual_variant_calculation               # provisional vs final RVU credit; MARGINAL vs FLAT_TIER invoice pricing
+    - optimistic_concurrency                 # OCC on ClientHospital.version and BillingPeriod.version for supersede-style creates
+    - derived_field_reconciliation           # reserved_rvu / completed_rvu_24h / pending_critical_count recomputed from children under a logical clock
+  entity_topology: flat                      # peer entities with FK references; no nested URL paths
+  state_machine_shape: cyclic                # Study amendment cycle, CredentialGrant renewal cycle, plus branching/fork-join machines
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: segregation_of_duties          # prelim signer may not sign final; case reconciler may not be a signer; peer roles for the rest
+  consistency_model: immediate               # all mutations + cascades are atomic and visible in the same request
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: ClientHospital
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Hospital display name" }
+      - { name: state_code, type: string, source: input, description: "US state where imaging is performed; studies inherit it (licensure scope)" }
+      - { name: status, type: enum, source: system, default: ONBOARDING, constraints: "ONBOARDING | ACTIVE | SUSPENDED", description: "Lifecycle; only ACTIVE hospitals may create/route studies" }
+      - { name: credentialing_mode, type: enum, source: input, default: BY_PROXY, constraints: "BY_PROXY | INDEPENDENT", description: "Which grant_type this hospital accepts for reader privileges" }
+      - { name: pricing_mode, type: enum, source: input, default: MARGINAL, constraints: "MARGINAL | FLAT_TIER", description: "Volume-pricing variant: tiered marginal units vs all units at highest reached tier rate" }
+      - { name: tat_stat_minutes, type: integer, source: input, default: 60, description: "TAT target minutes for STAT studies" }
+      - { name: tat_urgent_minutes, type: integer, source: input, default: 240, description: "TAT target minutes for URGENT studies" }
+      - { name: tat_routine_minutes, type: integer, source: input, default: 1440, description: "TAT target minutes for ROUTINE studies" }
+      - { name: penalty_per_breach_minute_cents, type: integer, source: input, default: 50, description: "Invoice penalty credited per whole breach minute per study" }
+      - { name: breach_penalty_cap_cents, type: integer, source: input, default: 20000, description: "Per-study penalty cap in cents" }
+
+  - name: Radiologist
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Reader display name" }
+      - { name: subspecialties, type: array, source: input, constraints: "members of NEURORAD | MSK | BODY | CHEST | PEDS | GENERAL", description: "Subspecialty credentials used by routing" }
+      - { name: license_states, type: array, source: input, description: "US state codes where the radiologist holds an active license" }
+      - { name: status, type: enum, source: input, default: ACTIVE, constraints: "ACTIVE | ON_LEAVE | INACTIVE", description: "Work eligibility; only ACTIVE is assignable" }
+      - { name: fatigue_cap_rvu, type: number, source: input, default: 30.0, description: "Max allowed utilization: reserved_rvu + completed_rvu_24h may reach but never exceed this cap" }
+      - { name: max_concurrent_stat, type: integer, source: input, default: 3, description: "Upper bound on this radiologist's ACTIVE assignments on STAT-priority studies (at the bound, further STAT assignment rejects)" }
+      - { name: reserved_rvu, type: number, source: computed, default: 0.0, description: "Sum of reserved_rvu over this radiologist's ACTIVE assignments (recomputed on every assignment mutation)" }
+      - { name: completed_rvu_24h, type: number, source: computed, default: 0.0, description: "Sum of credited_rvu over this radiologist's reports with status IN {SIGNED, SUPERSEDED} (provisional credit is not clawed back on supersede) and signed_at > (now - 24h), strict lower bound" }
+      - { name: stat_active_count, type: integer, source: computed, default: 0, description: "Count of ACTIVE assignments whose study priority is STAT" }
+      - { name: pending_critical_count, type: integer, source: computed, default: 0, description: "Count of CriticalResultNotice rows with radiologist_id = this radiologist and status IN {PENDING, NOTIFIED, ESCALATED}" }
+
+  - name: CoverageShift
+    parent: null
+    common_fields: true
+    fields:
+      - { name: radiologist_id, type: string, source: input, description: "FK -> Radiologist.id; owner of this coverage window" }
+      - { name: starts_at, type: datetime, source: input, description: "Window start (UTC); half-open interval [starts_at, ends_at)" }
+      - { name: ends_at, type: datetime, source: input, description: "Window end (UTC); must be strictly after starts_at" }
+      - { name: modalities, type: array, source: input, constraints: "members of CT | MR | XR | US | NM | MG", description: "Modalities covered during this shift" }
+      - { name: status, type: enum, source: system, default: SCHEDULED, constraints: "SCHEDULED | ACTIVE | COMPLETED | CANCELLED", description: "SCHEDULED->ACTIVE when logical clock enters window; ->COMPLETED when clock passes ends_at" }
+      - { name: after_hours, type: boolean, source: computed, description: "True when [starts_at, ends_at) intersects the platform after-hours window 22:00-07:00 UTC on any covered day" }
+
+  - name: RoutingPolicy
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospital_id, type: string, source: input, description: "FK -> ClientHospital.id; hospital this rule routes studies for" }
+      - { name: modality, type: enum, source: input, constraints: "CT | MR | XR | US | NM | MG", description: "Study modality matched" }
+      - { name: body_part_group, type: enum, source: input, constraints: "NEURO | BODY | MSK | CHEST | VASCULAR | OTHER", description: "Body-part group matched" }
+      - { name: priority, type: enum, source: input, constraints: "STAT | URGENT | ROUTINE", description: "Study priority matched" }
+      - { name: required_subspecialty, type: enum, source: input, constraints: "NEURORAD | MSK | BODY | CHEST | PEDS | GENERAL", description: "Subspecialty a radiologist must hold to take matched studies" }
+      - { name: prelim_required, type: boolean, source: input, default: false, description: "When true, a PRELIMINARY report must be signed before any FINAL report" }
+      - { name: status, type: enum, source: system, default: ACTIVE, constraints: "ACTIVE | RETIRED", description: "Creating a new ACTIVE policy with the same (hospital_id, modality, body_part_group, priority) retires the previous one" }
+
+  - name: Study
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospital_id, type: string, source: input, description: "FK -> ClientHospital.id; ordering facility; must equal X-User-ID for ClientHospitalUser" }
+      - { name: accession_number, type: string, source: input, description: "Order accession; unique per hospital among non-CANCELLED studies" }
+      - { name: modality, type: enum, source: input, constraints: "CT | MR | XR | US | NM | MG", description: "Imaging modality" }
+      - { name: body_part_group, type: enum, source: input, constraints: "NEURO | BODY | MSK | CHEST | VASCULAR | OTHER", description: "Body-part group" }
+      - { name: priority, type: enum, source: input, constraints: "STAT | URGENT | ROUTINE", description: "Read priority driving TAT target" }
+      - { name: patient_ref, type: string, source: input, description: "Opaque patient reference (no PHI semantics)" }
+      - { name: state_code, type: string, source: computed, description: "Copied from ClientHospital.state_code at creation; licensure scope" }
+      - { name: received_at, type: datetime, source: system, description: "Logical-clock timestamp at creation" }
+      - { name: due_at, type: datetime, source: computed, description: "received_at + hospital TAT minutes for priority (calculation tat_deadline)" }
+      - { name: status, type: enum, source: system, default: RECEIVED, constraints: "RECEIVED | QUEUED | ASSIGNED | IN_PROGRESS | PRELIMINARY_SIGNED | FINAL_SIGNED | AMENDMENT_PENDING | CANCELLED", description: "Read lifecycle" }
+      - { name: routing_policy_id, type: string, source: computed, description: "FK -> RoutingPolicy.id; resolved at route time; null for seeded/unrouted studies" , constraints: "nullable" }
+      - { name: assigned_radiologist_id, type: string, source: computed, constraints: "nullable", description: "FK -> Radiologist.id; radiologist of the current ACTIVE assignment; null when none" }
+      - { name: excluded_radiologist_ids, type: array, source: system, default: [], description: "Radiologist ids barred from future assignments on this study (release exclusion)" }
+      - { name: addendum_count, type: integer, source: system, default: 0, description: "Number of signed ADDENDUM reports" }
+      - { name: first_final_signed_at, type: datetime, source: system, constraints: "nullable", description: "Timestamp of the FIRST signed FINAL report; billing anchor; not moved by addenda" }
+      - { name: tat_breached, type: boolean, source: computed, default: false, description: "True when the TAT-relevant sign time is strictly greater than due_at" }
+      - { name: breach_minutes, type: integer, source: computed, default: 0, description: "floor((relevant signed_at - due_at) / 60s) when breached, else 0" }
+
+  - name: Assignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: study_id, type: string, source: input, description: "FK -> Study.id; study being read" }
+      - { name: radiologist_id, type: string, source: computed, description: "FK -> Radiologist.id; explicit when request supplied radiologist_id, else chosen by auto_assignment_selector" }
+      - { name: phase, type: enum, source: computed, constraints: "PRELIMINARY | FINAL", description: "PRELIMINARY when resolved policy.prelim_required and no SIGNED PRELIMINARY report exists yet; else FINAL" }
+      - { name: reserved_rvu, type: number, source: computed, description: "RVU reserved while ACTIVE; equals study_rvu of the study's modality" }
+      - { name: status, type: enum, source: system, default: ACTIVE, constraints: "ACTIVE | COMPLETED | RELEASED", description: "ACTIVE -> COMPLETED on phase-covering report sign; ACTIVE -> RELEASED on release or study cancel" }
+      - { name: auto_selected, type: boolean, source: system, description: "True when radiologist was chosen by the selector (radiologist_id omitted)" }
+
+  - name: Report
+    parent: null
+    common_fields: true
+    fields:
+      - { name: assignment_id, type: string, source: input, description: "FK -> Assignment.id; assignment this report fulfills" }
+      - { name: study_id, type: string, source: computed, description: "FK -> Study.id; copied from assignment" }
+      - { name: radiologist_id, type: string, source: computed, description: "FK -> Radiologist.id; copied from assignment (the author)" }
+      - { name: report_type, type: enum, source: input, constraints: "PRELIMINARY | FINAL | ADDENDUM", description: "Report kind; validity depends on study state (see validations)" }
+      - { name: findings_text, type: string, source: input, description: "Findings narrative" }
+      - { name: impression_text, type: string, source: input, description: "Impression narrative" }
+      - { name: critical_finding, type: boolean, source: input, default: false, description: "When true, signing spawns a CriticalResultNotice (PENDING)" }
+      - { name: discrepancy_grade, type: integer, source: input, constraints: "0..3, nullable", description: "Required on FINAL when a SIGNED PRELIMINARY exists: 0 concordant, 1 minor, 2 moderate, 3 major" }
+      - { name: status, type: enum, source: system, default: DRAFT, constraints: "DRAFT | SIGNED | SUPERSEDED", description: "DRAFT -> SIGNED on sign; SIGNED PRELIMINARY -> SUPERSEDED when the study's FINAL is signed" }
+      - { name: signed_at, type: datetime, source: system, constraints: "nullable", description: "Logical-clock timestamp of signing" }
+      - { name: credited_rvu, type: number, source: computed, default: 0.0, description: "RVU credited at sign per report_rvu_credit variant (0.8x provisional, (1-penalty)x final, 0 addendum)" }
+
+  - name: DiscrepancyCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: study_id, type: string, source: computed, description: "FK -> Study.id; copied from the reports" }
+      - { name: prelim_report_id, type: string, source: input, description: "FK -> Report.id; the SIGNED PRELIMINARY report" }
+      - { name: final_report_id, type: string, source: input, description: "FK -> Report.id; the SIGNED FINAL report" }
+      - { name: grade, type: integer, source: computed, description: "Copied from final report discrepancy_grade at creation" }
+      - { name: origin, type: enum, source: system, constraints: "AUTO | MANUAL", description: "AUTO when created by final-sign cascade with grade >= 2; MANUAL when created by QaReviewer" }
+      - { name: status, type: enum, source: system, default: OPEN, constraints: "OPEN | PEER_REVIEW | ESCALATED_QI | RECONCILED | NO_ACTION_CLOSED", description: "Reconciliation workflow" }
+      - { name: reconciliation_note, type: string, source: input, constraints: "nullable", description: "Recorded at reconcile" }
+      - { name: reconciled_by, type: string, source: system, constraints: "nullable", description: "X-User-ID recorded at reconcile" }
+
+  - name: CriticalResultNotice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: report_id, type: string, source: computed, description: "FK -> Report.id; the critical report" }
+      - { name: study_id, type: string, source: computed, description: "FK -> Study.id; copied from report" }
+      - { name: radiologist_id, type: string, source: computed, description: "FK -> Radiologist.id; signer responsible for communication" }
+      - { name: status, type: enum, source: system, default: PENDING, constraints: "PENDING | NOTIFIED | ESCALATED | READBACK_CONFIRMED", description: "Communication documentation workflow" }
+      - { name: notified_party_name, type: string, source: input, constraints: "nullable", description: "Who was notified (record-notification)" }
+      - { name: notified_at, type: datetime, source: system, constraints: "nullable", description: "When notification was recorded" }
+      - { name: readback_confirmed_by, type: string, source: input, constraints: "nullable", description: "Confirming party at the client hospital" }
+      - { name: readback_at, type: datetime, source: system, constraints: "nullable", description: "When read-back was confirmed" }
+      - { name: escalation_count, type: integer, source: system, default: 0, description: "Number of escalations (manual or clock-sweep)" }
+
+  - name: CredentialGrant
+    parent: null
+    common_fields: true
+    fields:
+      - { name: radiologist_id, type: string, source: input, description: "FK -> Radiologist.id" }
+      - { name: hospital_id, type: string, source: input, description: "FK -> ClientHospital.id" }
+      - { name: grant_type, type: enum, source: input, constraints: "BY_PROXY | INDEPENDENT", description: "Must equal the hospital's credentialing_mode" }
+      - { name: valid_from, type: string, source: input, description: "First valid day, inclusive (YYYY-MM-DD)" }
+      - { name: valid_until, type: string, source: input, description: "Last valid day, inclusive (YYYY-MM-DD); inclusive-day interval semantics" }
+      - { name: status, type: enum, source: system, default: PENDING, constraints: "PENDING | GRANTED | SUSPENDED | REVOKED | EXPIRED", description: "Credential lifecycle; GRANTED -> EXPIRED via clock sweep when date(now) > valid_until" }
+
+  - name: BillingPeriod
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospital_id, type: string, source: input, description: "FK -> ClientHospital.id" }
+      - { name: period_start, type: string, source: input, description: "First billable day, inclusive (YYYY-MM-DD)" }
+      - { name: period_end, type: string, source: input, description: "Last billable day, inclusive (YYYY-MM-DD); billable window is [period_start 00:00:00Z, period_end+1d 00:00:00Z)" }
+      - { name: status, type: enum, source: system, default: OPEN, constraints: "OPEN | CLOSED | INVOICED", description: "OPEN -> CLOSED -> INVOICED; CLOSED -> OPEN allowed within reopen grace (inclusive-day rule: date(now) <= period_end + 7 days)" }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: billing_period_id, type: string, source: computed, description: "FK -> BillingPeriod.id" }
+      - { name: hospital_id, type: string, source: computed, description: "FK -> ClientHospital.id; denormalized from period" }
+      - { name: status, type: enum, source: system, default: CURRENT, constraints: "CURRENT | VOID", description: "Regenerating a period voids the previous CURRENT invoice" }
+      - { name: pricing_mode_snapshot, type: enum, source: system, constraints: "MARGINAL | FLAT_TIER", description: "Hospital pricing_mode pinned at generation time" }
+      - { name: billable_study_count, type: integer, source: computed, description: "Studies counted per invoice input set (see invoice_volume_pricing)" }
+      - { name: line_items, type: array, source: computed, description: "One line per (hour_class, tier_index): {hour_class: REGULAR|AFTER_HOURS, tier_index, units, rate_cents, amount_cents}" }
+      - { name: critical_addon_cents, type: integer, source: computed, description: "250c per billable study whose FINAL report had critical_finding true" }
+      - { name: gross_cents, type: integer, source: computed, description: "Sum of line amounts + critical_addon_cents" }
+      - { name: penalty_credits_cents, type: integer, source: computed, description: "Sum over breached billable studies of min(breach_minutes * penalty_per_breach_minute_cents, breach_penalty_cap_cents)" }
+      - { name: total_cents, type: integer, source: computed, description: "max(0, gross_cents - penalty_credits_cents)" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: ClientHospital
+    initial_state: ONBOARDING
+    terminal_states: []
+    transitions:
+      - from: ONBOARDING
+        to: ACTIVE
+        trigger: "POST /telerad/hospitals/{id}/activate"
+        actor: PlatformAdmin
+        preconditions: ["hospital.status == ONBOARDING or SUSPENDED"]
+        side_effects: ["increments ClientHospital.version by 1", "refreshes updated_at"]
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /telerad/hospitals/{id}/activate"
+        actor: PlatformAdmin
+        preconditions: ["hospital.status == SUSPENDED"]
+        side_effects: ["increments ClientHospital.version by 1", "refreshes updated_at"]
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /telerad/hospitals/{id}/suspend"
+        actor: PlatformAdmin
+        preconditions: ["hospital.status == ACTIVE"]
+        side_effects: ["increments ClientHospital.version by 1", "refreshes updated_at", "new Study creation is rejected while SUSPENDED (ERR_HOSPITAL_NOT_ACTIVE)"]
+
+  - entity: Radiologist
+    initial_state: ACTIVE
+    terminal_states: [INACTIVE]
+    transitions:
+      - from: ACTIVE
+        to: ON_LEAVE
+        trigger: "PATCH /telerad/radiologists/{id}"
+        actor: PlatformAdmin
+        preconditions: ["radiologist.status == ACTIVE"]
+        side_effects: ["increments Radiologist.version by 1", "radiologist no longer eligible for assignment"]
+      - from: ON_LEAVE
+        to: ACTIVE
+        trigger: "PATCH /telerad/radiologists/{id}"
+        actor: PlatformAdmin
+        preconditions: ["radiologist.status == ON_LEAVE"]
+        side_effects: ["increments Radiologist.version by 1"]
+      - from: ACTIVE
+        to: INACTIVE
+        trigger: "PATCH /telerad/radiologists/{id}"
+        actor: PlatformAdmin
+        preconditions: ["radiologist.status == ACTIVE", "radiologist has zero ACTIVE assignments"]
+        side_effects: ["increments Radiologist.version by 1"]
+      - from: ON_LEAVE
+        to: INACTIVE
+        trigger: "PATCH /telerad/radiologists/{id}"
+        actor: PlatformAdmin
+        preconditions: ["radiologist.status == ON_LEAVE"]
+        side_effects: ["increments Radiologist.version by 1"]
+
+  - entity: CoverageShift
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "system: POST /telerad/_clock/set_current_utc sweep when starts_at <= now < ends_at"
+        actor: system
+        preconditions: ["shift.status == SCHEDULED", "starts_at <= current logical clock < ends_at"]
+        side_effects: ["increments CoverageShift.version by 1", "radiologist becomes shift-eligible for modalities in this window"]
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "system: POST /telerad/_clock/set_current_utc sweep when now >= ends_at"
+        actor: system
+        preconditions: ["shift.status == ACTIVE", "current logical clock >= ends_at"]
+        side_effects: ["increments CoverageShift.version by 1"]
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "system: POST /telerad/_clock/set_current_utc sweep when now >= ends_at (window skipped entirely)"
+        actor: system
+        preconditions: ["shift.status == SCHEDULED", "current logical clock >= ends_at"]
+        side_effects: ["increments CoverageShift.version by 1"]
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /telerad/shifts/{id}/cancel"
+        actor: PlatformAdmin
+        preconditions: ["shift.status == SCHEDULED"]
+        side_effects: ["increments CoverageShift.version by 1"]
+
+  - entity: RoutingPolicy
+    initial_state: ACTIVE
+    terminal_states: [RETIRED]
+    transitions:
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "system side effect of POST /telerad/routing-policies creating a new ACTIVE policy with the same (hospital_id, modality, body_part_group, priority)"
+        actor: system
+        preconditions: ["an existing ACTIVE policy shares the new policy's key"]
+        side_effects: ["increments RoutingPolicy.version by 1", "superseded policy no longer resolves at route time"]
+
+  - entity: Study
+    initial_state: RECEIVED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: RECEIVED
+        to: QUEUED
+        trigger: "POST /telerad/studies/{id}/route"
+        actor: DispatchOps
+        preconditions:
+          - "study.status == RECEIVED"
+          - "hospital.status == ACTIVE (else ERR_HOSPITAL_NOT_ACTIVE)"
+          - "exactly one ACTIVE RoutingPolicy matches (hospital_id, modality, body_part_group, priority) (else ERR_NO_ROUTING_POLICY)"
+        side_effects:
+          - "sets study.routing_policy_id to the matched ACTIVE policy"
+          - "increments Study.version by 1"
+      - from: QUEUED
+        to: ASSIGNED
+        trigger: "POST /telerad/assignments"
+        actor: DispatchOps
+        preconditions: ["study.status IN {QUEUED, PRELIMINARY_SIGNED, AMENDMENT_PENDING}", "expected_study_version matches study.version (OCC)", "no other ACTIVE assignment exists for the study", "eligibility checks per auto_assignment_selector (license, credential, shift, exclusion, fatigue, STAT concurrency)"]
+        side_effects:
+          - "creates Assignment(status=ACTIVE, phase per derivation rule, reserved_rvu = study_rvu, auto_selected flag)"
+          - "study.assigned_radiologist_id := assignment radiologist"
+          - "recomputes Radiologist.reserved_rvu (+= study_rvu) and stat_active_count when priority == STAT"
+          - "increments Study.version by 1"
+      - from: PRELIMINARY_SIGNED
+        to: ASSIGNED
+        trigger: "POST /telerad/assignments (FINAL phase)"
+        actor: DispatchOps
+        preconditions: ["same as QUEUED->ASSIGNED", "selector additionally excludes the prelim signer when phase == FINAL"]
+        side_effects: ["same as QUEUED->ASSIGNED"]
+      - from: AMENDMENT_PENDING
+        to: ASSIGNED
+        trigger: "POST /telerad/assignments (FINAL phase, addendum cycle)"
+        actor: DispatchOps
+        preconditions: ["same as QUEUED->ASSIGNED"]
+        side_effects: ["same as QUEUED->ASSIGNED"]
+      - from: ASSIGNED
+        to: IN_PROGRESS
+        trigger: "POST /telerad/assignments/{id}/accept"
+        actor: Radiologist
+        preconditions: ["assignment.status == ACTIVE", "X-User-ID == assignment.radiologist_id", "study.status == ASSIGNED"]
+        side_effects: ["study.status := IN_PROGRESS", "increments Study.version by 1", "increments Assignment.version by 1"]
+      - from: ASSIGNED
+        to: QUEUED
+        trigger: "POST /telerad/assignments/{id}/release"
+        actor: Radiologist
+        preconditions: ["assignment.status == ACTIVE", "X-User-ID == assignment.radiologist_id", "study.status == ASSIGNED"]
+        side_effects:
+          - "assignment.status := RELEASED (hop 1)"
+          - "study.status := QUEUED; study.assigned_radiologist_id := null; study.excluded_radiologist_ids += releasing radiologist (hop 2, caused by hop 1)"
+          - "recomputes Radiologist.reserved_rvu (-= study_rvu) and stat_active_count when priority == STAT (hop 3, caused by hop 2 requeue)"
+          - "increments Study.version and Assignment.version by 1"
+      - from: IN_PROGRESS
+        to: PRELIMINARY_SIGNED
+        trigger: "POST /telerad/reports/{id}/sign with report_type=PRELIMINARY"
+        actor: Radiologist
+        preconditions: ["report.status == DRAFT", "X-User-ID == report.radiologist_id", "assignment.status == ACTIVE", "study.status == IN_PROGRESS", "resolved policy.prelim_required == true (else ERR_PRELIM_NOT_PERMITTED)", "no SIGNED PRELIMINARY exists for the study (else ERR_PRELIM_NOT_PERMITTED)"]
+        side_effects:
+          - "report.status := SIGNED; report.signed_at := now; report.credited_rvu := 0.8 * study_rvu (hop 1)"
+          - "study.status := PRELIMINARY_SIGNED (hop 2, caused by hop 1 sign)"
+          - "assignment.status := COMPLETED; recomputes Radiologist.reserved_rvu (-= study_rvu) and completed_rvu_24h (+= credited_rvu) (hop 3, caused by hop 2)"
+          - "TAT evaluation: when prelim_required, sets tat_breached / breach_minutes from signed_at vs due_at"
+          - "when report.critical_finding: creates CriticalResultNotice(status=PENDING) (hop 3) which raises Radiologist.pending_critical_count (hop 4)"
+      - from: IN_PROGRESS
+        to: FINAL_SIGNED
+        trigger: "POST /telerad/reports/{id}/sign with report_type=FINAL"
+        actor: Radiologist
+        preconditions: ["report.status == DRAFT", "X-User-ID == report.radiologist_id", "assignment.status == ACTIVE", "study.status == IN_PROGRESS", "when policy.prelim_required: a SIGNED PRELIMINARY must exist (else ERR_FINAL_NOT_DUE)", "signer must differ from prelim signer when a prelim exists (else ERR_SAME_READER_CONFLICT)", "discrepancy_grade required when a SIGNED PRELIMINARY exists (else ERR_VALIDATION)", "no SIGNED FINAL exists yet"]
+        side_effects:
+          - "report.status := SIGNED; report.signed_at := now; report.credited_rvu := study_rvu * (1 - DISCREPANCY_PENALTY[grade]) (hop 1)"
+          - "study.status := FINAL_SIGNED; study.first_final_signed_at := signed_at (hop 2, caused by hop 1)"
+          - "the study's SIGNED PRELIMINARY report transitions to SUPERSEDED (hop 3, caused by hop 2)"
+          - "assignment.status := COMPLETED; recomputes Radiologist.reserved_rvu and completed_rvu_24h (hop 3)"
+          - "TAT evaluation: when NOT prelim_required, sets tat_breached / breach_minutes from signed_at vs due_at"
+          - "when discrepancy_grade >= 2: auto-creates DiscrepancyCase(status=OPEN, origin=AUTO) (hop 3, caused by hop 2 finalization)"
+          - "when report.critical_finding: creates CriticalResultNotice(status=PENDING) (hop 3) which raises Radiologist.pending_critical_count (hop 4)"
+      - from: IN_PROGRESS
+        to: FINAL_SIGNED
+        trigger: "POST /telerad/reports/{id}/sign with report_type=ADDENDUM"
+        actor: Radiologist
+        preconditions: ["report.status == DRAFT", "report_type == ADDENDUM requires study.first_final_signed_at set (else ERR_ADDENDUM_NOT_PERMITTED)", "X-User-ID == report.radiologist_id", "assignment.status == ACTIVE", "study.status == IN_PROGRESS (entered from AMENDMENT_PENDING via assignment)"]
+        side_effects:
+          - "report.status := SIGNED; report.signed_at := now; report.credited_rvu := 0.0 (hop 1)"
+          - "study.status := FINAL_SIGNED; study.addendum_count += 1; first_final_signed_at unchanged (hop 2)"
+          - "assignment.status := COMPLETED; recompute reserved_rvu / completed_rvu_24h (hop 3)"
+          - "when report.critical_finding: creates CriticalResultNotice(status=PENDING) (hop 3) which raises Radiologist.pending_critical_count (hop 4)"
+      - from: FINAL_SIGNED
+        to: AMENDMENT_PENDING
+        trigger: "POST /telerad/studies/{id}/request-addendum"
+        actor: ClientHospitalUser
+        preconditions: ["study.status == FINAL_SIGNED", "X-User-ID == study.hospital_id", "no DiscrepancyCase for this study with status IN {OPEN, PEER_REVIEW, ESCALATED_QI} (else ERR_OPEN_DISCREPANCY_EXISTS)"]
+        side_effects: ["study.status := AMENDMENT_PENDING", "increments Study.version by 1"]
+      - from: RECEIVED
+        to: CANCELLED
+        trigger: "POST /telerad/studies/{id}/cancel"
+        actor: ClientHospitalUser
+        preconditions: ["study.status IN {RECEIVED, QUEUED, ASSIGNED, IN_PROGRESS}", "canceller owns the study (ClientHospitalUser: X-User-ID == study.hospital_id) or is DispatchOps"]
+        side_effects: ["study.status := CANCELLED", "increments Study.version by 1"]
+      - from: QUEUED
+        to: CANCELLED
+        trigger: "POST /telerad/studies/{id}/cancel"
+        actor: ClientHospitalUser
+        preconditions: ["same as RECEIVED->CANCELLED"]
+        side_effects: ["same as RECEIVED->CANCELLED"]
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /telerad/studies/{id}/cancel"
+        actor: ClientHospitalUser
+        preconditions: ["same as RECEIVED->CANCELLED"]
+        side_effects:
+          - "study.status := CANCELLED (hop 1)"
+          - "the ACTIVE assignment transitions to RELEASED (hop 2, caused by hop 1)"
+          - "recomputes Radiologist.reserved_rvu (-= reserved_rvu) and stat_active_count (hop 3, caused by hop 2)"
+      - from: IN_PROGRESS
+        to: CANCELLED
+        trigger: "POST /telerad/studies/{id}/cancel"
+        actor: ClientHospitalUser
+        preconditions: ["same as RECEIVED->CANCELLED"]
+        side_effects: ["same as ASSIGNED->CANCELLED"]
+
+  - entity: Assignment
+    initial_state: ACTIVE
+    terminal_states: [COMPLETED, RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "system side effect of POST /telerad/reports/{id}/sign on a report of this assignment"
+        actor: system
+        preconditions: ["assignment.status == ACTIVE", "signed report covers this assignment"]
+        side_effects: ["recomputes Radiologist.reserved_rvu (-= reserved_rvu)", "recomputes Radiologist.completed_rvu_24h (+= report.credited_rvu)", "recomputes stat_active_count"]
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /telerad/assignments/{id}/release or study cancel cascade"
+        actor: Radiologist
+        preconditions: ["assignment.status == ACTIVE"]
+        side_effects: ["recomputes Radiologist.reserved_rvu (-= reserved_rvu)", "recomputes stat_active_count"]
+
+  - entity: Report
+    initial_state: DRAFT
+    terminal_states: [SIGNED, SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: SIGNED
+        trigger: "POST /telerad/reports/{id}/sign"
+        actor: Radiologist
+        preconditions: ["report.status == DRAFT", "X-User-ID == report.radiologist_id", "report_type validity per Study machine"]
+        side_effects: ["sets signed_at and credited_rvu", "drives Study transition per report_type (see Study machine)"]
+      - from: SIGNED
+        to: SUPERSEDED
+        trigger: "system side effect of the study's FINAL report being signed (applies to the SIGNED PRELIMINARY report only)"
+        actor: system
+        preconditions: ["report.status == SIGNED", "report.report_type == PRELIMINARY", "a FINAL report on the same study transitions DRAFT->SIGNED"]
+        side_effects: ["report.status := SUPERSEDED", "credited_rvu already granted is NOT clawed back (provisional credit stands)"]
+
+  - entity: DiscrepancyCase
+    initial_state: OPEN
+    terminal_states: [RECONCILED, NO_ACTION_CLOSED]
+    transitions:
+      - from: OPEN
+        to: PEER_REVIEW
+        trigger: "POST /telerad/discrepancy-cases/{id}/open-peer-review"
+        actor: QaReviewer
+        preconditions: ["case.status == OPEN"]
+        side_effects: ["increments DiscrepancyCase.version by 1"]
+      - from: OPEN
+        to: NO_ACTION_CLOSED
+        trigger: "POST /telerad/discrepancy-cases/{id}/close-no-action"
+        actor: QaReviewer
+        preconditions: ["case.status == OPEN", "case.grade <= 1"]
+        side_effects: ["increments DiscrepancyCase.version by 1"]
+      - from: PEER_REVIEW
+        to: ESCALATED_QI
+        trigger: "POST /telerad/discrepancy-cases/{id}/escalate"
+        actor: QaReviewer
+        preconditions: ["case.status == PEER_REVIEW"]
+        side_effects: ["increments DiscrepancyCase.version by 1"]
+      - from: PEER_REVIEW
+        to: RECONCILED
+        trigger: "POST /telerad/discrepancy-cases/{id}/reconcile"
+        actor: QaReviewer
+        preconditions: ["case.status IN {PEER_REVIEW, ESCALATED_QI}", "X-User-ID differs from both the prelim report's radiologist_id and the final report's radiologist_id (else ERR_SELF_RECONCILIATION_FORBIDDEN)"]
+        side_effects: ["sets reconciled_by := X-User-ID, reconciliation_note from payload", "increments DiscrepancyCase.version by 1"]
+      - from: ESCALATED_QI
+        to: RECONCILED
+        trigger: "POST /telerad/discrepancy-cases/{id}/reconcile"
+        actor: QaReviewer
+        preconditions: ["same as PEER_REVIEW->RECONCILED"]
+        side_effects: ["same as PEER_REVIEW->RECONCILED"]
+
+  - entity: CriticalResultNotice
+    initial_state: PENDING
+    terminal_states: [READBACK_CONFIRMED]
+    transitions:
+      - from: PENDING
+        to: NOTIFIED
+        trigger: "POST /telerad/critical-notices/{id}/record-notification"
+        actor: Radiologist
+        preconditions: ["notice.status IN {PENDING, ESCALATED}", "X-User-ID == notice.radiologist_id"]
+        side_effects: ["sets notified_party_name, notified_at := now", "increments CriticalResultNotice.version by 1"]
+      - from: ESCALATED
+        to: NOTIFIED
+        trigger: "POST /telerad/critical-notices/{id}/record-notification"
+        actor: Radiologist
+        preconditions: ["same as PENDING->NOTIFIED"]
+        side_effects: ["same as PENDING->NOTIFIED"]
+      - from: NOTIFIED
+        to: READBACK_CONFIRMED
+        trigger: "POST /telerad/critical-notices/{id}/confirm-readback"
+        actor: ClientHospitalUser
+        preconditions: ["notice.status IN {NOTIFIED, ESCALATED} and notified_at is set", "X-User-ID == notice.study's hospital_id"]
+        side_effects: ["sets readback_confirmed_by, readback_at := now", "recomputes Radiologist.pending_critical_count (-= 1)"]
+      - from: ESCALATED
+        to: READBACK_CONFIRMED
+        trigger: "POST /telerad/critical-notices/{id}/confirm-readback"
+        actor: ClientHospitalUser
+        preconditions: ["same as NOTIFIED->READBACK_CONFIRMED"]
+        side_effects: ["same as NOTIFIED->READBACK_CONFIRMED"]
+      - from: PENDING
+        to: ESCALATED
+        trigger: "POST /telerad/critical-notices/{id}/escalate OR system clock sweep when now > created_at + 30 minutes"
+        actor: DispatchOps
+        preconditions: ["notice.status IN {PENDING, NOTIFIED}"]
+        side_effects: ["escalation_count += 1", "increments CriticalResultNotice.version by 1"]
+      - from: NOTIFIED
+        to: ESCALATED
+        trigger: "POST /telerad/critical-notices/{id}/escalate OR system clock sweep when readback outstanding and now > notified_at + 60 minutes"
+        actor: DispatchOps
+        preconditions: ["notice.status == NOTIFIED", "readback_at is null"]
+        side_effects: ["escalation_count += 1", "increments CriticalResultNotice.version by 1"]
+
+  - entity: CredentialGrant
+    initial_state: PENDING
+    terminal_states: [REVOKED]
+    transitions:
+      - from: PENDING
+        to: GRANTED
+        trigger: "POST /telerad/credential-grants/{id}/grant"
+        actor: PlatformAdmin
+        preconditions: ["grant.status == PENDING"]
+        side_effects: ["increments CredentialGrant.version by 1"]
+      - from: GRANTED
+        to: SUSPENDED
+        trigger: "POST /telerad/credential-grants/{id}/suspend"
+        actor: PlatformAdmin
+        preconditions: ["grant.status == GRANTED"]
+        side_effects: ["increments CredentialGrant.version by 1", "radiologist fails credential eligibility for this hospital while SUSPENDED"]
+      - from: SUSPENDED
+        to: GRANTED
+        trigger: "POST /telerad/credential-grants/{id}/reinstate"
+        actor: PlatformAdmin
+        preconditions: ["grant.status == SUSPENDED", "date(now) <= valid_until (else grant must expire first)"]
+        side_effects: ["increments CredentialGrant.version by 1"]
+      - from: GRANTED
+        to: REVOKED
+        trigger: "POST /telerad/credential-grants/{id}/revoke"
+        actor: PlatformAdmin
+        preconditions: ["grant.status == GRANTED"]
+        side_effects: ["increments CredentialGrant.version by 1"]
+      - from: GRANTED
+        to: EXPIRED
+        trigger: "system: POST /telerad/_clock/set_current_utc sweep when date(now) > valid_until"
+        actor: system
+        preconditions: ["grant.status == GRANTED", "date(now) > valid_until"]
+        side_effects: ["increments CredentialGrant.version by 1", "radiologist fails credential eligibility for this hospital"]
+      - from: EXPIRED
+        to: PENDING
+        trigger: "POST /telerad/credential-grants/{id}/renew"
+        actor: PlatformAdmin
+        preconditions: ["grant.status == EXPIRED", "new [valid_from, valid_until] inclusive-day window does not overlap any other grant for (radiologist_id, hospital_id) with status IN {PENDING, GRANTED, SUSPENDED} (else ERR_GRANT_OVERLAP)"]
+        side_effects: ["sets valid_from / valid_until from payload", "increments CredentialGrant.version by 1"]
+
+  - entity: BillingPeriod
+    initial_state: OPEN
+    terminal_states: [INVOICED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /telerad/billing-periods/{id}/close"
+        actor: PlatformAdmin
+        preconditions: ["period.status == OPEN"]
+        side_effects: ["increments BillingPeriod.version by 1"]
+      - from: CLOSED
+        to: OPEN
+        trigger: "POST /telerad/billing-periods/{id}/reopen"
+        actor: PlatformAdmin
+        preconditions: ["period.status == CLOSED", "date(now) <= period_end + 7 days, inclusive-day comparison (else ERR_REOPEN_WINDOW_EXPIRED)"]
+        side_effects: ["increments BillingPeriod.version by 1"]
+      - from: CLOSED
+        to: INVOICED
+        trigger: "POST /telerad/billing-periods/{id}/generate-invoice"
+        actor: PlatformAdmin
+        preconditions: ["period.status IN {CLOSED, INVOICED}", "expected_billing_period_version matches period.version (OCC, else ERR_STALE_VERSION)"]
+        side_effects: ["creates Invoice(status=CURRENT) via invoice_volume_pricing + invoice_total_composition", "when regenerating from INVOICED: previous CURRENT invoice -> VOID", "period.status := INVOICED", "increments BillingPeriod.version by 1"]
+      - from: INVOICED
+        to: INVOICED
+        trigger: "POST /telerad/billing-periods/{id}/generate-invoice (regenerate / supersede)"
+        actor: PlatformAdmin
+        preconditions: ["same as CLOSED->INVOICED"]
+        side_effects: ["same as CLOSED->INVOICED"]
+
+  - entity: Invoice
+    initial_state: CURRENT
+    terminal_states: [VOID]
+    transitions:
+      - from: CURRENT
+        to: VOID
+        trigger: "system side effect of POST /telerad/billing-periods/{id}/generate-invoice superseding this invoice"
+        actor: system
+        preconditions: ["invoice.status == CURRENT", "a new invoice is generated for the same billing period"]
+        side_effects: ["increments Invoice.version by 1"]
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC on parent version; serial-observable only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: routing-policy-create-stale-hospital
+    parent_entity: ClientHospital
+    write_endpoint: "POST /telerad/routing-policies"
+    occ_field: expected_hospital_version
+    description: |
+      Creating a RoutingPolicy against a ClientHospital whose version has advanced
+      since the client last observed it is rejected. Creating a policy legitimately
+      supersedes (retires) any same-key ACTIVE policy, so a writer holding a stale
+      hospital version would silently base its routing decision on a retired policy
+      set; the stale-version check forces re-read before supersession.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: invoice-generate-stale-period
+    parent_entity: BillingPeriod
+    write_endpoint: "POST /telerad/billing-periods/{id}/generate-invoice"
+    occ_field: expected_billing_period_version
+    description: |
+      Generating an invoice against a BillingPeriod whose version has advanced since
+      the client last observed it is rejected. Regeneration legitimately supersedes
+      (voids) the prior CURRENT invoice, so a stale-version generate would void an
+      invoice the caller never saw; the OCC check forces re-read before supersession.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: tat_deadline
+    trigger: "on Study creation (and on seeded finalized studies)"
+    algorithm: threshold
+    formula: |
+      tat_minutes = hospital.tat_stat_minutes    if study.priority == STAT
+                  = hospital.tat_urgent_minutes  if study.priority == URGENT
+                  = hospital.tat_routine_minutes if study.priority == ROUTINE
+      study.due_at = study.received_at + tat_minutes * 60 seconds
+    input_set: "the study and its hospital's TAT configuration at creation time"
+    constants: {}
+    precision: "second precision; due_at is an exact instant"
+    variants: []
+
+  - name: study_rvu
+    trigger: "on Assignment creation (reservation) and Report sign (credit)"
+    algorithm: aggregation
+    formula: |
+      study_rvu = RVU_BASE[study.modality]
+    input_set: "the study's modality"
+    constants:
+      RVU_BASE: { CT: 1.5, MR: 2.0, XR: 0.5, US: 1.0, NM: 1.5, MG: 1.0 }
+    precision: "1 decimal place"
+    variants: []
+
+  - name: tat_breach_and_penalty
+    trigger: "on TAT-relevant report sign (PRELIMINARY sign when policy.prelim_required, else FINAL sign); penalty aggregated at invoice generation"
+    algorithm: threshold
+    formula: |
+      relevant_signed_at = prelim signed_at if policy.prelim_required else first_final_signed_at
+      tat_breached = relevant_signed_at > due_at        # strict >: signing exactly AT due_at is on time
+      breach_minutes = floor((relevant_signed_at - due_at) / 60s) when breached else 0
+      per_study_penalty_cents = min(breach_minutes * hospital.penalty_per_breach_minute_cents,
+                                    hospital.breach_penalty_cap_cents)
+    input_set: "the study, its resolved policy, its hospital penalty config"
+    constants: {}
+    precision: "integer cents; whole minutes via floor"
+    variants: []
+
+  - name: auto_assignment_selector
+    trigger: "POST /telerad/assignments when radiologist_id is omitted"
+    algorithm: constraint_propagation
+    formula: |
+      candidate set = all Radiologist rows where:
+        (1) status == ACTIVE
+        (2) study.state_code IN radiologist.license_states
+        (3) when study.routing_policy_id is not null: policy.required_subspecialty IN radiologist.subspecialties
+        (4) exists CredentialGrant(radiologist, study.hospital_id) with status == GRANTED
+            and valid_from <= date(now) <= valid_until
+        (5) exists CoverageShift(radiologist) with status == ACTIVE and study.modality IN shift.modalities
+        (6) radiologist.id NOT IN study.excluded_radiologist_ids
+        (7) radiologist.reserved_rvu + study_rvu <= radiologist.fatigue_cap_rvu   # equality allowed
+        (8) when study.priority == STAT: radiologist.stat_active_count < radiologist.max_concurrent_stat
+        (9) when phase == FINAL and a SIGNED PRELIMINARY exists: radiologist.id != prelim signer id
+      ranking: utilization_ratio = (reserved_rvu + study_rvu) / fatigue_cap_rvu  ASC
+      tie-break 1: stat_active_count ASC
+      tie-break 2: radiologist.created_at ASC
+      empty candidate set -> ERR_NO_ELIGIBLE_RADIOLOGIST; study remains QUEUED
+      manual assignment (radiologist_id supplied) evaluates the same filters and maps the
+      FIRST failing filter to its error, in validation-priority order:
+        (2) ERR_LICENSURE_GAP, (4) ERR_CREDENTIAL_NOT_ACTIVE (safety, priority 7);
+        (6) ERR_READER_EXCLUDED_FOR_STUDY, (5) ERR_NO_ACTIVE_SHIFT (constraint, priority 8);
+        (7) ERR_FATIGUE_CAP_EXCEEDED, (8) ERR_STAT_CONCURRENCY_LIMIT (fiscal, priority 9).
+    input_set: "all Radiologist rows; study; resolved policy; grants; shifts; logical clock"
+    constants: {}
+    precision: "utilization_ratio compared exactly (rational arithmetic); no rounding"
+    variants: []
+
+  - name: fatigue_utilization
+    trigger: "evaluated on assignment creation and re-derived on every assignment/report mutation and on read"
+    algorithm: aggregation
+    formula: |
+      reserved_rvu        = sum(assignment.reserved_rvu for ACTIVE assignments of radiologist)
+      completed_rvu_24h   = sum(report.credited_rvu for SIGNED reports of radiologist
+                                with status IN {SIGNED, SUPERSEDED} and signed_at > now - 24h)   # strict lower bound: exactly 24h ago is excluded
+      utilization         = reserved_rvu + completed_rvu_24h
+    input_set: "radiologist's ACTIVE assignments; radiologist's SIGNED reports inside the trailing 24h window under the logical clock"
+    constants: { WINDOW_HOURS: 24 }
+    precision: "1 decimal place"
+    variants: []
+
+  - name: report_rvu_credit
+    trigger: "on POST /telerad/reports/{id}/sign"
+    algorithm: aggregation
+    formula: |
+      base = study_rvu(study.modality)
+      provisional credit (report_type == PRELIMINARY): credited_rvu = round_half_up(0.8 * base, 2)
+      final credit (report_type == FINAL):             credited_rvu = round_half_up(base * (1 - DISCREPANCY_PENALTY[grade]), 2)
+                                                       grade null (no prelim) -> penalty 0
+      addendum credit (report_type == ADDENDUM):       credited_rvu = 0.0
+    input_set: "the signed report, its study, discrepancy_grade"
+    constants:
+      DISCREPANCY_PENALTY: { "0": 0.0, "1": 0.0, "2": 0.25, "3": 0.5 }
+      PRELIM_FACTOR: 0.8
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: provisional
+        when: "PRELIMINARY report signed"
+        difference: "credits 0.8x base RVU; provisional credit is NOT clawed back when the final supersedes the prelim"
+      - name: final
+        when: "FINAL report signed"
+        difference: "credits base * (1 - discrepancy penalty); identical study_rvu therefore yields a different credit than the provisional variant"
+
+  - name: invoice_volume_pricing
+    trigger: "on POST /telerad/billing-periods/{id}/generate-invoice"
+    algorithm: tiered_pricing
+    formula: |
+      billable set = Study rows of period.hospital_id with first_final_signed_at in
+        [period_start 00:00:00Z, period_end + 1 day 00:00:00Z) and status IN {FINAL_SIGNED, AMENDMENT_PENDING}
+      unit order: first_final_signed_at ASC, tie-break created_at ASC
+      tiers (1-indexed units): units 1..1000 @ 901c; units 1001..5000 @ 801c; units 5001+ @ 701c
+      per-unit tier rate r(u) = rate of the tier containing unit index u (MARGINAL variant)
+      after-hours unit: study.received_at wall-clock UTC time-of-day in [22:00, 07:00)
+      after-hours unit price = round_half_up(r(u) * AFTER_HOURS_MULTIPLIER) per unit  # per-unit rounding pinned in invoice_total_composition
+      critical add-on: +250c per billable study whose study's SIGNED FINAL report has critical_finding == true
+      variant MARGINAL:  each unit billed at its own tier rate
+      variant FLAT_TIER: every unit billed at the rate of the HIGHEST tier reached by billable_study_count
+    input_set: "billable studies as defined above; hospital pricing_mode (snapshot at generation)"
+    constants:
+      TIER1_LIMIT: 1000
+      TIER1_RATE_CENTS: 901
+      TIER2_LIMIT: 5000
+      TIER2_RATE_CENTS: 801
+      TIER3_RATE_CENTS: 701
+      AFTER_HOURS_MULTIPLIER: 1.5
+      CRITICAL_ADDON_CENTS: 250
+    precision: "integer cents, round_half_up at the pinned rounding point only"
+    variants:
+      - name: marginal
+        when: "hospital.pricing_mode == MARGINAL"
+        difference: "units are split across tiers; units 1..1000 at tier1 rate, 1001..5000 at tier2 rate, etc."
+      - name: flat_tier
+        when: "hospital.pricing_mode == FLAT_TIER"
+        difference: "ALL units are billed at the single rate of the highest tier reached; identical volume yields a different total than marginal"
+
+  - name: invoice_total_composition
+    trigger: "on POST /telerad/billing-periods/{id}/generate-invoice (after invoice_volume_pricing)"
+    algorithm: waterfall_allocation
+    formula: |
+      PINNED ROUNDING ORDER (order matters; alternative orders differ by cents):
+        step 1: for each after-hours unit, unit_price = round_half_up(tier_rate * 1.5)   # round FIRST, per unit
+        step 2: aggregate units into lines keyed by (hour_class, tier_index); line amount = units * unit_price
+                (regular-hour unit_price = tier_rate, already whole cents)
+        step 3: gross_cents = sum(line amounts) + critical_addon_cents
+        step 4: penalty_credits_cents = sum over breached billable studies of
+                min(breach_minutes * penalty_per_breach_minute_cents, breach_penalty_cap_cents)
+        step 5: total_cents = max(0, gross_cents - penalty_credits_cents)
+      Counter-example showing order sensitivity: 3 after-hours tier1 units:
+        pinned order: 3 * round_half_up(901 * 1.5) = 3 * 1352 = 4056
+        sum-then-round: round_half_up(3 * 1351.5) = round_half_up(4054.5) = 4055  (FORBIDDEN interpretation)
+    input_set: "output of invoice_volume_pricing; hospital penalty config; billable studies' breach flags"
+    constants:
+      AFTER_HOURS_MULTIPLIER: 1.5
+      CRITICAL_ADDON_CENTS: 250
+    precision: "integer cents, round_half_up, rounding only at step 1"
+    variants: []
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present; role recognized. For entity_backed roles, X-User-ID must equal the id of an existing instance of the backing entity (Radiologist role -> existing Radiologist row; ClientHospitalUser role -> existing ClientHospital row)."
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role is listed in the endpoint's roles; ownership binding holds where declared (Radiologist may only act on own assignments/reports/notices; ClientHospitalUser may only act on studies/notices of the hospital whose id equals X-User-ID; study creation requires hospital_id == X-User-ID)."
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Path ids exist, validated left-to-right; body-referenced ids (study_id, radiologist_id, assignment_id, hospital_id, prelim_report_id, final_report_id) exist. Each missing resource raises its domain-specific NOT_FOUND error."
+    error_id: ERR_STUDY_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: business_constraint
+    check: "Required payload fields present; enum fields hold declared members; types correct; discrepancy_grade present on FINAL reports when a SIGNED PRELIMINARY exists. Unknown/extra payload fields are IGNORED (never rejected)."
+    error_id: ERR_VALIDATION
+    http_status: 400
+    applies_to: "all mutating endpoints"
+  - priority: 5
+    category: business_constraint
+    check: "OCC: expected_<parent>_version equals the parent's current version (routing-policies -> ClientHospital.version; generate-invoice -> BillingPeriod.version; assignments -> Study.version)."
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: ["POST /telerad/routing-policies", "POST /telerad/billing-periods/{id}/generate-invoice", "POST /telerad/assignments"]
+  - priority: 6
+    category: state
+    check: "Target resource state permits the transition per its state machine; related-entity state gates: study create/route require hospital ACTIVE (ERR_HOSPITAL_NOT_ACTIVE); generic invalid transitions raise ERR_INVALID_STATE."
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 7
+    category: business_safety
+    check: "Licensure and credentialing: radiologist holds license in study.state_code (ERR_LICENSURE_GAP); GRANTED, non-expired CredentialGrant for (radiologist, hospital) (ERR_CREDENTIAL_NOT_ACTIVE); grant_type equals hospital.credentialing_mode at grant creation (ERR_GRANT_TYPE_MISMATCH); final/addendum signer differs from prelim signer (ERR_SAME_READER_CONFLICT); discrepancy reconciler differs from both signers (ERR_SELF_RECONCILIATION_FORBIDDEN). Intra-priority order: license before credential."
+    error_id: ERR_LICENSURE_GAP
+    http_status: 422
+    applies_to: ["POST /telerad/assignments", "POST /telerad/credential-grants", "POST /telerad/reports/{id}/sign", "POST /telerad/discrepancy-cases/{id}/reconcile"]
+  - priority: 8
+    category: business_constraint
+    check: "Structural rules: unique (hospital_id, accession_number) among non-CANCELLED studies (ERR_DUPLICATE_ACCESSION); routing policy resolvable at route (ERR_NO_ROUTING_POLICY); CoverageShift half-open overlap per radiologist among {SCHEDULED, ACTIVE} (ERR_SHIFT_OVERLAP); CredentialGrant inclusive-day overlap per (radiologist, hospital) among {PENDING, GRANTED, SUSPENDED} (ERR_GRANT_OVERLAP); BillingPeriod inclusive-day overlap per hospital among {OPEN, CLOSED, INVOICED} (ERR_PERIOD_OVERLAP); reader not in study.excluded_radiologist_ids (ERR_READER_EXCLUDED_FOR_STUDY); ACTIVE modality-matching shift exists (ERR_NO_ACTIVE_SHIFT); report-type/study-state compatibility (ERR_PRELIM_NOT_PERMITTED, ERR_FINAL_NOT_DUE, ERR_ADDENDUM_NOT_PERMITTED); no non-terminal DiscrepancyCase blocks addendum request and duplicate manual case for same report pair (ERR_OPEN_DISCREPANCY_EXISTS)."
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: ["POST /telerad/studies", "POST /telerad/studies/{id}/route", "POST /telerad/studies/{id}/request-addendum", "POST /telerad/shifts", "POST /telerad/credential-grants", "POST /telerad/credential-grants/{id}/renew", "POST /telerad/billing-periods", "POST /telerad/assignments", "POST /telerad/reports", "POST /telerad/discrepancy-cases"]
+  - priority: 9
+    category: business_temporal
+    check: "Reopen grace (inclusive-day): date(now) <= period_end + 7 days; period_end 2026-05-31 allows reopen through 2026-06-07 and rejects 2026-06-08 (ERR_REOPEN_WINDOW_EXPIRED)."
+    error_id: ERR_REOPEN_WINDOW_EXPIRED
+    http_status: 422
+    applies_to: ["POST /telerad/billing-periods/{id}/reopen"]
+  - priority: 10
+    category: business_fiscal
+    check: "Capacity/fiscal: projected utilization reserved_rvu + study_rvu > fatigue_cap_rvu rejects (equality allowed) (ERR_FATIGUE_CAP_EXCEEDED); STAT concurrency stat_active_count >= max_concurrent_stat rejects (ERR_STAT_CONCURRENCY_LIMIT); auto-selector candidate pool empty (ERR_NO_ELIGIBLE_RADIOLOGIST)."
+    error_id: ERR_FATIGUE_CAP_EXCEEDED
+    http_status: 422
+    applies_to: ["POST /telerad/assignments"]
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # ---- test-driving / platform ----
+  - { method: POST, path: "/telerad/_clock/set_current_utc", description: "Sets the logical clock; startup default is exactly 2026-05-01T00:00:00Z (never wall-clock). Triggers sweeps: shift activation/completion, grant expiry, notice auto-escalation.", roles: [PlatformAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: ["CoverageShift SCHEDULED->ACTIVE / ->COMPLETED sweep", "CredentialGrant GRANTED->EXPIRED sweep", "CriticalResultNotice PENDING->ESCALATED (>30min) and NOTIFIED->ESCALATED (>60min without readback) sweep"] }
+  - { method: POST, path: "/telerad/_seed/finalized-studies", description: "Test-driving fixture: creates `count` Study rows for a hospital already in FINAL_SIGNED status with given received_at / first_final_signed_at (due_at, tat_breached, breach_minutes computed normally). Received_at time-of-day drives after-hours classification.", roles: [PlatformAdmin], code: 201, input: [hospital_id, count, received_at, final_signed_at, "modality?", "priority?", "body_part_group?", "critical_finding?"], output: "{ created_count: integer, study_ids: array }", side_effects: ["creates count Studies (status FINAL_SIGNED)", "computes due_at / tat_breached / breach_minutes per study"] }
+
+  # ---- ClientHospital ----
+  - { method: POST, path: "/telerad/hospitals", description: "Register a client hospital", roles: [PlatformAdmin], code: 201, input: [name, state_code, "credentialing_mode?", "pricing_mode?", "tat_stat_minutes?", "tat_urgent_minutes?", "tat_routine_minutes?", "penalty_per_breach_minute_cents?", "breach_penalty_cap_cents?"], output: ClientHospital, side_effects: [] }
+  - { method: GET, path: "/telerad/hospitals/{id}", description: "Read a hospital", roles: [PlatformAdmin, DispatchOps, ClientHospitalUser], code: 200, input: [], output: ClientHospital, side_effects: [] }
+  - { method: GET, path: "/telerad/hospitals", description: "List hospitals", roles: [PlatformAdmin, DispatchOps], code: 200, input: ["status?", "limit?", "offset?"], output: "ClientHospital[]", side_effects: [] }
+  - { method: POST, path: "/telerad/hospitals/{id}/activate", description: "ONBOARDING/SUSPENDED -> ACTIVE", roles: [PlatformAdmin], code: 200, input: [], output: ClientHospital, side_effects: ["increments ClientHospital.version by 1"] }
+  - { method: POST, path: "/telerad/hospitals/{id}/suspend", description: "ACTIVE -> SUSPENDED", roles: [PlatformAdmin], code: 200, input: [], output: ClientHospital, side_effects: ["increments ClientHospital.version by 1"] }
+
+  # ---- Radiologist ----
+  - { method: POST, path: "/telerad/radiologists", description: "Onboard a radiologist", roles: [PlatformAdmin], code: 201, input: [full_name, subspecialties, license_states, "status?", "fatigue_cap_rvu?", "max_concurrent_stat?"], output: Radiologist, side_effects: [] }
+  - { method: GET, path: "/telerad/radiologists/{id}", description: "Read a radiologist incl. computed utilization fields", roles: [PlatformAdmin, DispatchOps, Radiologist, QaReviewer], code: 200, input: [], output: Radiologist, side_effects: [] }
+  - { method: GET, path: "/telerad/radiologists", description: "List radiologists", roles: [PlatformAdmin, DispatchOps, QaReviewer], code: 200, input: ["status?", "state_code?", "subspecialty?", "limit?", "offset?"], output: "Radiologist[]", side_effects: [] }
+  - { method: PATCH, path: "/telerad/radiologists/{id}", description: "Update status / caps / credentials", roles: [PlatformAdmin], code: 200, input: ["status?", "fatigue_cap_rvu?", "max_concurrent_stat?", "subspecialties?", "license_states?"], output: Radiologist, side_effects: ["increments Radiologist.version by 1"] }
+
+  # ---- CoverageShift ----
+  - { method: POST, path: "/telerad/shifts", description: "Schedule a coverage shift; rejects half-open overlap per radiologist among {SCHEDULED, ACTIVE} (ERR_SHIFT_OVERLAP)", roles: [PlatformAdmin], code: 201, input: [radiologist_id, starts_at, ends_at, modalities], output: CoverageShift, side_effects: [] }
+  - { method: GET, path: "/telerad/shifts/{id}", description: "Read a shift", roles: [PlatformAdmin, DispatchOps, Radiologist], code: 200, input: [], output: CoverageShift, side_effects: [] }
+  - { method: GET, path: "/telerad/shifts", description: "List shifts (FK reverse lookup by radiologist)", roles: [PlatformAdmin, DispatchOps, Radiologist], code: 200, input: ["radiologist_id?", "status?", "limit?", "offset?"], output: "CoverageShift[]", side_effects: [] }
+  - { method: POST, path: "/telerad/shifts/{id}/cancel", description: "SCHEDULED -> CANCELLED", roles: [PlatformAdmin], code: 200, input: [], output: CoverageShift, side_effects: ["increments CoverageShift.version by 1"] }
+
+  # ---- RoutingPolicy ----
+  - { method: POST, path: "/telerad/routing-policies", description: "Create routing rule (OCC on hospital); a same-key ACTIVE policy is retired", roles: [PlatformAdmin], code: 201, input: [hospital_id, modality, body_part_group, priority, required_subspecialty, "prelim_required?", expected_hospital_version], output: RoutingPolicy, side_effects: ["increments ClientHospital.version by 1", "retires same-key ACTIVE RoutingPolicy"] }
+  - { method: GET, path: "/telerad/routing-policies/{id}", description: "Read a routing policy", roles: [PlatformAdmin, DispatchOps], code: 200, input: [], output: RoutingPolicy, side_effects: [] }
+  - { method: GET, path: "/telerad/routing-policies", description: "List routing policies (FK reverse lookup by hospital)", roles: [PlatformAdmin, DispatchOps], code: 200, input: ["hospital_id?", "status?", "limit?", "offset?"], output: "RoutingPolicy[]", side_effects: [] }
+
+  # ---- CredentialGrant ----
+  - { method: POST, path: "/telerad/credential-grants", description: "Apply for privileges; grant_type must equal hospital.credentialing_mode; inclusive-day overlap rejected (ERR_GRANT_OVERLAP)", roles: [PlatformAdmin], code: 201, input: [radiologist_id, hospital_id, grant_type, valid_from, valid_until], output: CredentialGrant, side_effects: [] }
+  - { method: GET, path: "/telerad/credential-grants/{id}", description: "Read a grant", roles: [PlatformAdmin, DispatchOps, Radiologist], code: 200, input: [], output: CredentialGrant, side_effects: [] }
+  - { method: GET, path: "/telerad/credential-grants", description: "List grants (FK reverse lookup by radiologist / hospital)", roles: [PlatformAdmin, DispatchOps, Radiologist], code: 200, input: ["radiologist_id?", "hospital_id?", "status?", "limit?", "offset?"], output: "CredentialGrant[]", side_effects: [] }
+  - { method: POST, path: "/telerad/credential-grants/{id}/grant", description: "PENDING -> GRANTED", roles: [PlatformAdmin], code: 200, input: [], output: CredentialGrant, side_effects: ["increments CredentialGrant.version by 1"] }
+  - { method: POST, path: "/telerad/credential-grants/{id}/suspend", description: "GRANTED -> SUSPENDED", roles: [PlatformAdmin], code: 200, input: [], output: CredentialGrant, side_effects: ["increments CredentialGrant.version by 1"] }
+  - { method: POST, path: "/telerad/credential-grants/{id}/reinstate", description: "SUSPENDED -> GRANTED", roles: [PlatformAdmin], code: 200, input: [], output: CredentialGrant, side_effects: ["increments CredentialGrant.version by 1"] }
+  - { method: POST, path: "/telerad/credential-grants/{id}/revoke", description: "GRANTED -> REVOKED", roles: [PlatformAdmin], code: 200, input: [], output: CredentialGrant, side_effects: ["increments CredentialGrant.version by 1"] }
+  - { method: POST, path: "/telerad/credential-grants/{id}/renew", description: "EXPIRED -> PENDING with new inclusive validity window", roles: [PlatformAdmin], code: 200, input: [valid_from, valid_until], output: CredentialGrant, side_effects: ["increments CredentialGrant.version by 1"] }
+
+  # ---- Study ----
+  - { method: POST, path: "/telerad/studies", description: "Register an inbound study (hospital must be ACTIVE; hospital_id must equal X-User-ID for ClientHospitalUser)", roles: [ClientHospitalUser], code: 201, input: [hospital_id, accession_number, modality, body_part_group, priority, patient_ref], output: Study, side_effects: ["sets state_code from hospital", "computes due_at via tat_deadline"] }
+  - { method: GET, path: "/telerad/studies/{id}", description: "Read a study", roles: [PlatformAdmin, DispatchOps, Radiologist, ClientHospitalUser, QaReviewer], code: 200, input: [], output: Study, side_effects: [] }
+  - { method: GET, path: "/telerad/studies", description: "List studies (FK reverse lookups by hospital / routing policy / assigned radiologist)", roles: [PlatformAdmin, DispatchOps, Radiologist, ClientHospitalUser, QaReviewer], code: 200, input: ["hospital_id?", "routing_policy_id?", "assigned_radiologist_id?", "status?", "priority?", "limit?", "offset?"], output: "Study[]", side_effects: [] }
+  - { method: POST, path: "/telerad/studies/{id}/route", description: "RECEIVED -> QUEUED; resolves ACTIVE RoutingPolicy", roles: [DispatchOps], code: 200, input: [], output: Study, side_effects: ["sets routing_policy_id", "increments Study.version by 1"] }
+  - { method: POST, path: "/telerad/studies/{id}/cancel", description: "Cancel a non-finalized study; releases ACTIVE assignment and reserved RVU", roles: [ClientHospitalUser, DispatchOps], code: 200, input: [], output: Study, side_effects: ["ACTIVE assignment -> RELEASED", "recomputes radiologist reserved_rvu / stat_active_count", "increments Study.version by 1"] }
+  - { method: POST, path: "/telerad/studies/{id}/request-addendum", description: "FINAL_SIGNED -> AMENDMENT_PENDING (blocked while a non-terminal DiscrepancyCase exists)", roles: [ClientHospitalUser], code: 200, input: [], output: Study, side_effects: ["increments Study.version by 1"] }
+
+  # ---- Assignment ----
+  - { method: POST, path: "/telerad/assignments", description: "Assign a study (manual radiologist_id or auto_assignment_selector); OCC on Study.version", roles: [DispatchOps], code: 201, input: [study_id, "radiologist_id?", expected_study_version], output: Assignment, side_effects: ["study -> ASSIGNED", "recomputes radiologist reserved_rvu / stat_active_count", "increments Study.version by 1"] }
+  - { method: GET, path: "/telerad/assignments/{id}", description: "Read an assignment", roles: [PlatformAdmin, DispatchOps, Radiologist, QaReviewer], code: 200, input: [], output: Assignment, side_effects: [] }
+  - { method: GET, path: "/telerad/assignments", description: "List assignments (FK reverse lookup by study / radiologist)", roles: [PlatformAdmin, DispatchOps, Radiologist, QaReviewer], code: 200, input: ["study_id?", "radiologist_id?", "status?", "limit?", "offset?"], output: "Assignment[]", side_effects: [] }
+  - { method: POST, path: "/telerad/assignments/{id}/accept", description: "Radiologist accepts own assignment; study -> IN_PROGRESS", roles: [Radiologist], code: 200, input: [], output: Assignment, side_effects: ["study -> IN_PROGRESS", "increments Study.version by 1", "increments Assignment.version by 1"] }
+  - { method: POST, path: "/telerad/assignments/{id}/release", description: "Radiologist releases own assignment; study -> QUEUED and radiologist added to study exclusion list", roles: [Radiologist], code: 200, input: [], output: Assignment, side_effects: ["study -> QUEUED", "appends excluded_radiologist_ids", "recomputes reserved_rvu / stat_active_count", "increments Study.version by 1"] }
+
+  # ---- Report ----
+  - { method: POST, path: "/telerad/reports", description: "Create a DRAFT report on an ACTIVE assignment whose study is IN_PROGRESS (author = assignment radiologist)", roles: [Radiologist], code: 201, input: [assignment_id, report_type, findings_text, impression_text, "critical_finding?", "discrepancy_grade?"], output: Report, side_effects: [] }
+  - { method: GET, path: "/telerad/reports/{id}", description: "Read a report", roles: [PlatformAdmin, DispatchOps, Radiologist, QaReviewer, ClientHospitalUser], code: 200, input: [], output: Report, side_effects: [] }
+  - { method: GET, path: "/telerad/reports", description: "List reports (FK reverse lookup by study / assignment / radiologist)", roles: [PlatformAdmin, DispatchOps, Radiologist, QaReviewer, ClientHospitalUser], code: 200, input: ["study_id?", "assignment_id?", "radiologist_id?", "report_type?", "status?", "limit?", "offset?"], output: "Report[]", side_effects: [] }
+  - { method: POST, path: "/telerad/reports/{id}/sign", description: "DRAFT -> SIGNED; drives study transition, RVU credit, TAT evaluation, discrepancy-case and critical-notice cascades", roles: [Radiologist], code: 200, input: [], output: Report, side_effects: ["Study transition per report_type", "credited_rvu per report_rvu_credit", "assignment -> COMPLETED", "prelim SUPERSEDED on final sign", "DiscrepancyCase AUTO when grade >= 2", "CriticalResultNotice PENDING when critical_finding", "recomputes radiologist utilization + pending_critical_count"] }
+
+  # ---- DiscrepancyCase ----
+  - { method: POST, path: "/telerad/discrepancy-cases", description: "Manual case creation by QA (origin=MANUAL); rejects duplicate non-terminal case for the same (prelim, final) report pair", roles: [QaReviewer], code: 201, input: [prelim_report_id, final_report_id], output: DiscrepancyCase, side_effects: [] }
+  - { method: GET, path: "/telerad/discrepancy-cases/{id}", description: "Read a case", roles: [PlatformAdmin, DispatchOps, QaReviewer], code: 200, input: [], output: DiscrepancyCase, side_effects: [] }
+  - { method: GET, path: "/telerad/discrepancy-cases", description: "List cases (FK reverse lookup by study / prelim report / final report)", roles: [PlatformAdmin, DispatchOps, QaReviewer], code: 200, input: ["study_id?", "prelim_report_id?", "final_report_id?", "status?", "limit?", "offset?"], output: "DiscrepancyCase[]", side_effects: [] }
+  - { method: POST, path: "/telerad/discrepancy-cases/{id}/open-peer-review", description: "OPEN -> PEER_REVIEW", roles: [QaReviewer], code: 200, input: [], output: DiscrepancyCase, side_effects: ["increments DiscrepancyCase.version by 1"] }
+  - { method: POST, path: "/telerad/discrepancy-cases/{id}/close-no-action", description: "OPEN -> NO_ACTION_CLOSED (grade <= 1 only)", roles: [QaReviewer], code: 200, input: [], output: DiscrepancyCase, side_effects: ["increments DiscrepancyCase.version by 1"] }
+  - { method: POST, path: "/telerad/discrepancy-cases/{id}/escalate", description: "PEER_REVIEW -> ESCALATED_QI", roles: [QaReviewer], code: 200, input: [], output: DiscrepancyCase, side_effects: ["increments DiscrepancyCase.version by 1"] }
+  - { method: POST, path: "/telerad/discrepancy-cases/{id}/reconcile", description: "PEER_REVIEW/ESCALATED_QI -> RECONCILED; reconciler must not be a signer", roles: [QaReviewer], code: 200, input: [reconciliation_note], output: DiscrepancyCase, side_effects: ["sets reconciled_by", "increments DiscrepancyCase.version by 1"] }
+
+  # ---- CriticalResultNotice ----
+  - { method: GET, path: "/telerad/critical-notices/{id}", description: "Read a notice", roles: [PlatformAdmin, DispatchOps, Radiologist, ClientHospitalUser, QaReviewer], code: 200, input: [], output: CriticalResultNotice, side_effects: [] }
+  - { method: GET, path: "/telerad/critical-notices", description: "List notices (FK reverse lookup by report / study / radiologist)", roles: [PlatformAdmin, DispatchOps, Radiologist, ClientHospitalUser, QaReviewer], code: 200, input: ["report_id?", "study_id?", "radiologist_id?", "status?", "limit?", "offset?"], output: "CriticalResultNotice[]", side_effects: [] }
+  - { method: POST, path: "/telerad/critical-notices/{id}/record-notification", description: "PENDING/ESCALATED -> NOTIFIED (only the signing radiologist)", roles: [Radiologist], code: 200, input: [notified_party_name], output: CriticalResultNotice, side_effects: ["sets notified_at", "increments CriticalResultNotice.version by 1"] }
+  - { method: POST, path: "/telerad/critical-notices/{id}/confirm-readback", description: "NOTIFIED/ESCALATED -> READBACK_CONFIRMED (hospital owning the study)", roles: [ClientHospitalUser], code: 200, input: [readback_confirmed_by], output: CriticalResultNotice, side_effects: ["sets readback_at", "recomputes radiologist pending_critical_count (-=1)", "increments CriticalResultNotice.version by 1"] }
+  - { method: POST, path: "/telerad/critical-notices/{id}/escalate", description: "PENDING/NOTIFIED -> ESCALATED (manual; clock sweep performs the automatic form)", roles: [DispatchOps], code: 200, input: [], output: CriticalResultNotice, side_effects: ["escalation_count += 1", "increments CriticalResultNotice.version by 1"] }
+
+  # ---- BillingPeriod / Invoice ----
+  - { method: POST, path: "/telerad/billing-periods", description: "Open a billing period; inclusive-day overlap per hospital rejected (ERR_PERIOD_OVERLAP)", roles: [PlatformAdmin], code: 201, input: [hospital_id, period_start, period_end], output: BillingPeriod, side_effects: [] }
+  - { method: GET, path: "/telerad/billing-periods/{id}", description: "Read a period", roles: [PlatformAdmin, ClientHospitalUser], code: 200, input: [], output: BillingPeriod, side_effects: [] }
+  - { method: GET, path: "/telerad/billing-periods", description: "List periods (FK reverse lookup by hospital)", roles: [PlatformAdmin, ClientHospitalUser], code: 200, input: ["hospital_id?", "status?", "limit?", "offset?"], output: "BillingPeriod[]", side_effects: [] }
+  - { method: POST, path: "/telerad/billing-periods/{id}/close", description: "OPEN -> CLOSED", roles: [PlatformAdmin], code: 200, input: [], output: BillingPeriod, side_effects: ["increments BillingPeriod.version by 1"] }
+  - { method: POST, path: "/telerad/billing-periods/{id}/reopen", description: "CLOSED -> OPEN within grace window (inclusive-day: date(now) <= period_end + 7 days)", roles: [PlatformAdmin], code: 200, input: [], output: BillingPeriod, side_effects: ["increments BillingPeriod.version by 1"] }
+  - { method: POST, path: "/telerad/billing-periods/{id}/generate-invoice", description: "CLOSED/INVOICED -> INVOICED; computes Invoice; OCC on BillingPeriod.version; supersedes (voids) prior CURRENT invoice", roles: [PlatformAdmin], code: 201, input: [expected_billing_period_version], output: Invoice, side_effects: ["runs invoice_volume_pricing + invoice_total_composition", "prior CURRENT Invoice -> VOID", "period -> INVOICED", "increments BillingPeriod.version by 1"] }
+  - { method: GET, path: "/telerad/invoices/{id}", description: "Read an invoice incl. computed line_items/totals", roles: [PlatformAdmin, ClientHospitalUser], code: 200, input: [], output: Invoice, side_effects: [] }
+  - { method: GET, path: "/telerad/invoices", description: "List invoices (FK reverse lookup by billing period / hospital)", roles: [PlatformAdmin, ClientHospitalUser], code: 200, input: ["billing_period_id?", "hospital_id?", "status?", "limit?", "offset?"], output: "Invoice[]", side_effects: [] }
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/unknown X-User-Role or X-User-ID, or entity_backed role id does not resolve to an existing backing entity" }
+  - { id: ERR_UNAUTHORIZED, http: 403, condition: "Role not permitted on endpoint, or ownership binding violated (e.g., radiologist acting on another's assignment, hospital user acting on another hospital's study)" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Missing required field, invalid enum member, bad type, or missing discrepancy_grade on a FINAL report when a SIGNED PRELIMINARY exists" }
+  - { id: ERR_HOSPITAL_NOT_FOUND, http: 404, condition: "Referenced hospital id does not exist" }
+  - { id: ERR_RADIOLOGIST_NOT_FOUND, http: 404, condition: "Referenced radiologist id does not exist" }
+  - { id: ERR_SHIFT_NOT_FOUND, http: 404, condition: "Referenced shift id does not exist" }
+  - { id: ERR_POLICY_NOT_FOUND, http: 404, condition: "Referenced routing policy id does not exist" }
+  - { id: ERR_GRANT_NOT_FOUND, http: 404, condition: "Referenced credential grant id does not exist" }
+  - { id: ERR_STUDY_NOT_FOUND, http: 404, condition: "Referenced study id does not exist" }
+  - { id: ERR_ASSIGNMENT_NOT_FOUND, http: 404, condition: "Referenced assignment id does not exist" }
+  - { id: ERR_REPORT_NOT_FOUND, http: 404, condition: "Referenced report id does not exist" }
+  - { id: ERR_CASE_NOT_FOUND, http: 404, condition: "Referenced discrepancy case id does not exist" }
+  - { id: ERR_NOTICE_NOT_FOUND, http: 404, condition: "Referenced critical-result notice id does not exist" }
+  - { id: ERR_BILLING_PERIOD_NOT_FOUND, http: 404, condition: "Referenced billing period id does not exist" }
+  - { id: ERR_INVOICE_NOT_FOUND, http: 404, condition: "Referenced invoice id does not exist" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Target resource state does not permit the requested transition per its state machine" }
+  - { id: ERR_HOSPITAL_NOT_ACTIVE, http: 409, condition: "Study creation or routing attempted against a hospital not in ACTIVE status" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent entity's current version (OCC)" }
+  - { id: ERR_DUPLICATE_ACCESSION, http: 409, condition: "Another non-CANCELLED study for the same hospital already holds this accession_number" }
+  - { id: ERR_NO_ROUTING_POLICY, http: 422, condition: "No ACTIVE RoutingPolicy matches (hospital_id, modality, body_part_group, priority) at route time" }
+  - { id: ERR_LICENSURE_GAP, http: 422, condition: "Radiologist.license_states does not contain study.state_code" }
+  - { id: ERR_CREDENTIAL_NOT_ACTIVE, http: 422, condition: "No CredentialGrant with status GRANTED and valid_from <= today <= valid_until for (radiologist, hospital)" }
+  - { id: ERR_GRANT_TYPE_MISMATCH, http: 422, condition: "grant_type differs from the hospital's credentialing_mode" }
+  - { id: ERR_SAME_READER_CONFLICT, http: 422, condition: "FINAL/ADDENDUM signer equals the PRELIMINARY signer of the same study" }
+  - { id: ERR_PRELIM_NOT_PERMITTED, http: 422, condition: "PRELIMINARY report when resolved policy.prelim_required is false, or a SIGNED PRELIMINARY already exists" }
+  - { id: ERR_FINAL_NOT_DUE, http: 422, condition: "FINAL report when policy.prelim_required is true but no SIGNED PRELIMINARY exists yet" }
+  - { id: ERR_ADDENDUM_NOT_PERMITTED, http: 422, condition: "ADDENDUM report when the study has no signed FINAL (first_final_signed_at is null)" }
+  - { id: ERR_SHIFT_OVERLAP, http: 409, condition: "Half-open interval [starts_at, ends_at) collides with another shift of the same radiologist in status SCHEDULED or ACTIVE; touching endpoints (end == start) is allowed" }
+  - { id: ERR_GRANT_OVERLAP, http: 409, condition: "Inclusive-day [valid_from, valid_until] window shares at least one calendar day with another grant for the same (radiologist, hospital) in status PENDING/GRANTED/SUSPENDED" }
+  - { id: ERR_PERIOD_OVERLAP, http: 409, condition: "Inclusive-day [period_start, period_end] window overlaps another billing period of the same hospital in status OPEN/CLOSED/INVOICED" }
+  - { id: ERR_NO_ACTIVE_SHIFT, http: 422, condition: "Manual assignment: radiologist has no ACTIVE CoverageShift whose modalities include the study modality" }
+  - { id: ERR_READER_EXCLUDED_FOR_STUDY, http: 422, condition: "Manual assignment: radiologist is in study.excluded_radiologist_ids (previously released this study)" }
+  - { id: ERR_OPEN_DISCREPANCY_EXISTS, http: 409, condition: "Addendum request or manual case creation blocked by an existing DiscrepancyCase with status OPEN/PEER_REVIEW/ESCALATED_QI for the study (or same report pair)" }
+  - { id: ERR_REOPEN_WINDOW_EXPIRED, http: 422, condition: "Reopen attempted when date(now) > period_end + 7 days (inclusive-day grace)" }
+  - { id: ERR_FATIGUE_CAP_EXCEEDED, http: 422, condition: "Projected utilization reserved_rvu + study_rvu would be strictly greater than fatigue_cap_rvu (equality is allowed)" }
+  - { id: ERR_STAT_CONCURRENCY_LIMIT, http: 422, condition: "STAT study assignment when radiologist.stat_active_count >= max_concurrent_stat (at the limit rejects)" }
+  - { id: ERR_NO_ELIGIBLE_RADIOLOGIST, http: 422, condition: "Auto-selector candidate pool is empty after eligibility filters; study remains QUEUED" }
+  - { id: ERR_SELF_RECONCILIATION_FORBIDDEN, http: 403, condition: "Reconciler's X-User-ID equals the prelim or final report's radiologist_id (segregation of duties)" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlatformAdmin
+    description: "Teleradiology platform operator; manages hospitals, radiologists, shifts, routing policies, credential grants, billing; drives the logical clock and fixtures"
+    identity: opaque
+    exclusive_operations: ["hospital/radiologist/shift/routing-policy/credential-grant/billing-period administration", "POST /telerad/_clock/set_current_utc", "POST /telerad/_seed/finalized-studies"]
+    shared_operations: ["read access to all resources"]
+  - name: DispatchOps
+    description: "Operations dispatcher; routes studies, builds worklists by assigning studies, escalates critical-result notices"
+    identity: opaque
+    exclusive_operations: ["POST /telerad/studies/{id}/route", "POST /telerad/assignments", "POST /telerad/critical-notices/{id}/escalate"]
+    shared_operations: ["POST /telerad/studies/{id}/cancel", "read access to studies/assignments/reports/hospitals/radiologists/shifts/grants/notices/cases"]
+  - name: Radiologist
+    description: "Reading physician; accepts/releases own assignments, authors and signs reports, documents critical-result notification"
+    identity: "entity_backed:Radiologist"
+    exclusive_operations: ["POST /telerad/assignments/{id}/accept", "POST /telerad/assignments/{id}/release", "POST /telerad/reports", "POST /telerad/reports/{id}/sign", "POST /telerad/critical-notices/{id}/record-notification"]
+    shared_operations: ["read access to studies/assignments/reports/notices/shifts/grants/self"]
+  - name: ClientHospitalUser
+    description: "Client hospital operator; submits and cancels own studies, requests addenda, confirms critical-result read-back"
+    identity: "entity_backed:ClientHospital"
+    exclusive_operations: ["POST /telerad/studies", "POST /telerad/studies/{id}/request-addendum", "POST /telerad/critical-notices/{id}/confirm-readback"]
+    shared_operations: ["POST /telerad/studies/{id}/cancel (own hospital)", "read access to own studies/reports/notices/invoices/periods"]
+  - name: QaReviewer
+    description: "Quality/peer-review officer; manages discrepancy cases; barred from reconciling cases where they were a signer"
+    identity: opaque
+    exclusive_operations: ["POST /telerad/discrepancy-cases", "POST /telerad/discrepancy-cases/{id}/open-peer-review", "POST /telerad/discrepancy-cases/{id}/close-no-action", "POST /telerad/discrepancy-cases/{id}/escalate", "POST /telerad/discrepancy-cases/{id}/reconcile"]
+    shared_operations: ["read access to studies/reports/assignments/radiologists/cases"]

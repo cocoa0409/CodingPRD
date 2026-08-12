@@ -1,0 +1,1022 @@
+scenario: |
+  1246. Hospitalist Rounding & Census Management (hospitalist group): patient assignment & continuity rules, census leveling across providers & admission distribution, admission/discharge order timing & throughput target, handoff documentation at shift change, consult request routing & response time, length-of-stay & observation-status monitoring, night coverage & cross-cover load, productivity (encounters/wRVU) reporting
+
+domain_name: "hospitalist-census"
+api_prefix: ""
+
+complexity_profile:
+  primary_archetype: quota_allocation        # finite census capacity per provider, competed for by admissions
+  secondary_archetype: temporal_windowing    # shifts, coverage windows, observation 48h rule, consult SLA windows
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Handoff.version and Assignment.version
+    - rate_threshold_triggers                # census cap flips distribution_eligible; SLA/obs/LOS thresholds
+    - ops_run_checkpoint                     # POST /ops/monitor-run advances obs conversions, escalations, window locks
+    - selector_policy                        # admission distribution selector with eligibility/ranking/tie-break/fallback
+  entity_topology: flat                      # peer entities joined by foreign keys; no nested URL ownership except two create shortcuts
+  state_machine_shape: cyclic                # Assignment, Admission, Handoff, ConsultRequest, CoverageWindow, ProductivityReport all cycle; Patient carries parallel dimensions
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: peer_roles                     # GroupAdmin vs Hospitalist vs ConsultingSpecialist own disjoint operations
+  consistency_model: immediate               # every mutation + cascaded side effect visible in the same response / subsequent read
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Hospitalist
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Provider full name" }
+      - { name: specialty, type: enum, source: input, description: "Practice specialty", constraints: "one of INTERNAL_MEDICINE, FAMILY_MEDICINE, ICU" }
+      - { name: employment_status, type: enum, source: input, default: ACTIVE, description: "Employment state", constraints: "one of ACTIVE, ON_LEAVE, INACTIVE" }
+      - { name: max_census_cap, type: integer, source: input, default: 16, description: "Maximum number of ACTIVE assignments the hospitalist may hold at once", constraints: ">= 1" }
+      - { name: night_eligible, type: boolean, source: input, default: true, description: "May enroll in night coverage windows" }
+      - { name: current_census, type: integer, source: computed, default: 0, description: "Count of Assignment rows with status ACTIVE for this hospitalist; refreshed on every assignment mutation" }
+      - { name: pending_offers, type: integer, source: computed, default: 0, description: "Count of Admission rows status OFFERED with offered_to_hospitalist_id = this hospitalist" }
+      - { name: distribution_eligible, type: boolean, source: computed, default: true, description: "false while employment_status != ACTIVE or current_census >= max_census_cap; recomputed on every census or employment mutation" }
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - { name: mrn, type: string, source: input, description: "Medical record number", constraints: "unique across all patients" }
+      - { name: acuity, type: enum, source: input, description: "Clinical acuity", constraints: "one of HIGH, MEDIUM, LOW" }
+      - { name: admit_source, type: enum, source: input, description: "Arrival channel", constraints: "one of ED, DIRECT, TRANSFER" }
+      - { name: stay_type, type: enum, source: input, description: "INPATIENT or OBSERVATION at registration; flipped to INPATIENT by obs conversion", constraints: "one of INPATIENT, OBSERVATION" }
+      - { name: admitted_at, type: datetime, source: input, default: "current logical clock", description: "Admission timestamp (ISO8601 UTC); defaults to logical clock when omitted" }
+      - { name: admission_status, type: enum, source: system, default: ADMITTED, description: "Parallel dimension 1: ADMITTED -> DISCHARGED", constraints: "one of ADMITTED, DISCHARGED" }
+      - { name: observation_status, type: enum, source: system, description: "Parallel dimension 2: NONE for INPATIENT stay_type, else OBS_ACTIVE at creation", constraints: "one of NONE, OBS_ACTIVE, OBS_CONVERTED, OBS_CLOSED" }
+      - { name: observation_started_at, type: datetime, source: system, description: "Equals admitted_at when stay_type == OBSERVATION; null otherwise" }
+      - { name: los_midnights, type: integer, source: computed, default: 0, description: "Count of calendar-date boundaries (midnights UTC) crossed between admitted_at and the logical clock; refreshed by monitor-run" }
+      - { name: los_blocks, type: integer, source: computed, default: 0, description: "floor(elapsed_hours since admitted_at / 24); refreshed by monitor-run" }
+      - { name: los_alert_flag, type: boolean, source: computed, default: false, description: "true when los_midnights > EXPECTED_LOS_DAYS[stay_type][acuity] * LOS_ALERT_MULTIPLIER; refreshed by monitor-run" }
+
+  - name: Shift
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospitalist_id, type: string, source: input, description: "FK -> Hospitalist.id; owner of this shift" }
+      - { name: shift_type, type: enum, source: input, description: "one of DAY, NIGHT", constraints: "one of DAY, NIGHT" }
+      - { name: start_at, type: datetime, source: input, description: "Shift start (ISO8601 UTC); half-open interval start" }
+      - { name: end_at, type: datetime, source: input, description: "Shift end (ISO8601 UTC); half-open interval end; must be > start_at" }
+      - { name: state, type: enum, source: system, default: SCHEDULED, description: "SCHEDULED -> ACTIVE -> CLOSED", constraints: "one of SCHEDULED, ACTIVE, CLOSED" }
+
+  - name: Admission
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id; patient entering the distribution queue" }
+      - { name: status, type: enum, source: system, default: QUEUED, description: "QUEUED -> OFFERED -> ACCEPTED; OFFERED -> QUEUED on decline (selector re-runs)", constraints: "one of QUEUED, OFFERED, ACCEPTED" }
+      - { name: offered_to_hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; current offer target; null while QUEUED" }
+      - { name: declined_hospitalist_ids, type: array, source: system, default: "[]", description: "Hospitalist ids that declined this admission; excluded from subsequent selector runs for this admission" }
+      - { name: distribution_score, type: number, source: computed, description: "Winning candidate score from the most recent selector run; null while QUEUED" }
+      - { name: assignment_id, type: string, source: system, description: "FK -> Assignment.id; assignment created by acceptance; null until ACCEPTED" }
+      - { name: offered_at, type: datetime, source: system, description: "Timestamp of last OFFERED transition; null while never offered" }
+      - { name: decided_at, type: datetime, source: system, description: "Timestamp of ACCEPTED transition; null until decided" }
+
+  - name: Assignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id; assigned patient" }
+      - { name: hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; currently responsible hospitalist" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE -> PENDING_TRANSFER -> CLOSED | ACTIVE (cycle)", constraints: "one of ACTIVE, PENDING_TRANSFER, CLOSED" }
+      - { name: continuity_flag, type: boolean, source: computed, description: "true when this assignment restores a hospitalist-patient pairing whose prior CLOSED assignment closed within CONTINUITY_WINDOW_DAYS of assignment creation" }
+      - { name: assigned_at, type: datetime, source: system, description: "Creation timestamp of this assignment" }
+      - { name: closed_at, type: datetime, source: system, description: "Closure timestamp; null while ACTIVE/PENDING_TRANSFER" }
+      - { name: close_reason, type: enum, source: system, description: "Why the assignment closed", constraints: "one of DISCHARGE, TRANSFER; null while open" }
+      - { name: transfer_target_hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; pending transfer target; set while PENDING_TRANSFER, null otherwise" }
+
+  - name: DischargeOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id; taken from the create path" }
+      - { name: ordering_hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; X-User-ID of the creator" }
+      - { name: status, type: enum, source: system, default: PLANNED, description: "PLANNED -> ORDERED -> EXECUTED", constraints: "one of PLANNED, ORDERED, EXECUTED" }
+      - { name: target_discharge_at, type: datetime, source: input, description: "Planned discharge instant; the throughput cutoff derives from its calendar date" }
+      - { name: ordered_at, type: datetime, source: system, description: "Timestamp of PLANNED -> ORDERED" }
+      - { name: executed_at, type: datetime, source: system, description: "Timestamp of ORDERED -> EXECUTED" }
+      - { name: meets_throughput_target, type: boolean, source: computed, description: "true when executed_at <= date(target_discharge_at)T11:00:00Z; null until EXECUTED" }
+
+  - name: Handoff
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shift_id, type: string, source: system, description: "FK -> Shift.id; outgoing shift taken from the create path" }
+      - { name: receiving_hospitalist_id, type: string, source: input, description: "FK -> Hospitalist.id; hospitalist accepting the signout" }
+      - { name: patient_ids, type: array, source: input, description: "Patient ids covered by this signout" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT -> SUBMITTED -> ACCEPTED | RETURNED -> SUBMITTED (cycle)", constraints: "one of DRAFT, SUBMITTED, RETURNED, ACCEPTED" }
+      - { name: required_patient_count, type: integer, source: computed, description: "Count of ACTIVE assignments of the shift's hospitalist at submit time" }
+      - { name: covered_patient_count, type: integer, source: computed, description: "Count of required patients present in patient_ids" }
+      - { name: open_item_count, type: integer, source: computed, description: "required_patient_count - covered_patient_count; must equal 0 to submit" }
+      - { name: completeness_score, type: number, source: computed, description: "covered_patient_count / required_patient_count; 1.0 when required_patient_count == 0" }
+      - { name: submitted_at, type: datetime, source: system, description: "Last DRAFT|RETURNED -> SUBMITTED timestamp" }
+      - { name: reviewed_at, type: datetime, source: system, description: "ACCEPTED timestamp" }
+      - { name: return_reason, type: string, source: input, description: "Required on SUBMITTED -> RETURNED; stored on the handoff" }
+
+  - name: ConsultRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: patient_id, type: string, source: system, description: "FK -> Patient.id; taken from the create path" }
+      - { name: requesting_hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; X-User-ID of the creator; must hold an ACTIVE assignment for the patient" }
+      - { name: specialty, type: enum, source: input, description: "Consult specialty", constraints: "one of CARDIOLOGY, NEUROLOGY, SURGERY, INFECTIOUS_DISEASE, NEPHROLOGY" }
+      - { name: priority, type: enum, source: input, description: "Response urgency", constraints: "one of STAT, URGENT, ROUTINE" }
+      - { name: reason, type: string, source: input, description: "Clinical question" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN -> ACKNOWLEDGED -> COMPLETED -> REOPENED -> ACKNOWLEDGED (cycle); OPEN -> ESCALATED (monitor-run); COMPLETED -> CLOSED (monitor-run)", constraints: "one of OPEN, ACKNOWLEDGED, COMPLETED, ESCALATED, REOPENED, CLOSED" }
+      - { name: requested_at, type: datetime, source: system, description: "Creation timestamp" }
+      - { name: sla_deadline, type: datetime, source: computed, description: "requested_at + SLA_MINUTES[priority]; never recomputed on reopen" }
+      - { name: sla_breached, type: boolean, source: computed, default: false, description: "Set at acknowledge: acknowledged_at > sla_deadline (strictly greater)" }
+      - { name: acknowledged_at, type: datetime, source: system, description: "Timestamp of last acknowledge" }
+      - { name: completed_at, type: datetime, source: system, description: "Timestamp of ACKNOWLEDGED -> COMPLETED" }
+      - { name: escalation_count, type: integer, source: system, default: 0, description: "Number of OPEN -> ESCALATED transitions" }
+      - { name: response_minutes, type: number, source: computed, description: "(completed_at - requested_at) in minutes, 2 decimals; null until COMPLETED" }
+
+  - name: Encounter
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospitalist_id, type: string, source: system, description: "FK -> Hospitalist.id; X-User-ID of the recording hospitalist" }
+      - { name: patient_id, type: string, source: input, description: "FK -> Patient.id; encounter subject" }
+      - { name: encounter_type, type: enum, source: input, description: "Encounter kind driving the provisional wRVU estimate", constraints: "one of ADMISSION_HCP, SUBSEQUENT_VISIT, DISCHARGE_DAY, CONSULT_NOTE" }
+      - { name: occurred_on, type: string, source: input, description: "Service date YYYY-MM-DD; period membership for reports" }
+      - { name: wrvu_value, type: number, source: input, description: "Actual billed work RVU for the final variant" }
+      - { name: estimated_wrvu, type: number, source: computed, description: "round(ESTIMATED_WRVU[encounter_type] * ADJUST_FACTOR, 2) — per-line rounding, computed at creation" }
+      - { name: status, type: enum, source: system, default: RECORDED, description: "RECORDED -> VOIDED", constraints: "one of RECORDED, VOIDED" }
+      - { name: productivity_report_id, type: string, source: system, description: "FK -> ProductivityReport.id; set when a report links this encounter; null until linked" }
+
+  - name: ProductivityReport
+    parent: null
+    common_fields: true
+    fields:
+      - { name: hospitalist_id, type: string, source: input, description: "FK -> Hospitalist.id; report subject" }
+      - { name: period_start, type: string, source: input, description: "Inclusive period start date YYYY-MM-DD" }
+      - { name: period_end, type: string, source: input, description: "Inclusive period end date YYYY-MM-DD" }
+      - { name: status, type: enum, source: system, default: PROVISIONAL, description: "PROVISIONAL -> FINALIZED -> REOPENED -> FINALIZED (cycle)", constraints: "one of PROVISIONAL, FINALIZED, REOPENED" }
+      - { name: encounter_count, type: integer, source: computed, description: "Count of linked encounters with status RECORDED in the period" }
+      - { name: total_wrvu_provisional, type: number, source: computed, description: "Sum of per-encounter estimated_wrvu (per-line rounding then sum)" }
+      - { name: total_wrvu_final, type: number, source: computed, description: "round(sum of wrvu_value over RECORDED linked encounters, 2) — single rounding after summation; null until first finalize" }
+      - { name: wrvu_variance, type: number, source: computed, description: "total_wrvu_final - total_wrvu_provisional, 2 decimals; null until first finalize" }
+      - { name: generated_at, type: datetime, source: system, description: "Creation timestamp" }
+      - { name: finalized_at, type: datetime, source: system, description: "Last finalize timestamp" }
+
+  - name: CoverageWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: window_date, type: string, source: input, description: "Service date YYYY-MM-DD" }
+      - { name: window_type, type: enum, source: input, description: "NIGHT_PRIMARY or NIGHT_CROSS_COVER (cross-cover doubles load weight)", constraints: "one of NIGHT_PRIMARY, NIGHT_CROSS_COVER" }
+      - { name: start_at, type: datetime, source: input, description: "Window start (half-open)" }
+      - { name: end_at, type: datetime, source: input, description: "Window end (half-open); must be > start_at" }
+      - { name: capacity, type: integer, source: input, description: "Maximum enrolled hospitalists", constraints: ">= 1" }
+      - { name: enrolled_hospitalist_ids, type: array, source: system, default: "[]", description: "Ordered list of enrolled Hospitalist ids (enrollment order)" }
+      - { name: enrolled_count, type: integer, source: computed, default: 0, description: "Length of enrolled_hospitalist_ids" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN <-> FULL (capacity cycle); OPEN|FULL -> LOCKED at start_at; LOCKED -> CLOSED at end_at", constraints: "one of OPEN, FULL, LOCKED, CLOSED" }
+      - { name: current_load, type: number, source: computed, default: 0, description: "Cross-cover load score; recomputed by monitor-run while status == LOCKED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Shift
+    initial_state: SCHEDULED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /shifts/{id}/activate"
+        actor: "GroupAdmin | Hospitalist (owning)"
+        preconditions:
+          - "shift.state == SCHEDULED (else ERR_SHIFT_INVALID_STATE)"
+        side_effects:
+          - "increments Shift.version by 1"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /shifts/{id}/close"
+        actor: "GroupAdmin | Hospitalist (owning)"
+        preconditions:
+          - "shift.state == ACTIVE (else ERR_SHIFT_INVALID_STATE)"
+          - "exists Handoff h with h.shift_id == shift.id AND h.status == ACCEPTED (else ERR_SHIFT_HANDOFF_MISSING)"
+        side_effects:
+          - "increments Shift.version by 1"
+          - "assignments of the shift's hospitalist are NOT closed by shift close; census is unaffected"
+
+  - entity: Admission
+    initial_state: QUEUED
+    terminal_states: [ACCEPTED]
+    transitions:
+      - from: QUEUED
+        to: OFFERED
+        trigger: "system: admission_distribution_score selector runs as a side effect of POST /admissions and of every decline"
+        actor: system
+        preconditions:
+          - "candidate pool per calculations.admission_distribution_score eligibility is non-empty; empty pool leaves the admission QUEUED (documented fallback, no error)"
+        side_effects:
+          - "sets offered_to_hospitalist_id, offered_at, distribution_score"
+          - "increments winner.pending_offers by 1"
+          - "increments Admission.version by 1"
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /admissions/{id}/accept"
+        actor: "Hospitalist (the offered one)"
+        preconditions:
+          - "admission.status == OFFERED (else ERR_ADMISSION_INVALID_STATE)"
+          - "X-User-ID == admission.offered_to_hospitalist_id (else ERR_ADMISSION_NOT_OFFERED_TO_HOSPITALIST)"
+          - "no Assignment with patient_id == admission.patient_id AND status == ACTIVE (else ERR_DUPLICATE_ACTIVE_ASSIGNMENT)"
+          - "offered hospitalist employment_status == ACTIVE (else ERR_HOSPITALIST_NOT_ACTIVE)"
+          - "offered hospitalist has a Shift s with s.state == ACTIVE AND s.start_at <= now < s.end_at (else ERR_NO_ACTIVE_SHIFT)"
+          - "offered hospitalist.current_census < offered.max_census_cap (else ERR_CENSUS_CAP_REACHED)"
+        side_effects:
+          - "creates Assignment(patient_id, hospitalist_id = offered_to, status ACTIVE, continuity_flag per calculations.admission_distribution_score continuity predicate); sets admission.assignment_id"
+          - "sets decided_at; decrements hospitalist.pending_offers by 1"
+          - "increments hospitalist.current_census by 1; when the increment makes current_census == max_census_cap, sets hospitalist.distribution_eligible = false (threshold trigger)"
+          - "increments Admission.version and Hospitalist.version by 1"
+      - from: OFFERED
+        to: QUEUED
+        trigger: "POST /admissions/{id}/decline"
+        actor: "Hospitalist (the offered one)"
+        preconditions:
+          - "admission.status == OFFERED (else ERR_ADMISSION_INVALID_STATE)"
+          - "X-User-ID == admission.offered_to_hospitalist_id (else ERR_ADMISSION_NOT_OFFERED_TO_HOSPITALIST)"
+        side_effects:
+          - "appends X-User-ID to declined_hospitalist_ids; clears offered_to_hospitalist_id and distribution_score"
+          - "decrements decliner.pending_offers by 1"
+          - "immediately re-runs the selector (QUEUED -> OFFERED may fire in the same request, excluding decliners)"
+
+  - entity: Assignment
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: PENDING_TRANSFER
+        trigger: "POST /assignments/{id}/transfer"
+        actor: "Hospitalist (current holder) | GroupAdmin"
+        preconditions:
+          - "assignment.status == ACTIVE (else ERR_ASSIGNMENT_INVALID_STATE)"
+          - "OCC: request expected_assignment_version == assignment.version (else ERR_STALE_VERSION 412)"
+          - "target_hospitalist_id references an existing Hospitalist (else ERR_NOT_FOUND)"
+          - "target_hospitalist_id != assignment.hospitalist_id (else ERR_INVALID_REQUEST)"
+        side_effects:
+          - "sets transfer_target_hospitalist_id"
+          - "increments Assignment.version by 1"
+      - from: PENDING_TRANSFER
+        to: CLOSED
+        trigger: "POST /assignments/{id}/accept-transfer"
+        actor: "Hospitalist (the transfer target)"
+        preconditions:
+          - "assignment.status == PENDING_TRANSFER (else ERR_ASSIGNMENT_INVALID_STATE)"
+          - "X-User-ID == assignment.transfer_target_hospitalist_id (else ERR_TRANSFER_TARGET_MISMATCH)"
+          - "target has Shift s with s.state == ACTIVE AND s.start_at <= now < s.end_at (else ERR_NO_ACTIVE_SHIFT)"
+          - "target employment_status == ACTIVE (else ERR_HOSPITALIST_NOT_ACTIVE)"
+          - "target.current_census < target.max_census_cap (else ERR_CENSUS_CAP_REACHED)"
+        side_effects:
+          - "sets close_reason = TRANSFER, closed_at; source hospitalist.current_census - 1 and distribution_eligible recomputed (drops below cap -> true)"
+          - "creates new Assignment(same patient_id, hospitalist_id = target, status ACTIVE, continuity_flag true iff a CLOSED assignment for (patient, target) closed within CONTINUITY_WINDOW_DAYS)"
+          - "target.current_census + 1; when it reaches max_census_cap, target.distribution_eligible = false"
+          - "total ACTIVE assignment count is unchanged (one closed, one created) — calculations.census_conservation_invariant"
+          - "increments Assignment.version, both Hospitalist versions"
+      - from: PENDING_TRANSFER
+        to: ACTIVE
+        trigger: "POST /assignments/{id}/cancel-transfer"
+        actor: "Hospitalist (current holder) | GroupAdmin"
+        preconditions:
+          - "assignment.status == PENDING_TRANSFER (else ERR_ASSIGNMENT_INVALID_STATE)"
+        side_effects:
+          - "clears transfer_target_hospitalist_id"
+          - "increments Assignment.version by 1"
+          - "census fields of both hospitalists unchanged"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "system: side effect of DischargeOrder ORDERED -> EXECUTED on the same patient"
+        actor: system
+        preconditions:
+          - "assignment.status == ACTIVE"
+        side_effects:
+          - "sets close_reason = DISCHARGE, closed_at"
+          - "hospitalist.current_census - 1; distribution_eligible recomputed (drops below cap -> true)"
+
+  - entity: DischargeOrder
+    initial_state: PLANNED
+    terminal_states: [EXECUTED]
+    transitions:
+      - from: PLANNED
+        to: ORDERED
+        trigger: "POST /discharge-orders/{id}/order"
+        actor: "Hospitalist (ordering_hospitalist only)"
+        preconditions:
+          - "order.status == PLANNED (else ERR_DISCHARGE_ORDER_INVALID_STATE)"
+          - "X-User-ID == order.ordering_hospitalist_id (else ERR_UNAUTHORIZED_ROLE)"
+        side_effects:
+          - "sets ordered_at; increments DischargeOrder.version by 1"
+      - from: ORDERED
+        to: EXECUTED
+        trigger: "POST /discharge-orders/{id}/execute"
+        actor: "Hospitalist (ordering_hospitalist only)"
+        preconditions:
+          - "order.status == ORDERED (else ERR_DISCHARGE_ORDER_INVALID_STATE)"
+          - "patient.admission_status == ADMITTED (else ERR_PATIENT_NOT_ADMITTED)"
+          - "no ConsultRequest c with c.patient_id == order.patient_id AND c.priority == STAT AND c.status IN {OPEN, ESCALATED, ACKNOWLEDGED, REOPENED} (else ERR_OPEN_STAT_CONSULT_BLOCKS_DISCHARGE)"
+        side_effects:
+          - "sets executed_at; computes meets_throughput_target per calculations.discharge_throughput_target"
+          - "Patient: admission_status -> DISCHARGED; observation_status OBS_ACTIVE -> OBS_CLOSED (NONE stays NONE)"
+          - "Assignment: the patient's ACTIVE assignment -> CLOSED with close_reason DISCHARGE"
+          - "Hospitalist: ordering-side census effects per the assignment close (current_census - 1, distribution_eligible recompute)"
+          - "increments DischargeOrder.version, Patient.version, Assignment.version, Hospitalist.version"
+
+  - entity: Handoff
+    initial_state: DRAFT
+    terminal_states: [ACCEPTED]
+    transitions:
+      - from: DRAFT
+        to: DRAFT
+        trigger: "PUT /handoffs/{id} (revision without state change)"
+        actor: "Hospitalist (submitting hospitalist = shift owner)"
+        preconditions:
+          - "handoff.status IN {DRAFT, RETURNED} (else ERR_HANDOFF_INVALID_STATE)"
+          - "OCC: request expected_handoff_version == handoff.version (else ERR_STALE_VERSION 412)"
+        side_effects:
+          - "replaces patient_ids / receiving_hospitalist_id; recomputes counts"
+          - "increments Handoff.version by 1"
+      - from: RETURNED
+        to: RETURNED
+        trigger: "PUT /handoffs/{id} (revision without state change)"
+        actor: "Hospitalist (submitting hospitalist)"
+        preconditions:
+          - "handoff.status IN {DRAFT, RETURNED} (else ERR_HANDOFF_INVALID_STATE)"
+          - "OCC: request expected_handoff_version == handoff.version (else ERR_STALE_VERSION 412)"
+        side_effects:
+          - "replaces patient_ids / receiving_hospitalist_id; recomputes counts"
+          - "increments Handoff.version by 1"
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /handoffs/{id}/submit"
+        actor: "Hospitalist (submitting hospitalist)"
+        preconditions:
+          - "handoff.status IN {DRAFT, RETURNED} (else ERR_HANDOFF_INVALID_STATE)"
+          - "open_item_count == 0 — patient_ids cover every ACTIVE assignment of the shift's hospitalist (else ERR_HANDOFF_INCOMPLETE)"
+        side_effects:
+          - "computes required_patient_count, covered_patient_count, open_item_count, completeness_score"
+          - "sets submitted_at; increments Handoff.version by 1"
+      - from: RETURNED
+        to: SUBMITTED
+        trigger: "POST /handoffs/{id}/submit"
+        actor: "Hospitalist (submitting hospitalist)"
+        preconditions:
+          - "handoff.status IN {DRAFT, RETURNED} (else ERR_HANDOFF_INVALID_STATE)"
+          - "open_item_count == 0 (else ERR_HANDOFF_INCOMPLETE)"
+        side_effects:
+          - "recomputes counts; sets submitted_at; increments Handoff.version by 1"
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /handoffs/{id}/accept"
+        actor: "Hospitalist (receiving_hospitalist only)"
+        preconditions:
+          - "handoff.status == SUBMITTED (else ERR_HANDOFF_INVALID_STATE)"
+          - "X-User-ID == handoff.receiving_hospitalist_id (else ERR_UNAUTHORIZED_ROLE)"
+          - "X-User-ID != shift.hospitalist_id of handoff.shift_id (else ERR_HANDOFF_SELF_ACCEPT)"
+        side_effects:
+          - "sets reviewed_at; increments Handoff.version by 1"
+          - "makes the outgoing Shift closable (Shift close precondition now satisfiable)"
+      - from: SUBMITTED
+        to: RETURNED
+        trigger: "POST /handoffs/{id}/return"
+        actor: "Hospitalist (receiving_hospitalist only)"
+        preconditions:
+          - "handoff.status == SUBMITTED (else ERR_HANDOFF_INVALID_STATE)"
+          - "X-User-ID == handoff.receiving_hospitalist_id (else ERR_UNAUTHORIZED_ROLE)"
+        side_effects:
+          - "stores return_reason; increments Handoff.version by 1"
+
+  - entity: ConsultRequest
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: ACKNOWLEDGED
+        trigger: "POST /consult-requests/{id}/acknowledge"
+        actor: ConsultingSpecialist
+        preconditions:
+          - "consult.status IN {OPEN, ESCALATED, REOPENED} (else ERR_CONSULT_INVALID_STATE)"
+        side_effects:
+          - "sets acknowledged_at; computes sla_breached = (acknowledged_at > sla_deadline) — strictly greater, equality is NOT a breach"
+          - "increments ConsultRequest.version by 1"
+      - from: ESCALATED
+        to: ACKNOWLEDGED
+        trigger: "POST /consult-requests/{id}/acknowledge"
+        actor: ConsultingSpecialist
+        preconditions:
+          - "consult.status IN {OPEN, ESCALATED, REOPENED}"
+        side_effects:
+          - "sets acknowledged_at; sla_breached = true whenever the acknowledge happens after sla_deadline"
+          - "increments ConsultRequest.version by 1"
+      - from: REOPENED
+        to: ACKNOWLEDGED
+        trigger: "POST /consult-requests/{id}/acknowledge"
+        actor: ConsultingSpecialist
+        preconditions:
+          - "consult.status IN {OPEN, ESCALATED, REOPENED}"
+        side_effects:
+          - "sets acknowledged_at; sla_deadline is unchanged by reopen (original deadline still governs)"
+          - "increments ConsultRequest.version by 1"
+      - from: ACKNOWLEDGED
+        to: COMPLETED
+        trigger: "POST /consult-requests/{id}/complete"
+        actor: ConsultingSpecialist
+        preconditions:
+          - "consult.status == ACKNOWLEDGED (else ERR_CONSULT_INVALID_STATE)"
+        side_effects:
+          - "sets completed_at; computes response_minutes = (completed_at - requested_at) minutes, 2 decimals"
+          - "increments ConsultRequest.version by 1"
+      - from: COMPLETED
+        to: REOPENED
+        trigger: "POST /consult-requests/{id}/reopen"
+        actor: "Hospitalist (requesting_hospitalist only)"
+        preconditions:
+          - "consult.status == COMPLETED (else ERR_CONSULT_INVALID_STATE)"
+          - "now <= completed_at + REOPEN_WINDOW_HOURS (else ERR_CONSULT_REOPEN_WINDOW_EXPIRED)"
+        side_effects:
+          - "increments ConsultRequest.version by 1"
+      - from: OPEN
+        to: ESCALATED
+        trigger: "system: POST /ops/monitor-run when now > sla_deadline"
+        actor: system
+        preconditions:
+          - "consult.status == OPEN AND now > sla_deadline"
+        side_effects:
+          - "increments escalation_count by 1; increments ConsultRequest.version by 1"
+      - from: COMPLETED
+        to: CLOSED
+        trigger: "system: POST /ops/monitor-run when now > completed_at + REOPEN_WINDOW_HOURS"
+        actor: system
+        preconditions:
+          - "consult.status == COMPLETED AND now > completed_at + REOPEN_WINDOW_HOURS"
+        side_effects:
+          - "increments ConsultRequest.version by 1"
+
+  - entity: Patient
+    initial_state: "ADMITTED (admission axis) + NONE|OBS_ACTIVE (observation axis)"
+    terminal_states: ["OBS_CLOSED (observation axis)"]
+    transitions:
+      - from: ADMITTED
+        to: DISCHARGED
+        trigger: "system: side effect of DischargeOrder ORDERED -> EXECUTED"
+        actor: system
+        preconditions:
+          - "patient.admission_status == ADMITTED"
+        side_effects:
+          - "observation axis: OBS_ACTIVE -> OBS_CLOSED in the same mutation; NONE unchanged"
+          - "increments Patient.version by 1"
+      - from: DISCHARGED
+        to: ADMITTED
+        trigger: "system: side effect of POST /admissions referencing this patient (readmission)"
+        actor: system
+        preconditions:
+          - "patient.admission_status == DISCHARGED"
+        side_effects:
+          - "observation axis resets to NONE; stay_type unchanged; admitted_at is re-stamped to the readmission timestamp so LOS fields anchor to the new stay"
+          - "increments Patient.version by 1"
+      - from: OBS_ACTIVE
+        to: OBS_CONVERTED
+        trigger: "system: POST /ops/monitor-run when (now - observation_started_at) >= OBS_CONVERT_THRESHOLD_HOURS"
+        actor: system
+        preconditions:
+          - "patient.observation_status == OBS_ACTIVE AND elapsed >= 48.0 hours (equality converts)"
+        side_effects:
+          - "flips stay_type to INPATIENT"
+          - "increments Patient.version by 1"
+      - from: OBS_ACTIVE
+        to: OBS_CLOSED
+        trigger: "system: side effect of DischargeOrder ORDERED -> EXECUTED"
+        actor: system
+        preconditions:
+          - "patient.observation_status == OBS_ACTIVE"
+        side_effects:
+          - "increments Patient.version by 1"
+    note: "Two independent state dimensions evolve on one row (parallel shape): admission_status (ADMITTED -> DISCHARGED) and observation_status (NONE | OBS_ACTIVE -> OBS_CONVERTED | OBS_CLOSED)."
+
+  - entity: Encounter
+    initial_state: RECORDED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: RECORDED
+        to: VOIDED
+        trigger: "POST /encounters/{id}/void"
+        actor: "Hospitalist (owning) | GroupAdmin"
+        preconditions:
+          - "encounter.status == RECORDED (else ERR_ENCOUNTER_ALREADY_VOIDED)"
+        side_effects:
+          - "when encounter.productivity_report_id references a FINALIZED ProductivityReport: report status FINALIZED -> REOPENED and report totals recomputed excluding the voided encounter"
+          - "when the linked report is PROVISIONAL or REOPENED: totals recomputed, status unchanged"
+          - "increments Encounter.version by 1 (and ProductivityReport.version when reopened)"
+
+  - entity: ProductivityReport
+    initial_state: PROVISIONAL
+    terminal_states: []
+    note: "FINALIZED is a soft terminal; reopen (manual or void-induced) re-enters the cycle. REOPENED -> FINALIZED via finalize."
+    transitions:
+      - from: PROVISIONAL
+        to: FINALIZED
+        trigger: "POST /productivity-reports/{id}/finalize"
+        actor: GroupAdmin
+        preconditions:
+          - "report.status IN {PROVISIONAL, REOPENED} (else ERR_REPORT_INVALID_STATE)"
+        side_effects:
+          - "links period encounters (productivity_report_id set) and computes total_wrvu_provisional, total_wrvu_final, wrvu_variance per calculations.productivity_wrvu_total"
+          - "sets finalized_at; increments ProductivityReport.version by 1"
+      - from: FINALIZED
+        to: REOPENED
+        trigger: "POST /productivity-reports/{id}/reopen OR system side effect of POST /encounters/{id}/void on a linked encounter"
+        actor: "GroupAdmin | system"
+        preconditions:
+          - "report.status == FINALIZED (else ERR_REPORT_INVALID_STATE)"
+        side_effects:
+          - "recomputes totals over currently RECORDED linked encounters"
+          - "increments ProductivityReport.version by 1"
+      - from: REOPENED
+        to: FINALIZED
+        trigger: "POST /productivity-reports/{id}/finalize"
+        actor: GroupAdmin
+        preconditions:
+          - "report.status IN {PROVISIONAL, REOPENED}"
+        side_effects:
+          - "re-links all currently RECORDED in-period encounters (productivity_report_id), including any recorded after the first finalize"
+          - "recomputes totals; sets finalized_at; increments ProductivityReport.version by 1"
+
+  - entity: CoverageWindow
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: FULL
+        trigger: "system: side effect of POST /coverage-windows/{id}/enroll when the enrollment makes enrolled_count == capacity"
+        actor: system
+        preconditions:
+          - "window.status == OPEN"
+        side_effects:
+          - "increments CoverageWindow.version by 1"
+      - from: FULL
+        to: OPEN
+        trigger: "system: side effect of POST /coverage-windows/{id}/withdraw"
+        actor: system
+        preconditions:
+          - "window.status == FULL"
+        side_effects:
+          - "removes the hospitalist from enrolled_hospitalist_ids; decrements enrolled_count"
+          - "increments CoverageWindow.version by 1"
+      - from: OPEN
+        to: LOCKED
+        trigger: "system: POST /ops/monitor-run when now >= start_at"
+        actor: system
+        preconditions:
+          - "window.status IN {OPEN, FULL} AND now >= start_at"
+        side_effects:
+          - "increments CoverageWindow.version by 1"
+      - from: FULL
+        to: LOCKED
+        trigger: "system: POST /ops/monitor-run when now >= start_at"
+        actor: system
+        preconditions:
+          - "window.status IN {OPEN, FULL} AND now >= start_at"
+        side_effects:
+          - "increments CoverageWindow.version by 1"
+      - from: LOCKED
+        to: CLOSED
+        trigger: "system: POST /ops/monitor-run when now >= end_at"
+        actor: system
+        preconditions:
+          - "window.status == LOCKED AND now >= end_at"
+        side_effects:
+          - "increments CoverageWindow.version by 1"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: handoff-revise-stale-version
+    parent_entity: Handoff
+    write_endpoint: "PUT /handoffs/{id}"
+    occ_field: "expected_handoff_version"
+    description: |
+      Revising a Handoff whose version has advanced since the client last
+      observed it is rejected. This captures the case where another revision
+      (or a submit/return cycle) has legitimately advanced the handoff while
+      its status remains DRAFT or RETURNED — a status the product still
+      allows updates from — so the stale write would silently discard the
+      intervening change.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: assignment-transfer-stale-version
+    parent_entity: Assignment
+    write_endpoint: "POST /assignments/{id}/transfer"
+    occ_field: "expected_assignment_version"
+    description: |
+      Initiating a transfer on an Assignment whose version has advanced since
+      the client last observed it is rejected. This captures the case where
+      the assignment completed a full transfer-initiate/cancel cycle (ACTIVE
+      -> PENDING_TRANSFER -> ACTIVE) between the client's read and this
+      write: the status is legitimately ACTIVE again, so only the version
+      check distinguishes the stale write.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: admission_distribution_score
+    trigger: "side effect of POST /admissions (after row creation) and of POST /admissions/{id}/decline (after requeue)"
+    algorithm: weighted_scoring
+    formula: |
+      eligibility(h) =
+        h.employment_status == ACTIVE
+        AND h.distribution_eligible == true
+        AND h.current_census < h.max_census_cap
+        AND EXISTS Shift s: s.hospitalist_id == h.id AND s.state == ACTIVE
+            AND s.start_at <= now < s.end_at          # half-open coverage
+        AND h.id NOT IN admission.declined_hospitalist_ids
+        AND NOT EXISTS Admission a2: a2.offered_to_hospitalist_id == h.id
+            AND a2.status == OFFERED                   # one outstanding offer each
+      continuity(h)  = 1 if EXISTS Assignment a: a.patient_id == admission.patient_id
+                       AND a.hospitalist_id == h.id AND a.status == CLOSED
+                       AND a.closed_at >= now - CONTINUITY_WINDOW_DAYS days
+                       else 0
+      night_loaded(h)= 1 if covering shift s.shift_type == NIGHT AND h.pending_offers > 0 else 0
+      score(h) = min(1.0, (h.max_census_cap - h.current_census) / h.max_census_cap
+                          + CONTINUITY_BONUS * continuity(h))
+                 - NIGHT_PENALTY * night_loaded(h)
+      ranking: score(h) DESC;
+               tie -> h.current_census ASC;
+               tie -> covering shift s.start_at ASC;
+               tie -> covering shift s.created_at ASC   # never id
+      fallback: pool empty -> admission remains QUEUED, offered_to_hospitalist_id null, no error
+    input_set: "all Hospitalist rows; Shift rows state == ACTIVE; Assignment rows status == CLOSED for the same patient"
+    constants:
+      CONTINUITY_BONUS: 0.25
+      NIGHT_PENALTY: 0.10
+      CONTINUITY_WINDOW_DAYS: 30
+    precision: "score rounded to 4 decimal places, round_half_up; comparisons on the rounded value"
+
+  - name: census_leveling_projection
+    trigger: "GET /reports/census-leveling (computed on read at the logical clock)"
+    algorithm: forward_looking
+    formula: |
+      Evaluation order is pinned — each step uses only earlier steps' outputs:
+      (1) current_census[h] = count(Assignment a: a.hospitalist_id == h AND a.status == ACTIVE)
+      (2) eligible_set = Hospitalist h where h.employment_status == ACTIVE AND
+          EXISTS Shift s: s.hospitalist_id == h AND s.state == ACTIVE AND s.start_at <= now < s.end_at
+          group_avg_census = sum(current_census over eligible_set) / max(1, |eligible_set|)
+          — computed from CURRENT census only, never from projections
+      (3) projected_census[h] = current_census[h]
+          + count(Admission a: a.offered_to_hospitalist_id == h AND a.status == OFFERED)
+          - count(DischargeOrder o JOIN Assignment a ON o.patient_id == a.patient_id:
+              a.hospitalist_id == h AND a.status == ACTIVE
+              AND o.status IN {PLANNED, ORDERED}
+              AND o.target_discharge_at <= now + PROJECTION_HORIZON_HOURS hours)
+      (4) deviation[h] = (projected_census[h] - group_avg_census) / max(1, group_avg_census)
+      leveling_needed = max over h of abs(deviation[h]) > LEVELING_THRESHOLD
+    input_set: "Assignment ACTIVE; Admission OFFERED; DischargeOrder PLANNED|ORDERED within horizon; Hospitalist ACTIVE with covering ACTIVE shift"
+    constants:
+      LEVELING_THRESHOLD: 0.15
+      PROJECTION_HORIZON_HOURS: 24
+    precision: "deviations rounded to 4 decimals, round_half_up"
+    variants:
+      - name: forward_looking
+        when: "deviation_forward field of each report row"
+        difference: "uses projected_census (step 3) in the numerator"
+      - name: chronological
+        when: "deviation_chronological field of each report row"
+        difference: "uses current_census (step 1) in the numerator; identical inputs yield different deviations whenever OFFERED admissions or horizon-window discharge orders exist"
+
+  - name: productivity_wrvu_total
+    trigger: "POST /productivity-reports/generate (provisional); POST /productivity-reports/{id}/finalize (final); recomputed on void-induced reopen"
+    algorithm: aggregation
+    formula: |
+      Link set L = Encounter e where e.hospitalist_id == report.hospitalist_id
+        AND e.status == RECORDED
+        AND report.period_start <= e.occurred_on <= report.period_end   # inclusive both ends
+      PROVISIONAL variant (rounding order pinned: round per line, then sum):
+        total_wrvu_provisional = sum over L of round(ESTIMATED_WRVU[e.encounter_type] * ADJUST_FACTOR, 2)
+        (Encounter.estimated_wrvu stores exactly this per-line rounded value)
+      FINAL variant (rounding order pinned: sum raw, then one rounding):
+        total_wrvu_final = round(sum over L of e.wrvu_value, 2)
+      wrvu_variance = round(total_wrvu_final - total_wrvu_provisional, 2)
+      encounter_count = |L|
+    input_set: "Encounter rows for the hospitalist with status == RECORDED and occurred_on inside the inclusive period; VOIDED excluded from both variants"
+    constants:
+      ESTIMATED_WRVU: { ADMISSION_HCP: 2.5, SUBSEQUENT_VISIT: 1.2, DISCHARGE_DAY: 1.8, CONSULT_NOTE: 1.5 }
+      ADJUST_FACTOR: 1.06
+    precision: "2 decimal places, round_half_up; per-line-then-sum vs sum-then-round pinned per variant above"
+    variants:
+      - name: provisional
+        when: "report created / while status == PROVISIONAL"
+        difference: "estimate table x ADJUST_FACTOR, rounded per encounter line before summation"
+      - name: final
+        when: "on finalize"
+        difference: "raw wrvu_value summed first and rounded once; identical encounter sets generally yield a different total than provisional"
+
+  - name: discharge_throughput_target
+    trigger: "computed on DischargeOrder ORDERED -> EXECUTED; aggregated in census-leveling report"
+    algorithm: threshold
+    formula: |
+      cutoff = date(target_discharge_at) + "T11:00:00Z"
+      meets_throughput_target = (executed_at <= cutoff)     # equality meets the target
+      throughput_rate (report-level) =
+        count(EXECUTED orders in window with meets_throughput_target) / count(EXECUTED orders in window)
+      when the denominator count == 0 the rate field is null (empty-set edge)
+    input_set: "DischargeOrder rows status == EXECUTED for the grouping window"
+    constants:
+      DISCHARGE_CUTOFF_TIME: "11:00:00Z"
+    precision: "timestamps compared at millisecond precision"
+
+  - name: los_monitoring
+    trigger: "POST /ops/monitor-run refreshes los_midnights, los_blocks, los_alert_flag on every Patient with admission_status == ADMITTED"
+    algorithm: chronological
+    formula: |
+      los_midnights = count of calendar dates d (UTC) with date(admitted_at) < d <= date(now)
+      los_blocks    = floor((now - admitted_at) / 24 hours)
+      los_alert_flag = los_midnights > EXPECTED_LOS_DAYS[stay_type][acuity] * LOS_ALERT_MULTIPLIER
+                       # strictly greater; equality is NOT an alert
+    input_set: "Patient rows with admission_status == ADMITTED"
+    constants:
+      EXPECTED_LOS_DAYS:
+        INPATIENT: { HIGH: 6, MEDIUM: 4, LOW: 2 }
+        OBSERVATION: { HIGH: 2, MEDIUM: 2, LOW: 1 }
+      LOS_ALERT_MULTIPLIER: 1.5
+    precision: "elapsed computed at second precision"
+    variants:
+      - name: midnight_census
+        when: "los_midnights field; drives los_alert_flag"
+        difference: "counts calendar-date boundaries crossed; a 23:00 admission measured at next-day 01:00 yields 1"
+      - name: hour_block
+        when: "los_blocks field"
+        difference: "floor of elapsed 24-hour blocks; the same 23:00 -> 01:00 measurement yields 0"
+
+  - name: observation_status_monitor
+    trigger: "POST /ops/monitor-run"
+    algorithm: threshold
+    formula: |
+      for each Patient p with p.observation_status == OBS_ACTIVE:
+        elapsed_hours = (now - p.observation_started_at) in hours
+        if elapsed_hours >= OBS_CONVERT_THRESHOLD_HOURS:    # equality converts
+          p.observation_status = OBS_CONVERTED; p.stay_type = INPATIENT
+    input_set: "Patient rows with observation_status == OBS_ACTIVE"
+    constants:
+      OBS_CONVERT_THRESHOLD_HOURS: 48.0
+    precision: "elapsed compared at second precision; 47:59:59 does not convert, exactly 48:00:00 converts"
+
+  - name: consult_sla
+    trigger: "ConsultRequest creation (deadline); acknowledge (breach evaluation); monitor-run (escalation)"
+    algorithm: threshold
+    formula: |
+      sla_deadline = requested_at + SLA_MINUTES[priority] minutes
+      sla_breached (set at acknowledge) = acknowledged_at > sla_deadline   # strictly greater
+      escalation (monitor-run)            = status == OPEN AND now > sla_deadline
+      reopen gate                         = now <= completed_at + REOPEN_WINDOW_HOURS hours
+      auto-close (monitor-run)            = status == COMPLETED AND now > completed_at + REOPEN_WINDOW_HOURS hours
+    input_set: "ConsultRequest rows per transition guard above"
+    constants:
+      SLA_MINUTES: { STAT: 15, URGENT: 30, ROUTINE: 120 }
+      REOPEN_WINDOW_HOURS: 24
+    precision: "timestamps compared at millisecond precision"
+
+  - name: handoff_completeness
+    trigger: "POST /handoffs/{id}/submit (gate) and on every PUT revision (recompute)"
+    algorithm: aggregation
+    formula: |
+      required = set of patient_id from Assignment a where a.hospitalist_id == shift.hospitalist_id
+                 AND a.status == ACTIVE, evaluated at submit time
+      required_patient_count = |required|
+      covered_patient_count  = |required intersect set(patient_ids)|
+      open_item_count        = required_patient_count - covered_patient_count
+      completeness_score     = covered_patient_count / required_patient_count;
+                               1.0 when required_patient_count == 0
+      submit gate: open_item_count == 0
+    input_set: "Assignment rows status == ACTIVE for the outgoing shift's hospitalist at submit time"
+    constants: {}
+    precision: "score rounded to 4 decimals, round_half_up"
+
+  - name: cross_cover_load
+    trigger: "POST /ops/monitor-run recomputes current_load on every CoverageWindow with status == LOCKED"
+    algorithm: weighted_scoring
+    formula: |
+      census_g   = count(Assignment a: a.status == ACTIVE)                       # group-wide
+      mult       = NIGHT_CROSS_COVER_MULTIPLIER if window.window_type == NIGHT_CROSS_COVER else 1.0
+      consults_g = count(ConsultRequest c: c.status IN {OPEN, ESCALATED})
+      handoffs_g = count(Handoff h: h.status == SUBMITTED)
+      current_load = min(MAX_CROSS_COVER_LOAD,
+                         census_g * mult + consults_g * CONSULT_LOAD_WEIGHT + handoffs_g * HANDOFF_LOAD_WEIGHT)
+    input_set: "Assignment ACTIVE; ConsultRequest OPEN|ESCALATED; Handoff SUBMITTED; the LOCKED window itself"
+    constants:
+      MAX_CROSS_COVER_LOAD: 40
+      NIGHT_CROSS_COVER_MULTIPLIER: 2.0
+      CONSULT_LOAD_WEIGHT: 1
+      HANDOFF_LOAD_WEIGHT: 2
+    precision: "2 decimals, round_half_up; clamp applied last"
+
+  - name: census_conservation_invariant
+    trigger: "asserted after every Assignment mutation (accept, accept-transfer, cancel-transfer, discharge close)"
+    algorithm: aggregation
+    formula: |
+      TOTAL_ACTIVE = sum over Hospitalist h of count(Assignment a: a.hospitalist_id == h AND a.status == ACTIVE)
+      accept-transfer conserves TOTAL_ACTIVE (closes exactly one ACTIVE, creates exactly one ACTIVE)
+      discharge close decrements TOTAL_ACTIVE by exactly 1 in the same mutation that flips the patient to DISCHARGED
+      at every quiescent point: TOTAL_ACTIVE == count of distinct patients having an ACTIVE assignment,
+      and no patient ever has more than one ACTIVE assignment
+    input_set: "Assignment rows status == ACTIVE"
+    constants: {}
+    precision: "integer equality"
+
+  - name: wrvu_conservation_invariant
+    trigger: "asserted across void + identical re-record + reopen + refinalize sequences"
+    algorithm: aggregation
+    formula: |
+      For a FINALIZED report R, the compensating pair (void encounter e; record e' with identical
+      encounter_type, occurred_on, wrvu_value; finalize) leaves:
+        R.total_wrvu_final(after) == R.total_wrvu_final(before)
+        R.total_wrvu_provisional(after) == R.total_wrvu_provisional(before)
+    input_set: "Encounter rows linked to report R"
+    constants: {}
+    precision: "2 decimals, round_half_up"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present; role is a declared role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role permitted for the endpoint per §1.5 roles; ownership rules (X-User-ID must equal the resource's owning hospitalist field where stated)", error_id: ERR_UNAUTHORIZED_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: business_constraint, check: "Request shape: required fields present, types valid, enum membership, date/datetime formats parseable, transfer target != current hospitalist", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all" }
+  - { priority: 4, category: existence, check: "Path and body referenced ids exist, validated left-to-right", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all endpoints with path or body ids" }
+  - { priority: 5, category: state, check: "Own-resource state preconditions per §1.2 (admission OFFERED; assignment ACTIVE/PENDING_TRANSFER; order PLANNED/ORDERED; handoff DRAFT/RETURNED/SUBMITTED; consult OPEN/ESCALATED/REOPENED/ACKNOWLEDGED/COMPLETED; report PROVISIONAL/REOPENED/FINALIZED; encounter RECORDED; window not LOCKED/CLOSED; shift SCHEDULED/ACTIVE). OCC expected_*_version evaluated here, immediately after existence.", error_id: "ERR_ADMISSION_INVALID_STATE | ERR_ASSIGNMENT_INVALID_STATE | ERR_DISCHARGE_ORDER_INVALID_STATE | ERR_HANDOFF_INVALID_STATE | ERR_CONSULT_INVALID_STATE | ERR_REPORT_INVALID_STATE | ERR_ENCOUNTER_ALREADY_VOIDED | ERR_COVERAGE_WINDOW_NOT_OPEN | ERR_SHIFT_INVALID_STATE | ERR_STALE_VERSION", http_status: "409 (412 for ERR_STALE_VERSION)", applies_to: "state-transition endpoints" }
+  - { priority: 6, category: business_safety, check: "Discharge execute blocked while a STAT consult for the patient is in {OPEN, ESCALATED, ACKNOWLEDGED, REOPENED}; handoff accept by the same hospitalist who submitted", error_id: "ERR_OPEN_STAT_CONSULT_BLOCKS_DISCHARGE | ERR_HANDOFF_SELF_ACCEPT", http_status: "422 | 409", applies_to: ["POST /discharge-orders/{id}/execute", "POST /handoffs/{id}/accept"] }
+  - { priority: 7, category: business_temporal, check: "Shift creation: end_at > start_at and no half-open overlap with the hospitalist's existing shifts (adjacency permitted); accept/accept-transfer require a target shift ACTIVE covering now; consult reopen within window; enrollment conflicts with an overlapping own shift", error_id: "ERR_SHIFT_INVALID_WINDOW | ERR_SHIFT_OVERLAP | ERR_NO_ACTIVE_SHIFT | ERR_CONSULT_REOPEN_WINDOW_EXPIRED | ERR_ENROLL_SHIFT_CONFLICT", http_status: "422 | 409", applies_to: ["POST /shifts", "POST /admissions/{id}/accept", "POST /assignments/{id}/accept-transfer", "POST /consult-requests/{id}/reopen", "POST /coverage-windows/{id}/enroll"] }
+  - { priority: 8, category: business_constraint, check: "Cross-entity and uniqueness constraints: patient ADMITTED for consult/discharge-create; no second ACTIVE assignment per patient; handoff complete; not already enrolled; employment ACTIVE at accept/accept-transfer; caller is the offered hospitalist / transfer target; shift close has an ACCEPTED handoff (business_referential)", error_id: "ERR_PATIENT_NOT_ADMITTED | ERR_DUPLICATE_ACTIVE_ASSIGNMENT | ERR_HANDOFF_INCOMPLETE | ERR_ALREADY_ENROLLED | ERR_HOSPITALIST_NOT_ACTIVE | ERR_ADMISSION_NOT_OFFERED_TO_HOSPITALIST | ERR_TRANSFER_TARGET_MISMATCH | ERR_SHIFT_HANDOFF_MISSING", http_status: "409 | 422", applies_to: ["POST /patients/{patient_id}/consult-requests", "POST /patients/{patient_id}/discharge-orders", "POST /admissions/{id}/accept", "POST /handoffs/{id}/submit", "POST /coverage-windows/{id}/enroll", "POST /assignments/{id}/accept-transfer", "POST /shifts/{id}/close"] }
+  - { priority: 9, category: business_fiscal, check: "Capacity/quota last: hospitalist census strictly below max_census_cap; coverage window enrolled_count < capacity (status FULL maps here, LOCKED/CLOSED map to state at priority 5)", error_id: "ERR_CENSUS_CAP_REACHED | ERR_COVERAGE_WINDOW_FULL", http_status: 422, applies_to: ["POST /admissions/{id}/accept", "POST /assignments/{id}/accept-transfer", "POST /coverage-windows/{id}/enroll"] }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - { method: POST, path: "/hospitalists", description: "Create a hospitalist", roles: [GroupAdmin], code: 201, input: [full_name, specialty, "employment_status?", "max_census_cap?", "night_eligible?"], output: Hospitalist, side_effects: [] }
+  - { method: GET, path: "/hospitalists", description: "List hospitalists (paginated)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["employment_status?", "limit?", "offset?"], output: "Hospitalist[]", side_effects: [] }
+  - { method: GET, path: "/hospitalists/{id}", description: "Read one hospitalist incl. computed census fields", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Hospitalist, side_effects: [] }
+
+  - { method: POST, path: "/patients", description: "Register an admitted patient; stay_type OBSERVATION initializes observation axis", roles: [GroupAdmin], code: 201, input: [mrn, acuity, admit_source, stay_type, "admitted_at?"], output: Patient, side_effects: ["observation_status initialized (OBS_ACTIVE iff stay_type == OBSERVATION, else NONE)"] }
+  - { method: GET, path: "/patients", description: "List patients (paginated, filterable)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["admission_status?", "stay_type?", "los_alert?", "limit?", "offset?"], output: "Patient[]", side_effects: [] }
+  - { method: GET, path: "/patients/{id}", description: "Read one patient", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Patient, side_effects: [] }
+
+  - { method: POST, path: "/shifts", description: "Schedule a shift; half-open overlap with the hospitalist's existing shifts rejected; adjacency allowed", roles: [GroupAdmin], code: 201, input: [hospitalist_id, shift_type, start_at, end_at], output: Shift, side_effects: [] }
+  - { method: GET, path: "/shifts", description: "List shifts (FK reverse for Shift.hospitalist_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["hospitalist_id?", "state?", "limit?", "offset?"], output: "Shift[]", side_effects: [] }
+  - { method: GET, path: "/shifts/{id}", description: "Read one shift", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Shift, side_effects: [] }
+  - { method: POST, path: "/shifts/{id}/activate", description: "SCHEDULED -> ACTIVE", roles: [GroupAdmin, Hospitalist], code: 200, input: [], output: Shift, side_effects: ["increments Shift.version by 1"] }
+  - { method: POST, path: "/shifts/{id}/close", description: "ACTIVE -> CLOSED; requires an ACCEPTED handoff for this shift", roles: [GroupAdmin, Hospitalist], code: 200, input: [], output: Shift, side_effects: ["increments Shift.version by 1"] }
+
+  - { method: POST, path: "/admissions", description: "Queue an admission; the distribution selector runs immediately as a side effect; readmits a DISCHARGED patient", roles: [GroupAdmin], code: 201, input: [patient_id], output: Admission, side_effects: ["when patient.admission_status == DISCHARGED: readmission flips Patient admission_status -> ADMITTED (observation axis resets to NONE; stay_type unchanged)", "runs calculations.admission_distribution_score; may transition QUEUED -> OFFERED"] }
+  - { method: GET, path: "/admissions", description: "List admissions (FK reverse for patient_id, offered_to_hospitalist_id, assignment_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["patient_id?", "offered_to_hospitalist_id?", "assignment_id?", "status?", "limit?", "offset?"], output: "Admission[]", side_effects: [] }
+  - { method: GET, path: "/admissions/{id}", description: "Read one admission", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Admission, side_effects: [] }
+  - { method: POST, path: "/admissions/{id}/accept", description: "Offered hospitalist accepts; creates the ACTIVE assignment", roles: [Hospitalist], code: 200, input: [], output: Admission, side_effects: ["creates Assignment ACTIVE", "hospitalist.current_census + 1; distribution_eligible may flip false at cap", "pending_offers - 1"] }
+  - { method: POST, path: "/admissions/{id}/decline", description: "Offered hospitalist declines; requeues and re-runs the selector excluding decliners", roles: [Hospitalist], code: 200, input: [], output: Admission, side_effects: ["appends declined_hospitalist_ids", "re-runs selector (may OFFER next candidate)"] }
+
+  - { method: GET, path: "/assignments", description: "List assignments (FK reverse for patient_id, hospitalist_id, transfer_target_hospitalist_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["patient_id?", "hospitalist_id?", "transfer_target_hospitalist_id?", "status?", "limit?", "offset?"], output: "Assignment[]", side_effects: [] }
+  - { method: GET, path: "/assignments/{id}", description: "Read one assignment", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Assignment, side_effects: [] }
+  - { method: POST, path: "/assignments/{id}/transfer", description: "ACTIVE -> PENDING_TRANSFER to a target hospitalist; OCC-guarded", roles: [Hospitalist, GroupAdmin], code: 200, input: [target_hospitalist_id, expected_assignment_version], output: Assignment, side_effects: ["sets transfer_target_hospitalist_id", "increments Assignment.version by 1"] }
+  - { method: POST, path: "/assignments/{id}/accept-transfer", description: "Target accepts; this assignment CLOSED (TRANSFER), a new ACTIVE assignment is created for the target", roles: [Hospitalist], code: 200, input: [], output: Assignment, side_effects: ["closes source assignment (close_reason TRANSFER)", "creates new Assignment ACTIVE for target", "census -1 source / +1 target; distribution_eligible recomputed both sides"] }
+  - { method: POST, path: "/assignments/{id}/cancel-transfer", description: "PENDING_TRANSFER -> ACTIVE (cycle back)", roles: [Hospitalist, GroupAdmin], code: 200, input: [], output: Assignment, side_effects: ["clears transfer_target_hospitalist_id", "increments Assignment.version by 1"] }
+
+  - { method: POST, path: "/patients/{patient_id}/discharge-orders", description: "Create a PLANNED discharge order; caller must hold the patient's ACTIVE assignment", roles: [Hospitalist], code: 201, input: [target_discharge_at], output: DischargeOrder, side_effects: [] }
+  - { method: GET, path: "/discharge-orders", description: "List discharge orders (FK reverse for patient_id, ordering_hospitalist_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["patient_id?", "ordering_hospitalist_id?", "status?", "limit?", "offset?"], output: "DischargeOrder[]", side_effects: [] }
+  - { method: GET, path: "/discharge-orders/{id}", description: "Read one discharge order", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: DischargeOrder, side_effects: [] }
+  - { method: POST, path: "/discharge-orders/{id}/order", description: "PLANNED -> ORDERED", roles: [Hospitalist], code: 200, input: [], output: DischargeOrder, side_effects: ["sets ordered_at", "increments DischargeOrder.version by 1"] }
+  - { method: POST, path: "/discharge-orders/{id}/execute", description: "ORDERED -> EXECUTED; cascades patient discharge, assignment close, census recompute", roles: [Hospitalist], code: 200, input: [], output: DischargeOrder, side_effects: ["computes meets_throughput_target", "Patient -> DISCHARGED (obs axis -> OBS_CLOSED when OBS_ACTIVE)", "Assignment -> CLOSED (DISCHARGE)", "Hospitalist census - 1"] }
+
+  - { method: POST, path: "/shifts/{shift_id}/handoffs", description: "Create a DRAFT handoff for the outgoing shift", roles: [Hospitalist], code: 201, input: [receiving_hospitalist_id, patient_ids], output: Handoff, side_effects: ["computes completeness fields"] }
+  - { method: GET, path: "/handoffs", description: "List handoffs (FK reverse for shift_id, receiving_hospitalist_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["shift_id?", "receiving_hospitalist_id?", "status?", "limit?", "offset?"], output: "Handoff[]", side_effects: [] }
+  - { method: GET, path: "/handoffs/{id}", description: "Read one handoff", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Handoff, side_effects: [] }
+  - { method: PUT, path: "/handoffs/{id}", description: "Revise a DRAFT/RETURNED handoff; OCC-guarded; no state change", roles: [Hospitalist], code: 200, input: ["patient_ids?", "receiving_hospitalist_id?", expected_handoff_version], output: Handoff, side_effects: ["recomputes completeness fields", "increments Handoff.version by 1"] }
+  - { method: POST, path: "/handoffs/{id}/submit", description: "DRAFT|RETURNED -> SUBMITTED; requires open_item_count == 0", roles: [Hospitalist], code: 200, input: [], output: Handoff, side_effects: ["sets submitted_at", "increments Handoff.version by 1"] }
+  - { method: POST, path: "/handoffs/{id}/accept", description: "SUBMITTED -> ACCEPTED by the receiving hospitalist (never the submitter)", roles: [Hospitalist], code: 200, input: [], output: Handoff, side_effects: ["sets reviewed_at", "outgoing shift becomes closable"] }
+  - { method: POST, path: "/handoffs/{id}/return", description: "SUBMITTED -> RETURNED with a reason", roles: [Hospitalist], code: 200, input: [return_reason], output: Handoff, side_effects: ["stores return_reason", "increments Handoff.version by 1"] }
+
+  - { method: POST, path: "/patients/{patient_id}/consult-requests", description: "Create an OPEN consult; caller must hold the patient's ACTIVE assignment; patient must be ADMITTED", roles: [Hospitalist], code: 201, input: [specialty, priority, reason], output: ConsultRequest, side_effects: ["computes sla_deadline"] }
+  - { method: GET, path: "/consult-requests", description: "List consults (FK reverse for patient_id, requesting_hospitalist_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["patient_id?", "requesting_hospitalist_id?", "status?", "priority?", "limit?", "offset?"], output: "ConsultRequest[]", side_effects: [] }
+  - { method: GET, path: "/consult-requests/{id}", description: "Read one consult", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: ConsultRequest, side_effects: [] }
+  - { method: POST, path: "/consult-requests/{id}/acknowledge", description: "OPEN|ESCALATED|REOPENED -> ACKNOWLEDGED; evaluates sla_breached (strictly-greater)", roles: [ConsultingSpecialist], code: 200, input: [], output: ConsultRequest, side_effects: ["sets acknowledged_at, sla_breached"] }
+  - { method: POST, path: "/consult-requests/{id}/complete", description: "ACKNOWLEDGED -> COMPLETED", roles: [ConsultingSpecialist], code: 200, input: ["summary?"], output: ConsultRequest, side_effects: ["sets completed_at, response_minutes"] }
+  - { method: POST, path: "/consult-requests/{id}/reopen", description: "COMPLETED -> REOPENED within REOPEN_WINDOW_HOURS", roles: [Hospitalist], code: 200, input: ["reason?"], output: ConsultRequest, side_effects: ["increments ConsultRequest.version by 1"] }
+
+  - { method: POST, path: "/encounters", description: "Record a billable encounter for the calling hospitalist", roles: [Hospitalist], code: 201, input: [patient_id, encounter_type, occurred_on, wrvu_value], output: Encounter, side_effects: ["computes estimated_wrvu (per-line rounding)"] }
+  - { method: GET, path: "/encounters", description: "List encounters (FK reverse for hospitalist_id, patient_id, productivity_report_id)", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["hospitalist_id?", "patient_id?", "productivity_report_id?", "status?", "limit?", "offset?"], output: "Encounter[]", side_effects: [] }
+  - { method: GET, path: "/encounters/{id}", description: "Read one encounter", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: Encounter, side_effects: [] }
+  - { method: POST, path: "/encounters/{id}/void", description: "RECORDED -> VOIDED; reopens a FINALIZED linked report and recomputes its totals", roles: [Hospitalist, GroupAdmin], code: 200, input: [], output: Encounter, side_effects: ["linked FINALIZED report -> REOPENED with recomputed totals"] }
+
+  - { method: POST, path: "/productivity-reports/generate", description: "Create a PROVISIONAL productivity report for a hospitalist + period", roles: [GroupAdmin], code: 201, input: [hospitalist_id, period_start, period_end], output: ProductivityReport, side_effects: ["links in-period RECORDED encounters", "computes provisional totals"] }
+  - { method: GET, path: "/productivity-reports", description: "List reports (FK reverse for hospitalist_id)", roles: [GroupAdmin, Hospitalist], code: 200, input: ["hospitalist_id?", "status?", "limit?", "offset?"], output: "ProductivityReport[]", side_effects: [] }
+  - { method: GET, path: "/productivity-reports/{id}", description: "Read one report", roles: [GroupAdmin, Hospitalist], code: 200, input: [], output: ProductivityReport, side_effects: [] }
+  - { method: POST, path: "/productivity-reports/{id}/finalize", description: "PROVISIONAL|REOPENED -> FINALIZED; computes final variant totals", roles: [GroupAdmin], code: 200, input: [], output: ProductivityReport, side_effects: ["computes total_wrvu_final, wrvu_variance", "sets finalized_at"] }
+  - { method: POST, path: "/productivity-reports/{id}/reopen", description: "FINALIZED -> REOPENED; totals recomputed", roles: [GroupAdmin], code: 200, input: [], output: ProductivityReport, side_effects: ["recomputes totals"] }
+
+  - { method: POST, path: "/coverage-windows", description: "Create a night coverage / cross-cover window with a capacity pool", roles: [GroupAdmin], code: 201, input: [window_date, window_type, start_at, end_at, capacity], output: CoverageWindow, side_effects: [] }
+  - { method: GET, path: "/coverage-windows", description: "List coverage windows", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: ["window_type?", "status?", "limit?", "offset?"], output: "CoverageWindow[]", side_effects: [] }
+  - { method: GET, path: "/coverage-windows/{id}", description: "Read one coverage window incl. enrolled roster and load", roles: [GroupAdmin, Hospitalist, ConsultingSpecialist], code: 200, input: [], output: CoverageWindow, side_effects: [] }
+  - { method: POST, path: "/coverage-windows/{id}/enroll", description: "Calling hospitalist enrolls; capacity-pool overlap semantics (multiple enrollees up to capacity); own overlapping shift rejected", roles: [Hospitalist], code: 200, input: [], output: CoverageWindow, side_effects: ["appends enrolled_hospitalist_ids", "enrolled_count + 1; window OPEN -> FULL at capacity"] }
+  - { method: POST, path: "/coverage-windows/{id}/withdraw", description: "Calling hospitalist withdraws while window is OPEN or FULL", roles: [Hospitalist], code: 200, input: [], output: CoverageWindow, side_effects: ["removes from enrolled_hospitalist_ids", "window FULL -> OPEN"] }
+
+  - { method: POST, path: "/ops/monitor-run", description: "Ops-run checkpoint at the logical clock: obs conversions, consult escalations + auto-close, window lock/close, LOS flag refresh, cross-cover load recompute", roles: [GroupAdmin], code: 200, input: [], output: "{ evaluated_at: datetime, obs_converted_patient_ids: array, escalated_consult_ids: array, closed_consult_ids: array, locked_window_ids: array, closed_window_ids: array }", side_effects: ["calculations.observation_status_monitor", "calculations.consult_sla escalations/auto-close", "calculations.los_monitoring refresh", "window LOCKED/CLOSED transitions", "calculations.cross_cover_load recompute"] }
+  - { method: GET, path: "/reports/census-leveling", description: "Computed census-leveling report with forward-looking and chronological deviation variants per hospitalist", roles: [GroupAdmin, Hospitalist], code: 200, input: [], output: "{ generated_at: datetime, group_avg_census: number, leveling_needed: boolean, rows: array }", side_effects: ["runs calculations.census_leveling_projection"] }
+  - { method: POST, path: "/_clock/set_current_utc", description: "Test-driving endpoint: set the logical clock. Server startup default is 2026-05-01T00:00:00Z and never falls back to wall-clock time.", roles: [GroupAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: datetime }", side_effects: ["advances the logical clock used by every timestamp stamped after this call"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or malformed X-User-Role / X-User-ID headers" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "Role not permitted for the endpoint, or X-User-ID fails the resource ownership rule" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, unparseable type, unknown enum member, malformed datetime, or transfer target equals current hospitalist" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path or body referenced id does not exist" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "OCC expected_*_version does not match the parent entity's current version" }
+  - { id: ERR_ADMISSION_INVALID_STATE, http: 409, condition: "accept/decline on an admission not currently OFFERED" }
+  - { id: ERR_ADMISSION_NOT_OFFERED_TO_HOSPITALIST, http: 409, condition: "accept/decline by a hospitalist other than offered_to_hospitalist_id" }
+  - { id: ERR_ASSIGNMENT_INVALID_STATE, http: 409, condition: "transfer on non-ACTIVE assignment, or accept-transfer/cancel-transfer on non-PENDING_TRANSFER assignment" }
+  - { id: ERR_TRANSFER_TARGET_MISMATCH, http: 409, condition: "accept-transfer by a hospitalist other than transfer_target_hospitalist_id" }
+  - { id: ERR_DISCHARGE_ORDER_INVALID_STATE, http: 409, condition: "order on non-PLANNED order, or execute on non-ORDERED order" }
+  - { id: ERR_HANDOFF_INVALID_STATE, http: 409, condition: "PUT/submit outside DRAFT|RETURNED, or accept/return outside SUBMITTED" }
+  - { id: ERR_HANDOFF_SELF_ACCEPT, http: 409, condition: "receiving hospitalist equals the submitting hospitalist of the shift" }
+  - { id: ERR_HANDOFF_INCOMPLETE, http: 422, condition: "submit with open_item_count > 0 (patient_ids miss an ACTIVE assignment of the shift's hospitalist)" }
+  - { id: ERR_SHIFT_HANDOFF_MISSING, http: 409, condition: "shift close without an ACCEPTED handoff for the shift" }
+  - { id: ERR_SHIFT_INVALID_STATE, http: 409, condition: "activate on non-SCHEDULED shift, or close on non-ACTIVE shift" }
+  - { id: ERR_CONSULT_INVALID_STATE, http: 409, condition: "acknowledge outside OPEN|ESCALATED|REOPENED, complete outside ACKNOWLEDGED, reopen outside COMPLETED" }
+  - { id: ERR_CONSULT_REOPEN_WINDOW_EXPIRED, http: 422, condition: "reopen when now > completed_at + 24h" }
+  - { id: ERR_PATIENT_NOT_ADMITTED, http: 409, condition: "consult create / discharge-order create / discharge execute on a patient whose admission_status != ADMITTED" }
+  - { id: ERR_CENSUS_CAP_REACHED, http: 422, condition: "accept or accept-transfer when current_census == max_census_cap (boundary equality rejects)" }
+  - { id: ERR_NO_ACTIVE_SHIFT, http: 422, condition: "accept or accept-transfer when the hospitalist has no ACTIVE shift covering now (half-open)" }
+  - { id: ERR_HOSPITALIST_NOT_ACTIVE, http: 422, condition: "accept or accept-transfer when the hospitalist employment_status != ACTIVE" }
+  - { id: ERR_SHIFT_OVERLAP, http: 409, condition: "new shift's half-open [start_at, end_at) intersects an existing non-closed shift of the same hospitalist; pure adjacency (end == start) is allowed" }
+  - { id: ERR_SHIFT_INVALID_WINDOW, http: 422, condition: "shift end_at <= start_at" }
+  - { id: ERR_COVERAGE_WINDOW_FULL, http: 422, condition: "enroll when window.status == FULL (enrolled_count == capacity)" }
+  - { id: ERR_ALREADY_ENROLLED, http: 409, condition: "enroll when the calling hospitalist is already in enrolled_hospitalist_ids" }
+  - { id: ERR_COVERAGE_WINDOW_NOT_OPEN, http: 409, condition: "enroll/withdraw when window.status is LOCKED or CLOSED" }
+  - { id: ERR_ENROLL_SHIFT_CONFLICT, http: 409, condition: "enroll when the calling hospitalist owns a shift whose half-open interval overlaps the window; adjacency allowed" }
+  - { id: ERR_REPORT_INVALID_STATE, http: 409, condition: "finalize outside PROVISIONAL|REOPENED, or reopen outside FINALIZED" }
+  - { id: ERR_ENCOUNTER_ALREADY_VOIDED, http: 409, condition: "void on a VOIDED encounter" }
+  - { id: ERR_OPEN_STAT_CONSULT_BLOCKS_DISCHARGE, http: 422, condition: "discharge execute while a STAT consult for the patient is in OPEN|ESCALATED|ACKNOWLEDGED|REOPENED" }
+  - { id: ERR_DUPLICATE_ACTIVE_ASSIGNMENT, http: 409, condition: "admission accept when the patient already has an ACTIVE assignment" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: GroupAdmin
+    description: "Hospitalist-group operations administrator: roster, scheduling, admission intake, coverage windows, reports, ops-run, clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /hospitalists"
+      - "POST /patients"
+      - "POST /shifts"
+      - "POST /admissions"
+      - "POST /productivity-reports/generate, finalize, reopen"
+      - "POST /coverage-windows"
+      - "POST /ops/monitor-run"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "all GET endpoints"
+      - "POST /shifts/{id}/activate, close"
+      - "POST /assignments/{id}/transfer, cancel-transfer"
+      - "POST /encounters/{id}/void"
+  - name: Hospitalist
+    description: "Group physician: accepts admissions, rounds on assigned patients, orders/executes discharges, signs out handoffs, requests consults, records encounters, enrolls in coverage"
+    identity: "entity_backed:Hospitalist"
+    exclusive_operations:
+      - "POST /admissions/{id}/accept, decline"
+      - "POST /assignments/{id}/accept-transfer"
+      - "POST /patients/{patient_id}/discharge-orders; POST /discharge-orders/{id}/order, execute"
+      - "POST /shifts/{shift_id}/handoffs; PUT /handoffs/{id}; POST /handoffs/{id}/submit, accept, return"
+      - "POST /patients/{patient_id}/consult-requests; POST /consult-requests/{id}/reopen"
+      - "POST /encounters"
+      - "POST /coverage-windows/{id}/enroll, withdraw"
+    shared_operations:
+      - "all GET endpoints"
+      - "POST /shifts/{id}/activate, close (own shifts)"
+      - "POST /assignments/{id}/transfer, cancel-transfer (own assignments)"
+      - "POST /encounters/{id}/void (own encounters)"
+  - name: ConsultingSpecialist
+    description: "Specialist responding to routed consult requests"
+    identity: opaque
+    exclusive_operations:
+      - "POST /consult-requests/{id}/acknowledge, complete"
+    shared_operations:
+      - "all GET endpoints"

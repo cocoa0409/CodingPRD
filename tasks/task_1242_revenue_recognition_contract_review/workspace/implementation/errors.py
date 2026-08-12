@@ -1,0 +1,36 @@
+"""Error type and the exact error-id catalog from the scaffold."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.status = status
+        self.message = message
+
+
+ERR_MISSING_CONTEXT = "ERR_MISSING_OR_INVALID_CONTEXT_HEADER"   # 400
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                     # 400
+ERR_FORBIDDEN = "ERR_FORBIDDEN_FOR_ROLE"                        # 403
+ERR_NOT_TASK_OWNER = "ERR_NOT_TASK_OWNER"                       # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                                 # 404
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                         # 412
+ERR_INVALID_STATE_TRANSITION = "ERR_INVALID_STATE_TRANSITION"   # 409
+ERR_CONTRACT_NOT_ACTIVE = "ERR_CONTRACT_NOT_ACTIVE"             # 409
+ERR_ENTRY_LOCKED = "ERR_ENTRY_LOCKED"                           # 409
+ERR_PACK_PERIOD_NOT_CLOSED = "ERR_PACK_PERIOD_NOT_CLOSED"       # 409
+ERR_REVIEW_OUTSTANDING = "ERR_REVIEW_OUTSTANDING"               # 409
+ERR_SOD_VIOLATION = "ERR_SOD_VIOLATION"                         # 409
+ERR_PERIOD_CLOSED = "ERR_PERIOD_CLOSED"                         # 409
+ERR_PERIOD_OVERLAP = "ERR_PERIOD_OVERLAP"                       # 409
+ERR_PERIOD_REOPEN_LIMIT = "ERR_PERIOD_REOPEN_LIMIT"             # 409
+ERR_SSP_WINDOW_OVERLAP = "ERR_SSP_WINDOW_OVERLAP"               # 409
+ERR_COMBINATION_WINDOW_EXCEEDED = "ERR_COMBINATION_WINDOW_EXCEEDED"  # 409
+ERR_SCENARIO_WEIGHTS = "ERR_SCENARIO_WEIGHTS"                   # 422
+ERR_INVALID_AMOUNT = "ERR_INVALID_AMOUNT"                       # 422
+ERR_RECOGNITION_PATTERN_FORBIDDEN = "ERR_RECOGNITION_PATTERN_FORBIDDEN"  # 422
+ERR_NO_PENDING_POB = "ERR_NO_PENDING_POB"                       # 422
+ERR_SSP_NOT_FOUND = "ERR_SSP_NOT_FOUND"                         # 422
+ERR_COMBINATION_CRITERIA_NOT_MET = "ERR_COMBINATION_CRITERIA_NOT_MET"  # 422
+ERR_OVER_RECOGNITION = "ERR_OVER_RECOGNITION"                   # 422
+ERR_BILLING_EXCEEDS_PRICE = "ERR_BILLING_EXCEEDS_PRICE"         # 422

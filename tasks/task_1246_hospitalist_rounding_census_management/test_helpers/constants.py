@@ -1,0 +1,55 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Selector constants (PRD §3.3)
+CONTINUITY_BONUS = 0.25
+NIGHT_PENALTY = 0.10
+CONTINUITY_WINDOW_DAYS = 30
+
+# Census leveling (PRD §3.4)
+LEVELING_THRESHOLD = 0.15
+PROJECTION_HORIZON_HOURS = 24
+
+# wRVU (PRD §3.8)
+ESTIMATED_WRVU = {
+    "ADMISSION_HCP": 2.5,
+    "SUBSEQUENT_VISIT": 1.2,
+    "DISCHARGE_DAY": 1.8,
+    "CONSULT_NOTE": 1.5,
+}
+ADJUST_FACTOR = 1.06
+
+# Discharge throughput (PRD §3.5)
+DISCHARGE_CUTOFF_TIME = "11:00:00Z"
+
+# LOS monitoring (PRD §3.2)
+EXPECTED_LOS_DAYS = {
+    "INPATIENT": {"HIGH": 6, "MEDIUM": 4, "LOW": 2},
+    "OBSERVATION": {"HIGH": 2, "MEDIUM": 2, "LOW": 1},
+}
+LOS_ALERT_MULTIPLIER = 1.5
+
+# Observation status (PRD §3.2)
+OBS_CONVERT_THRESHOLD_HOURS = 48.0
+
+# Consult SLA (PRD §3.7)
+SLA_MINUTES = {
+    "STAT": 15,
+    "URGENT": 30,
+    "ROUTINE": 120,
+}
+REOPEN_WINDOW_HOURS = 24
+
+# Cross-cover load (PRD §3.9)
+MAX_CROSS_COVER_LOAD = 40
+NIGHT_CROSS_COVER_MULTIPLIER = 2.0
+CONSULT_LOAD_WEIGHT = 1
+HANDOFF_LOAD_WEIGHT = 2
+
+# Logical clock default (PRD §2.4)
+CLOCK_STARTUP_DEFAULT = "2026-05-01T00:00:00Z"
+
+# Pagination defaults (PRD §2.3)
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
