@@ -1,0 +1,74 @@
+"""Domain thresholds — numeric constants from PRD calculation and workflow rules."""
+
+# Reasonable-measures scoring (PRD §2.7)
+MEASURE_WEIGHTS = {
+    "POLICY": 10,
+    "TRAINING": 10,
+    "PHYSICAL": 15,
+    "CONTRACTUAL": 20,
+    "TECHNICAL": 25,
+}
+MULT_VERIFIED = 1.0
+MULT_IMPLEMENTED = 0.6
+POSTURE_THRESHOLD_STRONG = 70
+POSTURE_THRESHOLD_ADEQUATE = 40
+
+# Counterparty exposure index (PRD §2.8)
+PTS_ESCALATED = 25
+PTS_OVERDUE_NOW = 10
+PTS_DISCLOSURE_EXECUTED = 5
+EXPOSURE_CAP = 100
+TIER_MEDIUM_MIN = 30
+TIER_HIGH_MIN = 60
+EXPOSURE_WINDOW_DAYS = 365
+
+# Disclosure risk score (PRD §3.5)
+CLASS_BASE = {
+    "INTERNAL": 10,
+    "CONFIDENTIAL": 30,
+    "RESTRICTED": 60,
+    "CROWN_JEWEL": 90,
+}
+TIER_MULT = {
+    "LOW": 1.0,
+    "MEDIUM": 1.25,
+    "HIGH": 1.5,
+}
+MARKING_CREDIT = {
+    "STAMPED_CONFIDENTIAL": 10,
+    "ORAL_WITH_FOLLOWUP": 0,
+    "ENCRYPTED_DELIVERY": 20,
+}
+ENDORSEMENT_MIN = 80
+RISK_REJECT_MIN = 95
+
+# Demand-letter damages claim factors (PRD §3.7)
+CLAIM_FACTOR = {
+    "CEASE_AND_DESIST": 0.30,
+    "RETURN_OF_PROPERTY": 0.20,
+    "PRESERVATION": 0.15,
+}
+
+# Time-window rules (PRD §3)
+RETURN_WINDOW_DAYS = 30
+ACK_WINDOW_DAYS = 10
+GRANT_MAX_DAYS = 365
+REVIEW_WINDOW_DAYS = 90
+AUDIT_BUFFER_DAYS = 7
+TRAINING_VALIDITY_DAYS = 365
+EXECUTION_STALE_DAYS = 30
+BASIC_TS_DUE_DAYS = 30
+
+# Program defaults (PRD §2.5)
+DEFAULT_CLOCK = "2026-05-01T00:00:00Z"
+INITIAL_POLICY_VERSION = "v1"
+
+# Valid 64-hex hashes for evidence payloads
+SHA256_A = "a" * 64
+SHA256_B = "b" * 64
+SHA256_C = "c" * 64
+SHA256_D = "d" * 64
+SHA256_E = "e" * 64
+SHA256_F = "f" * 64
+SHA256_AB = "ab" * 32
+SHA256_CD = "cd" * 32

@@ -1,0 +1,50 @@
+"""Domain thresholds and numeric constants from PRD calculation rules."""
+
+# Logical clock startup default (PRD "The Logical Clock")
+CLOCK_START_UTC = "2026-05-01T00:00:00Z"
+
+# Swab / changeover validation constants (PRD "Changeover Execution and Swab Verification")
+SWAB_FAIL_CLUSTER_THRESHOLD = 2
+VALIDATION_BASE_SCORE = 100
+ON_TIME_BONUS = 5
+TARDY_PENALTY_PER_5MIN = 1
+TARDY_PENALTY_CAP = 20
+MARGIN_BONUS_PER_SWAB = 1
+MARGIN_BONUS_CAP = 10
+INVALIDATED_PENALTY = 2
+SCORE_MIN = 0
+SCORE_MAX = 100
+
+# Technician training score constants (PRD "Technician Certification, Training Scores, and Audit Findings")
+INITIAL_TRAINING_SCORE = 100
+MINOR_DEDUCTION = 2
+MAJOR_DEDUCTION = 5
+CRITICAL_DEDUCTION = 15
+OVERDUE_PENALTY = 3
+SUSPENSION_THRESHOLD = 60
+REINSTATE_SCORE_FLOOR = 75
+
+# Matrix entry default budget (PRD "Allergen Master Data and the Line-Allergen Matrix")
+DEFAULT_CHANGEOVER_MINUTES = 30
+
+# Pagination (PRD "Pagination")
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 100
+
+THRESHOLDS = {
+    "SWAB_FAIL_CLUSTER_THRESHOLD": SWAB_FAIL_CLUSTER_THRESHOLD,
+    "SUSPENSION_THRESHOLD": SUSPENSION_THRESHOLD,
+    "REINSTATE_SCORE_FLOOR": REINSTATE_SCORE_FLOOR,
+    "OVERDUE_PENALTY": OVERDUE_PENALTY,
+}
+
+# Common test payload defaults
+TEST_DEFAULTS = {
+    "ATP_ACTION_LEVEL_RLU": 150,
+    "ALLERGEN_ACTION_LEVEL_PPM": 2.0,
+    "MIN_SWAB_ZONES": 1,
+    "CERT_EXPIRY_UTC": "2027-01-01T00:00:00Z",
+    "FINDING_DUE_UTC": "2026-12-01T00:00:00Z",
+    "RUN_START_UTC": "2026-06-01T08:00:00Z",
+    "RUN_END_UTC": "2026-06-01T12:00:00Z",
+}

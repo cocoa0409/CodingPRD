@@ -1,0 +1,63 @@
+"""Domain thresholds and calculation constants (PRD §2.7-§2.9, §3.2, §3.4, §3.8, §3.9)."""
+
+# Sludge estimate (PRD §3.4/§3.5)
+SLUDGE_RATIO = {
+    "GASOLINE": 0.02,
+    "DISTILLATE": 0.03,
+    "JET": 0.015,
+    "CRUDE": 0.08,
+    "CHEMICAL": 0.05,
+    "VEGOIL": 0.04,
+}
+SURFACE_FACTOR = {"LOW": 0.5, "MEDIUM": 1.0, "HIGH": 2.0}
+
+# Contractor safety score (PRD §3.2)
+SCORE_BASE = 100.0
+INCIDENT_FACTOR = 2.0
+VIOLATION_FACTOR = 1.0
+NEAR_MISS_FACTOR = 0.25
+TRAINING_FACTOR = 0.5
+ROLLING_WINDOW_DAYS = 365
+SCORE_MIN = 0.00
+SCORE_MAX = 100.00
+
+# Flush volume (PRD §3.4)
+FLUSH_BASE_FACTOR = {"LOW": 0.02, "MEDIUM": 0.035, "HIGH": 0.05}
+FLUSH_CLASS_MULTIPLIER = {
+    "COMPATIBLE_DIRECT": 0.5,
+    "REQUIRES_FLUSH": 1.0,
+    "REQUIRES_FULL_STRIP": 1.8,
+}
+LINES_ALLOWANCE_L = 5000
+MIN_FLUSH_L = 2000
+MAX_FLUSH_L = 200000
+
+# Waste disposal cost (PRD §3.5)
+HAZARD_MULTIPLIER = {"NON_HAZARDOUS": 1.0, "HAZARDOUS": 2.5}
+
+# Invoice waterfall (PRD §3.8)
+FLUSH_RATE_CENTS_PER_LITER = 2
+TIER1_MIN_CENTS = 1000000
+TIER1_PCT = 0.10
+TIER2_MIN_CENTS = 500000
+TIER2_PCT = 0.05
+
+# Gas-free envelope (PRD §2.9)
+LEL_LIMIT_PCT = 10.0      # strict upper bound
+O2_MIN_PCT = 19.5         # closed band
+O2_MAX_PCT = 23.5
+H2S_LIMIT_PPM = 10.0      # inclusive
+BENZENE_LIMIT_PPM = 1.0   # strict upper bound
+CERT_VALIDITY_HOURS = 12
+REVALIDATE_EXTENSION_HOURS = 6
+
+# Tank window calendar (PRD §2.8)
+WINDOW_BUFFER_HOURS = 24
+
+# Terminal defaults (PRD §3.1)
+DEFAULT_SAFETY_SCORE_THRESHOLD = 85.0
+DEFAULT_SCORE_VARIANT = "ROLLING_12MO"
+DEFAULT_MASS_BALANCE_TOLERANCE_PCT = 2.0
+
+# Logical clock startup value (PRD §2.5)
+CLOCK_START = "2026-05-01T00:00:00Z"

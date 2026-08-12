@@ -1,0 +1,68 @@
+"""Domain thresholds and numeric constants from the PRD's calculation rules."""
+
+# VOC computation (PRD §3.5)
+GAL_TO_L = 3.78541
+THINNER_VOC_G_PER_ML = 0.9
+
+# Order pricing (PRD §3.3)
+CUSTOM_SETUP_FEE_CENTS = 7500
+RUSH_PCT = 0.12
+RUSH_PCT_THRESHOLD_CENTS = 200000
+RUSH_FLAT_CENTS = 15000
+CUSTOM_MIN_GALLONS = 50
+CUSTOM_MIN_GALLONS_RUSH = 100
+
+# Fill weigh gate (PRD §3.7)
+NOMINAL_FILL_G = {"QUART": 1150, "GALLON": 4600, "FIVE_GALLON": 23000}
+NOMINAL_VOLUME_GAL = {"QUART": 0.25, "GALLON": 1.0, "FIVE_GALLON": 5.0}
+SIZE_LITERS = {"QUART": 0.946, "GALLON": 3.785, "FIVE_GALLON": 18.927}
+TOLERANCE_PCT = 0.015
+TOLERANCE_FLOOR_G = 10
+
+# Fill reconciliation (PRD §3.7)
+RECON_TOLERANCE_PCT = 0.5
+
+# Batch costing (PRD §3.4 / §3.7)
+WASTE_RECOVERY = 0.5
+REWORK_FEE_CENTS = 25000
+
+# Credit claims (PRD §3.8)
+BAND_FULL_DAYS = 540
+BAND_MID_DAYS = 360
+BAND_LOW_DAYS = 180
+FREEZE_PENALTY_FACTOR = 0.5
+FREEZE_PENALTY_EXPOSURE_THRESHOLD = 2
+CLAIM_WINDOW_DAYS = 30
+
+# Rush capacity (PRD §3.3)
+RUSH_DAILY_LIMIT = 3
+
+# Disposal pricing (PRD §3.9)
+HAZMAT_VOC_THRESHOLD_GPL = 250
+RATE_HAZMAT_CENTS_PER_KG = 250
+RATE_NONHAZMAT_CENTS_PER_KG = 90
+MANIFEST_FEE_CENTS = 45000
+PAIL_RECOVERY_CENTS = 300
+RECOVERY_CAP_PCT = 0.20
+QUANTITY_TOLERANCE_PCT = 2
+
+# Retain sample retention by category, calendar months (PRD §3.6)
+RETENTION_MONTHS = {
+    "FLAT": 24,
+    "NONFLAT": 24,
+    "PRIMER": 18,
+    "INDUSTRIAL_MAINTENANCE": 36,
+    "TRAFFIC_MARKING": 12,
+}
+
+# Mill reservation (PRD §2.10)
+WASHDOWN_BUFFER_MIN = 30
+
+# Batch QC rework cap (PRD §3.6)
+MAX_REWORK = 2
+
+# Logical clock default before any client touches it (PRD §2.5)
+DEFAULT_CLOCK = "2026-05-01T00:00:00Z"
+
+# Common test windows on the shared test mill
+WINDOW_JUN10_AM = ("2026-06-10T08:00:00Z", "2026-06-10T12:00:00Z")

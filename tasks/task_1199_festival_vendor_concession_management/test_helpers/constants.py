@@ -1,0 +1,46 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules."""
+
+# Logical-clock anchors used across scenarios (PRD §2.5 pins the startup default).
+DEFAULT_CLOCK_ISO = "2026-05-01T00:00:00Z"
+EVENT_START_ISO = "2026-07-10T12:00:00Z"
+EVENT_END_ISO = "2026-07-12T23:00:00Z"
+AFTER_EVENT_END_ISO = "2026-07-13T00:00:00Z"
+IN_WINDOW_SALE_ISO = "2026-07-10T14:00:00Z"
+
+THRESHOLDS = {
+    # Tiered revenue share (PRD §3.6)
+    "TIER1_CEILING_CENTS": 500000,
+    "TIER2_CEILING_CENTS": 2000000,
+    "TIER1_MULTIPLIER_BP": 10000,
+    "TIER2_MULTIPLIER_BP": 15000,
+    "TIER3_MULTIPLIER_BP": 20000,
+    # Load-in logistics (PRD §3.5)
+    "CHECKIN_GRACE_MINUTES": 30,
+    "SLOT_LOCK_MINUTES": 120,
+    "NO_SHOW_FINE_CENTS": 25000,
+    # Inspections (PRD §3.4)
+    "HEALTH_SPOT_FAIL_FINE_CENTS": 50000,
+    # Vendor standing (PRD §3.7)
+    "STRIKE_SUSPENSION_THRESHOLD": 3,
+    # Performance (PRD §3.8)
+    "RETURN_SCORE_THRESHOLD": 70,
+    "SALES_WEIGHT": 40,
+    "COMPLIANCE_WEIGHT": 30,
+    "OPERATIONS_WEIGHT": 30,
+    "FINE_PENALTY": 15,
+    "WAIVED_FINE_PENALTY": 8,
+    "NO_SHOW_PENALTY_POINTS": 30,
+    # Curation (PRD §3.2)
+    "REVIEW_ROUND_LIMIT": 3,
+}
+
+TEST_DEFAULTS = {
+    "CATEGORY_CAP": 2,
+    "ZONE_POWER_AMPS": 100,
+    "ZONE_WATER_HOOKUPS": 1,
+    "BOOTH_OUTLET_AMPS": 60,
+    "POWER_DRAW_AMPS": 20,
+    "FLAT_FEE_CENTS": 50000,
+    "REVENUE_SHARE_PCT_BP": 1000,
+    "SLOT_MAX_VEHICLES": 10,
+}
