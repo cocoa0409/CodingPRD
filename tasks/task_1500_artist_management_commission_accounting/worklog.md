@@ -230,3 +230,41 @@ Done. `PRD_FINALIZED.md` is written at `/home/ubuntu/github/CodingPRD/tasks/task
   - (a) Subject: the effective-end anchor (`termination_date` vs `term_end_date`) in commission rate resolution at verification, feeding the IN_TERM boundary, the per-type sunset end, and the deal-in-term `confirmed_at` comparison.
   - (b) Impl paths enumerated and read/grepped: `services/calculations.py:53-95` (`resolve_commission`, selection at :65-68, downstream uses :71/:75/:83); sole callsite `routes/income_events.py:160` gated by `COMMISSIONABLE_POSTURES` at :156; `routes/agreements.py:52` (field born `None`), `:173-190` (stamped at terminate, `set_sunset_window` fed day-after), `:79-134` (PATCH never writes `termination_date` — DRAFT edits term dates/policies only, ACTIVE extends `term_end_date` only); `services/sweep.py:19-53` (never reads or clears `termination_date`; posture transitions key on `term_end_date`/stored `sunset_end_date`); `services/core.py:86-95` (`set_sunset_window` — stored window fields, separate concept); full-repo greps for `termination_date`, `term_end_date`, `sunset_start_date`, `sunset_end_date`, `TERMINATED`, `resolve_commission`, `term_relation`, `confirmed_at` confirming no other status-keyed choice exists.
   - (c) Wording adjustment: keyed the rule on the recorded field's presence rather than current status and stated the never-cleared persistence explicitly, so the sentence is exact for every enumerated posture — TERMINATED and SUNSET-after-termination anchor on `termination_date`; ACTIVE/EXPIRED/SUPERSEDED (field always `None`) anchor on `term_end_date`; CLOSED never reaches the code (verification gate rejects it). The sentence says nothing about `sunset_start_date`/`sunset_end_date`, leaving §3.2's window prose and §2.6's sweep prose untouched, and the rest of the §3.5 paragraph (sunset test, deal-in-term, rates) is verbatim.
+
+## Step 9: Complete PRD — 2026-08-13T18:55:00.000Z
+
+Done. `/home/ubuntu/github/CodingPRD/tasks/task_1500_artist_management_commission_accounting/workspace/PRD_COMPLETED.md` produced as a minimal patch over `PRD_FINALIZED.md`, pinned to `implementation/`.
+
+**Size delta:** PRD_FINALIZED.md 377 lines / 68,050 chars → PRD_COMPLETED.md 378 lines / 72,715 chars (+1 line, +4,665 chars; 24 changed hunks, no new sections).
+
+**Counts:** 18 ambiguity-pin edits, 6 mismatch-revision edits (24 hunks total).
+
+**Mismatch revisions** (PRD described behavior impl does not exhibit):
+- §2.6 + §3.1 — revise — mismatch — clock sweep ends only `ACTIVE` team members; `SUSPENDED` members survive a passed `window_end_date` — `implementation/services/sweep.py:81-86`
+- §2.7 item 5 — revise — mismatch — blanket "window end later than start" replaced with per-endpoint ordering, since team-member windows allow equality (`window_end >= window_start`) — `implementation/routes/team_members.py:30-31`
+- §2.8 (+ companion phrasing in §3.2, §3.3) — revise — mismatch — all three expected-version fields are optional, checked only when supplied, not required — `implementation/routes/agreements.py:39-45,85-98`, `implementation/routes/opportunities.py:129-134`
+- §3.1 — revise — mismatch — archived-artist blocked-creation list drops "agreements": impl allows DRAFT agreement creation for archived artists; the gate is at activation — `implementation/routes/agreements.py:28-61` (no archived check) vs `income_events.py:81`, `expenses.py:40`, `opportunities.py:55`, `engagements.py:47`, `options.py:53`, `advances.py:30`, `statements.py:49`
+- §3.2 — revise — mismatch — ACTIVE edit carrying no `term_end_date` → `ERR_INVALID_STATE`, a non-later `term_end_date` → `ERR_INVALID_REQUEST`, other fields ignored, and no-change edits do not increment `version` (old text claimed every edit increments) — `implementation/routes/agreements.py:100-133`
+- §3.5 — revise — mismatch — both REPORTED and VERIFIED voids increment the artist's `version` (old prose only mentioned it for VERIFIED) — `implementation/routes/income_events.py:218-220`
+- §3.8 — insert — mismatch — statement-generation gate order pinned to impl's actual order (archived gate before future-period gate; overlap before prior-statement-open), overriding §2.7 numbering — `implementation/routes/statements.py:46-78`
+- §3.9 — revise — mismatch — dispute resolve takes `outcome` of `UPHELD`/`REJECTED` (recorded as `RESOLVED_UPHELD`/`RESOLVED_REJECTED`), and the awarded-amount check fires after the state precondition — `implementation/routes/disputes.py:24,91-100`
+
+**Ambiguity pins** (PRD silent; inserted what impl does):
+- §2.1 — unresolvable/mismatched team-member identity → `ERR_ARTIST_ACCESS_DENIED` — `implementation/middleware.py:43-58,76-85`
+- §2.2 — unmatched paths/methods → `ERR_NOT_FOUND` 404 in the standard envelope — `implementation/app.py:30-36`
+- §2.3 — non-integer/out-of-range `limit`/`offset` → `ERR_INVALID_REQUEST`; list sort ties broken by `id` ascending — `implementation/routes/helpers.py:27-48,71`
+- §2.6 — logical-clock-stamped fields (`confirmed_at`, `issued_at`, `dispute_window_ends_at`) render at whole-second precision; `created_at`/`updated_at` record wall-clock time — `implementation/util.py:18-21,43-45`
+- §2.6 — one agreement may increment several sweep counts in a single advance (e.g. ACTIVE→EXPIRED→CLOSED) — `implementation/services/sweep.py:19-53`
+- §2.7 — create endpoints extract the body scoping key (`artist_id`; `agreement_id` resolved for rate-schedule creation) before header/role checks; single-resource reads check path existence before scoping/team-status — `implementation/routes/helpers.py:78-93`, `implementation/routes/rate_schedules.py:40-45`
+- §2.9 — completed the artist version-bump side-effect list (agreement create/terminate, income reporting/voiding, advance issuance, sweep expiry clearing `current_agreement_id`) — `implementation/services/core.py:29-67`
+- §3.1 — artist PATCH: unknown status value → `ERR_INVALID_STATE`; same-status write and no-change PATCH are no-ops; artists list filters are `status` and `current_agreement_id` — `implementation/routes/artists.py:45-99`
+- §3.2 — sunset window computed once at opening, never recomputed; close re-pins and excludes self from overlap scan — `implementation/services/core.py:86-95`, `implementation/routes/rate_schedules.py:117-129`
+- §3.3 — trailing evaluation window = [clock−365d, clock] inclusive; availability inspects only HOLD/CONFIRMED engagements — `implementation/services/calculations.py:213-254`
+- §3.3 — conversion copies `income_type`/`counterparty_name` from the opportunity; the engagement is created before the overlap check, so a failed conversion leaves it persisted as CONFIRMED with the opportunity still ACCEPTED — `implementation/routes/opportunities.py:210-228`
+- §3.4 — exercise-born engagement carries `opportunity_id` = option's `source_opportunity_id` (or null) and empty `counterparty_name`; same orphan-on-overlap-failure behavior — `implementation/routes/options.py:109-126`
+- §3.5 — agreement-resolution final tie-break by lowest `id` — `implementation/routes/income_events.py:50-57`
+- §3.7 — per-request approver-role match evaluated after the PENDING state check; resubmission clears `rejection_note` and re-stamps `submitted_by_user_id` — `implementation/routes/approval_requests.py:50-57`, `implementation/routes/expenses.py:91-93`
+- §3.8 — `rate_snapshot` entries carry `income_type`/`schedule_id`/`rate_bps` keys in line order; issue sweep guards (events still VERIFIED/SETTLED, expenses still APPROVED, recoup pin only if still null); amend skips upheld disputes already carried as adjustment lines — `implementation/services/calculations.py:344-348`, `implementation/routes/statements.py:154-170,196-207`
+- §3.9 — escalation creates its audit unconditionally (365-day window and one-open-audit guards apply only to the direct-demand path); withdraw-revert treats only OPEN/UNDER_REVIEW disputes as active; audit window boundary is exactly 365 days before the clock instant, inclusive — `implementation/routes/disputes.py:118-146`, `implementation/routes/audits.py:41-49`, `implementation/services/core.py:160-164`
+
+No sections added; all error codes, endpoint table, calculation formulas, and examples in the PRD were verified against impl and left untouched where already aligned.
