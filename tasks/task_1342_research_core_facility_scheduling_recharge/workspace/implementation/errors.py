@@ -1,0 +1,58 @@
+"""Error catalog and ApiError exception. Error IDs and HTTP statuses are
+exactly those declared in SCAFFOLD.yaml §1.6 / PRD §5."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.status = status
+        self.message = message
+
+
+ERROR_STATUS = {
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_BATCH_NOT_OPEN": 409,
+    "ERR_FY_CLOSED": 409,
+    "ERR_GRANT_HAS_OPEN_ENTRIES": 409,
+    "ERR_INSTRUMENT_UNAVAILABLE": 409,
+    "ERR_USER_SUSPENDED": 403,
+    "ERR_TRAINING_REQUIRED": 422,
+    "ERR_TRAINING_EXPIRED": 422,
+    "ERR_BOOKING_IN_PAST": 422,
+    "ERR_DURATION_OUT_OF_RANGE": 422,
+    "ERR_BOOKING_OVERLAP": 409,
+    "ERR_DOWNTIME_CONFLICT": 409,
+    "ERR_CONTRACT_OVERLAP": 409,
+    "ERR_USAGE_WINDOW_INVALID": 422,
+    "ERR_CONTRACT_REQUIRED": 422,
+    "ERR_UNIQUE_CONSTRAINT": 409,
+    "ERR_DUPLICATE_OPEN_BATCH": 409,
+    "ERR_DUPLICATE_BOOKING": 409,
+    "ERR_USAGE_LOG_EXISTS": 409,
+    "ERR_RATE_ORDER_INVALID": 422,
+    "ERR_PRIORITY_NOT_AVAILABLE": 422,
+    "ERR_PREEMPTION_BLOCKED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_PUBLICATION_EVIDENCE_MISSING": 422,
+    "ERR_ACK_REASON_REQUIRED": 422,
+    "ERR_GRANT_AFFILIATION_MISMATCH": 422,
+    "ERR_GRANT_INACTIVE": 422,
+    "ERR_GRANT_WINDOW_VIOLATION": 422,
+    "ERR_GRANT_NOT_AUTHORIZED": 403,
+    "ERR_GRANT_BUDGET_EXCEEDED": 422,
+    "ERR_RATE_CAP_EXCEEDED": 422,
+    "ERR_BREAK_EVEN_WAIVER_REQUIRED": 422,
+    "ERR_SUBSIDY_INELIGIBLE": 422,
+    "ERR_UNFINALIZED_BATCHES": 409,
+}
+
+
+def fail(error_id, message):
+    status = ERROR_STATUS.get(error_id, 400)
+    raise ApiError(error_id, status, message)

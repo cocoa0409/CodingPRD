@@ -1,0 +1,68 @@
+"""Domain thresholds and numeric constants from the PRD (§2.5, §3.2, §3.6-§3.9)."""
+
+# Logical clock (PRD §2.5): startup default instant.
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# Alert weighted scoring (PRD §3.2).
+EXCEPTION_WEIGHTS = {
+    "REFUND_NO_RECEIPT": 10,
+    "HIGH_VALUE_VOID": 14,
+    "PRICE_OVERRIDE": 8,
+    "NO_SALE_DRAWER": 6,
+    "SUSPEND_CANCEL": 8,
+    "SWEETHEART_SCAN": 12,
+    "SELF_CHECKOUT_MISMATCH": 9,
+}
+BAND1_MAX_CENTS = 5000        # amount < 5000 -> multiplier 1.0
+BAND2_MAX_CENTS = 20000       # 5000 <= amount < 20000 -> 1.5; >= 20000 -> 2.0
+ALERT_OPEN_THRESHOLD = 40.00
+ALERT_ESCALATE_THRESHOLD = 75.00
+ALERT_WINDOW_DAYS = 30
+
+# Civil demand tier schedule (PRD §3.6).
+TIER1_MAX_CENTS = 50000
+TIER1_PENALTY_CENTS = 10000
+TIER2_MAX_CENTS = 150000
+TIER2_BASE_CENTS = 25000
+TIER2_RATE = 0.10
+TIER3_BASE_CENTS = 50000
+TIER3_RATE = 0.20
+PENALTY_CAP_CENTS = 100000
+PRIOR_STEP = 0.5
+PRIOR_MAX_COUNTED = 4
+MULTIPLIER_CAP = 3.0
+
+# Restitution waterfall (PRD §3.6).
+NSF_FEE_CENTS = 2500
+WRITE_OFF_CAP_CENTS = 50000
+
+# Shrink accrual / variance (PRD §3.9).
+SALES_ACCRUAL_RATE = 0.0125
+VARIANCE_BREACH_PCT = 0.0200
+
+# Evidence retention horizons (PRD §3.7).
+RETENTION_STANDARD_DAYS = 90
+RETENTION_EXTENDED_DAYS = 365
+RETENTION_CASE_HOLD_DAYS_AFTER_CLOSE = 30
+
+# Interview documentation SLA (PRD §3.4).
+DOC_SLA_HOURS = 72
+
+# Temporal windows (PRD §3.5, §3.6).
+REOPEN_WINDOW_DAYS = 30
+DEMAND_ISSUE_WINDOW_DAYS = 60
+
+# ORC escalation conjuncts (PRD §3.8).
+ORC_MIN_CONFIRMED_CASES = 3
+ORC_MIN_DISTINCT_STORES = 2
+ORC_MIN_EXPOSURE_CENTS = 500000
+
+# Canonical actor ids (opaque X-User-ID values, PRD §2.1).
+ANALYST_1 = "ana-1"
+ANALYST_2 = "ana-2"
+MANAGER_1 = "mgr-1"
+MANAGER_2 = "mgr-2"
+HR_PARTNER_1 = "hr-1"
+ADMIN_1 = "adm-1"
+AUDITOR_1 = "aud-1"
+POS_FEED_1 = "feed-1"

@@ -1,0 +1,75 @@
+"""Domain thresholds and rate-card constants (PRD §2.8, §3)."""
+
+# Logical clock (PRD §2.4)
+CLOCK_DEFAULT = "2026-08-01T00:00:00Z"
+
+# Severity thresholds (PRD §3.3, inclusive at every threshold)
+SEVERE_LIVE = 10
+SEVERE_EVIDENCE = 20
+MODERATE_LIVE = 4
+MODERATE_EVIDENCE = 8
+LOW_LIVE = 1
+LOW_EVIDENCE = 1
+
+# Exposure posture (PRD §3.1)
+RESTRICTED_OPEN_CASES = 3
+ELEVATED_OPEN_CASES = 1
+
+# Adjacent exposure (PRD §3.3)
+ADJACENT_STACK_DELTA = 1
+ADJACENT_FLOOR_DELTA = 1
+AUTO_INITIAL_DELAY_HOURS = 24
+
+# Rate card (PRD §2.8), whole cents
+RATE_CARD = {
+    "NON_COMPLIANCE_FEE": 15000,
+    "REPEAT_INFESTATION": 22000,
+    "HEAT_SURCHARGE": 65000,
+    "LATE_FEE": 5000,
+}
+DISPOSAL_ITEM_RATE_CENTS = 7995
+OVERAGE_RATE_CENTS_PER_MIN = 175
+ADMIN_SURCHARGE_PCT = 0.075
+
+# Treatment cost estimates for the budget gate (PRD §2.8)
+TREATMENT_COST_ESTIMATE = {
+    "CHEMICAL": 12000,
+    "HEAT": 65000,
+    "EXCLUSION": 9000,
+    "TRAPPING": 6000,
+}
+
+# Lease ledger (PRD §3.2)
+LATE_FEE_THRESHOLD_CENTS = 50000
+LATE_FEE_BASE_CENTS = 5000
+DISPUTE_WINDOW_DAYS = 14
+
+# Treatment protocol (PRD §3.4/§3.5)
+PREP_NOTICE_HOURS = 48
+RESCHEDULE_LIMIT = 2
+TECHNICIAN_TRAVEL_BUFFER_MINUTES = 15
+HEAT_FLOOR_GAP_HOURS = 24
+
+# Clearance (PRD §3.6)
+REQUIRED_CONSECUTIVE_NEGATIVES = 2
+MIN_NEGATIVE_SPACING_DAYS = 14
+
+# Risk score (PRD §3.9)
+W_SEVERE = 40
+W_CASE = 15
+CASE_CAP = 3
+W_ADJACENT = 10
+ADJACENT_CAP = 2
+RECENCY_MAX = 25
+RECENCY_STEP_DAYS = 30
+RECENCY_STEP_POINTS = 5
+SEVERE_WINDOW_DAYS = 90
+RECENCY_WINDOW_DAYS = 180
+RISK_SCORE_CAP = 100
+
+# Pre-computed canonical amounts used across tests
+# (rate card x 1.075 surcharge, round-half-up per line, PRD §2.8/§3.7)
+NON_COMPLIANCE_FEE_AMOUNT = 16125            # round_half_up(15000 * 1.075)
+REPEAT_INFESTATION_AMOUNT_NO_COVERAGE = 23650  # round_half_up(22000 * 1.075)
+LATE_FEE_AMOUNT = 5375                       # round_half_up(5000 * 1.075)
+DISPOSAL_ITEM_AMOUNT = 8595                  # round_half_up(7995 * 1.075)

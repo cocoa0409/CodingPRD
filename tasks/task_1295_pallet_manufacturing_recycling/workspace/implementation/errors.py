@@ -1,0 +1,80 @@
+"""Error classes and error-ID constants per the scaffold error catalog."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+# --- Error catalog (id -> http status) -------------------------------------
+ERR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_REFERENCED_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SPEC_NOT_DRAFT": 409,
+    "ERR_SPEC_HAS_STOCK": 409,
+    "ERR_SPEC_ON_OPEN_ORDER": 409,
+    "ERR_INDEX_WINDOW_OVERLAP": 409,
+    "ERR_SEASON_WINDOW_OVERLAP": 409,
+    "ERR_PRICE_INDEX_MISSING": 422,
+    "ERR_BATCH_NOT_RECEIVING": 409,
+    "ERR_BATCH_NOT_SORTING": 409,
+    "ERR_BATCH_NOT_AUDIT": 409,
+    "ERR_CORES_UNSORTED": 409,
+    "ERR_CORE_ALREADY_SORTED": 409,
+    "ERR_SCRAP_NOTE_REQUIRED": 422,
+    "ERR_CORE_NOT_REPAIRABLE": 422,
+    "ERR_CORE_NOT_IN_YARD": 409,
+    "ERR_REPAIR_ALREADY_OPEN": 409,
+    "ERR_WO_NOT_OPEN": 409,
+    "ERR_WO_NOT_IN_PROGRESS": 409,
+    "ERR_LOT_NOT_AVAILABLE": 409,
+    "ERR_LOT_HAS_ALLOCATIONS": 409,
+    "ERR_HT_NOT_STAGING": 409,
+    "ERR_HT_NOT_RUNNING": 409,
+    "ERR_HT_EMPTY": 422,
+    "ERR_CHAMBER_OCCUPIED": 409,
+    "ERR_HT_DWELL_SHORT": 422,
+    "ERR_HT_SPECIES_MISMATCH": 422,
+    "ERR_HT_CAPACITY_EXCEEDED": 422,
+    "ERR_HT_REQUIRED": 422,
+    "ERR_INSUFFICIENT_STOCK": 422,
+    "ERR_CUSTOMER_NOT_ACTIVE": 409,
+    "ERR_CUSTOMER_NOT_SUSPENDED": 409,
+    "ERR_CUSTOMER_CREDIT_HOLD": 422,
+    "ERR_POOL_UNITS_OUTSTANDING": 409,
+    "ERR_OPEN_ORDERS_EXIST": 409,
+    "ERR_ORDER_NOT_DRAFT": 409,
+    "ERR_ORDER_EMPTY": 422,
+    "ERR_ORDER_NOT_CONFIRMED": 409,
+    "ERR_ORDER_NOT_ALLOCATED": 409,
+    "ERR_ORDER_NOT_CANCELLABLE": 409,
+    "ERR_ORDER_ALREADY_SETTLED": 409,
+    "ERR_PAYMENT_AMOUNT_MISMATCH": 422,
+    "ERR_RETURN_NOT_LOGGED": 409,
+    "ERR_RETURN_NOT_GRADED": 409,
+    "ERR_RETURN_EXCEEDS_OUTSTANDING": 422,
+    "ERR_ROUTE_NOT_PLAN": 409,
+    "ERR_ROUTE_NOT_DISPATCHED": 409,
+    "ERR_ROUTE_EMPTY": 422,
+    "ERR_CUBE_OVERFLOW": 422,
+    "ERR_DUPLICATE_STOP_SEQUENCE": 409,
+    "ERR_STOP_NOT_SCHEDULED": 409,
+    "ERR_STOP_NOT_ARRIVED": 409,
+    "ERR_STOP_OUT_OF_SEQUENCE": 409,
+    "ERR_STOPS_OPEN": 409,
+    "ERR_GRIND_NOT_QUEUED": 409,
+    "ERR_GRIND_NOT_RUNNING": 409,
+    "ERR_CORE_NOT_GRINDABLE": 422,
+}
+
+
+def raise_err(error_id, message):
+    raise ApiError(error_id, message, ERR[error_id])

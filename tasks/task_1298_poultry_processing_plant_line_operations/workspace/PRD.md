@@ -1,0 +1,320 @@
+# Poultry Plant Line Operations API — Product Requirements Document
+
+## 1. Introduction
+
+A poultry further-processing plant lives and dies by the disciplined choreography of its production shifts: live birds arrive by the truckload and are booked against shackle capacity, evisceration and chilling lines convert flock lots into chilled carcasses under USDA oversight, deboning lines turn that chilled inventory into customer orders against a finite labor budget, and every finished lot must carry an unbroken trace back to its shift and lot for regulatory and recall purposes. Woven through all of this are hard compliance obligations — sanitation and pre-operational inspection gates before production may open, water and chiller usage limits enforced against a logical plant clock, segregation of duties between the people who perform work and the people who certify it, and line-speed governance that couples mechanical ratings, regulatory caps, staffing reality, and inspector-approved waivers.
+
+This document specifies the API through which the plant operates that choreography. All resources are mounted under the `/poultry` prefix. The system is the single authority for booking and receiving flock lots, queuing and completing evisceration runs, coding and certifying condemnations, posting utility meter readings, scheduling deboning batches against customer orders, trace-locking finished lots into fresh or frozen routing, and settling lots through a yield-certification and regrade cycle. Every mutation and its cascading side effects commit atomically within the request that triggers them, and a server-maintained logical clock — never the wall clock — drives every time-based transition in the plant.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines system-wide rules, principles, and boilerplate that apply to the entire API.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two mandatory HTTP headers: `X-User-ID`, identifying the acting operator, and `X-User-Role`, declaring the operational capacity in which that operator acts. A request missing either header, or presenting a role that is not one of the declared roles, is rejected with `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` (HTTP 400). The system recognizes exactly eight roles, spelled as follows: `PlantManager`, `ShiftSupervisor`, `ReceivingClerk`, `LineOperator`, `QATechnician`, `SanitationLead`, `USDAInspector`, and `OrderPlanner`. An authenticated operator who attempts an operation outside their role's mandate is rejected with `ERR_INSUFFICIENT_PERMISSIONS` (HTTP 403); several lifecycle endpoints split permissions per action — for example, only a `USDAInspector` may advance a waiver to `APPROVED`, and only a `QATechnician` may clear a water-limit breach when resuming a suspended shift — and those per-action splits are stated with the workflows in §3.
+
+The eight roles divide the plant's duties as follows. A `PlantManager` owns plant configuration — registering processing lines and production shifts — drafts and submits line-speed waivers, disputes certified condemnation records, and is the sole operator permitted to set the server's logical clock. A `ShiftSupervisor` sets shift staffing, opens, suspends, resumes, and closes shifts, queues evisceration line runs, schedules deboning batches, settles flock lots, and ships trace-locked finished lots. A `ReceivingClerk` books and receives flock lots at live receiving. A `LineOperator` starts and completes line runs, adjusts run speed, and advances deboning batches through their lifecycle. A `QATechnician` creates and adjudicates pre-operational inspections, verifies or fails sanitation runs, records condemnation coding, posts utility meter readings and chill-chain temperature logs, trace-locks finished lots, recalls lots, and holds the exclusive authority to resume a shift suspended for a water-limit breach. A `SanitationLead` schedules sanitation runs, works them through completion, and takes corrective actions on failed inspections. A `USDAInspector` approves, denies, and revokes line-speed waivers, certifies condemnation records, reopens settled lots for regrade, may suspend shifts on regulatory hold, and may recall finished lots. An `OrderPlanner` owns customer orders: creating them, amending them, and cancelling them. All eight roles may use every read endpoint in the API.
+
+For every one of these eight roles — `PlantManager`, `ShiftSupervisor`, `ReceivingClerk`, `LineOperator`, `QATechnician`, `SanitationLead`, `USDAInspector`, and `OrderPlanner` — the identity model is opaque: `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it on the resources a request touches — for example as `completer_user_id` or `verifier_user_id` on a sanitation run, as `inspector_user_id` on a pre-operational inspection, as `recorded_by_user_id` or `certified_by_user_id` on a condemnation record, or as `approved_by` on a line-speed waiver — and the segregation-of-duties checks in §3 compare those recorded identifiers against the incoming header value, but the server never compares `X-User-ID` to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints paginate through two query parameters. The `limit` parameter sets the maximum number of items returned: it defaults to 10 when omitted, accepts a minimum of 1, and is capped at a maximum of 100. The `offset` parameter sets how many items to skip and defaults to 0. Unless otherwise specified, every list endpoint returns resources sorted by creation timestamp in ascending order. List responses carry the pagination fields `limit`, `offset`, `total_count`, and `has_more` in the `meta` object of the response envelope.
+
+### 2.4. Common Resource Properties and Append-Only Event Records
+
+Every primary lifecycle resource in the plant — processing lines, production shifts, sanitation runs, pre-operational inspections, line-speed waivers, flock lots, line runs, condemnation records, product orders, deboning batches, and finished lots — carries a standard set of system-managed fields:
+
+- `id` (string): a unique, server-minted UUID with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits recording when the resource was created.
+- `updated_at` (string): an ISO 8601 UTC timestamp refreshed on every mutation of the resource.
+- `version` (integer): a system-managed integer that increments by one with every modification to the resource, including mutations caused by cascades and recomputed derived fields.
+
+Each lifecycle resource also carries a `status` field (or, for product orders, the two parallel status dimensions described in §3.6) whose legal values are the state strings enumerated with each workflow in §3.
+
+Two resources are deliberately different: the utility meter reading and the chill-chain log are append-only event records. Each carries only `id` and `created_at`; both `updated_at` and `version` are absent, because an event, once posted, is never modified.
+
+### 2.5. The Logical Clock
+
+All time-based behavior in the plant is evaluated against a server-maintained logical clock, never against wall-clock time. At server startup the logical clock reads exactly `2026-08-01T00:00:00Z`. A `PlantManager`-only test-driving capability advances the clock by supplying a `to_iso8601` instant; the response carries the resulting `current_utc`. Setting the clock is the trigger that evaluates every clock-driven system transition in the plant: line-speed waivers activate when the clock reaches their window and expire when it passes their window's end, and flock lots progress from on-line to chilled once their chill hold has elapsed. The same time-based transitions are also evaluated lazily whenever a waiver or speed-related resource is read, whenever a flock lot is read, and whenever a deboning batch is created, so a reader never observes a stale lifecycle state merely because the clock has not been explicitly set.
+
+### 2.6. The Validation Ladder and Nested Resource Retrieval
+
+Every request is evaluated against an ordered ladder of checks; the first rung that fails stops evaluation and produces that rung's error. The ladder, from first to last:
+
+1. **Authentication context (priority 1).** Both headers present and the role declared, else `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` (HTTP 400). Malformed payloads — a missing required field, a type mismatch, an invalid enum value, an unknown field, a sanitation `window_start` that is not strictly earlier than `window_end`, or a required `findings` or `resolution_note` left absent — are rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+2. **Role authorization (priority 2).** The role must be permitted for the operation, including the per-action role splits on advance and transition endpoints, else `ERR_INSUFFICIENT_PERMISSIONS` (HTTP 403).
+3. **Existence (priority 3).** Every resource identifier referenced by the path or the request body must exist, validated left to right, else `ERR_NOT_FOUND` (HTTP 404). For nested paths the leftmost identifier is checked first: a request for a child under a non-existent parent reports the missing parent before the child is ever sought.
+4. **Optimistic concurrency (priority 3.5).** On the three writes listed in §2.7, the expected-version field is compared with the parent's current `version` before any business validation runs; a mismatch is rejected with the rule's HTTP 412 error.
+5. **State-machine admissibility (priority 4).** The target entity's own from-state must admit the requested transition, and where the operation executes inside a production shift the enclosing shift's status must admit it: run starts, speed changes, batch starts, batch resumes, and suspensions require the shift in `RUNNING` (else `ERR_SHIFT_NOT_RUNNING`), mutations against a `CLOSED` shift are rejected with `ERR_SHIFT_TERMINAL`, and the machine-specific guards `ERR_SHIFT_NOT_OPENABLE`, `ERR_SHIFT_NOT_SUSPENDED`, `ERR_FLOCK_LOT_NOT_RECEIVABLE`, `ERR_BATCH_NOT_ADVANCEABLE`, and `ERR_ORDER_NOT_AMENDABLE` fire at this rung; anything else unreachable from the current state is `ERR_INVALID_STATE_TRANSITION` (HTTP 409 throughout).
+6. **Regulatory and safety gates (priority 5).** Line-speed authorization, segregation of duties, and the chiller-limit fresh block — `ERR_LINE_SPEED_NOT_AUTHORIZED`, `ERR_SOD_PREOP_SANITATION`, `ERR_SOD_CONDEMNATION_SELF_CERTIFY`, and `ERR_CHILLER_LIMIT_FRESH_BLOCKED` (HTTP 403).
+7. **Linked-entity consistency (priority 6).** Cross-entity referential gates such as line-type matching, lot-to-shift matching, lot readiness, sanitation and pre-op gates, and open-production gates — `ERR_LINE_TYPE_MISMATCH`, `ERR_LOT_SHIFT_MISMATCH`, `ERR_RUN_NOT_STARTABLE`, `ERR_LOT_NOT_CHILLED`, `ERR_LOT_NOT_SETTLABLE`, `ERR_TRACE_LOCK_BLOCKED_UNCERTIFIED`, `ERR_PREOP_NOT_PASSED`, `ERR_SANITATION_NOT_VERIFIED`, `ERR_NO_RUNS_QUEUED`, `ERR_RUNS_NOT_TERMINAL`, and `ERR_ORDER_NOT_CANCELLABLE` (HTTP 409).
+8. **Time-window rules (priority 7).** Rules evaluated against the logical clock — batch creation after an order's due time (`ERR_ORDER_WINDOW_CLOSED`), waiver approval into an expired window (`ERR_WAIVER_WINDOW_EXPIRED`), and the chill-compliance window at trace-lock (`ERR_CHILL_NOT_COMPLIANT`) — all HTTP 409.
+9. **Capacity, overlap, and accountability constraints (priority 8).** Shackle capacity on flock booking, waiver-window overlap at approval, and condemnation counts within birds hung — `ERR_SHIFT_CAPACITY_EXCEEDED`, `ERR_WAIVER_WINDOW_OVERLAP`, and `ERR_CONDEMNATION_COUNT_EXCEEDS_HUNG` (HTTP 422).
+10. **Fiscal gate (priority 9).** The deboning labor budget check, `ERR_LABOR_BUDGET_EXCEEDED` (HTTP 402), runs last, after every other validation on batch creation has passed.
+
+### 2.7. Optimistic Concurrency Control
+
+Exactly three writes in the API participate in optimistic concurrency control, each against the current `version` of a single parent entity. A `POST /poultry/shifts/{id}/staffing` request must carry `expected_shift_version` equal to the shift's current `version`; the shift's staffing fields feed the effective line-speed ceiling and the water and projection denominators, so a writer holding a stale view of the shift must re-read before writing, and a mismatch is rejected with `ERR_STALE_SHIFT_VERSION` (HTTP 412). A `PUT /poultry/orders/{id}` request must carry `expected_order_version` equal to the order's current `version`; two sequential amendments each legitimately succeed under product semantics, so a second writer working from a stale read is rejected purely on the version, with `ERR_STALE_ORDER_VERSION` (HTTP 412). A `POST /poultry/lines/{id}/waivers` request must carry `expected_line_version` equal to the line's current `version`; waiver creation legitimately supersedes a prior draft or submitted waiver with an overlapping window on the same line, and that supersession itself advances the line's `version`, so a creator holding a stale line version must re-read before creating — a mismatch is rejected with `ERR_STALE_LINE_VERSION` (HTTP 412). In all three cases the expected-version field is a non-optional input. Endpoints not listed here do not take a version field at all.
+
+### 2.8. Regulatory Water and Chiller Limits
+
+The plant operates under three regulatory water limits, all expressed per unit of production and all enforced as strict thresholds — a rate must be strictly greater than its limit to breach; a rate exactly equal to its limit is compliant. Process-water intensity is tracked on two denominators that can legitimately disagree about compliance for identical meter readings: the birds basis, limited to 1500.0 gallons per 1000 birds processed, governs operational compliance and drives the automatic shift suspension described in §3.5; the weight basis, limited to 200.0 gallons per 100 pounds of chilled weight, is maintained for permit reporting. Chiller water is tracked separately, on the birds basis only, against a limit of 800.0 gallons per 1000 birds; a breached chiller limit does not suspend the shift but blocks fresh routing of finished lots at trace-lock. Breach evaluation happens when a meter reading is posted and lazily on reads; run completions recompute the denominators but never by themselves suspend the shift.
+
+### 2.9. Units, Precision, and Rounding
+
+All computed decimal quantities the API reports — water intensity rates, flock yields, labor-hour estimates, remaining labor, and deboned net weights — are rounded half-up to exactly 2 decimal places. The rounding order is pinned where it matters: each deboning batch's net weight is rounded first, and only then are per-batch values summed into an order's filled quantity; summing raw outputs and rounding once at the end is the rejected alternative and yields different cents. Breach comparisons against the water limits of §2.8 are made against the unrounded rate, not the reported rounded value. Line speeds are whole birds per minute: staffing-derived speed caps are rounded down to the next whole bird per minute. Product temperatures are compared at one decimal place of Celsius, and all time comparisons against the logical clock are made at second precision.
+
+### 2.10. Atomic Cascades and Cross-Entity Consistency
+
+The plant's consistency model is immediate: every mutation, together with all cascades it triggers, commits atomically within the request. When a parent resource changes state in a way that renders children non-operational — a suspended shift pausing its runs and holding its batches, a closed shift cancelling its queued runs, a cancelled order cancelling its scheduled batches — the system reconciles the dependents in the same request. Conversely, child events bubble up: a run's completion rolls into lot and shift aggregates, a condemnation certification reconciles its run and recomputes lot yield, and a batch's completion creates its finished lot and advances its order's allocation. Every such reconciliation that touches a resource refreshes that resource's `updated_at` and increments its `version`, so optimistic-concurrency holders always observe the effect of cascades.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Processing Lines and Line-Speed Governance
+
+Plant configuration begins with the processing line. A `PlantManager` registers each line with a `line_code` unique across the plant (conventionally something like EV-1 or DB-1), a `line_type` of either `EVISCERATION` or `DEBONING`, and a `rated_speed_bpm` greater than zero — the line's mechanical rating in birds per minute for evisceration, or birds-equivalent per minute for deboning. The line is a configuration entity with no lifecycle of its own; waiver windows and run or batch schedules are the temporal resources attached to it.
+
+Because the mechanical rating is not the legal ceiling, a `PlantManager` may draft a line-speed waiver under a line, supplying a `max_speed_bpm` — the maximum speed the waiver would authorize, useful only when it exceeds the regulatory base cap — together with `effective_from` and `effective_to` delimiting the waiver's half-open validity window: the window begins at `effective_from` and ends at, but does not include, `effective_to`, and the start must be strictly earlier than the end or the request fails as `ERR_INVALID_REQUEST`. Creation is an optimistic-concurrency write requiring `expected_line_version` as described in §2.7; a stale line version is rejected with `ERR_STALE_LINE_VERSION`. Creation also carries a supersession rule: if the new waiver's window overlaps the window of any existing waiver on the same line still in `DRAFT` or `SUBMITTED`, each such overlapping waiver is transitioned by the system to `SUPERSEDED`, and the line's `version` increments by one. A new waiver is born in `DRAFT`.
+
+The waiver lifecycle then runs under segregation between management and the inspector. A `PlantManager` advances a `DRAFT` waiver to `SUBMITTED`, and may likewise resubmit a `DENIED` waiver back to `SUBMITTED` in a resubmission cycle. A `USDAInspector` adjudicates a `SUBMITTED` waiver: advancing it to `APPROVED` is permitted only while the logical clock reads strictly earlier than the waiver's `effective_to` — an approval attempted at or after the window's end is rejected with `ERR_WAIVER_WINDOW_EXPIRED` — and only when no other waiver on the same line in `APPROVED` or `ACTIVE` has a half-open window intersecting this one. Two windows that merely touch, one ending exactly when the other begins, do not intersect and are allowed; a genuine overlap is rejected with `ERR_WAIVER_WINDOW_OVERLAP`. A successful approval records the inspector in `approved_by`. Denial — advancing to `DENIED` with a `reason` — increments the waiver's `denial_count` by one on each occurrence. An `APPROVED` waiver becomes `ACTIVE` by the system once the logical clock reaches `effective_from` while remaining earlier than `effective_to` (evaluated on clock-set and lazily on waiver and speed reads), and from that moment the line's effective speed ceiling uses the waiver's `max_speed_bpm`. When the clock reaches `effective_to`, an `ACTIVE` waiver becomes `EXPIRED`, and the effective speed is recomputed for the line's `RUNNING` runs: any run above the new cap is clamped down to it and flagged with `speed_clamped` set to true. A `USDAInspector` may also advance an `APPROVED` or `ACTIVE` waiver to `REVOKED` with a `reason`; revocation of an `ACTIVE` waiver triggers the same recomputation, clamping `current_speed_bpm` down to the recomputed cap where needed and setting `speed_clamped` to true on each clamped run. `EXPIRED`, `REVOKED`, and `SUPERSEDED` are terminal.
+
+The ceiling itself — the plant's effective maximum line speed for a run on a line within a shift — is resolved through a pinned evaluation order that deliberately breaks the circular-looking dependency between speed and staffing. First, a fixed staffing-requirement table is consulted, keyed only on the line's `line_type` and never on the current or requested speed: an `EVISCERATION` line requires 10 shacklers, 20 eviscerators, and 2 QA technicians; a `DEBONING` line requires 12 deboners and 1 QA technician. Second, a staffing ratio is computed as the minimum, across the positions required for that line type, of present headcount divided by required headcount, drawn from the shift's staffing fields; a required position with nobody present contributes a ratio of zero. Third, a staffing cap is derived: when the ratio is at least 1.0, the cap is the line's `rated_speed_bpm` multiplied by 1.0, rounded down to a whole bird per minute; when the ratio is at least 0.9 but below 1.0, the cap is the `rated_speed_bpm` multiplied by 0.9, again rounded down; when the ratio falls below 0.9, the cap collapses to the regulatory base cap for the line type and any waiver is void. Fourth, a regulatory cap is selected: the `max_speed_bpm` of the line's waiver in `ACTIVE` status whose half-open window covers the current logical time, or, when no active waiver applies, the regulatory base cap — 175 birds per minute for an `EVISCERATION` line and 45 birds-equivalent per minute for a `DEBONING` line. Should several active waivers cover the same instant — an outcome the overlap check exists to make impossible — the one with the latest `effective_from` wins, with ties broken by the latest `created_at`. Finally, the effective maximum is the smallest of the line's rated speed, the regulatory cap, and the staffing cap. This ceiling is evaluated at run creation, at run start, at every speed change, at waiver activation, expiry, and revocation, and at every staffing update; a requested speed no greater than the ceiling is authorized, and a request exactly equal to the ceiling is allowed.
+
+### 3.2. Shift Setup, Staffing, and the Sanitation Gates
+
+A `PlantManager` creates a production shift by naming its `shift_date` (a calendar date), its `shift_code` — one of `DAY_A`, `DAY_B`, or `NIGHT` — its `shackle_capacity_birds` (greater than zero; the maximum birds that may be booked into the shift across all flock lots), and its `labor_hours_budget` (zero or more; the deboning labor hours budgeted for the shift). A new shift is `SCHEDULED`, with all four staffing counts — `shacklers_present`, `eviscerators_present`, `deboners_present`, and `qa_techs_present` — starting at zero.
+
+Staffing is the `ShiftSupervisor`'s lever, and it is one of the plant's three optimistic-concurrency writes: a staffing update carries `shacklers_present`, `eviscerators_present`, `deboners_present`, and `qa_techs_present` alongside `expected_shift_version`, and a version mismatch is rejected with `ERR_STALE_SHIFT_VERSION`. A successful update increments the shift's `version` by one and immediately recomputes the effective speed ceiling (§3.1) for every `RUNNING` run of the shift; any run whose `current_speed_bpm` now exceeds its new ceiling is clamped down to it and flagged with `speed_clamped` set to true.
+
+Before a shift may open production, each line it will use must pass a two-stage hygiene gate operated under segregation of duties. A `SanitationLead` first schedules a sanitation run for a shift and line, giving a planned `window_start` and `window_end` with the start strictly earlier than the end. The sanitation run's lifecycle is `SCHEDULED` → `IN_PROGRESS` → `COMPLETED` → `VERIFIED`, with a re-wash cycle from `COMPLETED` to `FAILED_RECHECK` and back to `IN_PROGRESS`. Work may only begin — `SCHEDULED` → `IN_PROGRESS`, and likewise the re-wash return `FAILED_RECHECK` → `IN_PROGRESS` — while the parent shift is in `SCHEDULED` or `SUSPENDED`, never during `RUNNING` production, and only when no line run of that shift and line is in `RUNNING`; violations are rejected with `ERR_INVALID_STATE_TRANSITION`. When the lead completes the wash (`IN_PROGRESS` → `COMPLETED`) the system records their header identity in `completer_user_id`, anchoring the segregation check that follows. A `QATechnician` then adjudicates the completed run: advancing it to `VERIFIED` (permitted only from `COMPLETED`, else `ERR_INVALID_STATE_TRANSITION`) or to `FAILED_RECHECK`, in either case recording themselves in `verifier_user_id`. `VERIFIED` is terminal for the run.
+
+In parallel, a `QATechnician` creates a pre-operational inspection for the same shift and line; it is born `PENDING`. Passing it requires two things, both enforced at the moment of adjudication: at least one sanitation run in `VERIFIED` must exist for that shift and line, else `ERR_SANITATION_NOT_VERIFIED`; and the inspector's `X-User-ID` must differ from the `completer_user_id` of every sanitation run at `COMPLETED` or beyond for that shift and line — the person who washed the line may not pass its inspection, and a violation is rejected with `ERR_SOD_PREOP_SANITATION`. A pass records the inspector in `inspector_user_id`. Failing — `PENDING` → `FAILED` — requires a `findings` note (absent, the request is `ERR_INVALID_REQUEST`) and likewise records `inspector_user_id`. From `FAILED`, a `SanitationLead` or `QATechnician` moves the inspection to `CORRECTING`, and a `QATechnician` returns it from `CORRECTING` to `PENDING` for re-inspection, each return incrementing the inspection's `cycle_count` by one. `PASSED` is terminal.
+
+With the gates satisfied, a `ShiftSupervisor` opens production by transitioning the shift from `SCHEDULED` to `RUNNING`, naming the target in the request's `to_status` field. Four checks guard the open, evaluated in order: the shift must currently be `SCHEDULED`, else `ERR_SHIFT_NOT_OPENABLE`; at least one line run must be `QUEUED` for the shift, else `ERR_NO_RUNS_QUEUED` — this empty-set check runs first among the gates; then, for every line referenced by a `QUEUED` run, at least one sanitation run must be `VERIFIED` for that shift and line, else `ERR_SANITATION_NOT_VERIFIED` — the sanitation gate is checked before the pre-op gate; and finally, for every such line, at least one pre-operational inspection must be `PASSED`, else `ERR_PREOP_NOT_PASSED`. A successful open stamps `started_at` with the current logical time.
+
+### 3.3. Live Receiving: Booking and Receiving Flock Lots
+
+Live receiving is the `ReceivingClerk`'s desk. Booking a flock lot into a shift takes a unique `lot_code` identifying the grower's lot, the `grower_name`, a `booked_head_count` greater than zero, an `expected_avg_live_weight_lb` greater than zero, and the `receiving_shift_id` of the shift the lot is booked into. Booking enforces the shift's shackle capacity: the sum of `booked_head_count` across all lots of the shift, plus the new lot's booking, must not exceed the shift's `shackle_capacity_birds`; a total exactly equal to capacity is allowed, while a total strictly above it is rejected with `ERR_SHIFT_CAPACITY_EXCEEDED`. A booked lot is `BOOKED`.
+
+When the truck arrives, the clerk receives the lot, moving it from `BOOKED` to `RECEIVED` and recording the `head_count_received` (the actual birds received, which must be greater than zero), the `doa_count` (dead-on-arrival birds, never hung; zero or more), and the `total_live_weight_lb` (the scale weight of the load, greater than zero). A receive attempted on a lot no longer in `BOOKED` is rejected with `ERR_FLOCK_LOT_NOT_RECEIVABLE`.
+
+### 3.4. Evisceration Runs and Condemnation Accounting
+
+A `ShiftSupervisor` queues a flock lot onto a line by creating a line run with the `shift_id`, the `line_id`, the `flock_lot_id`, and a `planned_speed_bpm` greater than zero. Two referential checks bind the run to consistent parents: the line must be an `EVISCERATION` line — queuing onto a `DEBONING` line is rejected with `ERR_LINE_TYPE_MISMATCH` — and the lot's `receiving_shift_id` must equal the run's `shift_id`, else `ERR_LOT_SHIFT_MISMATCH`. The planned speed must also sit within the effective maximum line speed at creation, else `ERR_LINE_SPEED_NOT_AUTHORIZED`. The run is born `QUEUED`. Runs may be listed with optional filters `shift_id`, `line_id`, and `flock_lot_id`, with standard pagination.
+
+A `LineOperator` starts a queued run, moving it `QUEUED` → `RUNNING`, under four preconditions: the enclosing shift must be `RUNNING` (else `ERR_SHIFT_NOT_RUNNING`); the flock lot must be `RECEIVED` or `ON_LINE` (else `ERR_RUN_NOT_STARTABLE`); the run's `planned_speed_bpm` must be no greater than the effective maximum line speed evaluated now (else `ERR_LINE_SPEED_NOT_AUTHORIZED`); and at least one `PASSED` pre-operational inspection and one `VERIFIED` sanitation run must exist for the shift and line (else `ERR_PREOP_NOT_PASSED` or `ERR_SANITATION_NOT_VERIFIED` respectively). At start, `current_speed_bpm` is set to `planned_speed_bpm` and `started_at` is stamped with the logical time. If this is the lot's first running run, the lot bubbles up from `RECEIVED` to `ON_LINE`.
+
+While a run is `RUNNING`, the operator may change its speed: a speed change supplies `new_speed_bpm`, requires the enclosing shift in `RUNNING`, and is authorized when the new speed is no greater than the effective maximum — equality allowed — else `ERR_LINE_SPEED_NOT_AUTHORIZED`. A successful change updates `current_speed_bpm` and resets `speed_clamped` to false. Runs also pause and resume with their shift (§3.5): when the shift suspends, every `RUNNING` run moves to `PAUSED` with `auto_paused` set to true, and when the shift resumes, exactly those runs with `auto_paused` true return to `RUNNING` and have the flag reset to false.
+
+Completing a run — `RUNNING` → `COMPLETED` — is where production becomes measurement. The operator supplies `birds_hung` and `carcass_weight_lb`, each required to be greater than zero (else `ERR_INVALID_REQUEST`), and a completion attempted from any state other than `RUNNING` is `ERR_INVALID_STATE_TRANSITION`. Bird accountability is enforced at the dock: `birds_hung` may not exceed the lot's remaining hangable birds — its `head_count_received` minus its `doa_count` minus its `birds_hung_total` already hung — else `ERR_CONDEMNATION_COUNT_EXCEEDS_HUNG`, with an exactly-equal remainder allowed. Completion stamps `completed_at`, then rolls up: the lot's `birds_hung_total` (the sum of `birds_hung` over the lot's runs in `COMPLETED` or `RECONCILED`) and `carcass_weight_total_lb` (the corresponding sum of `carcass_weight_lb`) are updated, as are the shift's `birds_processed` and `chilled_weight_lb` over the same population of runs; the lot's `provisional_yield_pct` is recomputed; and the shift's `water_rate_birds_basis` and `water_rate_weight_basis` are recomputed from their new denominators — though a completion never by itself suspends the shift, since breaches are evaluated on meter readings, not completions. A run with zero condemnation records is reconciled automatically at completion, moving straight to `RECONCILED`, because no certification events will ever occur for it.
+
+Condemnation coding begins once a run is `COMPLETED` or `RECONCILED`. A `QATechnician` records a condemnation record against the `line_run_id`, choosing a USDA `condemnation_code` — one of `SEPTICEMIA`, `AIR_SACCULITIS`, `BRUISING`, `CONTAMINATION`, or `MACHINE_DAMAGE` — and a `carcass_count` greater than zero. The record is born `DRAFT` with the technician's identity in `recorded_by_user_id`, and its `effective_count` is its `amended_carcass_count` when one has been supplied, otherwise its `carcass_count`. Draft records count immediately: the run and lot condemned aggregates are recomputed on creation, and `DRAFT` counts feed the provisional yield.
+
+Certification belongs to the `USDAInspector`, under segregation of duties: the certifier's `X-User-ID` must differ from the record's `recorded_by_user_id` — a recorder may never certify their own record, rejected with `ERR_SOD_CONDEMNATION_SELF_CERTIFY`. Certification also passes a numerical gate: the sum of `effective_count` over the run's already-`CERTIFIED` records, plus the `effective_count` of the record being certified, must be no greater than the run's `birds_hung` — equality allowed — with `DRAFT` and `DISPUTED` records not participating in the gate; a violation is `ERR_CONDEMNATION_COUNT_EXCEEDS_HUNG`. A successful certification records the inspector in `certified_by_user_id` and then cascades in a fixed chain. First, the run's condemned aggregate is updated: the lot's `condemned_accounted` is the sum of `effective_count` over records in `DRAFT` or `CERTIFIED` on the lot's runs, with `DISPUTED` records excluded, and the lot's `carcasses_to_chill` is its `birds_hung_total` minus its `condemned_accounted`. Second, if every condemnation record of the run is now `CERTIFIED`, the run moves automatically from `COMPLETED` to `RECONCILED`, rolling its totals into the lot's certified aggregates. Third, if the lot is `SETTLED` or `REOPENED`, its `certified_yield_pct` is recomputed. Fourth, when that recomputation lowers the certified yield, finished lots of this flock lot in `TRACE_LOCKED` with `routing_status` `FRESH` whose order is `FLEXIBLE` flip from `FRESH` to `FROZEN` if the new certified yield has fallen below the fresh-yield threshold of §3.7. This chain — certify, reconcile, recompute, flip — is the intended serialization point between condemnation bookkeeping and routing.
+
+The regrade cycle runs through dispute and recertification. A `PlantManager` may advance a `CERTIFIED` record to `DISPUTED`, supplying a `reason` (absent, `ERR_INVALID_REQUEST`). Dispute is compensating bookkeeping: `DISPUTED` records are excluded from `condemned_accounted`, so the run's `carcasses_to_chill` rises by the record's `effective_count`; a run already `RECONCILED` stays `RECONCILED` — the state is retained — and the lot's aggregates are recomputed. A `USDAInspector` recertifies a `DISPUTED` record back to `CERTIFIED`, optionally supplying an `amended_carcass_count` greater than zero; the same segregation-of-duties and birds-hung gates apply, evaluated with the post-amendment `effective_count`, and the same four-link cascade follows.
+
+The conservation invariant underneath all of this is bird accountability: at all times a run's `birds_hung` equals its condemned birds (the sum of `effective_count` over records in `DRAFT` or `CERTIFIED`) plus its `carcasses_to_chill`, and certifying then disputing the same record leaves `carcasses_to_chill` exactly unchanged.
+
+Two yield variants diverge over the same recorded data, and both are reported on the lot. The provisional variant, `provisional_yield_pct`, is recomputed at each run completion and on every condemnation create, dispute, or recertify while condemnations remain uncertified; it is null until the lot's first run completes. It is an eviscerated-basis estimate: take the lot's `birds_hung_total` minus the provisional condemnation count (the sum of `effective_count` over records in `DRAFT` or `DISPUTED`), multiply by the eviscerated-basis allowance — 0.88 times the average live weight per bird, where the average live weight is the lot's `total_live_weight_lb` divided by its `head_count_received` — divide by `total_live_weight_lb`, multiply by 100 to express a percentage, and round half-up to two decimal places. The certified variant, `certified_yield_pct`, is computed at lot settlement and recomputed on later certification changes while the lot is `SETTLED` or `REOPENED`, and is null until the first settle; §3.8 defines it.
+
+Finally, the lot leaves the line for the chiller by system evaluation: a lot in `ON_LINE` moves to `CHILLED` once all of its runs sit in `COMPLETED`, `RECONCILED`, or `CANCELLED` with at least one `COMPLETED`, and the logical clock has reached four hours after the latest `completed_at` among its completed and reconciled runs — evaluated on clock-set and lazily on lot reads and batch creation.
+
+### 3.5. Water Metering, Suspension, and Shift Close
+
+Water stewardship runs on incremental meter readings. A `QATechnician` posts a reading against a `shift_id`, naming the `meter_type` — `PROCESS_WATER` or `CHILLER_WATER` — and the `gallons` consumed since the previous reading of that meter on that shift, which must be greater than zero. The reading is an append-only event stamped with `recorded_at` at the logical time it was posted; the readings of a shift may be listed with an optional `meter_type` filter. Each posting updates the shift's aggregates: `process_water_gallons` and `chiller_water_gallons`, the per-meter sums of `gallons` over the shift's readings.
+
+From those aggregates the shift's two regulatory rates are derived. The birds-basis rate, `water_rate_birds_basis`, is `process_water_gallons` multiplied by 1000 and divided by `birds_processed` — null while `birds_processed` is zero. The weight-basis rate, `water_rate_weight_basis`, is `process_water_gallons` multiplied by 100 and divided by `chilled_weight_lb` — null while `chilled_weight_lb` is zero. Both are reported rounded half-up to two decimal places, but breach logic always compares the unrounded rate. The flag `water_breach_active` is true exactly when the birds-basis rate is strictly greater than the 1500.0 gallons-per-1000-birds limit of §2.8 — a rate exactly equal to the limit is compliant. Independently, `chiller_limit_breached` is true when `chiller_water_gallons` multiplied by 1000 and divided by `birds_processed` is strictly greater than the 800.0 chiller limit; it does not suspend the shift but blocks fresh routing at trace-lock. Because the denominators differ, identical readings can be breaching on the birds basis while compliant on the weight basis.
+
+A process-water reading that flips `water_breach_active` from false to true while the shift is `RUNNING` triggers the plant's automatic suspension: the shift moves `RUNNING` → `SUSPENDED` with `suspend_reason` set to `WATER_LIMIT_BREACH`, every line run of the shift in `RUNNING` moves to `PAUSED` with `auto_paused` set to true, and every deboning batch of the shift in `IN_PROGRESS` moves to `ON_HOLD` — all atomically within the reading's request. The same suspension is available manually to a `ShiftSupervisor`, `QATechnician`, or `USDAInspector`, who supply a `reason_code` of `MANUAL` or `REGULATORY_HOLD`; the `WATER_LIMIT_BREACH` reason is system-only and may not be requested manually. Suspension from any state other than `RUNNING` is rejected with `ERR_SHIFT_NOT_RUNNING`; the `suspend_reason` field reads `NONE` whenever the shift is not suspended.
+
+Resuming — `SUSPENDED` → `RUNNING` — is performed by a `ShiftSupervisor` or `QATechnician` and requires a `resolution_note` of at least 10 characters (absent or shorter, `ERR_INVALID_REQUEST`). A resume attempted on a shift not in `SUSPENDED` is `ERR_SHIFT_NOT_SUSPENDED`. When the shift's `suspend_reason` is `WATER_LIMIT_BREACH`, only a `QATechnician` may clear it — regulatory water clearance — and any other role's attempt is rejected with `ERR_INSUFFICIENT_PERMISSIONS`. On resume, every run paused automatically (those with `auto_paused` true) returns to `RUNNING` with the flag reset to false, and `suspend_reason` resets to `NONE`. Batches in `ON_HOLD` deliberately stay on hold; they resume only through the batch's own advance. One classification rule pins an ambiguity in the lifecycle payload: a transition request targeting `RUNNING` from a state that is neither `SCHEDULED` nor `SUSPENDED` is classified by what it carries — carrying `resolution_note` makes it a resume attempt, rejected with `ERR_SHIFT_NOT_SUSPENDED`; without `resolution_note` it is an open attempt, rejected with `ERR_SHIFT_NOT_OPENABLE`.
+
+Closing a shift — from `RUNNING` or `SUSPENDED` to `CLOSED` — is a `ShiftSupervisor` action guarded by run terminality: no line run of the shift may remain in `RUNNING` or `PAUSED`, else `ERR_RUNS_NOT_TERMINAL`; a close attempted from any other state is `ERR_INVALID_STATE_TRANSITION`. On close, every run still `QUEUED` is cancelled to `CANCELLED`, `closed_at` is stamped with the logical time, and the labor ledger is settled: batches still holding estimates release them as described in §3.6, while completed-batch accounting is unchanged. `CLOSED` is terminal — any further mutation attempted against the shift is rejected with `ERR_SHIFT_TERMINAL`. Every lifecycle transition on the shift, like all mutations, increments the shift's `version` by one.
+
+### 3.6. Customer Orders, Deboning Batches, and the Labor Ledger
+
+Deboning begins from a customer order. An `OrderPlanner` creates one with a `customer_name`, a `product_code` — `WINGS`, `BREAST_FILLET`, `THIGH_MEAT`, `TENDERLOIN`, or `WHOLE_BIRD` — a `pounds_ordered` greater than zero, a `temperature_requirement` of `FRESH`, `FROZEN`, or `FLEXIBLE`, and a `due_at` customer due time. `FRESH` requires fresh routing, `FROZEN` forces frozen, and `FLEXIBLE` lets the routing decision of §3.7 choose. The order carries two parallel status dimensions that evolve independently on the same row: `fulfillment_status`, which runs `PENDING` → `IN_PRODUCTION` → `FULFILLED` with `CANCELLED` reachable from either of the first two, and `allocation_status`, which runs `UNALLOCATED` → `PARTIALLY_ALLOCATED` → `ALLOCATED`, driven purely by how the order's `filled_lb` compares with its `pounds_ordered`. A new order is `PENDING` and `UNALLOCATED`, with `filled_lb` at zero.
+
+While `fulfillment_status` remains `PENDING`, the planner may amend the order — any of `pounds_ordered`, `due_at`, or `temperature_requirement` — through the second of the plant's optimistic-concurrency writes, carrying `expected_order_version`; a version mismatch is `ERR_STALE_ORDER_VERSION`, and a successful amendment increments the order's `version` by one. Once fulfillment has left `PENDING`, amendment is rejected with `ERR_ORDER_NOT_AMENDABLE`. Cancellation — from `PENDING` or `IN_PRODUCTION` to `CANCELLED` — is permitted only when no batch of the order is in `IN_PROGRESS` or `ON_HOLD`, else `ERR_ORDER_NOT_CANCELLABLE`; on cancel, every `SCHEDULED` batch of the order cascades to `CANCELLED`, releasing its estimated labor back to the shift.
+
+A `ShiftSupervisor` schedules a deboning batch against an order by naming the `order_id`, the source `flock_lot_id`, the `shift_id` whose labor budget will be debited, the `line_id` — which must be a `DEBONING` line, else `ERR_LINE_TYPE_MISMATCH` — a `crew_count` greater than zero, and an `input_weight_lb` greater than zero. Two forward gates apply at creation: the order's `due_at` must still lie in the future of the logical clock, else `ERR_ORDER_WINDOW_CLOSED`, and the batch's estimated labor must fit the shift's remaining budget, else `ERR_LABOR_BUDGET_EXCEEDED` — this fiscal check runs last, after every other validation, per the ladder of §2.6. The estimate, `estimated_labor_hours`, is the `input_weight_lb` divided by 500 — one budgeted labor hour per five hundred pounds of input — rounded half-up to two decimal places, and it is debited from the shift at creation. The shift's `labor_hours_remaining` is its `labor_hours_budget` minus the sum of `estimated_labor_hours` over the shift's batches in `SCHEDULED`, `IN_PROGRESS`, or `ON_HOLD`, minus the sum of `actual_labor_hours` over its batches in `COMPLETED`. The ledger is conservative in both directions: creating and then cancelling the same `SCHEDULED` batch leaves `labor_hours_remaining` exactly unchanged. Batches may be listed with optional filters `order_id`, `flock_lot_id`, `shift_id`, and `line_id`, with standard pagination.
+
+A `LineOperator` advances the batch through its lifecycle. Starting — `SCHEDULED` → `IN_PROGRESS` — requires the enclosing shift in `RUNNING` (else `ERR_SHIFT_NOT_RUNNING`) and the source lot at `CHILLED`, `SETTLED`, or `REOPENED` (else `ERR_LOT_NOT_CHILLED`); the first batch of an order to enter `IN_PROGRESS` bubbles the order from `PENDING` to `IN_PRODUCTION`. A batch in `IN_PROGRESS` may be placed `ON_HOLD` by the operator and returns to `IN_PROGRESS` when the operator resumes it — resumption again requires the shift in `RUNNING`; the shift-suspension cascade of §3.5 also moves `IN_PROGRESS` batches to `ON_HOLD` automatically. A batch in `SCHEDULED` may be cancelled to `CANCELLED`, by the operator or by the order-cancel cascade, releasing its `estimated_labor_hours` back to the shift under the labor invariant.
+
+Completing a batch — `IN_PROGRESS` → `COMPLETED` — requires the operator to supply `actual_output_weight_lb` and `actual_labor_hours`, each greater than zero (else `ERR_INVALID_REQUEST`); completion attempted from any other state is rejected with `ERR_BATCH_NOT_ADVANCEABLE`. Completion computes the batch's `net_weight_lb`: the `actual_output_weight_lb` reduced by the plant's 2 percent trim allowance, rounded half-up to two decimal places. Completion then cascades: a finished lot is created for the batch (§3.7); the order's `filled_lb` and `allocation_status` are recomputed; and the shift's labor ledger swaps estimate for actual — the estimate is released and the actual hours are debited. The order's `filled_lb` is the sum of `net_weight_lb` over its `COMPLETED` batches, with the rounding order pinned per §2.9: each batch rounds first, then the order sums. Allocation follows directly: `filled_lb` of exactly zero leaves the order `UNALLOCATED`; greater than zero but less than `pounds_ordered` makes it `PARTIALLY_ALLOCATED`; and `filled_lb` greater than or equal to `pounds_ordered` — equality allocates — makes it `ALLOCATED`.
+
+### 3.7. Traceability, Chill Compliance, and Fresh-or-Frozen Routing
+
+Every completed deboning batch creates a finished lot — the plant's unit of traceability — born `OPEN` with `routing_status` `UNROUTED`. The finished lot carries its `deboning_batch_id`, its `order_id` copied from the batch, its `net_weight_lb` copied from the batch at creation, and a computed `trace_code` joining the flock lot's `lot_code`, the shift's `shift_code`, and the `deboning_batch_id` with slashes — the shift-and-lot traceability handle. Finished lots are discoverable through the finished-lots listing, with optional filters `deboning_batch_id` and `order_id`.
+
+Cold-chain evidence accrues as append-only chill-chain logs. A `QATechnician` appends an observation against a `finished_lot_id`, naming a `location` — `CHILLER`, `BLAST_FREEZER`, `COLD_STORAGE`, or `DOCK` — and the observed `temperature_c`, which must lie between minus 40 and plus 20 degrees Celsius inclusive. Each log is stamped with `recorded_at` at the logical time of posting, and the logs of a finished lot may be listed.
+
+Trace-lock is the compliance gate that turns an `OPEN` finished lot into a routable one. A `QATechnician` trace-locks the lot; three preconditions guard it, evaluated in order. First, every condemnation record on the source flock lot's runs must be `CERTIFIED`, else `ERR_TRACE_LOCK_BLOCKED_UNCERTIFIED`. Second, when the order's `temperature_requirement` is `FRESH`, the shift's `chiller_limit_breached` flag must be false — this regulatory safety check runs before any chill-window analysis and rejects with `ERR_CHILLER_LIMIT_FRESH_BLOCKED`. Third, again for `FRESH` orders, chill compliance must hold, else `ERR_CHILL_NOT_COMPLIANT`. A successful lock stamps `locked_at` and sets `routing_status` according to the routing decision.
+
+The routing decision chains certified yield, chill compliance, and the chiller water limit. Chill compliance is defined against the source run's completion: let the reference instant be the latest `completed_at` among the source flock lot's runs in `COMPLETED` or `RECONCILED`, with ties broken by the latest `created_at`. The lot is chill-compliant when some chill-chain log of this finished lot records a `temperature_c` no greater than 4.0 degrees at a `recorded_at` no later than eight hours after that reference instant, and the current logical time is no earlier than two hours after the reference instant — product must both have chilled fast enough and have dwelled long enough before locking. The decision then proceeds by the order's `temperature_requirement`. For `FRESH`: a breached chiller limit rejects with `ERR_CHILLER_LIMIT_FRESH_BLOCKED`, non-compliance rejects with `ERR_CHILL_NOT_COMPLIANT`, and otherwise the lot routes `FRESH`. For `FROZEN`: the lot routes `FROZEN` unconditionally. For `FLEXIBLE`: if the lot is not chill-compliant, or the chiller limit is breached, it routes `FROZEN`; otherwise, if the flock lot's `certified_yield_pct` is at least the fresh-yield threshold of 72.0 percent, it routes `FRESH` — a yield exactly at the threshold routes fresh — and otherwise it routes `FROZEN`.
+
+Routing is not frozen in amber for flexible product. When a later certification change recomputes a flock lot's `certified_yield_pct` downward, the system re-evaluates only the flip direction: finished lots of that flock lot in `TRACE_LOCKED` with `routing_status` `FRESH` on `FLEXIBLE` orders flip from `FRESH` to `FROZEN` if the new certified yield has fallen below 72.0. The flip never runs `FROZEN` to `FRESH`, and it never touches lots already `SHIPPED` or `RECALLED`.
+
+A `ShiftSupervisor` ships a `TRACE_LOCKED` lot, stamping `shipped_at`; each ship re-evaluates the order's fulfillment, moving the order from `IN_PRODUCTION` to `FULFILLED` when the sum of `net_weight_lb` over the order's `SHIPPED` finished lots reaches or exceeds its `pounds_ordered`. Recall — to `RECALLED` from either `TRACE_LOCKED` or `SHIPPED` — is available to a `QATechnician` or `USDAInspector` and requires a `reason` (absent, `ERR_INVALID_REQUEST`). `SHIPPED` and `RECALLED` are terminal.
+
+### 3.8. Settlement and the Regrade Cycle
+
+Settlement is the flock lot's financial-grade close, performed by a `ShiftSupervisor` advancing the lot to `SETTLED` from `CHILLED` or `REOPENED` (any other origin state is `ERR_INVALID_STATE_TRANSITION`). Settlement requires every condemnation record on the lot's runs to be `CERTIFIED` and at least one run of the lot to be `RECONCILED`, else `ERR_LOT_NOT_SETTLABLE`. Settling computes (or, after a reopen, recomputes) the lot's `certified_yield_pct` and stamps `settled_at` with the logical time of the latest transition into `SETTLED`.
+
+The certified yield is the live-basis counterpart of the provisional figure of §3.4, computed over the same recorded data but through a different lens: from the lot's `carcass_weight_total_lb`, subtract the certified condemnation count — the sum of `effective_count` over records in `CERTIFIED` — multiplied by the average carcass weight, where the average carcass weight is the `carcass_weight_total_lb` divided by the `birds_hung_total` (the variant is undefined while `birds_hung_total` is zero); divide the result by `total_live_weight_lb`; multiply by 100; and round half-up to two decimal places. Because the provisional variant uses the eviscerated basis with its 0.88 allowance and provisional condemnation counts while the certified variant uses measured carcass weight and certified counts only, the same data yields two different numbers by design.
+
+Regrade is the regulator's prerogative: a `USDAInspector` may advance a `SETTLED` lot to `REOPENED` — from any other state, `ERR_INVALID_STATE_TRANSITION`. While the lot is `REOPENED`, its condemnation records may be disputed and recertified as described in §3.4, and each certification change recomputes `certified_yield_pct`, with the routing flip of §3.7 applying to still-`TRACE_LOCKED` flexible lots. The lot settles again through the same settlement gate, `REOPENED` → `SETTLED`, and the cycle may repeat. The flock lot has no terminal state; `BOOKED` → `RECEIVED` → `ON_LINE` → `CHILLED` → `SETTLED`, with the `SETTLED` ↔ `REOPENED` regrade loop, is its full lifecycle.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return `201 Created`; operations that modify an existing resource — lifecycle transitions, staffing updates, amendments, receives, speed changes, trace-locks — return `200 OK`. Successful reads return `200 OK`. All request and response bodies follow the envelope of §2.2, and list endpoints paginate per §2.3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/poultry/lines` | Register a processing line | PlantManager |
+| GET | `/poultry/lines/{id}` | Get a processing line | All roles |
+| GET | `/poultry/lines/{id}/waivers` | List waivers of a line | All roles |
+| GET | `/poultry/lines/{id}/sanitation-runs` | List sanitation runs of a line | All roles |
+| GET | `/poultry/lines/{id}/pre-op-inspections` | List pre-op inspections of a line | All roles |
+| POST | `/poultry/lines/{id}/waivers` | Create a line-speed waiver (DRAFT); supersedes overlapping DRAFT/SUBMITTED waivers; OCC on line version | PlantManager |
+| POST | `/poultry/shifts` | Create a production shift (SCHEDULED; staffing counts start at 0) | PlantManager |
+| GET | `/poultry/shifts/{id}` | Get a shift including computed water rates, labor balance, and staffing | All roles |
+| POST | `/poultry/shifts/{id}/staffing` | Set shift staffing counts; OCC on shift version | ShiftSupervisor |
+| POST | `/poultry/shifts/{id}/transition` | Shift lifecycle: open, suspend, resume, close | ShiftSupervisor, QATechnician, USDAInspector |
+| GET | `/poultry/shifts/{id}/sanitation-runs` | List sanitation runs of a shift | All roles |
+| GET | `/poultry/shifts/{id}/pre-op-inspections` | List pre-op inspections of a shift | All roles |
+| GET | `/poultry/shifts/{id}/flock-lots` | List flock lots booked into a shift | All roles |
+| GET | `/poultry/shifts/{id}/utility-readings` | List utility meter readings of a shift | All roles |
+| POST | `/poultry/sanitation-runs` | Schedule a sanitation run for a shift and line | SanitationLead |
+| GET | `/poultry/sanitation-runs/{id}` | Get a sanitation run | All roles |
+| POST | `/poultry/sanitation-runs/{id}/advance` | Sanitation lifecycle: IN_PROGRESS and COMPLETED by SanitationLead; VERIFIED and FAILED_RECHECK by QATechnician | SanitationLead, QATechnician |
+| POST | `/poultry/pre-op-inspections` | Create a pre-operational inspection (PENDING) for a shift and line | QATechnician |
+| GET | `/poultry/pre-op-inspections/{id}` | Get a pre-op inspection | All roles |
+| POST | `/poultry/pre-op-inspections/{id}/advance` | Pre-op lifecycle: PASSED/FAILED/PENDING by QATechnician; CORRECTING by SanitationLead or QATechnician | QATechnician, SanitationLead |
+| GET | `/poultry/waivers/{id}` | Get a line-speed waiver | All roles |
+| POST | `/poultry/waivers/{id}/advance` | Waiver lifecycle: SUBMITTED by PlantManager (incl. DENIED resubmission); APPROVED/DENIED/REVOKED by USDAInspector | PlantManager, USDAInspector |
+| POST | `/poultry/flock-lots` | Book a flock lot into a shift (shackle-capacity checked) | ReceivingClerk |
+| GET | `/poultry/flock-lots/{id}` | Get a flock lot including yields and accountability fields | All roles |
+| POST | `/poultry/flock-lots/{id}/receive` | Receive a booked lot: head count, DOA, live weight (BOOKED to RECEIVED) | ReceivingClerk |
+| POST | `/poultry/flock-lots/{id}/advance` | Lot lifecycle: SETTLED by ShiftSupervisor; REOPENED by USDAInspector | ShiftSupervisor, USDAInspector |
+| POST | `/poultry/line-runs` | Queue a flock lot onto an EVISCERATION line within a shift | ShiftSupervisor |
+| GET | `/poultry/line-runs` | List line runs with filters and pagination | All roles |
+| GET | `/poultry/line-runs/{id}` | Get a line run | All roles |
+| POST | `/poultry/line-runs/{id}/set-speed` | Change the current speed of a RUNNING run | LineOperator |
+| POST | `/poultry/line-runs/{id}/advance` | Run lifecycle: start (RUNNING) or complete (COMPLETED with birds and weight) | LineOperator |
+| GET | `/poultry/line-runs/{id}/condemnation-records` | List condemnation records of a run | All roles |
+| POST | `/poultry/condemnation-records` | Record condemnation coding for a COMPLETED/RECONCILED run (DRAFT) | QATechnician |
+| GET | `/poultry/condemnation-records/{id}` | Get a condemnation record | All roles |
+| POST | `/poultry/condemnation-records/{id}/advance` | CERTIFIED by USDAInspector (optional amended count on recertify); DISPUTED by PlantManager | USDAInspector, PlantManager |
+| POST | `/poultry/utility-readings` | Post an incremental water/chiller meter reading; may auto-suspend the shift on breach | QATechnician |
+| POST | `/poultry/orders` | Create a customer order (PENDING / UNALLOCATED) | OrderPlanner |
+| GET | `/poultry/orders/{id}` | Get an order including filled_lb and both status dimensions | All roles |
+| PUT | `/poultry/orders/{id}` | Amend an order while fulfillment is PENDING; OCC on order version | OrderPlanner |
+| POST | `/poultry/orders/{id}/cancel` | Cancel an order; cascades CANCELLED to SCHEDULED batches and releases labor | OrderPlanner |
+| POST | `/poultry/deboning-batches` | Schedule a deboning batch on a DEBONING line; debits shift labor budget | ShiftSupervisor |
+| GET | `/poultry/deboning-batches` | List deboning batches with filters and pagination | All roles |
+| GET | `/poultry/deboning-batches/{id}` | Get a deboning batch | All roles |
+| POST | `/poultry/deboning-batches/{id}/advance` | Batch lifecycle: start/resume, hold, complete, cancel | LineOperator |
+| GET | `/poultry/finished-lots` | List finished lots with filters | All roles |
+| GET | `/poultry/finished-lots/{id}` | Get a finished lot including trace_code and routing_status | All roles |
+| POST | `/poultry/finished-lots/{id}/trace-lock` | Trace-lock a finished lot; computes routing_status | QATechnician |
+| POST | `/poultry/finished-lots/{id}/advance` | SHIPPED by ShiftSupervisor; RECALLED by QATechnician or USDAInspector | ShiftSupervisor, QATechnician, USDAInspector |
+| POST | `/poultry/chill-chain-logs` | Append a cold-chain temperature observation for a finished lot | QATechnician |
+| GET | `/poultry/finished-lots/{id}/chill-chain-logs` | List chill-chain logs of a finished lot | All roles |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock; evaluates all clock-driven system transitions | PlantManager |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` | 400 Bad Request |
+| `ERR_INSUFFICIENT_PERMISSIONS` | 403 Forbidden |
+| `ERR_NOT_FOUND` | 404 Not Found |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_STALE_SHIFT_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_ORDER_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_LINE_VERSION` | 412 Precondition Failed |
+| `ERR_SHIFT_NOT_OPENABLE` | 409 Conflict |
+| `ERR_SHIFT_TERMINAL` | 409 Conflict |
+| `ERR_SHIFT_NOT_RUNNING` | 409 Conflict |
+| `ERR_SHIFT_NOT_SUSPENDED` | 409 Conflict |
+| `ERR_RUNS_NOT_TERMINAL` | 409 Conflict |
+| `ERR_NO_RUNS_QUEUED` | 409 Conflict |
+| `ERR_PREOP_NOT_PASSED` | 409 Conflict |
+| `ERR_SANITATION_NOT_VERIFIED` | 409 Conflict |
+| `ERR_SOD_PREOP_SANITATION` | 403 Forbidden |
+| `ERR_SOD_CONDEMNATION_SELF_CERTIFY` | 403 Forbidden |
+| `ERR_LINE_SPEED_NOT_AUTHORIZED` | 403 Forbidden |
+| `ERR_WAIVER_WINDOW_OVERLAP` | 422 Unprocessable Entity |
+| `ERR_WAIVER_WINDOW_EXPIRED` | 409 Conflict |
+| `ERR_INVALID_STATE_TRANSITION` | 409 Conflict |
+| `ERR_FLOCK_LOT_NOT_RECEIVABLE` | 409 Conflict |
+| `ERR_SHIFT_CAPACITY_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_LOT_NOT_SETTLABLE` | 409 Conflict |
+| `ERR_RUN_NOT_STARTABLE` | 409 Conflict |
+| `ERR_LOT_SHIFT_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_LINE_TYPE_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_CONDEMNATION_COUNT_EXCEEDS_HUNG` | 422 Unprocessable Entity |
+| `ERR_LOT_NOT_CHILLED` | 409 Conflict |
+| `ERR_BATCH_NOT_ADVANCEABLE` | 409 Conflict |
+| `ERR_LABOR_BUDGET_EXCEEDED` | 402 Payment Required |
+| `ERR_ORDER_WINDOW_CLOSED` | 409 Conflict |
+| `ERR_ORDER_NOT_AMENDABLE` | 409 Conflict |
+| `ERR_ORDER_NOT_CANCELLABLE` | 409 Conflict |
+| `ERR_TRACE_LOCK_BLOCKED_UNCERTIFIED` | 409 Conflict |
+| `ERR_CHILL_NOT_COMPLIANT` | 409 Conflict |
+| `ERR_CHILLER_LIMIT_FRESH_BLOCKED` | 409 Conflict |

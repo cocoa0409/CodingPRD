@@ -1,0 +1,63 @@
+"""Domain thresholds — numeric constants from PRD calculations."""
+
+# Logical clock startup default (PRD §2.4)
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# Clearance validity (PRD §3.2)
+VALIDITY_MONTHS = {"BACKGROUND": 24, "HEALTH_TB": 12, "HEALTH_FLU": 12}
+REQUIRED_CLEARANCE_TYPES = ["BACKGROUND", "HEALTH_TB", "HEALTH_FLU"]
+
+# Compliance posture windows (PRD §2.9)
+POSTURE_GRACE_DAYS = 30
+POSTURE_EXPIRING_SOON_DAYS = 30
+
+# Recognition points (PRD §3.6)
+CATEGORY_MULTIPLIER = {
+    "PATIENT_FACING": 1.5,
+    "FUNDRAISING": 1.2,
+    "GIFT_SHOP": 1.0,
+    "COMMUNITY": 1.0,
+    "CLERICAL": 0.8,
+}
+TIER_THRESHOLDS = {
+    "BRONZE": 100.00,
+    "SILVER": 300.00,
+    "GOLD": 600.00,
+    "PRESIDENT": 1000.00,
+}
+
+# Service-year minimums and no-show penalty (PRD §3.6)
+NO_SHOW_PENALTY_HOURS = 2.0
+ADULT_ANNUAL_MIN_HOURS = 100.0
+JUNIOR_ANNUAL_MIN_HOURS = 40.0
+
+# Junior protections (PRD §3.5)
+JUNIOR_WEEKLY_CAP_HOURS = 16.0
+SUPERVISOR_MAX_JUNIORS = 3
+SUPERVISOR_MIN_AGE = 21
+
+# Placement negotiation (PRD §3.3)
+MAX_COUNTER_ROUNDS = 2
+MAX_ACCEPTED_PLACEMENTS = 2
+
+# Hours logging (PRD §3.6)
+MAX_ENTRY_MINUTES = 960
+
+# Gift shop / campaigns (PRD §3.7, §3.8)
+VOID_WINDOW_HOURS = 24
+DISBURSEMENT_COOLING_OFF_DAYS = 7
+MAX_PROMO_DISCOUNT_PCT = 50
+TIER_DISCOUNT_PCT = {"BRONZE": 5, "SILVER": 10, "GOLD": 15, "PRESIDENT": 20}
+JUNIOR_DISCOUNT_PCT = 5
+
+# Signup / self-cancel window (PRD §3.5)
+SIGNUP_WINDOW_HOURS = 24
+
+# Pagination (PRD §2.3)
+DEFAULT_LIMIT = 10
+MAX_LIMIT = 100
+
+# Common test dates
+SHIFT_DAY = "2026-08-10"
+SHIFT_START = "2026-08-10T08:00:00Z"
+SHIFT_END = "2026-08-10T12:00:00Z"

@@ -1,0 +1,80 @@
+"""Error types and the error catalog (PRD section 5)."""
+
+from __future__ import annotations
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+HTTP_STATUS = {
+    # Auth
+    "ERR_MISSING_OR_INVALID_ROLE": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_NEGOTIATOR_CANNOT_APPROVE_OWN_OFFER": 403,
+    "ERR_DIRECTOR_APPROVAL_REQUIRED": 403,
+    # Not found
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_DOCUMENT_NOT_FOUND": 404,
+    "ERR_ENCROACHMENT_NOT_FOUND": 404,
+    "ERR_OFFER_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_ZONE_NOT_FOUND": 404,
+    "ERR_VIOLATION_NOT_FOUND": 404,
+    "ERR_TITLE_TASK_NOT_FOUND": 404,
+    "ERR_REFERRAL_NOT_FOUND": 404,
+    # State
+    "ERR_CASE_NOT_OPEN_FOR_RECORDING": 409,
+    "ERR_CASE_NOT_MONITORING": 409,
+    "ERR_CASE_ALREADY_CLOSED": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_OFFER_NOT_TENDERED": 409,
+    "ERR_ENCROACHMENT_NOT_NEGOTIATING": 409,
+    "ERR_PERMIT_NOT_PENDING": 409,
+    "ERR_TASK_NOT_IN_PROGRESS": 409,
+    "ERR_DOCUMENT_NOT_DRAFT": 409,
+    "ERR_REFERRAL_NOT_ACCEPTED": 409,
+    "ERR_REFERRAL_NOT_FILED": 409,
+    "ERR_INSPECTION_NOT_PASSED": 409,
+    "ERR_ONLY_FAILED_INSPECTION_REVOKABLE": 409,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_NEGOTIATION_ROUNDS_NOT_EXHAUSTED": 409,
+    "ERR_OPEN_ENCROACHMENTS_REMAIN": 409,
+    "ERR_OPEN_OFFERS_EXIST": 409,
+    "ERR_PENDING_PERMITS_EXIST": 409,
+    "ERR_PENDING_LITIGATION_EXISTS": 409,
+    "ERR_NO_DOCUMENTS_ON_CASE": 409,
+    "ERR_NO_RECORDED_DOCUMENT": 409,
+    "ERR_RECORDED_DOCUMENT_EXISTS": 409,
+    "ERR_ONLY_MINOR_WAIVABLE": 409,
+    # Business
+    "ERR_CROSS_CASE_REFERENCE": 409,
+    "ERR_TITLE_NOT_CLEARED": 409,
+    "ERR_TITLE_DEFECTS_EXIST": 409,
+    "ERR_DUPLICATE_INSTRUMENT_NUMBER": 409,
+    "ERR_DOCUMENT_NOT_RECORDED": 409,
+    "ERR_SELF_SUPERSEDE": 409,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_DEADLINE_PASSED": 422,
+    "ERR_PERMIT_OVERLAP": 409,
+    "ERR_INSURANCE_REQUIRED": 409,
+    "ERR_PROHIBITED_SPECIES_NOT_EXEMPTABLE": 409,
+    "ERR_EXCESS_HEIGHT_TOO_LARGE": 409,
+    "ERR_COMPENSATION_EXCEEDS_BUDGET": 402,
+    # Concurrency
+    "ERR_STALE_CASE_VERSION": 412,
+    # Generic request-shape / framework errors (not in the PRD catalog but
+    # referenced by the design indices for malformed payloads)
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+def raise_err(error_id: str, message: str) -> None:
+    raise ApiError(error_id, HTTP_STATUS[error_id], message)

@@ -1,0 +1,47 @@
+"""Error catalog and ApiError exception. Error IDs and HTTP statuses from
+SCAFFOLD §1.6 / PRD §5."""
+
+
+ERROR_CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_CROSS_CUSTOMER_ACCESS": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_NOT_FOUND": 404,
+    "ERR_STALE_VERSION": 412,
+    "ERR_RECIPE_STATE": 409,
+    "ERR_RECIPE_NOT_APPROVED": 409,
+    "ERR_RECIPE_BUSY": 409,
+    "ERR_RECIPE_NO_COMPONENTS": 409,
+    "ERR_RECIPE_COMPONENT_CYCLE": 409,
+    "ERR_ORDER_NOT_OPEN": 409,
+    "ERR_BATCH_STATE": 409,
+    "ERR_CYCLE_STATE": 409,
+    "ERR_RUN_STATE": 409,
+    "ERR_CAPACITY_EXCEEDED": 409,
+    "ERR_BELOW_MIN_LOAD": 409,
+    "ERR_CELL_WINDOW_CONFLICT": 409,
+    "ERR_NO_CELL_AVAILABLE": 409,
+    "ERR_LINE_WINDOW_CONFLICT": 409,
+    "ERR_LINE_FORMAT_MISMATCH": 409,
+    "ERR_FILM_TYPE_MISMATCH": 409,
+    "ERR_FILM_LOT_QUARANTINED": 409,
+    "ERR_FILM_INSUFFICIENT": 409,
+    "ERR_CCP_NOT_CURRENT": 409,
+    "ERR_LOT_STATE": 409,
+    "ERR_LOT_EXPIRED": 409,
+    "ERR_STORAGE_CAPACITY_EXCEEDED": 409,
+    "ERR_TEMPERATURE_CLASS_MISMATCH": 409,
+    "ERR_INSUFFICIENT_CASES": 409,
+    "ERR_COMPLAINT_STATE": 409,
+    "ERR_COMPLAINT_UNITS_INVALID": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = ERROR_CATALOG[error_id]
+        self.message = message or error_id
+        super().__init__(self.message)

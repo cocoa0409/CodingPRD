@@ -1,0 +1,43 @@
+"""Domain thresholds and numeric constants from the PRD (§3.5–§3.9)."""
+
+# Logical clock startup default (PRD §2.4)
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+# Quote computation (PRD §3.5)
+HANDLING_PCT = 5
+TAX_RATE_PCT = 8
+EXPEDITE_FEE_CENTS = 7500
+
+# Settlement loyalty tiers (PRD §3.8)
+LOYALTY_TIER1_CENTS = 50000
+LOYALTY_TIER1_PCT = 10
+LOYALTY_TIER2_CENTS = 20000
+LOYALTY_TIER2_PCT = 5
+
+# Loaner late fees (PRD §3.7)
+DAILY_LATE_FEE_CENTS = 2500
+
+# Recurring-failure scoring (PRD §3.3)
+RECENT_WINDOW_DAYS = 90
+HISTORY_WINDOW_DAYS = 365
+CURRENT_RMA_WEIGHT = 2
+
+# Escalation monitoring window (PRD §3.9)
+MONITORING_WINDOW_DAYS = 90
+
+# Stale-authorization auto-cancel (PRD §3.9)
+STALE_AUTHORIZED_DAYS = 30
+
+# Customer defaults (PRD §3.1)
+DEFAULT_CREDIT_LIMIT_CENTS = 100000
+
+TEST_DEFAULTS = {
+    "STANDARD_WARRANTY_DAYS": 365,
+    "REPLACEMENT_COST_CENTS": 100000,
+    "FLAT_RATE_REPAIR_CENTS": 15000,
+    "LABOR_RATE_CENTS_PER_MINUTE": 200,
+    "REPLACE_THRESHOLD_PCT": 60,
+    "SLA_TURNAROUND_BUSINESS_DAYS": 5,
+    "PART_UNIT_COST_CENTS": 5000,
+    "LOANER_DEPOSIT_VALUE_CENTS": 40000,
+}

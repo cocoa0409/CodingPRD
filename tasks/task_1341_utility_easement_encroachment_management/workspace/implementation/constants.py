@@ -1,0 +1,78 @@
+"""Domain constants for the Utility Easement Encroachment API.
+
+The PRD/scaffold reference these as configured symbolic constants without
+assigning numeric values. Values marked (hint) come from the task's design
+indices; the rest are chosen defaults (documented as ambiguity resolutions).
+"""
+
+from __future__ import annotations
+
+# --- Roles (exact spellings per PRD section 2.1) ---
+ROLE_RIGHT_OF_WAY_AGENT = "RightOfWayAgent"
+ROLE_TITLE_EXAMINER = "TitleExaminer"
+ROLE_VEGETATION_INSPECTOR = "VegetationInspector"
+ROLE_LITIGATION_COUNSEL = "LitigationCounsel"
+ROLE_DEPARTMENT_DIRECTOR = "DepartmentDirector"
+
+ALL_ROLES = {
+    ROLE_RIGHT_OF_WAY_AGENT,
+    ROLE_TITLE_EXAMINER,
+    ROLE_VEGETATION_INSPECTOR,
+    ROLE_LITIGATION_COUNSEL,
+    ROLE_DEPARTMENT_DIRECTOR,
+}
+
+# --- Configured business constants ---
+# (hint) design indices: "assume DIRECTOR_APPROVAL_THRESHOLD_CENTS=10000000"
+DIRECTOR_APPROVAL_THRESHOLD_CENTS = 10_000_000
+# (hint) design indices: "NEGOTIATION_WINDOW_DAYS=30"
+NEGOTIATION_WINDOW_DAYS = 30
+# (hint) design indices: "assume MAX=3" for exhaustion; the full recipe chains
+# exercise begin + 3 counters (round 4) before escalating, so MAX=4 keeps every
+# declared setup call successful while preserving all asserted round counts.
+MAX_NEGOTIATION_ROUNDS = 4
+# Chosen defaults (unvalued in PRD/scaffold/designs):
+OWNER_RESPONSE_WINDOW_DAYS = 30
+REMEDIATION_WINDOW_DAYS = 30
+FILING_WINDOW_DAYS = 30
+VIOLATION_REMEDIATION_THRESHOLD = 3
+EXEMPTABLE_HEIGHT_MARGIN_FT = 5.0
+
+# --- Enums ---
+DOC_KINDS = {"DEED", "PLAT", "AMENDMENT", "JUDGMENT"}
+DISCOVERED_VIA = {"AERIAL_SURVEY", "FIELD_INSPECTION", "THIRD_PARTY_REPORT", "TITLE_SEARCH"}
+ENCROACHMENT_TYPES = {"STRUCTURE", "VEGETATION", "FENCE", "PAVEMENT", "UTILITY_CROSSING", "OTHER"}
+PERMIT_TYPES = {"DRIVEWAY", "LANDSCAPING", "FENCE_RETENTION", "STRUCTURE_RETENTION", "UTILITY_CROSSING"}
+INSPECTION_RESULTS = {"PASSED", "FAILED"}
+LOCATIONS_WITHIN_ZONE = {"WIRE_ZONE", "BORDER_ZONE"}
+SEARCH_SCOPES = {"FULL_CHAIN", "CURRENT_OWNER", "LIEN_ONLY"}
+REFERRAL_REASONS = {"NEGOTIATION_FAILED", "VEGETATION_REMEDIATION_FAILED", "TITLE_DEFECT", "CONDEMNATION"}
+
+# --- State sets ---
+CASE_TERMINAL = {"CLOSED_RESOLVED", "CLOSED_CONDEMNED", "CLOSED_ABANDONED"}
+CASE_RECORDABLE = {"MAPPING", "ACTIVE_MONITORING", "RESOLUTION_PENDING"}
+CASE_MONITORING = {"ACTIVE_MONITORING", "RESOLUTION_PENDING"}
+ENCROACHMENT_TERMINAL = {"REMOVED", "PERMITTED_RETROACTIVELY", "WAIVED", "ESCALATED_TO_LEGAL"}
+OFFER_COMMITTED_STATUSES = {"TENDERED", "COUNTERED", "ACCEPTED"}
+OFFER_OPEN_STATUSES = {"DRAFT", "TENDERED", "COUNTERED"}
+REFERRAL_PENDING_STATUSES = {"REFERRED", "ACCEPTED"}
+VIOLATION_OPEN_STATUSES = {"DETECTED", "NOTIFIED"}
+
+# --- Permit fee base rates (cents/year) ---
+PERMIT_BASE_RATES = {
+    "DRIVEWAY": 25000,
+    "LANDSCAPING": 10000,
+    "FENCE_RETENTION": 15000,
+    "STRUCTURE_RETENTION": 50000,
+    "UTILITY_CROSSING": 75000,
+}
+STRUCTURE_RETENTION_BUFFER_DAYS = 30
+
+# --- Severity weights ---
+TIER_WEIGHTS = {"MINOR": 1, "MODERATE": 3, "SEVERE": 7, "CRITICAL": 15}
+
+# --- Pagination ---
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0

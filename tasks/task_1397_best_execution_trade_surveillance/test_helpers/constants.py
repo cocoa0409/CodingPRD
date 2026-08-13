@@ -1,0 +1,48 @@
+"""Domain thresholds — numeric constants named in the PRD (§2.4, §3.5-§3.9)."""
+
+# Logical clock (PRD §2.4)
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Front-running detection (PRD §3.7)
+FRONT_RUNNING_WINDOW_SECONDS = 3600
+FRONT_RUNNING_W_TIME = 50
+FRONT_RUNNING_W_SIZE = 30
+FRONT_RUNNING_W_SIDE = 20
+
+# Alert triage (PRD §3.7)
+ALERT_ESCALATION_MIN_SCORE = 50
+
+# Marking the close (PRD §3.7)
+MARKING_CLOSE_TRIGGER_BPS = 25
+MARKING_CLOSE_SCORE_MULTIPLIER = 2
+MARKING_CLOSE_SCORE_CAP = 100
+
+# Communications lexicon tiering (PRD §3.8)
+COMM_REVIEW_MIN_SCORE = 40
+COMM_AUTO_ESCALATE_SCORE = 100
+
+# Regulatory late filing fee (PRD §3.7)
+LATE_BASE_CENTS = 50000
+LATE_PER_DAY_CENTS = 5000
+LATE_CAP_CENTS = 500000
+FILING_WINDOW_DAYS = 30
+
+# Committee quorum (PRD §3.5)
+APPROVAL_QUORUM = 3
+
+# Personal-account trading (PRD §3.6)
+MIN_HOLDING_SECONDS = 30 * 86400
+PRECLEARANCE_EXPIRY_HOURS = 48
+
+# Restricted-list buffer (PRD §3.9)
+RESTRICTED_BUFFER_SECONDS = 86400
+
+# Attestation refresh (PRD §3.1)
+ATTESTATION_REFRESH_DAYS = 365
+
+TEST_DEFAULTS = {
+    "ARR_FROM": "2026-08-01T00:00:00Z",
+    "ARR_TO": "2026-09-01T00:00:00Z",
+    "PERIOD_MONTH": "2026-08",
+    "QUARTER": "2026-Q3",
+}

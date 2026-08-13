@@ -1,0 +1,37 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules (§3)."""
+
+# Logical clock
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+# Reservations (PRD §3.3): 72-hour TTL
+RESERVATION_TTL_HOURS = 72
+
+# Returns (PRD §3.8): 30-day RMA window
+RMA_WINDOW_DAYS = 30
+
+# Expedite fee stacking (PRD §3.4)
+RUSH_PCT = 0.08
+EMERGENCY_PCT = 0.15
+AFTER_CUTOFF_MULT = 1.25
+STANDARD_FLAT_CENTS = 1500
+RUSH_MIN_CENTS = 2500
+EMERGENCY_MIN_CENTS = 5000
+
+# Warranty tiered credit (PRD §3.7)
+WARRANTY_TIER1_HOURS = 2000
+WARRANTY_TIER2_HOURS = 5000
+WARRANTY_TIER1_COVERAGE = 1.00
+WARRANTY_TIER2_COVERAGE = 0.50
+WARRANTY_TIER3_COVERAGE = 0.25
+
+# Return credit waterfall (PRD §3.8)
+RESTOCK_FEE_PCT = 0.15
+OBSOLETE_WRITE_DOWN_PCT = 0.50
+
+# Referral fee (PRD §3.10)
+REFERRAL_FEE_PCT = 0.10
+REFERRAL_FEE_CAP_CENTS = 25000
+
+# Call-out fee (PRD §3.6)
+WEEKEND_FEE_MULTIPLIER = 1.5
+PER_UNIT_HANDLING_CENTS = 250
