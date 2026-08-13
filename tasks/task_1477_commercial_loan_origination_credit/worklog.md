@@ -193,3 +193,41 @@ Done. `PRD_FINALIZED.md` is written at `/home/ubuntu/github/CodingPRD/tasks/task
 - (a) Subject: pipeline placement of the entity-dependent amount==proposed ERR_VALIDATION check at term-sheet issuance.
 - (b) Paths enumerated and read: `routes/termsheets.py` `create_term_sheet` (full function, lines 17-72: roles → `req_*` schema incl. `amount<=0` ERR_VALIDATION → `body_fk_exists` → OCC → state gate → equality check → supersede → create); `routes/termsheets.py` `respond_term_sheet` (no amount check, unaffected); grep for `proposed_amount_cents` across `implementation/` (hits in `serialize.py:53`, `routes/committee.py:33` level computation, `services/underwriting.py:176` sizing, `routes/applications.py:106,249` — none perform an amount-equality validation, so the edit's subject is unique to term-sheet issuance); grep for `ERR_STALE_VERSION`/`expected_loan_application_version` in `routes/` (only `termsheets.py` and `committee.py`); read `committee.py` `open_decision` (lines 94-144) confirming the same OCC → state → business ordering so §2.8 stage 5's "before every remaining state and business check" phrasing needed no change.
 - (c) Wording adjustment: the inserted sentence is scoped explicitly to "this endpoint" (term-sheet issuance) and explicitly limits stage-4's scope to "the request body's own ranges" rather than making a universal claim about all ERR_VALIDATION checks, so it cannot mis-describe the committee endpoint or any other route's validation ordering.
+
+## Step 9: Complete PRD — 2026-08-13T18:25:00.000Z
+
+The diff is complete and verified. All edits are in place. Final summary:
+
+## PRD_COMPLETED.md produced
+
+**Source**: `workspace/PRD_FINALIZED.md` (copied, then edited in place as `workspace/PRD_COMPLETED.md` per method — PRD.md untouched).
+
+**Size**: 360 → 360 lines; 72,445 → 78,040 chars (**+5,595 chars**). All edits are in-paragraph inserts/revisions; no new sections.
+
+**Counts**: 19 ambiguity-pins, 1 mismatch-revision (20 edited passages total).
+
+### Changes
+
+- **§2.3** — insert — ambiguity — pins invalid `limit`/`offset` → `ERR_VALIDATION`, `has_more` = (`offset` + returned-count < `total_count`), creation-timestamp ties broken by insertion sequence — `validation.py:126-154`, `response.py:29`, `routes/common.py:21-26`
+- **§2.4** — insert — ambiguity — request-supplied date/datetime fields (session `starts_at`/`ends_at`, sheet `expires_at`, letter `expiry_date`/`rate_lock_expires_at`, engagement dates) stored and echoed verbatim as supplied; comparisons parse them as instants — `routes/committee.py:69-70`, `routes/termsheets.py:65`, `routes/letters.py:49-52`
+- **§2.4** — revise — ambiguity — `version` "starts at its initial value" → "starts at 1" — `db.py:56-64`
+- **§2.5** — insert — ambiguity — ratios serialize as JSON numbers; 4th-decimal trailing zero not textually preserved (1.4730 → 1.473) — `services/money.py:25-29`
+- **§2.6** — insert — ambiguity — clock-set applies any supplied instant unconditionally; no monotonicity check; sweep runs against the new instant — `routes/clock.py:16-17`
+- **§2.8 stage 4** — revise — ambiguity — scopes "monetary amounts strictly greater than zero" to the five transactional amounts (request/sheet/appraisal-values/funding/allocated); statement figures admitted as any-sign integers; offset-less datetimes read as UTC; body-FK existence folded into stage 4; unrecognized body fields ignored — `routes/statements.py:20-24,33`, `validation.py:105-117`, `routes/common.py:14-18`
+- **§2.10** — insert — ambiguity — body-carried FK to a nonexistent resource → `ERR_VALIDATION` (not 404); `restatement_of_id` remains the `ERR_RESTATEMENT_TARGET_INVALID` exception — `routes/common.py:14-18`, `routes/statements.py:35-36`
+- **§3.1** — insert — ambiguity — borrower PATCH gates only the target value, so a `SUSPENDED` borrower may be set directly back to `ACTIVE`/`EXITED` — `routes/borrowers.py:86-101`
+- **§3.1** — revise — ambiguity — new application also carries nulls in `rating_basis`, `proposed_amount_cents`, `committee_level_required` until stamped — `routes/applications.py:102-107`
+- **§3.2** — insert — ambiguity — the eight raw statement figures are validated only as integers; §2.8's strictly-positive rule does not apply to spreads — `routes/statements.py:33` (`req_int` only)
+- **§3.2** — insert — ambiguity — `total_assets_cents` ≤ 0 → leverage ratio undefined → leverage factor contributes 20 points — `services/underwriting.py:104-105`
+- **§3.3** — insert — ambiguity — exception waiver gated only on the exception being `OPEN`, never on the application's stage (test_12 relies on waiving `LTV_MAXIMUM`/`COLLATERAL_COVERAGE_MIN` while in `CLOSING`); re-run in `EXCEPTION_REVIEW` recomputes only the two DSCRs plus the four finalize-time exceptions, leaving `risk_rating`/`rating_basis` unchanged — `routes/exceptions.py:39-40`, `routes/applications.py:54-64`
+- **§3.5** — insert — ambiguity — sizing step two's intermediate monthly payment (max annual ÷ 12) is not rounded; only the final principal cap is floored — `services/underwriting.py:185-186`
+- **§3.5** — insert — ambiguity — LTV/liquidation exception tests and the collateral-coverage tier compare exact unrounded quotients; the collateral re-test applies §3.3 refresh semantics (resolve-by-change, no resurrection of `WAIVED`) — `routes/applications.py:255-269`, `services/underwriting.py:118-128`, `services/policy.py:52-68`
+- **§3.5** — revise — ambiguity — vote gate enumeration now requires the application to still be in `COMMITTEE_REVIEW` (`ERR_INVALID_STATE`); the withdrawn-decision sentence now names `ERR_INVALID_STATE` at the state check — `routes/committee.py:162-166`
+- **§3.6** — revise — **mismatch** — rate-lock bound "no later than 23:59:59 UTC" → "no later than the end of the day on the expiry date — 23:59:59.999 UTC inclusive" (impl admits sub-second times up to .999) — `routes/letters.py:43-46`
+- **§3.7** — insert — ambiguity — checklist transition endpoint check order: schema (incl. rationale length) → from-state legality → policy-officer-only → `CRITICAL` severity; waiver on a non-`PENDING`/`RECEIVED` item fails `ERR_INVALID_STATE` before role is consulted — `routes/checklist.py:83-100`
+- **§3.7** — revise — ambiguity — `threshold_value` (and review `measured_value`) validated only as a JSON number; stored, echoed, and compared exactly as supplied; the 4dp/integer-cent phrasings are domain meaning, not input restrictions — `routes/covenants.py:59,69-74`
+- **§3.7** — insert — ambiguity — every funding release advances the application's `version` (its `funded_amount_cents` changes), including subsequent tranches that leave it `FUNDED` — `routes/funding.py:106-122`
+- **§3.8** — revise — ambiguity — covenant review semantics: `last_reviewed_period` recorded on every review pass or fail; a pass from `CURED` returns to `COMPLIANT`; a fail while `BREACH_PENDING` re-fires the cascade stacking a fresh `COVENANT_BREACH` each time; cure/waiver resolves every linked `OPEN` exception; a `WAIVED` covenant is terminal for reviews (`ERR_INVALID_STATE`) — `routes/covenants.py:99-123`, `services/policy.py:71-84`
+- **§3.8** — revise — ambiguity — withdrawal terminal set enumerated as `FUNDED`, `DECLINED`, `WITHDRAWN`, `EXPIRED` — `routes/applications.py:32,303-304`
+
+**Verified already-pinned (no change)**: the known Step 8 pins all check out against the impl — funding-release gate order, term-sheet amount-equality placed after OCC + state gate, `bank_hold_amount_cents` live from letter creation, DSCR refresh scope in `EXCEPTION_REVIEW`, closed-interval appraiser windows vs half-open session windows, tier/quorum tables, fee tiering with per-slice half-up then bank-remainder absorption, exposure conservation, and the OCC pair being the only version-carrying endpoints.
