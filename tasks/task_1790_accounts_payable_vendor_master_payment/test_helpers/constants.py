@@ -1,0 +1,47 @@
+"""Domain thresholds — numeric constants named in the PRD (§2.9, §3.1-§3.7)."""
+
+# Duplicate detection score thresholds (PRD §3.1; 4-decimal-place rounded score,
+# at-least semantics)
+DUP_HARD_BLOCK_THRESHOLD = 0.9000
+DUP_REVIEW_THRESHOLD = 0.7500
+
+# Sanctions screening fuzzy band floor (PRD §3.2)
+SCREEN_FUZZY_THRESHOLD = 0.8000
+
+# Invoice approval routing (PRD §3.5)
+NEW_VENDOR_DAYS = 30
+BANK_RECENT_HOURS = 72
+MAX_TIER = 3
+TIER_ROLE = {1: "APSupervisor", 2: "APManager", 3: "Controller"}
+
+# Payment run fee (PRD §2.9 / §3.6)
+WIRE_FEE_CENTS = 2500
+
+# Dormancy lifecycle (PRD §3.4)
+DORMANCY_DAYS = 180
+DORMANT_DEACTIVATE_DAYS = 90
+
+# Callback verification policy (PRD §3.3)
+CALLBACK_MAX_ATTEMPTS = 3
+CALLBACK_EXPIRY_HOURS = 48
+
+# Treasury daily release ceiling (PRD §3.7)
+TREASURY_DAILY_LIMIT_CENTS = 10_000_000
+
+# Logical clock default before any set call (PRD §2.4)
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+THRESHOLDS = {
+    "DUP_HARD_BLOCK_THRESHOLD": DUP_HARD_BLOCK_THRESHOLD,
+    "DUP_REVIEW_THRESHOLD": DUP_REVIEW_THRESHOLD,
+    "SCREEN_FUZZY_THRESHOLD": SCREEN_FUZZY_THRESHOLD,
+    "NEW_VENDOR_DAYS": NEW_VENDOR_DAYS,
+    "BANK_RECENT_HOURS": BANK_RECENT_HOURS,
+    "MAX_TIER": MAX_TIER,
+    "WIRE_FEE_CENTS": WIRE_FEE_CENTS,
+    "DORMANCY_DAYS": DORMANCY_DAYS,
+    "DORMANT_DEACTIVATE_DAYS": DORMANT_DEACTIVATE_DAYS,
+    "CALLBACK_MAX_ATTEMPTS": CALLBACK_MAX_ATTEMPTS,
+    "CALLBACK_EXPIRY_HOURS": CALLBACK_EXPIRY_HOURS,
+    "TREASURY_DAILY_LIMIT_CENTS": TREASURY_DAILY_LIMIT_CENTS,
+}

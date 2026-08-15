@@ -1,0 +1,49 @@
+"""Domain thresholds — numeric constants from PRD §2.8, §2.9, §3.7, §3.9."""
+
+# Logical clock (PRD §2.4)
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Registration renewal fee ladder (PRD §3.9)
+FEE_TIER1_MAX_CENTS = 2_500_000
+FEE_TIER2_MAX_CENTS = 10_000_000
+FEE_TIER3_MAX_CENTS = 50_000_000
+FEE_TIER1_BASE_CENTS = 5_000
+FEE_TIER2_BASE_CENTS = 15_000
+FEE_TIER3_BASE_CENTS = 30_000
+FEE_TIER4_BASE_CENTS = 50_000
+OVERAGE_UNIT_CENTS = 100_000
+OVERAGE_FEE_PER_UNIT_CENTS = 1_000
+ESTIMATE_SHARE = 0.10
+LATE_FEE_PCT = 0.10
+
+# Renewal / lapse windows (PRD §3.9)
+RENEWAL_WINDOW_DAYS = 90
+RENEWAL_DUE_WINDOW_DAYS = 60
+
+# D&O coverage floor (PRD §3.9)
+COVERAGE_FLOOR_FRACTION = 0.25
+
+# Meeting buffered-exclusion (PRD §2.8)
+MEETING_BUFFER_MINUTES = 30
+
+# Notice discipline (PRD §3.4)
+NOTICE_DAYS = 7
+
+# Evaluation weights and rating bands (PRD §3.7)
+EVAL_WEIGHTS = {
+    "LEADERSHIP": 0.30,
+    "FUNDRAISING": 0.20,
+    "FINANCIAL": 0.20,
+    "PROGRAM": 0.20,
+    "GOVERNANCE": 0.10,
+}
+BAND_EXCEEDS = 4.25
+BAND_MEETS = 3.00
+BAND_NEEDS_IMPROVEMENT = 2.00
+
+# Amendment adoption (PRD §3.5)
+DEPLETED_FRACTION = 0.75
+AMENDMENT_MIN_REQUIRED = 2
+
+# Public disclosure window (PRD §3.8)
+PUBLIC_DISCLOSURE_WINDOW_DAYS = 30

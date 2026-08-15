@@ -1,0 +1,35 @@
+"""Error taxonomy with exact IDs from the scaffold error catalog / PRD section 5."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_UNAUTHORIZED_ROLE = ("ERR_UNAUTHORIZED_ROLE", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_SAFETY_VIOLATION = ("ERR_SAFETY_VIOLATION", 422)
+ERR_TEMPORAL_CONFLICT = ("ERR_TEMPORAL_CONFLICT", 422)
+ERR_CERTIFICATION_INSUFFICIENT = ("ERR_CERTIFICATION_INSUFFICIENT", 422)
+ERR_CONSTRAINT_VIOLATION = ("ERR_CONSTRAINT_VIOLATION", 422)
+ERR_REFERENCE_INVALID = ("ERR_REFERENCE_INVALID", 422)
+ERR_CAPACITY_FULL = ("ERR_CAPACITY_FULL", 422)
+ERR_DELIVERY_OUT_OF_RANGE = ("ERR_DELIVERY_OUT_OF_RANGE", 422)
+ERR_ALLERGEN_CONFLICT = ("ERR_ALLERGEN_CONFLICT", 422)
+ERR_SUPERVISOR_REQUIRED = ("ERR_SUPERVISOR_REQUIRED", 422)
+ERR_EQUIPMENT_HALTED = ("ERR_EQUIPMENT_HALTED", 422)
+ERR_CANCEL_IN_LOCKOUT = ("ERR_CANCEL_IN_LOCKOUT", 422)
+ERR_GUEST_FLAGGED_NEEDS_REVIEW = ("ERR_GUEST_FLAGGED_NEEDS_REVIEW", 422)
+ERR_BATCH_EXPIRED = ("ERR_BATCH_EXPIRED", 422)
+ERR_VALIDATION = ("ERR_VALIDATION", 400)
+
+
+def raise_error(err_tuple, message: str = ""):
+    error_id, status = err_tuple
+    raise ApiError(error_id, status, message or error_id)

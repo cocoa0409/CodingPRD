@@ -1,0 +1,42 @@
+"""Domain thresholds — numeric constants named in the PRD."""
+
+# Logical clock
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Audit selection tiers (cents, inclusive thresholds)
+PHYSICAL_MIN_PREMIUM_CENTS = 1000000
+VOLUNTARY_MIN_PREMIUM_CENTS = 500000
+
+# Records requests
+RECORDS_DUE_DAYS = 15
+
+# Appointments
+APPOINTMENT_WINDOW_DAYS = 60
+NO_SHOW_LIMIT = 2
+
+# Disputes / billing windows
+DISPUTE_WINDOW_DAYS = 30
+BILLING_DUE_DAYS = 30
+CANCELLATION_GRACE_DAYS = 30
+
+# Estimated (non-compliance) audit multiplier
+ESTIMATED_AUDIT_MULTIPLIER = 1.25
+
+# Experience-mod revision
+VARIANCE_THRESHOLD = 0.05
+STEPS_PER_UNIT_VARIANCE = 20
+MOD_FLOOR = 0.75
+MOD_CEILING = 1.50
+
+# Common term dates used across tests
+TERM_START = "2026-01-01T00:00:00Z"
+TERM_END = "2026-07-31T00:00:00Z"
+CC_WINDOW_START = "2026-01-01T00:00:00Z"
+CC_WINDOW_END = "2026-12-31T23:59:59Z"
+
+TEST_DEFAULTS = {
+    "ESTIMATED_PREMIUM_CENTS": 600000,
+    "MINIMUM_PREMIUM_CENTS": 10000,
+    "PAYROLL_ESTIMATE_DOLLARS": 100000,
+    "RATE_PER_100_CENTS": 40,
+}

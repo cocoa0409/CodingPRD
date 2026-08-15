@@ -1,0 +1,45 @@
+"""Error taxonomy with exact IDs from the scaffold error catalog (Table 6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# auth / access
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_UNAUTHORIZED = ("ERR_UNAUTHORIZED", 403)
+ERR_RESERVATION_NOT_OWNED = ("ERR_RESERVATION_NOT_OWNED", 403)
+ERR_FLIGHT_NOT_ASSIGNED = ("ERR_FLIGHT_NOT_ASSIGNED", 403)
+# request / existence / concurrency
+ERR_INVALID_REQUEST = ("ERR_INVALID_REQUEST", 400)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+# state
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+# business: publish battery / flight ops
+ERR_PILOT_NOT_CURRENT = ("ERR_PILOT_NOT_CURRENT", 409)
+ERR_BALLOON_GROUNDED = ("ERR_BALLOON_GROUNDED", 409)
+ERR_SITE_PERMISSION_NOT_GRANTED = ("ERR_SITE_PERMISSION_NOT_GRANTED", 409)
+ERR_DAWN_WINDOW_EXPIRED = ("ERR_DAWN_WINDOW_EXPIRED", 409)
+ERR_CHASE_NOT_READY = ("ERR_CHASE_NOT_READY", 409)
+ERR_BALLOON_SCHEDULE_CONFLICT = ("ERR_BALLOON_SCHEDULE_CONFLICT", 409)
+ERR_PILOT_SCHEDULE_CONFLICT = ("ERR_PILOT_SCHEDULE_CONFLICT", 409)
+# business: payload / weather / capacity
+ERR_PAYLOAD_EXCEEDED = ("ERR_PAYLOAD_EXCEEDED", 422)
+ERR_WEATHER_LIMITS_EXCEEDED = ("ERR_WEATHER_LIMITS_EXCEEDED", 422)
+ERR_BASKET_CAPACITY_EXCEEDED = ("ERR_BASKET_CAPACITY_EXCEEDED", 422)
+ERR_CHARTER_EXCLUSIVE = ("ERR_CHARTER_EXCLUSIVE", 409)
+ERR_MANIFEST_INCOMPLETE = ("ERR_MANIFEST_INCOMPLETE", 422)
+ERR_NO_SUITABLE_SITE = ("ERR_NO_SUITABLE_SITE", 422)
+# fiscal
+ERR_PAYMENT_AMOUNT_MISMATCH = ("ERR_PAYMENT_AMOUNT_MISMATCH", 402)
+ERR_REFUND_POLICY_VIOLATION = ("ERR_REFUND_POLICY_VIOLATION", 422)
+
+
+def raise_error(spec, message: str = ""):
+    error_id, status = spec
+    raise ApiError(error_id, status, message or error_id)

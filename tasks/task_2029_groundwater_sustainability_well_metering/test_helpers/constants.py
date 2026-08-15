@@ -1,0 +1,41 @@
+"""Domain thresholds — numeric constants from PRD §2.5, §3.3–§3.8."""
+
+# Logical clock (PRD §2.5): fixed startup default; the server never uses wall-clock time.
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+DEFAULT_CLOCK_ISO_3DP = "2026-08-01T00:00:00.000Z"
+DEFAULT_WATER_YEAR = 2026
+
+# Pumping fee (PRD §3.3): reported_af * 3000 cents/af * basin-condition multiplier.
+FEE_CENTS_PER_AF = 3000
+FEE_MULT_NORMAL = 1.00
+FEE_MULT_WATCH = 1.10
+FEE_MULT_CRITICAL = 1.25
+
+# Overdraft penalty schedule (PRD §3.6).
+TIER1_LIMIT_FRACTION = 0.10
+TIER1_RATE_CENTS = 10000
+TIER2_RATE_CENTS = 25000
+LATE_REPORT_FEE_CENTS = 10000
+UNMETERED_PUMPING_FEE_CENTS = 50000
+
+# Basin-condition evaluation (PRD §3.5).
+MONITORING_RECENCY_DAYS = 90
+WATCH_BREACH_PCT = 25
+CRITICAL_BREACH_PCT = 50
+WATCH_MEAN_FT = 100.00
+CRITICAL_MEAN_FT = 120.00
+STANDARD_MONITORING_THRESHOLD_FT = 100.0
+STANDARD_MEASURED_AT = "2026-07-15T08:00:00Z"
+
+# Curtailment (PRD §3.8).
+CURTAILMENT_FACTOR_CRITICAL = 0.80
+
+# Year-end carryover (PRD §3.7).
+CARRYOVER_CAP_FRACTION = 0.25
+
+# Transfer market (PRD §3.4).
+MONTHLY_TRANSFER_CAP_AF = 5000
+TRANSFER_EXPIRY_HOURS = 72
+
+# Appeals (PRD §3.6).
+APPEAL_WINDOW_DAYS = 30

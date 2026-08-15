@@ -1,0 +1,1529 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Missing Participant Search & Plan Termination
+# =============================================================================
+
+scenario: |
+  Missing Participant Search & Plan Termination (terminating plan sponsor): uncashed check & undeliverable mail identification, search protocol (commercial locator/public records/credit bureau) escalation, PBGC missing participant program transfer, plan termination timeline & participant notices, blackout period notice & recordkeeper transition, final distribution & forfeiture handling, IRS determination letter request, fiduciary documentation of process
+
+domain_name: missing-participant-plan-termination
+api_prefix: ""   # flat topology: all endpoint paths in §1.5 are absolute as listed
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - optimistic_concurrency      # OCC on TerminationCase.version (notice supersede) and Participant.version (election supersede)
+    - cascading_side_effects      # locate -> restore -> forfeiture reversal -> ledger recompute; clock sweep -> stale check -> participant flag
+    - rate_threshold_triggers     # $1,000 / $5,000 default-treatment tiers; $200 withholding floor; 60/90-day, 30/60-day, 10/24-day, 15-day, 90-day windows
+    - scheduled_actions           # logical clock drives stale-check sweep and all statutory windows; default 2026-08-01T00:00:00Z
+  entity_topology: flat           # peer entities with FK references; no nested write paths
+  state_machine_shape: compound   # TerminationCase posture derived from participant states; Participant carries two independent state dimensions; MissingSearchCase is cyclic
+  relationship_patterns:
+    - one_to_many                 # case -> participants, notices, blackouts, DLRs, logs, expense allocations
+    - self_referential            # ParticipantNotice.superseded_by_id -> ParticipantNotice.id
+    - cross_aggregate             # Participant.active_search_case_id -> MissingSearchCase.id; Payout -> DistributionElection
+  role_model: segregation_of_duties  # the user who exhausts a search case may not approve its PBGC transfer or forfeiture
+  consistency_model: immediate    # every mutation (including cascades) is visible in the same request's response and subsequent reads
+  version_semantics: "Fields marked source: computed are derived on read and never stored; an entity's version increments only when a stored (input/system) field of that entity changes, updated_at refreshing alongside. Child-row creation does not bump the parent's version unless the writing endpoint's side_effects say so (§1.2.1 OCC endpoints always do)."
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: TerminationCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: plan_name, type: string, source: input, description: "Legal name of the terminating retirement plan" }
+      - { name: sponsor_ein, type: string, source: input, description: "9-digit employer identification number of the terminating plan sponsor", constraints: "exactly 9 digits" }
+      - { name: plan_number, type: string, source: input, description: "3-digit plan number", constraints: "exactly 3 digits" }
+      - { name: proposed_termination_date, type: datetime, source: input, description: "Proposed plan termination date; NOIT timing windows and effectuation are measured against this date" }
+      - { name: restoration_policy, type: enum, source: input, default: NOMINAL, description: "Forfeiture restoration basis for this case", constraints: "NOMINAL | EARNINGS_ADJUSTED" }
+      - { name: status, type: enum, source: system, description: "DRAFT | NOTICE_OF_INTENT_ISSUED | TERMINATION_EFFECTIVE | DISTRIBUTION_IN_PROGRESS | FINAL_RECONCILIATION | CLOSED" }
+      - { name: total_participant_count, type: integer, source: computed, default: 0, description: "Count of all Participant rows referencing this case" }
+      - { name: resolved_participant_count, type: integer, source: computed, default: 0, description: "Count of participants whose distribution_status is in {PAID_OUT, AUTO_ROLLED_OVER, PBGC_TRANSFERRED, FORFEITED}" }
+      - { name: missing_participant_count, type: integer, source: computed, default: 0, description: "Count of participants whose locate_status is MISSING" }
+      - { name: all_participants_resolved, type: boolean, source: computed, default: false, description: "true iff total_participant_count > 0 AND resolved_participant_count == total_participant_count" }
+      - { name: blackout_active, type: boolean, source: computed, default: false, description: "true iff any BlackoutPeriod of this case has status ACTIVE" }
+      - { name: default_treatment_date, type: datetime, source: computed, description: "Non-superseded DISTRIBUTION notice's action_effective_date + 30 days; null until a DISTRIBUTION notice is issued; recomputed on supersede", constraints: "nullable" }
+      - { name: total_plan_assets_cents, type: integer, source: computed, default: 0, description: "On TERMINATION_EFFECTIVE: sum of account_balance_cents over all participants; thereafter increased by sponsor_contribution_cents" }
+      - { name: sponsor_contribution_cents, type: integer, source: computed, default: 0, description: "Sponsor-funded earnings portion injected on EARNINGS_ADJUSTED forfeiture restorations" }
+      - { name: paid_out_cents, type: integer, source: computed, default: 0, description: "Sum of gross_cents over Payout rows with status CLEARED for this case" }
+      - { name: pbgc_transferred_cents, type: integer, source: computed, default: 0, description: "Sum of amount_cents over PBGCTransfer rows with status ACCEPTED for this case" }
+      - { name: forfeited_cents, type: integer, source: computed, default: 0, description: "Sum of forfeited_amount_cents over Forfeiture rows with status RECORDED for this case" }
+      - { name: expense_paid_cents, type: integer, source: computed, default: 0, description: "Sum of total_expense_cents over all ExpenseAllocation rows for this case" }
+      - { name: remaining_undistributed_cents, type: integer, source: computed, default: 0, description: "= total_plan_assets_cents - paid_out_cents - pbgc_transferred_cents - forfeited_cents - expense_paid_cents" }
+
+  - name: Participant
+    parent: null
+    common_fields: true
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; owning termination case" }
+      - { name: full_name, type: string, source: input, description: "Participant full legal name" }
+      - { name: ssn, type: string, source: input, description: "9-digit SSN used by credit-bureau search step", constraints: "exactly 9 digits" }
+      - { name: mailing_address, type: string, source: input, description: "Last known mailing address on record" }
+      - { name: account_balance_cents, type: integer, source: input, description: "Vested-or-unvested account balance in cents", constraints: ">= 0" }
+      - { name: vested_pct, type: integer, source: input, description: "Vesting percentage at intake; forced to 100 for every participant when the case reaches TERMINATION_EFFECTIVE (participants created afterwards are stored with 100 regardless of input)", constraints: "0..100" }
+      - { name: vested_balance_cents, type: integer, source: computed, description: "= round_half_up(account_balance_cents * vested_pct / 100) to whole cents" }
+      - { name: termination_expense_share_cents, type: integer, source: computed, default: 0, description: "Cumulative termination-expense allocations debited to this participant by ExpenseAllocation rows" }
+      - { name: net_distributable_cents, type: integer, source: computed, description: "= vested_balance_cents - termination_expense_share_cents" }
+      - { name: restoration_credit_cents, type: integer, source: computed, default: 0, description: "Sponsor-funded earnings credited to this participant on an EARNINGS_ADJUSTED forfeiture restoration; added to the gross of the next payout" }
+      - { name: locate_status, type: enum, source: system, description: "UNVERIFIED | FLAGGED_UNCASHED | FLAGGED_UNDELIVERABLE | MISSING | LOCATED" }
+      - { name: distribution_status, type: enum, source: system, description: "PENDING_ELECTION | ELECTION_SUBMITTED | ELECTION_ACCEPTED | PAID_OUT | AUTO_ROLLED_OVER | PBGC_TRANSFERRED | FORFEITED | RESTORED" }
+      - { name: active_search_case_id, type: string, source: system, description: "FK -> MissingSearchCase.id; the currently open or exhausted search case for this participant; null when none or the latest case is RESOLVED", constraints: "nullable" }
+      - { name: flagged_at, type: datetime, source: system, description: "Clock time when locate_status last left UNVERIFIED via a contact flag or stale-check sweep", constraints: "nullable" }
+      - { name: declared_missing_at, type: datetime, source: system, description: "Clock time of the most recent FLAGGED_* -> MISSING transition", constraints: "nullable" }
+      - { name: located_at, type: datetime, source: system, description: "Clock time of the most recent MISSING -> LOCATED transition", constraints: "nullable" }
+
+  - name: MissingSearchCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: participant_id, type: string, source: input, description: "FK -> Participant.id; the missing participant under search" }
+      - { name: termination_case_id, type: string, source: system, description: "FK -> TerminationCase.id; denormalized from the participant for case-level reporting" }
+      - { name: status, type: enum, source: system, description: "STEP1_COMMERCIAL_LOCATOR | STEP2_PUBLIC_RECORDS | STEP3_CREDIT_BUREAU | STEP4_CERTIFIED_MAIL | RESOLVED | EXHAUSTED" }
+      - { name: opened_at, type: datetime, source: system, description: "Clock time the case was first created (preserved across reopen)" }
+      - { name: resolved_at, type: datetime, source: system, description: "Clock time of transition into RESOLVED; cleared to null on reopen", constraints: "nullable" }
+      - { name: exhausted_at, type: datetime, source: system, description: "Clock time of transition into EXHAUSTED", constraints: "nullable" }
+      - { name: exhausted_by_user_id, type: string, source: system, description: "X-User-ID of the PlanAdministrator whose escalate call moved the case STEP4 -> EXHAUSTED; segregation-of-duties anchor", constraints: "nullable" }
+      - { name: exhaustion_snapshot_cents, type: integer, source: computed, description: "Participant.net_distributable_cents captured at the moment of exhaustion; basis for the EXHAUSTION_SNAPSHOT PBGC amount variant", constraints: "nullable" }
+      - { name: attempt_count, type: integer, source: computed, default: 0, description: "Count of SearchAttempt rows for this case" }
+
+  - name: SearchAttempt
+    parent: null
+    common_fields: false   # append-only event log: id + created_at only
+    fields:
+      - { name: search_case_id, type: string, source: input, description: "FK -> MissingSearchCase.id; owning search case (path id)" }
+      - { name: method, type: enum, source: input, description: "COMMERCIAL_LOCATOR | PUBLIC_RECORDS | CREDIT_BUREAU | CERTIFIED_MAIL; must equal the search case's current step" }
+      - { name: vendor_name, type: string, source: input, description: "Locator / bureau / mail vendor used" }
+      - { name: attempted_at, type: datetime, source: input, description: "Real-world attempt timestamp; must be >= search case opened_at, <= current clock, and >= every prior attempt's attempted_at on this case" }
+      - { name: outcome, type: enum, source: input, description: "NO_RESULT | LOCATED" }
+      - { name: notes, type: string, source: input, description: "Optional free-text detail", constraints: "nullable" }
+
+  - name: ParticipantNotice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; case the notice belongs to" }
+      - { name: notice_type, type: enum, source: input, description: "NOIT | INTERESTED_PARTY | BLACKOUT_ADVISORY | DISTRIBUTION" }
+      - { name: issued_at, type: datetime, source: system, description: "Clock time at issuance" }
+      - { name: action_effective_date, type: datetime, source: input, description: "Date of the noticed action: termination date (NOIT), blackout start (BLACKOUT_ADVISORY), distribution commencement (DISTRIBUTION), intended DLR filing date (INTERESTED_PARTY)" }
+      - { name: superseded_by_id, type: string, source: system, description: "FK -> ParticipantNotice.id; set when a newer notice of the same notice_type on the same case supersedes this one; null while this is the live notice", constraints: "nullable" }
+
+  - name: BlackoutPeriod
+    parent: null
+    common_fields: true
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; case whose recordkeeper transition causes the blackout" }
+      - { name: start_at, type: datetime, source: input, description: "Blackout start (inclusive); half-open interval start" }
+      - { name: end_at, type: datetime, source: input, description: "Blackout end (exclusive); half-open interval end; must be strictly after start_at" }
+      - { name: outgoing_recordkeeper, type: string, source: input, description: "Recordkeeper being transitioned away from" }
+      - { name: incoming_recordkeeper, type: string, source: input, description: "Recordkeeper being transitioned to" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | ACTIVE | COMPLETED" }
+      - { name: activated_at, type: datetime, source: system, description: "Clock time of activation", constraints: "nullable" }
+      - { name: completed_at, type: datetime, source: system, description: "Clock time of completion", constraints: "nullable" }
+
+  - name: DistributionElection
+    parent: null
+    common_fields: true
+    fields:
+      - { name: participant_id, type: string, source: input, description: "FK -> Participant.id; electing participant" }
+      - { name: election_method, type: enum, source: input, description: "LUMP_SUM_CHECK | DIRECT_ROLLOVER_IRA | DIRECT_ROLLOVER_QUALIFIED_PLAN" }
+      - { name: destination_detail, type: string, source: input, description: "Rollover destination institution / mailing instructions", constraints: "nullable" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | SUPERSEDED | ACCEPTED | REJECTED | SETTLED" }
+
+  - name: Payout
+    parent: null
+    common_fields: true
+    fields:
+      - { name: participant_id, type: string, source: system, description: "FK -> Participant.id; payee participant" }
+      - { name: distribution_election_id, type: string, source: system, description: "FK -> DistributionElection.id; originating election; null when created by apply-default-treatment", constraints: "nullable" }
+      - { name: source, type: enum, source: system, description: "ELECTION | DEFAULT_TREATMENT" }
+      - { name: method, type: enum, source: system, description: "LUMP_SUM_CHECK | DIRECT_ROLLOVER_IRA | DIRECT_ROLLOVER_QUALIFIED_PLAN | AUTO_ROLLOVER_IRA" }
+      - { name: gross_cents, type: integer, source: computed, description: "= participant.net_distributable_cents + participant.restoration_credit_cents at payout creation; the credit is consumed (reset to 0) by payout creation" }
+      - { name: withholding_cents, type: integer, source: computed, description: "20% of gross_cents (round_half_up to whole cents) when method == LUMP_SUM_CHECK and gross_cents >= 20000; otherwise 0" }
+      - { name: net_cents, type: integer, source: computed, description: "= gross_cents - withholding_cents" }
+      - { name: status, type: enum, source: system, description: "PREPARED | ISSUED | CLEARED | STALE_UNCASHED | VOIDED" }
+      - { name: issued_at, type: datetime, source: system, description: "Clock time of issuance (at creation, or at blackout completion for queued payouts)", constraints: "nullable" }
+      - { name: cleared_at, type: datetime, source: system, description: "Clock time of clearing", constraints: "nullable" }
+      - { name: stale_marked_at, type: datetime, source: system, description: "Clock time the stale sweep marked the check STALE_UNCASHED", constraints: "nullable" }
+
+  - name: PBGCTransfer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: participant_id, type: string, source: input, description: "FK -> Participant.id; missing participant whose benefit transfers to the PBGC Missing Participants Program" }
+      - { name: amount_basis, type: enum, source: input, description: "SUBMISSION_NET (participant.net_distributable_cents at transfer creation) | EXHAUSTION_SNAPSHOT (search case exhaustion_snapshot_cents)" }
+      - { name: amount_cents, type: integer, source: computed, description: "Transfer amount resolved per amount_basis at creation; frozen thereafter" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | ACCEPTED | REJECTED" }
+      - { name: submitted_at, type: datetime, source: system, description: "Clock time of creation" }
+      - { name: confirmed_at, type: datetime, source: system, description: "Clock time of PBGC acceptance", constraints: "nullable" }
+      - { name: rejection_reason, type: string, source: input, description: "Required when recording a PBGC rejection", constraints: "nullable" }
+
+  - name: Forfeiture
+    parent: null
+    common_fields: true
+    fields:
+      - { name: participant_id, type: string, source: input, description: "FK -> Participant.id; missing participant whose balance is forfeited as a last resort" }
+      - { name: rationale, type: string, source: input, description: "Fiduciary rationale for electing forfeiture over PBGC transfer" }
+      - { name: forfeited_amount_cents, type: integer, source: computed, description: "Participant.net_distributable_cents at forfeiture creation; frozen" }
+      - { name: status, type: enum, source: system, description: "RECORDED | RESTORED" }
+      - { name: restoration_amount_cents, type: integer, source: computed, description: "Amount restored on participant resurface, per the case restoration_policy; null while RECORDED", constraints: "nullable" }
+      - { name: restored_at, type: datetime, source: system, description: "Clock time of restoration", constraints: "nullable" }
+
+  - name: DeterminationLetterRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; case requesting the IRS determination letter (Form 5310)" }
+      - { name: intended_filing_date, type: datetime, source: input, description: "Planned IRS filing date; must be covered by a non-superseded INTERESTED_PARTY notice whose action_effective_date equals this date, issued 10 to 24 days before it" }
+      - { name: filed_at, type: datetime, source: system, description: "Clock time of actual filing", constraints: "nullable" }
+      - { name: status, type: enum, source: system, description: "DRAFT | FILED | FAVORABLE | ADVERSE | WITHDRAWN" }
+
+  - name: FiduciaryLogEntry
+    parent: null
+    common_fields: false   # append-only audit log: id + created_at only
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; case documented" }
+      - { name: entry_type, type: enum, source: input, description: "SEARCH_PROTOCOL_SUMMARY | NOTICE_DECISION | DISTRIBUTION_DECISION | FORFEITURE_RATIONALE | PBGC_TRANSFER_RATIONALE | CLOSURE_SIGNOFF" }
+      - { name: narrative, type: string, source: input, description: "Fiduciary documentation narrative", constraints: "minimum 50 characters" }
+      - { name: related_entity_id, type: string, source: input, description: "Polymorphic reference (not a strict FK): for SEARCH_PROTOCOL_SUMMARY, the MissingSearchCase.id being documented", constraints: "nullable" }
+      - { name: author_user_id, type: string, source: system, description: "X-User-ID of the author" }
+      - { name: author_role, type: string, source: system, description: "X-User-Role of the author" }
+
+  - name: ExpenseAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: termination_case_id, type: string, source: input, description: "FK -> TerminationCase.id; case whose termination expense is allocated" }
+      - { name: method, type: enum, source: input, description: "PRO_RATA_BY_BALANCE | EQUAL_PER_CAPITA" }
+      - { name: total_expense_cents, type: integer, source: input, description: "Total termination expense allocated across the eligible participant set", constraints: "> 0" }
+      - { name: description, type: string, source: input, description: "Expense description (e.g., recordkeeper final invoice)" }
+      - { name: eligible_participant_count, type: integer, source: computed, description: "Size of the input set actually debited (distribution_status in {PENDING_ELECTION, ELECTION_SUBMITTED, RESTORED})" }
+      - { name: remainder_recipient_participant_id, type: string, source: computed, description: "Participant that received the rounding remainder: largest vested_balance_cents in the input set; tie broken by earliest created_at", constraints: "nullable" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: TerminationCase
+    initial_state: DRAFT
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DRAFT
+        to: NOTICE_OF_INTENT_ISSUED
+        trigger: "POST /notices with notice_type=NOIT"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status is DRAFT (ERR_CASE_INVALID_STATE)"
+          - "action_effective_date == proposed_termination_date (ERR_NOIT_DATE_MISMATCH)"
+          - "issued_at (clock) within [proposed_termination_date - 90 days, proposed_termination_date - 60 days], inclusive, by whole calendar days (ERR_NOIT_TIMING_WINDOW)"
+        side_effects:
+          - "status -> NOTICE_OF_INTENT_ISSUED; TerminationCase.version += 1"
+      - from: NOTICE_OF_INTENT_ISSUED
+        to: NOTICE_OF_INTENT_ISSUED
+        trigger: "POST /notices with notice_type=NOIT (reissue: supersedes the live NOIT)"
+        actor: PlanAdministrator
+        preconditions:
+          - "Same date and timing checks as the DRAFT issuance"
+        side_effects:
+          - "Prior non-superseded NOIT's superseded_by_id set to the new notice id; TerminationCase.version += 1"
+      - from: NOTICE_OF_INTENT_ISSUED
+        to: TERMINATION_EFFECTIVE
+        trigger: "POST /termination-cases/{id}/effectuate-termination"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status is NOTICE_OF_INTENT_ISSUED (ERR_CASE_INVALID_STATE)"
+          - "Current clock >= proposed_termination_date (ERR_TERMINATION_DATE_NOT_REACHED)"
+        side_effects:
+          - "Every participant: vested_pct forced to 100; vested_balance_cents and net_distributable_cents recomputed; each participant's version += 1"
+          - "total_plan_assets_cents := sum of account_balance_cents over all participants; remaining_undistributed_cents := total_plan_assets_cents"
+      - from: TERMINATION_EFFECTIVE
+        to: DISTRIBUTION_IN_PROGRESS
+        trigger: "POST /termination-cases/{id}/begin-distributions"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status is TERMINATION_EFFECTIVE (ERR_CASE_INVALID_STATE)"
+          - "A non-superseded DISTRIBUTION ParticipantNotice exists for the case (ERR_DISTRIBUTION_NOTICE_REQUIRED)"
+          - "No BlackoutPeriod of the case is in SCHEDULED or ACTIVE (ERR_BLACKOUT_TRANSITION_PENDING)"
+        side_effects:
+          - "status -> DISTRIBUTION_IN_PROGRESS; default_treatment_date already pinned from the DISTRIBUTION notice"
+      - from: DISTRIBUTION_IN_PROGRESS
+        to: FINAL_RECONCILIATION
+        trigger: "POST /termination-cases/{id}/advance-to-reconciliation"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status is DISTRIBUTION_IN_PROGRESS (ERR_CASE_INVALID_STATE)"
+          - "all_participants_resolved == true (ERR_PARTICIPANTS_NOT_ALL_RESOLVED)"
+        side_effects:
+          - "status -> FINAL_RECONCILIATION"
+        note: "no separate residual precondition: every money movement drains exactly the participant's payable (with sponsor make-whole on excess), so remaining_undistributed_cents is 0 by construction whenever all participants are resolved"
+      - from: FINAL_RECONCILIATION
+        to: DISTRIBUTION_IN_PROGRESS
+        trigger: "POST /termination-cases/{id}/reopen-distributions"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status is FINAL_RECONCILIATION (ERR_CASE_INVALID_STATE)"
+          - "At least one participant has distribution_status == RESTORED (ERR_NO_REOPENABLE_PARTICIPANT)"
+        side_effects:
+          - "status -> DISTRIBUTION_IN_PROGRESS"
+        note: "revert edge: a resurfaced forfeited participant forces the case back into distribution processing"
+      - from: FINAL_RECONCILIATION
+        to: CLOSED
+        trigger: "POST /termination-cases/{id}/close"
+        actor: IndependentFiduciary
+        preconditions:
+          - "Case status is FINAL_RECONCILIATION (ERR_CASE_INVALID_STATE)"
+          - "all_participants_resolved == true (ERR_PARTICIPANTS_NOT_ALL_RESOLVED)"
+          - "No DeterminationLetterRequest of the case is in DRAFT or FILED (ERR_DLR_PENDING_BLOCKS_CLOSE)"
+          - "No DeterminationLetterRequest of the case is in ADVERSE (ERR_DLR_ADVERSE_BLOCKS_CLOSE)"
+          - "No BlackoutPeriod of the case is in SCHEDULED or ACTIVE (ERR_BLACKOUT_TRANSITION_PENDING)"
+          - "At least one FiduciaryLogEntry with entry_type CLOSURE_SIGNOFF exists for the case (ERR_FIDUCIARY_DOC_MISSING)"
+        side_effects:
+          - "status -> CLOSED"
+
+  - entity: Participant
+    initial_state: "locate_status=UNVERIFIED, distribution_status=PENDING_ELECTION"
+    terminal_states: ["distribution_status in {PAID_OUT, AUTO_ROLLED_OVER, PBGC_TRANSFERRED} (locate_status independent)"]
+    note: "Two independent state dimensions evolve on the same row: locate_status (contact lifecycle, cyclic) and distribution_status (money lifecycle, cyclic via RESTORED). A transition on one dimension never changes the other unless explicitly listed in side_effects."
+    transitions:
+      - from: "locate_status in {UNVERIFIED, LOCATED}"
+        to: "locate_status=FLAGGED_UNCASHED"
+        trigger: "POST /participants/{id}/contact-flags with flag_type=UNCASHED_CHECK, or system stale-check sweep on a STALE_UNCASHED payout (sweep fires only when locate_status == UNVERIFIED)"
+        actor: Recordkeeper | system
+        preconditions:
+          - "locate_status in {UNVERIFIED, LOCATED} (ERR_INVALID_FLAG_TRANSITION)"
+        side_effects:
+          - "flagged_at := now"
+      - from: "locate_status in {UNVERIFIED, LOCATED}"
+        to: "locate_status=FLAGGED_UNDELIVERABLE"
+        trigger: "POST /participants/{id}/contact-flags with flag_type=UNDELIVERABLE_MAIL"
+        actor: Recordkeeper
+        preconditions:
+          - "locate_status in {UNVERIFIED, LOCATED} (ERR_INVALID_FLAG_TRANSITION)"
+        side_effects:
+          - "flagged_at := now"
+      - from: "locate_status=FLAGGED_UNCASHED"
+        to: "locate_status=UNVERIFIED"
+        trigger: "POST /participants/{id}/clear-contact-flag with flag_type=UNCASHED_CHECK (check finally cleared / address re-confirmed)"
+        actor: Recordkeeper
+        preconditions:
+          - "locate_status == FLAGGED_UNCASHED and flag_type matches (ERR_INVALID_FLAG_TRANSITION)"
+        side_effects: []
+      - from: "locate_status=FLAGGED_UNDELIVERABLE"
+        to: "locate_status=UNVERIFIED"
+        trigger: "POST /participants/{id}/clear-contact-flag with flag_type=UNDELIVERABLE_MAIL (verified new address on file)"
+        actor: Recordkeeper
+        preconditions:
+          - "locate_status == FLAGGED_UNDELIVERABLE and flag_type matches (ERR_INVALID_FLAG_TRANSITION)"
+        side_effects: []
+      - from: "locate_status in {FLAGGED_UNCASHED, FLAGGED_UNDELIVERABLE}"
+        to: "locate_status=MISSING"
+        trigger: "POST /participants/{id}/declare-missing"
+        actor: PlanAdministrator
+        preconditions:
+          - "locate_status in {FLAGGED_UNCASHED, FLAGGED_UNDELIVERABLE} (ERR_PARTICIPANT_NOT_FLAGGED; an open search case implies MISSING, so this gate also covers re-declaration while a case is open)"
+          - "The participant's search case (at most one ever exists) must not be EXHAUSTED (ERR_SEARCH_CASE_EXHAUSTED_REDECLARE)"
+        side_effects:
+          - "declared_missing_at := now"
+          - "If no prior MissingSearchCase exists: create one in STEP1_COMMERCIAL_LOCATOR with opened_at := now; if the latest is RESOLVED: reopen it to STEP1_COMMERCIAL_LOCATOR and clear resolved_at to null"
+          - "active_search_case_id := that search case's id; participant.version += 1"
+      - from: "locate_status=MISSING"
+        to: "locate_status=LOCATED"
+        trigger: "POST /participants/{id}/locate, or a SearchAttempt with outcome=LOCATED on the open search case"
+        actor: PlanAdministrator | system
+        preconditions:
+          - "locate_status == MISSING (ERR_PARTICIPANT_NOT_MISSING)"
+        side_effects:
+          - "located_at := now"
+          - "The open MissingSearchCase (if any) transitions to RESOLVED with resolved_at := now; active_search_case_id := null"
+          - "CASCADE hop 2 (caused by this transition): if distribution_status == FORFEITED, distribution_status -> RESTORED (see distribution dimension)"
+      - from: "distribution_status=PENDING_ELECTION"
+        to: "distribution_status=ELECTION_SUBMITTED"
+        trigger: "POST /distribution-elections"
+        actor: Participant | PlanAdministrator
+        preconditions:
+          - "Case status == DISTRIBUTION_IN_PROGRESS (ERR_CASE_INVALID_STATE)"
+          - "locate_status != MISSING (ERR_PARTICIPANT_MISSING_BLOCKS_ELECTION)"
+          - "No BlackoutPeriod of the case is ACTIVE (ERR_BLACKOUT_ACTIVE_ELECTIONS_BLOCKED)"
+          - "distribution_status in {PENDING_ELECTION, ELECTION_SUBMITTED, RESTORED} (ERR_ELECTION_INVALID_STATE)"
+        side_effects:
+          - "Any prior election of this participant in SUBMITTED -> SUPERSEDED"
+          - "participant.version += 1 (OCC observable)"
+      - from: "distribution_status=ELECTION_SUBMITTED"
+        to: "distribution_status=ELECTION_ACCEPTED"
+        trigger: "POST /distribution-elections/{id}/accept"
+        actor: PlanAdministrator
+        preconditions:
+          - "Election status == SUBMITTED (ERR_ELECTION_INVALID_STATE)"
+          - "Participant locate_status != MISSING (ERR_PARTICIPANT_MISSING_BLOCKS_ELECTION)"
+        side_effects:
+          - "Create Payout (source=ELECTION): gross_cents := participant.net_distributable_cents at this moment; withholding per net_payout_withholding; status PREPARED if case blackout_active else ISSUED (issued_at := now)"
+      - from: "distribution_status in {PENDING_ELECTION, RESTORED}"
+        to: "distribution_status=ELECTION_ACCEPTED"
+        trigger: "POST /participants/{id}/apply-default-treatment"
+        actor: PlanAdministrator
+        preconditions:
+          - "Case status == DISTRIBUTION_IN_PROGRESS (ERR_CASE_INVALID_STATE)"
+          - "Current clock > case.default_treatment_date (ERR_DEFAULT_TREATMENT_WINDOW_NOT_PASSED)"
+          - "distribution_status in {PENDING_ELECTION, RESTORED} (ERR_ELECTION_INVALID_STATE)"
+          - "locate_status != MISSING (ERR_PARTICIPANT_MISSING_REQUIRES_SEARCH)"
+          - "Tier resolution per default_treatment_tier; net_distributable_cents > 500000 rejected (ERR_BALANCE_EXCEEDS_FORCED_LIMIT)"
+        side_effects:
+          - "Create Payout (source=DEFAULT_TREATMENT): method LUMP_SUM_CHECK if net < 100000 else AUTO_ROLLOVER_IRA; withholding per net_payout_withholding; status PREPARED if blackout_active else ISSUED"
+      - from: "distribution_status=ELECTION_ACCEPTED"
+        to: "distribution_status=PAID_OUT"
+        trigger: "POST /payouts/{id}/mark-cleared where payout.method == LUMP_SUM_CHECK"
+        actor: Recordkeeper
+        preconditions:
+          - "Payout status == ISSUED (ERR_PAYOUT_NOT_CLEARABLE)"
+        side_effects:
+          - "Election (if any) -> SETTLED; case.paid_out_cents += payout.gross_cents; remaining_undistributed_cents -= payout.gross_cents; resolved_participant_count recomputed"
+      - from: "distribution_status=ELECTION_ACCEPTED"
+        to: "distribution_status=AUTO_ROLLED_OVER"
+        trigger: "POST /payouts/{id}/mark-cleared where payout.method in {DIRECT_ROLLOVER_IRA, DIRECT_ROLLOVER_QUALIFIED_PLAN, AUTO_ROLLOVER_IRA}"
+        actor: Recordkeeper
+        preconditions:
+          - "Payout status == ISSUED (ERR_PAYOUT_NOT_CLEARABLE)"
+        side_effects:
+          - "Election (if any) -> SETTLED; case.paid_out_cents += payout.gross_cents; remaining_undistributed_cents -= payout.gross_cents; resolved_participant_count recomputed"
+      - from: "distribution_status=ELECTION_ACCEPTED"
+        to: "distribution_status=PENDING_ELECTION"
+        trigger: "POST /payouts/{id}/void (stale uncashed check voided)"
+        actor: Recordkeeper
+        preconditions:
+          - "Payout status == STALE_UNCASHED (ERR_PAYOUT_NOT_VOIDABLE)"
+        side_effects:
+          - "Payout -> VOIDED; no ledger movement (the uncashed gross never left remaining_undistributed_cents); linked election (if any) ACCEPTED -> SUPERSEDED so a fresh election is required"
+      - from: "distribution_status=PENDING_ELECTION"
+        to: "distribution_status=PBGC_TRANSFERRED"
+        trigger: "POST /pbgc-transfers/{id}/confirm"
+        actor: PlanAdministrator
+        preconditions:
+          - "PBGCTransfer status == SUBMITTED (ERR_PBGC_TRANSFER_NOT_SUBMITTED)"
+          - "Case status in {DISTRIBUTION_IN_PROGRESS, FINAL_RECONCILIATION} (ERR_CASE_INVALID_STATE; enforced at transfer creation and re-checked at confirm)"
+        side_effects:
+          - "CASCADE (caused by transfer acceptance): sponsor make-whole per the PBGCTransfer SUBMITTED -> ACCEPTED transition, then case.pbgc_transferred_cents += amount_cents; remaining_undistributed_cents := remaining - amount_cents + excess; resolved_participant_count recomputed"
+      - from: "distribution_status=PENDING_ELECTION"
+        to: "distribution_status=FORFEITED"
+        trigger: "POST /forfeitures"
+        actor: IndependentFiduciary
+        preconditions:
+          - "Case status in {DISTRIBUTION_IN_PROGRESS, FINAL_RECONCILIATION} (ERR_CASE_INVALID_STATE)"
+          - "See Forfeiture creation validations (segregation of duties, exhausted search, fiduciary documentation, zero balance, duplicates)"
+        side_effects:
+          - "case.forfeited_cents += forfeited_amount_cents; remaining_undistributed_cents -= forfeited_amount_cents; resolved_participant_count recomputed"
+      - from: "distribution_status=FORFEITED"
+        to: "distribution_status=RESTORED"
+        trigger: "system — caused by the MISSING -> LOCATED transition on the same participant (cascade hop 2)"
+        actor: system
+        preconditions:
+          - "locate transition just fired on this participant"
+        side_effects:
+          - "CASCADE hop 3 (caused by this restoration): the participant's RECORDED Forfeiture -> RESTORED with restoration_amount_cents per forfeiture_restoration_amount"
+      - from: "distribution_status=RESTORED"
+        to: "distribution_status=ELECTION_SUBMITTED"
+        trigger: "POST /distribution-elections (same transition as PENDING_ELECTION -> ELECTION_SUBMITTED)"
+        actor: Participant | PlanAdministrator
+        preconditions:
+          - "Same as the PENDING_ELECTION -> ELECTION_SUBMITTED transition"
+        side_effects:
+          - "Same as the PENDING_ELECTION -> ELECTION_SUBMITTED transition"
+
+  - entity: MissingSearchCase
+    initial_state: STEP1_COMMERCIAL_LOCATOR
+    terminal_states: [EXHAUSTED]
+    transitions:
+      - from: STEP1_COMMERCIAL_LOCATOR
+        to: STEP2_PUBLIC_RECORDS
+        trigger: "POST /search-cases/{id}/escalate"
+        actor: PlanAdministrator
+        preconditions:
+          - "Status == STEP1_COMMERCIAL_LOCATOR (ERR_SEARCH_CASE_NOT_ESCAPABLE)"
+          - "At least one SearchAttempt on this case with method == COMMERCIAL_LOCATOR and outcome == NO_RESULT (ERR_NO_ATTEMPT_ON_CURRENT_STEP)"
+        side_effects: []
+      - from: STEP2_PUBLIC_RECORDS
+        to: STEP3_CREDIT_BUREAU
+        trigger: "POST /search-cases/{id}/escalate"
+        actor: PlanAdministrator
+        preconditions:
+          - "Status == STEP2_PUBLIC_RECORDS (ERR_SEARCH_CASE_NOT_ESCAPABLE)"
+          - "At least one SearchAttempt with method == PUBLIC_RECORDS and outcome == NO_RESULT (ERR_NO_ATTEMPT_ON_CURRENT_STEP)"
+        side_effects: []
+      - from: STEP3_CREDIT_BUREAU
+        to: STEP4_CERTIFIED_MAIL
+        trigger: "POST /search-cases/{id}/escalate"
+        actor: PlanAdministrator
+        preconditions:
+          - "Status == STEP3_CREDIT_BUREAU (ERR_SEARCH_CASE_NOT_ESCAPABLE)"
+          - "At least one SearchAttempt with method == CREDIT_BUREAU and outcome == NO_RESULT (ERR_NO_ATTEMPT_ON_CURRENT_STEP)"
+        side_effects: []
+      - from: STEP4_CERTIFIED_MAIL
+        to: EXHAUSTED
+        trigger: "POST /search-cases/{id}/escalate"
+        actor: PlanAdministrator
+        preconditions:
+          - "Status == STEP4_CERTIFIED_MAIL (ERR_SEARCH_CASE_NOT_ESCAPABLE)"
+          - "At least one SearchAttempt with method == CERTIFIED_MAIL and outcome == NO_RESULT (ERR_NO_ATTEMPT_ON_CURRENT_STEP)"
+          - "Current clock >= (latest CERTIFIED_MAIL attempt's attempted_at + 15 days) (ERR_CERTIFIED_MAIL_RESPONSE_WINDOW_OPEN); latest = max attempted_at, tie-break latest created_at"
+        side_effects:
+          - "exhausted_at := now; exhausted_by_user_id := X-User-ID"
+          - "exhaustion_snapshot_cents := participant.net_distributable_cents at this moment"
+      - from: "STEP1_COMMERCIAL_LOCATOR | STEP2_PUBLIC_RECORDS | STEP3_CREDIT_BUREAU | STEP4_CERTIFIED_MAIL"
+        to: RESOLVED
+        trigger: "system — SearchAttempt with outcome=LOCATED recorded on this case, or POST /participants/{id}/locate on the participant"
+        actor: system
+        preconditions:
+          - "Case in a step state (not RESOLVED, not EXHAUSTED)"
+        side_effects:
+          - "resolved_at := now; participant.active_search_case_id := null"
+      - from: RESOLVED
+        to: STEP1_COMMERCIAL_LOCATOR
+        trigger: "system — caused by POST /participants/{id}/declare-missing when the latest search case is RESOLVED"
+        actor: system
+        preconditions:
+          - "Participant just transitioned to MISSING and this case is the latest for the participant"
+        side_effects:
+          - "resolved_at := null (cycle: the protocol restarts at step 1; opened_at preserved)"
+
+  - entity: DistributionElection
+    initial_state: SUBMITTED
+    terminal_states: [SETTLED, REJECTED, SUPERSEDED]
+    transitions:
+      - from: SUBMITTED
+        to: SUPERSEDED
+        trigger: "system — a newer POST /distribution-elections succeeds for the same participant"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /distribution-elections/{id}/accept"
+        actor: PlanAdministrator
+        preconditions:
+          - "Election status == SUBMITTED (ERR_ELECTION_INVALID_STATE)"
+          - "Participant locate_status != MISSING (ERR_PARTICIPANT_MISSING_BLOCKS_ELECTION)"
+        side_effects:
+          - "net_payout_withholding computed; Payout created (see Participant ELECTION_ACCEPTED transition)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /distribution-elections/{id}/reject"
+        actor: PlanAdministrator
+        preconditions:
+          - "Election status == SUBMITTED (ERR_ELECTION_INVALID_STATE)"
+        side_effects:
+          - "Participant distribution_status ELECTION_SUBMITTED -> PENDING_ELECTION"
+      - from: ACCEPTED
+        to: SETTLED
+        trigger: "system — caused by the linked Payout transitioning ISSUED -> CLEARED"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ACCEPTED
+        to: SUPERSEDED
+        trigger: "system — caused by the linked Payout transitioning STALE_UNCASHED -> VOIDED"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Payout
+    initial_state: "PREPARED (blackout active at creation) or ISSUED (otherwise)"
+    terminal_states: [CLEARED, VOIDED]
+    transitions:
+      - from: PREPARED
+        to: ISSUED
+        trigger: "system — caused by the case's ACTIVE BlackoutPeriod transitioning to COMPLETED"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "issued_at := blackout completion clock time"
+      - from: ISSUED
+        to: CLEARED
+        trigger: "POST /payouts/{id}/mark-cleared"
+        actor: Recordkeeper
+        preconditions:
+          - "Payout status == ISSUED (ERR_PAYOUT_NOT_CLEARABLE)"
+        side_effects:
+          - "cleared_at := now; linked election (if any) ACCEPTED -> SETTLED; participant -> PAID_OUT or AUTO_ROLLED_OVER per method; case.paid_out_cents += gross_cents; remaining_undistributed_cents -= gross_cents"
+      - from: ISSUED
+        to: STALE_UNCASHED
+        trigger: "system — stale-check sweep executed by POST /_clock/set_current_utc when method == LUMP_SUM_CHECK and now >= issued_at + 90 days"
+        actor: system
+        preconditions:
+          - "Payout status == ISSUED, method == LUMP_SUM_CHECK, and the clock advanced to >= issued_at + 90 days"
+        side_effects:
+          - "stale_marked_at := now"
+          - "CASCADE hop 2 (caused by this transition): if participant.locate_status == UNVERIFIED, locate_status -> FLAGGED_UNCASHED with flagged_at := now (uncashed-check identification); otherwise locate_status unchanged"
+      - from: STALE_UNCASHED
+        to: VOIDED
+        trigger: "POST /payouts/{id}/void"
+        actor: Recordkeeper
+        preconditions:
+          - "Payout status == STALE_UNCASHED (ERR_PAYOUT_NOT_VOIDABLE)"
+        side_effects:
+          - "no ledger movement (a stale check never left remaining_undistributed_cents); participant distribution_status ELECTION_ACCEPTED -> PENDING_ELECTION; linked election (if any) ACCEPTED -> SUPERSEDED"
+
+  - entity: PBGCTransfer
+    initial_state: SUBMITTED
+    terminal_states: [ACCEPTED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /pbgc-transfers/{id}/confirm"
+        actor: PlanAdministrator
+        preconditions:
+          - "Transfer status == SUBMITTED (ERR_PBGC_TRANSFER_NOT_SUBMITTED)"
+        side_effects:
+          - "confirmed_at := now; participant distribution_status -> PBGC_TRANSFERRED"
+          - "Sponsor make-whole: excess := max(0, amount_cents - participant.net_distributable_cents); if excess > 0: case.sponsor_contribution_cents += excess and case.total_plan_assets_cents += excess (the sponsor funds the frozen EXHAUSTION_SNAPSHOT benefit above the participant's post-expense net)"
+          - "case.pbgc_transferred_cents += amount_cents; case.remaining_undistributed_cents := remaining_undistributed_cents - amount_cents + excess; resolved_participant_count recomputed"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /pbgc-transfers/{id}/record-rejection"
+        actor: PlanAdministrator
+        preconditions:
+          - "Transfer status == SUBMITTED (ERR_PBGC_TRANSFER_NOT_SUBMITTED)"
+        side_effects:
+          - "rejection_reason recorded; participant remains MISSING with distribution_status PENDING_ELECTION (the plan must elect forfeiture or await a new PBGC submission)"
+
+  - entity: Forfeiture
+    initial_state: RECORDED
+    terminal_states: [RESTORED]
+    transitions:
+      - from: RECORDED
+        to: RESTORED
+        trigger: "system — caused by the participant's distribution_status FORFEITED -> RESTORED (cascade hop 3 of the locate cascade)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "restored_at := now; restoration_amount_cents computed per forfeiture_restoration_amount (case.restoration_policy selects variant; elapsed days = forfeiture.created_at -> now)"
+          - "CASCADE hop 4 (caused by this restoration): case.forfeited_cents -= forfeited_amount_cents; remaining_undistributed_cents += forfeited_amount_cents; if EARNINGS_ADJUSTED: earnings_part := restoration_amount_cents - forfeited_amount_cents, sponsor_contribution_cents += earnings_part, total_plan_assets_cents += earnings_part, remaining_undistributed_cents += earnings_part, and participant.restoration_credit_cents += earnings_part (paid out with the participant's next payout); resolved_participant_count recomputed"
+
+  - entity: DeterminationLetterRequest
+    initial_state: DRAFT
+    terminal_states: [FAVORABLE, WITHDRAWN]
+    transitions:
+      - from: DRAFT
+        to: FILED
+        trigger: "POST /determination-letter-requests/{id}/file"
+        actor: PlanAdministrator
+        preconditions:
+          - "DLR status == DRAFT (ERR_DLR_INVALID_STATE)"
+          - "Whole calendar days between the covering INTERESTED_PARTY notice's issued_at and now is in [10, 24] inclusive (ERR_INTERESTED_PARTY_WINDOW)"
+        side_effects:
+          - "filed_at := now"
+      - from: FILED
+        to: FAVORABLE
+        trigger: "POST /determination-letter-requests/{id}/record-determination with outcome=FAVORABLE"
+        actor: PlanAdministrator
+        preconditions:
+          - "DLR status == FILED (ERR_DLR_INVALID_STATE)"
+        side_effects: []
+      - from: FILED
+        to: ADVERSE
+        trigger: "POST /determination-letter-requests/{id}/record-determination with outcome=ADVERSE"
+        actor: PlanAdministrator
+        preconditions:
+          - "DLR status == FILED (ERR_DLR_INVALID_STATE)"
+        side_effects: []
+      - from: "DRAFT | FILED | ADVERSE"
+        to: WITHDRAWN
+        trigger: "POST /determination-letter-requests/{id}/withdraw"
+        actor: PlanAdministrator
+        preconditions:
+          - "DLR status in {DRAFT, FILED, ADVERSE} (ERR_DLR_INVALID_STATE)"
+        side_effects: []
+        note: "ADVERSE is not terminal: the sponsor must withdraw (and may file a fresh DLR) before the case can close"
+
+  - entity: BlackoutPeriod
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: SCHEDULED
+        to: ACTIVE
+        trigger: "POST /blackout-periods/{id}/activate"
+        actor: Recordkeeper
+        preconditions:
+          - "Blackout status == SCHEDULED (ERR_BLACKOUT_NOT_SCHEDULED)"
+          - "start_at <= now < end_at (ERR_BLACKOUT_NOT_IN_WINDOW)"
+          - "A non-superseded BLACKOUT_ADVISORY ParticipantNotice exists on the case with action_effective_date == start_at (ERR_BLACKOUT_NOTICE_MISSING); its own 30-to-60-day issuance window was enforced at issuance time"
+        side_effects:
+          - "activated_at := now; case.blackout_active recomputed (true); new distribution elections are now blocked"
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /blackout-periods/{id}/complete"
+        actor: Recordkeeper
+        preconditions:
+          - "Blackout status == ACTIVE (ERR_BLACKOUT_NOT_SCHEDULED)"
+          - "now >= end_at (ERR_BLACKOUT_NOT_ENDED)"
+        side_effects:
+          - "completed_at := now; case.blackout_active recomputed (false)"
+          - "CASCADE hop 2 (caused by this transition): every Payout of the case in PREPARED -> ISSUED with issued_at := now (queued distributions release)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only; state preconditions live in §1.2/§1.4)
+# =============================================================================
+concurrency_rules:
+  - rule_id: election-create-stale-participant
+    parent_entity: Participant
+    write_endpoint: "POST /distribution-elections"
+    occ_field: "expected_participant_version"
+    description: |
+      Creating a DistributionElection against a Participant whose version has
+      advanced beyond expected_participant_version is rejected. This captures
+      the case where another writer has just recorded a newer election (which
+      legitimately supersedes the previously SUBMITTED one under the election
+      state machine) or a cascade (vesting, flag, restoration) has mutated the
+      participant since the client's last read, making the client's view stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: notice-create-stale-case
+    parent_entity: TerminationCase
+    write_endpoint: "POST /notices"
+    occ_field: "expected_termination_case_version"
+    description: |
+      Issuing a ParticipantNotice against a TerminationCase whose version has
+      advanced beyond expected_termination_case_version is rejected. Issuance
+      legitimately supersedes any live notice of the same notice_type (and, for
+      NOIT/DISTRIBUTION, drives case status or default_treatment_date), so a
+      writer holding a stale case version must re-read before superseding.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# All day-window comparisons use whole calendar days: floor((b - a) / 86400s).
+# =============================================================================
+calculations:
+  - name: vested_balance
+    trigger: "participant creation; TERMINATION_EFFECTIVE transition (vested_pct forced to 100 for every participant)"
+    algorithm: aggregation
+    formula: |
+      vested_balance_cents = round_half_up(account_balance_cents * vested_pct / 100)
+      net_distributable_cents = vested_balance_cents - termination_expense_share_cents
+    input_set: "the single participant being created or re-vested"
+    precision: "integer cents, round_half_up"
+
+  - name: net_payout_withholding
+    trigger: "Payout creation (election acceptance or apply-default-treatment)"
+    algorithm: tiered_pricing
+    formula: |
+      inputs: gross_cents (= participant.net_distributable_cents at this moment),
+              method, WITHHOLDING_RATE, WITHHOLDING_FLOOR_CENTS
+      if method == LUMP_SUM_CHECK and gross_cents >= WITHHOLDING_FLOOR_CENTS:
+          withholding_cents = round_half_up(gross_cents * WITHHOLDING_RATE)
+      else:
+          withholding_cents = 0
+      net_cents = gross_cents - withholding_cents
+      # Conditional branches on method AND a gross floor: three inputs with
+      # non-linear interaction (floor gate multiplies the rate branch).
+    input_set: "the payout being created"
+    constants:
+      WITHHOLDING_RATE: 0.20
+      WITHHOLDING_FLOOR_CENTS: 20000   # $200.00: at or above -> withhold; below -> zero
+    precision: "integer cents, round_half_up"
+
+  - name: default_treatment_tier
+    trigger: "POST /participants/{id}/apply-default-treatment"
+    algorithm: threshold
+    formula: |
+      n = participant.net_distributable_cents
+      if n < CASHOUT_LIMIT_CENTS:            tier = CASH_OUT        -> Payout method LUMP_SUM_CHECK
+      elif n <= FORCED_ROLLOVER_LIMIT_CENTS: tier = AUTO_ROLLOVER   -> Payout method AUTO_ROLLOVER_IRA
+      else:                                  reject with ERR_BALANCE_EXCEEDS_FORCED_LIMIT
+      # Boundaries are inclusive-low / inclusive-high: exactly 100000 -> AUTO_ROLLOVER;
+      # exactly 500000 -> AUTO_ROLLOVER; 500001 -> rejected.
+    input_set: "the participant being defaulted"
+    constants:
+      CASHOUT_LIMIT_CENTS: 100000          # $1,000.00
+      FORCED_ROLLOVER_LIMIT_CENTS: 500000  # $5,000.00
+    precision: "integer cents, exact comparison"
+
+  - name: expense_allocation
+    trigger: "POST /expense-allocations"
+    algorithm: weighted_scoring
+    formula: |
+      E = input set: participants of the case with distribution_status in
+          {PENDING_ELECTION, ELECTION_SUBMITTED, RESTORED} (FORFEITED and terminal
+          participants are never debited)
+      PINNED ROUNDING ORDER (mode b): round each participant's share FIRST,
+      reconcile the remainder SECOND — never sum-then-round.
+      PRO_RATA_BY_BALANCE:
+        share_p = round_half_up(total_expense_cents * vested_balance_p / sum(vested_balance over E))
+      EQUAL_PER_CAPITA:
+        share_p = round_half_up(total_expense_cents / |E|)
+      Remainder R = total_expense_cents - sum(share_p over E)   # may be positive or negative
+      R is added to the share of the participant in E with the largest
+      vested_balance_cents; ties broken by earliest created_at.
+      Each participant's termination_expense_share_cents += share_p (after remainder);
+      net_distributable_cents recomputed for every p in E.
+    input_set: "participants with distribution_status in {PENDING_ELECTION, ELECTION_SUBMITTED, RESTORED} at execution time"
+    precision: "integer cents, round_half_up per participant before remainder reconciliation"
+    variants:
+      - name: PRO_RATA_BY_BALANCE
+        when: "ExpenseAllocation.method == PRO_RATA_BY_BALANCE"
+        difference: "share proportional to vested_balance_cents"
+      - name: EQUAL_PER_CAPITA
+        when: "ExpenseAllocation.method == EQUAL_PER_CAPITA"
+        difference: "share equal across the input set regardless of balance; identical inputs produce different per-participant cents than PRO_RATA_BY_BALANCE"
+
+  - name: forfeiture_restoration_amount
+    trigger: "system — participant MISSING -> LOCATED while distribution_status == FORFEITED"
+    algorithm: aggregation
+    formula: |
+      NOMINAL:            restoration_amount_cents = forfeited_amount_cents
+      EARNINGS_ADJUSTED:  days = whole calendar days from forfeiture.created_at to now
+                          earnings = round_half_up(forfeited_amount_cents * ADJUSTMENT_RATE * days / 365)
+                          restoration_amount_cents = forfeited_amount_cents + earnings
+                          (earnings part is sponsor-funded: sponsor_contribution_cents and
+                           total_plan_assets_cents increase by earnings)
+    input_set: "the single Forfeiture row flipping RECORDED -> RESTORED"
+    constants:
+      ADJUSTMENT_RATE: 0.045   # 4.5% annual simple earnings assumption
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: NOMINAL
+        when: "TerminationCase.restoration_policy == NOMINAL (default)"
+        difference: "restore exactly the forfeited amount"
+      - name: EARNINGS_ADJUSTED
+        when: "TerminationCase.restoration_policy == EARNINGS_ADJUSTED"
+        difference: "restore forfeited amount plus time-based earnings; identical forfeiture produces a strictly larger restoration whenever days > 0"
+
+  - name: pbgc_transfer_amount
+    trigger: "POST /pbgc-transfers"
+    algorithm: aggregation
+    formula: |
+      SUBMISSION_NET:      amount_cents = participant.net_distributable_cents at transfer creation
+      EXHAUSTION_SNAPSHOT: amount_cents = participant.active_search_case.exhaustion_snapshot_cents
+      The two diverge whenever an ExpenseAllocation debits the participant between
+      search exhaustion and transfer submission.
+    input_set: "the transfer being created and its participant"
+    precision: "integer cents, exact"
+    variants:
+      - name: SUBMISSION_NET
+        when: "PBGCTransfer.amount_basis == SUBMISSION_NET"
+        difference: "reflects expense allocations posted after search exhaustion"
+      - name: EXHAUSTION_SNAPSHOT
+        when: "PBGCTransfer.amount_basis == EXHAUSTION_SNAPSHOT"
+        difference: "freezes the benefit at exhaustion; identical data produces a larger amount than SUBMISSION_NET when an expense allocation intervened"
+
+  - name: resolution_posture
+    trigger: "any participant distribution_status change; participant creation"
+    algorithm: aggregation
+    formula: |
+      resolved_participant_count = count(participants with distribution_status in
+        {PAID_OUT, AUTO_ROLLED_OVER, PBGC_TRANSFERRED, FORFEITED})
+      total_participant_count = count(all participants of the case)
+      missing_participant_count = count(locate_status == MISSING)
+      all_participants_resolved = (total_participant_count > 0
+                                   and resolved_participant_count == total_participant_count)
+    input_set: "all participants of the case"
+    precision: "exact integer counts"
+
+  - name: fund_conservation
+    trigger: "invariant checked after every money-moving transition (payout clear/void, PBGC confirm, forfeiture create, forfeiture restore, expense allocation, effectuate-termination)"
+    algorithm: aggregation
+    formula: |
+      total_plan_assets_cents == paid_out_cents + pbgc_transferred_cents
+                                 + forfeited_cents + expense_paid_cents
+                                 + remaining_undistributed_cents
+      Compensating pair: forfeiture creation moves forfeited_amount from
+      remaining_undistributed_cents to forfeited_cents; its restoration moves the
+      same amount back (NOMINAL policy). The conserved quantity (total plan
+      assets) is unchanged by the pair.
+    input_set: "the TerminationCase row"
+    precision: "integer cents, exact equality"
+
+  - name: participant_count_conservation
+    trigger: "invariant checked after every distribution_status change"
+    algorithm: aggregation
+    formula: |
+      total_participant_count == resolved_participant_count + unresolved
+      where unresolved = count(distribution_status in
+        {PENDING_ELECTION, ELECTION_SUBMITTED, ELECTION_ACCEPTED, RESTORED})
+      Compensating pair: a payout clearing moves one participant into the resolved
+      set; a forfeiture restoration (FORFEITED -> RESTORED) moves one back out.
+      The conserved quantity (total participant count) is unchanged by the pair.
+    input_set: "all participants of the case"
+    precision: "exact integer counts"
+
+  - name: stale_check_sweep
+    trigger: "POST /_clock/set_current_utc (system sweep after the clock advances)"
+    algorithm: chronological
+    formula: |
+      for each Payout with status == ISSUED and method == LUMP_SUM_CHECK,
+      ordered by issued_at ASC (tie-break: created_at ASC):
+          if now >= issued_at + STALE_CHECK_DAYS days:  -> STALE_UNCASHED
+      Exact boundary: a check is stale when now == issued_at + 90 days (>=, not >).
+    input_set: "all ISSUED LUMP_SUM_CHECK payouts across all cases"
+    constants:
+      STALE_CHECK_DAYS: 90
+    precision: "whole calendar days, inclusive threshold"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present; X-User-Role is one of the declared roles"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role is permitted for this endpoint per §1.5; for POST /distribution-elections with role Participant, X-User-ID must equal the payload participant_id"
+    error_id: "ERR_FORBIDDEN_ROLE / ERR_PARTICIPANT_OWNERSHIP_VIOLATION"
+    http_status: 403
+    applies_to: "all"
+  - priority: 2.5
+    category: existence
+    check: "Request body shape: required fields present, types match, enum values in range, numeric constraints (>= 0 etc.) hold, narrative >= 50 chars; undeclared body fields are rejected"
+    error_id: "ERR_INVALID_REQUEST / ERR_NARRATIVE_TOO_SHORT"
+    http_status: 400
+    applies_to: "all write endpoints"
+    note: "ERR_NARRATIVE_TOO_SHORT returns http 422; pure schema failures return 400"
+  - priority: 3
+    category: existence
+    check: "Path resource ids exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 4
+    category: existence
+    check: "Body foreign-key references exist (termination_case_id, participant_id)"
+    error_id: ERR_REFERENCE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /participants, POST /notices, POST /blackout-periods, POST /distribution-elections, POST /pbgc-transfers, POST /forfeitures, POST /determination-letter-requests, POST /fiduciary-log-entries, POST /expense-allocations"
+  - priority: 5
+    category: state
+    check: "OCC: expected_*_version equals the parent's current version (evaluated before business rules, after existence)"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /notices, POST /distribution-elections"
+  - priority: 6
+    category: state
+    check: "Entity from-state permits the transition (case status gates; participant flag/missing gates; search-case step gates; election SUBMITTED gate; payout ISSUED/STALE gates; transfer SUBMITTED gate; DLR from-state; blackout from-state). Case-status gates on creation endpoints: POST /pbgc-transfers and POST /forfeitures require case status in {DISTRIBUTION_IN_PROGRESS, FINAL_RECONCILIATION}; POST /expense-allocations requires {TERMINATION_EFFECTIVE, DISTRIBUTION_IN_PROGRESS, FINAL_RECONCILIATION}; POST /determination-letter-requests requires any status except CLOSED; POST /blackout-periods requires any status except CLOSED; POST /participants requires {DRAFT, NOTICE_OF_INTENT_ISSUED, TERMINATION_EFFECTIVE} (ERR_CASE_CENSUS_FROZEN otherwise). POST /notices: NOIT requires case status in {DRAFT, NOTICE_OF_INTENT_ISSUED}; DISTRIBUTION requires TERMINATION_EFFECTIVE; BLACKOUT_ADVISORY and INTERESTED_PARTY require any status except CLOSED (ERR_CASE_INVALID_STATE otherwise). POST /pbgc-transfers and POST /forfeitures additionally require participant locate_status == MISSING (ERR_PARTICIPANT_NOT_MISSING) and distribution_status == PENDING_ELECTION (ERR_ELECTION_INVALID_STATE)"
+    error_id: "ERR_CASE_INVALID_STATE | ERR_CASE_CENSUS_FROZEN | ERR_INVALID_FLAG_TRANSITION | ERR_PARTICIPANT_NOT_FLAGGED | ERR_PARTICIPANT_NOT_MISSING | ERR_SEARCH_CASE_EXHAUSTED_REDECLARE | ERR_SEARCH_CASE_NOT_OPEN | ERR_SEARCH_CASE_NOT_ESCAPABLE | ERR_ELECTION_INVALID_STATE | ERR_PAYOUT_NOT_CLEARABLE | ERR_PAYOUT_NOT_VOIDABLE | ERR_PBGC_TRANSFER_ALREADY_OPEN | ERR_PBGC_TRANSFER_NOT_SUBMITTED | ERR_DLR_ALREADY_OPEN | ERR_DLR_INVALID_STATE | ERR_BLACKOUT_NOT_SCHEDULED"
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: X-User-ID must differ from the participant's active search case exhausted_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES_VIOLATION
+    http_status: 403
+    applies_to: "POST /pbgc-transfers, POST /forfeitures"
+  - priority: 8
+    category: business_safety
+    check: "Fiduciary documentation: a FiduciaryLogEntry entry_type=SEARCH_PROTOCOL_SUMMARY with related_entity_id == the exhausted search case id exists (transfers/forfeitures); a CLOSURE_SIGNOFF entry exists (close)"
+    error_id: ERR_FIDUCIARY_DOC_MISSING
+    http_status: 422
+    applies_to: "POST /pbgc-transfers, POST /forfeitures, POST /termination-cases/{id}/close"
+  - priority: 9
+    category: business_constraint
+    check: "Structural constraints: blackout half-open overlap; search attempt method matches current step; attempt timestamps chronological and within [opened_at, now]; no second open PBGC transfer; no second non-RESTORED forfeiture; no second open DLR; expense allocation blocked while any participant is ELECTION_ACCEPTED; expense allocation requires a non-empty eligible set (ERR_NO_ELIGIBLE_PARTICIPANTS)"
+    error_id: "ERR_BLACKOUT_WINDOW_OVERLAP | ERR_SEARCH_METHOD_MISMATCH | ERR_ATTEMPT_TIMESTAMP_INVALID | ERR_PBGC_TRANSFER_ALREADY_OPEN | ERR_FORFEITURE_ALREADY_RECORDED | ERR_DLR_ALREADY_OPEN | ERR_PAYOUTS_ALREADY_COMMITTED | ERR_NO_ELIGIBLE_PARTICIPANTS"
+    http_status: 409
+    applies_to: "resource-creation and attempt endpoints"
+    note: "ERR_SEARCH_METHOD_MISMATCH and ERR_ATTEMPT_TIMESTAMP_INVALID return http 422"
+  - priority: 10
+    category: business_temporal
+    check: "Statutory windows: NOIT 60-90 days before termination; INTERESTED_PARTY 10-24 days before filing; BLACKOUT_ADVISORY 30-60 days before start; blackout activation within [start_at, end_at); blackout completion at/after end_at; certified-mail 15-day trailing buffer and 15-day response window; effectuation at/after termination date; default treatment strictly after default_treatment_date"
+    error_id: "ERR_NOIT_TIMING_WINDOW | ERR_NOIT_DATE_MISMATCH | ERR_INTERESTED_PARTY_WINDOW | ERR_BLACKOUT_NOTICE_WINDOW | ERR_BLACKOUT_NOT_IN_WINDOW | ERR_BLACKOUT_NOT_ENDED | ERR_CERTIFIED_MAIL_WINDOW_ACTIVE | ERR_CERTIFIED_MAIL_RESPONSE_WINDOW_OPEN | ERR_TERMINATION_DATE_NOT_REACHED | ERR_DEFAULT_TREATMENT_WINDOW_NOT_PASSED"
+    http_status: 422
+    applies_to: "notice issuance, blackout lifecycle, DLR create/file, escalate, effectuate, apply-default-treatment"
+    note: "ERR_BLACKOUT_NOT_IN_WINDOW, ERR_BLACKOUT_NOT_ENDED, ERR_CERTIFIED_MAIL_WINDOW_ACTIVE, ERR_CERTIFIED_MAIL_RESPONSE_WINDOW_OPEN, ERR_TERMINATION_DATE_NOT_REACHED, ERR_DEFAULT_TREATMENT_WINDOW_NOT_PASSED return http 409"
+  - priority: 11
+    category: business_referential
+    check: "Cross-entity state: DISTRIBUTION notice exists before begin-distributions; covering BLACKOUT_ADVISORY notice exists before activation; covering INTERESTED_PARTY notice before DLR create/file; no SCHEDULED/ACTIVE blackout at begin-distributions or close; participant not MISSING for election create/accept/default-treatment; search case EXHAUSTED before PBGC/forfeiture; all participants resolved and residual zero for advance/close; DLR terminal for close"
+    error_id: "ERR_DISTRIBUTION_NOTICE_REQUIRED | ERR_BLACKOUT_NOTICE_MISSING | ERR_BLACKOUT_TRANSITION_PENDING | ERR_PARTICIPANT_MISSING_BLOCKS_ELECTION | ERR_PARTICIPANT_MISSING_REQUIRES_SEARCH | ERR_SEARCH_PROTOCOL_INCOMPLETE | ERR_PARTICIPANTS_NOT_ALL_RESOLVED | ERR_DLR_PENDING_BLOCKS_CLOSE | ERR_DLR_ADVERSE_BLOCKS_CLOSE | ERR_NO_REOPENABLE_PARTICIPANT"
+    http_status: 409
+    applies_to: "case transitions, elections, transfers, forfeitures"
+    note: "ERR_DISTRIBUTION_NOTICE_REQUIRED and ERR_BLACKOUT_NOTICE_MISSING return http 422"
+  - priority: 12
+    category: business_fiscal
+    check: "Money rules last: default-treatment forced limit; expense total within remaining undistributed; per-participant share within vested balance; non-zero balance for PBGC transfer / forfeiture"
+    error_id: "ERR_BALANCE_EXCEEDS_FORCED_LIMIT | ERR_INSUFFICIENT_REMAINING_BALANCE | ERR_EXPENSE_EXCEEDS_PARTICIPANT_BALANCE | ERR_ZERO_BALANCE_TRANSFER"
+    http_status: 422
+    applies_to: "apply-default-treatment, expense-allocations, pbgc-transfers, forfeitures"
+    note: "ERR_INSUFFICIENT_REMAINING_BALANCE returns http 402"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# All list endpoints also accept the envelope pagination params (limit, offset).
+# =============================================================================
+endpoints:
+  # --- logical clock (test-driving; declared contract) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock. Startup default (before any call) is exactly 2026-08-01T00:00:00Z and never falls back to wall-clock. May be set to any ISO 8601 instant (non-monotonic moves permitted). After setting, the stale_check_sweep runs over all ISSUED LUMP_SUM_CHECK payouts."
+    roles: [PlanAdministrator]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["stale_check_sweep: ISSUED LUMP_SUM_CHECK payouts with issued_at + 90 days <= now become STALE_UNCASHED; each such transition flags its participant FLAGGED_UNCASHED when locate_status == UNVERIFIED"]
+
+  # --- TerminationCase ---
+  - method: POST
+    path: "/termination-cases"
+    description: "Create a plan termination case (status DRAFT)"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [plan_name, sponsor_ein, plan_number, proposed_termination_date, "restoration_policy?"]
+    output: TerminationCase
+    side_effects: ["status = DRAFT; all counters zero"]
+  - method: GET
+    path: "/termination-cases/{id}"
+    description: "Get a termination case including all computed posture and ledger fields"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: []
+  - method: POST
+    path: "/termination-cases/{id}/effectuate-termination"
+    description: "NOTICE_OF_INTENT_ISSUED -> TERMINATION_EFFECTIVE at/after the proposed termination date"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: ["all participants forced to vested_pct=100 with vested_balance_cents recomputed (each participant version += 1)", "total_plan_assets_cents snapshotted; remaining_undistributed_cents initialized to it"]
+  - method: POST
+    path: "/termination-cases/{id}/begin-distributions"
+    description: "TERMINATION_EFFECTIVE -> DISTRIBUTION_IN_PROGRESS"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: ["status transition; requires live DISTRIBUTION notice and no SCHEDULED/ACTIVE blackout"]
+  - method: POST
+    path: "/termination-cases/{id}/advance-to-reconciliation"
+    description: "DISTRIBUTION_IN_PROGRESS -> FINAL_RECONCILIATION when every participant is resolved and residual is zero"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: ["status transition"]
+  - method: POST
+    path: "/termination-cases/{id}/reopen-distributions"
+    description: "FINAL_RECONCILIATION -> DISTRIBUTION_IN_PROGRESS when a forfeited participant has been restored"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: ["status transition"]
+  - method: POST
+    path: "/termination-cases/{id}/close"
+    description: "FINAL_RECONCILIATION -> CLOSED; final fiduciary sign-off"
+    roles: [IndependentFiduciary]
+    code: 200
+    input: []
+    output: TerminationCase
+    side_effects: ["status transition"]
+
+  # --- Participant ---
+  - method: POST
+    path: "/participants"
+    description: "Add a participant to a case census (open until DISTRIBUTION_IN_PROGRESS; created with vested_pct forced to 100 if the case is already TERMINATION_EFFECTIVE)"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [termination_case_id, full_name, ssn, mailing_address, account_balance_cents, vested_pct]
+    output: Participant
+    side_effects: ["locate_status = UNVERIFIED; distribution_status = PENDING_ELECTION; vested_balance_cents computed"]
+  - method: GET
+    path: "/participants/{id}"
+    description: "Get a participant including computed balances and both state dimensions"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: Participant
+    side_effects: []
+  - method: GET
+    path: "/participants"
+    description: "List participants with filters (FK reverse-reachability for termination_case_id and active_search_case_id)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["termination_case_id?", "active_search_case_id?", "locate_status?", "distribution_status?", "limit?", "offset?"]
+    output: "Participant[]"
+    side_effects: []
+  - method: POST
+    path: "/participants/{id}/contact-flags"
+    description: "Recordkeeper flags an uncashed check or undeliverable mail (uncashed/undeliverable identification)"
+    roles: [Recordkeeper]
+    code: 200
+    input: [flag_type, "evidence_note?"]
+    output: Participant
+    side_effects: ["locate_status -> FLAGGED_UNCASHED or FLAGGED_UNDELIVERABLE; flagged_at := now"]
+  - method: POST
+    path: "/participants/{id}/clear-contact-flag"
+    description: "Recordkeeper clears a flag (check finally cashed / new address verified)"
+    roles: [Recordkeeper]
+    code: 200
+    input: [flag_type]
+    output: Participant
+    side_effects: ["locate_status -> UNVERIFIED"]
+  - method: POST
+    path: "/participants/{id}/declare-missing"
+    description: "Declare a flagged participant missing; creates or reopens the MissingSearchCase in STEP1_COMMERCIAL_LOCATOR"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: Participant
+    side_effects: ["locate_status -> MISSING; declared_missing_at := now; MissingSearchCase created or reopened from RESOLVED; active_search_case_id set"]
+  - method: POST
+    path: "/participants/{id}/locate"
+    description: "Mark a MISSING participant located (direct verified contact); resolves the open search case and fires the forfeiture-restoration cascade when FORFEITED"
+    roles: [PlanAdministrator]
+    code: 200
+    input: ["verified_address?"]
+    output: Participant
+    side_effects: ["locate_status -> LOCATED; located_at := now; open search case -> RESOLVED; if distribution_status == FORFEITED: distribution_status -> RESTORED, Forfeiture -> RESTORED with restoration_amount_cents, case ledger recomputed (see Forfeiture transition hop 4)"]
+  - method: POST
+    path: "/participants/{id}/apply-default-treatment"
+    description: "Apply the balance-tiered default distribution to a non-responder after default_treatment_date"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: Participant
+    side_effects: ["default_treatment_tier resolved; Payout created (LUMP_SUM_CHECK or AUTO_ROLLOVER_IRA) with net_payout_withholding; distribution_status -> ELECTION_ACCEPTED"]
+
+  # --- MissingSearchCase / SearchAttempt ---
+  - method: GET
+    path: "/search-cases/{id}"
+    description: "Get a search case"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: MissingSearchCase
+    side_effects: []
+  - method: GET
+    path: "/search-cases"
+    description: "List search cases with filters (FK reverse-reachability for participant_id and termination_case_id)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["participant_id?", "termination_case_id?", "status?", "limit?", "offset?"]
+    output: "MissingSearchCase[]"
+    side_effects: []
+  - method: POST
+    path: "/search-cases/{id}/attempts"
+    description: "Record a search attempt; method must match the current step; outcome LOCATED resolves the case and the participant"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [method, vendor_name, attempted_at, outcome, "notes?"]
+    output: SearchAttempt
+    side_effects: ["attempt_count += 1; outcome LOCATED -> case RESOLVED and participant MISSING -> LOCATED (with forfeiture-restoration cascade when applicable)"]
+  - method: GET
+    path: "/search-cases/{id}/attempts"
+    description: "List attempts of a search case (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "SearchAttempt[]"
+    side_effects: []
+  - method: POST
+    path: "/search-cases/{id}/escalate"
+    description: "Advance the search protocol one step; STEP4 -> EXHAUSTED requires the 15-day certified-mail response window to have elapsed"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: MissingSearchCase
+    side_effects: ["step advance; on exhaustion: exhausted_at, exhausted_by_user_id, exhaustion_snapshot_cents set"]
+
+  # --- ParticipantNotice ---
+  - method: POST
+    path: "/notices"
+    description: "Issue a participant notice (NOIT / INTERESTED_PARTY / BLACKOUT_ADVISORY / DISTRIBUTION). Supersedes the live notice of the same type on the case. OCC-guarded on the case version."
+    roles: [PlanAdministrator]
+    code: 201
+    input: [termination_case_id, notice_type, action_effective_date, expected_termination_case_version]
+    output: ParticipantNotice
+    side_effects: ["prior non-superseded notice of same type gets superseded_by_id", "NOIT: case DRAFT -> NOTICE_OF_INTENT_ISSUED (reissue keeps status)", "DISTRIBUTION: default_treatment_date := action_effective_date + 30 days", "increments TerminationCase.version by 1"]
+  - method: GET
+    path: "/notices/{id}"
+    description: "Get a notice"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: ParticipantNotice
+    side_effects: []
+  - method: GET
+    path: "/notices"
+    description: "List notices with filters (FK reverse-reachability for termination_case_id and superseded_by_id)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["termination_case_id?", "notice_type?", "superseded_by_id?", "limit?", "offset?"]
+    output: "ParticipantNotice[]"
+    side_effects: []
+
+  # --- BlackoutPeriod ---
+  - method: POST
+    path: "/blackout-periods"
+    description: "Schedule a recordkeeper-transition blackout window; half-open [start_at, end_at); overlapping windows on the same case rejected, adjacency allowed"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [termination_case_id, start_at, end_at, outgoing_recordkeeper, incoming_recordkeeper]
+    output: BlackoutPeriod
+    side_effects: ["status = SCHEDULED"]
+  - method: GET
+    path: "/termination-cases/{id}/blackout-periods"
+    description: "List blackout periods of a case (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BlackoutPeriod[]"
+    side_effects: []
+  - method: POST
+    path: "/blackout-periods/{id}/activate"
+    description: "SCHEDULED -> ACTIVE inside the window; requires the covering BLACKOUT_ADVISORY notice"
+    roles: [Recordkeeper]
+    code: 200
+    input: []
+    output: BlackoutPeriod
+    side_effects: ["status transition; case.blackout_active recomputed"]
+  - method: POST
+    path: "/blackout-periods/{id}/complete"
+    description: "ACTIVE -> COMPLETED at/after end_at; releases queued PREPARED payouts"
+    roles: [Recordkeeper]
+    code: 200
+    input: []
+    output: BlackoutPeriod
+    side_effects: ["status transition; all PREPARED payouts of the case -> ISSUED with issued_at := now"]
+
+  # --- DistributionElection ---
+  - method: POST
+    path: "/distribution-elections"
+    description: "Submit a distribution election (participant self-service or administrator on behalf); supersedes a prior SUBMITTED election. OCC-guarded on the participant version."
+    roles: [Participant, PlanAdministrator]
+    code: 201
+    input: [participant_id, election_method, "destination_detail?", expected_participant_version]
+    output: DistributionElection
+    side_effects: ["prior SUBMITTED election -> SUPERSEDED", "participant distribution_status -> ELECTION_SUBMITTED", "increments Participant.version by 1"]
+  - method: GET
+    path: "/distribution-elections/{id}"
+    description: "Get an election"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: DistributionElection
+    side_effects: []
+  - method: GET
+    path: "/distribution-elections"
+    description: "List elections with filters (FK reverse-reachability for participant_id)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["participant_id?", "status?", "limit?", "offset?"]
+    output: "DistributionElection[]"
+    side_effects: []
+  - method: POST
+    path: "/distribution-elections/{id}/accept"
+    description: "Accept a SUBMITTED election; computes withholding and creates the Payout"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: DistributionElection
+    side_effects: ["election -> ACCEPTED; participant -> ELECTION_ACCEPTED; Payout created (PREPARED during blackout, else ISSUED)"]
+  - method: POST
+    path: "/distribution-elections/{id}/reject"
+    description: "Reject a SUBMITTED election with a reason"
+    roles: [PlanAdministrator]
+    code: 200
+    input: [reason]
+    output: DistributionElection
+    side_effects: ["election -> REJECTED; participant -> PENDING_ELECTION"]
+
+  # --- Payout ---
+  - method: GET
+    path: "/participants/{id}/payouts"
+    description: "List payouts of a participant (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Payout[]"
+    side_effects: []
+  - method: GET
+    path: "/distribution-elections/{id}/payouts"
+    description: "List payouts spawned by an election (FK reverse-reachability; 0 or 1 element)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: []
+    output: "Payout[]"
+    side_effects: []
+  - method: POST
+    path: "/payouts/{id}/mark-cleared"
+    description: "Recordkeeper confirms the check was cashed or the rollover was accepted by the custodian"
+    roles: [Recordkeeper]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["payout -> CLEARED; linked election -> SETTLED; participant -> PAID_OUT (LUMP_SUM_CHECK) or AUTO_ROLLED_OVER (rollover methods); case paid_out_cents/remaining_undistributed_cents and resolved_participant_count recomputed"]
+  - method: POST
+    path: "/payouts/{id}/void"
+    description: "Void a stale uncashed check; funds return to remaining_undistributed_cents and the participant must be re-resolved"
+    roles: [Recordkeeper]
+    code: 200
+    input: []
+    output: Payout
+    side_effects: ["payout -> VOIDED; no ledger movement (uncashed gross never left remaining_undistributed_cents); participant -> PENDING_ELECTION; linked election -> SUPERSEDED"]
+
+  # --- PBGCTransfer ---
+  - method: POST
+    path: "/pbgc-transfers"
+    description: "Submit a missing participant's benefit to the PBGC Missing Participants Program (requires exhausted search, segregation of duties, and fiduciary documentation)"
+    roles: [IndependentFiduciary]
+    code: 201
+    input: [participant_id, amount_basis]
+    output: PBGCTransfer
+    side_effects: ["amount_cents frozen per amount_basis (pbgc_transfer_amount)"]
+  - method: GET
+    path: "/participants/{id}/pbgc-transfers"
+    description: "List PBGC transfers of a participant (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "PBGCTransfer[]"
+    side_effects: []
+  - method: POST
+    path: "/pbgc-transfers/{id}/confirm"
+    description: "Record PBGC acceptance of the transfer"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: PBGCTransfer
+    side_effects: ["transfer -> ACCEPTED; participant -> PBGC_TRANSFERRED; case pbgc_transferred_cents/remaining_undistributed_cents/resolved_participant_count recomputed"]
+  - method: POST
+    path: "/pbgc-transfers/{id}/record-rejection"
+    description: "Record PBGC rejection of the transfer"
+    roles: [PlanAdministrator]
+    code: 200
+    input: [reason]
+    output: PBGCTransfer
+    side_effects: ["transfer -> REJECTED; participant remains MISSING / PENDING_ELECTION"]
+
+  # --- Forfeiture ---
+  - method: POST
+    path: "/forfeitures"
+    description: "Record a last-resort forfeiture of a missing participant's balance (requires exhausted search, segregation of duties, fiduciary documentation)"
+    roles: [IndependentFiduciary]
+    code: 201
+    input: [participant_id, rationale]
+    output: Forfeiture
+    side_effects: ["participant -> FORFEITED; case forfeited_cents/remaining_undistributed_cents/resolved_participant_count recomputed"]
+  - method: GET
+    path: "/participants/{id}/forfeitures"
+    description: "List forfeitures of a participant (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Forfeiture[]"
+    side_effects: []
+
+  # --- DeterminationLetterRequest ---
+  - method: POST
+    path: "/determination-letter-requests"
+    description: "Create an IRS determination letter request (Form 5310); requires the covering INTERESTED_PARTY notice for the intended filing date"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [termination_case_id, intended_filing_date]
+    output: DeterminationLetterRequest
+    side_effects: ["status = DRAFT"]
+  - method: GET
+    path: "/termination-cases/{id}/determination-letter-requests"
+    description: "List DLRs of a case (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "DeterminationLetterRequest[]"
+    side_effects: []
+  - method: POST
+    path: "/determination-letter-requests/{id}/file"
+    description: "File the DLR with the IRS; the interested-party notice must be 10-24 days old"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: DeterminationLetterRequest
+    side_effects: ["status -> FILED; filed_at := now"]
+  - method: POST
+    path: "/determination-letter-requests/{id}/record-determination"
+    description: "Record the IRS determination outcome"
+    roles: [PlanAdministrator]
+    code: 200
+    input: [outcome]
+    output: DeterminationLetterRequest
+    side_effects: ["status -> FAVORABLE or ADVERSE"]
+  - method: POST
+    path: "/determination-letter-requests/{id}/withdraw"
+    description: "Withdraw a DLR (from DRAFT, FILED, or ADVERSE)"
+    roles: [PlanAdministrator]
+    code: 200
+    input: []
+    output: DeterminationLetterRequest
+    side_effects: ["status -> WITHDRAWN"]
+
+  # --- FiduciaryLogEntry ---
+  - method: POST
+    path: "/fiduciary-log-entries"
+    description: "Append fiduciary documentation of the process (search protocol summary, notice/distribution decisions, forfeiture/PBGC rationale, closure sign-off)"
+    roles: [PlanAdministrator, IndependentFiduciary]
+    code: 201
+    input: [termination_case_id, entry_type, narrative, "related_entity_id?"]
+    output: FiduciaryLogEntry
+    side_effects: ["author_user_id and author_role stamped from headers"]
+  - method: GET
+    path: "/termination-cases/{id}/fiduciary-log-entries"
+    description: "List fiduciary log entries of a case (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["entry_type?", "limit?", "offset?"]
+    output: "FiduciaryLogEntry[]"
+    side_effects: []
+
+  # --- ExpenseAllocation ---
+  - method: POST
+    path: "/expense-allocations"
+    description: "Allocate a plan termination expense across the eligible participant set with pinned rounding order and remainder assignment"
+    roles: [PlanAdministrator]
+    code: 201
+    input: [termination_case_id, method, total_expense_cents, description]
+    output: ExpenseAllocation
+    side_effects: ["per-participant termination_expense_share_cents debited; net_distributable_cents recomputed; case expense_paid_cents += total_expense_cents; remaining_undistributed_cents -= total_expense_cents"]
+  - method: GET
+    path: "/termination-cases/{id}/expense-allocations"
+    description: "List expense allocations of a case (FK reverse-reachability)"
+    roles: [PlanAdministrator, IndependentFiduciary, Recordkeeper, Participant]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "ExpenseAllocation[]"
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing, or role not recognized" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role is not in the endpoint's allowed roles" }
+  - { id: ERR_PARTICIPANT_OWNERSHIP_VIOLATION, http: 403, condition: "Role Participant submits an election whose participant_id does not equal X-User-ID" }
+  # --- request shape ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, type mismatch, enum value out of range, or numeric constraint violated (e.g., negative balance, vested_pct outside 0..100, malformed EIN/SSN/plan number, end_at <= start_at)" }
+  - { id: ERR_NARRATIVE_TOO_SHORT, http: 422, condition: "FiduciaryLogEntry.narrative shorter than 50 characters" }
+  # --- existence ---
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path resource id does not exist (validated left-to-right)" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "A body foreign-key reference (termination_case_id, participant_id) does not exist" }
+  # --- optimistic concurrency ---
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_termination_case_version or expected_participant_version does not match the parent's current version" }
+  # --- state ---
+  - { id: ERR_CASE_INVALID_STATE, http: 409, condition: "Case status does not permit the requested transition or child operation" }
+  - { id: ERR_CASE_CENSUS_FROZEN, http: 409, condition: "POST /participants when the case has reached DISTRIBUTION_IN_PROGRESS or later" }
+  - { id: ERR_INVALID_FLAG_TRANSITION, http: 409, condition: "contact-flags from a locate_status other than UNVERIFIED/LOCATED, or clear-contact-flag whose flag_type does not match the current flag" }
+  - { id: ERR_PARTICIPANT_NOT_FLAGGED, http: 409, condition: "declare-missing requires locate_status in {FLAGGED_UNCASHED, FLAGGED_UNDELIVERABLE}" }
+  - { id: ERR_PARTICIPANT_NOT_MISSING, http: 409, condition: "locate requires locate_status == MISSING" }
+  - { id: ERR_SEARCH_CASE_EXHAUSTED_REDECLARE, http: 409, condition: "declare-missing while the participant's latest search case is EXHAUSTED" }
+  - { id: ERR_SEARCH_CASE_NOT_OPEN, http: 409, condition: "Recording a SearchAttempt on a RESOLVED or EXHAUSTED search case" }
+  - { id: ERR_SEARCH_CASE_NOT_ESCAPABLE, http: 409, condition: "escalate on a RESOLVED or EXHAUSTED search case" }
+  - { id: ERR_NO_ATTEMPT_ON_CURRENT_STEP, http: 409, condition: "escalate without at least one NO_RESULT attempt whose method matches the current step" }
+  - { id: ERR_SEARCH_METHOD_MISMATCH, http: 422, condition: "SearchAttempt.method does not equal the search case's current step method" }
+  - { id: ERR_ATTEMPT_TIMESTAMP_INVALID, http: 422, condition: "attempted_at is after now, before the case opened_at, or before an earlier attempt's attempted_at (attempts are chronological)" }
+  - { id: ERR_CERTIFIED_MAIL_WINDOW_ACTIVE, http: 409, condition: "A CERTIFIED_MAIL attempt falls inside the 15-day trailing buffer of a previous CERTIFIED_MAIL attempt on the same case (attempted_at < prior.attempted_at + 15 days)" }
+  - { id: ERR_CERTIFIED_MAIL_RESPONSE_WINDOW_OPEN, http: 409, condition: "escalate STEP4 -> EXHAUSTED before the latest CERTIFIED_MAIL attempt's attempted_at + 15 days" }
+  # --- business safety / compliance ---
+  - { id: ERR_SEGREGATION_OF_DUTIES_VIOLATION, http: 403, condition: "X-User-ID equals the exhausted search case's exhausted_by_user_id on PBGC transfer or forfeiture creation" }
+  - { id: ERR_FIDUCIARY_DOC_MISSING, http: 422, condition: "Required FiduciaryLogEntry absent: SEARCH_PROTOCOL_SUMMARY referencing the exhausted search case (transfer/forfeiture) or CLOSURE_SIGNOFF (close)" }
+  # --- business constraint ---
+  - { id: ERR_BLACKOUT_WINDOW_OVERLAP, http: 409, condition: "New blackout's half-open [start_at, end_at) intersects another blackout of the case; adjacency (start_at == other.end_at) is allowed" }
+  - { id: ERR_BLACKOUT_NOT_SCHEDULED, http: 409, condition: "Blackout activate from a status other than SCHEDULED, complete from a status other than ACTIVE, or BLACKOUT_ADVISORY issuance without a SCHEDULED blackout whose start_at == action_effective_date" }
+  - { id: ERR_PBGC_TRANSFER_ALREADY_OPEN, http: 409, condition: "A SUBMITTED PBGCTransfer already exists for the participant" }
+  - { id: ERR_PBGC_TRANSFER_NOT_SUBMITTED, http: 409, condition: "confirm/record-rejection on a transfer not in SUBMITTED" }
+  - { id: ERR_FORFEITURE_ALREADY_RECORDED, http: 409, condition: "A Forfeiture in RECORDED status already exists for the participant" }
+  - { id: ERR_DLR_ALREADY_OPEN, http: 409, condition: "A DeterminationLetterRequest in DRAFT, FILED, or ADVERSE already exists for the case" }
+  - { id: ERR_DLR_INVALID_STATE, http: 409, condition: "DLR transition attempted from a disallowed state" }
+  - { id: ERR_PAYOUTS_ALREADY_COMMITTED, http: 409, condition: "Expense allocation while any participant of the case is ELECTION_ACCEPTED (payout amounts already committed)" }
+  - { id: ERR_NO_ELIGIBLE_PARTICIPANTS, http: 409, condition: "Expense allocation with an empty eligible set (no participant in PENDING_ELECTION, ELECTION_SUBMITTED, or RESTORED)" }
+  - { id: ERR_ELECTION_INVALID_STATE, http: 409, condition: "Election create/accept/reject attempted from a disallowed distribution_status or election status" }
+  - { id: ERR_PAYOUT_NOT_CLEARABLE, http: 409, condition: "mark-cleared on a payout not in ISSUED" }
+  - { id: ERR_PAYOUT_NOT_VOIDABLE, http: 409, condition: "void on a payout not in STALE_UNCASHED" }
+  # --- business temporal ---
+  - { id: ERR_NOIT_TIMING_WINDOW, http: 422, condition: "NOIT issued outside [termination date - 90 days, termination date - 60 days] (whole calendar days, inclusive)" }
+  - { id: ERR_NOIT_DATE_MISMATCH, http: 422, condition: "NOIT action_effective_date differs from the case proposed_termination_date" }
+  - { id: ERR_INTERESTED_PARTY_WINDOW, http: 422, condition: "INTERESTED_PARTY notice issued outside [filing date - 24 days, filing date - 10 days]; or DLR create/file without a live covering notice in that window" }
+  - { id: ERR_BLACKOUT_NOTICE_WINDOW, http: 422, condition: "BLACKOUT_ADVISORY issued outside [start - 60 days, start - 30 days], or no SCHEDULED blackout with start_at == action_effective_date" }
+  - { id: ERR_BLACKOUT_NOT_IN_WINDOW, http: 409, condition: "Blackout activation outside [start_at, end_at)" }
+  - { id: ERR_BLACKOUT_NOT_ENDED, http: 409, condition: "Blackout completion before end_at" }
+  - { id: ERR_TERMINATION_DATE_NOT_REACHED, http: 409, condition: "effectuate-termination before proposed_termination_date" }
+  - { id: ERR_DEFAULT_TREATMENT_WINDOW_NOT_PASSED, http: 409, condition: "apply-default-treatment at or before case.default_treatment_date (strictly-greater comparison)" }
+  # --- business referential ---
+  - { id: ERR_DISTRIBUTION_NOTICE_REQUIRED, http: 422, condition: "begin-distributions without a non-superseded DISTRIBUTION notice" }
+  - { id: ERR_BLACKOUT_NOTICE_MISSING, http: 422, condition: "Blackout activation without a non-superseded BLACKOUT_ADVISORY notice whose action_effective_date == start_at" }
+  - { id: ERR_BLACKOUT_TRANSITION_PENDING, http: 409, condition: "begin-distributions or close while a BlackoutPeriod is SCHEDULED or ACTIVE" }
+  - { id: ERR_BLACKOUT_ACTIVE_ELECTIONS_BLOCKED, http: 409, condition: "Election creation while the case's blackout_active is true" }
+  - { id: ERR_PARTICIPANT_MISSING_BLOCKS_ELECTION, http: 409, condition: "Election create or accept while participant locate_status == MISSING" }
+  - { id: ERR_PARTICIPANT_MISSING_REQUIRES_SEARCH, http: 409, condition: "apply-default-treatment on a MISSING participant (search protocol must run instead)" }
+  - { id: ERR_SEARCH_PROTOCOL_INCOMPLETE, http: 409, condition: "PBGC transfer or forfeiture while the participant's active search case is not EXHAUSTED" }
+  - { id: ERR_PARTICIPANTS_NOT_ALL_RESOLVED, http: 409, condition: "advance-to-reconciliation or close while all_participants_resolved is false (includes the zero-participant empty set)" }
+  - { id: ERR_DLR_PENDING_BLOCKS_CLOSE, http: 409, condition: "close while a DLR is DRAFT or FILED" }
+  - { id: ERR_DLR_ADVERSE_BLOCKS_CLOSE, http: 409, condition: "close while a DLR is ADVERSE (must withdraw first)" }
+  - { id: ERR_NO_REOPENABLE_PARTICIPANT, http: 409, condition: "reopen-distributions without any participant in RESTORED" }
+  # --- business fiscal ---
+  - { id: ERR_BALANCE_EXCEEDS_FORCED_LIMIT, http: 422, condition: "apply-default-treatment with net_distributable_cents > 500000" }
+  - { id: ERR_INSUFFICIENT_REMAINING_BALANCE, http: 402, condition: "Expense allocation total_expense_cents exceeds case remaining_undistributed_cents" }
+  - { id: ERR_EXPENSE_EXCEEDS_PARTICIPANT_BALANCE, http: 422, condition: "A computed per-participant share would exceed that participant's vested_balance_cents" }
+  - { id: ERR_ZERO_BALANCE_TRANSFER, http: 422, condition: "PBGC transfer or forfeiture for a participant whose net_distributable_cents (or exhaustion snapshot, per basis) is 0" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PlanAdministrator
+    description: "Terminating plan sponsor's administrator: runs the termination timeline, notices, search protocol, elections on behalf, DLR, expense allocations, fiduciary documentation"
+    identity: opaque
+    exclusive_operations:
+      - "POST /termination-cases and all /termination-cases/{id}/* transitions except close"
+      - "POST /participants, declare-missing, locate, apply-default-treatment"
+      - "POST /search-cases/{id}/attempts and /escalate"
+      - "POST /notices, /blackout-periods, /expense-allocations"
+      - "POST /distribution-elections/{id}/accept and /reject"
+      - "POST /pbgc-transfers/{id}/confirm and /record-rejection"
+      - "POST /determination-letter-requests and its file/record-determination/withdraw"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /distribution-elections (on behalf of a participant; shared with Participant self-service)"
+      - "POST /fiduciary-log-entries (shared with IndependentFiduciary)"
+      - "All GET endpoints"
+  - name: IndependentFiduciary
+    description: "Independent fiduciary: approves PBGC transfers and forfeitures (segregated from the search exhauster) and signs off case closure"
+    identity: opaque
+    exclusive_operations:
+      - "POST /pbgc-transfers"
+      - "POST /forfeitures"
+      - "POST /termination-cases/{id}/close"
+    shared_operations:
+      - "POST /fiduciary-log-entries (shared with PlanAdministrator)"
+      - "All GET endpoints"
+  - name: Recordkeeper
+    description: "Recordkeeper: identifies uncashed checks and undeliverable mail, runs the blackout transition, clears and voids payouts"
+    identity: opaque
+    exclusive_operations:
+      - "POST /participants/{id}/contact-flags and /clear-contact-flag"
+      - "POST /blackout-periods/{id}/activate and /complete"
+      - "POST /payouts/{id}/mark-cleared and /void"
+    shared_operations:
+      - "All GET endpoints"
+  - name: Participant
+    description: "Plan participant self-service: may submit a distribution election only for themself (X-User-ID must equal the participant id)"
+    identity: "entity_backed:Participant"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /distribution-elections (own record only)"
+      - "All GET endpoints"

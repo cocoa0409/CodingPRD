@@ -1,0 +1,57 @@
+"""Domain thresholds and numeric constants from PRD §2–§3."""
+
+# Logical clock (PRD §2.4): the clock reads this instant before it is ever set.
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+# Team service-level defaults (PRD §3.1).
+DEFAULT_SPEED_TO_LEAD_WINDOW_SECONDS = 900
+DEFAULT_CLAIM_WINDOW_SECONDS = 7200
+
+# Auto-pause streak threshold (PRD §3.1): reaching three missed claims pauses the agent.
+AUTO_PAUSE_MISSED_CLAIMS = 3
+
+# Selector (PRD §3.2): default per-tier weights in basis points; HOT boost parameters.
+DEFAULT_TIER_WEIGHT_BPS = {"BRONZE": 10000, "SILVER": 11000, "GOLD": 12500, "PLATINUM": 15000}
+HOT_BOOST_MIN_CONVERSIONS = 5
+HOT_BOOST_MULTIPLIER = 2
+
+# Engagement scoring (PRD §3.5).
+ENGAGEMENT_POINTS = {
+    "EMAIL_OPEN": 5,
+    "LINK_CLICK": 10,
+    "CALL_ANSWERED": 20,
+    "FORM_SUBMIT": 25,
+    "REPLIED": 30,
+    "SHOWING_ATTENDED": 40,
+}
+DECAY_STEP1_DAYS = 30
+DECAY_STEP2_DAYS = 60
+WARM_THRESHOLD = 40
+HOT_THRESHOLD = 75
+
+# Performance tiers (PRD §3.7).
+PLATINUM_MIN_CONVERSIONS = 8
+PLATINUM_MAX_RESPONSE_SECONDS = 300
+GOLD_MIN_CONVERSIONS = 4
+GOLD_MAX_RESPONSE_SECONDS = 900
+SILVER_MIN_CONVERSIONS = 1
+
+# Commission waterfall (PRD §3.6).
+HOUSE_BPS = 3000
+VOLUME_TIER_THRESHOLD_CENTS = 10_000_000
+VOLUME_PREMIUM_BPS = 500
+FULL_BPS = 10000
+
+# Source ROI (PRD §3.7).
+EST_COMMISSION_BPS = 300
+TEMP_PROBABILITY_BPS = {"COLD": 500, "WARM": 2000, "HOT": 4500}
+DEFAULT_ROI_WINDOW_DAYS = 90
+
+# Scorecard weights (PRD §3.7).
+SCORECARD_W_CLAIM = 5
+SCORECARD_W_SPEED = 3
+SCORECARD_W_CONVERSION = 2
+
+# Test conveniences.
+BIG_BUDGET_CENTS = 100_000_000
+DEFAULT_EXPECTED_CLOSE_PRICE_CENTS = 30_000_000

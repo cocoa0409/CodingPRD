@@ -1,0 +1,52 @@
+"""Domain thresholds — numeric constants from PRD §3 calculation rules."""
+
+# Logical clock (PRD §2.4): the clock reads exactly this instant before any set.
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+# Approval chain tiers (PRD §3.3; thresholds are inclusive)
+T1_PURCHASING_CENTS = 500000        # $5,000  -> adds PURCHASING (and gates SOLE_SOURCE)
+T2_DIRECTOR_CENTS = 2500000         # $25,000 -> adds DIRECTOR; == competitive-bid threshold
+T3_CONTRACT_REVIEW_CENTS = 10000000  # $100,000 -> adds CONTRACT_REVIEW
+
+# Anti-splitting rolling aggregate (PRD §3.3)
+BID_THRESHOLD_CENTS = 2500000
+ANTI_SPLIT_WINDOW_DAYS = 30
+
+# Grant charge (PRD §3.3)
+DEFAULT_EQUIPMENT_CAP_CENTS = 500000
+
+# Three-way match tolerance (PRD §3.6)
+MATCH_TOL_PCT = 0.02
+
+# Award scoring weights (PRD §3.4)
+W_PRICE = 0.70
+W_DIVERSITY = 0.20
+W_SUSTAINABILITY = 0.10
+DEFAULT_MIN_QUOTES = 3
+
+# Statement-cycle aging (PRD §3.8)
+SUSPEND_AFTER_UNRECONCILED_CYCLES = 2
+
+# Elevation windows (PRD §3.8)
+ELEVATION_MIN_GAP_DAYS = 7
+
+# Surplus (PRD §3.9)
+REDISTRIBUTION_WINDOW_DAYS = 10
+DEPT_SHARE_PCT = 0.50
+MIN_SALE_FLOOR_CENTS = 2500
+EST_VALUE_FLOOR_PCT = 0.40
+HIGH_VALUE_SALE_CENTS = 5000000
+
+TEST_DEFAULTS = {
+    "DEPARTMENT_APPROVAL_LIMIT_CENTS": 10000000,
+    "DIVERSITY_GOAL_PCT": 0.25,
+    "SUSTAINABILITY_GOAL_PCT": 0.20,
+    "GRANT_BUDGET_START": "2026-01-01T00:00:00Z",
+    "GRANT_BUDGET_END": "2027-12-31T00:00:00Z",
+    "F_AND_A_RATE": 0.52,
+    "CONTRACT_EFFECTIVE_START": "2026-01-01T00:00:00Z",
+    "CONTRACT_EFFECTIVE_END": "2027-01-01T00:00:00Z",
+    "CARD_SINGLE_TXN_LIMIT_CENTS": 100000,
+    "CARD_MONTHLY_LIMIT_CENTS": 500000,
+    "REQUESTER_ID": "req-user-1",
+}

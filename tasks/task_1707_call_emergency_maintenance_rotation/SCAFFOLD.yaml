@@ -1,0 +1,1121 @@
+# =============================================================================
+# SCAFFOLD — On-Call Emergency Maintenance Rotation (apartment maintenance team)
+# §1.0–§1.7 seed tables. Difficulty design (§1.8) and corner design (§1.9) live
+# in sibling files SCAFFOLD_DIFFICULTY_DESIGN.yaml / SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  On-Call Emergency Maintenance Rotation (apartment maintenance team): rotation schedule & on-call pay/differential, call intake triage & true-emergency criteria, response time target & escalation to supervisor, after-hours vendor authorization limits, temporary mitigation & follow-up work order creation, resident relocation decision for uninhabitable unit, incident documentation & insurance notification, fatigue management & next-day scheduling
+
+domain_name: oncall-emergency-maintenance
+api_prefix: /v1
+
+complexity_profile:
+  primary_archetype: temporal_windowing        # rotation shifts + relocation stays: interval occupation of Technician / Unit resources
+  secondary_archetype: compliance_audit        # incident documentation, insurance notification deadlines, segregation of duties on money/relocation approvals
+  complexity_layers:
+    - optimistic_concurrency                   # OCC on CallTicket.version (dispatch) and RotationShift.version (transfer)
+    - cascading_side_effects                   # relocation approve -> unit -> work orders -> vendor authorizations; ticket close -> fatigue -> shift coverage
+    - rate_threshold_triggers                  # response SLA, escalation timers, fatigue caps, vendor authorization caps
+    - ops_run_checkpoint                       # POST /_ops/evaluate-escalations advances escalation levels against the logical clock
+  entity_topology: flat                        # peer entities joined by FK references; no nested URL ownership except documented create shortcuts
+  state_machine_shape: cyclic                  # CallTicket dispatch<->escalated loop, WorkOrder completed->reopened->in_progress loop, RelocationCase rejected->proposed loop, IncidentRecord returned->draft loop
+  relationship_patterns:
+    - one_to_many                              # Technician->RotationShift, CallTicket->VendorAuthorization, PayPeriod->PayStatement
+    - self_referential                         # WorkOrder.parent_work_order_id (follow-up chains)
+    - cross_aggregate                          # RelocationCase references Unit + CallTicket; VendorAuthorization references CallTicket + WorkOrder + Vendor + Technician x2
+  role_model: segregation_of_duties            # vendor authorization self-approval forbidden above tech cap; relocation approver must differ from proposer
+  consistency_model: immediate                 # every mutation + cascaded side effects visible in the same response / subsequent read
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (11 entities)
+# All datetimes ISO 8601 UTC with three fractional digits. All money integer cents.
+# =============================================================================
+entities:
+  - name: Technician
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Technician full name" }
+      - { name: capability, type: enum, source: input, description: "TECHNICIAN | SUPERVISOR — gates MaintenanceSupervisor role actions" }
+      - { name: base_hourly_rate_cents, type: integer, source: input, description: "Straight-time hourly rate in cents; > 0" }
+      - { name: on_call_differential_bp, type: integer, source: input, description: "On-call standby differential in basis points (1500 = 15%); >= 0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | INACTIVE" }
+      - { name: callback_minutes_168h, type: integer, source: computed, description: "Rolling sum of callback_minutes over CallTickets assigned to this technician with mitigated_at in (now-168h, now] and status in {MITIGATED, CLOSED}" }
+      - { name: fatigue_block_until, type: datetime, source: computed, description: "Null, or rest-window end (= triggering ticket mitigated_at + 10h) set when callback_minutes_168h crossed FATIGUE_CAP_MINUTES at a ticket close" }
+
+  - name: Unit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_number, type: string, source: input, description: "Property-wide unique unit identifier" }
+      - { name: building_code, type: string, source: input, description: "Building identifier within the property" }
+      - { name: habitability_status, type: enum, source: system, default: HABITABLE, description: "HABITABLE | UNINHABITABLE — flipped only by RelocationCase approve/end side effects" }
+
+  - name: Vendor
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Vendor company name" }
+      - { name: trade, type: enum, source: input, description: "PLUMBING | HVAC | ELECTRICAL | GENERAL | RESTORATION" }
+      - { name: per_incident_limit_cents, type: integer, source: input, description: "Maximum amount_cents authorizable on a single VendorAuthorization for this vendor; > 0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | SUSPENDED" }
+
+  - name: RotationShift
+    parent: null
+    common_fields: true
+    fields:
+      - { name: technician_id, type: string, source: input, description: "FK -> Technician.id; owning on-call technician (rewritten by transfer)" }
+      - { name: start_at, type: datetime, source: input, description: "Shift window start (half-open interval start, inclusive)" }
+      - { name: end_at, type: datetime, source: input, description: "Shift window end (half-open interval end, exclusive); must be > start_at" }
+      - { name: status, type: enum, source: system, default: PUBLISHED, description: "PUBLISHED | ACTIVE | COMPLETED | CANCELLED" }
+      - { name: needs_coverage, type: boolean, source: computed, default: false, description: "True when the fatigue cascade flagged this PUBLISHED shift as overlapping the owner's rest window" }
+      - { name: standby_minutes, type: integer, source: computed, description: "Set at completion: duration minutes minus callback overlap minutes (floor 0)" }
+      - { name: provisional_shift_pay_cents, type: integer, source: computed, description: "Set at completion: per-shift rounded standby pay (see standby_pay_provisional)" }
+
+  - name: CallTicket
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_id, type: string, source: input, description: "FK -> Unit.id; unit the call concerns" }
+      - { name: caller_name, type: string, source: input, description: "Resident / caller name" }
+      - { name: caller_phone, type: string, source: input, description: "Callback phone number" }
+      - { name: category, type: enum, source: input, description: "GAS_LEAK | FLOOD | NO_HEAT | NO_POWER | LOCKOUT | LEAK_MINOR | APPLIANCE | OTHER" }
+      - { name: description, type: string, source: input, description: "Free-text problem description" }
+      - { name: received_at, type: datetime, source: system, description: "Logical-clock timestamp at intake" }
+      - { name: is_true_emergency, type: boolean, source: system, description: "Set by triage; gates dispatch" }
+      - { name: status, type: enum, source: system, default: RECEIVED, description: "RECEIVED | TRIAGED | DISPATCHED | ESCALATED | ON_SCENE | MITIGATED | CLOSED | DEFERRED" }
+      - { name: sla_target_minutes, type: integer, source: computed, description: "Set at triage from category: GAS_LEAK/FLOOD=30, NO_HEAT/NO_POWER=60, all others=120" }
+      - { name: assigned_technician_id, type: string, source: system, description: "FK -> Technician.id; set by dispatch, null until then" }
+      - { name: triaged_at, type: datetime, source: system, description: "Set at triage" }
+      - { name: dispatched_at, type: datetime, source: system, description: "Set at (re-)dispatch; escalation timers measure from this" }
+      - { name: on_scene_at, type: datetime, source: system, description: "Set at arrive" }
+      - { name: mitigated_at, type: datetime, source: system, description: "Set at mitigate" }
+      - { name: closed_at, type: datetime, source: system, description: "Set at close" }
+      - { name: response_minutes, type: integer, source: computed, description: "on_scene_at - received_at in whole minutes, set at arrive" }
+      - { name: response_breach, type: boolean, source: computed, description: "Set at arrive: response_minutes > sla_target_minutes (strictly greater; equality is NOT a breach)" }
+      - { name: escalation_level, type: integer, source: system, default: 0, description: "0 while DISPATCHED; 1 or 2 after escalation; reset to 0 on re-dispatch" }
+      - { name: unit_declared_uninhabitable, type: boolean, source: system, default: false, description: "Set by mitigate(unit_uninhabitable=true); precondition for opening a RelocationCase" }
+      - { name: callback_minutes, type: integer, source: computed, description: "mitigated_at - dispatched_at in whole minutes, set at mitigate" }
+      - { name: callback_pay_cents, type: integer, source: computed, description: "Set at close per callback_pay calculation" }
+
+  - name: WorkOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: call_ticket_id, type: string, source: input, description: "FK -> CallTicket.id; originating ticket" }
+      - { name: unit_id, type: string, source: system, description: "FK -> Unit.id; copied from the originating CallTicket" }
+      - { name: parent_work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; optional self-reference making this a follow-up of a COMPLETED/VERIFIED parent" }
+      - { name: title, type: string, source: input, description: "Short work summary" }
+      - { name: description, type: string, source: input, description: "Work detail" }
+      - { name: priority, type: enum, source: system, description: "EMERGENCY_FOLLOWUP (auto-created at mitigate) | DEFERRED (auto-created at deferred triage) | STANDARD (manual)" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | ASSIGNED | IN_PROGRESS | ON_HOLD | COMPLETED | REOPENED | VERIFIED | CANCELLED" }
+      - { name: assigned_technician_id, type: string, source: system, description: "FK -> Technician.id; null until assign; null for vendor-executed orders" }
+
+  - name: VendorAuthorization
+    parent: null
+    common_fields: true
+    fields:
+      - { name: call_ticket_id, type: string, source: input, description: "FK -> CallTicket.id; incident this spend belongs to" }
+      - { name: work_order_id, type: string, source: input, description: "FK -> WorkOrder.id; must belong to call_ticket_id" }
+      - { name: vendor_id, type: string, source: input, description: "FK -> Vendor.id" }
+      - { name: amount_cents, type: integer, source: input, description: "Authorized ceiling for this engagement; > 0" }
+      - { name: requested_by_technician_id, type: string, source: system, description: "FK -> Technician.id; copied from X-User-ID at creation" }
+      - { name: authorized_by_technician_id, type: string, source: system, description: "FK -> Technician.id; set at authorize; null before. Null when the approver is PropertyAdmin (opaque role)" }
+      - { name: status, type: enum, source: system, default: PROPOSED, description: "PROPOSED | AUTHORIZED | REJECTED | VOIDED | INVOICED | PAID" }
+      - { name: invoice_subtotal_cents, type: integer, source: computed, description: "Set at invoice: sum of per-line rounded line totals" }
+      - { name: invoice_markup_cents, type: integer, source: computed, description: "Set at invoice: rounded markup on the rounded subtotal" }
+      - { name: invoice_total_cents, type: integer, source: computed, description: "Set at invoice: subtotal + markup" }
+
+  - name: RelocationCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_id, type: string, source: input, description: "FK -> Unit.id; unit being vacated" }
+      - { name: call_ticket_id, type: string, source: input, description: "FK -> CallTicket.id; originating incident; ticket's unit must equal unit_id" }
+      - { name: proposed_by_technician_id, type: string, source: system, description: "FK -> Technician.id; copied from X-User-ID at propose/resubmit" }
+      - { name: approved_by_technician_id, type: string, source: system, description: "FK -> Technician.id; set at approve when approver is a technician-backed role; null when approver is PropertyAdmin" }
+      - { name: start_date, type: datetime, source: input, description: "First night of displacement (midnight UTC), closed-interval start (inclusive)" }
+      - { name: end_date, type: datetime, source: input, description: "Last night of displacement (midnight UTC), closed-interval end (inclusive); must be > start_date" }
+      - { name: nightly_rate_cents, type: integer, source: input, description: "Negotiated nightly housing rate; > 0" }
+      - { name: planned_nights, type: integer, source: computed, description: "(end_date - start_date) / 86400s; >= 1" }
+      - { name: est_cost_cents, type: integer, source: computed, description: "planned_nights * nightly_rate_cents + RELOCATION_ADMIN_FEE_CENTS; computed at propose/resubmit/approve" }
+      - { name: actual_cost_cents, type: integer, source: computed, description: "Set at end per relocation_cost_actual (overage nights at 1.25x rounded per night)" }
+      - { name: status, type: enum, source: system, default: PROPOSED, description: "PROPOSED | APPROVED | ACTIVE | ENDED | REJECTED" }
+      - { name: reject_reason, type: string, source: input, description: "Required on reject; preserved through resubmit cycle" }
+
+  - name: IncidentRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: call_ticket_id, type: string, source: input, description: "FK -> CallTicket.id; exactly one IncidentRecord per CallTicket" }
+      - { name: narrative, type: string, source: input, description: "Chronological incident narrative" }
+      - { name: estimated_damage_cents, type: integer, source: input, description: "Estimated property damage; >= 0; drives insurance-notification requirement at >= INSURANCE_NOTIFY_THRESHOLD_CENTS" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT | SUBMITTED | UNDER_REVIEW | RETURNED | FINALIZED" }
+      - { name: created_by_technician_id, type: string, source: system, description: "FK -> Technician.id; copied from X-User-ID at creation" }
+      - { name: insurance_notified_at, type: datetime, source: system, description: "Set by notify-insurance; null until then" }
+      - { name: insurance_claim_number, type: string, source: input, description: "Carrier claim number supplied at notify-insurance" }
+      - { name: insurance_notification_late, type: boolean, source: computed, description: "Set at notify-insurance: insurance_notified_at > call_ticket.closed_at + 24h (strictly greater; equality is NOT late)" }
+      - { name: insurance_waived_reason, type: string, source: input, description: "Supplied at finalize when damage < threshold and notification is waived" }
+      - { name: return_reason, type: string, source: input, description: "Required on return (UNDER_REVIEW -> RETURNED)" }
+
+  - name: PayPeriod
+    parent: null
+    common_fields: true
+    fields:
+      - { name: period_start, type: datetime, source: input, description: "Inclusive period start (midnight UTC)" }
+      - { name: period_end, type: datetime, source: input, description: "Exclusive period end (midnight UTC); must be > period_start" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | CLOSED" }
+
+  - name: PayStatement
+    parent: null
+    common_fields: false
+    fields:
+      - { name: pay_period_id, type: string, source: system, description: "FK -> PayPeriod.id; period this statement settles" }
+      - { name: technician_id, type: string, source: system, description: "FK -> Technician.id; payee" }
+      - { name: standby_minutes_total, type: integer, source: system, description: "Sum of standby_minutes over included COMPLETED shifts" }
+      - { name: standby_pay_final_cents, type: integer, source: system, description: "Chronological tiered standby pay, single rounding at end (standby_pay_final)" }
+      - { name: callback_minutes_total, type: integer, source: system, description: "Sum of callback_minutes over included CLOSED tickets" }
+      - { name: callback_pay_final_cents, type: integer, source: system, description: "Sum of per-ticket callback_pay_cents (already rounded per ticket at close)" }
+      - { name: total_pay_cents, type: integer, source: system, description: "standby_pay_final_cents + callback_pay_final_cents" }
+
+# =============================================================================
+# §1.2 State Machine Table (8 machines)
+# =============================================================================
+state_machines:
+  - entity: CallTicket
+    initial_state: RECEIVED
+    terminal_states: [CLOSED, DEFERRED]
+    transitions:
+      - from: RECEIVED
+        to: TRIAGED
+        trigger: "POST /v1/call-tickets/{id}/triage with is_true_emergency=true"
+        actor: Dispatcher
+        preconditions:
+          - "status == RECEIVED (ERR_CALL_TICKET_INVALID_STATE)"
+        side_effects:
+          - "is_true_emergency=true; triaged_at=now; sla_target_minutes computed from category"
+      - from: RECEIVED
+        to: DEFERRED
+        trigger: "POST /v1/call-tickets/{id}/triage with is_true_emergency=false"
+        actor: Dispatcher
+        preconditions:
+          - "status == RECEIVED (ERR_CALL_TICKET_INVALID_STATE)"
+        side_effects:
+          - "is_true_emergency=false; triaged_at=now; auto-create WorkOrder(priority=DEFERRED, status=OPEN, unit_id copied)"
+      - from: TRIAGED
+        to: DISPATCHED
+        trigger: "POST /v1/call-tickets/{id}/dispatch"
+        actor: Dispatcher | MaintenanceSupervisor
+        preconditions:
+          - "status == TRIAGED (ERR_CALL_TICKET_INVALID_STATE) — TRIAGED is only reachable with is_true_emergency=true; DEFERRED tickets fail this state check"
+          - "OCC: expected_call_ticket_version == current version (ERR_STALE_CALL_TICKET_VERSION)"
+          - "technician.status == ACTIVE (ERR_TECHNICIAN_NOT_ON_SHIFT)"
+          - "technician has RotationShift status==ACTIVE with start_at <= now < end_at (ERR_TECHNICIAN_NOT_ON_SHIFT)"
+          - "technician not fatigue-blocked: fatigue_block_until is null or <= now (ERR_FATIGUE_REST_REQUIRED)"
+        side_effects:
+          - "assigned_technician_id=technician_id; dispatched_at=now; escalation_level=0; version += 1"
+      - from: ESCALATED
+        to: DISPATCHED
+        trigger: "POST /v1/call-tickets/{id}/dispatch (re-dispatch)"
+        actor: Dispatcher | MaintenanceSupervisor
+        preconditions:
+          - "same as TRIAGED -> DISPATCHED (status ESCALATED accepted)"
+        side_effects:
+          - "assigned_technician_id=new technician; dispatched_at=now; escalation_level reset to 0; version += 1"
+      - from: DISPATCHED
+        to: ESCALATED
+        trigger: "POST /v1/call-tickets/{id}/escalate (manual) OR POST /_ops/evaluate-escalations (system, now - dispatched_at > ACK_LEVEL_1_MINUTES)"
+        actor: Dispatcher | OnCallTechnician | MaintenanceSupervisor | system
+        preconditions:
+          - "status == DISPATCHED for manual escalate (ERR_CALL_TICKET_INVALID_STATE); system path additionally accepts status==ESCALATED with level<2 when now - dispatched_at > ACK_LEVEL_2_MINUTES"
+        side_effects:
+          - "escalation_level = max(1, escalation_level + 1) for manual; system sets level per elapsed window; status=ESCALATED"
+      - from: DISPATCHED
+        to: ON_SCENE
+        trigger: "POST /v1/call-tickets/{id}/arrive"
+        actor: OnCallTechnician
+        preconditions:
+          - "status in {DISPATCHED, ESCALATED} (ERR_CALL_TICKET_INVALID_STATE)"
+          - "X-User-ID == assigned_technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects:
+          - "on_scene_at=now; response_minutes=(on_scene_at - received_at); response_breach=(response_minutes > sla_target_minutes)"
+      - from: ESCALATED
+        to: ON_SCENE
+        trigger: "POST /v1/call-tickets/{id}/arrive"
+        actor: OnCallTechnician
+        preconditions: ["same as DISPATCHED -> ON_SCENE"]
+        side_effects: ["same as DISPATCHED -> ON_SCENE"]
+      - from: ON_SCENE
+        to: MITIGATED
+        trigger: "POST /v1/call-tickets/{id}/mitigate"
+        actor: OnCallTechnician
+        preconditions:
+          - "status == ON_SCENE (ERR_CALL_TICKET_INVALID_STATE)"
+          - "X-User-ID == assigned_technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects:
+          - "mitigated_at=now; callback_minutes=(mitigated_at - dispatched_at); unit_declared_uninhabitable=input flag"
+          - "auto-create follow-up WorkOrder(priority=EMERGENCY_FOLLOWUP, status=OPEN, unit_id copied)"
+      - from: MITIGATED
+        to: CLOSED
+        trigger: "POST /v1/call-tickets/{id}/close"
+        actor: Dispatcher | MaintenanceSupervisor
+        preconditions:
+          - "status == MITIGATED (ERR_CALL_TICKET_INVALID_STATE)"
+          - "IncidentRecord for this ticket exists with status in {SUBMITTED, UNDER_REVIEW, FINALIZED} (ERR_INCIDENT_RECORD_NOT_SUBMITTED)"
+          - "if unit_declared_uninhabitable: a RelocationCase with call_ticket_id==ticket.id exists with status in {APPROVED, ACTIVE, ENDED} (ERR_RELOCATION_UNRESOLVED)"
+        side_effects:
+          - "closed_at=now; callback_pay_cents computed (callback_pay)"
+          - "CASCADE B link 1: Technician.callback_minutes_168h recomputed (+= this ticket's callback_minutes within window)"
+          - "CASCADE B link 2: if recomputed callback_minutes_168h crossed from < FATIGUE_CAP_MINUTES to >= FATIGUE_CAP_MINUTES: Technician.fatigue_block_until = mitigated_at + REST_WINDOW_HOURS; AND every RotationShift of this technician with status==PUBLISHED overlapping [mitigated_at, mitigated_at + REST_WINDOW_HOURS) gets needs_coverage=true"
+
+  - entity: RotationShift
+    initial_state: PUBLISHED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PUBLISHED
+        to: ACTIVE
+        trigger: "POST /v1/rotation-shifts/{id}/start"
+        actor: OnCallTechnician (self) | PropertyAdmin
+        preconditions:
+          - "status == PUBLISHED (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "start_at <= now < end_at (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "OnCallTechnician actor must satisfy X-User-ID == technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects: ["version += 1"]
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /v1/rotation-shifts/{id}/complete"
+        actor: OnCallTechnician (self) | PropertyAdmin
+        preconditions:
+          - "status == ACTIVE (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "now >= end_at (shift window finished) (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "OnCallTechnician actor must satisfy X-User-ID == technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects:
+          - "standby_minutes and provisional_shift_pay_cents computed (standby_pay_provisional); version += 1"
+      - from: PUBLISHED
+        to: PUBLISHED
+        trigger: "POST /v1/rotation-shifts/{id}/transfer"
+        actor: PropertyAdmin | MaintenanceSupervisor
+        preconditions:
+          - "status == PUBLISHED (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "OCC: expected_rotation_shift_version == current version (ERR_STALE_ROTATION_SHIFT_VERSION)"
+          - "target technician.status == ACTIVE (ERR_ROTATION_SHIFT_INVALID_STATE)"
+          - "target technician not fatigue-blocked at shift start: fatigue_block_until null or <= start_at (ERR_FATIGUE_REST_REQUIRED)"
+          - "no half-open overlap with target technician's PUBLISHED/ACTIVE shifts (ERR_SHIFT_OVERLAP)"
+        side_effects:
+          - "technician_id = to_technician_id; needs_coverage=false; version += 1"
+      - from: PUBLISHED
+        to: CANCELLED
+        trigger: "POST /v1/rotation-shifts/{id}/cancel"
+        actor: PropertyAdmin | MaintenanceSupervisor
+        preconditions:
+          - "status == PUBLISHED (ERR_ROTATION_SHIFT_INVALID_STATE)"
+        side_effects: ["version += 1"]
+
+  - entity: WorkOrder
+    initial_state: OPEN
+    terminal_states: [VERIFIED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: ASSIGNED
+        trigger: "POST /v1/work-orders/{id}/assign (technician path)"
+        actor: MaintenanceSupervisor
+        preconditions:
+          - "status in {OPEN, REOPENED} (ERR_WORK_ORDER_INVALID_STATE)"
+          - "technician.status == ACTIVE and not fatigue-blocked (ERR_FATIGUE_REST_REQUIRED)"
+        side_effects: ["assigned_technician_id set; version += 1"]
+      - from: REOPENED
+        to: ASSIGNED
+        trigger: "POST /v1/work-orders/{id}/assign"
+        actor: MaintenanceSupervisor
+        preconditions: ["same as OPEN -> ASSIGNED"]
+        side_effects: ["assigned_technician_id set; version += 1"]
+      - from: OPEN
+        to: ASSIGNED
+        trigger: "system (VendorAuthorization AUTHORIZED side effect — vendor engagement)"
+        actor: system
+        preconditions: ["linked VendorAuthorization transitioned PROPOSED -> AUTHORIZED"]
+        side_effects: ["assigned_technician_id remains null (vendor executes)"]
+      - from: ASSIGNED
+        to: IN_PROGRESS
+        trigger: "POST /v1/work-orders/{id}/begin"
+        actor: OnCallTechnician
+        preconditions:
+          - "status == ASSIGNED (ERR_WORK_ORDER_INVALID_STATE)"
+          - "assigned_technician_id != null and X-User-ID == assigned_technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects: []
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /v1/work-orders/{id}/complete"
+        actor: OnCallTechnician | Vendor
+        preconditions:
+          - "status == IN_PROGRESS (ERR_WORK_ORDER_INVALID_STATE)"
+          - "OnCallTechnician: X-User-ID == assigned_technician_id; Vendor: X-User-ID == vendor_id of an AUTHORIZED/INVOICED VendorAuthorization on this work order (ERR_NOT_ASSIGNED_TECHNICIAN / ERR_VENDOR_MISMATCH)"
+        side_effects: []
+      - from: COMPLETED
+        to: VERIFIED
+        trigger: "POST /v1/work-orders/{id}/verify"
+        actor: MaintenanceSupervisor
+        preconditions: ["status == COMPLETED (ERR_WORK_ORDER_INVALID_STATE)"]
+        side_effects: []
+      - from: COMPLETED
+        to: REOPENED
+        trigger: "POST /v1/work-orders/{id}/reopen"
+        actor: MaintenanceSupervisor
+        preconditions: ["status == COMPLETED (ERR_WORK_ORDER_INVALID_STATE)"]
+        side_effects: []
+      - from: OPEN
+        to: ON_HOLD
+        trigger: "system (RelocationCase APPROVED cascade — unit became UNINHABITABLE)"
+        actor: system
+        preconditions: ["unit_id == approved case's unit; priority != EMERGENCY_FOLLOWUP"]
+        side_effects:
+          - "CASCADE A link 3: every VendorAuthorization with work_order_id == this.id and status == PROPOSED -> VOIDED"
+      - from: ASSIGNED
+        to: ON_HOLD
+        trigger: "system (RelocationCase APPROVED cascade)"
+        actor: system
+        preconditions: ["same as OPEN -> ON_HOLD"]
+        side_effects: ["same as OPEN -> ON_HOLD"]
+      - from: ON_HOLD
+        to: OPEN
+        trigger: "system (RelocationCase ENDED cascade — unit restored HABITABLE)"
+        actor: system
+        preconditions: ["unit_id == ended case's unit"]
+        side_effects: ["assigned_technician_id cleared"]
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /v1/work-orders/{id}/cancel"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions: ["status in {OPEN, ASSIGNED, ON_HOLD, REOPENED} (ERR_WORK_ORDER_INVALID_STATE)"]
+        side_effects: []
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /v1/work-orders/{id}/cancel"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions: ["same as OPEN -> CANCELLED"]
+        side_effects: []
+      - from: ON_HOLD
+        to: CANCELLED
+        trigger: "POST /v1/work-orders/{id}/cancel"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions: ["same as OPEN -> CANCELLED"]
+        side_effects: []
+      - from: REOPENED
+        to: CANCELLED
+        trigger: "POST /v1/work-orders/{id}/cancel"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions: ["same as OPEN -> CANCELLED"]
+        side_effects: []
+
+  - entity: VendorAuthorization
+    initial_state: PROPOSED
+    terminal_states: [REJECTED, VOIDED, PAID]
+    transitions:
+      - from: PROPOSED
+        to: AUTHORIZED
+        trigger: "POST /v1/vendor-authorizations/{id}/authorize"
+        actor: OnCallTechnician | MaintenanceSupervisor | PropertyAdmin
+        preconditions:
+          - "status == PROPOSED (ERR_VENDOR_AUTHORIZATION_INVALID_STATE)"
+          - "SoD: actor == requested_by_technician_id allowed only when amount_cents <= TECH_SELF_AUTH_CAP_CENTS (ERR_SELF_AUTHORIZATION_FORBIDDEN)"
+          - "vendor.status == ACTIVE (ERR_VENDOR_SUSPENDED)"
+          - "amount_cents <= vendor.per_incident_limit_cents (ERR_VENDOR_LIMIT_EXCEEDED)"
+          - "amount_cents <= role cap: technician 50000, supervisor 250000, admin unlimited (ERR_ROLE_AUTH_LIMIT_EXCEEDED)"
+          - "incident aggregate: sum(amount_cents of sibling VAs in {AUTHORIZED, INVOICED, PAID}) + amount_cents <= INCIDENT_VENDOR_CAP_CENTS (ERR_INCIDENT_VENDOR_CAP_EXCEEDED)"
+        side_effects:
+          - "authorized_by_technician_id = X-User-ID when actor is technician-backed, else null"
+          - "linked WorkOrder OPEN -> ASSIGNED (vendor engagement); version += 1"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /v1/vendor-authorizations/{id}/reject"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions:
+          - "status == PROPOSED (ERR_VENDOR_AUTHORIZATION_INVALID_STATE)"
+          - "SoD: X-User-ID != requested_by_technician_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects: []
+      - from: AUTHORIZED
+        to: VOIDED
+        trigger: "POST /v1/vendor-authorizations/{id}/void OR system (WorkOrder -> ON_HOLD cascade)"
+        actor: MaintenanceSupervisor | PropertyAdmin | system
+        preconditions: ["status == AUTHORIZED for manual void (ERR_VENDOR_AUTHORIZATION_INVALID_STATE); system path acts on PROPOSED only"]
+        side_effects: ["manual void: linked WorkOrder ASSIGNED -> OPEN (vendor disengaged compensation) ONLY when no sibling VendorAuthorization on the same work order remains in {AUTHORIZED, INVOICED}"]
+      - from: PROPOSED
+        to: VOIDED
+        trigger: "system (WorkOrder -> ON_HOLD cascade only)"
+        actor: system
+        preconditions: ["linked WorkOrder transitioned to ON_HOLD"]
+        side_effects: []
+      - from: AUTHORIZED
+        to: INVOICED
+        trigger: "POST /v1/vendor-authorizations/{id}/invoice"
+        actor: Vendor
+        preconditions:
+          - "status == AUTHORIZED (ERR_VENDOR_AUTHORIZATION_INVALID_STATE)"
+          - "X-User-ID == vendor_id (ERR_VENDOR_MISMATCH)"
+          - "invoice_total_cents <= round_half_up(amount_cents * INVOICE_OVERAGE_NUM / INVOICE_OVERAGE_DEN) (ERR_INVOICE_EXCEEDS_AUTHORIZATION)"
+        side_effects: ["invoice_subtotal_cents, invoice_markup_cents, invoice_total_cents computed (vendor_invoice_settlement)"]
+      - from: INVOICED
+        to: PAID
+        trigger: "POST /v1/vendor-authorizations/{id}/mark-paid"
+        actor: PropertyAdmin
+        preconditions: ["status == INVOICED (ERR_VENDOR_AUTHORIZATION_INVALID_STATE)"]
+        side_effects: []
+
+  - entity: RelocationCase
+    initial_state: PROPOSED
+    terminal_states: [ENDED, REJECTED]
+    transitions:
+      - from: PROPOSED
+        to: APPROVED
+        trigger: "POST /v1/relocation-cases/{id}/approve"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions:
+          - "status == PROPOSED (ERR_RELOCATION_CASE_INVALID_STATE)"
+          - "SoD: approving X-User-ID != proposed_by_technician_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "approved_by_technician_id set (null when approver is PropertyAdmin); est_cost_cents recomputed; version += 1"
+          - "CASCADE A link 1: Unit.habitability_status = UNINHABITABLE"
+          - "CASCADE A link 2: every WorkOrder with unit_id == case.unit_id, status in {OPEN, ASSIGNED}, priority != EMERGENCY_FOLLOWUP -> ON_HOLD"
+          - "CASCADE A link 3: (caused by link 2) each such WorkOrder's PROPOSED VendorAuthorizations -> VOIDED"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /v1/relocation-cases/{id}/reject"
+        actor: MaintenanceSupervisor | PropertyAdmin
+        preconditions:
+          - "status == PROPOSED (ERR_RELOCATION_CASE_INVALID_STATE)"
+          - "SoD: X-User-ID != proposed_by_technician_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects: ["reject_reason stored"]
+      - from: REJECTED
+        to: PROPOSED
+        trigger: "POST /v1/relocation-cases/{id}/resubmit"
+        actor: OnCallTechnician | MaintenanceSupervisor
+        preconditions:
+          - "status == REJECTED (ERR_RELOCATION_CASE_INVALID_STATE)"
+          - "closed-interval overlap re-checked against APPROVED/ACTIVE cases for the unit (ERR_RELOCATION_OVERLAP)"
+        side_effects: ["proposed_by_technician_id = actor; start/end/nightly_rate replaced; est_cost_cents recomputed; version += 1"]
+      - from: APPROVED
+        to: ACTIVE
+        trigger: "POST /v1/relocation-cases/{id}/activate"
+        actor: MaintenanceSupervisor
+        preconditions:
+          - "status == APPROVED (ERR_RELOCATION_CASE_INVALID_STATE)"
+          - "now >= start_date (ERR_BEFORE_START_DATE)"
+        side_effects: []
+      - from: ACTIVE
+        to: ENDED
+        trigger: "POST /v1/relocation-cases/{id}/end"
+        actor: MaintenanceSupervisor
+        preconditions:
+          - "status == ACTIVE (ERR_RELOCATION_CASE_INVALID_STATE)"
+          - "no WorkOrder with unit_id == case.unit_id in status {OPEN, ASSIGNED, IN_PROGRESS, REOPENED} — ON_HOLD excluded (ERR_WORK_ORDER_INVALID_STATE)"
+        side_effects:
+          - "actual_cost_cents computed (relocation_cost_actual); version += 1"
+          - "Unit.habitability_status = HABITABLE"
+          - "unit's ON_HOLD WorkOrders -> OPEN (assigned_technician_id cleared)"
+
+  - entity: IncidentRecord
+    initial_state: DRAFT
+    terminal_states: [FINALIZED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /v1/incident-records/{id}/submit"
+        actor: OnCallTechnician
+        preconditions:
+          - "status == DRAFT (ERR_INCIDENT_RECORD_INVALID_STATE)"
+          - "X-User-ID == created_by_technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects: []
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /v1/incident-records/{id}/begin-review"
+        actor: MaintenanceSupervisor
+        preconditions: ["status == SUBMITTED (ERR_INCIDENT_RECORD_INVALID_STATE)"]
+        side_effects: []
+      - from: UNDER_REVIEW
+        to: RETURNED
+        trigger: "POST /v1/incident-records/{id}/return"
+        actor: MaintenanceSupervisor
+        preconditions: ["status == UNDER_REVIEW (ERR_INCIDENT_RECORD_INVALID_STATE)"]
+        side_effects: ["return_reason stored"]
+      - from: RETURNED
+        to: DRAFT
+        trigger: "POST /v1/incident-records/{id}/revise"
+        actor: OnCallTechnician
+        preconditions:
+          - "status == RETURNED (ERR_INCIDENT_RECORD_INVALID_STATE)"
+          - "X-User-ID == created_by_technician_id (ERR_NOT_ASSIGNED_TECHNICIAN)"
+        side_effects: ["narrative / estimated_damage_cents replaced; version += 1"]
+      - from: UNDER_REVIEW
+        to: FINALIZED
+        trigger: "POST /v1/incident-records/{id}/finalize"
+        actor: MaintenanceSupervisor
+        preconditions:
+          - "status == UNDER_REVIEW (ERR_INCIDENT_RECORD_INVALID_STATE)"
+          - "parent CallTicket.status == CLOSED (ERR_CALL_TICKET_INVALID_STATE)"
+          - "estimated_damage_cents >= INSURANCE_NOTIFY_THRESHOLD_CENTS requires insurance_notified_at != null (ERR_INSURANCE_NOTIFICATION_REQUIRED); below threshold requires either notification or insurance_waived_reason (ERR_INSURANCE_NOTIFICATION_REQUIRED)"
+        side_effects: ["insurance_waived_reason stored when provided"]
+
+  - entity: PayPeriod
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /v1/pay-periods/{id}/close"
+        actor: PropertyAdmin
+        preconditions:
+          - "status == OPEN (ERR_PAY_PERIOD_INVALID_STATE)"
+          - "period_end <= now (ERR_PERIOD_NOT_ENDED)"
+          - "no RotationShift with start_at in [period_start, period_end) in status {PUBLISHED, ACTIVE} (ERR_OPEN_SHIFTS_IN_PERIOD)"
+        side_effects:
+          - "create one PayStatement per technician with >= 1 COMPLETED shift starting in period (standby_pay_final, chronological tiered, round-once)"
+          - "callback section: sum per-ticket callback_pay_cents for CLOSED tickets with closed_at in [period_start, period_end)"
+
+  - entity: Unit
+    initial_state: HABITABLE
+    terminal_states: []
+    transitions:
+      - from: HABITABLE
+        to: UNINHABITABLE
+        trigger: "system (RelocationCase PROPOSED -> APPROVED side effect)"
+        actor: system
+        preconditions: []
+        side_effects: ["CASCADE A link 2: unit's non-emergency OPEN/ASSIGNED WorkOrders -> ON_HOLD"]
+      - from: UNINHABITABLE
+        to: HABITABLE
+        trigger: "system (RelocationCase ACTIVE -> ENDED side effect)"
+        actor: system
+        preconditions: []
+        side_effects: ["unit's ON_HOLD WorkOrders -> OPEN (assigned_technician_id cleared)"]
+
+  - entity: Technician
+    initial_state: ACTIVE
+    terminal_states: [INACTIVE]
+    transitions:
+      - from: ACTIVE
+        to: INACTIVE
+        trigger: "POST /v1/technicians/{id}/deactivate"
+        actor: PropertyAdmin
+        preconditions:
+          - "status == ACTIVE (ERR_INVALID_REQUEST if already INACTIVE — one-way offboarding in v1)"
+        side_effects: ["version += 1"]
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: dispatch-stale-call-ticket
+    parent_entity: CallTicket
+    write_endpoint: "POST /v1/call-tickets/{id}/dispatch"
+    occ_field: "expected_call_ticket_version"
+    description: |
+      Dispatching (or re-dispatching) a CallTicket whose version has advanced
+      since the dispatcher last read it is rejected. This captures the case
+      where another writer has just re-dispatched the ticket (legitimately
+      superseding the prior assignment) and the current writer's view of the
+      ticket is therefore stale.
+    error_id: ERR_STALE_CALL_TICKET_VERSION
+    http_status: 412
+  - rule_id: transfer-stale-rotation-shift
+    parent_entity: RotationShift
+    write_endpoint: "POST /v1/rotation-shifts/{id}/transfer"
+    occ_field: "expected_rotation_shift_version"
+    description: |
+      Transferring a PUBLISHED RotationShift whose version has advanced since
+      the actor last read it is rejected. A transfer does not change the
+      shift's status, so a second transfer after a completed one observes
+      identical state; only the version check distinguishes a stale view.
+    error_id: ERR_STALE_ROTATION_SHIFT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table (9 rules)
+# =============================================================================
+calculations:
+  - name: standby_pay_provisional
+    trigger: "RotationShift ACTIVE -> COMPLETED (POST /v1/rotation-shifts/{id}/complete)"
+    algorithm: aggregation
+    formula: |
+      duration_minutes = (end_at - start_at) / 60
+      callback_overlap = sum of CallTicket.callback_minutes over tickets with
+        assigned_technician_id == shift.technician_id
+        AND dispatched_at in [start_at, end_at)   (half-open)
+        AND status in {MITIGATED, CLOSED}
+      standby_minutes = max(duration_minutes - callback_overlap, 0)
+      provisional_shift_pay_cents = round_half_up(
+        standby_minutes / 60 * base_hourly_rate_cents * (1 + on_call_differential_bp / 10000))
+      ROUNDING ORDER (pinned): round each shift individually at completion.
+    input_set: "the completing shift; tickets assigned to shift.technician_id with dispatched_at inside the shift window (half-open) in status MITIGATED or CLOSED"
+    constants:
+      ROUNDING: round_half_up to whole cents, applied per shift
+    precision: "integer cents, round_half_up per shift"
+    variants:
+      - name: provisional
+        when: "at shift completion"
+        difference: "per-shift rounding; no weekly tier cap applied"
+
+  - name: standby_pay_final
+    trigger: "PayPeriod OPEN -> CLOSED (POST /v1/pay-periods/{id}/close)"
+    algorithm: chronological
+    formula: |
+      shifts = RotationShifts with technician_id == T, status == COMPLETED,
+               start_at in [period_start, period_end)   (half-open)
+      order shifts by start_at ASC, tie-break created_at ASC
+      full_remaining = WEEKLY_STANDBY_SOFT_CAP_MINUTES (2400)
+      acc = 0  (exact rational accumulator; NO intermediate rounding)
+      for each shift:
+        m_full = min(shift.standby_minutes, full_remaining)
+        m_half = shift.standby_minutes - m_full
+        full_remaining = full_remaining - m_full
+        acc += m_full / 60 * base_hourly_rate_cents * (1 + on_call_differential_bp / 10000)
+        acc += m_half / 60 * base_hourly_rate_cents * (1 + on_call_differential_bp / 20000)   # half differential beyond cap
+      standby_pay_final_cents = round_half_up(acc)
+      EVALUATION ORDER (pinned, circular-looking dependency resolved): tier split is
+      computed on shift.standby_minutes (already fixed at completion); the differential
+      tier depends only on the running minute total, never on the pay amount.
+    input_set: "COMPLETED shifts of T with start_at in [period_start, period_end); excludes CANCELLED and PUBLISHED/ACTIVE shifts entirely"
+    constants:
+      WEEKLY_STANDBY_SOFT_CAP_MINUTES: 2400
+      HALF_DIFFERENTIAL_DIVISOR: 20000
+    precision: "integer cents, round_half_up applied ONCE to the period total"
+    variants:
+      - name: final
+        when: "pay period close"
+        difference: "chronological tier split at 2400 min with half differential beyond; single rounding at end — can differ from the sum of per-shift provisional values"
+
+  - name: callback_pay
+    trigger: "CallTicket MITIGATED -> CLOSED (POST /v1/call-tickets/{id}/close)"
+    algorithm: tiered_pricing
+    formula: |
+      billed_minutes = max(callback_minutes, CALLOUT_MINIMUM_MINUTES)      # nested max: 2h minimum
+      night   = dispatched_at UTC time-of-day in [22:00, 06:00)            # half-open overnight window
+      weekend = dispatched_at UTC weekday in {Saturday, Sunday}
+      hazard  = category in {GAS_LEAK, FLOOD}
+      rate_eff = base_hourly_rate_cents
+                 * (NIGHT_MULTIPLIER   if night   else 1.0)                # 1.5
+                 * (WEEKEND_MULTIPLIER if weekend else 1.0)                # 1.25
+                 * (HAZARD_MULTIPLIER  if hazard  else 1.0)                # 1.5
+      callback_pay_cents = round_half_up(billed_minutes / 60 * rate_eff)
+      Multipliers stack multiplicatively; all three flags read from the ticket's
+      dispatched_at / category, never from arrival or close time.
+    input_set: "the closing ticket (callback_minutes, dispatched_at, category) + assigned technician's rate fields"
+    constants:
+      CALLOUT_MINIMUM_MINUTES: 120
+      NIGHT_MULTIPLIER: 1.5
+      WEEKEND_MULTIPLIER: 1.25
+      HAZARD_MULTIPLIER: 1.5
+    precision: "integer cents, round_half_up"
+
+  - name: relocation_cost_estimate
+    trigger: "RelocationCase create, resubmit, and approve"
+    algorithm: aggregation
+    formula: |
+      planned_nights = (end_date - start_date) / 86400        # integer days, >= 1
+      est_cost_cents = planned_nights * nightly_rate_cents + RELOCATION_ADMIN_FEE_CENTS
+    input_set: "the case's own start_date, end_date, nightly_rate_cents"
+    constants:
+      RELOCATION_ADMIN_FEE_CENTS: 15000
+    precision: "integer cents (exact)"
+    variants:
+      - name: estimate
+        when: "while status in {PROPOSED, APPROVED, ACTIVE}"
+        difference: "uses planned nights; no overstay multiplier"
+
+  - name: relocation_cost_actual
+    trigger: "RelocationCase ACTIVE -> ENDED (POST /v1/relocation-cases/{id}/end)"
+    algorithm: aggregation
+    formula: |
+      actual_nights = (actual_end_date - start_date) / 86400   # integer days, must be >= 1
+      overage_nights = max(0, actual_nights - planned_nights)
+      normal_nights  = actual_nights - overage_nights
+      overage_night_rate = round_half_up(nightly_rate_cents * OVERAGE_NIGHT_MULTIPLIER)   # 1.25, rounded per night
+      actual_cost_cents = normal_nights * nightly_rate_cents
+                        + overage_nights * overage_night_rate
+                        + RELOCATION_ADMIN_FEE_CENTS
+    input_set: "the case's start_date, end_date, nightly_rate_cents + input actual_end_date"
+    constants:
+      RELOCATION_ADMIN_FEE_CENTS: 15000
+      OVERAGE_NIGHT_MULTIPLIER: 1.25
+    precision: "integer cents; overage nightly rate rounded once (round_half_up) before multiplying by overage nights"
+    variants:
+      - name: actual
+        when: "at ENDED"
+        difference: "uses actual nights; overstay nights billed at 1.25x — diverges from est_cost_cents whenever actual duration differs from plan"
+
+  - name: vendor_invoice_settlement
+    trigger: "VendorAuthorization AUTHORIZED -> INVOICED (POST /v1/vendor-authorizations/{id}/invoice)"
+    algorithm: aggregation
+    formula: |
+      for each invoice line: line_total_cents = round_half_up(quantity * unit_cost_cents)
+      invoice_subtotal_cents = sum(line_total_cents)                                   # sum of PER-LINE rounded values
+      invoice_markup_cents   = round_half_up(invoice_subtotal_cents * overhead_markup_bp / 10000)
+      invoice_total_cents    = invoice_subtotal_cents + invoice_markup_cents
+      acceptance ceiling     = round_half_up(amount_cents * INVOICE_OVERAGE_NUM / INVOICE_OVERAGE_DEN)   # 1.10x
+      accept (INVOICED) iff invoice_total_cents <= acceptance ceiling, else ERR_INVOICE_EXCEEDS_AUTHORIZATION
+      ROUNDING ORDER (pinned): round per line first, then sum, then markup on the
+      rounded subtotal, then round the markup. Sum-then-round yields different cents
+      and is NOT compliant.
+    input_set: "request body lines[] of {description, quantity, unit_cost_cents}; overhead_markup_bp; the authorization's amount_cents"
+    constants:
+      INVOICE_OVERAGE_NUM: 11000
+      INVOICE_OVERAGE_DEN: 10000
+    precision: "integer cents, round_half_up at each pinned step"
+
+  - name: sla_target_assignment
+    trigger: "CallTicket triage (RECEIVED -> TRIAGED) and arrive (response evaluation)"
+    algorithm: threshold
+    formula: |
+      sla_target_minutes = 30  if category in {GAS_LEAK, FLOOD}
+                         = 60  if category in {NO_HEAT, NO_POWER}
+                         = 120 otherwise
+      at arrive: response_minutes = (on_scene_at - received_at) / 60 (whole minutes)
+      response_breach = (response_minutes > sla_target_minutes)      # STRICTLY greater;
+      # equality (response_minutes == sla_target_minutes) is NOT a breach
+    input_set: "the ticket's category and timestamps"
+    constants:
+      SLA_HAZARD_MINUTES: 30
+      SLA_LIFE_SAFETY_MINUTES: 60
+      SLA_STANDARD_MINUTES: 120
+    precision: "whole minutes (truncate partial minutes)"
+
+  - name: fatigue_accumulation
+    trigger: "CallTicket close (recompute + possible block); read live at dispatch / shift create / transfer / work-order assign"
+    algorithm: aggregation
+    formula: |
+      callback_minutes_168h = sum(CallTicket.callback_minutes) over tickets with
+        assigned_technician_id == technician.id
+        AND status in {MITIGATED, CLOSED}
+        AND mitigated_at in (now - 168h, now]                        # left-open rolling window
+      CROSSING RULE (at ticket close only): if previous callback_minutes_168h < FATIGUE_CAP_MINUTES
+      and new value >= FATIGUE_CAP_MINUTES (boundary inclusive — exactly 720 blocks):
+        fatigue_block_until = this ticket's mitigated_at + REST_WINDOW_HOURS (10h)
+        AND set needs_coverage=true on every RotationShift of this technician with
+            status == PUBLISHED and start_at < fatigue_block_until and end_at > mitigated_at
+      LIVE BLOCK CHECK (dispatch / shift create / transfer / assign): blocked iff
+        fatigue_block_until is not null AND fatigue_block_until > now
+    input_set: "technician's tickets in the rolling window; technician's PUBLISHED shifts for coverage flagging"
+    constants:
+      FATIGUE_CAP_MINUTES: 720
+      REST_WINDOW_HOURS: 10
+    precision: "whole minutes"
+
+  - name: vendor_exposure_check
+    trigger: "VendorAuthorization authorize"
+    algorithm: threshold
+    formula: |
+      role_cap_cents = 50000   if actor is OnCallTechnician
+                     = 250000  if actor is MaintenanceSupervisor
+                     = +inf    if actor is PropertyAdmin
+      SoD (checked BEFORE fiscal caps): actor == requested_by_technician_id is allowed
+        only when amount_cents <= TECH_SELF_AUTH_CAP_CENTS (50000)
+      checks, in order:
+        1. amount_cents <= vendor.per_incident_limit_cents            (ERR_VENDOR_LIMIT_EXCEEDED; equality allowed)
+        2. amount_cents <= role_cap_cents                             (ERR_ROLE_AUTH_LIMIT_EXCEEDED; equality allowed)
+        3. sum(amount_cents of sibling VAs of the same call_ticket with status in
+           {AUTHORIZED, INVOICED, PAID}) + amount_cents <= INCIDENT_VENDOR_CAP_CENTS
+                                                                     (ERR_INCIDENT_VENDOR_CAP_EXCEEDED; equality allowed)
+    input_set: "the authorization; its vendor; sibling VendorAuthorizations of the same call_ticket in committed statuses"
+    constants:
+      TECH_SELF_AUTH_CAP_CENTS: 50000
+      SUPERVISOR_AUTH_CAP_CENTS: 250000
+      INCIDENT_VENDOR_CAP_CENTS: 500000
+    precision: "integer cents"
+
+  - name: insurance_notification_deadline
+    trigger: "IncidentRecord notify-insurance and finalize"
+    algorithm: threshold
+    formula: |
+      notification_required = (estimated_damage_cents >= INSURANCE_NOTIFY_THRESHOLD_CENTS)   # 100000; equality REQUIRES
+      deadline = call_ticket.closed_at + INSURANCE_NOTIFY_WINDOW_HOURS (24h)
+      insurance_notification_late = (insurance_notified_at > deadline)                       # STRICTLY greater;
+      # notification exactly at the deadline is NOT late
+      finalize gate: if notification_required and insurance_notified_at is null -> ERR_INSURANCE_NOTIFICATION_REQUIRED
+                     if not notification_required and insurance_notified_at is null
+                       and insurance_waived_reason is empty -> ERR_INSURANCE_NOTIFICATION_REQUIRED
+    input_set: "the incident record + parent ticket's closed_at"
+    constants:
+      INSURANCE_NOTIFY_THRESHOLD_CENTS: 100000
+      INSURANCE_NOTIFY_WINDOW_HOURS: 24
+    precision: "whole seconds on timestamps"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present; role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 401
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for endpoint; capability/ownership/SoD scoping: MaintenanceSupervisor actions require Technician.capability == SUPERVISOR; technician-self actions require X-User-ID match; vendor actions require X-User-ID == vendor_id; vendor-authorization self-approval above TECH_SELF_AUTH_CAP_CENTS forbidden; relocation approver must differ from proposer"
+    error_id: "ERR_FORBIDDEN_ROLE | ERR_NOT_SUPERVISOR_CAPABLE | ERR_NOT_ASSIGNED_TECHNICIAN | ERR_VENDOR_MISMATCH | ERR_SELF_AUTHORIZATION_FORBIDDEN | ERR_SEGREGATION_OF_DUTIES"
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Path resource ids exist, validated left-to-right; body FK references exist"
+    error_id: "ERR_TECHNICIAN_NOT_FOUND | ERR_UNIT_NOT_FOUND | ERR_VENDOR_NOT_FOUND | ERR_ROTATION_SHIFT_NOT_FOUND | ERR_CALL_TICKET_NOT_FOUND | ERR_WORK_ORDER_NOT_FOUND | ERR_VENDOR_AUTHORIZATION_NOT_FOUND | ERR_RELOCATION_CASE_NOT_FOUND | ERR_INCIDENT_RECORD_NOT_FOUND | ERR_PAY_PERIOD_NOT_FOUND | ERR_PAY_STATEMENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with resource ids"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body shape: required fields present, enum values valid, datetime/integer fields well-formed, end > start windows, amount_cents > 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+
+  - priority: 5
+    category: state
+    check: "Target resource in a valid state for the operation (per-entity invalid-state errors; OCC stale-version preconditions ride with the write endpoints at 412)"
+    error_id: "ERR_CALL_TICKET_INVALID_STATE | ERR_ROTATION_SHIFT_INVALID_STATE | ERR_WORK_ORDER_INVALID_STATE | ERR_VENDOR_AUTHORIZATION_INVALID_STATE | ERR_RELOCATION_CASE_INVALID_STATE | ERR_INCIDENT_RECORD_INVALID_STATE | ERR_PAY_PERIOD_INVALID_STATE | ERR_STALE_CALL_TICKET_VERSION | ERR_STALE_ROTATION_SHIFT_VERSION"
+    http_status: 409
+    applies_to: "state transition endpoints"
+
+  - priority: 6
+    category: business_safety
+    check: "Fatigue / rest: technician not fatigue-blocked (fatigue_block_until null or <= reference time) at dispatch, shift create, shift transfer, work-order assign"
+    error_id: ERR_FATIGUE_REST_REQUIRED
+    http_status: 409
+    applies_to: "POST /v1/call-tickets/{id}/dispatch, POST /v1/rotation-shifts, POST /v1/rotation-shifts/{id}/transfer, POST /v1/work-orders/{id}/assign"
+
+  - priority: 7
+    category: business_referential
+    check: "Cross-entity consistency and other-entity state gates: ticket is true emergency; technician on active shift; vendor ACTIVE; ticket declared uninhabitable before relocation; relocation unit matches ticket unit; vendor-authorization work order belongs to ticket; follow-up parent COMPLETED/VERIFIED; one incident record per ticket; incident record submitted before close; relocation resolved before close; insurance decision before finalize; pay period ended and shifts terminal before close"
+    error_id: "ERR_TECHNICIAN_NOT_ON_SHIFT | ERR_VENDOR_SUSPENDED | ERR_UNIT_NOT_UNINHABITABLE | ERR_REFERENTIAL_MISMATCH | ERR_FOLLOWUP_PARENT_NOT_FINISHED | ERR_INCIDENT_RECORD_EXISTS | ERR_INCIDENT_RECORD_NOT_SUBMITTED | ERR_RELOCATION_UNRESOLVED | ERR_INSURANCE_NOTIFICATION_REQUIRED | ERR_OPEN_SHIFTS_IN_PERIOD | ERR_PERIOD_NOT_ENDED"
+    http_status: 409
+    applies_to: "dispatch, vendor-authorization create/authorize, relocation create/end, incident create/finalize, ticket close, pay-period close, work-order create"
+
+  - priority: 8
+    category: business_temporal
+    check: "Interval occupation conflicts and time gates: rotation-shift half-open overlap per technician; relocation closed-interval overlap per unit (among APPROVED/ACTIVE); relocation activation not before start_date"
+    error_id: "ERR_SHIFT_OVERLAP | ERR_RELOCATION_OVERLAP | ERR_BEFORE_START_DATE"
+    http_status: 409
+    applies_to: "POST /v1/rotation-shifts, POST /v1/rotation-shifts/{id}/transfer, POST /v1/relocation-cases, POST /v1/relocation-cases/{id}/resubmit, POST /v1/relocation-cases/{id}/activate"
+
+  - priority: 9
+    category: business_constraint
+    check: "Uniqueness: unit_number property-wide unique at create"
+    error_id: ERR_UNIT_NUMBER_EXISTS
+    http_status: 409
+    applies_to: "POST /v1/units"
+
+  - priority: 10
+    category: business_fiscal
+    check: "Vendor money caps in pinned order: per-incident vendor limit, then role authorization cap, then per-incident aggregate cap; invoice overage ceiling at invoice time"
+    error_id: "ERR_VENDOR_LIMIT_EXCEEDED | ERR_ROLE_AUTH_LIMIT_EXCEEDED | ERR_INCIDENT_VENDOR_CAP_EXCEEDED | ERR_INVOICE_EXCEEDS_AUTHORIZATION"
+    http_status: 402
+    applies_to: "POST /v1/vendor-authorizations/{id}/authorize, POST /v1/vendor-authorizations/{id}/invoice"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# Read endpoints allow all five roles unless narrowed in `roles`.
+# =============================================================================
+endpoints:
+  # --- Technician ---
+  - { method: POST, path: "/v1/technicians", description: "Register a technician", roles: [PropertyAdmin], code: 201, input: [full_name, capability, base_hourly_rate_cents, on_call_differential_bp], output: Technician, side_effects: ["status=ACTIVE; callback_minutes_168h=0; fatigue_block_until=null"] }
+  - { method: GET, path: "/v1/technicians/{technicianId}", description: "Read a technician (fatigue fields live here)", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: Technician, side_effects: [] }
+  - { method: POST, path: "/v1/technicians/{technicianId}/deactivate", description: "Deactivate a technician (ACTIVE -> INACTIVE); blocks future dispatch/shift-create/transfer/assign", roles: [PropertyAdmin], code: 200, input: [], output: Technician, side_effects: ["status=INACTIVE; version += 1"] }
+  # --- Unit ---
+  - { method: POST, path: "/v1/units", description: "Register an apartment unit; unit_number unique", roles: [PropertyAdmin], code: 201, input: [unit_number, building_code], output: Unit, side_effects: ["habitability_status=HABITABLE"] }
+  - { method: GET, path: "/v1/units/{unitId}", description: "Read a unit", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: Unit, side_effects: [] }
+  # --- Vendor ---
+  - { method: POST, path: "/v1/vendors", description: "Register a vendor with its per-incident authorization limit", roles: [PropertyAdmin], code: 201, input: [name, trade, per_incident_limit_cents], output: Vendor, side_effects: ["status=ACTIVE"] }
+  - { method: GET, path: "/v1/vendors/{vendorId}", description: "Read a vendor", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: [], output: Vendor, side_effects: [] }
+  - { method: POST, path: "/v1/vendors/{vendorId}/suspend", description: "Suspend a vendor (blocks new proposals/authorizations)", roles: [PropertyAdmin], code: 200, input: [], output: Vendor, side_effects: ["status=SUSPENDED; version += 1"] }
+  # --- RotationShift ---
+  - { method: POST, path: "/v1/rotation-shifts", description: "Publish an on-call shift (half-open window; per-technician overlap rejected)", roles: [PropertyAdmin, MaintenanceSupervisor], code: 201, input: [technician_id, start_at, end_at], output: RotationShift, side_effects: ["status=PUBLISHED; needs_coverage=false"] }
+  - { method: GET, path: "/v1/rotation-shifts", description: "List shifts; filterable", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: ["technician_id?", "status?", "limit?", "offset?"], output: "RotationShift[]", side_effects: [] }
+  - { method: GET, path: "/v1/rotation-shifts/{rotationShiftId}", description: "Read a shift", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: RotationShift, side_effects: [] }
+  - { method: POST, path: "/v1/rotation-shifts/{rotationShiftId}/start", description: "Technician starts the on-call shift inside its window", roles: [OnCallTechnician, PropertyAdmin], code: 200, input: [], output: RotationShift, side_effects: ["PUBLISHED -> ACTIVE; version += 1"] }
+  - { method: POST, path: "/v1/rotation-shifts/{rotationShiftId}/complete", description: "Complete an ACTIVE shift after its window ends; computes standby_minutes and provisional_shift_pay_cents", roles: [OnCallTechnician, PropertyAdmin], code: 200, input: [], output: RotationShift, side_effects: ["ACTIVE -> COMPLETED; standby_pay_provisional; version += 1"] }
+  - { method: POST, path: "/v1/rotation-shifts/{rotationShiftId}/transfer", description: "Transfer a PUBLISHED shift to another technician (OCC-guarded)", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: [to_technician_id, expected_rotation_shift_version], output: RotationShift, side_effects: ["technician_id replaced; needs_coverage=false; increments RotationShift.version by 1"] }
+  - { method: POST, path: "/v1/rotation-shifts/{rotationShiftId}/cancel", description: "Cancel a PUBLISHED shift", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: [], output: RotationShift, side_effects: ["PUBLISHED -> CANCELLED; version += 1"] }
+  # --- CallTicket ---
+  - { method: POST, path: "/v1/call-tickets", description: "Intake: create an emergency call (received_at stamped from logical clock)", roles: [Dispatcher, PropertyAdmin], code: 201, input: [unit_id, caller_name, caller_phone, category, description], output: CallTicket, side_effects: ["status=RECEIVED; received_at=now"] }
+  - { method: GET, path: "/v1/call-tickets", description: "List call tickets; filterable", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: ["unit_id?", "assigned_technician_id?", "status?", "category?", "limit?", "offset?"], output: "CallTicket[]", side_effects: [] }
+  - { method: GET, path: "/v1/call-tickets/{callTicketId}", description: "Read a call ticket", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: [], output: CallTicket, side_effects: [] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/triage", description: "Triage: true emergency -> TRIAGED, else DEFERRED (+ auto DEFERRED work order)", roles: [Dispatcher], code: 200, input: [is_true_emergency], output: CallTicket, side_effects: ["sla_target_minutes computed; DEFERRED path auto-creates WorkOrder(priority=DEFERRED)"] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/dispatch", description: "Dispatch / re-dispatch an on-call technician (OCC-guarded)", roles: [Dispatcher, MaintenanceSupervisor], code: 200, input: [technician_id, expected_call_ticket_version], output: CallTicket, side_effects: ["TRIAGED/ESCALATED -> DISPATCHED; assigned_technician_id, dispatched_at set; escalation_level reset 0; increments CallTicket.version by 1"] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/arrive", description: "Assigned technician arrives on scene; response_minutes + response_breach computed", roles: [OnCallTechnician], code: 200, input: [], output: CallTicket, side_effects: ["DISPATCHED/ESCALATED -> ON_SCENE; sla_target_assignment evaluated"] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/escalate", description: "Manual escalation to supervisor (level +1, min 1)", roles: [Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: CallTicket, side_effects: ["DISPATCHED -> ESCALATED; escalation_level=max(1, level+1)"] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/mitigate", description: "Assigned technician records temporary mitigation; creates EMERGENCY_FOLLOWUP work order", roles: [OnCallTechnician], code: 200, input: [mitigation_notes, unit_uninhabitable], output: CallTicket, side_effects: ["ON_SCENE -> MITIGATED; mitigated_at, callback_minutes set; unit_declared_uninhabitable=input flag; auto-create WorkOrder(priority=EMERGENCY_FOLLOWUP, OPEN)"] }
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/close", description: "Close a mitigated ticket (requires submitted incident record + resolved relocation); computes callback pay; fatigue cascade", roles: [Dispatcher, MaintenanceSupervisor], code: 200, input: [], output: CallTicket, side_effects: ["MITIGATED -> CLOSED; callback_pay computed; CASCADE B: Technician.callback_minutes_168h recompute, possible fatigue block + needs_coverage flagging"] }
+  # --- VendorAuthorization ---
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/vendor-authorizations", description: "Propose after-hours vendor spend against a ticket", roles: [OnCallTechnician, MaintenanceSupervisor], code: 201, input: [work_order_id, vendor_id, amount_cents], output: VendorAuthorization, side_effects: ["status=PROPOSED; requested_by_technician_id=X-User-ID"] }
+  - { method: GET, path: "/v1/vendor-authorizations", description: "List vendor authorizations; filterable (covers all five FK reverse lookups)", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: ["call_ticket_id?", "work_order_id?", "vendor_id?", "requested_by_technician_id?", "authorized_by_technician_id?", "status?", "limit?", "offset?"], output: "VendorAuthorization[]", side_effects: [] }
+  - { method: GET, path: "/v1/vendor-authorizations/{vendorAuthorizationId}", description: "Read a vendor authorization", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: [], output: VendorAuthorization, side_effects: [] }
+  - { method: POST, path: "/v1/vendor-authorizations/{vendorAuthorizationId}/authorize", description: "Authorize proposed spend; SoD + layered caps; engages vendor onto the work order", roles: [OnCallTechnician, MaintenanceSupervisor, PropertyAdmin], code: 200, input: [], output: VendorAuthorization, side_effects: ["PROPOSED -> AUTHORIZED; authorized_by set; linked WorkOrder OPEN -> ASSIGNED; version += 1"] }
+  - { method: POST, path: "/v1/vendor-authorizations/{vendorAuthorizationId}/reject", description: "Reject proposed spend (rejecter must differ from requester)", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: ["reason?"], output: VendorAuthorization, side_effects: ["PROPOSED -> REJECTED"] }
+  - { method: POST, path: "/v1/vendor-authorizations/{vendorAuthorizationId}/void", description: "Void an AUTHORIZED engagement; compensates by releasing the work order to OPEN when no sibling authorization remains engaged", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: [], output: VendorAuthorization, side_effects: ["AUTHORIZED -> VOIDED; linked WorkOrder ASSIGNED -> OPEN iff no sibling VA on the same work order remains in {AUTHORIZED, INVOICED}"] }
+  - { method: POST, path: "/v1/vendor-authorizations/{vendorAuthorizationId}/invoice", description: "Vendor submits invoice lines; per-line rounding settlement; 10% overage ceiling", roles: [Vendor], code: 200, input: [lines, overhead_markup_bp], output: VendorAuthorization, side_effects: ["AUTHORIZED -> INVOICED; vendor_invoice_settlement computed"] }
+  - { method: POST, path: "/v1/vendor-authorizations/{vendorAuthorizationId}/mark-paid", description: "Mark an invoiced authorization paid", roles: [PropertyAdmin], code: 200, input: [], output: VendorAuthorization, side_effects: ["INVOICED -> PAID"] }
+  # --- WorkOrder ---
+  - { method: POST, path: "/v1/work-orders", description: "Create a STANDARD work order, optionally as follow-up of a finished parent (self-reference)", roles: [Dispatcher, MaintenanceSupervisor, PropertyAdmin], code: 201, input: [call_ticket_id, title, description, "parent_work_order_id?"], output: WorkOrder, side_effects: ["status=OPEN; priority=STANDARD; unit_id copied from ticket"] }
+  - { method: GET, path: "/v1/work-orders", description: "List work orders; filterable (covers call_ticket / unit / parent self-FK reverse lookups)", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: ["call_ticket_id?", "unit_id?", "parent_work_order_id?", "status?", "assigned_technician_id?", "limit?", "offset?"], output: "WorkOrder[]", side_effects: [] }
+  - { method: GET, path: "/v1/work-orders/{workOrderId}", description: "Read a work order", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor, Vendor], code: 200, input: [], output: WorkOrder, side_effects: [] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/assign", description: "Assign a work order to a technician", roles: [MaintenanceSupervisor], code: 200, input: [technician_id], output: WorkOrder, side_effects: ["OPEN/REOPENED -> ASSIGNED; assigned_technician_id set; version += 1"] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/begin", description: "Assigned technician begins work", roles: [OnCallTechnician], code: 200, input: [], output: WorkOrder, side_effects: ["ASSIGNED -> IN_PROGRESS"] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/complete", description: "Mark work complete (assigned technician, or engaged vendor)", roles: [OnCallTechnician, Vendor], code: 200, input: [], output: WorkOrder, side_effects: ["IN_PROGRESS -> COMPLETED"] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/verify", description: "Supervisor verifies completed work", roles: [MaintenanceSupervisor], code: 200, input: [], output: WorkOrder, side_effects: ["COMPLETED -> VERIFIED"] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/reopen", description: "Supervisor rejects completed work; rework cycle", roles: [MaintenanceSupervisor], code: 200, input: ["reason?"], output: WorkOrder, side_effects: ["COMPLETED -> REOPENED"] }
+  - { method: POST, path: "/v1/work-orders/{workOrderId}/cancel", description: "Cancel a non-terminal work order", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: [], output: WorkOrder, side_effects: ["OPEN/ASSIGNED/ON_HOLD/REOPENED -> CANCELLED"] }
+  # --- RelocationCase ---
+  - { method: POST, path: "/v1/relocation-cases", description: "Propose resident relocation for a unit declared uninhabitable (closed-interval stay)", roles: [OnCallTechnician, MaintenanceSupervisor], code: 201, input: [unit_id, call_ticket_id, start_date, end_date, nightly_rate_cents], output: RelocationCase, side_effects: ["status=PROPOSED; proposed_by=X-User-ID; est_cost_cents computed"] }
+  - { method: GET, path: "/v1/relocation-cases", description: "List relocation cases; filterable", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: ["unit_id?", "call_ticket_id?", "proposed_by_technician_id?", "approved_by_technician_id?", "status?", "limit?", "offset?"], output: "RelocationCase[]", side_effects: [] }
+  - { method: GET, path: "/v1/relocation-cases/{relocationCaseId}", description: "Read a relocation case", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: RelocationCase, side_effects: [] }
+  - { method: POST, path: "/v1/relocation-cases/{relocationCaseId}/approve", description: "Approve relocation (approver != proposer); fires CASCADE A (unit -> work orders -> vendor authorizations)", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: [], output: RelocationCase, side_effects: ["PROPOSED -> APPROVED; Unit -> UNINHABITABLE; non-emergency OPEN/ASSIGNED WorkOrders -> ON_HOLD; their PROPOSED VendorAuthorizations -> VOIDED; version += 1"] }
+  - { method: POST, path: "/v1/relocation-cases/{relocationCaseId}/reject", description: "Reject relocation (rejecter != proposer)", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: [reason], output: RelocationCase, side_effects: ["PROPOSED -> REJECTED; reject_reason stored"] }
+  - { method: POST, path: "/v1/relocation-cases/{relocationCaseId}/resubmit", description: "Amend and resubmit a REJECTED case (revision loop)", roles: [OnCallTechnician, MaintenanceSupervisor], code: 200, input: [start_date, end_date, nightly_rate_cents], output: RelocationCase, side_effects: ["REJECTED -> PROPOSED; proposed_by=actor; est_cost_cents recomputed; version += 1"] }
+  - { method: POST, path: "/v1/relocation-cases/{relocationCaseId}/activate", description: "Activate an approved case on/after its start_date", roles: [MaintenanceSupervisor], code: 200, input: [], output: RelocationCase, side_effects: ["APPROVED -> ACTIVE"] }
+  - { method: POST, path: "/v1/relocation-cases/{relocationCaseId}/end", description: "End an active case; computes actual cost; restores unit; resumes held work orders", roles: [MaintenanceSupervisor], code: 200, input: [actual_end_date], output: RelocationCase, side_effects: ["ACTIVE -> ENDED; relocation_cost_actual; Unit -> HABITABLE; ON_HOLD WorkOrders -> OPEN; version += 1"] }
+  # --- IncidentRecord ---
+  - { method: POST, path: "/v1/call-tickets/{callTicketId}/incident-record", description: "Create the ticket's single incident record (on-scene documentation)", roles: [OnCallTechnician, MaintenanceSupervisor], code: 201, input: [narrative, estimated_damage_cents], output: IncidentRecord, side_effects: ["status=DRAFT; created_by=X-User-ID; ticket must be ON_SCENE or MITIGATED"] }
+  - { method: GET, path: "/v1/incident-records", description: "List incident records; filterable (0-1 per ticket)", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: ["call_ticket_id?", "created_by_technician_id?", "status?", "limit?", "offset?"], output: "IncidentRecord[]", side_effects: [] }
+  - { method: GET, path: "/v1/incident-records/{incidentRecordId}", description: "Read an incident record", roles: [PropertyAdmin, Dispatcher, OnCallTechnician, MaintenanceSupervisor], code: 200, input: [], output: IncidentRecord, side_effects: [] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/submit", description: "Technician submits the draft record", roles: [OnCallTechnician], code: 200, input: [], output: IncidentRecord, side_effects: ["DRAFT -> SUBMITTED"] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/begin-review", description: "Supervisor begins review", roles: [MaintenanceSupervisor], code: 200, input: [], output: IncidentRecord, side_effects: ["SUBMITTED -> UNDER_REVIEW"] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/return", description: "Supervisor returns the record for revision (loop)", roles: [MaintenanceSupervisor], code: 200, input: [reason], output: IncidentRecord, side_effects: ["UNDER_REVIEW -> RETURNED; return_reason stored"] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/revise", description: "Technician revises a returned record back to DRAFT", roles: [OnCallTechnician], code: 200, input: [narrative, estimated_damage_cents], output: IncidentRecord, side_effects: ["RETURNED -> DRAFT; fields replaced; version += 1"] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/notify-insurance", description: "Record carrier notification; lateness computed against closed_at + 24h", roles: [MaintenanceSupervisor, PropertyAdmin], code: 200, input: [claim_number], output: IncidentRecord, side_effects: ["insurance_notified_at=now; insurance_claim_number set; insurance_notification_late computed"] }
+  - { method: POST, path: "/v1/incident-records/{incidentRecordId}/finalize", description: "Finalize after review; requires ticket CLOSED and insurance decision", roles: [MaintenanceSupervisor], code: 200, input: ["insurance_waived_reason?"], output: IncidentRecord, side_effects: ["UNDER_REVIEW -> FINALIZED"] }
+  # --- PayPeriod / PayStatement ---
+  - { method: POST, path: "/v1/pay-periods", description: "Open a pay period", roles: [PropertyAdmin], code: 201, input: [period_start, period_end], output: PayPeriod, side_effects: ["status=OPEN"] }
+  - { method: GET, path: "/v1/pay-periods/{payPeriodId}", description: "Read a pay period", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: [], output: PayPeriod, side_effects: [] }
+  - { method: POST, path: "/v1/pay-periods/{payPeriodId}/close", description: "Close period; emits one PayStatement per technician (final tiered standby pay + callback pay)", roles: [PropertyAdmin], code: 200, input: [], output: PayPeriod, side_effects: ["OPEN -> CLOSED; standby_pay_final per technician; PayStatements created"] }
+  - { method: GET, path: "/v1/pay-statements", description: "List pay statements; filterable", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: ["pay_period_id?", "technician_id?", "limit?", "offset?"], output: "PayStatement[]", side_effects: [] }
+  - { method: GET, path: "/v1/pay-statements/{payStatementId}", description: "Read a pay statement", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: [], output: PayStatement, side_effects: [] }
+  # --- Test-driving / ops checkpoint ---
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the logical clock. Startup default (before any set) is exactly 2026-08-01T00:00:00Z; the clock never falls back to wall time", roles: [PropertyAdmin], code: 200, input: [to_iso8601], output: "{ now_iso8601: string }", side_effects: ["logical clock advanced/set"] }
+  - { method: POST, path: "/_ops/evaluate-escalations", description: "Ops-run checkpoint: scan DISPATCHED/ESCALATED tickets; escalate per elapsed time since dispatched_at (>15min -> level 1, >30min -> level 2); also returns evaluated count", roles: [PropertyAdmin, MaintenanceSupervisor], code: 200, input: [], output: "{ evaluated_count: integer, escalated: array }", side_effects: ["DISPATCHED -> ESCALATED at level 1; ESCALATED level 1 -> level 2"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog (48)
+# =============================================================================
+errors:
+  # --- Auth / authorization ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 401, condition: "X-User-ID or X-User-Role header missing, or role not declared" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not in the endpoint's allowed roles" }
+  - { id: ERR_NOT_SUPERVISOR_CAPABLE, http: 403, condition: "X-User-Role=MaintenanceSupervisor but the Technician row's capability != SUPERVISOR" }
+  - { id: ERR_NOT_ASSIGNED_TECHNICIAN, http: 403, condition: "Technician-self action (arrive/mitigate/begin/shift start/complete, incident submit/revise) with X-User-ID not matching the assigned/created technician" }
+  - { id: ERR_VENDOR_MISMATCH, http: 403, condition: "Vendor role action with X-User-ID not equal to the authorization's vendor_id (invoice), or no engaged vendor match on work-order complete" }
+  - { id: ERR_SELF_AUTHORIZATION_FORBIDDEN, http: 403, condition: "Authorizer == requested_by_technician_id while amount_cents > TECH_SELF_AUTH_CAP_CENTS (50000)" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Relocation approve/reject attempted by the proposing technician, or vendor-authorization reject attempted by its requester" }
+  # --- Existence ---
+  - { id: ERR_TECHNICIAN_NOT_FOUND, http: 404, condition: "technician id (path or body) does not exist" }
+  - { id: ERR_UNIT_NOT_FOUND, http: 404, condition: "unit id does not exist" }
+  - { id: ERR_VENDOR_NOT_FOUND, http: 404, condition: "vendor id does not exist" }
+  - { id: ERR_ROTATION_SHIFT_NOT_FOUND, http: 404, condition: "rotation shift id does not exist" }
+  - { id: ERR_CALL_TICKET_NOT_FOUND, http: 404, condition: "call ticket id does not exist" }
+  - { id: ERR_WORK_ORDER_NOT_FOUND, http: 404, condition: "work order id does not exist" }
+  - { id: ERR_VENDOR_AUTHORIZATION_NOT_FOUND, http: 404, condition: "vendor authorization id does not exist" }
+  - { id: ERR_RELOCATION_CASE_NOT_FOUND, http: 404, condition: "relocation case id does not exist" }
+  - { id: ERR_INCIDENT_RECORD_NOT_FOUND, http: 404, condition: "incident record id does not exist" }
+  - { id: ERR_PAY_PERIOD_NOT_FOUND, http: 404, condition: "pay period id does not exist" }
+  - { id: ERR_PAY_STATEMENT_NOT_FOUND, http: 404, condition: "pay statement id does not exist" }
+  # --- State ---
+  - { id: ERR_CALL_TICKET_INVALID_STATE, http: 409, condition: "CallTicket not in a state permitting the requested transition" }
+  - { id: ERR_ROTATION_SHIFT_INVALID_STATE, http: 409, condition: "RotationShift not PUBLISHED/ACTIVE as required, or start/complete outside its window" }
+  - { id: ERR_WORK_ORDER_INVALID_STATE, http: 409, condition: "WorkOrder not in a state permitting the requested transition; also: relocation end blocked by non-terminal unit work orders" }
+  - { id: ERR_VENDOR_AUTHORIZATION_INVALID_STATE, http: 409, condition: "VendorAuthorization not in a state permitting the requested transition" }
+  - { id: ERR_RELOCATION_CASE_INVALID_STATE, http: 409, condition: "RelocationCase not in a state permitting the requested transition" }
+  - { id: ERR_INCIDENT_RECORD_INVALID_STATE, http: 409, condition: "IncidentRecord not in a state permitting the requested transition" }
+  - { id: ERR_PAY_PERIOD_INVALID_STATE, http: 409, condition: "PayPeriod not OPEN for close" }
+  - { id: ERR_STALE_CALL_TICKET_VERSION, http: 412, condition: "expected_call_ticket_version does not match the ticket's current version (OCC)" }
+  - { id: ERR_STALE_ROTATION_SHIFT_VERSION, http: 412, condition: "expected_rotation_shift_version does not match the shift's current version (OCC)" }
+  # --- Request shape ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, invalid enum value, malformed datetime, end <= start window, or non-positive amount" }
+  # --- Business: safety ---
+  - { id: ERR_FATIGUE_REST_REQUIRED, http: 409, condition: "Technician fatigue-blocked (fatigue_block_until > reference time) at dispatch / shift create / transfer / work-order assign" }
+  # --- Business: referential / cross-entity gates ---
+  - { id: ERR_TECHNICIAN_NOT_ON_SHIFT, http: 409, condition: "Dispatch target is INACTIVE or has no ACTIVE RotationShift covering now" }
+  - { id: ERR_VENDOR_SUSPENDED, http: 409, condition: "Vendor status == SUSPENDED at proposal or authorization" }
+  - { id: ERR_UNIT_NOT_UNINHABITABLE, http: 409, condition: "Relocation proposed for a ticket that was not mitigated with unit_uninhabitable=true" }
+  - { id: ERR_REFERENTIAL_MISMATCH, http: 422, condition: "RelocationCase.unit_id != ticket's unit_id, or VendorAuthorization.work_order_id does not belong to call_ticket_id" }
+  - { id: ERR_FOLLOWUP_PARENT_NOT_FINISHED, http: 409, condition: "parent_work_order_id references a WorkOrder not in {COMPLETED, VERIFIED}" }
+  - { id: ERR_INCIDENT_RECORD_EXISTS, http: 409, condition: "Second IncidentRecord created for the same CallTicket" }
+  - { id: ERR_INCIDENT_RECORD_NOT_SUBMITTED, http: 409, condition: "Ticket close while its IncidentRecord is missing or still DRAFT/RETURNED" }
+  - { id: ERR_RELOCATION_UNRESOLVED, http: 409, condition: "Ticket close with unit_declared_uninhabitable but no RelocationCase in {APPROVED, ACTIVE, ENDED}" }
+  - { id: ERR_INSURANCE_NOTIFICATION_REQUIRED, http: 409, condition: "Finalize without required carrier notification (damage >= 100000) or without notification/waiver (damage < 100000)" }
+  - { id: ERR_OPEN_SHIFTS_IN_PERIOD, http: 409, condition: "Pay-period close while a shift with start_at in the period is PUBLISHED or ACTIVE" }
+  - { id: ERR_PERIOD_NOT_ENDED, http: 409, condition: "Pay-period close before period_end <= now" }
+  # --- Business: temporal ---
+  - { id: ERR_SHIFT_OVERLAP, http: 409, condition: "Half-open [start_at, end_at) overlap with another PUBLISHED/ACTIVE shift of the same technician (adjacency end == start is allowed)" }
+  - { id: ERR_RELOCATION_OVERLAP, http: 409, condition: "Closed-interval [start_date, end_date] collision with an APPROVED/ACTIVE RelocationCase for the same unit (shared boundary date IS a conflict)" }
+  - { id: ERR_BEFORE_START_DATE, http: 409, condition: "Relocation activation before start_date" }
+  # --- Business: constraint ---
+  - { id: ERR_UNIT_NUMBER_EXISTS, http: 409, condition: "unit_number already registered" }
+  # --- Business: fiscal ---
+  - { id: ERR_VENDOR_LIMIT_EXCEEDED, http: 402, condition: "amount_cents > vendor.per_incident_limit_cents (equality allowed)" }
+  - { id: ERR_ROLE_AUTH_LIMIT_EXCEEDED, http: 402, condition: "amount_cents exceeds the acting role's cap (technician 50000 / supervisor 250000; equality allowed)" }
+  - { id: ERR_INCIDENT_VENDOR_CAP_EXCEEDED, http: 402, condition: "Sibling committed authorizations + amount_cents would exceed INCIDENT_VENDOR_CAP_CENTS (500000; equality allowed)" }
+  - { id: ERR_INVOICE_EXCEEDS_AUTHORIZATION, http: 409, condition: "invoice_total_cents > round_half_up(amount_cents * 1.10) (equality allowed)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PropertyAdmin
+    description: "Property operations administrator; manages technicians, units, vendors, shifts, pay periods; unlimited vendor authorization; runs clock/escalation ops"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/technicians"
+      - "POST /v1/technicians/{id}/deactivate"
+      - "POST /v1/units"
+      - "POST /v1/vendors and POST /v1/vendors/{id}/suspend"
+      - "POST /v1/pay-periods and POST /v1/pay-periods/{id}/close"
+      - "POST /v1/vendor-authorizations/{id}/mark-paid"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "shift create/transfer/cancel, relocation approve/reject, vendor authorization authorize/reject/void, work-order cancel, notify-insurance, evaluate-escalations, all reads"
+  - name: Dispatcher
+    description: "Call intake and triage operator; dispatches on-call technicians; closes mitigated tickets"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /v1/call-tickets/{id}/triage"
+    shared_operations:
+      - "POST /v1/call-tickets, dispatch, escalate, close, work-order create, all reads"
+  - name: OnCallTechnician
+    description: "Technician currently covering on-call shifts; arrives, mitigates, documents incidents, proposes vendor spend and relocations"
+    identity: "entity_backed:Technician"
+    exclusive_operations:
+      - "POST /v1/call-tickets/{id}/arrive and /mitigate (self, assigned)"
+      - "POST /v1/work-orders/{id}/begin (self, assigned)"
+      - "POST /v1/incident-records/{id}/submit and /revise (self, creator)"
+    shared_operations:
+      - "shift start/complete (self), incident-record create, vendor-authorization propose + authorize (self-auth <= 50000), relocation propose/resubmit, escalate, reads"
+  - name: MaintenanceSupervisor
+    description: "Supervising technician; handles escalations, approves relocations and vendor spend up to 250000, assigns/verifies work, reviews incident records"
+    identity: "entity_backed:Technician"
+    exclusive_operations:
+      - "POST /v1/work-orders/{id}/assign, /verify, /reopen"
+      - "POST /v1/incident-records/{id}/begin-review, /return, /finalize"
+      - "POST /v1/relocation-cases/{id}/activate and /end"
+    shared_operations:
+      - "dispatch, shift create/transfer/cancel, relocation approve/reject/propose/resubmit, vendor-authorization propose/authorize/reject/void, ticket close, notify-insurance, evaluate-escalations, reads"
+  - name: Vendor
+    description: "External trade vendor; submits invoices against its own authorizations; completes vendor-engaged work orders"
+    identity: "entity_backed:Vendor"
+    exclusive_operations:
+      - "POST /v1/vendor-authorizations/{id}/invoice (own vendor_id only)"
+    shared_operations:
+      - "POST /v1/work-orders/{id}/complete (when engaged via AUTHORIZED/INVOICED authorization), reads"

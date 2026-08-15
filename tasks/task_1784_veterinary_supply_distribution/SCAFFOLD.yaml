@@ -1,0 +1,1576 @@
+# =============================================================================
+# SCAFFOLD — Veterinary Supply Distribution (Covetrus-style distributor)
+# §1.0–§1.7 seed tables. Difficulty design (§1.8) and corner design (§1.9)
+# live in SCAFFOLD_DIFFICULTY_DESIGN.yaml / SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  Veterinary Supply Distribution (Covetrus style distributor): clinic account &
+  prescription-product controls, vaccine cold-chain & shipment temperature
+  record, manufacturer authorization & diversion prevention, practice bundle &
+  rebate accrual, backorder allocation on shortage, expiration dating &
+  short-date credit, equipment & consumable mix, delivery frequency & minimum
+
+domain_name: veterinary-supply-distribution
+api_prefix: /vet
+
+complexity_profile:
+  primary_archetype: quota_allocation        # finite lot stock competed for, reserved, released; backorder waterfall
+  secondary_archetype: compliance_audit      # Rx authorization, diversion prevention, cold-chain quarantine
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Clinic.version (PATCH + enrollment supersede)
+    - cascading_side_effects                 # cancel/expiry/quarantine chains spanning lot→line→backorder→order
+    - dual_variant_calculation               # provisional vs final rebate; claimed vs final short-date credit
+    - ops_run_checkpoint                     # POST /vet/_clock/set_current_utc sweeps expiries per epoch
+  entity_topology: flat                      # peer entities joined by FK references; a few sub-resource GETs
+  state_machine_shape: cyclic                # APPROVED⇄BACKORDERED, APPROVED⇄SUSPENDED, ACTIVE⇄SUSPENDED, IN_TRANSIT⇄QUARANTINED
+  relationship_patterns: [one_to_many, cross_aggregate]
+  role_model: peer_roles                     # each distributor role owns a resource family; ClinicBuyer owns its clinic
+  consistency_model: immediate               # all mutations + cascades atomic in the triggering request
+  difficulty_level: expert                   # 12 entities, 8 scenario-mandated feature areas
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Clinic
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_name, type: string, source: input, description: "Practice name" }
+      - { name: license_number, type: string, source: input, description: "State veterinary practice license number" }
+      - { name: dea_registration_number, type: string, source: input, required: false, default: null, description: "DEA registration; required to order is_controlled_substance products" }
+      - { name: ship_to_address, type: string, source: input, description: "Primary delivery address of the practice" }
+      - { name: status, type: enum, source: system, description: "PENDING_VERIFICATION | ACTIVE | SUSPENDED" }
+      - { name: credit_limit_cents, type: integer, source: input, description: "Maximum open order exposure", constraints: ">= 0" }
+      - { name: credit_used_cents, type: integer, source: computed, description: "Sum of total_cents over this clinic's orders in {APPROVED, BACKORDERED, SHIPPED}" }
+      - { name: minimum_order_value_cents, type: integer, source: input, description: "Merchandise net must be >= this at submit (boundary: equality passes)" }
+      - { name: delivery_frequency_per_week, type: integer, source: input, description: "Max orders with delivery_window_start in the same ISO week, counted over orders in {SUBMITTED, APPROVED, BACKORDERED}", constraints: ">= 1" }
+      - { name: free_freight_threshold_cents, type: integer, source: input, description: "Merchandise net >= threshold waives freight (boundary: equality waives)" }
+
+  - name: Product
+    parent: null
+    common_fields: true
+    fields:
+      - { name: sku, type: string, source: input, description: "Catalog SKU; unique across all products" }
+      - { name: product_name, type: string, source: input, description: "Display name" }
+      - { name: manufacturer_code, type: string, source: input, description: "Manufacturer identifier matched by ManufacturerAuthorization.manufacturer_code and BundleProgram.manufacturer_code (plain string, not an FK)" }
+      - { name: product_type, type: enum, source: input, description: "RX_PHARMACEUTICAL | VACCINE | EQUIPMENT | CONSUMABLE" }
+      - { name: is_controlled_substance, type: boolean, source: input, default: false, description: "Requires clinic DEA registration at order approval" }
+      - { name: requires_cold_chain, type: boolean, source: computed, description: "true iff product_type == VACCINE; input ignored" }
+      - { name: unit_price_cents, type: integer, source: input, description: "List price per unit", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "LISTED | DISCONTINUED" }
+
+  - name: ManufacturerAuthorization
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id; authorized practice" }
+      - { name: manufacturer_code, type: string, source: input, description: "Manufacturer scope of the authorization (plain string match on Product.manufacturer_code)" }
+      - { name: valid_from, type: string, source: input, description: "First valid date, ISO date, closed interval start" }
+      - { name: valid_until, type: string, source: input, description: "Last valid date, ISO date, closed interval end (must be >= valid_from)" }
+      - { name: approved_ship_to_address, type: string, source: input, description: "Only this address may receive the manufacturer's Rx product (diversion prevention)" }
+      - { name: quarterly_quantity_cap, type: integer, source: input, description: "Max RX_PHARMACEUTICAL units of this manufacturer the clinic may have approved per calendar quarter", constraints: "> 0" }
+      - { name: quantity_approved_this_quarter, type: integer, source: computed, description: "Sum of qty_requested over RX_PHARMACEUTICAL order lines of this manufacturer on orders approved in the current calendar quarter; decremented on cancel before dispatch" }
+      - { name: status, type: enum, source: system, description: "PENDING | APPROVED | SUSPENDED | REVOKED | EXPIRED" }
+
+  - name: InventoryLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; stocked product" }
+      - { name: lot_number, type: string, source: input, description: "Manufacturer lot number" }
+      - { name: expiry_date, type: string, source: input, description: "ISO date; must be strictly after the current clock date at receiving" }
+      - { name: qty_on_hand, type: integer, source: input, description: "Units physically received (at dispatch: decremented together with qty_allocated)", constraints: "> 0" }
+      - { name: qty_allocated, type: integer, source: computed, description: "Units reserved by ALLOCATED order lines" }
+      - { name: qty_available, type: integer, source: computed, description: "= qty_on_hand - qty_allocated (invariant: qty_on_hand == qty_allocated + qty_available)" }
+      - { name: status, type: enum, source: system, description: "AVAILABLE | DEPLETED (auto at qty_available == 0) | EXPIRED (clock sweep)" }
+
+  - name: Order
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id; buying practice" }
+      - { name: ship_to_address, type: string, source: input, description: "Delivery address; must equal approved_ship_to_address when Rx lines present" }
+      - { name: delivery_window_start, type: datetime, source: input, description: "Half-open delivery window start, ISO 8601" }
+      - { name: delivery_window_end, type: datetime, source: input, description: "Half-open delivery window end, ISO 8601 (must be > start)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SUBMITTED | APPROVED | BACKORDERED | SHIPPED | DELIVERED | REJECTED | CANCELLED" }
+      - { name: merchandise_subtotal_cents, type: integer, source: computed, description: "Sum of line_total_cents over all lines (gross, before bundle discount)" }
+      - { name: bundle_discount_cents, type: integer, source: computed, description: "Sum of per-line round_half_up(line_total_cents * bundle_discount_pct / 100) over qualifying lines; 0 when not bundle-qualified" }
+      - { name: merchandise_net_cents, type: integer, source: computed, description: "= merchandise_subtotal_cents - bundle_discount_cents; basis for minimum-order and free-freight checks" }
+      - { name: equipment_surcharge_cents, type: integer, source: computed, description: "= 1500 * total qty_requested over EQUIPMENT lines; never waived" }
+      - { name: freight_fee_cents, type: integer, source: computed, description: "0 when merchandise_net_cents >= clinic.free_freight_threshold_cents, else 2500" }
+      - { name: total_cents, type: integer, source: computed, description: "= merchandise_net_cents + equipment_surcharge_cents + freight_fee_cents" }
+      - { name: rejection_reason, type: string, source: input, required: false, default: null, description: "Recorded at reject" }
+
+  - name: OrderLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; parent order" }
+      - { name: product_id, type: string, source: input, description: "FK -> Product.id; ordered product" }
+      - { name: qty_requested, type: integer, source: input, description: "Units ordered", constraints: "> 0" }
+      - { name: qty_allocated, type: integer, source: computed, description: "0 or qty_requested (allocation is all-or-nothing per line)" }
+      - { name: lot_id, type: string, source: computed, description: "FK -> InventoryLot.id; the single lot covering this line (set at allocation, cleared on release); allocation requires one lot with qty_available >= qty_requested" }
+      - { name: unit_price_cents, type: integer, source: computed, description: "Snapshot of Product.unit_price_cents at submit" }
+      - { name: line_total_cents, type: integer, source: computed, description: "= unit_price_cents * qty_requested (exact integer, computed at submit)" }
+      - { name: status, type: enum, source: system, description: "PENDING | ALLOCATED | BACKORDERED | SHIPPED | DELIVERED | CANCELLED" }
+
+  - name: BackorderLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_line_id, type: string, source: input, description: "FK -> OrderLine.id; the shorted line" }
+      - { name: qty_open, type: integer, source: computed, description: "Units still owed; initialized to the line's full qty_requested" }
+      - { name: allocation_sequence, type: integer, source: system, description: "Monotonic integer minted at creation (1, 2, 3, ...); allocation order key (ASC); never derived from id" }
+      - { name: status, type: enum, source: system, description: "OPEN | FILLED | CANCELLED" }
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: order_id, type: string, source: input, description: "FK -> Order.id; the order being shipped (must be APPROVED)" }
+      - { name: carrier_name, type: string, source: input, description: "Carrier identifier" }
+      - { name: carrier_cold_chain_certified, type: boolean, source: input, default: false, description: "Carrier certification; required true when any shipped line requires_cold_chain" }
+      - { name: requires_cold_chain, type: boolean, source: computed, description: "true iff any line of the order has product.requires_cold_chain == true" }
+      - { name: temperature_log, type: array, source: system, description: "Append-only embedded readings [{recorded_at, temperature_celsius}]; only accepted while IN_TRANSIT and requires_cold_chain" }
+      - { name: has_unresolved_excursion, type: boolean, source: computed, description: "true once any reading falls outside [2.0, 8.0] Celsius inclusive; cleared only by resolve-quarantine RELEASED" }
+      - { name: status, type: enum, source: system, description: "PREPARING | IN_TRANSIT | QUARANTINED | DELIVERED | DESTROYED" }
+
+  - name: BundleProgram
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_name, type: string, source: input, description: "Program label" }
+      - { name: manufacturer_code, type: string, source: input, description: "Manufacturer scope; only lines whose product.manufacturer_code matches qualify" }
+      - { name: qualifying_product_types, type: array, source: input, description: "Subset of {RX_PHARMACEUTICAL, VACCINE, EQUIPMENT, CONSUMABLE}; qualifying line types" }
+      - { name: min_distinct_categories, type: integer, source: input, description: "Order must span at least this many distinct qualifying product_types to earn the bundle discount", constraints: ">= 1" }
+      - { name: bundle_discount_pct, type: integer, source: input, description: "Percent discount on qualifying lines when the order is bundle-qualified", constraints: "0..100" }
+      - { name: rebate_base_rate_bp, type: integer, source: input, description: "Basis points accrual rate below the bonus threshold" }
+      - { name: rebate_bonus_rate_bp, type: integer, source: input, description: "Basis points accrual rate at/above bonus_threshold_cents", constraints: ">= rebate_base_rate_bp" }
+      - { name: bonus_threshold_cents, type: integer, source: input, description: "QTD qualifying merchandise at/above which the bonus rate applies (boundary: equality earns bonus)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | ACTIVE | CLOSED" }
+
+  - name: BundleEnrollment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: input, description: "FK -> Clinic.id (path); enrolled practice" }
+      - { name: program_id, type: string, source: input, description: "FK -> BundleProgram.id; enrolled program" }
+      - { name: quarter, type: string, source: input, description: "Calendar quarter label, e.g. 2026-Q3" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUPERSEDED | FINALIZED" }
+      - { name: qtd_qualifying_cents, type: integer, source: computed, description: "Sum of net qualifying line amounts (line_total_cents - per-line discount) over this clinic's orders in {APPROVED, BACKORDERED, SHIPPED, DELIVERED} tagged to this enrollment" }
+
+  - name: RebateAccrual
+    parent: null
+    common_fields: true
+    fields:
+      - { name: enrollment_id, type: string, source: system, description: "FK -> BundleEnrollment.id; owning enrollment" }
+      - { name: order_id, type: string, source: system, description: "FK -> Order.id; source order" }
+      - { name: provisional_amount_cents, type: integer, source: computed, description: "Sum of per-line round_half_up(net_line_cents * rate_bp / 10000) at order approval, rate from QTD-before-order tier" }
+      - { name: final_amount_cents, type: integer, source: computed, default: null, description: "Recomputed at program close: per-line round_half_up(net_line_cents * final_rate_bp / 10000), final rate from quarter-final QTD tier, DELIVERED orders only; null until finalization" }
+      - { name: status, type: enum, source: system, description: "PROVISIONAL | FINALIZED | REVERSED" }
+
+  - name: ShortDateCredit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: clinic_id, type: string, source: system, description: "FK -> Clinic.id; derived from the order line's order" }
+      - { name: order_line_id, type: string, source: input, description: "FK -> OrderLine.id; must be a DELIVERED line" }
+      - { name: lot_id, type: string, source: input, description: "FK -> InventoryLot.id; must equal the line's lot_id" }
+      - { name: qty, type: integer, source: input, description: "Units credited", constraints: "1..order line qty_requested" }
+      - { name: days_to_expiry_at_request, type: integer, source: computed, description: "lot.expiry_date minus current clock date, in whole days" }
+      - { name: claimed_credit_cents, type: integer, source: computed, description: "per-unit round_half_up(unit_price_cents * rate) * qty; rate tier by days_to_expiry_at_request" }
+      - { name: final_credit_cents, type: integer, source: computed, default: null, description: "per-unit round_half_up(unit_price_cents * rate_at_receipt) * received_qty; null until finalize" }
+      - { name: received_qty, type: integer, source: input, description: "Units physically returned, supplied at finalize" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | APPROVED | CREDITED | DENIED | EXPIRED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Clinic
+    initial_state: PENDING_VERIFICATION
+    terminal_states: []
+    transitions:
+      - from: PENDING_VERIFICATION
+        to: ACTIVE
+        trigger: POST /vet/clinics/{id}/activate
+        actor: AccountManager
+        preconditions:
+          - "Clinic in PENDING_VERIFICATION (else ERR_CLINIC_INVALID_STATE)"
+        side_effects: ["increments Clinic.version by 1"]
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: POST /vet/clinics/{id}/suspend
+        actor: AccountManager
+        preconditions:
+          - "Clinic in ACTIVE (else ERR_CLINIC_INVALID_STATE)"
+        side_effects:
+          - "increments Clinic.version by 1"
+          - "Orders in DRAFT remain DRAFT; no order cascade (submit is blocked while SUSPENDED)"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: POST /vet/clinics/{id}/reinstate
+        actor: AccountManager
+        preconditions:
+          - "Clinic in SUSPENDED (else ERR_CLINIC_INVALID_STATE)"
+        side_effects: ["increments Clinic.version by 1"]
+
+  - entity: Product
+    initial_state: LISTED
+    terminal_states: [DISCONTINUED]
+    transitions:
+      - from: LISTED
+        to: DISCONTINUED
+        trigger: POST /vet/products/{id}/discontinue
+        actor: SupplyChainPlanner
+        preconditions:
+          - "Product in LISTED (else ERR_PRODUCT_INVALID_STATE)"
+        side_effects:
+          - "increments Product.version by 1"
+          - "New orders containing this product are rejected at submit (ERR_PRODUCT_DISCONTINUED); existing orders unaffected"
+
+  - entity: ManufacturerAuthorization
+    initial_state: PENDING
+    terminal_states: [REVOKED, EXPIRED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: POST /vet/manufacturer-authorizations/{id}/approve
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in PENDING (else ERR_AUTHORIZATION_INVALID_STATE)"
+          - "Referenced Clinic in ACTIVE (else ERR_CLINIC_NOT_ACTIVE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: APPROVED
+        to: SUSPENDED
+        trigger: POST /vet/manufacturer-authorizations/{id}/suspend
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in APPROVED (else ERR_AUTHORIZATION_INVALID_STATE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: SUSPENDED
+        to: APPROVED
+        trigger: POST /vet/manufacturer-authorizations/{id}/reinstate
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in SUSPENDED (else ERR_AUTHORIZATION_INVALID_STATE)"
+          - "valid_until >= current clock date (else ERR_AUTHORIZATION_INVALID_STATE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: PENDING
+        to: REVOKED
+        trigger: POST /vet/manufacturer-authorizations/{id}/revoke
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in {PENDING, APPROVED, SUSPENDED} (else ERR_AUTHORIZATION_INVALID_STATE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: APPROVED
+        to: REVOKED
+        trigger: POST /vet/manufacturer-authorizations/{id}/revoke
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in {PENDING, APPROVED, SUSPENDED} (else ERR_AUTHORIZATION_INVALID_STATE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: SUSPENDED
+        to: REVOKED
+        trigger: POST /vet/manufacturer-authorizations/{id}/revoke
+        actor: ComplianceOfficer
+        preconditions:
+          - "Authorization in {PENDING, APPROVED, SUSPENDED} (else ERR_AUTHORIZATION_INVALID_STATE)"
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "system (clock sweep on POST /vet/_clock/set_current_utc when valid_until < new current date)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments ManufacturerAuthorization.version by 1"]
+
+  - entity: InventoryLot
+    initial_state: AVAILABLE
+    terminal_states: [EXPIRED]
+    transitions:
+      - from: AVAILABLE
+        to: DEPLETED
+        trigger: "system (automatic when qty_available reaches 0 after allocation or dispatch)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments InventoryLot.version by 1"]
+      - from: DEPLETED
+        to: AVAILABLE
+        trigger: "system (automatic when qty_available rises above 0 after a release)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments InventoryLot.version by 1"]
+      - from: AVAILABLE
+        to: EXPIRED
+        trigger: "system (clock sweep when expiry_date < new current date)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "increments InventoryLot.version by 1"
+          - "Release cascade: every OrderLine with lot_id == this lot and status ALLOCATED reverts to BACKORDERED with qty_allocated 0, lot_id null; a new BackorderLine (qty_open = qty_requested, fresh allocation_sequence) is minted per reverted line; each such order with >= 1 BACKORDERED line transitions APPROVED -> BACKORDERED; qty_allocated := 0 on this lot"
+      - from: DEPLETED
+        to: EXPIRED
+        trigger: "system (clock sweep when expiry_date < new current date)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Same release cascade as AVAILABLE -> EXPIRED (DEPLETED lots may still hold allocations)"
+
+  - entity: Order
+    initial_state: DRAFT
+    terminal_states: [REJECTED, CANCELLED, DELIVERED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: POST /vet/orders/{id}/submit
+        actor: ClinicBuyer
+        preconditions:
+          - "Order in DRAFT (else ERR_ORDER_INVALID_STATE)"
+          - "Clinic in ACTIVE (else ERR_CLINIC_NOT_ACTIVE)"
+          - "Order has >= 1 line (else ERR_INVALID_REQUEST)"
+          - "Every line's product in LISTED (else ERR_PRODUCT_DISCONTINUED)"
+          - "Delivery-window overlap check on the clinic calendar (else ERR_DELIVERY_WINDOW_OVERLAP)"
+          - "Delivery-frequency cap check (else ERR_DELIVERY_FREQUENCY_EXCEEDED)"
+          - "merchandise_net_cents >= clinic.minimum_order_value_cents (else ERR_ORDER_BELOW_MINIMUM)"
+        side_effects:
+          - "Snapshot unit_price_cents and compute line_total_cents per line"
+          - "Compute merchandise_subtotal_cents, bundle_discount_cents, merchandise_net_cents, equipment_surcharge_cents, freight_fee_cents, total_cents (order_totals calculation)"
+          - "Reserve the delivery window on the clinic calendar"
+          - "increments Order.version by 1"
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: POST /vet/orders/{id}/approve
+        actor: AccountManager
+        preconditions:
+          - "Order in SUBMITTED (else ERR_ORDER_INVALID_STATE)"
+          - "Clinic in ACTIVE (else ERR_CLINIC_NOT_ACTIVE)"
+          - "Rx/controlled/diversion checks pass (ERR_RX_AUTHORIZATION_REQUIRED, ERR_DEA_REGISTRATION_REQUIRED, ERR_SHIP_TO_DIVERSION_MISMATCH)"
+          - "Quarterly cap check (ERR_QUARTERLY_CAP_EXCEEDED)"
+          - "clinic.credit_used_cents + total_cents <= clinic.credit_limit_cents (else ERR_CREDIT_LIMIT_EXCEEDED)"
+        side_effects:
+          - "fefo_allocation runs per line: single lot, all-or-nothing, expiry_date ASC then lot created_at ASC"
+          - "Fully covered lines -> ALLOCATED with lot_id set; lot.qty_allocated += qty_requested"
+          - "Uncovered lines -> BACKORDERED; BackorderLine minted (qty_open = qty_requested)"
+          - "This transition fires when every line is ALLOCATED"
+          - "ManufacturerAuthorization.quantity_approved_this_quarter += Rx units on this order"
+          - "If an ACTIVE BundleEnrollment exists for (clinic, current quarter label of the clock) whose program is ACTIVE and the order has >= 1 qualifying line: mint RebateAccrual PROVISIONAL with provisional rebate_accrual calculation; enrollment.qtd_qualifying_cents updated"
+          - "clinic.credit_used_cents recomputed"
+          - "increments Order.version by 1"
+      - from: SUBMITTED
+        to: BACKORDERED
+        trigger: POST /vet/orders/{id}/approve
+        actor: AccountManager
+        preconditions:
+          - "Same preconditions as SUBMITTED -> APPROVED"
+        side_effects:
+          - "Same allocation and accrual side effects; this transition fires when >= 1 line is BACKORDERED"
+      - from: BACKORDERED
+        to: APPROVED
+        trigger: "system (automatic when the order's last OPEN backorder is FILLED or CANCELLED and every remaining line is ALLOCATED)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments Order.version by 1"]
+      - from: APPROVED
+        to: BACKORDERED
+        trigger: "system (automatic when a lot expiry sweep or shipment DESTROYED resolution reverts one of its lines to BACKORDERED)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments Order.version by 1"]
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: POST /vet/orders/{id}/reject
+        actor: AccountManager
+        preconditions:
+          - "Order in SUBMITTED (else ERR_ORDER_INVALID_STATE)"
+        side_effects:
+          - "rejection_reason recorded"
+          - "Delivery window released from the clinic calendar"
+          - "increments Order.version by 1"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: POST /vet/orders/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions:
+          - "Order in {DRAFT, SUBMITTED, APPROVED, BACKORDERED} (else ERR_ORDER_INVALID_STATE)"
+        side_effects: ["Window released if reserved; increments Order.version by 1"]
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: POST /vet/orders/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions:
+          - "Order in {DRAFT, SUBMITTED, APPROVED, BACKORDERED} (else ERR_ORDER_INVALID_STATE)"
+        side_effects:
+          - "Delivery window released"
+          - "increments Order.version by 1"
+      - from: APPROVED
+        to: CANCELLED
+        trigger: POST /vet/orders/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions:
+          - "Order in {DRAFT, SUBMITTED, APPROVED, BACKORDERED} (else ERR_ORDER_INVALID_STATE)"
+        side_effects:
+          - "Release cascade (depth 3): (1) each ALLOCATED line -> CANCELLED, its lot.qty_allocated -= qty_requested (lot DEPLETED -> AVAILABLE if qty_available > 0); (2) the freed availability triggers backorder_allocation for the product, filling OPEN BackorderLines by allocation_sequence ASC (each fill: lot.qty_allocated += qty_open, line BACKORDERED -> ALLOCATED with lot_id set, BackorderLine -> FILLED); (3) each order whose last OPEN backorder filled transitions BACKORDERED -> APPROVED"
+          - "OPEN BackorderLines of this order -> CANCELLED"
+          - "PROVISIONAL RebateAccruals of this order -> REVERSED; enrollment.qtd_qualifying_cents decremented"
+          - "ManufacturerAuthorization.quantity_approved_this_quarter decremented for this order's Rx units"
+          - "clinic.credit_used_cents recomputed"
+          - "increments Order.version by 1"
+      - from: BACKORDERED
+        to: CANCELLED
+        trigger: POST /vet/orders/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions:
+          - "Order in {DRAFT, SUBMITTED, APPROVED, BACKORDERED} (else ERR_ORDER_INVALID_STATE)"
+        side_effects: ["Same release cascade as APPROVED -> CANCELLED (partially allocated lines release too)"]
+      - from: APPROVED
+        to: SHIPPED
+        trigger: "system (automatic when a Shipment for this order dispatches)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments Order.version by 1"]
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "system (automatic when the Shipment is delivered)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "All lines -> DELIVERED"
+          - "clinic.credit_used_cents recomputed (order leaves the counted set)"
+          - "increments Order.version by 1"
+
+  - entity: OrderLine
+    initial_state: PENDING
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: ALLOCATED
+        trigger: "system (fefo_allocation at order approval or backorder_allocation fill)"
+        actor: system
+        preconditions: ["Single lot with qty_available >= qty_requested and expiry_date >= order.delivery_window_end date + 30 days exists"]
+        side_effects: ["qty_allocated := qty_requested; lot_id set; lot.qty_allocated += qty_requested"]
+      - from: PENDING
+        to: BACKORDERED
+        trigger: "system (fefo_allocation at order approval finds no covering lot)"
+        actor: system
+        preconditions: []
+        side_effects: ["BackorderLine minted (qty_open = qty_requested)"]
+      - from: BACKORDERED
+        to: ALLOCATED
+        trigger: "system (backorder_allocation fills its OPEN BackorderLine)"
+        actor: system
+        preconditions: []
+        side_effects: ["BackorderLine -> FILLED (qty_open := 0); qty_allocated := qty_requested; lot_id set; lot.qty_allocated += qty_requested"]
+      - from: ALLOCATED
+        to: BACKORDERED
+        trigger: "system (lot expiry sweep release, or shipment DESTROYED resolution)"
+        actor: system
+        preconditions: []
+        side_effects: ["qty_allocated := 0; lot_id := null; new BackorderLine minted (qty_open = qty_requested, fresh allocation_sequence); parent order APPROVED -> BACKORDERED"]
+      - from: BACKORDERED
+        to: CANCELLED
+        trigger: POST /vet/backorder-lines/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions: ["BackorderLine in OPEN (else ERR_BACKORDER_LINE_INVALID_STATE)"]
+        side_effects:
+          - "BackorderLine -> CANCELLED"
+          - "Parent order recompute: if no line remains BACKORDERED and >= 1 line ALLOCATED -> APPROVED; if all lines CANCELLED -> CANCELLED (window released, credit recomputed)"
+      - from: ALLOCATED
+        to: SHIPPED
+        trigger: "system (shipment dispatch)"
+        actor: system
+        preconditions: []
+        side_effects: ["lot.qty_on_hand -= qty_requested; lot.qty_allocated -= qty_requested (conservation preserved)"]
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "system (shipment deliver)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ALLOCATED
+        to: CANCELLED
+        trigger: "system (parent order cancel)"
+        actor: system
+        preconditions: []
+        side_effects: ["lot.qty_allocated -= qty_requested (release)"]
+      - from: PENDING
+        to: CANCELLED
+        trigger: "system (parent order cancel from DRAFT or SUBMITTED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: BackorderLine
+    initial_state: OPEN
+    terminal_states: [FILLED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: FILLED
+        trigger: "system (backorder_allocation: a lot of the product has qty_available >= qty_open)"
+        actor: system
+        preconditions: []
+        side_effects: ["qty_open := 0; parent OrderLine BACKORDERED -> ALLOCATED"]
+      - from: OPEN
+        to: CANCELLED
+        trigger: POST /vet/backorder-lines/{id}/cancel
+        actor: ClinicBuyer | AccountManager
+        preconditions: ["BackorderLine in OPEN (else ERR_BACKORDER_LINE_INVALID_STATE)"]
+        side_effects: ["Parent order recompute per OrderLine BACKORDERED -> CANCELLED"]
+
+  - entity: Shipment
+    initial_state: PREPARING
+    terminal_states: [DELIVERED, DESTROYED]
+    transitions:
+      - from: PREPARING
+        to: IN_TRANSIT
+        trigger: POST /vet/shipments/{id}/dispatch
+        actor: SupplyChainPlanner
+        preconditions: ["Shipment in PREPARING (else ERR_SHIPMENT_INVALID_STATE)"]
+        side_effects:
+          - "Every ALLOCATED line of the order -> SHIPPED; lot.qty_on_hand and lot.qty_allocated decremented per line"
+          - "Order APPROVED -> SHIPPED"
+          - "increments Shipment.version by 1"
+      - from: IN_TRANSIT
+        to: QUARANTINED
+        trigger: "system (automatic on a temperature reading outside [2.0, 8.0] Celsius inclusive)"
+        actor: system
+        preconditions: []
+        side_effects: ["has_unresolved_excursion := true; increments Shipment.version by 1"]
+      - from: QUARANTINED
+        to: IN_TRANSIT
+        trigger: POST /vet/shipments/{id}/resolve-quarantine with outcome RELEASED
+        actor: ComplianceOfficer
+        preconditions: ["Shipment in QUARANTINED (else ERR_SHIPMENT_INVALID_STATE)"]
+        side_effects: ["has_unresolved_excursion := false; increments Shipment.version by 1"]
+      - from: QUARANTINED
+        to: DESTROYED
+        trigger: POST /vet/shipments/{id}/resolve-quarantine with outcome DESTROYED
+        actor: ComplianceOfficer
+        preconditions: ["Shipment in QUARANTINED (else ERR_SHIPMENT_INVALID_STATE)"]
+        side_effects:
+          - "Cascade (depth 2): each SHIPPED line of the order -> BACKORDERED (goods not returned to stock; qty_on_hand NOT restored), new BackorderLine minted per line; order SHIPPED -> BACKORDERED"
+          - "clinic.credit_used_cents recomputed (order re-enters the counted set as BACKORDERED)"
+          - "increments Shipment.version by 1"
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: POST /vet/shipments/{id}/deliver
+        actor: SupplyChainPlanner
+        preconditions: ["Shipment in IN_TRANSIT (else ERR_SHIPMENT_INVALID_STATE)"]
+        side_effects:
+          - "All lines SHIPPED -> DELIVERED; Order SHIPPED -> DELIVERED"
+          - "increments Shipment.version by 1"
+
+  - entity: BundleProgram
+    initial_state: DRAFT
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: POST /vet/bundle-programs/{id}/activate
+        actor: AccountManager
+        preconditions: ["Program in DRAFT (else ERR_PROGRAM_INVALID_STATE)"]
+        side_effects: ["increments BundleProgram.version by 1"]
+      - from: ACTIVE
+        to: CLOSED
+        trigger: POST /vet/bundle-programs/{id}/close
+        actor: AccountManager
+        preconditions: ["Program in ACTIVE (else ERR_PROGRAM_INVALID_STATE)"]
+        side_effects:
+          - "rebate_accrual final variant: for every enrollment of this program, final QTD tier is computed over DELIVERED orders only; each PROVISIONAL accrual whose order is DELIVERED -> FINALIZED with final_amount_cents; accruals whose order is not DELIVERED -> REVERSED"
+          - "Every ACTIVE enrollment of this program -> FINALIZED"
+          - "increments BundleProgram.version by 1"
+
+  - entity: BundleEnrollment
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED, FINALIZED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "system (a new BundleEnrollment is created for the same clinic_id + quarter)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Its PROVISIONAL RebateAccruals -> REVERSED"
+          - "increments BundleEnrollment.version by 1"
+      - from: ACTIVE
+        to: FINALIZED
+        trigger: "system (program close)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments BundleEnrollment.version by 1"]
+
+  - entity: RebateAccrual
+    initial_state: PROVISIONAL
+    terminal_states: [FINALIZED, REVERSED]
+    transitions:
+      - from: PROVISIONAL
+        to: FINALIZED
+        trigger: "system (program close; order DELIVERED)"
+        actor: system
+        preconditions: []
+        side_effects: ["final_amount_cents computed (final variant); increments RebateAccrual.version by 1"]
+      - from: PROVISIONAL
+        to: REVERSED
+        trigger: "system (order cancel, enrollment supersede, or program close with order not DELIVERED)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments RebateAccrual.version by 1"]
+
+  - entity: ShortDateCredit
+    initial_state: REQUESTED
+    terminal_states: [CREDITED, DENIED, EXPIRED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: POST /vet/short-date-credits/{id}/approve
+        actor: ComplianceOfficer
+        preconditions: ["Credit in REQUESTED (else ERR_CREDIT_INVALID_STATE)"]
+        side_effects: ["increments ShortDateCredit.version by 1"]
+      - from: REQUESTED
+        to: DENIED
+        trigger: POST /vet/short-date-credits/{id}/deny
+        actor: ComplianceOfficer
+        preconditions: ["Credit in REQUESTED (else ERR_CREDIT_INVALID_STATE)"]
+        side_effects: ["increments ShortDateCredit.version by 1"]
+      - from: APPROVED
+        to: CREDITED
+        trigger: POST /vet/short-date-credits/{id}/finalize
+        actor: ComplianceOfficer
+        preconditions:
+          - "Credit in APPROVED (else ERR_CREDIT_INVALID_STATE)"
+          - "1 <= received_qty <= qty (else ERR_RECEIVED_QTY_EXCEEDS_CLAIMED)"
+        side_effects: ["final_credit_cents computed (final variant, receipt-basis tier); increments ShortDateCredit.version by 1"]
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "system (clock sweep: current date > approval date + 30 days and not yet finalized)"
+        actor: system
+        preconditions: []
+        side_effects: ["increments ShortDateCredit.version by 1"]
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: clinic-update-stale-version
+    parent_entity: Clinic
+    write_endpoint: PATCH /vet/clinics/{id}
+    occ_field: expected_clinic_version
+    description: |
+      Updating a Clinic whose version has advanced since the client last
+      observed it is rejected. The client's profile edits are based on a stale
+      snapshot (e.g., another writer has just changed credit_limit_cents), so
+      the update must be re-based on the current version before it can apply.
+    error_id: ERR_STALE_CLINIC_VERSION
+    http_status: 412
+  - rule_id: enrollment-create-stale-clinic
+    parent_entity: Clinic
+    write_endpoint: POST /vet/clinics/{clinicId}/bundle-enrollments
+    occ_field: expected_clinic_version
+    description: |
+      Creating a BundleEnrollment against a Clinic whose version has advanced
+      since the client last observed it is rejected. A new enrollment
+      legitimately supersedes the prior ACTIVE enrollment for the same
+      clinic+quarter, so a writer acting on a stale clinic snapshot would
+      silently supersede an enrollment it never saw.
+    error_id: ERR_STALE_CLINIC_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: order_totals
+    trigger: "POST /vet/orders/{id}/submit (price snapshot); the computed totals persist until cancel/reject"
+    algorithm: constraint_propagation
+    formula: |
+      Evaluation order is PINNED (circular-looking chain — discount affects net,
+      net affects freight, freight affects total):
+        1. line_total_cents := unit_price_cents * qty_requested per line (exact integer)
+        2. merchandise_subtotal_cents := SUM(line_total_cents)
+        3. Bundle qualification: an ACTIVE BundleEnrollment exists for
+           (order.clinic_id, quarter label of the current clock date) whose
+           BundleProgram is ACTIVE, AND the order's qualifying lines (product
+           .manufacturer_code == program.manufacturer_code AND product_type in
+           program.qualifying_product_types) span >= program.min_distinct_categories
+           distinct product_type values
+        4. bundle_discount_cents := SUM over qualifying lines of
+           round_half_up(line_total_cents * program.bundle_discount_pct / 100);
+           0 when not qualified
+        5. merchandise_net_cents := merchandise_subtotal_cents - bundle_discount_cents
+        6. equipment_surcharge_cents := 1500 * SUM(qty_requested over EQUIPMENT lines)
+        7. freight_fee_cents := 0 if merchandise_net_cents >= clinic.free_freight_threshold_cents
+           else 2500   (boundary: equality waives freight)
+        8. total_cents := merchandise_net_cents + equipment_surcharge_cents + freight_fee_cents
+      Freight is computed on the NET (step 7 reads step 5), never on the gross
+      subtotal; the discount is computed on the gross qualifying lines (step 4
+      reads step 1), never on the net.
+    input_set: "All lines of the order; clinic row; ACTIVE enrollment + program rows if present"
+    constants:
+      FREIGHT_FLAT_CENTS: 2500
+      EQUIPMENT_SURCHARGE_CENTS_PER_UNIT: 1500
+    precision: "integer cents; per-line discount round_half_up before summation"
+
+  - name: rebate_accrual
+    trigger: "Provisional: order approval when an ACTIVE enrollment (clinic, current quarter) with ACTIVE program exists and >= 1 qualifying line. Final: POST /vet/bundle-programs/{id}/close."
+    algorithm: tiered_pricing
+    formula: |
+      qualifying net line amount := line_total_cents - round_half_up(line_total_cents * bundle_discount_pct / 100)
+        for lines matching program.manufacturer_code and program.qualifying_product_types.
+      PROVISIONAL variant (per order, at approval):
+        rate_bp := rebate_bonus_rate_bp if enrollment.qtd_qualifying_cents (BEFORE this
+                   order) >= bonus_threshold_cents else rebate_base_rate_bp
+        provisional_amount_cents := SUM over qualifying lines of
+          round_half_up(net_line_cents * rate_bp / 10000)     (round per line, then sum)
+        enrollment.qtd_qualifying_cents += SUM(net qualifying line amounts of this order)
+      FINAL variant (per accrual, at program close):
+        final_qtd := SUM of net qualifying line amounts over the enrollment's orders
+                     in DELIVERED status only
+        final_rate_bp := rebate_bonus_rate_bp if final_qtd >= bonus_threshold_cents
+                         else rebate_base_rate_bp
+        final_amount_cents := SUM over qualifying lines of the DELIVERED order of
+          round_half_up(net_line_cents * final_rate_bp / 10000)
+      Tier is NON-CUMULATIVE per order at approval (rate locked by QTD-before) but
+      RETROACTIVE at close (single final rate over the whole quarter) — identical
+      order data yields different amounts whenever the quarter crosses the bonus
+      threshold or an order is cancelled/undelivered.
+    input_set: "Provisional: this order's qualifying lines + enrollment.qtd_qualifying_cents. Final: enrollment's DELIVERED orders' qualifying lines."
+    constants: {}
+    precision: "integer cents; per-line round_half_up, then sum (pinned order)"
+    variants:
+      - name: provisional
+        when: "order approval"
+        difference: "rate locked by QTD-before-this-order tier; includes this order's requested amounts regardless of later delivery"
+      - name: final
+        when: "program close"
+        difference: "single retroactive rate by quarter-final QTD over DELIVERED orders only; cancelled/undelivered orders excluded (their accruals REVERSED)"
+
+  - name: short_date_credit_value
+    trigger: "Claimed: POST /vet/short-date-credits. Final: POST /vet/short-date-credits/{id}/finalize."
+    algorithm: tiered_pricing
+    formula: |
+      rate(days): days <= 30 -> 1.00 | 31..90 -> 0.50 | 91..180 -> 0.25 | > 180 -> ineligible
+      CLAIMED variant (at request):
+        d_req := lot.expiry_date - current_clock_date (whole days)
+        reject with ERR_NOT_SHORT_DATED when d_req > 180   (boundary: d_req == 180 eligible)
+        claimed_credit_cents := round_half_up(order_line.unit_price_cents * rate(d_req)) * qty
+      FINAL variant (at finalize):
+        d_rec := lot.expiry_date - current_clock_date (whole days, re-evaluated)
+        final_credit_cents := round_half_up(order_line.unit_price_cents * rate(d_rec)) * received_qty
+      Rounding order is PINNED: round the per-unit credit to whole cents FIRST
+      (round_half_up), then multiply by quantity. Sum-then-round is the
+      forbidden alternative (e.g. unit 999c at 50% with qty 3: 500*3 = 1500
+      vs round(1498.5) = 1499).
+      The two variants diverge whenever the receipt-date tier differs from the
+      request-date tier or received_qty < qty.
+    input_set: "The credited order line (unit price snapshot), the lot (expiry_date), the logical clock"
+    constants:
+      SHORT_DATE_WINDOW_DAYS: 180
+      TIER_FULL_CREDIT_DAYS: 30
+      TIER_HALF_CREDIT_DAYS: 90
+    precision: "integer cents; per-unit round_half_up, then multiply by quantity (pinned order)"
+    variants:
+      - name: claimed
+        when: "credit request"
+        difference: "tier from days_to_expiry_at_request; quantity = claimed qty"
+      - name: final
+        when: "finalize (return received)"
+        difference: "tier re-evaluated at the receipt clock date; quantity = received_qty"
+
+  - name: fefo_allocation
+    trigger: "POST /vet/orders/{id}/approve (per line, in order of OrderLine.created_at ASC)"
+    algorithm: chronological
+    formula: |
+      For each order line (PENDING), candidate lots:
+        eligibility: lot.product_id == line.product_id AND lot.status == AVAILABLE
+                     AND lot.qty_available >= line.qty_requested   (all-or-nothing, single lot)
+                     AND lot.expiry_date >= date(order.delivery_window_end) + 30 days
+        ranking:     expiry_date ASC; tie-break lot.created_at ASC (never id)
+        fallback:    no candidate -> line BACKORDERED, mint BackorderLine(qty_open = qty_requested)
+      On success: lot.qty_allocated += qty_requested; line ALLOCATED with lot_id.
+      A lot reaching qty_available == 0 auto-transitions AVAILABLE -> DEPLETED.
+    input_set: "InventoryLot rows of the line's product in {AVAILABLE}"
+    constants:
+      MIN_SHELF_LIFE_ON_DELIVERY_DAYS: 30
+    precision: "integer units"
+
+  - name: backorder_allocation
+    trigger: "POST /vet/inventory-lots (new stock) and any allocation release (order cancel, backorder-cancel with allocated siblings, expiry sweep)"
+    algorithm: waterfall_allocation
+    formula: |
+      For the affected product, candidate BackorderLines:
+        eligibility: status == OPEN AND order_line.product_id == affected product
+        ranking:     allocation_sequence ASC (strict, no ties possible — monotonic)
+        fallback:    none (leftover stock simply stays qty_available > 0)
+      Sweep in ranking order; fill a backorder ONLY when a single lot can cover
+      qty_open in full (same all-or-nothing single-lot rule, FEFO among lots by
+      expiry_date ASC then created_at ASC). A backorder that cannot be fully
+      covered is SKIPPED and the sweep continues to the next backorder line.
+      Each fill: BackorderLine -> FILLED, OrderLine -> ALLOCATED, lot debited;
+      then the parent order recomputes (BACKORDERED -> APPROVED when its last
+      OPEN backorder resolved and >= 1 line ALLOCATED).
+    input_set: "BackorderLine rows in {OPEN} joined to their OrderLine/Order"
+    constants: {}
+    precision: "integer units"
+
+  - name: credit_used
+    trigger: "recomputed on every order status change for the clinic"
+    algorithm: aggregation
+    formula: |
+      clinic.credit_used_cents := SUM(total_cents) over the clinic's orders with
+      status in {APPROVED, BACKORDERED, SHIPPED}.
+      DRAFT/SUBMITTED not yet committed; DELIVERED released (invoicing is out of
+      scope); REJECTED/CANCELLED excluded.
+    input_set: "Order rows of the clinic filtered by status"
+    constants: {}
+    precision: "integer cents"
+
+  - name: temperature_excursion_check
+    trigger: "POST /vet/shipments/{id}/temperature-readings"
+    algorithm: threshold
+    formula: |
+      Valid range INCLUSIVE: 2.0 <= temperature_celsius <= 8.0.
+      A reading exactly 2.0 or exactly 8.0 is IN RANGE; anything strictly
+      outside marks an excursion: has_unresolved_excursion := true and the
+      shipment auto-transitions IN_TRANSIT -> QUARANTINED.
+    input_set: "The posted reading"
+    constants:
+      TEMP_MIN_C: 2.0
+      TEMP_MAX_C: 8.0
+    precision: "tenths of a degree (inputs compared exactly)"
+
+  - name: quarterly_cap_check
+    trigger: "POST /vet/orders/{id}/approve when the order carries RX_PHARMACEUTICAL lines"
+    algorithm: threshold
+    formula: |
+      For each distinct manufacturer_code on the order's Rx lines:
+        cumulative := authorization.quantity_approved_this_quarter + SUM(qty_requested
+                      of this manufacturer's Rx lines on this order)
+        reject ERR_QUARTERLY_CAP_EXCEEDED when cumulative > quarterly_quantity_cap
+        (boundary: cumulative == cap is ALLOWED — the cap is inclusive).
+      quantity_approved_this_quarter resets when the calendar quarter of the
+      logical clock changes (evaluated lazily at each approval).
+    input_set: "APPROVED/SUBMITTED-epoch Rx lines of the (clinic, manufacturer) in the current calendar quarter"
+    constants: {}
+    precision: "integer units"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present; role value recognized"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all endpoints"
+  - priority: 2
+    category: auth
+    check: "Role permitted for this endpoint per §1.5 roles"
+    error_id: ERR_UNAUTHORIZED_ROLE
+    http_status: 403
+    applies_to: "all endpoints"
+  - priority: 2.5
+    category: auth
+    check: "Ownership: ClinicBuyer may only act on resources whose clinic_id == X-User-ID (order create/cancel/submit, short-date-credit create, bundle-enrollment create); AccountManager/SupplyChainPlanner/ComplianceOfficer are unscoped"
+    error_id: ERR_FORBIDDEN_OWNERSHIP
+    http_status: 403
+    applies_to: "ClinicBuyer-accessible mutation endpoints"
+  - priority: 3
+    category: existence
+    check: "Path and body-referenced resource ids exist, validated left-to-right (clinic, product, authorization, lot, order, order line, backorder line, shipment, program, enrollment, credit)"
+    error_id: "ERR_CLINIC_NOT_FOUND | ERR_PRODUCT_NOT_FOUND | ERR_AUTHORIZATION_NOT_FOUND | ERR_LOT_NOT_FOUND | ERR_ORDER_NOT_FOUND | ERR_ORDER_LINE_NOT_FOUND | ERR_BACKORDER_LINE_NOT_FOUND | ERR_SHIPMENT_NOT_FOUND | ERR_PROGRAM_NOT_FOUND | ERR_ENROLLMENT_NOT_FOUND | ERR_CREDIT_NOT_FOUND (by resource type)"
+    http_status: 404
+    applies_to: "all endpoints with resource ids"
+  - priority: 4
+    category: state
+    check: "Target entity in the required state for the transition (per §1.2 preconditions; per-entity ERR_*_INVALID_STATE)"
+    error_id: "ERR_CLINIC_INVALID_STATE | ERR_PRODUCT_INVALID_STATE | ERR_AUTHORIZATION_INVALID_STATE | ERR_ORDER_INVALID_STATE | ERR_SHIPMENT_INVALID_STATE | ERR_PROGRAM_INVALID_STATE | ERR_CREDIT_INVALID_STATE | ERR_BACKORDER_LINE_INVALID_STATE"
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 4.5
+    category: state
+    check: "Cross-entity state gates: order submit/approve require Clinic ACTIVE (ERR_CLINIC_NOT_ACTIVE); authorization approve requires Clinic ACTIVE; shipment create requires Order APPROVED (ERR_ORDER_INVALID_STATE); bundle-enrollment create requires Clinic ACTIVE and BundleProgram ACTIVE (ERR_CLINIC_NOT_ACTIVE / ERR_PROGRAM_NOT_ACTIVE)"
+    error_id: "ERR_CLINIC_NOT_ACTIVE | ERR_PROGRAM_NOT_ACTIVE"
+    http_status: 409
+    applies_to: "order submit/approve, authorization approve, shipment create, bundle-enrollment create"
+  - priority: 5
+    category: business_safety
+    check: "Rx controls at order approve: every RX_PHARMACEUTICAL line's manufacturer must have an authorization for the clinic with status APPROVED and valid_from <= current date <= valid_until (else ERR_RX_AUTHORIZATION_REQUIRED)"
+    error_id: ERR_RX_AUTHORIZATION_REQUIRED
+    http_status: 403
+    applies_to: "POST /vet/orders/{id}/approve"
+  - priority: 5.1
+    category: business_safety
+    check: "Controlled substances: any line with is_controlled_substance requires clinic.dea_registration_number non-null"
+    error_id: ERR_DEA_REGISTRATION_REQUIRED
+    http_status: 403
+    applies_to: "POST /vet/orders/{id}/approve"
+  - priority: 5.2
+    category: business_safety
+    check: "Diversion prevention: when any Rx line is present, order.ship_to_address must equal the authorization's approved_ship_to_address"
+    error_id: ERR_SHIP_TO_DIVERSION_MISMATCH
+    http_status: 403
+    applies_to: "POST /vet/orders/{id}/approve"
+  - priority: 5.3
+    category: business_safety
+    check: "Diversion volume cap: quarterly_cap_check (cumulative Rx units per manufacturer may reach but not exceed quarterly_quantity_cap)"
+    error_id: ERR_QUARTERLY_CAP_EXCEEDED
+    http_status: 409
+    applies_to: "POST /vet/orders/{id}/approve"
+  - priority: 5.4
+    category: business_safety
+    check: "Cold chain: shipment whose order contains requires_cold_chain lines must declare carrier_cold_chain_certified true"
+    error_id: ERR_COLD_CHAIN_CARRIER_REQUIRED
+    http_status: 400
+    applies_to: "POST /vet/shipments"
+  - priority: 5.5
+    category: business_safety
+    check: "Temperature readings only accepted for cold-chain shipments in IN_TRANSIT (else ERR_TEMPERATURE_LOG_NOT_APPLICABLE / ERR_SHIPMENT_INVALID_STATE)"
+    error_id: ERR_TEMPERATURE_LOG_NOT_APPLICABLE
+    http_status: 400
+    applies_to: "POST /vet/shipments/{id}/temperature-readings"
+  - priority: 6
+    category: business_constraint
+    check: "Structural inputs: required fields present, enums valid, qty > 0, delivery_window_end > delivery_window_start, valid_until >= valid_from"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all create/update endpoints"
+  - priority: 6.1
+    category: business_constraint
+    check: "SKU uniqueness across all products"
+    error_id: ERR_DUPLICATE_SKU
+    http_status: 409
+    applies_to: "POST /vet/products"
+  - priority: 6.2
+    category: business_constraint
+    check: "Lot expiry_date must be strictly after the current clock date at receiving"
+    error_id: ERR_INVALID_LOT_EXPIRY
+    http_status: 400
+    applies_to: "POST /vet/inventory-lots"
+  - priority: 6.3
+    category: business_constraint
+    check: "Authorization window overlap (closed intervals): for the same (clinic_id, manufacturer_code), no two authorizations in {PENDING, APPROVED, SUSPENDED} may share any calendar date — valid_from == another's valid_until IS a conflict"
+    error_id: ERR_AUTHORIZATION_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /vet/manufacturer-authorizations"
+  - priority: 6.4
+    category: business_constraint
+    check: "Delivery-window overlap (half-open intervals): the clinic's orders in {SUBMITTED, APPROVED, BACKORDERED} hold [delivery_window_start, delivery_window_end); a new order's window may touch (end == start) but not intersect"
+    error_id: ERR_DELIVERY_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /vet/orders/{id}/submit"
+  - priority: 6.5
+    category: business_constraint
+    check: "Delivery frequency: count of the clinic's window-holding orders with delivery_window_start in the same ISO week must stay <= delivery_frequency_per_week after submit"
+    error_id: ERR_DELIVERY_FREQUENCY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /vet/orders/{id}/submit"
+  - priority: 6.6
+    category: business_constraint
+    check: "Discontinued products cannot be submitted on new orders"
+    error_id: ERR_PRODUCT_DISCONTINUED
+    http_status: 409
+    applies_to: "POST /vet/orders/{id}/submit"
+  - priority: 6.7
+    category: business_constraint
+    check: "Short-date eligibility: days_to_expiry_at_request <= 180; lot_id must equal the order line's lot_id; line must be DELIVERED"
+    error_id: "ERR_NOT_SHORT_DATED | ERR_LOT_LINE_MISMATCH | ERR_ORDER_LINE_INVALID_STATE"
+    http_status: 400
+    applies_to: "POST /vet/short-date-credits"
+  - priority: 6.8
+    category: business_constraint
+    check: "OCC: expected_clinic_version must equal the clinic's current version"
+    error_id: ERR_STALE_CLINIC_VERSION
+    http_status: 412
+    applies_to: "PATCH /vet/clinics/{id}, POST /vet/clinics/{clinicId}/bundle-enrollments"
+  - priority: 7
+    category: business_fiscal
+    check: "Minimum order: merchandise_net_cents >= clinic.minimum_order_value_cents (equality passes)"
+    error_id: ERR_ORDER_BELOW_MINIMUM
+    http_status: 400
+    applies_to: "POST /vet/orders/{id}/submit"
+  - priority: 7.1
+    category: business_fiscal
+    check: "Credit limit: clinic.credit_used_cents + order.total_cents <= clinic.credit_limit_cents (equality passes)"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 402
+    applies_to: "POST /vet/orders/{id}/approve"
+  - priority: 7.2
+    category: business_fiscal
+    check: "Credit finalize quantity: 1 <= received_qty <= claimed qty"
+    error_id: ERR_RECEIVED_QTY_EXCEEDS_CLAIMED
+    http_status: 400
+    applies_to: "POST /vet/short-date-credits/{id}/finalize"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- logical clock (test-driving endpoint; ops-run checkpoint) ---
+  - method: POST
+    path: "/vet/_clock/set_current_utc"
+    description: "Advance the logical clock. Startup default is exactly 2026-08-01T00:00:00Z; the server never falls back to wall-clock time. Sweep side effects run on each set."
+    roles: [SystemAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: datetime }
+    side_effects:
+      - "Authorizations APPROVED with valid_until < new date -> EXPIRED"
+      - "InventoryLots with expiry_date < new date -> EXPIRED, firing the allocation-release cascade (lines -> BACKORDERED, fresh BackorderLines, orders APPROVED -> BACKORDERED)"
+      - "ShortDateCredits APPROVED more than 30 days past approval date -> EXPIRED"
+
+  # --- Clinic ---
+  - method: POST
+    path: "/vet/clinics"
+    description: "Onboard a clinic account (PENDING_VERIFICATION)"
+    roles: [AccountManager]
+    code: 201
+    input: [clinic_name, license_number, "dea_registration_number?", ship_to_address, credit_limit_cents, minimum_order_value_cents, delivery_frequency_per_week, free_freight_threshold_cents]
+    output: Clinic
+    side_effects: ["status = PENDING_VERIFICATION; credit_used_cents = 0; version = 1"]
+  - method: GET
+    path: "/vet/clinics/{id}"
+    description: "Read a clinic"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Clinic
+    side_effects: []
+  - method: PATCH
+    path: "/vet/clinics/{id}"
+    description: "Update clinic commercial terms (OCC-guarded)"
+    roles: [AccountManager]
+    code: 200
+    input: [expected_clinic_version, "clinic_name?", "ship_to_address?", "credit_limit_cents?", "minimum_order_value_cents?", "delivery_frequency_per_week?", "free_freight_threshold_cents?"]
+    output: Clinic
+    side_effects: ["increments Clinic.version by 1 (ERR_STALE_CLINIC_VERSION on mismatch)"]
+  - method: POST
+    path: "/vet/clinics/{id}/activate"
+    description: "Verify and activate a clinic"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: Clinic
+    side_effects: ["status -> ACTIVE; increments Clinic.version by 1"]
+  - method: POST
+    path: "/vet/clinics/{id}/suspend"
+    description: "Suspend a clinic (blocks order submit/approve)"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: Clinic
+    side_effects: ["status -> SUSPENDED; increments Clinic.version by 1"]
+  - method: POST
+    path: "/vet/clinics/{id}/reinstate"
+    description: "Reinstate a suspended clinic"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: Clinic
+    side_effects: ["status -> ACTIVE; increments Clinic.version by 1"]
+
+  # --- Product ---
+  - method: POST
+    path: "/vet/products"
+    description: "Create a catalog product"
+    roles: [SupplyChainPlanner]
+    code: 201
+    input: [sku, product_name, manufacturer_code, product_type, "is_controlled_substance?", unit_price_cents]
+    output: Product
+    side_effects: ["status = LISTED; requires_cold_chain computed from product_type"]
+  - method: GET
+    path: "/vet/products"
+    description: "List products with filters"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["sku?", "manufacturer_code?", "product_type?", "status?", "limit?", "offset?"]
+    output: "Product[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/products/{id}"
+    description: "Read a product"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Product
+    side_effects: []
+  - method: POST
+    path: "/vet/products/{id}/discontinue"
+    description: "Discontinue a product"
+    roles: [SupplyChainPlanner]
+    code: 200
+    input: []
+    output: Product
+    side_effects: ["status -> DISCONTINUED; increments Product.version by 1"]
+
+  # --- ManufacturerAuthorization ---
+  - method: POST
+    path: "/vet/manufacturer-authorizations"
+    description: "Request a manufacturer authorization for a clinic (PENDING); closed-window overlap check per (clinic_id, manufacturer_code)"
+    roles: [ComplianceOfficer]
+    code: 201
+    input: [clinic_id, manufacturer_code, valid_from, valid_until, approved_ship_to_address, quarterly_quantity_cap]
+    output: ManufacturerAuthorization
+    side_effects: ["status = PENDING; quantity_approved_this_quarter = 0"]
+  - method: GET
+    path: "/vet/manufacturer-authorizations"
+    description: "List authorizations with filters"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: ["clinic_id?", "manufacturer_code?", "status?", "limit?", "offset?"]
+    output: "ManufacturerAuthorization[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/manufacturer-authorizations/{id}"
+    description: "Read an authorization"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManufacturerAuthorization
+    side_effects: []
+  - method: POST
+    path: "/vet/manufacturer-authorizations/{id}/approve"
+    description: "Approve a pending authorization (clinic must be ACTIVE)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManufacturerAuthorization
+    side_effects: ["status -> APPROVED; increments version"]
+  - method: POST
+    path: "/vet/manufacturer-authorizations/{id}/suspend"
+    description: "Suspend an approved authorization"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManufacturerAuthorization
+    side_effects: ["status -> SUSPENDED; increments version"]
+  - method: POST
+    path: "/vet/manufacturer-authorizations/{id}/reinstate"
+    description: "Reinstate a suspended authorization"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManufacturerAuthorization
+    side_effects: ["status -> APPROVED; increments version"]
+  - method: POST
+    path: "/vet/manufacturer-authorizations/{id}/revoke"
+    description: "Revoke an authorization (terminal)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ManufacturerAuthorization
+    side_effects: ["status -> REVOKED; increments version"]
+
+  # --- InventoryLot ---
+  - method: POST
+    path: "/vet/inventory-lots"
+    description: "Receive stock into a new lot; triggers backorder_allocation for the product"
+    roles: [SupplyChainPlanner]
+    code: 201
+    input: [product_id, lot_number, expiry_date, qty_on_hand]
+    output: InventoryLot
+    side_effects:
+      - "status = AVAILABLE; qty_allocated = 0; qty_available = qty_on_hand"
+      - "backorder_allocation sweep for this product (allocation_sequence ASC, all-or-nothing single-lot fills)"
+  - method: GET
+    path: "/vet/inventory-lots"
+    description: "List lots with filters"
+    roles: [AccountManager, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["product_id?", "status?", "limit?", "offset?"]
+    output: "InventoryLot[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/inventory-lots/{id}"
+    description: "Read a lot"
+    roles: [AccountManager, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: InventoryLot
+    side_effects: []
+
+  # --- Order / OrderLine / BackorderLine ---
+  - method: POST
+    path: "/vet/orders"
+    description: "Create a DRAFT order with embedded lines [{product_id, qty_requested}]; ClinicBuyer may only create for own clinic"
+    roles: [ClinicBuyer]
+    code: 201
+    input: [clinic_id, ship_to_address, delivery_window_start, delivery_window_end, lines]
+    output: Order
+    side_effects: ["status = DRAFT; lines created PENDING"]
+  - method: GET
+    path: "/vet/orders"
+    description: "List orders with filters"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["clinic_id?", "status?", "limit?", "offset?"]
+    output: "Order[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/orders/{id}"
+    description: "Read an order"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Order
+    side_effects: []
+  - method: POST
+    path: "/vet/orders/{id}/submit"
+    description: "Submit a DRAFT order: snapshot prices, compute order_totals, reserve the delivery window"
+    roles: [ClinicBuyer]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["status -> SUBMITTED; order_totals computed and persisted; window reserved; increments Order.version"]
+  - method: POST
+    path: "/vet/orders/{id}/approve"
+    description: "Approve a SUBMITTED order: Rx/diversion/fiscal gates, then fefo_allocation; lands APPROVED or BACKORDERED"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["status -> APPROVED | BACKORDERED; allocations + backorders; provisional rebate_accrual when enrolled; credit_used recompute; increments Order.version"]
+  - method: POST
+    path: "/vet/orders/{id}/reject"
+    description: "Reject a SUBMITTED order"
+    roles: [AccountManager]
+    code: 200
+    input: [rejection_reason]
+    output: Order
+    side_effects: ["status -> REJECTED; window released; increments Order.version"]
+  - method: POST
+    path: "/vet/orders/{id}/cancel"
+    description: "Cancel an order (DRAFT/SUBMITTED/APPROVED/BACKORDERED); fires the release cascade"
+    roles: [ClinicBuyer, AccountManager]
+    code: 200
+    input: []
+    output: Order
+    side_effects: ["status -> CANCELLED; lot releases; backorder_allocation sweep; accrual reversal; credit_used recompute; increments Order.version"]
+  - method: GET
+    path: "/vet/order-lines"
+    description: "List order lines with filters"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["order_id?", "product_id?", "lot_id?", "status?", "limit?", "offset?"]
+    output: "OrderLine[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/order-lines/{id}"
+    description: "Read an order line"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+  - method: GET
+    path: "/vet/order-lines/{id}/backorder-lines"
+    description: "List backorder lines of an order line"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BackorderLine[]"
+    side_effects: []
+  - method: POST
+    path: "/vet/backorder-lines/{id}/cancel"
+    description: "Cancel an OPEN backorder line; parent order recomputes"
+    roles: [ClinicBuyer, AccountManager]
+    code: 200
+    input: []
+    output: BackorderLine
+    side_effects: ["status -> CANCELLED; parent order recompute (BACKORDERED -> APPROVED or CANCELLED); increments version"]
+
+  # --- Shipment / cold chain ---
+  - method: POST
+    path: "/vet/shipments"
+    description: "Create a shipment for an APPROVED order"
+    roles: [SupplyChainPlanner]
+    code: 201
+    input: [order_id, carrier_name, "carrier_cold_chain_certified?"]
+    output: Shipment
+    side_effects: ["status = PREPARING; requires_cold_chain computed; cold-chain carrier check"]
+  - method: GET
+    path: "/vet/shipments"
+    description: "List shipments with filters"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: ["order_id?", "status?", "limit?", "offset?"]
+    output: "Shipment[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/shipments/{id}"
+    description: "Read a shipment (includes temperature_log)"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: POST
+    path: "/vet/shipments/{id}/dispatch"
+    description: "Dispatch a PREPARING shipment"
+    roles: [SupplyChainPlanner]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["status -> IN_TRANSIT; lines -> SHIPPED; lots debited (qty_on_hand and qty_allocated); order -> SHIPPED"]
+  - method: POST
+    path: "/vet/shipments/{id}/deliver"
+    description: "Deliver an IN_TRANSIT shipment"
+    roles: [SupplyChainPlanner]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["status -> DELIVERED; lines -> DELIVERED; order -> DELIVERED; credit_used recompute"]
+  - method: POST
+    path: "/vet/shipments/{id}/temperature-readings"
+    description: "Append a temperature reading (cold-chain shipments in IN_TRANSIT only)"
+    roles: [SupplyChainPlanner]
+    code: 201
+    input: [recorded_at, temperature_celsius]
+    output: Shipment
+    side_effects: ["reading appended to temperature_log; excursion -> status QUARANTINED + has_unresolved_excursion"]
+  - method: POST
+    path: "/vet/shipments/{id}/resolve-quarantine"
+    description: "Quality disposition of a quarantined shipment"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [outcome]
+    output: Shipment
+    side_effects: ["RELEASED -> IN_TRANSIT (excursion cleared) | DESTROYED -> terminal, lines -> BACKORDERED with fresh backorders, order -> BACKORDERED, credit recompute"]
+
+  # --- BundleProgram / BundleEnrollment / RebateAccrual ---
+  - method: POST
+    path: "/vet/bundle-programs"
+    description: "Create a bundle/rebate program (DRAFT)"
+    roles: [AccountManager]
+    code: 201
+    input: [program_name, manufacturer_code, qualifying_product_types, min_distinct_categories, bundle_discount_pct, rebate_base_rate_bp, rebate_bonus_rate_bp, bonus_threshold_cents]
+    output: BundleProgram
+    side_effects: ["status = DRAFT"]
+  - method: GET
+    path: "/vet/bundle-programs/{id}"
+    description: "Read a program"
+    roles: [AccountManager, ClinicBuyer, SupplyChainPlanner, ComplianceOfficer]
+    code: 200
+    input: []
+    output: BundleProgram
+    side_effects: []
+  - method: POST
+    path: "/vet/bundle-programs/{id}/activate"
+    description: "Activate a DRAFT program"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: BundleProgram
+    side_effects: ["status -> ACTIVE"]
+  - method: POST
+    path: "/vet/bundle-programs/{id}/close"
+    description: "Close an ACTIVE program: finalize rebate accruals (final variant) and enrollments"
+    roles: [AccountManager]
+    code: 200
+    input: []
+    output: BundleProgram
+    side_effects: ["status -> CLOSED; accruals FINALIZED (DELIVERED orders) or REVERSED; enrollments -> FINALIZED"]
+  - method: POST
+    path: "/vet/clinics/{clinicId}/bundle-enrollments"
+    description: "Enroll a clinic in a program for a quarter (OCC-guarded; supersedes an existing ACTIVE enrollment for the same clinic+quarter)"
+    roles: [ClinicBuyer]
+    code: 201
+    input: [program_id, quarter, expected_clinic_version]
+    output: BundleEnrollment
+    side_effects: ["status = ACTIVE; prior ACTIVE enrollment for (clinic, quarter) -> SUPERSEDED with accrual reversal; increments Clinic.version by 1 (ERR_STALE_CLINIC_VERSION on mismatch)"]
+  - method: GET
+    path: "/vet/bundle-enrollments"
+    description: "List enrollments with filters"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: ["clinic_id?", "program_id?", "quarter?", "status?", "limit?", "offset?"]
+    output: "BundleEnrollment[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/bundle-enrollments/{id}"
+    description: "Read an enrollment"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: BundleEnrollment
+    side_effects: []
+  - method: GET
+    path: "/vet/rebate-accruals"
+    description: "List rebate accruals with filters"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: ["enrollment_id?", "order_id?", "status?", "limit?", "offset?"]
+    output: "RebateAccrual[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/rebate-accruals/{id}"
+    description: "Read a rebate accrual"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: RebateAccrual
+    side_effects: []
+
+  # --- ShortDateCredit ---
+  - method: POST
+    path: "/vet/short-date-credits"
+    description: "Request a short-date credit against a DELIVERED order line"
+    roles: [ClinicBuyer]
+    code: 201
+    input: [order_line_id, lot_id, qty]
+    output: ShortDateCredit
+    side_effects: ["status = REQUESTED; days_to_expiry_at_request + claimed_credit_cents computed"]
+  - method: GET
+    path: "/vet/short-date-credits"
+    description: "List short-date credits with filters"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: ["clinic_id?", "order_line_id?", "lot_id?", "status?", "limit?", "offset?"]
+    output: "ShortDateCredit[]"
+    side_effects: []
+  - method: GET
+    path: "/vet/short-date-credits/{id}"
+    description: "Read a short-date credit"
+    roles: [AccountManager, ClinicBuyer, ComplianceOfficer]
+    code: 200
+    input: []
+    output: ShortDateCredit
+    side_effects: []
+  - method: POST
+    path: "/vet/short-date-credits/{id}/approve"
+    description: "Approve a REQUESTED credit"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ShortDateCredit
+    side_effects: ["status -> APPROVED"]
+  - method: POST
+    path: "/vet/short-date-credits/{id}/deny"
+    description: "Deny a REQUESTED credit"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: []
+    output: ShortDateCredit
+    side_effects: ["status -> DENIED"]
+  - method: POST
+    path: "/vet/short-date-credits/{id}/finalize"
+    description: "Finalize an APPROVED credit on return receipt (final variant, receipt-basis tier)"
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [received_qty]
+    output: ShortDateCredit
+    side_effects: ["status -> CREDITED; final_credit_cents computed"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or role unrecognized" }
+  - { id: ERR_UNAUTHORIZED_ROLE, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_FORBIDDEN_OWNERSHIP, http: 403, condition: "ClinicBuyer acting on a resource whose clinic_id != X-User-ID" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/invalid field, bad enum, non-positive qty, window end <= start, valid_until < valid_from" }
+  - { id: ERR_CLINIC_NOT_FOUND, http: 404, condition: "Clinic id not found" }
+  - { id: ERR_PRODUCT_NOT_FOUND, http: 404, condition: "Product id not found" }
+  - { id: ERR_AUTHORIZATION_NOT_FOUND, http: 404, condition: "ManufacturerAuthorization id not found" }
+  - { id: ERR_LOT_NOT_FOUND, http: 404, condition: "InventoryLot id not found" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "Order id not found" }
+  - { id: ERR_ORDER_LINE_NOT_FOUND, http: 404, condition: "OrderLine id not found" }
+  - { id: ERR_BACKORDER_LINE_NOT_FOUND, http: 404, condition: "BackorderLine id not found" }
+  - { id: ERR_SHIPMENT_NOT_FOUND, http: 404, condition: "Shipment id not found" }
+  - { id: ERR_PROGRAM_NOT_FOUND, http: 404, condition: "BundleProgram id not found" }
+  - { id: ERR_ENROLLMENT_NOT_FOUND, http: 404, condition: "BundleEnrollment id not found" }
+  - { id: ERR_CREDIT_NOT_FOUND, http: 404, condition: "ShortDateCredit id not found" }
+  - { id: ERR_CLINIC_INVALID_STATE, http: 409, condition: "Clinic transition precondition failed" }
+  - { id: ERR_PRODUCT_INVALID_STATE, http: 409, condition: "Product transition precondition failed" }
+  - { id: ERR_AUTHORIZATION_INVALID_STATE, http: 409, condition: "Authorization transition precondition failed" }
+  - { id: ERR_ORDER_INVALID_STATE, http: 409, condition: "Order transition precondition failed (incl. shipment create on non-APPROVED order)" }
+  - { id: ERR_ORDER_LINE_INVALID_STATE, http: 409, condition: "Order line not in required state (e.g., short-date credit on a non-DELIVERED line)" }
+  - { id: ERR_SHIPMENT_INVALID_STATE, http: 409, condition: "Shipment transition precondition failed" }
+  - { id: ERR_PROGRAM_INVALID_STATE, http: 409, condition: "Program transition precondition failed" }
+  - { id: ERR_PROGRAM_NOT_ACTIVE, http: 409, condition: "Bundle-enrollment create requires the program in ACTIVE" }
+  - { id: ERR_CREDIT_INVALID_STATE, http: 409, condition: "ShortDateCredit transition precondition failed" }
+  - { id: ERR_BACKORDER_LINE_INVALID_STATE, http: 409, condition: "BackorderLine transition precondition failed" }
+  - { id: ERR_CLINIC_NOT_ACTIVE, http: 409, condition: "Operation requires the clinic in ACTIVE (order submit/approve, authorization approve)" }
+  - { id: ERR_RX_AUTHORIZATION_REQUIRED, http: 403, condition: "Rx line lacks an APPROVED, in-window ManufacturerAuthorization for (clinic, manufacturer_code)" }
+  - { id: ERR_DEA_REGISTRATION_REQUIRED, http: 403, condition: "Controlled-substance line but clinic.dea_registration_number is null" }
+  - { id: ERR_SHIP_TO_DIVERSION_MISMATCH, http: 403, condition: "Order ship_to_address differs from the authorization's approved_ship_to_address" }
+  - { id: ERR_QUARTERLY_CAP_EXCEEDED, http: 409, condition: "Cumulative approved Rx units for (clinic, manufacturer) this quarter would exceed quarterly_quantity_cap (cap itself is allowed)" }
+  - { id: ERR_COLD_CHAIN_CARRIER_REQUIRED, http: 400, condition: "Shipment carries cold-chain lines but carrier_cold_chain_certified is not true" }
+  - { id: ERR_TEMPERATURE_LOG_NOT_APPLICABLE, http: 400, condition: "Temperature reading posted for a shipment with requires_cold_chain == false" }
+  - { id: ERR_DUPLICATE_SKU, http: 409, condition: "Product sku already exists" }
+  - { id: ERR_INVALID_LOT_EXPIRY, http: 400, condition: "expiry_date not strictly after the current clock date" }
+  - { id: ERR_AUTHORIZATION_WINDOW_OVERLAP, http: 409, condition: "Closed-interval validity window collides with another non-terminal authorization for the same (clinic_id, manufacturer_code)" }
+  - { id: ERR_DELIVERY_WINDOW_OVERLAP, http: 409, condition: "Half-open delivery window intersects another window-holding order of the clinic" }
+  - { id: ERR_DELIVERY_FREQUENCY_EXCEEDED, http: 409, condition: "Weekly delivery cap would be exceeded" }
+  - { id: ERR_PRODUCT_DISCONTINUED, http: 409, condition: "Order submit contains a DISCONTINUED product" }
+  - { id: ERR_NOT_SHORT_DATED, http: 400, condition: "days_to_expiry_at_request > 180" }
+  - { id: ERR_LOT_LINE_MISMATCH, http: 400, condition: "lot_id does not equal the order line's allocated lot_id" }
+  - { id: ERR_ORDER_BELOW_MINIMUM, http: 400, condition: "merchandise_net_cents < clinic.minimum_order_value_cents" }
+  - { id: ERR_CREDIT_LIMIT_EXCEEDED, http: 402, condition: "credit_used_cents + total_cents would exceed credit_limit_cents" }
+  - { id: ERR_RECEIVED_QTY_EXCEEDS_CLAIMED, http: 400, condition: "finalize received_qty out of 1..claimed qty" }
+  - { id: ERR_STALE_CLINIC_VERSION, http: 412, condition: "expected_clinic_version does not match the clinic's current version (OCC)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ClinicBuyer
+    description: "Purchasing user at a clinic practice; scoped to own clinic's resources"
+    identity: "entity_backed:Clinic"
+    exclusive_operations:
+      - "POST /vet/orders — create order for own clinic"
+      - "POST /vet/orders/{id}/submit — submit own order"
+      - "POST /vet/clinics/{clinicId}/bundle-enrollments — enroll own clinic (OCC)"
+      - "POST /vet/short-date-credits — request credit on own delivered line"
+    shared_operations:
+      - "POST /vet/orders/{id}/cancel — cancel own order (shared with AccountManager)"
+      - "POST /vet/backorder-lines/{id}/cancel — cancel own backorder (shared with AccountManager)"
+      - "GET reads of own clinic, orders, lines, shipments, authorizations, enrollments, accruals, credits, products"
+  - name: AccountManager
+    description: "Distributor sales rep; owns clinic accounts, order approval, bundle programs"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vet/clinics, PATCH /vet/clinics/{id}, activate/suspend/reinstate"
+      - "POST /vet/orders/{id}/approve and /reject"
+      - "POST /vet/bundle-programs, activate, close"
+    shared_operations:
+      - "POST /vet/orders/{id}/cancel, POST /vet/backorder-lines/{id}/cancel (shared with ClinicBuyer)"
+      - "GET reads across clinics, orders, lots, shipments, programs, enrollments, accruals, credits"
+  - name: SupplyChainPlanner
+    description: "Distributor warehouse/logistics operator; owns catalog, inventory, shipments"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vet/products, POST /vet/products/{id}/discontinue"
+      - "POST /vet/inventory-lots"
+      - "POST /vet/shipments, dispatch, deliver, temperature-readings"
+    shared_operations:
+      - "GET reads of products, lots, orders, lines, shipments, clinics"
+  - name: ComplianceOfficer
+    description: "Distributor QA/regulatory officer; owns authorizations, quarantine dispositions, credit adjudication"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vet/manufacturer-authorizations and approve/suspend/reinstate/revoke"
+      - "POST /vet/shipments/{id}/resolve-quarantine"
+      - "POST /vet/short-date-credits/{id}/approve, /deny, /finalize"
+    shared_operations:
+      - "GET reads of authorizations, lots, shipments, enrollments, accruals, credits, orders, products"
+  - name: SystemAdmin
+    description: "Technical operator; drives the logical clock only"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /vet/_clock/set_current_utc"
+    shared_operations: []

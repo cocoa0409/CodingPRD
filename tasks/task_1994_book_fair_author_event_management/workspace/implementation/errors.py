@@ -1,0 +1,55 @@
+"""Error classes and the error-id catalog (PRD section 5 / scaffold section 1.6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERROR_STATUS = {
+    "ERR_MISSING_HEADERS": 400,
+    "ERR_ROLE_FORBIDDEN": 403,
+    "ERR_PARTY_NOT_FOUND": 404,
+    "ERR_ROLE_PARTY_KIND_MISMATCH": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_PARTY_SCOPE_MISMATCH": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_FAIR_NOT_OPEN": 409,
+    "ERR_AGREEMENT_NOT_ACCEPTED": 409,
+    "ERR_RECONCILIATION_NOT_APPROVED": 409,
+    "ERR_BOOKING_NOT_TRAVEL_READY": 409,
+    "ERR_SESSION_NOT_SIGNING": 409,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_OFFER_EXPIRED": 409,
+    "ERR_VENUE_CONFLICT": 409,
+    "ERR_SIGNING_FLOOR_CAPACITY_EXCEEDED": 409,
+    "ERR_OUTSIDE_SIGNING_WINDOW": 409,
+    "ERR_EMBARGO_ACTIVE": 409,
+    "ERR_DUPLICATE_RESOURCE": 409,
+    "ERR_SIGNING_CAPACITY_EXCEEDED": 409,
+    "ERR_LINE_CAPACITY_EXCEEDED": 409,
+    "ERR_TICKET_SESSION_MISMATCH": 409,
+    "ERR_LINE_FAIR_MISMATCH": 409,
+    "ERR_FIRM_SALE_NOT_RETURNABLE": 409,
+    "ERR_RETURN_QUANTITY_EXCEEDS_ON_HAND": 409,
+    "ERR_OVER_DELIVERY": 409,
+    "ERR_DAMAGE_EXCEEDS_ON_HAND": 409,
+    "ERR_STOCK_NOT_AVAILABLE": 409,
+    "ERR_PRICE_BEYOND_MARKDOWN": 409,
+    "ERR_TENDER_SHORT": 402,
+    "ERR_PROMO_BUDGET_EXCEEDED": 409,
+    "ERR_TRAVEL_CAP_EXCEEDED": 409,
+    "ERR_COUNTS_INCOMPLETE": 409,
+    "ERR_VARIANCE_BEYOND_TOLERANCE": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_PREORDER_WINDOW_CLOSED": 409,
+}
+
+
+def fail(error_id, message):
+    raise ApiError(error_id, ERROR_STATUS[error_id], message)

@@ -1,0 +1,355 @@
+# Mobile Truck Repair Roadside API — Product Requirements Document
+
+## 1. Introduction
+
+Breakdowns of heavy-duty trucks do not wait for business hours, and neither can the operation that answers them. This document specifies the Mobile Truck Repair Roadside API: the back-office and field-facing platform for a mobile diesel repair service that dispatches technicians in stocked parts vans to disabled Class-8 tractors and trailers. The system covers the full arc of a service event — intake and triage of the caller's symptom, dispatch of a certified technician under optimistic-concurrency protection, the on-site repair-versus-tow decision, estimate drafting and fleet authorization, warranty-versus-customer-pay valuation, roadside inspection defect correction, invoicing with tiered fleet discounts and a pinned payment waterfall, and the repeat-failure follow-up loop that can reopen a closed call when a repair does not hold.
+
+Two structural properties shape everything that follows. First, money moves through the platform in two parallel dimensions — a document's issuance lifecycle and its collection lifecycle evolve independently — and both are driven by a pricing engine whose provisional (estimate-time) and final (invoice-time) variants deliberately yield different totals for the same call. Second, fleet credit governance is enforced by cascading side effects: issuing an invoice can suspend a fleet mid-flight, and that suspension propagates into open calls and proposed dispatches four hops deep. Implementers should read the narrative sections as the authoritative specification; the endpoint table in Section 4 is a summary, not a substitute.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines system-wide rules, principles, and boilerplate that apply to the entire API.
+
+### 2.1. User and Role-Based Access Control
+
+All interactions with the API must be authenticated through a pair of mandatory HTTP headers. Each request must include `X-User-ID` to identify the acting user and `X-User-Role` to specify their operational capacity; a request missing either header, or carrying a blank value in either, is rejected with `ERR_UNAUTHENTICATED`. The system recognizes seven roles, spelled exactly as follows: `OpsAdmin`, `Dispatcher`, `Technician`, `FleetManager`, `BillingClerk`, `WarrantyAdministrator`, and `SafetyOfficer`. An attempt to perform an action outside the roles declared for that endpoint is rejected with `ERR_UNAUTHORIZED_ROLE`.
+
+The meaning of `X-User-ID` depends on the role. When `X-User-Role` is `Technician`, `X-User-ID` is the `id` of the acting `Technician`; ownership checks on any resource that references a technician — a dispatch's assigned technician, the on-site technician of a call, the van a stock item rides on — compare the resource's foreign-key field to `X-User-ID`, and a mismatch is rejected with `ERR_FORBIDDEN_OWNERSHIP`. When `X-User-Role` is `FleetManager`, `X-User-ID` is the `id` of the acting `FleetAccount`; ownership checks on fleet-scoped resources (estimates of that fleet's calls, the fleet's own account record, the fleet's invoices) compare the resource's fleet reference to `X-User-ID`. When `X-User-Role` is `OpsAdmin`, `Dispatcher`, `BillingClerk`, `WarrantyAdministrator`, or `SafetyOfficer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it (for example, as `created_by`, `issued_by`, `decided_by`, or `verified_by` on the affected resource) but does not compare it to any entity's `id`.
+
+Segregation of duties is enforced by role assignment and by identity pinning: warranty claims are filed by a `Technician` (or a `WarrantyAdministrator` on the technician's behalf) but decided only by a `WarrantyAdministrator`; invoices are drafted and issued by a `BillingClerk` but voided or written off only by an `OpsAdmin`; and an operator who issued an invoice may never void that same invoice — such an attempt is rejected with `ERR_SEGREGATION_OF_DUTIES`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+For endpoints that return lists of resources, pagination is controlled via query parameters. The `limit` parameter specifies the maximum number of items to return; if not provided it defaults to 10, with a minimum of 1 and a maximum of 100. The `offset` parameter specifies the number of items to skip and defaults to 0.
+
+Unless otherwise specified, all list endpoints return resources sorted by their creation timestamp in ascending order.
+
+Paginated and non-paginated list-based responses include the following fields in the `meta` object of the response envelope: `limit`, `offset`, `total_count`, and `has_more`.
+
+### 2.4. Common Resource Properties and the Audit Trail
+
+Every primary resource in the system — fleet accounts, rate cards, vehicles, technicians, service calls, dispatches, van stock items, estimates, part usages, tow orders, warranty claims, inspection defects, invoices, payments, repeat-failure cases, and restock requests — carries a standard set of system-managed fields:
+
+- `id` (string): a unique, server-minted identifier formatted as a UUID, with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits, recorded when the resource is first created.
+- `updated_at` (string): an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of the resource.
+- `version` (integer): a system-managed integer that increments with every modification to the resource, and serves as the basis of optimistic concurrency control.
+
+One resource is deliberately lighter. A `CallEvent` — the append-only audit row written whenever something happens to a service call — carries only `id` and `created_at` alongside its content fields (`service_call_id`, `event_type`, `actor_role`, `actor_id`, and an optional free-text `note`); it has no `updated_at` and no `version`, because events are never modified after they are written. Every state transition, posting, decision, and system cascade described in Section 3 appends the corresponding `CallEvent` to the affected call's trail, with `actor_role` and `actor_id` recording the acting request's headers (or the literal value `system` for cascades the server performs on its own).
+
+### 2.5. Nested Resource Retrieval and Request Validation Order
+
+The API enforces a strict, hierarchical validation protocol for all requests that target nested resources. When an endpoint path contains multiple resource identifiers, the system validates the existence of each identifier in sequential left-to-right order; the request is rejected immediately with `ERR_NOT_FOUND` at the first identifier that does not resolve to an existing resource. The same `ERR_NOT_FOUND` rejection applies when a foreign key carried in the request body — a `vehicle_id`, `technician_id`, `van_stock_item_id`, `service_call_id`, `original_service_call_id`, `new_service_call_id`, or `rate_card_id` — does not resolve.
+
+Across a whole request, checks are evaluated in a fixed priority order so that earlier failures are never masked by later ones. Authentication comes first (missing or blank headers, then role membership, then ownership scope), followed by existence resolution of path and body identifiers, then request-shape validation (missing required fields, mistyped values, unknown fields, non-positive quantities, inverted windows) with `ERR_VALIDATION`, then enum membership with `ERR_INVALID_ENUM`, then state-machine legality with `ERR_INVALID_STATE` and the terminal-call guard `ERR_CALL_ALREADY_TERMINAL`, then optimistic-concurrency rejection with `ERR_STALE_VERSION`, then the business rules described throughout Section 3 (certification, window overlap, fleet gates, fiscal limits, uniqueness, and the like), each carrying its own error identifier.
+
+### 2.6. The Logical Clock and the Daily Operations Run
+
+All timestamps the server assigns — `received_at`, `submitted_at`, `issued_at`, `due_at`, `completed_at`, `departed_at`, `arrived_at`, `posted_at`, and every computed deadline — are drawn from a single logical clock, never from wall-clock time. The server boots with this clock fixed at 2026-08-01T00:00:00Z. An `OpsAdmin` may advance it by supplying a `to_iso8601` instant; the clock may only move forward, and an attempt to set it to an earlier instant than the current value is rejected with `ERR_CLOCK_REGRESSION`. Anything in this document phrased as "now", "today", or "the current calendar month" refers to this logical clock.
+
+An `OpsAdmin`-only daily operations checkpoint sweeps the system for time-driven transitions in one run. It expires every dispatch still `PROPOSED` whose `window_end_at` has passed, returning each affected call from `DISPATCHED` to `TRIAGED`; it expires every estimate still `SUBMITTED` more than seven calendar days past its `submitted_at`; it escalates every inspection defect past its correction deadline; and it re-evaluates each fleet suspended for credit reasons, reinstating any whose month-to-date spend has fallen back within cap — including the natural month rollover, where the passing of the clock into a new calendar month empties the month-to-date window. The run reports back four counts: `expired_dispatch_count`, `expired_estimate_count`, `escalated_defect_count`, and `reinstated_fleet_count`.
+
+### 2.7. Monetary Values, Integer Cents, and Rounding
+
+All monetary values in the system are carried as integer cents — request payloads, computed fields, and stored totals alike. Wherever a multiplication or division would produce a fractional cent, the value is rounded half-up to the nearest whole cent at the individually marked rounding step, and only there. In particular, the parts tax on a document is computed exactly once against the parts subtotal — per-line tax rounding followed by summation is forbidden, because it can drift from the single-rounding result by cents. Percentages configured on rate cards are expressed in basis points (a value of 15000 means a multiplier of one and a half; 725 means a tax rate of seven and a quarter percent), and discount tiers are expressed as percentages applied with round-half-up to integer cents. Components of an invoice total are each rounded individually; the grand total itself is never re-rounded, only floored at zero.
+
+### 2.8. Optimistic Concurrency Control on Service Calls
+
+Two write operations against a service call require the client to prove it has observed the call's current state. Creating an estimate for a call and creating a dispatch for a call each require a non-optional request field `expected_service_call_version` carrying the client's last observed `version` of that call. If the value does not match the call's current `version` — because the call has been mutated since the client last read it, for example by another estimate or dispatch being created — the request is rejected with `ERR_STALE_VERSION` (HTTP 412). Both creations are themselves mutations of the call and increment its `version` by one, so two writers working from the same observed version cannot both succeed. No other endpoint takes a version field; all other mutations proceed without an optimistic-concurrency check.
+
+### 2.9. Rate Card Governance
+
+A `RateCard` is the system's price book. Each card declares a `name`, an hourly `labor_rate_standard_cents` and `labor_rate_master_cents`, an `after_hours_multiplier_bp` applied to labor on after-hours calls, a `travel_free_miles` allowance of one-way miles included at no charge on business-hours calls, a `travel_per_mile_cents` rate for billable miles, a `travel_time_per_minute_cents` rate for actual travel minutes, a flat `emergency_callout_fee_cents` for top-priority calls, a `parts_tax_rate_bp` applied to parts subtotals, and a coverage window bounded by `effective_from` and `effective_to`, both inclusive. Coverage windows of distinct cards must never overlap, and because both bounds are inclusive, two windows that merely touch at an endpoint already count as overlapping — publishing such a card is rejected with `ERR_RATE_CARD_WINDOW_OVERLAP`. This non-overlap invariant is what guarantees that window-based resolution (§3.5) always finds at most one candidate card for a given instant.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Fleet Accounts, Rate Cards, and Credit Governance
+
+An `OpsAdmin` onboards a fleet customer by creating a `FleetAccount` with the customer's `company_name`, an externally assigned `account_number` that must be unique across all fleets, an AP contact `billing_email`, and two fiscal guardrails: `per_call_authorization_limit_cents`, the largest estimate total a `Dispatcher` may approve without escalation, and `monthly_spend_cap_cents`, the ceiling on recognized month-to-date spend. A fleet may also declare `payment_terms_days` (defaulting to 30 when omitted) and may optionally pin a `rate_card_id`; when pinned, that card prices every one of the fleet's calls regardless of coverage windows, and when left null the window-covering card is used instead. A duplicate `account_number` at creation is rejected with `ERR_DUPLICATE_VIN` — the shared uniqueness error that also guards vehicle VINs and technician employee codes. New fleets begin `ACTIVE` with `suspension_reason` `NONE` and a `month_to_date_spend_cents` of zero.
+
+A fleet's `month_to_date_spend_cents` is the sum of `total_cents` over that fleet's invoices whose `issue_status` is `ISSUED` and whose `issued_at` falls inside the logical clock's current calendar month (inclusive of the month's first instant, exclusive of the next month's), plus the signed `amount_cents` of any spend adjustments posted to the fleet in the same window. From this figure the fleet's `effective_discount_tier` is derived: at least 500000 cents (five thousand dollars) of month-to-date spend earns `PLATINUM` at a ten percent discount, at least 200000 cents earns `GOLD` at five percent, and anything below earns `STANDARD` at zero — so 199999 cents is still `STANDARD` while 200000 crosses into `GOLD`, and 499999 remains `GOLD` while 500000 crosses into `PLATINUM`. An `OpsAdmin` may update the limits, terms, or pinned card via a fleet update, which increments the fleet's `version`.
+
+Fleet status governs which writes are allowed. An `OpsAdmin` may manually suspend a fleet (recording `suspension_reason` `ADMIN`) or reinstate one (resetting the reason to `NONE`). Four fleet-scoped writes — service-call intake, dispatch creation, estimate approval, and invoice issue — require the fleet to be `ACTIVE`; against a `SUSPENDED` fleet they are rejected with `ERR_FLEET_SUSPENDED`, and against a `CLOSED` fleet with `ERR_FLEET_CLOSED`. Closing a fleet is permitted only when none of its service calls remains in a non-terminal status; otherwise the close is rejected with `ERR_FLEET_HAS_OPEN_CALLS`. Billing corrections are posted as spend adjustments carrying a signed `amount_cents` and a `reason`; the adjustment is added to `month_to_date_spend_cents`, and when a decrease brings a `CREDIT_HOLD`-suspended fleet back to its cap or below, the fleet is automatically reinstated to `ACTIVE` with `suspension_reason` cleared to `NONE`.
+
+### 3.2. Vehicles, Technicians, and Van Stock
+
+Vehicles are registered by an `OpsAdmin` or `Dispatcher` with a `vin` (unique across all vehicles), a fleet or owner `unit_number`, `make`, `model`, `year`, and a starting `odometer_miles` that defaults to zero. A vehicle may optionally carry a `fleet_account_id` — when null the unit is a retail (non-fleet) customer — plus OEM warranty data: `oem_warranty_expires_at`, `oem_warranty_miles_limit`, and an `extended_warranty` flag defaulting to false. The odometer is monotone non-decreasing across both direct vehicle updates and repair completions; any update supplying a value below the currently recorded `odometer_miles` is rejected with `ERR_ODOMETER_REGRESSION`. Each vehicle carries a computed `roadworthiness`, which is `OUT_OF_SERVICE` while any of its inspection defects has `severity` `OOS` in a status of `OPEN`, `REPAIR_SCHEDULED`, `CORRECTED`, `VERIFICATION_FAILED`, or `ESCALATED`, and `ROADWORTHY` otherwise.
+
+Technicians are onboarded by an `OpsAdmin` with a `full_name`, a unique `employee_code`, an array of `certifications` drawn from `ENGINE`, `BRAKES`, `ELECTRICAL`, `HVAC`, `TIRES`, `WELDING`, and `DOT_INSPECTION`, a `labor_rate_class` of `STANDARD` or `MASTER` (which selects which labor column of the resolved rate card prices their work), and an informational `home_depot_city`. A technician manages their own availability among `OFF_DUTY`, `AVAILABLE`, and `ON_BREAK` through a self-service status transition carrying a target `to_status` (`OFF_DUTY` to `AVAILABLE`, `AVAILABLE` to `OFF_DUTY`, `AVAILABLE` to `ON_BREAK`, and `ON_BREAK` back to `AVAILABLE`); the fourth status, `ON_DISPATCH`, is system-managed only — set when the technician accepts a dispatch and cleared when the dispatch completes, when an accepted dispatch is released, or when a fleet-suspension cascade expires their proposed dispatch. A technician's `current_dispatch_id` points at their single in-flight dispatch (one in `ACCEPTED`, `EN_ROUTE`, or `ON_SITE`) and is null otherwise.
+
+Each technician's van carries `VanStockItem` rows, stocked by an `OpsAdmin` with a `part_number` unique per technician, a `description`, a `part_class` drawn from `ENGINE`, `COOLING`, `BRAKE`, `AIR_SYSTEM`, `ELECTRICAL`, `LIGHTING`, `TIRE`, `HVAC`, and `FILTERS`, a starting `qty_on_hand` (default zero), a `unit_cost_cents` used as the warranty valuation basis, a `unit_retail_cents` used for customer-pay pricing, and a `reorder_point` defaulting to 2. Stock moves through three channels: part usage on a call decrements `qty_on_hand`, returns and restock fulfillments restore it, and an `OpsAdmin` or the van's `Technician` may post a manual adjustment carrying a signed `qty_delta` and a `reason`, provided the resulting on-hand quantity is not negative. After every usage posting and every adjustment, the reorder trigger is re-evaluated: when `qty_on_hand` is at or below `reorder_point` and no restock request for the item is currently `PENDING` or `APPROVED`, the system opens an `AUTO_LOW_STOCK` `RestockRequest` whose `qty_requested` equals `reorder_point` plus 2 minus the on-hand count (at minimum one unit; a `MANUAL`-sourced restock instead carries the caller's requested quantity) and sets the item's `restock_pending` flag; an on-hand count exactly at the reorder point triggers, while one unit above it does not. An `OpsAdmin` then approves the request, fulfills it with a `fulfilled_qty` of at least one (which adds that many units back to `qty_on_hand`, recomputes `restock_pending`, and leaves the request `FULFILLED`), or rejects it with a `reason` recorded as `reject_reason` (which likewise recomputes `restock_pending` and leaves the request `REJECTED`).
+
+### 3.3. Call Intake and Triage
+
+A service event begins when a `Dispatcher` (or `OpsAdmin`) intakes a `ServiceCall` against a vehicle, supplying the `vehicle_id`, the `caller_name` and `caller_phone`, a free-text `breakdown_location_text` describing where the unit is disabled, the dispatch desk's one-way mileage estimate `distance_miles_from_depot`, a `symptom_category` drawn from `ENGINE_NO_START`, `OVERHEAT`, `BRAKE_FAULT`, `AIR_LEAK`, `ELECTRICAL`, `LIGHTING`, `TIRE_BLOWOUT`, `HVAC_ISSUE`, and `OTHER`, and a free-text `symptom_description`. Intake stamps `received_at` from the logical clock, denormalizes the vehicle's fleet onto the call as `fleet_account_id` (null for retail units), computes `after_hours` — true when the UTC hour of `received_at` is at or after 18 or before 6, so 18:00:00Z is after-hours while 17:59:59Z is not, and 06:00:00Z is not while 05:59:59Z is — sets the call to `RECEIVED`, and appends a `CALL_RECEIVED` event. For fleet vehicles, intake is one of the four fleet-gated writes. A call may be cancelled from `RECEIVED` by a `Dispatcher` (or `OpsAdmin`, or the `FleetManager` of the call's own fleet) with a `reason`, which records `cancel_reason` and appends `CALL_CANCELLED`.
+
+Triage is the dispatch desk's second look. Setting the call's `severity` — `BLOCKING`, `DRIVABLE`, or `DEFERRED` — moves it from `RECEIVED` to `TRIAGED`, optionally reclassifies `symptom_category` in the same request, computes the remaining triage fields, and appends a `TRIAGED` event. Priority follows severity directly: `BLOCKING` calls become `P1_EMERGENCY`, `DRIVABLE` become `P2_URGENT`, and `DEFERRED` become `P3_STANDARD`. The `required_certification` is mapped from the symptom: `ENGINE_NO_START` and `OVERHEAT` require `ENGINE`; `BRAKE_FAULT` and `AIR_LEAK` require `BRAKES`; `ELECTRICAL` and `LIGHTING` require `ELECTRICAL`; `TIRE_BLOWOUT` requires `TIRES`; `HVAC_ISSUE` requires `HVAC`; and `OTHER` maps to `ANY`. Independently, `required_part_class` maps `ENGINE_NO_START` to `ENGINE`, `OVERHEAT` to `COOLING`, `BRAKE_FAULT` to `BRAKE`, `AIR_LEAK` to `AIR_SYSTEM`, `ELECTRICAL` to `ELECTRICAL`, `LIGHTING` to `LIGHTING`, `TIRE_BLOWOUT` to `TIRE`, `HVAC_ISSUE` to `HVAC`, and `OTHER` to `NONE`. Before triage, `severity`, `priority`, `required_certification`, and `required_part_class` are all null.
+
+A triaged call may be cancelled as easily as a received one. Cancellation from `DISPATCHED` or `EN_ROUTE` additionally moves any of the call's `PROPOSED` or `ACCEPTED` dispatches to `RELEASED` (the latter freeing its technician back to `AVAILABLE` with `current_dispatch_id` cleared) and releases an `EN_ROUTE` dispatch the same way. Once a call is `CANCELLED` it is terminal: any further action attempted against it is rejected with `ERR_CALL_ALREADY_TERMINAL`.
+
+### 3.4. Dispatching and the Selector
+
+Dispatch creation is a `Dispatcher` (or `OpsAdmin`) action against a `TRIAGED` call, and it is one of the two OCC-guarded writes: the request must carry `expected_service_call_version` matching the call's current `version` or be rejected with `ERR_STALE_VERSION`. The request names the `technician_id`, a planned `window_start_at` and `window_end_at` (the end must be strictly later than the start), and `planned_travel_miles`. Creation is refused when the technician lacks the call's `required_certification` (unless that requirement is `ANY`), rejected with `ERR_TECHNICIAN_NOT_CERTIFIED`; refused when the call already has a dispatch in `ACCEPTED`, `EN_ROUTE`, or `ON_SITE`, rejected with `ERR_DISPATCH_ACTIVE`; refused when the named technician already holds a dispatch in `PROPOSED`, `ACCEPTED`, `EN_ROUTE`, or `ON_SITE` whose half-open window overlaps the requested one — the half-open convention means two windows that merely touch at an endpoint do not conflict — rejected with `ERR_DISPATCH_WINDOW_OVERLAP`; and subject to the fleet-status gate. A successful creation stamps the new dispatch `PROPOSED`, supersedes any prior `PROPOSED` dispatch of the same call to `SUPERSEDED`, moves the call from `TRIAGED` to `DISPATCHED`, increments the call's `version`, and appends a `DISPATCH_CREATED` event.
+
+To help the desk choose, a selector read on a `TRIAGED` call returns a `candidate_technician_id` plus the full ordered `ranked_technician_ids`. The eligible pool is technicians whose `status` is `AVAILABLE`, who hold the call's `required_certification` (or the requirement is `ANY`), and — when the call's `required_part_class` is not `NONE` — whose van carries at least one unit of a stock item in that class. Ranking is ascending by three keys in order: first the count of the technician's dispatches currently in `PROPOSED`, `ACCEPTED`, `EN_ROUTE`, or `ON_SITE`; then the technician's most recent `completed_at` across completed dispatches, with a technician who has never completed a dispatch sorting first; then the technician's own `created_at` as the final tie-break. When the eligible pool is empty the read is rejected with `ERR_NO_ELIGIBLE_TECHNICIAN`.
+
+The assigned technician answers the proposal. Accepting requires the actor to be the dispatch's own technician (`ERR_FORBIDDEN_OWNERSHIP` otherwise) and to currently be `AVAILABLE` (`ERR_TECHNICIAN_NOT_AVAILABLE` otherwise); it moves the dispatch to `ACCEPTED`, flips the technician to `ON_DISPATCH` with `current_dispatch_id` pinned, and appends `DISPATCH_ACCEPTED`. Rejecting — with an optional `reason` recorded as `rejection_reason` — moves the dispatch to `REJECTED`, appends `DISPATCH_REJECTED`, and, when no other active dispatch remains for the call, returns the call from `DISPATCHED` to `TRIAGED` to await re-dispatch. A `Dispatcher` may likewise release a `PROPOSED` or `ACCEPTED` dispatch with an optional `reason` recorded as `release_reason`, leaving the dispatch in `RELEASED`; releasing an accepted dispatch frees the technician to `AVAILABLE`, and in both cases the call returns to `TRIAGED` when no active dispatch remains. The daily run applies the same reversion when it expires a stale `PROPOSED` dispatch.
+
+Once accepted, the technician drives the dispatch through the roadside journey. Departing stamps `departed_at` from the logical clock, moves the dispatch to `EN_ROUTE`, the call to `EN_ROUTE`, and appends `DISPATCH_DEPARTED`. Arriving takes the one-way `actual_travel_miles` as input, stamps `arrived_at`, computes `actual_travel_minutes` as the whole-minute floor of the elapsed time between departure and arrival, moves the dispatch and the call to `ON_SITE`, and appends `DISPATCH_ARRIVED`. Completing the dispatch — permitted only once the call has reached `REPAIR_COMPLETED`, `TOW_IN_PROGRESS`, or `TOWED` (`ERR_INVALID_STATE` otherwise) — stamps the dispatch's `completed_at`, moves it to `COMPLETED`, and frees the technician to `AVAILABLE` with `current_dispatch_id` cleared.
+
+### 3.5. Diagnosis, Estimates, and Fleet Authorization
+
+On site, the assigned technician diagnoses the call, supplying a `diagnosis_summary` and a `resolution_path` of `ON_SITE_REPAIR` or `TOW_REQUIRED`. Diagnosis requires the actor to be the technician of the call's `ON_SITE` dispatch (`ERR_FORBIDDEN_OWNERSHIP` otherwise), moves the call from `ON_SITE` to `DIAGNOSED`, records both fields, and appends a `DIAGNOSED` event. The recorded `resolution_path` (which begins as `PENDING` before diagnosis) is the fork in the road for everything downstream: beginning a repair requires `ON_SITE_REPAIR` and ordering a tow requires `TOW_REQUIRED`, and either action attempted against the opposite path is rejected with `ERR_RESOLUTION_PATH_CONFLICT`.
+
+Pricing begins with rate-card resolution. When the call's fleet pins a `rate_card_id`, that card is used without consulting coverage windows; otherwise the system selects the single card whose closed window contains the call's `received_at`, and when no card covers that instant the pricing operation fails with `ERR_NO_ACTIVE_RATE_CARD`.
+
+A `Technician`, `Dispatcher`, or `OpsAdmin` drafts a `WorkEstimate` against the call — the second OCC-guarded write, again requiring `expected_service_call_version` — supplying `labor_hours_est`, `travel_miles_est`, and `parts_estimate_cents`, with an optional `includes_tow` flag (default false) and a `tow_estimate_cents` amount (default zero). Creation supersedes any prior estimate of the call in `DRAFT`, `SUBMITTED`, or `APPROVED` to `SUPERSEDED`, increments the call's `version`, appends an `ESTIMATE_CREATED` event, and computes the provisional `total_cents` variant of the pricing engine. The provisional variant prices labor as `labor_hours_est` multiplied by the class rate — the resolved card's `labor_rate_master_cents` when the technician on the call's currently active dispatch is a `MASTER`, otherwise `labor_rate_standard_cents` (a call with no active dispatch prices at the standard class) — further multiplied by the card's after-hours multiplier when the call is after-hours, with the labor amount rounded half-up to integer cents. Travel in the provisional variant is always charged on a one-way basis with the card's free-mile allowance deducted — the billable miles are `travel_miles_est` minus `travel_free_miles`, floored at zero, times `travel_per_mile_cents` — even when the call is after-hours; estimates never carry a travel-time component at all. A `P1_EMERGENCY` call adds the card's flat emergency callout fee. The gross of labor, travel, and callout earns the fleet's current discount tier percentage (retail calls are always `STANDARD`), rounded half-up; the tax on `parts_estimate_cents` at the card's basis-point rate is computed once and rounded half-up; and the provisional `total_cents` is the gross minus the discount, plus the parts estimate, plus the tow estimate when one is bundled, plus the tax.
+
+An estimate moves `DRAFT` to `SUBMITTED` when submitted, stamping `submitted_at`; a submitted estimate left undecided for more than seven calendar days is moved to `EXPIRED` by the daily run. Editing a `DRAFT` estimate in place (any subset of the same pricing inputs) recomputes `total_cents` without changing its `revision`; revising a `REJECTED` estimate moves it back to `DRAFT` and increments `revision` (which starts at 1 and is monotone per call), again recomputing the total. Approval is the fiscal checkpoint. For a fleet call the fleet must be `ACTIVE` (`ERR_FLEET_SUSPENDED` or `ERR_FLEET_CLOSED` otherwise). When the estimate's `total_cents` exceeds the fleet's `per_call_authorization_limit_cents` — a computed `requires_fleet_approval` flag surfaces exactly this condition — approval requires a `FleetManager` of that fleet or an `OpsAdmin`; a `Dispatcher` attempting it is rejected with `ERR_AUTHORIZATION_REQUIRED`. Independently, when the projected month spend — the fleet's current `month_to_date_spend_cents` plus the estimate's `total_cents` — would exceed `monthly_spend_cap_cents`, approval is rejected with `ERR_MONTHLY_CAP_EXCEEDED` unless an `OpsAdmin` passes `override_cap` as true; a projection landing exactly on the cap is allowed. Approval stamps `decided_by` and `decided_at` and appends `ESTIMATE_APPROVED`; rejection by a `FleetManager` (own fleet) or `OpsAdmin` records an optional `reason` as `reject_reason` and appends `ESTIMATE_REJECTED`.
+
+Beginning the repair — moving the call from `DIAGNOSED` to `REPAIR_IN_PROGRESS` — is gated twice: the resolution path must be `ON_SITE_REPAIR`, and no estimate of the call may be sitting in `DRAFT` or `SUBMITTED` (an `APPROVED` estimate, or no estimate at all, passes; otherwise `ERR_ESTIMATE_NOT_APPROVED`). The gate always refers to the newest estimate, since creating one supersedes its predecessors. Starting the work appends a `REPAIR_STARTED` event.
+
+### 3.6. Parts Usage and Repair Completion
+
+While the call is `REPAIR_IN_PROGRESS`, the on-site technician consumes van stock by posting a `PartUsage` naming the `van_stock_item_id`, a `qty` of at least one, and optionally a `charge_type` — `CUSTOMER_PAY` by default, or `SHOP_GUARANTEE`, which is valid only on comeback calls (the call's `is_comeback` flag must be true) and marks a line the shop absorbs rather than bills. The stock item must belong to the technician currently `ON_SITE` for the call (`ERR_PART_NOT_ON_VAN` otherwise), and the requested quantity may not exceed the item's `qty_on_hand` (`ERR_INSUFFICIENT_VAN_STOCK` otherwise). Posting decrements the item's `qty_on_hand` by the quantity, denormalizes the item's `part_number` onto the usage, snapshots `unit_price_cents` from the item's `unit_retail_cents` (for both charge types; guarantee lines are simply never summed into the invoice), computes `line_total_cents` as the exact integer-cent product of quantity and unit price, stamps `posted_at` from the logical clock, appends a `PART_POSTED` event, and re-evaluates the reorder trigger. Returns are all-or-nothing per usage line and only while the repair is still in progress — returns after completion are refused; returning restores the full `qty` to the van's `qty_on_hand` (so post plus return leaves the count unchanged), moves the usage to `RETURNED`, and appends `PART_RETURNED`.
+
+Completing the repair records the actuals: `labor_hours_actual` at quarter-hour granularity and a `completion_odometer_miles` that must be at least the vehicle's currently recorded `odometer_miles` (`ERR_ODOMETER_REGRESSION` otherwise). Completion stamps `completed_at` from the logical clock, moves the call from `REPAIR_IN_PROGRESS` to `REPAIR_COMPLETED`, cascades the odometer reading onto the vehicle's `odometer_miles`, and appends a `REPAIR_COMPLETED` event.
+
+### 3.7. Tow Coordination
+
+When diagnosis declares `TOW_REQUIRED`, a `Dispatcher`, `Technician`, or `OpsAdmin` orders a tow with the vendor's `tow_provider_name` and `tow_unit_id`, the `pickup_location_text` and `dropoff_location_text`, a requested `pickup_window_start_at` and `pickup_window_end_at` (end strictly later than start), and the `tow_fee_cents` passed through to the invoice. Ordering moves the call from `DIAGNOSED` to `TOW_IN_PROGRESS` and appends a `TOW_REQUESTED` event. The vendor's tow unit is the shared resource on which double-booking is policed: a new order is rejected with `ERR_TOW_WINDOW_OVERLAP` when another order on the same `tow_unit_id` in `REQUESTED` or `HOOKED` has a pickup window that intersects the new one after both windows are expanded by thirty minutes on each side — and for this buffered check, touching endpoints do count as conflict.
+
+The tow then proceeds through `REQUESTED` to `HOOKED` (stamping `hooked_at` and appending `TOW_HOOKED`) and from `HOOKED` to `DELIVERED` (stamping `delivered_at`, moving the call from `TOW_IN_PROGRESS` to `TOWED`, and appending `TOW_DELIVERED`). Cancelling a still-`REQUESTED` order moves it to `CANCELLED` and returns the call to `DIAGNOSED`, where a different resolution may be pursued.
+
+### 3.8. Warranty Claims
+
+When a repair completes on a covered vehicle, a warranty claim may be filed against the call — by the on-site `Technician` or by a `WarrantyAdministrator` acting on the technician's behalf. The claim names a `claim_type` of `OEM_BASE`, `OEM_POWERTRAIN`, or `EXTENDED_SERVICE_CONTRACT`, plus the OEM's flat-rate allowance `oem_labor_hours`, the reimbursed `oem_labor_rate_cents`, and the `parts_at_cost_cents` the OEM covers. The filer is recorded as `filed_by_technician_id`: for a `Technician` filer the system takes it from `X-User-ID`, and for a `WarrantyAdministrator` filer it is taken from the call's dispatch technician. Filing requires the call to be `REPAIR_COMPLETED`, and the vehicle to be inside the applicable coverage: for the two OEM claim types, the call's `received_at` must fall before the vehicle's `oem_warranty_expires_at` and the call's `completion_odometer_miles` must not exceed `oem_warranty_miles_limit` (`ERR_WARRANTY_WINDOW_EXPIRED` otherwise); for an extended-contract claim, the vehicle's `extended_warranty` flag must be true (`ERR_WARRANTY_NOT_APPLICABLE` otherwise). Two cross-document gates also apply: no claim may be filed while a non-`VOID` invoice exists for the call, and conversely no invoice may be drafted while a claim of the call sits in `DRAFT`, `SUBMITTED`, or `APPEALED` (`ERR_WARRANTY_CLAIM_UNDECIDED`) — and the invoice side of that gate, or a second live invoice, is rejected with `ERR_INVOICE_EXISTS`.
+
+Every claim is valued on two bases, both in integer cents with round-half-up. The OEM basis, `oem_value_cents`, is computed at filing: the product of `oem_labor_hours` and `oem_labor_rate_cents` rounded half-up, plus `parts_at_cost_cents`. The retail basis, `retail_value_cents`, is computed at submission: the call's `labor_hours_actual` multiplied by the resolved card's standard labor rate — OEMs reimburse the standard class, never the master premium — rounded half-up, plus the sum of `line_total_cents` over the call's `POSTED` customer-pay usages. The recoverable `recovered_cents` is the lesser of the two bases and is likewise computed at submission. The same repair data therefore yields two different values by design.
+
+A `WarrantyAdministrator` submits the claim (`DRAFT` to `SUBMITTED`, computing the retail basis and the recoverable split), then decides it by passing a `decision`: approval moves it to `APPROVED` with `decided_by` recorded; denial requires a `denial_reason` and records both it and `decided_by`. A denied claim may be appealed by a `Dispatcher` or `OpsAdmin`, moving it to `APPEALED` and incrementing `appeal_count`; the appeal cap is two, and an appeal attempted when `appeal_count` has already reached two is rejected with `ERR_APPEAL_LIMIT_REACHED` — a denial at that point is effectively terminal. An appealed claim is decided again under the same rules. Finally, an approved claim is settled by recording a `settled_amount_cents` that must equal `recovered_cents` exactly (a mismatch is rejected with `ERR_VALIDATION`), moving it to the terminal `SETTLED` state. Claims in `APPROVED` or `SETTLED` feed the invoice's warranty offset (§3.9).
+
+### 3.9. Invoicing, Payments, and the Suspension Cascade
+
+A `BillingClerk` drafts an `Invoice` for a call that has reached `REPAIR_COMPLETED` or `TOWED`, with no undecided warranty claim and no other live invoice; the new document's `invoice_id` reference is what payments are later posted against. Drafting runs the final variant of the pricing engine and snapshots every component onto the invoice. The final variant resolves the rate card the same way, takes the call's completed dispatch (the latest by `completed_at`), and prices labor from actuals: `labor_hours_actual` multiplied by the dispatched technician's class rate — copied onto the invoice as `labor_rate_cents` — multiplied by the after-hours multiplier when the call is after-hours, rounded half-up into `labor_amount_cents`. Travel is where the two variants diverge: the final variant reads the dispatch's `actual_travel_miles` (copied onto the invoice as `travel_miles_actual`), and on a business-hours call bills the excess over the card's free-mile allowance (actual miles minus `travel_free_miles`, floored at zero), while on an after-hours call bills portal-to-portal at twice the one-way actual miles with no free allowance deducted; the result is stored as `travel_miles_billable`, and the billable miles times `travel_per_mile_cents` form `travel_amount_cents`. The dispatch's `actual_travel_minutes` is likewise copied onto the invoice as `travel_minutes_actual`, and those minutes times `travel_time_per_minute_cents` form `travel_time_amount_cents`. A `P1_EMERGENCY` call adds the `emergency_callout_fee_cents` as `callout_fee_cents`, zero otherwise. The discount uses the fleet's tier snapshotted from `month_to_date_spend_cents` before this invoice is counted — the invoice's own total feeds the month total only afterward, at issue — applied to the gross of labor, travel amount, travel time, and callout, rounded half-up into `discount_cents`, with the tier stored on the invoice as `discount_tier`. `parts_subtotal_cents` sums `line_total_cents` over the call's `POSTED` customer-pay usages; `tow_charge_cents` sums `tow_fee_cents` over the call's `DELIVERED` tow orders; `tax_cents` is the parts subtotal times the card's `parts_tax_rate_bp` divided by ten thousand, rounded half-up exactly once. `warranty_offset_cents` sums `recovered_cents` over the call's claims in `APPROVED` or `SETTLED`, capped at the pre-offset total so it never drives the document negative. The invoice's `total_cents` is labor plus travel amount plus travel time plus callout, minus discount, plus parts subtotal, plus tow, plus tax, minus warranty offset, floored at zero; components are rounded individually and the total is never re-rounded. Comeback calls adjust the final variant before anything else: a `NO_CHARGE` comeback zeroes labor, travel amount, travel time, and callout, while a `REDUCED` comeback halves the computed labor amount with round-half-up. The drafted invoice begins with `issue_status` `DRAFT` and `payment_status` `UNPAID`, carries `created_by` from the issuer's header, copies `labor_hours_actual` and `after_hours` from the call, is numbered with an `invoice_number` of `INV-` followed by a zero-padded six-digit monotone sequence, and appends an `INVOICE_CREATED` event.
+
+Issuance is where the cascades live. Issuing requires the fleet to be `ACTIVE` for fleet calls. It stamps `issued_at` from the logical clock, records `issued_by`, computes `due_at` as `issued_at` plus the fleet's `payment_terms_days` (retail invoices are due on the spot, zero days), and moves the call from `REPAIR_COMPLETED` or `TOWED` to `INVOICED`, snapshotting the pre-issue status into `status_before_invoice` so a later void can revert it; the call appends `INVOICE_ISSUED`. Then the fleet cascade: the invoice's `total_cents` is added to the fleet's `month_to_date_spend_cents`, and if that pushes the month total strictly above `monthly_spend_cap_cents`, the fleet is suspended to `SUSPENDED` with `suspension_reason` `CREDIT_HOLD`; every one of that fleet's calls sitting in `RECEIVED`, `TRIAGED`, or `DISPATCHED` is then flagged with `hold_reason` `FLEET_CREDIT_HOLD` and a `HOLD_FLAGGED` event; every `PROPOSED` dispatch of those calls is expired, and any `DISPATCHED` call whose dispatch expired reverts to `TRIAGED`. A zero-total invoice — the hallmark of a `NO_CHARGE` comeback — skips the collection lifecycle entirely: at issue its `payment_status` goes straight to `PAID` and the call moves from `INVOICED` directly to `CLOSED`.
+
+Payments are posted by a `BillingClerk` with an `amount_cents` of at least one and at most the invoice's current `outstanding_cents` (`ERR_PAYMENT_EXCEEDS_BALANCE` otherwise), a `method` of `CHECK`, `CARD`, `ACH`, or `FLEET_ACCOUNT`, and an optional `received_at` (defaulting to the logical clock at posting). Each payment is allocated across the invoice's component buckets in a pinned order — first `tax_cents`, then `parts_subtotal_cents`, then `tow_charge_cents`, then `labor_amount_cents`, then `travel_time_amount_cents`, then `travel_amount_cents`, then `callout_fee_cents` — filling each bucket's remaining balance (face value minus prior posted allocations) before overflowing into the next, with the per-bucket split recorded on the payment as `allocation_json`. Payments process chronologically by `received_at`, with equal timestamps broken by `created_at` ascending, never by id. Posting recomputes the invoice's `amount_paid_cents` (the sum over `POSTED` payments) and `outstanding_cents` (the total minus the paid sum), moves `payment_status` from `UNPAID` to `PARTIALLY_PAID` while a balance remains, and appends `PAYMENT_POSTED`. When a payment brings the outstanding balance to zero, `payment_status` becomes `PAID` and the call cascades from `INVOICED` to `CLOSED` with a `CALL_CLOSED` event — and if that call was the comeback call of a confirmed repeat-failure case, the cascade continues one hop further (§3.10). Voiding a payment by a `BillingClerk` or `OpsAdmin` with a `reason` reverses its allocation, recomputes the amounts and the payment status (dropping back to `PARTIALLY_PAID` or `UNPAID` as the numbers dictate), moves the payment to `VOID`, and appends `PAYMENT_VOIDED`.
+
+Two terminal write-offs and reversals round out the document lifecycle. An `OpsAdmin` may void an `ISSUED` invoice with a `reason` recorded as `void_reason`, but only under segregation of duties (the acting user must differ from `issued_by`, else `ERR_SEGREGATION_OF_DUTIES`) and only while no `POSTED` payments exist on it (else `ERR_INVOICE_HAS_PAYMENTS`). Voiding subtracts the invoice's `total_cents` back out of the fleet's `month_to_date_spend_cents`, automatically reinstates a `CREDIT_HOLD`-suspended fleet whose month total has returned to its cap or below, reverts the call from `INVOICED` to whatever `status_before_invoice` captured (appending `INVOICE_VOIDED` when the call returns to `REPAIR_COMPLETED`), and leaves the document `VOID`. An `OpsAdmin` may instead write off an `ISSUED` invoice carrying an outstanding balance, recording a `writeoff_reason`; a write-off moves `payment_status` to `WRITTEN_OFF`, closes the call, and deliberately does not reduce month-to-date spend — written-off spend remains recognized. An invoice is considered overdue at read time when the logical clock has passed `due_at` and `outstanding_cents` remains above zero.
+
+### 3.10. Repeat Failures and Comeback Calls
+
+A repair that does not hold generates paperwork of its own. A `Dispatcher` or `OpsAdmin` opens a `RepeatFailureCase` naming the `vehicle_id`, the `original_service_call_id` (which must be a `CLOSED` call), and the `new_service_call_id` under review. The two calls must belong to the same vehicle (`ERR_VEHICLE_MISMATCH` otherwise) and share the same `symptom_category` — the case copies the new call's category and compares it to the original's, rejecting a mismatch with `ERR_REPEAT_SYMPTOM_MISMATCH`. At most one case per vehicle may be open at a time across `OPEN`, `UNDER_REVIEW`, and `CONFIRMED_COMEBACK` (`ERR_DUPLICATE_OPEN_CASE` otherwise). Opening computes the comeback window: `window_days` is the whole-day floor of the elapsed time between the original call's `completed_at` and the new call's `received_at`, and `miles_since_repair` is the vehicle's current `odometer_miles` minus the original call's `completion_odometer_miles`. The `charge_policy` follows: `NO_CHARGE` when the window is at most 30 days and the mileage at most 1000; `REDUCED` when the window is at most 45 days and the mileage at most 2000; otherwise `FULL`. A day-30, thousand-mile case is therefore free; day 31 with mileage inside the limit is reduced; day 45 at 2000 miles is still reduced; day 46 is full price.
+
+Review moves the case from `OPEN` to `UNDER_REVIEW`. An `OpsAdmin` then decides it. Confirming the comeback — allowed only when the `charge_policy` is not `FULL`, else `ERR_REPEAT_WINDOW_EXPIRED` — marks the new call with `is_comeback` true and points its `repeat_of_call_id` at the original, records `decided_by`, and reopens the original call from `CLOSED` to `REOPENED` with its `reopened_count` incremented and a `CALL_REOPENED` event appended. Rejecting the case records `decided_by` and an optional `decision_note` and terminates the case as `REJECTED`. The loop closes when the comeback call itself reaches `CLOSED`: the case moves to `RESOLVED` and the original call returns from `REOPENED` to `CLOSED` — including when the comeback call closes through the invoice-payment cascade of §3.9. The `charge_policy` computed here is what adjusts the comeback call's final invoice pricing.
+
+### 3.11. Inspection Defects and Roadworthiness
+
+Roadside inspections and annual checks generate `InspectionDefect` records, filed by a `SafetyOfficer` (or `OpsAdmin`) against a vehicle with a `source` of `ROADSIDE_DOT_INSPECTION`, `ANNUAL_INSPECTION`, or `DRIVER_REPORT`, a regulation `defect_code`, a `severity` of `OOS` or `NON_OOS`, an optional `citation_reference`, and the `discovered_at` timestamp of the citation. Filing computes `correction_deadline_at` as exactly 15 days after discovery and opens the defect as `OPEN`; an `OOS` defect immediately flips the vehicle's `roadworthiness` to `OUT_OF_SERVICE` per the derivation in §3.2.
+
+Correction flows through a linked service call. A `SafetyOfficer` attaches a correcting call by its `service_call_id`, which must name a call on the same vehicle (`ERR_VEHICLE_MISMATCH` otherwise); attachment moves the defect from `OPEN` — and equally from `VERIFICATION_FAILED` or `ESCALATED`, the two re-work entry points — to `REPAIR_SCHEDULED`, records `correcting_service_call_id` on the defect, and sets the call's `linked_defect_id` back to the defect. The on-site technician of that linked call marks the defect corrected with a `correction_note`, but only once the linked call has reached `REPAIR_COMPLETED` (`ERR_INVALID_STATE` otherwise) and only when the actor is the technician of the linked call's `ON_SITE` dispatch (`ERR_FORBIDDEN_OWNERSHIP` otherwise), moving the defect from `REPAIR_SCHEDULED` to `CORRECTED`.
+
+Verification belongs to the `SafetyOfficer` alone and requires the defect to be `CORRECTED` (`ERR_DEFECT_NOT_CORRECTED` otherwise); the verdict arrives as an `outcome` with an optional free-text `verification_note`. A passing outcome moves the defect to `VERIFIED` — its terminal state — recording `verified_by` and `verified_at` and recomputing the vehicle's roadworthiness; a failing outcome moves it to `VERIFICATION_FAILED` and recomputes roadworthiness the same way, from where a fresh correcting call may be attached. Meanwhile the daily run watches the deadline: any defect still in `OPEN`, `REPAIR_SCHEDULED`, `CORRECTED`, or `VERIFICATION_FAILED` once the logical clock has passed its `correction_deadline_at` is escalated to `ESCALATED` with `escalation_count` incremented; a defect exactly at its deadline is not yet escalated, because the comparison is strictly later-than. An `ESCALATED` defect can still be brought back by attaching a new correcting call, and an `OOS` defect holds the vehicle out of service through every state until `VERIFIED`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource — a fleet account, vehicle, technician, rate card, van stock item, service call, dispatch, estimate, part usage, tow order, warranty claim, inspection defect, invoice, payment, repeat-failure case, or spend adjustment — return `201 Created`. Operations that modify an existing resource, drive a state transition, or perform a read return `200 OK`. All resources are mounted under the `/roadside` prefix.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/roadside/_clock/set_current_utc` | Advance the logical clock (forward only) | OpsAdmin |
+| POST | `/roadside/_ops/run_daily` | Daily checkpoint: expire stale dispatches/estimates, escalate overdue defects, reinstate credit-hold fleets within cap | OpsAdmin |
+| POST | `/roadside/fleet-accounts` | Create a fleet account | OpsAdmin |
+| GET | `/roadside/fleet-accounts/{fleetAccountId}` | Get a fleet account (FleetManager limited to own id) | OpsAdmin, Dispatcher, BillingClerk, FleetManager, WarrantyAdministrator |
+| GET | `/roadside/fleet-accounts` | List fleet accounts | OpsAdmin, Dispatcher, BillingClerk |
+| PATCH | `/roadside/fleet-accounts/{fleetAccountId}` | Update fleet limits, terms, or pinned rate card | OpsAdmin |
+| POST | `/roadside/fleet-accounts/{fleetAccountId}/suspend` | Manually suspend a fleet (reason ADMIN) | OpsAdmin |
+| POST | `/roadside/fleet-accounts/{fleetAccountId}/reinstate` | Manually reinstate a fleet | OpsAdmin |
+| POST | `/roadside/fleet-accounts/{fleetAccountId}/close` | Close a fleet (requires no non-terminal calls) | OpsAdmin |
+| POST | `/roadside/fleet-accounts/{fleetAccountId}/spend-adjustments` | Post a signed current-month spend adjustment | OpsAdmin, BillingClerk |
+| POST | `/roadside/vehicles` | Register a vehicle | OpsAdmin, Dispatcher |
+| GET | `/roadside/vehicles/{vehicleId}` | Get a vehicle | OpsAdmin, Dispatcher, Technician, FleetManager, BillingClerk, SafetyOfficer, WarrantyAdministrator |
+| GET | `/roadside/vehicles` | List vehicles | OpsAdmin, Dispatcher, FleetManager, SafetyOfficer |
+| PATCH | `/roadside/vehicles/{vehicleId}` | Update odometer (monotone) and warranty data | OpsAdmin, Dispatcher, Technician |
+| POST | `/roadside/technicians` | Onboard a technician | OpsAdmin |
+| GET | `/roadside/technicians/{technicianId}` | Get a technician | OpsAdmin, Dispatcher, Technician |
+| GET | `/roadside/technicians` | List technicians | OpsAdmin, Dispatcher |
+| POST | `/roadside/technicians/{technicianId}/set-status` | Self-service availability transition (OFF_DUTY / AVAILABLE / ON_BREAK) | OpsAdmin, Technician |
+| POST | `/roadside/rate-cards` | Publish a rate card with a non-overlapping closed effective window | OpsAdmin |
+| GET | `/roadside/rate-cards/{rateCardId}` | Get a rate card | OpsAdmin, Dispatcher, BillingClerk |
+| GET | `/roadside/rate-cards` | List rate cards | OpsAdmin, Dispatcher, BillingClerk |
+| POST | `/roadside/technicians/{technicianId}/van-stock` | Stock a part on a technician's van | OpsAdmin |
+| GET | `/roadside/van-stock/{vanStockItemId}` | Get a van stock item | OpsAdmin, Dispatcher, Technician |
+| GET | `/roadside/van-stock` | List van stock | OpsAdmin, Dispatcher, Technician |
+| POST | `/roadside/van-stock/{vanStockItemId}/adjust` | Manual stock correction (signed delta; result non-negative); re-evaluates the reorder trigger | OpsAdmin, Technician |
+| POST | `/roadside/service-calls` | Intake a service call; stamps received_at and computes after_hours | Dispatcher, OpsAdmin |
+| GET | `/roadside/service-calls/{serviceCallId}` | Get a service call | OpsAdmin, Dispatcher, Technician, FleetManager, BillingClerk, WarrantyAdministrator, SafetyOfficer |
+| GET | `/roadside/service-calls` | List service calls | OpsAdmin, Dispatcher, FleetManager, BillingClerk |
+| POST | `/roadside/service-calls/{serviceCallId}/triage` | Set severity; computes priority, required certification and part class | Dispatcher, OpsAdmin |
+| POST | `/roadside/service-calls/{serviceCallId}/diagnose` | On-site technician records diagnosis and the repair-vs-tow decision | Technician |
+| POST | `/roadside/service-calls/{serviceCallId}/start-repair` | Begin wrench time (estimate gate applies) | Technician |
+| POST | `/roadside/service-calls/{serviceCallId}/complete-repair` | Finish repair; records actual labor hours and odometer | Technician |
+| POST | `/roadside/service-calls/{serviceCallId}/cancel` | Cancel a call before on-site work (FleetManager: own fleet's calls only) | Dispatcher, OpsAdmin, FleetManager |
+| GET | `/roadside/service-calls/{serviceCallId}/dispatch-suggestion` | Ranked eligible technicians for this TRIAGED call | Dispatcher, OpsAdmin |
+| GET | `/roadside/service-calls/{serviceCallId}/events` | Append-only audit trail of the call | OpsAdmin, Dispatcher, FleetManager, BillingClerk |
+| GET | `/roadside/call-events/{callEventId}` | Get a single call event | OpsAdmin, Dispatcher, FleetManager, BillingClerk |
+| GET | `/roadside/call-events` | List call events across calls (audit search) | OpsAdmin, Dispatcher, FleetManager, BillingClerk |
+| POST | `/roadside/service-calls/{serviceCallId}/dispatches` | Propose a dispatch (OCC on the call; supersedes a PROPOSED dispatch) | Dispatcher, OpsAdmin |
+| GET | `/roadside/dispatches/{dispatchId}` | Get a dispatch | OpsAdmin, Dispatcher, Technician |
+| GET | `/roadside/dispatches` | List dispatches | OpsAdmin, Dispatcher, Technician |
+| POST | `/roadside/dispatches/{dispatchId}/accept` | Assigned technician accepts | Technician |
+| POST | `/roadside/dispatches/{dispatchId}/reject` | Assigned technician rejects | Technician |
+| POST | `/roadside/dispatches/{dispatchId}/depart` | Technician departs | Technician |
+| POST | `/roadside/dispatches/{dispatchId}/arrive` | Technician arrives; records actual miles and travel minutes | Technician |
+| POST | `/roadside/dispatches/{dispatchId}/complete` | Close out the dispatch after work or handoff | Technician |
+| POST | `/roadside/dispatches/{dispatchId}/release` | Dispatcher pulls a PROPOSED/ACCEPTED dispatch | Dispatcher, OpsAdmin |
+| POST | `/roadside/service-calls/{serviceCallId}/estimates` | Create an estimate (OCC on the call); supersedes prior DRAFT/SUBMITTED/APPROVED estimates | Technician, Dispatcher, OpsAdmin |
+| GET | `/roadside/estimates/{estimateId}` | Get an estimate | OpsAdmin, Dispatcher, Technician, FleetManager, BillingClerk |
+| GET | `/roadside/estimates` | List estimates | OpsAdmin, Dispatcher, FleetManager |
+| PATCH | `/roadside/estimates/{estimateId}` | Edit a DRAFT estimate or revise a REJECTED one (revision + 1) | Technician, Dispatcher, OpsAdmin |
+| POST | `/roadside/estimates/{estimateId}/submit` | Submit an estimate for approval | Technician, Dispatcher, OpsAdmin |
+| POST | `/roadside/estimates/{estimateId}/approve` | Approve: Dispatcher/OpsAdmin within the fleet limit, FleetManager (own fleet) or OpsAdmin above it; monthly-cap projected check | Dispatcher, FleetManager, OpsAdmin |
+| POST | `/roadside/estimates/{estimateId}/reject` | Reject a submitted estimate | FleetManager, OpsAdmin |
+| POST | `/roadside/service-calls/{serviceCallId}/part-usages` | Consume van parts on the call (repair in progress, own van only) | Technician |
+| GET | `/roadside/part-usages/{partUsageId}` | Get a part usage | OpsAdmin, Dispatcher, Technician, BillingClerk |
+| GET | `/roadside/part-usages` | List part usages | OpsAdmin, Dispatcher, Technician, BillingClerk |
+| POST | `/roadside/part-usages/{partUsageId}/return` | Return the full line to van stock (repair must still be in progress) | Technician |
+| POST | `/roadside/service-calls/{serviceCallId}/tow-orders` | Order a tow (call must be DIAGNOSED with TOW_REQUIRED) | Dispatcher, Technician, OpsAdmin |
+| GET | `/roadside/tow-orders/{towOrderId}` | Get a tow order | OpsAdmin, Dispatcher, Technician, BillingClerk |
+| GET | `/roadside/tow-orders` | List tow orders | OpsAdmin, Dispatcher, BillingClerk |
+| POST | `/roadside/tow-orders/{towOrderId}/hook` | Tow unit hooked the vehicle | Dispatcher, OpsAdmin |
+| POST | `/roadside/tow-orders/{towOrderId}/deliver` | Tow delivered | Dispatcher, OpsAdmin |
+| POST | `/roadside/tow-orders/{towOrderId}/cancel` | Cancel a requested tow | Dispatcher, OpsAdmin |
+| POST | `/roadside/service-calls/{serviceCallId}/warranty-claims` | File a warranty claim (call REPAIR_COMPLETED, no non-VOID invoice) | Technician, WarrantyAdministrator |
+| GET | `/roadside/warranty-claims/{claimId}` | Get a claim | OpsAdmin, Dispatcher, Technician, WarrantyAdministrator, BillingClerk |
+| GET | `/roadside/warranty-claims` | List claims | OpsAdmin, WarrantyAdministrator, BillingClerk |
+| POST | `/roadside/warranty-claims/{claimId}/submit` | Submit to the OEM/administrator queue; computes retail basis and recovered split | WarrantyAdministrator |
+| POST | `/roadside/warranty-claims/{claimId}/decide` | Decide a SUBMITTED or APPEALED claim (APPROVED / DENIED) | WarrantyAdministrator |
+| POST | `/roadside/warranty-claims/{claimId}/appeal` | Appeal a DENIED claim (max 2 appeals) | Dispatcher, OpsAdmin |
+| POST | `/roadside/warranty-claims/{claimId}/settle` | Record OEM remittance; amount must equal recovered_cents | WarrantyAdministrator |
+| POST | `/roadside/vehicles/{vehicleId}/inspection-defects` | Record a roadside-inspection defect; OOS flips the vehicle OUT_OF_SERVICE | SafetyOfficer, OpsAdmin |
+| GET | `/roadside/inspection-defects/{inspectionDefectId}` | Get a defect | OpsAdmin, Dispatcher, Technician, SafetyOfficer, FleetManager |
+| GET | `/roadside/inspection-defects` | List defects | OpsAdmin, Dispatcher, SafetyOfficer, FleetManager |
+| POST | `/roadside/inspection-defects/{inspectionDefectId}/attach-call` | Link a correcting service call (OPEN / VERIFICATION_FAILED / ESCALATED to REPAIR_SCHEDULED) | SafetyOfficer, OpsAdmin |
+| POST | `/roadside/inspection-defects/{inspectionDefectId}/mark-corrected` | On-site technician marks the defect corrected | Technician |
+| POST | `/roadside/inspection-defects/{inspectionDefectId}/verify` | SafetyOfficer verifies correction (PASS / FAIL) | SafetyOfficer |
+| POST | `/roadside/service-calls/{serviceCallId}/invoices` | Draft the invoice with the full final pricing snapshot | BillingClerk |
+| GET | `/roadside/invoices/{invoiceId}` | Get an invoice | OpsAdmin, Dispatcher, BillingClerk, FleetManager |
+| GET | `/roadside/invoices` | List invoices | OpsAdmin, BillingClerk, FleetManager |
+| POST | `/roadside/invoices/{invoiceId}/issue` | Issue the invoice; feeds fleet month spend and the suspension cascade | BillingClerk, OpsAdmin |
+| POST | `/roadside/invoices/{invoiceId}/void` | Void an issued invoice (segregation of duties; no POSTED payments) | OpsAdmin |
+| POST | `/roadside/invoices/{invoiceId}/write-off` | Write off an unpaid balance (spend stays recognized) | OpsAdmin |
+| POST | `/roadside/invoices/{invoiceId}/payments` | Post a payment; waterfall allocation across pinned buckets | BillingClerk |
+| GET | `/roadside/payments/{paymentId}` | Get a payment | OpsAdmin, BillingClerk |
+| GET | `/roadside/payments` | List payments | OpsAdmin, BillingClerk |
+| POST | `/roadside/payments/{paymentId}/void` | Void a posted payment (reverses allocation) | BillingClerk, OpsAdmin |
+| POST | `/roadside/repeat-failure-cases` | Open a repeat-failure case linking an original CLOSED call and a new complaint call | Dispatcher, OpsAdmin |
+| GET | `/roadside/repeat-failure-cases/{repeatFailureCaseId}` | Get a case | OpsAdmin, Dispatcher |
+| GET | `/roadside/repeat-failure-cases` | List cases | OpsAdmin, Dispatcher |
+| POST | `/roadside/repeat-failure-cases/{repeatFailureCaseId}/review` | Move case to UNDER_REVIEW | Dispatcher, OpsAdmin |
+| POST | `/roadside/repeat-failure-cases/{repeatFailureCaseId}/decide` | Confirm (requires charge policy other than FULL) or reject | OpsAdmin |
+| GET | `/roadside/restock-requests/{restockRequestId}` | Get a restock request | OpsAdmin, Technician |
+| GET | `/roadside/restock-requests` | List restock requests | OpsAdmin, Technician |
+| POST | `/roadside/restock-requests/{restockRequestId}/approve` | Approve a pending restock | OpsAdmin |
+| POST | `/roadside/restock-requests/{restockRequestId}/fulfill` | Fulfill: adds units back to the van | OpsAdmin |
+| POST | `/roadside/restock-requests/{restockRequestId}/reject` | Reject a pending restock | OpsAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED_ROLE` | 403 |
+| `ERR_FORBIDDEN_OWNERSHIP` | 403 |
+| `ERR_NOT_FOUND` | 404 |
+| `ERR_VALIDATION` | 400 |
+| `ERR_INVALID_ENUM` | 400 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_CALL_ALREADY_TERMINAL` | 409 |
+| `ERR_STALE_VERSION` | 412 |
+| `ERR_ESTIMATE_NOT_APPROVED` | 409 |
+| `ERR_DEFECT_NOT_CORRECTED` | 409 |
+| `ERR_APPEAL_LIMIT_REACHED` | 409 |
+| `ERR_TECHNICIAN_NOT_AVAILABLE` | 409 |
+| `ERR_TECHNICIAN_NOT_CERTIFIED` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_DISPATCH_WINDOW_OVERLAP` | 409 |
+| `ERR_TOW_WINDOW_OVERLAP` | 409 |
+| `ERR_RATE_CARD_WINDOW_OVERLAP` | 409 |
+| `ERR_ODOMETER_REGRESSION` | 422 |
+| `ERR_CLOCK_REGRESSION` | 422 |
+| `ERR_FLEET_SUSPENDED` | 409 |
+| `ERR_FLEET_CLOSED` | 409 |
+| `ERR_FLEET_HAS_OPEN_CALLS` | 409 |
+| `ERR_WARRANTY_WINDOW_EXPIRED` | 409 |
+| `ERR_WARRANTY_NOT_APPLICABLE` | 409 |
+| `ERR_WARRANTY_CLAIM_UNDECIDED` | 409 |
+| `ERR_PART_NOT_ON_VAN` | 409 |
+| `ERR_VEHICLE_MISMATCH` | 409 |
+| `ERR_DUPLICATE_VIN` | 409 |
+| `ERR_DUPLICATE_OPEN_CASE` | 409 |
+| `ERR_INVOICE_EXISTS` | 409 |
+| `ERR_DISPATCH_ACTIVE` | 409 |
+| `ERR_RESOLUTION_PATH_CONFLICT` | 409 |
+| `ERR_INSUFFICIENT_VAN_STOCK` | 409 |
+| `ERR_NO_ELIGIBLE_TECHNICIAN` | 409 |
+| `ERR_REPEAT_SYMPTOM_MISMATCH` | 409 |
+| `ERR_REPEAT_WINDOW_EXPIRED` | 409 |
+| `ERR_NO_ACTIVE_RATE_CARD` | 409 |
+| `ERR_AUTHORIZATION_REQUIRED` | 409 |
+| `ERR_MONTHLY_CAP_EXCEEDED` | 409 |
+| `ERR_PAYMENT_EXCEEDS_BALANCE` | 422 |
+| `ERR_INVOICE_HAS_PAYMENTS` | 409 |

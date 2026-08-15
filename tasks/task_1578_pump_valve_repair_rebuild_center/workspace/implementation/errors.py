@@ -1,0 +1,60 @@
+"""Error classes and error ID constants, exactly per the scaffold error catalog."""
+from __future__ import annotations
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, message: str, http_status: int):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+# Error IDs / statuses (scaffold §1.6)
+ERR_UNAUTHENTICATED = ("ERR_UNAUTHENTICATED", 401)
+ERR_VALIDATION = ("ERR_VALIDATION", 400)
+ERR_FORBIDDEN = ("ERR_FORBIDDEN", 403)
+ERR_NOT_FOUND = ("ERR_NOT_FOUND", 404)
+ERR_INVALID_STATE = ("ERR_INVALID_STATE", 409)
+ERR_STALE_VERSION = ("ERR_STALE_VERSION", 412)
+ERR_QUOTE_EXPIRED = ("ERR_QUOTE_EXPIRED", 409)
+ERR_WINDOW_OVERLAP = ("ERR_WINDOW_OVERLAP", 409)
+ERR_ASSET_WINDOW_OVERLAP = ("ERR_ASSET_WINDOW_OVERLAP", 409)
+ERR_WARRANTY_NOT_ELIGIBLE = ("ERR_WARRANTY_NOT_ELIGIBLE", 409)
+ERR_SUPERSEDES_NOT_ACTIVE = ("ERR_SUPERSEDES_NOT_ACTIVE", 409)
+ERR_PART_OBSOLETE = ("ERR_PART_OBSOLETE", 409)
+ERR_SUBSTITUTION_TARGET_NOT_OBSOLETE = ("ERR_SUBSTITUTION_TARGET_NOT_OBSOLETE", 409)
+ERR_SUBSTITUTION_NOT_ALLOWED = ("ERR_SUBSTITUTION_NOT_ALLOWED", 409)
+ERR_WINDOW_FULL = ("ERR_WINDOW_FULL", 409)
+ERR_WINDOW_CAPACITY_EXCEEDED = ("ERR_WINDOW_CAPACITY_EXCEEDED", 409)
+ERR_CREDIT_LIMIT_EXCEEDED = ("ERR_CREDIT_LIMIT_EXCEEDED", 422)
+ERR_POOL_UNIT_UNAVAILABLE = ("ERR_POOL_UNIT_UNAVAILABLE", 409)
+ERR_POOL_CUSTOMER_MISMATCH = ("ERR_POOL_CUSTOMER_MISMATCH", 409)
+ERR_EXCHANGE_NOT_REQUESTED = ("ERR_EXCHANGE_NOT_REQUESTED", 409)
+ERR_POOL_PROGRAM_REQUIRED = ("ERR_POOL_PROGRAM_REQUIRED", 409)
+ERR_REPORT_ALREADY_EXISTS = ("ERR_REPORT_ALREADY_EXISTS", 409)
+ERR_ASSEMBLY_NOT_RECORDED = ("ERR_ASSEMBLY_NOT_RECORDED", 409)
+ERR_CERTIFICATION_NOT_APPLICABLE = ("ERR_CERTIFICATION_NOT_APPLICABLE", 409)
+ERR_SOD_VIOLATION = ("ERR_SOD_VIOLATION", 422)
+ERR_SET_PRESSURE_OUT_OF_TOLERANCE = ("ERR_SET_PRESSURE_OUT_OF_TOLERANCE", 422)
+
+
+def raise_err(pair, message: str):
+    error_id, status = pair
+    raise ApiError(error_id, message, status)
+
+
+def validation(message: str):
+    raise_err(ERR_VALIDATION, message)
+
+
+def not_found(message: str):
+    raise_err(ERR_NOT_FOUND, message)
+
+
+def forbidden(message: str):
+    raise_err(ERR_FORBIDDEN, message)
+
+
+def invalid_state(message: str):
+    raise_err(ERR_INVALID_STATE, message)

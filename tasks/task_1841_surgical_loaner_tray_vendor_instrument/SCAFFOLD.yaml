@@ -1,0 +1,1291 @@
+# =============================================================================
+# Task 1841 — Surgical Loaner Tray & Vendor Instrument Management
+# Scaffold seed tables (§1.0–§1.7). Difficulty design (§1.8) and corner design
+# (§1.9) live in sibling files.
+# =============================================================================
+
+scenario: |
+  1841. Surgical Loaner Tray & Vendor Instrument Management (OR vendor management office): case-linked loaner request & delivery deadline, vendor check-in with count sheet & documentation, sterilization turnaround before case time, missing/incomplete tray escalation, vendor rep credentialing & OR access, post-case pickup & reconciliation, damage/loss liability, late-delivery penalty & case delay tracking
+
+domain_name: surgical-loaner-ops
+api_prefix: /vendor-office
+
+complexity_profile:
+  primary_archetype: "Compliance / audit (credentialing gates, segregation of duties, penalty & liability adjudication with audit trail)"
+  secondary_archetype: "Posture-driven gating (LoanerRequest.readiness derived from child trays gates SurgicalCase start)"
+  complexity_layers:
+    - optimistic_concurrency       # OCC on SurgicalCase.version (reschedule) and DamageLossClaim.version (apportion)
+    - cascading_side_effects       # verify -> penalty -> request rollup; fail-qa -> tray -> readiness -> escalation
+    - dual_variant_calculation     # liability apportionment provisional-vs-final; case delay attribution provisional-vs-final
+    - rate_threshold_triggers      # grace minutes, penalty cap, rework limit, sterilizer slot capacity
+  entity_topology: hybrid          # flat FK-linked peers + nested creation under requests/cases/trays
+  state_machine_shape: compound    # request posture derived from child tray states; cyclic rework/renewal/dispute loops
+  relationship_patterns:
+    - one_to_many                  # vendor->reps, request->trays, tray->turns
+    - cross_aggregate              # LoanerRequest links SurgicalCase x Vendor; ORAccessPass links VendorRep x SurgicalCase
+    - polymorphic                  # Escalation.linked_tray_id optional per type; CaseDelayEvent.attributable_request_id per cause
+  role_model: segregation_of_duties  # check-in verifier cannot reconcile pickup nor waive penalty on same request
+  consistency_model: immediate     # every mutation visible in same response; no async reconciliation
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Vendor
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vendor_name, type: string, source: input, description: "Legal vendor name" }
+      - { name: vendor_code, type: string, source: input, description: "Unique vendor code", constraints: "unique across all vendors; duplicates -> ERR_DUPLICATE_VENDOR_CODE" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUSPENDED | TERMINATED; initial ACTIVE" }
+      - { name: late_grace_minutes, type: integer, source: input, description: "Contract grace minutes subtracted from late_minutes before billing", default: 15, constraints: ">= 0" }
+      - { name: late_rate_per_hour_cents, type: integer, source: input, description: "Contract penalty rate per billable hour (ceil)", constraints: "> 0" }
+      - { name: late_penalty_cap_cents, type: integer, source: input, description: "Per-assessment cap applied to time charge and (separately) to delay surcharge", constraints: "> 0" }
+      - { name: delay_surcharge_per_minute_cents, type: integer, source: input, description: "Surcharge rate per minute of vendor-attributable case delay", default: 0, constraints: ">= 0" }
+      - { name: outstanding_penalty_cents, type: integer, source: computed, description: "Sum of outstanding_cents over this vendor's penalties with status ASSESSED (ACCRUING/SETTLED/WAIVED_CLOSED/VOID excluded)", default: 0 }
+      - { name: outstanding_liability_cents, type: integer, source: computed, description: "Sum of final_vendor_share_cents over this vendor's claims with status APPORTIONED (FILED/DISPUTED/SETTLED excluded)", default: 0 }
+
+  - name: VendorRep
+    parent: Vendor
+    common_fields: true
+    fields:
+      - { name: vendor_id, type: string, source: system, description: "FK -> Vendor.id; owning vendor (from path)" }
+      - { name: full_name, type: string, source: input, description: "Rep full name" }
+      - { name: rep_email, type: string, source: input, description: "Rep contact email" }
+      - { name: credential_doc_ref, type: string, source: input, description: "Reference to credentialing documentation bundle" }
+      - { name: credential_status, type: enum, source: system, description: "PENDING_VERIFICATION | ACTIVE | EXPIRED | REVOKED; initial PENDING_VERIFICATION; ACTIVE -> EXPIRED is a clock-sweep transition" }
+      - { name: credential_expires_at, type: datetime, source: input, description: "Credential expiry set at approve-credential (renewal)", constraints: "must be > current clock time at approval" }
+      - { name: or_access_level, type: enum, source: input, description: "NONE | OBSERVER | SCRUB_ASSIST; set at approve-credential" }
+
+  - name: ORRoom
+    parent: null
+    common_fields: true
+    fields:
+      - { name: room_name, type: string, source: input, description: "Room display name" }
+      - { name: turnover_buffer_minutes, type: integer, source: input, description: "Required gap between this room's cases (buffered interval semantics)", default: 30, constraints: ">= 0" }
+
+  - name: SterilizerUnit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_name, type: string, source: input, description: "Sterilizer display name" }
+      - { name: slot_capacity, type: integer, source: input, description: "Max turns in STERILIZING on this unit (aggregate capacity semantics)", constraints: ">= 1" }
+      - { name: cycle_minutes, type: integer, source: input, description: "Cycle duration from start-cycle to COOLDOWN", constraints: "> 0" }
+      - { name: cooldown_minutes, type: integer, source: input, description: "Cooldown duration from COOLDOWN to releasable", constraints: ">= 0" }
+
+  - name: SurgicalCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: case_number, type: string, source: input, description: "Unique case number", constraints: "unique; duplicates -> ERR_DUPLICATE_CASE_NUMBER" }
+      - { name: or_room_id, type: string, source: system, description: "FK -> ORRoom.id; room the case occupies" }
+      - { name: procedure_type, type: string, source: input, description: "Procedure type" }
+      - { name: surgeon_name, type: string, source: input, description: "Surgeon name" }
+      - { name: scheduled_start_at, type: datetime, source: input, description: "Scheduled start (UTC)", constraints: "< scheduled_end_at else ERR_INVALID_REQUEST_BODY" }
+      - { name: scheduled_end_at, type: datetime, source: input, description: "Scheduled end (UTC)" }
+      - { name: actual_start_at, type: datetime, source: system, description: "Clock time at /start; null until started", default: null }
+      - { name: actual_end_at, type: datetime, source: system, description: "Clock time at /complete; null until completed", default: null }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | IN_PROGRESS | COMPLETED | CANCELLED; initial SCHEDULED" }
+      - { name: delay_minutes_provisional, type: integer, source: computed, description: "max(0, actual_start_at - scheduled_start_at) in whole minutes; set at /start", default: 0 }
+      - { name: vendor_delay_minutes_provisional, type: integer, source: computed, description: "delay_minutes_provisional if start used override_readiness, else 0 (all-or-nothing provisional rule)", default: 0 }
+      - { name: vendor_delay_minutes_final, type: integer, source: computed, description: "At /complete: sum of vendor-cause CaseDelayEvent.minutes capped at delay_minutes_provisional; provisional value if no events exist; null before completion", default: null }
+
+  - name: CaseDelayEvent
+    parent: SurgicalCase
+    common_fields: false
+    fields:
+      - { name: case_id, type: string, source: system, description: "FK -> SurgicalCase.id (from path)" }
+      - { name: cause, type: enum, source: input, description: "VENDOR_LATE_DELIVERY | STERILIZATION_TURNAROUND | REP_ACCESS_ISSUE | PATIENT | STAFFING | OTHER" }
+      - { name: minutes, type: integer, source: input, description: "Attributed delay minutes", constraints: "> 0 else ERR_INVALID_REQUEST_BODY" }
+      - { name: attributable_request_id, type: string, source: input, description: "FK -> LoanerRequest.id; REQUIRED for the three VENDOR_* causes, must be a request of this case (ERR_DELAY_REQUEST_LINK); must be omitted otherwise", default: null }
+      - { name: recorded_by_role, type: string, source: system, description: "X-User-Role of recorder" }
+
+  - name: LoanerRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: case_id, type: string, source: system, description: "FK -> SurgicalCase.id; case the trays serve" }
+      - { name: vendor_id, type: string, source: system, description: "FK -> Vendor.id; supplying vendor" }
+      - { name: priority_class, type: enum, source: input, description: "STANDARD | URGENT | EMERGENT; selects lead hours (48/24/12)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SUBMITTED | APPROVED | REJECTED | CANCELLED | CLOSED; initial DRAFT" }
+      - { name: readiness, type: enum, source: computed, description: "NOT_READY | AT_RISK | READY; derived from tray states + sterilization projection; zero trays => NOT_READY", default: NOT_READY }
+      - { name: required_delivery_by, type: datetime, source: computed, description: "case.scheduled_start_at - lead_hours(priority_class); set at approve, recomputed on reschedule", default: null }
+      - { name: penalty_exposure_cents, type: integer, source: computed, description: "Sum of time_charge_cents + delay_surcharge_cents over penalties in ACCRUING or ASSESSED", default: 0 }
+      - { name: submitted_at, type: datetime, source: system, description: "Clock time at submit", default: null }
+
+  - name: LoanerTray
+    parent: LoanerRequest
+    common_fields: true
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id (from path)" }
+      - { name: tray_code, type: string, source: input, description: "Tray code; unique within request", constraints: "duplicates within request -> ERR_DUPLICATE_TRAY_CODE" }
+      - { name: declared_instrument_count, type: integer, source: input, description: "Manifest instrument count", constraints: "> 0" }
+      - { name: implant_flag, type: boolean, source: input, description: "True if tray contains implants (implant log required at check-in)", default: false }
+      - { name: replacement_value_cents, type: integer, source: input, description: "Declared tray replacement value used for shortage/damage claims", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "EXPECTED | DELIVERY_PENDING | CHECKED_IN | PROCESSING | QUARANTINED | STERILE_READY | STAGED | IN_USE | USED | AWAITING_PICKUP | PICKED_UP | RECONCILED | MISSING | CANCELLED; initial EXPECTED" }
+      - { name: delivered_instrument_count, type: integer, source: computed, description: "Count from accepted check-in line; null until verified", default: null }
+      - { name: returned_instrument_count, type: integer, source: computed, description: "Count from pickup line; null until pickup", default: null }
+      - { name: shortage_count, type: integer, source: computed, description: "delivered_instrument_count - returned_instrument_count at reconcile", default: 0 }
+      - { name: rework_count, type: integer, source: system, description: "Sterilization QA failures; fail-qa when rework_count would exceed MAX_REWORKS=2 quarantines the tray", default: 0 }
+      - { name: required_sterile_ready_by, type: datetime, source: computed, description: "case.scheduled_start_at - PREP_BUFFER_MINUTES(60); recomputed on case reschedule", default: null }
+      - { name: projected_sterile_ready_at, type: datetime, source: computed, description: "Projection per calc_sterilization_turnaround; null when tray is STERILE_READY or later (actual governs)", default: null }
+
+  - name: CheckInEvent
+    parent: LoanerRequest
+    common_fields: false
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id (from path)" }
+      - { name: rep_id, type: string, source: system, description: "FK -> VendorRep.id; set from X-User-ID of the VendorRep caller" }
+      - { name: delivered_at, type: datetime, source: system, description: "Clock time at check-in creation" }
+      - { name: lines, type: array, source: input, description: "Count sheet: [{tray_id, instrument_count_delivered, condition_notes?}]; each tray must belong to request and be EXPECTED or MISSING; no duplicate tray_id (ERR_DUPLICATE_TRAY_LINE)" }
+      - { name: ifu_provided, type: boolean, source: input, description: "IFU documentation provided" }
+      - { name: implant_log_provided, type: boolean, source: input, description: "Implant log; REQUIRED true when any line tray has implant_flag (ERR_IMPLANT_LOG_REQUIRED)", default: false }
+      - { name: loaner_agreement_ref, type: string, source: input, description: "Signed loaner agreement reference" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | VERIFIED | PARTIALLY_VERIFIED; initial SUBMITTED (verify with all-QUARANTINE lines yields PARTIALLY_VERIFIED)" }
+      - { name: verified_by_user_id, type: string, source: system, description: "X-User-ID of verifying VendorCoordinator (SoD anchor)", default: null }
+      - { name: late_minutes, type: integer, source: computed, description: "max(0, delivered_at - required_delivery_by) in whole minutes, computed at verify", default: 0 }
+
+  - name: SterilizationTurn
+    parent: LoanerTray
+    common_fields: true
+    fields:
+      - { name: tray_id, type: string, source: system, description: "FK -> LoanerTray.id (from path)" }
+      - { name: sterilizer_unit_id, type: string, source: input, description: "FK -> SterilizerUnit.id; assigned at start-cycle; null until then", default: null }
+      - { name: attempt_number, type: integer, source: system, description: "1 + count of prior turns for this tray" }
+      - { name: status, type: enum, source: system, description: "DECONTAMINATING | STERILIZING | COOLDOWN | RELEASED | FAILED_QA; initial DECONTAMINATING" }
+      - { name: decon_started_at, type: datetime, source: system, description: "Clock at creation" }
+      - { name: cycle_started_at, type: datetime, source: system, description: "Clock at start-cycle", default: null }
+      - { name: cycle_completed_at, type: datetime, source: system, description: "cycle_started_at + unit.cycle_minutes, stamped by clock sweep into COOLDOWN", default: null }
+      - { name: released_at, type: datetime, source: system, description: "Clock at release", default: null }
+
+  - name: Escalation
+    parent: LoanerRequest
+    common_fields: true
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id (from path)" }
+      - { name: type, type: enum, source: input, description: "MISSING_TRAY | INCOMPLETE_COUNT | DOCUMENTATION | STERILIZATION_DELAY | LATE_DELIVERY" }
+      - { name: linked_tray_id, type: string, source: input, description: "FK -> LoanerTray.id; required for tray-scoped types; must belong to same request (ERR_TRAY_NOT_IN_REQUEST)", default: null }
+      - { name: status, type: enum, source: system, description: "OPEN | ACKNOWLEDGED | RESOLVED; initial OPEN" }
+      - { name: resolution_type, type: enum, source: system, description: "BACKFILL_DELIVERY | SUBSTITUTE_APPROVED | CASE_RESCHEDULED | CASE_CANCELLED | WAIVED; set at resolve", default: null }
+
+  - name: ORAccessPass
+    parent: null
+    common_fields: true
+    fields:
+      - { name: rep_id, type: string, source: system, description: "FK -> VendorRep.id; the rep seeking OR access" }
+      - { name: case_id, type: string, source: system, description: "FK -> SurgicalCase.id; the case the rep supports" }
+      - { name: window_start_at, type: datetime, source: computed, description: "case.scheduled_start_at - ACCESS_LEAD_MINUTES(120); recomputed on reschedule", default: null }
+      - { name: window_end_at, type: datetime, source: computed, description: "case.scheduled_end_at + ACCESS_TRAIL_MINUTES(30); exclusive upper bound; recomputed on reschedule", default: null }
+      - { name: status, type: enum, source: system, description: "REQUESTED | APPROVED | DENIED | ADMITTED | EXITED | EXPIRED | REVOKED; initial REQUESTED" }
+      - { name: denial_reason, type: string, source: input, description: "Reason recorded when decision=DENY", default: null }
+
+  - name: PickupRecord
+    parent: LoanerRequest
+    common_fields: true
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id (from path)" }
+      - { name: rep_id, type: string, source: system, description: "FK -> VendorRep.id; set from X-User-ID of the VendorRep caller" }
+      - { name: picked_up_at, type: datetime, source: system, description: "Clock time at pickup creation" }
+      - { name: lines, type: array, source: input, description: "[{tray_id, instrument_count_returned, condition: OK|DAMAGED}]; trays must be AWAITING_PICKUP; instrument_count_returned <= delivered_instrument_count (ERR_PICKUP_COUNT_EXCEEDS_DELIVERED)" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | RECONCILED | DISPUTED; initial SUBMITTED" }
+      - { name: reconciled_by_user_id, type: string, source: system, description: "X-User-ID of reconciling VendorCoordinator (SoD anchor)", default: null }
+      - { name: discrepancy_count, type: integer, source: computed, description: "Count of lines with shortage > 0 or condition DAMAGED", default: 0 }
+
+  - name: DamageLossClaim
+    parent: LoanerTray
+    common_fields: true
+    fields:
+      - { name: tray_id, type: string, source: system, description: "FK -> LoanerTray.id the claim is filed against" }
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id (denormalized from tray)" }
+      - { name: pickup_id, type: string, source: system, description: "FK -> PickupRecord.id; null for manual claims; null in responses for auto claims (test discovery via GET /vendor-office/claims?request_id=)", default: null }
+      - { name: claim_seq, type: integer, source: computed, description: "1-based creation order within request_id; deterministic list ordering = (created_at ASC, claim_seq ASC) — id never used" }
+      - { name: damage_type, type: enum, source: input, description: "LOSS | DAMAGE | CONTAMINATION" }
+      - { name: shortage_count, type: integer, source: computed, description: "Instrument shortage the claim covers (from reconciliation); 0 for manual claims", default: 0 }
+      - { name: claimed_amount_cents, type: integer, source: input, description: "Claimed value; auto claims compute round_half_up(replacement_value_cents x shortage_count / declared_instrument_count)", constraints: "> 0 (ERR_CLAIM_AMOUNT_INVALID)" }
+      - { name: provisional_vendor_share_cents, type: integer, source: computed, description: "Presumptive share at filing: LOSS 100% vendor, DAMAGE 50% (round_half_up), CONTAMINATION 0%" }
+      - { name: final_vendor_share_cents, type: integer, source: computed, description: "round_half_up(claimed_amount_cents x vendor_share_percent / 100) at apportion", default: null }
+      - { name: final_hospital_share_cents, type: integer, source: computed, description: "claimed_amount_cents - final_vendor_share_cents (remainder absorbs rounding)", default: null }
+      - { name: status, type: enum, source: system, description: "FILED | APPORTIONED | DISPUTED | SETTLED; initial FILED" }
+
+  - name: PenaltyAssessment
+    parent: LoanerRequest
+    common_fields: true
+    fields:
+      - { name: request_id, type: string, source: system, description: "FK -> LoanerRequest.id the penalty attaches to" }
+      - { name: check_in_id, type: string, source: system, description: "FK -> CheckInEvent.id whose late delivery triggered the penalty" }
+      - { name: late_minutes, type: integer, source: computed, description: "Snapshot from the check-in at creation" }
+      - { name: billable_minutes, type: integer, source: computed, description: "max(0, late_minutes - vendor.late_grace_minutes)" }
+      - { name: time_charge_cents, type: integer, source: computed, description: "min(vendor.late_penalty_cap_cents, vendor.late_rate_per_hour_cents x ceil(billable_minutes / 60)); 0 when billable 0" }
+      - { name: delay_surcharge_cents, type: integer, source: computed, description: "min(vendor.late_penalty_cap_cents, vendor_delay_minutes x vendor.delay_surcharge_per_minute_cents) at assess; vendor_delay_minutes = case.vendor_delay_minutes_final (case COMPLETED), stays 0 while ACCRUING", default: 0 }
+      - { name: assessed_cents, type: integer, source: computed, description: "time_charge_cents + delay_surcharge_cents" }
+      - { name: waived_cents, type: integer, source: system, description: "Cumulative waived amount", default: 0 }
+      - { name: settled_cents, type: integer, source: system, description: "Cumulative settled amount", default: 0 }
+      - { name: outstanding_cents, type: integer, source: computed, description: "assessed_cents - waived_cents - settled_cents", default: 0 }
+      - { name: status, type: enum, source: system, description: "ACCRUING | ASSESSED | SETTLED | WAIVED_CLOSED | VOID; initial ACCRUING" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Vendor
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: POST /vendor-office/vendors/{id}/suspend
+        actor: VendorCoordinator
+        preconditions: ["vendor.status == ACTIVE"]
+        side_effects: ["Suspended vendor blocks new LoanerRequest creation and pass approvals (ERR_VENDOR_NOT_ACTIVE)"]
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: POST /vendor-office/vendors/{id}/reinstate
+        actor: VendorCoordinator
+        preconditions: ["vendor.status == SUSPENDED"]
+        side_effects: []
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: POST /vendor-office/vendors/{id}/terminate
+        actor: VendorCoordinator
+        preconditions:
+          - "No LoanerRequest of this vendor in DRAFT/SUBMITTED/APPROVED (ERR_VENDOR_HAS_OPEN_WORK)"
+          - "No PenaltyAssessment of this vendor in ACCRUING/ASSESSED and no DamageLossClaim in FILED/APPORTIONED/DISPUTED (ERR_VENDOR_HAS_OPEN_WORK)"
+        side_effects: []
+      - from: SUSPENDED
+        to: TERMINATED
+        trigger: POST /vendor-office/vendors/{id}/terminate
+        actor: VendorCoordinator
+        preconditions: ["Same open-work guards as ACTIVE -> TERMINATED"]
+        side_effects: []
+
+  - entity: VendorRep
+    initial_state: PENDING_VERIFICATION
+    terminal_states: [REVOKED]
+    transitions:
+      - from: PENDING_VERIFICATION
+        to: ACTIVE
+        trigger: POST /vendor-office/reps/{id}/approve-credential
+        actor: VendorCoordinator
+        preconditions:
+          - "rep.credential_status in {PENDING_VERIFICATION, EXPIRED, ACTIVE}"
+          - "payload credential_expires_at > current clock time (ERR_CREDENTIAL_EXPIRY_PAST)"
+        side_effects: ["Sets credential_expires_at and or_access_level from payload"]
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: POST /vendor-office/reps/{id}/approve-credential (credential extension)
+        actor: VendorCoordinator
+        preconditions: ["payload credential_expires_at > current clock time"]
+        side_effects: ["Sets credential_expires_at and or_access_level from payload; version increments"]
+      - from: EXPIRED
+        to: ACTIVE
+        trigger: POST /vendor-office/reps/{id}/approve-credential (renewal — credential cycle)
+        actor: VendorCoordinator
+        preconditions: ["payload credential_expires_at > current clock time"]
+        side_effects: ["Sets credential_expires_at and or_access_level from payload"]
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system clock sweep (POST /vendor-office/_clock/set_current_utc)"
+        actor: system
+        preconditions: ["credential_expires_at <= new clock time"]
+        side_effects: []
+      - from: ACTIVE
+        to: REVOKED
+        trigger: POST /vendor-office/reps/{id}/revoke-credential
+        actor: VendorCoordinator
+        preconditions: ["rep.credential_status in {PENDING_VERIFICATION, ACTIVE, EXPIRED}"]
+        side_effects: ["All ORAccessPass of this rep in REQUESTED -> DENIED (reason 'credential_revoked'); in APPROVED -> REVOKED"]
+      - from: PENDING_VERIFICATION
+        to: REVOKED
+        trigger: POST /vendor-office/reps/{id}/revoke-credential
+        actor: VendorCoordinator
+        preconditions: []
+        side_effects: ["Same pass cascade as ACTIVE -> REVOKED"]
+      - from: EXPIRED
+        to: REVOKED
+        trigger: POST /vendor-office/reps/{id}/revoke-credential
+        actor: VendorCoordinator
+        preconditions: []
+        side_effects: ["Same pass cascade as ACTIVE -> REVOKED"]
+
+  - entity: SurgicalCase
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: SCHEDULED
+        trigger: POST /vendor-office/cases/{id}/reschedule (self-transition; OCC-guarded)
+        actor: ORScheduler
+        preconditions:
+          - "expected_case_version == case.version (ERR_STALE_VERSION, 412)"
+          - "New window must pass room buffered-overlap check (ERR_ROOM_TIME_CONFLICT)"
+        side_effects:
+          - "case.version increments by 1"
+          - "Recompute required_delivery_by for linked LoanerRequests with status APPROVED"
+          - "Recompute required_sterile_ready_by and projected_sterile_ready_at for trays of those requests; recompute each linked request's readiness"
+          - "If a linked request's readiness flips to AT_RISK or NOT_READY and case.scheduled_start_at - now <= ESCALATION_WINDOW_MINUTES: auto-create Escalation OPEN (type by cause)"
+          - "Recompute window_start_at / window_end_at for linked ORAccessPass in REQUESTED or APPROVED"
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: POST /vendor-office/cases/{id}/start
+        actor: ORScheduler
+        preconditions:
+          - "case.status == SCHEDULED (else ERR_CASE_INVALID_STATE)"
+          - "Every linked LoanerRequest with status APPROVED has readiness == READY, UNLESS payload override_readiness=true and override_reason non-empty (else ERR_CASE_READINESS_BLOCKED)"
+        side_effects:
+          - "actual_start_at = clock; delay_minutes_provisional = max(0, actual_start_at - scheduled_start_at) in whole minutes"
+          - "vendor_delay_minutes_provisional = delay_minutes_provisional if override used else 0"
+          - "Trays of linked requests in STAGED -> IN_USE"
+          - "If override used: auto-create one Escalation OPEN per non-READY APPROVED request (MISSING_TRAY if any tray EXPECTED/MISSING; else DOCUMENTATION if any tray QUARANTINED; else STERILIZATION_DELAY)"
+          - "case.version increments by 1"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: POST /vendor-office/cases/{id}/complete
+        actor: ORScheduler
+        preconditions: ["case.status == IN_PROGRESS"]
+        side_effects:
+          - "actual_end_at = clock"
+          - "vendor_delay_minutes_final computed per calc_case_delay_attribution (events sum capped at delay, else provisional)"
+          - "Tray cascade: IN_USE -> USED -> AWAITING_PICKUP; CHECKED_IN/PROCESSING/STERILE_READY/STAGED/QUARANTINED -> AWAITING_PICKUP; EXPECTED/MISSING/DELIVERY_PENDING -> CANCELLED"
+          - "Every tray mutation recomputes the owning request's readiness"
+          - "case.version increments by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: POST /vendor-office/cases/{id}/cancel
+        actor: ORScheduler
+        preconditions: ["case.status == SCHEDULED"]
+        side_effects:
+          - "Linked LoanerRequests in DRAFT/SUBMITTED/APPROVED -> CANCELLED; their non-terminal trays (EXPECTED/DELIVERY_PENDING/CHECKED_IN/PROCESSING/QUARANTINED/MISSING) -> CANCELLED; their SterilizationTurns in DECONTAMINATING/STERILIZING/COOLDOWN -> terminal release impossible (turn left FAILED_QA only via fail-qa; cancel leaves turn status untouched)"
+          - "PenaltyAssessments of those requests in ACCRUING -> VOID"
+          - "ORAccessPass of this case in REQUESTED -> DENIED (reason 'case_cancelled'); APPROVED -> REVOKED"
+          - "Escalations of those requests in OPEN/ACKNOWLEDGED -> RESOLVED with resolution_type CASE_CANCELLED"
+          - "case.version increments by 1"
+
+  - entity: CaseDelayEvent
+    initial_state: RECORDED
+    terminal_states: [RECORDED]
+    transitions: []
+    note: "Append-only; no transitions. Recording is guarded: case must be IN_PROGRESS or COMPLETED; sum of vendor-cause minutes after insert must be <= case.delay_minutes_provisional (ERR_CASE_DELAY_OVERATTRIBUTED)."
+
+  - entity: LoanerRequest
+    initial_state: DRAFT
+    terminal_states: [REJECTED, CANCELLED, CLOSED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: POST /vendor-office/requests/{id}/submit
+        actor: ORScheduler
+        preconditions:
+          - "At least one tray exists (ERR_REQUEST_NO_TRAYS)"
+          - "Deadline feasible: case.scheduled_start_at - now >= lead_hours(priority_class) (ERR_REQUEST_DEADLINE_INFEASIBLE)"
+        side_effects: ["submitted_at = clock; request.version increments"]
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /vendor-office/requests/{id}/decide (decision=APPROVE)"
+        actor: VendorCoordinator
+        preconditions: ["vendor.status == ACTIVE (ERR_VENDOR_NOT_ACTIVE)"]
+        side_effects:
+          - "required_delivery_by = case.scheduled_start_at - lead_hours(priority_class)"
+          - "For each tray: required_sterile_ready_by = case.scheduled_start_at - 60; projected_sterile_ready_at = null"
+          - "readiness recompute (EXPECTED trays present => NOT_READY)"
+          - "request.version increments"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /vendor-office/requests/{id}/decide (decision=REJECT)"
+        actor: VendorCoordinator
+        preconditions: []
+        side_effects: ["request.version increments"]
+      - from: DRAFT
+        to: CANCELLED
+        trigger: POST /vendor-office/requests/{id}/cancel (or case cancel cascade)
+        actor: ORScheduler
+        preconditions: ["request.status in {DRAFT, SUBMITTED, APPROVED}"]
+        side_effects:
+          - "Non-terminal trays -> CANCELLED (same set as case cancel cascade)"
+          - "Penalties ACCRUING -> VOID"
+          - "Escalations OPEN/ACKNOWLEDGED -> RESOLVED (resolution_type CASE_CANCELLED)"
+          - "request.version increments"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: POST /vendor-office/requests/{id}/cancel
+        actor: ORScheduler
+        preconditions: []
+        side_effects: ["Same cascade as DRAFT -> CANCELLED"]
+      - from: APPROVED
+        to: CANCELLED
+        trigger: POST /vendor-office/requests/{id}/cancel
+        actor: ORScheduler
+        preconditions: []
+        side_effects: ["Same cascade as DRAFT -> CANCELLED"]
+      - from: APPROVED
+        to: CLOSED
+        trigger: "system bubble-up (on pickup reconcile)"
+        actor: system
+        preconditions: ["linked case.status == COMPLETED and every tray of the request is terminal (RECONCILED or CANCELLED)"]
+        side_effects: ["request.version increments"]
+      - from: ANY
+        to: ANY
+        trigger: "readiness recompute (system, on any tray state/projection mutation, case reschedule, verify, stage, fail-qa, release)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "readiness = READY when request has >=1 tray and every non-CANCELLED tray is in {STERILE_READY, STAGED, IN_USE}"
+          - "else AT_RISK when every non-CANCELLED tray is in {DELIVERY_PENDING, CHECKED_IN, PROCESSING} and every PROCESSING/CHECKED_IN tray has projected_sterile_ready_at <= required_sterile_ready_by"
+          - "else NOT_READY (covers zero trays, any EXPECTED/MISSING/QUARANTINED tray, or any late projection)"
+          - "On a flip INTO AT_RISK or NOT_READY while request is APPROVED and case.scheduled_start_at - now <= ESCALATION_WINDOW_MINUTES(1440): auto-create Escalation OPEN (type by cause: tray EXPECTED/MISSING -> MISSING_TRAY; QUARANTINED -> DOCUMENTATION; else STERILIZATION_DELAY)"
+
+  - entity: LoanerTray
+    initial_state: EXPECTED
+    terminal_states: [RECONCILED, CANCELLED]
+    transitions:
+      - from: EXPECTED
+        to: DELIVERY_PENDING
+        trigger: POST /vendor-office/requests/{id}/check-ins (line names this tray)
+        actor: VendorRep
+        preconditions: ["tray.status in {EXPECTED, MISSING}"]
+        side_effects: ["Request readiness recompute"]
+      - from: MISSING
+        to: DELIVERY_PENDING
+        trigger: POST /vendor-office/requests/{id}/check-ins (backfill delivery of a missing tray)
+        actor: VendorRep
+        preconditions: []
+        side_effects: ["Request readiness recompute"]
+      - from: EXPECTED
+        to: MISSING
+        trigger: POST /vendor-office/trays/{id}/mark-missing
+        actor: VendorCoordinator
+        preconditions: ["tray.status == EXPECTED"]
+        side_effects: ["Auto-create Escalation OPEN type MISSING_TRAY with linked_tray_id = this tray", "Request readiness recompute"]
+      - from: DELIVERY_PENDING
+        to: CHECKED_IN
+        trigger: POST /vendor-office/check-ins/{id}/verify with line disposition ACCEPT
+        actor: VendorCoordinator
+        preconditions: ["Line disposition ACCEPT and line instrument_count_delivered >= 1"]
+        side_effects:
+          - "delivered_instrument_count = line.instrument_count_delivered"
+          - "If instrument_count_delivered < declared_instrument_count: auto-create Escalation OPEN type INCOMPLETE_COUNT"
+          - "Request readiness recompute"
+      - from: DELIVERY_PENDING
+        to: QUARANTINED
+        trigger: POST /vendor-office/check-ins/{id}/verify with line disposition QUARANTINE
+        actor: VendorCoordinator
+        preconditions: []
+        side_effects: ["Auto-create Escalation OPEN type DOCUMENTATION", "Request readiness recompute"]
+      - from: CHECKED_IN
+        to: PROCESSING
+        trigger: POST /vendor-office/trays/{id}/turns
+        actor: SterileProcessingTech
+        preconditions: ["tray.status == CHECKED_IN (ERR_TRAY_INVALID_STATE)"]
+        side_effects: ["Request readiness recompute (projection now governs)"]
+      - from: PROCESSING
+        to: CHECKED_IN
+        trigger: POST /vendor-office/turns/{id}/fail-qa (rework loop, rework allowed)
+        actor: SterileProcessingTech
+        preconditions: ["tray.rework_count + 1 <= MAX_REWORKS (2)"]
+        side_effects: ["tray.rework_count += 1", "projected_sterile_ready_at recomputed (tray needs a new turn)", "Request readiness recompute + flip-escalation rule applies"]
+      - from: PROCESSING
+        to: QUARANTINED
+        trigger: POST /vendor-office/turns/{id}/fail-qa (rework limit exceeded)
+        actor: SterileProcessingTech
+        preconditions: ["tray.rework_count + 1 > MAX_REWORKS (2)"]
+        side_effects: ["tray.rework_count += 1", "Auto-create Escalation OPEN type STERILIZATION_DELAY", "Request readiness recompute"]
+      - from: PROCESSING
+        to: STERILE_READY
+        trigger: POST /vendor-office/turns/{id}/release (QA pass)
+        actor: SterileProcessingTech
+        preconditions: ["turn.status == COOLDOWN and now >= cycle_completed_at + unit.cooldown_minutes (ERR_COOLDOWN_NOT_ELAPSED)"]
+        side_effects: ["projected_sterile_ready_at = null (actual governs)", "Request readiness recompute"]
+      - from: STERILE_READY
+        to: STAGED
+        trigger: POST /vendor-office/trays/{id}/stage
+        actor: ORCirculatorNurse
+        preconditions: ["request's case.status == SCHEDULED (ERR_CASE_INVALID_STATE)"]
+        side_effects: ["Request readiness recompute"]
+      - from: STAGED
+        to: IN_USE
+        trigger: "system (case start)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: IN_USE
+        to: USED
+        trigger: "system (case complete)"
+        actor: system
+        preconditions: []
+        side_effects: ["Immediately continues to AWAITING_PICKUP in the same cascade"]
+      - from: USED
+        to: AWAITING_PICKUP
+        trigger: "system (case complete, same cascade step)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: CHECKED_IN
+        to: AWAITING_PICKUP
+        trigger: "system (case complete — unused tray returned)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: PROCESSING
+        to: AWAITING_PICKUP
+        trigger: "system (case complete)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: STERILE_READY
+        to: AWAITING_PICKUP
+        trigger: "system (case complete)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: STAGED
+        to: AWAITING_PICKUP
+        trigger: "system (case complete — staged but case already over)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: QUARANTINED
+        to: AWAITING_PICKUP
+        trigger: "system (case complete — quarantined tray returned to vendor)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: EXPECTED
+        to: CANCELLED
+        trigger: "system (case complete without delivery, or request/case cancel)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: MISSING
+        to: CANCELLED
+        trigger: "system (case complete or request/case cancel)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: DELIVERY_PENDING
+        to: CANCELLED
+        trigger: "system (case complete or request/case cancel)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: AWAITING_PICKUP
+        to: PICKED_UP
+        trigger: POST /vendor-office/requests/{id}/pickups (line names this tray)
+        actor: VendorRep
+        preconditions: ["tray.status == AWAITING_PICKUP", "line.instrument_count_returned <= delivered_instrument_count (ERR_PICKUP_COUNT_EXCEEDS_DELIVERED)"]
+        side_effects: ["returned_instrument_count = line.instrument_count_returned"]
+      - from: PICKED_UP
+        to: RECONCILED
+        trigger: POST /vendor-office/pickups/{id}/reconcile
+        actor: VendorCoordinator
+        preconditions: ["pickup.status in {SUBMITTED, DISPUTED}"]
+        side_effects:
+          - "shortage_count = delivered_instrument_count - returned_instrument_count"
+          - "If shortage_count > 0: auto-create DamageLossClaim FILED (damage_type LOSS, claimed per calc_reconciliation_shortage_claims)"
+          - "If line.condition == DAMAGED: auto-create DamageLossClaim FILED (damage_type DAMAGE, claimed_amount_cents = replacement_value_cents, shortage_count 0)"
+          - "Request readiness recompute; if all trays terminal and case COMPLETED -> request CLOSED"
+
+  - entity: CheckInEvent
+    initial_state: SUBMITTED
+    terminal_states: [VERIFIED, PARTIALLY_VERIFIED]
+    transitions:
+      - from: SUBMITTED
+        to: VERIFIED
+        trigger: POST /vendor-office/check-ins/{id}/verify (all lines ACCEPT)
+        actor: VendorCoordinator
+        preconditions: ["checkin.status == SUBMITTED (ERR_CHECKIN_INVALID_STATE)"]
+        side_effects:
+          - "verified_by_user_id = X-User-ID; late_minutes computed (max(0, delivered_at - required_delivery_by))"
+          - "If late_minutes > vendor.late_grace_minutes (equivalently time_charge_cents > 0) and no PenaltyAssessment exists for this request: create PenaltyAssessment ACCRUING (link 1 of late-delivery cascade)"
+          - "Penalty creation recomputes request.penalty_exposure_cents (link 2)"
+          - "Tray dispositions applied per line (ACCEPT -> CHECKED_IN; QUARANTINE -> QUARANTINED), each firing its tray side effects"
+      - from: SUBMITTED
+        to: PARTIALLY_VERIFIED
+        trigger: POST /vendor-office/check-ins/{id}/verify (any line QUARANTINE, including all)
+        actor: VendorCoordinator
+        preconditions: ["checkin.status == SUBMITTED"]
+        side_effects: ["Same late/penalty computation and per-line tray dispositions as VERIFIED"]
+
+  - entity: SterilizationTurn
+    initial_state: DECONTAMINATING
+    terminal_states: [RELEASED, FAILED_QA]
+    transitions:
+      - from: DECONTAMINATING
+        to: STERILIZING
+        trigger: POST /vendor-office/turns/{id}/start-cycle
+        actor: SterileProcessingTech
+        preconditions:
+          - "now >= decon_started_at + DECON_MIN_MINUTES(30) (ERR_DECON_MIN_NOT_ELAPSED)"
+          - "Count of turns in STERILIZING on payload sterilizer_unit_id < unit.slot_capacity (ERR_STERILIZER_CAPACITY_EXCEEDED)"
+        side_effects:
+          - "sterilizer_unit_id = payload; cycle_started_at = now"
+          - "tray.projected_sterile_ready_at = now + unit.cycle_minutes + unit.cooldown_minutes; request readiness recompute"
+      - from: STERILIZING
+        to: COOLDOWN
+        trigger: "system clock sweep (POST /vendor-office/_clock/set_current_utc)"
+        actor: system
+        preconditions: ["cycle_started_at + unit.cycle_minutes <= new clock time"]
+        side_effects: ["cycle_completed_at = cycle_started_at + unit.cycle_minutes", "tray.projected_sterile_ready_at = cycle_completed_at + unit.cooldown_minutes; readiness recompute"]
+      - from: COOLDOWN
+        to: RELEASED
+        trigger: POST /vendor-office/turns/{id}/release
+        actor: SterileProcessingTech
+        preconditions: ["now >= cycle_completed_at + unit.cooldown_minutes (ERR_COOLDOWN_NOT_ELAPSED)"]
+        side_effects: ["released_at = now", "tray -> STERILE_READY (see LoanerTray side effects)"]
+      - from: STERILIZING
+        to: FAILED_QA
+        trigger: POST /vendor-office/turns/{id}/fail-qa
+        actor: SterileProcessingTech
+        preconditions: ["turn.status in {STERILIZING, COOLDOWN}"]
+        side_effects: ["Tray rework branch fires (PROCESSING -> CHECKED_IN with rework_count+1, or -> QUARANTINED when limit exceeded)"]
+      - from: COOLDOWN
+        to: FAILED_QA
+        trigger: POST /vendor-office/turns/{id}/fail-qa
+        actor: SterileProcessingTech
+        preconditions: []
+        side_effects: ["Same tray rework branch"]
+
+  - entity: Escalation
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: ACKNOWLEDGED
+        trigger: POST /vendor-office/escalations/{id}/acknowledge
+        actor: VendorCoordinator
+        preconditions: ["escalation.status == OPEN (ERR_ESCALATION_INVALID_STATE)"]
+        side_effects: []
+      - from: OPEN
+        to: RESOLVED
+        trigger: POST /vendor-office/escalations/{id}/resolve
+        actor: VendorCoordinator
+        preconditions:
+          - "If type == MISSING_TRAY and resolution_type == BACKFILL_DELIVERY: linked tray must be in {DELIVERY_PENDING, CHECKED_IN, PROCESSING, STERILE_READY, STAGED, IN_USE, USED, AWAITING_PICKUP, PICKED_UP, RECONCILED} (ERR_ESCALATION_RESOLUTION_INVALID)"
+        side_effects: ["resolution_type = payload"]
+      - from: ACKNOWLEDGED
+        to: RESOLVED
+        trigger: POST /vendor-office/escalations/{id}/resolve
+        actor: VendorCoordinator
+        preconditions: ["Same resolution guards as OPEN -> RESOLVED"]
+        side_effects: ["resolution_type = payload"]
+
+  - entity: ORAccessPass
+    initial_state: REQUESTED
+    terminal_states: [DENIED, EXITED, EXPIRED, REVOKED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /vendor-office/access-passes/{id}/decide (decision=APPROVE)"
+        actor: VendorCoordinator
+        preconditions:
+          - "case.status == SCHEDULED (ERR_CASE_INVALID_STATE)"
+          - "rep.vendor's status == ACTIVE (ERR_VENDOR_NOT_ACTIVE)"
+          - "rep.credential_status == ACTIVE (ERR_REP_CREDENTIAL_NOT_ACTIVE)"
+          - "rep.credential_expires_at > case.scheduled_end_at (ERR_CREDENTIAL_WINDOW_INSUFFICIENT)"
+        side_effects: ["window_start_at / window_end_at computed from case schedule"]
+      - from: REQUESTED
+        to: DENIED
+        trigger: "POST /vendor-office/access-passes/{id}/decide (decision=DENY)"
+        actor: VendorCoordinator
+        preconditions: []
+        side_effects: ["denial_reason = reason"]
+      - from: APPROVED
+        to: ADMITTED
+        trigger: POST /vendor-office/access-passes/{id}/admit
+        actor: ORCirculatorNurse
+        preconditions: ["window_start_at <= now < window_end_at (ERR_ACCESS_WINDOW_CLOSED)"]
+        side_effects: []
+      - from: ADMITTED
+        to: EXITED
+        trigger: "system clock sweep when now >= window_end_at"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: APPROVED
+        to: EXPIRED
+        trigger: "system clock sweep when now >= window_end_at"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: APPROVED
+        to: REVOKED
+        trigger: "system (case cancel cascade or rep credential revocation)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: REQUESTED
+        to: DENIED
+        trigger: "system (case cancel cascade or rep credential revocation)"
+        actor: system
+        preconditions: []
+        side_effects: ["denial_reason = 'case_cancelled' or 'credential_revoked'"]
+
+  - entity: PickupRecord
+    initial_state: SUBMITTED
+    terminal_states: [RECONCILED]
+    transitions:
+      - from: SUBMITTED
+        to: RECONCILED
+        trigger: POST /vendor-office/pickups/{id}/reconcile
+        actor: VendorCoordinator
+        preconditions:
+          - "pickup.status in {SUBMITTED, DISPUTED}"
+          - "SoD: X-User-ID != verified_by_user_id of every VERIFIED/PARTIALLY_VERIFIED CheckInEvent on the request (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "reconciled_by_user_id = X-User-ID; discrepancy_count computed"
+          - "Per-line tray reconciliation + auto claims (see LoanerTray PICKED_UP -> RECONCILED)"
+          - "Request bubble-up closure check"
+      - from: SUBMITTED
+        to: DISPUTED
+        trigger: POST /vendor-office/pickups/{id}/dispute
+        actor: VendorRep
+        preconditions: ["pickup.status == SUBMITTED", "X-User-ID is a rep of the request's vendor (ERR_REP_VENDOR_MISMATCH)"]
+        side_effects: []
+
+  - entity: DamageLossClaim
+    initial_state: FILED
+    terminal_states: [SETTLED]
+    transitions:
+      - from: FILED
+        to: APPORTIONED
+        trigger: POST /vendor-office/claims/{id}/apportion
+        actor: VendorCoordinator
+        preconditions:
+          - "expected_claim_version == claim.version (ERR_STALE_VERSION, 412)"
+          - "0 <= vendor_share_percent <= 100 (ERR_CLAIM_APPORTION_INVALID)"
+        side_effects:
+          - "final_vendor_share_cents = round_half_up(claimed_amount_cents x vendor_share_percent / 100); final_hospital_share_cents = claimed - final_vendor"
+          - "vendor.outstanding_liability_cents += final_vendor_share_cents"
+          - "claim.version increments by 1"
+      - from: APPORTIONED
+        to: DISPUTED
+        trigger: POST /vendor-office/claims/{id}/dispute
+        actor: VendorRep
+        preconditions: ["X-User-ID is a rep of the claim request's vendor (ERR_REP_VENDOR_MISMATCH)"]
+        side_effects: ["vendor.outstanding_liability_cents -= final_vendor_share_cents"]
+      - from: DISPUTED
+        to: APPORTIONED
+        trigger: POST /vendor-office/claims/{id}/apportion (re-apportionment after dispute — OCC-guarded cycle)
+        actor: VendorCoordinator
+        preconditions: ["expected_claim_version == claim.version", "0 <= vendor_share_percent <= 100"]
+        side_effects: ["Recompute final shares from new percent", "vendor.outstanding_liability_cents += final_vendor_share_cents", "claim.version increments by 1"]
+      - from: APPORTIONED
+        to: SETTLED
+        trigger: POST /vendor-office/claims/{id}/settle
+        actor: VendorCoordinator
+        preconditions: ["claim.status == APPORTIONED"]
+        side_effects: ["vendor.outstanding_liability_cents -= final_vendor_share_cents"]
+
+  - entity: PenaltyAssessment
+    initial_state: ACCRUING
+    terminal_states: [SETTLED, WAIVED_CLOSED, VOID]
+    transitions:
+      - from: ACCRUING
+        to: ASSESSED
+        trigger: POST /vendor-office/penalties/{id}/assess
+        actor: VendorCoordinator
+        preconditions: ["penalty.status == ACCRUING", "penalty request's case.status == COMPLETED (ERR_CASE_INVALID_STATE — final delay attribution must exist)"]
+        side_effects:
+          - "delay_surcharge_cents = min(vendor.late_penalty_cap_cents, case.vendor_delay_minutes_final x vendor.delay_surcharge_per_minute_cents)"
+          - "assessed_cents = time_charge_cents + delay_surcharge_cents; outstanding_cents = assessed_cents"
+          - "request.penalty_exposure_cents recompute; vendor.outstanding_penalty_cents += outstanding_cents"
+      - from: ACCRUING
+        to: VOID
+        trigger: "system (request or case cancel cascade)"
+        actor: system
+        preconditions: []
+        side_effects: ["request.penalty_exposure_cents recompute"]
+      - from: ASSESSED
+        to: ASSESSED
+        trigger: POST /vendor-office/penalties/{id}/waive (partial waiver; self-transition)
+        actor: VendorCoordinator
+        preconditions:
+          - "penalty.status == ASSESSED"
+          - "SoD: X-User-ID != verified_by_user_id of the penalty's check-in (ERR_SEGREGATION_OF_DUTIES)"
+          - "waive_amount_cents <= outstanding_cents (ERR_WAIVER_EXCEEDS_OUTSTANDING)"
+        side_effects:
+          - "waived_cents += waive_amount_cents; outstanding_cents recomputed"
+          - "vendor.outstanding_penalty_cents -= waive_amount_cents"
+          - "If outstanding_cents == 0 after waiver: status -> WAIVED_CLOSED instead"
+      - from: ASSESSED
+        to: WAIVED_CLOSED
+        trigger: POST /vendor-office/penalties/{id}/waive (full waiver of outstanding)
+        actor: VendorCoordinator
+        preconditions: ["Same guards as partial waive"]
+        side_effects: ["Same as partial waive; terminal"]
+      - from: ASSESSED
+        to: SETTLED
+        trigger: POST /vendor-office/penalties/{id}/settle
+        actor: VendorCoordinator
+        preconditions:
+          - "penalty.status == ASSESSED"
+          - "settle_amount_cents == outstanding_cents exactly (ERR_SETTLE_AMOUNT_MISMATCH)"
+        side_effects: ["settled_cents += settle_amount_cents; outstanding_cents = 0", "vendor.outstanding_penalty_cents -= settle_amount_cents"]
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: case-reschedule-stale-version
+    parent_entity: SurgicalCase
+    write_endpoint: "POST /vendor-office/cases/{id}/reschedule"
+    occ_field: "expected_case_version"
+    description: |
+      Rescheduling a SurgicalCase whose version has advanced since the client
+      last observed it is rejected: the new schedule legitimately supersedes the
+      prior one and re-derives delivery deadlines, sterilization windows, and
+      access-pass windows, so a stale writer would silently overwrite fresher
+      derived state. Rejected with ERR_STALE_VERSION (412).
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: claim-apportion-stale-version
+    parent_entity: DamageLossClaim
+    write_endpoint: "POST /vendor-office/claims/{id}/apportion"
+    occ_field: "expected_claim_version"
+    description: |
+      Apportioning a DamageLossClaim whose version has advanced since the client
+      last observed it is rejected: apportionment legitimately supersedes a prior
+      apportionment (e.g., re-adjudication after dispute) and moves money on the
+      vendor liability rollup, so a stale writer would double-move the rollup.
+      Rejected with ERR_STALE_VERSION (412).
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: calc_delivery_deadline
+    trigger: "LoanerRequest approve; SurgicalCase reschedule (re-derive)"
+    algorithm: threshold
+    formula: |
+      required_delivery_by = case.scheduled_start_at - LEAD_HOURS[request.priority_class]
+      Submit feasibility gate: case.scheduled_start_at - now >= LEAD_HOURS[priority_class]
+    input_set: "The request's linked SurgicalCase (any SCHEDULED state) and the request's priority_class"
+    constants:
+      LEAD_HOURS_STANDARD: 48
+      LEAD_HOURS_URGENT: 24
+      LEAD_HOURS_EMERGENT: 12
+      ESCALATION_WINDOW_MINUTES: 1440
+      PREP_BUFFER_MINUTES: 60
+      DECON_MIN_MINUTES: 30
+      MAX_REWORKS: 2
+      ACCESS_LEAD_MINUTES: 120
+      ACCESS_TRAIL_MINUTES: 30
+    precision: "whole minutes; datetimes exact to the second"
+
+  - name: calc_late_delivery_penalty
+    trigger: "Check-in verify (time charge, at creation of PenaltyAssessment) and penalty assess (delay surcharge)"
+    algorithm: tiered_pricing
+    formula: |
+      late_minutes        = max(0, floor((checkin.delivered_at - request.required_delivery_by) / 60s))
+      billable_minutes    = max(0, late_minutes - vendor.late_grace_minutes)
+      time_charge_cents   = min(vendor.late_penalty_cap_cents,
+                                vendor.late_rate_per_hour_cents * ceil(billable_minutes / 60))
+                            # ceil(0/60) = 0  =>  on-time or within-grace delivery yields 0 and NO PenaltyAssessment row
+      # at assess (case COMPLETED):
+      vendor_delay_minutes  = case.vendor_delay_minutes_final
+      delay_surcharge_cents = min(vendor.late_penalty_cap_cents,
+                                  vendor_delay_minutes * vendor.delay_surcharge_per_minute_cents)
+      assessed_cents        = time_charge_cents + delay_surcharge_cents
+    input_set: "The verified CheckInEvent, its LoanerRequest, the request's Vendor contract fields, and (at assess) the linked SurgicalCase final delay attribution"
+    constants:
+      MINUTES_PER_HOUR: 60
+    precision: "integer cents; ceil division for billable hours; min-cap applied AFTER multiplication, separately to time_charge and to surcharge"
+
+  - name: calc_case_delay_attribution
+    trigger: "SurgicalCase start (provisional) and complete (final)"
+    algorithm: chronological
+    formula: |
+      delay_minutes_provisional = max(0, actual_start_at - scheduled_start_at) in whole minutes
+      PROVISIONAL variant (at /start):
+        vendor_delay_minutes_provisional = delay_minutes_provisional if override_readiness was used else 0
+      FINAL variant (at /complete):
+        if count(CaseDelayEvent of case) > 0:
+          vendor_delay_minutes_final = min(delay_minutes_provisional,
+                                           sum(minutes over events with cause in {VENDOR_LATE_DELIVERY, STERILIZATION_TURNAROUND, REP_ACCESS_ISSUE}))
+        else:
+          vendor_delay_minutes_final = vendor_delay_minutes_provisional
+    input_set: "CaseDelayEvents of the case (all, regardless of recorder role); the start-override flag recorded at /start"
+    precision: "whole minutes"
+    variants:
+      - name: provisional
+        when: "At case start, before any delay-event review"
+        difference: "All-or-nothing: full delay attributed to vendor iff start needed a readiness override, else 0"
+      - name: final
+        when: "At case completion, after circulator/scheduler delay events exist"
+        difference: "Proportional per-cause attribution capped at total delay; equals provisional only when no events recorded"
+
+  - name: calc_liability_apportionment
+    trigger: "Claim creation (provisional, manual or auto) and claim apportion (final)"
+    algorithm: weighted_scoring
+    formula: |
+      PROVISIONAL (at filing): presumptive vendor percent by damage_type:
+        LOSS -> 100; DAMAGE -> 50; CONTAMINATION -> 0
+      provisional_vendor_share_cents = round_half_up(claimed_amount_cents * presumptive_percent / 100)
+      FINAL (at apportion, percent p from payload):
+        final_vendor_share_cents   = round_half_up(claimed_amount_cents * p / 100)
+        final_hospital_share_cents = claimed_amount_cents - final_vendor_share_cents
+    input_set: "The DamageLossClaim row (claimed_amount_cents, damage_type); apportion payload vendor_share_percent"
+    precision: "integer cents, round_half_up; hospital share is the remainder so shares always sum to claimed"
+    variants:
+      - name: provisional_presumptive
+        when: "At claim filing (manual or auto-created by reconciliation)"
+        difference: "Fixed presumptive percent by damage_type; no coordinator input"
+      - name: final_adjudicated
+        when: "At apportion / re-apportion after dispute"
+        difference: "Coordinator-supplied percent; identical claim data yields different cents than provisional"
+
+  - name: calc_sterilization_turnaround
+    trigger: "Tray CHECKED_IN, turn create, start-cycle, clock sweep into COOLDOWN, fail-qa, release, case reschedule"
+    algorithm: forward_looking
+    formula: |
+      required_sterile_ready_by = case.scheduled_start_at - PREP_BUFFER_MINUTES(60)
+      projected_sterile_ready_at (tray), by tray/turn position:
+        tray CHECKED_IN (no active turn):  now + DECON_MIN_MINUTES + min_cycle_cooldown
+        turn DECONTAMINATING:              decon_started_at + DECON_MIN_MINUTES + min_cycle_cooldown
+        turn STERILIZING:                  cycle_started_at + unit.cycle_minutes + unit.cooldown_minutes
+        turn COOLDOWN:                     cycle_completed_at + unit.cooldown_minutes
+        tray STERILE_READY or later:       null (actual released_at governs)
+      where min_cycle_cooldown = min(cycle_minutes + cooldown_minutes) over all SterilizerUnits;
+      if no SterilizerUnit exists, projection is null and the tray counts as NOT projected-on-time.
+    input_set: "The tray, its latest non-terminal SterilizationTurn, all SterilizerUnits, linked case schedule"
+    precision: "datetimes exact to the second; comparisons inclusive (<=) for on-time"
+
+  - name: calc_request_readiness
+    trigger: "Any tray state change, projection recompute, verify, stage, fail-qa, release, reschedule, case lifecycle cascade"
+    algorithm: aggregation
+    formula: |
+      T = trays of request with status != CANCELLED
+      if |T| == 0:                                            readiness = NOT_READY
+      elif every t in T has status in {STERILE_READY, STAGED, IN_USE}:       readiness = READY
+      elif every t in T has status in {DELIVERY_PENDING, CHECKED_IN, PROCESSING}
+           and every t with status in {CHECKED_IN, PROCESSING} has
+               projected_sterile_ready_at != null
+               and projected_sterile_ready_at <= required_sterile_ready_by:  readiness = AT_RISK
+      else:                                                   readiness = NOT_READY
+    input_set: "All LoanerTrays of the request except CANCELLED; their status and projection fields"
+    precision: "enum; ties impossible (total order over conditions evaluated top to bottom)"
+
+  - name: calc_access_window
+    trigger: "Pass decide-APPROVE; case reschedule re-derives for REQUESTED/APPROVED passes"
+    algorithm: interval_merge
+    formula: |
+      window_start_at = case.scheduled_start_at - ACCESS_LEAD_MINUTES(120)   # inclusive
+      window_end_at   = case.scheduled_end_at   + ACCESS_TRAIL_MINUTES(30)   # exclusive
+      admit allowed iff window_start_at <= now < window_end_at
+      credential sufficiency: rep.credential_expires_at > case.scheduled_end_at  (strictly greater)
+    input_set: "The pass's case schedule and rep credential expiry"
+    precision: "datetimes exact to the second; lower bound inclusive, upper bound exclusive"
+
+  - name: calc_reconciliation_shortage_claims
+    trigger: "Pickup reconcile"
+    algorithm: aggregation
+    formula: |
+      Per pickup line (ROUND PER LINE, THEN SUM — pinned order):
+        shortage_count          = delivered_instrument_count - instrument_count_returned
+        if shortage_count > 0:
+          claim.claimed_amount_cents = round_half_up(tray.replacement_value_cents
+                                                     * shortage_count / tray.declared_instrument_count)
+        if line.condition == DAMAGED:
+          separate claim with claimed_amount_cents = tray.replacement_value_cents (shortage_count 0)
+      request-level claimed total = sum of per-line claim amounts
+      (Rounding per line before summing is REQUIRED; converting total shortage value and
+       rounding once yields different cents and is non-conformant.)
+    input_set: "Pickup lines whose trays are PICKED_UP; tray delivered/declared counts and replacement values"
+    precision: "integer cents, round_half_up applied per line"
+
+  - name: calc_vendor_exposure_rollup
+    trigger: "Penalty assess/waive/settle/void; claim apportion/dispute/settle"
+    algorithm: aggregation
+    formula: |
+      vendor.outstanding_penalty_cents   = sum(p.outstanding_cents) over PenaltyAssessment p
+        where p.request.vendor_id == vendor.id and p.status == ASSESSED
+      vendor.outstanding_liability_cents = sum(c.final_vendor_share_cents) over DamageLossClaim c
+        where c.request's vendor_id == vendor.id and c.status == APPORTIONED
+    input_set: "Penalty rows filtered to status ASSESSED only; claim rows filtered to status APPORTIONED only — ACCRUING/SETTLED/WAIVED_CLOSED/VOID penalties and FILED/DISPUTED/SETTLED claims contribute 0"
+    precision: "integer cents"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-ID and X-User-Role headers present and non-empty", error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http_status: 400, applies_to: "all" }
+  - { priority: "1b", category: auth, check: "Request body parses and contains all required fields with valid types and enum members", error_id: ERR_VALIDATION, http_status: 400, applies_to: "all endpoints with a request body" }
+  - { priority: 2, category: auth, check: "X-User-Role is allowed to invoke this endpoint per §1.5 roles", error_id: ERR_FORBIDDEN_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Path and body-referenced resource ids exist, validated left-to-right (path template order, then body FK fields in declared input order)", error_id: "ERR_{RESOURCE}_NOT_FOUND", http_status: 404, applies_to: "all" }
+  - { priority: 4, category: business_constraint, check: "OCC: expected_<parent>_version equals the entity's current version", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /vendor-office/cases/{id}/reschedule; POST /vendor-office/claims/{id}/apportion" }
+  - { priority: 5, category: state, check: "Target entity is in a state that permits the invoked transition (per-entity domain errors)", error_id: "ERR_{ENTITY}_INVALID_STATE family (ERR_CASE_INVALID_STATE, ERR_REQUEST_INVALID_STATE, ERR_TRAY_INVALID_STATE, ERR_TURN_INVALID_STATE, ERR_CHECKIN_INVALID_STATE, ERR_PENALTY_INVALID_STATE, ERR_CLAIM_INVALID_STATE, ERR_PASS_INVALID_STATE, ERR_PICKUP_INVALID_STATE, ERR_VENDOR_NOT_ACTIVE)", http_status: 409, applies_to: "all action endpoints" }
+  - { priority: 6, category: business_safety, check: "Credentialing & sterility safety: rep credential ACTIVE and owned-by-vendor for vendor actions; implant log when implant trays checked in; decon minimum and cooldown elapsed before cycle/release", error_id: "ERR_REP_CREDENTIAL_NOT_ACTIVE (409), ERR_IMPLANT_LOG_REQUIRED (422), ERR_DECON_MIN_NOT_ELAPSED (409), ERR_COOLDOWN_NOT_ELAPSED (409), ERR_CREDENTIAL_WINDOW_INSUFFICIENT (409)", http_status: 409, applies_to: "check-ins create, passes decide, turns start-cycle/release" }
+  - { priority: 7, category: business_temporal, check: "Temporal windows: room buffered overlap, access admit window, submit deadline feasibility, credential expiry in future", error_id: "ERR_ROOM_TIME_CONFLICT (409), ERR_ACCESS_WINDOW_CLOSED (409), ERR_REQUEST_DEADLINE_INFEASIBLE (422), ERR_CREDENTIAL_EXPIRY_PAST (422)", http_status: 409, applies_to: "cases create/reschedule, passes admit, requests submit, reps approve-credential" }
+  - { priority: 8, category: business_constraint, check: "Constraint satisfaction: uniqueness (vendor_code, case_number, tray_code within request, duplicate tray line), sterilizer slot capacity, rework limit path, segregation of duties, escalate/resolve linkage guards", error_id: "ERR_DUPLICATE_VENDOR_CODE (409), ERR_DUPLICATE_CASE_NUMBER (409), ERR_DUPLICATE_TRAY_CODE (409), ERR_DUPLICATE_TRAY_LINE (409), ERR_STERILIZER_CAPACITY_EXCEEDED (409), ERR_SEGREGATION_OF_DUTIES (403), ERR_REQUEST_NO_TRAYS (409), ERR_ESCALATION_RESOLUTION_INVALID (409)", http_status: 409, applies_to: "create + action endpoints" }
+  - { priority: 9, category: business_referential, check: "Cross-entity FK coherence: acting rep belongs to request's vendor; check-in/pickup line trays belong to the path request; delay-event attributable_request_id belongs to the case and is required for vendor causes; claim tray/request consistent; escalation linked_tray belongs to request", error_id: "ERR_REP_VENDOR_MISMATCH (403), ERR_TRAY_NOT_IN_REQUEST (422), ERR_DELAY_REQUEST_LINK (422), ERR_DELAY_EVENT_INVALID (422)", http_status: 422, applies_to: "check-ins, pickups, delay-events, claims, escalations, access-passes, penalties/claims dispute" }
+  - { priority: 10, category: business_fiscal, check: "Fiscal bounds: claim amount > 0, vendor_share_percent within [0,100], waiver <= outstanding, settle amount == outstanding exactly, pickup returned count <= delivered count, vendor-cause delay sum <= total delay", error_id: "ERR_CLAIM_AMOUNT_INVALID (422), ERR_CLAIM_APPORTION_INVALID (422), ERR_WAIVER_EXCEEDS_OUTSTANDING (422), ERR_SETTLE_AMOUNT_MISMATCH (422), ERR_PICKUP_COUNT_EXCEEDS_DELIVERED (422), ERR_CASE_DELAY_OVERATTRIBUTED (422)", http_status: 422, applies_to: "claims, penalties, pickups, delay-events" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- clock (test-driving; logical clock, default 2026-08-01T00:00:00Z) ---
+  - method: POST
+    path: "/vendor-office/_clock/set_current_utc"
+    description: "Advance the logical server clock. Default time before any call is exactly 2026-08-01T00:00:00Z (never wall-clock). Side-effect sweep on every set: reps ACTIVE with credential_expires_at <= now -> EXPIRED; passes APPROVED with now >= window_end_at -> EXPIRED; passes ADMITTED with now >= window_end_at -> EXITED; turns STERILIZING with cycle_started_at + unit.cycle_minutes <= now -> COOLDOWN (cycle_completed_at stamped)."
+    roles: [VendorCoordinator]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["Sweep transitions listed in description"]
+
+  # --- Vendor ---
+  - { method: POST, path: "/vendor-office/vendors", description: "Create vendor with penalty contract terms", roles: [VendorCoordinator], code: 201, input: [vendor_name, vendor_code, "late_grace_minutes?", late_rate_per_hour_cents, late_penalty_cap_cents, "delay_surcharge_per_minute_cents?"], output: Vendor, side_effects: ["outstanding rollups initialized to 0"] }
+  - { method: GET, path: "/vendor-office/vendors", description: "List vendors", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["status?", "limit?", "offset?"], output: "Vendor[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/vendors/{id}", description: "Get vendor (includes outstanding rollups)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: Vendor, side_effects: [] }
+  - { method: POST, path: "/vendor-office/vendors/{id}/suspend", description: "ACTIVE -> SUSPENDED", roles: [VendorCoordinator], code: 200, input: [], output: Vendor, side_effects: ["status -> SUSPENDED"] }
+  - { method: POST, path: "/vendor-office/vendors/{id}/reinstate", description: "SUSPENDED -> ACTIVE", roles: [VendorCoordinator], code: 200, input: [], output: Vendor, side_effects: ["status -> ACTIVE"] }
+  - { method: POST, path: "/vendor-office/vendors/{id}/terminate", description: "ACTIVE/SUSPENDED -> TERMINATED with open-work guards", roles: [VendorCoordinator], code: 200, input: [], output: Vendor, side_effects: ["status -> TERMINATED"] }
+
+  # --- VendorRep ---
+  - { method: POST, path: "/vendor-office/vendors/{vendorId}/reps", description: "Register a rep under a vendor (initial PENDING_VERIFICATION)", roles: [VendorCoordinator], code: 201, input: [full_name, rep_email, credential_doc_ref], output: VendorRep, side_effects: [] }
+  - { method: GET, path: "/vendor-office/reps", description: "List reps (FK reverse for vendor_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["vendor_id?", "credential_status?", "limit?", "offset?"], output: "VendorRep[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/reps/{id}", description: "Get rep", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: VendorRep, side_effects: [] }
+  - { method: POST, path: "/vendor-office/reps/{id}/approve-credential", description: "Grant/renew credential: PENDING_VERIFICATION or EXPIRED -> ACTIVE", roles: [VendorCoordinator], code: 200, input: [credential_expires_at, or_access_level], output: VendorRep, side_effects: ["credential_status -> ACTIVE; expiry and access level set"] }
+  - { method: POST, path: "/vendor-office/reps/{id}/revoke-credential", description: "Revoke credential (terminal) with pass cascade", roles: [VendorCoordinator], code: 200, input: [], output: VendorRep, side_effects: ["credential_status -> REVOKED; passes REQUESTED -> DENIED, APPROVED -> REVOKED"] }
+
+  # --- ORRoom ---
+  - { method: POST, path: "/vendor-office/or-rooms", description: "Create OR room", roles: [ORScheduler], code: 201, input: [room_name, "turnover_buffer_minutes?"], output: ORRoom, side_effects: [] }
+  - { method: GET, path: "/vendor-office/or-rooms", description: "List OR rooms", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["limit?", "offset?"], output: "ORRoom[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/or-rooms/{id}", description: "Get OR room", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: ORRoom, side_effects: [] }
+
+  # --- SterilizerUnit ---
+  - { method: POST, path: "/vendor-office/sterilizer-units", description: "Create sterilizer unit", roles: [SterileProcessingTech], code: 201, input: [unit_name, slot_capacity, cycle_minutes, cooldown_minutes], output: SterilizerUnit, side_effects: [] }
+  - { method: GET, path: "/vendor-office/sterilizer-units", description: "List sterilizer units", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["limit?", "offset?"], output: "SterilizerUnit[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/sterilizer-units/{id}", description: "Get sterilizer unit", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: SterilizerUnit, side_effects: [] }
+
+  # --- SurgicalCase ---
+  - { method: POST, path: "/vendor-office/cases", description: "Create case; room buffered-overlap check (conflict iff NOT (new_start >= existing_end + buffer OR existing_start >= new_end + buffer))", roles: [ORScheduler], code: 201, input: [case_number, or_room_id, procedure_type, surgeon_name, scheduled_start_at, scheduled_end_at], output: SurgicalCase, side_effects: ["status SCHEDULED; delay fields default"] }
+  - { method: GET, path: "/vendor-office/cases", description: "List cases (FK reverse for or_room_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["or_room_id?", "status?", "limit?", "offset?"], output: "SurgicalCase[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/cases/{id}", description: "Get case (delay attribution fields)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: SurgicalCase, side_effects: [] }
+  - { method: POST, path: "/vendor-office/cases/{id}/reschedule", description: "OCC-guarded reschedule; re-derives request deadlines, tray windows, pass windows; readiness recompute + flip escalations", roles: [ORScheduler], code: 200, input: [scheduled_start_at, scheduled_end_at, expected_case_version], output: SurgicalCase, side_effects: ["case.version +1", "linked APPROVED requests required_delivery_by recomputed", "tray required/projected sterile-ready recomputed + readiness recompute + flip escalation", "pass windows recomputed"] }
+  - { method: POST, path: "/vendor-office/cases/{id}/start", description: "Start case; readiness gate with override; provisional delay attribution; STAGED trays -> IN_USE; override auto-escalations", roles: [ORScheduler], code: 200, input: ["override_readiness?", "override_reason?"], output: SurgicalCase, side_effects: ["actual_start_at = clock; provisional delay fields computed", "STAGED trays -> IN_USE", "override -> auto Escalation OPEN per deficient APPROVED request", "case.version +1"] }
+  - { method: POST, path: "/vendor-office/cases/{id}/complete", description: "Complete case; final delay attribution; tray cascade to AWAITING_PICKUP/CANCELLED", roles: [ORScheduler], code: 200, input: [], output: SurgicalCase, side_effects: ["actual_end_at = clock; vendor_delay_minutes_final computed", "tray cascade per §1.2", "readiness recompute per request", "case.version +1"] }
+  - { method: POST, path: "/vendor-office/cases/{id}/cancel", description: "Cancel case with full cascade (requests, trays, penalties VOID, passes, escalations)", roles: [ORScheduler], code: 200, input: [], output: SurgicalCase, side_effects: ["cascade per §1.2 SurgicalCase SCHEDULED -> CANCELLED"] }
+  - { method: POST, path: "/vendor-office/cases/{id}/delay-events", description: "Record a delay event; vendor causes require attributable_request_id of this case; cumulative vendor minutes <= delay_minutes_provisional", roles: [ORScheduler, ORCirculatorNurse], code: 201, input: [cause, minutes, "attributable_request_id?"], output: CaseDelayEvent, side_effects: ["recorded_by_role stamped"] }
+  - { method: GET, path: "/vendor-office/delay-events", description: "List delay events (FK reverse for case_id, attributable_request_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["case_id?", "attributable_request_id?", "limit?", "offset?"], output: "CaseDelayEvent[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/delay-events/{id}", description: "Get a delay event", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: CaseDelayEvent, side_effects: [] }
+
+  # --- LoanerRequest ---
+  - { method: POST, path: "/vendor-office/requests", description: "Create DRAFT loaner request linking case x vendor", roles: [ORScheduler], code: 201, input: [case_id, vendor_id, priority_class], output: LoanerRequest, side_effects: ["status DRAFT; readiness NOT_READY"] }
+  - { method: GET, path: "/vendor-office/requests", description: "List requests (FK reverse for case_id, vendor_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["case_id?", "vendor_id?", "status?", "readiness?", "limit?", "offset?"], output: "LoanerRequest[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/requests/{id}", description: "Get request", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: LoanerRequest, side_effects: [] }
+  - { method: POST, path: "/vendor-office/requests/{id}/trays", description: "Add tray to DRAFT request", roles: [ORScheduler], code: 201, input: [tray_code, declared_instrument_count, "implant_flag?", replacement_value_cents], output: LoanerTray, side_effects: ["tray EXPECTED; request readiness recompute"] }
+  - { method: GET, path: "/vendor-office/requests/{id}/trays", description: "List trays of a request (sub-resource)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["limit?", "offset?"], output: "LoanerTray[]", side_effects: [] }
+  - { method: POST, path: "/vendor-office/requests/{id}/submit", description: "DRAFT -> SUBMITTED with tray-count and deadline-feasibility gates", roles: [ORScheduler], code: 200, input: [], output: LoanerRequest, side_effects: ["submitted_at = clock; version +1"] }
+  - { method: POST, path: "/vendor-office/requests/{id}/decide", description: "VendorCoordinator approve (computes required_delivery_by + tray windows) or reject", roles: [VendorCoordinator], code: 200, input: [decision, "reason?"], output: LoanerRequest, side_effects: ["APPROVE: required_delivery_by and tray sterile windows computed; REJECT: terminal REJECTED; version +1"] }
+  - { method: POST, path: "/vendor-office/requests/{id}/cancel", description: "Cancel request (DRAFT/SUBMITTED/APPROVED) with tray/penalty/escalation cascade", roles: [ORScheduler], code: 200, input: [], output: LoanerRequest, side_effects: ["cascade per §1.2 LoanerRequest -> CANCELLED"] }
+
+  # --- LoanerTray ---
+  - { method: GET, path: "/vendor-office/trays", description: "List trays (FK reverse for request_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["request_id?", "status?", "limit?", "offset?"], output: "LoanerTray[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/trays/{id}", description: "Get tray", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: LoanerTray, side_effects: [] }
+  - { method: POST, path: "/vendor-office/trays/{id}/mark-missing", description: "EXPECTED -> MISSING; auto-creates MISSING_TRAY escalation", roles: [VendorCoordinator], code: 200, input: [], output: LoanerTray, side_effects: ["Escalation OPEN MISSING_TRAY created", "readiness recompute"] }
+  - { method: POST, path: "/vendor-office/trays/{id}/stage", description: "STERILE_READY -> STAGED (case must be SCHEDULED)", roles: [ORCirculatorNurse], code: 200, input: [], output: LoanerTray, side_effects: ["readiness recompute"] }
+
+  # --- CheckInEvent ---
+  - { method: POST, path: "/vendor-office/requests/{id}/check-ins", description: "Vendor rep delivery check-in with count sheet + documentation; covered trays -> DELIVERY_PENDING", roles: [VendorRep], code: 201, input: [lines, ifu_provided, "implant_log_provided?", loaner_agreement_ref], output: CheckInEvent, side_effects: ["delivered_at = clock; rep_id = X-User-ID; trays EXPECTED/MISSING -> DELIVERY_PENDING"] }
+  - { method: GET, path: "/vendor-office/check-ins", description: "List check-ins (FK reverse for request_id, rep_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["request_id?", "rep_id?", "status?", "limit?", "offset?"], output: "CheckInEvent[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/check-ins/{id}", description: "Get check-in", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: CheckInEvent, side_effects: [] }
+  - { method: POST, path: "/vendor-office/check-ins/{id}/verify", description: "Coordinator verifies count sheet with per-line disposition; late minutes computed; late delivery creates ACCRUING penalty (cascade link 1) and updates request penalty_exposure (link 2)", roles: [VendorCoordinator], code: 200, input: [line_dispositions], output: CheckInEvent, side_effects: ["verified_by_user_id = X-User-ID; late_minutes computed", "late_minutes > vendor.late_grace_minutes -> PenaltyAssessment ACCRUING created -> request.penalty_exposure_cents recomputed", "line trays -> CHECKED_IN or QUARANTINED with escalations"] }
+
+  # --- SterilizationTurn ---
+  - { method: POST, path: "/vendor-office/trays/{id}/turns", description: "Open sterilization turn on CHECKED_IN tray (turn starts DECONTAMINATING; tray -> PROCESSING)", roles: [SterileProcessingTech], code: 201, input: [], output: SterilizationTurn, side_effects: ["tray -> PROCESSING; decon_started_at = clock; readiness recompute"] }
+  - { method: GET, path: "/vendor-office/turns", description: "List turns (FK reverse for tray_id, sterilizer_unit_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["tray_id?", "sterilizer_unit_id?", "status?", "limit?", "offset?"], output: "SterilizationTurn[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/turns/{id}", description: "Get turn", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: SterilizationTurn, side_effects: [] }
+  - { method: POST, path: "/vendor-office/turns/{id}/start-cycle", description: "DECONTAMINATING -> STERILIZING on a unit; decon minimum + slot capacity guards", roles: [SterileProcessingTech], code: 200, input: [sterilizer_unit_id], output: SterilizationTurn, side_effects: ["cycle_started_at = clock; tray projection set; readiness recompute"] }
+  - { method: POST, path: "/vendor-office/turns/{id}/release", description: "COOLDOWN -> RELEASED (QA pass); tray -> STERILE_READY", roles: [SterileProcessingTech], code: 200, input: [], output: SterilizationTurn, side_effects: ["released_at = clock; tray -> STERILE_READY; readiness recompute"] }
+  - { method: POST, path: "/vendor-office/turns/{id}/fail-qa", description: "STERILIZING/COOLDOWN -> FAILED_QA; tray rework loop (CHECKED_IN) or QUARANTINED past MAX_REWORKS with escalation", roles: [SterileProcessingTech], code: 200, input: ["reason?"], output: SterilizationTurn, side_effects: ["tray rework_count +1; tray -> CHECKED_IN or QUARANTINED (+Escalation STERILIZATION_DELAY); projection + readiness recompute (cascade per §1.2)"] }
+
+  # --- Escalation ---
+  - { method: POST, path: "/vendor-office/requests/{id}/escalations", description: "Manual escalation on a request", roles: [VendorCoordinator], code: 201, input: [type, "linked_tray_id?"], output: Escalation, side_effects: ["status OPEN"] }
+  - { method: GET, path: "/vendor-office/escalations", description: "List escalations (FK reverse for request_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["request_id?", "status?", "type?", "linked_tray_id?", "limit?", "offset?"], output: "Escalation[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/escalations/{id}", description: "Get escalation", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: Escalation, side_effects: [] }
+  - { method: POST, path: "/vendor-office/escalations/{id}/acknowledge", description: "OPEN -> ACKNOWLEDGED", roles: [VendorCoordinator], code: 200, input: [], output: Escalation, side_effects: [] }
+  - { method: POST, path: "/vendor-office/escalations/{id}/resolve", description: "OPEN/ACKNOWLEDGED -> RESOLVED with per-type guards", roles: [VendorCoordinator], code: 200, input: [resolution_type], output: Escalation, side_effects: ["resolution_type stamped"] }
+
+  # --- ORAccessPass ---
+  - { method: POST, path: "/vendor-office/access-passes", description: "Request OR access for a rep on a case (case must be SCHEDULED; VendorRep callers may only request for themselves)", roles: [VendorRep, VendorCoordinator], code: 201, input: [rep_id, case_id], output: ORAccessPass, side_effects: ["status REQUESTED"] }
+  - { method: GET, path: "/vendor-office/access-passes", description: "List access passes (FK reverse for rep_id, case_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["rep_id?", "case_id?", "status?", "limit?", "offset?"], output: "ORAccessPass[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/access-passes/{id}", description: "Get access pass", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: ORAccessPass, side_effects: [] }
+  - { method: POST, path: "/vendor-office/access-passes/{id}/decide", description: "Approve (credential + vendor + case guards; computes window) or deny", roles: [VendorCoordinator], code: 200, input: [decision, "reason?"], output: ORAccessPass, side_effects: ["APPROVE: window_start_at/window_end_at computed; DENY: denial_reason stamped"] }
+  - { method: POST, path: "/vendor-office/access-passes/{id}/admit", description: "APPROVED -> ADMITTED within [window_start_at, window_end_at)", roles: [ORCirculatorNurse], code: 200, input: [], output: ORAccessPass, side_effects: [] }
+
+  # --- PickupRecord ---
+  - { method: POST, path: "/vendor-office/requests/{id}/pickups", description: "Post-case pickup with returned count sheet; covered trays -> PICKED_UP", roles: [VendorRep], code: 201, input: [lines], output: PickupRecord, side_effects: ["picked_up_at = clock; rep_id = X-User-ID; trays AWAITING_PICKUP -> PICKED_UP with returned counts"] }
+  - { method: GET, path: "/vendor-office/pickups", description: "List pickups (FK reverse for request_id, rep_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["request_id?", "rep_id?", "status?", "limit?", "offset?"], output: "PickupRecord[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/pickups/{id}", description: "Get pickup", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: PickupRecord, side_effects: [] }
+  - { method: POST, path: "/vendor-office/pickups/{id}/reconcile", description: "Reconcile counts (SoD vs check-in verifier); shortage/damage auto-claims; tray -> RECONCILED; request bubble-up CLOSED", roles: [VendorCoordinator], code: 200, input: [], output: PickupRecord, side_effects: ["per-line shortage + auto DamageLossClaim (calc_reconciliation_shortage_claims)", "trays -> RECONCILED", "request CLOSED when all trays terminal and case COMPLETED"] }
+  - { method: POST, path: "/vendor-office/pickups/{id}/dispute", description: "SUBMITTED -> DISPUTED by vendor rep (before reconcile)", roles: [VendorRep], code: 200, input: ["reason?"], output: PickupRecord, side_effects: [] }
+
+  # --- DamageLossClaim ---
+  - { method: POST, path: "/vendor-office/claims", description: "Manual claim against a tray (provisional presumptive share computed at filing)", roles: [VendorCoordinator], code: 201, input: [tray_id, request_id, damage_type, claimed_amount_cents], output: DamageLossClaim, side_effects: ["provisional_vendor_share_cents computed per calc_liability_apportionment"] }
+  - { method: GET, path: "/vendor-office/claims", description: "List claims (FK reverse for tray_id, request_id, pickup_id); order (created_at ASC, claim_seq ASC)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["tray_id?", "request_id?", "pickup_id?", "status?", "limit?", "offset?"], output: "DamageLossClaim[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/claims/{id}", description: "Get claim", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: DamageLossClaim, side_effects: [] }
+  - { method: POST, path: "/vendor-office/claims/{id}/apportion", description: "OCC-guarded apportion / re-apportion after dispute; computes final shares; vendor liability rollup +=", roles: [VendorCoordinator], code: 200, input: [vendor_share_percent, expected_claim_version], output: DamageLossClaim, side_effects: ["final shares computed (round_half_up vendor, hospital remainder)", "vendor.outstanding_liability_cents += final_vendor_share_cents", "claim.version +1"] }
+  - { method: POST, path: "/vendor-office/claims/{id}/dispute", description: "APPORTIONED -> DISPUTED by the vendor's rep; liability rollup -=", roles: [VendorRep], code: 200, input: ["reason?"], output: DamageLossClaim, side_effects: ["vendor.outstanding_liability_cents -= final_vendor_share_cents"] }
+  - { method: POST, path: "/vendor-office/claims/{id}/settle", description: "APPORTIONED -> SETTLED; liability rollup -=", roles: [VendorCoordinator], code: 200, input: [], output: DamageLossClaim, side_effects: ["vendor.outstanding_liability_cents -= final_vendor_share_cents"] }
+
+  # --- PenaltyAssessment ---
+  - { method: GET, path: "/vendor-office/penalties", description: "List penalties (FK reverse for request_id, check_in_id)", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: ["request_id?", "check_in_id?", "status?", "limit?", "offset?"], output: "PenaltyAssessment[]", side_effects: [] }
+  - { method: GET, path: "/vendor-office/penalties/{id}", description: "Get penalty", roles: [VendorCoordinator, ORScheduler, SterileProcessingTech, ORCirculatorNurse, VendorRep], code: 200, input: [], output: PenaltyAssessment, side_effects: [] }
+  - { method: POST, path: "/vendor-office/penalties/{id}/assess", description: "ACCRUING -> ASSESSED (case must be COMPLETED); computes delay surcharge from final attribution; rollups", roles: [VendorCoordinator], code: 200, input: [], output: PenaltyAssessment, side_effects: ["delay_surcharge_cents + assessed_cents computed", "request.penalty_exposure_cents recompute; vendor.outstanding_penalty_cents += outstanding_cents"] }
+  - { method: POST, path: "/vendor-office/penalties/{id}/waive", description: "Partial/full waiver (SoD vs check-in verifier); full waiver -> WAIVED_CLOSED", roles: [VendorCoordinator], code: 200, input: [waive_amount_cents, reason], output: PenaltyAssessment, side_effects: ["waived_cents += amount; outstanding recompute; vendor.outstanding_penalty_cents -= amount"] }
+  - { method: POST, path: "/vendor-office/penalties/{id}/settle", description: "Settle exactly the outstanding amount -> SETTLED", roles: [VendorCoordinator], code: 200, input: [settle_amount_cents], output: PenaltyAssessment, side_effects: ["settled_cents += amount; outstanding 0; vendor.outstanding_penalty_cents -= amount"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or empty" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "X-User-Role not in the endpoint's roles list" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed body: missing required field, wrong type, invalid enum member, non-positive numeric where required" }
+  # --- existence ---
+  - { id: ERR_VENDOR_NOT_FOUND, http: 404, condition: "vendor id does not exist" }
+  - { id: ERR_REP_NOT_FOUND, http: 404, condition: "rep id does not exist" }
+  - { id: ERR_ROOM_NOT_FOUND, http: 404, condition: "OR room id does not exist" }
+  - { id: ERR_STERILIZER_NOT_FOUND, http: 404, condition: "sterilizer unit id does not exist" }
+  - { id: ERR_CASE_NOT_FOUND, http: 404, condition: "case id does not exist" }
+  - { id: ERR_REQUEST_NOT_FOUND, http: 404, condition: "loaner request id does not exist" }
+  - { id: ERR_TRAY_NOT_FOUND, http: 404, condition: "tray id does not exist" }
+  - { id: ERR_CHECKIN_NOT_FOUND, http: 404, condition: "check-in id does not exist" }
+  - { id: ERR_TURN_NOT_FOUND, http: 404, condition: "sterilization turn id does not exist" }
+  - { id: ERR_ESCALATION_NOT_FOUND, http: 404, condition: "escalation id does not exist" }
+  - { id: ERR_PASS_NOT_FOUND, http: 404, condition: "access pass id does not exist" }
+  - { id: ERR_PICKUP_NOT_FOUND, http: 404, condition: "pickup id does not exist" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "claim id does not exist" }
+  - { id: ERR_PENALTY_NOT_FOUND, http: 404, condition: "penalty id does not exist" }
+  - { id: ERR_DELAY_EVENT_NOT_FOUND, http: 404, condition: "delay event id does not exist" }
+  # --- OCC ---
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not equal the entity's current version" }
+  # --- state ---
+  - { id: ERR_VENDOR_NOT_ACTIVE, http: 409, condition: "vendor not ACTIVE where required (request create/approve, pass approve)" }
+  - { id: ERR_VENDOR_HAS_OPEN_WORK, http: 409, condition: "terminate blocked by open requests, penalties, or claims" }
+  - { id: ERR_CASE_INVALID_STATE, http: 409, condition: "case not in required state (start/complete/cancel/reschedule/stage/assess guards)" }
+  - { id: ERR_CASE_READINESS_BLOCKED, http: 409, condition: "case start blocked: a linked APPROVED request is not READY and no override supplied" }
+  - { id: ERR_REQUEST_INVALID_STATE, http: 409, condition: "request not in required state (add tray, submit, decide, cancel, check-in, pickup, escalate guards)" }
+  - { id: ERR_TRAY_INVALID_STATE, http: 409, condition: "tray not in required state (mark-missing, turns create, stage, check-in line, pickup line guards)" }
+  - { id: ERR_TURN_INVALID_STATE, http: 409, condition: "turn not in required state for start-cycle/release/fail-qa" }
+  - { id: ERR_CHECKIN_INVALID_STATE, http: 409, condition: "check-in not SUBMITTED for verify" }
+  - { id: ERR_PICKUP_INVALID_STATE, http: 409, condition: "pickup not in required state for reconcile/dispute" }
+  - { id: ERR_CLAIM_INVALID_STATE, http: 409, condition: "claim not in required state for apportion/dispute/settle" }
+  - { id: ERR_PENALTY_INVALID_STATE, http: 409, condition: "penalty not in required state for assess/waive/settle" }
+  - { id: ERR_PASS_INVALID_STATE, http: 409, condition: "pass not in required state for decide/admit" }
+  - { id: ERR_ESCALATION_INVALID_STATE, http: 409, condition: "escalation not in required state for acknowledge/resolve" }
+  # --- safety ---
+  - { id: ERR_REP_CREDENTIAL_NOT_ACTIVE, http: 409, condition: "rep credential not ACTIVE (check-in create, pickup create, pass approve)" }
+  - { id: ERR_CREDENTIAL_EXPIRY_PAST, http: 422, condition: "approve-credential expiry not in the future" }
+  - { id: ERR_CREDENTIAL_WINDOW_INSUFFICIENT, http: 409, condition: "credential expires at or before case scheduled_end_at on pass approve" }
+  - { id: ERR_IMPLANT_LOG_REQUIRED, http: 422, condition: "implant tray in check-in lines without implant_log_provided=true" }
+  - { id: ERR_DECON_MIN_NOT_ELAPSED, http: 409, condition: "start-cycle before decon_started_at + 30 minutes" }
+  - { id: ERR_COOLDOWN_NOT_ELAPSED, http: 409, condition: "release before cycle_completed_at + cooldown_minutes" }
+  # --- temporal ---
+  - { id: ERR_ROOM_TIME_CONFLICT, http: 409, condition: "case window collides with another SCHEDULED/IN_PROGRESS case in the same room under buffered half-open semantics" }
+  - { id: ERR_ACCESS_WINDOW_CLOSED, http: 409, condition: "admit outside [window_start_at, window_end_at)" }
+  - { id: ERR_REQUEST_DEADLINE_INFEASIBLE, http: 422, condition: "submit when case.scheduled_start_at - now < lead_hours(priority_class)" }
+  # --- constraint ---
+  - { id: ERR_DUPLICATE_VENDOR_CODE, http: 409, condition: "vendor_code already exists" }
+  - { id: ERR_DUPLICATE_CASE_NUMBER, http: 409, condition: "case_number already exists" }
+  - { id: ERR_DUPLICATE_TRAY_CODE, http: 409, condition: "tray_code already used within the request" }
+  - { id: ERR_DUPLICATE_TRAY_LINE, http: 409, condition: "same tray_id appears twice in check-in lines" }
+  - { id: ERR_STERILIZER_CAPACITY_EXCEEDED, http: 409, condition: "start-cycle when active STERILIZING turns on the unit == slot_capacity" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "same X-User-ID performed check-in verification and now attempts pickup reconcile or penalty waive on the same request" }
+  - { id: ERR_REQUEST_NO_TRAYS, http: 409, condition: "submit a request with zero trays" }
+  - { id: ERR_ESCALATION_RESOLUTION_INVALID, http: 409, condition: "resolve MISSING_TRAY with BACKFILL_DELIVERY while linked tray is still EXPECTED/MISSING/CANCELLED" }
+  # --- referential ---
+  - { id: ERR_REP_VENDOR_MISMATCH, http: 403, condition: "acting rep does not belong to the request's/claim's vendor, or VendorRep requests a pass for another rep" }
+  - { id: ERR_TRAY_NOT_IN_REQUEST, http: 422, condition: "check-in line or escalation linked tray belongs to a different request" }
+  - { id: ERR_DELAY_REQUEST_LINK, http: 422, condition: "vendor-cause delay event missing attributable_request_id, or request not linked to this case" }
+  - { id: ERR_DELAY_EVENT_INVALID, http: 422, condition: "delay event minutes <= 0, case not IN_PROGRESS/COMPLETED, or other per-field guard" }
+  # --- fiscal ---
+  - { id: ERR_CLAIM_AMOUNT_INVALID, http: 422, condition: "claimed_amount_cents <= 0 or tray not in a claim-eligible state (PICKED_UP/RECONCILED/QUARANTINED)" }
+  - { id: ERR_CLAIM_APPORTION_INVALID, http: 422, condition: "vendor_share_percent outside [0, 100]" }
+  - { id: ERR_WAIVER_EXCEEDS_OUTSTANDING, http: 422, condition: "waive_amount_cents > penalty.outstanding_cents" }
+  - { id: ERR_SETTLE_AMOUNT_MISMATCH, http: 422, condition: "settle_amount_cents != penalty.outstanding_cents" }
+  - { id: ERR_PICKUP_COUNT_EXCEEDS_DELIVERED, http: 422, condition: "pickup line instrument_count_returned > tray.delivered_instrument_count" }
+  - { id: ERR_CASE_DELAY_OVERATTRIBUTED, http: 422, condition: "cumulative vendor-cause delay minutes would exceed case.delay_minutes_provisional" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: VendorCoordinator
+    description: "OR vendor management office staff: vendor/rep administration, request approval, check-in verification, escalations, access decisions, reconciliation, claims and penalties"
+    identity: opaque
+    exclusive_operations:
+      - "POST /vendor-office/vendors, /suspend, /reinstate, /terminate"
+      - "POST /vendor-office/vendors/{vendorId}/reps; POST /vendor-office/reps/{id}/approve-credential, /revoke-credential"
+      - "POST /vendor-office/requests/{id}/decide"
+      - "POST /vendor-office/check-ins/{id}/verify"
+      - "POST /vendor-office/trays/{id}/mark-missing"
+      - "POST /vendor-office/requests/{id}/escalations; POST /vendor-office/escalations/{id}/acknowledge, /resolve"
+      - "POST /vendor-office/access-passes/{id}/decide"
+      - "POST /vendor-office/pickups/{id}/reconcile"
+      - "POST /vendor-office/claims (+ /apportion, /settle)"
+      - "POST /vendor-office/penalties/{id}/assess, /waive, /settle"
+      - "POST /vendor-office/_clock/set_current_utc"
+    shared_operations:
+      - "All GET endpoints (role Any)"
+      - "POST /vendor-office/access-passes (shared with VendorRep)"
+  - name: ORScheduler
+    description: "OR scheduling office: rooms, surgical cases, case lifecycle, loaner request drafting/submission/cancellation, delay event recording"
+    identity: opaque
+    exclusive_operations:
+      - "POST /vendor-office/or-rooms"
+      - "POST /vendor-office/cases (+ /reschedule, /start, /complete, /cancel)"
+      - "POST /vendor-office/requests (+ /trays, /submit, /cancel)"
+    shared_operations:
+      - "All GET endpoints (role Any)"
+      - "POST /vendor-office/cases/{id}/delay-events (shared with ORCirculatorNurse)"
+  - name: SterileProcessingTech
+    description: "Sterile processing department technician: sterilizer units and sterilization turns"
+    identity: opaque
+    exclusive_operations:
+      - "POST /vendor-office/sterilizer-units"
+      - "POST /vendor-office/trays/{id}/turns; POST /vendor-office/turns/{id}/start-cycle, /release, /fail-qa"
+    shared_operations:
+      - "All GET endpoints (role Any)"
+  - name: ORCirculatorNurse
+    description: "OR circulator: stages trays for cases, admits credentialed reps, records intra-op delay events"
+    identity: opaque
+    exclusive_operations:
+      - "POST /vendor-office/trays/{id}/stage"
+      - "POST /vendor-office/access-passes/{id}/admit"
+    shared_operations:
+      - "All GET endpoints (role Any)"
+      - "POST /vendor-office/cases/{id}/delay-events (shared with ORScheduler)"
+  - name: VendorRep
+    description: "Vendor representative (entity-backed by VendorRep): delivers trays (check-in), picks up post-case, requests OR access, disputes claims/pickups"
+    identity: "entity_backed:VendorRep"
+    exclusive_operations:
+      - "POST /vendor-office/requests/{id}/check-ins"
+      - "POST /vendor-office/requests/{id}/pickups"
+      - "POST /vendor-office/pickups/{id}/dispute"
+      - "POST /vendor-office/claims/{id}/dispute"
+    shared_operations:
+      - "All GET endpoints (role Any)"
+      - "POST /vendor-office/access-passes (self only: rep_id must equal X-User-ID, else ERR_REP_VENDOR_MISMATCH)"
+  - name: Any
+    description: "Any authenticated role may read"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "All GET endpoints"

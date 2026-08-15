@@ -1,0 +1,1201 @@
+# =============================================================================
+# Task 1869 — Aircraft Painting & Interior Refurbishment (completion center)
+# SCAFFOLD.yaml — §1.0–§1.7
+# =============================================================================
+
+scenario: |
+  1869. Aircraft Painting & Interior Refurbishment (aircraft completion center): design/livery approval & paint scheme drawing, strip vs scuff decision & corrosion findings, slot scheduling & hangar occupancy, interior soft-goods burn certification, weight change & documentation, discovery work & change orders, quality inspection & rework, delivery date guarantee & penalty
+
+domain_name: aircraft-completion
+api_prefix: /completion
+
+# =============================================================================
+# Step 0: Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: workflow_orchestration
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency      # OCC on RefurbProgram.version guards all customer-side approvals
+    - cascading_side_effects      # CO approve -> program totals/date -> auto DelayEvent -> DRAFT invoice regen
+    - dual_variant_calculation    # weight provisional vs final; penalty projection vs settlement; booth scheduled vs actual
+    - version_pinning_on_approval # approved PaintScheme revision pinned; supersede re-baselines
+    - derived_field_reconciliation # program totals/date/penalty recomputed on every child mutation
+    - rate_threshold_triggers     # major-defect threshold, retest cap, weight-delta limit, penalty cap
+
+  entity_topology: flat           # all creates are top-level with FK in body; filtered-list GETs for reverse reachability
+  state_machine_shape: compound   # RefurbProgram phase machine is guarded by aggregate state of 6+ child entity types;
+                                  # PaintScheme/ChangeOrder/SoftGoodLot are cyclic; Program has a revert loop (IN_INSPECTION->IN_WORK)
+
+  relationship_patterns:
+    - one_to_many        # Program -> schemes, assessments, discovery items, change orders, slots, bookings, lots, WBRs, inspections, delays, invoices
+    - self_referential   # PaintScheme.superseded_by_id -> PaintScheme.id
+    - cross_aggregate    # HangarSlot/BoothBooking reference Program AND a resource entity (Bay/Booth); WBR pins approved PaintScheme
+
+  role_model: segregation_of_duties
+  # Approval chain (shop drafts -> customer approves) PLUS person-level SoD:
+  # WeightBalanceRecord signer must differ from preparer (tracked via X-User-ID).
+
+  consistency_model: immediate    # all mutations + cascades atomic within the request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Customer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Operator / owner legal name" }
+      - { name: contact_email, type: string, source: input, description: "Primary contact email" }
+      - { name: credit_status, type: enum, source: system, default: GOOD_STANDING, description: "GOOD_STANDING | CREDIT_HOLD; CREDIT_HOLD blocks slot booking, program booking and program advance into IN_WORK" }
+
+  - name: Aircraft
+    parent: null
+    common_fields: true
+    fields:
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; owning operator" }
+      - { name: tail_number, type: string, source: input, description: "Registration, e.g. N1869A" }
+      - { name: model, type: string, source: input, description: "Aircraft model, e.g. G650" }
+      - { name: max_delta_lbs, type: number, source: input, description: "Max |weight delta| in lbs sign-off may accept without a customer WEIGHT_ACK change order; gate is strict >" }
+      - { name: status, type: enum, source: system, default: IN_SERVICE, description: "IN_SERVICE | IN_REFURB | RETURNED" }
+
+  - name: RefurbProgram
+    parent: null
+    common_fields: true
+    fields:
+      - { name: aircraft_id, type: string, source: input, description: "FK -> Aircraft.id; aircraft under refurbishment" }
+      - { name: customer_id, type: string, source: input, description: "FK -> Customer.id; must equal aircraft.customer_id" }
+      - { name: base_price_cents, type: integer, source: input, description: "Contract base price in cents" }
+      - { name: daily_penalty_rate_cents, type: integer, source: input, description: "Late-delivery penalty accrual per calendar day" }
+      - { name: penalty_cap_pct, type: number, source: input, description: "Penalty cap as fraction of total_contract_value_cents (e.g. 0.10); cap rounded half-up to cents" }
+      - { name: contractual_delivery_date, type: datetime, source: input, description: "Original guaranteed delivery date (UTC calendar day)" }
+      - { name: committed_delivery_date, type: datetime, source: computed, description: "= contractual_delivery_date + sum of impact_days over CONFIRMED excusable DelayEvents + APPROVED change-order delta_days (applied in event order)" }
+      - { name: actual_delivery_date, type: datetime, source: system, description: "Set on transition to DELIVERED from the logical clock; null until then" }
+      - { name: status, type: enum, source: system, default: QUOTED, description: "QUOTED | BOOKED | INDUCTED | SURFACE_REVIEW | IN_WORK | IN_INSPECTION | READY_FOR_DELIVERY | DELIVERED | CANCELLED" }
+      - { name: total_contract_value_cents, type: integer, source: computed, description: "= base_price_cents + sum(delta_price_cents over APPROVED ChangeOrders)" }
+      - { name: discovery_cost_total_cents, type: integer, source: computed, description: "= sum over DiscoveryItems: APPROVED contributes est_cost_cents, COMPLETED contributes actual_cost_cents, REJECTED/DEFERRED/OPEN/ESTIMATED contribute 0" }
+      - { name: billed_total_cents, type: integer, source: computed, description: "= sum(total_cents) over Invoices with status in {ISSUED, PAID}; DRAFT and VOIDED contribute 0" }
+      - { name: penalty_final_cents, type: integer, source: computed, description: "Settlement-variant penalty, persisted when the FINAL invoice is issued and again at DELIVERED; 0 before" }
+      - { name: projected_penalty_cents, type: integer, source: computed, description: "Projection-variant penalty at the current logical clock (includes REPORTED excusable events); recomputed on read" }
+      - { name: rework_cycles, type: integer, source: system, default: 0, description: "Incremented each time an inspection FAIL reverts the program from IN_INSPECTION to IN_WORK" }
+      - { name: approved_scheme_id, type: string, source: system, description: "Currently APPROVED PaintScheme id (version-pinned); null until first approval" }
+      - { name: material_estimate_gallons, type: integer, source: computed, description: "paint_material_estimate total gallons (ceil per component) from the pinned scheme and current assessment decision; 0 until a scheme is APPROVED" }
+      - { name: material_estimate_cost_cents, type: integer, source: computed, description: "paint_material_estimate cost: total gallons x selected average-rate tier; 0 until a scheme is APPROVED" }
+
+  - name: PaintScheme
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: drawing_ref, type: string, source: input, description: "Livery drawing document reference" }
+      - { name: painted_area_sqft, type: integer, source: input, description: "Total painted area in sqft; feeds material and film-weight calcs" }
+      - { name: coat_count, type: integer, source: input, description: "Number of color coats" }
+      - { name: stripe_pct, type: number, source: input, default: 0, description: "Fraction of area receiving accent stripe paint (0..1)" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT | SUBMITTED | APPROVED | REJECTED | SUPERSEDED" }
+      - { name: superseded_by_id, type: string, source: system, description: "FK -> PaintScheme.id; set when a later scheme approval supersedes this one; null otherwise" }
+
+  - name: SurfaceAssessment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: status, type: enum, source: system, default: PENDING, description: "PENDING | DECIDED | SUPERSEDED" }
+      - { name: decision, type: enum, source: input, description: "STRIP | SCUFF; null until DECIDED. SCUFF applies the 0.85 material/film factor" }
+      - { name: corrosion_severity, type: enum, source: input, description: "NONE | LIGHT | HEAVY; null until DECIDED. HEAVY requires a linked DiscoveryItem before IN_WORK" }
+      - { name: findings_note, type: string, source: input, description: "Free-text corrosion findings" }
+      - { name: revision, type: integer, source: system, default: 1, description: "Bumped by every amend" }
+
+  - name: DiscoveryItem
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: assessment_id, type: string, source: input, description: "FK -> SurfaceAssessment.id; optional (?); when present must belong to the same program" }
+      - { name: source, type: enum, source: system, default: MANUAL, description: "MANUAL | INSPECTION_AUTO; INSPECTION_AUTO rows are system-created by a FAILED inspection with major_defects >= threshold" }
+      - { name: description, type: string, source: input, description: "Discovery description" }
+      - { name: safety_linked, type: boolean, source: input, default: false, description: "True for corrosion-safety items; such items can never be DEFERRED" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | ESTIMATED | APPROVED | COMPLETED | REJECTED | DEFERRED" }
+      - { name: est_cost_cents, type: integer, source: input, description: "ProgramManager estimate; null until ESTIMATED" }
+      - { name: est_hours, type: integer, source: input, description: "Estimated labor hours; null until ESTIMATED" }
+      - { name: actual_cost_cents, type: integer, source: input, description: "Actual cost recorded at COMPLETED" }
+      - { name: defer_reason, type: string, source: input, description: "Required (422) when deferring" }
+
+  - name: ChangeOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: kind, type: enum, source: input, default: SCOPE, description: "SCOPE | WEIGHT_ACK; WEIGHT_ACK requires acknowledges_weight_record_id" }
+      - { name: delta_price_cents, type: integer, source: input, description: "Signed price delta applied on APPROVED" }
+      - { name: delta_days, type: integer, source: input, default: 0, description: "Delivery-date shift in days applied on APPROVED; >0 also auto-creates a CONFIRMED CUSTOMER_CAUSED DelayEvent" }
+      - { name: description, type: string, source: input, description: "Scope change description" }
+      - { name: acknowledges_weight_record_id, type: string, source: input, description: "FK -> WeightBalanceRecord.id; required for kind=WEIGHT_ACK; customer acknowledgment of an over-limit weight delta" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT | SUBMITTED | APPROVED | REJECTED | COUNTERED" }
+      - { name: counter_note, type: string, source: input, description: "Customer counter rationale recorded on COUNTERED" }
+      - { name: negotiation_round, type: integer, source: system, default: 1, description: "Bumped on every COUNTERED -> DRAFT revise cycle" }
+
+  - name: HangarBay
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Bay identifier, e.g. BAY-1" }
+      - { name: daily_rate_cents, type: integer, source: input, description: "Stall fee per started 24h day" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | INACTIVE; INACTIVE bays reject new slots" }
+
+  - name: HangarSlot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: bay_id, type: string, source: input, description: "FK -> HangarBay.id" }
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: start_at, type: datetime, source: input, description: "Occupation start (half-open interval, inclusive)" }
+      - { name: end_at, type: datetime, source: input, description: "Occupation end (half-open interval, exclusive); adjacency end==start is allowed" }
+      - { name: status, type: enum, source: system, default: BOOKED, description: "BOOKED | ACTIVE | RELEASED | CANCELLED" }
+
+  - name: PaintBooth
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Booth identifier, e.g. BOOTH-1" }
+      - { name: hourly_rate_cents, type: integer, source: input, description: "Utilization fee per scheduled/actual hour" }
+      - { name: cure_buffer_hours, type: integer, source: input, description: "Mandatory empty gap after each booking's end before the next booking's start (cure/cleanup); gap == buffer is allowed, gap < buffer rejected" }
+
+  - name: BoothBooking
+    parent: null
+    common_fields: true
+    fields:
+      - { name: booth_id, type: string, source: input, description: "FK -> PaintBooth.id" }
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: start_at, type: datetime, source: input, description: "Scheduled spray window start" }
+      - { name: end_at, type: datetime, source: input, description: "Scheduled spray window end; buffer of booth.cure_buffer_hours must follow before any later booking" }
+      - { name: status, type: enum, source: system, default: BOOKED, description: "BOOKED | COMPLETED | CANCELLED" }
+      - { name: actual_hours, type: integer, source: input, description: "Actual booth occupancy hours recorded at COMPLETED" }
+      - { name: scheduled_fee_cents, type: integer, source: computed, description: "= scheduled hours (end_at - start_at) x booth.hourly_rate_cents" }
+      - { name: actual_fee_cents, type: integer, source: computed, description: "Null until COMPLETED; = scheduled hours x rate + overrun hours x rate x 1.25 (overrun = max(0, actual_hours - scheduled_hours)); if actual < scheduled, actual_fee = actual_hours x rate" }
+
+  - name: SoftGoodLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: description, type: string, source: input, description: "e.g. seat covers, carpets, sidewalls" }
+      - { name: material, type: string, source: input, description: "Material designation" }
+      - { name: quantity, type: integer, source: input, description: "Item count in the lot" }
+      - { name: estimated_weight_lbs, type: number, source: input, description: "Catalog weight per lot (provisional weight calc input)" }
+      - { name: status, type: enum, source: system, default: UNCERTIFIED, description: "UNCERTIFIED | IN_TEST | CERTIFIED | CERT_FAILED | CERT_QUARANTINED" }
+      - { name: fail_count, type: integer, source: system, default: 0, description: "Number of FAIL BurnTests recorded; 3rd FAIL transitions lot to CERT_QUARANTINED" }
+
+  - name: BurnTest
+    parent: null
+    common_fields: false   # append-only test record: id + created_at only; no updated_at, no version
+    fields:
+      - { name: lot_id, type: string, source: input, description: "FK -> SoftGoodLot.id" }
+      - { name: test_method, type: enum, source: input, description: "VERTICAL_12S | VERTICAL_60S | HORIZONTAL_25 (FAR 25.853 methods)" }
+      - { name: result, type: enum, source: input, description: "PASS | FAIL" }
+      - { name: lab_name, type: string, source: input, description: "Accredited lab that ran the burn test" }
+      - { name: test_sequence, type: integer, source: system, description: "Per-lot monotone sequence starting at 1; ordering key for certifying-test selection" }
+
+  - name: WeightBalanceRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: scheme_id, type: string, source: input, description: "FK -> PaintScheme.id; must be the program's currently APPROVED scheme (version-pinned input to the film estimate)" }
+      - { name: variant, type: enum, source: input, description: "PROVISIONAL | FINAL; PROVISIONAL uses estimated weights + 0.006 film factor, FINAL uses scale weights + 0.0058 factor" }
+      - { name: removal_weight_lbs, type: number, source: input, description: "Estimated (PROVISIONAL) or scale-actual (FINAL) removed interior weight" }
+      - { name: installed_weight_lbs, type: number, source: input, description: "Estimated (PROVISIONAL) or scale-actual (FINAL) installed interior weight" }
+      - { name: film_lbs, type: number, source: computed, description: "Paint film weight from pinned scheme (area x coats x factor x (1+stripe_pct), x0.85 when current assessment decision is SCUFF)" }
+      - { name: delta_lbs, type: number, source: computed, description: "= installed_weight_lbs - removal_weight_lbs + film_lbs, rounded to 1 decimal half-up" }
+      - { name: status, type: enum, source: system, default: PREPARED, description: "PREPARED | SIGNED_OFF | SUPERSEDED" }
+      - { name: prepared_by_user_id, type: string, source: system, description: "X-User-ID of the creating ShopTechnician; sign-off by the same user id is rejected (segregation of duties)" }
+
+  - name: QualityInspection
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: inspection_type, type: enum, source: input, description: "PREP | PAINT | INTERIOR | FINAL" }
+      - { name: status, type: enum, source: system, default: SCHEDULED, description: "SCHEDULED | PASSED | FAILED" }
+      - { name: major_defects, type: integer, source: input, description: "Recorded at result time; >= 2 on a FAIL auto-creates an INSPECTION_AUTO DiscoveryItem" }
+      - { name: minor_defects, type: integer, source: input, description: "Recorded at result time" }
+      - { name: rework_of_id, type: string, source: system, description: "FK -> QualityInspection.id; set on the re-inspection created after a FAILED inspection of the same type; null otherwise" }
+
+  - name: DelayEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: category, type: enum, source: input, description: "CUSTOMER_CAUSED | CENTER_CAUSED | FORCE_MAJEURE; CUSTOMER_CAUSED and FORCE_MAJEURE are excusable (shift committed date when CONFIRMED), CENTER_CAUSED is not" }
+      - { name: impact_days, type: integer, source: input, description: "Calendar days of schedule impact" }
+      - { name: reason, type: string, source: input, description: "Free-text reason" }
+      - { name: source, type: enum, source: system, default: MANUAL, description: "MANUAL | CHANGE_ORDER; CHANGE_ORDER rows are auto-created in CONFIRMED status by change-order approval" }
+      - { name: status, type: enum, source: system, default: REPORTED, description: "REPORTED | CONFIRMED | DISPUTED" }
+      - { name: event_seq, type: integer, source: system, description: "Per-program monotone sequence; chronological replay order key" }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: program_id, type: string, source: input, description: "FK -> RefurbProgram.id" }
+      - { name: kind, type: enum, source: input, description: "DEPOSIT | PROGRESS | FINAL; at most one non-VOIDED invoice per kind per program" }
+      - { name: status, type: enum, source: system, default: DRAFT, description: "DRAFT | ISSUED | PAID | VOIDED" }
+      - { name: lines, type: array, source: computed, description: "Computed line items [{label, amount_cents}]; each line individually rounded half-up to integer cents, then summed (pinned rounding order)" }
+      - { name: total_cents, type: integer, source: computed, description: "= sum of rounded line amounts" }
+      - { name: issued_at, type: datetime, source: system, description: "Logical-clock timestamp of ISSUED transition; null before" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Aircraft
+    initial_state: IN_SERVICE
+    terminal_states: []   # cyclic across programs: RETURNED aircraft may be inducted again
+    transitions:
+      - from: IN_SERVICE
+        to: IN_REFURB
+        trigger: "system (automatic when a RefurbProgram for this aircraft advances to INDUCTED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: IN_REFURB
+        to: RETURNED
+        trigger: "system (automatic when the RefurbProgram advances to DELIVERED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RETURNED
+        to: IN_REFURB
+        trigger: "system (automatic when a later RefurbProgram for this aircraft advances to INDUCTED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "Aircraft cycle: RETURNED -> IN_REFURB makes this machine cyclic"
+
+  - entity: RefurbProgram
+    initial_state: QUOTED
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: QUOTED
+        to: BOOKED
+        trigger: "POST /completion/programs/{id}/advance {to_phase: BOOKED}"
+        actor: ProgramManager
+        preconditions:
+          - "at least one HangarSlot for this program in status BOOKED (ERR_INVALID_STATE if none)"
+          - "customer.credit_status == GOOD_STANDING (ERR_CREDIT_HOLD)"
+        side_effects: ["increments RefurbProgram.version by 1"]
+      - from: BOOKED
+        to: INDUCTED
+        trigger: "POST /completion/programs/{id}/advance {to_phase: INDUCTED}"
+        actor: ProgramManager
+        preconditions:
+          - "at least one HangarSlot for this program in status ACTIVE whose window covers the logical clock (ERR_INVALID_STATE)"
+        side_effects:
+          - "Aircraft.status: IN_SERVICE|RETURNED -> IN_REFURB (cross-entity cascade)"
+          - "increments RefurbProgram.version by 1"
+      - from: INDUCTED
+        to: SURFACE_REVIEW
+        trigger: "POST /completion/programs/{id}/advance {to_phase: SURFACE_REVIEW}"
+        actor: ProgramManager
+        preconditions:
+          - "a SurfaceAssessment for this program exists in status PENDING or DECIDED (ERR_ASSESSMENT_REQUIRED)"
+        side_effects: ["increments RefurbProgram.version by 1"]
+      - from: SURFACE_REVIEW
+        to: IN_WORK
+        trigger: "POST /completion/programs/{id}/advance {to_phase: IN_WORK}"
+        actor: ProgramManager
+        preconditions:
+          - "current (latest non-SUPERSEDED) SurfaceAssessment.status == DECIDED (ERR_ASSESSMENT_REQUIRED)"
+          - "SAFETY: if current assessment corrosion_severity == HEAVY, at least one DiscoveryItem with assessment_id == current assessment exists (ERR_CORROSION_DISCOVERY_REQUIRED)"
+          - "a PaintScheme for this program is APPROVED (ERR_SCHEME_NOT_APPROVED)"
+          - "at least one BoothBooking for this program in status BOOKED (ERR_BOOTH_BOOKING_REQUIRED)"
+          - "FISCAL: customer.credit_status == GOOD_STANDING (ERR_CREDIT_HOLD)"
+        side_effects: ["increments RefurbProgram.version by 1"]
+      - from: IN_WORK
+        to: IN_INSPECTION
+        trigger: "POST /completion/programs/{id}/advance {to_phase: IN_INSPECTION}"
+        actor: ProgramManager
+        preconditions:
+          - "every DiscoveryItem of this program is in {COMPLETED, REJECTED, DEFERRED} (ERR_DISCOVERY_ITEMS_OPEN)"
+          - "at least one BoothBooking of this program is COMPLETED (ERR_BOOTH_BOOKING_REQUIRED)"
+        side_effects: ["increments RefurbProgram.version by 1"]
+      - from: IN_INSPECTION
+        to: READY_FOR_DELIVERY
+        trigger: "POST /completion/programs/{id}/advance {to_phase: READY_FOR_DELIVERY}"
+        actor: ProgramManager
+        preconditions:
+          - "SAFETY sub-order pinned (inspection -> cert -> weight): (1) no FAILED QualityInspection lacks a later PASSED inspection of the same inspection_type, and a FINAL inspection has PASSED (ERR_INSPECTION_OUTSTANDING)"
+          - "(2) every SoftGoodLot of this program has status CERTIFIED (ERR_CERT_REQUIRED; CERT_QUARANTINED also fails here)"
+          - "(3) a WeightBalanceRecord with variant FINAL and status SIGNED_OFF exists and its |delta_lbs| <= aircraft.max_delta_lbs OR an APPROVED WEIGHT_ACK ChangeOrder acknowledges it (ERR_WEIGHT_NOT_SIGNED_OFF)"
+        side_effects: ["increments RefurbProgram.version by 1"]
+      - from: READY_FOR_DELIVERY
+        to: DELIVERED
+        trigger: "POST /completion/programs/{id}/advance {to_phase: DELIVERED}"
+        actor: ProgramManager
+        preconditions:
+          - "FISCAL: the FINAL invoice exists with status PAID (ERR_INVOICE_NOT_SETTLED)"
+        side_effects:
+          - "actual_delivery_date = logical clock date; penalty_final_cents recomputed via delivery_penalty settlement variant"
+          - "every ACTIVE HangarSlot of this program -> RELEASED (cascade down)"
+          - "Aircraft.status -> RETURNED"
+          - "increments RefurbProgram.version by 1"
+      - from: IN_INSPECTION
+        to: IN_WORK
+        trigger: "system (automatic when a QualityInspection records result FAIL)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "rework_cycles += 1"
+          - "if major_defects >= 2: system creates DiscoveryItem(source=INSPECTION_AUTO, safety_linked=true, status=OPEN, program_id=this program)"
+          - "increments RefurbProgram.version by 1"
+        note: "Revert loop: IN_INSPECTION -> IN_WORK on any FAIL; program must re-advance after rework"
+      - from: QUOTED
+        to: CANCELLED
+        trigger: "POST /completion/programs/{id}/cancel"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: ["every BOOKED HangarSlot of this program -> CANCELLED (cascade down)"]
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /completion/programs/{id}/cancel"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: ["every BOOKED or ACTIVE HangarSlot of this program -> CANCELLED"]
+      - from: INDUCTED
+        to: CANCELLED
+        trigger: "POST /completion/programs/{id}/cancel"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: ["every BOOKED or ACTIVE HangarSlot of this program -> CANCELLED", "Aircraft.status -> RETURNED"]
+
+  - entity: PaintScheme
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /completion/paint-schemes/{id}/submit"
+        actor: DesignLead
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /completion/paint-schemes/{id}/approve"
+        actor: CustomerRep
+        preconditions:
+          - "OCC: expected_program_version == program.version (ERR_STALE_PROGRAM_VERSION)"
+          - "program.status in {QUOTED, BOOKED, INDUCTED, SURFACE_REVIEW} (ERR_SCHEME_PHASE_TOO_ADVANCED)"
+          - "ownership: X-User-ID == program.customer_id (ERR_FORBIDDEN_OWNERSHIP)"
+        side_effects:
+          - "prior APPROVED PaintScheme of this program (if any) -> SUPERSEDED with superseded_by_id = this scheme (compensating pair keeps approved count == 1)"
+          - "program.approved_scheme_id = this scheme id (version pin)"
+          - "increments RefurbProgram.version by 1"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /completion/paint-schemes/{id}/reject"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: []
+      - from: REJECTED
+        to: DRAFT
+        trigger: "POST /completion/paint-schemes/{id}/revise"
+        actor: DesignLead
+        preconditions: []
+        side_effects: []
+        note: "Revision loop: DRAFT->SUBMITTED->REJECTED->DRAFT (cyclic)"
+
+  - entity: SurfaceAssessment
+    initial_state: PENDING
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: PENDING
+        to: DECIDED
+        trigger: "POST /completion/surface-assessments/{id}/decide"
+        actor: ShopTechnician
+        preconditions: ["program.status in {INDUCTED, SURFACE_REVIEW} (ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: DECIDED
+        to: DECIDED
+        trigger: "POST /completion/surface-assessments/{id}/amend"
+        actor: ShopTechnician
+        preconditions: ["program.status == SURFACE_REVIEW (ERR_ASSESSMENT_LOCKED)"]
+        side_effects: ["revision += 1", "decision/corrosion_severity overwritten"]
+        note: "Self-loop amend; STRIP<->SCUFF flip changes downstream material and film-weight calcs"
+      - from: PENDING
+        to: SUPERSEDED
+        trigger: "system (automatic when a new SurfaceAssessment is created for the same program)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: DECIDED
+        to: SUPERSEDED
+        trigger: "system (automatic when a new SurfaceAssessment is created for the same program)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: DiscoveryItem
+    initial_state: OPEN
+    terminal_states: [COMPLETED, REJECTED, DEFERRED]
+    transitions:
+      - from: OPEN
+        to: ESTIMATED
+        trigger: "POST /completion/discovery-items/{id}/estimate"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: []
+      - from: ESTIMATED
+        to: APPROVED
+        trigger: "POST /completion/discovery-items/{id}/approve"
+        actor: CustomerRep
+        preconditions:
+          - "OCC: expected_program_version == program.version (ERR_STALE_PROGRAM_VERSION)"
+          - "ownership: X-User-ID == program.customer_id"
+        side_effects:
+          - "CASCADE link 1: program.discovery_cost_total_cents += est_cost_cents; increments RefurbProgram.version by 1"
+          - "CASCADE link 2 (caused by link 1's program-total mutation): every DRAFT Invoice of this program regenerates its computed lines and bumps its own version/updated_at"
+      - from: ESTIMATED
+        to: REJECTED
+        trigger: "POST /completion/discovery-items/{id}/reject"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: []
+      - from: ESTIMATED
+        to: DEFERRED
+        trigger: "POST /completion/discovery-items/{id}/defer"
+        actor: CustomerRep
+        preconditions:
+          - "SAFETY: safety_linked == false (ERR_SAFETY_DEFERRAL_FORBIDDEN)"
+          - "TEMPORAL: logical clock date <= program.committed_delivery_date (ERR_DELIVERY_WINDOW_PASSED)"
+          - "CONSTRAINT: defer_reason present and non-empty (ERR_DEFER_REASON_REQUIRED)"
+          - "ownership: X-User-ID == program.customer_id"
+        side_effects: []
+      - from: APPROVED
+        to: COMPLETED
+        trigger: "POST /completion/discovery-items/{id}/complete"
+        actor: ShopTechnician
+        preconditions: []
+        side_effects:
+          - "program.discovery_cost_total_cents += (actual_cost_cents - est_cost_cents); increments RefurbProgram.version by 1"
+          - "every DRAFT Invoice of this program regenerates its computed lines"
+
+  - entity: ChangeOrder
+    initial_state: DRAFT
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /completion/change-orders/{id}/submit"
+        actor: ProgramManager
+        preconditions:
+          - "program.status not in {DELIVERED, CANCELLED} (ERR_INVALID_STATE)"
+          - "kind == WEIGHT_ACK requires acknowledges_weight_record_id referencing a WeightBalanceRecord of the same program (ERR_REFERENTIAL_INTEGRITY)"
+        side_effects: []
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /completion/change-orders/{id}/approve"
+        actor: CustomerRep
+        preconditions:
+          - "OCC: expected_program_version == program.version (ERR_STALE_PROGRAM_VERSION)"
+          - "ownership: X-User-ID == program.customer_id"
+        side_effects:
+          - "CASCADE link 1: program.total_contract_value_cents += delta_price_cents; if delta_days > 0: program.committed_delivery_date += delta_days; increments RefurbProgram.version by 1"
+          - "CASCADE link 2 (caused by link 1's date mutation): if delta_days > 0, system creates DelayEvent(source=CHANGE_ORDER, category=CUSTOMER_CAUSED, impact_days=delta_days, status=CONFIRMED)"
+          - "CASCADE link 3 (caused by link 2's delay-event confirmation): program.projected_penalty_cents recomputed and every DRAFT Invoice of this program regenerates its computed lines (incl. penalty credit line on FINAL kind)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /completion/change-orders/{id}/reject"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: []
+      - from: SUBMITTED
+        to: COUNTERED
+        trigger: "POST /completion/change-orders/{id}/counter"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: []
+      - from: COUNTERED
+        to: DRAFT
+        trigger: "POST /completion/change-orders/{id}/revise"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: ["negotiation_round += 1", "delta_price_cents/delta_days/description overwritten from payload"]
+        note: "Negotiation cycle: DRAFT->SUBMITTED->COUNTERED->DRAFT"
+
+  - entity: HangarSlot
+    initial_state: BOOKED
+    terminal_states: [RELEASED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: ACTIVE
+        trigger: "POST /completion/hangar-slots/{id}/activate"
+        actor: ProgramManager
+        preconditions:
+          - "program.status in {BOOKED, INDUCTED} (ERR_INVALID_STATE)"
+          - "TEMPORAL: logical clock within [start_at, end_at) (ERR_SLOT_IN_PAST when clock >= end_at; ERR_INVALID_STATE when clock < start_at)"
+        side_effects: []
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /completion/hangar-slots/{id}/release"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: []
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /completion/hangar-slots/{id}/cancel"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: []
+        note: "Cancel restores bay occupancy: book-then-cancel leaves the bay overlap set unchanged (compensating invariant I1)"
+
+  - entity: BoothBooking
+    initial_state: BOOKED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: BOOKED
+        to: COMPLETED
+        trigger: "POST /completion/booth-bookings/{id}/complete"
+        actor: ShopTechnician
+        preconditions: ["program.status == IN_WORK (ERR_INVALID_STATE)"]
+        side_effects:
+          - "actual_fee_cents computed (scheduled vs actual dual-variant fee; overrun hours billed at 1.25x)"
+          - "increments RefurbProgram.version by 1"
+      - from: BOOKED
+        to: CANCELLED
+        trigger: "POST /completion/booth-bookings/{id}/cancel"
+        actor: ProgramManager
+        preconditions: []
+        side_effects: []
+
+  - entity: SoftGoodLot
+    initial_state: UNCERTIFIED
+    terminal_states: [CERTIFIED, CERT_QUARANTINED]
+    transitions:
+      - from: UNCERTIFIED
+        to: IN_TEST
+        trigger: "system (automatic when the first BurnTest is recorded for this lot)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: IN_TEST
+        to: CERTIFIED
+        trigger: "system (automatic when a recorded BurnTest has result PASS)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: IN_TEST
+        to: CERT_FAILED
+        trigger: "system (automatic when a recorded BurnTest has result FAIL and resulting fail_count < 3)"
+        actor: system
+        preconditions: []
+        side_effects: ["fail_count += 1"]
+      - from: IN_TEST
+        to: CERT_QUARANTINED
+        trigger: "system (automatic when a recorded BurnTest has result FAIL and resulting fail_count >= 3)"
+        actor: system
+        preconditions: []
+        side_effects: ["fail_count += 1"]
+        note: "Bounded retest cycle UNCERTIFIED->IN_TEST->CERT_FAILED->(next test)->IN_TEST; 3rd FAIL quarantines (terminal)"
+      - from: CERT_FAILED
+        to: IN_TEST
+        trigger: "system (automatic when a further BurnTest is recorded while CERT_FAILED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: WeightBalanceRecord
+    initial_state: PREPARED
+    terminal_states: [SIGNED_OFF, SUPERSEDED]
+    transitions:
+      - from: PREPARED
+        to: SIGNED_OFF
+        trigger: "POST /completion/weight-balance-records/{id}/sign-off"
+        actor: QualityInspector
+        preconditions:
+          - "SoD: X-User-ID != prepared_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "CONSTRAINT: |delta_lbs| <= aircraft.max_delta_lbs, OR an APPROVED WEIGHT_ACK ChangeOrder with acknowledges_weight_record_id == this record exists (ERR_WEIGHT_DELTA_EXCEEDED)"
+        side_effects:
+          - "any other SIGNED_OFF WeightBalanceRecord of the same program with the same variant -> SUPERSEDED (compensating pair keeps signed-off count per (program, variant) <= 1)"
+      - from: SIGNED_OFF
+        to: SUPERSEDED
+        trigger: "system (automatic when a newer WeightBalanceRecord of the same program and variant is SIGNED_OFF)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: QualityInspection
+    initial_state: SCHEDULED
+    terminal_states: [PASSED, FAILED]
+    transitions:
+      - from: SCHEDULED
+        to: PASSED
+        trigger: "POST /completion/quality-inspections/{id}/record-result {result: PASS}"
+        actor: QualityInspector
+        preconditions:
+          - "program.status == IN_INSPECTION (ERR_INVALID_STATE)"
+          - "if inspection_type == FINAL: at least one PASSED PAINT and one PASSED INTERIOR inspection exist for this program (ERR_FINAL_INSPECTION_PREREQUISITE)"
+        side_effects: []
+      - from: SCHEDULED
+        to: FAILED
+        trigger: "POST /completion/quality-inspections/{id}/record-result {result: FAIL}"
+        actor: QualityInspector
+        preconditions:
+          - "program.status == IN_INSPECTION (ERR_INVALID_STATE)"
+          - "if inspection_type == FINAL: same FINAL prerequisite as PASS (ERR_FINAL_INSPECTION_PREREQUISITE)"
+        side_effects:
+          - "program reverts IN_INSPECTION -> IN_WORK, rework_cycles += 1 (see RefurbProgram machine)"
+          - "if major_defects >= 2: system creates DiscoveryItem(source=INSPECTION_AUTO, safety_linked=true, status=OPEN)"
+        note: "FAILED is terminal for the record; rework means creating a NEW inspection (rework_of_id links the pair)"
+
+  - entity: DelayEvent
+    initial_state: REPORTED
+    terminal_states: [CONFIRMED, DISPUTED]
+    transitions:
+      - from: REPORTED
+        to: CONFIRMED
+        trigger: "POST /completion/delay-events/{id}/confirm"
+        actor: CenterAdmin
+        preconditions: []
+        side_effects:
+          - "if category in {CUSTOMER_CAUSED, FORCE_MAJEURE}: program.committed_delivery_date += impact_days (chronological application in event_seq order); CENTER_CAUSED never shifts"
+          - "program.projected_penalty_cents recomputed; DRAFT invoices regenerate lines"
+          - "increments RefurbProgram.version by 1"
+      - from: REPORTED
+        to: DISPUTED
+        trigger: "POST /completion/delay-events/{id}/dispute"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: []
+        note: "CHANGE_ORDER-sourced events are created directly in CONFIRMED (system actor), never REPORTED"
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID, VOIDED]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /completion/invoices/{id}/issue"
+        actor: FinanceClerk
+        preconditions:
+          - "kind-phase gate (ERR_INVOICE_KIND_PHASE): DEPOSIT requires program.status in {BOOKED, INDUCTED, SURFACE_REVIEW, IN_WORK, IN_INSPECTION, READY_FOR_DELIVERY}; PROGRESS requires IN_WORK or later (not DELIVERED/CANCELLED); FINAL requires READY_FOR_DELIVERY"
+          - "no other non-VOIDED invoice of same kind for this program (ERR_INVOICE_ALREADY_ISSUED)"
+        side_effects:
+          - "issued_at = logical clock; lines frozen (rounding per line, half-up, then summed)"
+          - "if kind == FINAL: program.penalty_final_cents = settlement-variant penalty as of issued_at (penalty fixed at issuance; later slippage is not re-billed)"
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /completion/invoices/{id}/pay"
+        actor: CustomerRep
+        preconditions: ["ownership: X-User-ID == program.customer_id"]
+        side_effects: ["program.billed_total_cents recomputed (includes this invoice); increments RefurbProgram.version by 1"]
+      - from: DRAFT
+        to: VOIDED
+        trigger: "POST /completion/invoices/{id}/void"
+        actor: FinanceClerk
+        preconditions: []
+        side_effects: ["program.billed_total_cents unchanged (DRAFT never contributed)"]
+      - from: ISSUED
+        to: VOIDED
+        trigger: "POST /completion/invoices/{id}/void"
+        actor: FinanceClerk
+        preconditions: ["program.status != DELIVERED (ERR_INVALID_STATE)"]
+        side_effects:
+          - "program.billed_total_cents recomputed (this invoice drops out) — issue-then-void leaves billed_total_cents unchanged (compensating invariant I2)"
+          - "increments RefurbProgram.version by 1"
+
+  - entity: HangarBay
+    initial_state: ACTIVE
+    terminal_states: []   # INACTIVE is reversible operationally via re-create; deactivate only
+    transitions:
+      - from: ACTIVE
+        to: INACTIVE
+        trigger: "POST /completion/hangar-bays/{id}/deactivate"
+        actor: CenterAdmin
+        preconditions: ["no BOOKED or ACTIVE HangarSlot on this bay (ERR_INVALID_STATE)"]
+        side_effects: []
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: scheme-approve-stale-program
+    parent_entity: RefurbProgram
+    write_endpoint: "POST /completion/paint-schemes/{id}/approve"
+    occ_field: expected_program_version
+    description: |
+      Approving a PaintScheme against a RefurbProgram whose version has advanced
+      since the client last observed it is rejected. Approval supersedes any
+      previously approved scheme and re-pins program.approved_scheme_id, so an
+      approval issued from a stale program view would silently re-baseline work
+      the client never saw.
+    error_id: ERR_STALE_PROGRAM_VERSION
+    http_status: 412
+  - rule_id: change-order-approve-stale-program
+    parent_entity: RefurbProgram
+    write_endpoint: "POST /completion/change-orders/{id}/approve"
+    occ_field: expected_program_version
+    description: |
+      Approving a ChangeOrder against a RefurbProgram whose version has advanced
+      since the client last observed it is rejected. Approval mutates
+      total_contract_value_cents and committed_delivery_date, so the approval's
+      commercial basis (price and date) must be the one the customer last read.
+    error_id: ERR_STALE_PROGRAM_VERSION
+    http_status: 412
+  - rule_id: discovery-approve-stale-program
+    parent_entity: RefurbProgram
+    write_endpoint: "POST /completion/discovery-items/{id}/approve"
+    occ_field: expected_program_version
+    description: |
+      Approving a DiscoveryItem against a RefurbProgram whose version has advanced
+      since the client last observed it is rejected. Approval debits
+      discovery_cost_total_cents, and the customer must approve against the
+      current running total, not a stale one.
+    error_id: ERR_STALE_PROGRAM_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: paint_material_estimate
+    trigger: "on demand (computed read) and re-evaluated whenever the APPROVED scheme or the current assessment decision changes"
+    algorithm: tiered_pricing
+    formula: |
+      raw_main_gal = scheme.painted_area_sqft * scheme.coat_count / COVERAGE_SQFT_PER_GAL
+      if current_assessment.decision == SCUFF: raw_main_gal = raw_main_gal * SCUFF_MATERIAL_FACTOR
+      gallons_main = ceil(raw_main_gal)
+      gallons_accent = ceil(scheme.painted_area_sqft * scheme.stripe_pct / ACCENT_COVERAGE_SQFT_PER_GAL)
+      total_gal = gallons_main + gallons_accent
+      tier rate (AVERAGE rate — ALL gallons bill at the selected tier rate, not marginal):
+        total_gal <= 20  -> 18500 cents/gal
+        21..60           -> 17250 cents/gal
+        > 60             -> 16000 cents/gal
+      material_cost_cents = total_gal * tier_rate   (exact integer, no rounding needed)
+    input_set: "the program's APPROVED PaintScheme (version-pinned) and the latest non-SUPERSEDED SurfaceAssessment in DECIDED status; if no assessment is DECIDED, decision defaults to STRIP factor 1.0"
+    constants:
+      COVERAGE_SQFT_PER_GAL: 350
+      SCUFF_MATERIAL_FACTOR: 0.85
+      ACCENT_COVERAGE_SQFT_PER_GAL: 500
+      TIER1_MAX_GAL: 20
+      TIER1_RATE_CENTS: 18500
+      TIER2_MAX_GAL: 60
+      TIER2_RATE_CENTS: 17250
+      TIER3_RATE_CENTS: 16000
+    precision: "integer gallons via ceil; integer cents"
+    variants:
+      - name: strip_full_prep
+        when: "current assessment decision == STRIP (or none recorded)"
+        difference: "raw_main_gal unscaled"
+      - name: scuff_and_spray
+        when: "current assessment decision == SCUFF"
+        difference: "raw_main_gal scaled by 0.85 before ceil — same area/coats produce fewer gallons"
+
+  - name: weight_delta
+    trigger: "on WeightBalanceRecord creation (delta_lbs computed and stored); film_lbs recomputed from the pinned scheme at creation time only"
+    algorithm: aggregation
+    formula: |
+      film_lbs = scheme.painted_area_sqft * scheme.coat_count * film_factor * (1 + scheme.stripe_pct)
+      if current_assessment.decision == SCUFF: film_lbs = film_lbs * SCUFF_MATERIAL_FACTOR
+      delta_lbs = round_half_up_1dp(installed_weight_lbs - removal_weight_lbs + film_lbs)
+      film_factor: PROVISIONAL variant -> FILM_LB_PER_SQFT_COAT_EST; FINAL variant -> FILM_LB_PER_SQFT_COAT_ACTUAL
+    input_set: "the record's pinned PaintScheme (scheme_id must equal program.approved_scheme_id at creation), the latest DECIDED assessment, and the record's input weights"
+    constants:
+      FILM_LB_PER_SQFT_COAT_EST: 0.006
+      FILM_LB_PER_SQFT_COAT_ACTUAL: 0.0058
+      SCUFF_MATERIAL_FACTOR: 0.85
+    precision: "1 decimal place, round_half_up (delta gate compares the ROUNDED stored value)"
+    variants:
+      - name: provisional
+        when: "variant == PROVISIONAL (planning stage; estimated weights)"
+        difference: "film_factor 0.006 (estimated film build) — for identical area/coats/weights the provisional delta differs from final"
+      - name: final
+        when: "variant == FINAL (post-weighing; scale weights)"
+        difference: "film_factor 0.0058 (measured film build); only FINAL records may be SIGNED_OFF for the delivery gate"
+
+  - name: delivery_penalty
+    trigger: "projection variant: recomputed on every RefurbProgram read and on any DelayEvent/ChangeOrder mutation; settlement variant: computed at FINAL invoice issuance and persisted again at DELIVERED"
+    algorithm: threshold
+    formula: |
+      PINNED EVALUATION ORDER (circular-looking dependency made explicit):
+      (1) contract_value_cents = base_price_cents + sum(delta_price_cents of APPROVED ChangeOrders)   [cap depends on this]
+      (2) cap_cents = round_half_up_0dp(contract_value_cents * penalty_cap_pct)
+      (3) adjusted_committed = contractual_delivery_date + sum(impact_days of included excusable events in event_seq order)
+      (4) non_excusable_days = max(0, calendar_days(reference_date - adjusted_committed))
+      (5) raw_cents = non_excusable_days * daily_penalty_rate_cents
+      (6) penalty_cents = min(raw_cents, cap_cents)
+      reference_date: settlement -> actual_delivery_date (or logical clock date at FINAL issuance if not yet delivered);
+                      projection -> max(logical clock date, adjusted_committed) i.e. assumes delivery at the later of today and the adjusted commitment
+    input_set: "settlement variant: only CONFIRMED DelayEvents with category in {CUSTOMER_CAUSED, FORCE_MAJEURE}; projection variant: CONFIRMED plus REPORTED excusable events (forward-looking includes pending). CENTER_CAUSED never shifts the date in either variant. DISPUTED events excluded from both."
+    constants: {}
+    precision: "integer cents; cap rounded half-up to integer cents before the min()"
+    variants:
+      - name: projection
+        when: "program read / any time before FINAL issuance"
+        difference: "includes REPORTED excusable events; reference_date = max(clock, adjusted_committed)"
+      - name: settlement
+        when: "FINAL invoice issuance and DELIVERED transition"
+        difference: "excludes REPORTED/DISPUTED events; reference_date = actual delivery — identical data can yield a different (usually larger) penalty than the projection a customer last saw"
+
+  - name: booth_utilization_fee
+    trigger: "scheduled variant on BoothBooking creation; actual variant on completion"
+    algorithm: threshold
+    formula: |
+      scheduled_hours = (end_at - start_at) in whole hours
+      scheduled_fee_cents = scheduled_hours * booth.hourly_rate_cents
+      overrun_hours = max(0, actual_hours - scheduled_hours)
+      if actual_hours <= scheduled_hours:
+        actual_fee_cents = actual_hours * booth.hourly_rate_cents
+      else:
+        actual_fee_cents = scheduled_hours * booth.hourly_rate_cents + overrun_hours * booth.hourly_rate_cents * OVERRUN_PREMIUM_MULT
+    input_set: "the booking and its PaintBooth rate"
+    constants:
+      OVERRUN_PREMIUM_MULT: 1.25
+    precision: "integer cents (overrun term may be fractional: round half-up to integer cents)"
+    variants:
+      - name: scheduled
+        when: "while booking is BOOKED"
+        difference: "bills the reserved window regardless of usage"
+      - name: actual
+        when: "after COMPLETED"
+        difference: "bills actual occupancy with a 1.25x premium on overrun hours — differs from scheduled whenever actual_hours != scheduled_hours"
+
+  - name: invoice_line_totals
+    trigger: "on Invoice creation (DRAFT) and frozen at ISSUED; DRAFT lines regenerate on any program-total/discovery/penalty mutation"
+    algorithm: aggregation
+    formula: |
+      PINNED ROUNDING ORDER: every line is individually rounded half-up to integer cents FIRST, then summed. Sum-then-round is forbidden.
+      DEPOSIT lines:  [ milestone = round(base_price_cents * DEPOSIT_PCT) ]
+      PROGRESS lines: [ milestone = round(base_price_cents * PROGRESS_PCT),
+                        hangar_stall = ceil_days(active_slot_window) * bay.daily_rate_cents ]
+      FINAL lines:    [ remainder = total_contract_value_cents - deposit_milestone_line - progress_milestone_line,
+                        for each discovery item in {APPROVED, COMPLETED}:  item_i = actual_cost_cents if COMPLETED else est_cost_cents,
+                        for each such item:  handling_i = round_half_up(item_i * DISCOVERY_HANDLING_PCT)   [per-item line — rounding order load-bearing],
+                        booth_fee = sum(actual_fee_cents of COMPLETED bookings; scheduled_fee_cents of BOOKED bookings if none completed),
+                        penalty_credit = -penalty_final_cents (settlement variant at issuance) ]
+      deposit_milestone_line and progress_milestone_line are the ROUNDED milestone constants
+      (round(base*0.10), round(base*0.40)) whether or not those invoices were ever created.
+      total_cents = sum(lines)
+    input_set: "program, its bay slots (BOOKED/ACTIVE/RELEASED), COMPLETED/BOOKED booth bookings, APPROVED/COMPLETED discovery items, APPROVED change orders, penalty per delivery_penalty settlement variant"
+    constants:
+      DEPOSIT_PCT: 0.10
+      PROGRESS_PCT: 0.40
+      DISCOVERY_HANDLING_PCT: 0.10
+    precision: "per-line round_half_up to integer cents, then integer sum"
+    variants: []
+
+  - name: committed_date_adjustment
+    trigger: "on DelayEvent confirmation and on ChangeOrder approval (delta_days > 0)"
+    algorithm: chronological
+    formula: |
+      committed_delivery_date = contractual_delivery_date + sum over events E (ordered by event_seq ASC) of
+        E.impact_days where E.status == CONFIRMED and E.category in {CUSTOMER_CAUSED, FORCE_MAJEURE}
+      CENTER_CAUSED contributes 0; REPORTED/DISPUTED contribute 0.
+      Applications are cumulative and order-stable via event_seq (system-assigned, never random).
+    input_set: "all DelayEvents of the program"
+    constants: {}
+    precision: "integer calendar days"
+    variants: []
+
+  - name: burn_certification_derivation
+    trigger: "on every BurnTest recorded for a lot"
+    algorithm: chronological
+    formula: |
+      tests ordered by test_sequence ASC (per-lot monotone; tie impossible by construction)
+      fail_count = count(result == FAIL)
+      latest = test with max(test_sequence)
+      if latest.result == PASS -> lot CERTIFIED (only reachable from IN_TEST)
+      if latest.result == FAIL and fail_count >= MAX_RETESTS -> lot CERT_QUARANTINED
+      if latest.result == FAIL and fail_count < MAX_RETESTS -> lot CERT_FAILED
+      A lot with fail_count == 2 that records a PASS becomes CERTIFIED with 2 fails on record (fails never reset).
+    input_set: "all BurnTests of the lot"
+    constants:
+      MAX_RETESTS: 3
+    precision: "integer counts"
+    variants: []
+
+  - name: major_defect_discovery_trigger
+    trigger: "on QualityInspection record-result with result FAIL"
+    algorithm: threshold
+    formula: |
+      if major_defects >= MAJOR_DEFECT_THRESHOLD: system creates DiscoveryItem(source=INSPECTION_AUTO, safety_linked=true)
+      boundary: major_defects == 1 -> no item; major_defects == 2 -> item created
+    input_set: "the inspection record"
+    constants:
+      MAJOR_DEFECT_THRESHOLD: 2
+    precision: "integer count, >= comparison"
+    variants: []
+
+  - name: hangar_stall_fee
+    trigger: "as a PROGRESS invoice line"
+    algorithm: aggregation
+    formula: |
+      days = ceil((slot.end_at - slot.start_at) / 24h)   [calendar-day ceiling of the occupied window]
+      stall_fee_cents = days * bay.daily_rate_cents
+      input slot = the program's longest-duration non-CANCELLED slot (BOOKED/ACTIVE/RELEASED); ties broken by earliest created_at; if none, line is 0
+    input_set: "the program's HangarSlots excluding CANCELLED"
+    constants: {}
+    precision: "integer cents"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present and role is a declared role", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role is listed in the endpoint's roles", error_id: ERR_FORBIDDEN_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "Request body parses; every required input field present and typed/enum-valid", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all write endpoints" }
+  - { priority: 4, category: existence, check: "Path resources exist, validated left-to-right", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all endpoints with path ids" }
+  - { priority: 5, category: auth, check: "Ownership: entity-backed CustomerRep X-User-ID must equal the program's customer_id on customer-side actions", error_id: ERR_FORBIDDEN_OWNERSHIP, http_status: 403, applies_to: "scheme approve/reject, discovery approve/reject/defer, change-order approve/reject/counter, invoice pay, delay dispute" }
+  - { priority: 6, category: state, check: "OCC: expected_program_version equals current RefurbProgram.version", error_id: ERR_STALE_PROGRAM_VERSION, http_status: 412, applies_to: "POST /completion/paint-schemes/{id}/approve, POST /completion/change-orders/{id}/approve, POST /completion/discovery-items/{id}/approve" }
+  - { priority: 7, category: state, check: "Entity in a valid from-state for the requested transition (incl. terminal lockdown)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "all action/advance endpoints" }
+  - { priority: 8, category: state, check: "Aircraft not already under refurbishment (status IN_REFURB) when creating a program", error_id: ERR_AIRCRAFT_BUSY, http_status: 409, applies_to: "POST /completion/programs" }
+  - { priority: 9, category: state, check: "HangarBay must be ACTIVE to accept new slots; deactivation requires no BOOKED/ACTIVE slots", error_id: ERR_BAY_INACTIVE, http_status: 409, applies_to: "POST /completion/hangar-slots, POST /completion/hangar-bays/{id}/deactivate" }
+  - { priority: 10, category: state, check: "PaintScheme approve allowed only while program.status in {QUOTED, BOOKED, INDUCTED, SURFACE_REVIEW}", error_id: ERR_SCHEME_PHASE_TOO_ADVANCED, http_status: 409, applies_to: "POST /completion/paint-schemes/{id}/approve" }
+  - { priority: 11, category: business_safety, check: "HEAVY corrosion assessment requires a linked DiscoveryItem before IN_WORK", error_id: ERR_CORROSION_DISCOVERY_REQUIRED, http_status: 409, applies_to: "POST /completion/programs/{id}/advance" }
+  - { priority: 12, category: business_safety, check: "safety_linked DiscoveryItem may never be deferred", error_id: ERR_SAFETY_DEFERRAL_FORBIDDEN, http_status: 409, applies_to: "POST /completion/discovery-items/{id}/defer" }
+  - { priority: 13, category: business_safety, check: "READY_FOR_DELIVERY gate step 1: no unresolved FAILED inspection and FINAL PASSED", error_id: ERR_INSPECTION_OUTSTANDING, http_status: 409, applies_to: "POST /completion/programs/{id}/advance" }
+  - { priority: 14, category: business_safety, check: "READY_FOR_DELIVERY gate step 2: every SoftGoodLot CERTIFIED", error_id: ERR_CERT_REQUIRED, http_status: 409, applies_to: "POST /completion/programs/{id}/advance" }
+  - { priority: 15, category: business_safety, check: "READY_FOR_DELIVERY gate step 3: SIGNED_OFF FINAL WeightBalanceRecord within limit or WEIGHT_ACK-approved", error_id: ERR_WEIGHT_NOT_SIGNED_OFF, http_status: 409, applies_to: "POST /completion/programs/{id}/advance" }
+  - { priority: 16, category: business_temporal, check: "Slot start_at must be >= logical clock and start_at < end_at", error_id: ERR_SLOT_IN_PAST, http_status: 409, applies_to: "POST /completion/hangar-slots" }
+  - { priority: 17, category: business_temporal, check: "HangarSlot half-open overlap: reject if any BOOKED/ACTIVE slot on the same bay has s < new.end_at and new.start_at < e; adjacency (end == start) allowed", error_id: ERR_SLOT_OVERLAP, http_status: 409, applies_to: "POST /completion/hangar-slots" }
+  - { priority: 18, category: business_temporal, check: "Booth buffer-gap: reject unless for every BOOKED/COMPLETED booking on the booth: new.start_at >= b.end_at + cure_buffer_hours OR new.end_at + cure_buffer_hours <= b.start_at", error_id: ERR_BOOTH_BUFFER_VIOLATION, http_status: 409, applies_to: "POST /completion/booth-bookings" }
+  - { priority: 19, category: business_temporal, check: "Discovery deferral only while logical clock date <= program.committed_delivery_date", error_id: ERR_DELIVERY_WINDOW_PASSED, http_status: 409, applies_to: "POST /completion/discovery-items/{id}/defer" }
+  - { priority: 20, category: business_referential, check: "Body FKs exist and are cross-consistent (program_id/customer_id/aircraft_id alignment; assessment_id belongs to same program; scheme_id is program's approved scheme; acknowledges_weight_record_id belongs to same program)", error_id: ERR_REFERENTIAL_INTEGRITY, http_status: 422, applies_to: "all create endpoints with body FKs" }
+  - { priority: 21, category: business_constraint, check: "defer requires non-empty defer_reason", error_id: ERR_DEFER_REASON_REQUIRED, http_status: 422, applies_to: "POST /completion/discovery-items/{id}/defer" }
+  - { priority: 22, category: business_constraint, check: "Weight sign-off: |rounded delta_lbs| <= aircraft.max_delta_lbs unless an APPROVED WEIGHT_ACK ChangeOrder acknowledges the record", error_id: ERR_WEIGHT_DELTA_EXCEEDED, http_status: 409, applies_to: "POST /completion/weight-balance-records/{id}/sign-off" }
+  - { priority: 23, category: business_constraint, check: "Sign-off signer must differ from prepared_by_user_id", error_id: ERR_SEGREGATION_OF_DUTIES, http_status: 403, applies_to: "POST /completion/weight-balance-records/{id}/sign-off" }
+  - { priority: 24, category: business_constraint, check: "FINAL inspection requires prior PASSED PAINT and PASSED INTERIOR inspections", error_id: ERR_FINAL_INSPECTION_PREREQUISITE, http_status: 409, applies_to: "POST /completion/quality-inspections/{id}/record-result" }
+  - { priority: 25, category: business_constraint, check: "Advance gates: assessment exists/DECIDED (ERR_ASSESSMENT_REQUIRED), approved scheme (ERR_SCHEME_NOT_APPROVED), booth booking present/completed (ERR_BOOTH_BOOKING_REQUIRED), discovery items terminal (ERR_DISCOVERY_ITEMS_OPEN), invoice kind-phase gate and per-kind uniqueness (ERR_INVOICE_KIND_PHASE / ERR_INVOICE_ALREADY_ISSUED), assessment amend only in SURFACE_REVIEW (ERR_ASSESSMENT_LOCKED)", error_id: "ERR_ASSESSMENT_REQUIRED / ERR_SCHEME_NOT_APPROVED / ERR_BOOTH_BOOKING_REQUIRED / ERR_DISCOVERY_ITEMS_OPEN / ERR_INVOICE_KIND_PHASE / ERR_INVOICE_ALREADY_ISSUED / ERR_ASSESSMENT_LOCKED", http_status: 409, applies_to: "advance, invoice issue, assessment amend endpoints" }
+  - { priority: 26, category: business_fiscal, check: "Customer credit_status must be GOOD_STANDING for slot booking and advance to BOOKED/IN_WORK", error_id: ERR_CREDIT_HOLD, http_status: 402, applies_to: "POST /completion/hangar-slots, POST /completion/programs/{id}/advance" }
+  - { priority: 27, category: business_fiscal, check: "DELIVERED requires the FINAL invoice PAID", error_id: ERR_INVOICE_NOT_SETTLED, http_status: 409, applies_to: "POST /completion/programs/{id}/advance" }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- logical clock (test-driving) ---
+  - { method: POST, path: "/completion/_clock/set_current_utc", description: "Set the logical clock. Before any call, the clock reads exactly 2026-08-01T00:00:00Z (startup default; never falls back to wall clock).", roles: [CenterAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: [] }
+
+  # --- Customer ---
+  - { method: POST, path: "/completion/customers", description: "Register a customer/operator", roles: [CenterAdmin], code: 201, input: [name, contact_email], output: Customer, side_effects: ["credit_status defaults to GOOD_STANDING"] }
+  - { method: GET, path: "/completion/customers", description: "List customers (paginated)", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "credit_status?"], output: "Customer[]", side_effects: [] }
+  - { method: POST, path: "/completion/customers/{id}/credit-status", description: "Set customer credit status", roles: [CenterAdmin], code: 200, input: [credit_status], output: Customer, side_effects: [] }
+
+  # --- Aircraft ---
+  - { method: POST, path: "/completion/aircraft", description: "Register an aircraft", roles: [CenterAdmin], code: 201, input: [customer_id, tail_number, model, max_delta_lbs], output: Aircraft, side_effects: ["status=IN_SERVICE"] }
+  - { method: GET, path: "/completion/aircraft/{id}", description: "Get aircraft", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: Aircraft, side_effects: [] }
+  - { method: GET, path: "/completion/aircraft", description: "List aircraft (filterable by customer)", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "customer_id?"], output: "Aircraft[]", side_effects: [] }
+
+  # --- RefurbProgram ---
+  - { method: POST, path: "/completion/programs", description: "Create a refurbishment program (quote)", roles: [ProgramManager], code: 201, input: [aircraft_id, customer_id, base_price_cents, daily_penalty_rate_cents, penalty_cap_pct, contractual_delivery_date], output: RefurbProgram, side_effects: ["status=QUOTED, committed_delivery_date=contractual_delivery_date, totals=0, rework_cycles=0; ERR_AIRCRAFT_BUSY if aircraft IN_REFURB"] }
+  - { method: GET, path: "/completion/programs/{id}", description: "Get program incl. all computed fields (projected_penalty_cents recomputed on read)", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: RefurbProgram, side_effects: [] }
+  - { method: GET, path: "/completion/programs", description: "List programs", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "aircraft_id?", "customer_id?", "status?"], output: "RefurbProgram[]", side_effects: [] }
+  - { method: POST, path: "/completion/programs/{id}/advance", description: "Advance program phase (to_phase gated per state machine)", roles: [ProgramManager], code: 200, input: [to_phase], output: RefurbProgram, side_effects: ["per RefurbProgram machine: aircraft cascade, slot release on DELIVERED, penalty_final_cents settlement, version +1"] }
+  - { method: POST, path: "/completion/programs/{id}/cancel", description: "Cancel a program (QUOTED/BOOKED/INDUCTED only)", roles: [ProgramManager], code: 200, input: [], output: RefurbProgram, side_effects: ["BOOKED/ACTIVE HangarSlots -> CANCELLED; from INDUCTED: Aircraft -> RETURNED"] }
+
+  # --- PaintScheme ---
+  - { method: POST, path: "/completion/paint-schemes", description: "Create livery/paint scheme (DRAFT)", roles: [DesignLead], code: 201, input: [program_id, drawing_ref, painted_area_sqft, coat_count, "stripe_pct?"], output: PaintScheme, side_effects: [] }
+  - { method: GET, path: "/completion/paint-schemes/{id}", description: "Get scheme", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: PaintScheme, side_effects: [] }
+  - { method: GET, path: "/completion/paint-schemes", description: "List schemes", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "superseded_by_id?", "status?"], output: "PaintScheme[]", side_effects: [] }
+  - { method: POST, path: "/completion/paint-schemes/{id}/submit", description: "Submit scheme for customer approval", roles: [DesignLead], code: 200, input: [], output: PaintScheme, side_effects: ["status DRAFT -> SUBMITTED"] }
+  - { method: POST, path: "/completion/paint-schemes/{id}/approve", description: "Customer approves scheme; supersedes prior approved scheme (OCC on program)", roles: [CustomerRep], code: 200, input: [expected_program_version], output: PaintScheme, side_effects: ["prior APPROVED scheme -> SUPERSEDED (superseded_by_id set)", "program.approved_scheme_id = this id", "increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/paint-schemes/{id}/reject", description: "Customer rejects scheme", roles: [CustomerRep], code: 200, input: [], output: PaintScheme, side_effects: ["status SUBMITTED -> REJECTED"] }
+  - { method: POST, path: "/completion/paint-schemes/{id}/revise", description: "Return rejected scheme to DRAFT for revision", roles: [DesignLead], code: 200, input: [], output: PaintScheme, side_effects: ["status REJECTED -> DRAFT"] }
+
+  # --- SurfaceAssessment ---
+  - { method: POST, path: "/completion/surface-assessments", description: "Create surface assessment (supersedes prior non-terminal assessment of the program)", roles: [ShopTechnician], code: 201, input: [program_id], output: SurfaceAssessment, side_effects: ["prior PENDING/DECIDED assessment of the program -> SUPERSEDED"] }
+  - { method: GET, path: "/completion/surface-assessments/{id}", description: "Get assessment", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: SurfaceAssessment, side_effects: [] }
+  - { method: GET, path: "/completion/surface-assessments", description: "List assessments", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?"], output: "SurfaceAssessment[]", side_effects: [] }
+  - { method: POST, path: "/completion/surface-assessments/{id}/decide", description: "Record strip-vs-scuff decision and corrosion severity", roles: [ShopTechnician], code: 200, input: [decision, corrosion_severity, "findings_note?"], output: SurfaceAssessment, side_effects: ["status PENDING -> DECIDED"] }
+  - { method: POST, path: "/completion/surface-assessments/{id}/amend", description: "Amend a DECIDED assessment (only while program in SURFACE_REVIEW); bumps revision", roles: [ShopTechnician], code: 200, input: [decision, corrosion_severity, "findings_note?"], output: SurfaceAssessment, side_effects: ["revision += 1"] }
+
+  # --- DiscoveryItem ---
+  - { method: POST, path: "/completion/discovery-items", description: "Log discovery work item", roles: [ShopTechnician], code: 201, input: [program_id, description, "assessment_id?", "safety_linked?"], output: DiscoveryItem, side_effects: ["status=OPEN; requires program.status in {INDUCTED, SURFACE_REVIEW, IN_WORK, IN_INSPECTION}"] }
+  - { method: GET, path: "/completion/discovery-items/{id}", description: "Get discovery item", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: DiscoveryItem, side_effects: [] }
+  - { method: GET, path: "/completion/discovery-items", description: "List discovery items", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "assessment_id?", "status?"], output: "DiscoveryItem[]", side_effects: [] }
+  - { method: POST, path: "/completion/discovery-items/{id}/estimate", description: "PM attaches cost/hour estimate", roles: [ProgramManager], code: 200, input: [est_cost_cents, est_hours], output: DiscoveryItem, side_effects: ["status OPEN -> ESTIMATED"] }
+  - { method: POST, path: "/completion/discovery-items/{id}/approve", description: "Customer approves estimate (OCC on program); debits program discovery total", roles: [CustomerRep], code: 200, input: [expected_program_version], output: DiscoveryItem, side_effects: ["program.discovery_cost_total_cents += est_cost_cents", "DRAFT invoices regenerate lines", "increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/discovery-items/{id}/reject", description: "Customer rejects estimate", roles: [CustomerRep], code: 200, input: [], output: DiscoveryItem, side_effects: ["status ESTIMATED -> REJECTED"] }
+  - { method: POST, path: "/completion/discovery-items/{id}/defer", description: "Customer defers non-safety item (reason required; safety/temporal gates)", roles: [CustomerRep], code: 200, input: ["defer_reason?"], output: DiscoveryItem, side_effects: ["status ESTIMATED -> DEFERRED"] }
+  - { method: POST, path: "/completion/discovery-items/{id}/complete", description: "Technician completes approved work with actual cost", roles: [ShopTechnician], code: 200, input: [actual_cost_cents], output: DiscoveryItem, side_effects: ["program.discovery_cost_total_cents += (actual_cost_cents - est_cost_cents)", "DRAFT invoices regenerate lines", "increments RefurbProgram.version by 1"] }
+
+  # --- ChangeOrder ---
+  - { method: POST, path: "/completion/change-orders", description: "Draft a change order", roles: [ProgramManager], code: 201, input: [program_id, delta_price_cents, description, "kind?", "delta_days?", "acknowledges_weight_record_id?"], output: ChangeOrder, side_effects: ["status=DRAFT, negotiation_round=1"] }
+  - { method: GET, path: "/completion/change-orders/{id}", description: "Get change order", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: ChangeOrder, side_effects: [] }
+  - { method: GET, path: "/completion/change-orders", description: "List change orders", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "status?", "acknowledges_weight_record_id?"], output: "ChangeOrder[]", side_effects: [] }
+  - { method: POST, path: "/completion/change-orders/{id}/submit", description: "Submit change order to customer", roles: [ProgramManager], code: 200, input: [], output: ChangeOrder, side_effects: ["status DRAFT -> SUBMITTED"] }
+  - { method: POST, path: "/completion/change-orders/{id}/approve", description: "Customer approves (OCC on program); applies price/date deltas and cascades", roles: [CustomerRep], code: 200, input: [expected_program_version], output: ChangeOrder, side_effects: ["program.total_contract_value_cents += delta_price_cents", "if delta_days>0: committed_delivery_date += delta_days AND auto DelayEvent(CONFIRMED, CUSTOMER_CAUSED)", "DRAFT invoices regenerate lines; projected penalty recomputed", "increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/change-orders/{id}/reject", description: "Customer rejects change order", roles: [CustomerRep], code: 200, input: [], output: ChangeOrder, side_effects: ["status SUBMITTED -> REJECTED"] }
+  - { method: POST, path: "/completion/change-orders/{id}/counter", description: "Customer counters with note", roles: [CustomerRep], code: 200, input: [counter_note], output: ChangeOrder, side_effects: ["status SUBMITTED -> COUNTERED"] }
+  - { method: POST, path: "/completion/change-orders/{id}/revise", description: "PM revises a countered order back to DRAFT (negotiation round +1)", roles: [ProgramManager], code: 200, input: ["delta_price_cents?", "delta_days?", "description?"], output: ChangeOrder, side_effects: ["status COUNTERED -> DRAFT", "negotiation_round += 1"] }
+
+  # --- HangarBay / HangarSlot ---
+  - { method: POST, path: "/completion/hangar-bays", description: "Register a hangar bay", roles: [CenterAdmin], code: 201, input: [name, daily_rate_cents], output: HangarBay, side_effects: ["status=ACTIVE"] }
+  - { method: GET, path: "/completion/hangar-bays", description: "List bays", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "status?"], output: "HangarBay[]", side_effects: [] }
+  - { method: POST, path: "/completion/hangar-bays/{id}/deactivate", description: "Deactivate a bay (no open slots)", roles: [CenterAdmin], code: 200, input: [], output: HangarBay, side_effects: ["status ACTIVE -> INACTIVE"] }
+  - { method: POST, path: "/completion/hangar-slots", description: "Book a hangar slot (half-open interval; overlap rejected; adjacency allowed). Program must be QUOTED or BOOKED (ERR_INVALID_STATE otherwise).", roles: [ProgramManager], code: 201, input: [bay_id, program_id, start_at, end_at], output: HangarSlot, side_effects: ["status=BOOKED"] }
+  - { method: GET, path: "/completion/hangar-slots/{id}", description: "Get slot", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: HangarSlot, side_effects: [] }
+  - { method: GET, path: "/completion/hangar-slots", description: "List slots", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "bay_id?", "program_id?", "status?"], output: "HangarSlot[]", side_effects: [] }
+  - { method: POST, path: "/completion/hangar-slots/{id}/activate", description: "Activate a booked slot (clock must be inside window; program BOOKED/INDUCTED)", roles: [ProgramManager], code: 200, input: [], output: HangarSlot, side_effects: ["status BOOKED -> ACTIVE"] }
+  - { method: POST, path: "/completion/hangar-slots/{id}/release", description: "Release an active slot", roles: [ProgramManager], code: 200, input: [], output: HangarSlot, side_effects: ["status ACTIVE -> RELEASED"] }
+  - { method: POST, path: "/completion/hangar-slots/{id}/cancel", description: "Cancel a booked slot (restores bay occupancy)", roles: [ProgramManager], code: 200, input: [], output: HangarSlot, side_effects: ["status BOOKED -> CANCELLED"] }
+
+  # --- PaintBooth / BoothBooking ---
+  - { method: POST, path: "/completion/paint-booths", description: "Register a paint booth with cure buffer", roles: [CenterAdmin], code: 201, input: [name, hourly_rate_cents, cure_buffer_hours], output: PaintBooth, side_effects: [] }
+  - { method: GET, path: "/completion/paint-booths", description: "List booths", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?"], output: "PaintBooth[]", side_effects: [] }
+  - { method: POST, path: "/completion/booth-bookings", description: "Book a booth window (buffer-gap semantics: next start >= prior end + cure_buffer_hours). Program must be in {QUOTED, BOOKED, INDUCTED, SURFACE_REVIEW, IN_WORK} (ERR_INVALID_STATE otherwise).", roles: [ProgramManager], code: 201, input: [booth_id, program_id, start_at, end_at], output: BoothBooking, side_effects: ["status=BOOKED; scheduled_fee_cents computed"] }
+  - { method: GET, path: "/completion/booth-bookings/{id}", description: "Get booking", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: BoothBooking, side_effects: [] }
+  - { method: GET, path: "/completion/booth-bookings", description: "List bookings", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "booth_id?", "program_id?", "status?"], output: "BoothBooking[]", side_effects: [] }
+  - { method: POST, path: "/completion/booth-bookings/{id}/complete", description: "Mark spray work done with actual hours (computes actual_fee_cents with 1.25x overrun premium)", roles: [ShopTechnician], code: 200, input: [actual_hours], output: BoothBooking, side_effects: ["status BOOKED -> COMPLETED", "actual_fee_cents computed", "increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/booth-bookings/{id}/cancel", description: "Cancel a booking (frees the buffered window)", roles: [ProgramManager], code: 200, input: [], output: BoothBooking, side_effects: ["status BOOKED -> CANCELLED"] }
+
+  # --- SoftGoodLot / BurnTest ---
+  - { method: POST, path: "/completion/soft-good-lots", description: "Register an interior soft-goods lot (program must not be DELIVERED/CANCELLED)", roles: [ShopTechnician], code: 201, input: [program_id, description, material, quantity, estimated_weight_lbs], output: SoftGoodLot, side_effects: ["status=UNCERTIFIED, fail_count=0"] }
+  - { method: GET, path: "/completion/soft-good-lots/{id}", description: "Get lot", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: SoftGoodLot, side_effects: [] }
+  - { method: GET, path: "/completion/soft-good-lots", description: "List lots", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "status?"], output: "SoftGoodLot[]", side_effects: [] }
+  - { method: POST, path: "/completion/soft-good-lots/{id}/burn-tests", description: "Record a burn test (drives lot certification state machine; not allowed on CERTIFIED/CERT_QUARANTINED lots)", roles: [ShopTechnician], code: 201, input: [test_method, result, lab_name], output: BurnTest, side_effects: ["lot transitions per burn_certification_derivation", "test_sequence = next per-lot sequence"] }
+  - { method: GET, path: "/completion/soft-good-lots/{id}/burn-tests", description: "List burn tests of a lot, ordered by test_sequence", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?"], output: "BurnTest[]", side_effects: [] }
+
+  # --- WeightBalanceRecord ---
+  - { method: POST, path: "/completion/weight-balance-records", description: "Prepare a weight & balance record (scheme_id must equal program.approved_scheme_id, else ERR_REFERENTIAL_INTEGRITY; program must not be DELIVERED/CANCELLED)", roles: [ShopTechnician], code: 201, input: [program_id, scheme_id, variant, removal_weight_lbs, installed_weight_lbs], output: WeightBalanceRecord, side_effects: ["film_lbs and delta_lbs computed (variant-dependent film factor); prepared_by_user_id = X-User-ID"] }
+  - { method: GET, path: "/completion/weight-balance-records/{id}", description: "Get record", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: WeightBalanceRecord, side_effects: [] }
+  - { method: GET, path: "/completion/weight-balance-records", description: "List records", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "scheme_id?", "variant?", "status?"], output: "WeightBalanceRecord[]", side_effects: [] }
+  - { method: POST, path: "/completion/weight-balance-records/{id}/sign-off", description: "QualityInspector signs off (SoD: signer != preparer; |delta| gate vs aircraft.max_delta_lbs or WEIGHT_ACK)", roles: [QualityInspector], code: 200, input: [], output: WeightBalanceRecord, side_effects: ["status PREPARED -> SIGNED_OFF", "prior SIGNED_OFF record of same program+variant -> SUPERSEDED"] }
+
+  # --- QualityInspection ---
+  - { method: POST, path: "/completion/quality-inspections", description: "Schedule an inspection (program must be IN_WORK or IN_INSPECTION, else ERR_INVALID_STATE)", roles: [QualityInspector], code: 201, input: [program_id, inspection_type], output: QualityInspection, side_effects: ["status=SCHEDULED"] }
+  - { method: GET, path: "/completion/quality-inspections/{id}", description: "Get inspection", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: QualityInspection, side_effects: [] }
+  - { method: GET, path: "/completion/quality-inspections", description: "List inspections", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "inspection_type?", "status?", "rework_of_id?"], output: "QualityInspection[]", side_effects: [] }
+  - { method: POST, path: "/completion/quality-inspections/{id}/record-result", description: "Record PASS/FAIL with defect counts (FAIL reverts program to IN_WORK; >=2 majors auto-creates safety DiscoveryItem)", roles: [QualityInspector], code: 200, input: [result, major_defects, minor_defects], output: QualityInspection, side_effects: ["on FAIL: program IN_INSPECTION -> IN_WORK, rework_cycles += 1", "on FAIL with major_defects >= 2: auto DiscoveryItem(INSPECTION_AUTO, safety_linked=true)"] }
+
+  # --- DelayEvent ---
+  - { method: POST, path: "/completion/delay-events", description: "Report a schedule delay event (program must not be DELIVERED/CANCELLED)", roles: [ProgramManager], code: 201, input: [program_id, category, impact_days, reason], output: DelayEvent, side_effects: ["status=REPORTED, source=MANUAL, event_seq assigned"] }
+  - { method: GET, path: "/completion/delay-events/{id}", description: "Get delay event", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: DelayEvent, side_effects: [] }
+  - { method: GET, path: "/completion/delay-events", description: "List delay events", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "status?", "category?"], output: "DelayEvent[]", side_effects: [] }
+  - { method: POST, path: "/completion/delay-events/{id}/confirm", description: "Confirm event (excusable categories shift committed_delivery_date)", roles: [CenterAdmin], code: 200, input: [], output: DelayEvent, side_effects: ["status REPORTED -> CONFIRMED", "if excusable: program.committed_delivery_date += impact_days", "DRAFT invoices regenerate lines; increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/delay-events/{id}/dispute", description: "Customer disputes a reported event", roles: [CustomerRep], code: 200, input: [], output: DelayEvent, side_effects: ["status REPORTED -> DISPUTED"] }
+
+  # --- Invoice ---
+  - { method: POST, path: "/completion/invoices", description: "Create a DRAFT invoice (DEPOSIT/PROGRESS/FINAL) with per-line rounded computed lines; creation allowed in any non-terminal program phase (kind gate applies at ISSUE)", roles: [FinanceClerk], code: 201, input: [program_id, kind], output: Invoice, side_effects: ["lines computed per invoice_line_totals (regenerated while DRAFT on program mutations)"] }
+  - { method: GET, path: "/completion/invoices/{id}", description: "Get invoice", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: [], output: Invoice, side_effects: [] }
+  - { method: GET, path: "/completion/invoices", description: "List invoices", roles: [CenterAdmin, ProgramManager, DesignLead, ShopTechnician, QualityInspector, FinanceClerk, CustomerRep], code: 200, input: ["limit?", "offset?", "program_id?", "kind?", "status?"], output: "Invoice[]", side_effects: [] }
+  - { method: POST, path: "/completion/invoices/{id}/issue", description: "Issue invoice (kind-phase gate; freezes lines; FINAL persists program.penalty_final_cents)", roles: [FinanceClerk], code: 200, input: [], output: Invoice, side_effects: ["status DRAFT -> ISSUED", "issued_at = clock", "FINAL: program.penalty_final_cents = settlement penalty"] }
+  - { method: POST, path: "/completion/invoices/{id}/pay", description: "Customer pays an ISSUED invoice (ownership-checked)", roles: [CustomerRep], code: 200, input: [], output: Invoice, side_effects: ["status ISSUED -> PAID", "program.billed_total_cents recomputed", "increments RefurbProgram.version by 1"] }
+  - { method: POST, path: "/completion/invoices/{id}/void", description: "Void a DRAFT or ISSUED invoice (not after program DELIVERED)", roles: [FinanceClerk], code: 200, input: [], output: Invoice, side_effects: ["status -> VOIDED", "program.billed_total_cents recomputed (issue-then-void nets to zero change)"] }
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID headers" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_FORBIDDEN_OWNERSHIP, http: 403, condition: "CustomerRep X-User-ID does not match the program's customer_id" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Malformed body, missing required field, or invalid enum/value" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path resource does not exist (checked left-to-right)" }
+  - { id: ERR_STALE_PROGRAM_VERSION, http: 412, condition: "expected_program_version != current RefurbProgram.version on OCC-guarded approvals" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Entity not in a valid from-state for the requested transition (incl. terminal lockdown)" }
+  - { id: ERR_AIRCRAFT_BUSY, http: 409, condition: "Program create while aircraft.status == IN_REFURB" }
+  - { id: ERR_BAY_INACTIVE, http: 409, condition: "Slot booking on an INACTIVE bay, or deactivating a bay with open slots" }
+  - { id: ERR_SCHEME_PHASE_TOO_ADVANCED, http: 409, condition: "Scheme approval attempted after program passed SURFACE_REVIEW" }
+  - { id: ERR_SCHEME_NOT_APPROVED, http: 409, condition: "Advance to IN_WORK without an APPROVED paint scheme" }
+  - { id: ERR_ASSESSMENT_REQUIRED, http: 409, condition: "Advance requires an existing (or DECIDED) surface assessment" }
+  - { id: ERR_ASSESSMENT_LOCKED, http: 409, condition: "Amend attempted while program not in SURFACE_REVIEW" }
+  - { id: ERR_CORROSION_DISCOVERY_REQUIRED, http: 409, condition: "HEAVY corrosion assessment with no linked DiscoveryItem blocks IN_WORK" }
+  - { id: ERR_SAFETY_DEFERRAL_FORBIDDEN, http: 409, condition: "Deferral of a safety_linked DiscoveryItem" }
+  - { id: ERR_DELIVERY_WINDOW_PASSED, http: 409, condition: "Deferral attempted after program.committed_delivery_date" }
+  - { id: ERR_DEFER_REASON_REQUIRED, http: 422, condition: "Deferral without a non-empty defer_reason" }
+  - { id: ERR_DISCOVERY_ITEMS_OPEN, http: 409, condition: "Advance to IN_INSPECTION with non-terminal discovery items" }
+  - { id: ERR_SLOT_IN_PAST, http: 409, condition: "Slot start_at before logical clock, or start_at >= end_at" }
+  - { id: ERR_SLOT_OVERLAP, http: 409, condition: "Half-open interval collision with a BOOKED/ACTIVE slot on the same bay" }
+  - { id: ERR_BOOTH_BUFFER_VIOLATION, http: 409, condition: "Booking leaves less than cure_buffer_hours after a prior booking's end (or before a later booking's start)" }
+  - { id: ERR_BOOTH_BOOKING_REQUIRED, http: 409, condition: "Advance requires a BOOKED (IN_WORK) or COMPLETED (IN_INSPECTION) booth booking" }
+  - { id: ERR_CERT_REQUIRED, http: 409, condition: "READY_FOR_DELIVERY with any lot not CERTIFIED (incl. CERT_QUARANTINED)" }
+  - { id: ERR_WEIGHT_NOT_SIGNED_OFF, http: 409, condition: "READY_FOR_DELIVERY without a SIGNED_OFF FINAL WeightBalanceRecord (or acknowledged over-limit)" }
+  - { id: ERR_WEIGHT_DELTA_EXCEEDED, http: 409, condition: "Sign-off with |delta_lbs| > aircraft.max_delta_lbs and no APPROVED WEIGHT_ACK change order" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Sign-off X-User-ID equals record's prepared_by_user_id" }
+  - { id: ERR_INSPECTION_OUTSTANDING, http: 409, condition: "READY_FOR_DELIVERY with an unresolved FAILED inspection or no PASSED FINAL" }
+  - { id: ERR_FINAL_INSPECTION_PREREQUISITE, http: 409, condition: "FINAL inspection result recorded without prior PASSED PAINT and INTERIOR inspections" }
+  - { id: ERR_REFERENTIAL_INTEGRITY, http: 422, condition: "Body FK missing/dangling/cross-inconsistent (e.g. assessment of another program, scheme not the program's approved scheme, WEIGHT_ACK without acknowledges_weight_record_id)" }
+  - { id: ERR_CREDIT_HOLD, http: 402, condition: "Customer on CREDIT_HOLD attempted slot booking or advance to BOOKED/IN_WORK" }
+  - { id: ERR_INVOICE_KIND_PHASE, http: 409, condition: "Invoice kind not issuable in the program's current phase" }
+  - { id: ERR_INVOICE_ALREADY_ISSUED, http: 409, condition: "Second non-VOIDED invoice of the same kind for the program" }
+  - { id: ERR_INVOICE_NOT_SETTLED, http: 409, condition: "Advance to DELIVERED while the FINAL invoice is not PAID" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CenterAdmin
+    description: "Completion-center administrator: master data (customers, bays, booths), credit status, delay confirmation, logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/customers; POST /completion/customers/{id}/credit-status"
+      - "POST /completion/aircraft"
+      - "POST /completion/hangar-bays; POST /completion/hangar-bays/{id}/deactivate"
+      - "POST /completion/paint-booths"
+      - "POST /completion/delay-events/{id}/confirm"
+      - "POST /completion/_clock/set_current_utc"
+    shared_operations: ["all GET endpoints"]
+  - name: ProgramManager
+    description: "Center-side program manager: programs, scheduling (slots/bookings), change-order drafting, discovery estimates, delay reporting"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/programs; POST /completion/programs/{id}/advance; POST /completion/programs/{id}/cancel"
+      - "POST /completion/hangar-slots; activate/release/cancel"
+      - "POST /completion/booth-bookings; POST /completion/booth-bookings/{id}/cancel"
+      - "POST /completion/change-orders; submit; revise"
+      - "POST /completion/discovery-items/{id}/estimate"
+      - "POST /completion/delay-events"
+    shared_operations: ["all GET endpoints"]
+  - name: DesignLead
+    description: "Livery designer: paint scheme drafting and submission"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/paint-schemes; submit; revise"
+    shared_operations: ["all GET endpoints"]
+  - name: ShopTechnician
+    description: "Shop floor technician: surface assessment, discovery logging/completion, soft-goods lots and burn tests, weight record preparation, booth completion"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/surface-assessments; decide; amend"
+      - "POST /completion/discovery-items; POST /completion/discovery-items/{id}/complete"
+      - "POST /completion/soft-good-lots; POST /completion/soft-good-lots/{id}/burn-tests"
+      - "POST /completion/weight-balance-records"
+      - "POST /completion/booth-bookings/{id}/complete"
+    shared_operations: ["all GET endpoints"]
+  - name: QualityInspector
+    description: "Quality inspector: inspections and weight-record sign-off; may not sign off a record they prepared (segregation of duties via X-User-ID)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/quality-inspections; POST /completion/quality-inspections/{id}/record-result"
+      - "POST /completion/weight-balance-records/{id}/sign-off"
+    shared_operations: ["all GET endpoints"]
+  - name: FinanceClerk
+    description: "Billing clerk: invoice drafting, issuance, voiding"
+    identity: opaque
+    exclusive_operations:
+      - "POST /completion/invoices; POST /completion/invoices/{id}/issue; POST /completion/invoices/{id}/void"
+    shared_operations: ["all GET endpoints"]
+  - name: CustomerRep
+    description: "Customer representative (acts as the Customer entity): all approval decisions and invoice payment; ownership-checked against program.customer_id"
+    identity: "entity_backed:Customer"
+    exclusive_operations:
+      - "POST /completion/paint-schemes/{id}/approve; reject"
+      - "POST /completion/discovery-items/{id}/approve; reject; defer"
+      - "POST /completion/change-orders/{id}/approve; reject; counter"
+      - "POST /completion/invoices/{id}/pay"
+      - "POST /completion/delay-events/{id}/dispute"
+    shared_operations: ["all GET endpoints"]

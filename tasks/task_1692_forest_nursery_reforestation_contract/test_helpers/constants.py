@@ -1,0 +1,61 @@
+"""Domain thresholds and constants — numeric rules stated in PRD §2 and §3."""
+
+# Logical clock (PRD §2.5)
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+CLOCK_DEFAULT_CREATED_AT = "2026-08-01T00:00:00.000Z"
+
+# Species pricing (PRD §3.3)
+UNIT_PRICE_CENTS = {
+    "DOUGLAS_FIR": 320,
+    "LOBLOLLY_PINE": 280,
+    "WHITE_OAK": 540,
+}
+
+# Volume-discount tiers keyed on the pre-discount subtotal (PRD §3.3)
+TIER1_MIN_CENTS = 2_000_000
+TIER2_MIN_CENTS = 5_000_000
+TIER1_DISCOUNT = 0.10
+TIER2_DISCOUNT = 0.15
+
+# Lead times in days (PRD §3.3)
+LEAD_DAYS_CONIFER = 210
+LEAD_DAYS_HARDWOOD = 120
+CONIFER_SPECIES = ("DOUGLAS_FIR", "LOBLOLLY_PINE")
+HARDWOOD_SPECIES = ("WHITE_OAK",)
+
+# Yield projection (PRD §3.2)
+SEEDS_PER_GRAM = {
+    "DOUGLAS_FIR": 88,
+    "LOBLOLLY_PINE": 55,
+    "WHITE_OAK": 0.2,
+}
+EXPECTED_CULL_KEEP_FACTOR = 0.88  # 1 - 0.12 expected cull rate
+
+# Seed-transfer tolerance (PRD §3.1, §3.3, §3.4)
+ZONE_MIDPOINT_TOLERANCE_FT = 500
+
+# Contract sizing (PRD §3.5)
+TREES_PER_ACRE_MIN = 200
+TREES_PER_ACRE_MAX = 800
+CONTINGENCY_PCT_MAX = 0.25
+LARGE_SITE_ACRES = 50
+LARGE_SITE_SURCHARGE = 0.05
+
+# Herbicide efficacy window in days (PRD §3.5)
+HERBICIDE_MIN_AGE_DAYS = 14
+HERBICIDE_MAX_AGE_DAYS = 120
+
+# Survival survey rules (PRD §3.6)
+SURVEY_WINDOW_MIN_DAYS = 300
+SURVEY_WINDOW_MAX_DAYS = 400
+STANDARD_THRESHOLD_PCT = 70.00
+COST_SHARE_THRESHOLD_PCT = 80.00
+REPEAT_FAILURE_FACTOR = 1.25
+ESCALATION_CAP_MULT = 2
+
+# Shipment deadlines (PRD §3.4)
+HANDLING_WINDOW_HOURS = 72
+COLD_STORAGE_MAX_DAYS = 45
+
+# Cost-share award (PRD §3.7)
+STEWARDSHIP_BONUS_PCT = 0.10

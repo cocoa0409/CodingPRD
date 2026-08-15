@@ -1,0 +1,56 @@
+"""Domain thresholds — numeric constants from PRD §3 rules."""
+
+DEFAULT_CLOCK = "2026-08-01T06:00:00Z"
+
+THRESHOLDS = {
+    # lane margin screen (PRD §3.2)
+    "DEADHEAD_ESTIMATE_MILES": 100,
+    "VARIABLE_COST_CPM": 145,
+    "FLEET_AVG_PAY_CPM": 62,
+    # fuel surcharge (PRD §3.2)
+    "FSC_BASELINE_CENTS": 300,
+    # hours of service (PRD §3.4)
+    "DRIVE_LIMIT_MIN": 660,
+    "WINDOW_LIMIT_MIN": 840,
+    "CYCLE_LIMIT_MIN": 4200,
+    "CYCLE_WINDOW_MIN": 10080,
+    "LONG_OFF_MIN": 600,
+    "RESTART_MIN": 2040,
+    "BREAK_MIN": 30,
+    "BREAK_DRIVE_MIN": 480,
+    "AVG_SPEED_MPH": 50,
+    "MAX_DAYS_OUT": 14,
+    # detention (PRD §3.5)
+    "FREE_MINUTES": 120,
+    "DETENTION_INCREMENT_MIN": 15,
+    "DETENTION_INCREMENT_CENTS": 1500,
+    # accessorial pricing (PRD §3.6)
+    "LAYOVER_CENTS_PER_DAY": 30000,
+    "STOP_OFF_CENTS_PER_STOP": 10000,
+    # safety (PRD §3.8)
+    "SAFETY_ASSIGNMENT_MIN": 60,
+    "FULL_WEIGHT_HOURS": 8760,
+    "HALF_WEIGHT_HOURS": 17520,
+    # settlement (PRD §3.9)
+    "MIN_WEEKLY_CENTS": 120000,
+    "DRIVER_ACCESSORIAL_SHARE_BP": 2500,
+    # backhaul (PRD §3.3)
+    "INTERSTATE_DEADHEAD_MILES": 250,
+    # cancellation tiers (PRD §3.2)
+    "CANCEL_ACCEPTED_FEE_CENTS": 15000,
+    "CANCEL_TONU_MIN_FEE_CENTS": 25000,
+}
+
+TEST_DEFAULTS = {
+    "PAY_RATE_CENTS_PER_MILE": 62,
+    "PAY_PERCENTAGE_BP": 2750,
+    "RATE_CENTS": 250000,
+    "WEIGHT_LBS": 42000,
+    "LOADED_MILES": 900,
+    "RPM_FLOOR_CENTS": 200,
+    "PLANNED_DEADHEAD_MILES": 120,
+    "NATIONAL_PUMP_CENTS": 450,
+    "TANK_CAPACITY_GALLONS": 200,
+    "CURRENT_FUEL_GALLONS": 150,
+    "ODOMETER_MILES": 100000,
+}

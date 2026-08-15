@@ -1,0 +1,54 @@
+"""Domain thresholds and numeric constants from PRD §2 and §3."""
+
+# Logical clock (PRD §2.5): startup default, never wall-clock.
+CLOCK_START = "2026-08-01T00:00:00Z"
+
+# Fare quote (PRD §3.4).
+FARE = {
+    "BASE_FARE_PEAK_PER_PERSON_CENTS": 39900,
+    "BASE_FARE_REGULAR_PER_PERSON_CENTS": 29900,
+    "WEIGHT_SURCHARGE_THRESHOLD_LBS": 200,
+    "WEIGHT_SURCHARGE_PER_PERSON_CENTS": 2500,
+    "CHARTER_FLAT_SMALL_CENTS": 120000,    # capacity <= 4
+    "CHARTER_FLAT_MEDIUM_CENTS": 180000,   # capacity 5..8
+    "CHARTER_FLAT_LARGE_CENTS": 250000,    # capacity >= 9
+    "CHARTER_PEAK_MULTIPLIER": 1.25,
+    "PHOTO_STANDARD_CENTS": 4900,
+    "PHOTO_DELUXE_CENTS": 9900,
+}
+
+# Refund policy (PRD §3.7).
+REFUND = {
+    "WEATHER_PCT": 100,
+    "OPERATOR_PCT": 100,
+    "CUSTOMER_EARLY_PCT": 80,
+    "CUSTOMER_LATE_PCT": 0,
+    "GOODWILL_OPERATOR_PCT": 10,
+    "CUSTOMER_CANCEL_LATE_HOURS": 24,
+}
+
+# Pilot currency (PRD §2.10).
+CURRENCY = {
+    "FAA_MIN_TAKEOFFS_LANDINGS_90D": 3,
+    "OPERATOR_MIN_PIC_HOURS_180D": 12.0,
+}
+
+# Flight composition (PRD §3.2).
+FLIGHT_RULES = {
+    "DAWN_WINDOW_MINUTES": 90,
+    "DEFAULT_FUEL_LBS": 200,
+}
+
+# Standard test geography: default flight date/window (REGULAR season).
+DEFAULTS = {
+    "FLIGHT_DATE": "2026-08-10",
+    "DAWN_START": "2026-08-10T05:30:00Z",
+    "DAWN_END": "2026-08-10T07:00:00Z",
+    "DAWN_MID": "2026-08-10T06:00:00Z",
+    "PEAK_DATE": "2026-10-05",
+    "PEAK_DAWN_START": "2026-10-05T05:30:00Z",
+    "PEAK_DAWN_END": "2026-10-05T07:00:00Z",
+    "INSPECTION_DATE": "2026-07-01",
+    "PERMISSION_EXPIRES": "2027-12-31",
+    "MEDICAL_EXPIRES": "2027-06-30",
+}

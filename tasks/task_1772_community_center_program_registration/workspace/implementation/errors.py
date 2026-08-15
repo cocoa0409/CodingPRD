@@ -1,0 +1,59 @@
+"""Error catalog (SCAFFOLD section 1.6 / PRD section 5).
+
+Every API failure is an ApiError carrying the scaffold-declared error_id and
+HTTP status.  Messages are human-readable free text; tests key on error_id.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.status = status
+
+
+HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SEASON_NOT_PUBLISHED": 409,
+    "ERR_SEASON_CLOSED": 409,
+    "ERR_SESSION_NOT_OPEN": 409,
+    "ERR_REGISTRATION_NOT_ENROLLED": 409,
+    "ERR_PAYMENT_NOT_ALLOWED": 409,
+    "ERR_REFUND_NOT_PENDING": 409,
+    "ERR_CONTRACT_NOT_ACCEPTED": 409,
+    "ERR_SAFETY_FORM_REQUIRED": 422,
+    "ERR_GUARDIAN_SIGNATURE_REQUIRED": 422,
+    "ERR_SELF_SIGNATURE_REQUIRED": 422,
+    "ERR_REGISTRATION_WINDOW_NOT_OPEN": 422,
+    "ERR_RESIDENT_PRIORITY_WINDOW": 422,
+    "ERR_REGISTRATION_WINDOW_CLOSED": 422,
+    "ERR_ATTENDANCE_TOO_EARLY": 422,
+    "ERR_DUPLICATE_REGISTRATION": 409,
+    "ERR_AGE_INELIGIBLE": 422,
+    "ERR_ROOM_CAPACITY_INSUFFICIENT": 422,
+    "ERR_ROOM_UNAVAILABLE": 409,
+    "ERR_ROOM_CONFLICT": 409,
+    "ERR_INSTRUCTOR_DOUBLE_BOOKED": 409,
+    "ERR_CAPACITY_BELOW_ENROLLED": 409,
+    "ERR_NO_MEETINGS": 422,
+    "ERR_DUPLICATE_SAFETY_FORM": 409,
+    "ERR_DUPLICATE_SCHOLARSHIP_APPLICATION": 409,
+    "ERR_DUPLICATE_ATTENDANCE": 409,
+    "ERR_DUPLICATE_CONTRACT": 409,
+    "ERR_CONTRACT_INSTRUCTOR_MISMATCH": 422,
+    "ERR_NOT_HOUSEHOLD_MEMBER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INCORRECT_AMOUNT": 422,
+    "ERR_INSUFFICIENT_CREDIT": 422,
+    "ERR_SCHOLARSHIP_BUDGET_EXCEEDED": 422,
+}
+
+
+def raise_err(error_id, message):
+    raise ApiError(error_id, message, HTTP_STATUS[error_id])

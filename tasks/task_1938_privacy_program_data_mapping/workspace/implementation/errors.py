@@ -1,0 +1,37 @@
+"""Error catalog: exact error ids and HTTP statuses (PRD section 5)."""
+
+HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_STALE_VERSION": 412,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_REQUEST_NOT_VERIFIED": 409,
+    "ERR_ACTIVITY_RETIRED": 409,
+    "ERR_TASKS_OUTSTANDING": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_MECHANISM_NOT_ADEQUATE": 422,
+    "ERR_PIA_NOT_APPROVED": 409,
+    "ERR_NO_PUBLISHED_NOTICE": 422,
+    "ERR_ELEMENT_RETIRED": 422,
+    "ERR_VENDOR_NOT_APPROVED": 422,
+    "ERR_SYSTEM_DECOMMISSIONED": 422,
+    "ERR_CONTRACT_NOT_EXECUTED": 422,
+    "ERR_NO_EXECUTED_CONTRACT": 422,
+    "ERR_INVALID_WINDOW": 422,
+    "ERR_NOTICE_WINDOW_OVERLAP": 409,
+    "ERR_DUPLICATE_KEY": 409,
+    "ERR_TRANSFER_WINDOW_CONFLICT": 409,
+    "ERR_OPEN_ASSESSMENT_EXISTS": 409,
+    "ERR_NO_SYSTEMS_IN_SCOPE": 422,
+    "ERR_NO_DOCUMENTED_PURPOSE": 422,
+    "ERR_INVALID_REQUEST": 400,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message):
+        self.error_id = error_id
+        self.http_status = HTTP_STATUS[error_id]
+        self.message = message
+        super().__init__(message)

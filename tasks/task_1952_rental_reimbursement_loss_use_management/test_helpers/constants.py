@@ -1,0 +1,39 @@
+"""Domain thresholds and shared scenario values (PRD §2.4, §3.5, §3.6, §3.8)."""
+
+# Logical clock instant before any call is made (PRD §2.4).
+DEFAULT_LOGICAL_CLOCK = "2026-08-01T00:00:00Z"
+
+# Tax handling: 8 percent per calendar day, round half up per day (PRD §3.8).
+TAX_RATE = 0.08
+DOCUMENTATION_FEE_CAP_CENTS = 2500
+
+# Grace periods (PRD §3.5 completion grace, PRD §3.6 return grace).
+COMPLETION_GRACE_DAYS = 1
+RETURN_GRACE_DAYS = 1
+
+# Canonical partner rate card used by the shared scenario builders.
+BASE_ECONOMY_RATE_CENTS = 4500
+BASE_STANDARD_RATE_CENTS = 6000
+BASE_PREMIUM_RATE_CENTS = 9000
+BASE_ECONOMY_CAPACITY = 2
+BASE_STANDARD_CAPACITY = 1
+BASE_PREMIUM_CAPACITY = 1
+
+# Canonical claim terms: limit 6000/day, cap 20 days, per-diem 3500.
+BASE_DAILY_LIMIT_CENTS = 6000
+BASE_DURATION_CAP_DAYS = 20
+BASE_LOU_PER_DIEM_CENTS = 3500
+BASE_INITIAL_RESERVE_CENTS = BASE_DAILY_LIMIT_CENTS * BASE_DURATION_CAP_DAYS  # 120000
+
+# Canonical booking window: 2026-08-05 .. 2026-08-15 (10 half-open days).
+BASE_PICKUP_DATE = "2026-08-05"
+BASE_AUTHORIZED_RETURN_DATE = "2026-08-15"
+BASE_AUTHORIZED_DAYS = 10
+BASE_VEHICLE_CLASS = "STANDARD"
+BASE_ESTIMATED_CHARGE_CENTS = BASE_AUTHORIZED_DAYS * BASE_STANDARD_RATE_CENTS  # 60000
+
+# Canonical repair estimate and canonical clock positions.
+BASE_REPAIR_ESTIMATE = "2026-08-14"
+ACTIVATION_CLOCK = "2026-08-05T09:00:00Z"
+RETURN_CLOCK = "2026-08-15T10:00:00Z"
+REPAIR_COMPLETION_CLOCK = "2026-08-14T15:00:00Z"

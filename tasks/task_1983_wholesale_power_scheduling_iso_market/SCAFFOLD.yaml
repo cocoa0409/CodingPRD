@@ -1,0 +1,1688 @@
+# =============================================================================
+# Task 1983: Wholesale Power Scheduling & ISO Market Settlement
+# Scaffold seed tables (§1.0–§1.7). Difficulty design lives in
+# SCAFFOLD_DIFFICULTY_DESIGN.yaml; corner design in SCAFFOLD_CORNER_DESIGN.yaml.
+# =============================================================================
+
+scenario: |
+  1983. Wholesale Power Scheduling & ISO Market Settlement (PJM/ERCOT market participant): day-ahead bid/offer submission & timing, real-time deviation & imbalance charge, generator outage reporting & availability, congestion/loss component allocation, settlement statement validation & dispute window, capacity obligation & performance penalty, ancillary service revenue, credit collateral posting
+
+domain_name: wholesale-power-iso-settlement
+api_prefix: /market
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  # Same operating day settled twice (preliminary vs final price/telemetry
+  # variants) producing divergent statements; resettlement re-opens the ledger.
+  secondary_archetype: compliance_audit
+  # Dispute windows, outage reporting obligations, margin-call cure deadlines,
+  # segregation of duties between trading / settlement / credit functions.
+  complexity_layers:
+    - dual_variant_calculation     # preliminary vs final settlement; gross vs net credit exposure
+    - cascading_side_effects       # outage approval → availability → obligation risk → margin call
+    - ops_run_checkpoint           # OperatingDay epoch machine gates DA run / RT close / settlement runs
+    - optimistic_concurrency       # OCC on OperatingDay.version and GeneratorAsset.version
+  entity_topology: flat            # peer entities joined by FK references; no nested ownership tree in URLs
+  state_machine_shape: cyclic      # offers (DRAFT↔SUBMITTED), statements (ISSUED↔UNDER_DISPUTE), outages (DENIED→SUBMITTED) all cycle
+  relationship_patterns:
+    - one_to_many                  # participant → generators/statements/postings; day → offers/nodes/events
+    - cross_aggregate              # lines → generator; disputes → statement+participant; awards → generator+day
+    - self_referential             # SettlementStatement.supersedes_statement_id chains resettlement versions
+  role_model: segregation_of_duties
+  # Trader / SettlementAnalyst / CreditOfficer are disjoint participant-side
+  # functions; IsoOperator is the market authority. No role shares another
+  # role's exclusive operation.
+  consistency_model: immediate     # every mutation + cascade is atomic within the request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (flat topology; FKs use canonical prefix)
+# =============================================================================
+entities:
+  - name: MarketParticipant
+    parent: null
+    common_fields: true
+    fields:
+      - { name: company_name, type: string, source: input, description: "Legal name of the market participant" }
+      - { name: credit_rating_tier, type: enum, source: input, description: "INVESTMENT_GRADE | BELOW_INVESTMENT_GRADE — selects collateral_requirement variant and unsecured allowance" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | MARGIN_CALL | SUSPENDED — credit posture machine" }
+      - { name: posted_collateral_cents, type: integer, source: computed, description: "Sum of amount_cents over own CollateralPosting rows with status POSTED" }
+      - { name: collateral_requirement_cents, type: integer, source: computed, description: "Raw requirement from collateral_requirement calc (variant selected by credit_rating_tier), before unsecured allowance" }
+      - { name: unsecured_allowance_cents, type: integer, source: computed, description: "100000 for INVESTMENT_GRADE, 0 for BELOW_INVESTMENT_GRADE (constant per tier)" }
+
+  - name: GeneratorAsset
+    parent: null
+    common_fields: true
+    fields:
+      - { name: market_participant_id, type: string, source: input, description: "FK -> MarketParticipant.id; owning participant" }
+      - { name: unit_name, type: string, source: input, description: "Unit identifier" }
+      - { name: pricing_node, type: string, source: input, description: "Pricing node name used to look up PriceNode components (e.g. WEST_HUB)" }
+      - { name: capacity_mw, type: number, source: input, description: "Installed capacity MW; must be > 0" }
+      - { name: availability_mw, type: number, source: computed, description: "capacity_mw × (1 − max derate_pct/100 over APPROVED outages covering current logical time); see availability_recompute" }
+      - { name: status, type: enum, source: system, description: "AVAILABLE | ON_OUTAGE | DECOMMISSIONED" }
+
+  - name: OperatingDay
+    parent: null
+    common_fields: true
+    fields:
+      - { name: market_date, type: string, source: input, description: "Operating day date YYYY-MM-DD; unique across all OperatingDay rows" }
+      - { name: da_gate_close_at, type: datetime, source: input, description: "Day-ahead gate close instant (logical clock); submissions at exactly this instant are accepted, after are rejected" }
+      - { name: status, type: enum, source: system, description: "DA_OPEN | DA_GATED | RT_COMPLETE | PRELIM_SETTLED | FINAL_SETTLED | CLOSED — market epoch machine" }
+
+  - name: PriceNode
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operating_day_id, type: string, source: system, description: "FK -> OperatingDay.id; owning operating day" }
+      - { name: node_name, type: string, source: input, description: "Pricing node name; unique within the operating day" }
+      - { name: da_energy_cents_per_mwh, type: integer, source: input, description: "Day-ahead energy component, posted at run-day-ahead-market" }
+      - { name: da_congestion_cents_per_mwh, type: integer, source: input, description: "Day-ahead congestion component" }
+      - { name: da_loss_cents_per_mwh, type: integer, source: input, description: "Day-ahead loss component" }
+      - { name: rt_prelim_energy_cents_per_mwh, type: integer, source: input, description: "Preliminary real-time energy component, posted at close-real-time" }
+      - { name: rt_prelim_congestion_cents_per_mwh, type: integer, source: input, description: "Preliminary real-time congestion component" }
+      - { name: rt_prelim_loss_cents_per_mwh, type: integer, source: input, description: "Preliminary real-time loss component" }
+      - { name: rt_final_energy_cents_per_mwh, type: integer, source: input, description: "Final real-time energy component, posted at run-final-settlement" }
+      - { name: rt_final_congestion_cents_per_mwh, type: integer, source: input, description: "Final real-time congestion component" }
+      - { name: rt_final_loss_cents_per_mwh, type: integer, source: input, description: "Final real-time loss component" }
+
+  - name: DayAheadOffer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operating_day_id, type: string, source: input, description: "FK -> OperatingDay.id; target operating day" }
+      - { name: generator_asset_id, type: string, source: input, description: "FK -> GeneratorAsset.id; offered unit" }
+      - { name: offered_mw, type: number, source: input, description: "Offered MW block; must be > 0" }
+      - { name: offer_price_cents_per_mwh, type: integer, source: input, description: "Offer floor price; offer clears iff offer_price <= DA LMP at the unit's node" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SUBMITTED | SUPERSEDED | EXPIRED | CLEARED | NOT_CLEARED" }
+      - { name: cleared_mw, type: number, source: computed, description: "Cleared MW assigned at run-day-ahead-market (0 unless CLEARED)" }
+      - { name: da_lmp_cents_per_mwh, type: integer, source: computed, description: "DA LMP (energy+congestion+loss) at the unit's node observed at clearing" }
+
+  - name: RealTimeTelemetry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: generator_asset_id, type: string, source: system, description: "FK -> GeneratorAsset.id; metered unit" }
+      - { name: operating_day_id, type: string, source: input, description: "FK -> OperatingDay.id; metered day" }
+      - { name: interval_index, type: integer, source: input, description: "Hour index 1..24 of the operating day" }
+      - { name: actual_mw, type: number, source: input, description: "Metered average MW for the interval; >= 0" }
+      - { name: status, type: enum, source: system, description: "RECORDED | SUPERSEDED — a later reading for the same (generator, day, interval) supersedes" }
+
+  - name: OutageReport
+    parent: null
+    common_fields: true
+    fields:
+      - { name: generator_asset_id, type: string, source: system, description: "FK -> GeneratorAsset.id; unit on outage" }
+      - { name: outage_type, type: enum, source: input, description: "FULL | PARTIAL" }
+      - { name: derate_pct, type: integer, source: input, description: "Derate percent; FULL requires exactly 100, PARTIAL requires 1..99" }
+      - { name: start_at, type: datetime, source: input, description: "Outage window start (inclusive); must be < end_at" }
+      - { name: end_at, type: datetime, source: input, description: "Outage window end (exclusive — half-open interval)" }
+      - { name: reason, type: string, source: input, description: "Free-text outage reason" }
+      - { name: denial_reason, type: string, source: system, description: "Recorded when ISO denies the report" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED | ACKNOWLEDGED | APPROVED | DENIED | CANCELLED" }
+
+  - name: SettlementStatement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: market_participant_id, type: string, source: system, description: "FK -> MarketParticipant.id; billed participant" }
+      - { name: operating_day_id, type: string, source: system, description: "FK -> OperatingDay.id; settled day" }
+      - { name: run_type, type: enum, source: system, description: "PRELIMINARY | FINAL | RESETTLEMENT" }
+      - { name: status, type: enum, source: system, description: "ISSUED | UNDER_DISPUTE | SUPERSEDED | CLOSED | PAID" }
+      - { name: da_energy_credit_cents, type: integer, source: computed, description: "DA energy credit (positive number; subtracted in net) = Σ 24·cleared_mw·da_energy over CLEARED offers" }
+      - { name: imbalance_charge_cents, type: integer, source: computed, description: "Signed RT energy imbalance incl. deadband/penalty multipliers (positive = charge)" }
+      - { name: congestion_charge_cents, type: integer, source: computed, description: "DA + RT congestion allocation, per-interval rounded then summed (see congestion_loss_allocation)" }
+      - { name: loss_charge_cents, type: integer, source: computed, description: "DA + RT loss allocation, per-interval rounded then summed" }
+      - { name: ancillary_revenue_cents, type: integer, source: computed, description: "Ancillary revenue (positive number; subtracted in net)" }
+      - { name: capacity_charge_cents, type: integer, source: computed, description: "Capacity performance penalties minus bonuses attributed to this day (positive = charge)" }
+      - { name: net_amount_cents, type: integer, source: computed, description: "congestion + loss + imbalance + capacity − da_energy_credit − ancillary_revenue; positive = participant owes ISO" }
+      - { name: paid_cents, type: integer, source: system, description: "Amount covered by collateral draws; statement → PAID when paid_cents >= net_amount_cents (net > 0)", default: 0 }
+      - { name: issued_at, type: datetime, source: system, description: "Logical time the statement was issued" }
+      - { name: dispute_window_ends_at, type: datetime, source: system, description: "issued_at + 72h; disputes filed at exactly this instant are accepted, after are rejected" }
+      - { name: supersedes_statement_id, type: string, source: system, description: "FK -> SettlementStatement.id; resettlement statements point at the statement they replace; null otherwise" }
+
+  - name: SettlementLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: settlement_statement_id, type: string, source: system, description: "FK -> SettlementStatement.id; owning statement" }
+      - { name: generator_asset_id, type: string, source: system, description: "FK -> GeneratorAsset.id; unit the line belongs to" }
+      - { name: charge_type, type: enum, source: system, description: "DA_ENERGY_CREDIT | RT_IMBALANCE | CONGESTION | LOSSES | ANCILLARY | CAPACITY" }
+      - { name: mw_quantity, type: number, source: computed, description: "MW basis of the line (cleared MW, deviation MW, awarded MW, or shortfall MW)" }
+      - { name: amount_cents, type: integer, source: computed, description: "Signed charge convention: positive = charge to participant, negative = credit" }
+
+  - name: SettlementDispute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: settlement_statement_id, type: string, source: system, description: "FK -> SettlementStatement.id; disputed statement" }
+      - { name: market_participant_id, type: string, source: system, description: "FK -> MarketParticipant.id; filing participant" }
+      - { name: dispute_reason, type: enum, source: input, description: "PRICE_ERROR | METER_DATA_ERROR | CALCULATION_ERROR | MISSING_ANCILLARY_CREDIT" }
+      - { name: disputed_line_ids, type: array, source: input, description: "Non-empty list of SettlementLine ids; every id must belong to the disputed statement" }
+      - { name: status, type: enum, source: system, description: "FILED | UNDER_REVIEW | UPHELD | REJECTED | WITHDRAWN" }
+
+  - name: AncillaryServiceAward
+    parent: null
+    common_fields: true
+    fields:
+      - { name: generator_asset_id, type: string, source: input, description: "FK -> GeneratorAsset.id; awarded unit" }
+      - { name: operating_day_id, type: string, source: system, description: "FK -> OperatingDay.id; award day" }
+      - { name: service_type, type: enum, source: input, description: "REGULATION | SYNC_RESERVE | SUPPLEMENTAL_RESERVE" }
+      - { name: awarded_mw, type: number, source: input, description: "Awarded MW; must be > 0" }
+      - { name: capacity_price_cents, type: integer, source: input, description: "Capacity price per MW for the award" }
+      - { name: performance_price_cents, type: integer, source: input, description: "Performance price per MW; required iff service_type == REGULATION" }
+      - { name: mileage_ratio, type: number, source: input, description: "Mileage multiplier; required iff service_type == REGULATION" }
+      - { name: start_interval, type: integer, source: input, description: "First award hour 1..24 (inclusive)" }
+      - { name: end_interval, type: integer, source: input, description: "Last award hour 1..24 (inclusive, closed interval); must be >= start_interval" }
+      - { name: performance_score, type: number, source: computed, description: "Share of award intervals whose RECORDED telemetry actual_mw >= 0.9 × awarded_mw; computed at settlement" }
+      - { name: revenue_cents, type: integer, source: computed, description: "Award revenue per ancillary_revenue calc; 0 while AWARDED before settlement or when CANCELLED" }
+      - { name: status, type: enum, source: system, description: "AWARDED | SETTLED | CANCELLED" }
+
+  - name: CapacityObligation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: generator_asset_id, type: string, source: input, description: "FK -> GeneratorAsset.id; obligated unit" }
+      - { name: delivery_period, type: string, source: input, description: "Delivery month YYYY-MM; at most one ACTIVE/AT_RISK obligation per (generator, delivery_period)" }
+      - { name: obligated_mw, type: number, source: input, description: "Committed capacity MW; must be > 0" }
+      - { name: capacity_rate_cents_per_mw, type: integer, source: input, description: "Monthly capacity rate per MW" }
+      - { name: expected_output_mw, type: number, source: computed, description: "min(obligated_mw, generator availability_mw); recomputed whenever availability changes" }
+      - { name: accrued_penalty_cents, type: integer, source: system, description: "Running penalties from COMPLETED performance events", default: 0 }
+      - { name: accrued_bonus_cents, type: integer, source: system, description: "Running bonus allocations from the penalty pool", default: 0 }
+      - { name: gross_revenue_cents, type: integer, source: computed, description: "obligated_mw × capacity_rate_cents_per_mw, fixed at close" }
+      - { name: charged_penalty_cents, type: integer, source: computed, description: "min(accrued_penalty_cents, 1.5 × gross_revenue_cents), fixed at close" }
+      - { name: forgiven_penalty_cents, type: integer, source: computed, description: "accrued_penalty_cents − charged_penalty_cents, fixed at close" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | AT_RISK | CLOSED" }
+
+  - name: CapacityPerformanceEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: operating_day_id, type: string, source: system, description: "FK -> OperatingDay.id; day the event falls on" }
+      - { name: start_interval, type: integer, source: input, description: "First event hour 1..24 (inclusive, closed interval)" }
+      - { name: end_interval, type: integer, source: input, description: "Last event hour 1..24 (inclusive, closed interval); >= start_interval" }
+      - { name: penalties_collected_cents, type: integer, source: computed, description: "Σ penalties assessed at completion", default: 0 }
+      - { name: bonuses_paid_cents, type: integer, source: computed, description: "Σ bonuses allocated at completion; equals penalties_collected_cents whenever any over-performance exists", default: 0 }
+      - { name: status, type: enum, source: system, description: "DECLARED | ACTIVE | COMPLETED" }
+
+  - name: CollateralPosting
+    parent: null
+    common_fields: true
+    fields:
+      - { name: market_participant_id, type: string, source: system, description: "FK -> MarketParticipant.id; posting participant" }
+      - { name: amount_cents, type: integer, source: input, description: "Posted amount; must be > 0" }
+      - { name: instrument_type, type: enum, source: input, description: "CASH | LETTER_OF_CREDIT" }
+      - { name: status, type: enum, source: system, description: "POSTED | RELEASED | DRAWN" }
+
+  - name: MarginCall
+    parent: null
+    common_fields: true
+    fields:
+      - { name: market_participant_id, type: string, source: system, description: "FK -> MarketParticipant.id; called participant" }
+      - { name: required_additional_cents, type: integer, source: computed, description: "effective_requirement − posted_collateral at issuance" }
+      - { name: due_at, type: datetime, source: system, description: "issued_at + 24h cure window; a cure at exactly due_at is accepted, after is defaulted" }
+      - { name: status, type: enum, source: system, description: "OPEN | CURED | DEFAULTED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: MarketParticipant
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: MARGIN_CALL
+        trigger: "system (credit_posture_evaluation: effective_requirement > posted_collateral_cents and no OPEN MarginCall exists)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Create MarginCall: required_additional_cents = effective_requirement − posted_collateral_cents; due_at = now + 24h; status OPEN"
+      - from: MARGIN_CALL
+        to: ACTIVE
+        trigger: "system (credit_posture_evaluation: posted_collateral_cents >= effective_requirement)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "OPEN MarginCall → CURED"
+      - from: MARGIN_CALL
+        to: SUSPENDED
+        trigger: "system (credit_posture_evaluation: logical clock past MarginCall.due_at and posted_collateral_cents < effective_requirement)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "OPEN MarginCall → DEFAULTED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /market/participants/{participantId}/evaluate-credit"
+        actor: IsoOperator
+        preconditions:
+          - "posted_collateral_cents >= effective_requirement"
+        side_effects: []
+
+  - entity: GeneratorAsset
+    initial_state: AVAILABLE
+    terminal_states: [DECOMMISSIONED]
+    transitions:
+      - from: AVAILABLE
+        to: ON_OUTAGE
+        trigger: "system (availability_recompute: an APPROVED FULL outage covers the current logical time)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "availability_mw recomputed per availability_recompute"
+      - from: ON_OUTAGE
+        to: AVAILABLE
+        trigger: "system (availability_recompute: no APPROVED FULL outage covers the current logical time — outage window elapsed or outage cancelled)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "availability_mw recomputed per availability_recompute"
+      - from: AVAILABLE
+        to: DECOMMISSIONED
+        trigger: "POST /market/generators/{generatorId}/decommission"
+        actor: Trader
+        preconditions:
+          - "No DayAheadOffer for this generator in {DRAFT, SUBMITTED} (ERR_GENERATOR_HAS_OPEN_COMMITMENTS)"
+          - "No OutageReport for this generator in {SUBMITTED, ACKNOWLEDGED, APPROVED} (ERR_GENERATOR_HAS_OPEN_COMMITMENTS)"
+          - "No CapacityObligation for this generator in {ACTIVE, AT_RISK} (ERR_GENERATOR_HAS_OPEN_COMMITMENTS)"
+        side_effects: []
+
+  - entity: OperatingDay
+    initial_state: DA_OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: DA_OPEN
+        to: DA_GATED
+        trigger: "POST /market/operating-days/{operatingDayId}/run-day-ahead-market"
+        actor: IsoOperator
+        preconditions:
+          - "node_prices deck covers the pricing_node of every SUBMITTED offer on this day (ERR_PRICE_DECK_INCOMPLETE)"
+        side_effects:
+          - "Create one PriceNode per node_prices entry"
+          - "da_clearing runs: SUBMITTED offer → CLEARED (offer_price <= DA LMP) with cleared_mw = offered_mw, else → NOT_CLEARED with cleared_mw = 0"
+          - "DRAFT offers on this day → EXPIRED"
+          - "Increments OperatingDay.version by 1"
+      - from: DA_GATED
+        to: RT_COMPLETE
+        trigger: "POST /market/operating-days/{operatingDayId}/close-real-time"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "Store rt_prelim components on this day's PriceNodes"
+          - "Telemetry window closes for this day"
+          - "Increments OperatingDay.version by 1"
+      - from: RT_COMPLETE
+        to: PRELIM_SETTLED
+        trigger: "POST /market/operating-days/{operatingDayId}/run-preliminary-settlement"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "Generate PRELIMINARY SettlementStatement + SettlementLine rows per participant with activity (preliminary variant of imbalance_settlement / congestion_loss_allocation; ancillary_revenue; capacity_charge from events COMPLETED on this day)"
+          - "AncillaryServiceAward AWARDED → SETTLED with revenue_cents computed"
+          - "Increments OperatingDay.version by 1"
+      - from: PRELIM_SETTLED
+        to: FINAL_SETTLED
+        trigger: "POST /market/operating-days/{operatingDayId}/run-final-settlement"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "PRELIMINARY statements → SUPERSEDED"
+          - "Generate FINAL statements (final variant) with issued_at = now, dispute_window_ends_at = now + 72h"
+          - "credit_posture_evaluation per participant (may create MarginCall, participant → MARGIN_CALL)"
+          - "Increments OperatingDay.version by 1"
+      - from: FINAL_SETTLED
+        to: CLOSED
+        trigger: "POST /market/operating-days/{operatingDayId}/close"
+        actor: IsoOperator
+        preconditions:
+          - "No SettlementStatement for this day in UNDER_DISPUTE (ERR_UNRESOLVED_DISPUTES)"
+        side_effects:
+          - "Statements with status ISSUED → CLOSED"
+          - "Increments OperatingDay.version by 1"
+
+  - entity: DayAheadOffer
+    initial_state: DRAFT
+    terminal_states: [CLEARED, NOT_CLEARED, EXPIRED, SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /market/offers/{offerId}/submit"
+        actor: Trader
+        preconditions:
+          - "OperatingDay.status == DA_OPEN (ERR_MARKET_NOT_OPEN)"
+          - "GeneratorAsset.status == AVAILABLE (ERR_GENERATOR_NOT_AVAILABLE)"
+          - "MarketParticipant.status != SUSPENDED (ERR_PARTICIPANT_SUSPENDED)"
+          - "logical now <= OperatingDay.da_gate_close_at (ERR_DA_GATE_CLOSED); exactly at gate close is accepted"
+          - "offered_mw <= GeneratorAsset.availability_mw (ERR_OFFER_MW_EXCEEDS_AVAILABILITY)"
+          - "credit headroom: effective_requirement including this offer's risk <= posted_collateral_cents (ERR_CREDIT_HEADROOM_EXCEEDED)"
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed (offer risk adder applies)"
+      - from: SUBMITTED
+        to: DRAFT
+        trigger: "POST /market/offers/{offerId}/withdraw"
+        actor: Trader
+        preconditions:
+          - "OperatingDay.status == DA_OPEN (ERR_MARKET_NOT_OPEN)"
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed (offer risk adder removed)"
+        note: "Submission/withdrawal cycle — may repeat any number of times while the day stays DA_OPEN"
+      - from: DRAFT
+        to: SUPERSEDED
+        trigger: "system (POST /market/operating-days/{operatingDayId}/offers creates a new offer for the same (generator_asset_id, operating_day_id))"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: SUPERSEDED
+        trigger: "system (POST /market/operating-days/{operatingDayId}/offers creates a new offer for the same (generator_asset_id, operating_day_id))"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed (superseded offer's risk removed)"
+      - from: DRAFT
+        to: EXPIRED
+        trigger: "system (run-day-ahead-market executes while offer still DRAFT)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SUBMITTED
+        to: CLEARED
+        trigger: "system (run-day-ahead-market: offer_price_cents_per_mwh <= DA LMP at node; equality clears)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "cleared_mw = offered_mw; da_lmp_cents_per_mwh = DA LMP"
+          - "MarketParticipant.collateral_requirement_cents recomputed (offer risk removed)"
+      - from: SUBMITTED
+        to: NOT_CLEARED
+        trigger: "system (run-day-ahead-market: offer_price_cents_per_mwh > DA LMP at node)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "cleared_mw = 0"
+          - "MarketParticipant.collateral_requirement_cents recomputed (offer risk removed)"
+
+  - entity: RealTimeTelemetry
+    initial_state: RECORDED
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: RECORDED
+        to: SUPERSEDED
+        trigger: "system (POST /market/generators/{generatorId}/telemetry carries a reading for the same (generator_asset_id, operating_day_id, interval_index))"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: OutageReport
+    initial_state: SUBMITTED
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: SUBMITTED
+        to: ACKNOWLEDGED
+        trigger: "POST /market/outages/{outageId}/acknowledge"
+        actor: IsoOperator
+        preconditions: []
+        side_effects: []
+      - from: ACKNOWLEDGED
+        to: APPROVED
+        trigger: "POST /market/outages/{outageId}/approve"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "CASCADE LINK 1: GeneratorAsset.availability_mw recomputed per availability_recompute; status → ON_OUTAGE if outage_type FULL covers now"
+          - "CASCADE LINK 2: each CapacityObligation with generator_asset_id = this generator and status ∈ {ACTIVE, AT_RISK}: expected_output_mw = min(obligated_mw, availability_mw); expected_output_mw < obligated_mw → AT_RISK, else → ACTIVE"
+          - "CASCADE LINK 3 (from link 2): on every transition into AT_RISK, MarketParticipant.collateral_requirement_cents recomputed (capacity risk adder = obligated_mw × 50000) and credit_posture_evaluation runs (may create MarginCall → participant MARGIN_CALL)"
+      - from: ACKNOWLEDGED
+        to: DENIED
+        trigger: "POST /market/outages/{outageId}/deny"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "denial_reason recorded from request"
+      - from: DENIED
+        to: SUBMITTED
+        trigger: "POST /market/outages/{outageId}/resubmit"
+        actor: Trader
+        preconditions:
+          - "Overlap rule re-evaluated against {SUBMITTED, ACKNOWLEDGED, APPROVED} outages of the same generator (ERR_OUTAGE_OVERLAP)"
+        side_effects: []
+        note: "Resubmission cycle — a denied report may be corrected and resubmitted any number of times"
+      - from: SUBMITTED
+        to: CANCELLED
+        trigger: "POST /market/outages/{outageId}/cancel"
+        actor: Trader
+        preconditions: []
+        side_effects: []
+      - from: ACKNOWLEDGED
+        to: CANCELLED
+        trigger: "POST /market/outages/{outageId}/cancel"
+        actor: Trader
+        preconditions: []
+        side_effects: []
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "POST /market/outages/{outageId}/cancel"
+        actor: Trader
+        preconditions: []
+        side_effects:
+          - "COMPENSATION of approve cascade: availability_mw recomputed without this outage; obligations recomputed (AT_RISK → ACTIVE when expected_output_mw == obligated_mw again); capacity risk adder removed and credit_posture_evaluation re-run (may CURE a MarginCall)"
+
+  - entity: SettlementStatement
+    initial_state: ISSUED
+    terminal_states: [SUPERSEDED, CLOSED, PAID]
+    transitions:
+      - from: ISSUED
+        to: SUPERSEDED
+        trigger: "system (run-final-settlement supersedes PRELIMINARY statements; dispute resolve UPHELD supersedes the disputed FINAL/RESETTLEMENT statement)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "On dispute-upheld: create RESETTLEMENT statement per resettlement_recompute, status ISSUED, supersedes_statement_id = this statement"
+      - from: ISSUED
+        to: UNDER_DISPUTE
+        trigger: "POST /market/statements/{statementId}/disputes"
+        actor: SettlementAnalyst
+        preconditions:
+          - "run_type ∈ {FINAL, RESETTLEMENT} (ERR_STATEMENT_NOT_FINAL)"
+          - "No other dispute of this statement in {FILED, UNDER_REVIEW} (ERR_DISPUTE_ALREADY_OPEN)"
+          - "logical now <= dispute_window_ends_at (ERR_DISPUTE_WINDOW_CLOSED); exactly at window end is accepted"
+        side_effects: []
+      - from: UNDER_DISPUTE
+        to: ISSUED
+        trigger: "system (dispute WITHDRAWN or REJECTED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "Dispute cycle — statement may re-enter UNDER_DISPUTE on a later filing"
+      - from: ISSUED
+        to: CLOSED
+        trigger: "system (POST /market/operating-days/{operatingDayId}/close)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ISSUED
+        to: PAID
+        trigger: "system (POST /market/postings/{postingId}/draw waterfall covers paid_cents >= net_amount_cents, net_amount_cents > 0)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed (paid statement leaves the requirement input set)"
+
+  - entity: SettlementDispute
+    initial_state: FILED
+    terminal_states: [UPHELD, REJECTED, WITHDRAWN]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /market/disputes/{disputeId}/start-review"
+        actor: IsoOperator
+        preconditions: []
+        side_effects: []
+      - from: UNDER_REVIEW
+        to: UPHELD
+        trigger: "POST /market/disputes/{disputeId}/resolve"
+        actor: IsoOperator
+        preconditions:
+          - "outcome == UPHELD"
+        side_effects:
+          - "CASCADE LINK 1: disputed SettlementStatement → SUPERSEDED; new RESETTLEMENT statement ISSUED per resettlement_recompute (net reduced by Σ disputed line amounts)"
+          - "CASCADE LINK 2 (from link 1): MarketParticipant.collateral_requirement_cents recomputed over the new statement set and credit_posture_evaluation runs — an OPEN MarginCall whose deficiency disappears → CURED and participant MARGIN_CALL → ACTIVE"
+      - from: UNDER_REVIEW
+        to: REJECTED
+        trigger: "POST /market/disputes/{disputeId}/resolve"
+        actor: IsoOperator
+        preconditions:
+          - "outcome == REJECTED"
+        side_effects:
+          - "Disputed SettlementStatement UNDER_DISPUTE → ISSUED"
+      - from: FILED
+        to: WITHDRAWN
+        trigger: "POST /market/disputes/{disputeId}/withdraw"
+        actor: SettlementAnalyst
+        preconditions: []
+        side_effects:
+          - "Disputed SettlementStatement UNDER_DISPUTE → ISSUED"
+
+  - entity: AncillaryServiceAward
+    initial_state: AWARDED
+    terminal_states: [SETTLED, CANCELLED]
+    transitions:
+      - from: AWARDED
+        to: SETTLED
+        trigger: "system (run-preliminary-settlement or run-final-settlement for the award's operating day)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "performance_score and revenue_cents computed per ancillary_revenue"
+      - from: AWARDED
+        to: CANCELLED
+        trigger: "POST /market/awards/{awardId}/cancel"
+        actor: IsoOperator
+        preconditions:
+          - "OperatingDay.status ∈ {DA_OPEN, DA_GATED, RT_COMPLETE} (ERR_INVALID_STATE_TRANSITION once preliminary settlement has run)"
+        side_effects:
+          - "revenue_cents stays 0; excluded from settlement input set"
+
+  - entity: CapacityObligation
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: AT_RISK
+        trigger: "system (availability recompute leaves expected_output_mw < obligated_mw)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed with capacity risk adder; credit_posture_evaluation runs"
+      - from: AT_RISK
+        to: ACTIVE
+        trigger: "system (availability recompute restores expected_output_mw == obligated_mw)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "MarketParticipant.collateral_requirement_cents recomputed without the adder; credit_posture_evaluation runs"
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /market/obligations/{obligationId}/close"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "capacity_stop_loss_close computes gross_revenue_cents, charged_penalty_cents, forgiven_penalty_cents"
+      - from: AT_RISK
+        to: CLOSED
+        trigger: "POST /market/obligations/{obligationId}/close"
+        actor: IsoOperator
+        preconditions: []
+        side_effects:
+          - "capacity_stop_loss_close computes gross_revenue_cents, charged_penalty_cents, forgiven_penalty_cents; risk adder removed and credit_posture_evaluation re-run"
+
+  - entity: CapacityPerformanceEvent
+    initial_state: DECLARED
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: DECLARED
+        to: ACTIVE
+        trigger: "POST /market/events/{eventId}/activate"
+        actor: IsoOperator
+        preconditions: []
+        side_effects: []
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /market/events/{eventId}/complete"
+        actor: IsoOperator
+        preconditions:
+          - "OperatingDay.status ∈ {DA_OPEN, DA_GATED, RT_COMPLETE} (ERR_INVALID_STATE_TRANSITION once preliminary settlement has run)"
+        side_effects:
+          - "capacity_performance_charge runs for every CapacityObligation with status ∈ {ACTIVE, AT_RISK} whose delivery_period == YYYY-MM of the event day's market_date"
+          - "penalties_collected_cents and bonuses_paid_cents set; obligations' accrued_penalty_cents / accrued_bonus_cents updated"
+          - "credit_posture_evaluation per affected participant"
+
+  - entity: CollateralPosting
+    initial_state: POSTED
+    terminal_states: [RELEASED, DRAWN]
+    transitions:
+      - from: POSTED
+        to: RELEASED
+        trigger: "POST /market/postings/{postingId}/release"
+        actor: CreditOfficer
+        preconditions:
+          - "No MarginCall for this participant in OPEN (ERR_OPEN_MARGIN_CALL)"
+          - "posted_collateral_cents after release >= effective_requirement (ERR_COLLATERAL_SHORTFALL); equality is allowed"
+        side_effects:
+          - "MarketParticipant.posted_collateral_cents -= amount_cents; collateral_requirement_cents unchanged; credit_posture_evaluation re-run"
+      - from: POSTED
+        to: DRAWN
+        trigger: "POST /market/postings/{postingId}/draw"
+        actor: IsoOperator
+        preconditions:
+          - "Participant has a MarginCall in DEFAULTED (ERR_POSTING_NOT_DRAWABLE)"
+        side_effects:
+          - "MarketParticipant.posted_collateral_cents -= amount_cents"
+          - "Draw amount applied as a waterfall over this participant's ISSUED statements with net_amount_cents > paid_cents, ordered issued_at ASC then created_at ASC: each statement's paid_cents increased; statement → PAID when fully covered; residual draw amount beyond uncovered statements is rejected (ERR_INVALID_REQUEST if amount exceeds uncovered total)"
+
+  - entity: MarginCall
+    initial_state: OPEN
+    terminal_states: [CURED, DEFAULTED]
+    transitions:
+      - from: OPEN
+        to: CURED
+        trigger: "system (credit_posture_evaluation: posted_collateral_cents >= effective_requirement at or before due_at — posting created, requirement shrank, or resettlement reduced exposure; cure at exactly due_at is accepted)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Participant MARGIN_CALL → ACTIVE"
+      - from: OPEN
+        to: DEFAULTED
+        trigger: "system (credit_posture_evaluation: logical clock past due_at and posted_collateral_cents < effective_requirement)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Participant MARGIN_CALL → SUSPENDED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (true CREATE-with-supersede races only, OCC-resolved)
+# =============================================================================
+concurrency_rules:
+  - rule_id: offer-create-stale-day
+    parent_entity: OperatingDay
+    write_endpoint: "POST /market/operating-days/{operatingDayId}/offers"
+    occ_field: "expected_operating_day_version"
+    description: |
+      Creating a DayAheadOffer against an OperatingDay whose version has
+      advanced since the client last observed it is rejected. Creating an
+      offer legitimately supersedes the prior DRAFT/SUBMITTED offer for the
+      same (generator, day) slot and bumps OperatingDay.version, so a client
+      acting on a stale view of the day's offer stack must re-observe before
+      writing.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: telemetry-submit-stale-asset
+    parent_entity: GeneratorAsset
+    write_endpoint: "POST /market/generators/{generatorId}/telemetry"
+    occ_field: "expected_generator_asset_version"
+    description: |
+      Submitting a telemetry batch against a GeneratorAsset whose version has
+      advanced since the client last observed it is rejected. A telemetry
+      batch legitimately supersedes prior readings for the same
+      (generator, day, interval) and bumps GeneratorAsset.version, so a
+      client correcting meter data on a stale view of the asset must
+      re-observe before writing.
+    error_id: ERR_STALE_ASSET_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: da_clearing
+    trigger: "POST /market/operating-days/{operatingDayId}/run-day-ahead-market"
+    algorithm: threshold
+    formula: |
+      For each DayAheadOffer on this OperatingDay with status == SUBMITTED,
+      ordered by DayAheadOffer.created_at ASC:
+        node = PriceNode of this day whose node_name == offer.generator.pricing_node
+        lmp_da = node.da_energy_cents_per_mwh + node.da_congestion_cents_per_mwh + node.da_loss_cents_per_mwh
+        if offer.offer_price_cents_per_mwh <= lmp_da:   # equality clears
+          offer → CLEARED, cleared_mw = offered_mw, da_lmp_cents_per_mwh = lmp_da
+        else:
+          offer → NOT_CLEARED, cleared_mw = 0
+      Offers still DRAFT at this point → EXPIRED.
+    input_set: "DayAheadOffer rows of this OperatingDay; only status SUBMITTED are cleared; DRAFT expire"
+    precision: "integer cents; no rounding needed (all inputs integer)"
+    constants: {}
+
+  - name: availability_recompute
+    trigger: "OutageReport approve / cancel / resubmit, and any logical-clock change observed by credit or offer flows"
+    algorithm: aggregation
+    formula: |
+      covering = OutageReport rows of this generator with status == APPROVED
+                 and start_at <= logical_now < end_at   # half-open
+      if any covering row has outage_type == FULL:
+        availability_mw = 0; generator → ON_OUTAGE
+      else:
+        max_derate = max(derate_pct over covering rows, default 0)
+        availability_mw = capacity_mw × (1 − max_derate / 100)
+        generator → AVAILABLE (unless DECOMMISSIONED)
+      Then recompute every CapacityObligation of this generator in {ACTIVE, AT_RISK}:
+        expected_output_mw = min(obligated_mw, availability_mw)
+        expected < obligated → AT_RISK else ACTIVE (with credit side effects per state machine)
+    input_set: "APPROVED OutageReport rows whose half-open window covers logical_now; overlapping APPROVED PARTIAL outages do not stack — the max derate wins"
+    precision: "availability_mw kept as exact number (capacity × integer pct); no rounding"
+    constants: {}
+
+  - name: imbalance_settlement
+    trigger: "run-preliminary-settlement / run-final-settlement"
+    algorithm: chronological
+    formula: |
+      For each CLEARED offer (generator g, cleared_mw C) of the operating day,
+      for each interval i in 1..24 processed in ascending index order:
+        A_i = actual_mw of the telemetry row (g, day, i) with status RECORDED;
+              missing interval → A_i = 0
+        dev_i = A_i − C
+        deadband = DEVIATION_DEADBAND_PCT × C          # exact number, not rounded
+        within_i = min(|dev_i|, deadband) with the sign of dev_i
+        excess_i = |dev_i| − deadband if |dev_i| > deadband else 0
+        # |dev_i| == deadband exactly → no penalty; entire within portion at 1.00×
+        energy_i = −(within_i) × E_rt                    # positive = charge (short position)
+        if dev_i < 0 and excess_i > 0:  energy_i += excess_i × E_rt × SHORT_PENALTY_MULT   # 1.10
+        if dev_i > 0 and excess_i > 0:  energy_i += −(excess_i × E_rt × LONG_CREDIT_MULT)  # 0.90 credit
+        round each energy_i HALF_UP to whole cents, then sum over i → imbalance_charge_cents (signed)
+      Telemetry for generators without a CLEARED offer on that day is EXCLUDED
+      from settlement (no statement activity from telemetry alone).
+      E_rt is the rt energy component at g.pricing_node from the active variant's price set.
+    input_set: "Generators with a CLEARED offer on this day; intervals 1..24 ascending; RECORDED telemetry only (SUPERSEDED ignored)"
+    constants:
+      DEVIATION_DEADBAND_PCT: 0.05
+      SHORT_PENALTY_MULT: 1.10
+      LONG_CREDIT_MULT: 0.90
+    precision: "round_half_up per interval to whole cents, then sum (sum-then-round is NOT used)"
+    variants:
+      - name: preliminary
+        when: "run-preliminary-settlement"
+        difference: "Uses rt_prelim_* price components and the telemetry set as-of the preliminary run"
+      - name: final
+        when: "run-final-settlement (and resettlement)"
+        difference: "Uses rt_final_* price components and the full corrected telemetry set; identical physical day yields different cents whenever rt_final != rt_prelim"
+
+  - name: congestion_loss_allocation
+    trigger: "run-preliminary-settlement / run-final-settlement"
+    algorithm: chronological
+    formula: |
+      For each CLEARED offer (generator g, cleared_mw C at node n), per interval i 1..24:
+        da_cong_i = C × n.da_congestion_cents_per_mwh        # charge (positive)
+        da_loss_i = C × n.da_loss_cents_per_mwh
+        dev_i = A_i − C   (same telemetry input set as imbalance_settlement)
+        rt_cong_i = −(dev_i) × n.rt_congestion_cents_per_mwh # short deviation pays RT congestion
+        rt_loss_i = −(dev_i) × n.rt_loss_cents_per_mwh
+      ROUNDING ORDER (pinned): round EVERY per-interval component HALF_UP to
+      whole cents FIRST, then sum. Sum-then-round is NOT used — the two orders
+      differ whenever per-interval products carry fractional cents (e.g.
+      dev −2.5 MW × 35 cents = 87.5 → 88 per interval; two such intervals give
+      176 by this rule vs 175 under sum-then-round).
+      congestion_charge_cents = Σ_i round(da_cong_i) + round(rt_cong_i)
+      loss_charge_cents       = Σ_i round(da_loss_i) + round(rt_loss_i)
+      Variant price set (rt_prelim vs rt_final) follows the settlement run variant.
+    input_set: "Generators with a CLEARED offer on this day; intervals 1..24 ascending"
+    constants: {}
+    precision: "round_half_up per interval per component, then sum (pinned order)"
+
+  - name: ancillary_revenue
+    trigger: "run-preliminary-settlement / run-final-settlement (award AWARDED → SETTLED)"
+    algorithm: tiered_pricing
+    formula: |
+      For each AncillaryServiceAward with status == AWARDED on the settled day:
+        window = intervals start_interval..end_interval INCLUSIVE (closed interval)
+        qualifying = count of i in window with a RECORDED telemetry row actual_mw >= PERFORMANCE_FLOOR × awarded_mw
+        performance_score = qualifying / (end_interval − start_interval + 1)   # missing telemetry counts as non-qualifying
+        tier_multiplier = 1.00 if score >= 0.95
+                          0.85 if 0.75 <= score < 0.95      # 0.75 exactly → 0.85 tier
+                          0.50 if 0.50 <= score < 0.75
+                          0.00 if score < 0.50
+        capacity_component = awarded_mw × capacity_price_cents × tier_multiplier
+        if service_type == REGULATION:                        # conditional branch
+          performance_component = awarded_mw × performance_price_cents × mileage_ratio   # NOT scaled by tier
+        else:
+          performance_component = 0
+        revenue_cents = round_half_up(capacity_component + performance_component)
+      CANCELLED awards are excluded (revenue 0).
+    input_set: "AncillaryServiceAward rows of this day with status == AWARDED at settlement time; RECORDED telemetry in the award window"
+    constants:
+      PERFORMANCE_FLOOR: 0.9
+    precision: "round_half_up once on the final sum per award"
+    variants: []
+
+  - name: capacity_performance_charge
+    trigger: "POST /market/events/{eventId}/complete"
+    algorithm: waterfall_allocation
+    formula: |
+      Scope: CapacityObligation rows with status ∈ {ACTIVE, AT_RISK} whose
+      delivery_period == the YYYY-MM of the event day's market_date.
+      hours = end_interval − start_interval + 1   (closed interval)
+      For each in-scope obligation o on generator g:
+        expected_o = min(o.obligated_mw, g.availability_mw)
+        actual_o   = mean of RECORDED telemetry actual_mw over the event
+                     intervals (missing interval counts as 0)
+        shortfall_o = max(0, expected_o − actual_o)
+        surplus_o   = max(0, actual_o − expected_o)
+        penalty_o = round_half_up(shortfall_o × PENALTY_RATE_CENTS_PER_MWH × hours)
+      pool = Σ penalty_o
+      # Bonus allocation (revenue-neutral): bonus claims = surplus_o × hours (MWh).
+      # bonus_o = pool × claim_o / Σ claims, round_half_up per claimant; any
+      # rounding remainder goes to the claimant with the largest claim,
+      # tie-break CapacityObligation.created_at ASC. If Σ claims == 0 the pool
+      # is retained by the market operator and bonuses_paid_cents = 0.
+      event.penalties_collected_cents = pool
+      event.bonuses_paid_cents = Σ bonus_o   (== pool whenever Σ claims > 0)
+      o.accrued_penalty_cents += penalty_o; o.accrued_bonus_cents += bonus_o
+      Statement attribution: capacity_charge_cents on the event day's
+      settlement statement per participant = Σ penalty − Σ bonus over that
+      participant's obligations in scope of events COMPLETED on that day.
+    input_set: "Obligations in {ACTIVE, AT_RISK} for the event month's delivery_period; RECORDED telemetry over the closed event interval window"
+    constants:
+      PENALTY_RATE_CENTS_PER_MWH: 50000
+    precision: "round_half_up to whole cents per penalty and per bonus; remainder to largest claim"
+    variants: []
+
+  - name: capacity_stop_loss_close
+    trigger: "POST /market/obligations/{obligationId}/close"
+    algorithm: threshold
+    formula: |
+      EVALUATION ORDER (pinned — resolves the circular-looking dependency
+      between net revenue and the penalty cap):
+        (1) gross_revenue_cents = round_half_up(obligated_mw × capacity_rate_cents_per_mw)
+            — computed FIRST, before any penalty offset, and used as the cap basis;
+        (2) cap_cents = round_half_up(STOP_LOSS_FACTOR × gross_revenue_cents);
+        (3) charged_penalty_cents = min(accrued_penalty_cents, cap_cents)
+            — accrued exactly == cap is charged in full (inclusive);
+        (4) forgiven_penalty_cents = accrued_penalty_cents − charged_penalty_cents.
+      Net capacity settlement is NOT fed back into gross_revenue_cents.
+    input_set: "The single CapacityObligation being closed"
+    constants:
+      STOP_LOSS_FACTOR: 1.5
+    precision: "round_half_up to whole cents at steps (1) and (2)"
+    variants: []
+
+  - name: collateral_requirement
+    trigger: "offer submit/withdraw/supersede/clear, statement issuance (final/settlement), dispute resolve, obligation AT_RISK transitions, posting create/release/draw, POST evaluate-credit"
+    algorithm: aggregation
+    formula: |
+      statement_basis = over SettlementStatement rows of the participant with
+        run_type ∈ {FINAL, RESETTLEMENT} and status ∈ {ISSUED, UNDER_DISPUTE}:
+        each contributes (net_amount_cents − paid_cents)
+      offer_risk = Σ over DayAheadOffer of the participant with status == SUBMITTED:
+                   offered_mw × REFERENCE_PRICE_CENTS_PER_MWH × OFFER_RISK_FACTOR
+      capacity_risk = Σ over CapacityObligation of the participant's generators
+                      with status == AT_RISK: obligated_mw × CAPACITY_RISK_CENTS_PER_MW
+      Variant selection by participant.credit_rating_tier:
+        BELOW_INVESTMENT_GRADE → gross_exposure:
+          requirement = Σ |statement_basis| + offer_risk + capacity_risk
+        INVESTMENT_GRADE → net_exposure:
+          requirement = max(0, Σ statement_basis) + offer_risk + capacity_risk
+      unsecured_allowance_cents = 100000 (INVESTMENT_GRADE) | 0 (BELOW_INVESTMENT_GRADE)
+      effective_requirement = max(0, requirement − unsecured_allowance_cents)
+      Stored on participant: collateral_requirement_cents = requirement (raw).
+    input_set: "Statements run_type ∈ {FINAL, RESETTLEMENT} and status ∈ {ISSUED, UNDER_DISPUTE} (PRELIMINARY, SUPERSEDED, CLOSED, PAID excluded); SUBMITTED offers; AT_RISK obligations"
+    constants:
+      REFERENCE_PRICE_CENTS_PER_MWH: 5000
+      OFFER_RISK_FACTOR: 0.10
+      CAPACITY_RISK_CENTS_PER_MW: 50000
+      IG_UNSECURED_ALLOWANCE_CENTS: 100000
+    precision: "integer cents; offer_risk rounded half_up per offer before summing"
+    variants:
+      - name: gross_exposure
+        when: "participant.credit_rating_tier == BELOW_INVESTMENT_GRADE"
+        difference: "Sums absolute per-statement remainders — credits do not offset debits"
+      - name: net_exposure
+        when: "participant.credit_rating_tier == INVESTMENT_GRADE"
+        difference: "Nets statement remainders across days and floors at 0 — same ledger yields a strictly smaller requirement whenever the statement set mixes signs"
+
+  - name: credit_posture_evaluation
+    trigger: "Every collateral_requirement recompute; posting create/release/draw; run-final-settlement; dispute resolve UPHELD; obligation AT_RISK transitions; POST evaluate-credit"
+    algorithm: threshold
+    formula: |
+      effective_requirement = max(0, collateral_requirement_cents − unsecured_allowance_cents)
+      if posted_collateral_cents >= effective_requirement:
+        any OPEN MarginCall → CURED
+        participant MARGIN_CALL → ACTIVE
+        # SUSPENDED participants do NOT auto-reinstate here; only an explicit
+        # POST /market/participants/{id}/evaluate-credit moves SUSPENDED → ACTIVE
+      elif no MarginCall of this participant is OPEN:
+        create MarginCall(required_additional_cents = effective_requirement − posted_collateral_cents,
+                          due_at = logical_now + CURE_WINDOW_HOURS, status OPEN)
+        participant → MARGIN_CALL
+      if a MarginCall is OPEN and logical_now > due_at and posted_collateral_cents < effective_requirement:
+        that MarginCall → DEFAULTED; participant → SUSPENDED
+        # cure at exactly due_at is accepted; strictly after → default
+      A participant with an OPEN MarginCall keeps that call's required_additional_cents
+      unchanged on later re-evaluations (no in-place update); DEFAULTED calls never cure.
+    input_set: "Single participant's postings, margin calls, and requirement fields"
+    constants:
+      CURE_WINDOW_HOURS: 24
+    precision: "integer cents"
+    variants: []
+
+  - name: resettlement_recompute
+    trigger: "POST /market/disputes/{disputeId}/resolve with outcome == UPHELD"
+    algorithm: aggregation
+    formula: |
+      new statement: run_type RESETTLEMENT, status ISSUED,
+        supersedes_statement_id = disputed statement id,
+        issued_at = logical_now, dispute_window_ends_at = logical_now + 72h
+      Every component field copied from the disputed statement EXCEPT:
+        net_amount_cents = disputed.net_amount_cents − Σ amount_cents over the dispute's disputed_line_ids
+        capacity/energy/etc. component fields: the components containing a
+        disputed line are reduced by that line's amount_cents
+      paid_cents carried over from the disputed statement.
+      The disputed statement → SUPERSEDED (leaves the requirement input set);
+      the RESETTLEMENT statement enters it.
+    input_set: "The disputed FINAL/RESETTLEMENT statement and the dispute's line set"
+    constants: {}
+    precision: "integer cents"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority — lower number wins when a
+# request violates several rules at once)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and well-formed; role must be a declared role name"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Caller role is listed in the endpoint's roles"
+    error_id: ERR_FORBIDDEN_FOR_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Request body parses; every required input field present; enum fields within declared value sets; numeric ranges sane (amount_cents > 0, interval indices 1..24, start < end / start_interval <= end_interval); unknown fields rejected"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all endpoints with a request body"
+  - priority: 4
+    category: existence
+    check: "Path ids exist, validated left-to-right; body-referenced ids (generator_asset_id, operating_day_id, market_participant_id) exist"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all resource endpoints"
+  - priority: 5
+    category: business_referential
+    check: "Participant scoping: Trader / SettlementAnalyst / CreditOfficer may only touch resources whose owning MarketParticipant.id == X-User-ID (via generator, offer, statement, or posting chain). IsoOperator is exempt"
+    error_id: ERR_OWNERSHIP_VIOLATION
+    http_status: 403
+    applies_to: "all Trader / SettlementAnalyst / CreditOfficer write endpoints"
+  - priority: 6
+    category: business_referential
+    check: "Optimistic concurrency: expected_operating_day_version == current OperatingDay.version; expected_generator_asset_version == current GeneratorAsset.version"
+    error_id: "ERR_STALE_VERSION / ERR_STALE_ASSET_VERSION"
+    http_status: 412
+    applies_to: "POST /market/operating-days/{operatingDayId}/offers; POST /market/generators/{generatorId}/telemetry"
+  - priority: 7
+    category: state
+    check: "Path-target resource in a state that permits the transition (per §1.2 from-state lists); terminal-state lockdown. Includes ERR_DISPUTE_ALREADY_OPEN when filing a second open dispute on one statement"
+    error_id: "ERR_INVALID_STATE_TRANSITION | ERR_DISPUTE_ALREADY_OPEN"
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 8
+    category: state
+    check: "Cross-entity state preconditions: OperatingDay.status == DA_OPEN for offer create/submit/withdraw (ERR_MARKET_NOT_OPEN); GeneratorAsset.status == AVAILABLE for offer create/submit (ERR_GENERATOR_NOT_AVAILABLE); MarketParticipant.status != SUSPENDED for offer submit (ERR_PARTICIPANT_SUSPENDED); statement run_type ∈ {FINAL, RESETTLEMENT} for dispute create (ERR_STATEMENT_NOT_FINAL); no OPEN MarginCall for posting release (ERR_OPEN_MARGIN_CALL); DEFAULTED MarginCall present for posting draw (ERR_POSTING_NOT_DRAWABLE)"
+    error_id: "ERR_MARKET_NOT_OPEN | ERR_GENERATOR_NOT_AVAILABLE | ERR_PARTICIPANT_SUSPENDED | ERR_STATEMENT_NOT_FINAL | ERR_OPEN_MARGIN_CALL | ERR_POSTING_NOT_DRAWABLE"
+    http_status: 409
+    applies_to: "offer create/submit/withdraw, dispute create, posting release/draw, generator decommission (ERR_GENERATOR_HAS_OPEN_COMMITMENTS)"
+  - priority: 9
+    category: business_referential
+    check: "Structural references: every disputed_line_id belongs to the disputed statement (ERR_LINE_NOT_IN_STATEMENT); telemetry operating_day_id names a real day (existence at 4) and consistency of ids in nested payloads"
+    error_id: ERR_LINE_NOT_IN_STATEMENT
+    http_status: 409
+    applies_to: "POST /market/statements/{statementId}/disputes"
+  - priority: 10
+    category: business_temporal
+    check: "Gate and window timing against the logical clock: offer submit at/before da_gate_close_at (ERR_DA_GATE_CLOSED); telemetry only while day DA_GATED (ERR_TELEMETRY_WINDOW_CLOSED); dispute at/before dispute_window_ends_at (ERR_DISPUTE_WINDOW_CLOSED)"
+    error_id: "ERR_DA_GATE_CLOSED | ERR_TELEMETRY_WINDOW_CLOSED | ERR_DISPUTE_WINDOW_CLOSED"
+    http_status: 409
+    applies_to: "offer submit, telemetry create, dispute create"
+  - priority: 11
+    category: business_constraint
+    check: "Uniqueness and overlap constraints: OperatingDay.market_date unique (ERR_OPERATING_DAY_EXISTS); at most one ACTIVE/AT_RISK obligation per (generator, delivery_period) (ERR_OBLIGATION_DUPLICATE_PERIOD); outage half-open overlap (ERR_OUTAGE_OVERLAP); performance-event closed-interval + 1h buffer (ERR_EVENT_BUFFER_VIOLATION); award window vs APPROVED outage overlap (ERR_AWARD_OVERLAPS_OUTAGE); offered_mw <= availability_mw (ERR_OFFER_MW_EXCEEDS_AVAILABILITY); run-day-ahead deck completeness (ERR_PRICE_DECK_INCOMPLETE); decommission open-commitment check is priority 8"
+    error_id: "ERR_OPERATING_DAY_EXISTS | ERR_OBLIGATION_DUPLICATE_PERIOD | ERR_OUTAGE_OVERLAP | ERR_EVENT_BUFFER_VIOLATION | ERR_AWARD_OVERLAPS_OUTAGE | ERR_OFFER_MW_EXCEEDS_AVAILABILITY | ERR_PRICE_DECK_INCOMPLETE"
+    http_status: 409
+    applies_to: "create/action endpoints as listed"
+  - priority: 12
+    category: business_fiscal
+    check: "Credit gates: offer submit projected effective_requirement (incl. this offer's risk) <= posted_collateral_cents (ERR_CREDIT_HEADROOM_EXCEEDED); posting release keeps posted_collateral_cents >= effective_requirement (ERR_COLLATERAL_SHORTFALL)"
+    error_id: "ERR_CREDIT_HEADROOM_EXCEEDED | ERR_COLLATERAL_SHORTFALL"
+    http_status: 409
+    applies_to: "offer submit, posting release"
+
+# =============================================================================
+# Global conventions (referenced by §1.5 list endpoints and §1.3 calcs)
+# =============================================================================
+conventions:
+  list_order: "Every GET list endpoint returns rows ordered by created_at ASC (stable; ties broken by insertion sequence)"
+  logical_clock: "All gate/window/deadline rules read the logical clock (POST /market/_clock/set_current_utc); startup default is exactly 2026-08-01T00:00:00Z"
+  statement_line_emission: "One SettlementLine per (generator × charge_type) with a NON-ZERO amount; zero-amount components emit no line; lines ordered created_at ASC"
+  statement_generation_input_set: "A PRELIMINARY/FINAL statement is generated per (participant, day) having at least one of: a CLEARED offer, an AWARDED ancillary award, or a capacity charge from an event COMPLETED on that day; telemetry alone (no cleared offer) produces no statement and is excluded from settlement"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Test-driving clock ---
+  - method: POST
+    path: "/market/_clock/set_current_utc"
+    description: "Set the logical clock used by every gate/window/deadline rule. Startup default is exactly 2026-08-01T00:00:00Z; before any set_current_utc call the clock reads this default and never falls back to wall-clock time"
+    roles: [IsoOperator]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["Availability recompute for generators with APPROVED outages (window entry/exit)"]
+
+  # --- MarketParticipant ---
+  - method: POST
+    path: "/market/participants"
+    description: "Register a market participant"
+    roles: [IsoOperator]
+    code: 201
+    input: [company_name, credit_rating_tier]
+    output: MarketParticipant
+    side_effects: ["status=ACTIVE, posted_collateral_cents=0, collateral_requirement_cents=0"]
+  - method: GET
+    path: "/market/participants/{participantId}"
+    description: "Get a market participant"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: MarketParticipant
+    side_effects: []
+  - method: POST
+    path: "/market/participants/{participantId}/evaluate-credit"
+    description: "Recompute collateral_requirement_cents and run credit_posture_evaluation (issue/cure/default margin calls)"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: MarketParticipant
+    side_effects: ["May create MarginCall; participant status transitions per credit_posture_evaluation"]
+
+  # --- GeneratorAsset ---
+  - method: POST
+    path: "/market/generators"
+    description: "Register a generator for a participant"
+    roles: [IsoOperator]
+    code: 201
+    input: [market_participant_id, unit_name, pricing_node, capacity_mw]
+    output: GeneratorAsset
+    side_effects: ["status=AVAILABLE, availability_mw=capacity_mw"]
+  - method: GET
+    path: "/market/generators/{generatorId}"
+    description: "Get a generator"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: GeneratorAsset
+    side_effects: []
+  - method: GET
+    path: "/market/generators"
+    description: "List generators"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["market_participant_id?", "status?"]
+    output: "GeneratorAsset[]"
+    side_effects: []
+  - method: POST
+    path: "/market/generators/{generatorId}/decommission"
+    description: "Decommission an AVAILABLE generator with no open commitments"
+    roles: [Trader]
+    code: 200
+    input: []
+    output: GeneratorAsset
+    side_effects: ["status → DECOMMISSIONED"]
+
+  # --- OperatingDay / market runs ---
+  - method: POST
+    path: "/market/operating-days"
+    description: "Create an operating day (market_date unique)"
+    roles: [IsoOperator]
+    code: 201
+    input: [market_date, da_gate_close_at]
+    output: OperatingDay
+    side_effects: ["status=DA_OPEN"]
+  - method: GET
+    path: "/market/operating-days/{operatingDayId}"
+    description: "Get an operating day"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: OperatingDay
+    side_effects: []
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/run-day-ahead-market"
+    description: "Gate the day, post DA price deck, run da_clearing"
+    roles: [IsoOperator]
+    code: 200
+    input: [node_prices]
+    output: OperatingDay
+    side_effects: ["PriceNode rows created", "Offers CLEARED / NOT_CLEARED / EXPIRED", "DA_GATED", "increments OperatingDay.version by 1"]
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/close-real-time"
+    description: "Close telemetry window and post preliminary RT prices"
+    roles: [IsoOperator]
+    code: 200
+    input: [rt_node_prices_prelim]
+    output: OperatingDay
+    side_effects: ["PriceNode rt_prelim components stored", "RT_COMPLETE", "increments OperatingDay.version by 1"]
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/run-preliminary-settlement"
+    description: "Generate PRELIMINARY statements (preliminary variants of settlement calcs)"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: OperatingDay
+    side_effects: ["PRELIMINARY SettlementStatement + SettlementLine rows", "AWARDED awards → SETTLED with revenue", "PRELIM_SETTLED", "increments OperatingDay.version by 1"]
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/run-final-settlement"
+    description: "Supersede preliminaries, issue FINAL statements (final variants), open 72h dispute windows, evaluate credit"
+    roles: [IsoOperator]
+    code: 200
+    input: [rt_node_prices_final]
+    output: OperatingDay
+    side_effects: ["PRELIMINARY → SUPERSEDED", "FINAL statements ISSUED with issued_at/dispute_window_ends_at", "credit_posture_evaluation per participant", "FINAL_SETTLED", "increments OperatingDay.version by 1"]
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/close"
+    description: "Close the operating day (all disputes must be resolved)"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: OperatingDay
+    side_effects: ["ISSUED statements → CLOSED", "CLOSED", "increments OperatingDay.version by 1"]
+  - method: GET
+    path: "/market/operating-days/{id}/price-nodes"
+    description: "List price nodes of a day (sub-resource of OperatingDay)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: "PriceNode[]"
+    side_effects: []
+
+  # --- DayAheadOffer ---
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/offers"
+    description: "Create a DRAFT day-ahead offer; supersedes any DRAFT/SUBMITTED offer of the same (generator, day); OCC-guarded on the day"
+    roles: [Trader]
+    code: 201
+    input: [generator_asset_id, offered_mw, offer_price_cents_per_mwh, expected_operating_day_version]
+    output: DayAheadOffer
+    side_effects: ["Prior DRAFT/SUBMITTED offer for same (generator, day) → SUPERSEDED", "increments OperatingDay.version by 1"]
+  - method: POST
+    path: "/market/offers/{offerId}/submit"
+    description: "Submit a DRAFT offer into the day-ahead market (validation chain per §1.4)"
+    roles: [Trader]
+    code: 200
+    input: []
+    output: DayAheadOffer
+    side_effects: ["DRAFT → SUBMITTED", "collateral_requirement recompute"]
+  - method: POST
+    path: "/market/offers/{offerId}/withdraw"
+    description: "Withdraw a SUBMITTED offer back to DRAFT while the day is DA_OPEN"
+    roles: [Trader]
+    code: 200
+    input: []
+    output: DayAheadOffer
+    side_effects: ["SUBMITTED → DRAFT", "collateral_requirement recompute"]
+  - method: GET
+    path: "/market/offers/{offerId}"
+    description: "Get an offer"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: DayAheadOffer
+    side_effects: []
+  - method: GET
+    path: "/market/offers"
+    description: "List offers (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["operating_day_id?", "generator_asset_id?", "status?"]
+    output: "DayAheadOffer[]"
+    side_effects: []
+
+  # --- RealTimeTelemetry ---
+  - method: POST
+    path: "/market/generators/{generatorId}/telemetry"
+    description: "Submit a batch of interval readings for one operating day; supersedes prior readings per (generator, day, interval); OCC-guarded on the generator"
+    roles: [Trader]
+    code: 201
+    input: [operating_day_id, readings, expected_generator_asset_version]
+    output: { recorded_count: integer, telemetry_ids: array }
+    side_effects: ["New rows RECORDED; conflicting prior rows → SUPERSEDED", "increments GeneratorAsset.version by 1"]
+  - method: GET
+    path: "/market/telemetry/{telemetryId}"
+    description: "Get a telemetry row"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: RealTimeTelemetry
+    side_effects: []
+  - method: GET
+    path: "/market/telemetry"
+    description: "List telemetry rows (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["generator_asset_id?", "operating_day_id?", "interval_index?"]
+    output: "RealTimeTelemetry[]"
+    side_effects: []
+
+  # --- OutageReport ---
+  - method: POST
+    path: "/market/generators/{generatorId}/outages"
+    description: "File an outage/derate report (SUBMITTED)"
+    roles: [Trader]
+    code: 201
+    input: [outage_type, derate_pct, start_at, end_at, reason]
+    output: OutageReport
+    side_effects: ["Overlap check vs same-generator outages in {SUBMITTED, ACKNOWLEDGED, APPROVED} (half-open)"]
+  - method: GET
+    path: "/market/outages/{outageId}"
+    description: "Get an outage report"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: OutageReport
+    side_effects: []
+  - method: GET
+    path: "/market/outages"
+    description: "List outage reports (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["generator_asset_id?", "status?"]
+    output: "OutageReport[]"
+    side_effects: []
+  - method: POST
+    path: "/market/outages/{outageId}/acknowledge"
+    description: "ISO acknowledges a submitted outage report"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: OutageReport
+    side_effects: ["SUBMITTED → ACKNOWLEDGED"]
+  - method: POST
+    path: "/market/outages/{outageId}/approve"
+    description: "ISO approves an acknowledged report; fires availability → obligation → credit cascade"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: OutageReport
+    side_effects: ["ACKNOWLEDGED → APPROVED", "availability_recompute", "obligation expected_output/AT_RISK recompute", "credit_posture_evaluation"]
+  - method: POST
+    path: "/market/outages/{outageId}/deny"
+    description: "ISO denies an acknowledged report"
+    roles: [IsoOperator]
+    code: 200
+    input: [denial_reason]
+    output: OutageReport
+    side_effects: ["ACKNOWLEDGED → DENIED"]
+  - method: POST
+    path: "/market/outages/{outageId}/resubmit"
+    description: "Resubmit a DENIED report with corrections (cycle back to SUBMITTED)"
+    roles: [Trader]
+    code: 200
+    input: ["derate_pct?", "start_at?", "end_at?", "reason?"]
+    output: OutageReport
+    side_effects: ["DENIED → SUBMITTED", "overlap re-check"]
+  - method: POST
+    path: "/market/outages/{outageId}/cancel"
+    description: "Cancel a report; cancelling APPROVED compensates the approval cascade"
+    roles: [Trader]
+    code: 200
+    input: []
+    output: OutageReport
+    side_effects: ["{SUBMITTED, ACKNOWLEDGED, APPROVED} → CANCELLED", "if APPROVED: availability restored, obligations recomputed, credit re-evaluated"]
+
+  # --- SettlementStatement / SettlementLine ---
+  - method: GET
+    path: "/market/statements/{statementId}"
+    description: "Get a settlement statement"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: SettlementStatement
+    side_effects: []
+  - method: GET
+    path: "/market/statements"
+    description: "List settlement statements (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["market_participant_id?", "operating_day_id?", "status?", "run_type?", "supersedes_statement_id?"]
+    output: "SettlementStatement[]"
+    side_effects: []
+  - method: GET
+    path: "/market/statements/{statementId}/lines"
+    description: "List lines of a statement"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: "SettlementLine[]"
+    side_effects: []
+  - method: GET
+    path: "/market/lines/{lineId}"
+    description: "Get a settlement line"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: SettlementLine
+    side_effects: []
+  - method: GET
+    path: "/market/lines"
+    description: "List settlement lines (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["settlement_statement_id?", "generator_asset_id?", "charge_type?"]
+    output: "SettlementLine[]"
+    side_effects: []
+
+  # --- SettlementDispute ---
+  - method: POST
+    path: "/market/statements/{statementId}/disputes"
+    description: "File a dispute against a FINAL/RESETTLEMENT statement within its dispute window"
+    roles: [SettlementAnalyst]
+    code: 201
+    input: [dispute_reason, disputed_line_ids]
+    output: SettlementDispute
+    side_effects: ["Dispute FILED", "statement ISSUED → UNDER_DISPUTE"]
+  - method: GET
+    path: "/market/disputes/{disputeId}"
+    description: "Get a dispute"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: SettlementDispute
+    side_effects: []
+  - method: GET
+    path: "/market/disputes"
+    description: "List disputes (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["settlement_statement_id?", "market_participant_id?", "status?"]
+    output: "SettlementDispute[]"
+    side_effects: []
+  - method: POST
+    path: "/market/disputes/{disputeId}/start-review"
+    description: "ISO starts reviewing a filed dispute"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: SettlementDispute
+    side_effects: ["FILED → UNDER_REVIEW"]
+  - method: POST
+    path: "/market/disputes/{disputeId}/resolve"
+    description: "ISO resolves a dispute; UPHELD creates a RESETTLEMENT statement and re-evaluates credit"
+    roles: [IsoOperator]
+    code: 200
+    input: [outcome]
+    output: SettlementDispute
+    side_effects: ["UPHELD: old statement SUPERSEDED, RESETTLEMENT statement ISSUED per resettlement_recompute, credit re-evaluated", "REJECTED: statement → ISSUED"]
+  - method: POST
+    path: "/market/disputes/{disputeId}/withdraw"
+    description: "Filer withdraws a FILED dispute"
+    roles: [SettlementAnalyst]
+    code: 200
+    input: []
+    output: SettlementDispute
+    side_effects: ["FILED → WITHDRAWN", "statement → ISSUED"]
+
+  # --- AncillaryServiceAward ---
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/awards"
+    description: "Award ancillary service to a generator for a window of the operating day"
+    roles: [IsoOperator]
+    code: 201
+    input: [generator_asset_id, service_type, awarded_mw, capacity_price_cents, "performance_price_cents?", "mileage_ratio?", start_interval, end_interval]
+    output: AncillaryServiceAward
+    side_effects: ["status AWARDED", "day must be DA_OPEN or DA_GATED (ERR_MARKET_NOT_OPEN)", "award window must not intersect any APPROVED outage of the generator (ERR_AWARD_OVERLAPS_OUTAGE)"]
+  - method: GET
+    path: "/market/awards/{awardId}"
+    description: "Get an award"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: AncillaryServiceAward
+    side_effects: []
+  - method: GET
+    path: "/market/awards"
+    description: "List awards (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["generator_asset_id?", "operating_day_id?", "status?"]
+    output: "AncillaryServiceAward[]"
+    side_effects: []
+  - method: POST
+    path: "/market/awards/{awardId}/cancel"
+    description: "Cancel an award before preliminary settlement"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: AncillaryServiceAward
+    side_effects: ["AWARDED → CANCELLED"]
+
+  # --- CapacityObligation ---
+  - method: POST
+    path: "/market/obligations"
+    description: "Create a capacity obligation for a generator and delivery period"
+    roles: [IsoOperator]
+    code: 201
+    input: [generator_asset_id, delivery_period, obligated_mw, capacity_rate_cents_per_mw]
+    output: CapacityObligation
+    side_effects: ["status ACTIVE; expected_output_mw = min(obligated_mw, availability_mw); immediate AT_RISK recompute if derated"]
+  - method: GET
+    path: "/market/obligations/{obligationId}"
+    description: "Get an obligation"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: CapacityObligation
+    side_effects: []
+  - method: GET
+    path: "/market/obligations"
+    description: "List obligations (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["generator_asset_id?", "status?"]
+    output: "CapacityObligation[]"
+    side_effects: []
+  - method: POST
+    path: "/market/obligations/{obligationId}/close"
+    description: "Close an obligation; runs capacity_stop_loss_close"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: CapacityObligation
+    side_effects: ["→ CLOSED", "gross_revenue_cents / charged_penalty_cents / forgiven_penalty_cents fixed", "credit re-evaluation"]
+
+  # --- CapacityPerformanceEvent ---
+  - method: POST
+    path: "/market/operating-days/{operatingDayId}/performance-events"
+    description: "Declare a capacity performance event (closed interval; 1h buffer vs sibling events)"
+    roles: [IsoOperator]
+    code: 201
+    input: [start_interval, end_interval]
+    output: CapacityPerformanceEvent
+    side_effects: ["status DECLARED"]
+  - method: GET
+    path: "/market/events/{eventId}"
+    description: "Get an event"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: CapacityPerformanceEvent
+    side_effects: []
+  - method: GET
+    path: "/market/events"
+    description: "List events (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["operating_day_id?", "status?"]
+    output: "CapacityPerformanceEvent[]"
+    side_effects: []
+  - method: POST
+    path: "/market/events/{eventId}/activate"
+    description: "Activate a declared event"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: CapacityPerformanceEvent
+    side_effects: ["DECLARED → ACTIVE"]
+  - method: POST
+    path: "/market/events/{eventId}/complete"
+    description: "Complete an active event; runs capacity_performance_charge"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: CapacityPerformanceEvent
+    side_effects: ["ACTIVE → COMPLETED", "penalties/bonuses computed and accrued to obligations", "penalties_collected_cents / bonuses_paid_cents set", "credit_posture_evaluation per affected participant"]
+
+  # --- CollateralPosting ---
+  - method: POST
+    path: "/market/participants/{participantId}/postings"
+    description: "Post collateral (cash or letter of credit)"
+    roles: [CreditOfficer]
+    code: 201
+    input: [amount_cents, instrument_type]
+    output: CollateralPosting
+    side_effects: ["status POSTED", "posted_collateral_cents += amount_cents", "credit_posture_evaluation (may CURE an OPEN margin call)"]
+  - method: GET
+    path: "/market/postings/{postingId}"
+    description: "Get a posting"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: CollateralPosting
+    side_effects: []
+  - method: GET
+    path: "/market/postings"
+    description: "List postings (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["market_participant_id?", "status?"]
+    output: "CollateralPosting[]"
+    side_effects: []
+  - method: POST
+    path: "/market/postings/{postingId}/release"
+    description: "Release a posting back to the participant (no OPEN margin call; sufficiency preserved)"
+    roles: [CreditOfficer]
+    code: 200
+    input: []
+    output: CollateralPosting
+    side_effects: ["POSTED → RELEASED", "posted_collateral_cents -= amount_cents", "credit_posture_evaluation"]
+  - method: POST
+    path: "/market/postings/{postingId}/draw"
+    description: "ISO draws on a posting to cover a defaulted participant's ISSUED statements (waterfall oldest-first)"
+    roles: [IsoOperator]
+    code: 200
+    input: []
+    output: CollateralPosting
+    side_effects: ["POSTED → DRAWN", "posted_collateral_cents -= amount_cents", "statement paid_cents waterfall (issued_at ASC, tie created_at ASC); fully covered → PAID"]
+
+  # --- MarginCall ---
+  - method: GET
+    path: "/market/margin-calls/{marginCallId}"
+    description: "Get a margin call"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: []
+    output: MarginCall
+    side_effects: []
+  - method: GET
+    path: "/market/margin-calls"
+    description: "List margin calls (filtered)"
+    roles: [Trader, SettlementAnalyst, CreditOfficer, IsoOperator]
+    code: 200
+    input: ["market_participant_id?", "status?"]
+    output: "MarginCall[]"
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing, malformed, or names an undeclared role" }
+  - { id: ERR_FORBIDDEN_FOR_ROLE, http: 403, condition: "Caller role is not in the endpoint's role list (e.g. Trader runs a market run; IsoOperator submits an offer; SettlementAnalyst posts collateral)" }
+  # --- request / existence ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, unknown field, enum outside declared set, non-positive amount, interval outside 1..24, start >= end, REGULATION award missing performance_price_cents/mileage_ratio, draw amount exceeds uncovered statement total" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path or body-referenced id does not exist" }
+  # --- ownership / OCC ---
+  - { id: ERR_OWNERSHIP_VIOLATION, http: 403, condition: "Participant-scoped role acts on a resource owned by a different MarketParticipant" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_operating_day_version != current OperatingDay.version on offer create" }
+  - { id: ERR_STALE_ASSET_VERSION, http: 412, condition: "expected_generator_asset_version != current GeneratorAsset.version on telemetry submit" }
+  # --- state ---
+  - { id: ERR_INVALID_STATE_TRANSITION, http: 409, condition: "Path-target resource not in a from-state that permits the trigger (incl. terminal-state lockdown and day-epoch ordering violations)" }
+  - { id: ERR_DISPUTE_ALREADY_OPEN, http: 409, condition: "A dispute of the same statement is already in FILED or UNDER_REVIEW" }
+  - { id: ERR_MARKET_NOT_OPEN, http: 409, condition: "Offer create/submit/withdraw or award create while OperatingDay.status is not DA_OPEN (awards also allowed while DA_GATED)" }
+  - { id: ERR_GENERATOR_NOT_AVAILABLE, http: 409, condition: "Offer create/submit references a generator whose status is ON_OUTAGE or DECOMMISSIONED" }
+  - { id: ERR_PARTICIPANT_SUSPENDED, http: 409, condition: "Offer submit while the owning participant is SUSPENDED" }
+  - { id: ERR_STATEMENT_NOT_FINAL, http: 409, condition: "Dispute filed against a statement whose run_type is PRELIMINARY" }
+  - { id: ERR_OPEN_MARGIN_CALL, http: 409, condition: "Posting release while the participant has an OPEN margin call" }
+  - { id: ERR_POSTING_NOT_DRAWABLE, http: 409, condition: "Draw attempted while the participant has no DEFAULTED margin call" }
+  - { id: ERR_GENERATOR_HAS_OPEN_COMMITMENTS, http: 409, condition: "Decommission with offers in {DRAFT, SUBMITTED}, outages in {SUBMITTED, ACKNOWLEDGED, APPROVED}, or obligations in {ACTIVE, AT_RISK}" }
+  - { id: ERR_UNRESOLVED_DISPUTES, http: 409, condition: "Operating day close while any statement of the day is UNDER_DISPUTE" }
+  # --- temporal ---
+  - { id: ERR_DA_GATE_CLOSED, http: 409, condition: "Offer submit with logical now strictly after OperatingDay.da_gate_close_at (at exactly gate close is accepted)" }
+  - { id: ERR_TELEMETRY_WINDOW_CLOSED, http: 409, condition: "Telemetry submit while the operating day is not DA_GATED" }
+  - { id: ERR_DISPUTE_WINDOW_CLOSED, http: 409, condition: "Dispute filed with logical now strictly after dispute_window_ends_at (at exactly window end is accepted)" }
+  # --- constraint ---
+  - { id: ERR_OPERATING_DAY_EXISTS, http: 409, condition: "An OperatingDay with the same market_date already exists" }
+  - { id: ERR_OBLIGATION_DUPLICATE_PERIOD, http: 409, condition: "An obligation in {ACTIVE, AT_RISK} already exists for this (generator, delivery_period)" }
+  - { id: ERR_OUTAGE_OVERLAP, http: 409, condition: "New/resubmitted outage's half-open [start_at, end_at) intersects a same-generator outage in {SUBMITTED, ACKNOWLEDGED, APPROVED}; adjacency (start == other end) is allowed" }
+  - { id: ERR_EVENT_BUFFER_VIOLATION, http: 409, condition: "Performance event's closed interval fails the 1-hour buffer rule against a sibling event in {DECLARED, ACTIVE, COMPLETED} on the same day: accepted only if (new.start_interval >= existing.end_interval + 2) OR (existing.start_interval >= new.end_interval + 2) for every sibling — one full gap interval is mandatory; direct adjacency is a violation" }
+  - { id: ERR_AWARD_OVERLAPS_OUTAGE, http: 409, condition: "Award's closed interval window intersects (on interval granularity) an APPROVED outage window of the same generator on that day" }
+  - { id: ERR_OFFER_MW_EXCEEDS_AVAILABILITY, http: 409, condition: "offered_mw > generator.availability_mw at submit" }
+  - { id: ERR_PRICE_DECK_INCOMPLETE, http: 409, condition: "run-day-ahead-market deck lacks a node entry for the pricing_node of a SUBMITTED offer" }
+  # --- fiscal ---
+  - { id: ERR_CREDIT_HEADROOM_EXCEEDED, http: 409, condition: "Offer submit would push effective_requirement above posted_collateral_cents" }
+  - { id: ERR_COLLATERAL_SHORTFALL, http: 409, condition: "Posting release would leave posted_collateral_cents strictly below effective_requirement (equality allowed)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix — segregation_of_duties: the three participant-side roles
+# are disjoint functions; an organization MUST assign them to different
+# operators. IsoOperator holds all market-authority functions and none of the
+# participant-side ones.
+# =============================================================================
+roles:
+  - name: Trader
+    description: "Participant-side trading/operations desk: day-ahead offers, meter telemetry, outage reports, generator decommission"
+    identity: "entity_backed:MarketParticipant"
+    exclusive_operations:
+      - "POST /market/operating-days/{operatingDayId}/offers"
+      - "POST /market/offers/{offerId}/submit"
+      - "POST /market/offers/{offerId}/withdraw"
+      - "POST /market/generators/{generatorId}/telemetry"
+      - "POST /market/generators/{generatorId}/outages"
+      - "POST /market/outages/{outageId}/resubmit"
+      - "POST /market/outages/{outageId}/cancel"
+      - "POST /market/generators/{generatorId}/decommission"
+    shared_operations:
+      - "All GET /market/** read endpoints"
+  - name: SettlementAnalyst
+    description: "Participant-side settlement assurance: validates statements and files/withdraws disputes; may NOT trade or move collateral"
+    identity: "entity_backed:MarketParticipant"
+    exclusive_operations:
+      - "POST /market/statements/{statementId}/disputes"
+      - "POST /market/disputes/{disputeId}/withdraw"
+    shared_operations:
+      - "All GET /market/** read endpoints"
+  - name: CreditOfficer
+    description: "Participant-side treasury: posts and releases collateral; may NOT trade or file disputes"
+    identity: "entity_backed:MarketParticipant"
+    exclusive_operations:
+      - "POST /market/participants/{participantId}/postings"
+      - "POST /market/postings/{postingId}/release"
+    shared_operations:
+      - "All GET /market/** read endpoints"
+  - name: IsoOperator
+    description: "Market authority: registers participants/generators, runs the market and settlement epochs, adjudicates outages and disputes, manages awards/obligations/events, draws collateral, sets the logical clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /market/_clock/set_current_utc"
+      - "POST /market/participants"
+      - "POST /market/participants/{participantId}/evaluate-credit"
+      - "POST /market/generators"
+      - "POST /market/operating-days"
+      - "POST /market/operating-days/{operatingDayId}/run-day-ahead-market"
+      - "POST /market/operating-days/{operatingDayId}/close-real-time"
+      - "POST /market/operating-days/{operatingDayId}/run-preliminary-settlement"
+      - "POST /market/operating-days/{operatingDayId}/run-final-settlement"
+      - "POST /market/operating-days/{operatingDayId}/close"
+      - "POST /market/outages/{outageId}/acknowledge"
+      - "POST /market/outages/{outageId}/approve"
+      - "POST /market/outages/{outageId}/deny"
+      - "POST /market/disputes/{disputeId}/start-review"
+      - "POST /market/disputes/{disputeId}/resolve"
+      - "POST /market/operating-days/{operatingDayId}/awards"
+      - "POST /market/awards/{awardId}/cancel"
+      - "POST /market/obligations"
+      - "POST /market/obligations/{obligationId}/close"
+      - "POST /market/operating-days/{operatingDayId}/performance-events"
+      - "POST /market/events/{eventId}/activate"
+      - "POST /market/events/{eventId}/complete"
+      - "POST /market/postings/{postingId}/draw"
+    shared_operations:
+      - "All GET /market/** read endpoints"
+
+
+
+

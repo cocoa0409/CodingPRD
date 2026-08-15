@@ -1,0 +1,1383 @@
+# =============================================================================
+# PRD Benchmark Scaffold: Warming & Cooling Center Operations (community shelter)
+# =============================================================================
+
+scenario: |
+  Warming & Cooling Center Operations (community shelter): activation trigger by temperature/heat index & duration, site network & capacity per facility, staffing/volunteer roster & overnight coverage, guest intake with minimal barriers & pet/belonging policy, transportation to sites & outreach to unsheltered residents, meal/supply provisioning & partner donations, medical/behavioral escalation protocol, deactivation & after-action reporting
+
+domain_name: warming-cooling-center-ops
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: quota_allocation        # beds / pet slots / lockers / van seats: reserved, committed, released
+  secondary_archetype: posture_driven_gating # Episode + SiteActivation lifecycle gates all child operations
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Episode.version (extensions) and Site.version (capacity amend)
+    - cascading_side_effects                 # deactivation cascade: Episode -> SiteActivation -> GuestStay -> TransportDispatch
+    - rate_threshold_triggers                # sustained temperature/heat-index breach with gap tolerance
+    - ops_run_checkpoint                     # run-ops sweep: shift completion, no-show expiry, deactivation readiness
+  entity_topology: graph                     # junction entities (GuestStay, Shift) link Guest/StaffMember into Episode/SiteActivation web
+  state_machine_shape: cyclic                # Episode STANDBY<->ACTIVATING and ACTIVE<->DEACTIVATING loops; GuestStay branches
+  relationship_patterns: [one_to_many, many_to_many, cross_aggregate]
+  role_model: segregation_of_duties          # reporter != resolver; activator != approver; shift staff != confirmer
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Episode
+    parent: null
+    common_fields: true
+    fields:
+      - { name: mode, type: enum, source: input, description: "WARMING | COOLING — selects breach metric (WARMING: temp_f <= threshold_f; COOLING: heat_index_f >= threshold_f)" }
+      - { name: threshold_f, type: number, source: input, description: "Breach threshold in Fahrenheit; inclusive on both modes" }
+      - { name: sustained_hours_required, type: integer, source: input, description: "Consecutive breach minutes >= sustained_hours_required*60 arms the trigger", constraints: ">= 1" }
+      - { name: scheduled_end_at, type: datetime, source: input, description: "Planned episode end; mutable only via extensions" }
+      - { name: status, type: enum, source: system, description: "STANDBY | ACTIVATING | ACTIVE | DEACTIVATING | DEACTIVATED | CLOSED" }
+      - { name: trigger_met, type: boolean, source: computed, description: "Live output of breach_run_evaluation; true while current breach run >= required minutes" }
+      - { name: breach_run_minutes, type: integer, source: computed, description: "Length in minutes of the current qualifying breach run (0 when no live run)" }
+      - { name: activated_at, type: datetime, source: system, description: "Logical-clock timestamp of ACTIVATING -> ACTIVE; null until first activation" }
+      - { name: activated_by_user_id, type: string, source: system, description: "X-User-ID captured on the activate call; used for AAR approval segregation-of-duties" }
+      - { name: deactivated_at, type: datetime, source: system, description: "Logical-clock timestamp of ACTIVE -> DEACTIVATING; null until deactivation begins" }
+      - { name: extension_count, type: integer, source: system, default: 0, description: "Number of successful extensions applied" }
+      - { name: ops_run_index, type: integer, source: system, default: 0, description: "Monotone counter incremented by each run-ops sweep" }
+
+  - name: WeatherReading
+    parent: Episode
+    common_fields: false   # append-only event log: id + created_at only; no update endpoint, no version
+    fields:
+      - { name: episode_id, type: string, source: system, description: "FK -> Episode.id; owning episode" }
+      - { name: observed_at, type: datetime, source: input, description: "When the observation was taken; evaluation orders by observed_at ASC, tie-break created_at ASC" }
+      - { name: temp_f, type: number, source: input, description: "Observed air temperature Fahrenheit" }
+      - { name: heat_index_f, type: number, source: input, description: "Observed heat index Fahrenheit" }
+      - { name: source, type: enum, source: input, default: "MANUAL", description: "NWS | MANUAL" }
+
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility name" }
+      - { name: address, type: string, source: input, description: "Street address" }
+      - { name: bed_capacity, type: integer, source: input, description: "Total guest beds", constraints: ">= 0" }
+      - { name: pet_capacity, type: integer, source: input, description: "Kennel slots for guest pets", constraints: ">= 0" }
+      - { name: locker_capacity, type: integer, source: input, description: "Belonging storage bins", constraints: ">= 0" }
+
+  - name: SiteActivation
+    parent: Episode
+    common_fields: true
+    fields:
+      - { name: episode_id, type: string, source: system, description: "FK -> Episode.id; owning episode" }
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id; facility being activated" }
+      - { name: capacity_override, type: integer, source: input, description: "Optional episode-specific bed cap; when present, beds_effective pins this instead of Site.bed_capacity", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "OPENING | OPEN | DRAINING | CLOSED" }
+      - { name: beds_effective, type: integer, source: computed, description: "Bed cap pinned at OPEN: capacity_override if set else Site.bed_capacity at that moment (version-pinned; later Site PATCH does not retro-change it)" }
+      - { name: occupied_beds, type: integer, source: computed, description: "Count of GuestStay at this activation with status CHECKED_IN" }
+      - { name: reserved_beds, type: integer, source: computed, description: "Count of GuestStay at this activation with status RESERVED" }
+      - { name: beds_free, type: integer, source: computed, description: "= beds_effective - occupied_beds - reserved_beds" }
+      - { name: pet_slots_free, type: integer, source: computed, description: "= Site.pet_capacity - sum(pet_slots_used over stays with status IN {RESERVED, CHECKED_IN})" }
+      - { name: lockers_free, type: integer, source: computed, description: "= Site.locker_capacity - sum(lockers_used over stays with status IN {RESERVED, CHECKED_IN})" }
+      - { name: overnight_coverage_gap_minutes, type: integer, source: computed, description: "Uncovered minutes of tonight's overnight window [22:00, 06:00+1d) by CONFIRMED shifts (see overnight_coverage_gap)" }
+      - { name: lead_coverage_ok, type: boolean, source: computed, description: "True iff some CONFIRMED shift with role_on_shift == SITE_LEAD fully contains tonight's overnight window" }
+      - { name: meal_stock_on_hand, type: integer, source: computed, description: "RECEIVED MEAL donation units minus served_count of SERVED meal services at this activation" }
+      - { name: meal_stock_projected, type: integer, source: computed, description: "= meal_stock_on_hand + quantity of PLEDGED MEAL donations at this activation" }
+      - { name: opened_at, type: datetime, source: system, description: "Logical-clock timestamp of first entry into OPEN; null until opened" }
+
+  - name: StaffMember
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Roster display name" }
+      - { name: skills, type: array, source: input, description: "Array of enum: INTAKE | MEDICAL | OUTREACH | SITE_LEAD | DRIVER" }
+      - { name: active, type: boolean, source: input, default: true, description: "Inactive staff cannot be assigned new shifts" }
+
+  - name: Shift
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: system, description: "FK -> SiteActivation.id; activation being staffed" }
+      - { name: staff_member_id, type: string, source: input, description: "FK -> StaffMember.id; person working the shift" }
+      - { name: role_on_shift, type: enum, source: input, description: "INTAKE | MEDICAL | OUTREACH | SITE_LEAD | GENERAL" }
+      - { name: start_at, type: datetime, source: input, description: "Half-open window start (inclusive)" }
+      - { name: end_at, type: datetime, source: input, description: "Half-open window end (exclusive); must be > start_at" }
+      - { name: status, type: enum, source: system, description: "PLANNED | CONFIRMED | COMPLETED | CANCELLED" }
+
+  - name: Guest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: alias, type: string, source: input, description: "Minimal-barrier identifier; no legal name or ID is ever required" }
+      - { name: has_pets, type: boolean, source: input, default: false, description: "Guest arrives with pets" }
+      - { name: pet_count, type: integer, source: input, default: 0, description: "Number of pets; must be 0 when has_pets is false", constraints: ">= 0" }
+      - { name: bag_count, type: integer, source: input, default: 0, description: "Belonging bags; each stay pins lockers_used = ceil(bag_count / 2)", constraints: ">= 0" }
+      - { name: medical_flag, type: boolean, source: input, default: false, description: "Self-declared medical vulnerability" }
+      - { name: medical_hold_active, type: boolean, source: computed, default: false, description: "True while any MEDICAL incident for this guest is ESCALATED and not RESOLVED" }
+
+  - name: GuestStay
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: system, description: "FK -> SiteActivation.id; where the guest is staying" }
+      - { name: guest_id, type: string, source: input, description: "FK -> Guest.id; who is staying" }
+      - { name: transport_dispatch_id, type: string, source: system, description: "FK -> TransportDispatch.id; set when the stay was created by a dispatch reservation, null for walk-ins" }
+      - { name: status, type: enum, source: system, description: "RESERVED | CHECKED_IN | CHECKED_OUT | NO_SHOW | CANCELLED | TRANSFERRED_OUT" }
+      - { name: pet_slots_used, type: integer, source: system, default: 0, description: "Pinned at intake = Guest.pet_count at that moment" }
+      - { name: lockers_used, type: integer, source: system, default: 0, description: "Pinned at intake = ceil(Guest.bag_count / 2)" }
+      - { name: checked_in_at, type: datetime, source: system, description: "Logical-clock timestamp of entering CHECKED_IN; null until checked in" }
+      - { name: checked_out_at, type: datetime, source: system, description: "Logical-clock timestamp of leaving CHECKED_IN; null until checkout/eject/transfer" }
+      - { name: bed_nights_provisional, type: integer, source: computed, description: "Midnights crossed while CHECKED_IN plus 1 extra if still CHECKED_IN now (provisional variant of bed_nights)" }
+      - { name: bed_nights_final, type: integer, source: computed, description: "Final variant of bed_nights: count of 00:00Z boundaries M with checked_in_at < M <= checked_out_at; null while still CHECKED_IN" }
+      - { name: transfer_sequence, type: integer, source: system, default: 0, description: "0 for the original stay; each transfer creates the successor stay with transfer_sequence + 1" }
+
+  - name: Vehicle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: label, type: string, source: input, description: "Vehicle call sign" }
+      - { name: seats, type: integer, source: input, description: "Passenger seats available for guests", constraints: ">= 1" }
+      - { name: turnaround_minutes, type: integer, source: input, default: 30, description: "Mandatory buffer around each assigned dispatch window on this vehicle", constraints: ">= 0" }
+
+  - name: TransportDispatch
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: input, description: "FK -> SiteActivation.id; destination activation" }
+      - { name: vehicle_id, type: string, source: system, description: "FK -> Vehicle.id; null until assign" }
+      - { name: requested_by_user_id, type: string, source: system, description: "X-User-ID of the creating OutreachWorker" }
+      - { name: guest_ids, type: array, source: input, description: "Array of FK -> Guest.id; riders to pick up (>= 1)" }
+      - { name: pickup_window_start, type: datetime, source: input, description: "Half-open pickup window start (inclusive)" }
+      - { name: pickup_window_end, type: datetime, source: input, description: "Half-open pickup window end (exclusive); must be > pickup_window_start" }
+      - { name: has_pets, type: boolean, source: input, default: false, description: "Whether the rider group includes pets" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | ASSIGNED | ARRIVED | CANCELLED" }
+      - { name: reserved_bed_count, type: integer, source: system, default: 0, description: "Beds held at the destination = number of its stays still RESERVED" }
+      - { name: arrived_at, type: datetime, source: system, description: "Logical-clock timestamp of ASSIGNED -> ARRIVED; basis for no-show grace; null until arrival" }
+
+  - name: Donation
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: system, description: "FK -> SiteActivation.id; receiving activation" }
+      - { name: partner_name, type: string, source: input, description: "Donating partner organization" }
+      - { name: category, type: enum, source: input, description: "MEAL | WATER | BEDDING | HYGIENE | PET_SUPPLIES" }
+      - { name: quantity, type: integer, source: input, description: "Units donated (MEAL unit = one meal)", constraints: ">= 1" }
+      - { name: status, type: enum, source: system, description: "PLEDGED | RECEIVED" }
+
+  - name: MealService
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: system, description: "FK -> SiteActivation.id; activation serving the meal" }
+      - { name: service_date, type: datetime, source: input, description: "Calendar date of service (time component ignored)" }
+      - { name: meal_period, type: enum, source: input, description: "BREAKFAST | LUNCH | DINNER" }
+      - { name: planned_meals, type: integer, source: computed, description: "Pinned at creation = ceil((occupied_beds + reserved_beds at creation) * period buffer); see meal_planned_rounding" }
+      - { name: served_count, type: integer, source: input, description: "Meals actually served; set by serve", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "PLANNED | SERVED" }
+
+  - name: Incident
+    parent: SiteActivation
+    common_fields: true
+    fields:
+      - { name: site_activation_id, type: string, source: input, description: "FK -> SiteActivation.id; where the incident occurred" }
+      - { name: guest_id, type: string, source: input, description: "FK -> Guest.id; involved guest, optional" }
+      - { name: kind, type: enum, source: input, description: "MEDICAL | BEHAVIORAL — selects the resolver role (MEDICAL: MedicalResponder; BEHAVIORAL: SiteLead)" }
+      - { name: severity, type: integer, source: input, description: "1 | 2 | 3", constraints: "1..3" }
+      - { name: reporter_user_id, type: string, source: system, description: "X-User-ID of the reporting user; resolver must differ (segregation of duties)" }
+      - { name: status, type: enum, source: system, description: "REPORTED | ESCALATED | RESOLVED" }
+      - { name: resolved_by_user_id, type: string, source: system, description: "X-User-ID of the resolver; null until resolved" }
+      - { name: resolution_note, type: string, source: input, description: "Free-text resolution summary captured by resolve" }
+
+  - name: AfterActionReport
+    parent: Episode
+    common_fields: true
+    fields:
+      - { name: episode_id, type: string, source: system, description: "FK -> Episode.id; reported episode (at most one report per episode)" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SUBMITTED | APPROVED" }
+      - { name: total_unique_guests, type: integer, source: computed, description: "Count of distinct guest_id over all stays of the episode, any status" }
+      - { name: total_bed_nights, type: integer, source: computed, description: "Sum of bed_nights_final over all stays of the episode (final variant only)" }
+      - { name: meals_served, type: integer, source: computed, description: "Sum of served_count over SERVED MealService of the episode" }
+      - { name: incidents_by_severity, type: object, source: computed, description: 'Map {"1": n, "2": n, "3": n} counting all Incidents of the episode by severity' }
+      - { name: transports_arrived, type: integer, source: computed, description: "Count of TransportDispatch of the episode with status ARRIVED" }
+      - { name: submitted_by_user_id, type: string, source: system, description: "X-User-ID of submitter; null until submitted" }
+      - { name: approved_by_user_id, type: string, source: system, description: "X-User-ID of approver; must differ from Episode.activated_by_user_id; null until approved" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Episode
+    initial_state: STANDBY
+    terminal_states: [CLOSED]
+    transitions:
+      - from: STANDBY
+        to: ACTIVATING
+        trigger: "POST /api/episodes/{episode_id}/evaluate"
+        actor: EOCManager
+        preconditions:
+          - "trigger_met == true at evaluation time (breach_run_evaluation)"
+        side_effects:
+          - "No field mutation besides status and updated_at/version"
+      - from: ACTIVATING
+        to: STANDBY
+        trigger: "POST /api/episodes/{episode_id}/evaluate"
+        actor: EOCManager
+        preconditions:
+          - "trigger_met == false at evaluation time (breach run reset by a non-breach reading or an over-gap)"
+        side_effects:
+          - "Stand-down: no other entity is mutated"
+        note: "Cycle 1: STANDBY -> ACTIVATING -> STANDBY may repeat indefinitely"
+      - from: ACTIVATING
+        to: ACTIVE
+        trigger: "POST /api/episodes/{episode_id}/activate"
+        actor: EOCManager
+        preconditions:
+          - "trigger_met == true at activation time (ERR_TRIGGER_NOT_MET)"
+          - "At least one SiteActivation of this episode exists with status IN {OPENING, OPEN} (ERR_NO_SITES_DESIGNATED)"
+        side_effects:
+          - "activated_at = logical clock now (first activation only; reactivations keep the original)"
+          - "activated_by_user_id = X-User-ID of the caller (first activation only)"
+      - from: ACTIVE
+        to: DEACTIVATING
+        trigger: "POST /api/episodes/{episode_id}/deactivate"
+        actor: EOCManager
+        preconditions: []
+        side_effects:
+          - "deactivated_at = logical clock now"
+          - "CASCADE L1: each SiteActivation of this episode with status OPEN -> DRAINING, processed in created_at ASC order; each with status OPENING -> CLOSED (with its own close side effects)"
+          - "CASCADE L2 (from each OPEN -> DRAINING mutation): every GuestStay of that activation with status RESERVED -> CANCELLED, in created_at ASC order, releasing its bed/pet/locker usage"
+          - "CASCADE L3 (from each RESERVED -> CANCELLED mutation where transport_dispatch_id is set): the linked TransportDispatch.reserved_bed_count decrements by 1; if that mutation drops it to 0 and the dispatch status is ASSIGNED, the dispatch -> CANCELLED"
+      - from: DEACTIVATING
+        to: ACTIVE
+        trigger: "POST /api/episodes/{episode_id}/evaluate"
+        actor: EOCManager
+        preconditions:
+          - "trigger_met == true at evaluation time"
+        side_effects:
+          - "Re-surge: each SiteActivation of this episode with status DRAINING -> OPEN, in created_at ASC order (already-CANCELLED stays are NOT resurrected; CLOSED activations stay CLOSED)"
+        note: "Cycle 2: ACTIVE -> DEACTIVATING -> ACTIVE on weather re-breach during drain"
+      - from: DEACTIVATING
+        to: DEACTIVATED
+        trigger: "system (during POST run-ops sweep, or immediately when the last non-CLOSED SiteActivation closes)"
+        actor: system
+        preconditions:
+          - "Every SiteActivation of this episode has status == CLOSED"
+        side_effects: []
+      - from: DEACTIVATED
+        to: CLOSED
+        trigger: "system (side effect of POST /api/after-action-reports/{aar_id}/approve)"
+        actor: system
+        preconditions:
+          - "The episode's AfterActionReport transitioned SUBMITTED -> APPROVED"
+        side_effects: []
+
+  - entity: SiteActivation
+    initial_state: OPENING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPENING
+        to: OPEN
+        trigger: "POST /api/site-activations/{site_activation_id}/open"
+        actor: SiteLead
+        preconditions:
+          - "Episode of this activation has status == ACTIVE (ERR_EPISODE_NOT_ACTIVE)"
+          - "overnight_coverage_gap_minutes == 0 (ERR_OVERNIGHT_COVERAGE_GAP)"
+          - "lead_coverage_ok == true (ERR_LEAD_COVERAGE_MISSING)"
+          - "beds_effective >= 1 (ERR_VALIDATION)"
+        side_effects:
+          - "beds_effective is pinned now: capacity_override if set, else Site.bed_capacity at this moment"
+          - "opened_at = logical clock now (first open only)"
+      - from: DRAINING
+        to: OPEN
+        trigger: "system (Episode DEACTIVATING -> ACTIVE re-surge)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Intake re-enabled; cancelled stays remain CANCELLED"
+      - from: OPEN
+        to: DRAINING
+        trigger: "system (Episode ACTIVE -> DEACTIVATING cascade L1)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CASCADE L2: every GuestStay here with status RESERVED -> CANCELLED (created_at ASC), releasing bed/pet/locker usage"
+      - from: OPENING
+        to: CLOSED
+        trigger: "POST /api/site-activations/{site_activation_id}/close"
+        actor: SiteLead
+        preconditions:
+          - "No GuestStay of this activation with status IN {RESERVED, CHECKED_IN} (ERR_STAYS_STILL_ACTIVE)"
+        side_effects:
+          - "Shifts of this activation with status IN {PLANNED, CONFIRMED} -> CANCELLED"
+          - "If Episode status == DEACTIVATING and this was the last non-CLOSED activation: Episode -> DEACTIVATED"
+      - from: DRAINING
+        to: CLOSED
+        trigger: "POST /api/site-activations/{site_activation_id}/close"
+        actor: SiteLead
+        preconditions:
+          - "No GuestStay of this activation with status IN {RESERVED, CHECKED_IN} (ERR_STAYS_STILL_ACTIVE)"
+        side_effects:
+          - "Shifts of this activation with status IN {PLANNED, CONFIRMED} -> CANCELLED"
+          - "If Episode status == DEACTIVATING and this was the last non-CLOSED activation: Episode -> DEACTIVATED"
+
+  - entity: GuestStay
+    initial_state: CHECKED_IN
+    terminal_states: [CHECKED_OUT, NO_SHOW, CANCELLED, TRANSFERRED_OUT]
+    transitions:
+      - from: null
+        to: CHECKED_IN
+        trigger: "POST /api/site-activations/{site_activation_id}/stays (walk-in intake)"
+        actor: IntakeStaff
+        preconditions:
+          - "SiteActivation status == OPEN (ERR_SITE_NOT_OPEN)"
+          - "Guest.medical_hold_active == false (ERR_GUEST_MEDICAL_HOLD)"
+          - "No other stay of this guest in the same episode with status IN {RESERVED, CHECKED_IN} (ERR_GUEST_ALREADY_HAS_ACTIVE_STAY)"
+          - "beds_free >= 1 (ERR_NO_BED_AVAILABLE); Guest.pet_count <= pet_slots_free (ERR_PET_CAPACITY_EXCEEDED); ceil(Guest.bag_count/2) <= lockers_free (ERR_LOCKER_CAPACITY_EXCEEDED) — checked in this order"
+        side_effects:
+          - "pet_slots_used = Guest.pet_count; lockers_used = ceil(Guest.bag_count/2); checked_in_at = now"
+      - from: null
+        to: RESERVED
+        trigger: "system (TransportDispatch REQUESTED -> ASSIGNED creates one RESERVED stay per guest_id)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "pet_slots_used/lockers_used pinned from Guest as in walk-in intake; transport_dispatch_id set"
+      - from: RESERVED
+        to: CHECKED_IN
+        trigger: "POST /api/stays/{stay_id}/check-in"
+        actor: IntakeStaff
+        preconditions:
+          - "Linked TransportDispatch status == ARRIVED (ERR_DISPATCH_NOT_ARRIVED)"
+          - "Guest.medical_hold_active == false (ERR_GUEST_MEDICAL_HOLD)"
+        side_effects:
+          - "checked_in_at = now; bed accounting moves reserved -> occupied"
+      - from: RESERVED
+        to: NO_SHOW
+        trigger: "system (run-ops sweep: linked dispatch ARRIVED and now >= dispatch.arrived_at + 60 minutes)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Bed/pet/locker usage released; linked dispatch.reserved_bed_count decrements"
+      - from: RESERVED
+        to: CANCELLED
+        trigger: "system (episode deactivation cascade L2, or dispatch cancel)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Bed/pet/locker usage released; if caused by cascade L2, linked dispatch.reserved_bed_count decrements (cascade L3)"
+      - from: CHECKED_IN
+        to: CHECKED_OUT
+        trigger: "POST /api/stays/{stay_id}/check-out"
+        actor: IntakeStaff
+        preconditions: []
+        side_effects:
+          - "checked_out_at = now; bed_nights_final computed; bed/pet/locker usage released"
+      - from: CHECKED_IN
+        to: CHECKED_OUT
+        trigger: "system (BEHAVIORAL severity-3 Incident escalation ejects the guest)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Same release effects as a normal check-out; checked_out_at = now; bed_nights_final computed"
+      - from: CHECKED_IN
+        to: TRANSFERRED_OUT
+        trigger: "POST /api/stays/{stay_id}/transfer"
+        actor: IntakeStaff
+        preconditions:
+          - "Target SiteActivation belongs to the SAME episode (ERR_CROSS_EPISODE_TRANSFER)"
+          - "Target SiteActivation status == OPEN (ERR_SITE_NOT_OPEN)"
+          - "Guest.medical_hold_active == false (ERR_GUEST_MEDICAL_HOLD)"
+          - "Target beds_free >= 1 (ERR_NO_BED_AVAILABLE); target pet_slots_free >= pet_slots_used (ERR_PET_CAPACITY_EXCEEDED); target lockers_free >= lockers_used (ERR_LOCKER_CAPACITY_EXCEEDED) — checked in this order"
+        side_effects:
+          - "Source stay -> TRANSFERRED_OUT with checked_out_at = now; bed_nights_final computed; source usage released"
+          - "A new GuestStay is created at the target in CHECKED_IN carrying the same guest_id, pet_slots_used, lockers_used, transport_dispatch_id = null, transfer_sequence = source.transfer_sequence + 1, checked_in_at = now"
+
+  - entity: TransportDispatch
+    initial_state: REQUESTED
+    terminal_states: [ARRIVED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: ASSIGNED
+        trigger: "POST /api/transport-dispatches/{dispatch_id}/assign"
+        actor: TransportCoordinator
+        preconditions:
+          - "Vehicle seats >= size of guest_ids (ERR_VEHICLE_TOO_SMALL)"
+          - "No vehicle window conflict including turnaround buffer (ERR_VEHICLE_WINDOW_CONFLICT)"
+          - "SiteActivation status == OPEN (ERR_SITE_NOT_OPEN)"
+          - "No guest_id already has a stay in this episode with status IN {RESERVED, CHECKED_IN} (ERR_GUEST_ALREADY_HAS_ACTIVE_STAY)"
+          - "dispatch_reservation_capacity passes: beds_free >= rider count (ERR_INSUFFICIENT_BEDS_FOR_DISPATCH); if has_pets: sum(Guest.pet_count) <= pet_slots_free (ERR_PET_CAPACITY_EXCEEDED); sum(ceil(bag_count/2)) <= lockers_free (ERR_LOCKER_CAPACITY_EXCEEDED) — checked in this order"
+        side_effects:
+          - "vehicle_id set; reserved_bed_count = size of guest_ids"
+          - "One GuestStay per guest_id is created in RESERVED status (cascade into GuestStay)"
+      - from: ASSIGNED
+        to: ARRIVED
+        trigger: "POST /api/transport-dispatches/{dispatch_id}/arrive"
+        actor: TransportCoordinator
+        preconditions: []
+        side_effects:
+          - "arrived_at = now; vehicle window occupation ends; RESERVED stays become check-in eligible"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /api/transport-dispatches/{dispatch_id}/cancel"
+        actor: [OutreachWorker, TransportCoordinator]
+        preconditions: []
+        side_effects: []
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /api/transport-dispatches/{dispatch_id}/cancel"
+        actor: [OutreachWorker, TransportCoordinator]
+        preconditions: []
+        side_effects:
+          - "Every linked GuestStay with status RESERVED -> CANCELLED (beds/pets/lockers released); reserved_bed_count -> 0"
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "system (episode deactivation cascade L3: last RESERVED stay cancelled by site drain)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Shift
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: CONFIRMED
+        trigger: "POST /api/shifts/{shift_id}/confirm"
+        actor: SiteLead
+        preconditions:
+          - "SiteActivation status IN {OPENING, OPEN} (ERR_INVALID_STATE)"
+          - "Caller X-User-ID != staff_member_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "StaffMember.active == true (ERR_INVALID_STATE)"
+          - "If role_on_shift != GENERAL, StaffMember.skills must contain role_on_shift (ERR_SKILL_MISMATCH)"
+          - "No other CONFIRMED shift of the same staff member whose half-open [start_at, end_at) intersects this one; touching endpoints (end == start) do NOT intersect (ERR_SHIFT_OVERLAP)"
+        side_effects:
+          - "overnight_coverage_gap_minutes and lead_coverage_ok recompute"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /api/shifts/{shift_id}/cancel"
+        actor: SiteLead
+        preconditions: []
+        side_effects:
+          - "Coverage fields recompute"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /api/shifts/{shift_id}/cancel"
+        actor: SiteLead
+        preconditions: []
+        side_effects:
+          - "Coverage fields recompute (gap may reopen)"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "system (run-ops sweep: end_at <= logical clock now)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Coverage fields recompute"
+
+  - entity: Donation
+    initial_state: PLEDGED
+    terminal_states: [RECEIVED]
+    transitions:
+      - from: PLEDGED
+        to: RECEIVED
+        trigger: "POST /api/donations/{donation_id}/receive"
+        actor: SiteLead
+        preconditions: []
+        side_effects:
+          - "meal_stock_on_hand / meal_stock_projected recompute (RECEIVED enters on-hand)"
+
+  - entity: MealService
+    initial_state: PLANNED
+    terminal_states: [SERVED]
+    transitions:
+      - from: PLANNED
+        to: SERVED
+        trigger: "POST /api/meal-services/{meal_service_id}/serve"
+        actor: SiteLead
+        preconditions:
+          - "served_count <= meal_stock_on_hand of the activation (ERR_INSUFFICIENT_MEAL_STOCK)"
+        side_effects:
+          - "meal_stock_on_hand decreases by served_count"
+
+  - entity: Incident
+    initial_state: REPORTED
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: REPORTED
+        to: ESCALATED
+        trigger: "POST /api/incidents/{incident_id}/escalate"
+        actor: "MedicalResponder (kind == MEDICAL) | SiteLead (kind == BEHAVIORAL); wrong role -> ERR_FORBIDDEN"
+        preconditions: []
+        side_effects:
+          - "kind == MEDICAL: Guest.medical_hold_active := true for the linked guest (if guest_id set)"
+          - "kind == BEHAVIORAL and severity == 3 and guest_id set and the guest has a CHECKED_IN stay at this activation: that stay -> CHECKED_OUT (ejection; release effects fire)"
+          - "kind == BEHAVIORAL severity 1-2: no stay effect"
+      - from: REPORTED
+        to: RESOLVED
+        trigger: "POST /api/incidents/{incident_id}/resolve"
+        actor: "MedicalResponder (kind == MEDICAL) | SiteLead (kind == BEHAVIORAL); wrong role -> ERR_FORBIDDEN"
+        preconditions:
+          - "Caller X-User-ID != reporter_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "resolved_by_user_id = caller"
+      - from: ESCALATED
+        to: RESOLVED
+        trigger: "POST /api/incidents/{incident_id}/resolve"
+        actor: "MedicalResponder (kind == MEDICAL) | SiteLead (kind == BEHAVIORAL); wrong role -> ERR_FORBIDDEN"
+        preconditions:
+          - "Caller X-User-ID != reporter_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "resolved_by_user_id = caller"
+          - "kind == MEDICAL and guest_id set: medical_hold_active recomputes — false when no other ESCALATED-and-unresolved MEDICAL incident remains for that guest"
+
+  - entity: AfterActionReport
+    initial_state: DRAFT
+    terminal_states: [APPROVED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /api/after-action-reports/{aar_id}/submit"
+        actor: EOCManager
+        preconditions:
+          - "Every Incident of the episode has status == RESOLVED (ERR_OPEN_INCIDENTS_REMAIN)"
+          - "Every SiteActivation of the episode has status == CLOSED (ERR_SITES_NOT_CLOSED)"
+        side_effects:
+          - "submitted_by_user_id = caller"
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /api/after-action-reports/{aar_id}/approve"
+        actor: EOCManager
+        preconditions:
+          - "Caller X-User-ID != Episode.activated_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "approved_by_user_id = caller"
+          - "Episode DEACTIVATED -> CLOSED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: episode-extend-stale-version
+    parent_entity: Episode
+    write_endpoint: "POST /api/episodes/{episode_id}/extensions"
+    occ_field: expected_episode_version
+    description: |
+      Extending an Episode whose version has advanced since the client last
+      observed it is rejected. Extensions are always legal while ACTIVE, so a
+      second sequential extension carrying a stale version would otherwise
+      succeed on an out-of-date deactivation forecast; OCC on Episode.version
+      reduces this to a deterministic stale-version check.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: site-capacity-amend-stale-version
+    parent_entity: Site
+    write_endpoint: "PATCH /api/sites/{site_id}"
+    occ_field: expected_site_version
+    description: |
+      Amending a Site whose version has advanced since the client last
+      observed it is rejected. Capacity edits are otherwise always legal, so a
+      second sequential PATCH with a stale version would silently overwrite a
+      concurrent planner's capacity decision; OCC on Site.version makes the
+      conflict deterministic.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: breach_run_evaluation
+    trigger: "POST /api/episodes/{episode_id}/weather-readings (after append) and POST /api/episodes/{episode_id}/evaluate"
+    algorithm: chronological
+    formula: |
+      readings = all WeatherReading of the episode, ordered by observed_at ASC, tie-break created_at ASC.
+      breach(r) = (mode == COOLING and r.heat_index_f >= threshold_f) or (mode == WARMING and r.temp_f <= threshold_f).
+      # thresholds are INCLUSIVE on both modes (>= / <=)
+      run_start = null; run_last = null; best_run = 0
+      for r in readings:
+        if not breach(r): run_start = null; run_last = null; continue   # non-breach resets the run
+        if run_start is null: run_start = r.observed_at; run_last = r.observed_at; continue
+        gap_min = (r.observed_at - run_last) in minutes
+        if gap_min <= MAX_GAP_MINUTES: run_last = r.observed_at          # gap of exactly 15 keeps the run; 16 breaks it
+        else: run_start = r.observed_at; run_last = r.observed_at        # over-gap starts a new run
+      if run_start is null: breach_run_minutes = 0; trigger_met = false
+      else:
+        breach_run_minutes = (run_last - run_start) in minutes
+        trigger_met = breach_run_minutes >= sustained_hours_required * 60   # exactly equal QUALIFIES
+    input_set: "All WeatherReading of the episode regardless of source; out-of-order arrival is normalized by the sort"
+    constants:
+      MAX_GAP_MINUTES: 15
+      MINUTES_PER_HOUR: 60
+    precision: "whole minutes; datetime arithmetic exact to the second then floored to minutes"
+
+  - name: capacity_recompute
+    trigger: "Any GuestStay creation or status change at a SiteActivation; SiteActivation open (pins beds_effective)"
+    algorithm: aggregation
+    formula: |
+      occupied_beds = count(stays at activation with status == CHECKED_IN)
+      reserved_beds = count(stays at activation with status == RESERVED)
+      beds_free = beds_effective - occupied_beds - reserved_beds
+      pet_slots_free = Site.pet_capacity - sum(stay.pet_slots_used for stays with status IN {RESERVED, CHECKED_IN})
+      lockers_free = Site.locker_capacity - sum(stay.lockers_used for stays with status IN {RESERVED, CHECKED_IN})
+      # Included statuses: RESERVED, CHECKED_IN. Excluded: CHECKED_OUT, NO_SHOW, CANCELLED, TRANSFERRED_OUT.
+      # INVARIANT (bed conservation): beds_effective == occupied_beds + reserved_beds + beds_free at all times.
+    input_set: "GuestStay of the activation filtered by status as above"
+
+  - name: dispatch_reservation_capacity
+    trigger: "POST /api/transport-dispatches/{dispatch_id}/assign"
+    algorithm: threshold
+    formula: |
+      riders = size(dispatch.guest_ids)
+      # combinatorial gate: nested min across three independent pools, with a conditional pet branch
+      if beds_free < riders: reject ERR_INSUFFICIENT_BEDS_FOR_DISPATCH
+      if dispatch.has_pets:
+        pets_needed = sum(Guest.pet_count for guest_id in guest_ids)
+        if pets_needed > pet_slots_free: reject ERR_PET_CAPACITY_EXCEEDED
+      lockers_needed = sum(ceil(Guest.bag_count / 2) for guest_id in guest_ids)
+      if lockers_needed > lockers_free: reject ERR_LOCKER_CAPACITY_EXCEEDED
+      # all-or-nothing: no partial reservation; check order pinned: beds -> pets -> lockers
+    input_set: "Destination SiteActivation computed pools plus Guest records of guest_ids"
+    constants:
+      BAGS_PER_LOCKER: 2
+
+  - name: overnight_coverage_gap
+    trigger: "Shift create/confirm/cancel at the activation; POST .../open; run-ops"
+    algorithm: interval_merge
+    formula: |
+      tonight = [today(clock) 22:00, tomorrow(clock) 06:00)   # half-open window, 480 minutes
+      segs = for each Shift of the activation with status == CONFIRMED:
+               intersect [start_at, end_at) with tonight; keep non-empty pieces
+      merge segs as half-open intervals: [22:00, 02:00) and [02:00, 06:00) MERGE (touching endpoints merge);
+      covered = sum of merged lengths in minutes
+      overnight_coverage_gap_minutes = 480 - covered           # 0 required to open
+      lead_coverage_ok = exists Shift with status == CONFIRMED and role_on_shift == SITE_LEAD
+                         whose [start_at, end_at) fully contains tonight (start_at <= 22:00 and end_at >= 06:00+1d)
+    input_set: "Shifts of this activation with status == CONFIRMED only (PLANNED/CANCELLED/COMPLETED excluded)"
+    constants:
+      OVERNIGHT_START_HOUR: 22
+      OVERNIGHT_END_HOUR: 6
+      OVERNIGHT_MINUTES: 480
+
+  - name: bed_nights
+    trigger: "GuestStay checkout/eject/transfer (final); any read of a CHECKED_IN stay (provisional); AAR creation (final sum)"
+    algorithm: aggregation
+    formula: |
+      midnight_crossings(a, b) = count of 00:00:00Z instants M with a < M <= b
+      final(stay)     = midnight_crossings(stay.checked_in_at, stay.checked_out_at)      # requires both set
+      provisional(stay) = midnight_crossings(stay.checked_in_at, now)
+                          + (1 if stay.status == CHECKED_IN else 0)
+      # GuestStay.bed_nights_final = final(stay) once CHECKED_OUT/TRANSFERRED_OUT/NO_SHOW-irrelevant; null while CHECKED_IN
+      # GuestStay.bed_nights_provisional is live on every read
+      # AfterActionReport.total_bed_nights = sum of bed_nights_final over ALL stays of the episode
+    input_set: "GuestStay records of the episode; final requires checked_out_at set"
+    precision: "integer nights"
+    variants:
+      - name: final
+        when: "Stay has left CHECKED_IN (checkout, ejection, transfer-out)"
+        difference: "Counts only fully crossed 00:00Z boundaries; never credits the in-progress night"
+      - name: provisional
+        when: "Stay is CHECKED_IN now"
+        difference: "Adds +1 for the current in-progress night, so provisional >= final for the same stay"
+
+  - name: supply_stock
+    trigger: "Donation create/receive; MealService serve; any read of SiteActivation"
+    algorithm: aggregation
+    formula: |
+      meal_stock_on_hand   = sum(quantity of Donation at activation with category == MEAL and status == RECEIVED)
+                             - sum(served_count of MealService at activation with status == SERVED)
+      meal_stock_projected = meal_stock_on_hand
+                             + sum(quantity of Donation at activation with category == MEAL and status == PLEDGED)
+    input_set: "Donations filtered by category == MEAL and split by status; MealService filtered to SERVED"
+    precision: "integer units"
+    variants:
+      - name: on_hand
+        when: "Serve gating and physical stock"
+        difference: "Counts RECEIVED donations only"
+      - name: projected
+        when: "Planning view"
+        difference: "Additionally counts PLEDGED donations, so projected >= on_hand for the same data"
+
+  - name: meal_planned_rounding
+    trigger: "POST /api/site-activations/{site_activation_id}/meal-services (planned_meals pinned at creation)"
+    algorithm: threshold
+    formula: |
+      attendance = occupied_beds + reserved_beds at creation moment (pinned snapshot)
+      planned_meals(service) = ceil(attendance * BUFFER[meal_period])
+      # ROUNDING ORDER PINNED: each MealService rounds UP individually at creation;
+      # any daily/site total is the SUM of those per-service rounded values (round-per-line then sum).
+      # Sum-then-round (ceil(sum of unrounded)) is FORBIDDEN and yields a different number.
+    input_set: "Stay counts of the activation at creation; buffer constant per meal_period"
+    constants:
+      BREAKFAST_BUFFER: 1.10
+      LUNCH_BUFFER: 1.15
+      DINNER_BUFFER: 1.25
+    precision: "ceil to integer meals per service"
+
+  - name: aar_aggregation
+    trigger: "POST /api/episodes/{episode_id}/after-action-reports (fields computed at creation and pinned)"
+    algorithm: aggregation
+    formula: |
+      total_unique_guests   = count(distinct guest_id over all GuestStay of the episode, any status)
+      total_bed_nights      = sum(bed_nights_final over all GuestStay of the episode)
+      meals_served          = sum(served_count over MealService of the episode with status == SERVED)
+      incidents_by_severity = {"1": c1, "2": c2, "3": c3} over all Incidents of the episode (any status)
+      transports_arrived    = count(TransportDispatch of the episode with status == ARRIVED)
+    input_set: "All child entities of the episode; explicit status filters as written"
+    precision: "integers"
+
+  - name: ops_sweep
+    trigger: "POST /api/episodes/{episode_id}/run-ops"
+    algorithm: threshold
+    formula: |
+      ops_run_index += 1
+      Step order is pinned:
+      (1) every CONFIRMED Shift of the episode with end_at <= now -> COMPLETED (created_at ASC)
+      (2) every RESERVED GuestStay of the episode whose linked dispatch has status == ARRIVED
+          and now >= dispatch.arrived_at + NO_SHOW_GRACE_MINUTES -> NO_SHOW (created_at ASC);
+          each releases its bed/pet/locker usage and decrements the dispatch reserved_bed_count
+      (3) if Episode status == DEACTIVATING and all SiteActivations are CLOSED -> DEACTIVATED
+    input_set: "Entities of this episode only"
+    constants:
+      NO_SHOW_GRACE_MINUTES: 60
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and role is a declared role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Caller role is in the endpoint's role list; for Incident escalate/resolve the role must also match the incident kind (MEDICAL -> MedicalResponder, BEHAVIORAL -> SiteLead)"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: existence
+    check: "Path ids exist, validated left-to-right; nested child must belong to the path parent; body-referenced ids (site_id, guest_id, staff_member_id, vehicle_id, target_site_activation_id, guest_ids[*]) must exist"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 4
+    category: state
+    check: "OCC: expected_episode_version must equal Episode.version on extensions; expected_site_version must equal Site.version on PATCH /api/sites/{site_id}"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /api/episodes/{episode_id}/extensions; PATCH /api/sites/{site_id}"
+  - priority: 5
+    category: state
+    check: "Target entity is in a state that permits the transition (terminal-state lockdown included); cross-entity state guards evaluated parents-first: Episode before SiteActivation before stay/dispatch. Emits ERR_INVALID_STATE, ERR_EPISODE_NOT_ACTIVE, ERR_SITE_NOT_OPEN, ERR_TRIGGER_NOT_MET, ERR_DISPATCH_NOT_ARRIVED, ERR_VALIDATION (beds_effective >= 1 on open)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 6
+    category: business_safety
+    check: "Guest.medical_hold_active blocks intake, check-in, transfer (ERR_GUEST_MEDICAL_HOLD); role_on_shift != GENERAL requires the skill on StaffMember.skills (ERR_SKILL_MISMATCH)"
+    error_id: ERR_GUEST_MEDICAL_HOLD
+    http_status: 409
+    applies_to: "stays create, check-in, transfer; shift confirm"
+  - priority: 7
+    category: business_constraint
+    check: "Uniqueness and segregation: one active stay per guest per episode (ERR_GUEST_ALREADY_HAS_ACTIVE_STAY); one AfterActionReport per episode (ERR_INVALID_STATE); segregation of duties on shift confirm, incident resolve, AAR approve (ERR_SEGREGATION_OF_DUTIES); staff shift overlap half-open (ERR_SHIFT_OVERLAP); vehicle window conflict with turnaround buffer (ERR_VEHICLE_WINDOW_CONFLICT); same-episode transfer (ERR_CROSS_EPISODE_TRANSFER); activate requires a designated site (ERR_NO_SITES_DESIGNATED); AAR submit requires incidents resolved (ERR_OPEN_INCIDENTS_REMAIN) and sites closed (ERR_SITES_NOT_CLOSED); close requires no active stays (ERR_STAYS_STILL_ACTIVE)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "business endpoints"
+  - priority: 8
+    category: business_temporal
+    check: "Window shape: end strictly after start for shifts and pickup windows and extensions must move scheduled_end_at strictly forward (ERR_INVALID_WINDOW); overnight coverage gap must be 0 (ERR_OVERNIGHT_COVERAGE_GAP, evaluated before lead coverage at equal priority); lead coverage required (ERR_LEAD_COVERAGE_MISSING)"
+    error_id: ERR_INVALID_WINDOW
+    http_status: 422
+    applies_to: "shift create, dispatch create, site-activation open"
+  - priority: 9
+    category: business_fiscal
+    check: "Capacity pools, checked in pinned order beds -> pets -> lockers: walk-in intake/transfer (ERR_NO_BED_AVAILABLE, ERR_PET_CAPACITY_EXCEEDED, ERR_LOCKER_CAPACITY_EXCEEDED); dispatch assign (ERR_INSUFFICIENT_BEDS_FOR_DISPATCH, ERR_VEHICLE_TOO_SMALL); meal serve (ERR_INSUFFICIENT_MEAL_STOCK)"
+    error_id: ERR_NO_BED_AVAILABLE
+    http_status: 409
+    applies_to: "stays create, transfer, dispatch assign, meal serve"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Episode lifecycle ---
+  - method: POST
+    path: "/api/episodes"
+    description: "Create an activation Episode in STANDBY"
+    roles: [EOCManager]
+    code: 201
+    input: [mode, threshold_f, sustained_hours_required, scheduled_end_at]
+    output: Episode
+    side_effects: ["status=STANDBY, trigger_met=false, breach_run_minutes=0, extension_count=0, ops_run_index=0"]
+  - method: GET
+    path: "/api/episodes/{episode_id}"
+    description: "Get one Episode"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: []
+  - method: POST
+    path: "/api/episodes/{id}/weather-readings"
+    description: "Append a WeatherReading (immutable); recomputes breach_run_evaluation"
+    roles: [EOCManager]
+    code: 201
+    input: [observed_at, temp_f, heat_index_f, "source?"]
+    output: WeatherReading
+    side_effects: ["breach_run_evaluation recomputed; trigger_met and breach_run_minutes refreshed"]
+  - method: GET
+    path: "/api/episodes/{id}/weather-readings"
+    description: "List readings of an episode (observed_at ASC, created_at ASC tie-break)"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: WeatherReading[]
+    side_effects: []
+  - method: POST
+    path: "/api/episodes/{episode_id}/evaluate"
+    description: "Evaluate the trigger now: STANDBY->ACTIVATING when met; ACTIVATING->STANDBY when unmet; DEACTIVATING->ACTIVE when re-met; ERR_INVALID_STATE in ACTIVE/DEACTIVATED/CLOSED"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: ["breach_run_evaluation recomputed before the transition decision"]
+  - method: POST
+    path: "/api/episodes/{episode_id}/activate"
+    description: "ACTIVATING -> ACTIVE"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: ["activated_at and activated_by_user_id stamped on first activation"]
+  - method: POST
+    path: "/api/episodes/{episode_id}/extensions"
+    description: "Extend scheduled_end_at while ACTIVE (OCC-guarded); new_scheduled_end_at must be strictly after the current scheduled_end_at (ERR_INVALID_WINDOW)"
+    roles: [EOCManager]
+    code: 200
+    input: [new_scheduled_end_at, expected_episode_version]
+    output: Episode
+    side_effects: ["scheduled_end_at replaced; extension_count += 1; increments Episode.version by 1"]
+  - method: POST
+    path: "/api/episodes/{episode_id}/deactivate"
+    description: "ACTIVE -> DEACTIVATING with the full L1->L2->L3 cascade"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: ["SiteActivations OPEN->DRAINING / OPENING->CLOSED; RESERVED stays -> CANCELLED; drained dispatches -> CANCELLED"]
+  - method: POST
+    path: "/api/episodes/{episode_id}/run-ops"
+    description: "Ops checkpoint sweep (ops_sweep calculation)"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: Episode
+    side_effects: ["ops_run_index += 1; shifts completed; no-shows expired; DEACTIVATING->DEACTIVATED when all sites CLOSED; increments Episode.version by 1"]
+
+  # --- Site registry ---
+  - method: POST
+    path: "/api/sites"
+    description: "Register a facility"
+    roles: [EOCManager]
+    code: 201
+    input: [name, address, bed_capacity, pet_capacity, locker_capacity]
+    output: Site
+    side_effects: []
+  - method: GET
+    path: "/api/sites/{site_id}"
+    description: "Get one Site"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+  - method: PATCH
+    path: "/api/sites/{site_id}"
+    description: "Amend site capacity (OCC-guarded); does NOT retro-change beds_effective already pinned on OPEN activations"
+    roles: [EOCManager]
+    code: 200
+    input: ["name?", "address?", "bed_capacity?", "pet_capacity?", "locker_capacity?", expected_site_version]
+    output: Site
+    side_effects: ["increments Site.version by 1"]
+
+  # --- SiteActivation ---
+  - method: POST
+    path: "/api/episodes/{episode_id}/site-activations"
+    description: "Designate a site for the episode; created in OPENING. Episode status must be IN {STANDBY, ACTIVATING, ACTIVE} (ERR_INVALID_STATE)"
+    roles: [EOCManager]
+    code: 201
+    input: [site_id, "capacity_override?"]
+    output: SiteActivation
+    side_effects: ["status=OPENING"]
+  - method: GET
+    path: "/api/site-activations"
+    description: "List SiteActivations with filters"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["episode_id?", "site_id?", "status?", "limit?", "offset?"]
+    output: SiteActivation[]
+    side_effects: []
+  - method: GET
+    path: "/api/site-activations/{site_activation_id}"
+    description: "Get one SiteActivation including computed capacity, coverage and stock fields"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: SiteActivation
+    side_effects: []
+  - method: POST
+    path: "/api/site-activations/{site_activation_id}/open"
+    description: "OPENING -> OPEN (coverage-, lead-, episode-gated; pins beds_effective)"
+    roles: [SiteLead]
+    code: 200
+    input: []
+    output: SiteActivation
+    side_effects: ["beds_effective pinned; opened_at stamped"]
+  - method: POST
+    path: "/api/site-activations/{site_activation_id}/close"
+    description: "OPENING|DRAINING -> CLOSED (requires no active stays)"
+    roles: [SiteLead]
+    code: 200
+    input: []
+    output: SiteActivation
+    side_effects: ["non-terminal shifts -> CANCELLED; may tip Episode DEACTIVATING -> DEACTIVATED"]
+
+  # --- Staff & shifts ---
+  - method: POST
+    path: "/api/staff-members"
+    description: "Add a roster member"
+    roles: [EOCManager]
+    code: 201
+    input: [full_name, skills, "active?"]
+    output: StaffMember
+    side_effects: []
+  - method: GET
+    path: "/api/staff-members"
+    description: "List roster"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["active?", "limit?", "offset?"]
+    output: StaffMember[]
+    side_effects: []
+  - method: POST
+    path: "/api/site-activations/{site_activation_id}/shifts"
+    description: "Plan a shift (PLANNED); activation must be OPENING or OPEN"
+    roles: [SiteLead]
+    code: 201
+    input: [staff_member_id, role_on_shift, start_at, end_at]
+    output: Shift
+    side_effects: ["status=PLANNED"]
+  - method: GET
+    path: "/api/shifts"
+    description: "List shifts with filters"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["site_activation_id?", "staff_member_id?", "status?", "limit?", "offset?"]
+    output: Shift[]
+    side_effects: []
+  - method: GET
+    path: "/api/shifts/{shift_id}"
+    description: "Get one shift"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: []
+  - method: POST
+    path: "/api/shifts/{shift_id}/confirm"
+    description: "PLANNED -> CONFIRMED (SoD, skill, overlap gates)"
+    roles: [SiteLead]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: ["coverage fields recompute"]
+  - method: POST
+    path: "/api/shifts/{shift_id}/cancel"
+    description: "PLANNED|CONFIRMED -> CANCELLED"
+    roles: [SiteLead]
+    code: 200
+    input: []
+    output: Shift
+    side_effects: ["coverage fields recompute"]
+
+  # --- Guests & stays ---
+  - method: POST
+    path: "/api/guests"
+    description: "Register a guest (minimal barriers: alias only)"
+    roles: [IntakeStaff]
+    code: 201
+    input: [alias, "has_pets?", "pet_count?", "bag_count?", "medical_flag?"]
+    output: Guest
+    side_effects: ["medical_hold_active=false"]
+  - method: GET
+    path: "/api/guests/{guest_id}"
+    description: "Get one guest"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: Guest
+    side_effects: []
+  - method: POST
+    path: "/api/site-activations/{site_activation_id}/stays"
+    description: "Walk-in intake: creates a GuestStay directly in CHECKED_IN"
+    roles: [IntakeStaff]
+    code: 201
+    input: [guest_id]
+    output: GuestStay
+    side_effects: ["pet_slots_used/lockers_used pinned; bed/pet/locker pools debited"]
+  - method: GET
+    path: "/api/stays"
+    description: "List stays with filters"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["site_activation_id?", "guest_id?", "transport_dispatch_id?", "status?", "limit?", "offset?"]
+    output: GuestStay[]
+    side_effects: []
+  - method: GET
+    path: "/api/stays/{stay_id}"
+    description: "Get one stay (live bed_nights_provisional)"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: GuestStay
+    side_effects: []
+  - method: POST
+    path: "/api/stays/{stay_id}/check-in"
+    description: "RESERVED -> CHECKED_IN (dispatch must be ARRIVED)"
+    roles: [IntakeStaff]
+    code: 200
+    input: []
+    output: GuestStay
+    side_effects: ["reserved -> occupied"]
+  - method: POST
+    path: "/api/stays/{stay_id}/check-out"
+    description: "CHECKED_IN -> CHECKED_OUT"
+    roles: [IntakeStaff]
+    code: 200
+    input: []
+    output: GuestStay
+    side_effects: ["bed_nights_final computed; pools credited"]
+  - method: POST
+    path: "/api/stays/{stay_id}/transfer"
+    description: "CHECKED_IN at source -> TRANSFERRED_OUT and a new CHECKED_IN stay at the target activation"
+    roles: [IntakeStaff]
+    code: 200
+    input: [target_site_activation_id]
+    output: GuestStay
+    side_effects: ["source stay terminal; successor stay created with transfer_sequence + 1; pools move between activations"]
+
+  # --- Vehicles & transport ---
+  - method: POST
+    path: "/api/vehicles"
+    description: "Register a vehicle"
+    roles: [TransportCoordinator]
+    code: 201
+    input: [label, seats, "turnaround_minutes?"]
+    output: Vehicle
+    side_effects: []
+  - method: GET
+    path: "/api/vehicles"
+    description: "List vehicles"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: Vehicle[]
+    side_effects: []
+  - method: POST
+    path: "/api/transport-dispatches"
+    description: "Request a transport dispatch (REQUESTED); target activation must be OPEN"
+    roles: [OutreachWorker]
+    code: 201
+    input: [site_activation_id, guest_ids, pickup_window_start, pickup_window_end, "has_pets?"]
+    output: TransportDispatch
+    side_effects: ["status=REQUESTED, reserved_bed_count=0"]
+  - method: GET
+    path: "/api/transport-dispatches"
+    description: "List dispatches with filters"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["site_activation_id?", "vehicle_id?", "status?", "limit?", "offset?"]
+    output: TransportDispatch[]
+    side_effects: []
+  - method: GET
+    path: "/api/transport-dispatches/{dispatch_id}"
+    description: "Get one dispatch"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportDispatch
+    side_effects: []
+  - method: POST
+    path: "/api/transport-dispatches/{dispatch_id}/assign"
+    description: "REQUESTED -> ASSIGNED; reserves beds by creating RESERVED stays"
+    roles: [TransportCoordinator]
+    code: 200
+    input: [vehicle_id]
+    output: TransportDispatch
+    side_effects: ["vehicle_id set; RESERVED stay per guest created; reserved_bed_count = riders"]
+  - method: POST
+    path: "/api/transport-dispatches/{dispatch_id}/arrive"
+    description: "ASSIGNED -> ARRIVED"
+    roles: [TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportDispatch
+    side_effects: ["arrived_at stamped; stays check-in eligible"]
+  - method: POST
+    path: "/api/transport-dispatches/{dispatch_id}/cancel"
+    description: "REQUESTED|ASSIGNED -> CANCELLED; cancels RESERVED stays when assigned"
+    roles: [OutreachWorker, TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportDispatch
+    side_effects: ["linked RESERVED stays -> CANCELLED; reserved_bed_count -> 0"]
+
+  # --- Donations & meals ---
+  - method: POST
+    path: "/api/site-activations/{id}/donations"
+    description: "Record a partner donation pledge (PLEDGED)"
+    roles: [SiteLead]
+    code: 201
+    input: [partner_name, category, quantity]
+    output: Donation
+    side_effects: ["meal_stock_projected increases for MEAL pledges"]
+  - method: GET
+    path: "/api/site-activations/{id}/donations"
+    description: "List donations of an activation"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["status?", "category?", "limit?", "offset?"]
+    output: Donation[]
+    side_effects: []
+  - method: POST
+    path: "/api/donations/{donation_id}/receive"
+    description: "PLEDGED -> RECEIVED"
+    roles: [SiteLead]
+    code: 200
+    input: []
+    output: Donation
+    side_effects: ["meal_stock_on_hand increases for MEAL category"]
+  - method: POST
+    path: "/api/site-activations/{id}/meal-services"
+    description: "Plan a meal service; planned_meals pinned via meal_planned_rounding"
+    roles: [SiteLead]
+    code: 201
+    input: [service_date, meal_period]
+    output: MealService
+    side_effects: ["planned_meals pinned from current occupancy snapshot"]
+  - method: GET
+    path: "/api/site-activations/{id}/meal-services"
+    description: "List meal services of an activation"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: MealService[]
+    side_effects: []
+  - method: POST
+    path: "/api/meal-services/{meal_service_id}/serve"
+    description: "PLANNED -> SERVED; consumes meal stock"
+    roles: [SiteLead]
+    code: 200
+    input: [served_count]
+    output: MealService
+    side_effects: ["meal_stock_on_hand decreases by served_count"]
+
+  # --- Incidents ---
+  - method: POST
+    path: "/api/incidents"
+    description: "Report an incident (REPORTED); reporter_user_id = X-User-ID"
+    roles: [SiteLead, IntakeStaff, OutreachWorker, MedicalResponder]
+    code: 201
+    input: [site_activation_id, "guest_id?", kind, severity]
+    output: Incident
+    side_effects: ["status=REPORTED"]
+  - method: GET
+    path: "/api/incidents"
+    description: "List incidents with filters"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["site_activation_id?", "guest_id?", "status?", "kind?", "limit?", "offset?"]
+    output: Incident[]
+    side_effects: []
+  - method: GET
+    path: "/api/incidents/{incident_id}"
+    description: "Get one incident"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: []
+    output: Incident
+    side_effects: []
+  - method: POST
+    path: "/api/incidents/{incident_id}/escalate"
+    description: "REPORTED -> ESCALATED; kind-selects role; divergent side effects (medical hold vs behavioral ejection)"
+    roles: [MedicalResponder, SiteLead]
+    code: 200
+    input: []
+    output: Incident
+    side_effects: ["MEDICAL: guest medical_hold_active := true; BEHAVIORAL severity 3: guest stay ejected to CHECKED_OUT"]
+  - method: POST
+    path: "/api/incidents/{incident_id}/resolve"
+    description: "REPORTED|ESCALATED -> RESOLVED; resolver must differ from reporter"
+    roles: [MedicalResponder, SiteLead]
+    code: 200
+    input: [resolution_note]
+    output: Incident
+    side_effects: ["resolved_by_user_id stamped; MEDICAL: medical_hold recomputed"]
+
+  # --- After-action reporting ---
+  - method: POST
+    path: "/api/episodes/{id}/after-action-reports"
+    description: "Create the episode's AfterActionReport (DRAFT); Episode status must be IN {DEACTIVATING, DEACTIVATED} so the report can be drafted during drain (ERR_INVALID_STATE otherwise); at most one report per episode (ERR_INVALID_STATE on duplicate); aggregates pinned at creation"
+    roles: [EOCManager]
+    code: 201
+    input: []
+    output: AfterActionReport
+    side_effects: ["aar_aggregation fields computed and pinned"]
+  - method: GET
+    path: "/api/episodes/{id}/after-action-reports"
+    description: "List after-action reports of an episode"
+    roles: [EOCManager, SiteLead, IntakeStaff, OutreachWorker, MedicalResponder, TransportCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: AfterActionReport[]
+    side_effects: []
+  - method: POST
+    path: "/api/after-action-reports/{aar_id}/submit"
+    description: "DRAFT -> SUBMITTED (all incidents resolved, all sites closed)"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: AfterActionReport
+    side_effects: ["submitted_by_user_id stamped"]
+  - method: POST
+    path: "/api/after-action-reports/{aar_id}/approve"
+    description: "SUBMITTED -> APPROVED (approver != episode activator); closes the Episode"
+    roles: [EOCManager]
+    code: 200
+    input: []
+    output: AfterActionReport
+    side_effects: ["approved_by_user_id stamped; Episode DEACTIVATED -> CLOSED"]
+
+  # --- Test-driving clock ---
+  - method: POST
+    path: "/api/_clock/set_current_utc"
+    description: "Set the logical clock. Startup default is exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time."
+    roles: [EOCManager]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["logical clock replaced"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_VALIDATION, http: 400, condition: "Missing/invalid required field, bad enum value, type mismatch, or beds_effective < 1 on open" }
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or invalid X-User-Role / X-User-ID headers" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not allowed on endpoint, or incident kind handled by the wrong role (MEDICAL vs BEHAVIORAL)" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path or body-referenced id does not exist (or wrong parent scope)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Entity not in a state permitting the transition; includes terminal-state lockdown, inactive staff assignment, duplicate AfterActionReport" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_episode_version / expected_site_version does not match current version (OCC)" }
+  - { id: ERR_TRIGGER_NOT_MET, http: 409, condition: "activate while trigger_met is false" }
+  - { id: ERR_EPISODE_NOT_ACTIVE, http: 409, condition: "Operation requires Episode status == ACTIVE (open, extensions)" }
+  - { id: ERR_NO_SITES_DESIGNATED, http: 409, condition: "activate with zero SiteActivations in {OPENING, OPEN}" }
+  - { id: ERR_SITE_NOT_OPEN, http: 409, condition: "Intake, dispatch create/assign, or transfer target requires SiteActivation status == OPEN" }
+  - { id: ERR_GUEST_MEDICAL_HOLD, http: 409, condition: "Guest has an active medical hold (unresolved ESCALATED MEDICAL incident)" }
+  - { id: ERR_SKILL_MISMATCH, http: 409, condition: "role_on_shift != GENERAL not present in StaffMember.skills" }
+  - { id: ERR_GUEST_ALREADY_HAS_ACTIVE_STAY, http: 409, condition: "Guest already has a stay with status IN {RESERVED, CHECKED_IN} in this episode" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 409, condition: "Same user on both sides of a segregated pair: shift staff confirming own shift, incident reporter resolving own incident, episode activator approving the AAR" }
+  - { id: ERR_SHIFT_OVERLAP, http: 409, condition: "CONFIRMED shift of the same staff member intersects half-open [start_at, end_at); touching endpoints allowed" }
+  - { id: ERR_VEHICLE_WINDOW_CONFLICT, http: 409, condition: "Vehicle already assigned to a dispatch whose pickup window expanded by +/- turnaround_minutes intersects the new window" }
+  - { id: ERR_INVALID_WINDOW, http: 422, condition: "end_at <= start_at (shift) or pickup_window_end <= pickup_window_start (dispatch)" }
+  - { id: ERR_OVERNIGHT_COVERAGE_GAP, http: 409, condition: "open with overnight_coverage_gap_minutes > 0" }
+  - { id: ERR_LEAD_COVERAGE_MISSING, http: 409, condition: "open without a SITE_LEAD CONFIRMED shift fully containing the overnight window" }
+  - { id: ERR_NO_BED_AVAILABLE, http: 409, condition: "beds_free < 1 for intake/transfer" }
+  - { id: ERR_PET_CAPACITY_EXCEEDED, http: 409, condition: "Pet requirement exceeds pet_slots_free (intake, transfer, dispatch assign)" }
+  - { id: ERR_LOCKER_CAPACITY_EXCEEDED, http: 409, condition: "Locker requirement exceeds lockers_free (intake, transfer, dispatch assign)" }
+  - { id: ERR_INSUFFICIENT_BEDS_FOR_DISPATCH, http: 409, condition: "beds_free < rider count at dispatch assign (all-or-nothing)" }
+  - { id: ERR_VEHICLE_TOO_SMALL, http: 409, condition: "Vehicle.seats < rider count at assign" }
+  - { id: ERR_INSUFFICIENT_MEAL_STOCK, http: 409, condition: "served_count > meal_stock_on_hand at serve" }
+  - { id: ERR_OPEN_INCIDENTS_REMAIN, http: 409, condition: "AAR submit while any episode Incident is not RESOLVED" }
+  - { id: ERR_SITES_NOT_CLOSED, http: 409, condition: "AAR submit while any episode SiteActivation is not CLOSED" }
+  - { id: ERR_STAYS_STILL_ACTIVE, http: 409, condition: "SiteActivation close while stays remain in {RESERVED, CHECKED_IN}" }
+  - { id: ERR_DISPATCH_NOT_ARRIVED, http: 409, condition: "check-in of a RESERVED stay whose linked dispatch is not ARRIVED" }
+  - { id: ERR_CROSS_EPISODE_TRANSFER, http: 409, condition: "transfer target SiteActivation belongs to a different Episode" }
+
+# =============================================================================
+# §1.7 RBAC Matrix (segregation_of_duties)
+# =============================================================================
+roles:
+  - name: EOCManager
+    description: "Emergency operations center manager; owns episode lifecycle, site registry, roster, ops sweeps, after-action workflow, and the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/episodes; POST .../weather-readings; POST .../evaluate; POST .../activate; POST .../extensions; POST .../deactivate; POST .../run-ops"
+      - "POST /api/sites; PATCH /api/sites/{site_id}"
+      - "POST /api/episodes/{episode_id}/site-activations"
+      - "POST /api/staff-members"
+      - "POST /api/episodes/{episode_id}/after-action-reports; POST /api/after-action-reports/{aar_id}/submit; POST /api/after-action-reports/{aar_id}/approve"
+      - "POST /api/_clock/set_current_utc"
+    shared_operations:
+      - "All GET endpoints"
+  - name: SiteLead
+    description: "Activation floor manager; opens/closes sites, plans and confirms shifts, receives donations, runs meal services, handles BEHAVIORAL incidents"
+    identity: "entity_backed:StaffMember"
+    exclusive_operations:
+      - "POST /api/site-activations/{site_activation_id}/open; POST .../close"
+      - "POST /api/site-activations/{site_activation_id}/shifts; POST /api/shifts/{shift_id}/confirm; POST /api/shifts/{shift_id}/cancel"
+      - "POST /api/site-activations/{site_activation_id}/donations; POST /api/donations/{donation_id}/receive"
+      - "POST /api/site-activations/{site_activation_id}/meal-services; POST /api/meal-services/{meal_service_id}/serve"
+    shared_operations:
+      - "POST /api/incidents (report)"
+      - "POST /api/incidents/{incident_id}/escalate and /resolve for kind == BEHAVIORAL only"
+      - "All GET endpoints"
+  - name: IntakeStaff
+    description: "Front-desk intake worker; registers guests and runs the stay lifecycle"
+    identity: "entity_backed:StaffMember"
+    exclusive_operations:
+      - "POST /api/guests"
+      - "POST /api/site-activations/{site_activation_id}/stays"
+      - "POST /api/stays/{stay_id}/check-in; POST .../check-out; POST .../transfer"
+    shared_operations:
+      - "POST /api/incidents (report)"
+      - "All GET endpoints"
+  - name: OutreachWorker
+    description: "Field outreach to unsheltered residents; requests and cancels transport dispatches"
+    identity: "entity_backed:StaffMember"
+    exclusive_operations:
+      - "POST /api/transport-dispatches"
+    shared_operations:
+      - "POST /api/transport-dispatches/{dispatch_id}/cancel (shared with TransportCoordinator)"
+      - "POST /api/incidents (report)"
+      - "All GET endpoints"
+  - name: MedicalResponder
+    description: "Medical escalation authority; triages, escalates and resolves MEDICAL incidents"
+    identity: "entity_backed:StaffMember"
+    exclusive_operations:
+      - "POST /api/incidents/{incident_id}/escalate and /resolve for kind == MEDICAL only"
+    shared_operations:
+      - "POST /api/incidents (report)"
+      - "All GET endpoints"
+  - name: TransportCoordinator
+    description: "Fleet dispatcher; registers vehicles, assigns and arrives dispatches"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/vehicles"
+      - "POST /api/transport-dispatches/{dispatch_id}/assign; POST .../arrive"
+    shared_operations:
+      - "POST /api/transport-dispatches/{dispatch_id}/cancel (shared with OutreachWorker)"
+      - "All GET endpoints"

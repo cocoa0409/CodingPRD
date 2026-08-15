@@ -1,0 +1,63 @@
+"""Error classes and error ID constants (from the scaffold/PRD error catalog)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+# --- Error IDs (exact strings from the PRD section 5 catalogue) ---
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                  # 401
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"                        # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                              # 404
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                  # 400
+ERR_INVALID_ENUM = "ERR_INVALID_ENUM"                        # 400
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                      # 409
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                      # 412
+ERR_SELF_ACTION_FORBIDDEN = "ERR_SELF_ACTION_FORBIDDEN"      # 403
+ERR_SECURITY_RESTRICTED = "ERR_SECURITY_RESTRICTED"          # 422
+ERR_COMPLIANCE_HOLD = "ERR_COMPLIANCE_HOLD"                  # 422
+ERR_TRADE_IN_BLACKOUT = "ERR_TRADE_IN_BLACKOUT"              # 422
+ERR_DATE_RANGE_INVALID = "ERR_DATE_RANGE_INVALID"            # 422
+ERR_POLICY_ACK_REQUIRED = "ERR_POLICY_ACK_REQUIRED"          # 422
+ERR_TRAINING_OVERDUE = "ERR_TRAINING_OVERDUE"                # 422
+ERR_DUPLICATE_VOTE = "ERR_DUPLICATE_VOTE"                    # 409
+ERR_DUPLICATE_QUARTER_WINDOW = "ERR_DUPLICATE_QUARTER_WINDOW"  # 409
+ERR_DUPLICATE_RESTRICTED_ENTRY = "ERR_DUPLICATE_RESTRICTED_ENTRY"  # 409
+ERR_OVERLAPPING_APPROVAL = "ERR_OVERLAPPING_APPROVAL"        # 409
+ERR_QUANTITY_EXCEEDS_APPROVED = "ERR_QUANTITY_EXCEEDS_APPROVED"  # 422
+ERR_CASE_ALREADY_OPEN = "ERR_CASE_ALREADY_OPEN"              # 409
+
+HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_INVALID_REQUEST: 400,
+    ERR_INVALID_ENUM: 400,
+    ERR_INVALID_STATE: 409,
+    ERR_STALE_VERSION: 412,
+    ERR_SELF_ACTION_FORBIDDEN: 403,
+    ERR_SECURITY_RESTRICTED: 422,
+    ERR_COMPLIANCE_HOLD: 422,
+    ERR_TRADE_IN_BLACKOUT: 422,
+    ERR_DATE_RANGE_INVALID: 422,
+    ERR_POLICY_ACK_REQUIRED: 422,
+    ERR_TRAINING_OVERDUE: 422,
+    ERR_DUPLICATE_VOTE: 409,
+    ERR_DUPLICATE_QUARTER_WINDOW: 409,
+    ERR_DUPLICATE_RESTRICTED_ENTRY: 409,
+    ERR_OVERLAPPING_APPROVAL: 409,
+    ERR_QUANTITY_EXCEEDS_APPROVED: 422,
+    ERR_CASE_ALREADY_OPEN: 409,
+}
+
+
+def err(error_id, message):
+    return ApiError(error_id, HTTP_STATUS[error_id], message)
+
+
+def not_found(what="resource"):
+    return ApiError(ERR_NOT_FOUND, 404, f"{what} does not exist")

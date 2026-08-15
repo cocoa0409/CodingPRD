@@ -1,0 +1,1573 @@
+# =============================================================================
+# Task 1916 — Scenic Shop & Set Fabrication — SCAFFOLD.yaml (§1.0–§1.7)
+# =============================================================================
+
+scenario: |
+  1916. Scenic Shop & Set Fabrication (scenic construction shop): bid from
+  design drawings & material takeoff, build schedule vs load-in deadline,
+  shop capacity across concurrent productions, engineering for automation &
+  structural safety, paint/finishing & texture approval, transport &
+  installation labor, change order from design revisions, strike, storage &
+  reuse inventory
+
+domain_name: scenic-shop-fabrication
+api_prefix: /scenic
+
+# =============================================================================
+# §0 Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation        # shop crew-hour capacity + bay slots + truck fleet competed for by concurrent productions
+  secondary_archetype: multi_party_negotiation # bid counter/revise rounds, change-order approval, finish-sample approval (shop vs client)
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Production/Takeoff/StockItem version for supersede-style writes
+    - cascading_side_effects                 # CO approval → production fields → bay auto-release → committed-hours → posture
+    - dual_variant_calculation               # ROM vs detailed bid pricing; static vs dynamic safety factor; replacement vs recovery stock valuation
+    - rate_threshold_triggers                # posture thresholds (TIGHT >= 8000bp, SATURATED >= 10000bp); volume-discount tier >= 500000
+    - version_pinning_on_approval            # bid pins drawing_revision at creation; accept re-validates pin; CO consumes next revision
+    - ops_run_checkpoint                     # run_epoch expires stale bids and recomputes posture
+    - soft_delete                            # BayReservation RELEASED rows remain queryable but are excluded from overlap checks
+    - pagination_with_filtering              # all list endpoints filter by FK + paginate
+  entity_topology: flat                      # all collections top-level under /scenic; pure FK references; reverse reads via filtered lists
+  state_machine_shape: cyclic                # Bid COUNTERED->SUBMITTED loop, EngineeringReview REVISION_REQUIRED->PENDING loop,
+                                             # FinishSample REJECTED->SUBMITTED loop, StockItem ACTIVE<->DEPLETED loop,
+                                             # Production IN_BUILD<->ON_HOLD revert — plus linear spines elsewhere
+  relationship_patterns:
+    - one_to_many                            # Client->DesignPackage, Takeoff->TakeoffLine, Production->{reviews, samples, COs, reservations, plans}
+    - cross_aggregate                        # TakeoffLine.stock_item_id (inventory aggregate), Bid.takeoff_id, Production.bid_id
+  role_model: segregation_of_duties          # review approver != preparer (by X-User-ID); resubmit restricted to preparer;
+                                             # shop-side roles (build/price) vs client-side approval roles are disjoint
+  consistency_model: immediate               # all mutations + cascades atomic in-request; computed fields refreshed synchronously
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# Money: integer cents. Rates/percentages: integer basis points (10000 = 100%).
+# All datetimes ISO8601 UTC and interpreted on the logical clock (see
+# POST /scenic/_clock/set-current-utc; server default 2026-08-01T00:00:00Z).
+# =============================================================================
+entities:
+  - name: Shop
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Shop name" }
+      - { name: weekly_crew_hours_capacity, type: integer, source: input, description: "Crew-hours the shop can work per week; > 0" }
+      - { name: horizon_weeks, type: integer, source: input, description: "Capacity planning horizon in weeks; > 0" }
+      - { name: bay_count, type: integer, source: input, description: "Number of build bays; bay slots are numbered 1..bay_count; > 0" }
+      - { name: truck_fleet_size, type: integer, source: input, description: "Total trucks available for transport windows; > 0" }
+      - { name: labor_rate_cents_per_hour, type: integer, source: input, description: "Straight-time shop labor rate; > 0" }
+      - { name: overtime_multiplier_bp, type: integer, source: input, description: "Labor multiplier in bp applied when posture is TIGHT or SATURATED (e.g. 15000 = 1.5x); >= 10000" }
+      - { name: overhead_pct_bp, type: integer, source: input, description: "Overhead surcharge in bp applied to (materials + labor); >= 0" }
+      - { name: margin_pct_bp, type: integer, source: input, description: "Margin in bp applied on top of (materials + labor + overhead) for bids; >= 0" }
+      - { name: committed_crew_hours, type: integer, source: computed, default: 0, description: "Sum of committed_crew_hours over Productions with status IN {SCHEDULED, IN_BUILD, ON_HOLD}" }
+      - { name: capacity_ratio_bp, type: integer, source: computed, default: 0, description: "= round_half_up(committed_crew_hours * 10000 / (weekly_crew_hours_capacity * horizon_weeks), 0)" }
+      - { name: posture, type: enum, source: computed, default: OPEN, description: "OPEN | TIGHT | SATURATED — derived from capacity_ratio_bp (>= 10000 SATURATED; >= 8000 TIGHT; else OPEN)" }
+      - { name: inventory_value_cents, type: integer, source: computed, default: 0, description: "Sum of reuse_value_cents over all StockItems of this shop (recovery-basis valuation)" }
+      - { name: epoch_index, type: integer, source: system, default: 0, description: "Monotone counter incremented by run_epoch" }
+
+  - name: Client
+    parent: Shop
+    common_fields: true
+    fields:
+      - { name: shop_id, type: string, source: input, description: "FK -> Shop.id; owning shop" }
+      - { name: company_name, type: string, source: input, description: "Production company name" }
+      - { name: contact_email, type: string, source: input, description: "Primary contact email" }
+      - { name: credit_limit_cents, type: integer, source: input, description: "Maximum outstanding committed production price allowed for this client; >= 0" }
+      - { name: outstanding_cents, type: integer, source: computed, default: 0, description: "Sum of current_price_cents over this client's Productions with status IN {SCHEDULED, IN_BUILD, ON_HOLD, BUILT, LOADED_IN, STRUCK}" }
+
+  - name: DesignPackage
+    parent: Client
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id; owning client" }
+      - { name: show_title, type: string, source: input, description: "Production/show title; uniqueness scope with client_id for the CURRENT package" }
+      - { name: venue, type: string, source: input, description: "Venue name/address" }
+      - { name: load_in_at, type: datetime, source: input, description: "Contractual load-in deadline (UTC)" }
+      - { name: strike_at, type: datetime, source: input, description: "Contractual strike date (UTC); must be > load_in_at" }
+      - { name: drawing_revision, type: integer, source: system, description: "1 for the first package of (client_id, show_title); max(existing revisions)+1 on each re-upload" }
+      - { name: status, type: enum, source: system, description: "CURRENT | SUPERSEDED — exactly one CURRENT per (client_id, show_title)" }
+
+  - name: Takeoff
+    parent: DesignPackage
+    common_fields: true
+    fields:
+      - { name: design_package_id, type: string, source: input, description: "FK -> DesignPackage.id; package this takeoff quantifies" }
+      - { name: estimator_user_id, type: string, source: system, description: "X-User-ID of the creating Estimator" }
+      - { name: labor_hours_est, type: integer, source: input, description: "Estimated shop labor hours; > 0" }
+      - { name: pinned_package_revision, type: integer, source: system, description: "DesignPackage.drawing_revision captured at takeoff creation" }
+      - { name: materials_subtotal_cents, type: integer, source: computed, default: 0, description: "Sum of line_total_cents over the takeoff's TakeoffLines; recomputed on every line add/delete" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> LOCKED; LOCKED when a DETAILED bid referencing this takeoff is submitted" }
+      - { name: notes, type: string, source: input, required: false, description: "Free-form estimator notes" }
+
+  - name: TakeoffLine
+    parent: Takeoff
+    common_fields: true
+    fields:
+      - { name: takeoff_id, type: string, source: input, description: "FK -> Takeoff.id; owning takeoff" }
+      - { name: material_code, type: string, source: input, description: "Material identifier, e.g. LUMBER_4X8 | STEEL_TUBE | PAINT_GAL" }
+      - { name: quantity, type: integer, source: input, description: "Units required; > 0" }
+      - { name: source, type: enum, source: input, description: "PURCHASE | STOCK — STOCK lines consume StockItem inventory" }
+      - { name: unit_cost_cents, type: integer, source: input, required: false, description: "Required when source=PURCHASE; ignored when source=STOCK (unit cost derives from the StockItem condition factor)" }
+      - { name: stock_item_id, type: string, source: input, required: false, description: "FK -> StockItem.id; required when source=STOCK, must be absent when source=PURCHASE" }
+      - { name: waste_pct_bp, type: integer, source: input, default: 0, description: "Cut/waste allowance in bp applied per line; >= 0" }
+      - { name: applied_unit_cost_cents, type: integer, source: computed, description: "unit_cost_cents for PURCHASE; round_half_up(replacement_cost_cents * condition factor bp / 10000, 0) for STOCK" }
+      - { name: line_total_cents, type: integer, source: computed, description: "round_half_up(quantity * applied_unit_cost_cents * (10000 + waste_pct_bp) / 10000, 0) — rounding happens PER LINE before any summation" }
+
+  - name: Bid
+    parent: Client
+    common_fields: true
+    fields:
+      - { name: client_id, type: string, source: input, description: "FK -> Client.id; client receiving the bid" }
+      - { name: design_package_id, type: string, source: input, description: "FK -> DesignPackage.id; package being priced" }
+      - { name: pricing_variant, type: enum, source: input, description: "DETAILED | ROM (rough order of magnitude)" }
+      - { name: takeoff_id, type: string, source: input, required: false, description: "FK -> Takeoff.id; required when pricing_variant=DETAILED, must be absent when ROM" }
+      - { name: floor_area_sqft, type: integer, source: input, required: false, description: "Required when pricing_variant=ROM; > 0" }
+      - { name: complexity_class, type: enum, source: input, required: false, description: "Required when pricing_variant=ROM: A_SIMPLE | B_STANDARD | C_COMPLEX" }
+      - { name: has_automation_scope, type: boolean, source: input, description: "True when the design includes automation (moving elements); drives required review scopes" }
+      - { name: bays_required, type: integer, source: input, description: "Bay slots this production needs during its build window; > 0" }
+      - { name: build_start_at, type: datetime, source: input, description: "Planned build start (UTC); must be < package load_in_at" }
+      - { name: estimated_crew_hours, type: integer, source: input, required: false, description: "Required when pricing_variant=ROM (capacity commitment source); > 0. Ignored for DETAILED (takeoff.labor_hours_est is used)" }
+      - { name: validity_days, type: integer, source: input, description: "Days the submitted price remains valid; > 0" }
+      - { name: pinned_drawing_revision, type: integer, source: system, description: "DesignPackage.drawing_revision captured at bid creation; submit/accept re-validate it is still the package's current revision" }
+      - { name: price_cents, type: integer, source: computed, description: "Computed at creation per bid_price_detailed or bid_price_rom; replaced by revised_price_cents on revise" }
+      - { name: valid_until, type: datetime, source: system, description: "Set at submit: logical clock at submit + validity_days" }
+      - { name: round_no, type: integer, source: system, default: 1, description: "Negotiation round; increments by 1 on each revise" }
+      - { name: production_id, type: string, source: system, required: false, description: "FK -> Production.id; set when the bid is ACCEPTED and its Production is created; null otherwise" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> SUBMITTED -> {ACCEPTED | REJECTED | COUNTERED | WITHDRAWN | EXPIRED}; COUNTERED -> SUBMITTED on revise; WITHDRAWN also from DRAFT/COUNTERED" }
+
+  - name: Production
+    parent: Shop
+    common_fields: true
+    fields:
+      - { name: shop_id, type: string, source: system, description: "FK -> Shop.id; shop executing the build (from the bid's client's shop)" }
+      - { name: bid_id, type: string, source: system, description: "FK -> Bid.id; accepted bid this production was spawned from" }
+      - { name: client_id, type: string, source: system, description: "FK -> Client.id; copied from bid.client_id at acceptance" }
+      - { name: show_title, type: string, source: system, description: "Copied from the bid's design package" }
+      - { name: build_start_at, type: datetime, source: system, description: "Copied from bid.build_start_at" }
+      - { name: load_in_deadline_at, type: datetime, source: system, description: "Copied from package.load_in_at at acceptance; shifted by delta_load_in_days on change-order approval" }
+      - { name: strike_at, type: datetime, source: system, description: "Copied from package.strike_at" }
+      - { name: committed_crew_hours, type: integer, source: system, description: "takeoff.labor_hours_est (DETAILED) or bid.estimated_crew_hours (ROM) at acceptance; adjusted by delta_labor_hours on change-order approval; may go down but is floored at 1" }
+      - { name: bays_required, type: integer, source: system, description: "Copied from bid.bays_required" }
+      - { name: required_review_scopes, type: array, source: system, description: "[\"STRUCTURAL\"] or [\"STRUCTURAL\", \"AUTOMATION\"] when bid.has_automation_scope; scopes that must have an APPROVED EngineeringReview before start-build" }
+      - { name: applied_drawing_revision, type: integer, source: system, description: "Revision the build currently reflects; = bid.pinned_drawing_revision at acceptance; = approved change order's new_drawing_revision after CO approval" }
+      - { name: current_price_cents, type: integer, source: computed, description: "= accepted bid.price_cents + sum(delta_price_cents over APPROVED ChangeOrders)" }
+      - { name: built_at, type: datetime, source: system, required: false, description: "Logical clock timestamp recorded at complete-build" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> IN_BUILD -> BUILT -> LOADED_IN -> STRUCK -> CLOSED; IN_BUILD <-> ON_HOLD hold loop driven by engineering revisions" }
+
+  - name: EngineeringReview
+    parent: Production
+    common_fields: true
+    fields:
+      - { name: production_id, type: string, source: input, description: "FK -> Production.id; production under review" }
+      - { name: scope, type: enum, source: input, description: "STRUCTURAL | AUTOMATION" }
+      - { name: design_load_lb, type: number, source: input, description: "Anticipated load in pounds; > 0; up to 2 decimals" }
+      - { name: member_capacity_lb, type: number, source: input, description: "Rated capacity of the supporting member/automation in pounds; > 0; up to 2 decimals" }
+      - { name: impact_factor_bp, type: integer, source: input, required: false, description: "Dynamic amplification in bp; required when scope=AUTOMATION (>= 10000), must be absent when STRUCTURAL" }
+      - { name: prepared_by_user_id, type: string, source: system, description: "X-User-ID of the creator; the approver must be a different user (segregation of duties)" }
+      - { name: sf_static, type: number, source: computed, description: "round_half_up(member_capacity_lb / design_load_lb, 2); approve requires >= 1.50" }
+      - { name: sf_dynamic, type: number, source: computed, required: false, description: "AUTOMATION only: round_half_up(member_capacity_lb / round_half_up(design_load_lb * impact_factor_bp / 10000, 2), 2); approve requires >= 2.00" }
+      - { name: round_no, type: integer, source: system, default: 1, description: "Revision round; increments on each resubmit" }
+      - { name: revision_note, type: string, source: system, required: false, description: "Latest note supplied by request-revision" }
+      - { name: status, type: enum, source: system, description: "PENDING -> {APPROVED | REVISION_REQUIRED}; REVISION_REQUIRED -> PENDING on resubmit" }
+
+  - name: FinishSample
+    parent: Production
+    common_fields: true
+    fields:
+      - { name: production_id, type: string, source: input, description: "FK -> Production.id; production this sample belongs to" }
+      - { name: finish_code, type: string, source: input, description: "Paint/finish specification code, e.g. SCUFF_BRICK_RED" }
+      - { name: texture_ref, type: string, source: input, description: "Texture reference identifier or description" }
+      - { name: round_no, type: integer, source: system, default: 1, description: "Submission round; increments on each resubmit" }
+      - { name: rejection_note, type: string, source: system, required: false, description: "Latest client rejection note" }
+      - { name: status, type: enum, source: system, description: "SUBMITTED -> {APPROVED | REJECTED}; REJECTED -> SUBMITTED on resubmit" }
+
+  - name: ChangeOrder
+    parent: Production
+    common_fields: true
+    fields:
+      - { name: production_id, type: string, source: input, description: "FK -> Production.id; production being revised" }
+      - { name: new_drawing_revision, type: integer, source: input, description: "Revision this CO moves the build to; must equal the design package's current revision and be > production.applied_drawing_revision" }
+      - { name: delta_materials_cents, type: integer, source: input, description: "Signed material cost delta in cents (may be negative); |delta| <= 100000000" }
+      - { name: delta_labor_hours, type: integer, source: input, description: "Signed labor-hour delta (may be negative); production.committed_crew_hours is floored at 1 after applying" }
+      - { name: delta_load_in_days, type: integer, source: input, description: "Signed shift of load_in_deadline_at in whole days (negative = earlier deadline)" }
+      - { name: priced_posture, type: enum, source: system, description: "Shop posture observed at CO creation; selects the labor multiplier in change_order_price" }
+      - { name: priced_production_status, type: enum, source: system, description: "Production status observed at CO creation; selects the rework multiplier in change_order_price" }
+      - { name: delta_price_cents, type: integer, source: computed, description: "Computed at creation per change_order_price and pinned on the CO; approval applies this pinned value" }
+      - { name: co_no, type: integer, source: system, description: "Per-production monotone sequence starting at 1, assigned in creation order (ties impossible: creation is serialized by Production OCC)" }
+      - { name: status, type: enum, source: system, description: "PROPOSED -> {APPROVED | REJECTED | WITHDRAWN}" }
+
+  - name: BayReservation
+    parent: Production
+    common_fields: true
+    fields:
+      - { name: production_id, type: string, source: input, description: "FK -> Production.id; production occupying the bay" }
+      - { name: bay_slot, type: integer, source: input, description: "Bay number; 1 <= bay_slot <= shop.bay_count" }
+      - { name: window_start, type: datetime, source: input, description: "Occupation start (UTC); must be < window_end" }
+      - { name: window_end, type: datetime, source: input, description: "Occupation end (UTC); must be <= production.load_in_deadline_at at creation" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> RELEASED (soft delete; RELEASED rows stay queryable but are excluded from overlap checks and reserved-count sums)" }
+
+  - name: StockItem
+    parent: Shop
+    common_fields: true
+    fields:
+      - { name: shop_id, type: string, source: input, description: "FK -> Shop.id; owning shop (set implicitly to the production's shop for strike-created items)" }
+      - { name: material_code, type: string, source: input, description: "Material identifier" }
+      - { name: condition_grade, type: enum, source: input, description: "A | B | C — drives the reuse unit-cost factor (A=6000bp, B=4000bp, C=2500bp)" }
+      - { name: quantity_on_hand, type: integer, source: input, description: "Units physically stored; >= 0; input at creation, afterwards mutated only by adjust / takeoff-line consume+restore / strike reclaim" }
+      - { name: origin, type: enum, source: system, description: "PURCHASED (POST /stock-items) | RECLAIMED (created by strike when no matching item exists)" }
+      - { name: replacement_cost_cents, type: integer, source: input, description: "New-purchase replacement cost per unit; > 0. For strike-created items this is supplied by the reclaim line's replacement_cost_cents" }
+      - { name: reuse_unit_cost_cents, type: integer, source: computed, description: "round_half_up(replacement_cost_cents * condition factor bp / 10000, 0)" }
+      - { name: reuse_value_cents, type: integer, source: computed, description: "quantity_on_hand * reuse_unit_cost_cents (recovery basis)" }
+      - { name: replacement_value_cents, type: integer, source: computed, description: "quantity_on_hand * replacement_cost_cents (replacement basis)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE <-> DEPLETED; ACTIVE iff quantity_on_hand > 0, DEPLETED iff == 0 (system-managed on every quantity mutation)" }
+
+  - name: TransportPlan
+    parent: Production
+    common_fields: true
+    fields:
+      - { name: production_id, type: string, source: input, description: "FK -> Production.id; production being hauled" }
+      - { name: truck_count, type: integer, source: input, description: "Trucks committed to this move; >= 1" }
+      - { name: install_crew_hours, type: integer, source: input, description: "On-site install labor hours; >= 1" }
+      - { name: depart_at, type: datetime, source: input, description: "Fleet occupation start (UTC); must be < arrive_at" }
+      - { name: arrive_at, type: datetime, source: input, description: "Fleet occupation end (UTC); trucks are committed over the half-open window [depart_at, arrive_at)" }
+      - { name: status, type: enum, source: system, description: "PLANNED -> CONFIRMED -> EXECUTED; PLANNED -> CANCELLED" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: DesignPackage
+    initial_state: CURRENT
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: CURRENT
+        to: SUPERSEDED
+        trigger: "system (when POST /scenic/design-packages creates a package for a (client_id, show_title) that already has a CURRENT package)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "prior CURRENT package -> SUPERSEDED; new package becomes the sole CURRENT with drawing_revision = prior max revision + 1"
+          - "no in-place mutation of bids pinned to the old revision; their pinned_drawing_revision simply ceases to be current (staleness is detected at submit/accept)"
+
+  - entity: Takeoff
+    initial_state: DRAFT
+    terminal_states: [LOCKED]
+    transitions:
+      - from: DRAFT
+        to: LOCKED
+        trigger: "system (when a DETAILED Bid referencing this takeoff transitions DRAFT -> SUBMITTED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "further POST /scenic/takeoff-lines or DELETE /scenic/takeoff-lines/{id} against this takeoff are rejected with ERR_TAKEOFF_LOCKED"
+
+  - entity: Bid
+    initial_state: DRAFT
+    terminal_states: [ACCEPTED, REJECTED, WITHDRAWN, EXPIRED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /scenic/bids/{bidId}/submit"
+        actor: Estimator
+        preconditions:
+          - "bid.status == DRAFT (else ERR_INVALID_STATE)"
+          - "design package status == CURRENT and bid.pinned_drawing_revision == package.drawing_revision (else ERR_STALE_DRAWING_REVISION)"
+          - "shop.posture != SATURATED (else ERR_SHOP_SATURATED)"
+        side_effects:
+          - "bid.valid_until = logical clock at submit + validity_days"
+          - "if pricing_variant == DETAILED: referenced Takeoff -> LOCKED"
+      - from: SUBMITTED
+        to: COUNTERED
+        trigger: "POST /scenic/bids/{bidId}/counter"
+        actor: ClientPM
+        preconditions:
+          - "bid.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "X-User-ID == bid.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects: []
+      - from: COUNTERED
+        to: SUBMITTED
+        trigger: "POST /scenic/bids/{bidId}/revise"
+        actor: Estimator
+        preconditions:
+          - "bid.status == COUNTERED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "bid.price_cents = revised_price_cents (input)"
+          - "bid.round_no += 1"
+          - "bid.valid_until = logical clock at revise + validity_days"
+      - from: SUBMITTED
+        to: ACCEPTED
+        trigger: "POST /scenic/bids/{bidId}/accept"
+        actor: ClientPM
+        preconditions:
+          - "bid.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "X-User-ID == bid.client_id (else ERR_NOT_OWN_RESOURCE)"
+          - "design package status == CURRENT and bid.pinned_drawing_revision == package.drawing_revision (else ERR_STALE_DRAWING_REVISION)"
+          - "logical clock <= bid.valid_until (else ERR_BID_EXPIRED)"
+          - "client.outstanding_cents + bid.price_cents <= client.credit_limit_cents (else ERR_CREDIT_LIMIT_EXCEEDED)"
+          - "shop.posture != SATURATED (else ERR_SHOP_SATURATED)"
+        side_effects:
+          - "create Production (status SCHEDULED; shop_id = client's shop; bid_id, client_id, show_title, build_start_at, bays_required copied from bid/package; load_in_deadline_at = package.load_in_at; strike_at = package.strike_at; committed_crew_hours = takeoff.labor_hours_est for DETAILED else bid.estimated_crew_hours; applied_drawing_revision = bid.pinned_drawing_revision; required_review_scopes = [STRUCTURAL] (+ AUTOMATION when bid.has_automation_scope); current_price_cents = bid.price_cents)"
+          - "bid.production_id = new Production.id"
+          - "Shop.committed_crew_hours += production.committed_crew_hours; Shop.capacity_ratio_bp and Shop.posture recomputed"
+          - "Client.outstanding_cents recomputed (now includes the new production's current_price_cents)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /scenic/bids/{bidId}/reject"
+        actor: ClientPM
+        preconditions:
+          - "bid.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "X-User-ID == bid.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects: []
+      - from: DRAFT
+        to: WITHDRAWN
+        trigger: "POST /scenic/bids/{bidId}/withdraw"
+        actor: Estimator
+        preconditions: ["bid.status IN {DRAFT, SUBMITTED, COUNTERED} (else ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: SUBMITTED
+        to: WITHDRAWN
+        trigger: "POST /scenic/bids/{bidId}/withdraw"
+        actor: Estimator
+        preconditions: ["bid.status IN {DRAFT, SUBMITTED, COUNTERED} (else ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: COUNTERED
+        to: WITHDRAWN
+        trigger: "POST /scenic/bids/{bidId}/withdraw"
+        actor: Estimator
+        preconditions: ["bid.status IN {DRAFT, SUBMITTED, COUNTERED} (else ERR_INVALID_STATE)"]
+        side_effects: []
+      - from: SUBMITTED
+        to: EXPIRED
+        trigger: "system (during POST /scenic/shops/{shopId}/run-epoch: SUBMITTED bids of this shop with logical clock > valid_until)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Production
+    initial_state: SCHEDULED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_BUILD
+        trigger: "POST /scenic/productions/{productionId}/start-build"
+        actor: ShopForeman
+        preconditions:
+          - "production.status == SCHEDULED (else ERR_INVALID_STATE)"
+          - "for every scope in required_review_scopes there EXISTS an APPROVED EngineeringReview with production_id == production.id and matching scope (else ERR_ENGINEERING_NOT_APPROVED)"
+          - "count of ACTIVE BayReservations with production_id == production.id >= production.bays_required (else ERR_BAY_UNDER_RESERVED)"
+        side_effects: []
+      - from: IN_BUILD
+        to: ON_HOLD
+        trigger: "system (when an EngineeringReview of this production transitions PENDING -> REVISION_REQUIRED)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "production work pauses; complete-build is rejected while ON_HOLD (state gate)"
+      - from: ON_HOLD
+        to: IN_BUILD
+        trigger: "system (when the last non-APPROVED EngineeringReview of this production reaches APPROVED, i.e. all reviews APPROVED after an approve)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: IN_BUILD
+        to: BUILT
+        trigger: "POST /scenic/productions/{productionId}/complete-build"
+        actor: ShopForeman
+        preconditions:
+          - "production.status == IN_BUILD (else ERR_INVALID_STATE)"
+          - "no EngineeringReview of this production in PENDING or REVISION_REQUIRED (else ERR_ENGINEERING_NOT_APPROVED)"
+          - "every FinishSample of this production has status == APPROVED (else ERR_FINISH_NOT_APPROVED)"
+          - "production.load_in_deadline_at - logical clock >= 2 days (else ERR_LOAD_IN_TOO_SOON); a gap of exactly 2 days passes"
+        side_effects:
+          - "production.built_at = logical clock"
+      - from: BUILT
+        to: LOADED_IN
+        trigger: "POST /scenic/productions/{productionId}/load-in"
+        actor: TransportCoordinator
+        preconditions:
+          - "production.status == BUILT (else ERR_INVALID_STATE)"
+          - "exists a TransportPlan with production_id == production.id and status == CONFIRMED (else ERR_TRANSPORT_NOT_CONFIRMED)"
+        side_effects:
+          - "every CONFIRMED TransportPlan of this production -> EXECUTED"
+      - from: LOADED_IN
+        to: STRUCK
+        trigger: "POST /scenic/productions/{productionId}/strike"
+        actor: ShopForeman
+        preconditions:
+          - "production.status == LOADED_IN (else ERR_INVALID_STATE)"
+        side_effects:
+          - "for each reclaim line {material_code, quantity, condition_grade, replacement_cost_cents}: find the StockItem of the production's shop matching (material_code, condition_grade) — any origin — or create one (origin RECLAIMED, quantity_on_hand 0) when none matches; then StockItem.quantity_on_hand += quantity"
+          - "each touched StockItem's status is system-flipped: DEPLETED -> ACTIVE when quantity leaves 0"
+          - "Shop.inventory_value_cents recomputed (sum of reuse_value_cents over the shop's StockItems) after all lines apply"
+      - from: STRUCK
+        to: CLOSED
+        trigger: "POST /scenic/productions/{productionId}/close"
+        actor: ShopForeman
+        preconditions:
+          - "production.status == STRUCK (else ERR_INVALID_STATE)"
+          - "no ChangeOrder of this production in PROPOSED (else ERR_CHANGE_ORDERS_PENDING)"
+          - "no BayReservation of this production in ACTIVE (else ERR_RESERVATIONS_OPEN)"
+        side_effects:
+          - "Shop.committed_crew_hours -= production.committed_crew_hours; Shop.capacity_ratio_bp and Shop.posture recomputed"
+          - "Client.outstanding_cents recomputed (closed production drops out of the outstanding set)"
+
+  - entity: EngineeringReview
+    initial_state: PENDING
+    terminal_states: [APPROVED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /scenic/engineering-reviews/{reviewId}/approve"
+        actor: StaffEngineer
+        preconditions:
+          - "review.status == PENDING (else ERR_INVALID_STATE)"
+          - "X-User-ID != review.prepared_by_user_id (else ERR_SEGREGATION_OF_DUTIES)"
+          - "sf_static >= 1.50 and (scope == STRUCTURAL or sf_dynamic >= 2.00) (else ERR_SAFETY_FACTOR_INSUFFICIENT)"
+        side_effects:
+          - "if production.status == ON_HOLD and all EngineeringReviews of the production are now APPROVED: production -> IN_BUILD"
+      - from: PENDING
+        to: REVISION_REQUIRED
+        trigger: "POST /scenic/engineering-reviews/{reviewId}/request-revision"
+        actor: StaffEngineer
+        preconditions:
+          - "review.status == PENDING (else ERR_INVALID_STATE)"
+        side_effects:
+          - "review.revision_note = input revision_note"
+          - "if production.status == IN_BUILD: production -> ON_HOLD"
+      - from: REVISION_REQUIRED
+        to: PENDING
+        trigger: "POST /scenic/engineering-reviews/{reviewId}/resubmit"
+        actor: ShopForeman | StaffEngineer
+        preconditions:
+          - "review.status == REVISION_REQUIRED (else ERR_INVALID_STATE)"
+          - "X-User-ID == review.prepared_by_user_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects:
+          - "review.design_load_lb / member_capacity_lb / impact_factor_bp replaced by inputs"
+          - "sf_static and sf_dynamic recomputed"
+          - "review.round_no += 1"
+
+  - entity: FinishSample
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /scenic/finish-samples/{sampleId}/approve"
+        actor: ClientPM
+        preconditions:
+          - "sample.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "X-User-ID == sample's production.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects: []
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /scenic/finish-samples/{sampleId}/reject"
+        actor: ClientPM
+        preconditions:
+          - "sample.status == SUBMITTED (else ERR_INVALID_STATE)"
+          - "X-User-ID == sample's production.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects:
+          - "sample.rejection_note = input rejection_note"
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /scenic/finish-samples/{sampleId}/resubmit"
+        actor: PaintCharge
+        preconditions:
+          - "sample.status == REJECTED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "sample.texture_ref replaced by input"
+          - "sample.round_no += 1"
+
+  - entity: ChangeOrder
+    initial_state: PROPOSED
+    terminal_states: [APPROVED, REJECTED, WITHDRAWN]
+    transitions:
+      - from: PROPOSED
+        to: APPROVED
+        trigger: "POST /scenic/change-orders/{coId}/approve"
+        actor: ClientPM
+        preconditions:
+          - "co.status == PROPOSED (else ERR_INVALID_STATE)"
+          - "X-User-ID == co's production.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects:
+          - "Production.current_price_cents += co.delta_price_cents"
+          - "Production.load_in_deadline_at += co.delta_load_in_days days"
+          - "Production.committed_crew_hours = max(1, committed_crew_hours + co.delta_labor_hours)"
+          - "Production.applied_drawing_revision = co.new_drawing_revision"
+          - "cascade: every ACTIVE BayReservation of the production with window_end > the NEW load_in_deadline_at -> RELEASED (caused by the deadline mutation above)"
+          - "cascade: Shop.committed_crew_hours recomputed from the production's new committed_crew_hours (caused by the hours mutation above)"
+          - "cascade: Shop.capacity_ratio_bp and Shop.posture recomputed from the new committed_crew_hours (caused by the committed-hours mutation above)"
+          - "Client.outstanding_cents recomputed (price mutation above)"
+          - "Production.version incremented for each mutation step in this cascade"
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /scenic/change-orders/{coId}/reject"
+        actor: ClientPM
+        preconditions:
+          - "co.status == PROPOSED (else ERR_INVALID_STATE)"
+          - "X-User-ID == co's production.client_id (else ERR_NOT_OWN_RESOURCE)"
+        side_effects:
+          - "none — Production fields, bay reservations, and shop aggregates are explicitly untouched (compensating-invariant anchor)"
+      - from: PROPOSED
+        to: WITHDRAWN
+        trigger: "POST /scenic/change-orders/{coId}/withdraw"
+        actor: Estimator
+        preconditions:
+          - "co.status == PROPOSED (else ERR_INVALID_STATE)"
+        side_effects: []
+
+  - entity: BayReservation
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "DELETE /scenic/bay-reservations/{reservationId}"
+        actor: ShopForeman
+        preconditions:
+          - "reservation.status == ACTIVE (else ERR_INVALID_STATE)"
+        side_effects:
+          - "row retained (soft delete); excluded from overlap checks and reserved-count sums thereafter"
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "system (cascade from ChangeOrder approval when window_end > new production.load_in_deadline_at)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: StockItem
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: DEPLETED
+        trigger: "system (any quantity mutation leaves quantity_on_hand == 0: POST /stock-items create with 0, adjust, takeoff-line consume)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: DEPLETED
+        to: ACTIVE
+        trigger: "system (any quantity mutation leaves quantity_on_hand > 0: adjust, takeoff-line restore on delete, strike reclaim)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: TransportPlan
+    initial_state: PLANNED
+    terminal_states: [EXECUTED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: CONFIRMED
+        trigger: "POST /scenic/transport-plans/{planId}/confirm"
+        actor: TransportCoordinator
+        preconditions:
+          - "plan.status == PLANNED (else ERR_INVALID_STATE)"
+          - "production.status not IN {LOADED_IN, STRUCK, CLOSED} (else ERR_INVALID_STATE)"
+        side_effects: []
+      - from: CONFIRMED
+        to: EXECUTED
+        trigger: "system (when the production transitions BUILT -> LOADED_IN)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /scenic/transport-plans/{planId}/cancel"
+        actor: TransportCoordinator
+        preconditions:
+          - "plan.status == PLANNED (else ERR_INVALID_STATE)"
+        side_effects:
+          - "plan stops counting toward fleet overlap sums"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (true races only — OCC on the parent's version)
+# =============================================================================
+concurrency_rules:
+  - rule_id: change-order-create-stale-production
+    parent_entity: Production
+    write_endpoint: "POST /scenic/change-orders"
+    occ_field: "expected_production_version"
+    description: |
+      Creating a ChangeOrder against a Production whose version has advanced
+      since the client last observed it is rejected. Multiple PROPOSED change
+      orders on one production are legitimate, so a second sequential create
+      would otherwise succeed on a stale pricing base; the OCC check forces
+      the writer to re-read the production (price, deadline, committed hours)
+      before proposing deltas.
+    error_id: ERR_STALE_PRODUCTION_VERSION
+    http_status: 412
+  - rule_id: takeoff-line-add-stale-takeoff
+    parent_entity: Takeoff
+    write_endpoint: "POST /scenic/takeoff-lines"
+    occ_field: "expected_takeoff_version"
+    description: |
+      Adding a TakeoffLine against a Takeoff whose version has advanced since
+      the client last observed it is rejected. Adding further lines is always
+      legitimate on a DRAFT takeoff, so a stale writer would otherwise price
+      from an out-of-date materials subtotal; the OCC check forces a re-read.
+    error_id: ERR_STALE_TAKEOFF_VERSION
+    http_status: 412
+  - rule_id: stock-adjust-stale-item
+    parent_entity: StockItem
+    write_endpoint: "POST /scenic/stock-items/{itemId}/adjust"
+    occ_field: "expected_stock_item_version"
+    description: |
+      Adjusting a StockItem whose version has advanced since the client last
+      observed it is rejected. Quantity adjustments are deltas applied to the
+      current on-hand value, so a stale writer would otherwise base its delta
+      on an out-of-date quantity; the OCC check forces a re-read.
+    error_id: ERR_STALE_STOCK_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: bid_price_detailed
+    trigger: "POST /scenic/bids creation with pricing_variant=DETAILED"
+    algorithm: tiered_pricing
+    formula: |
+      # Evaluation order is pinned top-to-bottom; every round_half_up targets integer cents.
+      # (1) per-line totals — rounding happens PER LINE, never on the sum:
+      for each TakeoffLine of takeoff_id:
+        applied_unit = (source == PURCHASE) ? unit_cost_cents
+                     : round_half_up(stock_item.replacement_cost_cents * CONDITION_FACTOR_BP[stock_item.condition_grade] / 10000, 0)
+        line_total_cents = round_half_up(quantity * applied_unit * (10000 + waste_pct_bp) / 10000, 0)
+      # (2) gross materials:
+      gross_materials_cents = sum(line_total_cents)
+      # (3) volume-discount tier is keyed on the PRE-DISCOUNT gross:
+      tier_bp = (gross_materials_cents >= VOLUME_TIER_MIN_CENTS) ? VOLUME_TIER_DISCOUNT_BP : 0
+      # (4) discount applied after tier selection:
+      discounted_materials_cents = round_half_up(gross_materials_cents * (10000 - tier_bp) / 10000, 0)
+      # (5) labor:
+      labor_cost_cents = takeoff.labor_hours_est * shop.labor_rate_cents_per_hour
+      # (6) base / overhead / margin, each step rounded:
+      base_cents     = discounted_materials_cents + labor_cost_cents
+      overhead_cents = round_half_up(base_cents * shop.overhead_pct_bp / 10000, 0)
+      margin_cents   = round_half_up((base_cents + overhead_cents) * shop.margin_pct_bp / 10000, 0)
+      price_cents    = base_cents + overhead_cents + margin_cents
+    input_set: "All TakeoffLines of the referenced takeoff (any source); the takeoff must belong to the bid's design package"
+    constants:
+      VOLUME_TIER_MIN_CENTS: 500000
+      VOLUME_TIER_DISCOUNT_BP: 500
+      CONDITION_FACTOR_BP: { A: 6000, B: 4000, C: 2500 }
+    precision: "integer cents; round_half_up at each pinned step"
+    variants:
+      - name: rom_sibling
+        when: "pricing_variant=ROM — see bid_price_rom; identical package priced by the two variants yields different price_cents"
+        difference: "ROM never reads takeoff lines; priced from floor area x complexity rate x urgency multiplier"
+
+  - name: bid_price_rom
+    trigger: "POST /scenic/bids creation with pricing_variant=ROM"
+    algorithm: forward_looking
+    formula: |
+      days_until_load_in = floor((package.load_in_at - logical clock at creation) / 86400 seconds)
+      urgency_bp = (days_until_load_in <= URGENCY_WINDOW_DAYS) ? URGENCY_MULTIPLIER_BP : 10000
+      price_cents = round_half_up(floor_area_sqft * ROM_RATE_CENTS_PER_SQFT[complexity_class] * urgency_bp / 10000, 0)
+    input_set: "Bid inputs floor_area_sqft, complexity_class, and the package load_in_at; no takeoff lines are read"
+    constants:
+      ROM_RATE_CENTS_PER_SQFT: { A_SIMPLE: 9000, B_STANDARD: 14000, C_COMPLEX: 22000 }
+      URGENCY_WINDOW_DAYS: 28
+      URGENCY_MULTIPLIER_BP: 12500
+    precision: "integer cents; round_half_up"
+    variants:
+      - name: detailed_sibling
+        when: "pricing_variant=DETAILED — see bid_price_detailed"
+        difference: "detailed pricing is takeoff-line driven; the two variants disagree on identical design packages"
+
+  - name: engineering_safety_factor
+    trigger: "POST /scenic/engineering-reviews creation and POST /scenic/engineering-reviews/{reviewId}/resubmit; verdict enforced at approve"
+    algorithm: threshold
+    formula: |
+      sf_static = round_half_up(member_capacity_lb / design_load_lb, 2)                      # both scopes
+      if scope == AUTOMATION:
+        effective_load_lb = round_half_up(design_load_lb * impact_factor_bp / 10000, 2)      # pinned: load amplified BEFORE division
+        sf_dynamic = round_half_up(member_capacity_lb / effective_load_lb, 2)
+      approve requires: sf_static >= SF_STATIC_MIN  (boundary: exactly 1.50 passes)
+                        and (scope == STRUCTURAL or sf_dynamic >= SF_DYNAMIC_MIN)            # exactly 2.00 passes
+    input_set: "The review's own design_load_lb, member_capacity_lb, impact_factor_bp"
+    constants:
+      SF_STATIC_MIN: 1.50
+      SF_DYNAMIC_MIN: 2.00
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: static_only
+        when: "scope=STRUCTURAL"
+        difference: "verdict depends on sf_static alone; identical numbers that pass STRUCTURAL can fail AUTOMATION"
+      - name: dynamic_amplified
+        when: "scope=AUTOMATION"
+        difference: "load amplified by impact_factor_bp and verdict additionally gated on sf_dynamic >= 2.00"
+
+  - name: change_order_price
+    trigger: "POST /scenic/change-orders creation (delta_price_cents computed once, at creation, and pinned on the CO; approval applies the pinned value)"
+    algorithm: constraint_propagation
+    formula: |
+      # Evaluation order pinned top-to-bottom. Inputs: delta_materials_cents (m),
+      # delta_labor_hours (h), delta_load_in_days (d), shop posture at creation (p),
+      # production status at creation (s).
+      mult_bp   = (p IN {TIGHT, SATURATED}) ? shop.overtime_multiplier_bp : 10000            # branch on entity state
+      labor_component_cents = sign(h) * round_half_up(abs(h) * shop.labor_rate_cents_per_hour * mult_bp / 10000, 0)
+      rush_bp   = (d < 0) ? min(RUSH_CAP_BP, RUSH_PER_DAY_BP * abs(d)) : 0                   # nested min; cap binds at |d| >= 6
+      rush_component_cents  = (d < 0 and labor_component_cents > 0)
+                              ? round_half_up(labor_component_cents * rush_bp / 10000, 0) : 0
+      rework_bp = (s IN {BUILT, LOADED_IN}) ? REWORK_BP : 10000                              # branch on production lifecycle
+      materials_component_cents = round_half_up(m * (10000 + shop.overhead_pct_bp) / 10000 * rework_bp / 10000, 0)
+      delta_price_cents = materials_component_cents + labor_component_cents + rush_component_cents
+      # Change orders carry NO margin (cost + overhead only) — deliberate divergence from bid pricing.
+    input_set: "The CO's three deltas; shop posture at creation; production status at creation"
+    constants:
+      RUSH_PER_DAY_BP: 500
+      RUSH_CAP_BP: 3000
+      REWORK_BP: 12000
+    precision: "integer cents; round_half_up at each pinned step"
+    variants: []
+
+  - name: reuse_credit
+    trigger: "TakeoffLine create with source=STOCK (unit-cost derivation consumed by bid_price_detailed)"
+    algorithm: constraint_propagation
+    formula: |
+      # Circular-looking dependency, pinned: the volume tier in bid_price_detailed depends on
+      # gross materials, and reuse changes gross materials. Order is fixed:
+      #   (1) reuse-adjusted unit costs per line  -> (2) gross materials  ->
+      #   (3) tier selected from PRE-DISCOUNT gross  -> (4) discount applied.
+      # The tier MUST be keyed on the pre-discount gross; keying it on the discounted
+      # subtotal is the forbidden alternative reading.
+      reuse_unit_cost_cents = round_half_up(stock_item.replacement_cost_cents * CONDITION_FACTOR_BP[stock_item.condition_grade] / 10000, 0)
+    input_set: "The referenced StockItem's replacement_cost_cents and condition_grade"
+    constants:
+      CONDITION_FACTOR_BP: { A: 6000, B: 4000, C: 2500 }
+    precision: "integer cents; round_half_up"
+    variants: []
+
+  - name: capacity_posture
+    trigger: "any mutation of a Production's committed_crew_hours or status entering/leaving {SCHEDULED, IN_BUILD, ON_HOLD}; also recomputed by run_epoch"
+    algorithm: aggregation
+    formula: |
+      committed_crew_hours = sum(production.committed_crew_hours
+                                 for productions of the shop with status IN {SCHEDULED, IN_BUILD, ON_HOLD})
+      capacity_ratio_bp = round_half_up(committed_crew_hours * 10000 /
+                                        (shop.weekly_crew_hours_capacity * shop.horizon_weeks), 0)
+      posture = SATURATED if capacity_ratio_bp >= 10000
+                else TIGHT if capacity_ratio_bp >= 8000      # boundary: exactly 8000 is TIGHT
+                else OPEN
+    input_set: "Productions of the shop filtered to status IN {SCHEDULED, IN_BUILD, ON_HOLD} — BUILT/LOADED_IN/STRUCK/CLOSED are excluded"
+    constants:
+      TIGHT_THRESHOLD_BP: 8000
+      SATURATED_THRESHOLD_BP: 10000
+    precision: "integer bp; round_half_up"
+    variants: []
+
+  - name: stock_valuation
+    trigger: "computed on every StockItem read/list and folded into Shop.inventory_value_cents on any quantity mutation"
+    algorithm: aggregation
+    formula: |
+      reuse_unit_cost_cents   = round_half_up(replacement_cost_cents * CONDITION_FACTOR_BP[condition_grade] / 10000, 0)
+      reuse_value_cents       = quantity_on_hand * reuse_unit_cost_cents        # recovery basis
+      replacement_value_cents = quantity_on_hand * replacement_cost_cents       # replacement basis
+      shop.inventory_value_cents = sum(reuse_value_cents over all StockItems of the shop)   # recovery basis only
+    input_set: "All StockItems of the shop regardless of status (DEPLETED items contribute 0)"
+    constants:
+      CONDITION_FACTOR_BP: { A: 6000, B: 4000, C: 2500 }
+    precision: "integer cents; round_half_up"
+    variants:
+      - name: replacement_basis
+        when: "replacement_value_cents field"
+        difference: "uses full replacement cost; identical stock yields replacement_value_cents > reuse_value_cents for every grade (factors < 10000bp)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is a declared role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all endpoints"
+  - priority: 2
+    category: auth
+    check: "acting role is listed in the endpoint's roles; for ClientPM, X-User-ID must equal the target resource's client_id (bid.client_id / production.client_id / design-package client_id); for review resubmit, X-User-ID must equal prepared_by_user_id"
+    error_id: ERR_FORBIDDEN | ERR_NOT_OWN_RESOURCE
+    http_status: 403
+    applies_to: "all endpoints"
+  - priority: 3
+    category: existence
+    check: "path ids and body-referenced ids (production_id, takeoff_id, stock_item_id, design_package_id, client_id, bid's takeoff/package consistency) exist"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with ids"
+  - priority: 4
+    category: state
+    check: "target entity is in a state from which the requested transition exists (state-machine preconditions); DRAFT/LOCKED takeoff line mutation -> ERR_TAKEOFF_LOCKED; terminal entities reject all actions; child-creation gates on parent state: change-order create requires production.status IN {SCHEDULED, IN_BUILD, ON_HOLD, BUILT, LOADED_IN}; engineering-review, finish-sample, bay-reservation and transport-plan create require production.status NOT IN {STRUCK, CLOSED}"
+    error_id: ERR_INVALID_STATE | ERR_TAKEOFF_LOCKED
+    http_status: 409
+    applies_to: "all action endpoints and child-creation endpoints gated on parent state"
+  - priority: 5
+    category: business_safety
+    check: "engineering approve requires sf_static >= 1.50 and (AUTOMATION) sf_dynamic >= 2.00; review approve requires approver != preparer (segregation of duties)"
+    error_id: ERR_SAFETY_FACTOR_INSUFFICIENT | ERR_SEGREGATION_OF_DUTIES
+    http_status: 422 | 403
+    applies_to: "POST /scenic/engineering-reviews/{reviewId}/approve"
+  - priority: 6
+    category: business_referential
+    check: "bid submit/accept: design package CURRENT and bid.pinned_drawing_revision == package.drawing_revision; change-order create: new_drawing_revision == package current revision and > production.applied_drawing_revision"
+    error_id: ERR_STALE_DRAWING_REVISION | ERR_REVISION_NOT_CURRENT
+    http_status: 409
+    applies_to: "POST /scenic/bids/{id}/submit, POST /scenic/bids/{id}/accept, POST /scenic/change-orders"
+  - priority: 7
+    category: business_constraint
+    check: "structural rules: bay_slot within 1..shop.bay_count (ERR_BAY_SLOT_INVALID); (shop_id, material_code, condition_grade) unique among StockItems (ERR_DUPLICATE_STOCK_ITEM); stock-sourced line quantity <= stock_item.quantity_on_hand (ERR_STOCK_INSUFFICIENT); adjust never drives quantity_on_hand below 0 (ERR_STOCK_NEGATIVE); conditional required fields by variant/source (ERR_VALIDATION)"
+    error_id: ERR_BAY_SLOT_INVALID | ERR_DUPLICATE_STOCK_ITEM | ERR_STOCK_INSUFFICIENT | ERR_STOCK_NEGATIVE | ERR_VALIDATION
+    http_status: 422 | 409 | 400
+    applies_to: "creation endpoints, stock adjust, takeoff-line create"
+  - priority: 8
+    category: business_temporal
+    check: "interval rules: bay reservation window must not overlap an ACTIVE reservation on the same bay_slot, half-open [window_start, window_end) — adjacency allowed (ERR_BAY_OVERLAP); window_end <= production.load_in_deadline_at (ERR_WINDOW_PAST_DEADLINE); transport plans: sum of truck_count over the shop's non-CANCELLED plans whose [depart_at, arrive_at) overlaps the new window, plus the new truck_count, must be <= shop.truck_fleet_size (ERR_FLEET_OVER_COMMITTED); complete-build requires load_in_deadline_at - clock >= 2 days (ERR_LOAD_IN_TOO_SOON); bid accept requires clock <= valid_until (ERR_BID_EXPIRED)"
+    error_id: ERR_BAY_OVERLAP | ERR_WINDOW_PAST_DEADLINE | ERR_FLEET_OVER_COMMITTED | ERR_LOAD_IN_TOO_SOON | ERR_BID_EXPIRED
+    http_status: 409
+    applies_to: "POST /scenic/bay-reservations, POST /scenic/transport-plans, POST /scenic/productions/{id}/complete-build, POST /scenic/bids/{id}/accept"
+  - priority: 9
+    category: business_fiscal
+    check: "bid accept: client.outstanding_cents + bid.price_cents <= client.credit_limit_cents (equality passes)"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /scenic/bids/{id}/accept"
+  - priority: 10
+    category: business_constraint
+    check: "capacity/posture gates: bid submit and bid accept rejected while shop.posture == SATURATED; start-build requires count of ACTIVE bay reservations >= production.bays_required"
+    error_id: ERR_SHOP_SATURATED | ERR_BAY_UNDER_RESERVED
+    http_status: 409
+    applies_to: "POST /scenic/bids/{id}/submit, POST /scenic/bids/{id}/accept, POST /scenic/productions/{id}/start-build"
+  - priority: 11
+    category: business_constraint
+    check: "close barriers: no PROPOSED change orders (ERR_CHANGE_ORDERS_PENDING) checked before no ACTIVE bay reservations (ERR_RESERVATIONS_OPEN)"
+    error_id: ERR_CHANGE_ORDERS_PENDING | ERR_RESERVATIONS_OPEN
+    http_status: 409
+    applies_to: "POST /scenic/productions/{id}/close"
+  - priority: 12
+    category: state
+    check: "OCC precondition: expected_<parent>_version equals the parent's current version (change-order create, takeoff-line create, stock adjust)"
+    error_id: ERR_STALE_PRODUCTION_VERSION | ERR_STALE_TAKEOFF_VERSION | ERR_STALE_STOCK_VERSION
+    http_status: 412
+    applies_to: "POST /scenic/change-orders, POST /scenic/takeoff-lines, POST /scenic/stock-items/{itemId}/adjust"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# All list endpoints additionally accept limit? and offset? and return the
+# §1.0 pagination fields. The clock endpoint's default is normative: before
+# any set-current-utc call the logical clock reads exactly
+# 2026-08-01T00:00:00Z and never falls back to wall-clock time.
+# =============================================================================
+endpoints:
+  # --- Shop ---
+  - method: POST
+    path: "/scenic/shops"
+    description: "Create a shop (capacity config + rates)"
+    roles: [ShopAdmin]
+    code: 201
+    input: [name, weekly_crew_hours_capacity, horizon_weeks, bay_count, truck_fleet_size, labor_rate_cents_per_hour, overtime_multiplier_bp, overhead_pct_bp, margin_pct_bp]
+    output: Shop
+    side_effects: ["committed_crew_hours=0, capacity_ratio_bp=0, posture=OPEN, inventory_value_cents=0, epoch_index=0"]
+  - method: GET
+    path: "/scenic/shops/{shopId}"
+    description: "Get a shop"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: Shop
+    side_effects: []
+  - method: GET
+    path: "/scenic/shops/{shopId}/summary"
+    description: "Computed read: posture, capacity and inventory aggregates"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: "{ posture: string, committed_crew_hours: integer, capacity_crew_hours_horizon: integer, capacity_ratio_bp: integer, active_productions: integer, inventory_value_cents: integer, epoch_index: integer }"
+    side_effects: []
+  - method: POST
+    path: "/scenic/shops/{shopId}/run-epoch"
+    description: "Operations checkpoint: expire stale bids, recompute posture, bump epoch_index"
+    roles: [ShopAdmin]
+    code: 200
+    input: []
+    output: Shop
+    side_effects:
+      - "epoch_index += 1"
+      - "SUBMITTED bids of this shop with logical clock > valid_until -> EXPIRED"
+      - "capacity_posture recomputed"
+
+  # --- Logical clock (test-driving) ---
+  - method: POST
+    path: "/scenic/_clock/set-current-utc"
+    description: "Set the logical clock. Before any call the clock reads exactly 2026-08-01T00:00:00Z (server startup default; never wall-clock)."
+    roles: [ShopAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects: ["logical clock := to_iso8601 for all subsequent time-dependent rules"]
+
+  # --- Client ---
+  - method: POST
+    path: "/scenic/clients"
+    description: "Create a client (production company)"
+    roles: [ShopAdmin]
+    code: 201
+    input: [shop_id, company_name, contact_email, credit_limit_cents]
+    output: Client
+    side_effects: ["outstanding_cents=0"]
+  - method: GET
+    path: "/scenic/clients"
+    description: "List clients (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["shop_id?", "limit?", "offset?"]
+    output: Client[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/clients/{clientId}"
+    description: "Get a client"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: Client
+    side_effects: []
+
+  # --- DesignPackage ---
+  - method: POST
+    path: "/scenic/design-packages"
+    description: "Client uploads design drawings; re-upload for the same (client_id, show_title) supersedes the prior CURRENT package and bumps drawing_revision"
+    roles: [ClientPM]
+    code: 201
+    input: [client_id, show_title, venue, load_in_at, strike_at]
+    output: DesignPackage
+    side_effects:
+      - "prior CURRENT package for (client_id, show_title) -> SUPERSEDED"
+      - "drawing_revision = 1 if none existed, else max prior revision + 1"
+  - method: GET
+    path: "/scenic/design-packages"
+    description: "List design packages (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["client_id?", "show_title?", "status?", "limit?", "offset?"]
+    output: DesignPackage[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/design-packages/{packageId}"
+    description: "Get a design package"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: DesignPackage
+    side_effects: []
+
+  # --- Takeoff ---
+  - method: POST
+    path: "/scenic/takeoffs"
+    description: "Estimator opens a material takeoff against a design package"
+    roles: [Estimator]
+    code: 201
+    input: [design_package_id, labor_hours_est, "notes?"]
+    output: Takeoff
+    side_effects: ["pinned_package_revision = package.drawing_revision at creation", "status=DRAFT", "materials_subtotal_cents=0", "estimator_user_id = X-User-ID"]
+  - method: GET
+    path: "/scenic/takeoffs"
+    description: "List takeoffs (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["design_package_id?", "status?", "limit?", "offset?"]
+    output: Takeoff[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/takeoffs/{takeoffId}"
+    description: "Get a takeoff"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: Takeoff
+    side_effects: []
+
+  # --- TakeoffLine ---
+  - method: POST
+    path: "/scenic/takeoff-lines"
+    description: "Add a material line to a DRAFT takeoff (OCC on takeoff version)"
+    roles: [Estimator]
+    code: 201
+    input: [takeoff_id, expected_takeoff_version, material_code, quantity, source, "unit_cost_cents?", "stock_item_id?", "waste_pct_bp?"]
+    output: TakeoffLine
+    side_effects:
+      - "increments Takeoff.version by 1"
+      - "Takeoff.materials_subtotal_cents recomputed (per-line rounding then sum per bid_price_detailed steps 1-2)"
+      - "if source=STOCK: StockItem.quantity_on_hand -= quantity (ERR_STOCK_INSUFFICIENT when quantity > quantity_on_hand; exactly consuming to 0 is allowed); StockItem status may flip ACTIVE -> DEPLETED; Shop.inventory_value_cents recomputed"
+  - method: GET
+    path: "/scenic/takeoff-lines"
+    description: "List takeoff lines (filterable; reverse reachability for takeoff_id and stock_item_id)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["takeoff_id?", "stock_item_id?", "limit?", "offset?"]
+    output: TakeoffLine[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/takeoff-lines/{lineId}"
+    description: "Get a takeoff line"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: TakeoffLine
+    side_effects: []
+  - method: DELETE
+    path: "/scenic/takeoff-lines/{lineId}"
+    description: "Remove a line from a DRAFT takeoff (compensates stock consumption)"
+    roles: [Estimator]
+    code: 204
+    input: []
+    output: null
+    side_effects:
+      - "increments Takeoff.version by 1"
+      - "Takeoff.materials_subtotal_cents recomputed"
+      - "if source=STOCK: StockItem.quantity_on_hand += line.quantity (restore); status may flip DEPLETED -> ACTIVE; Shop.inventory_value_cents recomputed"
+
+  # --- Bid ---
+  - method: POST
+    path: "/scenic/bids"
+    description: "Create a bid (DETAILED from a takeoff, or ROM from area x complexity)"
+    roles: [Estimator]
+    code: 201
+    input: [client_id, design_package_id, pricing_variant, has_automation_scope, bays_required, build_start_at, validity_days, "takeoff_id?", "floor_area_sqft?", "complexity_class?", "estimated_crew_hours?"]
+    output: Bid
+    side_effects:
+      - "pinned_drawing_revision = package.drawing_revision at creation"
+      - "price_cents computed per bid_price_detailed or bid_price_rom"
+      - "status=DRAFT, round_no=1, production_id=null"
+  - method: GET
+    path: "/scenic/bids"
+    description: "List bids (filterable; reverse reachability for client_id, design_package_id, takeoff_id)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["client_id?", "design_package_id?", "takeoff_id?", "production_id?", "status?", "limit?", "offset?"]
+    output: Bid[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/bids/{bidId}"
+    description: "Get a bid"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: []
+  - method: POST
+    path: "/scenic/bids/{bidId}/submit"
+    description: "Submit a DRAFT bid to the client (locks the takeoff for DETAILED bids; pins valid_until)"
+    roles: [Estimator]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: ["status -> SUBMITTED", "valid_until = clock + validity_days", "DETAILED: Takeoff -> LOCKED"]
+  - method: POST
+    path: "/scenic/bids/{bidId}/counter"
+    description: "Client counters with a target price"
+    roles: [ClientPM]
+    code: 200
+    input: [counter_price_cents, "note?"]
+    output: Bid
+    side_effects: ["status -> COUNTERED"]
+  - method: POST
+    path: "/scenic/bids/{bidId}/revise"
+    description: "Estimator re-prices a COUNTERED bid and resubmits (negotiation cycle)"
+    roles: [Estimator]
+    code: 200
+    input: [revised_price_cents]
+    output: Bid
+    side_effects: ["price_cents = revised_price_cents", "round_no += 1", "valid_until = clock + validity_days", "status -> SUBMITTED"]
+  - method: POST
+    path: "/scenic/bids/{bidId}/accept"
+    description: "Client accepts a SUBMITTED bid; spawns the Production (cascade)"
+    roles: [ClientPM]
+    code: 200
+    input: []
+    output: Bid
+    side_effects:
+      - "status -> ACCEPTED"
+      - "Production created (see Bid state machine); bid.production_id set"
+      - "Shop.committed_crew_hours / capacity_ratio_bp / posture recomputed"
+      - "Client.outstanding_cents recomputed"
+  - method: POST
+    path: "/scenic/bids/{bidId}/reject"
+    description: "Client rejects a SUBMITTED bid"
+    roles: [ClientPM]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: ["status -> REJECTED"]
+  - method: POST
+    path: "/scenic/bids/{bidId}/withdraw"
+    description: "Estimator withdraws a DRAFT/SUBMITTED/COUNTERED bid"
+    roles: [Estimator]
+    code: 200
+    input: []
+    output: Bid
+    side_effects: ["status -> WITHDRAWN"]
+
+  # --- Production ---
+  - method: GET
+    path: "/scenic/productions"
+    description: "List productions (filterable; reverse reachability for shop_id, client_id, bid_id)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["shop_id?", "client_id?", "bid_id?", "status?", "limit?", "offset?"]
+    output: Production[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/productions/{productionId}"
+    description: "Get a production"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: Production
+    side_effects: []
+  - method: POST
+    path: "/scenic/productions/{productionId}/start-build"
+    description: "Begin fabrication; gated on required engineering approvals and bay coverage"
+    roles: [ShopForeman]
+    code: 200
+    input: []
+    output: Production
+    side_effects: ["status -> IN_BUILD"]
+  - method: POST
+    path: "/scenic/productions/{productionId}/complete-build"
+    description: "Mark fabrication complete; gated on finish approvals, clean reviews, and the 2-day load-in buffer"
+    roles: [ShopForeman]
+    code: 200
+    input: []
+    output: Production
+    side_effects: ["status -> BUILT", "built_at = logical clock"]
+  - method: POST
+    path: "/scenic/productions/{productionId}/load-in"
+    description: "Execute load-in; requires a CONFIRMED transport plan (which is EXECUTED as a side effect)"
+    roles: [TransportCoordinator]
+    code: 200
+    input: []
+    output: Production
+    side_effects: ["status -> LOADED_IN", "CONFIRMED TransportPlans -> EXECUTED"]
+  - method: POST
+    path: "/scenic/productions/{productionId}/strike"
+    description: "Strike the set; reclaim reusable materials into stock (find-or-create by material_code + condition_grade)"
+    roles: [ShopForeman]
+    code: 200
+    input: [reclaim_lines]
+    output: Production
+    side_effects:
+      - "status -> STRUCK"
+      - "per reclaim line: StockItem find-or-create, quantity_on_hand += quantity, DEPLETED -> ACTIVE flip"
+      - "Shop.inventory_value_cents recomputed"
+  - method: POST
+    path: "/scenic/productions/{productionId}/close"
+    description: "Close the production; releases committed crew-hours back to the shop"
+    roles: [ShopForeman]
+    code: 200
+    input: []
+    output: Production
+    side_effects: ["status -> CLOSED", "Shop.committed_crew_hours -= production.committed_crew_hours; posture recomputed", "Client.outstanding_cents recomputed"]
+
+  # --- EngineeringReview ---
+  - method: POST
+    path: "/scenic/engineering-reviews"
+    description: "Create a structural or automation safety review; prepared_by_user_id = X-User-ID"
+    roles: [ShopForeman, StaffEngineer]
+    code: 201
+    input: [production_id, scope, design_load_lb, member_capacity_lb, "impact_factor_bp?"]
+    output: EngineeringReview
+    side_effects: ["status=PENDING, round_no=1", "sf_static (and sf_dynamic for AUTOMATION) computed", "prepared_by_user_id = X-User-ID"]
+  - method: GET
+    path: "/scenic/engineering-reviews"
+    description: "List engineering reviews (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["production_id?", "scope?", "status?", "limit?", "offset?"]
+    output: EngineeringReview[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/engineering-reviews/{reviewId}"
+    description: "Get an engineering review"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: EngineeringReview
+    side_effects: []
+  - method: POST
+    path: "/scenic/engineering-reviews/{reviewId}/approve"
+    description: "Stamp approval; approver must differ from preparer (segregation of duties) and safety factors must pass"
+    roles: [StaffEngineer]
+    code: 200
+    input: []
+    output: EngineeringReview
+    side_effects: ["status -> APPROVED", "bubble-up: production ON_HOLD -> IN_BUILD when all reviews APPROVED"]
+  - method: POST
+    path: "/scenic/engineering-reviews/{reviewId}/request-revision"
+    description: "Send the review back for redesign; holds an in-progress build"
+    roles: [StaffEngineer]
+    code: 200
+    input: [revision_note]
+    output: EngineeringReview
+    side_effects: ["status -> REVISION_REQUIRED", "production IN_BUILD -> ON_HOLD"]
+  - method: POST
+    path: "/scenic/engineering-reviews/{reviewId}/resubmit"
+    description: "Preparer resubmits revised numbers (only the preparing user may resubmit)"
+    roles: [ShopForeman, StaffEngineer]
+    code: 200
+    input: [design_load_lb, member_capacity_lb, "impact_factor_bp?"]
+    output: EngineeringReview
+    side_effects: ["status -> PENDING", "round_no += 1", "safety factors recomputed"]
+
+  # --- FinishSample ---
+  - method: POST
+    path: "/scenic/finish-samples"
+    description: "Paint charge submits a finish/texture sample for client approval"
+    roles: [PaintCharge]
+    code: 201
+    input: [production_id, finish_code, texture_ref]
+    output: FinishSample
+    side_effects: ["status=SUBMITTED, round_no=1"]
+  - method: GET
+    path: "/scenic/finish-samples"
+    description: "List finish samples (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["production_id?", "status?", "limit?", "offset?"]
+    output: FinishSample[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/finish-samples/{sampleId}"
+    description: "Get a finish sample"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: FinishSample
+    side_effects: []
+  - method: POST
+    path: "/scenic/finish-samples/{sampleId}/approve"
+    description: "Client approves the sample"
+    roles: [ClientPM]
+    code: 200
+    input: []
+    output: FinishSample
+    side_effects: ["status -> APPROVED"]
+  - method: POST
+    path: "/scenic/finish-samples/{sampleId}/reject"
+    description: "Client rejects the sample with a note"
+    roles: [ClientPM]
+    code: 200
+    input: [rejection_note]
+    output: FinishSample
+    side_effects: ["status -> REJECTED"]
+  - method: POST
+    path: "/scenic/finish-samples/{sampleId}/resubmit"
+    description: "Paint charge resubmits a rejected sample with a new texture reference"
+    roles: [PaintCharge]
+    code: 200
+    input: [texture_ref]
+    output: FinishSample
+    side_effects: ["status -> SUBMITTED", "round_no += 1"]
+
+  # --- ChangeOrder ---
+  - method: POST
+    path: "/scenic/change-orders"
+    description: "Estimator prices a design revision against a production (OCC on production version)"
+    roles: [Estimator]
+    code: 201
+    input: [production_id, expected_production_version, new_drawing_revision, delta_materials_cents, delta_labor_hours, delta_load_in_days]
+    output: ChangeOrder
+    side_effects:
+      - "increments Production.version by 1"
+      - "delta_price_cents computed per change_order_price at creation and pinned"
+      - "priced_posture / priced_production_status captured at creation"
+      - "co_no assigned (per-production monotone from 1 in creation order)"
+      - "status=PROPOSED"
+  - method: GET
+    path: "/scenic/change-orders"
+    description: "List change orders (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["production_id?", "status?", "limit?", "offset?"]
+    output: ChangeOrder[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/change-orders/{coId}"
+    description: "Get a change order"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: []
+  - method: POST
+    path: "/scenic/change-orders/{coId}/approve"
+    description: "Client approves a proposed change order; runs the price/deadline/hours cascade"
+    roles: [ClientPM]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: ["status -> APPROVED", "Production price/deadline/hours/applied_revision updated", "ACTIVE bay reservations past the new deadline -> RELEASED", "Shop committed hours + posture recomputed", "Client.outstanding_cents recomputed"]
+  - method: POST
+    path: "/scenic/change-orders/{coId}/reject"
+    description: "Client rejects a proposed change order; production is explicitly untouched"
+    roles: [ClientPM]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: ["status -> REJECTED"]
+  - method: POST
+    path: "/scenic/change-orders/{coId}/withdraw"
+    description: "Estimator withdraws a proposed change order"
+    roles: [Estimator]
+    code: 200
+    input: []
+    output: ChangeOrder
+    side_effects: ["status -> WITHDRAWN"]
+
+  # --- BayReservation ---
+  - method: POST
+    path: "/scenic/bay-reservations"
+    description: "Reserve a bay slot for a production window (half-open; same-slot adjacency allowed)"
+    roles: [ShopForeman]
+    code: 201
+    input: [production_id, bay_slot, window_start, window_end]
+    output: BayReservation
+    side_effects: ["status=ACTIVE"]
+  - method: GET
+    path: "/scenic/bay-reservations"
+    description: "List bay reservations (filterable; RELEASED rows included and distinguishable by status)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["production_id?", "bay_slot?", "status?", "limit?", "offset?"]
+    output: BayReservation[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/bay-reservations/{reservationId}"
+    description: "Get a bay reservation (RELEASED rows included)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: BayReservation
+    side_effects: []
+  - method: DELETE
+    path: "/scenic/bay-reservations/{reservationId}"
+    description: "Release an ACTIVE reservation (soft delete)"
+    roles: [ShopForeman]
+    code: 204
+    input: []
+    output: null
+    side_effects: ["status -> RELEASED"]
+
+  # --- StockItem ---
+  - method: POST
+    path: "/scenic/stock-items"
+    description: "Register a purchased stock item; (shop_id, material_code, condition_grade) unique"
+    roles: [ShopAdmin]
+    code: 201
+    input: [shop_id, material_code, condition_grade, quantity_on_hand, replacement_cost_cents]
+    output: StockItem
+    side_effects: ["origin=PURCHASED", "status ACTIVE iff quantity_on_hand > 0 else DEPLETED", "computed valuation fields", "Shop.inventory_value_cents recomputed"]
+  - method: GET
+    path: "/scenic/stock-items"
+    description: "List stock items (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["shop_id?", "material_code?", "condition_grade?", "status?", "origin?", "limit?", "offset?"]
+    output: StockItem[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/stock-items/{itemId}"
+    description: "Get a stock item"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: StockItem
+    side_effects: []
+  - method: POST
+    path: "/scenic/stock-items/{itemId}/adjust"
+    description: "Adjust on-hand quantity by a signed delta (OCC on stock item version)"
+    roles: [ShopAdmin]
+    code: 200
+    input: [delta_quantity, expected_stock_item_version, "reason?"]
+    output: StockItem
+    side_effects:
+      - "increments StockItem.version by 1"
+      - "quantity_on_hand += delta_quantity (result must be >= 0 else ERR_STOCK_NEGATIVE)"
+      - "status flip per quantity; Shop.inventory_value_cents recomputed"
+
+  # --- TransportPlan ---
+  - method: POST
+    path: "/scenic/transport-plans"
+    description: "Plan transport/install for a production; fleet aggregate capacity enforced over overlapping windows"
+    roles: [TransportCoordinator]
+    code: 201
+    input: [production_id, truck_count, install_crew_hours, depart_at, arrive_at]
+    output: TransportPlan
+    side_effects: ["status=PLANNED"]
+  - method: GET
+    path: "/scenic/transport-plans"
+    description: "List transport plans (filterable)"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: ["production_id?", "status?", "limit?", "offset?"]
+    output: TransportPlan[]
+    side_effects: []
+  - method: GET
+    path: "/scenic/transport-plans/{planId}"
+    description: "Get a transport plan"
+    roles: [ShopAdmin, Estimator, ShopForeman, StaffEngineer, PaintCharge, ClientPM, TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportPlan
+    side_effects: []
+  - method: POST
+    path: "/scenic/transport-plans/{planId}/confirm"
+    description: "Confirm a planned transport"
+    roles: [TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportPlan
+    side_effects: ["status -> CONFIRMED"]
+  - method: POST
+    path: "/scenic/transport-plans/{planId}/cancel"
+    description: "Cancel a planned transport (stops counting toward fleet overlap sums)"
+    roles: [TransportCoordinator]
+    code: 200
+    input: []
+    output: TransportPlan
+    side_effects: ["status -> CANCELLED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role / X-User-ID headers missing or role not declared" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role is not in the endpoint's roles list" }
+  - { id: ERR_NOT_OWN_RESOURCE, http: 403, condition: "Ownership violation: ClientPM acting on another client's resource, or review resubmit by a user other than prepared_by_user_id" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id or body-referenced id does not exist (e.g., unknown production_id, takeoff_id, stock_item_id, design_package_id, client_id)" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Malformed request: missing required field, unknown field, invalid enum value, or conditional field violation (e.g., ROM bid without floor_area_sqft; STOCK line without stock_item_id; quantity <= 0; window_start >= window_end; depart_at >= arrive_at; build_start_at >= package load_in_at; strike_at <= load_in_at)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Entity is in a state from which the requested transition does not exist (includes terminal-state lockdown)" }
+  - { id: ERR_TAKEOFF_LOCKED, http: 409, condition: "Takeoff is LOCKED (a DETAILED bid referencing it has been submitted); line add/delete rejected" }
+  - { id: ERR_STALE_PRODUCTION_VERSION, http: 412, condition: "expected_production_version != Production.version on change-order create" }
+  - { id: ERR_STALE_TAKEOFF_VERSION, http: 412, condition: "expected_takeoff_version != Takeoff.version on takeoff-line create" }
+  - { id: ERR_STALE_STOCK_VERSION, http: 412, condition: "expected_stock_item_version != StockItem.version on stock adjust" }
+  - { id: ERR_SAFETY_FACTOR_INSUFFICIENT, http: 422, condition: "Approve rejected: sf_static < 1.50 or (AUTOMATION) sf_dynamic < 2.00" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Review approver's X-User-ID equals the review's prepared_by_user_id" }
+  - { id: ERR_ENGINEERING_NOT_APPROVED, http: 409, condition: "start-build lacks an APPROVED review for a required scope, or complete-build has reviews in PENDING/REVISION_REQUIRED" }
+  - { id: ERR_FINISH_NOT_APPROVED, http: 409, condition: "complete-build with any FinishSample not APPROVED" }
+  - { id: ERR_TRANSPORT_NOT_CONFIRMED, http: 409, condition: "load-in with no CONFIRMED TransportPlan for the production" }
+  - { id: ERR_BAY_OVERLAP, http: 409, condition: "Bay window overlaps an ACTIVE reservation on the same bay_slot (half-open [start, end); adjacency end == start is allowed)" }
+  - { id: ERR_BAY_SLOT_INVALID, http: 422, condition: "bay_slot < 1 or > shop.bay_count" }
+  - { id: ERR_WINDOW_PAST_DEADLINE, http: 409, condition: "Bay reservation window_end > production.load_in_deadline_at" }
+  - { id: ERR_BAY_UNDER_RESERVED, http: 409, condition: "start-build with count of ACTIVE reservations < production.bays_required" }
+  - { id: ERR_FLEET_OVER_COMMITTED, http: 409, condition: "Sum of truck_count over non-CANCELLED plans overlapping the new window, plus new truck_count, exceeds shop.truck_fleet_size" }
+  - { id: ERR_LOAD_IN_TOO_SOON, http: 409, condition: "complete-build when load_in_deadline_at - logical clock < 2 days (exactly 2 days passes)" }
+  - { id: ERR_STALE_DRAWING_REVISION, http: 409, condition: "Bid submit/accept: package SUPERSEDED or bid.pinned_drawing_revision != package.drawing_revision" }
+  - { id: ERR_REVISION_NOT_CURRENT, http: 409, condition: "Change-order create: new_drawing_revision != package current revision, or <= production.applied_drawing_revision" }
+  - { id: ERR_CREDIT_LIMIT_EXCEEDED, http: 409, condition: "Bid accept would push client.outstanding_cents + price_cents above credit_limit_cents (equality passes)" }
+  - { id: ERR_SHOP_SATURATED, http: 409, condition: "Bid submit/accept while shop.posture == SATURATED" }
+  - { id: ERR_STOCK_INSUFFICIENT, http: 409, condition: "STOCK-sourced takeoff line quantity > stock_item.quantity_on_hand" }
+  - { id: ERR_STOCK_NEGATIVE, http: 409, condition: "Stock adjust would drive quantity_on_hand below 0" }
+  - { id: ERR_DUPLICATE_STOCK_ITEM, http: 409, condition: "StockItem create with (shop_id, material_code, condition_grade) already existing" }
+  - { id: ERR_BID_EXPIRED, http: 409, condition: "Bid accept when logical clock > valid_until" }
+  - { id: ERR_CHANGE_ORDERS_PENDING, http: 409, condition: "Production close with any PROPOSED change order" }
+  - { id: ERR_RESERVATIONS_OPEN, http: 409, condition: "Production close with any ACTIVE bay reservation" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ShopAdmin
+    description: "Shop operator administrator; owns shop configuration, stock registry, and the ops checkpoint"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/shops"
+      - "POST /scenic/clients"
+      - "POST /scenic/shops/{shopId}/run-epoch"
+      - "POST /scenic/_clock/set-current-utc"
+      - "POST /scenic/stock-items"
+      - "POST /scenic/stock-items/{itemId}/adjust"
+    shared_operations:
+      - "all GET endpoints"
+  - name: Estimator
+    description: "Shop estimator; builds takeoffs, prices bids, negotiates revisions, drafts change orders"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/takeoffs"
+      - "POST /scenic/takeoff-lines"
+      - "DELETE /scenic/takeoff-lines/{lineId}"
+      - "POST /scenic/bids"
+      - "POST /scenic/bids/{bidId}/submit"
+      - "POST /scenic/bids/{bidId}/revise"
+      - "POST /scenic/bids/{bidId}/withdraw"
+      - "POST /scenic/change-orders"
+      - "POST /scenic/change-orders/{coId}/withdraw"
+    shared_operations:
+      - "all GET endpoints"
+  - name: ShopForeman
+    description: "Shop floor manager; drives build lifecycle, bay reservations, strike; may prepare engineering reviews"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/productions/{productionId}/start-build"
+      - "POST /scenic/productions/{productionId}/complete-build"
+      - "POST /scenic/productions/{productionId}/strike"
+      - "POST /scenic/productions/{productionId}/close"
+      - "POST /scenic/bay-reservations"
+      - "DELETE /scenic/bay-reservations/{reservationId}"
+    shared_operations:
+      - "all GET endpoints"
+      - "POST /scenic/engineering-reviews (shared with StaffEngineer)"
+      - "POST /scenic/engineering-reviews/{reviewId}/resubmit (shared with StaffEngineer; preparer-only)"
+  - name: StaffEngineer
+    description: "Licensed engineer; stamps (or kicks back) safety reviews; may also prepare reviews — but never approve their own (segregation of duties)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/engineering-reviews/{reviewId}/approve"
+      - "POST /scenic/engineering-reviews/{reviewId}/request-revision"
+    shared_operations:
+      - "all GET endpoints"
+      - "POST /scenic/engineering-reviews (shared with ShopForeman)"
+      - "POST /scenic/engineering-reviews/{reviewId}/resubmit (shared with ShopForeman; preparer-only)"
+  - name: PaintCharge
+    description: "Charge scenic artist; submits and resubmits finish/texture samples"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/finish-samples"
+      - "POST /scenic/finish-samples/{sampleId}/resubmit"
+    shared_operations:
+      - "all GET endpoints"
+  - name: ClientPM
+    description: "Client-side production manager; uploads design packages and renders all client decisions (bid counter/accept/reject, sample approve/reject, change-order approve/reject)"
+    identity: "entity_backed:Client"
+    exclusive_operations:
+      - "POST /scenic/design-packages"
+      - "POST /scenic/bids/{bidId}/counter"
+      - "POST /scenic/bids/{bidId}/accept"
+      - "POST /scenic/bids/{bidId}/reject"
+      - "POST /scenic/finish-samples/{sampleId}/approve"
+      - "POST /scenic/finish-samples/{sampleId}/reject"
+      - "POST /scenic/change-orders/{coId}/approve"
+      - "POST /scenic/change-orders/{coId}/reject"
+    shared_operations:
+      - "all GET endpoints"
+  - name: TransportCoordinator
+    description: "Transport and install labor coordinator; plans/confirms/cancels trucking and executes load-in"
+    identity: opaque
+    exclusive_operations:
+      - "POST /scenic/transport-plans"
+      - "POST /scenic/transport-plans/{planId}/confirm"
+      - "POST /scenic/transport-plans/{planId}/cancel"
+      - "POST /scenic/productions/{productionId}/load-in"
+    shared_operations:
+      - "all GET endpoints"

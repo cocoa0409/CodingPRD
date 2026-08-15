@@ -1,0 +1,1596 @@
+scenario: |
+  Anesthesia Group Staffing & Billing (anesthesia physician group): daily assignment
+  across sites with supervision ratio, medical direction (TEFRA) compliance
+  documentation, time-unit & base-unit charge calculation, modifier assignment by
+  provider type, call/late-stay stipend & subsidy from hospital, concurrency audit &
+  compliance risk, credential/DEA currency, case cancellation & standby pay
+
+domain_name: anesthesia-group-staffing-billing
+api_prefix: /anesthesia-ops
+
+# =============================================================================
+# Step 0: Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: compliance_audit       # TEFRA medical-direction documentation, ratio enforcement, credential gating, audit findings
+  secondary_archetype: pricing_engine       # base-unit + time-unit charge engine with modifier-driven rates and 50/50 direction splits
+  complexity_layers:
+    - optimistic_concurrency                # OCC on AnesthesiaCase.version / DailyRoster.version / Provider.version
+    - cascading_side_effects                # case completion -> assignments -> claims -> findings -> audit score
+    - dual_variant_calculation              # provisional vs final charge; realtime vs audit-period risk score
+    - rate_threshold_triggers               # 1:4 supervision ratio, standby-notice tiers, daily/monthly stipend caps, risk bands
+  entity_topology: flat                     # peer collections joined by FK references, no URL nesting except action endpoints
+  state_machine_shape: compound             # roster lock gated on child case terminality; several cyclic/branching child machines
+  relationship_patterns:
+    - many_to_many                          # CaseAssignment joins Provider <-> AnesthesiaCase; CallAssignment joins Provider <-> DailyRoster
+    - cross_aggregate                       # claims reference cases+providers; findings reference audits+cases+assignments
+  role_model: segregation_of_duties         # attesting physician cannot verify own attestation; scheduling/billing/audit roles disjoint
+  consistency_model: immediate              # every mutation + cascade is visible in the same request's response / subsequent reads
+
+# =============================================================================
+# Table 1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Site
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility name" }
+      - { name: status, type: enum, source: system, description: "ACTIVE always in v1; reserved for future archival", default: "ACTIVE", constraints: "enum {ACTIVE}" }
+
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Provider legal name" }
+      - { name: provider_type, type: enum, source: input, description: "ANESTHESIOLOGIST | CRNA | AA (anesthesiologist assistant). Drives modifier matrix." }
+      - { name: npi, type: string, source: input, description: "National Provider Identifier, unique across providers", constraints: "unique" }
+      - { name: credential_expires_on, type: string, source: input, description: "Board/credential expiry date YYYY-MM-DD; valid THROUGH that date (assignment allowed when service_date <= expiry)" }
+      - { name: dea_expires_on, type: string, source: input, description: "DEA registration expiry YYYY-MM-DD; valid THROUGH that date" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> SUSPENDED (clock sweep past expiry) -> ACTIVE (credential renewal). enum {ACTIVE, SUSPENDED}" }
+
+  - name: DailyRoster
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id; roster scopes one site on one calendar date" }
+      - { name: service_date, type: string, source: input, description: "YYYY-MM-DD; unique per site", constraints: "unique together with site_id" }
+      - { name: required_primary_slots, type: integer, source: input, description: "Planned number of confirmed primary providers needed; >= 0" }
+      - { name: scheduled_day_end_minute, type: integer, source: input, description: "Contracted day end, minutes from midnight 0..1438; late-stay measured past this", constraints: "0 <= v <= 1438" }
+      - { name: lifecycle, type: enum, source: system, description: "DRAFT -> PUBLISHED -> LOCKED; PUBLISHED -> DRAFT unpublish revert. enum {DRAFT, PUBLISHED, LOCKED}" }
+      - { name: posture, type: enum, source: computed, description: "STAFFED iff count of CONFIRMED CASE_PRIMARY assignments on this roster's cases >= required_primary_slots, else UNDERSTAFFED. enum {UNDERSTAFFED, STAFFED}" }
+
+  - name: AnesthesiaCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: roster_id, type: string, source: input, description: "FK -> DailyRoster.id; case belongs to one roster (site+date)" }
+      - { name: procedure_code, type: string, source: input, description: "Lookup key into ProcedureFeeSchedule.procedure_code (NOT an id FK); must exist at creation" }
+      - { name: physical_status, type: enum, source: input, description: "ASA physical status P1|P2|P3|P4|P5|P6; adds units per PS table" }
+      - { name: emergency_flag, type: boolean, source: input, default: false, description: "Emergency case: +2 qualifying units when true" }
+      - { name: scheduled_start_minute, type: integer, source: input, description: "Minutes from midnight, 0..1438" }
+      - { name: scheduled_end_minute, type: integer, source: input, description: "Minutes from midnight; scheduled_start_minute < scheduled_end_minute <= 1439" }
+      - { name: actual_start_minute, type: integer, source: system, description: "Clock minute-of-day when case started; null until start" , default: null }
+      - { name: actual_end_minute, type: integer, source: system, description: "Clock minute-of-day when case completed; null until complete", default: null }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> IN_PROGRESS -> COMPLETED; SCHEDULED -> CANCELLED. enum {SCHEDULED, IN_PROGRESS, COMPLETED, CANCELLED}" }
+      - { name: cancellation_reason, type: string, source: input, description: "Required on cancel; null otherwise", default: null }
+      - { name: cancellation_notice_minutes, type: integer, source: computed, description: "scheduled start absolute minute minus cancel clock absolute minute (same-date math: start_minute - clock minute-of-day); null unless CANCELLED", default: null }
+      - { name: provisional_charge_cents, type: integer, source: computed, description: "Forward-looking estimate from SCHEDULED minutes, recomputed on primary-accept and on reschedule; null until a primary assignment is CONFIRMED", default: null }
+      - { name: final_charge_cents, type: integer, source: computed, description: "Sum of the case's auto-created claims' charge_cents at completion; null until COMPLETED", default: null }
+
+  - name: CaseAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: case_id, type: string, source: input, description: "FK -> AnesthesiaCase.id" }
+      - { name: roster_id, type: string, source: system, description: "FK -> DailyRoster.id; denormalized from case.roster_id at creation for filtering/posture" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id" }
+      - { name: assignment_role, type: enum, source: input, description: "CASE_PRIMARY (hands-on anesthetist) | CASE_DIRECTING (medically directing anesthesiologist). enum {CASE_PRIMARY, CASE_DIRECTING}" }
+      - { name: status, type: enum, source: system, description: "PROPOSED -> CONFIRMED (provider accept) / DECLINED (provider) / CANCELLED (scheduler) / SUPERSEDED (replaced by new same-role assignment) / COMPLETED (case completes). enum {PROPOSED, CONFIRMED, DECLINED, CANCELLED, SUPERSEDED, COMPLETED}" }
+
+  - name: CallAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: roster_id, type: string, source: input, description: "FK -> DailyRoster.id" }
+      - { name: provider_id, type: string, source: input, description: "FK -> Provider.id" }
+      - { name: window_start_minute, type: integer, source: input, description: "Closed-interval start, 0..1438" }
+      - { name: window_end_minute, type: integer, source: input, description: "Closed-interval end (INCLUSIVE): start < end <= 1439. Two windows sharing any minute - including an endpoint minute - conflict." }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> COMPLETED (clock sweep past window end) | RELEASED (early release). enum {SCHEDULED, COMPLETED, RELEASED}" }
+      - { name: released_at_minute, type: integer, source: system, description: "Clock minute-of-day at early release; null unless RELEASED", default: null }
+
+  - name: DirectionAttestation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: case_id, type: string, source: input, description: "FK -> AnesthesiaCase.id; unique together with physician_id" }
+      - { name: physician_id, type: string, source: input, description: "FK -> Provider.id; must be an ANESTHESIOLOGIST; unique together with case_id" }
+      - { name: step_preanesthetic_exam, type: boolean, source: input, default: false, description: "TEFRA step 1: performed pre-anesthetic exam and evaluation" }
+      - { name: step_prescribes_plan, type: boolean, source: input, default: false, description: "TEFRA step 2: prescribed the anesthesia plan" }
+      - { name: step_participates_key_portions, type: boolean, source: input, default: false, description: "TEFRA step 3: personally participated in the most demanding portions (induction and emergence)" }
+      - { name: step_ensures_qualified_personnel, type: boolean, source: input, default: false, description: "TEFRA step 4: ensured any procedures not personally performed were done by a qualified individual" }
+      - { name: step_monitors_course, type: boolean, source: input, default: false, description: "TEFRA step 5: monitored the course of anesthesia administration at frequent intervals" }
+      - { name: step_available_for_emergencies, type: boolean, source: input, default: false, description: "TEFRA step 6: remained physically present and available for immediate diagnosis and treatment of emergencies" }
+      - { name: step_post_anesthesia_care, type: boolean, source: input, default: false, description: "TEFRA step 7: provided indicated post-anesthesia care" }
+      - { name: submitted_count, type: integer, source: computed, description: "Number of successful submits (increments on every IN_PROGRESS/REJECTED -> SUBMITTED)", default: 0 }
+      - { name: rejection_reason, type: string, source: input, description: "Required on reject; cleared on resubmit", default: null }
+      - { name: status, type: enum, source: system, description: "IN_PROGRESS -> SUBMITTED -> VERIFIED | REJECTED; REJECTED -> SUBMITTED (revision loop). enum {IN_PROGRESS, SUBMITTED, VERIFIED, REJECTED}" }
+
+  - name: BillingClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: case_id, type: string, source: system, description: "FK -> AnesthesiaCase.id" }
+      - { name: provider_id, type: string, source: system, description: "FK -> Provider.id; the payee (primary anesthetist or directing physician)" }
+      - { name: modifier_code, type: enum, source: computed, description: "PERSONAL | QY | QK | AD | QX | QZ; resolved at case completion per modifier_determination" }
+      - { name: units_total, type: number, source: computed, description: "Total anesthesia units at 0.1 precision (3.0 flat for AD); null until computed at creation" }
+      - { name: charge_cents, type: integer, source: computed, description: "Final charge in cents per charge_units + direction_split rounding order" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> READY -> SUBMITTED -> PAID | DENIED | WRITTEN_OFF; DENIED -> READY resubmission loop. enum {DRAFT, READY, SUBMITTED, DENIED, PAID, WRITTEN_OFF}" }
+      - { name: denial_reason, type: string, source: input, description: "Required on record-denial; null otherwise", default: null }
+      - { name: paid_amount_cents, type: integer, source: input, description: "Required on record-payment; null otherwise", default: null }
+      - { name: resubmission_count, type: integer, source: computed, description: "Increments on each DENIED -> READY transition", default: 0 }
+
+  - name: ProcedureFeeSchedule
+    parent: null
+    common_fields: true
+    fields:
+      - { name: procedure_code, type: string, source: input, description: "Unique lookup code referenced by AnesthesiaCase.procedure_code", constraints: "unique" }
+      - { name: base_units, type: integer, source: input, description: "Base units for the procedure; 1..50" }
+      - { name: contracted_max_cents, type: integer, source: input, description: "Maximum allowable charge per claim for this procedure; mark-ready fiscal gate" }
+      - { name: description, type: string, source: input, description: "Human description", default: "" }
+
+  - name: StipendAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: site_id, type: string, source: input, description: "FK -> Site.id" }
+      - { name: effective_from, type: string, source: input, description: "YYYY-MM-DD, closed interval start (inclusive)" }
+      - { name: effective_to, type: string, source: input, description: "YYYY-MM-DD, closed interval end (inclusive); >= effective_from. Per-site windows may not share any calendar date." }
+      - { name: call_stipend_cents, type: integer, source: input, description: "Flat stipend for a fully served call night; >= 0" }
+      - { name: late_stay_rate_cents_per_minute, type: integer, source: input, description: "Per-minute rate past scheduled_day_end_minute; >= 0" }
+      - { name: standby_full_cents, type: integer, source: input, description: "Standby pay when case cancelled with notice < 120 minutes; >= 0" }
+      - { name: standby_partial_cents, type: integer, source: input, description: "Standby pay when 120 <= notice < 1440 minutes; >= 0" }
+
+  - name: StipendLedgerEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: provider_id, type: string, source: system, description: "FK -> Provider.id" }
+      - { name: roster_id, type: string, source: system, description: "FK -> DailyRoster.id; supplies site + occurred_date" }
+      - { name: entry_type, type: enum, source: system, description: "CALL | LATE_STAY | STANDBY. enum {CALL, LATE_STAY, STANDBY}" }
+      - { name: occurred_date, type: string, source: system, description: "YYYY-MM-DD copied from roster.service_date at creation" }
+      - { name: amount_cents, type: integer, source: computed, description: "Raw accrued amount before caps" }
+      - { name: applied_amount_cents, type: integer, source: computed, description: "Amount payable after the daily cap waterfall (STANDBY+LATE_STAY share DAILY_STIPEND_CAP_CENTS per provider per occurred_date, applied in created_at ASC order; CALL entries always apply in full at the daily level)" }
+      - { name: status, type: enum, source: system, description: "ACCRUED -> VOIDED. enum {ACCRUED, VOIDED}" }
+
+  - name: ComplianceAudit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: roster_id, type: string, source: input, description: "FK -> DailyRoster.id; at most one OPEN audit per roster" }
+      - { name: status, type: enum, source: system, description: "OPEN -> CLOSED (all findings RESOLVED or DISMISSED). enum {OPEN, CLOSED}" }
+      - { name: realtime_score, type: integer, source: computed, description: "Sum of severity weights of OPEN findings whose linked case is non-terminal (SCHEDULED or IN_PROGRESS); forward-looking exposure variant" }
+      - { name: period_score, type: integer, source: computed, description: "Sum of severity weights of OPEN findings whose linked case is terminal (COMPLETED or CANCELLED); chronological actuals variant" }
+      - { name: risk_band, type: enum, source: computed, description: "Derived from period_score: LOW < 20 <= ELEVATED < 50 <= HIGH < 100 <= CRITICAL. enum {LOW, ELEVATED, HIGH, CRITICAL}" }
+
+  - name: AuditFinding
+    parent: null
+    common_fields: true
+    fields:
+      - { name: audit_id, type: string, source: system, description: "FK -> ComplianceAudit.id" }
+      - { name: case_id, type: string, source: system, description: "FK -> AnesthesiaCase.id; null only for malformed imports (never in v1 flows)", default: null }
+      - { name: assignment_id, type: string, source: system, description: "FK -> CaseAssignment.id; set for CREDENTIAL_LAPSE (the exposed assignment), null otherwise", default: null }
+      - { name: finding_type, type: enum, source: system, description: "TEFRA_GAP (MAJOR 30) | CONCURRENCY_RETRO_BREACH (CRITICAL 60) | CREDENTIAL_LAPSE (MINOR 10). enum {TEFRA_GAP, CONCURRENCY_RETRO_BREACH, CREDENTIAL_LAPSE}" }
+      - { name: severity, type: enum, source: system, description: "MINOR | MAJOR | CRITICAL mapped 1:1 from finding_type. enum {MINOR, MAJOR, CRITICAL}" }
+      - { name: status, type: enum, source: system, description: "OPEN -> RESOLVED | DISMISSED. enum {OPEN, RESOLVED, DISMISSED}" }
+      - { name: resolution_note, type: string, source: input, description: "Optional note on resolve/dismiss", default: null }
+
+# =============================================================================
+# Table 2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Provider
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: POST /_clock/set_current_utc sweep — fires when the new clock date is strictly greater than credential_expires_on OR dea_expires_on"
+        actor: system
+        preconditions:
+          - "new clock date > min(credential_expires_on, dea_expires_on)"
+        side_effects:
+          - "Provider.version increments by 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "PATCH /anesthesia-ops/providers/{id}/credentials with both expiry dates >= current clock date"
+        actor: GroupAdministrator
+        preconditions:
+          - "credential_expires_on >= clock date AND dea_expires_on >= clock date (after applying the patch)"
+        side_effects:
+          - "Provider.version increments by 1 (single increment for the patch + reinstate)"
+        note: "If the patch leaves any expiry < clock date, provider stays SUSPENDED; patch itself still succeeds and bumps version."
+
+  - entity: DailyRoster
+    initial_state: DRAFT
+    terminal_states: [LOCKED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /anesthesia-ops/rosters/{id}/publish"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "DailyRoster.version increments by 1"
+      - from: PUBLISHED
+        to: DRAFT
+        trigger: "POST /anesthesia-ops/rosters/{id}/unpublish"
+        actor: Scheduler
+        preconditions:
+          - "Every AnesthesiaCase on this roster is in SCHEDULED or CANCELLED (none IN_PROGRESS or COMPLETED), else ERR_CASES_OUTSTANDING"
+        side_effects:
+          - "DailyRoster.version increments by 1"
+      - from: PUBLISHED
+        to: LOCKED
+        trigger: "POST /anesthesia-ops/rosters/{id}/lock"
+        actor: Scheduler
+        preconditions:
+          - "Every AnesthesiaCase on this roster is terminal (COMPLETED or CANCELLED), else ERR_CASES_OUTSTANDING"
+        side_effects:
+          - "DailyRoster.version increments by 1"
+        note: "LOCKED is terminal; billing opens (claims may be submitted) only after lock."
+
+  - entity: AnesthesiaCase
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /anesthesia-ops/cases/{id}/start"
+        actor: Scheduler
+        preconditions:
+          - "Roster lifecycle == PUBLISHED (ERR_ROSTER_NOT_PUBLISHED)"
+          - "Clock date == roster.service_date (ERR_CLOCK_DATE_MISMATCH)"
+        side_effects:
+          - "actual_start_minute := clock minute-of-day"
+          - "AnesthesiaCase.version increments by 1"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /anesthesia-ops/cases/{id}/complete"
+        actor: Scheduler
+        preconditions:
+          - "Clock date == roster.service_date (ERR_CLOCK_DATE_MISMATCH)"
+          - "Clock minute-of-day > actual_start_minute (ERR_INVALID_ACTUAL_MINUTES)"
+        side_effects:
+          - "actual_end_minute := clock minute-of-day; AnesthesiaCase.version increments by 1"
+          - "All PROPOSED/CONFIRMED CaseAssignments of this case -> COMPLETED (each bumps its own version)"
+          - "Auto-create one DRAFT BillingClaim per assignment that was CONFIRMED at the moment of completion (PROPOSED-at-completion assignments generate NO claim); modifier + charge computed per calculations.modifier_determination / charge_units / direction_split using ACTUAL minutes"
+          - "final_charge_cents := sum of created claims' charge_cents"
+          - "If a CASE_DIRECTING assignment was CONFIRMED at completion and its attestation (matching case_id + physician_id) is not VERIFIED: auto-create TEFRA_GAP finding (severity MAJOR) on the roster's OPEN ComplianceAudit, creating an OPEN audit if none exists; audit.period_score recomputes (bubble-up)"
+          - "If the primary provider has no CallAssignment (any status) on this roster date and actual_end_minute > roster.scheduled_day_end_minute and a StipendAgreement covers (site, service_date): create LATE_STAY entry amount = (actual_end - day_end) * late_stay_rate_cents_per_minute, then run daily_cap_waterfall for (provider, occurred_date)"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /anesthesia-ops/cases/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "Clock date <= roster.service_date (ERR_CLOCK_DATE_MISMATCH when strictly after)"
+        side_effects:
+          - "cancellation_notice_minutes := scheduled_start_minute - clock minute-of-day when clock date == service_date; if clock date < service_date, notice := 1440 + scheduled_start_minute - clock minute-of-day (prior-day cancels always land in the >= 1440 tier when clock is any time on an earlier date); if clock date > service_date the cancel is rejected with ERR_CLOCK_DATE_MISMATCH"
+          - "All PROPOSED/CONFIRMED CaseAssignments of this case -> CANCELLED (each bumps its own version)"
+          - "If the CASE_PRIMARY assignment was CONFIRMED at cancel time and a StipendAgreement covers (site, service_date): create STANDBY entry tiered by cancellation_notice_minutes (notice < 120 -> standby_full_cents; 120 <= notice < 1440 -> standby_partial_cents; notice >= 1440 -> no entry), then run daily_cap_waterfall for (provider, occurred_date)"
+          - "AnesthesiaCase.version increments by 1"
+
+  - entity: CaseAssignment
+    initial_state: PROPOSED
+    terminal_states: [DECLINED, CANCELLED, SUPERSEDED, COMPLETED]
+    transitions:
+      - from: PROPOSED
+        to: CONFIRMED
+        trigger: "POST /anesthesia-ops/assignments/{id}/accept"
+        actor: "AttendingAnesthesiologist or CRNA (X-User-ID must equal provider_id)"
+        preconditions:
+          - "Provider status == ACTIVE (ERR_PROVIDER_SUSPENDED)"
+          - "roster.service_date <= provider.credential_expires_on AND <= provider.dea_expires_on (ERR_CREDENTIAL_EXPIRED)"
+        side_effects:
+          - "If assignment_role == CASE_PRIMARY: recompute case.provisional_charge_cents (calculations.provisional_charge)"
+          - "Roster posture re-derives on read (STAFFED once confirmed primaries >= required_primary_slots)"
+          - "CaseAssignment.version increments by 1"
+      - from: PROPOSED
+        to: DECLINED
+        trigger: "POST /anesthesia-ops/assignments/{id}/decline"
+        actor: "AttendingAnesthesiologist or CRNA (X-User-ID must equal provider_id)"
+        preconditions: []
+        side_effects:
+          - "CaseAssignment.version increments by 1"
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /anesthesia-ops/assignments/{id}/cancel"
+        actor: Scheduler
+        preconditions: []
+        side_effects:
+          - "CaseAssignment.version increments by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /anesthesia-ops/assignments/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "Case status == SCHEDULED (ERR_ASSIGNMENT_NOT_CANCELLABLE once the case is IN_PROGRESS or terminal)"
+        side_effects:
+          - "If assignment_role == CASE_PRIMARY: case.provisional_charge_cents := null (no confirmed primary remains)"
+          - "CaseAssignment.version increments by 1"
+        note: "No standby stipend for provider-initiated/scheduler reassignment; standby only fires on case cancellation."
+      - from: PROPOSED
+        to: SUPERSEDED
+        trigger: "system: a new CaseAssignment with the same (case_id, assignment_role) is created via POST /anesthesia-ops/cases/{id}/assignments"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CaseAssignment.version increments by 1"
+      - from: CONFIRMED
+        to: SUPERSEDED
+        trigger: "system: a new CaseAssignment with the same (case_id, assignment_role) is created via POST /anesthesia-ops/cases/{id}/assignments"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "If assignment_role == CASE_PRIMARY: case.provisional_charge_cents recomputed for the replacement once the replacement is CONFIRMED (null until then)"
+          - "CaseAssignment.version increments by 1"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "system: parent case completes"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CaseAssignment.version increments by 1"
+      - from: PROPOSED
+        to: COMPLETED
+        trigger: "system: parent case completes"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "PROPOSED assignments also close out COMPLETED at case completion but generate no claim (claim requires the assignment to have been CONFIRMED at completion; see BillingClaim creation rule in AnesthesiaCase.complete)."
+
+  - entity: CallAssignment
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, RELEASED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "system: POST /_clock/set_current_utc sweep — fires when the new clock is strictly past (service_date + window_end_minute)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Create CALL StipendLedgerEntry amount = call_stipend_cents (full) if a StipendAgreement covers (site, service_date); applied_amount_cents = amount_cents (CALL exempt from daily cap)"
+          - "CallAssignment.version increments by 1"
+      - from: SCHEDULED
+        to: RELEASED
+        trigger: "POST /anesthesia-ops/call-assignments/{id}/release"
+        actor: Scheduler
+        preconditions:
+          - "Clock date == roster.service_date (ERR_CLOCK_DATE_MISMATCH)"
+          - "Clock minute-of-day strictly inside (window_start_minute, window_end_minute); at or before start, or at/after end -> ERR_CALL_NOT_RELEASABLE (use the clock sweep for natural completion)"
+        side_effects:
+          - "released_at_minute := clock minute-of-day"
+          - "served = released_at_minute - window_start_minute; window_len = window_end_minute - window_start_minute; tier: served*2 >= window_len -> full call_stipend_cents; served*4 >= window_len -> round_half_up(call_stipend_cents / 2); else no entry"
+          - "Create CALL StipendLedgerEntry for tier > 0 (CALL exempt from daily cap)"
+          - "CallAssignment.version increments by 1"
+
+  - entity: DirectionAttestation
+    initial_state: IN_PROGRESS
+    terminal_states: [VERIFIED]
+    transitions:
+      - from: IN_PROGRESS
+        to: SUBMITTED
+        trigger: "POST /anesthesia-ops/attestations/{id}/submit"
+        actor: "AttendingAnesthesiologist (X-User-ID must equal physician_id)"
+        preconditions:
+          - "All seven step_* booleans in the request body are true (ERR_TEFRA_STEPS_INCOMPLETE)"
+        side_effects:
+          - "submitted_count increments by 1; rejection_reason := null; version increments"
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /anesthesia-ops/attestations/{id}/submit"
+        actor: "AttendingAnesthesiologist (X-User-ID must equal physician_id)"
+        preconditions:
+          - "All seven step_* booleans in the request body are true (ERR_TEFRA_STEPS_INCOMPLETE)"
+        side_effects:
+          - "submitted_count increments by 1; rejection_reason := null; version increments"
+        note: "Revision loop: rejected attestations return to the physician for resubmission."
+      - from: SUBMITTED
+        to: VERIFIED
+        trigger: "POST /anesthesia-ops/attestations/{id}/verify"
+        actor: "AttendingAnesthesiologist (X-User-ID must differ from physician_id — segregation of duties)"
+        preconditions:
+          - "Reviewer is not the attesting physician (ERR_SELF_REVIEW_FORBIDDEN)"
+        side_effects:
+          - "version increments"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /anesthesia-ops/attestations/{id}/reject"
+        actor: "AttendingAnesthesiologist (X-User-ID must differ from physician_id)"
+        preconditions:
+          - "Reviewer is not the attesting physician (ERR_SELF_REVIEW_FORBIDDEN)"
+        side_effects:
+          - "rejection_reason := request value; version increments"
+
+  - entity: BillingClaim
+    initial_state: DRAFT
+    terminal_states: [PAID, WRITTEN_OFF]
+    transitions:
+      - from: DRAFT
+        to: READY
+        trigger: "POST /anesthesia-ops/claims/{id}/mark-ready"
+        actor: BillingSpecialist
+        preconditions:
+          - "No other claim with same (case_id, provider_id) in READY/SUBMITTED/PAID (ERR_DUPLICATE_CLAIM)"
+          - "charge_cents <= contracted_max_cents of the case's procedure_code (ERR_CHARGE_EXCEEDS_MAX)"
+        side_effects:
+          - "version increments"
+      - from: DENIED
+        to: READY
+        trigger: "POST /anesthesia-ops/claims/{id}/mark-ready"
+        actor: BillingSpecialist
+        preconditions:
+          - "No other claim with same (case_id, provider_id) in READY/SUBMITTED/PAID (ERR_DUPLICATE_CLAIM)"
+          - "charge_cents <= contracted_max_cents (ERR_CHARGE_EXCEEDS_MAX)"
+        side_effects:
+          - "resubmission_count increments by 1; denial_reason := null; version increments"
+        note: "Resubmission cycle: DENIED claims re-enter READY without charge recomputation."
+      - from: READY
+        to: SUBMITTED
+        trigger: "POST /anesthesia-ops/claims/{id}/submit"
+        actor: BillingSpecialist
+        preconditions:
+          - "Roster of the claim's case is LOCKED (ERR_ROSTER_NOT_LOCKED)"
+        side_effects:
+          - "version increments"
+      - from: SUBMITTED
+        to: PAID
+        trigger: "POST /anesthesia-ops/claims/{id}/record-payment"
+        actor: BillingSpecialist
+        preconditions: []
+        side_effects:
+          - "paid_amount_cents := request value; version increments"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /anesthesia-ops/claims/{id}/record-denial"
+        actor: BillingSpecialist
+        preconditions: []
+        side_effects:
+          - "denial_reason := request value; version increments"
+      - from: SUBMITTED
+        to: WRITTEN_OFF
+        trigger: "POST /anesthesia-ops/claims/{id}/write-off"
+        actor: BillingSpecialist
+        preconditions: []
+        side_effects:
+          - "version increments"
+      - from: DENIED
+        to: WRITTEN_OFF
+        trigger: "POST /anesthesia-ops/claims/{id}/write-off"
+        actor: BillingSpecialist
+        preconditions: []
+        side_effects:
+          - "version increments"
+
+  - entity: StipendLedgerEntry
+    initial_state: ACCRUED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: ACCRUED
+        to: VOIDED
+        trigger: "POST /anesthesia-ops/stipend-entries/{id}/void"
+        actor: GroupAdministrator
+        preconditions: []
+        side_effects:
+          - "daily_cap_waterfall re-runs for (provider_id, occurred_date): remaining ACCRUED STANDBY/LATE_STAY entries are re-applied in created_at ASC order"
+          - "version increments"
+
+  - entity: ComplianceAudit
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /anesthesia-ops/audits/{id}/close"
+        actor: ComplianceAuditor
+        preconditions:
+          - "All AuditFindings with audit_id == this audit are RESOLVED or DISMISSED (ERR_UNRESOLVED_FINDINGS)"
+        side_effects:
+          - "version increments"
+
+  - entity: AuditFinding
+    initial_state: OPEN
+    terminal_states: [RESOLVED, DISMISSED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /anesthesia-ops/findings/{id}/resolve"
+        actor: ComplianceAuditor
+        preconditions:
+          - "Parent audit status == OPEN (ERR_AUDIT_NOT_OPEN)"
+        side_effects:
+          - "Parent audit realtime_score / period_score / risk_band recompute (finding leaves the OPEN set)"
+          - "version increments"
+      - from: OPEN
+        to: DISMISSED
+        trigger: "POST /anesthesia-ops/findings/{id}/dismiss"
+        actor: ComplianceAuditor
+        preconditions:
+          - "Parent audit status == OPEN (ERR_AUDIT_NOT_OPEN)"
+        side_effects:
+          - "Parent audit realtime_score / period_score / risk_band recompute"
+          - "version increments"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: assignment-create-stale-case
+    parent_entity: AnesthesiaCase
+    write_endpoint: "POST /anesthesia-ops/cases/{id}/assignments"
+    occ_field: "expected_case_version"
+    description: |
+      Creating a CaseAssignment against an AnesthesiaCase whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another writer has just created a same-role assignment (which
+      legitimately supersedes the prior one) and the current writer's view of
+      the case is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: roster-update-stale-roster
+    parent_entity: DailyRoster
+    write_endpoint: "PATCH /anesthesia-ops/rosters/{id}"
+    occ_field: "expected_roster_version"
+    description: |
+      Patching a DailyRoster's staffing requirements with an
+      expected_roster_version that no longer matches the roster's current
+      version is rejected; the client's view of the roster is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: credentials-update-stale-provider
+    parent_entity: Provider
+    write_endpoint: "PATCH /anesthesia-ops/providers/{id}/credentials"
+    occ_field: "expected_provider_version"
+    description: |
+      Updating a Provider's credential/DEA expiry dates with an
+      expected_provider_version that no longer matches the provider's current
+      version (e.g., advanced by a clock-sweep suspension) is rejected; the
+      client's view of the provider is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: charge_units
+    trigger: "BillingClaim creation (auto at case completion, or manual POST /claims); also drives provisional_charge via the same unit math on scheduled minutes"
+    algorithm: tiered_pricing
+    formula: |
+      Inputs: procedure base_units (ProcedureFeeSchedule), minutes (ACTUAL end-start
+      for final claims; SCHEDULED end-start for provisional), physical_status,
+      emergency_flag.
+      1. base = ProcedureFeeSchedule[procedure_code].base_units
+      2. time_units = round_half_up(minutes / TIME_UNIT_MINUTES, 1 decimal)
+         # e.g. 6 min -> 0.4 ; 7 min -> 0.5 ; 120 min -> 8.0
+      3. ps_units = PS_TABLE[physical_status]            # P1:0 P2:0 P3:1 P4:2 P5:3 P6:0
+      4. qual_units = EMERGENCY_QUALIFYING_UNITS if emergency_flag else 0
+      5. units_total = round_half_up(base + time_units + ps_units + qual_units, 1 decimal)
+    input_set: "Exactly one case + one payee provider; minutes source depends on variant (actual vs scheduled)"
+    constants:
+      TIME_UNIT_MINUTES: 15
+      EMERGENCY_QUALIFYING_UNITS: 2
+      PS_P1: 0
+      PS_P2: 0
+      PS_P3: 1
+      PS_P4: 2
+      PS_P5: 3
+      PS_P6: 0
+    precision: "units at 1 decimal place, round_half_up; money at whole cents, round_half_up"
+    note: "Combinatorial mode (a): >=3 inputs with conditional branch table (PS tiers, emergency branch) feeding a non-linear sum."
+
+  - name: modifier_determination
+    trigger: "BillingClaim creation (case completion or manual POST /claims)"
+    algorithm: constraint_propagation
+    formula: |
+      Let primary = the case's CaseAssignment with assignment_role == CASE_PRIMARY that
+      reached COMPLETED via the completion cascade; let directing = same for
+      CASE_DIRECTING (may be absent).
+      Context for the PRIMARY provider's claim:
+        - primary.provider_type == ANESTHESIOLOGIST and no directing assignment:
+            modifier = PERSONAL; applicable_cf = PERSONAL_CF_CENTS; share = 100%
+        - primary.provider_type in {CRNA, AA} and no directing assignment:
+            modifier = QZ; applicable_cf = CRNA_SOLO_CF_CENTS; share = 100%
+        - directing exists AND attestation(case_id, directing.provider_id).status == VERIFIED:
+      # ('directing exists' = a CASE_DIRECTING assignment that was CONFIRMED at completion)
+            peak = count of the directing physician's CONFIRMED/COMPLETED CASE_DIRECTING
+                   assignments (same roster service_date) whose case's SCHEDULED interval
+                   [scheduled_start_minute, scheduled_end_minute) contains this case's
+                   scheduled_start_minute (this case included)
+            primary claim: modifier = QX; paid as split remainder (see direction_split)
+            physician claim: modifier = QY if peak == 1 else QK; both use DIRECTION_CF_CENTS gross
+        - directing exists AND attestation not VERIFIED (missing, IN_PROGRESS, SUBMITTED, REJECTED):
+            primary claim: modifier = QZ; applicable_cf = CRNA_SOLO_CF_CENTS; share = 100% of its own units
+            physician claim: modifier = AD; units_total = AD_FLAT_UNITS (3.0);
+                             charge = AD_FLAT_UNITS * SUPERVISION_CF_CENTS (no time units)
+    input_set: "The case's COMPLETED assignments + the attestation keyed by (case_id, directing physician)"
+    constants:
+      PERSONAL_CF_CENTS: 8000
+      DIRECTION_CF_CENTS: 8001
+      SUPERVISION_CF_CENTS: 4000
+      CRNA_SOLO_CF_CENTS: 7500
+      AD_FLAT_UNITS: 3
+    note: "Modifier matrix is the compliance crux: an unverified TEFRA attestation flips a directed case to AD (physician flat 3 units) + QZ (primary full rate)."
+
+  - name: direction_split
+    trigger: "BillingClaim creation when modifier context is QY/QK + QX (verified medical direction)"
+    algorithm: waterfall_allocation
+    formula: |
+      gross_cents = round_half_up(units_total * DIRECTION_CF_CENTS, 0)   # units rounded to 0.1 FIRST per charge_units, THEN multiplied, THEN rounded to whole cents
+      physician_claim.charge_cents = round_half_up(gross_cents / 2, 0)   # round_half_up: exact .5 rounds away from zero
+      primary_claim.charge_cents   = gross_cents - physician_claim.charge_cents
+      # PINNED ORDER: round units -> multiply -> round gross cents -> round physician half -> remainder to primary.
+      # Naive round-each-half double-counts the odd cent (e.g. gross 136017 -> naive 68009+68009=136018 != gross).
+    input_set: "One completed directed case with VERIFIED attestation"
+    constants:
+      DIRECTION_CF_CENTS: 8001
+    precision: "whole cents, round_half_up; split AFTER gross rounding; primary receives the remainder"
+    note: "Combinatorial mode (b): nested rounding order is pinned; per-half rounding vs round-then-split differ on odd gross values."
+
+  - name: provisional_charge
+    trigger: "CaseAssignment PROPOSED -> CONFIRMED (accept) when assignment_role == CASE_PRIMARY; PATCH /cases/{id} reschedule while a primary is CONFIRMED; set to null when the confirmed primary is cancelled/superseded before replacement confirms"
+    algorithm: forward_looking
+    formula: |
+      minutes = scheduled_end_minute - scheduled_start_minute
+      units = charge_units(minutes, scheduled basis)
+      context CF: PERSONAL_CF_CENTS if primary is ANESTHESIOLOGIST and no CONFIRMED CASE_DIRECTING on the case;
+                  DIRECTION_CF_CENTS if a CONFIRMED CASE_DIRECTING exists (optimistic: assumes attestation will verify);
+                  CRNA_SOLO_CF_CENTS if primary is CRNA/AA and no CONFIRMED CASE_DIRECTING.
+      provisional_charge_cents = round_half_up(units * context_CF, 0)
+    input_set: "The case + its CONFIRMED assignments at evaluation time"
+    precision: "whole cents, round_half_up"
+    variants:
+      - name: optimistic_direction
+        when: "A CASE_DIRECTING assignment is CONFIRMED but attestation not yet VERIFIED"
+        difference: "Uses DIRECTION_CF gross at the case level, assuming direction will be verified; final claims may diverge to AD+QZ."
+    note: "Dual-variant vs final claims: identical case data yields different money when actual minutes differ from scheduled or attestation fails."
+
+  - name: final_charge
+    trigger: "AnesthesiaCase IN_PROGRESS -> COMPLETED"
+    algorithm: chronological
+    formula: |
+      minutes = actual_end_minute - actual_start_minute
+      units per charge_units(actual minutes)
+      modifiers per modifier_determination using ACTUAL attestation state at completion
+      claims created per the modifier matrix; case.final_charge_cents = sum(created claims' charge_cents)
+    input_set: "The case + COMPLETED assignments + attestation state at completion"
+    precision: "whole cents, round_half_up"
+    variants:
+      - name: actuals_based
+        when: "Always at completion"
+        difference: "Uses actual minutes and actual attestation status; diverges from provisional_charge whenever actuals differ from schedule or direction verification failed."
+
+  - name: supervision_ratio_check
+    trigger: "POST /cases/{id}/assignments with assignment_role == CASE_DIRECTING; also re-run for the case's existing CONFIRMED/PROPOSED CASE_DIRECTING assignments on PATCH /cases/{id} reschedule"
+    algorithm: threshold
+    formula: |
+      Candidate set: the physician's CaseAssignments with assignment_role == CASE_DIRECTING,
+      status in {PROPOSED, CONFIRMED}, on cases of the same roster service_date, PLUS the
+      new/updated case's scheduled interval.
+      Build the half-open interval set [scheduled_start_minute, scheduled_end_minute).
+      peak = maximum overlap count over the sweep (intervals touching at an endpoint do NOT overlap).
+      Reject with ERR_SUPERVISION_RATIO_EXCEEDED when peak > RATIO_MAX.
+      Additionally reject with ERR_PROVIDER_DOUBLE_BOOKED when the new DIRECTING interval
+      overlaps (strictly, half-open) any of the same physician's PROPOSED/CONFIRMED
+      CASE_PRIMARY intervals on the same date (cannot direct while personally performing).
+    input_set: "Physician's non-terminal directing assignments on the service date + candidate interval"
+    constants:
+      RATIO_MAX: 4
+    note: "Aggregate-capacity interval semantics (peak concurrency), NOT pairwise disjointness: 4 pairwise-overlapping rooms are allowed."
+
+  - name: double_booking_check
+    trigger: "POST /cases/{id}/assignments with assignment_role == CASE_PRIMARY; re-run on PATCH /cases/{id} reschedule for the case's PROPOSED/CONFIRMED primary"
+    algorithm: interval_merge
+    formula: |
+      For the target provider, collect PROPOSED/CONFIRMED CASE_PRIMARY intervals on the same
+      service_date (all rosters), plus (for ANESTHESIOLOGIST) their PROPOSED/CONFIRMED
+      CASE_DIRECTING intervals (a physician personally performing cannot also direct).
+      Half-open semantics [start, end): conflict iff a.start < b.end AND b.start < a.end.
+      Adjacent intervals (a.end == b.start) do NOT conflict.
+      Conflict -> ERR_PROVIDER_DOUBLE_BOOKED.
+    input_set: "Provider's non-terminal case-scoped assignments on the service date"
+    note: "Pairwise half-open disjointness — contrast with supervision_ratio_check's capacity semantics and CallAssignment's closed intervals."
+
+  - name: rest_buffer_check
+    trigger: "POST /cases/{id}/assignments with assignment_role == CASE_PRIMARY"
+    algorithm: time_gap
+    formula: |
+      For each of the provider's CallAssignments (status SCHEDULED/COMPLETED/RELEASED) on the
+      same service_date with window_end_minute <= case.scheduled_start_minute:
+        gap = case.scheduled_start_minute - window_end_minute
+        if gap < REST_MINUTES: reject with ERR_INSUFFICIENT_REST
+      Exactly REST_MINUTES of gap is allowed (reject only when strictly less).
+    constants:
+      REST_MINUTES: 480
+    note: "Buffer-gap semantics — a third interval flavor (pairwise half-open vs capacity vs closed-with-buffer)."
+
+  - name: standby_pay
+    trigger: "AnesthesiaCase SCHEDULED -> CANCELLED (only when the CASE_PRIMARY assignment was CONFIRMED at cancel time and a StipendAgreement covers (site, service_date))"
+    algorithm: threshold
+    formula: |
+      notice = case.cancellation_notice_minutes
+      if notice < STANDBY_FULL_NOTICE_MINUTES:  raw = agreement.standby_full_cents
+      elif notice < STANDBY_NOTICE_FREE_MINUTES: raw = agreement.standby_partial_cents
+      else: no entry created
+      Boundaries: notice exactly 120 -> PARTIAL (>= 120 branch); notice exactly 1440 -> no entry.
+      Entry then enters daily_cap_waterfall.
+    constants:
+      STANDBY_FULL_NOTICE_MINUTES: 120
+      STANDBY_NOTICE_FREE_MINUTES: 1440
+
+  - name: late_stay_pay
+    trigger: "AnesthesiaCase IN_PROGRESS -> COMPLETED"
+    algorithm: threshold
+    formula: |
+      Eligible iff the completing case's COMPLETED CASE_PRIMARY provider has NO CallAssignment
+      of any status on the same roster date, AND a StipendAgreement covers (site, service_date),
+      AND actual_end_minute > roster.scheduled_day_end_minute.
+      raw = (actual_end_minute - scheduled_day_end_minute) * late_stay_rate_cents_per_minute
+      One LATE_STAY entry per completed case. Entry then enters daily_cap_waterfall.
+    note: "On-call providers are excluded: call stipend already compensates late stays."
+
+  - name: daily_cap_waterfall
+    trigger: "Creation or voiding of any StipendLedgerEntry for a (provider_id, occurred_date) bucket"
+    algorithm: waterfall_allocation
+    formula: |
+      Bucket = entries with same (provider_id, occurred_date), status != VOIDED,
+      entry_type in {STANDBY, LATE_STAY}; CALL entries are exempt (applied = amount always).
+      Walk bucket in created_at ASC order (ties impossible at 3-fractional-digit resolution;
+      if a tie is ever observed, the earlier created_at wins — ids are never consulted):
+        applied_amount_cents = min(amount_cents, max(0, DAILY_STIPEND_CAP_CENTS - running_applied))
+        running_applied += applied_amount_cents
+      PINNED EVALUATION ORDER (circular-looking dependency): an entry's applied amount depends on
+      the running total of earlier entries, which itself changes when any entry is created or
+      voided — the walk always restarts from the beginning in created_at order, so results are
+      deterministic and order-sensitive (standby created at cancel precedes late-stay at completion).
+    constants:
+      DAILY_STIPEND_CAP_CENTS: 50000
+    note: "Combinatorial mode (c): evaluation order pinned against a circular-looking cap dependency."
+
+  - name: monthly_subsidy_summary
+    trigger: "GET /anesthesia-ops/stipend-entries/summary"
+    algorithm: waterfall_allocation
+    formula: |
+      Month bucket = entries with provider_id == :provider_id and occurred_date within :month
+      (YYYY-MM), status != VOIDED.
+      gross_cents = sum(amount_cents)
+      Walk entries ordered by (occurred_date ASC, created_at ASC):
+        month_applied_i = min(applied_amount_cents_i, max(0, MONTHLY_STIPEND_CAP_CENTS - running))
+      applied_cents = sum(month_applied_i); capped_cents = gross_cents - applied_cents
+      # Consumes the DAILY-capped applied_amount_cents, not raw amounts: daily cap first, monthly cap second.
+    constants:
+      MONTHLY_STIPEND_CAP_CENTS: 400000
+
+  - name: compliance_risk_score
+    trigger: "ComplianceAudit creation; finding creation (auto TEFRA_GAP / CREDENTIAL_LAPSE / scan findings); finding resolve/dismiss; linked case terminal transition (recompute bucket membership)"
+    algorithm: weighted_scoring
+    formula: |
+      Weights: MINOR=10, MAJOR=30, CRITICAL=60 (mapped 1:1 from finding_type:
+      CREDENTIAL_LAPSE->MINOR, TEFRA_GAP->MAJOR, CONCURRENCY_RETRO_BREACH->CRITICAL).
+      Consider only findings with status == OPEN.
+      A finding's bucket case: case_id if set, else the case of assignment_id (CREDENTIAL_LAPSE).
+      realtime_score = sum(weights of OPEN findings whose bucket case.status in {SCHEDULED, IN_PROGRESS})
+      period_score   = sum(weights of OPEN findings whose bucket case.status in {COMPLETED, CANCELLED})
+      risk_band from period_score: < 20 LOW; >= 20 and < 50 ELEVATED; >= 50 and < 100 HIGH; >= 100 CRITICAL.
+      Boundary: exactly 20 -> ELEVATED; exactly 100 -> CRITICAL.
+    variants:
+      - name: realtime_exposure
+        when: "Continuously computed field realtime_score"
+        difference: "Forward-looking: counts only findings on NON-terminal cases (exposure that can still be mitigated)."
+      - name: audit_period_score
+        when: "Continuously computed field period_score + risk_band"
+        difference: "Chronological actuals: counts only findings on terminal cases; identical finding sets yield different scores from realtime_exposure."
+    note: "Dual-variant on the ComplianceAudit entity domain (vs BillingClaim for provisional/final charge)."
+
+  - name: audit_scan
+    trigger: "POST /anesthesia-ops/audits (create-or-merge scan)"
+    algorithm: aggregation
+    formula: |
+      If an OPEN ComplianceAudit exists for roster_id, scan merges into it (dedupe: skip a
+      candidate finding when an OPEN finding with the same (finding_type, case_id,
+      assignment_id) already exists in that audit); else create a new OPEN audit.
+      Scan rules:
+        (a) CONCURRENCY_RETRO_BREACH (CRITICAL): for each physician, build ACTUAL intervals
+            [actual_start_minute, actual_end_minute) of the roster's COMPLETED cases carrying
+            that physician's COMPLETED CASE_DIRECTING assignment; if peak overlap > RATIO_MAX,
+            raise ONE finding per (physician, roster) linked to the case in the peak set with
+            the latest actual_start_minute (tie: earliest created_at).
+        (b) CREDENTIAL_LAPSE (MINOR): for each PROPOSED/CONFIRMED CaseAssignment on the roster
+            whose provider has min(credential_expires_on, dea_expires_on) < roster.service_date,
+            raise one finding linked via assignment_id.
+        (c) TEFRA_GAP (MAJOR): for each COMPLETED case with a COMPLETED CASE_DIRECTING
+            assignment whose attestation is not VERIFIED, raise one finding (same shape as the
+            completion-time auto-finding).
+      After merging, recompute realtime_score / period_score / risk_band.
+    input_set: "All cases, assignments, providers, attestations of the roster"
+
+# =============================================================================
+# Table 4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers must be present and X-User-Role must be a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Role must be listed in the endpoint's roles"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: business_constraint
+    check: "Request schema: required fields present, types correct, enum values valid, no unknown fields; integer windows sane (0 <= start < end <= 1439); dates well-formed"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+    note: "ERR_INVALID_TIME_WINDOW is the specialized 400 for start>=end / out-of-range minute windows on cases and call assignments."
+
+  - priority: 3b
+    category: business_constraint
+    check: "Minute window fields: 0 <= start_minute < end_minute <= 1439"
+    error_id: ERR_INVALID_TIME_WINDOW
+    http_status: 400
+    applies_to: "POST /anesthesia-ops/cases, PATCH /anesthesia-ops/cases/{id}, POST /anesthesia-ops/call-assignments"
+
+  - priority: 4
+    category: existence
+    check: "Path ids exist (left-to-right), then body FK references exist in declared input order (site_id, roster_id, provider_id, case_id, physician_id); procedure_code must match an existing ProcedureFeeSchedule"
+    error_id: "ERR_{RESOURCE}_NOT_FOUND / ERR_UNKNOWN_PROCEDURE_CODE"
+    http_status: 404
+    applies_to: "all endpoints with path ids or body FKs"
+
+  - priority: 5
+    category: auth
+    check: "Ownership / segregation of duties: entity-backed role's X-User-ID must equal the resource's provider_id/physician_id (accept, decline, submit); attestation reviewer must NOT equal physician_id"
+    error_id: "ERR_OWNERSHIP_MISMATCH / ERR_SELF_REVIEW_FORBIDDEN"
+    http_status: 403
+    applies_to: "POST /assignments/{id}/accept|decline, POST /attestations/{id}/submit|verify|reject, POST /attestations (physician role)"
+
+  - priority: 6
+    category: state
+    check: "Roster lifecycle gate: assignments/call-assignments require PUBLISHED; case create requires DRAFT or PUBLISHED; case start requires PUBLISHED; claim submit requires LOCKED; roster/case/attestation/claim/finding/audit target-state preconditions per §1.2"
+    error_id: "ERR_ROSTER_NOT_PUBLISHED / ERR_ROSTER_NOT_DRAFT / ERR_ROSTER_NOT_LOCKED / ERR_CASE_NOT_SCHEDULED / ERR_CASE_NOT_IN_PROGRESS / ERR_CASE_NOT_CANCELLABLE / ERR_CASES_OUTSTANDING / ERR_CLOCK_DATE_MISMATCH / ERR_INVALID_ACTUAL_MINUTES / ERR_ASSIGNMENT_NOT_PROPOSED / ERR_ASSIGNMENT_NOT_CANCELLABLE / ERR_CALL_NOT_RELEASABLE / ERR_ATTESTATION_NOT_SUBMITTABLE / ERR_ATTESTATION_NOT_SUBMITTED / ERR_CLAIM_NOT_READYABLE / ERR_CLAIM_NOT_SUBMITTABLE / ERR_CLAIM_NOT_SETTLABLE / ERR_AUDIT_NOT_OPEN / ERR_UNRESOLVED_FINDINGS / ERR_ENTRY_NOT_VOIDABLE / ERR_PROVIDER_SUSPENDED"
+    http_status: 409
+    applies_to: "state transition endpoints"
+    note: "Sub-order within state: roster lifecycle (6a) -> target resource state (6b) -> clock/actual-time consistency (6c)."
+
+  - priority: 6d
+    category: state
+    check: "OCC: expected_<parent>_version request field must equal the parent entity's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /anesthesia-ops/cases/{id}/assignments, PATCH /anesthesia-ops/cases/{id}, PATCH /anesthesia-ops/rosters/{id}, PATCH /anesthesia-ops/providers/{id}/credentials"
+    note: "Evaluated after the target resource's own state preconditions, before any business rule."
+
+  - priority: 7
+    category: business_safety
+    check: "Credential currency then supervision ratio: provider ACTIVE and roster.service_date <= credential_expires_on AND <= dea_expires_on (ERR_CREDENTIAL_EXPIRED); then directing peak concurrency <= RATIO_MAX (ERR_SUPERVISION_RATIO_EXCEEDED)"
+    error_id: "ERR_CREDENTIAL_EXPIRED / ERR_SUPERVISION_RATIO_EXCEEDED"
+    http_status: 409
+    applies_to: "POST /anesthesia-ops/cases/{id}/assignments, POST /anesthesia-ops/assignments/{id}/accept (credential re-check only)"
+    note: "Sub-order: credential (7a) before ratio (7b)."
+
+  - priority: 8
+    category: business_referential
+    check: "Uniqueness / duplicate guards: one roster per (site_id, service_date); unique npi; unique procedure_code; one attestation per (case_id, physician_id); mark-ready blocked when another claim with same (case_id, provider_id) is READY/SUBMITTED/PAID"
+    error_id: "ERR_DUPLICATE_ROSTER / ERR_DUPLICATE_PROVIDER_NPI / ERR_DUPLICATE_PROCEDURE_CODE / ERR_DUPLICATE_ATTESTATION / ERR_DUPLICATE_CLAIM"
+    http_status: 409
+    applies_to: "POST /rosters, POST /providers, POST /fee-schedules, POST /attestations, POST /claims/{id}/mark-ready"
+
+  - priority: 9
+    category: business_constraint
+    check: "Resource interval conflicts: provider double-booking (half-open), call-window overlap (closed interval, per provider per service_date across all rosters), stipend-agreement window overlap (closed date interval, per site)"
+    error_id: "ERR_PROVIDER_DOUBLE_BOOKED / ERR_CALL_WINDOW_OVERLAP / ERR_AGREEMENT_WINDOW_OVERLAP"
+    http_status: 409
+    applies_to: "POST /cases/{id}/assignments, PATCH /cases/{id}, POST /call-assignments, POST /stipend-agreements"
+
+  - priority: 10
+    category: business_temporal
+    check: "Rest buffer: CASE_PRIMARY start minus provider's same-date call window_end must be >= REST_MINUTES when the call ends at or before case start"
+    error_id: ERR_INSUFFICIENT_REST
+    http_status: 409
+    applies_to: "POST /anesthesia-ops/cases/{id}/assignments"
+
+  - priority: 11
+    category: business_fiscal
+    check: "charge_cents <= contracted_max_cents of the case's procedure_code at mark-ready"
+    error_id: ERR_CHARGE_EXCEEDS_MAX
+    http_status: 402
+    applies_to: "POST /anesthesia-ops/claims/{id}/mark-ready"
+
+  - priority: 12
+    category: business_safety
+    check: "TEFRA completeness: all seven step_* booleans true on submit"
+    error_id: ERR_TEFRA_STEPS_INCOMPLETE
+    http_status: 422
+    applies_to: "POST /anesthesia-ops/attestations/{id}/submit"
+    note: "Checked after ownership/state: a non-owner submitting with incomplete steps gets ERR_OWNERSHIP_MISMATCH, not the TEFRA error."
+
+# =============================================================================
+# Table 5: API Endpoint Table
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+endpoints:
+  # --- Logical clock (test-driving) ---
+  - method: POST
+    path: "/anesthesia-ops/_clock/set_current_utc"
+    description: "Set the server's logical clock. Startup default (before any call) is exactly 2026-08-01T00:00:00Z; the logical clock NEVER falls back to wall-clock time. Side effects sweep: providers whose min(credential_expires_on, dea_expires_on) < new clock date transition ACTIVE -> SUSPENDED; SCHEDULED CallAssignments whose window end is strictly past transition to COMPLETED with CALL stipend accrual."
+    roles: [GroupAdministrator]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["provider suspension sweep", "call-assignment auto-completion sweep + CALL stipend entries"]
+
+  # --- Site ---
+  - method: POST
+    path: "/anesthesia-ops/sites"
+    description: "Create a facility site"
+    roles: [GroupAdministrator]
+    code: 201
+    input: [name]
+    output: Site
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/sites/{id}"
+    description: "Get a site"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: Site
+    side_effects: []
+
+  # --- Provider ---
+  - method: POST
+    path: "/anesthesia-ops/providers"
+    description: "Register a provider (ANESTHESIOLOGIST | CRNA | AA)"
+    roles: [GroupAdministrator]
+    code: 201
+    input: [full_name, provider_type, npi, credential_expires_on, dea_expires_on]
+    output: Provider
+    side_effects: ["status initialized ACTIVE"]
+  - method: GET
+    path: "/anesthesia-ops/providers"
+    description: "List providers"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["provider_type?", "status?", "limit?", "offset?"]
+    output: "Provider[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/providers/{id}"
+    description: "Get a provider"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: Provider
+    side_effects: []
+  - method: PATCH
+    path: "/anesthesia-ops/providers/{id}/credentials"
+    description: "Update credential/DEA expiry dates (OCC-guarded); auto-reinstates SUSPENDED -> ACTIVE when both dates are >= clock date; shortening expiry below confirmed assignments' service_date raises CREDENTIAL_LAPSE findings"
+    roles: [GroupAdministrator]
+    code: 200
+    input: [credential_expires_on, dea_expires_on, expected_provider_version]
+    output: Provider
+    side_effects:
+      - "Provider.version increments by 1"
+      - "If SUSPENDED and both new dates >= clock date: status -> ACTIVE"
+      - "For each PROPOSED/CONFIRMED CaseAssignment of this provider whose roster.service_date > min(new expiry dates): raise CREDENTIAL_LAPSE finding (MINOR) on that roster's OPEN ComplianceAudit, creating the audit if none exists; audit scores recompute"
+
+  # --- ProcedureFeeSchedule ---
+  - method: POST
+    path: "/anesthesia-ops/fee-schedules"
+    description: "Create a procedure-code fee row"
+    roles: [GroupAdministrator]
+    code: 201
+    input: [procedure_code, base_units, contracted_max_cents, "description?"]
+    output: ProcedureFeeSchedule
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/fee-schedules/{id}"
+    description: "Get a fee schedule row"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: ProcedureFeeSchedule
+    side_effects: []
+  - method: PATCH
+    path: "/anesthesia-ops/fee-schedules/{id}"
+    description: "Amend base units / contracted max (contract renegotiation)"
+    roles: [GroupAdministrator]
+    code: 200
+    input: ["base_units?", "contracted_max_cents?"]
+    output: ProcedureFeeSchedule
+    side_effects: ["ProcedureFeeSchedule.version increments by 1"]
+
+  # --- StipendAgreement ---
+  - method: POST
+    path: "/anesthesia-ops/stipend-agreements"
+    description: "Create a hospital stipend/subsidy agreement for a site over a closed date window (per-site windows may not share any calendar date)"
+    roles: [GroupAdministrator]
+    code: 201
+    input: [site_id, effective_from, effective_to, call_stipend_cents, late_stay_rate_cents_per_minute, standby_full_cents, standby_partial_cents]
+    output: StipendAgreement
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/stipend-agreements"
+    description: "List stipend agreements (filterable by site)"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["site_id?", "limit?", "offset?"]
+    output: "StipendAgreement[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/stipend-agreements/{id}"
+    description: "Get a stipend agreement"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: StipendAgreement
+    side_effects: []
+
+  # --- DailyRoster ---
+  - method: POST
+    path: "/anesthesia-ops/rosters"
+    description: "Create a daily roster for a site (unique per site+date)"
+    roles: [Scheduler]
+    code: 201
+    input: [site_id, service_date, required_primary_slots, scheduled_day_end_minute]
+    output: DailyRoster
+    side_effects: ["lifecycle DRAFT", "posture UNDERSTAFFED"]
+  - method: GET
+    path: "/anesthesia-ops/rosters"
+    description: "List rosters"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["site_id?", "service_date?", "lifecycle?", "limit?", "offset?"]
+    output: "DailyRoster[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/rosters/{id}"
+    description: "Get a roster (includes derived posture)"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: DailyRoster
+    side_effects: []
+  - method: PATCH
+    path: "/anesthesia-ops/rosters/{id}"
+    description: "Update staffing requirements (OCC-guarded); allowed in DRAFT or PUBLISHED"
+    roles: [Scheduler]
+    code: 200
+    input: ["required_primary_slots?", "scheduled_day_end_minute?", expected_roster_version]
+    output: DailyRoster
+    side_effects: ["DailyRoster.version increments by 1", "posture re-derives"]
+  - method: POST
+    path: "/anesthesia-ops/rosters/{id}/publish"
+    description: "Publish roster (DRAFT -> PUBLISHED)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: DailyRoster
+    side_effects: ["DailyRoster.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/rosters/{id}/unpublish"
+    description: "Revert roster to DRAFT; blocked once any case has started or completed"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: DailyRoster
+    side_effects: ["DailyRoster.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/rosters/{id}/lock"
+    description: "Lock roster (PUBLISHED -> LOCKED); requires all cases terminal; opens billing"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: DailyRoster
+    side_effects: ["DailyRoster.version increments by 1"]
+
+  # --- AnesthesiaCase ---
+  - method: POST
+    path: "/anesthesia-ops/cases"
+    description: "Schedule a case on a roster"
+    roles: [Scheduler]
+    code: 201
+    input: [roster_id, procedure_code, physical_status, "emergency_flag?", scheduled_start_minute, scheduled_end_minute]
+    output: AnesthesiaCase
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/cases"
+    description: "List cases"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["roster_id?", "status?", "limit?", "offset?"]
+    output: "AnesthesiaCase[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/cases/{id}"
+    description: "Get a case (includes provisional/final charge fields)"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: AnesthesiaCase
+    side_effects: []
+  - method: PATCH
+    path: "/anesthesia-ops/cases/{id}"
+    description: "Reschedule a SCHEDULED case (OCC-guarded); revalidates ratio/double-booking/rest for its PROPOSED/CONFIRMED assignments; recomputes provisional_charge_cents if a primary is CONFIRMED"
+    roles: [Scheduler]
+    code: 200
+    input: ["scheduled_start_minute?", "scheduled_end_minute?", expected_case_version]
+    output: AnesthesiaCase
+    side_effects: ["AnesthesiaCase.version increments by 1", "overlap/ratio revalidation", "provisional_charge_cents recompute when primary CONFIRMED"]
+  - method: POST
+    path: "/anesthesia-ops/cases/{id}/start"
+    description: "Start a case (stamps actual_start_minute from logical clock)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: AnesthesiaCase
+    side_effects: ["actual_start_minute stamped", "AnesthesiaCase.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/cases/{id}/complete"
+    description: "Complete a case; fires the completion cascade (assignments COMPLETED, claims auto-created, TEFRA-gap finding, late-stay stipend)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: AnesthesiaCase
+    side_effects: ["full completion cascade per §1.2 AnesthesiaCase IN_PROGRESS -> COMPLETED"]
+  - method: POST
+    path: "/anesthesia-ops/cases/{id}/cancel"
+    description: "Cancel a SCHEDULED case; fires cancellation cascade (assignments CANCELLED, standby stipend tiering)"
+    roles: [Scheduler]
+    code: 200
+    input: [cancellation_reason]
+    output: AnesthesiaCase
+    side_effects: ["full cancellation cascade per §1.2 AnesthesiaCase SCHEDULED -> CANCELLED"]
+
+  # --- CaseAssignment ---
+  - method: POST
+    path: "/anesthesia-ops/cases/{id}/assignments"
+    description: "Propose a case assignment (OCC-guarded). A new assignment with the same assignment_role as an existing PROPOSED/CONFIRMED assignment supersedes it."
+    roles: [Scheduler]
+    code: 201
+    input: [provider_id, assignment_role, expected_case_version]
+    output: CaseAssignment
+    side_effects:
+      - "Supersede: existing PROPOSED/CONFIRMED assignment with same (case_id, assignment_role) -> SUPERSEDED"
+      - "AnesthesiaCase.version increments by 1 (assignment churn is a case mutation)"
+      - "status PROPOSED"
+  - method: GET
+    path: "/anesthesia-ops/assignments"
+    description: "List case assignments"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["case_id?", "provider_id?", "roster_id?", "status?", "assignment_role?", "limit?", "offset?"]
+    output: "CaseAssignment[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/assignments/{id}"
+    description: "Get a case assignment"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: CaseAssignment
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/assignments/{id}/accept"
+    description: "Assigned provider accepts (PROPOSED -> CONFIRMED); re-checks credential currency"
+    roles: [AttendingAnesthesiologist, CRNA]
+    code: 200
+    input: []
+    output: CaseAssignment
+    side_effects: ["provisional_charge_cents recompute when CASE_PRIMARY", "CaseAssignment.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/assignments/{id}/decline"
+    description: "Assigned provider declines (PROPOSED -> DECLINED)"
+    roles: [AttendingAnesthesiologist, CRNA]
+    code: 200
+    input: []
+    output: CaseAssignment
+    side_effects: ["CaseAssignment.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/assignments/{id}/cancel"
+    description: "Scheduler cancels a PROPOSED/CONFIRMED assignment (case must still be SCHEDULED); no stipend"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: CaseAssignment
+    side_effects: ["provisional_charge_cents := null when a CONFIRMED CASE_PRIMARY is cancelled", "CaseAssignment.version increments by 1"]
+
+  # --- CallAssignment ---
+  - method: POST
+    path: "/anesthesia-ops/call-assignments"
+    description: "Schedule a call-coverage window on a roster (closed interval; per-provider per-date overlap rejected)"
+    roles: [Scheduler]
+    code: 201
+    input: [roster_id, provider_id, window_start_minute, window_end_minute]
+    output: CallAssignment
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/call-assignments"
+    description: "List call assignments"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["roster_id?", "provider_id?", "status?", "limit?", "offset?"]
+    output: "CallAssignment[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/call-assignments/{id}"
+    description: "Get a call assignment"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: CallAssignment
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/call-assignments/{id}/release"
+    description: "Release a provider from call early (tiered stipend by served fraction)"
+    roles: [Scheduler]
+    code: 200
+    input: []
+    output: CallAssignment
+    side_effects: ["tiered CALL stipend entry per §1.2 CallAssignment SCHEDULED -> RELEASED"]
+
+  # --- DirectionAttestation ---
+  - method: POST
+    path: "/anesthesia-ops/attestations"
+    description: "Create a TEFRA direction attestation for a case+physician (one per pair)"
+    roles: [Scheduler, AttendingAnesthesiologist]
+    code: 201
+    input: [case_id, physician_id]
+    output: DirectionAttestation
+    side_effects: ["status IN_PROGRESS; when created by an AttendingAnesthesiologist, X-User-ID must equal physician_id (ERR_OWNERSHIP_MISMATCH)"]
+  - method: GET
+    path: "/anesthesia-ops/attestations"
+    description: "List attestations"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["case_id?", "physician_id?", "status?", "limit?", "offset?"]
+    output: "DirectionAttestation[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/attestations/{id}"
+    description: "Get an attestation"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: DirectionAttestation
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/attestations/{id}/submit"
+    description: "Physician submits all seven TEFRA steps (from IN_PROGRESS or REJECTED)"
+    roles: [AttendingAnesthesiologist]
+    code: 200
+    input: [step_preanesthetic_exam, step_prescribes_plan, step_participates_key_portions, step_ensures_qualified_personnel, step_monitors_course, step_available_for_emergencies, step_post_anesthesia_care]
+    output: DirectionAttestation
+    side_effects: ["submitted_count increments", "DirectionAttestation.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/attestations/{id}/verify"
+    description: "A different anesthesiologist verifies the attestation (segregation of duties)"
+    roles: [AttendingAnesthesiologist]
+    code: 200
+    input: []
+    output: DirectionAttestation
+    side_effects: ["DirectionAttestation.version increments by 1"]
+  - method: POST
+    path: "/anesthesia-ops/attestations/{id}/reject"
+    description: "A different anesthesiologist rejects the attestation, returning it for revision"
+    roles: [AttendingAnesthesiologist]
+    code: 200
+    input: [rejection_reason]
+    output: DirectionAttestation
+    side_effects: ["DirectionAttestation.version increments by 1"]
+
+  # --- BillingClaim ---
+  - method: POST
+    path: "/anesthesia-ops/claims"
+    description: "Manually create a DRAFT claim for a COMPLETED case + provider with a COMPLETED assignment (duplicates allowed here; dedupe enforced at mark-ready)"
+    roles: [BillingSpecialist]
+    code: 201
+    input: [case_id, provider_id]
+    output: BillingClaim
+    side_effects: ["modifier/charge recomputed identically to the completion cascade"]
+  - method: GET
+    path: "/anesthesia-ops/claims"
+    description: "List claims"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["case_id?", "provider_id?", "status?", "modifier_code?", "limit?", "offset?"]
+    output: "BillingClaim[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/claims/{id}"
+    description: "Get a claim"
+    roles: [GroupAdministrator, Scheduler, AttendingAnesthesiologist, CRNA, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: BillingClaim
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/claims/{id}/mark-ready"
+    description: "DRAFT|DENIED -> READY; referential duplicate check precedes fiscal max check"
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: BillingClaim
+    side_effects: ["resubmission_count increments on DENIED -> READY"]
+  - method: POST
+    path: "/anesthesia-ops/claims/{id}/submit"
+    description: "READY -> SUBMITTED; requires the case's roster LOCKED"
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: BillingClaim
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/claims/{id}/record-payment"
+    description: "SUBMITTED -> PAID"
+    roles: [BillingSpecialist]
+    code: 200
+    input: [paid_amount_cents]
+    output: BillingClaim
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/claims/{id}/record-denial"
+    description: "SUBMITTED -> DENIED"
+    roles: [BillingSpecialist]
+    code: 200
+    input: [denial_reason]
+    output: BillingClaim
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/claims/{id}/write-off"
+    description: "SUBMITTED|DENIED -> WRITTEN_OFF"
+    roles: [BillingSpecialist]
+    code: 200
+    input: []
+    output: BillingClaim
+    side_effects: []
+
+  # --- StipendLedgerEntry ---
+  - method: GET
+    path: "/anesthesia-ops/stipend-entries"
+    description: "List stipend ledger entries"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist]
+    code: 200
+    input: ["provider_id?", "roster_id?", "entry_type?", "status?", "limit?", "offset?"]
+    output: "StipendLedgerEntry[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/stipend-entries/{id}"
+    description: "Get a stipend entry"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist]
+    code: 200
+    input: []
+    output: StipendLedgerEntry
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/stipend-entries/summary"
+    description: "Month-to-date subsidy summary with monthly-cap waterfall for a provider + YYYY-MM month"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist]
+    code: 200
+    input: [provider_id, month]
+    output: { provider_id: string, month: string, gross_cents: integer, applied_cents: integer, capped_cents: integer, entry_count: integer }
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/stipend-entries/{id}/void"
+    description: "Void an ACCRUED entry; daily waterfall re-runs for the bucket"
+    roles: [GroupAdministrator]
+    code: 200
+    input: []
+    output: StipendLedgerEntry
+    side_effects: ["daily_cap_waterfall re-run per calculations.daily_cap_waterfall"]
+
+  # --- ComplianceAudit / AuditFinding ---
+  - method: POST
+    path: "/anesthesia-ops/audits"
+    description: "Run a compliance scan over a roster (creates an OPEN audit or merges into the existing OPEN one with dedupe)"
+    roles: [ComplianceAuditor]
+    code: 201
+    input: [roster_id]
+    output: ComplianceAudit
+    side_effects: ["audit_scan per calculations.audit_scan", "scores recomputed"]
+  - method: GET
+    path: "/anesthesia-ops/audits"
+    description: "List audits"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["roster_id?", "status?", "limit?", "offset?"]
+    output: "ComplianceAudit[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/audits/{id}"
+    description: "Get an audit (includes realtime_score, period_score, risk_band)"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: ComplianceAudit
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/audits/{id}/close"
+    description: "Close an audit; all findings must be RESOLVED or DISMISSED"
+    roles: [ComplianceAuditor]
+    code: 200
+    input: []
+    output: ComplianceAudit
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/findings"
+    description: "List audit findings"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: ["audit_id?", "case_id?", "assignment_id?", "finding_type?", "status?", "limit?", "offset?"]
+    output: "AuditFinding[]"
+    side_effects: []
+  - method: GET
+    path: "/anesthesia-ops/findings/{id}"
+    description: "Get a finding"
+    roles: [GroupAdministrator, Scheduler, BillingSpecialist, ComplianceAuditor]
+    code: 200
+    input: []
+    output: AuditFinding
+    side_effects: []
+  - method: POST
+    path: "/anesthesia-ops/findings/{id}/resolve"
+    description: "Resolve an OPEN finding (audit must be OPEN)"
+    roles: [ComplianceAuditor]
+    code: 200
+    input: ["resolution_note?"]
+    output: AuditFinding
+    side_effects: ["audit scores recompute"]
+  - method: POST
+    path: "/anesthesia-ops/findings/{id}/dismiss"
+    description: "Dismiss an OPEN finding (audit must be OPEN)"
+    roles: [ComplianceAuditor]
+    code: 200
+    input: ["dismissal_reason?"]
+    output: AuditFinding
+    side_effects: ["audit scores recompute"]
+
+# =============================================================================
+# Table 6: Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing, or role value not a declared role" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_OWNERSHIP_MISMATCH, http: 403, condition: "Entity-backed role's X-User-ID does not equal the resource's provider_id/physician_id" }
+  - { id: ERR_SELF_REVIEW_FORBIDDEN, http: 403, condition: "Attestation reviewer X-User-ID equals physician_id (segregation of duties)" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, type mismatch, invalid enum value, or unknown field" }
+  - { id: ERR_INVALID_TIME_WINDOW, http: 400, condition: "Minute window invalid: not 0 <= start < end <= 1439" }
+  - { id: ERR_SITE_NOT_FOUND, http: 404, condition: "site_id does not exist" }
+  - { id: ERR_PROVIDER_NOT_FOUND, http: 404, condition: "provider_id / path provider id does not exist" }
+  - { id: ERR_ROSTER_NOT_FOUND, http: 404, condition: "roster_id / path roster id does not exist" }
+  - { id: ERR_CASE_NOT_FOUND, http: 404, condition: "case_id / path case id does not exist" }
+  - { id: ERR_ASSIGNMENT_NOT_FOUND, http: 404, condition: "path assignment id does not exist" }
+  - { id: ERR_CALL_ASSIGNMENT_NOT_FOUND, http: 404, condition: "path call-assignment id does not exist" }
+  - { id: ERR_ATTESTATION_NOT_FOUND, http: 404, condition: "path attestation id does not exist" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "path claim id does not exist" }
+  - { id: ERR_FEE_SCHEDULE_NOT_FOUND, http: 404, condition: "path fee-schedule id does not exist" }
+  - { id: ERR_AGREEMENT_NOT_FOUND, http: 404, condition: "path stipend-agreement id does not exist" }
+  - { id: ERR_STIPEND_ENTRY_NOT_FOUND, http: 404, condition: "path stipend-entry id does not exist" }
+  - { id: ERR_AUDIT_NOT_FOUND, http: 404, condition: "path audit id does not exist" }
+  - { id: ERR_FINDING_NOT_FOUND, http: 404, condition: "path finding id does not exist" }
+  - { id: ERR_UNKNOWN_PROCEDURE_CODE, http: 404, condition: "procedure_code matches no ProcedureFeeSchedule row" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_*_version does not match the parent entity's current version (OCC)" }
+  - { id: ERR_ROSTER_NOT_PUBLISHED, http: 409, condition: "Operation requires roster lifecycle PUBLISHED (assignments, call-assignments, case start)" }
+  - { id: ERR_ROSTER_NOT_DRAFT, http: 409, condition: "publish requires lifecycle DRAFT" }
+  - { id: ERR_ROSTER_NOT_LOCKED, http: 409, condition: "claim submit requires the case's roster LOCKED" }
+  - { id: ERR_ROSTER_LIFECYCLE_LOCKED, http: 409, condition: "Mutation not allowed on a LOCKED roster (case create, reschedule, assignment create, unpublish, roster patch)" }
+  - { id: ERR_CASES_OUTSTANDING, http: 409, condition: "lock requires all cases terminal; unpublish requires no IN_PROGRESS/COMPLETED cases" }
+  - { id: ERR_CASE_NOT_SCHEDULED, http: 409, condition: "Operation requires case status SCHEDULED (start, reschedule, assignment create)" }
+  - { id: ERR_CASE_NOT_IN_PROGRESS, http: 409, condition: "complete requires case status IN_PROGRESS" }
+  - { id: ERR_CASE_NOT_CANCELLABLE, http: 409, condition: "cancel requires case status SCHEDULED" }
+  - { id: ERR_CLOCK_DATE_MISMATCH, http: 409, condition: "Logical clock date must equal roster.service_date for start/complete/release; cancel rejects clock dates after service_date" }
+  - { id: ERR_INVALID_ACTUAL_MINUTES, http: 409, condition: "complete requires clock minute-of-day > actual_start_minute" }
+  - { id: ERR_ASSIGNMENT_NOT_PROPOSED, http: 409, condition: "accept/decline requires assignment status PROPOSED" }
+  - { id: ERR_ASSIGNMENT_NOT_CANCELLABLE, http: 409, condition: "assignment cancel requires PROPOSED/CONFIRMED and case still SCHEDULED" }
+  - { id: ERR_CALL_NOT_RELEASABLE, http: 409, condition: "release requires SCHEDULED status and clock strictly inside the window" }
+  - { id: ERR_ATTESTATION_NOT_SUBMITTABLE, http: 409, condition: "submit requires status IN_PROGRESS or REJECTED" }
+  - { id: ERR_ATTESTATION_NOT_SUBMITTED, http: 409, condition: "verify/reject requires status SUBMITTED" }
+  - { id: ERR_CLAIM_NOT_READYABLE, http: 409, condition: "mark-ready requires claim status DRAFT or DENIED" }
+  - { id: ERR_CLAIM_NOT_SUBMITTABLE, http: 409, condition: "submit requires claim status READY" }
+  - { id: ERR_CLAIM_NOT_SETTLABLE, http: 409, condition: "record-payment/record-denial require SUBMITTED; write-off requires SUBMITTED or DENIED" }
+  - { id: ERR_AUDIT_NOT_OPEN, http: 409, condition: "finding resolve/dismiss requires parent audit OPEN" }
+  - { id: ERR_UNRESOLVED_FINDINGS, http: 409, condition: "audit close blocked by OPEN findings" }
+  - { id: ERR_ENTRY_NOT_VOIDABLE, http: 409, condition: "void requires entry status ACCRUED" }
+  - { id: ERR_PROVIDER_SUSPENDED, http: 409, condition: "Operation requires provider status ACTIVE (assignment accept)" }
+  - { id: ERR_CREDENTIAL_EXPIRED, http: 409, condition: "roster.service_date is strictly after credential_expires_on or dea_expires_on (service on the expiry date itself is allowed)" }
+  - { id: ERR_SUPERVISION_RATIO_EXCEEDED, http: 409, condition: "Adding the directing interval would push the physician's peak directed concurrency above 4" }
+  - { id: ERR_PROVIDER_DOUBLE_BOOKED, http: 409, condition: "Half-open interval overlap with the provider's existing same-date case assignment (primary vs any case-scoped role)" }
+  - { id: ERR_CALL_WINDOW_OVERLAP, http: 409, condition: "Closed-interval call-window overlap for the same provider on the same service_date (sharing an endpoint minute conflicts)" }
+  - { id: ERR_INSUFFICIENT_REST, http: 409, condition: "Case start is < 480 minutes after the provider's same-date call window end" }
+  - { id: ERR_AGREEMENT_WINDOW_OVERLAP, http: 409, condition: "Stipend agreement date window shares a calendar date with another agreement for the same site" }
+  - { id: ERR_DUPLICATE_ROSTER, http: 409, condition: "A roster already exists for (site_id, service_date)" }
+  - { id: ERR_DUPLICATE_PROVIDER_NPI, http: 409, condition: "npi already registered" }
+  - { id: ERR_DUPLICATE_PROCEDURE_CODE, http: 409, condition: "procedure_code already exists" }
+  - { id: ERR_DUPLICATE_ATTESTATION, http: 409, condition: "An attestation already exists for (case_id, physician_id)" }
+  - { id: ERR_DUPLICATE_CLAIM, http: 409, condition: "Another claim with same (case_id, provider_id) is READY/SUBMITTED/PAID" }
+  - { id: ERR_NO_COMPLETED_ASSIGNMENT, http: 409, condition: "Manual claim create: provider has no COMPLETED assignment on the case (or case not COMPLETED)" }
+  - { id: ERR_TEFRA_STEPS_INCOMPLETE, http: 422, condition: "submit requires all seven TEFRA step booleans true" }
+  - { id: ERR_CHARGE_EXCEEDS_MAX, http: 402, condition: "charge_cents exceeds contracted_max_cents of the case's procedure_code" }
+
+# =============================================================================
+# Table 7: RBAC Permission Matrix
+# =============================================================================
+roles:
+  - name: GroupAdministrator
+    description: "Group business office admin: owns configuration (sites, providers, fee schedules, stipend agreements), credential maintenance, stipend voids, and the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /anesthesia-ops/sites"
+      - "POST /anesthesia-ops/providers, PATCH /anesthesia-ops/providers/{id}/credentials"
+      - "POST /anesthesia-ops/fee-schedules, PATCH /anesthesia-ops/fee-schedules/{id}"
+      - "POST /anesthesia-ops/stipend-agreements"
+      - "POST /anesthesia-ops/stipend-entries/{id}/void"
+      - "POST /anesthesia-ops/_clock/set_current_utc"
+    shared_operations:
+      - "All GET list/detail endpoints"
+  - name: Scheduler
+    description: "Group scheduling coordinator: builds rosters, schedules cases, proposes/cancels assignments, manages call coverage, records case start/complete/cancel"
+    identity: opaque
+    exclusive_operations:
+      - "POST /anesthesia-ops/rosters, PATCH /anesthesia-ops/rosters/{id}, publish/unpublish/lock"
+      - "POST /anesthesia-ops/cases, PATCH /anesthesia-ops/cases/{id}, start/complete/cancel"
+      - "POST /anesthesia-ops/cases/{id}/assignments, POST /anesthesia-ops/assignments/{id}/cancel"
+      - "POST /anesthesia-ops/call-assignments, POST /anesthesia-ops/call-assignments/{id}/release"
+    shared_operations:
+      - "POST /anesthesia-ops/attestations (shared with AttendingAnesthesiologist)"
+      - "GET list/detail endpoints; GET stipend-entries + summary"
+  - name: AttendingAnesthesiologist
+    description: "Anesthesiologist member of the group; accepts own assignments, attests TEFRA steps for own directed cases, verifies/rejects OTHER physicians' attestations"
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /anesthesia-ops/attestations/{id}/submit (own attestation only)"
+      - "POST /anesthesia-ops/attestations/{id}/verify, POST /anesthesia-ops/attestations/{id}/reject (never own — segregation of duties)"
+    shared_operations:
+      - "POST /anesthesia-ops/assignments/{id}/accept|decline (own assignments; shared with CRNA)"
+      - "POST /anesthesia-ops/attestations (shared with Scheduler; physician_id must equal X-User-ID)"
+      - "GET list/detail endpoints"
+  - name: CRNA
+    description: "Certified registered nurse anesthetist; accepts or declines own assignments"
+    identity: "entity_backed:Provider"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /anesthesia-ops/assignments/{id}/accept|decline (own assignments; shared with AttendingAnesthesiologist)"
+      - "GET list/detail endpoints (except stipend-entries)"
+  - name: BillingSpecialist
+    description: "Group billing staff: manages claim lifecycle from DRAFT through payment/denial/write-off"
+    identity: opaque
+    exclusive_operations:
+      - "POST /anesthesia-ops/claims, mark-ready, submit, record-payment, record-denial, write-off"
+    shared_operations:
+      - "GET list/detail endpoints; GET stipend-entries + summary"
+  - name: ComplianceAuditor
+    description: "Independent compliance reviewer: runs roster audits, resolves/dismisses findings, closes audits"
+    identity: opaque
+    exclusive_operations:
+      - "POST /anesthesia-ops/audits, POST /anesthesia-ops/audits/{id}/close"
+      - "POST /anesthesia-ops/findings/{id}/resolve, POST /anesthesia-ops/findings/{id}/dismiss"
+    shared_operations:
+      - "GET list/detail endpoints"

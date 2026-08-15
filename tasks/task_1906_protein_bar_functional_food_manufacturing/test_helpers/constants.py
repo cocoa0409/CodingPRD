@@ -1,0 +1,57 @@
+"""Domain thresholds — numeric constants named in the PRD (§2.7, §3.3–§3.9)."""
+
+# Protein claim substantiation (§3.4, §3.5, §3.8)
+HIGH_PROTEIN_MIN_G_PER_SERVING = 10.0
+GOOD_SOURCE_MIN_G_PER_SERVING = 5.0
+LOW_SUGAR_MAX_G_PER_BAR = 4.0
+
+# Allergen changeover control (§2.7, §3.7)
+HIGH_RISK_ALLERGENS = ("PEANUT", "TREE_NUT")
+SWAB_LIMIT_PPM = 20
+WET_CLEAN_STALENESS_MIN = 1440
+BUFFER_MINUTES = {
+    "NONE": 0,
+    "DRY_CLEAN": 30,
+    "WET_CLEAN": 60,
+    "SWAB_VALIDATE": 90,
+}
+
+# Cut plan (§3.8)
+TRIM_PCT = 0.04
+BARS_PER_CASE = 12
+
+# Lot release gates (§3.8)
+YIELD_TOLERANCE_PCT = 5.0
+RETAIN_MIN_DAYS = 30
+
+# Agreement quarter window (§3.3)
+QUARTER_DAYS = 91
+FINAL_TIER_UPTO_CASES = 999999999
+
+# Line day availability (§3.6)
+DAY_MINUTES = 1440
+
+# Shelf-life pulls (§3.9)
+PULL_GRACE_DAYS = 2
+DEFAULT_PULL_INTERVAL_DAYS = 7
+
+# Logical clock startup value (§2.4)
+CLOCK_STARTUP_UTC = "2026-08-01T00:00:00Z"
+
+# Standard time anchors reused across fixtures
+CLOCK_RUN_DAY_EVE = "2026-08-05T06:00:00Z"
+SLOT_START = "2026-08-06T08:00:00Z"
+SLOT_END = "2026-08-06T10:00:00Z"
+CLOCK_AFTER_RUN = "2026-08-06T10:00:00Z"
+RECEIVED_AT_DEFAULT = "2026-08-01T00:00:00Z"
+QUARTER_START_DEFAULT = "2026-07-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "BAR_WEIGHT_G": 60,
+    "BATCH_SIZE_KG": 100,
+    "MOQ_CASES": 100,
+    "COMMITTED_CASES": 300,
+    "FLAT_RATE_CENTS": 500,
+    "CAPACITY_KG_PER_HOUR": 500,
+    "SLAB_WEIGHT_KG": 20,
+}

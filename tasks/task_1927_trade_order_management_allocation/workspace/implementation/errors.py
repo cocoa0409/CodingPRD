@@ -1,0 +1,64 @@
+"""Error type and the full error-id catalog (id -> HTTP status)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+ERR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_ACCOUNT_NOT_FOUND": 404,
+    "ERR_SECURITY_NOT_FOUND": 404,
+    "ERR_BROKER_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_BLOCK_NOT_FOUND": 404,
+    "ERR_BUDGET_NOT_FOUND": 404,
+    "ERR_RESTRICTION_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_ALLOCATION_NOT_FOUND": 404,
+    "ERR_TRADE_ERROR_NOT_FOUND": 404,
+    "ERR_INSTRUCTION_NOT_FOUND": 404,
+    "ERR_POSITION_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ACCOUNT_TYPE_FORBIDDEN": 422,
+    "ERR_ACCOUNT_SUSPENDED": 409,
+    "ERR_SECURITY_HALTED": 409,
+    "ERR_BROKER_SUSPENDED": 409,
+    "ERR_BROKER_ASSET_CLASS_UNSUPPORTED": 422,
+    "ERR_TRADE_PROHIBITED": 422,
+    "ERR_POSITION_LIMIT_BREACH": 422,
+    "ERR_LOT_SIZE_VIOLATION": 422,
+    "ERR_BLOCK_SECURITY_MISMATCH": 422,
+    "ERR_BLOCK_SIDE_MISMATCH": 422,
+    "ERR_ORDER_ALREADY_BLOCKED": 409,
+    "ERR_ORDER_NOT_APPROVED": 409,
+    "ERR_ORDER_NOT_IN_BLOCK": 409,
+    "ERR_BLOCK_NOT_OPEN": 409,
+    "ERR_EMPTY_BLOCK": 422,
+    "ERR_OVERFILL": 422,
+    "ERR_FILL_BEFORE_ROUTE": 422,
+    "ERR_BUDGET_PERIOD_OVERLAP": 409,
+    "ERR_RESTRICTION_WINDOW_OVERLAP": 409,
+    "ERR_NOTHING_TO_ALLOCATE": 422,
+    "ERR_PLAN_NOT_POSTABLE": 409,
+    "ERR_PLAN_STALE_BATCH": 409,
+    "ERR_UNFAIR_ALLOCATION": 422,
+    "ERR_ERROR_ALREADY_OPEN": 409,
+    "ERR_ALLOCATION_ALREADY_SETTLED": 409,
+    "ERR_CORRECTION_QTY_EXCEEDS": 422,
+    "ERR_NO_ERROR_ACCOUNT": 422,
+    "ERR_NO_ACTIVE_BUDGET": 422,
+    "ERR_COMMISSION_BUDGET_EXCEEDED": 422,
+}
+
+
+def raise_err(error_id, message=None):
+    raise ApiError(error_id, ERR[error_id], message or error_id)

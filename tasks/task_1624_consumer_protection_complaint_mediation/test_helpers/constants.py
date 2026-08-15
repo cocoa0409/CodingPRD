@@ -1,0 +1,54 @@
+"""Domain thresholds — numeric constants from the PRD's calculation narratives (§2.6, §3)."""
+
+# Logical clock (PRD §2.6)
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+
+# Filing window (PRD §3.2)
+FILING_WINDOW_DAYS = 365
+
+# Response deadline (PRD §3.3)
+RESPONSE_BASE_DAYS = 30
+OUT_OF_STATE_EXTENSION_DAYS = 15
+
+# Offer expiry / cooling-off (PRD §3.5, §3.6)
+OFFER_TTL_DAYS = 14
+COOLING_OFF_HOURS = 72
+
+# Publication embargo (PRD §2.10, §3.9)
+EMBARGO_DAYS = 10
+
+# Pattern score (PRD §3.8)
+PATTERN_W_SETTLED = 10
+PATTERN_W_UNRESOLVED = 15
+PATTERN_W_REFERRED = 25
+PATTERN_OVERDUE_PENALTY = 5
+PATTERN_WINDOW_DAYS = 730
+WATCHLIST_MIN = 60
+FLAGGED_MIN = 100
+PATTERN_SCORE_CAP = 1000
+
+# Public rating (PRD §3.9)
+DEMERIT_SETTLED = 5
+DEMERIT_UNRESOLVED = 15
+DEMERIT_REFERRED = 25
+TIER_A_MIN = 90
+TIER_B_MIN = 70
+TIER_C_MIN = 40
+RATING_BASE = 100
+RECENCY_WINDOW_DAYS = 365
+
+# Mediation fee tiers, in cents (PRD §3.6)
+FEE_TIER1_LIMIT = 100_000
+FEE_TIER2_LIMIT = 500_000
+FEE_TIER2_RATE = 0.02
+FEE_TIER3_RATE = 0.01
+
+# Business response cap (PRD §3.3)
+RESUBMISSION_CAP = 3
+
+# Mediator calendar turnover buffer (PRD §3.4)
+MEDIATOR_BUFFER_MINUTES = 30
+
+# Pagination (PRD §2.3)
+PAGE_LIMIT_DEFAULT = 10
+PAGE_OFFSET_DEFAULT = 0

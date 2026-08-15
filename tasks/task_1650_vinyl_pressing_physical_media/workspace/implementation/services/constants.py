@@ -1,0 +1,125 @@
+"""Business constants from the scaffold calculations table."""
+
+from decimal import Decimal
+
+# --- Color configs ---
+COLOR_CONFIGS = {"BLACK", "SOLID_COLOR", "SPLATTER", "MARBLED", "PICTURE_DISC"}
+COLOR_FAMILY_OF = {
+    "BLACK": "STANDARD",
+    "SOLID_COLOR": "STANDARD",
+    "SPLATTER": "SPECIAL_EFFECT",
+    "MARBLED": "SPECIAL_EFFECT",
+    "PICTURE_DISC": "PICTURE",
+}
+COLOR_FAMILIES = {"STANDARD", "SPECIAL_EFFECT", "PICTURE"}
+
+VARIANT_MIN_QTY = {
+    "BLACK": 1,
+    "SOLID_COLOR": 100,
+    "SPLATTER": 100,
+    "MARBLED": 100,
+    "PICTURE_DISC": 200,
+}
+
+TOLERANCE = {
+    "BLACK": 5.0,
+    "SOLID_COLOR": 6.0,
+    "SPLATTER": 8.0,
+    "MARBLED": 8.0,
+    "PICTURE_DISC": 12.0,
+}
+
+# --- Quote pricing constants ---
+TIER1_LIMIT = 299
+TIER1_RATE = 320
+TIER2_LIMIT = 999
+TIER2_RATE = 275
+TIER3_LIMIT = 4999
+TIER3_RATE = 240
+TIER4_RATE = 210
+
+VARIANT_SURCHARGE = {
+    "BLACK": 0,
+    "SOLID_COLOR": 35,
+    "SPLATTER": 55,
+    "MARBLED": 65,
+    "PICTURE_DISC": 120,
+}
+MIN_VARIANT_SURCHARGE = 5000
+WEIGHT_SURCHARGE = {140: 0, 180: 25}
+LACQUER_PER_SIDE = 17500
+STAMPER_FEE = 30000
+STAMPER_LIFE = 1000
+SETUP_ORDER = 40000
+SETUP_PER_NONBLACK_VARIANT = 15000
+
+TIER_PCT = {
+    "STANDARD": Decimal("0"),
+    "SILVER": Decimal("0.03"),
+    "GOLD": Decimal("0.05"),
+    "PLATINUM": Decimal("0.08"),
+}
+DISCOUNT_TIERS = {"STANDARD", "SILVER", "GOLD", "PLATINUM"}
+
+OVERRUN_POLICIES = {"EXACT_ONLY", "ACCEPT_AND_BILL_10", "ACCEPT_ALL_AND_BILL"}
+OVERRUN_PCT = Decimal("0.10")
+UNDERRUN_PCT = Decimal("0.10")
+
+# --- Invoice constants ---
+TP_REVISION_FEE = 45000
+REPRESS_FLAT = 150000
+
+# --- Cancellation fee tiers ---
+CANCEL_PCT = {
+    "DRAFT": Decimal("0"),
+    "QUOTED": Decimal("0"),
+    "CONFIRMED": Decimal("0.10"),
+    "TOOLING": Decimal("0.25"),
+    "AWAITING_TP_APPROVAL": Decimal("0.25"),
+    "QUEUED": Decimal("0.50"),
+    "SCHEDULED": Decimal("0.50"),
+}
+
+# --- Backlog / risk ---
+REPRESS_INFLATION = Decimal("0.25")
+CHANGEOVER_HOURS = 1
+
+STAGE_LEAD = {
+    "CONFIRMED": 45,
+    "TOOLING": 35,
+    "AWAITING_TP_APPROVAL": 28,
+    "QUEUED": 21,
+    "PRESSING": 3,
+    "QC_REVIEW": 2,
+}
+TP_REVISION_DELAY_DAYS = 7
+REPRESS_DELAY_DAYS = 10
+PRINT_TRANSIT_DAYS = 3
+BUFFER_DAYS = 14
+
+RISK_ORDER = {"ON_TRACK": 0, "AT_RISK": 1, "LATE": 2}
+
+# --- Warehousing ---
+UNITS_PER_PALLET = {"LP": 100, "EP": 150, "SINGLE_7": 300}
+ZONE_DAILY_PALLETS = {"A": 40, "B": 25, "C": 15}
+ZONES = {"A", "B", "C"}
+FORMATS = {"LP", "EP", "SINGLE_7"}
+WEIGHTS = {140, 180}
+
+# --- Storage fees ---
+DAILY_PALLET_RATE = 55
+MONTHLY_PALLET_RATE = 1500
+MIN_MONTHLY_STORAGE = 5000
+
+# --- Waitlist promotion ---
+TIER_WEIGHT = {"PLATINUM": 40, "GOLD": 30, "SILVER": 20, "STANDARD": 10}
+
+# --- Order constraints ---
+ORDER_MIN_UNITS = 100
+MIN_LEAD_DAYS = 21
+TP_MAX_QUANTITY = 20
+
+SIDES_CHOICES = {1, 2}
+PLATING_ROUTES = {"TWO_STEP", "THREE_STEP"}
+PRINT_COMPONENTS = {"JACKET", "INNER_SLEEVE", "INSERT", "LABEL"}
+TONNAGE_CLASSES = {"STANDARD", "HEAVY"}

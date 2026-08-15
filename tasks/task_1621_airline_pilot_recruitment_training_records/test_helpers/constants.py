@@ -1,0 +1,61 @@
+"""Domain thresholds and rate-card constants from the PRD narratives."""
+
+# Logical clock (PRD section on the logical clock)
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+
+# Applicant screening (ATP minimum)
+ATP_MINIMUM_HOURS = 1500
+
+# Records pipeline
+RECORDS_RESPONSE_WINDOW_DAYS = 30
+
+# Rate card (PRD training cost accounting section)
+GROUND_SCHOOL_FEE_CENTS = 150000
+IOE_RATE_CENTS_PER_HOUR = 9000
+CHECKRIDE_FEE_CENTS = 120000
+RETRAINING_SURCHARGE_RATE = 0.25
+RETRAINING_CHARGE_CENTS = 30000  # round_half_up(120000 * 0.25)
+
+# Milestones and the retraining loop
+MILESTONE_PASS_SCORE = 80
+MAX_CHECKRIDE_ATTEMPTS = 2
+
+# Currency recency
+RECENCY_WINDOW_DAYS = 90
+WARNING_BAND_DAYS = 7
+LAPSED_TO_EXPIRED_DAYS = 365
+DEFAULT_LANDINGS_REQUIRED_90D = 3
+
+# Instructor scheduling
+INSTRUCTOR_BUFFER_MINUTES = 30
+
+# Medical validity (whole calendar months from the issue month)
+FIRST_CLASS_MONTHS_UNDER_40 = 12
+FIRST_CLASS_MONTHS_40_PLUS = 6
+THIRD_CLASS_MONTHS_UNDER_40 = 60
+THIRD_CLASS_MONTHS_40_PLUS = 24
+MIN_PILOT_AGE_AT_ISSUE = 17
+
+# Attrition seat forecast per-phase survival probabilities
+PHASE_SURVIVAL = {
+    "GROUND_SCHOOL": 0.90,
+    "SIMULATOR": 0.95,
+    "CHECKRIDE": 0.97,
+    "IOE": 0.98,
+}
+REMEDIATION_SURVIVAL = 0.80
+
+# Common schedule anchors used across fixtures
+DEFAULT_CLASS_DATE = "2026-08-10T00:00:00Z"
+CLASS_START_CLOCK = "2026-08-10T09:00:00Z"
+DEFAULT_MEDICAL_ISSUED_AT = "2026-07-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "SIMULATOR_COST_PER_HOUR_CENTS": 45000,
+    "IOE_HOURS_REQUIRED": 10,
+    "SEAT_CAPACITY": 10,
+    "BASE_ATTRITION_RATE": 0.20,
+    "DAILY_MAX_SESSIONS": 8,
+    "TOTAL_FLIGHT_HOURS": 2000,
+    "PILOT_AGE_AT_ISSUE": 30,
+}

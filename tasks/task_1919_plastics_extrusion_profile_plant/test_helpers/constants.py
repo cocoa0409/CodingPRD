@@ -1,0 +1,83 @@
+"""Domain thresholds and canonical fixture values (PRD §3 calculations)."""
+
+# Pass-through / invoicing (PRD §3.4, §3.8)
+PASS_THROUGH_FACTOR = 0.85
+TOOLING_SURCHARGE_PCT = 0.10
+
+# Purge scrap estimate (PRD §3.5)
+PURGE_BASE_KG = {
+    "SAME_RESIN_SAME_COLOR": 2.0,
+    "SAME_RESIN_LIGHT_TO_DARK": 4.0,
+    "SAME_RESIN_DARK_TO_LIGHT": 8.0,
+    "RESIN_CHANGE": 12.0,
+}
+SCREW_FACTOR_TIER1_MAX_MM = 45
+SCREW_FACTOR_TIER2_MAX_MM = 90
+SCREW_FACTOR_TIER1 = 1.0
+SCREW_FACTOR_TIER2 = 1.6
+SCREW_FACTOR_TIER3 = 2.2
+GRADE_MULT = {"STANDARD": 1.0, "HIGH_EFFICIENCY": 0.7}
+COLOR_RANK = {
+    "NATURAL": 0, "WHITE": 1, "YELLOW": 2, "RED": 3,
+    "BLUE": 4, "GREEN": 5, "BROWN": 6, "BLACK": 7,
+}
+
+# Canonical engineering envelope used across tests.
+WALL_DIMENSION = {
+    "name": "wall",
+    "nominal_mm": 2.0,
+    "tol_plus_mm": 0.1,
+    "tol_minus_mm": 0.1,
+    "ucl_mm": 2.05,
+    "lcl_mm": 1.95,
+}
+
+DEFAULTS = {
+    "CUSTOMER_NAME": "Acme",
+    "CREDIT_LIMIT_CENTS": 10000000,
+    "PROFILE_CODE": "P-100",
+    "SPC_SUBGROUP_SIZE": 3,
+    "SAMPLE_EVERY_M": 2000,
+    "RESIN_CONTENT_KG_PER_M": 0.8,
+    "MIN_LINE_SPEED_MPM": 10,
+    "MAX_LINE_SPEED_MPM": 40,
+    "DIE_CODE": "D-A",
+    "TOOLING_COST_CENTS": 500000,
+    "COMMITTED_LENGTH_M": 10000,
+    "COMMITTED_WEIGHT_KG": 8000,
+    "AMORTIZATION_MODE": "PER_METER",
+    "BUFFER_HOURS": 4,
+    "MIN_SCREW_MM": 40,
+    "MAX_SCREW_MM": 90,
+    "LINE_CODE": "L-1",
+    "SCREW_DIAMETER_MM": 60,
+    "FORMULA_CODE": "F-RED25",
+    "BASE_RESIN_TYPE": "PVC",
+    "COLOR_FAMILY": "RED",
+    "LET_DOWN_RATIO": 25.0,
+    "MAX_REGRIND_PCT": 20,
+    "TARGET_BATCH_KG": 1000.0,
+    "ORDERED_LENGTH_M": 5000,
+    "CUT_LENGTH_MM": 2000,
+    "PIECES_PER_BUNDLE": 25,
+    "BASE_UNIT_PRICE_CENTS_PER_M": 1000,
+    "LINE_SPEED_MPM": 25,
+}
+
+# Logical-clock anchors (PRD §2.5: startup default is exactly 2026-08-01T00:00:00Z)
+CLOCK_JUNE = "2026-06-01T00:00:00Z"
+CLOCK_AUGUST = "2026-08-01T00:00:00Z"
+DEFAULT_STARTUP_CLOCK = "2026-08-01T00:00:00Z"
+DEFAULT_INDEX_POINTS = (("2026-06", 100.0), ("2026-07", 120.0), ("2026-08", 140.0))
+
+# Standard planned windows for assignments (PRD §3.5 half-open windows)
+WINDOW_10_12 = ("2026-08-10T10:00:00Z", "2026-08-10T12:00:00Z")
+WINDOW_12_14 = ("2026-08-10T12:00:00Z", "2026-08-10T14:00:00Z")
+WINDOW_14_16 = ("2026-08-10T14:00:00Z", "2026-08-10T16:00:00Z")
+WINDOW_16_18 = ("2026-08-10T16:00:00Z", "2026-08-10T18:00:00Z")
+WINDOW_11_13 = ("2026-08-10T11:00:00Z", "2026-08-10T13:00:00Z")
+WINDOW_1230_14 = ("2026-08-10T12:30:00Z", "2026-08-10T14:00:00Z")
+
+# In-control subgroup for the canonical wall dimension (xbar 2.00, limits 1.95/2.05)
+IN_CONTROL_MEASUREMENTS = [2.0, 2.02, 1.98]
+IN_CONTROL_MEASUREMENTS_B = [2.01, 1.99, 2.0]
