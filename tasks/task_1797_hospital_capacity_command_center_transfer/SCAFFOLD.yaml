@@ -1,0 +1,1780 @@
+# =============================================================================
+# SCAFFOLD.yaml — Hospital Capacity Command Center & Transfer Center
+# §1.0–§1.7 (difficulty design and corner design live in sibling files)
+# =============================================================================
+
+scenario: |
+  Hospital Capacity Command Center & Transfer Center (health system command center):
+  real-time bed availability & pending discharge visibility, transfer request intake
+  with accepting-physician consult, bed assignment matching acuity/isolation/service,
+  diversion status & ambulance notification, boarding time & escalation huddle
+  triggers, inter-hospital load balancing within system, patient placement conflict
+  resolution, capacity forecast for elective scheduling.
+
+domain_name: hospital-capacity-command-center
+api_prefix: /cc
+
+# =============================================================================
+# §0 Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation        # finite staffed-bed pool: held / occupied / released / cooled-down
+  secondary_archetype: multi_party_negotiation  # transfer intake + accepting-physician consult with decline/re-consult rounds
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on TransferRequest.version and BedHold.version
+    - cascading_side_effects                 # discharge -> bed -> forecast staleness -> elective window; diversion -> pipeline
+    - dual_variant_calculation               # raw vs pressure-weighted load; committed vs provisional census
+    - rate_threshold_triggers                # boarding >=120min huddle; weighted load >=95.0 diversion recommendation
+    - selector_policy                        # bed candidate ranking with eligibility filter, score, tie-break, empty fallback
+    - derived_field_reconciliation           # published forecast stale flag on bed-availability mutations
+    - temporal_windowing                     # diversion half-open windows; bed cooling buffers
+  entity_topology: hybrid                    # create nested under Facility, read/action flat by id
+  state_machine_shape: cyclic                # TransferRequest re-consult loop; BoardingRecord parallel dimensions; Bed cycles
+  relationship_patterns:
+    - one_to_many                            # Facility -> Bed/Physician/Admission/TransferRequest/DiversionEvent/BoardingRecord/CapacityForecast
+    - cross_aggregate                        # BedAssignment joins TransferRequest + BedHold + Bed
+    - self_referential: false
+  role_model: segregation_of_duties          # diversion declare/lift and assignment create/complete must be different actors
+  consistency_model: immediate               # every mutation is visible in the same request's response
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (11 entities)
+# =============================================================================
+entities:
+  - name: Facility
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Facility display name" }
+      - { name: region, type: string, source: input, description: "Region code for inter-hospital load balancing grouping" }
+      - { name: diversion_status, type: enum, source: computed, default: "ACCEPTING", description: "ACCEPTING | DIVERT_FULL | DIVERT_SERVICE; derived from DiversionEvent rows with status ACTIVE whose [starts_at, ends_at) contains now", constraints: "DIVERT_FULL when any ACTIVE FULL diversion in window; else DIVERT_SERVICE when any ACTIVE SERVICE diversion in window; else ACCEPTING" }
+      - { name: diversion_recommended, type: boolean, source: computed, default: false, description: "true when load_score_weighted >= 95.0 (diversion recommendation threshold, >= boundary)" }
+      - { name: staffed_beds, type: integer, source: computed, default: 0, description: "Count of Bed rows of this facility with staffed == true" }
+      - { name: occupied_beds, type: integer, source: computed, default: 0, description: "Count of staffed Bed rows with status OCCUPIED" }
+      - { name: held_beds, type: integer, source: computed, default: 0, description: "Count of staffed Bed rows with status HELD" }
+      - { name: available_beds, type: integer, source: computed, default: 0, description: "Count of staffed Bed rows with status AVAILABLE" }
+      - { name: out_of_service_beds, type: integer, source: computed, default: 0, description: "Count of Bed rows with status OUT_OF_SERVICE" }
+      - { name: boarding_waiters, type: integer, source: computed, default: 0, description: "Count of BoardingRecord rows of this facility with placement_status IN {WAITING, OFFERED}" }
+      - { name: active_inbound_transfers, type: integer, source: computed, default: 0, description: "Count of TransferRequest rows of this facility with status IN {INTAKE, CONSULT_PENDING, DECLINED, EXPIRED, ACCEPTED, HOLD_PLACED, ASSIGNED} (all non-terminal)" }
+      - { name: load_score_raw, type: number, source: computed, default: 0, description: "RAW_OCCUPANCY variant of transfer_load_score; see calculations" }
+      - { name: load_score_weighted, type: number, source: computed, default: 0, description: "PRESSURE_WEIGHTED variant of transfer_load_score; see calculations" }
+      - { name: service_weighted_occupancy_pct, type: number, source: computed, default: 0, description: "Per-service occupancy rounded half-up to 1dp FIRST, then weighted by fixed SERVICE_WEIGHTS; see calculations.facility_service_occupancy" }
+      - { name: next_elective_window_start, type: datetime, source: computed, description: "Null unless a non-stale PUBLISHED CapacityForecast exists; = forecast.generated_at + h hours for the first hour h whose provisional census <= inpatient_bed_count - ELECTIVE_BUFFER", constraints: "null when no PUBLISHED non-stale forecast or no qualifying hour" }
+
+  - name: Bed
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; owning facility (from create path)" }
+      - { name: unit, type: string, source: input, description: "Nursing unit label, e.g. ICU-1, M-2, ED-1" }
+      - { name: label, type: string, source: input, description: "Bed label within unit" }
+      - { name: service, type: enum, source: input, description: "CARDIAC | NEURO | TRAUMA | MEDICAL | SURGICAL | ONCOLOGY", constraints: "MEDICAL beds act as universal overflow in the bed selector" }
+      - { name: max_acuity, type: enum, source: input, description: "ACUITY_1_CRITICAL | ACUITY_2_STEPDOWN | ACUITY_3_MEDICAL_SURGICAL | ACUITY_4_OBSERVATION; bed accepts requests whose acuity rank <= bed rank (CRITICAL rank 4 highest)" }
+      - { name: isolation_capability, type: enum, source: input, description: "NONE | CONTACT | DROPLET | AIRBORNE (ordered ranks 0..3); bed accepts requests whose isolation_need rank <= capability rank" }
+      - { name: staffed, type: boolean, source: input, default: true, description: "Unstaffed beds are excluded from load denominators, occupancy, and the selector" }
+      - { name: turnover_minutes, type: integer, source: input, default: 45, description: "Cleaning buffer applied after a hold ends or a discharge confirms; blocks new holds until cooling_until" }
+      - { name: status, type: enum, source: system, description: "AVAILABLE | HELD | OCCUPIED | OUT_OF_SERVICE; HELD is system-managed via BedHold lifecycle only", constraints: "initial AVAILABLE" }
+      - { name: projected_free_at, type: datetime, source: computed, description: "Null unless the occupying Admission is PENDING_DISCHARGE; = admission.expected_discharge_at + turnover_minutes" }
+      - { name: cooling_until, type: datetime, source: computed, description: "Null unless the bed is in post-hold/post-discharge turnover; = last hold end or discharge confirm time + turnover_minutes; new holds require now >= cooling_until" }
+
+  - name: Physician
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; employing facility (from create path)" }
+      - { name: full_name, type: string, source: input, description: "Physician display name" }
+      - { name: services, type: array, source: input, description: "Array of service enums the physician is credentialed to accept for" }
+      - { name: status, type: enum, source: input, default: "ON_CALL", description: "ON_CALL | OFF_CALL; consult dispatch requires ON_CALL" }
+
+  - name: Admission
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; owning facility (from create path)" }
+      - { name: bed_id, type: string, source: input, description: "FK -> Bed.id; bed the patient occupies (must belong to same facility, be AVAILABLE and staffed)" }
+      - { name: patient_ref, type: string, source: input, description: "De-identified patient reference" }
+      - { name: acuity, type: enum, source: input, description: "ACUITY_1_CRITICAL | ACUITY_2_STEPDOWN | ACUITY_3_MEDICAL_SURGICAL | ACUITY_4_OBSERVATION" }
+      - { name: isolation_need, type: enum, source: input, description: "NONE | CONTACT | DROPLET | AIRBORNE" }
+      - { name: service, type: enum, source: input, description: "CARDIAC | NEURO | TRAUMA | MEDICAL | SURGICAL | ONCOLOGY" }
+      - { name: status, type: enum, source: system, description: "ADMITTED | PENDING_DISCHARGE | DISCHARGED", constraints: "initial ADMITTED" }
+      - { name: expected_discharge_at, type: datetime, source: input, description: "Set when marked pending discharge; used by forecast census" , constraints: "required by pending-discharge endpoint" }
+      - { name: discharge_order_signed, type: boolean, source: input, default: false, description: "Set at pending-discharge; signed orders count in the COMMITTED census variant, unsigned only in PROVISIONAL" }
+      - { name: pending_discharge_at, type: datetime, source: system, description: "Timestamp of the ADMITTED -> PENDING_DISCHARGE transition; null otherwise" }
+      - { name: confirmed_discharge_at, type: datetime, source: system, description: "Timestamp of the PENDING_DISCHARGE -> DISCHARGED transition; null otherwise" }
+
+  - name: TransferRequest
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; destination facility (from create path; changed by rebalance)" }
+      - { name: source_facility_name, type: string, source: input, description: "Free-text name of the requesting external facility" }
+      - { name: patient_ref, type: string, source: input, description: "De-identified patient reference" }
+      - { name: acuity, type: enum, source: input, description: "ACUITY_1_CRITICAL | ACUITY_2_STEPDOWN | ACUITY_3_MEDICAL_SURGICAL | ACUITY_4_OBSERVATION" }
+      - { name: isolation_need, type: enum, source: input, description: "NONE | CONTACT | DROPLET | AIRBORNE" }
+      - { name: service, type: enum, source: input, description: "CARDIAC | NEURO | TRAUMA | MEDICAL | SURGICAL | ONCOLOGY" }
+      - { name: priority, type: enum, source: input, description: "EMERGENT | URGENT | ELECTIVE" }
+      - { name: preferred_unit, type: string, source: input, description: "Optional unit preference used only as a +5 selector bonus", constraints: "optional" }
+      - { name: status, type: enum, source: system, description: "INTAKE | CONSULT_PENDING | DECLINED | EXPIRED | ACCEPTED | HOLD_PLACED | ASSIGNED | COMPLETED | CANCELLED", constraints: "initial INTAKE; terminal COMPLETED, CANCELLED" }
+      - { name: accepting_physician_id, type: string, source: system, description: "FK -> Physician.id; physician currently consulted; null until consult and after decline/expire/rebalance" }
+      - { name: consult_deadline, type: datetime, source: system, description: "now + CONSULT_TTL_MINUTES at consult dispatch; null otherwise" }
+      - { name: consult_count, type: integer, source: computed, default: 0, description: "Increments on every consult dispatch (re-consult rounds included)" }
+      - { name: decline_reason, type: enum, source: system, description: "DIVERSION | NO_CAPACITY | CLINICAL | PHYSICIAN_DECLINED | TIMEOUT; null unless DECLINED/EXPIRED" }
+      - { name: intake_coordinator_id, type: string, source: system, description: "X-User-ID of the TransferCenterCoordinator who created the request" }
+      - { name: assigned_bed_id, type: string, source: system, description: "FK -> Bed.id; set when ASSIGNED, null otherwise" }
+
+  - name: BedHold
+    parent: Bed
+    common_fields: true
+    fields:
+      - { name: bed_id, type: string, source: system, description: "FK -> Bed.id; held bed" }
+      - { name: transfer_request_id, type: string, source: system, description: "FK -> TransferRequest.id; request the hold serves" }
+      - { name: starts_at, type: datetime, source: system, description: "Logical-clock time at hold creation" }
+      - { name: ttl_minutes, type: integer, source: input, default: 60, description: "Hold time-to-live in minutes (HOLD_TTL_MINUTES default 60)" }
+      - { name: expires_at, type: datetime, source: system, description: "= starts_at + ttl_minutes; a hold expires when now >= expires_at (>= boundary)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | CONSUMED | RELEASED | EXPIRED", constraints: "initial ACTIVE" }
+      - { name: extend_count, type: integer, source: system, default: 0, description: "Number of successful extends; hard cap HOLD_EXTEND_MAX = 2" }
+
+  - name: BedAssignment
+    parent: TransferRequest
+    common_fields: true
+    fields:
+      - { name: transfer_request_id, type: string, source: system, description: "FK -> TransferRequest.id; the request being placed" }
+      - { name: bed_hold_id, type: string, source: input, description: "FK -> BedHold.id; the ACTIVE hold consumed by this assignment" }
+      - { name: bed_id, type: string, source: system, description: "FK -> Bed.id; copied from the consumed hold" }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of the TransferCenterCoordinator who created the assignment" }
+      - { name: status, type: enum, source: system, description: "PLACED | COMPLETED | CANCELLED", constraints: "initial PLACED" }
+      - { name: completed_at, type: datetime, source: system, description: "Timestamp of patient arrival; null otherwise" }
+
+  - name: DiversionEvent
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; diverting facility (from create path)" }
+      - { name: level, type: enum, source: input, description: "FULL | SERVICE" }
+      - { name: service, type: enum, source: input, description: "CARDIAC | NEURO | TRAUMA | MEDICAL | SURGICAL | ONCOLOGY; required iff level == SERVICE, forbidden otherwise" }
+      - { name: starts_at, type: datetime, source: input, description: "Window start; half-open [starts_at, ends_at) so adjacency is allowed" }
+      - { name: ends_at, type: datetime, source: input, description: "Window end; must be > starts_at" }
+      - { name: declared_by_user_id, type: string, source: system, description: "X-User-ID of the HouseSupervisor who declared the diversion" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | LIFTED | EXPIRED", constraints: "initial ACTIVE; EXPIRED when sweep observes now >= ends_at" }
+      - { name: lifted_at, type: datetime, source: system, description: "Timestamp of manual lift; null otherwise" }
+      - { name: lifted_by_user_id, type: string, source: system, description: "X-User-ID of the lifting HouseSupervisor; must differ from declared_by_user_id (segregation of duties)" }
+
+  - name: BoardingRecord
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; owning facility (from create path)" }
+      - { name: admission_id, type: string, source: input, description: "FK -> Admission.id; the boarded admission (its bed's unit must be an ED unit)" }
+      - { name: started_at, type: datetime, source: system, description: "Logical-clock time at record creation" }
+      - { name: boarding_minutes, type: integer, source: computed, default: 0, description: "max(last_heartbeat_minutes, floor((now - started_at) minutes)); see calculations.boarding_minutes" }
+      - { name: placement_status, type: enum, source: system, description: "WAITING | OFFERED | PLACED | LEFT_AMA — independent parallel dimension", constraints: "initial WAITING" }
+      - { name: escalation_status, type: enum, source: system, description: "NONE | HUDDLE_CALLED | HUDDLE_RESOLVED — independent parallel dimension", constraints: "initial NONE" }
+      - { name: huddle_count_24h, type: integer, source: computed, default: 0, description: "Count of EscalationHuddle rows for this record with called_at >= now - 24h (rolling window, inclusive boundary)" }
+      - { name: executive_escalation, type: boolean, source: computed, default: false, description: "true once huddle_count_24h >= 3 (evaluated on huddle resolve) or boarding_minutes >= 240 (evaluated on heartbeat/sweep)" }
+      - { name: last_heartbeat_minutes, type: integer, source: system, description: "Last observed_minutes accepted via heartbeat; null until first heartbeat" }
+
+  - name: EscalationHuddle
+    parent: BoardingRecord
+    common_fields: true
+    fields:
+      - { name: boarding_record_id, type: string, source: system, description: "FK -> BoardingRecord.id; the boarding record being escalated" }
+      - { name: trigger_reason, type: enum, source: system, description: "AUTO_THRESHOLD (boarding_minutes >= 120) | MANUAL (HouseSupervisor)" }
+      - { name: status, type: enum, source: system, description: "CALLED | RESOLVED", constraints: "initial CALLED" }
+      - { name: called_at, type: datetime, source: system, description: "Logical-clock time the huddle was called" }
+      - { name: resolved_at, type: datetime, source: system, description: "Timestamp of resolution; null otherwise" }
+      - { name: resolution, type: string, source: input, description: "Free-text resolution note captured at resolve", constraints: "optional" }
+
+  - name: CapacityForecast
+    parent: Facility
+    common_fields: true
+    fields:
+      - { name: facility_id, type: string, source: system, description: "FK -> Facility.id; forecasted facility (from create path)" }
+      - { name: horizon_hours, type: integer, source: input, description: "Forecast horizon in hours, 1..72" }
+      - { name: generated_at, type: datetime, source: system, description: "Logical-clock time at generation; hour h maps to generated_at + h hours" }
+      - { name: variant_snapshots, type: object, source: computed, description: "{ committed: integer[horizon], provisional: integer[horizon] } — projected inpatient census per hour for both variants of calculations.projected_census" }
+      - { name: occupancy_pct_committed, type: number, source: computed, description: "mean of committed census / inpatient_bed_count * 100, 1dp round_half_up" }
+      - { name: occupancy_pct_provisional, type: number, source: computed, description: "mean of provisional census / inpatient_bed_count * 100, 1dp round_half_up" }
+      - { name: status, type: enum, source: system, description: "PROVISIONAL | PUBLISHED | SUPERSEDED", constraints: "initial PROVISIONAL; creating a new forecast supersedes all prior PROVISIONAL/PUBLISHED forecasts of the facility" }
+      - { name: stale, type: boolean, source: computed, default: false, description: "Set true on the latest PUBLISHED forecast whenever bed availability mutates (discharge confirm, pending-discharge mark/rescind); never set on PROVISIONAL forecasts" }
+      - { name: published_at, type: datetime, source: system, description: "Timestamp of publish; null otherwise" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Facility
+    field: diversion_status
+    initial_state: ACCEPTING
+    terminal_states: []
+    note: "Derived posture, never set directly; recomputed on diversion create/lift/expire and on every load-affecting mutation"
+    transitions:
+      - from: ACCEPTING
+        to: DIVERT_FULL
+        trigger: "system (a DiversionEvent with level FULL, status ACTIVE, and starts_at <= now < ends_at exists)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Transfer intake and rebalance-target selection become blocked (ERR_FACILITY_ON_DIVERSION)"
+      - from: ACCEPTING
+        to: DIVERT_SERVICE
+        trigger: "system (a DiversionEvent with level SERVICE, status ACTIVE, in window exists, and no FULL diversion in window)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Transfer intake for the named service becomes blocked (ERR_FACILITY_ON_DIVERSION)"
+      - from: [DIVERT_FULL, DIVERT_SERVICE]
+        to: ACCEPTING
+        trigger: "system (lift or sweep-expiry removes the last in-window ACTIVE diversion)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: Bed
+    field: status
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: OUT_OF_SERVICE
+        trigger: "POST /cc/beds/{id}/status with to_status=OUT_OF_SERVICE"
+        actor: BedManager
+        preconditions: []
+        side_effects:
+          - "Facility staffed/available counts recomputed; load scores recomputed"
+      - from: OUT_OF_SERVICE
+        to: AVAILABLE
+        trigger: "POST /cc/beds/{id}/status with to_status=AVAILABLE"
+        actor: BedManager
+        preconditions: []
+        side_effects:
+          - "Facility counts and load scores recomputed"
+      - from: AVAILABLE
+        to: HELD
+        trigger: "system (BedHold created on this bed)"
+        actor: system
+        preconditions:
+          - "Bed AVAILABLE, staffed, unit != ED"
+          - "cooling_until is null OR now >= cooling_until (ERR_BED_HOLD_WINDOW_CONFLICT)"
+        side_effects:
+          - "cooling_until cleared"
+          - "Facility held/available counts and load scores recomputed"
+      - from: HELD
+        to: AVAILABLE
+        trigger: "system (BedHold released or sweep-expired)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "cooling_until = now + turnover_minutes"
+          - "Facility counts and load scores recomputed"
+      - from: HELD
+        to: OCCUPIED
+        trigger: "system (BedAssignment completed — patient arrived)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Facility counts and load scores recomputed"
+      - from: AVAILABLE
+        to: OCCUPIED
+        trigger: "system (Admission created on this bed)"
+        actor: system
+        preconditions:
+          - "Bed AVAILABLE and staffed (ERR_BED_NOT_AVAILABLE)"
+        side_effects:
+          - "cooling_until cleared; Facility counts and load scores recomputed"
+      - from: OCCUPIED
+        to: AVAILABLE
+        trigger: "system (occupying Admission confirmed discharged)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "cooling_until = now + turnover_minutes; projected_free_at = null"
+          - "CASCADE LINK 2: any bed-availability mutation (status or projected_free_at) marks the facility's latest PUBLISHED CapacityForecast stale = true (PROVISIONAL forecasts untouched)"
+          - "CASCADE LINK 3 (via forecast staleness): Facility.next_elective_window_start = null"
+          - "Facility counts and load scores recomputed"
+
+  - entity: Admission
+    field: status
+    initial_state: ADMITTED
+    terminal_states: [DISCHARGED]
+    transitions:
+      - from: ADMITTED
+        to: PENDING_DISCHARGE
+        trigger: "POST /cc/admissions/{id}/pending-discharge"
+        actor: BedManager
+        preconditions:
+          - "Admission ADMITTED (ERR_ADMISSION_INVALID_STATE)"
+        side_effects:
+          - "pending_discharge_at = now; expected_discharge_at and discharge_order_signed recorded"
+          - "Bed.projected_free_at = expected_discharge_at + bed.turnover_minutes"
+          - "Bed-availability mutation cascade: latest PUBLISHED CapacityForecast stale = true; Facility.next_elective_window_start = null"
+      - from: PENDING_DISCHARGE
+        to: ADMITTED
+        trigger: "POST /cc/admissions/{id}/rescind-pending-discharge"
+        actor: BedManager
+        preconditions: []
+        side_effects:
+          - "pending_discharge_at = null; expected_discharge_at = null; discharge_order_signed = false"
+          - "Bed.projected_free_at = null"
+          - "Bed-availability mutation cascade: latest PUBLISHED CapacityForecast stale = true; Facility.next_elective_window_start = null"
+      - from: PENDING_DISCHARGE
+        to: DISCHARGED
+        trigger: "POST /cc/admissions/{id}/confirm-discharge"
+        actor: BedManager
+        preconditions: []
+        side_effects:
+          - "confirmed_discharge_at = now"
+          - "Bed OCCUPIED -> AVAILABLE with cooling_until = now + turnover_minutes (CASCADE LINK 1)"
+          - "Bed mutation marks latest PUBLISHED CapacityForecast stale = true (CASCADE LINK 2)"
+          - "Forecast staleness nulls Facility.next_elective_window_start (CASCADE LINK 3)"
+
+  - entity: TransferRequest
+    field: status
+    initial_state: INTAKE
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: INTAKE
+        to: CONSULT_PENDING
+        trigger: "POST /cc/transfer-requests/{id}/consult"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "Physician exists in this facility (ERR_PHYSICIAN_NOT_FOUND)"
+          - "Physician.status == ON_CALL (ERR_PHYSICIAN_NOT_ON_CALL)"
+          - "request.service IN physician.services (ERR_PHYSICIAN_NOT_CREDENTIALED_FOR_SERVICE)"
+        side_effects:
+          - "accepting_physician_id = physician_id; consult_deadline = now + 30 minutes; consult_count += 1; decline_reason = null; version += 1"
+      - from: [DECLINED, EXPIRED]
+        to: CONSULT_PENDING
+        trigger: "POST /cc/transfer-requests/{id}/consult (re-consult cycle)"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "Same physician preconditions as INTAKE -> CONSULT_PENDING"
+        side_effects:
+          - "Same as INTAKE -> CONSULT_PENDING (cyclic re-consult round)"
+      - from: CONSULT_PENDING
+        to: ACCEPTED
+        trigger: "POST /cc/transfer-requests/{id}/consult-response with decision=ACCEPT"
+        actor: AcceptingPhysician
+        preconditions:
+          - "X-User-ID == accepting_physician_id (ERR_INSUFFICIENT_PERMISSIONS ownership)"
+          - "now < consult_deadline (ERR_CONSULT_WINDOW_EXPIRED)"
+        side_effects:
+          - "consult_deadline = null; version += 1"
+      - from: CONSULT_PENDING
+        to: DECLINED
+        trigger: "POST /cc/transfer-requests/{id}/consult-response with decision=DECLINE, or system (diversion declared on destination facility)"
+        actor: "AcceptingPhysician or system"
+        preconditions:
+          - "Manual: X-User-ID == accepting_physician_id; now < consult_deadline"
+        side_effects:
+          - "decline_reason recorded (PHYSICIAN_DECLINED | NO_CAPACITY | CLINICAL | DIVERSION); accepting_physician_id = null; consult_deadline = null; version += 1"
+      - from: INTAKE
+        to: DECLINED
+        trigger: "system (diversion declared on destination facility)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "decline_reason = DIVERSION; version += 1"
+      - from: CONSULT_PENDING
+        to: EXPIRED
+        trigger: "system (sweep observes now >= consult_deadline)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "decline_reason = TIMEOUT; accepting_physician_id = null; consult_deadline = null; version += 1"
+      - from: ACCEPTED
+        to: HOLD_PLACED
+        trigger: "system (BedHold created for this request)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "version += 1; facility load scores recomputed"
+      - from: HOLD_PLACED
+        to: ACCEPTED
+        trigger: "system (the request's ACTIVE BedHold is released or sweep-expired)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "version += 1; facility load scores recomputed (placement loop back to ACCEPTED)"
+      - from: HOLD_PLACED
+        to: ASSIGNED
+        trigger: "POST /cc/transfer-requests/{id}/bed-assignments"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "Request HOLD_PLACED (ERR_TRANSFER_INVALID_STATE)"
+          - "expected_transfer_request_version == current version (ERR_STALE_VERSION)"
+          - "Referenced BedHold is ACTIVE and belongs to this request (ERR_HOLD_INVALID_STATE)"
+        side_effects:
+          - "assigned_bed_id = hold.bed_id; version += 1"
+          - "BedAssignment created PLACED with created_by_user_id = X-User-ID"
+          - "BedHold -> CONSUMED"
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "system (BedAssignment completed)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Bed HELD -> OCCUPIED; new Admission created ADMITTED on the bed with the request's acuity/isolation/service"
+          - "Facility counts and load scores recomputed; version += 1"
+      - from: [INTAKE, CONSULT_PENDING, DECLINED, EXPIRED, ACCEPTED, HOLD_PLACED, ASSIGNED]
+        to: CANCELLED
+        trigger: "POST /cc/transfer-requests/{id}/cancel"
+        actor: TransferCenterCoordinator
+        preconditions: []
+        side_effects:
+          - "If HOLD_PLACED: its ACTIVE BedHold -> RELEASED (bed HELD -> AVAILABLE with cooling_until), per BedHold release rules"
+          - "accepting_physician_id = null; consult_deadline = null; version += 1"
+          - "Facility load scores recomputed"
+
+  - entity: BedHold
+    field: status
+    initial_state: ACTIVE
+    terminal_states: [CONSUMED, RELEASED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "POST /cc/bed-holds/{id}/extend (self-loop extension)"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "Hold ACTIVE (ERR_HOLD_INVALID_STATE)"
+          - "expected_bed_hold_version == current version (ERR_STALE_VERSION)"
+          - "extend_count < HOLD_EXTEND_MAX (2) (ERR_HOLD_EXTEND_LIMIT_EXCEEDED)"
+        side_effects:
+          - "expires_at += EXTEND_MINUTES (30); extend_count += 1; version += 1"
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /cc/bed-holds/{id}/release, or system (transfer request cancelled while HOLD_PLACED)"
+        actor: "TransferCenterCoordinator or system"
+        preconditions: []
+        side_effects:
+          - "Bed HELD -> AVAILABLE with cooling_until = now + bed.turnover_minutes"
+          - "TransferRequest HOLD_PLACED -> ACCEPTED; version += 1 on the request"
+          - "Facility counts and load scores recomputed"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system (sweep observes now >= expires_at)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Same bed/request/facility side effects as RELEASED (bed cools down, request returns HOLD_PLACED -> ACCEPTED)"
+      - from: ACTIVE
+        to: CONSUMED
+        trigger: "system (BedAssignment created against this hold)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Bed remains HELD pending patient arrival"
+
+  - entity: BedAssignment
+    field: status
+    initial_state: PLACED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: COMPLETED
+        trigger: "POST /cc/bed-assignments/{id}/complete"
+        actor: BedManager
+        preconditions:
+          - "Assignment PLACED (ERR_INVALID_STATE on assignment)"
+          - "X-User-ID != created_by_user_id (segregation of duties, ERR_SOD_ASSIGNMENT_CREATE_COMPLETE_SAME_ACTOR)"
+        side_effects:
+          - "completed_at = now"
+          - "TransferRequest ASSIGNED -> COMPLETED"
+          - "Bed HELD -> OCCUPIED; new Admission created ADMITTED on the bed"
+          - "Facility counts and load scores recomputed"
+
+  - entity: DiversionEvent
+    field: status
+    initial_state: ACTIVE
+    terminal_states: [LIFTED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: LIFTED
+        trigger: "POST /cc/diversions/{id}/lift"
+        actor: HouseSupervisor
+        preconditions:
+          - "Diversion ACTIVE (ERR_DIVERSION_INVALID_STATE)"
+          - "X-User-ID != declared_by_user_id (segregation of duties, ERR_SOD_DIVERSION_DECLARE_LIFT_SAME_ACTOR)"
+          - "now >= created_at + MIN_DIVERSION_MINUTES (30) (ERR_DIVERSION_LIFT_TOO_SOON)"
+        side_effects:
+          - "lifted_at = now; lifted_by_user_id = X-User-ID"
+          - "Facility.diversion_status recomputed"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system (sweep observes now >= ends_at)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Facility.diversion_status recomputed"
+      - from: ACTIVE
+        to: ACTIVE
+        trigger: "system (on creation — cascade, not a self-loop transition of state but of effects)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "CASCADE LINK 1: Facility.diversion_status recomputed (may become DIVERT_FULL / DIVERT_SERVICE)"
+          - "CASCADE LINK 2: on entering DIVERT_FULL, every TransferRequest of the facility in INTAKE or CONSULT_PENDING -> DECLINED with decline_reason = DIVERSION, accepting_physician_id = null, consult_deadline = null"
+          - "Facility.active_inbound_transfers and load scores recomputed after the declines"
+        note: "Documented on the create transition; see endpoint POST /cc/facilities/{id}/diversions"
+
+  - entity: BoardingRecord
+    field: placement_status
+    initial_state: WAITING
+    terminal_states: [PLACED, LEFT_AMA]
+    note: "Parallel dimension 1 of 2 — placement_status evolves independently of escalation_status"
+    transitions:
+      - from: WAITING
+        to: OFFERED
+        trigger: "POST /cc/boarding-records/{id}/offer"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "placement_status == WAITING (ERR_BOARDING_INVALID_STATE)"
+        side_effects: []
+      - from: OFFERED
+        to: PLACED
+        trigger: "POST /cc/boarding-records/{id}/place"
+        actor: TransferCenterCoordinator
+        preconditions:
+          - "placement_status == OFFERED (ERR_BOARDING_INVALID_STATE)"
+        side_effects:
+          - "Facility.boarding_waiters recomputed (record leaves the waiter set)"
+      - from: [WAITING, OFFERED]
+        to: LEFT_AMA
+        trigger: "POST /cc/boarding-records/{id}/leave-ama"
+        actor: TransferCenterCoordinator
+        preconditions: []
+        side_effects:
+          - "Facility.boarding_waiters recomputed"
+
+  - entity: BoardingRecord
+    field: escalation_status
+    initial_state: NONE
+    terminal_states: []
+    note: "Parallel dimension 2 of 2 — cyclic escalation loop NONE -> HUDDLE_CALLED -> HUDDLE_RESOLVED -> (re-escalate)"
+    transitions:
+      - from: NONE
+        to: HUDDLE_CALLED
+        trigger: "system (heartbeat or sweep observes boarding_minutes >= BOARDING_HUDDLE_THRESHOLD_MINUTES = 120) or POST /cc/boarding-records/{id}/huddles (MANUAL)"
+        actor: "system or HouseSupervisor"
+        preconditions:
+          - "placement_status IN {WAITING, OFFERED}"
+          - "escalation_status != HUDDLE_CALLED (ERR_HUDDLE_INVALID_STATE for the manual endpoint)"
+        side_effects:
+          - "EscalationHuddle created CALLED with trigger_reason AUTO_THRESHOLD or MANUAL"
+      - from: HUDDLE_RESOLVED
+        to: HUDDLE_CALLED
+        trigger: "system (boarding_minutes still >= 120 at a later heartbeat/sweep) or manual huddle create"
+        actor: "system or HouseSupervisor"
+        preconditions:
+          - "placement_status IN {WAITING, OFFERED}"
+        side_effects:
+          - "EscalationHuddle created CALLED (cyclic re-escalation)"
+      - from: HUDDLE_CALLED
+        to: HUDDLE_RESOLVED
+        trigger: "system (the open EscalationHuddle is resolved)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "huddle_count_24h recomputed; if count of huddles with called_at >= now - 24h >= 3 then executive_escalation = true"
+
+  - entity: EscalationHuddle
+    field: status
+    initial_state: CALLED
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: CALLED
+        to: RESOLVED
+        trigger: "POST /cc/huddles/{id}/resolve"
+        actor: HouseSupervisor
+        preconditions:
+          - "Huddle CALLED (ERR_HUDDLE_INVALID_STATE)"
+        side_effects:
+          - "resolved_at = now; resolution recorded"
+          - "BoardingRecord.escalation_status HUDDLE_CALLED -> HUDDLE_RESOLVED; huddle_count_24h recomputed; executive_escalation set when >= 3 huddles within 24h"
+
+  - entity: CapacityForecast
+    field: status
+    initial_state: PROVISIONAL
+    terminal_states: [SUPERSEDED]
+    transitions:
+      - from: PROVISIONAL
+        to: PUBLISHED
+        trigger: "POST /cc/capacity-forecasts/{id}/publish"
+        actor: CapacityPlanner
+        preconditions:
+          - "Forecast PROVISIONAL (ERR_FORECAST_INVALID_STATE)"
+        side_effects:
+          - "published_at = now"
+          - "Facility.next_elective_window_start = generated_at + h hours for the first hour h with provisional census <= inpatient_bed_count - ELECTIVE_BUFFER (2); null when no such hour"
+      - from: [PROVISIONAL, PUBLISHED]
+        to: SUPERSEDED
+        trigger: "system (a new CapacityForecast is created for the same facility)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "If the superseded forecast was the latest PUBLISHED one, Facility.next_elective_window_start is recomputed from the surviving latest PUBLISHED non-stale forecast, else null"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only — true races pass the serial-observability filter)
+# =============================================================================
+concurrency_rules:
+  - rule_id: transfer-assignment-stale-version
+    parent_entity: TransferRequest
+    write_endpoint: "POST /cc/transfer-requests/{id}/bed-assignments"
+    occ_field: "expected_transfer_request_version"
+    description: |
+      Creating a BedAssignment against a TransferRequest whose version has
+      advanced since the client last observed it is rejected. This captures the
+      case where another writer has placed or released a hold (which legitimately
+      moves the request between ACCEPTED and HOLD_PLACED and advances its
+      version) and the current writer's view of the request is therefore stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: bed-hold-extend-stale-version
+    parent_entity: BedHold
+    write_endpoint: "POST /cc/bed-holds/{id}/extend"
+    occ_field: "expected_bed_hold_version"
+    description: |
+      Extending a BedHold whose version has advanced since the client last
+      observed it is rejected. A prior successful extend both pushed expires_at
+      forward and advanced the hold's version, so a second extend carrying the
+      pre-extension version is operating on a stale view of the hold.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: transfer_load_score
+    trigger: "every mutation that changes occupied/held/available bed counts, boarding_waiters, or active_inbound_transfers (admission create/confirm, hold create/release/expire/consume, boarding create/place/leave, transfer intake/cancel/complete, diversion decline cascade, bed status change)"
+    algorithm: weighted_scoring
+    formula: |
+      staffed = count(Bed where staffed == true)          # all units incl. ED
+      occupied = count(staffed Bed where status == OCCUPIED)
+      held = count(staffed Bed where status == HELD)
+      boarders = count(BoardingRecord where placement_status IN {WAITING, OFFERED})
+      inbound = count(TransferRequest where status IN {INTAKE, CONSULT_PENDING, DECLINED, EXPIRED, ACCEPTED, HOLD_PLACED, ASSIGNED})
+      pressure = occupied + HELD_WEIGHT*held + BOARDING_WEIGHT*boarders + INBOUND_WEIGHT*inbound
+      load_score_raw      = round_half_up(100 * occupied / staffed, 1)      # variant RAW_OCCUPANCY
+      load_score_weighted = round_half_up(100 * pressure / staffed, 1)      # variant PRESSURE_WEIGHTED
+      diversion_recommended = (load_score_weighted >= 95.0)                  # >= boundary pinned
+      If staffed == 0: both scores = 0 and diversion_recommended = false.
+    input_set: "Beds with staffed == true (all units, ED included); BoardingRecord rows with placement_status IN {WAITING, OFFERED}; TransferRequest rows in any non-terminal status"
+    constants:
+      HELD_WEIGHT: 0.5
+      BOARDING_WEIGHT: 0.75
+      INBOUND_WEIGHT: 0.5
+      DIVERSION_RECOMMEND_THRESHOLD: 95.0
+    precision: "1 decimal place, round_half_up"
+    variants:
+      - name: RAW_OCCUPANCY
+        when: "Regulatory/dashboard occupancy reporting (load_score_raw)"
+        difference: "Counts only physically occupied beds; ignores holds, boarders, and inbound pipeline"
+      - name: PRESSURE_WEIGHTED
+        when: "Diversion recommendation and inter-hospital load balancing (load_score_weighted)"
+        difference: "Adds fractional pressure for held beds, ED boarders, and inbound transfers — diverges from RAW whenever any of those sets is non-empty"
+
+  - name: projected_census
+    trigger: "CapacityForecast creation (both variants computed per hour h = 1..horizon_hours)"
+    algorithm: forward_looking
+    formula: |
+      Let base = count of OCCUPIED staffed Bed rows whose unit is NOT an ED unit (inpatient census).
+      Let signed(h)   = count(Admission PENDING_DISCHARGE with discharge_order_signed == true
+                                and expected_discharge_at <= generated_at + h hours and bed non-ED)
+      Let unsigned(h) = count(Admission PENDING_DISCHARGE with discharge_order_signed == false
+                                and expected_discharge_at <= generated_at + h hours and bed non-ED)
+      Let ed_adds     = ceil(boarding_waiters * ED_CONVERSION_RATE)   # applied for every h >= 1
+      COMMITTED[h]  = base - signed(h)
+      PROVISIONAL[h] = base - signed(h) - unsigned(h) + ed_adds
+      A discharge counts toward hour h iff expected_discharge_at <= generated_at + h hours (inclusive <=).
+      occupancy_pct_committed  = round_half_up(100 * mean(COMMITTED[h])  / inpatient_bed_count, 1)
+      occupancy_pct_provisional = round_half_up(100 * mean(PROVISIONAL[h]) / inpatient_bed_count, 1)
+      inpatient_bed_count = count of staffed non-ED Bed rows. If 0, both occupancy percentages = 0.
+    input_set: "Admissions of the facility in status PENDING_DISCHARGE (DISCHARGED excluded — their beds are already free); OCCUPIED staffed non-ED beds for the base; boarding_waiters as defined in transfer_load_score"
+    constants:
+      ED_CONVERSION_RATE: 0.8
+      ELECTIVE_BUFFER: 2
+    precision: "census integers exact; occupancy percentages 1 decimal place, round_half_up"
+    variants:
+      - name: COMMITTED
+        when: "occupancy_pct_committed and committed[] snapshot — conservative view for compliance reporting"
+        difference: "Subtracts only signed discharge orders; ignores unsigned pending discharges and ED boarder conversions"
+      - name: PROVISIONAL
+        when: "occupancy_pct_provisional and provisional[] snapshot — planning view driving next_elective_window_start"
+        difference: "Also subtracts unsigned pending discharges and adds ceil(boarding_waiters * 0.8) expected ED placements each hour; diverges from COMMITTED whenever unsigned pending discharges or boarders exist"
+
+  - name: bed_match_score
+    trigger: "GET /cc/facilities/{id}/bed-candidates, and POST /cc/transfer-requests/{id}/bed-holds when bed_id is omitted (server-side selection)"
+    algorithm: tiered_scoring
+    formula: |
+      # Mode (a): >= 3 inputs with non-linear interaction — eligibility gate, tiered service
+      # match, headroom inversion, and conditional bonuses; I() is the indicator function.
+      ELIGIBILITY (all must hold; failures are silently excluded in candidates, or map to
+      ERR_ISOLATION_INCOMPATIBLE / ERR_ACUITY_EXCEEDS_BED_CAPABILITY / ERR_SERVICE_MISMATCH /
+      ERR_BED_NOT_AVAILABLE when bed_id is given explicitly):
+        bed.status == AVAILABLE AND bed.staffed == true AND bed.unit does not start with "ED"
+        acuity_rank(bed.max_acuity) >= acuity_rank(request.acuity)
+        iso_rank(bed.isolation_capability) >= iso_rank(request.isolation_need)
+        bed.service == request.service OR bed.service == "MEDICAL"
+      RANKS: acuity_rank: OBSERVATION=1, MEDICAL_SURGICAL=2, STEPDOWN=3, CRITICAL=4
+             iso_rank:    NONE=0, CONTACT=1, DROPLET=2, AIRBORNE=3
+      SCORE:
+        score = 1000 * I(bed.service == request.service)
+              + 100 * (4 - (acuity_rank(bed.max_acuity) - acuity_rank(request.acuity)))   # tightest fit wins
+              + 10  * I(iso_rank(bed.isolation_capability) == iso_rank(request.isolation_need))
+              + 5   * I(request.preferred_unit is not null AND bed.unit == request.preferred_unit)
+      ORDER: score DESC, tie-break Bed.created_at ASC (never id).
+      FALLBACK: candidate list may be empty; explicit-selection with an empty pool -> ERR_NO_ELIGIBLE_BED.
+    input_set: "All Bed rows of the facility"
+    constants:
+      SERVICE_MATCH_POINTS: 1000
+      ACUITY_FIT_BASE: 4
+      ACUITY_FIT_POINTS: 100
+      ISO_EXACT_POINTS: 10
+      UNIT_PREFERENCE_POINTS: 5
+    precision: "integer arithmetic, no rounding"
+
+  - name: facility_service_occupancy
+    trigger: "GET /cc/facilities/{id}/load-score (service_weighted_occupancy_pct field)"
+    algorithm: aggregation
+    formula: |
+      # Mode (b): nested rounding where the order matters. PINNED ORDER: round each
+      # per-service percentage to 1 decimal FIRST, then weight and sum, then round again.
+      For each service s present among staffed, non-ED beds:
+        occ_pct_s = round_half_up(100 * occupied_s / beds_s, 1)      # ROUND FIRST
+      service_weighted_occupancy_pct =
+        round_half_up( sum_s(SERVICE_WEIGHTS[s] * occ_pct_s) / sum_s(SERVICE_WEIGHTS[s]), 1 )
+      (Alternative order — aggregate-then-round — is documented but NOT used; it yields a
+       different value, e.g. 42.9 vs the pinned 36.7 for the 3-service fixture in §1.8.)
+      Services with no staffed non-ED beds contribute to neither sum.
+    input_set: "Staffed Bed rows whose unit does not start with ED; occupied = status OCCUPIED"
+    constants:
+      SERVICE_WEIGHTS: { CARDIAC: 0.5, MEDICAL: 0.3, NEURO: 0.2, TRAUMA: 0.2, SURGICAL: 0.2, ONCOLOGY: 0.2 }
+    precision: "1 decimal place, round_half_up — per-service FIRST, then weighted aggregate (pinned order)"
+
+  - name: boarding_minutes
+    trigger: "BoardingRecord read, heartbeat, and sweep"
+    algorithm: aggregation
+    formula: |
+      heartbeat_component = last_heartbeat_minutes if not null else 0
+      clock_component = floor((now - started_at) in whole minutes)
+      boarding_minutes = max(heartbeat_component, clock_component)
+
+  - name: boarding_escalation_check
+    trigger: "heartbeat, sweep, and huddle resolve"
+    algorithm: threshold
+    formula: |
+      if placement_status IN {WAITING, OFFERED} AND escalation_status IN {NONE, HUDDLE_RESOLVED}
+         AND boarding_minutes >= BOARDING_HUDDLE_THRESHOLD_MINUTES:      # >= pinned: 120 triggers, 119 does not
+        create EscalationHuddle(CALLED, AUTO_THRESHOLD); escalation_status = HUDDLE_CALLED
+      if boarding_minutes >= EXECUTIVE_ESCALATION_MINUTES:               # 240, >= pinned
+        executive_escalation = true
+      on huddle resolve:
+        huddle_count_24h = count(EscalationHuddle of this record with called_at >= now - 24h)   # inclusive >=
+        if huddle_count_24h >= HUDDLE_MAX_PER_WINDOW: executive_escalation = true               # 3
+    constants:
+      BOARDING_HUDDLE_THRESHOLD_MINUTES: 120
+      EXECUTIVE_ESCALATION_MINUTES: 240
+      HUDDLE_MAX_PER_WINDOW: 3
+      HUDDLE_WINDOW_HOURS: 24
+
+  - name: hold_expiry_check
+    trigger: "sweep"
+    algorithm: threshold
+    formula: |
+      For each BedHold with status == ACTIVE:
+        if now >= expires_at:          # >= pinned: expires exactly AT expires_at
+          hold -> EXPIRED (with the documented bed/request/facility side effects)
+    constants:
+      HOLD_TTL_MINUTES: 60
+      EXTEND_MINUTES: 30
+      HOLD_EXTEND_MAX: 2
+
+  - name: consult_window_check
+    trigger: "sweep; consult-response re-validates inline"
+    algorithm: threshold
+    formula: |
+      A CONSULT_PENDING TransferRequest whose consult_deadline has passed is expired:
+        if now >= consult_deadline:    # >= pinned
+          request -> EXPIRED with decline_reason = TIMEOUT
+      consult-response is rejected with ERR_CONSULT_WINDOW_EXPIRED when now >= consult_deadline.
+    constants:
+      CONSULT_TTL_MINUTES: 30
+
+  - name: diversion_window_overlap
+    trigger: "DiversionEvent creation"
+    algorithm: interval_merge
+    formula: |
+      # Interval semantics: HALF-OPEN [starts_at, ends_at). Adjacency is ALLOWED:
+      # a new window with starts_at == existing.ends_at does NOT overlap.
+      overlap iff new.starts_at < existing.ends_at AND existing.starts_at < new.ends_at
+      Checked against all other DiversionEvent rows of the same facility with status ACTIVE.
+      Also requires ends_at > starts_at (else ERR_INVALID_REQUEST) and, when level == SERVICE,
+      service must be present (service forbidden when level == FULL) (ERR_INVALID_REQUEST).
+
+  - name: bed_cooling_window
+    trigger: "BedHold creation (explicit bed_id or selector)"
+    algorithm: interval_merge
+    formula: |
+      # Interval semantics: CLOSED residual buffer — DIFFERENT from the diversion half-open rule.
+      # After a hold ends (release/expiry) or a discharge confirms, the bed cools down:
+      #   cooling_until = end_time + bed.turnover_minutes
+      # A new hold on that bed is rejected with ERR_BED_HOLD_WINDOW_CONFLICT iff
+      #   now < cooling_until          (strict <: arriving exactly AT cooling_until is allowed)
+      # i.e. the blocked interval is the closed span [end_time, cooling_until).
+      cooling_until is cleared when a hold is successfully placed or an admission is created.
+
+  - name: hold_quota_check
+    trigger: "BedHold creation"
+    algorithm: threshold
+    formula: |
+      active_holds = count(BedHold of beds of this facility with status == ACTIVE)
+      if active_holds >= HOLD_QUOTA_PER_FACILITY: reject with ERR_HOLD_QUOTA_EXCEEDED
+      (>= pinned: the 6th hold succeeds, the 7th fails)
+    constants:
+      HOLD_QUOTA_PER_FACILITY: 6
+
+  - name: rebalance_margin_check
+    trigger: "POST /cc/transfer-requests/{id}/rebalance"
+    algorithm: threshold
+    formula: |
+      source = load_score_weighted(current facility); target = load_score_weighted(target facility)
+      allowed iff source - target >= REBALANCE_MARGIN          # >= pinned: exactly 10.0 is allowed
+      else ERR_REBALANCE_MARGIN_NOT_MET
+      Target facility diversion_status must be ACCEPTING (ERR_FACILITY_ON_DIVERSION).
+    constants:
+      REBALANCE_MARGIN: 10.0
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers must be present and non-empty"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "Role must be listed in the endpoint's roles; for entity-backed roles the X-User-ID must resolve to an instance of the backing entity, and ownership checks (accepting physician on consult-response) compare X-User-ID to the stored FK"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Request body well-formed: required fields present, types correct, enum values valid (e.g. to_status must be AVAILABLE or OUT_OF_SERVICE, never HELD/OCCUPIED), ends_at > starts_at, service present iff diversion level == SERVICE"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all endpoints with a body"
+
+  - priority: 4
+    category: existence
+    check: "Resource IDs in path must exist, validated left-to-right; nested children must belong to the path facility (a bed/physician/admission/request id from another facility returns the child's 404)"
+    error_id: "ERR_FACILITY_NOT_FOUND | ERR_BED_NOT_FOUND | ERR_PHYSICIAN_NOT_FOUND | ERR_ADMISSION_NOT_FOUND | ERR_TRANSFER_REQUEST_NOT_FOUND | ERR_HOLD_NOT_FOUND | ERR_ASSIGNMENT_NOT_FOUND | ERR_DIVERSION_NOT_FOUND | ERR_BOARDING_RECORD_NOT_FOUND | ERR_HUDDLE_NOT_FOUND | ERR_FORECAST_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+
+  - priority: 5
+    category: state
+    check: "Target resource must be in the correct state for the requested operation (per state machine tables)"
+    error_id: "ERR_TRANSFER_INVALID_STATE | ERR_BED_NOT_AVAILABLE | ERR_ADMISSION_INVALID_STATE | ERR_ADMISSION_NOT_ED_BOARDER | ERR_BOARDING_INVALID_STATE | ERR_HUDDLE_INVALID_STATE | ERR_FORECAST_INVALID_STATE | ERR_DIVERSION_INVALID_STATE | ERR_HOLD_INVALID_STATE"
+    http_status: 409
+    applies_to: "state transition and child-creation endpoints"
+
+  - priority: 6
+    category: state
+    check: "OCC: expected_transfer_request_version / expected_bed_hold_version must equal the entity's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /cc/transfer-requests/{id}/bed-assignments, POST /cc/bed-holds/{id}/extend"
+
+  - priority: 7
+    category: business_safety
+    check: "Isolation compatibility: iso_rank(bed.isolation_capability) >= iso_rank(request.isolation_need)"
+    error_id: ERR_ISOLATION_INCOMPATIBLE
+    http_status: 422
+    applies_to: "POST /cc/transfer-requests/{id}/bed-holds (explicit bed_id)"
+
+  - priority: 8
+    category: business_safety
+    check: "Acuity capability: acuity_rank(bed.max_acuity) >= acuity_rank(request.acuity)"
+    error_id: ERR_ACUITY_EXCEEDS_BED_CAPABILITY
+    http_status: 422
+    applies_to: "POST /cc/transfer-requests/{id}/bed-holds (explicit bed_id)"
+
+  - priority: 9
+    category: business_safety
+    check: "Service match: bed.service == request.service OR bed.service == MEDICAL (universal overflow)"
+    error_id: ERR_SERVICE_MISMATCH
+    http_status: 422
+    applies_to: "POST /cc/transfer-requests/{id}/bed-holds (explicit bed_id)"
+
+  - priority: 10
+    category: business_safety
+    check: "Physician credentialed for the request's service: request.service IN physician.services"
+    error_id: ERR_PHYSICIAN_NOT_CREDENTIALED_FOR_SERVICE
+    http_status: 422
+    applies_to: "POST /cc/transfer-requests/{id}/consult"
+
+  - priority: 11
+    category: business_safety
+    check: "Physician must be ON_CALL"
+    error_id: ERR_PHYSICIAN_NOT_ON_CALL
+    http_status: 409
+    applies_to: "POST /cc/transfer-requests/{id}/consult"
+
+  - priority: 12
+    category: business_referential
+    check: "Segregation of duties: diversion lift actor != declared_by_user_id; assignment complete actor != assignment.created_by_user_id"
+    error_id: "ERR_SOD_DIVERSION_DECLARE_LIFT_SAME_ACTOR | ERR_SOD_ASSIGNMENT_CREATE_COMPLETE_SAME_ACTOR"
+    http_status: 403
+    applies_to: "POST /cc/diversions/{id}/lift, POST /cc/bed-assignments/{id}/complete"
+
+  - priority: 13
+    category: business_temporal
+    check: "Consult response only before consult_deadline; diversion lift only at/after created_at + 30 minutes"
+    error_id: "ERR_CONSULT_WINDOW_EXPIRED | ERR_DIVERSION_LIFT_TOO_SOON"
+    http_status: 409
+    applies_to: "POST /cc/transfer-requests/{id}/consult-response, POST /cc/diversions/{id}/lift"
+
+  - priority: 14
+    category: business_temporal
+    check: "Window conflicts: diversion windows (half-open, adjacency allowed) must not overlap another ACTIVE diversion of the facility; bed cooling buffer (closed, now < cooling_until) must be clear before a new hold"
+    error_id: "ERR_DIVERSION_WINDOW_OVERLAP | ERR_BED_HOLD_WINDOW_CONFLICT"
+    http_status: 409
+    applies_to: "POST /cc/facilities/{id}/diversions, POST /cc/transfer-requests/{id}/bed-holds"
+
+  - priority: 15
+    category: business_constraint
+    check: "Quotas and uniqueness: facility active-hold count < 6; at most one BoardingRecord with placement_status IN {WAITING, OFFERED} per admission; hold extend_count < 2; facility diversion gates transfer intake and rebalance target; rebalance margin >= 10.0; selector pool non-empty when bed_id omitted"
+    error_id: "ERR_HOLD_QUOTA_EXCEEDED | ERR_BOARDING_RECORD_ALREADY_OPEN | ERR_HOLD_EXTEND_LIMIT_EXCEEDED | ERR_FACILITY_ON_DIVERSION | ERR_REBALANCE_MARGIN_NOT_MET | ERR_NO_ELIGIBLE_BED"
+    http_status: 409
+    applies_to: "POST /cc/transfer-requests/{id}/bed-holds, POST /cc/facilities/{id}/boarding-records, POST /cc/bed-holds/{id}/extend, POST /cc/facilities/{id}/transfer-requests, POST /cc/transfer-requests/{id}/rebalance"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Facility ---
+  - method: POST
+    path: "/cc/facilities"
+    description: "Create a facility"
+    roles: [SystemAdministrator]
+    code: 201
+    input: [name, region]
+    output: Facility
+    side_effects: ["All computed counters initialized to 0; diversion_status ACCEPTING; diversion_recommended false"]
+
+  - method: GET
+    path: "/cc/facilities/{id}"
+    description: "Get a facility with all computed load fields"
+    roles: [Any]
+    code: 200
+    input: []
+    output: Facility
+    side_effects: []
+
+  - method: GET
+    path: "/cc/facilities/{id}/load-score"
+    description: "Computed read: both load-score variants plus components"
+    roles: [Any]
+    code: 200
+    input: []
+    output: { raw_occupancy_pct: number, pressure_weighted_pct: number, service_weighted_occupancy_pct: number, diversion_recommended: boolean, staffed_beds: integer, occupied_beds: integer, held_beds: integer, boarding_waiters: integer, active_inbound_transfers: integer }
+    side_effects: []
+
+  - method: GET
+    path: "/cc/facilities/{id}/bed-candidates"
+    description: "Ranked eligible beds for a transfer request per calculations.bed_match_score (empty list when no eligible bed)"
+    roles: [Any]
+    code: 200
+    input: [transfer_request_id]
+    output: { candidates: array }
+    side_effects: []
+
+  # --- DiversionEvent ---
+  - method: POST
+    path: "/cc/facilities/{id}/diversions"
+    description: "Declare a diversion window (ambulance notification posture); overlap-checked half-open windows"
+    roles: [HouseSupervisor]
+    code: 201
+    input: [level, "service?", starts_at, ends_at]
+    output: DiversionEvent
+    side_effects:
+      - "declared_by_user_id = X-User-ID; status ACTIVE"
+      - "CASCADE LINK 1: Facility.diversion_status recomputed"
+      - "CASCADE LINK 2 (only when the facility enters DIVERT_FULL): every TransferRequest in INTAKE or CONSULT_PENDING -> DECLINED with decline_reason=DIVERSION, accepting_physician_id=null, consult_deadline=null"
+      - "Facility load scores recomputed after declines"
+
+  - method: GET
+    path: "/cc/facilities/{id}/diversions"
+    description: "List diversion events of a facility"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "DiversionEvent[]"
+    side_effects: []
+
+  - method: POST
+    path: "/cc/diversions/{id}/lift"
+    description: "Lift an ACTIVE diversion (segregation of duties + minimum duration)"
+    roles: [HouseSupervisor]
+    code: 200
+    input: []
+    output: DiversionEvent
+    side_effects: ["status -> LIFTED; lifted_at=now; lifted_by_user_id = X-User-ID; Facility.diversion_status recomputed"]
+
+  # --- Bed ---
+  - method: POST
+    path: "/cc/facilities/{id}/beds"
+    description: "Register a bed"
+    roles: [SystemAdministrator]
+    code: 201
+    input: [unit, label, service, max_acuity, isolation_capability, "staffed?", "turnover_minutes?"]
+    output: Bed
+    side_effects: ["status AVAILABLE; Facility bed counts recomputed"]
+
+  - method: GET
+    path: "/cc/facilities/{id}/beds"
+    description: "List beds of a facility (filterable; paginated)"
+    roles: [Any]
+    code: 200
+    input: ["status?", "service?", "limit?", "offset?"]
+    output: "Bed[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/beds/{id}"
+    description: "Get a bed"
+    roles: [Any]
+    code: 200
+    input: []
+    output: Bed
+    side_effects: []
+
+  - method: POST
+    path: "/cc/beds/{id}/status"
+    description: "Move a bed AVAILABLE <-> OUT_OF_SERVICE (HELD/OCCUPIED are system-managed and rejected here)"
+    roles: [BedManager]
+    code: 200
+    input: [to_status]
+    output: Bed
+    side_effects: ["Facility bed counts and load scores recomputed"]
+
+  - method: GET
+    path: "/cc/beds/{id}/admissions"
+    description: "List admissions occupying (or formerly occupying) a bed"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Admission[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/beds/{id}/bed-holds"
+    description: "List holds placed on a bed"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "BedHold[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/beds/{id}/transfer-requests"
+    description: "List transfer requests assigned to a bed (0 or 1 while ASSIGNED)"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "TransferRequest[]"
+    side_effects: []
+
+  # --- Physician ---
+  - method: POST
+    path: "/cc/facilities/{id}/physicians"
+    description: "Register a physician on the on-call roster"
+    roles: [SystemAdministrator]
+    code: 201
+    input: [full_name, services, "status?"]
+    output: Physician
+    side_effects: []
+
+  - method: GET
+    path: "/cc/facilities/{id}/physicians"
+    description: "List physicians of a facility"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Physician[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/physicians/{id}"
+    description: "Get a physician"
+    roles: [Any]
+    code: 200
+    input: []
+    output: Physician
+    side_effects: []
+
+  - method: POST
+    path: "/cc/physicians/{id}/status"
+    description: "Set physician ON_CALL / OFF_CALL"
+    roles: [HouseSupervisor]
+    code: 200
+    input: [to_status]
+    output: Physician
+    side_effects: []
+
+  - method: GET
+    path: "/cc/physicians/{id}/transfer-requests"
+    description: "List transfer requests where this physician is the accepting physician"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "TransferRequest[]"
+    side_effects: []
+
+  # --- Admission ---
+  - method: POST
+    path: "/cc/facilities/{id}/admissions"
+    description: "Direct-admit a patient into an AVAILABLE staffed bed"
+    roles: [BedManager]
+    code: 201
+    input: [bed_id, patient_ref, acuity, isolation_need, service]
+    output: Admission
+    side_effects: ["Bed AVAILABLE -> OCCUPIED; cooling_until cleared; Facility counts and load scores recomputed"]
+
+  - method: GET
+    path: "/cc/facilities/{id}/admissions"
+    description: "List admissions of a facility (pending-discharge visibility via status filter)"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "Admission[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/admissions/{id}"
+    description: "Get an admission"
+    roles: [Any]
+    code: 200
+    input: []
+    output: Admission
+    side_effects: []
+
+  - method: POST
+    path: "/cc/admissions/{id}/pending-discharge"
+    description: "Mark an admission pending discharge with an expected time and order-signed flag"
+    roles: [BedManager]
+    code: 200
+    input: [expected_discharge_at, discharge_order_signed]
+    output: Admission
+    side_effects:
+      - "ADMITTED -> PENDING_DISCHARGE; pending_discharge_at = now"
+      - "Bed.projected_free_at = expected_discharge_at + bed.turnover_minutes"
+      - "Bed-availability cascade: latest PUBLISHED CapacityForecast stale = true; Facility.next_elective_window_start = null"
+
+  - method: POST
+    path: "/cc/admissions/{id}/confirm-discharge"
+    description: "Confirm discharge — frees the bed with a cooling buffer"
+    roles: [BedManager]
+    code: 200
+    input: []
+    output: Admission
+    side_effects:
+      - "PENDING_DISCHARGE -> DISCHARGED; confirmed_discharge_at = now"
+      - "CASCADE LINK 1: Bed OCCUPIED -> AVAILABLE, projected_free_at=null, cooling_until = now + turnover_minutes"
+      - "CASCADE LINK 2: latest PUBLISHED CapacityForecast stale = true"
+      - "CASCADE LINK 3: Facility.next_elective_window_start = null"
+      - "Facility counts and load scores recomputed"
+
+  - method: POST
+    path: "/cc/admissions/{id}/rescind-pending-discharge"
+    description: "Rescind a pending discharge (patient stays)"
+    roles: [BedManager]
+    code: 200
+    input: []
+    output: Admission
+    side_effects:
+      - "PENDING_DISCHARGE -> ADMITTED; pending fields cleared"
+      - "Bed.projected_free_at = null; forecast staleness cascade as on pending-discharge"
+
+  - method: GET
+    path: "/cc/admissions/{id}/boarding-records"
+    description: "List boarding records of an admission"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BoardingRecord[]"
+    side_effects: []
+
+  # --- TransferRequest ---
+  - method: POST
+    path: "/cc/facilities/{id}/transfer-requests"
+    description: "Transfer request intake"
+    roles: [TransferCenterCoordinator]
+    code: 201
+    input: [source_facility_name, patient_ref, acuity, isolation_need, service, priority, "preferred_unit?"]
+    output: TransferRequest
+    side_effects: ["status INTAKE; intake_coordinator_id = X-User-ID; Facility active_inbound_transfers and load scores recomputed"]
+
+  - method: GET
+    path: "/cc/facilities/{id}/transfer-requests"
+    description: "List transfer requests of a facility (filterable by status; paginated)"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "TransferRequest[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/transfer-requests/{id}"
+    description: "Get a transfer request"
+    roles: [Any]
+    code: 200
+    input: []
+    output: TransferRequest
+    side_effects: []
+
+  - method: POST
+    path: "/cc/transfer-requests/{id}/consult"
+    description: "Dispatch an accepting-physician consult (also the re-consult loop from DECLINED/EXPIRED)"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: [physician_id]
+    output: TransferRequest
+    side_effects: ["status -> CONSULT_PENDING; accepting_physician_id set; consult_deadline = now + 30m; consult_count += 1; version += 1"]
+
+  - method: POST
+    path: "/cc/transfer-requests/{id}/consult-response"
+    description: "Accepting physician accepts or declines the consult (ownership-checked)"
+    roles: [AcceptingPhysician]
+    code: 200
+    input: [decision, "decline_reason?"]
+    output: TransferRequest
+    side_effects: ["ACCEPT -> ACCEPTED; DECLINE -> DECLINED with decline_reason, accepting_physician_id=null; version += 1"]
+
+  - method: POST
+    path: "/cc/transfer-requests/{id}/cancel"
+    description: "Cancel any non-terminal transfer request"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: []
+    output: TransferRequest
+    side_effects: ["status -> CANCELLED; if HOLD_PLACED its ACTIVE hold -> RELEASED with bed cooling; version += 1; load recompute"]
+
+  - method: POST
+    path: "/cc/transfer-requests/{id}/rebalance"
+    description: "Inter-hospital load balancing: redirect a request to a sibling facility when the weighted-score margin >= 10.0"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: [target_facility_id]
+    output: TransferRequest
+    side_effects: ["facility_id = target; status -> INTAKE; accepting_physician_id=null; consult_deadline=null; decline_reason=null; version += 1; load recompute on both facilities"]
+
+  # --- BedHold ---
+  - method: POST
+    path: "/cc/transfer-requests/{id}/bed-holds"
+    description: "Place a bed hold for an ACCEPTED request — explicit bed_id (validated) or omitted (selector: eligibility, score DESC, created_at ASC tie-break, empty pool -> ERR_NO_ELIGIBLE_BED)"
+    roles: [TransferCenterCoordinator]
+    code: 201
+    input: ["bed_id?", "ttl_minutes?"]
+    output: BedHold
+    side_effects:
+      - "starts_at = now; expires_at = now + ttl_minutes (default 60); status ACTIVE"
+      - "Bed AVAILABLE -> HELD; cooling_until cleared"
+      - "TransferRequest ACCEPTED -> HOLD_PLACED; version += 1"
+      - "Facility counts and load scores recomputed"
+
+  - method: GET
+    path: "/cc/transfer-requests/{id}/bed-holds"
+    description: "List holds of a transfer request"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "BedHold[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/bed-holds/{id}"
+    description: "Get a bed hold"
+    roles: [Any]
+    code: 200
+    input: []
+    output: BedHold
+    side_effects: []
+
+  - method: POST
+    path: "/cc/bed-holds/{id}/extend"
+    description: "Extend an ACTIVE hold by 30 minutes (max 2 extends; OCC-guarded)"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: [expected_bed_hold_version]
+    output: BedHold
+    side_effects: ["expires_at += 30m; extend_count += 1; increments BedHold.version by 1"]
+
+  - method: POST
+    path: "/cc/bed-holds/{id}/release"
+    description: "Release an ACTIVE hold (bed cools down; request returns to ACCEPTED)"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: []
+    output: BedHold
+    side_effects: ["status -> RELEASED; Bed HELD -> AVAILABLE with cooling_until; TransferRequest HOLD_PLACED -> ACCEPTED; load recompute"]
+
+  - method: GET
+    path: "/cc/bed-holds/{id}/bed-assignments"
+    description: "List assignments consuming a hold (0 or 1)"
+    roles: [Any]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "BedAssignment[]"
+    side_effects: []
+
+  # --- BedAssignment ---
+  - method: POST
+    path: "/cc/transfer-requests/{id}/bed-assignments"
+    description: "Convert an ACTIVE hold into a placement (OCC-guarded on the request version)"
+    roles: [TransferCenterCoordinator]
+    code: 201
+    input: [bed_hold_id, expected_transfer_request_version]
+    output: BedAssignment
+    side_effects:
+      - "BedAssignment PLACED; created_by_user_id = X-User-ID"
+      - "TransferRequest HOLD_PLACED -> ASSIGNED; assigned_bed_id set; increments TransferRequest.version by 1"
+      - "BedHold -> CONSUMED; bed remains HELD"
+
+  - method: GET
+    path: "/cc/transfer-requests/{id}/bed-assignments"
+    description: "List assignments of a transfer request (0 or 1)"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "BedAssignment[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/beds/{id}/bed-assignments"
+    description: "List assignments placed on a bed"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "BedAssignment[]"
+    side_effects: []
+
+  - method: POST
+    path: "/cc/bed-assignments/{id}/complete"
+    description: "Patient arrived — completes the assignment (segregation of duties vs creator)"
+    roles: [BedManager]
+    code: 200
+    input: []
+    output: BedAssignment
+    side_effects:
+      - "status -> COMPLETED; completed_at = now"
+      - "TransferRequest ASSIGNED -> COMPLETED"
+      - "Bed HELD -> OCCUPIED; new Admission created ADMITTED on the bed"
+      - "Facility counts and load scores recomputed"
+
+  # --- BoardingRecord / EscalationHuddle ---
+  - method: POST
+    path: "/cc/facilities/{id}/boarding-records"
+    description: "Open a boarding record for an ED admission awaiting an inpatient bed"
+    roles: [TransferCenterCoordinator]
+    code: 201
+    input: [admission_id]
+    output: BoardingRecord
+    side_effects: ["placement WAITING; escalation NONE; started_at = now; Facility.boarding_waiters recomputed; load recompute"]
+
+  - method: GET
+    path: "/cc/facilities/{id}/boarding-records"
+    description: "List boarding records of a facility"
+    roles: [Any]
+    code: 200
+    input: ["placement_status?", "limit?", "offset?"]
+    output: "BoardingRecord[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/boarding-records/{id}"
+    description: "Get a boarding record"
+    roles: [Any]
+    code: 200
+    input: []
+    output: BoardingRecord
+    side_effects: []
+
+  - method: POST
+    path: "/cc/boarding-records/{id}/heartbeat"
+    description: "Report observed boarding minutes (monotonic); auto-calls a huddle at >= 120"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: [observed_minutes]
+    output: BoardingRecord
+    side_effects:
+      - "last_heartbeat_minutes = observed_minutes; boarding_minutes recomputed (max of heartbeat and clock components)"
+      - "If boarding_minutes >= 120 and escalation_status IN {NONE, HUDDLE_RESOLVED} and placement IN {WAITING, OFFERED}: EscalationHuddle CALLED(AUTO_THRESHOLD); escalation_status -> HUDDLE_CALLED"
+      - "If boarding_minutes >= 240: executive_escalation = true"
+
+  - method: POST
+    path: "/cc/boarding-records/{id}/offer"
+    description: "Offer an inpatient bed to a waiting boarder"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: []
+    output: BoardingRecord
+    side_effects: ["placement_status WAITING -> OFFERED"]
+
+  - method: POST
+    path: "/cc/boarding-records/{id}/place"
+    description: "Mark a boarder placed in an inpatient bed"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: []
+    output: BoardingRecord
+    side_effects: ["placement_status OFFERED -> PLACED; Facility.boarding_waiters recomputed; load recompute"]
+
+  - method: POST
+    path: "/cc/boarding-records/{id}/leave-ama"
+    description: "Patient left against medical advice"
+    roles: [TransferCenterCoordinator]
+    code: 200
+    input: []
+    output: BoardingRecord
+    side_effects: ["placement_status -> LEFT_AMA; Facility.boarding_waiters recomputed; load recompute"]
+
+  - method: POST
+    path: "/cc/boarding-records/{id}/huddles"
+    description: "Manually call an escalation huddle"
+    roles: [HouseSupervisor]
+    code: 201
+    input: []
+    output: EscalationHuddle
+    side_effects: ["EscalationHuddle CALLED(MANUAL); BoardingRecord.escalation_status -> HUDDLE_CALLED"]
+
+  - method: GET
+    path: "/cc/boarding-records/{id}/huddles"
+    description: "List huddles of a boarding record"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "EscalationHuddle[]"
+    side_effects: []
+
+  - method: POST
+    path: "/cc/huddles/{id}/resolve"
+    description: "Resolve a called huddle"
+    roles: [HouseSupervisor]
+    code: 200
+    input: ["resolution?"]
+    output: EscalationHuddle
+    side_effects: ["status -> RESOLVED; resolved_at = now; BoardingRecord.escalation_status -> HUDDLE_RESOLVED; huddle_count_24h recomputed; executive_escalation set when >= 3 huddles within 24h"]
+
+  # --- CapacityForecast ---
+  - method: POST
+    path: "/cc/facilities/{id}/capacity-forecasts"
+    description: "Generate a capacity forecast (both census variants); supersedes prior PROVISIONAL/PUBLISHED forecasts of the facility"
+    roles: [CapacityPlanner]
+    code: 201
+    input: [horizon_hours]
+    output: CapacityForecast
+    side_effects: ["status PROVISIONAL; stale=false; prior PROVISIONAL/PUBLISHED forecasts -> SUPERSEDED; Facility.next_elective_window_start recomputed (null until a publish)"]
+
+  - method: GET
+    path: "/cc/facilities/{id}/capacity-forecasts"
+    description: "List forecasts of a facility"
+    roles: [Any]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "CapacityForecast[]"
+    side_effects: []
+
+  - method: GET
+    path: "/cc/capacity-forecasts/{id}"
+    description: "Get a forecast with variant snapshots"
+    roles: [Any]
+    code: 200
+    input: []
+    output: CapacityForecast
+    side_effects: []
+
+  - method: POST
+    path: "/cc/capacity-forecasts/{id}/publish"
+    description: "Publish a PROVISIONAL forecast — pins it for elective scheduling"
+    roles: [CapacityPlanner]
+    code: 200
+    input: []
+    output: CapacityForecast
+    side_effects: ["status -> PUBLISHED; published_at = now; Facility.next_elective_window_start = generated_at + first hour h with provisional census <= inpatient_bed_count - 2 (null when none)"]
+
+  # --- Test-driving endpoints ---
+  - method: POST
+    path: "/cc/_clock/set_current_utc"
+    description: "Set the server's logical clock. Startup default (before any call) is exactly 2026-08-01T00:00:00Z and MUST NOT fall back to wall-clock time; all timestamps, deadlines, windows, sweeps, and forecasts read this clock."
+    roles: [SystemAdministrator]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["Logical clock advanced to to_iso8601"]
+
+  - method: POST
+    path: "/cc/_sweeps/run"
+    description: "Run one housekeeping sweep against the logical clock: expire ACTIVE holds with now >= expires_at, expire CONSULT_PENDING requests with now >= consult_deadline, expire ACTIVE diversions with now >= ends_at, and run the boarding escalation check for all open boarding records"
+    roles: [SystemAdministrator]
+    code: 200
+    input: []
+    output: { expired_hold_ids: array, expired_consult_request_ids: array, expired_diversion_ids: array, escalated_boarding_record_ids: array }
+    side_effects:
+      - "Hold expiry: EXPIRED + bed cooling + request HOLD_PLACED -> ACCEPTED"
+      - "Consult expiry: EXPIRED with decline_reason=TIMEOUT"
+      - "Diversion expiry: EXPIRED + diversion_status recompute"
+      - "Boarding escalation: huddle at >= 120 min; executive_escalation at >= 240 min"
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- Auth ---
+  - id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http: 400
+    condition: "X-User-ID or X-User-Role header missing or empty"
+  - id: ERR_INSUFFICIENT_PERMISSIONS
+    http: 403
+    condition: "Role not permitted for this endpoint, or entity-backed ownership check failed (e.g. consult-response by a physician other than accepting_physician_id)"
+  # --- Shape / existence ---
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, type mismatch, invalid enum, ends_at <= starts_at, diversion service present iff level==SERVICE, to_status not in {AVAILABLE, OUT_OF_SERVICE}, observed_minutes regressing below last heartbeat"
+  - id: ERR_FACILITY_NOT_FOUND
+    http: 404
+    condition: "Facility id does not exist"
+  - id: ERR_BED_NOT_FOUND
+    http: 404
+    condition: "Bed id does not exist (or belongs to a different facility on nested paths)"
+  - id: ERR_PHYSICIAN_NOT_FOUND
+    http: 404
+    condition: "Physician id does not exist (or belongs to a different facility)"
+  - id: ERR_ADMISSION_NOT_FOUND
+    http: 404
+    condition: "Admission id does not exist (or belongs to a different facility)"
+  - id: ERR_TRANSFER_REQUEST_NOT_FOUND
+    http: 404
+    condition: "Transfer request id does not exist (or belongs to a different facility)"
+  - id: ERR_HOLD_NOT_FOUND
+    http: 404
+    condition: "Bed hold id does not exist"
+  - id: ERR_ASSIGNMENT_NOT_FOUND
+    http: 404
+    condition: "Bed assignment id does not exist"
+  - id: ERR_DIVERSION_NOT_FOUND
+    http: 404
+    condition: "Diversion event id does not exist"
+  - id: ERR_BOARDING_RECORD_NOT_FOUND
+    http: 404
+    condition: "Boarding record id does not exist"
+  - id: ERR_HUDDLE_NOT_FOUND
+    http: 404
+    condition: "Escalation huddle id does not exist"
+  - id: ERR_FORECAST_NOT_FOUND
+    http: 404
+    condition: "Capacity forecast id does not exist"
+  # --- State ---
+  - id: ERR_TRANSFER_INVALID_STATE
+    http: 409
+    condition: "Transfer request not in a state permitting the operation (consult requires INTAKE/DECLINED/EXPIRED; consult-response requires CONSULT_PENDING; hold create requires ACCEPTED; assignment requires HOLD_PLACED; cancel requires non-terminal; rebalance requires INTAKE/CONSULT_PENDING/DECLINED/EXPIRED)"
+  - id: ERR_BED_NOT_AVAILABLE
+    http: 409
+    condition: "Bed not AVAILABLE (or unstaffed) for admission/hold; bed status endpoint target state invalid for current state"
+  - id: ERR_ADMISSION_INVALID_STATE
+    http: 409
+    condition: "pending-discharge requires ADMITTED; confirm/rescind require PENDING_DISCHARGE"
+  - id: ERR_ADMISSION_NOT_ED_BOARDER
+    http: 409
+    condition: "Boarding record creation requires the admission's bed to be in an ED unit (unit starts with 'ED')"
+  - id: ERR_BOARDING_INVALID_STATE
+    http: 409
+    condition: "offer requires WAITING; place requires OFFERED; heartbeat/huddles require non-terminal placement"
+  - id: ERR_HUDDLE_INVALID_STATE
+    http: 409
+    condition: "Manual huddle requires escalation_status != HUDDLE_CALLED; resolve requires huddle CALLED"
+  - id: ERR_FORECAST_INVALID_STATE
+    http: 409
+    condition: "publish requires PROVISIONAL"
+  - id: ERR_DIVERSION_INVALID_STATE
+    http: 409
+    condition: "lift requires diversion ACTIVE"
+  - id: ERR_HOLD_INVALID_STATE
+    http: 409
+    condition: "extend/release require hold ACTIVE; assignment requires referenced hold ACTIVE and belonging to the request"
+  # --- Business: safety ---
+  - id: ERR_ISOLATION_INCOMPATIBLE
+    http: 422
+    condition: "iso_rank(bed.isolation_capability) < iso_rank(request.isolation_need) on explicit bed hold"
+  - id: ERR_ACUITY_EXCEEDS_BED_CAPABILITY
+    http: 422
+    condition: "acuity_rank(bed.max_acuity) < acuity_rank(request.acuity) on explicit bed hold"
+  - id: ERR_SERVICE_MISMATCH
+    http: 422
+    condition: "bed.service != request.service and bed.service != MEDICAL on explicit bed hold"
+  - id: ERR_PHYSICIAN_NOT_CREDENTIALED_FOR_SERVICE
+    http: 422
+    condition: "request.service not in physician.services on consult dispatch"
+  - id: ERR_PHYSICIAN_NOT_ON_CALL
+    http: 409
+    condition: "physician.status != ON_CALL on consult dispatch"
+  # --- Business: referential (segregation of duties) ---
+  - id: ERR_SOD_DIVERSION_DECLARE_LIFT_SAME_ACTOR
+    http: 403
+    condition: "Diversion lift X-User-ID equals declared_by_user_id"
+  - id: ERR_SOD_ASSIGNMENT_CREATE_COMPLETE_SAME_ACTOR
+    http: 403
+    condition: "Assignment complete X-User-ID equals assignment.created_by_user_id"
+  # --- Business: temporal ---
+  - id: ERR_CONSULT_WINDOW_EXPIRED
+    http: 409
+    condition: "consult-response at or after consult_deadline (now >= deadline)"
+  - id: ERR_DIVERSION_LIFT_TOO_SOON
+    http: 409
+    condition: "lift before created_at + 30 minutes"
+  - id: ERR_DIVERSION_WINDOW_OVERLAP
+    http: 409
+    condition: "New diversion window overlaps another ACTIVE diversion of the facility (half-open [start,end); adjacency allowed)"
+  - id: ERR_BED_HOLD_WINDOW_CONFLICT
+    http: 409
+    condition: "New hold on a bed whose cooling buffer is still running (now < cooling_until)"
+  # --- Business: constraint / quota ---
+  - id: ERR_HOLD_QUOTA_EXCEEDED
+    http: 409
+    condition: "Facility already has 6 ACTIVE holds (7th rejected)"
+  - id: ERR_BOARDING_RECORD_ALREADY_OPEN
+    http: 409
+    condition: "Admission already has a boarding record with placement_status IN {WAITING, OFFERED}"
+  - id: ERR_HOLD_EXTEND_LIMIT_EXCEEDED
+    http: 409
+    condition: "Hold extend_count already 2 (3rd extend rejected)"
+  - id: ERR_FACILITY_ON_DIVERSION
+    http: 409
+    condition: "Transfer intake or rebalance target blocked: facility DIVERT_FULL, or DIVERT_SERVICE matching the request's service"
+  - id: ERR_REBALANCE_MARGIN_NOT_MET
+    http: 409
+    condition: "source load_score_weighted - target load_score_weighted < 10.0"
+  - id: ERR_NO_ELIGIBLE_BED
+    http: 409
+    condition: "Selector invoked (bed_id omitted) and no bed passes eligibility"
+  # --- Concurrency ---
+  - id: ERR_STALE_VERSION
+    http: 412
+    condition: "expected_transfer_request_version / expected_bed_hold_version does not match the entity's current version"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: SystemAdministrator
+    description: "Health-system IT operator; provisions facilities, beds, physician roster; drives the logical clock and housekeeping sweeps"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cc/facilities"
+      - "POST /cc/facilities/{id}/beds"
+      - "POST /cc/facilities/{id}/physicians"
+      - "POST /cc/_clock/set_current_utc"
+      - "POST /cc/_sweeps/run"
+
+  - name: BedManager
+    description: "Unit bed manager; controls bed availability, direct admissions, discharge milestones, and confirms patient arrivals"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cc/beds/{id}/status"
+      - "POST /cc/facilities/{id}/admissions"
+      - "POST /cc/admissions/{id}/pending-discharge"
+      - "POST /cc/admissions/{id}/confirm-discharge"
+      - "POST /cc/admissions/{id}/rescind-pending-discharge"
+      - "POST /cc/bed-assignments/{id}/complete"
+
+  - name: TransferCenterCoordinator
+    description: "Transfer center coordinator; owns intake, consult dispatch, holds, placements, rebalancing, and boarding tracking"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cc/facilities/{id}/transfer-requests"
+      - "POST /cc/transfer-requests/{id}/consult"
+      - "POST /cc/transfer-requests/{id}/cancel"
+      - "POST /cc/transfer-requests/{id}/rebalance"
+      - "POST /cc/transfer-requests/{id}/bed-holds"
+      - "POST /cc/bed-holds/{id}/extend"
+      - "POST /cc/bed-holds/{id}/release"
+      - "POST /cc/transfer-requests/{id}/bed-assignments"
+      - "POST /cc/facilities/{id}/boarding-records"
+      - "POST /cc/boarding-records/{id}/heartbeat"
+      - "POST /cc/boarding-records/{id}/offer"
+      - "POST /cc/boarding-records/{id}/place"
+      - "POST /cc/boarding-records/{id}/leave-ama"
+
+  - name: AcceptingPhysician
+    description: "Physician accepting or declining transfer consults; X-User-ID is the Physician entity id"
+    identity: "entity_backed:Physician"
+    exclusive_operations:
+      - "POST /cc/transfer-requests/{id}/consult-response"
+
+  - name: HouseSupervisor
+    description: "House supervisor; declares and lifts diversion (segregated duties), manages physician on-call status, calls and resolves escalation huddles"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cc/facilities/{id}/diversions"
+      - "POST /cc/diversions/{id}/lift"
+      - "POST /cc/physicians/{id}/status"
+      - "POST /cc/boarding-records/{id}/huddles"
+      - "POST /cc/huddles/{id}/resolve"
+
+  - name: CapacityPlanner
+    description: "Capacity planning analyst; generates and publishes capacity forecasts for elective scheduling"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /cc/facilities/{id}/capacity-forecasts"
+      - "POST /cc/capacity-forecasts/{id}/publish"
+
+  - name: Any
+    description: "Read-only access shared by every authenticated role"
+    identity: "opaque"
+    shared_operations:
+      - "GET /cc/facilities/{id}"
+      - "GET /cc/facilities/{id}/load-score"
+      - "GET /cc/facilities/{id}/bed-candidates"
+      - "GET /cc/facilities/{id}/diversions"
+      - "GET /cc/facilities/{id}/beds"
+      - "GET /cc/beds/{id}"
+      - "GET /cc/beds/{id}/admissions"
+      - "GET /cc/beds/{id}/bed-holds"
+      - "GET /cc/beds/{id}/transfer-requests"
+      - "GET /cc/facilities/{id}/physicians"
+      - "GET /cc/physicians/{id}"
+      - "GET /cc/physicians/{id}/transfer-requests"
+      - "GET /cc/facilities/{id}/admissions"
+      - "GET /cc/admissions/{id}"
+      - "GET /cc/admissions/{id}/boarding-records"
+      - "GET /cc/facilities/{id}/transfer-requests"
+      - "GET /cc/transfer-requests/{id}"
+      - "GET /cc/transfer-requests/{id}/bed-holds"
+      - "GET /cc/transfer-requests/{id}/bed-assignments"
+      - "GET /cc/beds/{id}/bed-assignments"
+      - "GET /cc/bed-holds/{id}"
+      - "GET /cc/bed-holds/{id}/bed-assignments"
+      - "GET /cc/facilities/{id}/boarding-records"
+      - "GET /cc/boarding-records/{id}"
+      - "GET /cc/boarding-records/{id}/huddles"
+      - "GET /cc/facilities/{id}/capacity-forecasts"
+      - "GET /cc/capacity-forecasts/{id}"

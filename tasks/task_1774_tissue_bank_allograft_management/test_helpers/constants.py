@@ -1,0 +1,40 @@
+"""Domain thresholds — numeric constants from the PRD (§3.3, §3.8, §2.11)."""
+
+THRESHOLDS = {
+    # Supplier qualification score model (PRD §3.8)
+    "CONFIRMED_FINDING_PENALTY": 20,
+    "ACTIVE_RECALL_PENALTY": 15,
+    "OPEN_ADVERSE_PENALTY": 10,
+    "EXPIRED_DOC_PENALTY": 5,
+    "SUSPENSION_SCORE": 60,
+    # Excursion severity model (PRD §3.3)
+    "DEVIATION_CAP_PTS": 40,
+    "DEVIATION_PTS_PER_DEGREE": 8,
+    "DURATION_CAP_PTS": 30,
+    "DURATION_PTS_PER_HOUR": 6,
+    "UNIT_CAP_PTS": 20,
+    "UNIT_PTS_EACH": 2,
+    "TIER_PTS": {"STANDARD": 0, "SENSITIVE": 5, "CRITICAL": 10},
+    "SEVERITY_HIGH": 60,
+    "SEVERITY_MEDIUM": 25,
+    # Freezer capacity gating (PRD §3.3)
+    "RESERVE_TRIGGER_UTILIZATION_PCT": 80.0,
+    "RESERVED_SLOTS": 2,
+    # Disposition retention (PRD §2.11)
+    "RETENTION_DAYS": 3650,
+}
+
+TEST_DEFAULTS = {
+    "FREEZER_MIN": -80.0,
+    "FREEZER_MAX": -60.0,
+    "FREEZER_CAPACITY": 50,
+    "UNIT_COST_CENTS": 5000,
+    "UNIT_EXPIRATION": "2027-01-01T00:00:00Z",
+    "CASE_START": "2026-08-10T10:00:00Z",
+    "CASE_END": "2026-08-10T12:00:00Z",
+    "IMPLANT_CLOCK": "2026-08-10T11:00:00Z",
+    "DOC_VALID_FROM": "2026-01-01T00:00:00Z",
+    "DOC_VALID_TO": "2027-12-31T00:00:00Z",
+    "RECALL_WINDOW_START": "2026-01-01T00:00:00Z",
+    "RECALL_WINDOW_END": "2026-12-31T00:00:00Z",
+}

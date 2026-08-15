@@ -1,0 +1,29 @@
+"""Error classes and error ID constants (from SCAFFOLD.yaml error catalog)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"              # 401
+ERR_FORBIDDEN = "ERR_FORBIDDEN"                          # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                          # 404
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                  # 409
+ERR_STALE_ROUTE_VERSION = "ERR_STALE_ROUTE_VERSION"      # 412
+ERR_STALE_REQUEST_VERSION = "ERR_STALE_REQUEST_VERSION"  # 412
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"              # 400
+ERR_PROHIBITED_ITEM = "ERR_PROHIBITED_ITEM"              # 422
+ERR_PREPARATION_NOT_ACKED = "ERR_PREPARATION_NOT_ACKED"  # 422
+ERR_HOUSEHOLD_SUSPENDED = "ERR_HOUSEHOLD_SUSPENDED"      # 409
+ERR_ZONE_MISMATCH = "ERR_ZONE_MISMATCH"                  # 422
+ERR_TEMPORAL_CONFLICT = "ERR_TEMPORAL_CONFLICT"          # 422
+ERR_DUPLICATE_PICKUP_DATE = "ERR_DUPLICATE_PICKUP_DATE"  # 409
+ERR_ROUTE_CAPACITY_EXCEEDED = "ERR_ROUTE_CAPACITY_EXCEEDED"  # 409
+ERR_ROUTE_LOCKED = "ERR_ROUTE_LOCKED"                    # 409
+ERR_ROUTE_NOT_EMPTY = "ERR_ROUTE_NOT_EMPTY"              # 409
+ERR_DETERMINATION_INCONSISTENT = "ERR_DETERMINATION_INCONSISTENT"  # 422
+ERR_ASSESSMENT_NOT_SETTLABLE = "ERR_ASSESSMENT_NOT_SETTLABLE"      # 409

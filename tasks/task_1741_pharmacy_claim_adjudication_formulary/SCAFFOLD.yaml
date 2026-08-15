@@ -1,0 +1,843 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Pharmacy Claim Adjudication & Formulary Edits
+# PBM point-of-sale claims processing with eligibility, formulary/UM edits,
+# DUR screening with pharmacist overrides, copay accumulator/maximizer logic,
+# specialty channel restriction, reversal/reprocessing, and pharmacy audit.
+# =============================================================================
+
+scenario: |
+  Pharmacy Claim Adjudication & Formulary Edits (PBM claims processing): point-of-sale claim processing & eligibility check, formulary tier & step-therapy/prior-auth edits, quantity limit & days-supply rules, DUR (drug utilization review) alerts & pharmacist override codes, copay calculation & accumulator/maximizer logic, specialty drug channel restriction, reversal/reprocessing & pharmacy audit, rebate-eligible claim tagging
+
+domain_name: pharmacy-claim-adjudication
+api_prefix: /
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - dual_variant_calculation      # copay assistance ACCUMULATOR vs MAXIMIZER; audit clawback CLAIM_LEVEL vs EXTRAPOLATED
+    - cascading_side_effects        # audit close -> claim clawback -> pharmacy balance -> pharmacy suspension; plan retire -> member -> PA
+    - rate_threshold_triggers       # deductible/OOP-max crossing; pharmacy auto-suspend threshold
+    - optimistic_concurrency        # OCC on FormularyEntry.version
+  entity_topology: flat             # all resources top-level; relationships via FK references, no URL nesting (except alert sub-resource read)
+  state_machine_shape: cyclic       # Claim: PAID->REVERSED->PAID, REJECTED->REJECTED resubmit loop; PharmacyAudit: FINDINGS_RECORDED<->DISPUTED cycle
+  relationship_patterns:
+    - one_to_many                   # Plan->FormularyEntry, Member->Claim/PA, Claim->DurAlert, Pharmacy->PharmacyAudit
+    - cross_aggregate               # Claim references Member, Pharmacy, Drug, PriorAuthorization across aggregates
+  role_model: peer_roles            # PbmAdmin config, Pharmacist dispenses, Member requests PA, ClinicalReviewer decides PA, Auditor audits
+  consistency_model: immediate      # all mutations and derived-field updates visible in the same request's response
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Plan
+    parent: null
+    common_fields: true   # id, created_at, updated_at, version
+    fields:
+      - { name: name, type: string, source: input, description: "Plan name" }
+      - { name: deductible_cents, type: integer, source: input, description: "Annual individual deductible in cents; member pays full allowed cost until met", constraints: ">= 0" }
+      - { name: oop_max_cents, type: integer, source: input, description: "Annual out-of-pocket maximum in cents; patient responsibility capped at remaining OOP", constraints: ">= 0" }
+      - { name: assistance_model, type: enum, source: input, description: "Copay-assistance variant: ACCUMULATOR (member must pay at least member_min_pay_cents per fill) | MAXIMIZER (card pays up to card_fill_cap_cents per fill)", constraints: "ACCUMULATOR | MAXIMIZER" }
+      - { name: member_min_pay_cents, type: integer, source: input, description: "ACCUMULATOR model: minimum the member must pay out of pocket per fill; card may not cover this portion", constraints: ">= 0; used only when assistance_model == ACCUMULATOR" }
+      - { name: card_fill_cap_cents, type: integer, source: input, description: "MAXIMIZER model: maximum the copay card pays per fill; 0 means uncapped", constraints: ">= 0; used only when assistance_model == MAXIMIZER" }
+      - { name: dispensing_fee_cents, type: integer, source: input, description: "Flat dispensing fee added to every claim's allowed amount", constraints: ">= 0" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> ACTIVE -> RETIRED", constraints: "DRAFT | ACTIVE | RETIRED; initial DRAFT" }
+
+  - name: Drug
+    parent: null
+    common_fields: true
+    fields:
+      - { name: ndc, type: string, source: input, description: "National Drug Code; unique across all drugs", constraints: "unique" }
+      - { name: name, type: string, source: input, description: "Drug name" }
+      - { name: therapeutic_class, type: string, source: input, description: "Therapeutic class label; drives THERAPEUTIC_DUPLICATION DUR screening" }
+      - { name: unit_cost_cents, type: integer, source: input, description: "Ingredient cost per unit in cents", constraints: "> 0" }
+      - { name: max_daily_dose_units, type: integer, source: input, description: "Maximum units per day; quantity > max_daily_dose_units * days_supply triggers HIGH_DAILY_DOSE alert", constraints: "> 0" }
+      - { name: is_specialty, type: boolean, source: input, default: false, description: "True = restricted to SPECIALTY-channel pharmacies" }
+
+  - name: FormularyEntry
+    parent: Plan
+    common_fields: true
+    fields:
+      - { name: plan_id, type: string, source: input, description: "FK -> Plan.id; plan owning this formulary row" }
+      - { name: drug_id, type: string, source: input, description: "FK -> Drug.id; drug covered by this row" }
+      - { name: tier, type: integer, source: input, description: "Formulary tier label (1=preferred generic ... 4=specialty)", constraints: "1..4" }
+      - { name: pa_required, type: boolean, source: input, default: false, description: "True = claim requires an APPROVED, unexpired PriorAuthorization with sufficient remaining quantity" }
+      - { name: step_therapy_required, type: boolean, source: input, default: false, description: "True = member must have a PAID claim for step_drug_id within the lookback window" }
+      - { name: step_drug_id, type: string, source: input, description: "FK -> Drug.id; prerequisite drug for step therapy. Required iff step_therapy_required is true; null otherwise", constraints: "required when step_therapy_required = true" }
+      - { name: step_therapy_lookback_days, type: integer, source: input, default: 180, description: "Step-therapy window: a PAID step-drug claim with fill_date in [fill_date - lookback_days, fill_date] (both inclusive) satisfies the edit", constraints: "> 0" }
+      - { name: quantity_limit_per_fill, type: integer, source: input, description: "Maximum units per claim; quantity > limit fails ERR_QUANTITY_LIMIT_EXCEEDED (quantity == limit passes)", constraints: "> 0" }
+      - { name: max_days_supply, type: integer, source: input, description: "Maximum days supply per claim; days_supply > max fails ERR_DAYS_SUPPLY_EXCEEDED", constraints: "> 0" }
+      - { name: copay_type, type: enum, source: input, description: "FLAT = copay_flat_cents per fill | PERCENTAGE = copay_percentage of allowed_cents", constraints: "FLAT | PERCENTAGE" }
+      - { name: copay_flat_cents, type: integer, source: input, description: "Flat copay in cents; required iff copay_type == FLAT; may be 0", constraints: ">= 0; required when copay_type == FLAT" }
+      - { name: copay_percentage, type: number, source: input, description: "Coinsurance percentage of allowed_cents; required iff copay_type == PERCENTAGE", constraints: "0..100; required when copay_type == PERCENTAGE" }
+      - { name: rebate_eligible, type: boolean, source: input, default: false, description: "True = PAID claims for this drug are tagged REBATE_ELIGIBLE" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | INACTIVE (set INACTIVE when parent plan is retired)", constraints: "ACTIVE | INACTIVE; initial ACTIVE" }
+
+  - name: Pharmacy
+    parent: null
+    common_fields: true
+    fields:
+      - { name: ncpdp_id, type: string, source: input, description: "NCPDP provider id; unique", constraints: "unique" }
+      - { name: name, type: string, source: input, description: "Pharmacy name" }
+      - { name: channel, type: enum, source: input, description: "Dispensing channel", constraints: "RETAIL | SPECIALTY | MAIL_ORDER" }
+      - { name: auto_suspend_threshold_cents, type: integer, source: input, description: "Debt tolerance: pharmacy auto-suspends when balance_cents <= -auto_suspend_threshold_cents (boundary inclusive)", constraints: "> 0" }
+      - { name: balance_cents, type: integer, source: computed, default: 0, description: "Plan-payable ledger: += claim.plan_paid_cents when a claim goes PAID; -= claim.plan_paid_cents on reversal; -= audit.total_clawback_cents on audit close" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | SUSPENDED (auto when balance_cents <= -threshold; reinstated by admin once balance restored)", constraints: "ACTIVE | SUSPENDED; initial ACTIVE" }
+
+  - name: Member
+    parent: Plan
+    common_fields: true
+    fields:
+      - { name: plan_id, type: string, source: input, description: "FK -> Plan.id; plan providing coverage" }
+      - { name: external_ref, type: string, source: input, description: "Plan-scoped member identifier; unique", constraints: "unique" }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: eligibility_start_date, type: string, source: input, description: "ISO date (YYYY-MM-DD); coverage start, inclusive" }
+      - { name: eligibility_end_date, type: string, source: input, description: "ISO date; coverage end, inclusive; must be >= eligibility_start_date" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | TERMINATED (set TERMINATED when parent plan is retired)", constraints: "ACTIVE | TERMINATED; initial ACTIVE" }
+      - { name: deductible_paid_cents, type: integer, source: computed, default: 0, description: "Accumulated member cash applied to deductible; += min(member_pays_cents, deductible_applied_cents) per PAID claim; restored on reversal" }
+      - { name: oop_paid_cents, type: integer, source: computed, default: 0, description: "Accumulated member out-of-pocket (member_pays_cents only; card amounts never accumulate); restored on reversal" }
+      - { name: oop_max_reached, type: boolean, source: computed, default: false, description: "True iff oop_paid_cents >= plan.oop_max_cents; recomputed on every accumulator mutation" }
+      - { name: card_drug_id, type: string, source: input, description: "FK -> Drug.id; manufacturer copay card drug. Null = member has no copay card", constraints: "optional" }
+      - { name: card_balance_cents, type: integer, source: input, default: 0, description: "Copay card balance; seeded at creation, debited by card_applied_cents when the card pays, credited back on reversal", constraints: ">= 0" }
+
+  - name: PriorAuthorization
+    parent: Member
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; member the PA is for" }
+      - { name: drug_id, type: string, source: input, description: "FK -> Drug.id; drug the PA authorizes" }
+      - { name: requested_quantity, type: integer, source: input, description: "Units requested by the member", constraints: "> 0" }
+      - { name: note, type: string, source: input, description: "Free-text clinical note", constraints: "optional" }
+      - { name: status, type: enum, source: system, description: "PENDING -> APPROVED | DENIED; PENDING|APPROVED -> CANCELLED when member is terminated", constraints: "PENDING | APPROVED | DENIED | CANCELLED; initial PENDING" }
+      - { name: approved_quantity, type: integer, source: system, description: "Units authorized; set by approve call; null until APPROVED" }
+      - { name: quantity_consumed, type: integer, source: computed, default: 0, description: "Units consumed by PAID claims linked to this PA; decremented on reversal" }
+      - { name: expires_at, type: string, source: system, description: "ISO date, inclusive; usable while expires_at >= claim fill_date; set by approve call; null until APPROVED" }
+      - { name: denial_reason, type: string, source: system, description: "Set by deny call; null unless DENIED" }
+      - { name: decided_by, type: string, source: system, description: "X-User-ID of the deciding ClinicalReviewer; null while PENDING" }
+
+  - name: Claim
+    parent: Member
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; patient" }
+      - { name: pharmacy_id, type: string, source: system, description: "FK -> Pharmacy.id; dispensing pharmacy, taken from the Pharmacist's X-User-ID" }
+      - { name: drug_id, type: string, source: input, description: "FK -> Drug.id; drug dispensed" }
+      - { name: prescription_number, type: string, source: input, description: "Pharmacy-assigned prescription number" }
+      - { name: fill_date, type: string, source: input, description: "ISO date of fill; drives eligibility, PA expiry, step-therapy lookback, and DUR overlap" }
+      - { name: quantity, type: integer, source: input, description: "Units dispensed", constraints: "> 0" }
+      - { name: days_supply, type: integer, source: input, description: "Days the fill covers; fill window is the half-open interval [fill_date, fill_date + days_supply)", constraints: "> 0" }
+      - { name: status, type: enum, source: system, description: "Set at adjudication: PAID | REJECTED; PAID -> REVERSED -> PAID|REJECTED via reprocess; REJECTED -> PAID|REJECTED via resubmit", constraints: "PAID | REJECTED | REVERSED" }
+      - { name: reject_reasons, type: array, source: system, description: "Ordered list of failed adjudication-edit error_ids (edit order pinned in validations); empty when PAID" }
+      - { name: allowed_cents, type: integer, source: computed, default: 0, description: "= drug.unit_cost_cents * quantity + plan.dispensing_fee_cents; 0 while REJECTED" }
+      - { name: copay_base_cents, type: integer, source: computed, default: 0, description: "Tier copay before deductible/OOP shaping: FLAT -> copay_flat_cents; PERCENTAGE -> round_half_up(allowed_cents * copay_percentage / 100)" }
+      - { name: deductible_applied_cents, type: integer, source: computed, default: 0, description: "= min(allowed_cents, max(0, plan.deductible_cents - member.deductible_paid_cents)) at adjudication time" }
+      - { name: card_applied_cents, type: integer, source: computed, default: 0, description: "Amount the copay card paid (0 when member has no card, card drug mismatch, or zero balance)" }
+      - { name: member_pays_cents, type: integer, source: computed, default: 0, description: "Member cash responsibility = patient_resp - card_applied_cents" }
+      - { name: plan_paid_cents, type: integer, source: computed, default: 0, description: "= allowed_cents - patient_resp (patient_resp = member_pays_cents + card_applied_cents)" }
+      - { name: pa_id, type: string, source: system, description: "FK -> PriorAuthorization.id; the APPROVED PA this claim consumed, null when none required/used" }
+      - { name: resubmit_count, type: integer, source: system, default: 0, description: "Number of resubmit calls against this claim" }
+      - { name: audit_status, type: enum, source: system, description: "UNAUDITED | FLAGGED (in an open audit's findings) | CLAWED_BACK (audit closed with a clawback finding)", constraints: "UNAUDITED | FLAGGED | CLAWED_BACK; initial UNAUDITED" }
+      - { name: rebate_tag, type: enum, source: computed, description: "REBATE_ELIGIBLE when PAID and formulary entry rebate_eligible; REBATE_VOID when a previously ELIGIBLE claim is reversed or clawed back; REBATE_INELIGIBLE otherwise", constraints: "REBATE_ELIGIBLE | REBATE_INELIGIBLE | REBATE_VOID" }
+
+  - name: DurAlert
+    parent: Claim
+    common_fields: false   # id + created_at only (append-only screening record)
+    fields:
+      - { name: claim_id, type: string, source: system, description: "FK -> Claim.id; claim whose adjudication raised the alert" }
+      - { name: alert_type, type: enum, source: system, description: "EARLY_REFILL | THERAPEUTIC_DUPLICATION | HIGH_DAILY_DOSE", constraints: "EARLY_REFILL | THERAPEUTIC_DUPLICATION | HIGH_DAILY_DOSE" }
+      - { name: severity, type: enum, source: system, description: "HIGH_DAILY_DOSE -> HIGH; all others MEDIUM. An OPEN HIGH alert forces ERR_DUR_HARD_STOP", constraints: "MEDIUM | HIGH" }
+      - { name: status, type: enum, source: system, description: "OPEN -> OVERRIDDEN (pharmacist override on resubmit) | SUPERSEDED (reprocess regenerated alerts)", constraints: "OPEN | OVERRIDDEN | SUPERSEDED; initial OPEN" }
+      - { name: override_code, type: enum, source: system, description: "Pharmacist professional-service code recorded on override; null while OPEN", constraints: "PROFESSIONAL_CONSULT | PRESCRIBER_CONFIRMED | PATIENT_EDUCATED | null" }
+  - name: PharmacyAudit
+    parent: Pharmacy
+    common_fields: true
+    fields:
+      - { name: pharmacy_id, type: string, source: input, description: "FK -> Pharmacy.id; pharmacy under audit" }
+      - { name: window_start_date, type: string, source: input, description: "ISO date; audit window start, inclusive (closed interval)" }
+      - { name: window_end_date, type: string, source: input, description: "ISO date; audit window end, inclusive; must be >= window_start_date" }
+      - { name: extrapolation_method, type: enum, source: input, description: "Clawback variant: CLAIM_LEVEL = sum of finding clawbacks | EXTRAPOLATED = per-claim extrapolation to the paid-claim universe", constraints: "CLAIM_LEVEL | EXTRAPOLATED" }
+      - { name: status, type: enum, source: system, description: "OPEN -> FINDINGS_RECORDED -> DISPUTED -> FINDINGS_RECORDED (revision cycle) -> CLOSED_WITH_FINDINGS | OPEN -> CLOSED_NO_FINDINGS", constraints: "OPEN | FINDINGS_RECORDED | DISPUTED | CLOSED_WITH_FINDINGS | CLOSED_NO_FINDINGS; initial OPEN" }
+      - { name: findings, type: array, source: system, description: "List of {claim_id, clawback_cents}; replaced wholesale by each findings call; empty until first findings call" }
+      - { name: sample_size, type: integer, source: computed, default: 0, description: "= count of findings recorded" }
+      - { name: universe_paid_claims, type: integer, source: computed, default: 0, description: "= count of the pharmacy's claims with status PAID and fill_date within [window_start_date, window_end_date] inclusive, measured at close time" }
+      - { name: total_clawback_cents, type: integer, source: computed, default: 0, description: "Computed at close per calculations.audit_clawback_total; 0 while open and for CLOSED_NO_FINDINGS" }
+      - { name: dispute_reason, type: string, source: system, description: "Recorded by the most recent dispute call; null unless DISPUTED at least once" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Plan
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /plans/{id}/activate"
+        actor: PbmAdmin
+        preconditions:
+          - "Plan.status == DRAFT (ERR_PLAN_INVALID_STATE)"
+          - "At least one FormularyEntry exists with plan_id == Plan.id (ERR_PLAN_NO_FORMULARY_ENTRIES)"
+        side_effects: []
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "POST /plans/{id}/retire"
+        actor: PbmAdmin
+        preconditions:
+          - "Plan.status == ACTIVE (ERR_PLAN_INVALID_STATE)"
+        side_effects:
+          - "Cascade link 1: every FormularyEntry with plan_id == Plan.id -> status INACTIVE"
+          - "Cascade link 1: every Member with plan_id == Plan.id -> status TERMINATED"
+          - "Cascade link 2 (caused by member termination, not by the retire call directly): every PriorAuthorization of a terminated member with status in {PENDING, APPROVED} -> CANCELLED"
+
+  - entity: Pharmacy
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system (automatic after any balance mutation leaves balance_cents <= -auto_suspend_threshold_cents)"
+        actor: system
+        preconditions:
+          - "Pharmacy.balance_cents <= -Pharmacy.auto_suspend_threshold_cents (boundary inclusive)"
+        side_effects: []
+        note: "Checked after claim payment (+), reversal (-), and audit-close clawback (-) postings"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /pharmacies/{id}/reinstate"
+        actor: PbmAdmin
+        preconditions:
+          - "Pharmacy.status == SUSPENDED (ERR_PHARMACY_NOT_SUSPENDED)"
+          - "Pharmacy.balance_cents > -auto_suspend_threshold_cents (ERR_PHARMACY_DEBT_OUTSTANDING)"
+        side_effects: []
+
+  - entity: Member
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "system (cascade from POST /plans/{id}/retire)"
+        actor: system
+        preconditions:
+          - "Member.plan_id == retired Plan.id"
+        side_effects:
+          - "Cascade link 2: this member's PriorAuthorizations in {PENDING, APPROVED} -> CANCELLED"
+
+  - entity: Claim
+    initial_state: "set at creation by adjudication: PAID when all edits pass, else REJECTED"
+    terminal_states: []
+    transitions:
+      - from: "(new)"
+        to: PAID
+        trigger: "POST /claims"
+        actor: Pharmacist
+        preconditions:
+          - "Dispensing pharmacy (caller's X-User-ID) status == ACTIVE (ERR_PHARMACY_SUSPENDED)"
+          - "All adjudication edits pass (validations priorities 12.1-12.11); DUR alerts created as screening dictates"
+        side_effects:
+          - "Member accumulator posting (calculations.member_accumulator_posting): deductible_paid_cents += min(member_pays_cents, deductible_applied_cents); oop_paid_cents += member_pays_cents; oop_max_reached recomputed"
+          - "If card_applied_cents > 0: Member.card_balance_cents -= card_applied_cents"
+          - "If a PA was consumed (pa_id set): PriorAuthorization.quantity_consumed += quantity (calculations.pa_quantity_consumption)"
+          - "Pharmacy.balance_cents += plan_paid_cents; then auto-suspend check"
+          - "rebate_tag computed per calculations.rebate_tagging"
+      - from: "(new)"
+        to: REJECTED
+        trigger: "POST /claims"
+        actor: Pharmacist
+        preconditions:
+          - "At least one adjudication edit failed (HTTP 422 returned with first failed edit as error_id; claim persisted)"
+        side_effects:
+          - "reject_reasons = all failed edit error_ids in pinned edit order; all financial fields 0; rebate_tag REBATE_INELIGIBLE"
+          - "DUR alerts created as screening dictates (they may be overridden on resubmit)"
+      - from: REJECTED
+        to: PAID
+        trigger: "POST /claims/{id}/resubmit"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Claim.status == REJECTED (ERR_CLAIM_NOT_REJECTED)"
+          - "Pharmacy.status == ACTIVE (ERR_PHARMACY_SUSPENDED)"
+          - "dur_overrides reference only this claim's OPEN alerts with valid override_code (ERR_INVALID_REQUEST); after overrides, all adjudication edits pass (no OPEN HIGH alert remains)"
+        side_effects:
+          - "Each named OPEN DurAlert -> OVERRIDDEN with override_code"
+          - "resubmit_count += 1; reject_reasons cleared"
+          - "Same financial side effects as (new) -> PAID (accumulators, card, PA consumption, pharmacy balance, rebate_tag)"
+      - from: REJECTED
+        to: REJECTED
+        trigger: "POST /claims/{id}/resubmit (edits still failing)"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Claim.status == REJECTED; at least one edit still fails (HTTP 422)"
+        side_effects:
+          - "Each named OPEN DurAlert -> OVERRIDDEN with override_code"
+          - "resubmit_count += 1; reject_reasons recomputed in pinned edit order"
+      - from: PAID
+        to: REVERSED
+        trigger: "POST /claims/{id}/reverse"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Claim.status == PAID (ERR_CLAIM_NOT_PAID)"
+          - "Pharmacy.status == ACTIVE (ERR_PHARMACY_SUSPENDED)"
+        side_effects:
+          - "Member.deductible_paid_cents -= min(member_pays_cents, deductible_applied_cents); Member.oop_paid_cents -= member_pays_cents; oop_max_reached recomputed (compensating invariant: accumulators return to pre-claim values)"
+          - "Member.card_balance_cents += card_applied_cents (card restoration, when a card was applied)"
+          - "If pa_id set: PriorAuthorization.quantity_consumed -= quantity (compensating invariant: PA consumption returns to pre-claim value)"
+          - "Pharmacy.balance_cents -= plan_paid_cents; then auto-suspend check"
+          - "If rebate_tag == REBATE_ELIGIBLE: rebate_tag -> REBATE_VOID"
+      - from: REVERSED
+        to: PAID
+        trigger: "POST /claims/{id}/reprocess (corrected quantity/days_supply/fill_date pass adjudication)"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Claim.status == REVERSED (ERR_CLAIM_NOT_REVERSED)"
+          - "Pharmacy.status == ACTIVE (ERR_PHARMACY_SUSPENDED)"
+          - "All adjudication edits pass on the corrected field values"
+        side_effects:
+          - "OPEN DurAlerts -> SUPERSEDED; DUR screening re-run on corrected values, fresh alerts created"
+          - "All financial fields recomputed from corrected values; same posting side effects as (new) -> PAID"
+      - from: REVERSED
+        to: REJECTED
+        trigger: "POST /claims/{id}/reprocess (corrected values still fail an edit; HTTP 422)"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Claim.status == REVERSED; at least one edit fails"
+        side_effects:
+          - "OPEN DurAlerts -> SUPERSEDED; DUR screening re-run; reject_reasons recomputed; financial fields stay 0"
+
+  - entity: PriorAuthorization
+    initial_state: PENDING
+    terminal_states: [DENIED, CANCELLED]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /prior-authorizations/{id}/approve"
+        actor: ClinicalReviewer
+        preconditions:
+          - "PriorAuthorization.status == PENDING (ERR_PA_NOT_PENDING)"
+        side_effects:
+          - "approved_quantity and expires_at set from payload; decided_by = reviewer X-User-ID"
+      - from: PENDING
+        to: DENIED
+        trigger: "POST /prior-authorizations/{id}/deny"
+        actor: ClinicalReviewer
+        preconditions:
+          - "PriorAuthorization.status == PENDING (ERR_PA_NOT_PENDING)"
+        side_effects:
+          - "denial_reason set; decided_by = reviewer X-User-ID"
+      - from: PENDING
+        to: CANCELLED
+        trigger: "system (cascade: member terminated by plan retirement)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: APPROVED
+        to: CANCELLED
+        trigger: "system (cascade: member terminated by plan retirement)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: DurAlert
+    initial_state: OPEN
+    terminal_states: [OVERRIDDEN, SUPERSEDED]
+    transitions:
+      - from: OPEN
+        to: OVERRIDDEN
+        trigger: "POST /claims/{id}/resubmit carrying dur_overrides entry for this alert"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "Alert belongs to the resubmitted claim; alert.status == OPEN; override_code in enum"
+        side_effects:
+          - "override_code recorded"
+      - from: OPEN
+        to: SUPERSEDED
+        trigger: "POST /claims/{id}/reprocess (alerts regenerated on corrected values)"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions: []
+        side_effects: []
+
+  - entity: PharmacyAudit
+    initial_state: OPEN
+    terminal_states: [CLOSED_WITH_FINDINGS, CLOSED_NO_FINDINGS]
+    transitions:
+      - from: OPEN
+        to: FINDINGS_RECORDED
+        trigger: "POST /audits/{id}/findings"
+        actor: Auditor
+        preconditions:
+          - "PharmacyAudit.status in {OPEN, FINDINGS_RECORDED, DISPUTED} (ERR_AUDIT_INVALID_STATE)"
+          - "findings non-empty (ERR_INVALID_REQUEST); every claim auditable (ERR_CLAIM_NOT_AUDITABLE)"
+        side_effects:
+          - "findings replaced wholesale; sample_size recomputed"
+          - "Each newly referenced claim: audit_status UNAUDITED -> FLAGGED; claims dropped from the prior finding set return to UNAUDITED"
+      - from: FINDINGS_RECORDED
+        to: FINDINGS_RECORDED
+        trigger: "POST /audits/{id}/findings (revision)"
+        actor: Auditor
+        preconditions:
+          - "Same as OPEN -> FINDINGS_RECORDED"
+        side_effects:
+          - "Same as OPEN -> FINDINGS_RECORDED"
+      - from: DISPUTED
+        to: FINDINGS_RECORDED
+        trigger: "POST /audits/{id}/findings (revision after dispute — completes the dispute cycle)"
+        actor: Auditor
+        preconditions:
+          - "Same as OPEN -> FINDINGS_RECORDED"
+        side_effects:
+          - "Same as OPEN -> FINDINGS_RECORDED"
+      - from: FINDINGS_RECORDED
+        to: DISPUTED
+        trigger: "POST /audits/{id}/dispute"
+        actor: Pharmacist (owning pharmacy only)
+        preconditions:
+          - "PharmacyAudit.status == FINDINGS_RECORDED (ERR_AUDIT_INVALID_STATE)"
+        side_effects:
+          - "dispute_reason recorded"
+      - from: OPEN
+        to: CLOSED_NO_FINDINGS
+        trigger: "POST /audits/{id}/close (no findings ever recorded)"
+        actor: Auditor
+        preconditions:
+          - "PharmacyAudit.status in {OPEN, FINDINGS_RECORDED} (ERR_AUDIT_INVALID_STATE — DISPUTED must be resolved by revised findings first)"
+        side_effects:
+          - "total_clawback_cents = 0"
+      - from: FINDINGS_RECORDED
+        to: CLOSED_WITH_FINDINGS
+        trigger: "POST /audits/{id}/close"
+        actor: Auditor
+        preconditions:
+          - "PharmacyAudit.status in {OPEN, FINDINGS_RECORDED} (ERR_AUDIT_INVALID_STATE)"
+        side_effects:
+          - "Cascade link 1: universe_paid_claims measured; total_clawback_cents computed per calculations.audit_clawback_total; every claim in findings: audit_status FLAGGED -> CLAWED_BACK"
+          - "Cascade link 2 (caused by each claim's clawback posting): claim.rebate_tag REBATE_ELIGIBLE -> REBATE_VOID; Pharmacy.balance_cents -= total_clawback_cents"
+          - "Cascade link 3 (caused by the balance mutation): if Pharmacy.balance_cents <= -auto_suspend_threshold_cents then Pharmacy.status ACTIVE -> SUSPENDED"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: formulary-entry-update-stale-version
+    parent_entity: FormularyEntry
+    write_endpoint: "PUT /formulary-entries/{id}"
+    occ_field: expected_formulary_entry_version
+    description: |
+      Updating a FormularyEntry whose version has advanced since the client last
+      observed it is rejected: the client's view (e.g., tier, quantity limit, or
+      copay terms it based the edit on) is stale. This is expressed purely as an
+      OCC check on FormularyEntry.version — a request carrying an
+      expected_formulary_entry_version that no longer matches the stored version
+      fails with ERR_STALE_VERSION, regardless of how the stored version advanced.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: claim_pricing
+    trigger: "Claim adjudication (POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess) once all non-pricing edits pass"
+    algorithm: threshold
+    formula: |
+      allowed_cents = drug.unit_cost_cents * quantity + plan.dispensing_fee_cents
+      remaining_ded = max(0, plan.deductible_cents - member.deductible_paid_cents)
+      deductible_applied_cents = min(allowed_cents, remaining_ded)
+      post_ded = allowed_cents - deductible_applied_cents
+      copay_base_cents = entry.copay_flat_cents                                  if entry.copay_type == FLAT
+                       = round_half_up(allowed_cents * entry.copay_percentage / 100)  if PERCENTAGE
+      copay_owed = min(copay_base_cents, post_ded)
+      patient_resp_before_oop = deductible_applied_cents + copay_owed
+      remaining_oop = max(0, plan.oop_max_cents - member.oop_paid_cents)
+      patient_resp = min(patient_resp_before_oop, remaining_oop)
+      plan_paid_cents = allowed_cents - patient_resp
+      # Evaluation order is pinned exactly as written top-to-bottom; plan_paid
+      # depends on patient_resp, which depends on deductible and OOP state.
+    input_set: "The claim being adjudicated; its Drug; the member's Plan; the ACTIVE FormularyEntry matching (plan_id, drug_id); the member's current accumulators"
+    constants: {}
+    precision: "integer cents; PERCENTAGE copay rounds half-up to whole cents at the single rounding point in copay_base_cents"
+    variants: []
+
+  - name: copay_assistance_application
+    trigger: "Immediately after claim_pricing computes patient_resp, when member.card_drug_id == claim.drug_id and member.card_balance_cents > 0"
+    algorithm: waterfall_allocation
+    formula: |
+      if plan.assistance_model == ACCUMULATOR:
+          card_applied_cents = min(member.card_balance_cents,
+                                   max(0, patient_resp - plan.member_min_pay_cents))
+      if plan.assistance_model == MAXIMIZER:
+          cap = plan.card_fill_cap_cents if plan.card_fill_cap_cents > 0 else patient_resp
+          card_applied_cents = min(member.card_balance_cents, patient_resp, cap)
+      member_pays_cents = patient_resp - card_applied_cents
+      # Only member_pays_cents ever accumulates to deductible/OOP; card money
+      # never accumulates under either variant.
+    input_set: "The claim's patient_resp; the member's card fields; the plan's assistance knobs"
+    constants: {}
+    precision: "integer cents; no rounding"
+    variants:
+      - name: ACCUMULATOR
+        when: "plan.assistance_model == ACCUMULATOR"
+        difference: "Card may cover patient_resp only down to plan.member_min_pay_cents; the member always pays at least that floor per fill (unless card balance is short)"
+      - name: MAXIMIZER
+        when: "plan.assistance_model == MAXIMIZER"
+        difference: "Card covers patient_resp up to plan.card_fill_cap_cents per fill (uncapped when cap is 0); no member floor — same inputs produce different member_pays_cents and accumulator increments than ACCUMULATOR"
+
+  - name: member_accumulator_posting
+    trigger: "Claim transition into PAID (forward) and into REVERSED (compensation)"
+    algorithm: aggregation
+    formula: |
+      Forward (PAID):
+        deductible_credit = min(member_pays_cents, deductible_applied_cents)
+        member.deductible_paid_cents += deductible_credit
+        member.oop_paid_cents += member_pays_cents
+      Compensation (REVERSED): subtract the same stored amounts.
+      After either: member.oop_max_reached = (member.oop_paid_cents >= plan.oop_max_cents)   # >= boundary
+    input_set: "The transitioning claim's stored financial fields; the member row; the plan's oop_max_cents"
+    constants: {}
+    precision: "integer cents"
+    variants: []
+
+  - name: pa_quantity_consumption
+    trigger: "Claim transition into PAID when adjudication selected a PA (forward) and into REVERSED (compensation)"
+    algorithm: aggregation
+    formula: |
+      Forward: pa.quantity_consumed += claim.quantity
+      Compensation: pa.quantity_consumed -= claim.quantity
+      remaining_quantity = pa.approved_quantity - pa.quantity_consumed   # must be >= claim.quantity at adjudication
+    input_set: "The claim's pa_id and quantity; the PA row"
+    constants: {}
+    precision: "integer units"
+    variants: []
+
+  - name: dur_screening
+    trigger: "Every claim adjudication (create, resubmit, reprocess) after all formulary/UM edits pass"
+    algorithm: interval_merge
+    formula: |
+      Let W_new = [fill_date, fill_date + days_supply)  — HALF-OPEN: a fill exactly on the day the
+      prior supply runs out (fill_date == prior.fill_date + prior.days_supply) does NOT overlap.
+      Consider only other claims of the same member with status == PAID (REJECTED/REVERSED excluded).
+      EARLY_REFILL (MEDIUM): any PAID claim c of same member AND same drug with
+          c.fill_date < fill_date + days_supply AND fill_date < c.fill_date + c.days_supply
+      THERAPEUTIC_DUPLICATION (MEDIUM): any PAID claim c of same member, c.drug_id != drug_id,
+          drug(c).therapeutic_class == drug.therapeutic_class, same overlap predicate
+      HIGH_DAILY_DOSE (HIGH): quantity > drug.max_daily_dose_units * days_supply  (equality is NOT an alert)
+      Duplicate alert rows are suppressed per (claim_id, alert_type): one row per type per claim.
+    input_set: "The claim; all other PAID claims of the same member; the drug rows involved"
+    constants: {}
+    precision: "date arithmetic in whole days; strict inequality (half-open) for fill windows"
+    variants: []
+
+  - name: step_therapy_satisfaction
+    trigger: "Adjudication edit 12.8 when entry.step_therapy_required is true"
+    algorithm: chronological
+    formula: |
+      satisfied = exists a claim c with c.member_id == claim.member_id,
+                  c.drug_id == entry.step_drug_id, c.status == PAID,
+                  and claim.fill_date - entry.step_therapy_lookback_days <= c.fill_date <= claim.fill_date
+      (both bounds INCLUSIVE: a step-drug fill exactly lookback_days before the new fill_date satisfies)
+    input_set: "Member's PAID claims for the step drug only; REVERSED and REJECTED claims never satisfy"
+    constants: {}
+    precision: "whole days, inclusive both ends"
+    variants: []
+
+  - name: audit_clawback_total
+    trigger: "POST /audits/{id}/close from FINDINGS_RECORDED"
+    algorithm: aggregation
+    formula: |
+      universe_paid_claims = count(pharmacy claims with status == PAID and
+                                   window_start_date <= fill_date <= window_end_date)   # closed interval
+      sample_size = count(findings)
+      CLAIM_LEVEL:  total_clawback_cents = sum(f.clawback_cents for f in findings)
+      EXTRAPOLATED: factor = universe_paid_claims / sample_size
+                    total_clawback_cents = sum(round_half_up(f.clawback_cents * factor) for f in findings)
+      # ROUNDING ORDER PINNED: round each per-claim extrapolated clawback to whole
+      # cents FIRST, then sum. (Sum-then-round is forbidden: e.g. clawbacks
+      # 3333 and 1001 with factor 3/2 -> 5000 + 1502 = 6502, not 6501.)
+      If sample_size == 0: total_clawback_cents = 0 (CLOSED_NO_FINDINGS path).
+    input_set: "The audit's findings; the pharmacy's PAID claims inside the closed window at close time"
+    constants: {}
+    precision: "integer cents; per-claim round_half_up BEFORE summation (pinned order)"
+    variants:
+      - name: CLAIM_LEVEL
+        when: "audit.extrapolation_method == CLAIM_LEVEL"
+        difference: "Only the recorded findings are clawed back; universe size is irrelevant to the total"
+      - name: EXTRAPOLATED
+        when: "audit.extrapolation_method == EXTRAPOLATED"
+        difference: "Each finding is scaled by universe/sample with per-claim rounding; identical findings produce a larger total whenever universe > sample"
+
+  - name: rebate_tagging
+    trigger: "Claim enters PAID (compute) and claim reversal / audit clawback (voiding)"
+    algorithm: aggregation
+    formula: |
+      On PAID: rebate_tag = REBATE_ELIGIBLE if entry.rebate_eligible else REBATE_INELIGIBLE
+      On REJECTED (any path): rebate_tag = REBATE_INELIGIBLE
+      On REVERSED or audit clawback: REBATE_ELIGIBLE -> REBATE_VOID; REBATE_INELIGIBLE unchanged
+    input_set: "The claim; its FormularyEntry.rebate_eligible"
+    constants: {}
+    precision: "n/a"
+    variants: []
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present; role is a known role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role is listed in the endpoint's roles"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "Entity-backed ownership: Pharmacist X-User-ID == claim.pharmacy_id / audit.pharmacy_id; Member X-User-ID == payload member_id (PA create) or owning member (member/claim reads)"
+    error_id: ERR_PHARMACY_MISMATCH
+    http_status: 403
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reverse, POST /claims/{id}/reprocess, POST /audits/{id}/dispute (ERR_PHARMACY_MISMATCH); POST /prior-authorizations, GET /members/{id}, GET /claims, GET /claims/{id} for Member callers (ERR_MEMBER_MISMATCH)"
+  - priority: 4
+    category: existence
+    check: "Path ids then body FKs resolve to existing rows, left to right (plan/drug/member/pharmacy/claim/PA/audit/formulary-entry). A Pharmacist X-User-ID that matches no Pharmacy yields ERR_PHARMACY_NOT_FOUND here"
+    error_id: ERR_PLAN_NOT_FOUND | ERR_DRUG_NOT_FOUND | ERR_MEMBER_NOT_FOUND | ERR_PHARMACY_NOT_FOUND | ERR_CLAIM_NOT_FOUND | ERR_PA_NOT_FOUND | ERR_AUDIT_NOT_FOUND | ERR_FORMULARY_ENTRY_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "Endpoint state preconditions: claim writes require dispensing Pharmacy.status == ACTIVE (ERR_PHARMACY_SUSPENDED); reverse requires claim PAID (ERR_CLAIM_NOT_PAID); reprocess requires REVERSED (ERR_CLAIM_NOT_REVERSED); resubmit requires REJECTED (ERR_CLAIM_NOT_REJECTED); approve/deny require PA PENDING (ERR_PA_NOT_PENDING); plan activate requires DRAFT then >=1 formulary entry (ERR_PLAN_INVALID_STATE before ERR_PLAN_NO_FORMULARY_ENTRIES); plan retire requires ACTIVE (ERR_PLAN_INVALID_STATE); audit findings require status in {OPEN, FINDINGS_RECORDED, DISPUTED}, dispute requires FINDINGS_RECORDED, close requires {OPEN, FINDINGS_RECORDED} (ERR_AUDIT_INVALID_STATE); reinstate requires SUSPENDED (ERR_PHARMACY_NOT_SUSPENDED) then balance_cents > -threshold (ERR_PHARMACY_DEBT_OUTSTANDING)"
+    error_id: ERR_PHARMACY_SUSPENDED | ERR_CLAIM_NOT_PAID | ERR_CLAIM_NOT_REVERSED | ERR_CLAIM_NOT_REJECTED | ERR_PA_NOT_PENDING | ERR_PLAN_INVALID_STATE | ERR_PLAN_NO_FORMULARY_ENTRIES | ERR_AUDIT_INVALID_STATE | ERR_PHARMACY_NOT_SUSPENDED | ERR_PHARMACY_DEBT_OUTSTANDING
+    http_status: 409
+    applies_to: "stateful action endpoints"
+  - priority: 6
+    category: state
+    check: "OCC: PUT /formulary-entries/{id} requires expected_formulary_entry_version == stored version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "PUT /formulary-entries/{id}"
+  - priority: 7
+    category: business_constraint
+    check: "Request shape: required fields present; integers parse; quantity > 0; days_supply > 0; dates valid ISO and start <= end; enums valid (channel, copay_type, extrapolation_method, override_code); tier in 1..4; copay field present for copay_type; step_drug_id present iff step_therapy_required; findings non-empty and each clawback_cents > 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+  - priority: 8
+    category: business_constraint
+    check: "Uniqueness: Drug.ndc unique (ERR_INVALID_REQUEST); FormularyEntry (plan_id, drug_id) unique across all statuses (ERR_DUPLICATE_FORMULARY_ENTRY); Member.external_ref unique (ERR_INVALID_REQUEST); Pharmacy.ncpdp_id unique (ERR_INVALID_REQUEST); no second PA with status in {PENDING, APPROVED} for same (member_id, drug_id) (ERR_DUPLICATE_ACTIVE_PA)"
+    error_id: ERR_INVALID_REQUEST | ERR_DUPLICATE_FORMULARY_ENTRY | ERR_DUPLICATE_ACTIVE_PA
+    http_status: "400 for ERR_INVALID_REQUEST (ndc/external_ref/ncpdp_id uniqueness); 409 for ERR_DUPLICATE_FORMULARY_ENTRY and ERR_DUPLICATE_ACTIVE_PA"
+    applies_to: "POST /drugs, POST /formulary-entries, POST /members, POST /pharmacies, POST /prior-authorizations"
+  - priority: 9
+    category: business_temporal
+    check: "Audit window overlap: no second audit on the same pharmacy with status in {OPEN, FINDINGS_RECORDED, DISPUTED} whose CLOSED window [window_start_date, window_end_date] intersects — both bounds inclusive, so merely touching boundaries (new.start == existing.end) IS an overlap. Window start <= end itself is priority 7"
+    error_id: ERR_AUDIT_WINDOW_OVERLAP
+    http_status: 422
+    applies_to: "POST /audits"
+  - priority: 10
+    category: business_referential
+    check: "Audit findings referential: every findings claim_id exists (priority 4), belongs to the audit's pharmacy, has status PAID, fill_date within the audit window (closed), and audit_status == UNAUDITED"
+    error_id: ERR_CLAIM_NOT_AUDITABLE
+    http_status: 422
+    applies_to: "POST /audits/{id}/findings"
+  - priority: 12.1
+    category: business_temporal
+    check: "Adjudication edit 1 (claims only): member.status == ACTIVE and eligibility_start_date <= fill_date <= eligibility_end_date (both inclusive)"
+    error_id: ERR_MEMBER_INELIGIBLE
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.2
+    category: business_constraint
+    check: "Adjudication edit 2: member's Plan.status == ACTIVE"
+    error_id: ERR_PLAN_NOT_ACTIVE
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.3
+    category: business_referential
+    check: "Adjudication edit 3: an ACTIVE FormularyEntry exists for (member.plan_id, claim.drug_id)"
+    error_id: ERR_DRUG_NOT_ON_FORMULARY
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.4
+    category: business_constraint
+    check: "Adjudication edit 4: if drug.is_specialty then dispensing pharmacy.channel == SPECIALTY"
+    error_id: ERR_SPECIALTY_CHANNEL_REQUIRED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.5
+    category: business_safety
+    check: "Adjudication edit 5: if entry.pa_required, an APPROVED PA exists for (member, drug). Selector: PAs with status APPROVED; rank expires_at ASC; tie-break created_at ASC"
+    error_id: ERR_PRIOR_AUTH_REQUIRED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.6
+    category: business_safety
+    check: "Adjudication edit 6: selected PA usable at fill_date: expires_at >= fill_date (inclusive); if all APPROVED PAs are expired at fill_date"
+    error_id: ERR_PA_EXPIRED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.7
+    category: business_safety
+    check: "Adjudication edit 7: claim.quantity <= selected PA's remaining quantity (approved_quantity - quantity_consumed)"
+    error_id: ERR_PA_QUANTITY_EXCEEDED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.8
+    category: business_safety
+    check: "Adjudication edit 8: if entry.step_therapy_required, calculations.step_therapy_satisfaction holds"
+    error_id: ERR_STEP_THERAPY_NOT_MET
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.9
+    category: business_safety
+    check: "Adjudication edit 9: quantity <= entry.quantity_limit_per_fill (equality passes)"
+    error_id: ERR_QUANTITY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.10
+    category: business_safety
+    check: "Adjudication edit 10: days_supply <= entry.max_days_supply (equality passes)"
+    error_id: ERR_DAYS_SUPPLY_EXCEEDED
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+  - priority: 12.11
+    category: business_safety
+    check: "Adjudication edit 11 (DUR hard stop): no DurAlert of this claim with severity HIGH and status OPEN (after applying this call's dur_overrides)"
+    error_id: ERR_DUR_HARD_STOP
+    http_status: 422
+    applies_to: "POST /claims, POST /claims/{id}/resubmit, POST /claims/{id}/reprocess"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - { method: POST, path: "/plans", description: "Create a benefit plan (status DRAFT)", roles: [PbmAdmin], code: 201, input: [name, deductible_cents, oop_max_cents, assistance_model, member_min_pay_cents, card_fill_cap_cents, dispensing_fee_cents], output: Plan, side_effects: [] }
+  - { method: GET, path: "/plans/{id}", description: "Fetch one plan", roles: [PbmAdmin, Pharmacist, Member, ClinicalReviewer, Auditor], code: 200, input: [], output: Plan, side_effects: [] }
+  - { method: POST, path: "/plans/{id}/activate", description: "DRAFT -> ACTIVE; requires >= 1 formulary entry", roles: [PbmAdmin], code: 200, input: [], output: Plan, side_effects: ["Plan.status -> ACTIVE"] }
+  - { method: POST, path: "/plans/{id}/retire", description: "ACTIVE -> RETIRED; cascades: formulary entries INACTIVE, members TERMINATED, their PENDING/APPROVED PAs CANCELLED", roles: [PbmAdmin], code: 200, input: [], output: Plan, side_effects: ["Plan retire cascade (state_machines.Plan)"] }
+
+  - { method: POST, path: "/drugs", description: "Register a drug (NDC unique)", roles: [PbmAdmin], code: 201, input: [ndc, name, therapeutic_class, unit_cost_cents, max_daily_dose_units, "is_specialty?"], output: Drug, side_effects: [] }
+  - { method: GET, path: "/drugs/{id}", description: "Fetch one drug", roles: [PbmAdmin, Pharmacist, Member, ClinicalReviewer, Auditor], code: 200, input: [], output: Drug, side_effects: [] }
+
+  - { method: POST, path: "/formulary-entries", description: "Add a drug to a plan's formulary with tier/UM/pricing terms; (plan_id, drug_id) unique", roles: [PbmAdmin], code: 201, input: [plan_id, drug_id, tier, quantity_limit_per_fill, max_days_supply, copay_type, "pa_required?", "step_therapy_required?", "step_drug_id?", "step_therapy_lookback_days?", "copay_flat_cents?", "copay_percentage?", "rebate_eligible?"], output: FormularyEntry, side_effects: [] }
+  - { method: GET, path: "/formulary-entries", description: "List formulary entries, filterable by plan/drug/step-drug", roles: [PbmAdmin, Pharmacist, Member, ClinicalReviewer, Auditor], code: 200, input: ["plan_id?", "drug_id?", "step_drug_id?", "limit?", "offset?"], output: "FormularyEntry[]", side_effects: [] }
+  - { method: GET, path: "/formulary-entries/{id}", description: "Fetch one formulary entry", roles: [PbmAdmin, Pharmacist, Member, ClinicalReviewer, Auditor], code: 200, input: [], output: FormularyEntry, side_effects: [] }
+  - { method: PUT, path: "/formulary-entries/{id}", description: "Update formulary terms; OCC: expected_formulary_entry_version must match stored version", roles: [PbmAdmin], code: 200, input: [expected_formulary_entry_version, "tier?", "pa_required?", "step_therapy_required?", "step_drug_id?", "step_therapy_lookback_days?", "quantity_limit_per_fill?", "max_days_supply?", "copay_type?", "copay_flat_cents?", "copay_percentage?", "rebate_eligible?"], output: FormularyEntry, side_effects: ["increments FormularyEntry.version by 1"] }
+
+  - { method: POST, path: "/pharmacies", description: "Register a network pharmacy (NCPDP id unique)", roles: [PbmAdmin], code: 201, input: [ncpdp_id, name, channel, auto_suspend_threshold_cents], output: Pharmacy, side_effects: [] }
+  - { method: GET, path: "/pharmacies/{id}", description: "Fetch one pharmacy (balance, status)", roles: [PbmAdmin, Pharmacist, Auditor], code: 200, input: [], output: Pharmacy, side_effects: [] }
+  - { method: POST, path: "/pharmacies/{id}/balance-adjustments", description: "Record a payment/adjustment against the pharmacy ledger; amount_cents may be positive (settlement) or negative", roles: [PbmAdmin], code: 200, input: [amount_cents, reason], output: Pharmacy, side_effects: ["Pharmacy.balance_cents += amount_cents", "increments Pharmacy.version by 1", "auto-suspend check"] }
+  - { method: POST, path: "/pharmacies/{id}/reinstate", description: "SUSPENDED -> ACTIVE; requires balance_cents > -auto_suspend_threshold_cents", roles: [PbmAdmin], code: 200, input: [], output: Pharmacy, side_effects: ["Pharmacy.status -> ACTIVE", "increments Pharmacy.version by 1"] }
+
+  - { method: POST, path: "/members", description: "Enroll a member into a plan with optional copay card (card_drug_id + card_balance_cents)", roles: [PbmAdmin], code: 201, input: [plan_id, external_ref, full_name, eligibility_start_date, eligibility_end_date, "card_drug_id?", "card_balance_cents?"], output: Member, side_effects: [] }
+  - { method: GET, path: "/members", description: "List members; filter by plan or card drug", roles: [PbmAdmin, ClinicalReviewer, Auditor], code: 200, input: ["plan_id?", "card_drug_id?", "limit?", "offset?"], output: "Member[]", side_effects: [] }
+  - { method: GET, path: "/members/{id}", description: "Fetch one member (accumulators, card balance). Member role may read self only", roles: [PbmAdmin, Member, ClinicalReviewer, Auditor], code: 200, input: [], output: Member, side_effects: [] }
+
+  - { method: POST, path: "/prior-authorizations", description: "Member requests a PA for a drug; member_id must equal caller X-User-ID; no second active (PENDING/APPROVED) PA per (member, drug)", roles: [Member], code: 201, input: [member_id, drug_id, requested_quantity, "note?"], output: PriorAuthorization, side_effects: [] }
+  - { method: GET, path: "/prior-authorizations", description: "List PAs; filter by member/drug/status", roles: [PbmAdmin, Member, Pharmacist, ClinicalReviewer, Auditor], code: 200, input: ["member_id?", "drug_id?", "status?", "limit?", "offset?"], output: "PriorAuthorization[]", side_effects: [] }
+  - { method: GET, path: "/prior-authorizations/{id}", description: "Fetch one PA (quantity_consumed, expiry)", roles: [PbmAdmin, Member, Pharmacist, ClinicalReviewer, Auditor], code: 200, input: [], output: PriorAuthorization, side_effects: [] }
+  - { method: POST, path: "/prior-authorizations/{id}/approve", description: "PENDING -> APPROVED with quantity and expiry", roles: [ClinicalReviewer], code: 200, input: [approved_quantity, expires_at], output: PriorAuthorization, side_effects: ["sets approved_quantity, expires_at, decided_by", "increments PriorAuthorization.version by 1"] }
+  - { method: POST, path: "/prior-authorizations/{id}/deny", description: "PENDING -> DENIED with reason", roles: [ClinicalReviewer], code: 200, input: [denial_reason], output: PriorAuthorization, side_effects: ["sets denial_reason, decided_by", "increments PriorAuthorization.version by 1"] }
+
+  - { method: POST, path: "/claims", description: "Point-of-sale claim submission; pharmacy is the caller's X-User-ID. Runs the pinned adjudication pipeline (validations 12.1-12.11) plus pricing, card application, DUR screening. All edits pass -> 201 with status PAID. Any edit fails -> claim persisted with status REJECTED and HTTP 422 whose error_id is the FIRST failed edit; claim.reject_reasons lists all failed edits in edit order", roles: [Pharmacist], code: 201, input: [member_id, drug_id, prescription_number, fill_date, quantity, days_supply], output: Claim, side_effects: ["claim payment cascade (state_machines.Claim (new)->PAID): accumulators, card debit, PA consumption, pharmacy balance, rebate_tag", "DurAlert creation per calculations.dur_screening"] }
+  - { method: GET, path: "/claims", description: "List claims; Pharmacist callers see only own pharmacy's claims, Member callers only their own", roles: [PbmAdmin, Pharmacist, Member, Auditor], code: 200, input: ["member_id?", "pharmacy_id?", "drug_id?", "pa_id?", "status?", "limit?", "offset?"], output: "Claim[]", side_effects: [] }
+  - { method: GET, path: "/claims/{id}", description: "Fetch one claim (same ownership scoping)", roles: [PbmAdmin, Pharmacist, Member, Auditor], code: 200, input: [], output: Claim, side_effects: [] }
+  - { method: POST, path: "/claims/{id}/resubmit", description: "Re-adjudicate a REJECTED claim, optionally carrying dur_overrides: [{alert_id, override_code}]. Overrides for alerts not OPEN are ignored. Passes -> 200 PAID; still failing -> 422, claim stays REJECTED", roles: [Pharmacist], code: 200, input: ["dur_overrides?"], output: Claim, side_effects: ["alert overrides", "resubmit_count += 1", "payment cascade when edits pass"] }
+  - { method: POST, path: "/claims/{id}/reverse", description: "PAID -> REVERSED; full compensation of accumulators, card balance, PA consumption, pharmacy balance; rebate tag voided", roles: [Pharmacist], code: 200, input: [reversal_reason], output: Claim, side_effects: ["reversal compensation cascade (state_machines.Claim PAID->REVERSED)"] }
+  - { method: POST, path: "/claims/{id}/reprocess", description: "REVERSED -> re-adjudicate with corrected values (omitted fields keep stored values). Passes -> 200 PAID; fails -> 422, claim REJECTED", roles: [Pharmacist], code: 200, input: ["quantity?", "days_supply?", "fill_date?"], output: Claim, side_effects: ["OPEN alerts SUPERSEDED; DUR re-run", "payment cascade when edits pass"] }
+  - { method: GET, path: "/claims/{id}/dur-alerts", description: "List DUR alerts raised for a claim", roles: [PbmAdmin, Pharmacist, Auditor], code: 200, input: ["limit?", "offset?"], output: "DurAlert[]", side_effects: [] }
+
+  - { method: POST, path: "/audits", description: "Open a pharmacy audit over a closed date window; overlapping open-window audits on the same pharmacy rejected", roles: [Auditor], code: 201, input: [pharmacy_id, window_start_date, window_end_date, extrapolation_method], output: PharmacyAudit, side_effects: [] }
+  - { method: GET, path: "/audits", description: "List audits; filter by pharmacy/status", roles: [PbmAdmin, Pharmacist, Auditor], code: 200, input: ["pharmacy_id?", "status?", "limit?", "offset?"], output: "PharmacyAudit[]", side_effects: [] }
+  - { method: GET, path: "/audits/{id}", description: "Fetch one audit (findings, totals)", roles: [PbmAdmin, Pharmacist, Auditor], code: 200, input: [], output: PharmacyAudit, side_effects: [] }
+  - { method: POST, path: "/audits/{id}/findings", description: "Record/revise findings [{claim_id, clawback_cents}] wholesale; referenced claims become FLAGGED, dropped claims return to UNAUDITED", roles: [Auditor], code: 200, input: [findings], output: PharmacyAudit, side_effects: ["findings replaced; sample_size recomputed; claim audit_status transitions"] }
+  - { method: POST, path: "/audits/{id}/dispute", description: "FINDINGS_RECORDED -> DISPUTED by the audited pharmacy's pharmacist", roles: [Pharmacist], code: 200, input: [dispute_reason], output: PharmacyAudit, side_effects: ["dispute_reason recorded"] }
+  - { method: POST, path: "/audits/{id}/close", description: "OPEN -> CLOSED_NO_FINDINGS, or FINDINGS_RECORDED -> CLOSED_WITH_FINDINGS with clawback cascade (computes total_clawback_cents, claws back claims, debits pharmacy balance, may suspend pharmacy)", roles: [Auditor], code: 200, input: [], output: PharmacyAudit, side_effects: ["audit clawback cascade (state_machines.PharmacyAudit)"] }
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or unknown auth headers (priority 1)" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not in the endpoint's roles (priority 2)" }
+  - { id: ERR_PHARMACY_MISMATCH, http: 403, condition: "Pharmacist X-User-ID does not own the target claim/audit (priority 3)" }
+  - { id: ERR_MEMBER_MISMATCH, http: 403, condition: "Member X-User-ID does not match the member_id acted upon (priority 3)" }
+  - { id: ERR_PLAN_NOT_FOUND, http: 404, condition: "plan_id / {id} does not resolve to a Plan" }
+  - { id: ERR_DRUG_NOT_FOUND, http: 404, condition: "drug_id / step_drug_id / card_drug_id / {id} does not resolve to a Drug" }
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "member_id / {id} does not resolve to a Member" }
+  - { id: ERR_PHARMACY_NOT_FOUND, http: 404, condition: "pharmacy_id / {id} / Pharmacist X-User-ID does not resolve to a Pharmacy" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "{id} / findings claim_id does not resolve to a Claim" }
+  - { id: ERR_PA_NOT_FOUND, http: 404, condition: "{id} does not resolve to a PriorAuthorization" }
+  - { id: ERR_AUDIT_NOT_FOUND, http: 404, condition: "{id} does not resolve to a PharmacyAudit" }
+  - { id: ERR_FORMULARY_ENTRY_NOT_FOUND, http: 404, condition: "{id} does not resolve to a FormularyEntry" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Request-shape violation (priority 7) or ndc/external_ref uniqueness (priority 8): missing required field, non-positive quantity/days_supply/clawback, invalid enum/date, tier out of 1..4, copay field missing for copay_type, step_drug_id missing while step_therapy_required, empty findings, duplicate ndc/external_ref/ncpdp_id" }
+  - { id: ERR_PHARMACY_SUSPENDED, http: 409, condition: "Claim write endpoint called by a SUSPENDED pharmacy (priority 5)" }
+  - { id: ERR_CLAIM_NOT_PAID, http: 409, condition: "Reverse attempted on a claim not in PAID" }
+  - { id: ERR_CLAIM_NOT_REVERSED, http: 409, condition: "Reprocess attempted on a claim not in REVERSED" }
+  - { id: ERR_CLAIM_NOT_REJECTED, http: 409, condition: "Resubmit attempted on a claim not in REJECTED" }
+  - { id: ERR_PA_NOT_PENDING, http: 409, condition: "Approve/deny attempted on a PA not in PENDING" }
+  - { id: ERR_PLAN_INVALID_STATE, http: 409, condition: "Activate requires DRAFT; retire requires ACTIVE" }
+  - { id: ERR_PLAN_NO_FORMULARY_ENTRIES, http: 409, condition: "Activate attempted with zero formulary entries" }
+  - { id: ERR_AUDIT_INVALID_STATE, http: 409, condition: "Findings/dispute/close attempted from a disallowed audit status (incl. close from DISPUTED)" }
+  - { id: ERR_PHARMACY_NOT_SUSPENDED, http: 409, condition: "Reinstate attempted on a pharmacy not in SUSPENDED" }
+  - { id: ERR_PHARMACY_DEBT_OUTSTANDING, http: 409, condition: "Reinstate attempted while balance_cents <= -auto_suspend_threshold_cents" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_formulary_entry_version does not match stored FormularyEntry.version" }
+  - { id: ERR_DUPLICATE_FORMULARY_ENTRY, http: 409, condition: "A FormularyEntry already exists for (plan_id, drug_id) in any status" }
+  - { id: ERR_DUPLICATE_ACTIVE_PA, http: 409, condition: "A PA with status PENDING or APPROVED already exists for (member_id, drug_id)" }
+  - { id: ERR_AUDIT_WINDOW_OVERLAP, http: 422, condition: "New audit's closed window touches/overlaps an existing non-closed audit window on the same pharmacy (inclusive bounds)" }
+  - { id: ERR_CLAIM_NOT_AUDITABLE, http: 422, condition: "Findings reference a claim that belongs to another pharmacy, is not PAID, lies outside the audit window, or is not UNAUDITED" }
+  - { id: ERR_MEMBER_INELIGIBLE, http: 422, condition: "Adjudication edit 1: member not ACTIVE or fill_date outside the inclusive eligibility window" }
+  - { id: ERR_PLAN_NOT_ACTIVE, http: 422, condition: "Adjudication edit 2: member's plan not ACTIVE" }
+  - { id: ERR_DRUG_NOT_ON_FORMULARY, http: 422, condition: "Adjudication edit 3: no ACTIVE formulary entry for (plan, drug)" }
+  - { id: ERR_SPECIALTY_CHANNEL_REQUIRED, http: 422, condition: "Adjudication edit 4: specialty drug submitted by a non-SPECIALTY channel pharmacy" }
+  - { id: ERR_PRIOR_AUTH_REQUIRED, http: 422, condition: "Adjudication edit 5: entry requires PA and no APPROVED PA exists for (member, drug)" }
+  - { id: ERR_PA_EXPIRED, http: 422, condition: "Adjudication edit 6: all APPROVED PAs expired before fill_date (expires_at >= fill_date is usable)" }
+  - { id: ERR_PA_QUANTITY_EXCEEDED, http: 422, condition: "Adjudication edit 7: quantity exceeds PA remaining quantity" }
+  - { id: ERR_STEP_THERAPY_NOT_MET, http: 422, condition: "Adjudication edit 8: no PAID step-drug claim inside the inclusive lookback window" }
+  - { id: ERR_QUANTITY_LIMIT_EXCEEDED, http: 422, condition: "Adjudication edit 9: quantity > quantity_limit_per_fill (equality passes)" }
+  - { id: ERR_DAYS_SUPPLY_EXCEEDED, http: 422, condition: "Adjudication edit 10: days_supply > max_days_supply (equality passes)" }
+  - { id: ERR_DUR_HARD_STOP, http: 422, condition: "Adjudication edit 11: an OPEN HIGH-severity DUR alert remains after this call's overrides" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: PbmAdmin
+    description: "PBM operations administrator; owns all configuration (plans, drugs, formulary, pharmacies, members) and pharmacy finance operations"
+    identity: opaque
+    exclusive_operations: ["POST /plans", "POST /plans/{id}/activate", "POST /plans/{id}/retire", "POST /drugs", "POST /formulary-entries", "PUT /formulary-entries/{id}", "POST /pharmacies", "POST /pharmacies/{id}/balance-adjustments", "POST /pharmacies/{id}/reinstate", "POST /members"]
+    shared_operations: ["all GET endpoints"]
+  - name: Pharmacist
+    description: "Dispensing pharmacy operator; submits and manages claims for their own pharmacy, disputes audits of their own pharmacy"
+    identity: "entity_backed:Pharmacy"
+    exclusive_operations: ["POST /claims", "POST /claims/{id}/resubmit", "POST /claims/{id}/reverse", "POST /claims/{id}/reprocess", "POST /audits/{id}/dispute"]
+    shared_operations: ["GET /plans/{id}", "GET /drugs/{id}", "GET /formulary-entries", "GET /formulary-entries/{id}", "GET /pharmacies/{id}", "GET /prior-authorizations", "GET /prior-authorizations/{id}", "GET /claims", "GET /claims/{id}", "GET /claims/{id}/dur-alerts", "GET /audits", "GET /audits/{id}"]
+  - name: Member
+    description: "Plan member/patient; requests prior authorizations for self, reads own record and claims"
+    identity: "entity_backed:Member"
+    exclusive_operations: ["POST /prior-authorizations"]
+    shared_operations: ["GET /plans/{id}", "GET /drugs/{id}", "GET /formulary-entries", "GET /formulary-entries/{id}", "GET /members/{id} (self only)", "GET /prior-authorizations", "GET /prior-authorizations/{id}", "GET /claims", "GET /claims/{id} (own only)"]
+  - name: ClinicalReviewer
+    description: "PBM clinical reviewer; decides prior authorizations"
+    identity: opaque
+    exclusive_operations: ["POST /prior-authorizations/{id}/approve", "POST /prior-authorizations/{id}/deny"]
+    shared_operations: ["GET /plans/{id}", "GET /drugs/{id}", "GET /formulary-entries", "GET /formulary-entries/{id}", "GET /members", "GET /members/{id}", "GET /prior-authorizations", "GET /prior-authorizations/{id}"]
+  - name: Auditor
+    description: "PBM audit officer; opens and closes pharmacy audits and records findings"
+    identity: opaque
+    exclusive_operations: ["POST /audits", "POST /audits/{id}/findings", "POST /audits/{id}/close"]
+    shared_operations: ["GET /plans/{id}", "GET /drugs/{id}", "GET /formulary-entries", "GET /formulary-entries/{id}", "GET /pharmacies/{id}", "GET /members", "GET /members/{id}", "GET /prior-authorizations", "GET /prior-authorizations/{id}", "GET /claims", "GET /claims/{id}", "GET /claims/{id}/dur-alerts", "GET /audits", "GET /audits/{id}"]

@@ -13,6 +13,7 @@ Mirrors the pattern of checking server health before each test to prevent cascad
 
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -55,6 +56,39 @@ def _kill_port(port: int) -> None:
     )
 
 
+def _port_free(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return False
+    except OSError:
+        return True
+
+
+def _spawn_server(port: int, cwd: str, command: str, log_path: str):
+    """Spawn one server subprocess (detached, output to log) and return the
+    Popen handle so the poll loop can detect an instant crash (e.g.
+    EADDRINUSE) and respawn instead of polling a dead process forever."""
+    env = _inject_dnsboot({**os.environ, "PORT": str(port)})
+    log = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=cwd,
+            env=env,
+            stdout=log,
+            stderr=log,
+            start_new_session=True,
+        )
+    except OSError:
+        log.close()
+        return None
+    # Child holds its own dup of the fd; close the parent's copy so a long
+    # per-test-server run doesn't leak one fd per restart.
+    log.close()
+    return proc
+
+
 def _restart_server() -> bool:
     """
     Emergency restart from within the pytest process.
@@ -67,31 +101,65 @@ def _restart_server() -> bool:
     port = _extract_port(_api_url)
     _kill_port(port)
 
+    # SIGKILL teardown is asynchronous: wait until the listener is actually
+    # gone before rebinding, otherwise the new server can crash on EADDRINUSE.
+    for _ in range(20):  # up to ~2s
+        if _port_free(port):
+            break
+        time.sleep(0.1)
+
     directory, command = _parse_command(_start_command)
     cwd = os.path.abspath(directory)
-    env = _inject_dnsboot({**os.environ, "PORT": str(port)})
+    log_path = os.path.join(
+        os.environ.get("TMPDIR", "/tmp"),
+        f"prd_bench_server_{port}.log",
+    )
 
-    try:
-        subprocess.Popen(
-            command,
-            shell=True,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except OSError:
+    # Poll for up to ~30 seconds (60 x 0.5s; nominal — a slow GET can stretch
+    # each iteration). The window is generous because the concurrent stability
+    # sweep runs 8+ suites in lockstep on shared hosts, where a transient
+    # CPU/IO stall can starve an otherwise-healthy boot past a shorter window
+    # and surface as a spurious "could not be restarted". Both knobs are
+    # env-overridable; a genuinely dead server still fails the poll.
+    iters = int(os.environ.get("_PRD_BENCH_RESTART_POLL_ITERS", "60"))
+    req_timeout = float(os.environ.get("_PRD_BENCH_RESTART_POLL_TIMEOUT", "1.0"))
+    proc = _spawn_server(port, cwd, command, log_path)
+    if proc is None:
         return False
-
-    # Poll for up to 15 seconds
-    for _ in range(30):
+    respawns = 0
+    for _ in range(iters):
+        # Instant-crash detection (e.g. bind failure): respawn instead of
+        # burning the whole poll window on a process that will never serve.
+        if proc.poll() is not None:
+            if respawns >= 3:
+                logger.warning(
+                    f"Server on port {port} exited immediately "
+                    f"(code={proc.returncode}); giving up after {respawns} respawns. "
+                    f"See {log_path}"
+                )
+                return False
+            respawns += 1
+            logger.info(
+                f"Server on port {port} exited immediately "
+                f"(code={proc.returncode}), respawning ({respawns}/3). See {log_path}"
+            )
+            for _ in range(10):  # brief settle before rebind
+                if _port_free(port):
+                    break
+                time.sleep(0.1)
+            proc = _spawn_server(port, cwd, command, log_path)
+            if proc is None:
+                return False
         time.sleep(0.5)
         try:
-            requests.get(_api_url, timeout=0.4)
+            requests.get(_api_url, timeout=req_timeout)
             return True
         except (requests.ConnectionError, requests.Timeout):
             continue
+    logger.warning(
+        f"Server on port {port} did not respond within the restart poll "
+        f"window ({iters} iters). See {log_path}"
+    )
     return False
 
 

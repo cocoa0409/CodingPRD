@@ -1,0 +1,87 @@
+"""Error classes and error ID constants (PRD §5 error catalogue)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+# --- Auth ---
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+
+# --- Existence ---
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+
+# --- Request shape ---
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_VALIDATION = "ERR_VALIDATION"
+ERR_BLOCKLIST_SCOPE_MISMATCH = "ERR_BLOCKLIST_SCOPE_MISMATCH"
+ERR_INVALID_TIME_RANGE = "ERR_INVALID_TIME_RANGE"
+ERR_PG_COMMITMENT_MISMATCH = "ERR_PG_COMMITMENT_MISMATCH"
+ERR_RECONCILIATION_INPUT_MISMATCH = "ERR_RECONCILIATION_INPUT_MISMATCH"
+ERR_SUPPLY_CHAIN_TOO_DEEP = "ERR_SUPPLY_CHAIN_TOO_DEEP"
+ERR_DUPLICATE_SEAT = "ERR_DUPLICATE_SEAT"
+
+# --- State ---
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_PUBLISHER_SUSPENDED = "ERR_PUBLISHER_SUSPENDED"
+ERR_PACKAGE_NOT_ACTIVE = "ERR_PACKAGE_NOT_ACTIVE"
+ERR_PARTNER_NOT_ACTIVE = "ERR_PARTNER_NOT_ACTIVE"
+ERR_DEAL_NOT_EDITABLE = "ERR_DEAL_NOT_EDITABLE"
+ERR_DEAL_WINDOW_CLOSED = "ERR_DEAL_WINDOW_CLOSED"
+ERR_ALREADY_CONFIRMED = "ERR_ALREADY_CONFIRMED"
+ERR_ALREADY_VOIDED = "ERR_ALREADY_VOIDED"
+ERR_VOID_AFTER_SETTLEMENT = "ERR_VOID_AFTER_SETTLEMENT"
+ERR_REPORT_ALREADY_TERMINAL = "ERR_REPORT_ALREADY_TERMINAL"
+ERR_BATCH_NOT_SUBMITTABLE = "ERR_BATCH_NOT_SUBMITTABLE"
+ERR_BATCH_NOT_PENDING_APPROVAL = "ERR_BATCH_NOT_PENDING_APPROVAL"
+ERR_BATCH_NOT_APPROVED = "ERR_BATCH_NOT_APPROVED"
+ERR_BATCH_NOT_SETTLED = "ERR_BATCH_NOT_SETTLED"
+ERR_LINE_NOT_PENDING = "ERR_LINE_NOT_PENDING"
+ERR_LINE_NOT_HELD = "ERR_LINE_NOT_HELD"
+ERR_LINE_NOT_WRITABLE_OFF = "ERR_LINE_NOT_WRITABLE_OFF"
+ERR_ENTRY_ALREADY_LIFTED = "ERR_ENTRY_ALREADY_LIFTED"
+ERR_PARTNER_NOT_RESUMABLE = "ERR_PARTNER_NOT_RESUMABLE"
+ERR_SEASONAL_WINDOW_OVERLAP = "ERR_SEASONAL_WINDOW_OVERLAP"
+ERR_PAYOUT_PERIOD_OVERLAP = "ERR_PAYOUT_PERIOD_OVERLAP"
+ERR_SUPPLY_CHAIN_NOT_TAIL = "ERR_SUPPLY_CHAIN_NOT_TAIL"
+
+# --- OCC ---
+ERR_STALE_VERSION = "ERR_STALE_VERSION"
+
+
+def unauthenticated(msg="X-User-ID or X-User-Role header missing or malformed"):
+    return ApiError(ERR_UNAUTHENTICATED, 401, msg)
+
+
+def unauthorized(msg="Caller role is not permitted for this endpoint"):
+    return ApiError(ERR_UNAUTHORIZED, 403, msg)
+
+
+def segregation_of_duties(msg="Payout batch approver must differ from its creator"):
+    return ApiError(ERR_SEGREGATION_OF_DUTIES, 403, msg)
+
+
+def not_found(msg="Resource not found"):
+    return ApiError(ERR_NOT_FOUND, 404, msg)
+
+
+def invalid_request(msg="Malformed request body"):
+    return ApiError(ERR_INVALID_REQUEST, 400, msg)
+
+
+def validation(msg="Field-level validation failed"):
+    return ApiError(ERR_VALIDATION, 422, msg)
+
+
+def invalid_state(msg="Entity is in a state that does not permit this operation"):
+    return ApiError(ERR_INVALID_STATE, 409, msg)
+
+
+def stale_version(msg="Expected version does not match the current version"):
+    return ApiError(ERR_STALE_VERSION, 412, msg)

@@ -1,0 +1,35 @@
+"""Domain thresholds and default values from the PRD."""
+
+# PRD §2.4: the logical clock reads exactly 2026-08-01T00:00:00Z before any set call.
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Common monetary / configuration defaults used by factories and fixtures.
+DEFAULT_LABOR_RATE_CENTS_PER_HOUR = 6000
+DEFAULT_NOTICE_LEAD_HOURS = 24
+DEFAULT_BUDGET_CENTS = 100_000_000
+DEFAULT_PLAN_YEAR = 2026
+DEFAULT_REPLACEMENT_COST_CENTS = 400_000
+DEFAULT_EXPECTED_LIFE_MONTHS = 120
+DEFAULT_WARRANTY_MONTHS = 24
+DEFAULT_INSTALLED_ON = "2024-01-01T00:00:00Z"
+DEFAULT_FREQUENCY_DAYS = 90
+DEFAULT_ESTIMATED_LABOR_MINUTES = 30
+DEFAULT_EFFECTIVE_FROM = "2026-01-01T00:00:00Z"
+
+# Default batch window / scheduling instants (always after the default clock).
+DEFAULT_WINDOW_START = "2026-08-02T08:00:00Z"
+DEFAULT_WINDOW_END = "2026-08-02T18:00:00Z"
+DEFAULT_SCHEDULED_START = "2026-08-02T09:00:00Z"
+
+# Opaque operator identifiers.
+DEFAULT_TECHNICIAN_ID = "tech-1"
+SECOND_TECHNICIAN_ID = "tech-9"
+DEFAULT_AUDITOR_ID = "aud-1"
+DEFAULT_PROPERTY_MANAGER_ID = "pm-1"
+
+# PRD §3.7: condition factors applied by the CONDITION_BASED forecast variant.
+CONDITION_FACTORS = {1: 0.60, 2: 0.80, 3: 1.00, 4: 1.15, 5: 1.30}
+
+# PRD §3.7: due-soon window sizes by unit occupancy.
+DUE_SOON_WINDOW_OCCUPIED_DAYS = 7
+DUE_SOON_WINDOW_VACANT_DAYS = 1

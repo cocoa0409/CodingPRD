@@ -1,0 +1,1373 @@
+# =============================================================================
+# PRD Benchmark Scaffold — task_1882 LTL Terminal Operations & Linehaul Planning
+# =============================================================================
+
+scenario: |
+  1882. LTL Terminal Operations & Linehaul Planning (Old Dominion style LTL terminal):
+  pickup/delivery route dispatch, dock door assignment & freight sortation by destination,
+  trailer load planning & cube/weight optimization, linehaul schedule & meet-point relay,
+  freight rating (class/NMFC) & re-class inspection, dimensioner measurement & billing
+  adjustment, damage/overage-shortage-damage handling, service standard & on-time reporting
+
+domain_name: ltl-terminal-operations
+api_prefix: /ltl
+
+complexity_profile:
+  primary_archetype: quota_allocation        # trailer cube/weight is a finite pool competed for by shipments
+  secondary_archetype: posture_driven_gating # OutboundTrailer.posture gates all manifest/linehaul operations
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on OutboundTrailer.version for manifest + dispatch writes
+    - cascading_side_effects                 # reclass inspection -> rating delta -> invoice adjustment -> claim recheck
+    - dual_variant_calculation               # GROSS vs DIM chargeable-weight rating; provisional vs final relay ETA
+    - rate_threshold_triggers                # service-standard on-time %, cube/weight utilization breakpoints
+
+  entity_topology: flat                      # peer entities with foreign keys, no URL nesting
+  state_machine_shape: parallel              # Shipment carries (rating_status x handling_status); OutboundTrailer is posture_driven
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate                        # Shipment -> LinehaulLeg via ManifestEntry; Inspection -> Shipment
+  role_model: peer_roles                     # Dispatcher / DockSupervisor / RatingClerk / OS&DClerk own disjoint surfaces
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Terminal
+    parent: null
+    common_fields: true
+    fields:
+      - { name: code, type: string, source: input, description: "Unique 3-letter terminal code (e.g. 'CHI')", constraints: "unique across Terminal; uppercase A-Z, length 3" }
+      - { name: name, type: string, source: input, description: "Human-readable terminal name" }
+      - { name: dock_doors, type: integer, source: input, description: "Total physical dock doors at the terminal", constraints: "integer >= 1" }
+      - { name: timezone, type: string, source: input, description: "IANA timezone used for service-standard cutoff math", default: "America/Chicago" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | CLOSED", default: "ACTIVE" }
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: pro_number, type: string, source: system, description: "Server-minted progressive shipment identifier 'PRO-' + zero-padded serial" }
+      - { name: origin_terminal_id, type: string, source: input, description: "FK -> Terminal.id; terminal receiving the freight" }
+      - { name: destination_terminal_id, type: string, source: input, description: "FK -> Terminal.id; terminal freight is bound for" }
+      - { name: nmfc_class, type: enum, source: input, description: "Declared NMFC freight class", constraints: "CLASS_50 | CLASS_55 | CLASS_60 | CLASS_65 | CLASS_70 | CLASS_85 | CLASS_100 | CLASS_125" }
+      - { name: actual_weight_lbs, type: integer, source: input, description: "Shipper-declared gross weight in whole pounds", constraints: "integer >= 1" }
+      - { name: length_in, type: integer, source: input, description: "Declared length inches", constraints: "integer >= 1" }
+      - { name: width_in, type: integer, source: input, description: "Declared width inches", constraints: "integer >= 1" }
+      - { name: height_in, type: integer, source: input, description: "Declared height inches", constraints: "integer >= 1" }
+      - { name: accessorial_codes, type: array, source: input, description: "Accessorial service codes requested at tender", default: "[]", constraints: "each element in {LIFTGATE, NOTIFY, RESIDENTIAL, INSIDE}" }
+      - { name: service_standard, type: enum, source: input, description: "Committed transit-time product", constraints: "STANDARD | EXPEDITED | GUARANTEED" }
+      - { name: chargeable_weight_lbs, type: integer, source: computed, description: "max(actual_weight_lbs, dim_weight_lbs) after dimensioner; equals actual_weight_lbs until measured" }
+      - { name: dim_weight_lbs, type: integer, source: computed, description: "ceil(L*W*H / DIM_DIVISOR); 0 until a DimensionerScan exists" }
+      - { name: rated_amount_cents, type: integer, source: computed, description: "Current billed amount per active rating variant; 0 until first rating run" }
+      - { name: billed_amount_cents, type: integer, source: computed, description: "Finalized billed amount; 0 until Shipment enters BILLED" }
+      - { name: rating_status, type: enum, source: system, description: "UNRATED -> RATED -> INSPECTION_PENDING -> RERATED -> BILLED; RERATED -> INSPECTION_PENDING loop allowed" }
+      - { name: handling_status, type: enum, source: system, description: "TENDERED -> ON_DOCK -> MANIFESTED -> IN_LINEHAUL -> DELIVERED; or TENDERED/ON_DOCK -> CANCELLED" }
+      - { name: osd_hold, type: boolean, source: computed, description: "true while any linked OsdCase has status OPEN; gates manifesting", default: false }
+      - { name: tendered_at_utc, type: datetime, source: system, description: "Logical-clock instant of shipment tender (creation)" }
+      - { name: committed_delivery_utc, type: datetime, source: computed, description: "tendered_at_utc + SERVICE_DAYS[service_standard] calendar days (terminal-local at destination)" }
+      - { name: delivered_at_utc, type: datetime, source: system, description: "Logical-clock instant the final relay leg arrived; null until DELIVERED" }
+
+  - name: PickupRoute
+    parent: null
+    common_fields: true
+    fields:
+      - { name: terminal_id, type: string, source: input, description: "FK -> Terminal.id; home terminal of this P&D route" }
+      - { name: route_date, type: string, source: input, description: "Service date YYYY-MM-DD (terminal-local)" }
+      - { name: driver_id, type: string, source: input, description: "Opaque driver identifier from the driver roster" }
+      - { name: shift_start_minute, type: integer, source: input, description: "Route start as minute-of-day [0,1439]" }
+      - { name: shift_end_minute, type: integer, source: input, description: "Route end as minute-of-day [1,1440]; must be > shift_start_minute" }
+      - { name: status, type: enum, source: system, description: "PLANNED -> DISPATCHED -> COMPLETED; DISPATCHED -> RECALLED" }
+
+  - name: PickupStop
+    parent: null
+    common_fields: true
+    fields:
+      - { name: route_id, type: string, source: input, description: "FK -> PickupRoute.id; owning route" }
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; shipment collected at this stop" }
+      - { name: stop_sequence, type: integer, source: input, description: "1-based visit order within the route", constraints: "integer >= 1" }
+      - { name: planned_arrival_minute, type: integer, source: input, description: "Planned arrival minute-of-day; must fall inside [route.shift_start_minute, route.shift_end_minute]" }
+      - { name: status, type: enum, source: system, description: "PLANNED -> ARRIVED -> PICKED_UP; PLANNED/ARRIVED -> SKIPPED" }
+
+  - name: DockDoor
+    parent: null
+    common_fields: true
+    fields:
+      - { name: terminal_id, type: string, source: input, description: "FK -> Terminal.id; owning terminal" }
+      - { name: door_number, type: integer, source: input, description: "Physical door label", constraints: "integer >= 1; (terminal_id, door_number) unique" }
+      - { name: door_kind, type: enum, source: input, description: "INBOUND strip doors receive P&D freight; OUTBOUND load doors build linehaul trailers", constraints: "INBOUND | OUTBOUND" }
+      - { name: status, type: enum, source: system, description: "AVAILABLE -> RESERVED -> OCCUPIED -> AVAILABLE; any non-terminal -> OUT_OF_SERVICE; OUT_OF_SERVICE -> AVAILABLE" }
+
+  - name: SortationBatch
+    parent: null
+    common_fields: true
+    fields:
+      - { name: terminal_id, type: string, source: input, description: "FK -> Terminal.id; terminal running the sort" }
+      - { name: inbound_door_id, type: string, source: input, description: "FK -> DockDoor.id; door the batch is stripped at (must be INBOUND kind)" }
+      - { name: destination_terminal_id, type: string, source: input, description: "FK -> Terminal.id; single destination this batch sorts for" }
+      - { name: status, type: enum, source: system, description: "OPEN -> CLOSED -> DISPOSITIONED" }
+
+  - name: OutboundTrailer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: terminal_id, type: string, source: input, description: "FK -> Terminal.id; origin terminal building this trailer" }
+      - { name: destination_terminal_id, type: string, source: input, description: "FK -> Terminal.id; linehaul destination" }
+      - { name: outbound_door_id, type: string, source: input, description: "FK -> DockDoor.id; door the trailer is spotted at (must be OUTBOUND kind)" }
+      - { name: max_weight_lbs, type: integer, source: input, description: "Legal payload cap in lbs", constraints: "integer >= 1" }
+      - { name: max_cube_cuft, type: integer, source: input, description: "Interior cube capacity in cubic feet", constraints: "integer >= 1" }
+      - { name: loaded_weight_lbs, type: integer, source: computed, description: "Sum of chargeable_weight_lbs over ManifestEntries on this trailer; 0 while empty" }
+      - { name: loaded_cube_cuft, type: integer, source: computed, description: "Sum of shipment cube (ceil(L*W*H/1728)) over ManifestEntries; 0 while empty" }
+      - { name: utilization_pct, type: number, source: computed, description: "max(loaded_weight/max_weight, loaded_cube/max_cube)*100 rounded to 1 decimal; binding constraint drives utilization" }
+      - { name: posture, type: enum, source: system, description: "LOADING -> READY -> SEALED -> DISPATCHED -> ARRIVED; READY/SEALED -> LOADING reopen allowed; any of LOADING/READY -> VOIDED", default: "LOADING" }
+
+  - name: ManifestEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: trailer_id, type: string, source: input, description: "FK -> OutboundTrailer.id; trailer carrying the shipment" }
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; manifested shipment (a shipment has at most one non-REMOVED entry)" }
+      - { name: load_position, type: integer, source: input, description: "Nose-to-tail slot index (1 = nose); delivery sequence runs tail-first", constraints: "integer >= 1" }
+      - { name: status, type: enum, source: system, description: "ACTIVE -> REMOVED" }
+
+  - name: LinehaulLeg
+    parent: null
+    common_fields: true
+    fields:
+      - { name: origin_terminal_id, type: string, source: input, description: "FK -> Terminal.id; leg origin" }
+      - { name: destination_terminal_id, type: string, source: input, description: "FK -> Terminal.id; leg destination or relay point" }
+      - { name: trailer_id, type: string, source: input, description: "FK -> OutboundTrailer.id; trailer moved by this leg" }
+      - { name: planned_departure_utc, type: datetime, source: input, description: "Planned departure instant (ISO8601 UTC)" }
+      - { name: planned_arrival_utc, type: datetime, source: input, description: "Planned arrival instant; must be strictly after planned_departure_utc" }
+      - { name: actual_departure_utc, type: datetime, source: system, description: "Set when leg departs; null until then" }
+      - { name: actual_arrival_utc, type: datetime, source: system, description: "Set when leg arrives; null until then" }
+      - { name: provisional_eta_utc, type: datetime, source: computed, description: "Forward-looking ETA: planned_arrival + accrued delay minutes; basis for service-standard projection before arrival" }
+      - { name: relay_sequence, type: integer, source: input, description: "1-based leg index of a meet-point relay chain sharing the same trailer", constraints: "integer >= 1" }
+      - { name: status, type: enum, source: system, description: "PLANNED -> EN_ROUTE -> ARRIVED; PLANNED -> CANCELLED" }
+
+  - name: DimensionerScan
+    parent: null
+    common_fields: false
+    fields:
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; measured shipment" }
+      - { name: measured_length_in, type: integer, source: input, description: "Dimensioner length inches", constraints: "integer >= 1" }
+      - { name: measured_width_in, type: integer, source: input, description: "Dimensioner width inches", constraints: "integer >= 1" }
+      - { name: measured_height_in, type: integer, source: input, description: "Dimensioner height inches", constraints: "integer >= 1" }
+      - { name: measured_weight_lbs, type: integer, source: input, description: "Certified scale weight lbs", constraints: "integer >= 1" }
+      - { name: scanned_by, type: string, source: system, description: "X-User-ID of the RatingClerk operating the dimensioner" }
+
+  - name: Inspection
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; shipment under re-class inspection" }
+      - { name: scan_id, type: string, source: input, description: "FK -> DimensionerScan.id; measurement evidence for the inspection" }
+      - { name: claimed_nmfc_class, type: enum, source: input, description: "Inspector-asserted correct class (same enum as Shipment.nmfc_class)" }
+      - { name: outcome, type: enum, source: system, description: "PENDING -> CONFIRMED_RECLASS | REJECTED; terminal in both non-PENDING states" }
+      - { name: adjustment_cents, type: integer, source: computed, description: "Signed billing delta applied on CONFIRMED_RECLASS (positive = upcharge); 0 on REJECTED" }
+
+  - name: OsdCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shipment_id, type: string, source: input, description: "FK -> Shipment.id; affected shipment" }
+      - { name: case_kind, type: enum, source: input, description: "OVERAGE | SHORTAGE | DAMAGE", constraints: "OVERAGE | SHORTAGE | DAMAGE" }
+      - { name: claimed_amount_cents, type: integer, source: input, description: "Claimed loss value in cents", constraints: "integer >= 0" }
+      - { name: item_amounts_cents, type: array, source: input, description: "Per-line claimed amounts in cents; liability uses per-line rounding then sum", constraints: "non-empty array of integers >= 0" }
+      - { name: awarded_amount_cents, type: integer, source: computed, description: "Capped liability award; 0 until RESOLVED" }
+      - { name: status, type: enum, source: system, description: "OPEN -> UNDER_REVIEW -> RESOLVED | DENIED" }
+
+  - name: ServiceStandardReport
+    parent: null
+    common_fields: false
+    fields:
+      - { name: terminal_id, type: string, source: input, description: "FK -> Terminal.id; terminal the report covers" }
+      - { name: report_date, type: string, source: input, description: "Calendar date (terminal-local) the report summarizes, YYYY-MM-DD" }
+      - { name: window_start_utc, type: datetime, source: computed, description: "Inclusive UTC instant of the terminal-local day start" }
+      - { name: window_end_utc, type: datetime, source: computed, description: "Exclusive UTC instant of the next terminal-local day start (half-open window)" }
+      - { name: shipments_due, type: integer, source: computed, description: "Count of shipments whose committed delivery instant falls in [window_start_utc, window_end_utc)" }
+      - { name: shipments_on_time, type: integer, source: computed, description: "Due shipments delivered at or before commitment" }
+      - { name: on_time_pct, type: number, source: computed, description: "shipments_on_time/shipments_due*100, 1 decimal; 0.0 when shipments_due == 0" }
+      - { name: service_level_met, type: boolean, source: computed, description: "on_time_pct >= ON_TIME_TARGET_PCT (95.0)" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Terminal
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /ltl/terminals/{terminalId}/close"
+        actor: TerminalAdmin
+        preconditions: []
+        side_effects: ["new tenders/trailers/batches/reservations against this terminal rejected with ERR_TERMINAL_CLOSED"]
+
+  - entity: Shipment
+    initial_state: "rating_status=UNRATED, handling_status=TENDERED"
+    terminal_states: ["handling_status=DELIVERED", "handling_status=CANCELLED", "rating_status=BILLED"]
+    transitions:
+      - from: "rating_status=UNRATED"
+        to: "rating_status=RATED"
+        trigger: "POST /ltl/shipments/{shipmentId}/rate"
+        actor: RatingClerk
+        preconditions:
+          - "handling_status in {TENDERED, ON_DOCK}"
+          - "origin_terminal_id and destination_terminal_id reference ACTIVE Terminals"
+        side_effects:
+          - "rated_amount_cents := freight_rating(GROSS variant, declared dims)"
+          - "chargeable_weight_lbs := actual_weight_lbs; dim_weight_lbs := 0"
+      - from: "rating_status=RATED"
+        to: "rating_status=INSPECTION_PENDING"
+        trigger: "POST /ltl/inspections"
+        actor: RatingClerk
+        preconditions:
+          - "shipment.rating_status == RATED"
+          - "scan_id references a DimensionerScan whose shipment_id == this shipment"
+        side_effects:
+          - "dim_weight_lbs := ceil(L*W*H/DIM_DIVISOR) from scan dims"
+          - "chargeable_weight_lbs := max(measured_weight_lbs, dim_weight_lbs)"
+      - from: "rating_status=INSPECTION_PENDING"
+        to: "rating_status=RERATED"
+        trigger: "POST /ltl/inspections/{inspectionId}/confirm"
+        actor: RatingClerk
+        preconditions: ["inspection.outcome == PENDING"]
+        side_effects:
+          - "inspection.outcome := CONFIRMED_RECLASS"
+          - "shipment.nmfc_class := inspection.claimed_nmfc_class"
+          - "rated_amount_cents := freight_rating(DIM variant, measured dims & weight)"
+          - "inspection.adjustment_cents := rated_amount_cents(new) - rated_amount_cents(pre-inspection)"
+      - from: "rating_status=INSPECTION_PENDING"
+        to: "rating_status=RATED"
+        trigger: "POST /ltl/inspections/{inspectionId}/reject"
+        actor: RatingClerk
+        preconditions: ["inspection.outcome == PENDING"]
+        side_effects:
+          - "inspection.outcome := REJECTED"
+          - "inspection.adjustment_cents := 0"
+          - "chargeable_weight_lbs reverts to actual_weight_lbs; dim_weight_lbs := 0"
+      - from: "rating_status=RERATED"
+        to: "rating_status=INSPECTION_PENDING"
+        trigger: "POST /ltl/inspections (re-inspection cycle)"
+        actor: RatingClerk
+        preconditions: ["shipment.rating_status == RERATED", "scan_id references a scan for this shipment newer than the prior scan (created_at ordering)"]
+        side_effects: ["same dim/chargeable recompute as RATED->INSPECTION_PENDING"]
+      - from: "rating_status in {RATED, RERATED}"
+        to: "rating_status=BILLED"
+        trigger: "POST /ltl/shipments/{shipmentId}/bill"
+        actor: RatingClerk
+        preconditions:
+          - "handling_status == DELIVERED"
+          - "no linked OsdCase with status in {OPEN, UNDER_REVIEW}"
+        side_effects: ["billed_amount_cents := rated_amount_cents (frozen)"]
+      - from: "handling_status=TENDERED"
+        to: "handling_status=ON_DOCK"
+        trigger: "POST /ltl/pickup-stops/{stopId}/complete (PICKED_UP)"
+        actor: Dispatcher
+        preconditions:
+          - "stop.status == ARRIVED"
+          - "shipment.handling_status == TENDERED"
+        side_effects:
+          - "stop.status := PICKED_UP"
+          - "if all stops on route in {PICKED_UP, SKIPPED} then route.status := COMPLETED"
+      - from: "handling_status=ON_DOCK"
+        to: "handling_status=MANIFESTED"
+        trigger: "POST /ltl/trailers/{trailerId}/manifest-entries"
+        actor: DockSupervisor
+        preconditions:
+          - "trailer.posture == LOADING"
+          - "shipment.handling_status == ON_DOCK"
+          - "shipment.rating_status in {RATED, RERATED}"
+          - "shipment.osd_hold == false"
+          - "trailer.destination_terminal_id == shipment.destination_terminal_id"
+          - "projected loaded_weight_lbs + shipment.chargeable_weight_lbs <= trailer.max_weight_lbs AND projected loaded_cube_cuft + shipment cube <= trailer.max_cube_cuft"
+          - "no other ManifestEntry with shipment_id == this shipment and status == ACTIVE"
+        side_effects:
+          - "trailer.loaded_weight_lbs += shipment.chargeable_weight_lbs"
+          - "trailer.loaded_cube_cuft += ceil(L*W*H/1728) of shipment dims"
+          - "trailer.utilization_pct recomputed"
+          - "trailer.version incremented"
+      - from: "handling_status=MANIFESTED"
+        to: "handling_status=ON_DOCK"
+        trigger: "POST /ltl/manifest-entries/{entryId}/remove"
+        actor: DockSupervisor
+        preconditions: ["entry.status == ACTIVE", "trailer.posture in {LOADING, READY}"]
+        side_effects:
+          - "entry.status := REMOVED"
+          - "trailer.loaded_weight_lbs -= shipment.chargeable_weight_lbs; loaded_cube_cuft -= shipment cube; utilization recomputed"
+          - "trailer.version incremented"
+      - from: "handling_status=MANIFESTED"
+        to: "handling_status=IN_LINEHAUL"
+        trigger: "POST /ltl/linehaul-legs/{legId}/depart"
+        actor: Dispatcher
+        preconditions: ["leg.trailer_id manifests this shipment", "trailer.posture == DISPATCHED"]
+        side_effects: ["all ACTIVE ManifestEntries' shipments on the trailer transition to IN_LINEHAUL"]
+      - from: "handling_status=IN_LINEHAUL"
+        to: "handling_status=DELIVERED"
+        trigger: "POST /ltl/linehaul-legs/{legId}/arrive (final leg of relay chain)"
+        actor: Dispatcher
+        preconditions: ["leg.destination_terminal_id == shipment.destination_terminal_id"]
+        side_effects:
+          - "leg.actual_arrival_utc := now"
+          - "trailer.posture := ARRIVED"
+          - "all ACTIVE ManifestEntries' shipments on the trailer transition to DELIVERED with delivered_at_utc := now"
+      - from: "handling_status in {TENDERED, ON_DOCK}"
+        to: "handling_status=CANCELLED"
+        trigger: "POST /ltl/shipments/{shipmentId}/cancel"
+        actor: Dispatcher
+        preconditions: ["no ACTIVE ManifestEntry references this shipment"]
+        side_effects: ["any PLANNED PickupStop referencing this shipment transitions to SKIPPED"]
+
+  - entity: PickupRoute
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, RECALLED]
+    transitions:
+      - from: PLANNED
+        to: DISPATCHED
+        trigger: "POST /ltl/pickup-routes/{routeId}/dispatch"
+        actor: Dispatcher
+        preconditions: ["route has >= 1 PickupStop with status PLANNED"]
+        side_effects: []
+      - from: DISPATCHED
+        to: COMPLETED
+        trigger: "system: all stops reach {PICKED_UP, SKIPPED}"
+        actor: system
+        preconditions: ["every PickupStop on route has status in {PICKED_UP, SKIPPED}"]
+        side_effects: []
+      - from: DISPATCHED
+        to: RECALLED
+        trigger: "POST /ltl/pickup-routes/{routeId}/recall"
+        actor: Dispatcher
+        preconditions: ["no stop on route has status ARRIVED"]
+        side_effects: ["all PLANNED stops on route transition to SKIPPED"]
+
+  - entity: PickupStop
+    initial_state: PLANNED
+    terminal_states: [PICKED_UP, SKIPPED]
+    transitions:
+      - from: PLANNED
+        to: ARRIVED
+        trigger: "POST /ltl/pickup-stops/{stopId}/arrive"
+        actor: Dispatcher
+        preconditions: ["route.status == DISPATCHED"]
+        side_effects: []
+      - from: ARRIVED
+        to: PICKED_UP
+        trigger: "POST /ltl/pickup-stops/{stopId}/complete"
+        actor: Dispatcher
+        preconditions: ["stop.status == ARRIVED"]
+        side_effects: ["shipment.handling_status TENDERED -> ON_DOCK; bubble-up route completion check"]
+      - from: PLANNED
+        to: SKIPPED
+        trigger: "POST /ltl/pickup-stops/{stopId}/skip or route recall or shipment cancel"
+        actor: Dispatcher
+        preconditions: []
+        side_effects: ["bubble-up route completion check"]
+
+  - entity: DockDoor
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: RESERVED
+        trigger: "POST /ltl/dock-doors/{doorId}/reserve"
+        actor: DockSupervisor
+        preconditions: ["door.status == AVAILABLE", "terminal.status == ACTIVE"]
+        side_effects: []
+      - from: RESERVED
+        to: OCCUPIED
+        trigger: "POST /ltl/dock-doors/{doorId}/occupy"
+        actor: DockSupervisor
+        preconditions: ["door.status == RESERVED"]
+        side_effects: []
+      - from: OCCUPIED
+        to: AVAILABLE
+        trigger: "POST /ltl/dock-doors/{doorId}/release"
+        actor: DockSupervisor
+        preconditions: ["no SortationBatch with inbound_door_id == door and status in {OPEN, CLOSED}; no OutboundTrailer with outbound_door_id == door and posture in {LOADING, READY, SEALED}"]
+        side_effects: []
+      - from: "AVAILABLE | RESERVED | OCCUPIED"
+        to: OUT_OF_SERVICE
+        trigger: "POST /ltl/dock-doors/{doorId}/take-out-of-service"
+        actor: DockSupervisor
+        preconditions: ["same no-active-user precondition as release"]
+        side_effects: []
+      - from: OUT_OF_SERVICE
+        to: AVAILABLE
+        trigger: "POST /ltl/dock-doors/{doorId}/return-to-service"
+        actor: DockSupervisor
+        preconditions: []
+        side_effects: []
+
+  - entity: SortationBatch
+    initial_state: OPEN
+    terminal_states: [DISPOSITIONED]
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /ltl/sortation-batches/{batchId}/close"
+        actor: DockSupervisor
+        preconditions: ["batch.status == OPEN"]
+        side_effects: []
+      - from: CLOSED
+        to: DISPOSITIONED
+        trigger: "POST /ltl/sortation-batches/{batchId}/disposition"
+        actor: DockSupervisor
+        preconditions: ["batch.status == CLOSED"]
+        side_effects: ["inbound dock door freed (release precondition unblocks)"]
+
+  - entity: OutboundTrailer
+    initial_state: LOADING
+    terminal_states: [ARRIVED, VOIDED]
+    transitions:
+      - from: LOADING
+        to: READY
+        trigger: "POST /ltl/trailers/{trailerId}/mark-ready"
+        actor: DockSupervisor
+        preconditions: ["trailer has >= 1 ACTIVE ManifestEntry", "utilization_pct >= MIN_UTILIZATION_PCT (60.0)"]
+        side_effects: []
+      - from: READY
+        to: SEALED
+        trigger: "POST /ltl/trailers/{trailerId}/seal"
+        actor: DockSupervisor
+        preconditions: ["trailer.posture == READY"]
+        side_effects: []
+      - from: SEALED
+        to: DISPATCHED
+        trigger: "POST /ltl/linehaul-legs (create first leg) or POST /ltl/linehaul-legs/{legId}/depart"
+        actor: Dispatcher
+        preconditions: ["trailer.posture == SEALED", "leg.origin_terminal_id == trailer.terminal_id"]
+        side_effects:
+          - "leg.actual_departure_utc := now (on depart)"
+          - "leg.status := EN_ROUTE"
+          - "shipments manifested on trailer: handling_status MANIFESTED -> IN_LINEHAUL"
+      - from: READY
+        to: LOADING
+        trigger: "POST /ltl/trailers/{trailerId}/reopen"
+        actor: DockSupervisor
+        preconditions: ["trailer.posture in {READY, SEALED}"]
+        side_effects: ["recompute posture gating; allows manifest add/remove again"]
+      - from: SEALED
+        to: LOADING
+        trigger: "POST /ltl/trailers/{trailerId}/reopen"
+        actor: DockSupervisor
+        preconditions: ["no LinehaulLeg with trailer_id == this trailer and status == EN_ROUTE"]
+        side_effects: []
+      - from: DISPATCHED
+        to: ARRIVED
+        trigger: "POST /ltl/linehaul-legs/{legId}/arrive on the final relay leg"
+        actor: Dispatcher
+        preconditions: ["leg.status == EN_ROUTE", "leg.destination_terminal_id == trailer.destination_terminal_id"]
+        side_effects:
+          - "leg.status := ARRIVED; actual_arrival_utc := now"
+          - "manifested shipments IN_LINEHAUL -> DELIVERED"
+      - from: "LOADING | READY"
+        to: VOIDED
+        trigger: "POST /ltl/trailers/{trailerId}/void"
+        actor: DockSupervisor
+        preconditions: ["no ACTIVE ManifestEntry on trailer"]
+        side_effects: ["outbound dock door freed (release precondition unblocks)"]
+
+  - entity: LinehaulLeg
+    initial_state: PLANNED
+    terminal_states: [ARRIVED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: EN_ROUTE
+        trigger: "POST /ltl/linehaul-legs/{legId}/depart"
+        actor: Dispatcher
+        preconditions:
+          - "trailer.posture == SEALED (first leg of relay) OR prior leg (relay_sequence - 1) for same trailer has status ARRIVED"
+          - "if relay_sequence > 1: leg.planned_departure_utc >= prior leg's actual_arrival_utc + MIN_CONNECT_MINUTES"
+        side_effects:
+          - "actual_departure_utc := now"
+          - "first leg: trailer SEALED -> DISPATCHED; manifested shipments MANIFESTED -> IN_LINEHAUL"
+      - from: EN_ROUTE
+        to: ARRIVED
+        trigger: "POST /ltl/linehaul-legs/{legId}/arrive"
+        actor: Dispatcher
+        preconditions: ["leg.status == EN_ROUTE"]
+        side_effects:
+          - "actual_arrival_utc := now"
+          - "final relay leg (destination == trailer.destination_terminal_id): trailer DISPATCHED -> ARRIVED, shipments IN_LINEHAUL -> DELIVERED"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /ltl/linehaul-legs/{legId}/cancel"
+        actor: Dispatcher
+        preconditions: ["leg.status == PLANNED"]
+        side_effects: []
+
+  - entity: OsdCase
+    initial_state: OPEN
+    terminal_states: [RESOLVED, DENIED]
+    transitions:
+      - from: OPEN
+        to: UNDER_REVIEW
+        trigger: "POST /ltl/osd-cases/{caseId}/review"
+        actor: OsdClerk
+        preconditions: []
+        side_effects: ["shipment.osd_hold := true (already true from creation)"]
+      - from: UNDER_REVIEW
+        to: RESOLVED
+        trigger: "POST /ltl/osd-cases/{caseId}/resolve"
+        actor: OsdClerk
+        preconditions: ["case.status == UNDER_REVIEW"]
+        side_effects:
+          - "awarded_amount_cents := osd_liability(case.item_amounts_cents, shipment.nmfc_class, shipment.actual_weight_lbs, shipment.rated_amount_cents)"
+          - "shipment.osd_hold := false when no other OPEN/UNDER_REVIEW case on the shipment"
+          - "if shipment.rating_status == BILLED then billed_amount_cents := billed_amount_cents - awarded_amount_cents (claim offset against billed revenue)"
+      - from: UNDER_REVIEW
+        to: DENIED
+        trigger: "POST /ltl/osd-cases/{caseId}/deny"
+        actor: OsdClerk
+        preconditions: ["case.status == UNDER_REVIEW"]
+        side_effects:
+          - "awarded_amount_cents := 0"
+          - "shipment.osd_hold := false when no other OPEN/UNDER_REVIEW case on the shipment"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: trailer-manifest-stale-version
+    parent_entity: OutboundTrailer
+    write_endpoint: "POST /ltl/trailers/{trailerId}/manifest-entries"
+    occ_field: "expected_trailer_version"
+    description: |
+      Creating a ManifestEntry against an OutboundTrailer whose version has
+      advanced since the client last observed it is rejected. The trailer's
+      loaded_weight/loaded_cube ledger may have been mutated by another
+      manifest add/remove, so a stale write would allocate cube the client
+      never saw as committed.
+    error_id: ERR_STALE_TRAILER_VERSION
+    http_status: 412
+  - rule_id: trailer-dispatch-stale-version
+    parent_entity: OutboundTrailer
+    write_endpoint: "POST /ltl/trailers/{trailerId}/seal"
+    occ_field: "expected_trailer_version"
+    description: |
+      Sealing a trailer based on a stale observed version is rejected; the
+      client must re-read loaded totals and utilization after any manifest
+      mutation before certifying the trailer for dispatch.
+    error_id: ERR_STALE_TRAILER_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: freight_rating
+    trigger: "POST /ltl/shipments/{id}/rate (GROSS variant) and inspection confirm (DIM variant)"
+    algorithm: tiered_pricing
+    formula: |
+      chargeable_weight_lbs = max(actual_weight_lbs, ceil(L*W*H / DIM_DIVISOR))   # DIM variant
+      chargeable_weight_lbs = actual_weight_lbs                                     # GROSS variant
+      rate_per_cwt_cents = CLASS_RATE_CENTS[nmfc_class]                              # flat per-class rate
+      linehaul_cents = round_half_up( chargeable_weight_lbs / 100 * rate_per_cwt_cents )
+      fuel_cents = round_half_up( linehaul_cents * FUEL_SURCHARGE_PCT )
+      accessorial_cents = sum(ACCESSORIAL_RATE_CENTS[code] for code in accessorial_codes)
+      rated_amount_cents = linehaul_cents + fuel_cents + accessorial_cents
+      # Rounding order is PINNED: round the line-haul first, then compute fuel on the
+      # rounded line-haul, then add unrounded (integer) accessorials. Never sum-then-round.
+    input_set: "the single Shipment being rated; accessorial_codes in declared order (addition is commutative)"
+    constants:
+      DIM_DIVISOR: 194
+      FUEL_SURCHARGE_PCT: 0.22
+      CLASS_RATE_CENTS: { CLASS_50: 1800, CLASS_55: 2000, CLASS_60: 2150, CLASS_65: 2350, CLASS_70: 2500, CLASS_85: 2900, CLASS_100: 3400, CLASS_125: 4100 }
+      ACCESSORIAL_RATE_CENTS: { LIFTGATE: 7500, NOTIFY: 3500, RESIDENTIAL: 9000, INSIDE: 12000 }
+    precision: "integer cents; each multiplication round_half_up to whole cents before the next step"
+    variants:
+      - name: GROSS
+        when: "initial rating at tender; no certified measurement exists"
+        difference: "chargeable weight = declared actual_weight_lbs; declared dims ignored"
+      - name: DIM
+        when: "post-inspection re-rate after a DimensionerScan exists"
+        difference: "chargeable weight = max(measured_weight_lbs, ceil(measured dims product / DIM_DIVISOR))"
+
+  - name: osd_liability
+    trigger: "POST /ltl/osd-cases/{caseId}/resolve"
+    algorithm: waterfall_allocation
+    formula: |
+      # Per-line rounding THEN sum (mode (b): rounding order pinned).
+      line_cents_i = round_half_up(item_amounts_cents[i])  # already integer cents; identity
+      gross_claim_cents = sum(line_cents_i)
+      class_cap_cents = round_half_up(actual_weight_lbs * LIABILITY_PER_LB_CENTS[nmfc_class])
+      freight_cap_cents = round_half_up(rated_amount_cents * FREIGHT_MULTIPLE_CAP)  # cap = 10x freight
+      awarded_amount_cents = min(claimed_amount_cents, gross_claim_cents, class_cap_cents, freight_cap_cents)
+      # Waterfall: the award can never exceed the smallest of the four ceilings,
+      # evaluated strictly in the order above; equal caps resolve to the same value.
+    input_set: "the resolving OsdCase and its linked Shipment (current nmfc_class, actual_weight_lbs, rated_amount_cents)"
+    constants:
+      LIABILITY_PER_LB_CENTS: { CLASS_50: 150, CLASS_55: 200, CLASS_60: 250, CLASS_65: 300, CLASS_70: 350, CLASS_85: 450, CLASS_100: 600, CLASS_125: 800 }
+      FREIGHT_MULTIPLE_CAP: 10
+    precision: "integer cents; caps each round_half_up to whole cents before the min()"
+
+  - name: trailer_utilization
+    trigger: "every ManifestEntry create/remove on the trailer"
+    algorithm: aggregation
+    formula: |
+      loaded_weight_lbs = sum(shipment.chargeable_weight_lbs for ACTIVE ManifestEntries)
+      loaded_cube_cuft  = sum(ceil(shipment.L * shipment.W * shipment.H / 1728) for ACTIVE ManifestEntries)
+      utilization_pct   = round_half_up_1dp( max(loaded_weight_lbs / max_weight_lbs,
+                                                 loaded_cube_cuft / max_cube_cuft) * 100 )
+      # The BINDING constraint (weight vs cube) drives utilization: a trailer 95%
+      # full by cube but 40% by weight reports 95.0.
+    input_set: "ManifestEntries with status == ACTIVE on this trailer only; REMOVED excluded"
+    constants:
+      MIN_UTILIZATION_PCT: 60.0
+    precision: "1 decimal place, round_half_up"
+
+  - name: relay_feasibility_and_eta
+    trigger: "POST /ltl/linehaul-legs (planning) and POST /ltl/linehaul-legs/{id}/depart (provisional ETA)"
+    algorithm: forward_looking
+    formula: |
+      # Planning feasibility for relay leg N (N > 1, same trailer):
+      feasible := leg_N.planned_departure_utc >= leg_(N-1).planned_arrival_utc + MIN_CONNECT_MINUTES
+      # Provisional ETA once a leg departs:
+      accrued_delay_min = max(0, (actual_departure_utc - planned_departure_utc) in whole minutes)
+      provisional_eta_utc = planned_arrival_utc + accrued_delay_min minutes
+      # Downstream projection for relay leg N+1 while leg N is EN_ROUTE:
+      projected_arrival_(N+1) = leg_(N+1).planned_arrival_utc
+                                if provisional_eta_N <= leg_(N+1).planned_departure_utc - MIN_CONNECT_MINUTES
+                                else leg_(N+1).planned_arrival_utc
+                                      + (provisional_eta_N + MIN_CONNECT_MINUTES - leg_(N+1).planned_departure_utc)
+    input_set: "LinehaulLegs sharing the same trailer_id, ordered by relay_sequence ASC; legs with status CANCELLED excluded"
+    constants:
+      MIN_CONNECT_MINUTES: 45
+    precision: "whole minutes; accrual truncated toward zero; ETA instants in UTC"
+    variants:
+      - name: PLANNED_ETA
+        when: "before any leg departs"
+        difference: "projection uses planned times only, no accrued delay"
+      - name: PROVISIONAL_ETA
+        when: "leg N EN_ROUTE, leg N+1 still PLANNED"
+        difference: "projection includes accrued departure delay and the MIN_CONNECT buffer; the two ETAs diverge by exactly the connect shortfall"
+
+  - name: on_time_performance
+    trigger: "POST /ltl/terminals/{terminalId}/service-standard-reports"
+    algorithm: threshold
+    formula: |
+      due_shipments = shipments with destination_terminal_id == terminal
+                      AND committed_delivery_utc in [window_start_utc, window_end_utc)   # half-open
+                      AND handling_status in {IN_LINEHAUL, DELIVERED}
+      on_time = due AND handling_status == DELIVERED AND delivered_at_utc <= committed_delivery_utc   # <= semantics: exactly-at-commitment is ON TIME
+      on_time_pct = round_half_up_1dp(shipments_on_time / shipments_due * 100) if shipments_due > 0 else 0.0
+      service_level_met = on_time_pct >= ON_TIME_TARGET_PCT
+    input_set: "shipments whose committed instant falls inside the half-open day window; TENDERED/ON_DOCK/MANIFESTED/CANCELLED shipments excluded from both numerator and denominator"
+    constants:
+      ON_TIME_TARGET_PCT: 95.0
+      SERVICE_DAYS: { STANDARD: 3, EXPEDITED: 2, GUARANTEED: 1 }
+    precision: "on_time_pct 1 decimal place, round_half_up; boundary is >= 95.0 (95.0 itself meets standard)"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-Role and X-User-ID headers present; role in RBAC matrix", error_id: ERR_UNAUTHENTICATED, http_status: 401, applies_to: "all" }
+  - { priority: 2, category: auth, check: "role is permitted to call this endpoint per §1.5 roles", error_id: ERR_FORBIDDEN, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: existence, check: "path ids resolve left-to-right (terminal, shipment, route, stop, door, batch, trailer, entry, leg, inspection, case)", error_id: ERR_NOT_FOUND, http_status: 404, applies_to: "all" }
+  - { priority: 4, category: existence, check: "body FK fields (origin_terminal_id, destination_terminal_id, route_id, shipment_id, trailer_id, scan_id, etc.) resolve to existing entities", error_id: ERR_REFERENCE_NOT_FOUND, http_status: 404, applies_to: "POST create endpoints" }
+  - { priority: 5, category: state, check: "target entity state precondition for the requested transition per §1.2 (e.g. trailer LOADING for manifest-add, stop ARRIVED for complete, leg EN_ROUTE for arrive)", error_id: ERR_INVALID_STATE, http_status: 409, applies_to: "action endpoints" }
+  - { priority: 6, category: state, check: "OCC: expected_trailer_version == trailer.version on manifest-add and seal", error_id: ERR_STALE_TRAILER_VERSION, http_status: 412, applies_to: ["POST /ltl/trailers/{trailerId}/manifest-entries", "POST /ltl/trailers/{trailerId}/seal"] }
+  - { priority: 7, category: business_safety, check: "hazmat-equivalent guard: shipment.osd_hold == false before manifest-add; freight under active OS&D investigation must not be loaded", error_id: ERR_SHIPMENT_ON_OSD_HOLD, http_status: 409, applies_to: ["POST /ltl/trailers/{trailerId}/manifest-entries"] }
+  - { priority: 8, category: business_constraint, check: "trailer destination matches shipment destination_terminal_id before manifest-add", error_id: ERR_DESTINATION_MISMATCH, http_status: 422, applies_to: ["POST /ltl/trailers/{trailerId}/manifest-entries"] }
+  - { priority: 10, category: business_constraint, check: "dock door kind matches usage: SortationBatch.inbound_door must be INBOUND; OutboundTrailer.outbound_door must be OUTBOUND", error_id: ERR_DOOR_KIND_MISMATCH, http_status: 422, applies_to: ["POST /ltl/sortation-batches", "POST /ltl/trailers"] }
+  - { priority: 11, category: business_temporal, check: "PickupStop.planned_arrival_minute within [route.shift_start_minute, route.shift_end_minute] (closed interval)", error_id: ERR_STOP_OUTSIDE_SHIFT, http_status: 422, applies_to: ["POST /ltl/pickup-stops"] }
+  - { priority: 12, category: business_temporal, check: "relay leg planning feasibility: leg_N.planned_departure_utc >= leg_(N-1).planned_arrival_utc + 45 minutes for same-trailer relay chains", error_id: ERR_RELAY_CONNECT_INFEASIBLE, http_status: 422, applies_to: ["POST /ltl/linehaul-legs"] }
+  - { priority: 13, category: business_temporal, check: "LinehaulLeg.planned_arrival_utc strictly after planned_departure_utc", error_id: ERR_LEG_WINDOW_INVALID, http_status: 422, applies_to: ["POST /ltl/linehaul-legs"] }
+  - { priority: 14, category: business_fiscal, check: "projected trailer load stays within caps: loaded_weight + shipment.chargeable_weight <= max_weight_lbs AND loaded_cube + shipment cube <= max_cube_cuft (strictly greater is rejected; exactly-at-cap is allowed)", error_id: ERR_TRAILER_OVER_CAPACITY, http_status: 422, applies_to: ["POST /ltl/trailers/{trailerId}/manifest-entries"] }
+  - { priority: 15, category: business_fiscal, check: "bill only when handling_status == DELIVERED and no OPEN/UNDER_REVIEW OsdCase", error_id: ERR_SHIPMENT_NOT_BILLABLE, http_status: 409, applies_to: ["POST /ltl/shipments/{shipmentId}/bill"] }
+  - { priority: 16, category: business_safety, check: "operations on entities whose terminal has status CLOSED are rejected (door reserve, trailer creation, sortation open, shipment tender to a CLOSED origin)", error_id: ERR_TERMINAL_CLOSED, http_status: 409, applies_to: ["POST /ltl/dock-doors/{doorId}/reserve", "POST /ltl/trailers", "POST /ltl/sortation-batches", "POST /ltl/shipments"] }
+  - { priority: 17, category: state, check: "stop arrive requires route.status == DISPATCHED", error_id: ERR_ROUTE_NOT_DISPATCHED, http_status: 409, applies_to: ["POST /ltl/pickup-stops/{stopId}/arrive"] }
+  - { priority: 18, category: state, check: "departing relay leg N requires same-trailer leg N-1 in status ARRIVED", error_id: ERR_RELAY_SEQUENCE_VIOLATION, http_status: 409, applies_to: ["POST /ltl/linehaul-legs/{legId}/depart"] }
+  - { priority: 19, category: business_constraint, check: "mark-ready requires >= 1 ACTIVE ManifestEntry and utilization_pct >= 60.0", error_id: ERR_TRAILER_NOT_LOADABLE, http_status: 422, applies_to: ["POST /ltl/trailers/{trailerId}/mark-ready"] }
+  - { priority: 20, category: business_constraint, check: "enum membership and integer ranges per §1.1 constraints (nmfc_class, accessorial codes, door_number >= 1, shift_end > shift_start)", error_id: ERR_INVALID_REQUEST, http_status: 400, applies_to: "all" }
+  - { priority: 21, category: business_referential, check: "Inspection.scan_id references a DimensionerScan whose shipment_id equals the inspection's shipment_id", error_id: ERR_SCAN_SHIPMENT_MISMATCH, http_status: 422, applies_to: ["POST /ltl/inspections"] }
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- system clock (test-driving; default 2026-08-01T00:00:00Z) ---
+  - method: POST
+    path: "/ltl/_clock/set_current_utc"
+    description: "Set the server's logical clock (default at startup: 2026-08-01T00:00:00Z). Test-driving endpoint."
+    roles: [TerminalAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: datetime }
+    side_effects: []
+
+  # --- Terminal ---
+  - method: POST
+    path: "/ltl/terminals"
+    description: "Register a terminal"
+    roles: [TerminalAdmin]
+    code: 201
+    input: [code, name, dock_doors, "timezone?"]
+    output: Terminal
+    side_effects: ["status = ACTIVE"]
+  - method: GET
+    path: "/ltl/terminals"
+    description: "List terminals"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor, RatingClerk, OsdClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Terminal[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/terminals/{terminalId}"
+    description: "Get one terminal"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor, RatingClerk, OsdClerk]
+    code: 200
+    input: []
+    output: Terminal
+    side_effects: []
+  - method: POST
+    path: "/ltl/terminals/{terminalId}/close"
+    description: "Close a terminal (rejects new tenders, trailer spottings, sortation batches, door reservations)"
+    roles: [TerminalAdmin]
+    code: 200
+    input: []
+    output: Terminal
+    side_effects: ["status ACTIVE -> CLOSED"]
+
+  # --- Shipment ---
+  - method: POST
+    path: "/ltl/shipments"
+    description: "Tender a shipment (creates UNRATED/TENDERED)"
+    roles: [Dispatcher]
+    code: 201
+    input: [origin_terminal_id, destination_terminal_id, nmfc_class, actual_weight_lbs, length_in, width_in, height_in, service_standard, "accessorial_codes?"]
+    output: Shipment
+    side_effects: ["pro_number minted", "rating_status = UNRATED", "handling_status = TENDERED"]
+  - method: GET
+    path: "/ltl/shipments"
+    description: "List shipments (filterable)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor, RatingClerk, OsdClerk]
+    code: 200
+    input: ["origin_terminal_id?", "destination_terminal_id?", "rating_status?", "handling_status?", "limit?", "offset?"]
+    output: "Shipment[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/shipments/{shipmentId}"
+    description: "Get one shipment"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor, RatingClerk, OsdClerk]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+  - method: POST
+    path: "/ltl/shipments/{shipmentId}/rate"
+    description: "Run initial GROSS-variant rating"
+    roles: [RatingClerk]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["freight_rating(GROSS)", "rating_status UNRATED -> RATED"]
+  - method: POST
+    path: "/ltl/shipments/{shipmentId}/bill"
+    description: "Finalize billing on a delivered shipment"
+    roles: [RatingClerk]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["billed_amount_cents := rated_amount_cents", "rating_status -> BILLED"]
+  - method: POST
+    path: "/ltl/shipments/{shipmentId}/cancel"
+    description: "Cancel a tendered/on-dock shipment"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: ["handling_status -> CANCELLED", "PLANNED pickup stops -> SKIPPED"]
+
+  # --- PickupRoute / PickupStop ---
+  - method: POST
+    path: "/ltl/pickup-routes"
+    description: "Plan a P&D route"
+    roles: [Dispatcher]
+    code: 201
+    input: [terminal_id, route_date, driver_id, shift_start_minute, shift_end_minute]
+    output: PickupRoute
+    side_effects: ["status = PLANNED"]
+  - method: GET
+    path: "/ltl/pickup-routes"
+    description: "List pickup routes"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["terminal_id?", "route_date?", "status?", "limit?", "offset?"]
+    output: "PickupRoute[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/pickup-routes/{routeId}"
+    description: "Get one pickup route"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: PickupRoute
+    side_effects: []
+  - method: POST
+    path: "/ltl/pickup-routes/{routeId}/dispatch"
+    description: "Dispatch a planned route"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: PickupRoute
+    side_effects: ["status PLANNED -> DISPATCHED"]
+  - method: POST
+    path: "/ltl/pickup-routes/{routeId}/recall"
+    description: "Recall a dispatched route with no ARRIVED stops"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: PickupRoute
+    side_effects: ["status -> RECALLED", "PLANNED stops -> SKIPPED"]
+  - method: POST
+    path: "/ltl/pickup-stops"
+    description: "Add a pickup stop to a route"
+    roles: [Dispatcher]
+    code: 201
+    input: [route_id, shipment_id, stop_sequence, planned_arrival_minute]
+    output: PickupStop
+    side_effects: ["status = PLANNED"]
+  - method: GET
+    path: "/ltl/pickup-routes/{routeId}/stops"
+    description: "List stops of a route (sub-resource FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "PickupStop[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/pickup-stops/{stopId}"
+    description: "Get one pickup stop"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: PickupStop
+    side_effects: []
+  - method: GET
+    path: "/ltl/pickup-stops"
+    description: "List pickup stops (filtered-list FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["route_id?", "shipment_id?", "status?", "limit?", "offset?"]
+    output: "PickupStop[]"
+    side_effects: []
+  - method: POST
+    path: "/ltl/pickup-stops/{stopId}/arrive"
+    description: "Mark stop arrived"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: PickupStop
+    side_effects: ["status PLANNED -> ARRIVED"]
+  - method: POST
+    path: "/ltl/pickup-stops/{stopId}/complete"
+    description: "Complete pickup (freight now on dock)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: PickupStop
+    side_effects: ["status ARRIVED -> PICKED_UP", "shipment TENDERED -> ON_DOCK", "route completion check"]
+  - method: POST
+    path: "/ltl/pickup-stops/{stopId}/skip"
+    description: "Skip a planned stop"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: PickupStop
+    side_effects: ["status -> SKIPPED", "route completion check"]
+
+  # --- DockDoor ---
+  - method: POST
+    path: "/ltl/dock-doors"
+    description: "Register a dock door"
+    roles: [DockSupervisor]
+    code: 201
+    input: [terminal_id, door_number, door_kind]
+    output: DockDoor
+    side_effects: ["status = AVAILABLE"]
+  - method: GET
+    path: "/ltl/dock-doors"
+    description: "List dock doors"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["terminal_id?", "door_kind?", "status?", "limit?", "offset?"]
+    output: "DockDoor[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/dock-doors/{doorId}"
+    description: "Get one dock door"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: []
+  - method: POST
+    path: "/ltl/dock-doors/{doorId}/reserve"
+    description: "Reserve a door"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: ["status AVAILABLE -> RESERVED"]
+  - method: POST
+    path: "/ltl/dock-doors/{doorId}/occupy"
+    description: "Mark door occupied"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: ["status RESERVED -> OCCUPIED"]
+  - method: POST
+    path: "/ltl/dock-doors/{doorId}/release"
+    description: "Release door when no active batch/trailer uses it"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: ["status OCCUPIED -> AVAILABLE"]
+  - method: POST
+    path: "/ltl/dock-doors/{doorId}/take-out-of-service"
+    description: "Take door out of service"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: ["status -> OUT_OF_SERVICE"]
+  - method: POST
+    path: "/ltl/dock-doors/{doorId}/return-to-service"
+    description: "Return door to service"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: DockDoor
+    side_effects: ["status OUT_OF_SERVICE -> AVAILABLE"]
+
+  # --- SortationBatch ---
+  - method: POST
+    path: "/ltl/sortation-batches"
+    description: "Open a sortation batch at an inbound door for one destination"
+    roles: [DockSupervisor]
+    code: 201
+    input: [terminal_id, inbound_door_id, destination_terminal_id]
+    output: SortationBatch
+    side_effects: ["status = OPEN"]
+  - method: GET
+    path: "/ltl/sortation-batches"
+    description: "List sortation batches"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["terminal_id?", "inbound_door_id?", "destination_terminal_id?", "status?", "limit?", "offset?"]
+    output: "SortationBatch[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/sortation-batches/{batchId}"
+    description: "Get one sortation batch"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: SortationBatch
+    side_effects: []
+  - method: POST
+    path: "/ltl/sortation-batches/{batchId}/close"
+    description: "Close a batch"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: SortationBatch
+    side_effects: ["status OPEN -> CLOSED"]
+  - method: POST
+    path: "/ltl/sortation-batches/{batchId}/disposition"
+    description: "Disposition a closed batch (frees inbound door)"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: SortationBatch
+    side_effects: ["status CLOSED -> DISPOSITIONED"]
+
+  # --- OutboundTrailer / ManifestEntry ---
+  - method: POST
+    path: "/ltl/trailers"
+    description: "Spot an outbound trailer at a door for a destination"
+    roles: [DockSupervisor]
+    code: 201
+    input: [terminal_id, destination_terminal_id, outbound_door_id, max_weight_lbs, max_cube_cuft]
+    output: OutboundTrailer
+    side_effects: ["posture = LOADING", "loaded_* = 0", "utilization_pct = 0.0"]
+  - method: GET
+    path: "/ltl/trailers"
+    description: "List outbound trailers"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["terminal_id?", "destination_terminal_id?", "outbound_door_id?", "posture?", "limit?", "offset?"]
+    output: "OutboundTrailer[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/trailers/{trailerId}"
+    description: "Get one trailer (with loaded ledger)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: OutboundTrailer
+    side_effects: []
+  - method: POST
+    path: "/ltl/trailers/{trailerId}/manifest-entries"
+    description: "Manifest a shipment onto the trailer (OCC-guarded)"
+    roles: [DockSupervisor]
+    code: 201
+    input: [shipment_id, load_position, expected_trailer_version]
+    output: ManifestEntry
+    side_effects: ["shipment ON_DOCK -> MANIFESTED", "trailer loaded ledger += shipment weight/cube", "utilization recomputed", "increments OutboundTrailer.version by 1"]
+  - method: GET
+    path: "/ltl/trailers/{trailerId}/manifest-entries"
+    description: "List manifest entries on a trailer (sub-resource FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: "ManifestEntry[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/manifest-entries"
+    description: "List manifest entries (filtered-list FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["trailer_id?", "shipment_id?", "status?", "limit?", "offset?"]
+    output: "ManifestEntry[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/manifest-entries/{entryId}"
+    description: "Get one manifest entry"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: ManifestEntry
+    side_effects: []
+  - method: POST
+    path: "/ltl/manifest-entries/{entryId}/remove"
+    description: "Remove a manifest entry (trailer still LOADING/READY)"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: ManifestEntry
+    side_effects: ["entry -> REMOVED", "shipment MANIFESTED -> ON_DOCK", "trailer loaded ledger -= shipment weight/cube", "utilization recomputed", "increments OutboundTrailer.version by 1"]
+  - method: POST
+    path: "/ltl/trailers/{trailerId}/mark-ready"
+    description: "Mark trailer ready (>= 1 entry, utilization >= 60.0)"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: OutboundTrailer
+    side_effects: ["posture LOADING -> READY"]
+  - method: POST
+    path: "/ltl/trailers/{trailerId}/seal"
+    description: "Seal trailer for dispatch (OCC-guarded)"
+    roles: [DockSupervisor]
+    code: 200
+    input: [expected_trailer_version]
+    output: OutboundTrailer
+    side_effects: ["posture READY -> SEALED", "increments OutboundTrailer.version by 1"]
+  - method: POST
+    path: "/ltl/trailers/{trailerId}/reopen"
+    description: "Reopen a READY/SEALED trailer back to LOADING"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: OutboundTrailer
+    side_effects: ["posture READY|SEALED -> LOADING", "increments OutboundTrailer.version by 1"]
+  - method: POST
+    path: "/ltl/trailers/{trailerId}/void"
+    description: "Void an empty LOADING/READY trailer"
+    roles: [DockSupervisor]
+    code: 200
+    input: []
+    output: OutboundTrailer
+    side_effects: ["posture -> VOIDED"]
+
+  # --- LinehaulLeg ---
+  - method: POST
+    path: "/ltl/linehaul-legs"
+    description: "Plan a linehaul leg (relay chains share trailer_id; relay_sequence orders them)"
+    roles: [Dispatcher]
+    code: 201
+    input: [origin_terminal_id, destination_terminal_id, trailer_id, planned_departure_utc, planned_arrival_utc, relay_sequence]
+    output: LinehaulLeg
+    side_effects: ["status = PLANNED", "relay feasibility validation for relay_sequence > 1"]
+  - method: GET
+    path: "/ltl/linehaul-legs"
+    description: "List linehaul legs"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: ["trailer_id?", "origin_terminal_id?", "destination_terminal_id?", "status?", "limit?", "offset?"]
+    output: "LinehaulLeg[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/linehaul-legs/{legId}"
+    description: "Get one leg (with provisional_eta_utc)"
+    roles: [TerminalAdmin, Dispatcher, DockSupervisor]
+    code: 200
+    input: []
+    output: LinehaulLeg
+    side_effects: []
+  - method: POST
+    path: "/ltl/linehaul-legs/{legId}/depart"
+    description: "Depart a planned leg (stamps actual departure; computes provisional ETA)"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: LinehaulLeg
+    side_effects: ["status PLANNED -> EN_ROUTE", "actual_departure_utc := now", "provisional_eta_utc computed", "first leg: trailer SEALED -> DISPATCHED", "manifested shipments -> IN_LINEHAUL"]
+  - method: POST
+    path: "/ltl/linehaul-legs/{legId}/arrive"
+    description: "Arrive an en-route leg"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: LinehaulLeg
+    side_effects: ["status EN_ROUTE -> ARRIVED", "actual_arrival_utc := now", "final leg: trailer -> ARRIVED, shipments -> DELIVERED"]
+  - method: POST
+    path: "/ltl/linehaul-legs/{legId}/cancel"
+    description: "Cancel a planned leg"
+    roles: [Dispatcher]
+    code: 200
+    input: []
+    output: LinehaulLeg
+    side_effects: ["status PLANNED -> CANCELLED"]
+
+  # --- DimensionerScan / Inspection ---
+  - method: POST
+    path: "/ltl/dimensioner-scans"
+    description: "Record a dimensioner + certified-scale measurement (append-only)"
+    roles: [RatingClerk]
+    code: 201
+    input: [shipment_id, measured_length_in, measured_width_in, measured_height_in, measured_weight_lbs]
+    output: DimensionerScan
+    side_effects: ["scanned_by := X-User-ID"]
+  - method: GET
+    path: "/ltl/shipments/{shipmentId}/dimensioner-scans"
+    description: "List scans of a shipment (sub-resource FK reverse reachability)"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "DimensionerScan[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/dimensioner-scans/{scanId}"
+    description: "Get one dimensioner scan"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: []
+    output: DimensionerScan
+    side_effects: []
+  - method: GET
+    path: "/ltl/dimensioner-scans"
+    description: "List dimensioner scans (filtered-list FK reverse reachability)"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: ["shipment_id?", "limit?", "offset?"]
+    output: "DimensionerScan[]"
+    side_effects: []
+  - method: POST
+    path: "/ltl/inspections"
+    description: "Open a re-class inspection on a RATED/RERATED shipment"
+    roles: [RatingClerk]
+    code: 201
+    input: [shipment_id, scan_id, claimed_nmfc_class]
+    output: Inspection
+    side_effects: ["shipment rating_status -> INSPECTION_PENDING", "dim/chargeable weight recompute from scan"]
+  - method: GET
+    path: "/ltl/shipments/{shipmentId}/inspections"
+    description: "List inspections of a shipment (sub-resource FK reverse reachability)"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "Inspection[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/inspections/{inspectionId}"
+    description: "Get one inspection"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: []
+    output: Inspection
+    side_effects: []
+  - method: GET
+    path: "/ltl/inspections"
+    description: "List inspections (filtered-list FK reverse reachability)"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: ["shipment_id?", "scan_id?", "outcome?", "limit?", "offset?"]
+    output: "Inspection[]"
+    side_effects: []
+  - method: POST
+    path: "/ltl/inspections/{inspectionId}/confirm"
+    description: "Confirm re-class: apply DIM-variant rating and adjustment"
+    roles: [RatingClerk]
+    code: 200
+    input: []
+    output: Inspection
+    side_effects: ["outcome -> CONFIRMED_RECLASS", "shipment nmfc_class := claimed", "freight_rating(DIM)", "adjustment_cents computed"]
+  - method: POST
+    path: "/ltl/inspections/{inspectionId}/reject"
+    description: "Reject re-class: restore pre-inspection rating basis"
+    roles: [RatingClerk]
+    code: 200
+    input: []
+    output: Inspection
+    side_effects: ["outcome -> REJECTED", "adjustment_cents := 0", "chargeable weight reverts to declared"]
+
+  # --- OsdCase ---
+  - method: POST
+    path: "/ltl/osd-cases"
+    description: "Open an overage/shortage/damage case"
+    roles: [OsdClerk]
+    code: 201
+    input: [shipment_id, case_kind, claimed_amount_cents, item_amounts_cents]
+    output: OsdCase
+    side_effects: ["status = OPEN", "shipment.osd_hold := true"]
+  - method: GET
+    path: "/ltl/osd-cases"
+    description: "List OS&D cases"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: ["shipment_id?", "case_kind?", "status?", "limit?", "offset?"]
+    output: "OsdCase[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/osd-cases/{caseId}"
+    description: "Get one case"
+    roles: [TerminalAdmin, RatingClerk, OsdClerk]
+    code: 200
+    input: []
+    output: OsdCase
+    side_effects: []
+  - method: POST
+    path: "/ltl/osd-cases/{caseId}/review"
+    description: "Move case to UNDER_REVIEW"
+    roles: [OsdClerk]
+    code: 200
+    input: []
+    output: OsdCase
+    side_effects: ["status OPEN -> UNDER_REVIEW"]
+  - method: POST
+    path: "/ltl/osd-cases/{caseId}/resolve"
+    description: "Resolve case: compute capped liability award"
+    roles: [OsdClerk]
+    code: 200
+    input: []
+    output: OsdCase
+    side_effects: ["status -> RESOLVED", "osd_liability computed", "shipment.osd_hold cleared when no other open case", "billed_amount_cents offset when already BILLED"]
+  - method: POST
+    path: "/ltl/osd-cases/{caseId}/deny"
+    description: "Deny case"
+    roles: [OsdClerk]
+    code: 200
+    input: []
+    output: OsdCase
+    side_effects: ["status -> DENIED", "awarded := 0", "shipment.osd_hold cleared when no other open case"]
+
+  # --- ServiceStandardReport ---
+  - method: POST
+    path: "/ltl/terminals/{terminalId}/service-standard-reports"
+    description: "Generate the on-time report for a terminal-local date"
+    roles: [TerminalAdmin]
+    code: 201
+    input: [report_date]
+    output: ServiceStandardReport
+    side_effects: ["on_time_performance computed over the half-open day window"]
+  - method: GET
+    path: "/ltl/terminals/{terminalId}/service-standard-reports"
+    description: "List reports for a terminal (sub-resource FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "ServiceStandardReport[]"
+    side_effects: []
+  - method: GET
+    path: "/ltl/service-standard-reports/{reportId}"
+    description: "Get one service standard report"
+    roles: [TerminalAdmin, Dispatcher]
+    code: 200
+    input: []
+    output: ServiceStandardReport
+    side_effects: []
+  - method: GET
+    path: "/ltl/service-standard-reports"
+    description: "List service standard reports (filtered-list FK reverse reachability)"
+    roles: [TerminalAdmin, Dispatcher]
+    code: 200
+    input: ["terminal_id?", "report_date?", "limit?", "offset?"]
+    output: "ServiceStandardReport[]"
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/invalid X-User-Role or X-User-ID" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted on this endpoint" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id does not resolve" }
+  - { id: ERR_REFERENCE_NOT_FOUND, http: 404, condition: "Body FK field does not resolve" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, enum violation, or range violation" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Entity state precondition for the requested transition not met" }
+  - { id: ERR_STALE_TRAILER_VERSION, http: 412, condition: "expected_trailer_version does not match trailer.version (OCC)" }
+  - { id: ERR_SHIPMENT_ON_OSD_HOLD, http: 409, condition: "Manifest-add on a shipment with an OPEN/UNDER_REVIEW OsdCase" }
+  - { id: ERR_DESTINATION_MISMATCH, http: 422, condition: "Trailer destination != shipment destination_terminal_id on manifest-add" }
+  - { id: ERR_DOOR_KIND_MISMATCH, http: 422, condition: "INBOUND door used for trailer spotting or OUTBOUND door used for sortation" }
+  - { id: ERR_STOP_OUTSIDE_SHIFT, http: 422, condition: "PickupStop.planned_arrival_minute outside [shift_start_minute, shift_end_minute]" }
+  - { id: ERR_RELAY_CONNECT_INFEASIBLE, http: 422, condition: "Relay leg departs less than 45 minutes after prior leg's planned arrival" }
+  - { id: ERR_LEG_WINDOW_INVALID, http: 422, condition: "planned_arrival_utc not strictly after planned_departure_utc" }
+  - { id: ERR_TRAILER_OVER_CAPACITY, http: 422, condition: "Projected loaded weight or cube exceeds trailer caps (strictly greater rejected; exactly-at-cap allowed)" }
+  - { id: ERR_SHIPMENT_NOT_BILLABLE, http: 409, condition: "Bill attempted while not DELIVERED or with an open OS&D case" }
+  - { id: ERR_TRAILER_NOT_LOADABLE, http: 422, condition: "mark-ready with zero ACTIVE entries or utilization_pct < 60.0" }
+  - { id: ERR_SCAN_SHIPMENT_MISMATCH, http: 422, condition: "Inspection.scan_id references a scan of a different shipment" }
+  - { id: ERR_TERMINAL_CLOSED, http: 409, condition: "Operation targets a Terminal with status CLOSED" }
+  - { id: ERR_ROUTE_NOT_DISPATCHED, http: 409, condition: "Stop arrive attempted while route not DISPATCHED" }
+  - { id: ERR_RELAY_SEQUENCE_VIOLATION, http: 409, condition: "Departing leg N while prior same-trailer leg N-1 is not ARRIVED" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: TerminalAdmin
+    description: "Terminal staff administrator; manages terminals, runs service-standard reports, operates the logical clock"
+    identity: opaque
+    exclusive_operations: ["POST /ltl/terminals", "POST /ltl/terminals/{id}/close", "POST /ltl/terminals/{id}/service-standard-reports", "POST /ltl/_clock/set_current_utc"]
+    shared_operations: ["GET endpoints"]
+  - name: Dispatcher
+    description: "P&D and linehaul dispatcher; tenders shipments, plans routes/stops, dispatches routes and legs"
+    identity: opaque
+    exclusive_operations: ["POST /ltl/shipments", "POST /ltl/shipments/{id}/cancel", "POST /ltl/pickup-routes", "POST /ltl/pickup-routes/{id}/dispatch", "POST /ltl/pickup-routes/{id}/recall", "POST /ltl/pickup-stops", "POST /ltl/pickup-stops/{id}/arrive", "POST /ltl/pickup-stops/{id}/complete", "POST /ltl/pickup-stops/{id}/skip", "POST /ltl/linehaul-legs", "POST /ltl/linehaul-legs/{id}/depart", "POST /ltl/linehaul-legs/{id}/arrive", "POST /ltl/linehaul-legs/{id}/cancel"]
+    shared_operations: ["GET endpoints"]
+  - name: DockSupervisor
+    description: "Dock operations lead; manages doors, sortation batches, trailers and manifests"
+    identity: opaque
+    exclusive_operations: ["POST /ltl/dock-doors and door lifecycle actions", "POST /ltl/sortation-batches and batch actions", "POST /ltl/trailers", "POST /ltl/trailers/{id}/manifest-entries", "POST /ltl/manifest-entries/{id}/remove", "POST /ltl/trailers/{id}/mark-ready", "POST /ltl/trailers/{id}/seal", "POST /ltl/trailers/{id}/reopen", "POST /ltl/trailers/{id}/void"]
+    shared_operations: ["GET endpoints"]
+  - name: RatingClerk
+    description: "Freight rating and inspection clerk; rates shipments, runs dimensioner scans and re-class inspections, bills"
+    identity: opaque
+    exclusive_operations: ["POST /ltl/shipments/{id}/rate", "POST /ltl/shipments/{id}/bill", "POST /ltl/dimensioner-scans", "POST /ltl/inspections", "POST /ltl/inspections/{id}/confirm", "POST /ltl/inspections/{id}/reject"]
+    shared_operations: ["GET endpoints"]
+  - name: OsdClerk
+    description: "Overage/shortage/damage claims clerk"
+    identity: opaque
+    exclusive_operations: ["POST /ltl/osd-cases", "POST /ltl/osd-cases/{id}/review", "POST /ltl/osd-cases/{id}/resolve", "POST /ltl/osd-cases/{id}/deny"]
+    shared_operations: ["GET endpoints"]

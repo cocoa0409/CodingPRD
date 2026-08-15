@@ -1,0 +1,64 @@
+"""Error classes and the error-ID catalog (PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status per error id (PRD §5 catalogue)
+ERR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_FORBIDDEN_OWNERSHIP": 403,
+    "ERR_CLAIM_SO_DUTY_VIOLATION": 403,
+    "ERR_RETEST_SO_DUTY_VIOLATION": 403,
+    "ERR_BLEND_APPROVER_CONFLICT": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_CUSTOMER_NOT_FOUND": 404,
+    "ERR_LOT_NOT_FOUND": 404,
+    "ERR_TEST_NOT_FOUND": 404,
+    "ERR_SCHEDULE_NOT_FOUND": 404,
+    "ERR_UNIT_NOT_FOUND": 404,
+    "ERR_TICKET_NOT_FOUND": 404,
+    "ERR_RUN_NOT_FOUND": 404,
+    "ERR_BLEND_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_PAYMENT_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_LOT_ON_DAMAGE_HOLD": 409,
+    "ERR_INVOICE_NOT_ISSUED": 409,
+    "ERR_AGREEMENT_NOT_ACTIVE": 409,
+    "ERR_DUPLICATE_ACTIVE_AGREEMENT": 409,
+    "ERR_STALE_LOT_VERSION": 412,
+    "ERR_STALE_INVOICE_VERSION": 412,
+    "ERR_STALE_SCHEDULE_VERSION": 409,
+    "ERR_MOISTURE_EXCEEDS_DRYER_LIMIT": 422,
+    "ERR_TARGET_MOISTURE_INVALID": 422,
+    "ERR_TICKET_WINDOW_INVALID": 422,
+    "ERR_CAPACITY_EXCEEDED": 422,
+    "ERR_PREEMPTION_NOT_ALLOWED": 422,
+    "ERR_RUN_OVERLAP": 409,
+    "ERR_SCHEDULE_WINDOW_OVERLAP": 409,
+    "ERR_BLEND_COMMODITY_MISMATCH": 422,
+    "ERR_BLEND_OWNERSHIP_MISMATCH": 422,
+    "ERR_INSUFFICIENT_BLEND_GRAIN": 422,
+    "ERR_METER_READING_INVALID": 422,
+    "ERR_CLAIM_AFTER_DELIVERY": 422,
+    "ERR_CLAIM_RUN_MISMATCH": 422,
+    "ERR_CREDIT_LIMIT_EXCEEDED": 422,
+    "ERR_CUSTOMER_SUSPENDED": 422,
+    "ERR_PAYMENT_EXCEEDS_DUE": 422,
+    "ERR_NO_BILLABLE_ACTIVITY": 422,
+    "ERR_PAYMENT_NOT_REVERSIBLE": 409,
+}
+
+
+def raise_err(error_id, message=None):
+    raise ApiError(error_id, ERR[error_id], message)

@@ -1,0 +1,41 @@
+"""Blueprint registry."""
+
+from routes import (
+    programs,
+    classrooms,
+    families,
+    children,
+    registrations,
+    volunteers,
+    screening,
+    assignments,
+    plans,
+    orders,
+    items,
+    distributions,
+    days,
+    attendance,
+    messages,
+    retention,
+    clock_route,
+)
+
+ALL_BLUEPRINTS = [
+    programs.bp,
+    classrooms.bp,
+    families.bp,
+    children.bp,
+    registrations.bp,
+    volunteers.bp,
+    screening.bp,
+    assignments.bp,
+    plans.bp,
+    orders.bp,
+    items.bp,
+    distributions.bp,
+    days.bp,
+    attendance.bp,
+    messages.bp,
+    retention.bp,
+    clock_route.bp,
+]

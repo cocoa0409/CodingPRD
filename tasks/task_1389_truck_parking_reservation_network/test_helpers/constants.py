@@ -1,0 +1,60 @@
+"""Domain thresholds — numeric constants from the PRD's rules (sections 2-3)."""
+
+# Logical clock startup default (PRD 2.4).
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Site enforcement knob defaults (PRD 3.1).
+NO_SHOW_GRACE_MINUTES = 60
+OVERSTAY_GRACE_MINUTES = 30
+CANCELLATION_FREE_WINDOW_HOURS = 24
+
+# Booking window bound (PRD 3.4).
+MAX_NIGHTS = 14
+
+# Waitlist offer TTL (PRD 3.7) and incident reopen window (PRD 3.8).
+OFFER_TTL_MINUTES = 30
+REOPEN_WINDOW_HOURS = 72
+
+# Default rate-plan catalog constants (PRD 3.1/3.2).
+TIER2_PCT = 60
+TIER3_PCT = 80
+TIER4_PCT = 95
+MULT_LOW = 0.9
+MULT_MID = 1.0
+MULT_HIGH = 1.25
+MULT_MAX = 1.5
+PEAK_MULTIPLIER = 1.2
+PEAK_DAYS = ["FRI", "SAT"]
+
+# Loyalty program (PRD 3.3).
+SILVER_AT = 12
+GOLD_AT = 30
+PLATINUM_AT = 60
+SILVER_PCT = 5
+GOLD_PCT = 10
+PLATINUM_PCT = 15
+POINTS_PER_NIGHT = 10
+
+# Driver standing (PRD 3.3).
+NO_SHOW_STRIKE_WEIGHT = 1
+EVICTION_STRIKE_WEIGHT = 2
+SUSPENDED_AT_STRIKES = 3
+
+# Overstay penalty (PRD 3.5).
+OVERSTAY_RATE_MULT = 1.5
+OVERSTAY_HOURLY_DIVISOR = 20
+OVERSTAY_ESCALATION_HOURS = 4
+
+# Invoice volume tiers keyed on gross (PRD 3.9).
+INVOICE_TIER1_GROSS = 500_000
+INVOICE_TIER1_PCT = 2
+INVOICE_TIER2_GROSS = 2_000_000
+INVOICE_TIER2_PCT = 5
+INVOICE_TIER3_GROSS = 5_000_000
+INVOICE_TIER3_PCT = 8
+DEFAULT_PAYMENT_TERMS_DAYS = 30
+
+TEST_DEFAULTS = {
+    "BASE_NIGHTLY_RATE_CENTS": 5000,
+    "CREDIT_LIMIT_CENTS": 10_000_000,
+}

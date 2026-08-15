@@ -1,0 +1,63 @@
+"""Error catalog. Every error id and HTTP status from PRD Section 5."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str = ""):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+ERR = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_ENUM": 400,
+    "ERR_PROVIDER_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_EDIT_RULE_NOT_FOUND": 404,
+    "ERR_EDIT_VERSION_NOT_FOUND": 404,
+    "ERR_EDIT_HIT_NOT_FOUND": 404,
+    "ERR_REVIEW_TASK_NOT_FOUND": 404,
+    "ERR_DISPUTE_NOT_FOUND": 404,
+    "ERR_IBR_NOT_FOUND": 404,
+    "ERR_INPATIENT_REVIEW_NOT_FOUND": 404,
+    "ERR_SAVINGS_PERIOD_NOT_FOUND": 404,
+    "ERR_VENDOR_EDIT_NOT_FOUND": 404,
+    "ERR_STALE_VERSION": 412,
+    "ERR_CLAIM_NOT_SCREENABLE": 409,
+    "ERR_CLAIM_NOT_PAYABLE": 409,
+    "ERR_CLAIM_LINES_LOCKED": 409,
+    "ERR_EDIT_VERSION_NOT_APPROVABLE": 409,
+    "ERR_REVIEW_TASK_NOT_DECIDABLE": 409,
+    "ERR_DISPUTE_NOT_DECIDABLE": 409,
+    "ERR_DISPUTE_NOT_OPEN": 409,
+    "ERR_IBR_NOT_COMPLETABLE": 409,
+    "ERR_INPATIENT_REVIEW_NOT_DECIDABLE": 409,
+    "ERR_PERIOD_NOT_FINALIZABLE": 409,
+    "ERR_CLINICAL_ATTESTATION_REQUIRED": 422,
+    "ERR_SOD_AUTHOR_APPROVAL": 403,
+    "ERR_SOD_REVIEWER_ADJUDICATION": 403,
+    "ERR_PROVIDER_TERMINATED": 422,
+    "ERR_SENIOR_REVIEW_REQUIRED": 403,
+    "ERR_EDIT_WINDOW_OVERLAP": 409,
+    "ERR_DISPUTE_ALREADY_OPEN": 409,
+    "ERR_REVIEWER_CAPACITY_EXCEEDED": 409,
+    "ERR_DUPLICATE_PERIOD_KEY": 409,
+    "ERR_DISPUTE_WINDOW_EXPIRED": 422,
+    "ERR_DECISION_DEADLINE_PASSED": 422,
+    "ERR_PROVIDER_AUDIT_OVERLAP": 409,
+    "ERR_IBR_NOT_YET_EXPIRABLE": 422,
+    "ERR_EDIT_VERSION_IN_USE": 409,
+    "ERR_HIT_NOT_ON_CLAIM": 422,
+    "ERR_DRG_CODE_UNKNOWN": 422,
+    "ERR_LINE_AMOUNT_MISMATCH": 422,
+    "ERR_NO_CLAIM_LINES": 422,
+    "ERR_INVALID_RELEASE_AMOUNT": 422,
+}
+
+
+def raise_err(error_id: str, message: str = ""):
+    raise ApiError(error_id, ERR[error_id], message or error_id)

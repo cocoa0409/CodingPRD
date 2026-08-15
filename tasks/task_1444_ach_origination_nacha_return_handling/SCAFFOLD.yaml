@@ -1,0 +1,1115 @@
+scenario: |
+  ACH Origination & NACHA Return Handling (originating depository bank): originator underwriting & exposure limit, file intake, validation & warehousing until effective date, return/NOC processing & re-presentment rules, unauthorized return rate monitoring & threshold breach, same-day ACH window & cutoff pricing, reversal request eligibility & timing, ODFI risk monitoring & originator suspension, settlement & GL reconciliation
+
+domain_name: ach-odfi-origination
+api_prefix: /ach
+
+# =============================================================================
+# Step 0: Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: compliance_audit        # NACHA rules, SoD, rate monitoring, suspension
+  secondary_archetype: ledger_reconciliation # settlement batch vs GL postings, dual totals
+  complexity_layers:
+    - cascading_side_effects       # return -> rate snapshot -> breach -> risk case -> suspension -> file rejection -> entry cancellation
+    - dual_variant_calculation     # return-rate (60d vs MTD), exposure (gross vs debit-only), fee (quoted vs assessed), recon (expected vs posted)
+    - rate_threshold_triggers      # 0.5% unauthorized-rate breach, exposure limit crossing, $1M same-day cap
+    - optimistic_concurrency       # OCC on Originator.version and AchFile.version
+  entity_topology: flat            # peer entities joined by FKs; no nested creation paths
+  state_machine_shape: parallel    # AchEntry lifecycle runs cycles while SettlementBatch compound state advances; Originator risk cycle runs independently
+  relationship_patterns:
+    - one_to_many                  # Originator->AchFile->AchEntry; AchEntry->ReturnCase/NocRecord/ReversalRequest
+    - cross_aggregate              # SettlementBatch aggregates entries/reversals/postings across originators
+  role_model: segregation_of_duties # underwriter / operations / risk officer / finance are disjoint; dispatcher may not reconcile own batch
+  consistency_model: immediate     # all side effects atomic within the request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Originator
+    parent: null
+    common_fields: true
+    fields:
+      - { name: legal_name, type: string, source: input, description: "Legal name of the originating company" }
+      - { name: sec_codes_allowed, type: array, source: input, description: "Subset of [PPD, CCD, WEB, TEL] the originator may originate" }
+      - { name: exposure_limit_cents, type: integer, source: input, default: 0, description: "Maximum outstanding debit exposure approved at underwriting; set by PATCH approve" }
+      - { name: fee_discount_bps, type: integer, source: input, default: 0, description: "Per-entry fee discount in basis points, 0..10000, applied per-entry then summed" }
+      - { name: status, type: enum, source: system, description: "PENDING_UNDERWRITING | ACTIVE | WATCH | SUSPENDED | TERMINATED" }
+      - { name: unauth_rate_bps_trailing, type: integer, source: computed, default: 0, description: "Latest trailing-60-day unauthorized return rate in integer bps (round_half_up); refreshed by snapshot POST and by unauthorized-return registration" }
+      - { name: unauth_rate_bps_mtd, type: integer, source: computed, default: 0, description: "Latest calendar-month-to-date unauthorized return rate in integer bps; refreshed the same way" }
+      - { name: outstanding_exposure_gross_cents, type: integer, source: computed, default: 0, description: "Sum of amount_cents over all entries of this originator with status IN {WAREHOUSED, TRANSMITTED}" }
+      - { name: outstanding_exposure_debit_cents, type: integer, source: computed, default: 0, description: "Same as gross but restricted to entries with direction == DEBIT" }
+
+  - name: CutoffWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: window_kind, type: enum, source: input, description: "SAME_DAY_1 | SAME_DAY_2 | SAME_DAY_3 | NEXT_DAY; unique across CutoffWindow rows" }
+      - { name: opens_at_utc, type: string, source: input, description: "HH:MM UTC time-of-day the window opens" }
+      - { name: closes_at_utc, type: string, source: input, description: "HH:MM UTC time-of-day the window closes; must be strictly later than opens_at_utc" }
+      - { name: per_entry_fee_cents, type: integer, source: input, description: "Base per-entry fee for files assigned this window (>= 0)" }
+      - { name: file_fee_cents, type: integer, source: input, description: "Flat per-file fee for files assigned this window (>= 0)" }
+      - { name: large_entry_surcharge_cents, type: integer, source: input, description: "Per-entry surcharge added when entry amount_cents > LARGE_ENTRY_THRESHOLD_CENTS (>= 0)" }
+
+  - name: AchFile
+    parent: null
+    common_fields: true
+    fields:
+      - { name: originator_id, type: string, source: system, description: "FK -> Originator.id; set from caller identity at intake" }
+      - { name: sec_code, type: enum, source: input, description: "PPD | CCD | WEB | TEL; must be in originator.sec_codes_allowed" }
+      - { name: requested_window_kind, type: enum, source: input, description: "SAME_DAY_1 | SAME_DAY_2 | SAME_DAY_3 | NEXT_DAY" }
+      - { name: effective_date, type: string, source: input, description: "YYYY-MM-DD; must be a banking day within [today, today + 2 banking days]" }
+      - { name: assigned_window_kind, type: enum, source: system, description: "Window actually assigned at release (null until released); may differ from requested_window_kind when cutoff was missed" }
+      - { name: settlement_date, type: string, source: system, description: "YYYY-MM-DD assigned at release: today if a same-day window is open, else next banking day" }
+      - { name: settlement_batch_id, type: string, source: system, description: "FK -> SettlementBatch.id; assigned at release via find-or-create on (assigned_window_kind, settlement_date)" }
+      - { name: entry_count, type: integer, source: computed, default: 0, description: "Count of AchEntry rows belonging to this file in ALL statuses (never decremented)" }
+      - { name: total_amount_cents, type: integer, source: computed, default: 0, description: "Sum of amount_cents over entries of this file in ALL statuses (never decremented)" }
+      - { name: quoted_fee_cents, type: integer, source: computed, description: "Provisional fee computed at each entries-append using requested_window_kind rate card" }
+      - { name: assessed_fee_cents, type: integer, source: computed, description: "Final fee computed at release using assigned_window_kind rate card; null until released" }
+      - { name: status, type: enum, source: system, description: "WAREHOUSED | RELEASED | DISPATCHED | SETTLED | CANCELLED | REJECTED" }
+
+  - name: AchEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: file_id, type: string, source: system, description: "FK -> AchFile.id" }
+      - { name: direction, type: enum, source: input, description: "DEBIT | CREDIT" }
+      - { name: amount_cents, type: integer, source: input, description: "Entry amount; must be > 0" }
+      - { name: receiver_account, type: string, source: input, description: "Receiver account number" }
+      - { name: receiver_routing, type: string, source: input, description: "9-digit RDFI routing number" }
+      - { name: representment_count, type: integer, source: system, default: 0, description: "Number of RETURNED -> TRANSMITTED re-presentments so far; hard cap 2" }
+      - { name: last_return_code, type: enum, source: system, description: "R01 | R02 | R05 | R07 | R10; null until first return" }
+      - { name: first_transmitted_at, type: datetime, source: system, description: "Timestamp of first WAREHOUSED -> TRANSMITTED transition; denominator anchor for rate calcs" }
+      - { name: settled_at, type: datetime, source: system, description: "Timestamp of the most recent TRANSMITTED -> SETTLED transition; anchor for reversal window" }
+      - { name: status, type: enum, source: system, description: "WAREHOUSED | TRANSMITTED | SETTLED | RETURNED | CLOSED | CANCELLED" }
+
+  - name: ReturnCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: entry_id, type: string, source: system, description: "FK -> AchEntry.id" }
+      - { name: return_code, type: enum, source: input, description: "R01 | R02 | R05 | R07 | R10" }
+      - { name: received_at, type: datetime, source: system, description: "Logical-clock timestamp of return registration" }
+      - { name: is_unauthorized, type: boolean, source: computed, description: "true iff return_code IN {R05, R07, R10}" }
+      - { name: representment_number, type: integer, source: computed, default: 0, description: "0 for the first return of the entry; 1 after one re-presentment; 2 after two" }
+      - { name: gl_posted, type: boolean, source: system, default: false, description: "Whether the reversing GL pair has been written (swept by the next settle for the same originator)" }
+      - { name: disposition, type: enum, source: system, description: "OPEN | REPRESENTED | FINAL" }
+
+  - name: NocRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: entry_id, type: string, source: system, description: "FK -> AchEntry.id" }
+      - { name: noc_code, type: enum, source: input, description: "C01 | C02 | C03" }
+      - { name: corrected_data, type: string, source: input, description: "Corrected account/routing data supplied by the RDFI" }
+      - { name: received_at, type: datetime, source: system, description: "Logical-clock timestamp of NOC registration" }
+      - { name: due_date, type: string, source: computed, description: "YYYY-MM-DD = received date + 6 banking days (Mon-Fri); application due by end of this banking day" }
+      - { name: late_applied, type: boolean, source: system, default: false, description: "true when application happened while status was OVERDUE" }
+      - { name: status, type: enum, source: system, description: "RECEIVED | OVERDUE | APPLIED" }
+
+  - name: ReversalRequest
+    parent: null
+    common_fields: true
+    fields:
+      - { name: entry_id, type: string, source: system, description: "FK -> AchEntry.id" }
+      - { name: reason, type: enum, source: input, description: "DUPLICATE_ENTRY | WRONG_AMOUNT | WRONG_ACCOUNT" }
+      - { name: requested_at, type: datetime, source: system, description: "Logical-clock timestamp of creation" }
+      - { name: window_expires_at, type: string, source: computed, description: "YYYY-MM-DD = entry.settled_at date + 5 banking days; request must be created on or before this date" }
+      - { name: status, type: enum, source: system, description: "REQUESTED | TRANSMITTED | SETTLED | CANCELLED" }
+
+  - name: ReturnRateSnapshot
+    parent: null
+    common_fields: false   # immutable audit record
+    fields:
+      - { name: originator_id, type: string, source: system, description: "FK -> Originator.id" }
+      - { name: computed_at, type: datetime, source: system, description: "Logical-clock timestamp of computation" }
+      - { name: unauth_returns_60d, type: integer, source: computed, description: "Count of unauthorized ReturnCases (is_unauthorized) with received_at IN (computed_at - 60 days, computed_at] whose entry direction == DEBIT" }
+      - { name: debits_60d, type: integer, source: computed, description: "Count of DEBIT entries of the originator with first_transmitted_at IN (computed_at - 60 days, computed_at]" }
+      - { name: unauth_returns_mtd, type: integer, source: computed, description: "Count of unauthorized ReturnCases with received_at IN [first day of computed_at's calendar month 00:00:00.000Z, computed_at]" }
+      - { name: debits_mtd, type: integer, source: computed, description: "Count of DEBIT entries with first_transmitted_at IN [month start, computed_at]" }
+      - { name: rate_bps_trailing_60d, type: integer, source: computed, description: "round_half_up(10000 * unauth_returns_60d / debits_60d); 0 when debits_60d == 0" }
+      - { name: rate_bps_mtd, type: integer, source: computed, description: "round_half_up(10000 * unauth_returns_mtd / debits_mtd); 0 when debits_mtd == 0" }
+      - { name: breach, type: boolean, source: computed, description: "true iff rate_bps_trailing_60d > UNAUTH_THRESHOLD_BPS OR rate_bps_mtd > UNAUTH_THRESHOLD_BPS" }
+
+  - name: RiskCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: originator_id, type: string, source: system, description: "FK -> Originator.id" }
+      - { name: source, type: enum, source: system, description: "RATE_BREACH (auto-opened by snapshot) | MANUAL (opened by OdfiRiskOfficer)" }
+      - { name: status, type: enum, source: system, description: "OPEN | RESOLVED" }
+      - { name: resolution_action, type: enum, source: system, description: "SUSPEND | WATCH | REINSTATE | TERMINATE | DISMISS; null until resolved" }
+      - { name: resolved_by_user_id, type: string, source: system, description: "X-User-ID of the resolving OdfiRiskOfficer; null until resolved" }
+
+  - name: SettlementBatch
+    parent: null
+    common_fields: true
+    fields:
+      - { name: window_kind, type: enum, source: system, description: "SAME_DAY_1 | SAME_DAY_2 | SAME_DAY_3 | NEXT_DAY; unique per (window_kind, settlement_date) via find-or-create" }
+      - { name: settlement_date, type: string, source: system, description: "YYYY-MM-DD the batch settles" }
+      - { name: status, type: enum, source: system, description: "OPEN | DISPATCHED | SETTLED | RECONCILED" }
+      - { name: expected_net_cents, type: integer, source: computed, description: "Computed at dispatch: principal_net - fee_total (evaluation order pinned in batch_settlement_net)" }
+      - { name: posted_net_cents, type: integer, source: computed, description: "Computed at settle: signed sum of this batch's GlPosting rows (credits - debits on ORIGINATOR_RECEIVABLE)" }
+      - { name: recon_variance_cents, type: integer, source: computed, description: "Computed at reconcile attempt: posted_net_cents - expected_net_cents" }
+      - { name: dispatched_by_user_id, type: string, source: system, description: "X-User-ID of the OdfiOperations user who dispatched; reconciler must differ (SoD)" }
+      - { name: reconciled_by_user_id, type: string, source: system, description: "X-User-ID of the OdfiFinance user who reconciled; null until reconciled" }
+
+  - name: GlPosting
+    parent: null
+    common_fields: false   # append-only ledger event
+    fields:
+      - { name: settlement_batch_id, type: string, source: system, description: "FK -> SettlementBatch.id" }
+      - { name: account_code, type: enum, source: system, description: "SETTLEMENT_CLEARING | ORIGINATOR_RECEIVABLE | FEE_INCOME" }
+      - { name: debit_cents, type: integer, source: system, default: 0, description: "Debit leg amount; exactly one of debit_cents/credit_cents is > 0 per row" }
+      - { name: credit_cents, type: integer, source: system, default: 0, description: "Credit leg amount" }
+      - { name: memo, type: string, source: system, description: "Free-text reference (entry id, return case id, reversal id, or file fee note); never a decision input" }
+      - { name: posted_at, type: datetime, source: system, description: "Logical-clock timestamp of posting" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Originator
+    initial_state: PENDING_UNDERWRITING
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: PENDING_UNDERWRITING
+        to: ACTIVE
+        trigger: "PATCH /ach/originators/{id} with decision=APPROVE"
+        actor: OdfiUnderwriter
+        preconditions:
+          - "status == PENDING_UNDERWRITING (ERR_ORIGINATOR_STATUS_TERMINAL otherwise)"
+          - "expected_originator_version matches (ERR_STALE_VERSION)"
+          - "exposure_limit_cents provided and > 0 (ERR_INVALID_REQUEST)"
+        side_effects:
+          - "exposure_limit_cents and fee_discount_bps persisted"
+      - from: PENDING_UNDERWRITING
+        to: TERMINATED
+        trigger: "PATCH /ach/originators/{id} with decision=DECLINE"
+        actor: OdfiUnderwriter
+        preconditions:
+          - "status == PENDING_UNDERWRITING (ERR_ORIGINATOR_STATUS_TERMINAL otherwise)"
+          - "expected_originator_version matches (ERR_STALE_VERSION)"
+        side_effects: []
+      - from: ACTIVE
+        to: WATCH
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=WATCH"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status == ACTIVE (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects: []
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=SUSPEND"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {ACTIVE, WATCH} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "Every AchFile of this originator with status == WAREHOUSED -> REJECTED"
+          - "That file mutation itself cascades: every AchEntry of each such file with status == WAREHOUSED -> CANCELLED"
+          - "Originator.outstanding_exposure_gross_cents / _debit_cents recomputed (cancelled entries drop out)"
+      - from: WATCH
+        to: SUSPENDED
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=SUSPEND"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {ACTIVE, WATCH} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "Every AchFile of this originator with status == WAREHOUSED -> REJECTED"
+          - "That file mutation itself cascades: every AchEntry of each such file with status == WAREHOUSED -> CANCELLED"
+          - "Originator.outstanding_exposure_gross_cents / _debit_cents recomputed"
+      - from: WATCH
+        to: ACTIVE
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=REINSTATE"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {SUSPENDED, WATCH} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects: []
+      - from: SUSPENDED
+        to: WATCH
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=REINSTATE"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {SUSPENDED, WATCH} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects: []
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=TERMINATE"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {ACTIVE, WATCH, SUSPENDED} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "Same WAREHOUSED file/entry cascade as SUSPEND"
+      - from: WATCH
+        to: TERMINATED
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=TERMINATE"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {ACTIVE, WATCH, SUSPENDED} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "Same WAREHOUSED file/entry cascade as SUSPEND"
+      - from: SUSPENDED
+        to: TERMINATED
+        trigger: "POST /ach/risk-cases/{id}/resolve with action=TERMINATE"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "Originator.status IN {ACTIVE, WATCH, SUSPENDED} (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "Same WAREHOUSED file/entry cascade as SUSPEND"
+        note: "DISMISS resolution leaves Originator.status unchanged (no transition)."
+
+  - entity: AchFile
+    initial_state: WAREHOUSED
+    terminal_states: [SETTLED, CANCELLED, REJECTED]
+    transitions:
+      - from: WAREHOUSED
+        to: RELEASED
+        trigger: "POST /ach/ach-files/{id}/release"
+        actor: OdfiOperations
+        preconditions:
+          - "File.status == WAREHOUSED (ERR_FILE_NOT_WAREHOUSED)"
+          - "Originator.status == ACTIVE (ERR_ORIGINATOR_NOT_ACTIVE)"
+          - "entry_count >= 1 (ERR_FILE_EMPTY)"
+          - "current banking day == effective_date (ERR_RELEASE_DATE_MISMATCH)"
+          - "at least one CutoffWindow exists for the assigned-window rule (ERR_NO_ELIGIBLE_WINDOW)"
+        side_effects:
+          - "Window assignment: if requested window's closes_at_utc > now, assigned = requested; elif any same-day window still open, assigned = the open one with earliest closes_at_utc; else assigned = NEXT_DAY"
+          - "settlement_date = today if assigned is same-day, else next banking day"
+          - "settlement_batch_id = find-or-create OPEN SettlementBatch on (assigned_window_kind, settlement_date)"
+          - "assessed_fee_cents computed via file_fee using assigned_window_kind"
+      - from: WAREHOUSED
+        to: CANCELLED
+        trigger: "POST /ach/ach-files/{id}/cancel"
+        actor: OriginatorOps
+        preconditions:
+          - "File.status == WAREHOUSED (ERR_FILE_NOT_WAREHOUSED)"
+          - "Caller owns the file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects:
+          - "Every AchEntry of this file with status == WAREHOUSED -> CANCELLED"
+          - "Originator exposure recomputed"
+      - from: WAREHOUSED
+        to: REJECTED
+        trigger: "system (cascade from Originator -> SUSPENDED or -> TERMINATED)"
+        actor: system
+        preconditions:
+          - "File.status == WAREHOUSED"
+        side_effects:
+          - "Every AchEntry of this file with status == WAREHOUSED -> CANCELLED"
+      - from: RELEASED
+        to: DISPATCHED
+        trigger: "system (POST /ach/settlement-batches/{id}/advance action=DISPATCH on the file's batch)"
+        actor: system
+        preconditions:
+          - "Batch.status == OPEN"
+        side_effects:
+          - "Every AchEntry of this file (all in WAREHOUSED) -> TRANSMITTED, first_transmitted_at set"
+      - from: DISPATCHED
+        to: SETTLED
+        trigger: "system (POST /ach/settlement-batches/{id}/advance action=SETTLE on the file's batch)"
+        actor: system
+        preconditions:
+          - "Batch.status == DISPATCHED"
+        side_effects:
+          - "Entries TRANSMITTED -> SETTLED (set settled_at)"
+
+  - entity: AchEntry
+    initial_state: WAREHOUSED
+    terminal_states: [CLOSED, CANCELLED]
+    transitions:
+      - from: WAREHOUSED
+        to: TRANSMITTED
+        trigger: "system (batch advance action=DISPATCH)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "first_transmitted_at := now (only when representment_count == 0)"
+      - from: TRANSMITTED
+        to: SETTLED
+        trigger: "system (batch advance action=SETTLE)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "settled_at := now"
+          - "GL settlement pair posted into this batch (see gl_settlement_postings)"
+          - "Originator exposure recomputed (entry leaves outstanding set)"
+      - from: SETTLED
+        to: RETURNED
+        trigger: "POST /ach/ach-entries/{id}/returns"
+        actor: OdfiOperations
+        preconditions:
+          - "Entry.status == SETTLED (ERR_ENTRY_NOT_SETTLED from any other status, including CLOSED/CANCELLED)"
+          - "return_code IN {R01, R02, R05, R07, R10} (ERR_INVALID_REQUEST otherwise)"
+        side_effects:
+          - "ReturnCase created (disposition OPEN, representment_number := entry.representment_count)"
+          - "entry.last_return_code := return_code; Entry.status := RETURNED for ALL return codes (exit from RETURNED is via re-presentment or close only)"
+          - "If ReturnCase.is_unauthorized: immediately recompute unauthorized_return_rate at the current clock and update Originator.unauth_rate_bps_trailing / unauth_rate_bps_mtd; if the recomputed breach is true AND no OPEN RiskCase with source == RATE_BREACH exists for this originator, create one (OPEN, RATE_BREACH) — the Originator rate-field mutation itself triggers this RiskCase creation"
+      - from: RETURNED
+        to: TRANSMITTED
+        trigger: "POST /ach/ach-entries/{id}/representments"
+        actor: OdfiOperations
+        preconditions:
+          - "Entry.status == RETURNED (ERR_ENTRY_NOT_RETURNED)"
+          - "entry.last_return_code == R01 (ERR_REPRESENTMENT_CODE_PROHIBITED)"
+          - "entry.representment_count < 2 (ERR_REPRESENTMENT_EXHAUSTED at count == 2)"
+        side_effects:
+          - "representment_count += 1"
+          - "The OPEN ReturnCase for this entry (disposition == OPEN) -> disposition REPRESENTED"
+          - "Entry joins the re-flow sweep: the next batch settle for the entry's originator settles it"
+      - from: RETURNED
+        to: CLOSED
+        trigger: "POST /ach/ach-entries/{id}/close"
+        actor: OriginatorOps
+        preconditions:
+          - "Entry.status IN {SETTLED, RETURNED} (ERR_ENTRY_NOT_RETURNED from other states)"
+          - "Caller owns the entry's file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects:
+          - "Any OPEN ReturnCase for this entry -> FINAL"
+      - from: SETTLED
+        to: CLOSED
+        trigger: "POST /ach/ach-entries/{id}/close"
+        actor: OriginatorOps
+        preconditions:
+          - "Entry.status IN {SETTLED, RETURNED} (ERR_ENTRY_NOT_RETURNED)"
+          - "Caller owns the entry's file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects: []
+      - from: WAREHOUSED
+        to: CANCELLED
+        trigger: "system (file cancel cascade or originator suspension cascade)"
+        actor: system
+        preconditions:
+          - "Entry.status == WAREHOUSED"
+        side_effects: []
+        note: "Cyclic shape: SETTLED -> RETURNED -> TRANSMITTED -> SETTLED -> RETURNED, bounded by representment_count <= 2."
+
+  - entity: ReturnCase
+    initial_state: OPEN
+    terminal_states: [FINAL, REPRESENTED]
+    transitions:
+      - from: OPEN
+        to: REPRESENTED
+        trigger: "system (POST /ach/ach-entries/{id}/representments on the case's entry)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: FINAL
+        trigger: "system (POST /ach/ach-entries/{id}/close on the case's entry)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: NocRecord
+    initial_state: RECEIVED
+    terminal_states: [APPLIED]
+    transitions:
+      - from: RECEIVED
+        to: OVERDUE
+        trigger: "system (POST /ach/_clock/set_current_utc sweep: current banking day > due_date)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RECEIVED
+        to: APPLIED
+        trigger: "POST /ach/noc-records/{id}/apply"
+        actor: OriginatorOps
+        preconditions:
+          - "NocRecord.status IN {RECEIVED, OVERDUE} (ERR_NOC_NOT_ACTIONABLE from APPLIED)"
+          - "Caller owns the NOC's entry's file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects: []
+      - from: OVERDUE
+        to: APPLIED
+        trigger: "POST /ach/noc-records/{id}/apply"
+        actor: OriginatorOps
+        preconditions:
+          - "NocRecord.status IN {RECEIVED, OVERDUE} (ERR_NOC_NOT_ACTIONABLE)"
+          - "Caller owns the NOC's entry's file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects:
+          - "late_applied := true (applied while OVERDUE)"
+
+  - entity: ReversalRequest
+    initial_state: REQUESTED
+    terminal_states: [SETTLED, CANCELLED]
+    transitions:
+      - from: REQUESTED
+        to: TRANSMITTED
+        trigger: "POST /ach/reversal-requests/{id}/advance with action=TRANSMIT"
+        actor: OdfiOperations
+        preconditions:
+          - "ReversalRequest.status == REQUESTED (ERR_REVERSAL_NOT_ACTIONABLE)"
+        side_effects:
+          - "Reversal joins the re-flow sweep: settled by the next batch settle for the entry's originator"
+      - from: REQUESTED
+        to: CANCELLED
+        trigger: "POST /ach/reversal-requests/{id}/advance with action=CANCEL"
+        actor: OriginatorOps
+        preconditions:
+          - "ReversalRequest.status == REQUESTED (ERR_REVERSAL_NOT_ACTIONABLE)"
+          - "Caller owns the reversal's entry's file (ERR_RESOURCE_OWNERSHIP)"
+        side_effects: []
+      - from: TRANSMITTED
+        to: SETTLED
+        trigger: "system (batch advance action=SETTLE for the entry's originator)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Reversal GL pair posted (exact inverse of the original entry's settlement pair)"
+
+  - entity: RiskCase
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: RESOLVED
+        trigger: "POST /ach/risk-cases/{id}/resolve"
+        actor: OdfiRiskOfficer
+        preconditions:
+          - "RiskCase.status == OPEN (ERR_RISK_CASE_ALREADY_RESOLVED)"
+          - "action applicable to Originator.status: SUSPEND<-{ACTIVE,WATCH}; WATCH<-{ACTIVE}; REINSTATE<-{SUSPENDED,WATCH}; TERMINATE<-{ACTIVE,WATCH,SUSPENDED}; DISMISS<-any (ERR_RESOLUTION_NOT_APPLICABLE)"
+        side_effects:
+          - "resolution_action and resolved_by_user_id persisted"
+          - "Divergent per action: SUSPEND -> Originator -> SUSPENDED + file/entry cascade; WATCH -> Originator -> WATCH; REINSTATE -> SUSPENDED:WATCH or WATCH:ACTIVE; TERMINATE -> Originator -> TERMINATED + cascade; DISMISS -> no originator change"
+        note: "Branching shape with divergent side-effect sets per resolution branch."
+
+  - entity: SettlementBatch
+    initial_state: OPEN
+    terminal_states: [RECONCILED]
+    transitions:
+      - from: OPEN
+        to: DISPATCHED
+        trigger: "POST /ach/settlement-batches/{id}/advance with action=DISPATCH"
+        actor: OdfiOperations
+        preconditions:
+          - "Batch.status == OPEN (ERR_BATCH_NOT_OPEN)"
+          - "Dispatch of an empty batch is permitted: expected_net_cents computes to 0"
+        side_effects:
+          - "Assigned RELEASED files -> DISPATCHED; their entries (all WAREHOUSED at this point) -> TRANSMITTED with first_transmitted_at set"
+          - "expected_net_cents computed via batch_settlement_net (principal first, then per-file fees, then the dispatch-time snapshot of the originator-scoped re-flow sweep set)"
+          - "dispatched_by_user_id := caller X-User-ID"
+      - from: DISPATCHED
+        to: SETTLED
+        trigger: "POST /ach/settlement-batches/{id}/advance with action=SETTLE"
+        actor: OdfiOperations
+        preconditions:
+          - "Batch.status == DISPATCHED (ERR_BATCH_NOT_OPEN)"
+        side_effects:
+          - "This batch's TRANSMITTED entries -> SETTLED (settled_at := now); settlement GL pair per entry posted into this batch"
+          - "Fee GL postings posted per settled file (DR ORIGINATOR_RECEIVABLE / CR FEE_INCOME by assessed_fee_cents)"
+          - "Re-flow sweep, originator-scoped: for every originator with >= 1 entry settling in this batch — (a) all its re-presented entries (status TRANSMITTED, representment_count >= 1, not in this batch's dispatch set) -> SETTLED with settlement pair posted here; (b) all its unposted ReturnCases (gl_posted == false) get reversing GL pairs posted here, gl_posted := true; (c) all its TRANSMITTED ReversalRequests -> SETTLED with inverse GL pairs posted here"
+          - "posted_net_cents computed from this batch's GlPosting rows"
+          - "Originator exposure recomputed for every affected originator"
+      - from: SETTLED
+        to: RECONCILED
+        trigger: "POST /ach/settlement-batches/{id}/reconcile"
+        actor: OdfiFinance
+        preconditions:
+          - "Batch.status == SETTLED (ERR_BATCH_NOT_OPEN)"
+          - "caller X-User-ID != dispatched_by_user_id (ERR_SOD_VIOLATION)"
+          - "posted_net_cents == expected_net_cents (ERR_RECONCILIATION_MISMATCH when recon_variance_cents != 0)"
+        side_effects:
+          - "reconciled_by_user_id := caller X-User-ID"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: originator-patch-stale-version
+    parent_entity: Originator
+    write_endpoint: "PATCH /ach/originators/{id}"
+    occ_field: expected_originator_version
+    description: |
+      Updating an Originator (underwriting decision, exposure limit, or fee
+      discount) whose version has advanced since the client last observed it
+      is rejected: another writer (an underwriter PATCH, or a risk-case
+      resolution that changed status and bumped version) has modified the
+      originator, so the current writer's view is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: file-entries-stale-version
+    parent_entity: AchFile
+    write_endpoint: "POST /ach/ach-files/{id}/entries"
+    occ_field: expected_file_version
+    description: |
+      Appending entries to a WAREHOUSED AchFile whose version has advanced
+      since the client last observed it is rejected: a prior entries-append
+      legitimately mutated the file (totals and quoted fee were recomputed),
+      so the current writer's base state is stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: unauthorized_return_rate
+    trigger: "POST /ach/originators/{id}/return-rate-snapshots"
+    algorithm: threshold
+    formula: |
+      UNAUTH_CODES = {R05, R07, R10}
+      Banking days are Monday-Friday (no holiday calendar).
+      # Variant A (trailing 60 days):
+      num_a = count(ReturnCase rc where rc.entry.file.originator_id == O.id
+                    AND rc.is_unauthorized AND rc.entry.direction == DEBIT
+                    AND (computed_at - 60 days) < rc.received_at <= computed_at)
+      den_a = count(AchEntry e where e.file.originator_id == O.id
+                    AND e.direction == DEBIT AND e.first_transmitted_at IS NOT NULL
+                    AND (computed_at - 60 days) < e.first_transmitted_at <= computed_at)
+      rate_bps_trailing_60d = den_a == 0 ? 0 : round_half_up(10000 * num_a / den_a)  # integer bps
+      # Variant B (calendar month to date):
+      month_start = first day of computed_at's UTC month at 00:00:00.000Z
+      num_b / den_b: same filters with window [month_start, computed_at] (inclusive both ends)
+      rate_bps_mtd = den_b == 0 ? 0 : round_half_up(10000 * num_b / den_b)
+      breach = (rate_bps_trailing_60d > UNAUTH_THRESHOLD_BPS) OR (rate_bps_mtd > UNAUTH_THRESHOLD_BPS)
+      # strict greater-than: exactly 50 bps does NOT breach
+    input_set: "ReturnCases of the originator's DEBIT entries with is_unauthorized == true; DEBIT entries with first_transmitted_at set; windows anchored at the logical clock"
+    constants:
+      UNAUTH_THRESHOLD_BPS: 50
+      TRAILING_WINDOW_DAYS: 60
+    precision: "integer basis points, round_half_up applied once to the final ratio"
+    variants:
+      - name: trailing_60d
+        when: "default regulatory view"
+        difference: "half-open window (computed_at - 60d, computed_at] — an item exactly 60 days old is EXCLUDED"
+      - name: month_to_date
+        when: "calendar-month view used for NACHA monthly reporting"
+        difference: "closed window [month_start, computed_at] — same returns/debits can yield a different rate and a different breach outcome"
+
+  - name: outstanding_exposure
+    trigger: "on AchEntry create (entries-append), on any AchEntry status transition, on file cancel/suspension cascades; read at intake validation and GET /ach/originators/{id}"
+    algorithm: aggregation
+    formula: |
+      outstanding_exposure_gross_cents = sum(e.amount_cents for e in entries of O
+                                             where e.status IN {WAREHOUSED, TRANSMITTED})
+      outstanding_exposure_debit_cents = same with e.direction == DEBIT
+      # Admission check at entries-append (mode: forward-looking worst case):
+      #   reject when outstanding_exposure_debit_cents + incoming_debit_total > exposure_limit_cents
+      #   (strictly greater rejects; equality ADMITS)
+    input_set: "AchEntry rows of the originator in statuses {WAREHOUSED, TRANSMITTED} only; SETTLED/RETURNED/CLOSED/CANCELLED excluded"
+    constants: {}
+    precision: "integer cents, no rounding"
+    variants:
+      - name: gross
+        when: "reporting view on GET /ach/originators/{id}"
+        difference: "counts DEBIT and CREDIT entries"
+      - name: debit_only
+        when: "limit enforcement at entries-append"
+        difference: "counts DEBIT entries only; a file of pure CREDIT entries never trips the limit"
+
+  - name: file_fee
+    trigger: "entries-append recomputes quoted_fee_cents with requested_window_kind; release computes assessed_fee_cents with assigned_window_kind"
+    algorithm: tiered_pricing
+    formula: |
+      rate_card = CutoffWindow with window_kind == <requested or assigned kind>  # required, else ERR_NO_ELIGIBLE_WINDOW
+      per_entry_fee(e) = rate_card.per_entry_fee_cents
+                         + (e.amount_cents > LARGE_ENTRY_THRESHOLD_CENTS ? rate_card.large_entry_surcharge_cents : 0)
+      discounted_entry_fee(e) = round_half_up(per_entry_fee(e) * (10000 - O.fee_discount_bps) / 10000)  # PER ENTRY, then summed
+      fee = rate_card.file_fee_cents + sum(discounted_entry_fee(e) for e in file entries)  # file fee NOT discounted
+      # ROUNDING ORDER PINNED (mode b): discount is rounded per entry to whole cents FIRST
+      # (round_half_up), then summed. "Sum raw then round once" is a plausible alternative
+      # reading and yields different cents; it is NOT the rule.
+      # NON-LINEAR INPUTS (mode a): window kind x entry count x per-entry amount-tier branch
+      # x originator discount bps.
+    input_set: "All AchEntry rows of the file regardless of status at compute time (append-time: current entries; release-time: all entries, which are all WAREHOUSED)"
+    constants:
+      LARGE_ENTRY_THRESHOLD_CENTS: 10000000   # $100,000.00; strictly greater triggers surcharge
+    precision: "integer cents; per-entry round_half_up, then sum"
+    variants:
+      - name: quoted
+        when: "at intake / entries-append"
+        difference: "uses requested_window_kind rate card"
+      - name: assessed
+        when: "at release"
+        difference: "uses assigned_window_kind rate card; diverges from quoted whenever the requested window's cutoff was missed and the file rolled to another window"
+
+  - name: batch_settlement_net
+    trigger: "dispatch computes expected_net_cents; settle computes posted_net_cents; reconcile compares"
+    algorithm: aggregation
+    formula: |
+      # EVALUATION ORDER PINNED (mode c — fee tiering keys on principal, net keys on fee):
+      # step 1: principal_net = sum over this batch's dispatched entries of
+      #         (direction == DEBIT ? +amount_cents : -amount_cents)
+      # step 2: fee_total   = sum of assessed_fee_cents over the batch's dispatched files
+      #         (file_fee was computed per file at release from its OWN entry count — never
+      #          from batch membership — which breaks the fee<->batch-size circularity)
+      # step 3: reflow_adjustment, evaluated AT DISPATCH over the originator-scoped re-flow
+      #         sweep set S = { unposted ReturnCases (gl_posted == false), re-presented
+      #         entries (TRANSMITTED, representment_count >= 1, not in this dispatch set),
+      #         TRANSMITTED ReversalRequests } whose entry's originator has >= 1 entry in
+      #         this batch's dispatch set:
+      #           return case of DEBIT entry:  -amount ;  of CREDIT entry: +amount
+      #           re-presented DEBIT entry:    +amount ;  re-presented CREDIT entry: -amount
+      #           reversal of DEBIT entry:     -amount ;  reversal of CREDIT entry: +amount
+      # step 4: expected_net_cents = principal_net - fee_total + reflow_adjustment
+      # settle: posted_net_cents = sum over this batch's GlPosting rows of
+      #         (credit_cents - debit_cents) where account_code == ORIGINATOR_RECEIVABLE
+      # recon:  recon_variance_cents = posted_net_cents - expected_net_cents
+      #         reconcile requires recon_variance_cents == 0 exactly
+      # DRIFT: the sweep set is snapshotted at dispatch for expected_net_cents; settle posts
+      # the set as it exists AT SETTLE. A return/re-presentment/reversal that ENTERS the set
+      # between dispatch and settle posts into the batch but was never in expected_net_cents,
+      # so recon_variance_cents != 0 and reconcile is rejected (ERR_RECONCILIATION_MISMATCH).
+    input_set: "Dispatch: files assigned to the batch in status RELEASED plus the sweep set S snapshotted at dispatch. Settle: all GlPosting rows with settlement_batch_id == batch.id."
+    constants: {}
+    precision: "integer cents, no rounding"
+    variants: []
+
+  - name: banking_day_add
+    trigger: "effective-date validation (today + 2 banking days), NOC due_date (received + 6 banking days), reversal window_expires_at (settled + 5 banking days), NEXT_DAY settlement_date"
+    algorithm: chronological
+    formula: |
+      banking_day_add(date, n): advance one calendar day at a time; count only Mon-Fri days;
+      stop when n banking days have been counted. Next banking day := banking_day_add(date, 1).
+      Weekend-only rule — there is no holiday table.
+    input_set: "a YYYY-MM-DD date and a positive integer n"
+    constants: {}
+    precision: "whole days"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present; X-User-Role is a declared role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Caller role appears in the endpoint's roles list"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "OriginatorOps ownership: X-User-ID equals the originator id of the target resource chain (file.originator_id; entry via file; NOC/reversal via entry->file)"
+    error_id: ERR_RESOURCE_OWNERSHIP
+    http_status: 403
+    applies_to: "POST /ach/ach-files, POST /ach/ach-files/{id}/entries, POST /ach/ach-files/{id}/cancel, POST /ach/ach-entries/{id}/reversals, POST /ach/ach-entries/{id}/close, POST /ach/noc-records/{id}/apply, POST /ach/reversal-requests/{id}/advance (action=CANCEL)"
+  - priority: 4
+    category: existence
+    check: "Path identifiers resolve left-to-right; non-existent id or id not under the parent chain"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path ids"
+  - priority: 5
+    category: business_constraint
+    check: "Request-body schema: required fields present, enum values in range, amount_cents > 0, YYYY-MM-DD/HH:MM formats valid"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all endpoints with a request body"
+  - priority: 6
+    category: state
+    check: "Target resource state precondition for the operation (originator ACTIVE for file intake, entries-append, and release; file WAREHOUSED for append/cancel/release; entry SETTLED for returns and reversals, RETURNED for representments, REQUESTED for reversal advance, batch in the required state, risk case OPEN, NOC actionable)"
+    error_id: ERR_ORIGINATOR_NOT_ACTIVE
+    http_status: 409
+    applies_to: "state-gated endpoints (each maps to its specific state error: ERR_ORIGINATOR_NOT_ACTIVE, ERR_FILE_NOT_WAREHOUSED, ERR_ENTRY_NOT_SETTLED, ERR_ENTRY_NOT_RETURNED, ERR_REVERSAL_NOT_ACTIONABLE, ERR_BATCH_NOT_OPEN, ERR_RISK_CASE_ALREADY_RESOLVED, ERR_NOC_NOT_ACTIONABLE, ERR_RESOLUTION_NOT_APPLICABLE)"
+  - priority: 7
+    category: business_constraint
+    check: "OCC: expected_originator_version / expected_file_version equals the entity's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "PATCH /ach/originators/{id}, POST /ach/ach-files/{id}/entries"
+  - priority: 8
+    category: business_safety
+    check: "NACHA compliance: same-day file contains no entry with amount_cents > SAME_DAY_MAX_ENTRY_CENTS; reversal reason in allowed set; release/cancel quota on SoD: reconciler != dispatcher; re-presentment only of R01"
+    error_id: ERR_SAME_DAY_INELIGIBLE
+    http_status: 422
+    applies_to: "POST /ach/ach-files/{id}/entries (ERR_SAME_DAY_INELIGIBLE, ERR_REPRESENTMENT_CODE_PROHIBITED on representments), POST /ach/ach-entries/{id}/reversals (ERR_INVALID_REVERSAL_REASON), POST /ach/settlement-batches/{id}/reconcile (ERR_SOD_VIOLATION)"
+  - priority: 9
+    category: business_temporal
+    check: "Time-window rules: effective_date within [today, today + 2 banking days] and a banking day; release only on the effective date; reversal requested on or before settled_at + 5 banking days"
+    error_id: ERR_EFFECTIVE_DATE_WINDOW
+    http_status: 422
+    applies_to: "POST /ach/ach-files (ERR_EFFECTIVE_DATE_WINDOW), POST /ach/ach-files/{id}/release (ERR_RELEASE_DATE_MISMATCH), POST /ach/ach-entries/{id}/reversals (ERR_REVERSAL_WINDOW_EXPIRED)"
+  - priority: 10
+    category: business_constraint
+    check: "Structural constraints: no second active reversal per entry; CutoffWindow kind unique and time-of-day intervals [opens,closes) non-overlapping among same-day kinds (adjacency allowed); file has >= 1 entry at release; a window exists for the requested kind"
+    error_id: ERR_DUPLICATE_ACTIVE_REVERSAL
+    http_status: 409
+    applies_to: "POST /ach/ach-entries/{id}/reversals (ERR_DUPLICATE_ACTIVE_REVERSAL), POST /ach/cutoff-windows (ERR_WINDOW_OVERLAP), POST /ach/ach-files/{id}/release (ERR_FILE_EMPTY, ERR_NO_ELIGIBLE_WINDOW), representments (ERR_REPRESENTMENT_EXHAUSTED)"
+  - priority: 11
+    category: business_fiscal
+    check: "Money limits: debit exposure admission check (strictly-greater rejects); recon variance must be exactly zero"
+    error_id: ERR_EXPOSURE_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /ach/ach-files/{id}/entries (ERR_EXPOSURE_LIMIT_EXCEEDED), POST /ach/settlement-batches/{id}/reconcile (ERR_RECONCILIATION_MISMATCH)"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  - method: POST
+    path: "/ach/_clock/set_current_utc"
+    description: "Test-driving logical clock. Sets the server's current UTC time. Startup default before any call is exactly 2026-08-01T00:00:00Z (no wall-clock fallback). Side effect: NOC overdue sweep — every RECEIVED NocRecord whose due_date is before the new current banking day transitions to OVERDUE."
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["NocRecord RECEIVED -> OVERDUE sweep"]
+
+  - method: POST
+    path: "/ach/originators"
+    description: "Register an originator (status PENDING_UNDERWRITING)"
+    roles: [OdfiUnderwriter]
+    code: 201
+    input: [legal_name, sec_codes_allowed]
+    output: Originator
+    side_effects: []
+
+  - method: GET
+    path: "/ach/originators/{id}"
+    description: "Read an originator including computed exposure and latest rate fields"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: Originator
+    side_effects: []
+
+  - method: PATCH
+    path: "/ach/originators/{id}"
+    description: "Underwriting decision / limit maintenance. decision=APPROVE (PENDING_UNDERWRITING -> ACTIVE, requires exposure_limit_cents > 0), decision=DECLINE (-> TERMINATED), or limit/discount update on ACTIVE/WATCH originators (no status change). OCC-guarded."
+    roles: [OdfiUnderwriter]
+    code: 200
+    input: [expected_originator_version, "decision?", "exposure_limit_cents?", "fee_discount_bps?"]
+    output: Originator
+    side_effects: ["increments Originator.version by 1", "status transition per decision"]
+
+  - method: POST
+    path: "/ach/originators/{id}/return-rate-snapshots"
+    description: "Compute a new unauthorized-return-rate snapshot at the current logical clock; if breach is true AND no OPEN RiskCase with source == RATE_BREACH exists for the originator, auto-open one Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OdfiRiskOfficer]
+    code: 201
+    input: []
+    output: ReturnRateSnapshot
+    side_effects: ["updates Originator.unauth_rate_bps_trailing / unauth_rate_bps_mtd", "creates RiskCase (OPEN, RATE_BREACH) when breach == true and no such OPEN case exists"]
+
+  - method: GET
+    path: "/ach/originators/{id}/return-rate-snapshots"
+    description: "List rate snapshots of an originator"
+    roles: [OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance, OriginatorOps]
+    code: 200
+    input: []
+    output: ReturnRateSnapshot[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/originators/{id}/risk-cases"
+    description: "Manually open a RiskCase (source MANUAL) for an originator Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OdfiRiskOfficer]
+    code: 201
+    input: []
+    output: RiskCase
+    side_effects: []
+
+  - method: GET
+    path: "/ach/originators/{id}/risk-cases"
+    description: "List risk cases of an originator"
+    roles: [OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance, OriginatorOps]
+    code: 200
+    input: []
+    output: RiskCase[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/risk-cases/{id}/resolve"
+    description: "Resolve an OPEN risk case; action drives the originator transition and divergent cascades"
+    roles: [OdfiRiskOfficer]
+    code: 200
+    input: [action]
+    output: RiskCase
+    side_effects: ["Originator transition per action (see Originator machine)", "SUSPEND/TERMINATE cascade: WAREHOUSED files -> REJECTED, their WAREHOUSED entries -> CANCELLED, exposure recomputed"]
+
+  - method: POST
+    path: "/ach/ach-files"
+    description: "File intake. Caller must be the originator (X-User-ID == originator id of a status==ACTIVE originator). Validates effective-date window and SEC-code permission; creates the empty WAREHOUSED file shell. Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OriginatorOps]
+    code: 201
+    input: [sec_code, requested_window_kind, effective_date]
+    output: AchFile
+    side_effects: []
+
+  - method: GET
+    path: "/ach/ach-files"
+    description: "List files; filterable"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: [ "originator_id?", "status?", "settlement_batch_id?", "limit?", "offset?"]
+    output: AchFile[]
+    side_effects: []
+
+  - method: GET
+    path: "/ach/ach-files/{id}"
+    description: "Read a file"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: AchFile
+    side_effects: []
+
+  - method: POST
+    path: "/ach/ach-files/{id}/entries"
+    description: "Append entries to a WAREHOUSED file (bulk, atomic: on any rejection no entry is persisted). Requires the file's originator status == ACTIVE (ERR_ORIGINATOR_NOT_ACTIVE) and the file WAREHOUSED (ERR_FILE_NOT_WAREHOUSED). Recomputes totals, quoted fee, exposure; enforces same-day cap and debit-exposure admission. OCC-guarded. Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OriginatorOps]
+    code: 200
+    input: [expected_file_version, entries]
+    output: AchFile
+    side_effects: ["creates AchEntry rows (status WAREHOUSED)", "increments AchFile.version by 1", "recomputes entry_count, total_amount_cents, quoted_fee_cents", "recomputes Originator outstanding exposure"]
+
+  - method: GET
+    path: "/ach/ach-files/{id}/entries"
+    description: "List entries of a file"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: AchEntry[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/ach-files/{id}/release"
+    description: "Release a WAREHOUSED file on its effective date; assigns window per cutoff rule, computes assessed fee, joins/creates the settlement batch"
+    roles: [OdfiOperations]
+    code: 200
+    input: []
+    output: AchFile
+    side_effects: ["AchFile WAREHOUSED -> RELEASED", "find-or-create SettlementBatch OPEN", "assessed_fee_cents computed"]
+
+  - method: POST
+    path: "/ach/ach-files/{id}/cancel"
+    description: "Originator cancels its own WAREHOUSED file"
+    roles: [OriginatorOps]
+    code: 200
+    input: []
+    output: AchFile
+    side_effects: ["AchFile WAREHOUSED -> CANCELLED", "entries WAREHOUSED -> CANCELLED", "exposure recomputed"]
+
+  - method: GET
+    path: "/ach/ach-entries/{id}"
+    description: "Read an entry"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: AchEntry
+    side_effects: []
+
+  - method: POST
+    path: "/ach/ach-entries/{id}/returns"
+    description: "Register an inbound RDFI return against a SETTLED entry; creates the ReturnCase and applies the return transition/auto-close rule"
+    roles: [OdfiOperations]
+    code: 201
+    input: [return_code]
+    output: ReturnCase
+    side_effects: ["AchEntry SETTLED -> RETURNED", "ReturnCase created (OPEN)", "last_return_code updated", "unauthorized codes: originator rate recompute + conditional RATE_BREACH RiskCase auto-open"]
+
+  - method: POST
+    path: "/ach/ach-entries/{id}/representments"
+    description: "Re-present a RETURNED entry (R01 only, fewer than 2 prior re-presentments)"
+    roles: [OdfiOperations]
+    code: 200
+    input: []
+    output: AchEntry
+    side_effects: ["AchEntry RETURNED -> TRANSMITTED, representment_count += 1", "OPEN ReturnCase -> REPRESENTED"]
+
+  - method: POST
+    path: "/ach/ach-entries/{id}/nocs"
+    description: "Register an inbound NOC against an entry (allowed from SETTLED or RETURNED)"
+    roles: [OdfiOperations]
+    code: 201
+    input: [noc_code, corrected_data]
+    output: NocRecord
+    side_effects: ["NocRecord created (RECEIVED, due_date = received + 6 banking days)"]
+
+  - method: GET
+    path: "/ach/ach-entries/{id}/noc-records"
+    description: "List NOCs of an entry Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: NocRecord[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/noc-records/{id}/apply"
+    description: "Originator marks a NOC as applied to its customer records. Allowed from RECEIVED or OVERDUE (late apply sets late_applied); from APPLIED fails ERR_NOC_NOT_ACTIONABLE."
+    roles: [OriginatorOps]
+    code: 200
+    input: []
+    output: NocRecord
+    side_effects: ["NocRecord -> APPLIED (late_applied := true when applied from OVERDUE)"]
+
+  - method: POST
+    path: "/ach/ach-entries/{id}/reversals"
+    description: "Originator requests reversal of its own SETTLED entry within 5 banking days of settlement, with an allowed reason and no active reversal on the entry"
+    roles: [OriginatorOps]
+    code: 201
+    input: [reason]
+    output: ReversalRequest
+    side_effects: ["ReversalRequest created (REQUESTED, window_expires_at computed)"]
+
+  - method: GET
+    path: "/ach/ach-entries/{id}/reversal-requests"
+    description: "List reversal requests of an entry Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: ReversalRequest[]
+    side_effects: []
+
+  - method: GET
+    path: "/ach/ach-entries/{id}/return-cases"
+    description: "List return cases of an entry Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: ReturnCase[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/ach-entries/{id}/close"
+    description: "Close a SETTLED or RETURNED entry (write-off); finalizes any OPEN ReturnCase"
+    roles: [OriginatorOps, OdfiOperations]
+    code: 200
+    input: []
+    output: AchEntry
+    side_effects: ["AchEntry -> CLOSED", "OPEN ReturnCase -> FINAL"]
+
+  - method: POST
+    path: "/ach/reversal-requests/{id}/advance"
+    description: "action=TRANSMIT (OdfiOperations): REQUESTED -> TRANSMITTED. action=CANCEL (OriginatorOps owner): REQUESTED -> CANCELLED."
+    roles: [OdfiOperations, OriginatorOps]
+    code: 200
+    input: [action]
+    output: ReversalRequest
+    side_effects: ["status transition per action"]
+
+  - method: POST
+    path: "/ach/settlement-batches/{id}/advance"
+    description: "action=DISPATCH (from OPEN): files RELEASED -> DISPATCHED, entries -> TRANSMITTED, expected_net_cents computed (dispatch-time sweep snapshot), dispatched_by_user_id recorded. action=SETTLE (from DISPATCHED): entries -> SETTLED, GL pairs posted (settlement + fees + originator-scoped re-flow sweep of returns/re-presentments/reversals as it exists AT SETTLE), posted_net_cents computed."
+    roles: [OdfiOperations]
+    code: 200
+    input: [action]
+    output: SettlementBatch
+    side_effects: ["per action: dispatch cascade + expected_net_cents, or settle sweep + GlPosting rows + posted_net_cents + exposure recompute"]
+
+  - method: POST
+    path: "/ach/settlement-batches/{id}/reconcile"
+    description: "OdfiFinance reconciles a SETTLED batch; requires zero variance and a reconciler different from the dispatcher (SoD)"
+    roles: [OdfiFinance]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: ["SettlementBatch SETTLED -> RECONCILED"]
+
+  - method: GET
+    path: "/ach/settlement-batches/{id}"
+    description: "Read a settlement batch"
+    roles: [OriginatorOps, OdfiUnderwriter, OdfiOperations, OdfiRiskOfficer, OdfiFinance]
+    code: 200
+    input: []
+    output: SettlementBatch
+    side_effects: []
+
+  - method: GET
+    path: "/ach/settlement-batches/{id}/gl-postings"
+    description: "List GL postings of a batch Results sorted by created_at ASC (insertion order; id never used for ordering)."
+    roles: [OdfiOperations, OdfiFinance, OdfiRiskOfficer, OdfiUnderwriter]
+    code: 200
+    input: []
+    output: GlPosting[]
+    side_effects: []
+
+  - method: POST
+    path: "/ach/cutoff-windows"
+    description: "Define a cutoff window (kind unique; same-day windows' [opens_at_utc, closes_at_utc) intervals must not overlap; adjacency allowed)"
+    roles: [OdfiOperations]
+    code: 201
+    input: [window_kind, opens_at_utc, closes_at_utc, per_entry_fee_cents, file_fee_cents, large_entry_surcharge_cents]
+    output: CutoffWindow
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing/malformed X-User-Role or X-User-ID, or undeclared role" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Caller role not in endpoint roles (e.g., OriginatorOps calling release)" }
+  - { id: ERR_RESOURCE_OWNERSHIP, http: 403, condition: "OriginatorOps acting on a resource chain whose originator id != X-User-ID" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id does not exist or is not under the parent chain" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, bad enum, amount_cents <= 0, malformed date/time, unknown return/noc code" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_*_version does not match the entity's current version (OCC)" }
+  - { id: ERR_ORIGINATOR_NOT_ACTIVE, http: 409, condition: "File intake or release while originator status != ACTIVE" }
+  - { id: ERR_ORIGINATOR_STATUS_TERMINAL, http: 409, condition: "PATCH decision on an originator not in PENDING_UNDERWRITING, or any PATCH on TERMINATED" }
+  - { id: ERR_FILE_NOT_WAREHOUSED, http: 409, condition: "Release/cancel/entries-append on a file not in WAREHOUSED" }
+  - { id: ERR_FILE_EMPTY, http: 422, condition: "Release of a file with entry_count == 0" }
+  - { id: ERR_RELEASE_DATE_MISMATCH, http: 409, condition: "Release when current banking day != file.effective_date" }
+  - { id: ERR_NO_ELIGIBLE_WINDOW, http: 422, condition: "No CutoffWindow row exists for the requested/assigned window kind at intake or release" }
+  - { id: ERR_ENTRY_NOT_SETTLED, http: 409, condition: "Return or reversal registration on an entry not in SETTLED (WAREHOUSED/TRANSMITTED/CLOSED/CANCELLED)" }
+  - { id: ERR_ENTRY_NOT_RETURNED, http: 409, condition: "Re-presentment or close-path expectation violated: representment requires RETURNED; close requires SETTLED or RETURNED" }
+  - { id: ERR_REPRESENTMENT_CODE_PROHIBITED, http: 422, condition: "Re-presentment attempted when last_return_code != R01" }
+  - { id: ERR_REPRESENTMENT_EXHAUSTED, http: 422, condition: "Re-presentment attempted when representment_count == 2" }
+  - { id: ERR_SAME_DAY_INELIGIBLE, http: 422, condition: "Entries-append to a same-day-requested file containing an entry with amount_cents > 100000000 ($1,000,000.00); exactly 100000000 is eligible" }
+  - { id: ERR_EFFECTIVE_DATE_WINDOW, http: 422, condition: "effective_date not a banking day, before today, or more than 2 banking days ahead" }
+  - { id: ERR_EXPOSURE_LIMIT_EXCEEDED, http: 422, condition: "Entries-append would push outstanding_exposure_debit_cents strictly above exposure_limit_cents; equality admits" }
+  - { id: ERR_REVERSAL_WINDOW_EXPIRED, http: 422, condition: "Reversal requested after settled_at + 5 banking days" }
+  - { id: ERR_INVALID_REVERSAL_REASON, http: 422, condition: "Reversal reason not in {DUPLICATE_ENTRY, WRONG_AMOUNT, WRONG_ACCOUNT}" }
+  - { id: ERR_DUPLICATE_ACTIVE_REVERSAL, http: 409, condition: "Entry already has a ReversalRequest in REQUESTED or TRANSMITTED" }
+  - { id: ERR_REVERSAL_NOT_ACTIONABLE, http: 409, condition: "advance on a reversal not in REQUESTED (already TRANSMITTED/SETTLED/CANCELLED)" }
+  - { id: ERR_BATCH_NOT_OPEN, http: 409, condition: "dispatch on non-OPEN batch; settle on non-DISPATCHED batch; reconcile on non-SETTLED batch" }
+  - { id: ERR_RECONCILIATION_MISMATCH, http: 422, condition: "reconcile when posted_net_cents != expected_net_cents" }
+  - { id: ERR_SOD_VIOLATION, http: 403, condition: "reconcile called by the same X-User-ID recorded as dispatched_by_user_id" }
+  - { id: ERR_WINDOW_OVERLAP, http: 409, condition: "CutoffWindow create with duplicate window_kind, closes <= opens, or same-day time interval overlapping an existing same-day window (half-open [opens,closes); adjacency allowed)" }
+  - { id: ERR_NOC_NOT_ACTIONABLE, http: 409, condition: "apply on a NocRecord already APPLIED" }
+  - { id: ERR_RISK_CASE_ALREADY_RESOLVED, http: 409, condition: "resolve on a RiskCase in RESOLVED" }
+  - { id: ERR_RESOLUTION_NOT_APPLICABLE, http: 409, condition: "resolve action not applicable to the originator's current status (SUSPEND needs ACTIVE/WATCH; WATCH needs ACTIVE; REINSTATE needs SUSPENDED/WATCH; TERMINATE needs ACTIVE/WATCH/SUSPENDED; DISMISS always allowed)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: OriginatorOps
+    description: "Operations user of an originating company; acts only on its own originator's files/entries/NOCs/reversals"
+    identity: "entity_backed:Originator"
+    exclusive_operations: ["POST /ach/ach-files", "POST /ach/ach-files/{id}/entries", "POST /ach/ach-files/{id}/cancel", "POST /ach/ach-entries/{id}/reversals", "POST /ach/noc-records/{id}/apply", "reversal CANCEL via advance"]
+    shared_operations: ["GET reads of own resources", "POST /ach/ach-entries/{id}/close (with OdfiOperations)", "POST /ach/_clock/set_current_utc"]
+  - name: OdfiUnderwriter
+    description: "Bank underwriting officer; registers and approves originators, maintains limits"
+    identity: "opaque"
+    exclusive_operations: ["POST /ach/originators", "PATCH /ach/originators/{id}"]
+    shared_operations: ["GET reads", "POST /ach/_clock/set_current_utc"]
+  - name: OdfiOperations
+    description: "Bank ACH operations; releases files, registers returns/NOCs, dispatches and settles batches, transmits reversals"
+    identity: "opaque"
+    exclusive_operations: ["POST /ach/ach-files/{id}/release", "POST /ach/ach-entries/{id}/returns", "POST /ach/ach-entries/{id}/representments", "POST /ach/ach-entries/{id}/nocs", "batch DISPATCH/SETTLE via POST /ach/settlement-batches/{id}/advance", "POST /ach/cutoff-windows", "reversal TRANSMIT via advance"]
+    shared_operations: ["GET reads", "POST /ach/ach-entries/{id}/close (with OriginatorOps)", "POST /ach/_clock/set_current_utc"]
+  - name: OdfiRiskOfficer
+    description: "Bank risk monitoring; runs rate snapshots, opens and resolves risk cases (suspension/reinstatement)"
+    identity: "opaque"
+    exclusive_operations: ["POST /ach/originators/{id}/return-rate-snapshots", "POST /ach/originators/{id}/risk-cases", "POST /ach/risk-cases/{id}/resolve"]
+    shared_operations: ["GET reads", "POST /ach/_clock/set_current_utc"]
+  - name: OdfiFinance
+    description: "Bank finance; reconciles settled batches. Segregation of duties: may not reconcile a batch whose dispatched_by_user_id equals the reconciler's X-User-ID"
+    identity: "opaque"
+    exclusive_operations: ["POST /ach/settlement-batches/{id}/reconcile"]
+    shared_operations: ["GET reads", "POST /ach/_clock/set_current_utc"]

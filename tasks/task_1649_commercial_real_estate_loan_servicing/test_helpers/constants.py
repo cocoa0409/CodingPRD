@@ -1,0 +1,51 @@
+"""Domain thresholds — numeric constants named in the PRD narratives."""
+
+# Logical servicing clock (PRD: startup default, never wall time).
+CLOCK_START = "2026-08-01T00:00:00Z"
+
+# Statement cadence (PRD reporting section).
+RENT_ROLL_DUE_OFFSET_DAYS = 15
+OP_STMT_DUE_OFFSET_DAYS = 45
+
+# Covenant math (PRD covenant-surveillance section).
+RATIO_DECIMAL_PLACES = 4
+APPRAISAL_VALIDITY_MONTHS = 24
+
+# Major-lease tests (PRD leasing section).
+MAJOR_LEASE_RENT_CENTS = 500_000
+MAJOR_LEASE_SQFT = 5_000
+MAJOR_LEASE_TERM_MONTHS = 60
+ESTOPPEL_VALIDITY_DAYS = 90
+
+# Disbursement waterfall (PRD reserves section).
+DEFAULT_RETAINAGE_PCT = 0.10
+ELEVATED_RETAINAGE_FLOOR = 0.20
+
+# Force-placed insurance (PRD collateral-oversight section).
+FORCE_PLACED_PREMIUM_PCT = 0.02
+FORCE_PLACED_TERM_DAYS = 365
+
+# Assumption pricing (PRD transfers section).
+ASSUMPTION_OUTSTANDING_PCT = 0.01
+ASSUMPTION_ORIGINAL_PCT = 0.005
+ASSUMPTION_FLAT_CENTS = 25_000
+ASSUMPTION_FEE_MIN_CENTS = 1_000_000
+ASSUMPTION_FEE_MAX_CENTS = 25_000_000
+ASSUMPTION_APPROVAL_VALIDITY_DAYS = 60
+ASSUMPTION_INSPECTION_FRESHNESS_MONTHS = 12
+
+# Distress and sweep (PRD delinquency/watchlist section).
+DEFAULT_DAYS_DELINQUENT = 60
+MATURITY_RISK_WINDOW_DAYS = 180
+RISK_ENTRY_THRESHOLD = 70
+ESCALATION_REVIEW_THRESHOLD = 85
+MAX_EXTENSION_OPTIONS_PER_LOAN = 2
+
+# Reusable calendar anchors (quarter boundaries used across tests).
+Q1_2026 = ("2026-01-01T00:00:00Z", "2026-03-31T00:00:00Z")
+Q2_2025 = ("2025-04-01T00:00:00Z", "2025-06-30T00:00:00Z")
+Q3_2025 = ("2025-07-01T00:00:00Z", "2025-09-30T00:00:00Z")
+Q4_2025 = ("2025-10-01T00:00:00Z", "2025-12-31T00:00:00Z")
+Q1_2026_Q = Q1_2026
+Q2_2026 = ("2026-04-01T00:00:00Z", "2026-06-30T00:00:00Z")
+Q4_2026_START = "2026-10-01T00:00:00Z"

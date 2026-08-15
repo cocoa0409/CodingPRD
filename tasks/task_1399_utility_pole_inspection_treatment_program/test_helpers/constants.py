@@ -1,0 +1,59 @@
+"""Domain thresholds and numeric constants from the PRD (§2.5, §3.3, §3.5, §3.8, §3.9)."""
+
+# Logical clock startup default (PRD §2.5).
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# Required sound shell thickness by ANSI class (PRD §3.3).
+REQUIRED_SHELL_IN = {"H1": 2.75, "1": 2.50, "2": 2.25, "3": 2.00, "4": 1.75, "5": 1.50}
+
+# Conservative-variant species factors (PRD §3.3).
+SPECIES_FACTOR = {
+    "SOUTHERN_PINE": 1.00,
+    "DOUGLAS_FIR": 0.95,
+    "WESTERN_RED_CEDAR": 0.90,
+    "LARCH": 1.02,
+}
+
+DECAY_PENALTY_PER_INCH = 5.0
+MOISTURE_THRESHOLD = 30.0
+MOISTURE_MULT = 0.95
+
+# Classification thresholds on effective_rs_pct (PRD §3.3).
+SERVICEABLE_MIN = 60.00
+MONITOR_MIN = 45.00
+REJECT_ROUTINE_MIN = 30.00
+
+# Warranty durations by product (PRD §3.5).
+PRODUCT_WARRANTY_YEARS = {"CCA_WRAP": 10, "PENTA_GEL": 8, "COPPER_NAPHTHENATE": 5}
+
+# Contractor quality scoring (PRD §3.5).
+ROLLING_WINDOW = 5
+SUSPEND_THRESHOLD = 70.00
+BONUS_THRESHOLD = 90.00
+
+# Production billing (PRD §3.9).
+BASE_RATE_CENTS = {"CCA_WRAP": 17500, "PENTA_GEL": 21000, "COPPER_NAPHTHENATE": 14500}
+SPECIES_MULT = {
+    "SOUTHERN_PINE": 1.00,
+    "DOUGLAS_FIR": 1.15,
+    "WESTERN_RED_CEDAR": 0.90,
+    "LARCH": 1.05,
+}
+MOBILIZATION_CENTS = 40000
+EARLY_BONUS_PCT = 0.05
+QA_FAIL_PENALTY_CENTS = 2500
+FIELD_SEASON_DAYS = 120
+
+# Replacement queue (PRD §3.8).
+ESCALATION_RATE = 1.08
+DEFAULT_REPLACEMENT_COST_CENTS = 250000
+DEFERRAL_STEP = 5
+JOINT_USE_BONUS = 10
+AGE_BONUS = 5
+AGE_CUTOFF_YEAR = 1969
+CRITICAL_FLOOR = 80
+SCORE_CAP = 100
+FEEDER_CRITICAL_TAG = "FEEDER_CRITICAL"
+
+# Attachment-audit cure window (PRD §3.7).
+CURE_PERIOD_DAYS = 45

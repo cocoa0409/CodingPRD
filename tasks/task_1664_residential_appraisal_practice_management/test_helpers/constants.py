@@ -1,0 +1,50 @@
+"""Domain thresholds and constants named in the PRD."""
+
+# Logical clock default reading before any explicit set (PRD 2.4).
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Fee quote constants (PRD 3.3).
+FEE_FLOOR_CENTS = 35000
+FEE_CAP_CENTS = 150000
+RETAIL_RUSH_BPS = 1500
+RETAIL_BASE_CENTS = {"STANDARD": 45000, "COMPLEX": 60000, "HIGH_VALUE": 85000}
+RETAIL_REVISION_FEE_CENTS = 15000
+MULTI_2_4_SURCHARGE_CENTS = 15000
+MANUFACTURED_SURCHARGE_CENTS = 7500
+GOVERNMENT_LOAN_SURCHARGE_CENTS = 5000
+
+# Tier determination (PRD 3.3): inclusive HIGH_VALUE threshold.
+HIGH_VALUE_THRESHOLD_CENTS = 100000000
+
+# Comparable adjustment / eligibility (PRD 3.5).
+ADJ_LINE_ROUND_CENTS = 10000
+NET_ADJ_LIMIT_PCT = 15.00
+GROSS_ADJ_LIMIT_PCT = 25.00
+DISTANCE_LIMIT_MILES = 2.00
+SALE_RECENCY_DAYS = 365
+
+# Value conclusion (PRD 3.6).
+MIN_LOCKED_COMPS = 3
+VALUE_ROUND_CENTS = 100000
+
+# Scorecard (PRD 3.2).
+MIN_COMPLETED_FOR_RATING = 4
+PROBATION_THRESHOLD = 0.90
+SUSPENSION_THRESHOLD = 0.75
+
+# Retention (PRD 3.8).
+STANDARD_RETENTION_YEARS = 5
+JUDICIAL_RETENTION_YEARS = 2
+COMPLAINT_RESPONSE_DEADLINE_DAYS = 21
+
+# Cancellation (PRD 3.9).
+CANCELLATION_RATE = 0.5
+
+# Appointments (PRD 3.4): travel buffer on each side of a confirmed window.
+APPOINTMENT_BUFFER_MINUTES = 30
+
+# Reconsideration-of-value intake window (PRD 3.7).
+ROV_WINDOW_DAYS = 90
+
+# A well-formed UUID that never resolves to a stored record.
+UNKNOWN_UUID = "11111111-1111-1111-1111-111111111111"

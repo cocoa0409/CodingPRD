@@ -1,0 +1,53 @@
+"""Domain thresholds — numeric constants from the PRD's calculation rules (§2, §3)."""
+
+# Inherent risk scoring (PRD §3.1)
+RISK_WEIGHTED_LIKELIHOOD_COEF = 8
+RISK_WEIGHTED_IMPACT_COEF = 12
+RISK_CONSERVATIVE_AXIS_MULTIPLIER = 20
+RISK_TIER_CRITICAL_MIN = 85
+RISK_TIER_HIGH_MIN = 70
+RISK_TIER_MODERATE_MIN = 40
+
+# Engagement priority score (PRD §3.4)
+PRIORITY_RECENCY_TIER1_MONTHS = 36   # >= 36 months -> 30 points
+PRIORITY_RECENCY_TIER1_POINTS = 30
+PRIORITY_RECENCY_TIER2_MONTHS = 24   # 24..35 -> 20
+PRIORITY_RECENCY_TIER2_POINTS = 20
+PRIORITY_RECENCY_TIER3_MONTHS = 12   # 12..23 -> 10
+PRIORITY_RECENCY_TIER3_POINTS = 10
+PRIORITY_NEVER_AUDITED_MONTHS = 999
+PRIORITY_SCRUTINY_BONUS = 15
+PRIORITY_SCORE_CAP = 100
+
+# Plan coverage (PRD §3.3)
+HIGH_RISK_SCORE_MIN = 70
+
+# Hours rollup (PRD §3.5): per-item ceil(h*2)/2, then sum
+ROUNDING_GRANULARITY = 0.5
+BUDGET_OVERRUN_ALLOWANCE = 1.10  # sign-off gate: actual + item <= budget * 1.10
+
+# Rating config default bands (PRD §3.2)
+DEFAULT_CRITICAL_MIN = 20
+DEFAULT_HIGH_MIN = 12
+DEFAULT_MODERATE_MIN = 6
+
+# Extension caps (PRD §3.7)
+MAX_EXTENSIONS_PER_PLAN = 2
+MAX_CUMULATIVE_EXTENSION_DAYS = 180
+
+# QA rating (PRD §3.9)
+QA_FAIL_DIMENSION_MAX = 2          # any dimension <= 2 -> FAIL
+QA_FAIL_OVERALL_EXCLUSIVE_MAX = 3.0  # overall < 3.0 -> FAIL
+QA_PASS_DIMENSION_MIN = 4
+QA_PASS_OVERALL_MIN = 4.0
+
+# Negotiation rounds (PRD §3.6)
+MAX_NEGOTIATION_ROUNDS = 3
+
+# Cooling period (PRD §3.4)
+COOLING_PERIOD_DAYS = 90
+
+# Logical clock startup default (PRD §2.5)
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+# Canonical clock used by fixtures so engagement windows are always in the future
+FIXTURE_CLOCK = "2026-01-15T00:00:00Z"

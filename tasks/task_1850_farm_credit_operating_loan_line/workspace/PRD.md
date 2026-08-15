@@ -1,0 +1,354 @@
+# Farm Credit Operating Loan & Line API — Product Requirements Document
+
+## 1. Introduction
+
+A Farm Credit System association lives and dies by the season. Each spring, member farm operations draw operating lines against a borrowing base assembled from crop budgets and pledged collateral; each fall, harvest proceeds flow back as repayments; and in the bad years the association must restructure, defer, charge off, or foreclose with the discipline its regulators and its borrower-owners expect of a cooperative lender. This document specifies the API that runs that cycle end to end: loan origination under committee approval, a borrowing base that starts as a projection and is trued up at harvest, crop insurance assignment with the association named as loss payee, chattel and real-estate security perfected through UCC filings with statutory continuation windows, working-capital covenant monitoring, margin calls when coverage thins, disaster-linked payment deferrals, restructures for distressed borrowers, and the co-op's annual patronage dividend.
+
+The specification is written for the engineer implementing the service. Section 2 states the system-wide contracts — the response envelope, pagination, the logical clock, monetary precision, optimistic concurrency, and the fixed order in which validation failures surface. Section 3 walks the business workflows in narrative form; rules are deliberately scattered across the subsections where they belong operationally, and the same rule may be reinforced from more than one angle. Section 4 is the endpoint catalogue and Section 5 the error catalogue; both are shape-only summaries, and the behavioral detail behind every row lives in Sections 2 and 3.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID`, identifying the caller, and `X-User-Role`, naming one of the six declared roles — `Borrower`, `LoanOfficer`, `CreditCommittee`, `InsuranceAdjuster`, `AssociationBoard`, and `System`. A request missing either header, or carrying a role string outside that declared set, is rejected with `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` (HTTP 400). A caller whose role is not listed for the target endpoint is rejected with `ERR_FORBIDDEN_FOR_ROLE` (HTTP 403).
+
+A `Borrower` is a farm operation; it acts only on its own loans, budgets, draws, repayments, deferrals, claims, and policies. A `LoanOfficer` is association lending staff; it originates and services loans, files UCC statements, records covenant evaluations, and disburses draws. A `CreditCommittee` is the credit approval authority; it approves loans, restructures, and deferrals, waives covenant breaches, and escalates margin calls. An `InsuranceAdjuster` files loss reports and approves or denies indemnities. An `AssociationBoard` is the co-op board; it governs the association, declares disasters, and declares and pays patronage. A `System` caller is the automation role for the logical clock and the periodic review checkpoint.
+
+When `X-User-Role` is `Borrower`, `X-User-ID` is the `id` of the acting `Borrower` record; ownership checks on any resource that traces back to a borrower — creating a draw, repayment, crop budget, deferral request, or insurance claim against one of its loans, cancelling one of its own draws, or cancelling one of its own policies — compare the resource's owning borrower to `X-User-ID`, and a mismatch is rejected with `ERR_RESOURCE_NOT_OWNED` (HTTP 403). When `X-User-Role` is `LoanOfficer`, `CreditCommittee`, `InsuranceAdjuster`, `AssociationBoard`, or `System`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity: the server may record it — for example as `recorded_by_user_id` on a covenant evaluation or `created_by_user_id` on a restructure plan, where it anchors the segregation-of-duties checks described later — but it is never compared to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints paginate with two query parameters: `limit` (default 10, minimum 1, maximum 100) and `offset` (default 0). Results are sorted by `created_at` ascending — oldest record first — and the `meta` object of a list response carries `limit`, `offset`, `total_count`, and `has_more`. List endpoints also accept optional equality filters drawn from the resource's own fields where applicable: `association_id`, `borrower_id`, `loan_account_id`, `collateral_id`, `policy_id`, `assigned_loan_id`, `collateral_type`, and `status` appear as filters on the lists that own them, alongside the pagination parameters.
+
+### 2.4. The Logical Clock and the Periodic Review Checkpoint
+
+The server keeps its own logical clock; no date-sensitive rule ever reads wall-clock time. Before any clock call, the logical clock starts at exactly 2026-08-01T00:00:00Z. A `System`-only test-driving capability sets the clock to a supplied `to_iso8601` instant and returns the resulting `current_utc`; the logical clock never falls back to wall-clock time. Maturity checks, UCC lapse checks, coverage and deferral windows, accrual day counts, and the association's `current_fiscal_year` — the UTC calendar year of the logical clock — all read this clock. Setting the clock mutates no entity by itself: time-driven transitions fire only at the next periodic review.
+
+The periodic review is the association's ops-run checkpoint, invoked by `System` or `LoanOfficer` against one association, and it performs all of the following in a single run: the association's `review_index` — a monotonic counter starting at 0 at creation — increments by 1; interest accrues to the clock date for every loan in `ACTIVE` or `RESTRUCTURING` status (terminal loans do not accrue); every `FILED` or `CONTINUED` UCC filing whose `lapse_date` is at or before the clock lapses, with the collateral, borrowing-base, posture, and margin cascade that follows; every `APPROVED` deferral whose window contains the clock moves into effect, and every `APPROVED` or `IN_EFFECT` deferral whose window has ended expires; every loan's coverage-band posture is recomputed, and a review that closes with a loan already `DELINQUENT` increments that loan's `consecutive_delinquent_reviews`, which reaching 2 forces the posture to `DEFAULT`; and a margin deficiency sweep issues or cures margin call notices per loan. The run returns the association.
+
+### 2.5. Monetary Precision, Interest Conventions, and Ratio Units
+
+All monetary values are integer cents — never floats, never decimals with fraction digits. Interest rates are carried as integer basis points, so a 7.00% annual rate is stored as 700. Two rounding disciplines are pinned globally: where a rule says "rounded half-up to whole cents" the half-cent rounds toward the larger cent; where a rule says "floored" the value truncates toward zero at the cent boundary. Interest accrues on an actual/360 convention — the year is treated as 360 days and days are counted as whole UTC calendar days between accrual dates. Coverage ratios are carried in thousandths ("milli"), so a required current ratio of 1.100 is stored as 1100. Each calculation in Section 3 restates the precision it uses at the point of business context; none of them ever emits a fractional cent.
+
+### 2.6. Resource Identity, Versioning, and Optimistic Concurrency
+
+Every resource in this API carries four common properties. The `id` is a server-minted UUID with no type prefix. `created_at` and `updated_at` are ISO 8601 UTC timestamps with three fractional digits; `created_at` is fixed at creation and `updated_at` refreshes on every mutation of that resource. The `version` is an integer that increments by 1 on every mutation of the resource.
+
+Because this model is flat — child records reference their loan or borrower by body-supplied identifiers rather than by URL nesting — a mutation aimed at one resource frequently rewrites another's derived state, and the version of the affected loan moves with it. Submitting, approving, activating, charging off, or foreclosing a loan increments that loan's `version` by 1. So do creating, approving, or recording actuals on one of its crop budgets; releasing one of its collateral items; creating or terminating one of its UCC filings; paying one of its insurance claims; disbursing or rescinding one of its draws; creating or reversing one of its repayments; and creating, rejecting, executing, or withdrawing one of its restructure plans. Recording an appraisal increments the collateral's own `version` by 1.
+
+Three write operations carry an explicit optimistic-concurrency guard, and no other endpoint accepts a version field:
+
+- Creating a crop budget requires the request to carry `expected_loan_version` equal to the target loan's current `version`. A newer budget supersedes an existing `DRAFT` budget, and the loan's borrowing base anchors to the newest budget, so a writer holding a stale loan version would silently build on a superseded projection; if the loan's version has advanced since the client last observed it, the create is rejected with `ERR_STALE_VERSION` (HTTP 412).
+- Creating a restructure plan likewise requires `expected_loan_version` matching the loan's current `version`. A new plan legitimately supersedes the prior non-terminal plan and moves the loan to `RESTRUCTURING`, so a stale writer would unknowingly supersede terms it never saw; a version mismatch is rejected with `ERR_STALE_VERSION` (HTTP 412).
+- Recording an appraisal requires `expected_collateral_version` matching the collateral's current `version`. Each new appraisal supersedes the prior value and immediately reshapes the borrowing base, so an appraisal keyed to a stale collateral version is rejected with `ERR_STALE_VERSION` (HTTP 412).
+
+### 2.7. Validation Order and Error Precedence
+
+When a single request would violate several rules, the server reports only one failure: the violation whose category sits earliest in the precedence below. The tiers are evaluated in this order, and within a tier the individual checks follow the order stated:
+
+1. **Context headers.** `X-User-ID` and `X-User-Role` are present and the role is declared — `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER`.
+2. **Role permission.** The caller's role is listed for the endpoint — `ERR_FORBIDDEN_FOR_ROLE`.
+3. **Borrower ownership.** On `Borrower`-role write endpoints, the caller owns the target resource chain — `ERR_RESOURCE_NOT_OWNED`.
+4. **Request shape.** Required fields are present, enum values are in range, amounts are positive integers, window fields start before they end, and an approved commitment is positive and no more than the requested commitment — `ERR_INVALID_REQUEST`.
+5. **Existence.** Path identifiers and body-supplied foreign keys — `loan_account_id`, `borrower_id`, `collateral_id`, `policy_id`, `association_id` — resolve to existing records, validated left to right — `ERR_NOT_FOUND`.
+6. **Optimistic concurrency.** A request carrying `expected_loan_version` or `expected_collateral_version` matches the parent entity's current `version` — `ERR_STALE_VERSION`.
+7. **Generic state preconditions.** The requested transition is listed for the entity's current state, and terminal states accept no transitions — `ERR_INVALID_STATE_TRANSITION`.
+8. **Loan-level gates.** Draw approve, disburse, and rescind, plan creation, and deferral creation require the loan `ACTIVE`; repayment creation and claim payment accept `ACTIVE` or `RESTRUCTURING` — violations yield `ERR_LOAN_NOT_ACTIVE`. Draw approval additionally requires the posture not be `DELINQUENT` or `DEFAULT` — `ERR_LOAN_POSTURE_BLOCKS_DRAWS`. `Borrower`-role creation of draws, crop budgets, or deferrals while the borrower is `SUSPENDED` yields `ERR_BORROWER_SUSPENDED`.
+9. **Insurance and perfection gates.** Activation and draw approval require an `ASSIGNED` `ACTIVE` policy — `ERR_INSURANCE_NOT_ASSIGNED` — and activation requires a `PLEDGED` `PERFECTED` collateral — `ERR_COLLATERAL_UNPERFECTED`. Within this tier the insurance check precedes the collateral check.
+10. **Temporal windows.** Activation before maturity — `ERR_MATURITY_PASSED`; UCC continuation inside its statutory window — `ERR_CONTINUATION_WINDOW_NOT_OPEN`; policy coverage overlap — `ERR_COVERAGE_OVERLAP`; deferral windows that overlap — `ERR_DEFERRAL_OVERLAP`, checked first — or sit closer than thirty days — `ERR_DEFERRAL_GAP_TOO_SMALL`; same-day-only rescission — `ERR_RESCIND_WINDOW_CLOSED`.
+11. **Uniqueness and duty rules.** Filing-number uniqueness — `ERR_FILING_NUMBER_TAKEN`; policy-number uniqueness — `ERR_POLICY_NUMBER_TAKEN`; assignment of an already-assigned policy — `ERR_POLICY_ALREADY_ASSIGNED`; segregation of duties on covenant waiver and plan approval — `ERR_SEGREGATION_OF_DUTIES`; disaster-plan prerequisites — `ERR_DISASTER_REQUIRED`; the restructure distress gate — `ERR_RESTRUCTURE_GATE_NOT_MET`; one distribution per association and fiscal year — `ERR_DISTRIBUTION_EXISTS`; the declaration fiscal year — `ERR_INVALID_FISCAL_YEAR`; and the approved-budget gate at activation — `ERR_BUDGET_NOT_APPROVED`.
+12. **Cross-aggregate integrity.** Records joined in one request must belong to one association — `ERR_CROSS_ASSOCIATION_REFERENCE` — checked on policy assignment, claim creation, deferral creation, collateral creation, and budget creation alike; a claim must name the loan its policy is assigned to — `ERR_POLICY_NOT_ASSIGNED_TO_LOAN`; a deferral must name a live disaster declaration covering the borrower's county — `ERR_DISASTER_NOT_FOUND`.
+13. **Fiscal ceilings.** Draw amount against available credit — `ERR_DRAW_EXCEEDS_AVAILABILITY`; repayment against total debt — `ERR_PAYMENT_EXCEEDS_OUTSTANDING`; adjuster approval against remaining coverage — `ERR_CLAIM_EXCEEDS_COVERAGE`; collateral release against a deficiency — `ERR_RELEASE_WOULD_CREATE_DEFICIENCY`; patronage allocation against an eligible base — `ERR_NO_ELIGIBLE_PATRONAGE_BASE`.
+
+### 2.8. Derived State and the Standard Recompute Cascade
+
+Several fields on this API are never set by clients; the server derives them. A loan's `payment_posture`, `borrowing_base_cents`, and `pending_draw_cents` are computed; a collateral item's `perfection_state` is computed; a borrower's `status` and `active_covenant_breach_count` are derived from covenant and loan events. Consistency is immediate: every mutation's effects are visible in that mutation's own response.
+
+After any event that changes a loan's `outstanding_principal_cents`, recomputes its `borrowing_base_cents`, or sets its `approved_commitment_cents`, the server runs what this document calls the standard cascade: the coverage-band posture recompute of Section 3.6, the margin deficiency check of Section 3.8 — which may issue a new notice or cure an outstanding one — and a re-evaluation of the borrower's standing under the suspension rule of Section 3.1. Narratives below say "the standard cascade runs" rather than re-enumerating the three steps each time.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Associations, Borrowers, and Disaster Declarations
+
+An `AssociationBoard` member founds the association by supplying its display `name` and Farm Credit System `charter_number`. The new association starts with `review_index` 0 and an empty `active_disaster_declarations` list. When weather or market catastrophe strikes, the board declares a disaster by supplying a `disaster_ref`, the affected `counties`, and a `start_date` and `end_date`; the declaration is appended to `active_disaster_declarations` as a record of exactly those four values, and declarations are never mutated or removed once appended.
+
+A `LoanOfficer` enrolls a farm operation by supplying the owning `association_id`, the operation's `legal_name`, its `tax_id`, and its primary `county`. The borrower record starts in `ACTIVE` status, with `patronage_eligible` true and `active_covenant_breach_count` 0. The `county` is not decorative: disaster declarations are matched against it when the borrower later asks for a deferral or a disaster restructure.
+
+Borrower standing is derived, not assigned. A borrower moves from `ACTIVE` to `SUSPENDED` whenever any of three conditions comes to hold: its `active_covenant_breach_count` reaches at least 2, any of its loans carries a `payment_posture` of `DELINQUENT` or `DEFAULT`, or any margin call notice on its loans stands `ESCALATED`. While suspended, borrower-initiated creation of draw requests, crop budgets, and deferral requests is rejected with `ERR_BORROWER_SUSPENDED`. Standing is re-evaluated after every posture change, every covenant record, waiver, or void, and every margin-call escalation or cure; when none of the three conditions holds any longer, the borrower returns from `SUSPENDED` to `ACTIVE` on its own.
+
+A `CreditCommittee` member terminates a borrower only when every one of its loans has reached a terminal state — `PAID_OFF`, `CHARGED_OFF`, or `FORECLOSED` — and any attempt earlier is rejected with `ERR_INVALID_STATE_TRANSITION`. Termination sets `patronage_eligible` to false; the same flag flips false the moment any of the borrower's loans is charged off, since a borrower who has cost the co-op a loan no longer shares in its earnings.
+
+### 3.2. Loan Origination: Application, Committee Approval, and the Activation Gates
+
+Origination begins when a `LoanOfficer` files an application naming the `borrower_id`, the `requested_commitment_cents`, the annual `rate_bps` in basis points, the `season_year` the line finances, and the `maturity_date` at which the line must be settled. The new loan enters `DRAFT` with `payment_posture` `CURRENT`, both balances — `outstanding_principal_cents` and `accrued_interest_cents` — at 0, `approved_commitment_cents` still null, and its `association_id` denormalized from the borrower record at creation so the loan's association never drifts from its owner's.
+
+Submission by the officer moves the application `DRAFT` → `SUBMITTED`. Committee approval then sets the commitment: the supplied `approved_commitment_cents` must be a positive amount no greater than the `requested_commitment_cents`, and anything outside that range is rejected as `ERR_INVALID_REQUEST`. Approval moves the loan `SUBMITTED` → `APPROVED` and recomputes the borrowing base for the first time with the commitment cap in force — before approval the base stands uncapped, and afterward it can never exceed the approved commitment.
+
+Activation is where origination earns its keep. Four gates stand between `APPROVED` and `ACTIVE`, evaluated in this order. First, at least one insurance policy with `status` `ACTIVE` and `assignment_status` `ASSIGNED` to this loan must exist, else `ERR_INSURANCE_NOT_ASSIGNED`. Second, at least one collateral item must be `PLEDGED` with `perfection_state` `PERFECTED`, else `ERR_COLLATERAL_UNPERFECTED` — the insurance gate is checked before the collateral gate, so a loan missing both reports the insurance failure. Third, the logical clock must sit strictly before the loan's `maturity_date`; a clock at or past maturity is rejected with `ERR_MATURITY_PASSED`. Fourth, an `APPROVED` crop budget must exist for this loan and season, else `ERR_BUDGET_NOT_APPROVED`. When all four pass, the loan moves to `ACTIVE` and its `last_accrual_date` — null until this moment — is set to the clock date, anchoring the interest convention of Section 3.6.
+
+From `ACTIVE`, a loan's remaining exits are all governed elsewhere: payoff at exact zero (Section 3.6), restructure entry and return (Section 3.8), charge-off and foreclosure (Section 3.8). The terminal states are `PAID_OFF`, `CHARGED_OFF`, and `FORECLOSED`, and a terminal loan accepts no further transitions of any kind.
+
+### 3.3. Crop Budgets and the Borrowing Base
+
+Each season's plan starts as a crop budget filed by the `Borrower` — only the borrower role files budgets — against a loan by `loan_account_id`. The budget's `season_year` must equal the loan's `season_year`, and a mismatch fails request-shape validation as `ERR_INVALID_REQUEST`. The borrower supplies the `crop_type` code, the planted `acres`, the `projected_revenue_cents` and `projected_expenses_cents`; `actual_revenue_cents` stays null until harvest actuals are recorded. Because a new budget supersedes an existing `DRAFT` budget of the same loan, creation carries the optimistic-concurrency guard of Section 2.6: the request must present `expected_loan_version` matching the loan's current `version`, and a stale version is rejected with `ERR_STALE_VERSION`. Budget creation is accepted while the loan sits in any non-terminal status other than `RESTRUCTURING` — the budget must be able to exist before activation can gate on it — and is rejected with `ERR_LOAN_NOT_ACTIVE` when the loan is `RESTRUCTURING` or terminal.
+
+A new budget enters `DRAFT`, and filing a newer draft supersedes the prior draft of the same loan to `SUPERSEDED`. Officer approval is the moment a budget starts to matter: a `LoanOfficer` approves a budget only when no other `APPROVED` budget for the same loan was created after it — approval always belongs to the newest plan — and the approval supersedes any other `APPROVED` budget of the loan to `SUPERSEDED`, recomputes the borrowing base on the provisional variant, and runs the standard cascade. After harvest, the `Borrower` or a `LoanOfficer` records `actual_revenue_cents`; the budget moves `APPROVED` → `ACTUALIZED`, the borrowing base flips to the harvest true-up variant, and the standard cascade runs again. `SUPERSEDED` and `ACTUALIZED` are terminal for a budget.
+
+The borrowing base itself is assembled the same way everywhere it is recomputed — at loan approval, budget approval, actuals recording, UCC filing creation, lapse, or termination, appraisal, and collateral release. For every collateral item of the loan that is `PLEDGED` and `PERFECTED` — `UNPERFECTED` and `RELEASED` items are excluded — the appraised value is multiplied by the advance rate for its `collateral_type`: 75% (7500 basis points) for `CHATTEL_CROP`, 70% for `EQUIPMENT`, 80% for `REAL_ESTATE`. Each per-collateral product is floored to whole cents first, then the item's `prior_lien_cents` is subtracted, with the contribution floored at zero so a senior lien can never make a line negative. Those contributions sum to the collateral component. The crop component comes from the single budget that feeds the base: while the feeding budget is `APPROVED`, it is 60% (6000 basis points) of `projected_revenue_cents`, floored to whole cents, and with no `APPROVED` budget the crop component is zero; once the feeding budget is `ACTUALIZED`, it is 60% of `actual_revenue_cents`, floored to whole cents — identical collateral and commitment produce a different base whenever actual revenue differs from the projection. `DRAFT` and `SUPERSEDED` budgets never feed the base. The raw base is the collateral component plus the crop component; before the committee has set `approved_commitment_cents` the raw base stands as `borrowing_base_cents`, and afterward `borrowing_base_cents` is the lesser of the approved commitment and the raw base. The evaluation order is pinned — per-collateral floors first, then the sum, then the commitment cap last — and since appraised values are already integer cents and the advance rates are integer basis points, the per-line floor is pinned for determinism rather than to discard fractions.
+
+### 3.4. Collateral, Appraisals, and UCC Perfection
+
+A `LoanOfficer` pledges collateral to a loan by naming the `loan_account_id`, the `collateral_type` — `CHATTEL_CROP`, `EQUIPMENT`, or `REAL_ESTATE`, which selects the advance rate used in Section 3.3 — a free-text `description`, the current `appraised_value_cents`, and optionally `prior_lien_cents`, which defaults to 0 when omitted. The item enters `PLEDGED` with `perfection_state` `UNPERFECTED`, and unperfected collateral contributes nothing to the borrowing base until a filing perfects it. Perfection is derived: a collateral item is `PERFECTED` exactly when at least one of its UCC filings stands `FILED` or `CONTINUED`, and `UNPERFECTED` otherwise.
+
+Perfecting a security interest means filing a UCC-1 financing statement. The officer files one by supplying the `collateral_id`, a `filing_number` that must be unique across the association — a duplicate is rejected with `ERR_FILING_NUMBER_TAKEN` — the `jurisdiction`, and the effective `filed_date`. The filing is created directly in `FILED` status, its `lapse_date` is computed as the `filed_date` plus five calendar years, the collateral's `perfection_state` flips to `PERFECTED`, and the borrowing base recomputes with the standard cascade.
+
+Financing statements age. A continuation statement may be filed only inside the statutory window — on or after the day 180 days before the current `lapse_date` and strictly before the `lapse_date` itself; outside that window the continuation is rejected with `ERR_CONTINUATION_WINDOW_NOT_OPEN`. A successful continuation moves `FILED` → `CONTINUED`, and a filing already `CONTINUED` may be continued again on the same terms, each continuation adding another five calendar years to the `lapse_date`. When the periodic review finds a `FILED` or `CONTINUED` filing whose `lapse_date` is at or before the clock, the filing lapses: its status becomes `LAPSED`, the collateral's `perfection_state` is recomputed and falls to `UNPERFECTED` when no other live filing remains, the collateral drops out of the borrowing base, and the standard cascade runs — a lapse is exactly how a margin call notice gets created without anyone touching the loan. An officer may also terminate a filing outright, and release or foreclosure cascades terminate filings as well; termination moves `FILED` or `CONTINUED` to `TERMINATED`, recomputes perfection, and runs the standard cascade. `LAPSED` and `TERMINATED` are terminal.
+
+Values move with the market, so appraisals supersede. Recording a new appraisal presents `appraised_value_cents` together with `expected_collateral_version` matching the collateral's current `version`; a version that has advanced since the client last read the collateral is rejected with `ERR_STALE_VERSION`, because each new appraisal supersedes the prior value and immediately reshapes the borrowing base. A landed appraisal updates `appraised_value_cents`, bumps the collateral's `version`, recomputes the base, and runs the standard cascade.
+
+Release is the mirror image of pledge. A `LoanOfficer` may release a `PLEDGED` item only when, after its removal, the recomputed borrowing base would still cover the outstanding principal — concretely, the outstanding principal must remain at or below the lesser of the approved commitment and the recomputed base; otherwise the release is rejected with `ERR_RELEASE_WOULD_CREATE_DEFICIENCY`. A successful release moves the collateral to `RELEASED` (terminal), terminates any of its `FILED` or `CONTINUED` filings, recomputes the base without the item, and runs the standard cascade. Foreclosure releases collateral without that check, as Section 3.8 describes.
+
+### 3.5. Crop Insurance: Policies, Claims, and the Indemnity Waterfall
+
+A policy enters the books when a `Borrower` or a `LoanOfficer` records it with the owning `borrower_id`, a `policy_number` unique per borrower — duplicates are rejected with `ERR_POLICY_NUMBER_TAKEN` — the insured `crop_type` and `county`, the half-open coverage window from `coverage_start` (inclusive) to `coverage_end` (exclusive), and the `coverage_amount_cents` ceiling. Coverage windows for the same borrower, crop type, and county must not overlap; adjacency — one window's `coverage_start` landing exactly on another's `coverage_end` — is allowed, and an overlapping submission is rejected with `ERR_COVERAGE_OVERLAP`. A new policy starts `ACTIVE` and `UNASSIGNED`, with `assigned_loan_id` null.
+
+Assignment names the association as loss payee. A `LoanOfficer` assigns a policy by naming the `loan_account_id`, and four checks guard the act: the policy must be `ACTIVE`, else `ERR_POLICY_NOT_ACTIVE`; it must not already be `ASSIGNED`, else `ERR_POLICY_ALREADY_ASSIGNED`; the loan and the policy must belong to the same association, else `ERR_CROSS_ASSOCIATION_REFERENCE`; and the coverage window must contain the loan season — the clock at or after `coverage_start`, and `coverage_end` at or after the loan's `maturity_date` — else `ERR_INVALID_REQUEST`. Assignment sets `assigned_loan_id`, records the association as loss payee, and moves `assignment_status` `UNASSIGNED` → `ASSIGNED`. Cancelling a policy — by the borrower or an officer — is blocked while any of its claims stands `REPORTED`, `ADJUSTED`, `APPROVED`, or `UNDER_APPEAL`, surfacing `ERR_INVALID_STATE_TRANSITION`; a clean cancel moves the policy to `CANCELLED`, releases any assignment (`ASSIGNED` → `RELEASED`), and clears `assigned_loan_id`.
+
+When hail or drought hits, the `Borrower` or a `LoanOfficer` reports a claim under an assigned policy, supplying the `policy_id`, the `loan_account_id`, and the grower-claimed `claimed_loss_cents`. The claim's `loan_account_id` must equal the policy's `assigned_loan_id` and the policy must stand `ASSIGNED`, else the report is rejected with `ERR_POLICY_NOT_ASSIGNED_TO_LOAN`; reporting against a `CANCELLED` policy yields `ERR_POLICY_NOT_ACTIVE`; and all parties must share one association under the cross-association rule. The claim opens in `REPORTED` with `adjuster_approved_cents` null.
+
+From there the claim runs an adjust-and-appeal loop owned by the `InsuranceAdjuster`. The adjuster's report sets the indemnity amount: from `REPORTED` → `ADJUSTED`, and again from `UNDER_APPEAL` → `ADJUSTED` when an appeal sends it back, in which case the new figure overwrites the old. Either way, `adjuster_approved_cents` may not exceed the policy's remaining coverage — the `coverage_amount_cents` less the sum of `indemnity_to_lender_cents` over this policy's claims already in `PAID` status — and an excessive report is rejected with `ERR_CLAIM_EXCEEDS_COVERAGE`. The adjuster approves an `ADJUSTED` claim to `APPROVED`, or denies a claim from any of `REPORTED`, `ADJUSTED`, or `UNDER_APPEAL` to `DENIED` (terminal). The borrower or an officer who disputes an approved amount appeals it, moving `APPROVED` → `UNDER_APPEAL` and reopening the adjuster's report.
+
+Payment is the lender's moment as loss payee. A `LoanOfficer` pays an `APPROVED` claim, and only while the loan stands `ACTIVE` or `RESTRUCTURING` — anything else is `ERR_LOAN_NOT_ACTIVE`. The `indemnity_to_lender_cents` is the lesser of `adjuster_approved_cents` and the coverage remaining at payment time. Interest first accrues to the clock date under the convention of Section 3.6. Then the waterfall: `applied_interest_cents` is the lesser of the indemnity and the accrued interest; `applied_principal_cents` is the lesser of what remains and the outstanding principal; and any indemnity beyond total debt becomes `remitted_to_borrower_cents`. Balances fall accordingly, the claim moves to `PAID` (terminal), and if principal and interest both reach exactly zero the loan auto-transitions `ACTIVE` → `PAID_OFF`. The standard cascade then runs — a claim payment that restores coverage is precisely how an `ISSUED` margin call gets cured without a draw ever moving.
+
+### 3.6. The Seasonal Cycle: Draws, Disbursement, Repayment, and Interest
+
+Advances begin as draw requests. The `Borrower` — against its own loans — or a `LoanOfficer` on the borrower's behalf files a request naming the `loan_account_id`, the `amount_cents`, and a `purpose` of `SEED`, `FERTILIZER`, `FUEL`, `LABOR`, `EQUIPMENT_REPAIR`, or `LIVING_EXPENSE`; the request enters `REQUESTED` with `disbursement_date` null. Approval belongs to the officer and enforces four gates in a fixed order: the loan must be `ACTIVE`, else `ERR_LOAN_NOT_ACTIVE`; the posture must not be `DELINQUENT` or `DEFAULT`, else `ERR_LOAN_POSTURE_BLOCKS_DRAWS`; at least one policy `ASSIGNED` and `ACTIVE` for this loan must exist, else `ERR_INSURANCE_NOT_ASSIGNED`; and the amount must fit available credit, else `ERR_DRAW_EXCEEDS_AVAILABILITY`. Available credit is the lesser of `approved_commitment_cents` and `borrowing_base_cents`, minus `outstanding_principal_cents`, minus `pending_draw_cents` — and `pending_draw_cents` sums `amount_cents` over exactly this loan's draws in `APPROVED` status, excluding `REQUESTED`, `DENIED`, `CANCELLED`, `DISBURSED`, and `RESCINDED` alike. An amount equal to available credit passes; only a strictly greater amount fails. Approval moves `REQUESTED` → `APPROVED` and reserves availability by adding the amount to `pending_draw_cents`.
+
+Disbursement turns the reservation into principal. The officer disburses an `APPROVED` draw; interest first accrues to the clock date, then `outstanding_principal_cents` grows by the `amount_cents`, `pending_draw_cents` shrinks by the same amount, the `disbursement_date` is stamped with the clock, and the draw lands in `DISBURSED` with the standard cascade behind it. Three exits remain. An officer denies a `REQUESTED` draw — optionally recording a `reason` — moving it to `DENIED`. The borrower cancels its own draw from `REQUESTED` or `APPROVED` into `CANCELLED`, and cancelling an approved draw releases the reservation by subtracting its amount from `pending_draw_cents`. And an officer rescinds a `DISBURSED` draw on the same UTC date as its `disbursement_date` — any later date is rejected with `ERR_RESCIND_WINDOW_CLOSED` — subtracting the amount from outstanding principal with zero interest drift, because a same-day rescission spans zero accrual days on the draw amount; the draw ends `RESCINDED` and the standard cascade runs. `DENIED`, `CANCELLED`, and `RESCINDED` are terminal, and disbursement and rescission both require the loan `ACTIVE` under the loan-level gate of Section 2.7.
+
+Interest accrues in segments between consecutive events. For a segment in which principal stays constant at some value for a whole number of UTC days, the daily charge is that principal times the loan's `rate_bps` divided by 3,600,000 — basis points over ten thousand over a 360-day year, the actual/360 convention — rounded half-up to whole cents; the segment's accrual is that daily charge times the number of days. The rounding order is pinned: each segment's daily charge is rounded to whole cents first and then multiplied by days; accumulating raw fractions over a segment and rounding once at the end yields different cents and is non-conformant. Accrual runs before the balance change of every balance-mutating event — draw disbursement, repayment creation or reversal, claim payment, restructure execution — and as a sweep at each periodic review, advancing `last_accrual_date` to the clock date each time and adding the segment accrual into `accrued_interest_cents`. Only loans in `ACTIVE` or `RESTRUCTURING` accrue; terminal loans do not.
+
+Repayments close the loop. The `Borrower` repays one of its own loans by naming the `loan_account_id`, the `amount_cents`, and a `source` of `HARVEST_PROCEEDS`, `INSURANCE_INDEMNITY`, or `OTHER`; the loan must stand `ACTIVE` or `RESTRUCTURING`, else `ERR_LOAN_NOT_ACTIVE`. The payment applies in full at creation: interest accrues to the clock date first; then if the amount exceeds accrued interest plus outstanding principal, the request is rejected outright with `ERR_PAYMENT_EXCEEDS_OUTSTANDING` — there is no partial application. Otherwise `applied_interest_cents` is the lesser of the amount and the accrued interest, `applied_principal_cents` is the remainder of the amount, interest and principal fall by those portions, and the repayment records both portions with status `APPLIED`. When the two balances both reach exactly zero, the loan auto-transitions `ACTIVE` → `PAID_OFF`. The standard cascade follows, including borrower standing re-evaluation.
+
+Reversal unwinds a misapplied payment. An officer reverses an `APPLIED` repayment — optionally with a `reason` — provided the loan is not in a terminal state, else `ERR_INVALID_STATE_TRANSITION`. Interest accrues to the clock date first; then the recorded `applied_interest_cents` is added back to `accrued_interest_cents` and `applied_principal_cents` back to `outstanding_principal_cents`, the repayment moves to `REVERSED` (terminal), and the standard cascade runs.
+
+A loan also exposes a computed read — its financial summary — returning the current `outstanding_principal_cents`, `accrued_interest_cents`, `borrowing_base_cents`, `pending_draw_cents`, the derived `available_credit_cents` and `coverage_cents`, and the current `payment_posture` and `status`. It is a point-in-time snapshot over the rules of this section and carries no side effects.
+
+### 3.7. Working-Capital Covenants and Borrower Standing
+
+Each loan's operating line carries a working-capital covenant, monitored through evaluations recorded by a `LoanOfficer`. Recording an evaluation names the `loan_account_id`, the statement's `as_of_date`, and the reported `current_assets_cents` and `current_liabilities_cents`; the server denormalizes the loan's `borrower_id` onto the record and stamps `recorded_by_user_id` with the caller's `X-User-ID`, anchoring the segregation of duties enforced at waiver time. Three derived values land on the record at once. `working_capital_cents` is the assets less the liabilities. `required_ratio_milli` tiers off the loan's `approved_commitment_cents`: a commitment at or below 25,000,000 cents ($250,000) requires 1100 — a current ratio of 1.100 — at or below 100,000,000 cents ($1,000,000) requires 1250, and anything larger requires 1400. And the `outcome` is decided by exact integer cross-multiplication with no rounding of the ratio: when the liabilities are zero, the evaluation is `COMPLIANT` if assets are positive and `BREACH` if assets are also zero; otherwise the evaluation is `COMPLIANT` exactly when the assets times one thousand are at least the `required_ratio_milli` times the liabilities, and `BREACH` otherwise. A display ratio `current_ratio_milli` — the floor of the assets times one thousand divided by the liabilities, defined as 0 when both are zero and 999999999 when liabilities are zero with positive assets — is computed independently and never feeds the outcome. The evaluation enters `RECORDED`.
+
+The consequences land immediately on the borrower. A `RECORDED` evaluation with outcome `BREACH` increments the borrower's `active_covenant_breach_count` by one and re-evaluates borrower standing — remember from Section 3.1 that two active breaches suspend the borrower. A `RECORDED` `COMPLIANT` outcome resets the count to 0 and likewise re-evaluates standing.
+
+Two exits close an evaluation. The `CreditCommittee` waives a `RECORDED` evaluation, moving it to `WAIVED` (terminal) — but segregation of duties forbids the committee member whose `X-User-ID` equals the evaluation's `recorded_by_user_id` from waiving it, and such an attempt is rejected with `ERR_SEGREGATION_OF_DUTIES`. A `LoanOfficer` voids a mis-recorded evaluation, moving `RECORDED` → `VOIDED` (terminal). Both exits share one side effect with equal force: if the evaluation's outcome was `BREACH`, the borrower's `active_covenant_breach_count` decrements by one and borrower standing is re-evaluated; a `COMPLIANT` evaluation's waiver or voiding touches nothing.
+
+### 3.8. Distress Workflows: Margin Calls, Restructures, Deferrals, and Loan Exit
+
+Coverage thins before it breaks, and the margin machinery watches it. After every event that recomputes a loan's borrowing base or moves its outstanding principal — and in the sweep of every periodic review — the server computes the deficiency: `outstanding_principal_cents` less the lesser of `approved_commitment_cents` and `borrowing_base_cents`. When the deficiency is positive and no `ISSUED` notice already exists for the loan, a `MarginCallNotice` is created in `ISSUED` status recording that `deficiency_cents`. When the deficiency is zero or negative and an `ISSUED` notice exists, that notice cures itself to `CURED` and borrower standing is re-evaluated. An `ESCALATED` notice is never auto-cured.
+
+Escalation is the committee's hammer. A `CreditCommittee` member escalates an `ISSUED` notice to `ESCALATED`, and three things happen together: the loan's `payment_posture` is forced to `DEFAULT`, its `consecutive_delinquent_reviews` is set to 2, and the borrower's standing is re-evaluated — which under Section 3.1 suspends the borrower. An escalated notice is also the key that opens foreclosure: the committee forecloses an `ACTIVE` loan only while an `ESCALATED` notice exists for it, else `ERR_INVALID_STATE_TRANSITION`, and foreclosure releases every `PLEDGED` collateral item of the loan to `RELEASED` and terminates every `FILED` or `CONTINUED` filing on that collateral to `TERMINATED` — the release-deficiency check of Section 3.4 does not apply to this cascade. The other terminal exit for a distressed loan is charge-off: the committee charges off an `ACTIVE` loan only when its posture is `DEFAULT`, else `ERR_INVALID_STATE_TRANSITION`, and charge-off flips the borrower's `patronage_eligible` to false and re-evaluates borrower standing, which a `DEFAULT` loan keeps suspended.
+
+Before those exits comes the restructure. A `LoanOfficer` proposes a plan for a distressed loan, and the creation is heavily gated: the loan must be `ACTIVE`, else `ERR_LOAN_NOT_ACTIVE`; the distress gate requires the posture to be `DELINQUENT` or `DEFAULT` or an `ISSUED` or `ESCALATED` margin call to exist for the loan, else `ERR_RESTRUCTURE_GATE_NOT_MET`; and the request carries `expected_loan_version` under the optimistic-concurrency guard of Section 2.6, rejected stale with `ERR_STALE_VERSION`. The officer sets the `plan_type` — `STANDARD` or `DISASTER` — the `amortization_style` of `EQUAL_INSTALLMENT` or `BALLOON`, the `extension_months` added to maturity at execution, the post-restructure `new_rate_bps`, and whether to `capitalize_interest`. A `DISASTER` plan carries two further prerequisites: an active disaster declaration covering the borrower, and at least one `APPROVED`, `IN_EFFECT`, or `EXPIRED` deferral on the loan; missing either is rejected with `ERR_DISASTER_REQUIRED`.
+
+Creation freezes the economics onto the plan. Interest first accrues to the clock date; then `base_balance_cents` is frozen as the `outstanding_principal_cents` plus, when `capitalize_interest` is true, the `accrued_interest_cents`, and `new_installment_cents` is computed from those frozen figures. The monthly rate is the `new_rate_bps` divided by 1,200,000. Under `EQUAL_INSTALLMENT` the installment is the fully amortizing annuity over `extension_months` payments: the base balance times the monthly rate times the n-th power of one plus the monthly rate, divided by the n-th power of one plus the monthly rate minus one — with n being `extension_months` — rounded half-up to whole cents; the final installment absorbs any residual and is not modeled on the plan. Under `BALLOON` the installment is interest-only: the base balance times the monthly rate, rounded half-up to whole cents, with principal due at the end. Identical base, rate, and term produce a much smaller balloon installment than the annuity; both are valid servicing constructs.
+
+Creation also reorders the docket: any prior non-terminal plan of the loan — `PROPOSED`, `COMMITTEE_REVIEW`, or `APPROVED` — is superseded to `SUPERSEDED`, the loan moves `ACTIVE` → `RESTRUCTURING`, the new plan opens `PROPOSED`, and `created_by_user_id` records the caller. While a loan stands `RESTRUCTURING`, draw approvals are blocked with `ERR_LOAN_NOT_ACTIVE`, though repayments and claim payments still land, since those accept `ACTIVE` or `RESTRUCTURING`, and budget creation is refused under the same gate. Submission by the officer moves the plan `PROPOSED` → `COMMITTEE_REVIEW`. The committee approves a plan in review — but the member whose `X-User-ID` equals the plan's `created_by_user_id` is barred by segregation of duties, rejected with `ERR_SEGREGATION_OF_DUTIES` — moving it to `APPROVED`; or rejects it with an optional `reason`, moving it to `REJECTED` and returning the loan `RESTRUCTURING` → `ACTIVE` when no other non-terminal plan exists for the loan. Rejection is not the end: resubmitting a `REJECTED` plan sends it back to `COMMITTEE_REVIEW` and reopens the loan's restructuring, moving the loan `ACTIVE` → `RESTRUCTURING` again. The officer may also withdraw a `PROPOSED` plan to `WITHDRAWN`, which likewise returns the loan to `ACTIVE` when no other non-terminal plan remains.
+
+Execution is the payoff of the whole workflow. An officer executes an `APPROVED` plan: when `capitalize_interest` is set, `outstanding_principal_cents` is rewritten to the frozen `base_balance_cents` and `accrued_interest_cents` zeroes out; the loan's `rate_bps` becomes the `new_rate_bps` and its `maturity_date` extends by the `extension_months`; the plan moves to `EXECUTED` (terminal); the loan returns `RESTRUCTURING` → `ACTIVE` with `payment_posture` reset to `CURRENT` and `consecutive_delinquent_reviews` reset to 0. That posture reset is authoritative: the standard posture recompute is skipped once at execution, and the bands of Section 3.6 speak again only at the next balance- or base-affecting event. Execution is, in fact, the only way out of `DEFAULT` short of terminal payoff — the posture rules otherwise never leave `DEFAULT`.
+
+Disaster relief runs on its own track. A `Borrower` requests a deferral for one of its own `ACTIVE` loans — suspended borrowers are turned away per Section 3.1 — by naming the `loan_account_id`, a `disaster_ref`, and a half-open window from `requested_start` (inclusive) to `requested_end` (exclusive). The `disaster_ref` must match an entry in the association's `active_disaster_declarations` that covers the borrower's `county` and whose `end_date` is at or after the clock; an absent, expired, or county-mismatched reference is rejected with `ERR_DISASTER_NOT_FOUND`. The window itself must be well formed — `requested_start` not before the clock date and `requested_end` strictly after `requested_start` — or the request fails shape validation with `ERR_INVALID_REQUEST`. The request enters `SUBMITTED`. The `CreditCommittee` approves or denies: approval enforces, in order, that the new window does not overlap any other `APPROVED` or `IN_EFFECT` deferral of the same loan — `ERR_DEFERRAL_OVERLAP` — and only then that the gap between the new window and each such existing window is at least 30 days in both directions, neither starting less than thirty days after an existing window's end nor ending less than thirty days before an existing window's start — `ERR_DEFERRAL_GAP_TOO_SMALL`. Denial moves the request to `DENIED` (terminal). Thereafter the periodic review drives the lifecycle: an `APPROVED` deferral whose `requested_start` is at or before the clock while the clock still sits strictly before `requested_end` moves to `IN_EFFECT`; any `APPROVED` or `IN_EFFECT` deferral whose `requested_end` is at or before the clock moves to `EXPIRED`, whether or not it ever activated; and an officer may end an `IN_EFFECT` deferral early, moving it to `ENDED_EARLY`. `DENIED`, `EXPIRED`, and `ENDED_EARLY` are terminal.
+
+The posture bands themselves deserve a precise restatement, because every distress workflow keys off them. Coverage is the lesser of `approved_commitment_cents` and `borrowing_base_cents`, minus `outstanding_principal_cents` — the `coverage_cents` of the financial summary. When coverage times ten is at least the approved commitment — coverage of exactly one-tenth of the commitment counts — the loan recomputes to `CURRENT`. When coverage is zero or more but below one-tenth of the commitment, the loan recomputes to `WATCH`. When coverage is negative, the loan recomputes to `DELINQUENT`. Any recompute that lands outside `DELINQUENT` resets `consecutive_delinquent_reviews` to 0. `DEFAULT` is never band-derived: it arrives only when a periodic review closes with the loan already `DELINQUENT` so that `consecutive_delinquent_reviews` reaches 2, or when a margin call escalates. And `DEFAULT` is sticky — the only exits are restructure execution, which resets the posture to `CURRENT`, or the loan reaching a terminal state. Every posture transition, in either direction, re-evaluates the borrower's standing.
+
+### 3.9. Patronage Dividends and the Co-op Year-End
+
+A cooperative returns earnings to its borrower-owners, and this API runs that distribution. Once a fiscal year closes, an `AssociationBoard` member declares the patronage pool for an association by naming the `association_id`, the `fiscal_year`, and the `pool_cents`. The `fiscal_year` must equal the association's `current_fiscal_year` minus one — the distribution is always for the year just closed — and any other year is rejected with `ERR_INVALID_FISCAL_YEAR`; one distribution exists per association and fiscal year, and a duplicate declaration is rejected with `ERR_DISTRIBUTION_EXISTS`. The distribution opens `DECLARED` with `allocated_cents` 0, `undistributed_cents` equal to the full `pool_cents`, and an empty `allocation_lines` list.
+
+Allocation computes each borrower's share from the interest it actually paid. The eligible population is the association's borrowers with `patronage_eligible` true and status other than `TERMINATED`; and the whole allocation is rejected with `ERR_NO_ELIGIBLE_PATRONAGE_BASE` when the total eligible interest weight is zero. Each eligible borrower's weight is the sum of `applied_interest_cents` over its loans' repayments with status `APPLIED` — `REVERSED` repayments are excluded, and insurance-indemnity applications are not repayments and never count — whose `created_at` falls inside the half-open fiscal-year window, on or after January 1 of the `fiscal_year` at 00:00:00 UTC and strictly before January 1 of the following year. Borrowers whose weight is zero are excluded from the lines entirely. Each line's raw share is the exact rational `pool_cents` times the borrower's weight divided by the total weight — no rounding yet. The cap then binds first: a borrower's dividend never exceeds 25% (2500 basis points) of the interest it paid, so each line's share is the lesser of its raw share and the cap. Each capped share is floored to whole cents. The cents left over — the pool less the sum of floored shares — are then given out one cent at a time, but only to lines whose cap did not bind: those lines rank by the fractional part of their exact raw share from largest to smallest, ties broken by the borrower record's earlier `created_at`, and each line in that order receives one additional cent until the leftover is exhausted or every uncapped fractional part has been awarded. Cents that remain because caps cannot absorb them are never redistributed; they stay in `undistributed_cents`. Each allocation line records the `borrower_id`, the `interest_paid_cents` weight, the `raw_share_cents`, the resulting `final_share_cents`, and a `clawed_back` flag; `allocated_cents` becomes the sum of the final shares, and the invariant `allocated_cents` plus `undistributed_cents` equals `pool_cents` holds from this moment forward. Allocation moves the distribution `DECLARED` → `ALLOCATED`.
+
+Payment by the board moves `ALLOCATED` → `PAID`; shares are recorded as paid in cash and touch no loan balances. Should a borrower's eligibility later prove reversed — a charge-off discovered late, for instance — the board claws back that borrower's line from the paid distribution by naming the `borrower_id`: the line's `clawed_back` flag sets true, its `final_share_cents` leaves `allocated_cents` and returns to `undistributed_cents`, the distribution's status remains `PAID`, and the pool invariant survives the clawback exactly as it survived allocation.
+
+## 4. Endpoint Definitions
+
+Every endpoint below returns HTTP 201 when it creates a new resource and HTTP 200 when it modifies, acts upon, or reads an existing resource. Request bodies, derived-field behavior, side effects, and authorization failures are all specified in Sections 2 and 3; this table is the routing and role summary only.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | /_clock/set_current_utc | Set the server's logical clock | System |
+| POST | /associations | Create a Farm Credit association | AssociationBoard |
+| GET | /associations/{id} | Get an association | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /associations/{id}/declare_disaster | Declare a disaster covering counties for a date range | AssociationBoard |
+| POST | /associations/{id}/run_periodic_review | Run the periodic review checkpoint for an association | System, LoanOfficer |
+| POST | /borrowers | Create a borrower (farm operation) | LoanOfficer |
+| GET | /borrowers/{id} | Get a borrower | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /borrowers | List borrowers | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /borrowers/{id}/terminate | Terminate a borrower whose loans are all terminal | CreditCommittee |
+| POST | /loan-accounts | Create a loan application | LoanOfficer |
+| GET | /loan-accounts/{id} | Get a loan | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /loan-accounts | List loans | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /loan-accounts/{id}/submit | Submit the application for committee review | LoanOfficer |
+| POST | /loan-accounts/{id}/approve | Approve the application with a commitment amount | CreditCommittee |
+| POST | /loan-accounts/{id}/activate | Activate the line once insurance, perfection, maturity, and budget gates pass | LoanOfficer |
+| POST | /loan-accounts/{id}/charge_off | Charge off a DEFAULT loan | CreditCommittee |
+| POST | /loan-accounts/{id}/foreclose | Foreclose a loan with an ESCALATED margin call | CreditCommittee |
+| GET | /loan-accounts/{id}/financial_summary | Computed read of derived loan fields | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /crop-budgets | Create a crop budget; supersedes an existing DRAFT; OCC-guarded on the loan version | Borrower |
+| GET | /crop-budgets/{id} | Get a crop budget | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /crop-budgets | List crop budgets | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /crop-budgets/{id}/approve | Approve a budget; supersedes other APPROVED budgets and recomputes the base | LoanOfficer |
+| POST | /crop-budgets/{id}/record_actuals | Record actual harvest revenue; switches the base to the true-up variant | Borrower, LoanOfficer |
+| POST | /collateral | Pledge collateral to a loan | LoanOfficer |
+| GET | /collateral/{id} | Get a collateral item | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /collateral | List collateral | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /collateral/{id}/appraise | Record a superseding appraisal; OCC-guarded on the collateral version | LoanOfficer |
+| POST | /collateral/{id}/release | Release pledged collateral, blocked if it would open a deficiency | LoanOfficer |
+| POST | /ucc-filings | File a UCC-1 financing statement perfecting a collateral | LoanOfficer |
+| GET | /ucc-filings/{id} | Get a UCC filing | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /ucc-filings | List UCC filings | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /ucc-filings/{id}/continue | File a continuation statement within the statutory window | LoanOfficer |
+| POST | /ucc-filings/{id}/terminate | Terminate a filing, releasing perfection | LoanOfficer |
+| POST | /insurance-policies | Record a crop insurance policy | Borrower, LoanOfficer |
+| GET | /insurance-policies/{id} | Get a policy | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /insurance-policies | List policies | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /insurance-policies/{id}/assign | Assign a policy to a loan with the association as loss payee | LoanOfficer |
+| POST | /insurance-policies/{id}/cancel | Cancel a policy, releasing any assignment | Borrower, LoanOfficer |
+| POST | /insurance-claims | Report a claim under an assigned policy | Borrower, LoanOfficer |
+| GET | /insurance-claims/{id} | Get a claim | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /insurance-claims | List claims | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /insurance-claims/{id}/adjuster_report | File the adjuster's approved-loss report | InsuranceAdjuster |
+| POST | /insurance-claims/{id}/approve | Approve the indemnity | InsuranceAdjuster |
+| POST | /insurance-claims/{id}/deny | Deny the claim | InsuranceAdjuster |
+| POST | /insurance-claims/{id}/appeal | Appeal an approved claim amount | Borrower, LoanOfficer |
+| POST | /insurance-claims/{id}/pay | Record indemnity receipt and apply the waterfall to the loan | LoanOfficer |
+| POST | /draw-requests | Request an advance against the line | Borrower, LoanOfficer |
+| GET | /draw-requests/{id} | Get a draw request | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /draw-requests | List draw requests | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /draw-requests/{id}/approve | Approve a draw, reserving availability | LoanOfficer |
+| POST | /draw-requests/{id}/disburse | Disburse an approved draw | LoanOfficer |
+| POST | /draw-requests/{id}/deny | Deny a requested draw | LoanOfficer |
+| POST | /draw-requests/{id}/cancel | Borrower cancels a requested or approved draw | Borrower |
+| POST | /draw-requests/{id}/rescind | Same-day rescission of a disbursed draw | LoanOfficer |
+| POST | /repayments | Make a repayment, applied in full via the waterfall at creation | Borrower |
+| GET | /repayments/{id} | Get a repayment | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /repayments | List repayments | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /repayments/{id}/reverse | Reverse an applied repayment, restoring balances | LoanOfficer |
+| POST | /covenant-evaluations | Record borrower financials and evaluate the working-capital covenant | LoanOfficer |
+| GET | /covenant-evaluations/{id} | Get a covenant evaluation | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /covenant-evaluations | List covenant evaluations | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /covenant-evaluations/{id}/waive | Committee waives a recorded breach, segregated from the recorder | CreditCommittee |
+| POST | /covenant-evaluations/{id}/void | Void a mis-recorded evaluation | LoanOfficer |
+| POST | /restructure-plans | Propose a restructure for a distressed loan; OCC-guarded on the loan version | LoanOfficer |
+| GET | /restructure-plans/{id} | Get a restructure plan | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /restructure-plans | List restructure plans | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /restructure-plans/{id}/submit | Submit, or resubmit after rejection, to the credit committee | LoanOfficer |
+| POST | /restructure-plans/{id}/approve | Committee approves the plan, segregated from its creator | CreditCommittee |
+| POST | /restructure-plans/{id}/reject | Committee rejects the plan | CreditCommittee |
+| POST | /restructure-plans/{id}/execute | Execute an approved plan: capitalize, re-rate, extend maturity, reset posture | LoanOfficer |
+| POST | /restructure-plans/{id}/withdraw | Withdraw a proposed plan | LoanOfficer |
+| POST | /deferral-requests | Request a disaster-linked payment deferral window | Borrower |
+| GET | /deferral-requests/{id} | Get a deferral request | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /deferral-requests | List deferral requests | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /deferral-requests/{id}/approve | Approve a deferral; overlap and 30-day buffer rules enforced | CreditCommittee |
+| POST | /deferral-requests/{id}/deny | Deny a deferral | CreditCommittee |
+| POST | /deferral-requests/{id}/end_early | End an in-effect deferral early | LoanOfficer |
+| POST | /patronage-distributions | Declare the annual patronage pool for the prior fiscal year | AssociationBoard |
+| GET | /patronage-distributions/{id} | Get a distribution | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /patronage-distributions | List distributions | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /patronage-distributions/{id}/allocate | Compute per-borrower allocations from fiscal-year interest weights | AssociationBoard |
+| POST | /patronage-distributions/{id}/pay | Pay the allocated shares in cash | AssociationBoard |
+| POST | /patronage-distributions/{id}/clawback | Claw back one borrower's share after payment | AssociationBoard |
+| GET | /margin-call-notices/{id} | Get a margin call notice | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| GET | /margin-call-notices | List margin call notices | Borrower, LoanOfficer, CreditCommittee, InsuranceAdjuster, AssociationBoard, System |
+| POST | /margin-call-notices/{id}/escalate | Escalate an uncured margin call; loan posture forced to DEFAULT | CreditCommittee |
+
+## 5. Error Code Catalogue
+
+Every error response carries one of the identifiers below in its `error_id` field, with the HTTP status shown. The conditions that trigger each error are specified in the narratives of Sections 2 and 3.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER | 400 |
+| ERR_FORBIDDEN_FOR_ROLE | 403 |
+| ERR_RESOURCE_NOT_OWNED | 403 |
+| ERR_NOT_FOUND | 404 |
+| ERR_INVALID_REQUEST | 400 |
+| ERR_STALE_VERSION | 412 |
+| ERR_INVALID_STATE_TRANSITION | 409 |
+| ERR_LOAN_NOT_ACTIVE | 409 |
+| ERR_LOAN_POSTURE_BLOCKS_DRAWS | 409 |
+| ERR_BORROWER_SUSPENDED | 409 |
+| ERR_INSURANCE_NOT_ASSIGNED | 409 |
+| ERR_COLLATERAL_UNPERFECTED | 409 |
+| ERR_MATURITY_PASSED | 409 |
+| ERR_BUDGET_NOT_APPROVED | 409 |
+| ERR_DRAW_EXCEEDS_AVAILABILITY | 422 |
+| ERR_PAYMENT_EXCEEDS_OUTSTANDING | 422 |
+| ERR_RESCIND_WINDOW_CLOSED | 409 |
+| ERR_COVERAGE_OVERLAP | 409 |
+| ERR_POLICY_NUMBER_TAKEN | 409 |
+| ERR_POLICY_NOT_ACTIVE | 409 |
+| ERR_POLICY_ALREADY_ASSIGNED | 409 |
+| ERR_POLICY_NOT_ASSIGNED_TO_LOAN | 409 |
+| ERR_CLAIM_EXCEEDS_COVERAGE | 422 |
+| ERR_FILING_NUMBER_TAKEN | 409 |
+| ERR_CONTINUATION_WINDOW_NOT_OPEN | 409 |
+| ERR_CROSS_ASSOCIATION_REFERENCE | 422 |
+| ERR_SEGREGATION_OF_DUTIES | 409 |
+| ERR_DEFERRAL_OVERLAP | 409 |
+| ERR_DEFERRAL_GAP_TOO_SMALL | 409 |
+| ERR_DISASTER_NOT_FOUND | 409 |
+| ERR_DISASTER_REQUIRED | 409 |
+| ERR_RESTRUCTURE_GATE_NOT_MET | 409 |
+| ERR_RELEASE_WOULD_CREATE_DEFICIENCY | 422 |
+| ERR_DISTRIBUTION_EXISTS | 409 |
+| ERR_INVALID_FISCAL_YEAR | 409 |
+| ERR_NO_ELIGIBLE_PATRONAGE_BASE | 422 |

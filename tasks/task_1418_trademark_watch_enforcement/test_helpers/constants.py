@@ -1,0 +1,60 @@
+"""Domain thresholds and numeric constants from the PRD's calculation rules."""
+
+# Startup logical clock (PRD: the clock reads exactly this instant at startup)
+STARTUP_CLOCK = "2026-08-01T00:00:00Z"
+
+# Confusion score (provisional intake weights and tier cutoffs)
+PROVISIONAL_WEIGHT_MARK = 0.5
+PROVISIONAL_WEIGHT_GOODS = 0.3
+PROVISIONAL_WEIGHT_CHANNELS = 0.2
+FLOOR_MIN_SCORE = 85
+TIER_HIGH_MIN = 70
+TIER_MEDIUM_MIN = 40
+
+# Opposition window
+OPPOSITION_WINDOW_DAYS = 30
+
+# Maintenance filing fees
+PER_CLASS_FEE_CENTS = 40000
+BAND_HIGH_MIN_CENTS = 240000
+SURCHARGE_RATE_HIGH = 0.25
+SURCHARGE_RATE_STANDARD = 0.10
+LATE_PER_CLASS_CENTS = 10000
+
+# Counterfeit damages
+STATUTORY_MULTIPLIER = 1.5
+
+# Portfolio exposure index
+MATTER_WEIGHT = {
+    "OPPOSITION": 10,
+    "CANCELLATION": 15,
+    "INFRINGEMENT": 20,
+    "COUNTERFEIT": 25,
+}
+JEOPARDY_MULTIPLIER = 1.5
+ELEVATED_THRESHOLD = 100
+
+# Fee accrual ledger
+ISSUE_FEE_CENTS = 75000
+REISSUE_FEE_CENTS = 25000
+PLATFORM_FEE_CENTS = {
+    "AMAZON": 15000,
+    "EBAY": 12000,
+    "ALIBABA": 18000,
+    "META": 9000,
+    "DOMAIN_REGISTRAR": 25000,
+}
+
+# Caps
+AGREEMENT_ROUND_CAP = 8
+TAKEDOWN_APPEAL_CAP = 2
+DEFAULT_MAX_EXTENSIONS = 3
+
+# Referral thresholds
+MANUAL_REFERRAL_MIN_CONFIRMED = 3
+AUTO_REFERRAL_THRESHOLD = 5
+
+TEST_DEFAULTS = {
+    "BUDGET": 500000,
+    "LARGE_BUDGET": 1000000,
+}

@@ -1,0 +1,82 @@
+"""Domain thresholds and pre-computed fixture totals (PRD §3 formulas applied to the
+reference rule book: Marion County threshold 120, tax 700bp, base fee 15000 + 50/sqft;
+GardenPro model base 300000, tier1 1500, tier2 2000, bounds 8-16 x 8-24)."""
+
+# --- Pricing constants (PRD §3.2) ---
+OPTION_PRICE_CENTS = {"WINDOW": 15000, "LOFT": 25000, "RAMP": 10000, "ELECTRICAL": 40000}
+DELIVERY_PREBUILT_CENTS = 25000
+DELIVERY_ONSITE_CENTS = 45000
+GRAVEL_PER_SQFT_CENTS = 800
+SLAB_PER_SQFT_CENTS = 1500
+SLAB_MIN_CENTS = 200000
+PIER_EACH_CENTS = 12000
+AUGER_EACH_CENTS = 7500
+REMOVAL_BASE_CENTS = 30000
+REMOVAL_PER_SQFT_CENTS = 500
+TRADE_IN_CAP_BP = 1500  # 15% of structure price
+RTO_FACTOR_BP = 16000  # 1.6x contract multiplier
+
+# --- Deposit / cancellation (PRD §3.5, §3.6) ---
+DEPOSIT_BP = 2000  # 20% of quoted_total_cents
+ADMIN_FEE_CENTS = 5000
+RESTOCK_BP = 1000  # 10% of structure_price_cents
+
+# --- RTO servicing (PRD §3.7) ---
+LATE_FEE_BP = 1000  # 10% of monthly installment
+GRACE_DAYS = 7
+DEFAULT_AFTER_DAYS = 45
+INSTALLMENT_INTERVAL_DAYS = 30
+
+# --- Site assessment (PRD §3.3) ---
+ACCESS_MARGIN_PREBUILT_IN = 12
+ACCESS_MARGIN_ONSITE_IN = 36
+MAX_SLOPE_PCT = 15
+PREP_SLOPE_PCT = 8
+WINDOW_MIN_HOUR = 6
+WINDOW_MAX_HOUR = 20
+
+# --- Warranty service (PRD §3.8) ---
+SERVICE_CALL_BASE_CENTS = 15000
+REOPEN_WINDOW_DAYS = 30
+
+# --- Logical clock (PRD §2.6) ---
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# --- Pre-computed totals for the reference configurations ---
+# 10x12 (120 sqft) [WINDOW] PRE_BUILT GRAVEL_PAD AUGER_STRAP
+STRUCTURE_PRICE_10X12 = 392000  # 300000 + 40*1500 + 16*2000
+QUOTED_10X12_WINDOW_CASH = 601490  # subtotal 573000 + tax 28490
+QUOTED_10X12_WINDOW_RTO = 945290  # round(573000*1.6) + 28490
+QUOTED_10X12_NOOPT_CASH = 585440  # subtotal 558000 + tax 27440
+DEPOSIT_10X12_WINDOW = 120298  # round(601490*0.20)
+DEPOSIT_10X12_NOOPT = 117088  # round(585440*0.20)
+PERMIT_FEE_120_SQFT = 21000  # 15000 + 120*50
+
+# 16x24 (384 sqft) no options ON_SITE_BUILD PIERS AUGER_STRAP
+STRUCTURE_PRICE_16X24 = 920000  # 300000 + 40*1500 + 280*2000
+QUOTED_16X24_OSB_PIERS = 1392400
+
+# 8x8 (64 sqft) no options PRE_BUILT GRAVEL_PAD AUGER_STRAP
+QUOTED_8X8_CASH = 427200
+DEPOSIT_8X8 = 85440  # round(427200*0.20)
+
+# 8x8 + [WINDOW]
+QUOTED_8X8_WINDOW = 443250
+
+# 10x12 [WINDOW] with SUITABLE_WITH_PREP prep_cost 30000 folded in
+QUOTED_10X12_WINDOW_PREP_30000 = 631490
+
+# 10x12 no options, removal of an 80 sqft structure, trade-in appraised 100000 (capped 58800)
+QUOTED_10X12_REMOVAL_TRADEIN = 596640
+
+# RTO contract on the 10x12 [WINDOW] configuration (24 months)
+RTO_TOTAL_24MO = 945290
+RTO_MONTHLY_24MO = 39387  # round_half_up(945290/24)
+RTO_FINAL_24MO = 39389  # 945290 - 39387*23
+RTO_LATE_FEE_24MO = 3939  # round_half_up(39387*0.10)
+RTO_CURE_PAYMENT = 43326  # late fee 3939 + one installment 39387
+
+# Cancellation waterfall on the 10x12 [WINDOW] order cancelled from SCHEDULED
+# with collected 200000 (120298 + 79702): admin 5000 + permit 21000 + restock 39200
+CANCEL_RETAINED_SCHEDULED = 65200
+CANCEL_REFUND_SCHEDULED = 134800

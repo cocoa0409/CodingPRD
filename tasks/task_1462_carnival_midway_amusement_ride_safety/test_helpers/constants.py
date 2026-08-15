@@ -1,0 +1,57 @@
+"""Domain thresholds — numeric constants named in the PRD (sections 3.2-3.8)."""
+
+# Logical clock (PRD section 2.4)
+STARTUP_CLOCK_ISO = "2026-08-01T00:00:00Z"
+STARTUP_CREATED_AT = "2026-08-01T00:00:00.000Z"
+
+# Permit fee (PRD section 3.2)
+PERMIT_BASE_FEE_CENTS = 25000
+PERMIT_REINSPECTION_SURCHARGE_CENTS = 7500
+PERMIT_MAX_FEE_CENTS = 200000
+PERMIT_CLASS_RATE_CENTS = {
+    "KIDDIE": 5000,
+    "FAMILY": 9000,
+    "THRILL": 14000,
+    "EXTREME": 20000,
+}
+
+# Credit bundle tiers (PRD section 3.5)
+BUNDLE_TIER1_MAX = 9
+BUNDLE_TIER2_MAX = 24
+BUNDLE_TIER2_DISCOUNT = 0.10
+BUNDLE_TIER3_DISCOUNT = 0.20
+
+# Service fee (PRD section 3.5)
+SERVICE_FEE_PCT = 0.06
+SERVICE_FEE_MIN_CENTS = 50
+
+# Daily settlement (PRD section 3.8)
+RECONCILIATION_FLAG_THRESHOLD_CENTS = 1000
+
+# Inspector assignment (PRD section 3.2)
+TRAVEL_BUFFER_HOURS = 2
+INSPECTOR_DEFAULT_MAX_DAILY = 3
+
+# Wind thresholds (PRD section 3.7)
+FAIR_WIND_CLOSURE_MPH = 45
+FAIR_WIND_RESUME_MPH = 39
+RIDE_RESUME_HYSTERESIS_MPH = 3
+
+# Minor incident escalation (PRD section 3.7)
+MINOR_INCIDENT_DAILY_THRESHOLD = 3
+
+# Standard season dates used across fixtures
+SEASON = {
+    "setup_start_date": "2026-08-01",
+    "opening_date": "2026-08-03",
+    "closing_date": "2026-08-05",
+    "teardown_end_date": "2026-08-07",
+}
+SETUP_DAY_ISO = "2026-08-01T00:00:00Z"
+INSPECTION_DAY = "2026-08-02"
+INSPECTION_CLOCK_ISO = "2026-08-02T10:00:00Z"
+OPERATING_DATE = "2026-08-03"
+OPERATING_CLOCK_ISO = "2026-08-03T08:00:00Z"
+TEARDOWN_CLOCK_ISO = "2026-08-06T08:00:00Z"
+TEARDOWN_DATE = "2026-08-06"
+CERT_FAR_FUTURE = "2026-12-31"

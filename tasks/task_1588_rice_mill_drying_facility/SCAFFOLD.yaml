@@ -1,0 +1,1696 @@
+# =============================================================================
+# Task 1588: Rice Mill & Drying Facility (Riceland-style mill) — seed tables
+# =============================================================================
+
+scenario: |
+  Rice Mill & Drying Facility (Riceland style mill): paddy intake moisture & drying shrink calculation, storage bin segregation by variety, milling yield (head rice/broken) & grade, byproduct (bran/hull) sales, grower settlement on dry weight & quality, contract vs spot delivery scheduling, packaging & private-label run, food-safety & fumigation record
+
+domain_name: rice-mill-drying-facility
+api_prefix: /mill
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation      # grower settlement: provisional vs final money
+  secondary_archetype: quota_allocation          # bin capacity reserved/committed/released
+  complexity_layers:
+    - optimistic_concurrency                     # OCC on DeliveryContract.version (delivery + amend)
+    - dual_variant_calculation                   # shrink (handheld vs official), settlement rounding, mill yield (estimated vs actual)
+    - cascading_side_effects                     # regrade -> settlement -> season; fumigation -> bin -> drying runs
+    - rate_threshold_triggers                    # drying-charge tiers, grade thresholds, spot intake cap, over-delivery tolerance
+  entity_topology: flat                          # peer entities joined by FK references; season_id scopes tenancy
+  state_machine_shape: cyclic                    # regrade self-loop, settlement dispute loop, byproduct release loop, bin fumigation loop, season reopen loop
+  relationship_patterns:
+    - one_to_many                                # Grower -> PaddyLot/Settlement/Contract; Bin -> DryingRun/MillRun/FumigationEvent
+    - cross_aggregate                            # PaddyLot references Contract, Bin, DryingRun, Settlement
+    - polymorphic                                # FoodSafetyHold.target_id targets Bin OR PaddyLot via target_type
+  role_model: segregation_of_duties              # settlement approver must differ from creator; peer ops roles otherwise
+  consistency_model: immediate                   # every mutation + cascade visible in the same response
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table (flat topology; all weights in cwt = 100 lb)
+# =============================================================================
+entities:
+  - name: HarvestSeason
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Season label, e.g. '2026 Fall Crop'" }
+      - { name: intake_start_date, type: string, source: input, description: "First allowed lot scheduled_date, YYYY-MM-DD inclusive" }
+      - { name: intake_end_date, type: string, source: input, description: "Last allowed lot scheduled_date, YYYY-MM-DD inclusive" }
+      - { name: spot_daily_cap, type: integer, source: input, description: "Max non-rejected SPOT lots per scheduled_date; CONTRACT lots exempt" }
+      - { name: current_clock_iso, type: datetime, source: system, default: "2026-08-01T00:00:00Z", description: "Logical clock; starts at 2026-08-01T00:00:00Z, advanced only via clock/set" }
+      - { name: status, type: enum, source: system, description: "SETUP | INTAKE_OPEN | INTAKE_CLOSED | SETTLEMENT_REVIEW | SETTLED" }
+
+  - name: Grower
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id; season this grower account belongs to" }
+      - { name: farm_code, type: string, source: input, description: "Grower farm code; unique within season_id" }
+      - { name: legal_name, type: string, source: input, description: "Grower legal name" }
+      - { name: advance_issued_cents, type: integer, source: input, default: 0, description: "Input-financing advance issued at onboarding" }
+      - { name: advance_outstanding_cents, type: integer, source: computed, default: 0, description: "Unpaid advance balance; initialized to advance_issued_cents, debited at settlement pay" }
+      - { name: cumulative_paid_cents, type: integer, source: computed, default: 0, description: "Sum of final_net_cents over this grower's PAID settlements" }
+
+  - name: DeliveryContract
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: grower_id, type: string, source: input, description: "FK -> Grower.id; contracting grower" }
+      - { name: variety, type: enum, source: input, description: "LONG_GRAIN | MEDIUM_GRAIN" }
+      - { name: contracted_cwt, type: number, source: input, description: "Contracted dry-weight volume, 2dp cwt" }
+      - { name: base_price_cents_per_cwt, type: integer, source: input, description: "Contract base price per dry cwt before grade adjustment" }
+      - { name: grade_adjustments, type: object, source: input, description: "Map of grade -> cents/cwt delta applied to base price; keys US_NO_1..US_NO_5, SAMPLE" }
+      - { name: delivery_count, type: integer, source: system, default: 0, description: "Number of non-rejected lots booked against this contract; increments at lot create" }
+      - { name: fulfilled_cwt, type: number, source: computed, default: 0, description: "Sum of dry_weight_cwt of lots linked to this contract with status in {GRADED, BINNED, SETTLED}" }
+      - { name: status, type: enum, source: system, description: "OPEN | PARTIALLY_FULFILLED | FULFILLED | CANCELLED | DEFAULTED" }
+
+  - name: Bin
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: bin_code, type: string, source: input, description: "Bin identifier; unique within season_id" }
+      - { name: capacity_cwt, type: number, source: input, description: "Maximum dry cwt the bin holds, 2dp" }
+      - { name: variety_lock, type: enum, source: system, description: "LONG_GRAIN | MEDIUM_GRAIN | null; set by first allocation, cleared when stock_cwt and reserved_cwt both return to 0" }
+      - { name: stock_cwt, type: number, source: computed, default: 0, description: "Dry cwt physically in bin (committed storage minus mill draws)" }
+      - { name: reserved_cwt, type: number, source: computed, default: 0, description: "Dry cwt reserved by PLANNED drying runs" }
+      - { name: available_cwt, type: number, source: computed, default: 0, description: "= capacity_cwt - stock_cwt - reserved_cwt, 2dp" }
+      - { name: status, type: enum, source: system, description: "AVAILABLE | FUMIGATING | AERATING" }
+
+  - name: PaddyLot
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: grower_id, type: string, source: input, description: "FK -> Grower.id; delivering grower" }
+      - { name: contract_id, type: string, source: input, description: "FK -> DeliveryContract.id; required iff source == CONTRACT, null otherwise" }
+      - { name: bin_id, type: string, source: system, description: "FK -> Bin.id; set when lot becomes BINNED (via store or drying-run complete), null before" }
+      - { name: drying_run_id, type: string, source: system, description: "FK -> DryingRun.id; set while lot is referenced by a non-terminal drying run, null otherwise" }
+      - { name: settlement_id, type: string, source: system, description: "FK -> Settlement.id; set when the lot is snapshotted into a settlement, never cleared" }
+      - { name: variety, type: enum, source: input, description: "LONG_GRAIN | MEDIUM_GRAIN" }
+      - { name: source, type: enum, source: input, description: "CONTRACT | SPOT" }
+      - { name: spot_price_cents_per_cwt, type: integer, source: input, description: "Agreed spot price per dry cwt; required iff source == SPOT" }
+      - { name: scheduled_date, type: string, source: input, description: "Intake appointment date YYYY-MM-DD; must lie within season intake window; SPOT lots count against that date's spot cap" }
+      - { name: gross_weight_lbs, type: integer, source: input, description: "Scale gross weight, whole pounds" }
+      - { name: tare_weight_lbs, type: integer, source: input, description: "Scale tare weight, whole pounds; must be < gross_weight_lbs" }
+      - { name: net_wet_cwt, type: number, source: computed, description: "= round_half_up((gross_weight_lbs - tare_weight_lbs)/100, 2)" }
+      - { name: moisture_pct_handheld, type: number, source: input, description: "Scale handheld moisture reading, 1dp; basis for provisional shrink" }
+      - { name: moisture_pct_official, type: number, source: system, description: "Official lab moisture from grading, 1dp; basis for final shrink" }
+      - { name: provisional_dry_weight_cwt, type: number, source: computed, description: "Dry weight at create using moisture_pct_handheld; superseded by dry_weight_cwt at grading" }
+      - { name: dry_weight_cwt, type: number, source: computed, description: "Settlement-basis dry weight using moisture_pct_official; null until graded" }
+      - { name: moisture_shrink_cwt, type: number, source: computed, description: "net_wet_cwt lost to moisture removal at official moisture" }
+      - { name: handling_loss_cwt, type: number, source: computed, description: "Flat 0.5% of net_wet_cwt when official moisture > base, else 0" }
+      - { name: foreign_matter_pct, type: number, source: system, description: "Grading input: foreign matter %, 1dp" }
+      - { name: damage_pct, type: number, source: system, description: "Grading input: damaged kernels %, 1dp" }
+      - { name: broken_pct, type: number, source: system, description: "Grading input: broken kernels %, 1dp" }
+      - { name: grade_score, type: number, source: computed, description: "= 2*foreign_matter_pct + 3*damage_pct + 1*broken_pct, 2dp" }
+      - { name: grade, type: enum, source: computed, description: "US_NO_1 | US_NO_2 | US_NO_3 | US_NO_4 | US_NO_5 | SAMPLE from grade_score thresholds" }
+      - { name: drying_charge_cents, type: integer, source: computed, description: "Tiered drying charge on net_wet_cwt by official moisture points over base" }
+      - { name: price_cents_per_cwt, type: integer, source: computed, description: "CONTRACT: contract base + grade_adjustments[grade]; SPOT: spot_price_cents_per_cwt unchanged" }
+      - { name: line_value_cents, type: integer, source: computed, description: "= round_half_up(dry_weight_cwt * price_cents_per_cwt, 0)" }
+      - { name: graded_date, type: string, source: system, description: "YYYY-MM-DD of the season logical clock at grading; settlement period eligibility key" }
+      - { name: reject_reason, type: string, source: input, description: "Required on reject; null otherwise" }
+      - { name: status, type: enum, source: system, description: "WEIGHED | GRADED | BINNED | SETTLED | REJECTED" }
+
+  - name: DryingRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: destination_bin_id, type: string, source: input, description: "FK -> Bin.id; bin receiving dried paddy" }
+      - { name: lot_ids, type: array, source: input, description: "GRADED PaddyLot ids to dry; each must be unassigned to any other non-terminal run" }
+      - { name: fuel_cost_cents, type: integer, source: input, default: 0, description: "Fuel cost recorded for the run (informational)" }
+      - { name: expected_output_cwt, type: number, source: computed, description: "= sum of dry_weight_cwt of referenced lots at creation, 2dp" }
+      - { name: actual_output_cwt, type: number, source: input, description: "Operator-measured dry output, supplied at complete; 2dp" }
+      - { name: status, type: enum, source: system, description: "PLANNED | COMPLETED | CANCELLED" }
+
+  - name: MillRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: input_bin_id, type: string, source: input, description: "FK -> Bin.id; bin the paddy is drawn from" }
+      - { name: variety, type: enum, source: system, description: "Copied from Bin.variety_lock at creation" }
+      - { name: input_cwt, type: number, source: input, description: "Dry paddy cwt drawn from the bin, 2dp" }
+      - { name: est_head_cwt, type: number, source: computed, description: "Standard-yield head rice estimate at complete" }
+      - { name: est_broken_cwt, type: number, source: computed, description: "Standard-yield broken estimate at complete (plug within total rice)" }
+      - { name: est_brewers_cwt, type: number, source: computed, description: "Standard-yield brewers estimate at complete" }
+      - { name: est_bran_cwt, type: number, source: computed, description: "Standard-yield bran estimate at complete" }
+      - { name: est_hull_cwt, type: number, source: computed, description: "Standard-yield hull estimate at complete (global plug)" }
+      - { name: est_loss_cwt, type: number, source: computed, description: "Standard milling loss estimate at complete" }
+      - { name: act_head_cwt, type: number, source: input, description: "Actual head rice measured, at verify" }
+      - { name: act_broken_cwt, type: number, source: input, description: "Actual broken measured, at verify" }
+      - { name: act_brewers_cwt, type: number, source: input, description: "Actual brewers measured, at verify" }
+      - { name: act_bran_cwt, type: number, source: input, description: "Actual bran measured, at verify" }
+      - { name: act_hull_cwt, type: number, source: input, description: "Actual hull measured, at verify" }
+      - { name: act_loss_cwt, type: number, source: computed, description: "= input_cwt - sum(act_*), 2dp; plug at verify" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | IN_PROCESS | COMPLETED | VERIFIED | VOIDED" }
+
+  - name: PackagingRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: line_id, type: enum, source: input, description: "LINE_1 | LINE_2; packaging line resource" }
+      - { name: brand_label, type: string, source: input, description: "Brand or private-label customer name printed on the run" }
+      - { name: package_size_kg, type: number, source: input, description: "Net weight per package in kg" }
+      - { name: units_planned, type: integer, source: input, description: "Planned package count" }
+      - { name: units_produced, type: integer, source: input, description: "Actual packages produced; supplied at complete" }
+      - { name: head_rice_consumed_cwt, type: number, source: computed, description: "= round_half_up(units_produced * package_size_kg * 2.20462262 / 100, 2), debited from head-rice inventory at complete" }
+      - { name: starts_at, type: datetime, source: input, description: "Run window start, ISO8601 UTC" }
+      - { name: ends_at, type: datetime, source: input, description: "Run window end, ISO8601 UTC; must be > starts_at" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | COMPLETED | CANCELLED" }
+
+  - name: ByproductSaleOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: product, type: enum, source: input, description: "BRAN | HULL | BROKEN | BREWERS" }
+      - { name: quantity_cwt, type: number, source: input, description: "Quantity sold, 2dp" }
+      - { name: price_cents_per_cwt, type: integer, source: input, description: "Sale price per cwt" }
+      - { name: buyer_name, type: string, source: input, description: "Buyer identity" }
+      - { name: status, type: enum, source: system, description: "OPEN | RESERVED | SHIPPED | CANCELLED" }
+
+  - name: FumigationEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: bin_id, type: string, source: input, description: "FK -> Bin.id; treated bin" }
+      - { name: fumigant_code, type: string, source: input, description: "Fumigant product code" }
+      - { name: applicator_license, type: string, source: input, description: "Licensed applicator number" }
+      - { name: started_at, type: datetime, source: input, description: "Treatment start ISO8601 UTC; must be <= season logical clock at creation (back-dated records allowed)" }
+      - { name: exposure_hours, type: integer, source: input, description: "Sealed exposure hours" }
+      - { name: aeration_hours, type: integer, source: input, description: "Aeration hours after exposure" }
+      - { name: exposure_ends_at, type: datetime, source: computed, description: "= started_at + exposure_hours" }
+      - { name: clearance_at, type: datetime, source: computed, description: "= exposure_ends_at + aeration_hours; treatment window is the half-open interval [started_at, clearance_at)" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | AERATING | CLEARED" }
+
+  - name: FoodSafetyHold
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: target_type, type: enum, source: input, description: "BIN | LOT; selects which entity target_id references" }
+      - { name: target_id, type: string, source: input, description: "Polymorphic reference: a Bin.id when target_type == BIN, a PaddyLot.id when target_type == LOT" }
+      - { name: reason_code, type: string, source: input, description: "Hold reason code, e.g. AFLATOXIN_SUSPECT, PEST_ACTIVITY" }
+      - { name: resolution_note, type: string, source: input, description: "Required at release" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | RELEASED" }
+
+  - name: Settlement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: season_id, type: string, source: input, description: "FK -> HarvestSeason.id" }
+      - { name: grower_id, type: string, source: input, description: "FK -> Grower.id; payee" }
+      - { name: period_start_date, type: string, source: input, description: "First eligible graded_date, inclusive" }
+      - { name: period_end_date, type: string, source: input, description: "Last eligible graded_date, inclusive" }
+      - { name: lot_ids, type: array, source: system, description: "Snapshot of eligible BINNED, unsettled lots for this grower/season at creation; membership immutable thereafter" }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of the creator; approver must differ (segregation of duties)" }
+      - { name: provisional_gross_cents, type: integer, source: computed, description: "Sum of per-line rounded line_value_cents (per-line rounding variant)" }
+      - { name: provisional_drying_cents, type: integer, source: computed, description: "Sum of member lots' drying_charge_cents" }
+      - { name: provisional_checkoff_cents, type: integer, source: computed, description: "Sum over lines of round_half_up(line_value_cents * 0.005, 0)" }
+      - { name: provisional_advance_repay_cents, type: integer, source: computed, description: "min(grower.advance_outstanding_cents at compute time, max(0, gross - drying - checkoff))" }
+      - { name: provisional_net_cents, type: integer, source: computed, description: "= gross - drying - checkoff - advance_repay (provisional variant)" }
+      - { name: final_gross_cents, type: integer, source: computed, description: "= sum of exact line values, single rounding at the end (aggregate rounding variant); set at approve" }
+      - { name: final_drying_cents, type: integer, source: computed, description: "Sum of member lots' drying_charge_cents at approve" }
+      - { name: final_checkoff_cents, type: integer, source: computed, description: "= round_half_up(sum of exact line values * 0.005, 0); set at approve" }
+      - { name: final_advance_repay_cents, type: integer, source: computed, description: "min(advance_outstanding at approve, max(0, final_gross - final_drying - final_checkoff))" }
+      - { name: final_net_cents, type: integer, source: computed, description: "= final_gross - final_drying - final_checkoff - final_advance_repay; the amount paid" }
+      - { name: dispute_reason, type: string, source: input, description: "Required on dispute; auto-set to LOT_REGRADED when cascade-disputed" }
+      - { name: status, type: enum, source: system, description: "DRAFT | PROVISIONAL_ISSUED | APPROVED | DISPUTED | PAID" }
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: HarvestSeason
+    initial_state: SETUP
+    terminal_states: [SETTLED]
+    transitions:
+      - from: SETUP
+        to: INTAKE_OPEN
+        trigger: "POST /mill/seasons/{id}/open-intake"
+        actor: MillAdmin
+        preconditions: ["season.status == SETUP (ERR_INVALID_SEASON_STATE)"]
+        side_effects: []
+      - from: INTAKE_OPEN
+        to: INTAKE_CLOSED
+        trigger: "POST /mill/seasons/{id}/close-intake"
+        actor: MillAdmin
+        preconditions: ["season.status == INTAKE_OPEN (ERR_INVALID_SEASON_STATE)"]
+        side_effects: []
+      - from: INTAKE_CLOSED
+        to: INTAKE_OPEN
+        trigger: "POST /mill/seasons/{id}/reopen-intake"
+        actor: MillAdmin
+        preconditions:
+          - "season.status == INTAKE_CLOSED (ERR_INVALID_SEASON_STATE)"
+          - "no Settlement in season with status in {PROVISIONAL_ISSUED, APPROVED, PAID} (ERR_SEASON_REOPEN_BLOCKED)"
+        side_effects: []
+      - from: INTAKE_CLOSED
+        to: SETTLEMENT_REVIEW
+        trigger: "POST /mill/seasons/{id}/begin-settlement-review"
+        actor: MillAdmin
+        preconditions:
+          - "season.status == INTAKE_CLOSED (ERR_INVALID_SEASON_STATE)"
+          - "no PaddyLot in season with status in {WEIGHED, GRADED} and no DryingRun with status PLANNED and no MillRun with status IN_PROCESS (ERR_UNRESOLVED_INTAKE_WORK)"
+          - "no FoodSafetyHold in season with status ACTIVE (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+        side_effects: []
+      - from: SETTLEMENT_REVIEW
+        to: INTAKE_CLOSED
+        trigger: "system (automatic when any Settlement in this season enters DISPUTED)"
+        actor: system
+        preconditions: ["a Settlement in this season transitions to DISPUTED"]
+        side_effects: ["season.status reverts so disputed settlement can be revised and re-approved"]
+      - from: SETTLEMENT_REVIEW
+        to: SETTLED
+        trigger: "POST /mill/seasons/{id}/settle"
+        actor: MillAdmin
+        preconditions:
+          - "season.status == SETTLEMENT_REVIEW (ERR_INVALID_SEASON_STATE)"
+          - "every Settlement in season has status PAID (ERR_UNPAID_SETTLEMENTS_EXIST)"
+          - "no ByproductSaleOrder in season with status in {OPEN, RESERVED} (ERR_OPEN_BYPRODUCT_ORDERS)"
+        side_effects:
+          - "Every DeliveryContract in season with status in {OPEN, PARTIALLY_FULFILLED} and fulfilled_cwt < contracted_cwt -> DEFAULTED"
+
+  - entity: DeliveryContract
+    initial_state: OPEN
+    terminal_states: [FULFILLED, CANCELLED, DEFAULTED]
+    transitions:
+      - from: OPEN
+        to: PARTIALLY_FULFILLED
+        trigger: "system (automatic when a linked lot is graded and 0 < fulfilled_cwt < contracted_cwt)"
+        actor: system
+        preconditions: ["linked lot grading succeeds"]
+        side_effects: ["contract.fulfilled_cwt recomputed", "contract.version incremented"]
+      - from: OPEN
+        to: FULFILLED
+        trigger: "system (automatic when a linked lot is graded and fulfilled_cwt >= contracted_cwt)"
+        actor: system
+        preconditions: ["linked lot grading succeeds"]
+        side_effects: ["contract.fulfilled_cwt recomputed", "contract.version incremented"]
+      - from: PARTIALLY_FULFILLED
+        to: FULFILLED
+        trigger: "system (automatic when a linked lot is graded and fulfilled_cwt >= contracted_cwt)"
+        actor: system
+        preconditions: ["linked lot grading succeeds"]
+        side_effects: ["contract.fulfilled_cwt recomputed", "contract.version incremented"]
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /mill/contracts/{id}/cancel"
+        actor: Merchandiser
+        preconditions:
+          - "contract.status in {OPEN, PARTIALLY_FULFILLED} (ERR_CONTRACT_NOT_OPEN)"
+          - "contract.fulfilled_cwt == 0 (ERR_CONTRACT_HAS_DELIVERIES)"
+        side_effects: []
+      - from: PARTIALLY_FULFILLED
+        to: CANCELLED
+        trigger: "POST /mill/contracts/{id}/cancel"
+        actor: Merchandiser
+        preconditions:
+          - "contract.status in {OPEN, PARTIALLY_FULFILLED} (ERR_CONTRACT_NOT_OPEN)"
+          - "contract.fulfilled_cwt == 0 (ERR_CONTRACT_HAS_DELIVERIES)"
+        side_effects: []
+      - from: OPEN
+        to: DEFAULTED
+        trigger: "system (automatic at season settle when fulfilled_cwt < contracted_cwt)"
+        actor: system
+        preconditions: ["season transitions to SETTLED"]
+        side_effects: []
+      - from: PARTIALLY_FULFILLED
+        to: DEFAULTED
+        trigger: "system (automatic at season settle when fulfilled_cwt < contracted_cwt)"
+        actor: system
+        preconditions: ["season transitions to SETTLED"]
+        side_effects: []
+
+  - entity: Bin
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: FUMIGATING
+        trigger: "system (on POST /mill/fumigation-events for this bin)"
+        actor: system
+        preconditions: ["bin.status == AVAILABLE (ERR_BIN_FUMIGATION_ACTIVE)"]
+        side_effects:
+          - "Every PLANNED DryingRun with destination_bin_id == bin.id -> CANCELLED; its reserved_cwt released from the bin and each referenced lot's drying_run_id cleared to null"
+      - from: FUMIGATING
+        to: AERATING
+        trigger: "system (on POST /mill/fumigation-events/{id}/begin-aeration)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: AERATING
+        to: AVAILABLE
+        trigger: "system (on POST /mill/fumigation-events/{id}/clear)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: PaddyLot
+    initial_state: WEIGHED
+    terminal_states: [SETTLED, REJECTED]
+    transitions:
+      - from: WEIGHED
+        to: GRADED
+        trigger: "POST /mill/lots/{id}/grade"
+        actor: QualityLabTech
+        preconditions:
+          - "lot.status == WEIGHED (ERR_INVALID_LOT_STATE)"
+          - "no ACTIVE FoodSafetyHold with target_type == LOT and target_id == lot.id (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+          - "if source == CONTRACT: fulfilled_cwt + computed dry_weight_cwt <= contracted_cwt * 1.05 (ERR_OVERDELIVERY_BEYOND_TOLERANCE)"
+        side_effects:
+          - "compute dry_weight_cwt, moisture_shrink_cwt, handling_loss_cwt, grade_score, grade, drying_charge_cents, price_cents_per_cwt, line_value_cents, graded_date (from season clock)"
+          - "if source == CONTRACT: recompute contract.fulfilled_cwt, auto-advance contract OPEN->PARTIALLY_FULFILLED or ->FULFILLED, contract.version increments"
+      - from: GRADED
+        to: GRADED
+        trigger: "POST /mill/lots/{id}/regrade"
+        actor: QualityLabTech
+        preconditions:
+          - "lot.status in {GRADED, BINNED} (ERR_INVALID_LOT_STATE)"
+          - "no ACTIVE FoodSafetyHold with target_type == LOT and target_id == lot.id (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+          - "if lot is BINNED and dry weight increases: bin.available_cwt >= (new dry - old dry) (ERR_BIN_CAPACITY_EXCEEDED)"
+        side_effects:
+          - "recompute all grading-derived fields; moisture_shrink/handling/grade/charge/price/line_value refreshed"
+          - "if lot is BINNED: bin.stock_cwt adjusted by (new dry_weight_cwt - old dry_weight_cwt)"
+          - "if lot.settlement_id references a Settlement in DRAFT: settlement provisional_* recomputed"
+          - "if lot.settlement_id references a Settlement in PROVISIONAL_ISSUED: that settlement -> DISPUTED with dispute_reason LOT_REGRADED; if the season is in SETTLEMENT_REVIEW it -> INTAKE_CLOSED"
+      - from: BINNED
+        to: BINNED
+        trigger: "POST /mill/lots/{id}/regrade"
+        actor: QualityLabTech
+        preconditions: ["same as GRADED->GRADED regrade"]
+        side_effects: ["same as GRADED->GRADED regrade"]
+      - from: GRADED
+        to: BINNED
+        trigger: "POST /mill/lots/{id}/store"
+        actor: ScaleOperator
+        preconditions:
+          - "lot.status == GRADED (ERR_INVALID_LOT_STATE)"
+          - "lot.drying_run_id is null (ERR_LOT_ALREADY_IN_DRYING_RUN)"
+          - "target bin.status == AVAILABLE (ERR_BIN_NOT_RECEIVE_READY)"
+          - "no ACTIVE FoodSafetyHold on the lot or on the target bin (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+          - "bin.variety_lock is null or equals lot.variety (ERR_BIN_VARIETY_MISMATCH)"
+          - "bin.available_cwt >= lot.dry_weight_cwt (ERR_BIN_CAPACITY_EXCEEDED)"
+        side_effects:
+          - "bin.stock_cwt += lot.dry_weight_cwt; bin.variety_lock set to lot.variety if null; bin.version increments"
+          - "lot.bin_id set; lot.status -> BINNED"
+      - from: GRADED
+        to: BINNED
+        trigger: "system (on POST /mill/drying-runs/{id}/complete containing this lot)"
+        actor: system
+        preconditions: []
+        side_effects: ["lot.bin_id = run.destination_bin_id; lot.status -> BINNED"]
+      - from: BINNED
+        to: SETTLED
+        trigger: "system (on POST /mill/settlements/{id}/approve when lot is in settlement.lot_ids)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SETTLED
+        to: BINNED
+        trigger: "system (on POST /mill/settlements/{id}/dispute from APPROVED when lot is in settlement.lot_ids)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: WEIGHED
+        to: REJECTED
+        trigger: "POST /mill/lots/{id}/reject"
+        actor: QualityLabTech
+        preconditions: ["lot.status in {WEIGHED, GRADED} (ERR_INVALID_LOT_STATE)"]
+        side_effects: ["if source == CONTRACT: contract.delivery_count unchanged but lot excluded from fulfilled_cwt forever"]
+      - from: GRADED
+        to: REJECTED
+        trigger: "POST /mill/lots/{id}/reject"
+        actor: QualityLabTech
+        preconditions: ["lot.status in {WEIGHED, GRADED} (ERR_INVALID_LOT_STATE)"]
+        side_effects: ["if source == CONTRACT: contract.fulfilled_cwt recomputed without this lot; contract status re-derived (may drop FULFILLED/PARTIALLY_FULFILLED back toward OPEN)"]
+
+  - entity: DryingRun
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: COMPLETED
+        trigger: "POST /mill/drying-runs/{id}/complete"
+        actor: DryerOperator
+        preconditions:
+          - "run.status == PLANNED (ERR_DRYING_RUN_NOT_PLANNED)"
+          - "destination bin.status == AVAILABLE (ERR_BIN_NOT_RECEIVE_READY)"
+          - "no ACTIVE FoodSafetyHold on the destination bin (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+        side_effects:
+          - "bin.reserved_cwt -= expected_output_cwt; bin.stock_cwt += actual_output_cwt; bin.version increments"
+          - "every referenced lot: status GRADED -> BINNED, bin_id = destination_bin_id, drying_run_id kept for traceability"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /mill/drying-runs/{id}/cancel"
+        actor: DryerOperator
+        preconditions: ["run.status == PLANNED (ERR_DRYING_RUN_NOT_PLANNED)"]
+        side_effects:
+          - "bin.reserved_cwt -= expected_output_cwt; bin.version increments"
+          - "every referenced lot: drying_run_id cleared to null, status stays GRADED"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "system (automatic when destination bin enters FUMIGATING)"
+        actor: system
+        preconditions: []
+        side_effects: ["same as manual cancel"]
+
+  - entity: MillRun
+    initial_state: SCHEDULED
+    terminal_states: [VERIFIED, VOIDED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROCESS
+        trigger: "POST /mill/mill-runs/{id}/start"
+        actor: MillSupervisor
+        preconditions:
+          - "run.status == SCHEDULED (ERR_MILL_RUN_INVALID_STATE)"
+          - "input bin.status == AVAILABLE (ERR_BIN_NOT_RECEIVE_READY)"
+          - "no ACTIVE FoodSafetyHold on the input bin (ERR_ACTIVE_HOLD_BLOCKS_OPERATION)"
+          - "bin.stock_cwt >= run.input_cwt (ERR_MILL_INPUT_EXCEEDS_BIN_STOCK)"
+        side_effects: ["bin.stock_cwt -= input_cwt; bin.version increments; if stock_cwt hits 0 and reserved_cwt == 0, bin.variety_lock -> null"]
+      - from: IN_PROCESS
+        to: COMPLETED
+        trigger: "POST /mill/mill-runs/{id}/complete"
+        actor: MillSupervisor
+        preconditions: ["run.status == IN_PROCESS (ERR_MILL_RUN_INVALID_STATE)"]
+        side_effects: ["compute est_* outputs per milling_yield_split; byproduct inventory credited with est_* quantities"]
+      - from: COMPLETED
+        to: VERIFIED
+        trigger: "POST /mill/mill-runs/{id}/verify"
+        actor: MillSupervisor
+        preconditions:
+          - "run.status == COMPLETED (ERR_MILL_RUN_INVALID_STATE)"
+          - "applying per-product delta (act_* - est_*) must keep inventory available_cwt >= 0 for every product (ERR_INVENTORY_ADJUSTMENT_NEGATIVE)"
+        side_effects: ["inventory adjusted by (act_* - est_*) per product; act_loss_cwt computed as plug"]
+      - from: COMPLETED
+        to: VOIDED
+        trigger: "POST /mill/mill-runs/{id}/void"
+        actor: MillSupervisor
+        preconditions:
+          - "run.status == COMPLETED (ERR_MILL_RUN_INVALID_STATE)"
+          - "removing est_* outputs must keep inventory available_cwt >= 0 for every product (ERR_INVENTORY_ADJUSTMENT_NEGATIVE)"
+        side_effects: ["inventory debited by est_* per product; bin stock NOT restored"]
+
+  - entity: PackagingRun
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /mill/packaging-runs/{id}/complete"
+        actor: MillSupervisor
+        preconditions:
+          - "run.status == SCHEDULED (ERR_PACKAGING_RUN_INVALID_STATE)"
+          - "head-rice inventory available_cwt >= head_rice_consumed_cwt (ERR_INSUFFICIENT_MILLED_RICE)"
+        side_effects: ["compute head_rice_consumed_cwt; debit head-rice inventory"]
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /mill/packaging-runs/{id}/cancel"
+        actor: MillSupervisor
+        preconditions: ["run.status == SCHEDULED (ERR_PACKAGING_RUN_INVALID_STATE)"]
+        side_effects: []
+
+  - entity: ByproductSaleOrder
+    initial_state: OPEN
+    terminal_states: [SHIPPED, CANCELLED]
+    transitions:
+      - from: OPEN
+        to: RESERVED
+        trigger: "POST /mill/byproduct-orders/{id}/reserve"
+        actor: Merchandiser
+        preconditions:
+          - "order.status == OPEN (ERR_ORDER_INVALID_STATE)"
+          - "inventory available_cwt for product >= quantity_cwt (ERR_INSUFFICIENT_BYPRODUCT_INVENTORY)"
+        side_effects: ["inventory reserved_cwt for product += quantity_cwt"]
+      - from: RESERVED
+        to: OPEN
+        trigger: "POST /mill/byproduct-orders/{id}/release"
+        actor: Merchandiser
+        preconditions: ["order.status == RESERVED (ERR_ORDER_INVALID_STATE)"]
+        side_effects: ["inventory reserved_cwt for product -= quantity_cwt"]
+      - from: RESERVED
+        to: SHIPPED
+        trigger: "POST /mill/byproduct-orders/{id}/ship"
+        actor: Merchandiser
+        preconditions: ["order.status == RESERVED (ERR_ORDER_INVALID_STATE)"]
+        side_effects: ["inventory reserved_cwt -= quantity_cwt; shipped_cwt += quantity_cwt"]
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /mill/byproduct-orders/{id}/cancel"
+        actor: Merchandiser
+        preconditions: ["order.status in {OPEN, RESERVED} (ERR_ORDER_INVALID_STATE)"]
+        side_effects: ["if previously RESERVED: reserved_cwt -= quantity_cwt"]
+      - from: RESERVED
+        to: CANCELLED
+        trigger: "POST /mill/byproduct-orders/{id}/cancel"
+        actor: Merchandiser
+        preconditions: ["order.status in {OPEN, RESERVED} (ERR_ORDER_INVALID_STATE)"]
+        side_effects: ["reserved_cwt -= quantity_cwt"]
+
+  - entity: FumigationEvent
+    initial_state: ACTIVE
+    terminal_states: [CLEARED]
+    transitions:
+      - from: ACTIVE
+        to: AERATING
+        trigger: "POST /mill/fumigation-events/{id}/begin-aeration"
+        actor: FumigationTech
+        preconditions:
+          - "event.status == ACTIVE (ERR_FUMIGATION_INVALID_STATE)"
+          - "season logical clock >= exposure_ends_at (ERR_EXPOSURE_INCOMPLETE)"
+        side_effects: ["bin.status FUMIGATING -> AERATING; bin.version increments"]
+      - from: AERATING
+        to: CLEARED
+        trigger: "POST /mill/fumigation-events/{id}/clear"
+        actor: FumigationTech
+        preconditions:
+          - "event.status == AERATING (ERR_FUMIGATION_INVALID_STATE)"
+          - "season logical clock >= clearance_at (ERR_AERATION_INCOMPLETE)"
+        side_effects: ["bin.status AERATING -> AVAILABLE; bin.version increments"]
+
+  - entity: FoodSafetyHold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /mill/holds/{id}/release"
+        actor: SafetyOfficer
+        preconditions: ["hold.status == ACTIVE (ERR_HOLD_ALREADY_RELEASED)"]
+        side_effects: ["resolution_note recorded"]
+
+  - entity: Settlement
+    initial_state: DRAFT
+    terminal_states: [PAID]
+    transitions:
+      - from: DRAFT
+        to: PROVISIONAL_ISSUED
+        trigger: "POST /mill/settlements/{id}/issue-provisional"
+        actor: SettlementClerk
+        preconditions:
+          - "settlement.status == DRAFT (ERR_SETTLEMENT_INVALID_STATE)"
+          - "season.status in {INTAKE_CLOSED, SETTLEMENT_REVIEW} (ERR_INVALID_SEASON_STATE)"
+        side_effects: ["provisional_* snapshot locked"]
+      - from: PROVISIONAL_ISSUED
+        to: APPROVED
+        trigger: "POST /mill/settlements/{id}/approve"
+        actor: SettlementClerk
+        preconditions:
+          - "settlement.status == PROVISIONAL_ISSUED (ERR_SETTLEMENT_INVALID_STATE)"
+          - "season.status == SETTLEMENT_REVIEW (ERR_SEASON_NOT_SETTLEMENT_REVIEW)"
+          - "X-User-ID != settlement.created_by_user_id (ERR_SOD_APPROVER_IS_CREATOR)"
+        side_effects:
+          - "compute final_* via aggregate-rounding variant (final_checkoff on summed exact line values, single rounding)"
+          - "every lot in lot_ids: BINNED -> SETTLED"
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /mill/settlements/{id}/pay"
+        actor: SettlementClerk
+        preconditions: ["settlement.status == APPROVED (ERR_SETTLEMENT_INVALID_STATE)"]
+        side_effects:
+          - "grower.advance_outstanding_cents -= final_advance_repay_cents"
+          - "grower.cumulative_paid_cents += final_net_cents; grower.version increments"
+      - from: PROVISIONAL_ISSUED
+        to: DISPUTED
+        trigger: "POST /mill/settlements/{id}/dispute or system (lot regrade of a member lot)"
+        actor: SettlementClerk | GrowerRep | system
+        preconditions: ["settlement.status in {PROVISIONAL_ISSUED, APPROVED} (ERR_SETTLEMENT_INVALID_STATE)"]
+        side_effects: ["if season.status == SETTLEMENT_REVIEW: season -> INTAKE_CLOSED"]
+      - from: APPROVED
+        to: DISPUTED
+        trigger: "POST /mill/settlements/{id}/dispute"
+        actor: SettlementClerk | GrowerRep
+        preconditions: ["settlement.status in {PROVISIONAL_ISSUED, APPROVED} (ERR_SETTLEMENT_INVALID_STATE)"]
+        side_effects:
+          - "every lot in lot_ids: SETTLED -> BINNED"
+          - "if season.status == SETTLEMENT_REVIEW: season -> INTAKE_CLOSED"
+      - from: DISPUTED
+        to: DRAFT
+        trigger: "POST /mill/settlements/{id}/revise"
+        actor: SettlementClerk
+        preconditions: ["settlement.status == DISPUTED (ERR_SETTLEMENT_INVALID_STATE)"]
+        side_effects: ["provisional_* recomputed over the same lot_ids with current lot values"]
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC on parent version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: contract-delivery-stale-version
+    parent_entity: DeliveryContract
+    write_endpoint: "POST /mill/lots"
+    occ_field: expected_contract_version
+    description: |
+      Creating a CONTRACT-source PaddyLot against a DeliveryContract whose
+      version has advanced since the client last observed it (e.g. another
+      delivery was just booked, another lot was just graded against it, or the
+      contract was amended) is rejected. The client's view of fulfillment state
+      is stale; re-read the contract and retry.
+    error_id: ERR_STALE_CONTRACT_VERSION
+    http_status: 412
+  - rule_id: contract-amend-stale-version
+    parent_entity: DeliveryContract
+    write_endpoint: "PUT /mill/contracts/{id}"
+    occ_field: expected_contract_version
+    description: |
+      Amending a DeliveryContract's price or volume with an
+      expected_contract_version that does not match the contract's current
+      version is rejected as a lost update. Both sequential amendments are
+      individually legitimate; the second must re-read the contract first.
+    error_id: ERR_STALE_CONTRACT_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: net_wet_weight
+    trigger: "PaddyLot creation"
+    algorithm: aggregation
+    formula: |
+      net_wet_lbs = gross_weight_lbs - tare_weight_lbs   (must be > 0)
+      net_wet_cwt = round_half_up(net_wet_lbs / 100, 2)
+    input_set: "the newly created lot"
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+
+  - name: paddy_dry_weight
+    trigger: "PaddyLot creation (provisional variant) and grading/regrade (final variant)"
+    algorithm: threshold
+    formula: |
+      BASE = 13.0
+      if M > BASE:
+        moisture_shrink_pct = 100 * (M - BASE) / (100 - BASE)
+        handling_loss_pct = HANDLING_LOSS_PCT            # flat 0.5
+      else:
+        moisture_shrink_pct = 0
+        handling_loss_pct = 0
+      total_shrink_pct = moisture_shrink_pct + handling_loss_pct
+      dry_weight_cwt = round_half_up(net_wet_cwt * (1 - total_shrink_pct/100), 2)
+      moisture_shrink_cwt = round_half_up(net_wet_cwt * moisture_shrink_pct/100, 2)
+      handling_loss_cwt  = round_half_up(net_wet_cwt * handling_loss_pct/100, 2)
+    input_set: "single lot; M is moisture_pct_handheld (provisional) or moisture_pct_official (final)"
+    constants:
+      BASE_MOISTURE_PCT: 13.0
+      HANDLING_LOSS_PCT: 0.5
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: provisional_handheld
+        when: "lot creation; result stored on provisional_dry_weight_cwt"
+        difference: "uses moisture_pct_handheld (scale probe); superseded at grading"
+      - name: final_official
+        when: "grading or regrade; result stored on dry_weight_cwt and drives settlement + contract fulfillment"
+        difference: "uses moisture_pct_official (lab); identical inputs can produce a different dry weight than provisional whenever handheld != official"
+
+  - name: drying_charge
+    trigger: "PaddyLot grading and regrade"
+    algorithm: tiered_pricing
+    formula: |
+      points = max(0, moisture_pct_official - 13.0)      # 1dp
+      tier1 = min(points, 3.0) * TIER1_CENTS             # 4 cents/cwt/point
+      tier2 = min(max(points - 3.0, 0), 3.0) * TIER2_CENTS   # 7
+      tier3 = max(points - 6.0, 0) * TIER3_CENTS             # 12
+      rate_cents_per_cwt = tier1 + tier2 + tier3         # marginal tiers summed
+      drying_charge_cents = round_half_up(net_wet_cwt * rate_cents_per_cwt, 0)
+    input_set: "single lot at grading"
+    constants:
+      TIER1_MAX_POINTS: 3.0
+      TIER1_CENTS: 4
+      TIER2_MAX_POINTS: 3.0
+      TIER2_CENTS: 7
+      TIER3_CENTS: 12
+    precision: "integer cents, round_half_up; boundary: points == 3.0 lies entirely in tier 1, points == 6.0 fills tiers 1+2 exactly"
+
+  - name: grade_determination
+    trigger: "PaddyLot grading and regrade"
+    algorithm: weighted_scoring
+    formula: |
+      grade_score = round_half_up(2*foreign_matter_pct + 3*damage_pct + 1*broken_pct, 2)
+      grade = US_NO_1 if grade_score <= 2.0
+              US_NO_2 if grade_score <= 5.0
+              US_NO_3 if grade_score <= 10.0
+              US_NO_4 if grade_score <= 15.0
+              US_NO_5 if grade_score <= 20.0
+              else SAMPLE
+    input_set: "grading factor inputs of a single lot"
+    constants:
+      W_FOREIGN_MATTER: 2
+      W_DAMAGE: 3
+      W_BROKEN: 1
+    precision: "score 2dp round_half_up; thresholds inclusive (<=)"
+
+  - name: contract_fulfillment
+    trigger: "PaddyLot grading (add), lot reject from GRADED (remove), settlement unaffected"
+    algorithm: aggregation
+    formula: |
+      fulfilled_cwt = sum(dry_weight_cwt of lots with contract_id == this contract
+                          and status in {GRADED, BINNED, SETTLED})
+      over-delivery guard at grade time:
+        if fulfilled_before + this_lot.dry_weight_cwt > round_half_up(contracted_cwt * 1.05, 2)
+          -> reject grading with ERR_OVERDELIVERY_BEYOND_TOLERANCE   (whole lot)
+      status: fulfilled == 0 -> OPEN; 0 < fulfilled < contracted -> PARTIALLY_FULFILLED;
+              fulfilled >= contracted -> FULFILLED (exactly 100% fulfills)
+    input_set: "all lots of the contract; REJECTED lots excluded"
+    constants:
+      OVERDELIVERY_TOLERANCE_PCT: 5.0
+    precision: "2 decimal places, round_half_up; tolerance comparison is strict >"
+
+  - name: settlement_amount
+    trigger: "Settlement creation and revise (provisional variant); Settlement approve (final variant)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Evaluation order is pinned to break the fee/advance circularity:
+      #   gross -> drying -> checkoff -> advance -> net. Never reorder.
+      lines = member lots (membership frozen at creation)
+      per lot: line_value_cents = round_half_up(dry_weight_cwt * price_cents_per_cwt, 0)
+      drying_cents = sum(lot.drying_charge_cents)
+      VARIANT provisional (per-line rounding):
+        gross_cents   = sum(line_value_cents)
+        checkoff_cents = sum(round_half_up(line_value_cents * CHECKOFF_RATE, 0))
+      VARIANT final (aggregate rounding):
+        gross_cents   = round_half_up(sum(dry_weight_cwt * price_cents_per_cwt), 0)
+        checkoff_cents = round_half_up(gross_exact * CHECKOFF_RATE, 0)   # rounded ONCE
+      advance_repay_cents = min(grower.advance_outstanding_cents,
+                                max(0, gross_cents - drying_cents - checkoff_cents))
+      net_cents = gross_cents - drying_cents - checkoff_cents - advance_repay_cents
+    input_set: "lots with status BINNED (SETTLED after approve), grower match, season match, graded_date within [period_start_date, period_end_date] inclusive, settlement_id null at snapshot time"
+    constants:
+      CHECKOFF_RATE: 0.005
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: provisional_per_line
+        when: "creation and revise"
+        difference: "checkoff rounded per lot line then summed; gross = sum of per-line rounded values"
+      - name: final_aggregate
+        when: "approve"
+        difference: "line values summed exactly, checkoff rounded once on the aggregate; for the same lots the two variants can differ by cents"
+
+  - name: milling_yield_split
+    trigger: "MillRun complete (estimated variant), MillRun verify (actual variant)"
+    algorithm: waterfall_allocation
+    formula: |
+      # Estimated (standards) — evaluation order pinned; hull is the global plug:
+      total_rice = round_half_up(input_cwt * TOTAL_RICE_PCT[variety], 2)
+      est_head    = round_half_up(total_rice * HEAD_RATIO[variety], 2)
+      est_brewers = round_half_up(total_rice * BREWERS_PCT, 2)
+      est_broken  = total_rice - est_head - est_brewers              # plug within rice
+      est_bran    = round_half_up(input_cwt * BRAN_PCT, 2)
+      est_loss    = round_half_up(input_cwt * LOSS_PCT, 2)
+      est_hull    = input_cwt - total_rice - est_bran - est_loss     # global plug
+      # conservation: est_head + est_broken + est_brewers + est_bran + est_hull + est_loss == input_cwt
+      # Actual (verify): operator supplies act_head/act_broken/act_brewers/act_bran/act_hull;
+      act_loss = input_cwt - (act_head + act_broken + act_brewers + act_bran + act_hull)  # plug
+      inventory delta at verify: per product, available += (act - est)
+    input_set: "single mill run"
+    constants:
+      TOTAL_RICE_PCT: { LONG_GRAIN: 0.68, MEDIUM_GRAIN: 0.72 }
+      HEAD_RATIO: { LONG_GRAIN: 0.60, MEDIUM_GRAIN: 0.66 }
+      BREWERS_PCT: 0.05
+      BRAN_PCT: 0.08
+      LOSS_PCT: 0.02
+    precision: "2 decimal places, round_half_up; plugs are never rounded"
+    variants:
+      - name: estimated_standards
+        when: "complete"
+        difference: "outputs from published variety standards; credited to inventory at complete"
+      - name: actual_measured
+        when: "verify"
+        difference: "operator-measured outputs replace estimates; inventory adjusted by signed delta; can be negative per product"
+
+  - name: byproduct_inventory
+    trigger: "mill-run complete/verify/void, byproduct-order reserve/release/ship/cancel, packaging-run complete; read via inventory endpoint"
+    algorithm: aggregation
+    formula: |
+      For product p in {HEAD_RICE, BROKEN, BREWERS, BRAN, HULL}:
+        produced(p) = sum(est output of COMPLETED mill runs) + sum(act output of VERIFIED mill runs)
+        consumed(p) = sum(head_rice_consumed_cwt of COMPLETED packaging runs) if p == HEAD_RICE else 0
+        reserved(p) = sum(quantity_cwt of ByproductSaleOrder with status == RESERVED)
+        shipped(p)  = sum(quantity_cwt of ByproductSaleOrder with status == SHIPPED)
+        available(p) = produced(p) - consumed(p) - reserved(p) - shipped(p)
+      Guards: reserve requires quantity_cwt <= available(product) (== allowed);
+              void/verify require the delta to keep every available(p) >= 0.
+    input_set: "mill runs in {COMPLETED, VERIFIED}; orders in {RESERVED, SHIPPED}; packaging runs in {COMPLETED}; all scoped to season"
+    constants: {}
+    precision: "2 decimal places, round_half_up"
+
+  - name: bin_capacity_allocation
+    trigger: "lot store, drying-run create/complete/cancel, mill-run start, lot regrade with weight change"
+    algorithm: constraint_propagation
+    formula: |
+      available_cwt = capacity_cwt - stock_cwt - reserved_cwt
+      reserve (drying create): reserved_cwt += expected_output_cwt; requires expected_output_cwt <= available_cwt
+      commit  (drying complete): reserved_cwt -= expected_output_cwt; stock_cwt += actual_output_cwt
+      release (drying cancel):   reserved_cwt -= expected_output_cwt
+      store   (lot direct):      stock_cwt += lot.dry_weight_cwt; requires lot.dry_weight_cwt <= available_cwt
+      draw    (mill start):      stock_cwt -= run.input_cwt; requires run.input_cwt <= stock_cwt
+      variety_lock: set to incoming variety when null at any credit; cleared to null when stock_cwt == 0 and reserved_cwt == 0
+    input_set: "single bin; all its lots, drying runs, mill runs"
+    constants: {}
+    precision: "2 decimal places, round_half_up; capacity comparisons use <= (exact fit allowed)"
+
+  - name: packaging_line_overlap
+    trigger: "PackagingRun creation"
+    algorithm: interval_merge
+    formula: |
+      CHANGEOVER = 30 minutes (buffer applied to both ends)
+      conflict exists iff exists another run on same line_id with status in {SCHEDULED} such that:
+        new.starts_at < existing.ends_at + 30min AND existing.starts_at < new.ends_at + 30min
+      A gap of exactly 30 minutes is allowed (strict <). COMPLETED/CANCELLED runs never conflict.
+    input_set: "non-terminal (SCHEDULED) packaging runs on the same line in the same season"
+    constants:
+      CHANGEOVER_MINUTES: 30
+    precision: "minute precision on timestamps"
+
+  - name: fumigation_window
+    trigger: "FumigationEvent creation, begin-aeration, clear"
+    algorithm: interval_merge
+    formula: |
+      window = [started_at, clearance_at)  -- HALF-OPEN: clearance_at = started_at + exposure_hours + aeration_hours
+      conflict at creation iff exists another FumigationEvent on same bin (any status, history included) with:
+        new.started_at < other.clearance_at AND other.started_at < new.clearance_at
+      Back-to-back treatments allowed: new.started_at == other.clearance_at is NOT a conflict.
+      begin-aeration requires clock >= exposure_ends_at; clear requires clock >= clearance_at (== allowed).
+    input_set: "all fumigation events on the same bin in the same season"
+    constants: {}
+    precision: "second precision on timestamps"
+
+  - name: spot_intake_cap
+    trigger: "PaddyLot creation with source == SPOT"
+    algorithm: threshold
+    formula: |
+      count = number of lots in season with source == SPOT, scheduled_date == new.scheduled_date,
+              status != REJECTED
+      allowed iff count < season.spot_daily_cap   (the cap-th truck is admitted; cap+1-th rejected)
+      CONTRACT-source lots never count and are never blocked by the cap.
+    input_set: "season lots with matching scheduled_date"
+    constants: {}
+    precision: "integer count; comparison is strict <"
+
+# =============================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "Role is permitted for this endpoint per §1.5 roles"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: auth
+    check: "Identity scoping: GrowerRep may only access resources whose grower_id == X-User-ID; settlement approver must differ from settlement.created_by_user_id"
+    error_id: ERR_IDENTITY_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "GrowerRep reads/actions; POST /mill/settlements/{id}/approve (SoD uses ERR_SOD_APPROVER_IS_CREATOR)"
+  - priority: 4
+    category: existence
+    check: "Request shape: required fields present, types valid, enum values valid, tare_weight_lbs < gross_weight_lbs, ends_at > starts_at, CONTRACT lots carry contract_id + expected_contract_version + matching grower/variety, SPOT lots carry spot_price_cents_per_cwt, started_at <= season clock for fumigation"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all mutating endpoints"
+  - priority: 5
+    category: existence
+    check: "Referenced resources exist, validated left-to-right (path ids, then body FKs); FKs must belong to the same season as the target"
+    error_id: ERR_SEASON_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with resource ids (error id varies by resource: ERR_GROWER_NOT_FOUND, ERR_CONTRACT_NOT_FOUND, ERR_BIN_NOT_FOUND, ERR_LOT_NOT_FOUND, ERR_DRYING_RUN_NOT_FOUND, ERR_MILL_RUN_NOT_FOUND, ERR_PACKAGING_RUN_NOT_FOUND, ERR_BYPRODUCT_ORDER_NOT_FOUND, ERR_FUMIGATION_NOT_FOUND, ERR_HOLD_NOT_FOUND, ERR_SETTLEMENT_NOT_FOUND)"
+  - priority: 6
+    category: state
+    check: "Target resource state machine permits the transition (season/lot/contract/bin/run/order/fumigation/hold/settlement state preconditions per §1.2)"
+    error_id: ERR_INVALID_SEASON_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints (error id varies by entity)"
+  - priority: 7
+    category: state
+    check: "OCC: expected_contract_version matches the contract's current version"
+    error_id: ERR_STALE_CONTRACT_VERSION
+    http_status: 412
+    applies_to: "POST /mill/lots (source CONTRACT), PUT /mill/contracts/{id}"
+  - priority: 8
+    category: business_safety
+    check: "No ACTIVE FoodSafetyHold blocks the operation (on the lot, or on the source/destination bin); season begin-settlement-review requires zero ACTIVE holds"
+    error_id: ERR_ACTIVE_HOLD_BLOCKS_OPERATION
+    http_status: 422
+    applies_to: "lot grade/regrade/store, drying-run create/complete, mill-run start, season begin-settlement-review"
+  - priority: 9
+    category: business_temporal
+    check: "Temporal rules: scheduled_date within season intake window; fumigation clock gates (exposure/aeration complete); packaging line buffer overlap; fumigation window overlap"
+    error_id: ERR_OUTSIDE_INTAKE_WINDOW
+    http_status: 409
+    applies_to: "lot create, fumigation create/begin-aeration/clear, packaging create (error id varies: ERR_EXPOSURE_INCOMPLETE, ERR_AERATION_INCOMPLETE, ERR_LINE_SCHEDULE_CONFLICT, ERR_FUMIGATION_WINDOW_CONFLICT)"
+  - priority: 10
+    category: business_constraint
+    check: "Referential/constraint rules: farm_code and bin_code unique per season; bin variety lock match; lot not already in a non-terminal drying run; over-delivery tolerance; settlement period has eligible lots"
+    error_id: ERR_DUPLICATE_FARM_CODE
+    http_status: 409
+    applies_to: "grower create, bin create, lot grade, drying-run create, settlement create (error id varies: ERR_DUPLICATE_BIN_CODE, ERR_BIN_VARIETY_MISMATCH, ERR_LOT_ALREADY_IN_DRYING_RUN, ERR_OVERDELIVERY_BEYOND_TOLERANCE, ERR_SETTLEMENT_PERIOD_EMPTY)"
+  - priority: 11
+    category: business_fiscal
+    check: "Capacity/inventory/quota: bin capacity, spot daily cap, mill input vs bin stock, byproduct/milled-rice availability, inventory non-negativity on void/verify"
+    error_id: ERR_BIN_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "lot store, drying-run create, lot create (SPOT), mill-run start, byproduct reserve, packaging complete, mill-run void/verify (error id varies: ERR_SPOT_CAP_REACHED, ERR_MILL_INPUT_EXCEEDS_BIN_STOCK, ERR_INSUFFICIENT_BYPRODUCT_INVENTORY, ERR_INSUFFICIENT_MILLED_RICE, ERR_INVENTORY_ADJUSTMENT_NEGATIVE)"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- HarvestSeason ---
+  - method: POST
+    path: "/mill/seasons"
+    description: "Create a harvest season; logical clock starts at 2026-08-01T00:00:00Z"
+    roles: [MillAdmin]
+    code: 201
+    input: [name, intake_start_date, intake_end_date, spot_daily_cap]
+    output: HarvestSeason
+    side_effects: ["status = SETUP", "current_clock_iso = 2026-08-01T00:00:00Z"]
+  - method: GET
+    path: "/mill/seasons"
+    description: "List seasons"
+    roles: &all_roles [MillAdmin, ScaleOperator, QualityLabTech, DryerOperator, MillSupervisor, Merchandiser, SettlementClerk, SafetyOfficer, FumigationTech, GrowerRep]
+    code: 200
+    input: ["limit?", "offset?", "status?"]
+    output: "HarvestSeason[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/seasons/{id}"
+    description: "Get one season"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: []
+  - method: POST
+    path: "/mill/seasons/{id}/open-intake"
+    description: "SETUP -> INTAKE_OPEN"
+    roles: [MillAdmin]
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: ["status -> INTAKE_OPEN"]
+  - method: POST
+    path: "/mill/seasons/{id}/close-intake"
+    description: "INTAKE_OPEN -> INTAKE_CLOSED"
+    roles: [MillAdmin]
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: ["status -> INTAKE_CLOSED"]
+  - method: POST
+    path: "/mill/seasons/{id}/reopen-intake"
+    description: "INTAKE_CLOSED -> INTAKE_OPEN; blocked while any settlement is past DRAFT"
+    roles: [MillAdmin]
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: ["status -> INTAKE_OPEN"]
+  - method: POST
+    path: "/mill/seasons/{id}/begin-settlement-review"
+    description: "INTAKE_CLOSED -> SETTLEMENT_REVIEW; requires all intake work resolved and no active holds"
+    roles: [MillAdmin]
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: ["status -> SETTLEMENT_REVIEW"]
+  - method: POST
+    path: "/mill/seasons/{id}/settle"
+    description: "SETTLEMENT_REVIEW -> SETTLED; under-delivered contracts auto-DEFAULTED"
+    roles: [MillAdmin]
+    code: 200
+    input: []
+    output: HarvestSeason
+    side_effects: ["status -> SETTLED", "contracts OPEN/PARTIALLY_FULFILLED with fulfilled_cwt < contracted_cwt -> DEFAULTED"]
+  - method: POST
+    path: "/mill/seasons/{id}/clock/set"
+    description: "Advance the season logical clock; default before any set is exactly 2026-08-01T00:00:00Z and the clock never falls back to wall-clock time"
+    roles: [MillAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: HarvestSeason
+    side_effects: ["current_clock_iso = to_iso8601"]
+  - method: GET
+    path: "/mill/seasons/{id}/byproduct-inventory"
+    description: "Computed per-product inventory for the season (produced/reserved/shipped/consumed/available)"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: { HEAD_RICE: object, BROKEN: object, BREWERS: object, BRAN: object, HULL: object }
+    side_effects: []
+
+  # --- Grower ---
+  - method: POST
+    path: "/mill/growers"
+    description: "Onboard a grower into a season"
+    roles: [Merchandiser]
+    code: 201
+    input: [season_id, farm_code, legal_name, "advance_issued_cents?"]
+    output: Grower
+    side_effects: ["advance_outstanding_cents = advance_issued_cents", "cumulative_paid_cents = 0"]
+  - method: GET
+    path: "/mill/growers"
+    description: "List growers (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "farm_code?"]
+    output: "Grower[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/growers/{id}"
+    description: "Get one grower"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: Grower
+    side_effects: []
+
+  # --- DeliveryContract ---
+  - method: POST
+    path: "/mill/contracts"
+    description: "Create a delivery contract (version 1, status OPEN)"
+    roles: [Merchandiser]
+    code: 201
+    input: [season_id, grower_id, variety, contracted_cwt, base_price_cents_per_cwt, grade_adjustments]
+    output: DeliveryContract
+    side_effects: ["status = OPEN", "fulfilled_cwt = 0", "delivery_count = 0"]
+  - method: GET
+    path: "/mill/contracts"
+    description: "List contracts (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "grower_id?", "variety?", "status?"]
+    output: "DeliveryContract[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/contracts/{id}"
+    description: "Get one contract"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: DeliveryContract
+    side_effects: []
+  - method: PUT
+    path: "/mill/contracts/{id}"
+    description: "Amend price/volume of an undelivered contract; OCC-guarded"
+    roles: [Merchandiser]
+    code: 200
+    input: [expected_contract_version, "contracted_cwt?", "base_price_cents_per_cwt?", "grade_adjustments?"]
+    output: DeliveryContract
+    side_effects: ["increments DeliveryContract.version by 1"]
+  - method: POST
+    path: "/mill/contracts/{id}/cancel"
+    description: "Cancel a contract with zero fulfilled volume"
+    roles: [Merchandiser]
+    code: 200
+    input: []
+    output: DeliveryContract
+    side_effects: ["status -> CANCELLED"]
+
+  # --- Bin ---
+  - method: POST
+    path: "/mill/bins"
+    description: "Create a storage bin"
+    roles: [MillAdmin]
+    code: 201
+    input: [season_id, bin_code, capacity_cwt]
+    output: Bin
+    side_effects: ["status = AVAILABLE", "variety_lock = null", "stock_cwt = reserved_cwt = 0", "available_cwt = capacity_cwt"]
+  - method: GET
+    path: "/mill/bins"
+    description: "List bins (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "status?", "variety_lock?"]
+    output: "Bin[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/bins/{id}"
+    description: "Get one bin"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: Bin
+    side_effects: []
+
+  # --- PaddyLot ---
+  - method: POST
+    path: "/mill/lots"
+    description: "Scale-ticket intake of one paddy truckload; computes net wet weight and provisional dry weight"
+    roles: [ScaleOperator]
+    code: 201
+    input: [season_id, grower_id, variety, source, gross_weight_lbs, tare_weight_lbs, scheduled_date, moisture_pct_handheld, "contract_id?", "expected_contract_version?", "spot_price_cents_per_cwt?"]
+    output: PaddyLot
+    side_effects:
+      - "status = WEIGHED; net_wet_cwt + provisional_dry_weight_cwt computed"
+      - "if source == CONTRACT: contract.delivery_count += 1 and DeliveryContract.version incremented (OCC check on expected_contract_version)"
+      - "if source == SPOT: spot daily cap enforced for scheduled_date"
+  - method: GET
+    path: "/mill/lots"
+    description: "List lots (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "grower_id?", "contract_id?", "bin_id?", "drying_run_id?", "settlement_id?", "variety?", "source?", "status?", "scheduled_date?"]
+    output: "PaddyLot[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/lots/{id}"
+    description: "Get one lot"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: PaddyLot
+    side_effects: []
+  - method: POST
+    path: "/mill/lots/{id}/grade"
+    description: "Official grading: lab moisture + factor inputs; computes final dry weight, grade, charges, line value"
+    roles: [QualityLabTech]
+    code: 200
+    input: [moisture_pct_official, foreign_matter_pct, damage_pct, broken_pct]
+    output: PaddyLot
+    side_effects: ["status WEIGHED -> GRADED", "contract fulfillment recomputed (may auto-advance contract)", "graded_date = season clock date"]
+  - method: POST
+    path: "/mill/lots/{id}/regrade"
+    description: "Re-grade a GRADED or BINNED lot; cascades into settlement dispute and season revert when applicable"
+    roles: [QualityLabTech]
+    code: 200
+    input: [moisture_pct_official, foreign_matter_pct, damage_pct, broken_pct]
+    output: PaddyLot
+    side_effects: ["grading-derived fields recomputed", "bin stock adjusted if BINNED", "DRAFT settlement recomputed; PROVISIONAL_ISSUED settlement -> DISPUTED; SETTLEMENT_REVIEW season -> INTAKE_CLOSED"]
+  - method: POST
+    path: "/mill/lots/{id}/reject"
+    description: "Reject a WEIGHED or GRADED lot (quality refusal)"
+    roles: [QualityLabTech]
+    code: 200
+    input: [reject_reason]
+    output: PaddyLot
+    side_effects: ["status -> REJECTED", "contract fulfillment recomputed if applicable"]
+  - method: POST
+    path: "/mill/lots/{id}/store"
+    description: "Direct-bin a GRADED lot (no drying needed); capacity + variety-lock + hold guarded"
+    roles: [ScaleOperator]
+    code: 200
+    input: [bin_id]
+    output: PaddyLot
+    side_effects: ["status GRADED -> BINNED", "bin.stock_cwt += dry_weight_cwt; variety lock set; Bin.version incremented"]
+
+  # --- DryingRun ---
+  - method: POST
+    path: "/mill/drying-runs"
+    description: "Plan a drying run over GRADED lots into a destination bin; reserves bin capacity"
+    roles: [DryerOperator]
+    code: 201
+    input: [season_id, lot_ids, destination_bin_id, "fuel_cost_cents?"]
+    output: DryingRun
+    side_effects: ["status = PLANNED", "expected_output_cwt = sum of lot dry weights", "bin.reserved_cwt += expected_output_cwt; Bin.version incremented", "lot.drying_run_id set for each referenced lot"]
+  - method: GET
+    path: "/mill/drying-runs"
+    description: "List drying runs (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "destination_bin_id?", "status?"]
+    output: "DryingRun[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/drying-runs/{id}"
+    description: "Get one drying run"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: DryingRun
+    side_effects: []
+  - method: POST
+    path: "/mill/drying-runs/{id}/complete"
+    description: "Complete a PLANNED run; commits actual output to bin stock, bins the lots"
+    roles: [DryerOperator]
+    code: 200
+    input: [actual_output_cwt]
+    output: DryingRun
+    side_effects: ["status -> COMPLETED", "reserved released, stock += actual_output_cwt; Bin.version incremented", "lots -> BINNED with bin_id set"]
+  - method: POST
+    path: "/mill/drying-runs/{id}/cancel"
+    description: "Cancel a PLANNED run; releases reservation, lots stay GRADED"
+    roles: [DryerOperator]
+    code: 200
+    input: []
+    output: DryingRun
+    side_effects: ["status -> CANCELLED", "reserved released; Bin.version incremented", "lot.drying_run_id cleared"]
+
+  # --- MillRun ---
+  - method: POST
+    path: "/mill/mill-runs"
+    description: "Schedule a mill run drawing paddy from a bin; variety copied from bin lock"
+    roles: [MillSupervisor]
+    code: 201
+    input: [season_id, input_bin_id, input_cwt]
+    output: MillRun
+    side_effects: ["status = SCHEDULED", "variety = bin.variety_lock"]
+  - method: GET
+    path: "/mill/mill-runs"
+    description: "List mill runs (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "input_bin_id?", "status?", "variety?"]
+    output: "MillRun[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/mill-runs/{id}"
+    description: "Get one mill run"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: MillRun
+    side_effects: []
+  - method: POST
+    path: "/mill/mill-runs/{id}/start"
+    description: "Start a SCHEDULED run; debits bin stock"
+    roles: [MillSupervisor]
+    code: 200
+    input: []
+    output: MillRun
+    side_effects: ["status -> IN_PROCESS", "bin.stock_cwt -= input_cwt; Bin.version incremented; variety_lock cleared if bin empty"]
+  - method: POST
+    path: "/mill/mill-runs/{id}/complete"
+    description: "Complete an IN_PROCESS run; computes standard-yield est_* outputs and credits inventory"
+    roles: [MillSupervisor]
+    code: 200
+    input: []
+    output: MillRun
+    side_effects: ["status -> COMPLETED", "est_* computed per milling_yield_split", "inventory credited"]
+  - method: POST
+    path: "/mill/mill-runs/{id}/verify"
+    description: "Verify a COMPLETED run with actual measured outputs; inventory adjusted by signed delta"
+    roles: [MillSupervisor]
+    code: 200
+    input: [act_head_cwt, act_broken_cwt, act_brewers_cwt, act_bran_cwt, act_hull_cwt]
+    output: MillRun
+    side_effects: ["status -> VERIFIED", "act_loss_cwt = input - sum(act_*)", "inventory adjusted by (act - est) per product"]
+  - method: POST
+    path: "/mill/mill-runs/{id}/void"
+    description: "Void a COMPLETED run; removes its estimated outputs from inventory (bin stock not restored)"
+    roles: [MillSupervisor]
+    code: 200
+    input: []
+    output: MillRun
+    side_effects: ["status -> VOIDED", "inventory debited by est_* per product"]
+
+  # --- PackagingRun ---
+  - method: POST
+    path: "/mill/packaging-runs"
+    description: "Schedule a packaging/private-label run on a line; 30-minute changeover buffer enforced"
+    roles: [MillSupervisor]
+    code: 201
+    input: [season_id, line_id, brand_label, package_size_kg, units_planned, starts_at, ends_at]
+    output: PackagingRun
+    side_effects: ["status = SCHEDULED", "overlap check vs SCHEDULED runs on same line with 30-min buffer"]
+  - method: GET
+    path: "/mill/packaging-runs"
+    description: "List packaging runs (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "line_id?", "status?"]
+    output: "PackagingRun[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/packaging-runs/{id}"
+    description: "Get one packaging run"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: PackagingRun
+    side_effects: []
+  - method: POST
+    path: "/mill/packaging-runs/{id}/complete"
+    description: "Complete a SCHEDULED run; consumes head-rice inventory by units_produced"
+    roles: [MillSupervisor]
+    code: 200
+    input: [units_produced]
+    output: PackagingRun
+    side_effects: ["status -> COMPLETED", "head_rice_consumed_cwt computed and debited from HEAD_RICE inventory"]
+  - method: POST
+    path: "/mill/packaging-runs/{id}/cancel"
+    description: "Cancel a SCHEDULED run"
+    roles: [MillSupervisor]
+    code: 200
+    input: []
+    output: PackagingRun
+    side_effects: ["status -> CANCELLED"]
+
+  # --- ByproductSaleOrder ---
+  - method: POST
+    path: "/mill/byproduct-orders"
+    description: "Create a byproduct sale order (bran/hull/broken/brewers)"
+    roles: [Merchandiser]
+    code: 201
+    input: [season_id, product, quantity_cwt, price_cents_per_cwt, buyer_name]
+    output: ByproductSaleOrder
+    side_effects: ["status = OPEN"]
+  - method: GET
+    path: "/mill/byproduct-orders"
+    description: "List byproduct orders (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "product?", "status?"]
+    output: "ByproductSaleOrder[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/byproduct-orders/{id}"
+    description: "Get one byproduct order"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: ByproductSaleOrder
+    side_effects: []
+  - method: POST
+    path: "/mill/byproduct-orders/{id}/reserve"
+    description: "Reserve inventory for an OPEN order"
+    roles: [Merchandiser]
+    code: 200
+    input: []
+    output: ByproductSaleOrder
+    side_effects: ["status -> RESERVED", "reserved_cwt += quantity_cwt"]
+  - method: POST
+    path: "/mill/byproduct-orders/{id}/release"
+    description: "Release a RESERVED order back to OPEN"
+    roles: [Merchandiser]
+    code: 200
+    input: []
+    output: ByproductSaleOrder
+    side_effects: ["status -> OPEN", "reserved_cwt -= quantity_cwt"]
+  - method: POST
+    path: "/mill/byproduct-orders/{id}/ship"
+    description: "Ship a RESERVED order"
+    roles: [Merchandiser]
+    code: 200
+    input: []
+    output: ByproductSaleOrder
+    side_effects: ["status -> SHIPPED", "reserved -= q; shipped += q"]
+  - method: POST
+    path: "/mill/byproduct-orders/{id}/cancel"
+    description: "Cancel an OPEN or RESERVED order"
+    roles: [Merchandiser]
+    code: 200
+    input: []
+    output: ByproductSaleOrder
+    side_effects: ["status -> CANCELLED", "reservation released if any"]
+
+  # --- FumigationEvent ---
+  - method: POST
+    path: "/mill/fumigation-events"
+    description: "Log a fumigation treatment on a bin; half-open window conflict check; bin -> FUMIGATING and PLANNED drying runs auto-cancel"
+    roles: [FumigationTech]
+    code: 201
+    input: [season_id, bin_id, fumigant_code, applicator_license, started_at, exposure_hours, aeration_hours]
+    output: FumigationEvent
+    side_effects: ["status = ACTIVE", "bin AVAILABLE -> FUMIGATING; Bin.version incremented", "PLANNED drying runs targeting bin -> CANCELLED with reservation release"]
+  - method: GET
+    path: "/mill/fumigation-events"
+    description: "List fumigation events (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "bin_id?", "status?"]
+    output: "FumigationEvent[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/fumigation-events/{id}"
+    description: "Get one fumigation event"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: FumigationEvent
+    side_effects: []
+  - method: POST
+    path: "/mill/fumigation-events/{id}/begin-aeration"
+    description: "ACTIVE -> AERATING once exposure window elapsed on the season clock"
+    roles: [FumigationTech]
+    code: 200
+    input: []
+    output: FumigationEvent
+    side_effects: ["status -> AERATING", "bin FUMIGATING -> AERATING; Bin.version incremented"]
+  - method: POST
+    path: "/mill/fumigation-events/{id}/clear"
+    description: "AERATING -> CLEARED once clearance time reached; bin returns to AVAILABLE"
+    roles: [FumigationTech]
+    code: 200
+    input: []
+    output: FumigationEvent
+    side_effects: ["status -> CLEARED", "bin AERATING -> AVAILABLE; Bin.version incremented"]
+
+  # --- FoodSafetyHold ---
+  - method: POST
+    path: "/mill/holds"
+    description: "Place a food-safety hold on a bin or a lot (polymorphic target)"
+    roles: [SafetyOfficer]
+    code: 201
+    input: [season_id, target_type, target_id, reason_code]
+    output: FoodSafetyHold
+    side_effects: ["status = ACTIVE"]
+  - method: GET
+    path: "/mill/holds"
+    description: "List holds (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "target_type?", "target_id?", "status?"]
+    output: "FoodSafetyHold[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/holds/{id}"
+    description: "Get one hold"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: FoodSafetyHold
+    side_effects: []
+  - method: POST
+    path: "/mill/holds/{id}/release"
+    description: "Release an ACTIVE hold"
+    roles: [SafetyOfficer]
+    code: 200
+    input: [resolution_note]
+    output: FoodSafetyHold
+    side_effects: ["status -> RELEASED"]
+
+  # --- Settlement ---
+  - method: POST
+    path: "/mill/settlements"
+    description: "Draft a settlement: snapshots eligible BINNED unsettled lots for the grower in the period; computes provisional amounts"
+    roles: [SettlementClerk]
+    code: 201
+    input: [season_id, grower_id, period_start_date, period_end_date]
+    output: Settlement
+    side_effects: ["status = DRAFT", "lot_ids snapshot; lot.settlement_id set on members", "provisional_* computed (per-line rounding variant)", "created_by_user_id = X-User-ID"]
+  - method: GET
+    path: "/mill/settlements"
+    description: "List settlements (filterable)"
+    roles: *all_roles
+    code: 200
+    input: ["limit?", "offset?", "season_id?", "grower_id?", "status?"]
+    output: "Settlement[]"
+    side_effects: []
+  - method: GET
+    path: "/mill/settlements/{id}"
+    description: "Get one settlement"
+    roles: *all_roles
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: []
+  - method: POST
+    path: "/mill/settlements/{id}/issue-provisional"
+    description: "DRAFT -> PROVISIONAL_ISSUED (locks provisional snapshot)"
+    roles: [SettlementClerk]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["status -> PROVISIONAL_ISSUED"]
+  - method: POST
+    path: "/mill/settlements/{id}/approve"
+    description: "PROVISIONAL_ISSUED -> APPROVED; final aggregate-rounding computation; lots -> SETTLED; approver must differ from creator"
+    roles: [SettlementClerk]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["status -> APPROVED", "final_* computed (aggregate rounding variant)", "member lots BINNED -> SETTLED"]
+  - method: POST
+    path: "/mill/settlements/{id}/pay"
+    description: "APPROVED -> PAID; applies advance repayment and credits grower"
+    roles: [SettlementClerk]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["status -> PAID", "grower.advance_outstanding_cents -= final_advance_repay_cents", "grower.cumulative_paid_cents += final_net_cents; Grower.version incremented"]
+  - method: POST
+    path: "/mill/settlements/{id}/dispute"
+    description: "PROVISIONAL_ISSUED or APPROVED -> DISPUTED; approved disputes revert lots to BINNED and season to INTAKE_CLOSED"
+    roles: [SettlementClerk, GrowerRep]
+    code: 200
+    input: [dispute_reason]
+    output: Settlement
+    side_effects: ["status -> DISPUTED", "from APPROVED: lots revert to BINNED", "season SETTLEMENT_REVIEW -> INTAKE_CLOSED"]
+  - method: POST
+    path: "/mill/settlements/{id}/revise"
+    description: "DISPUTED -> DRAFT; provisional amounts recomputed over same lots"
+    roles: [SettlementClerk]
+    code: 200
+    input: []
+    output: Settlement
+    side_effects: ["status -> DRAFT", "provisional_* recomputed"]
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or role unrecognized" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_IDENTITY_SCOPE_VIOLATION, http: 403, condition: "GrowerRep X-User-ID does not match the target resource's grower_id" }
+  - { id: ERR_SOD_APPROVER_IS_CREATOR, http: 403, condition: "Settlement approver X-User-ID equals settlement.created_by_user_id (segregation of duties)" }
+  # --- request shape ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/invalid required field, bad enum value, tare_weight_lbs >= gross_weight_lbs, ends_at <= starts_at, CONTRACT lot missing contract_id/expected_contract_version or grower/variety mismatch with contract, SPOT lot missing spot_price_cents_per_cwt, fumigation started_at in the future" }
+  # --- existence (404) ---
+  - { id: ERR_SEASON_NOT_FOUND, http: 404, condition: "HarvestSeason id not found" }
+  - { id: ERR_GROWER_NOT_FOUND, http: 404, condition: "Grower id not found (or in a different season than the target)" }
+  - { id: ERR_CONTRACT_NOT_FOUND, http: 404, condition: "DeliveryContract id not found (or different season)" }
+  - { id: ERR_BIN_NOT_FOUND, http: 404, condition: "Bin id not found (or different season)" }
+  - { id: ERR_LOT_NOT_FOUND, http: 404, condition: "PaddyLot id not found (or different season)" }
+  - { id: ERR_DRYING_RUN_NOT_FOUND, http: 404, condition: "DryingRun id not found" }
+  - { id: ERR_MILL_RUN_NOT_FOUND, http: 404, condition: "MillRun id not found" }
+  - { id: ERR_PACKAGING_RUN_NOT_FOUND, http: 404, condition: "PackagingRun id not found" }
+  - { id: ERR_BYPRODUCT_ORDER_NOT_FOUND, http: 404, condition: "ByproductSaleOrder id not found" }
+  - { id: ERR_FUMIGATION_NOT_FOUND, http: 404, condition: "FumigationEvent id not found" }
+  - { id: ERR_HOLD_NOT_FOUND, http: 404, condition: "FoodSafetyHold id not found" }
+  - { id: ERR_SETTLEMENT_NOT_FOUND, http: 404, condition: "Settlement id not found" }
+  # --- state (409) ---
+  - { id: ERR_INVALID_SEASON_STATE, http: 409, condition: "Season transition attempted from a state that does not allow it" }
+  - { id: ERR_SEASON_INTAKE_NOT_OPEN, http: 409, condition: "Lot creation requires season.status == INTAKE_OPEN" }
+  - { id: ERR_SEASON_NOT_SETTLEMENT_REVIEW, http: 409, condition: "Settlement approve requires season.status == SETTLEMENT_REVIEW" }
+  - { id: ERR_SEASON_REOPEN_BLOCKED, http: 409, condition: "Reopen-intake blocked: a settlement exists with status in {PROVISIONAL_ISSUED, APPROVED, PAID}" }
+  - { id: ERR_UNRESOLVED_INTAKE_WORK, http: 409, condition: "begin-settlement-review blocked: lots still WEIGHED/GRADED, a PLANNED drying run, or an IN_PROCESS mill run exists" }
+  - { id: ERR_UNPAID_SETTLEMENTS_EXIST, http: 409, condition: "Season settle blocked: a settlement exists not in PAID" }
+  - { id: ERR_OPEN_BYPRODUCT_ORDERS, http: 409, condition: "Season settle blocked: a byproduct order is OPEN or RESERVED" }
+  - { id: ERR_INVALID_LOT_STATE, http: 409, condition: "Lot transition attempted from a disallowed status (grade requires WEIGHED; regrade requires GRADED/BINNED; reject requires WEIGHED/GRADED; store requires GRADED)" }
+  - { id: ERR_CONTRACT_NOT_OPEN, http: 409, condition: "Lot booking or cancel requires contract status in {OPEN, PARTIALLY_FULFILLED}" }
+  - { id: ERR_CONTRACT_HAS_DELIVERIES, http: 409, condition: "Contract cancel/amend blocked: fulfilled_cwt > 0" }
+  - { id: ERR_BIN_NOT_RECEIVE_READY, http: 409, condition: "Bin status is FUMIGATING or AERATING; cannot receive or release grain" }
+  - { id: ERR_BIN_FUMIGATION_ACTIVE, http: 409, condition: "Fumigation create requires bin.status == AVAILABLE" }
+  - { id: ERR_DRYING_RUN_NOT_PLANNED, http: 409, condition: "Drying-run complete/cancel requires status PLANNED" }
+  - { id: ERR_MILL_RUN_INVALID_STATE, http: 409, condition: "Mill-run start requires SCHEDULED; complete requires IN_PROCESS; verify/void require COMPLETED" }
+  - { id: ERR_PACKAGING_RUN_INVALID_STATE, http: 409, condition: "Packaging complete/cancel requires status SCHEDULED" }
+  - { id: ERR_ORDER_INVALID_STATE, http: 409, condition: "Byproduct order transition attempted from a disallowed status" }
+  - { id: ERR_FUMIGATION_INVALID_STATE, http: 409, condition: "begin-aeration requires ACTIVE; clear requires AERATING" }
+  - { id: ERR_HOLD_ALREADY_RELEASED, http: 409, condition: "Hold release requires status ACTIVE" }
+  - { id: ERR_SETTLEMENT_INVALID_STATE, http: 409, condition: "Settlement transition attempted from a disallowed status" }
+  # --- OCC (412) ---
+  - { id: ERR_STALE_CONTRACT_VERSION, http: 412, condition: "expected_contract_version does not match the contract's current version" }
+  # --- business safety (422) ---
+  - { id: ERR_ACTIVE_HOLD_BLOCKS_OPERATION, http: 422, condition: "An ACTIVE FoodSafetyHold on the lot or involved bin blocks the operation; also blocks season begin-settlement-review" }
+  # --- business temporal (409) ---
+  - { id: ERR_OUTSIDE_INTAKE_WINDOW, http: 409, condition: "Lot scheduled_date outside [intake_start_date, intake_end_date]" }
+  - { id: ERR_EXPOSURE_INCOMPLETE, http: 409, condition: "begin-aeration before season clock reaches exposure_ends_at" }
+  - { id: ERR_AERATION_INCOMPLETE, http: 409, condition: "clear before season clock reaches clearance_at" }
+  - { id: ERR_LINE_SCHEDULE_CONFLICT, http: 409, condition: "Packaging run overlaps another SCHEDULED run on the same line within the 30-minute changeover buffer" }
+  - { id: ERR_FUMIGATION_WINDOW_CONFLICT, http: 409, condition: "Fumigation window [started_at, clearance_at) overlaps another event on the same bin" }
+  # --- business constraint ---
+  - { id: ERR_DUPLICATE_FARM_CODE, http: 409, condition: "farm_code already used within the season" }
+  - { id: ERR_DUPLICATE_BIN_CODE, http: 409, condition: "bin_code already used within the season" }
+  - { id: ERR_BIN_VARIETY_MISMATCH, http: 422, condition: "Bin variety_lock differs from incoming lot variety" }
+  - { id: ERR_LOT_ALREADY_IN_DRYING_RUN, http: 409, condition: "Lot is already referenced by a non-terminal drying run" }
+  - { id: ERR_OVERDELIVERY_BEYOND_TOLERANCE, http: 422, condition: "Grading would push contract fulfilled_cwt beyond 105% of contracted_cwt" }
+  - { id: ERR_SETTLEMENT_PERIOD_EMPTY, http: 422, condition: "No eligible BINNED unsettled lots for grower in the period" }
+  # --- business fiscal / capacity (409) ---
+  - { id: ERR_BIN_CAPACITY_EXCEEDED, http: 409, condition: "Allocation would exceed bin.available_cwt (store, drying-run create, regrade weight increase)" }
+  - { id: ERR_SPOT_CAP_REACHED, http: 409, condition: "Daily SPOT intake cap reached for scheduled_date" }
+  - { id: ERR_MILL_INPUT_EXCEEDS_BIN_STOCK, http: 409, condition: "Mill-run input_cwt exceeds bin.stock_cwt at start" }
+  - { id: ERR_INSUFFICIENT_BYPRODUCT_INVENTORY, http: 409, condition: "Reserve quantity exceeds available byproduct inventory" }
+  - { id: ERR_INSUFFICIENT_MILLED_RICE, http: 409, condition: "Packaging completion consumes more head rice than inventory available" }
+  - { id: ERR_INVENTORY_ADJUSTMENT_NEGATIVE, http: 409, condition: "Mill-run void or verify would drive a product's available inventory below zero" }
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: MillAdmin
+    description: "Facility administrator: seasons, bins, logical clock, season lifecycle"
+    identity: opaque
+    exclusive_operations:
+      - "POST /mill/seasons; POST /mill/seasons/{id}/open-intake|close-intake|reopen-intake|begin-settlement-review|settle|clock/set"
+      - "POST /mill/bins"
+    shared_operations: ["all GET endpoints"]
+  - name: Merchandiser
+    description: "Grain merchandiser: grower onboarding, contracts, byproduct sales"
+    identity: opaque
+    exclusive_operations:
+      - "POST /mill/growers"
+      - "POST /mill/contracts; PUT /mill/contracts/{id}; POST /mill/contracts/{id}/cancel"
+      - "POST /mill/byproduct-orders; reserve|release|ship|cancel"
+    shared_operations: ["all GET endpoints"]
+  - name: ScaleOperator
+    description: "Weighmaster: scale-ticket intake and direct bin storage"
+    identity: opaque
+    exclusive_operations: ["POST /mill/lots", "POST /mill/lots/{id}/store"]
+    shared_operations: ["all GET endpoints"]
+  - name: QualityLabTech
+    description: "Grading laboratory: official grading, regrade, quality rejection"
+    identity: opaque
+    exclusive_operations: ["POST /mill/lots/{id}/grade", "POST /mill/lots/{id}/regrade", "POST /mill/lots/{id}/reject"]
+    shared_operations: ["all GET endpoints"]
+  - name: DryerOperator
+    description: "Drying plant operator: drying runs"
+    identity: opaque
+    exclusive_operations: ["POST /mill/drying-runs", "POST /mill/drying-runs/{id}/complete", "POST /mill/drying-runs/{id}/cancel"]
+    shared_operations: ["all GET endpoints"]
+  - name: MillSupervisor
+    description: "Mill and packaging floor supervisor"
+    identity: opaque
+    exclusive_operations:
+      - "POST /mill/mill-runs; start|complete|verify|void"
+      - "POST /mill/packaging-runs; complete|cancel"
+    shared_operations: ["all GET endpoints"]
+  - name: SettlementClerk
+    description: "Grower accounting: settlement lifecycle; may not approve own drafts"
+    identity: opaque
+    exclusive_operations: ["POST /mill/settlements", "issue-provisional", "approve", "pay", "revise"]
+    shared_operations: ["all GET endpoints", "POST /mill/settlements/{id}/dispute (shared with GrowerRep)"]
+  - name: GrowerRep
+    description: "External grower representative; reads and disputes only own records"
+    identity: "entity_backed:Grower"
+    exclusive_operations: []
+    shared_operations:
+      - "GET endpoints scoped to resources whose grower_id == X-User-ID (ERR_IDENTITY_SCOPE_VIOLATION otherwise)"
+      - "POST /mill/settlements/{id}/dispute (shared with SettlementClerk; own settlements only)"
+  - name: SafetyOfficer
+    description: "Food-safety compliance: holds on bins and lots"
+    identity: opaque
+    exclusive_operations: ["POST /mill/holds", "POST /mill/holds/{id}/release"]
+    shared_operations: ["all GET endpoints"]
+  - name: FumigationTech
+    description: "Licensed fumigation applicator: treatment records"
+    identity: opaque
+    exclusive_operations: ["POST /mill/fumigation-events", "begin-aeration", "clear"]
+    shared_operations: ["all GET endpoints"]
+
+
+
+

@@ -1,0 +1,1161 @@
+# =============================================================================
+# Livestock Transport & Hauling (cattle hauling carrier) — scaffold seed tables
+# =============================================================================
+
+scenario: |
+  Livestock Transport & Hauling (cattle hauling carrier): load planning by species/weight & trailer compartment, driver hours & rest/unload requirements, health paper & brand inspection verification, shrink allowance & delivery weight dispute, biosecurity washout between loads, weather (heat/cold) hold decision, backhaul & rate per loaded mile, animal welfare incident reporting
+
+domain_name: livestock-transport-hauling
+api_prefix: /haul
+
+complexity_profile:
+  primary_archetype: quota_allocation        # trailer compartment capacity (head/weight) competed for by co-planned loads
+  secondary_archetype: compliance_audit      # health papers, brand inspection, washout log, welfare incidents, SoD
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Load.version (plan), Driver.version (assign), Settlement.version (counter)
+    - cascading_side_effects                 # deliver -> driver clocks -> cycle exhaustion -> unassign -> trailer release
+    - dual_variant_calculation               # provisional vs final settlement; session vs calendar-day driving minutes
+    - rate_threshold_triggers                # HOS 660/840/480/4200, confinement 1680, rest 300, washout 96h, weather thresholds
+  entity_topology: flat                      # peer entities joined by foreign keys, no nested ownership paths
+  state_machine_shape: cyclic                # Load IN_TRANSIT<->WEATHER_HOLD / DRAFT<->PLANNED; Settlement DISPUTED<->COUNTERED
+  relationship_patterns:
+    - one_to_many                            # Trailer->TrailerCompartment, Load->CompartmentAllocation, Load->papers/tickets/holds
+    - self_referential                       # Load.backhaul_of_load_id -> Load.id
+    - cross_aggregate                        # CompartmentAllocation -> TrailerCompartment; WelfareIncident -> Driver
+  role_model: segregation_of_duties          # paper creator cannot verify own paper; disjoint operational roles
+  consistency_model: immediate               # all derived fields recomputed within the triggering request
+
+# =============================================================================
+# Table 1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Shipper
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Shipper (ranch/feedlot) legal name" }
+      - { name: contact_email, type: string, source: input, description: "Billing contact email" }
+      - { name: default_shrink_allowance_pct, type: number, source: input, default: 2.0, description: "Default shrink allowance percent applied to loads without an override" }
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Driver full name" }
+      - { name: license_no, type: string, source: input, description: "CDL license number; unique across drivers" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | SUSPENDED; SUSPENDED when critical_incident_count_90d >= 2", constraints: "ACTIVE | SUSPENDED" }
+      - { name: session_driving_minutes, type: integer, source: computed, description: "Driving minutes since end of last off-duty gap >= 600 min (HOS 11-hour session clock)" }
+      - { name: calendar_day_driving_minutes, type: integer, source: computed, description: "Driving minutes within current UTC calendar day [midnight, now], intervals clipped at midnight" }
+      - { name: cycle_on_duty_minutes_8d, type: integer, source: computed, description: "On-duty minutes (DUTY_ON..DUTY_OFF, open interval counted to now) clipped to trailing window [now-8*1440min, now]" }
+      - { name: driving_since_break_minutes, type: integer, source: computed, description: "Driving minutes accumulated since end of last qualifying break (BREAK interval >= 30 min or off-duty gap >= 30 min) or session start" }
+      - { name: duty_window_expires_at, type: datetime, source: computed, description: "Latest DUTY_ON preceded by >= 600 min off-duty, plus 840 min; null when no anchored shift" }
+      - { name: hos_status, type: enum, source: computed, description: "CYCLE_EXHAUSTED if cycle_on_duty_minutes_8d >= 4200; else SESSION_EXHAUSTED if session_driving_minutes >= 660; else WINDOW_CLOSED if on duty and now > duty_window_expires_at; else BREAK_REQUIRED if driving_since_break_minutes >= 480; else ELIGIBLE", constraints: "ELIGIBLE | BREAK_REQUIRED | SESSION_EXHAUSTED | WINDOW_CLOSED | CYCLE_EXHAUSTED" }
+      - { name: critical_incident_count_90d, type: integer, source: computed, description: "Count of CLOSED WelfareIncident rows with severity CRITICAL and occurred_at >= now - 90 days for this driver" }
+
+  - name: DriverDutyEvent
+    parent: null
+    common_fields: false
+    fields:
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id" }
+      - { name: event_type, type: enum, source: input, description: "Duty event kind", constraints: "DUTY_ON | DUTY_OFF | DRIVING_ON | DRIVING_OFF | BREAK_START | BREAK_END" }
+      - { name: occurred_at, type: datetime, source: input, description: "Event timestamp; must be <= current logical clock and >= previous event's occurred_at (equal allowed)" }
+      - { name: source, type: enum, source: system, default: MANUAL, description: "MANUAL (posted) | SYSTEM (appended by depart/arrive/deliver/hold transitions)", constraints: "MANUAL | SYSTEM" }
+      - { name: load_id, type: string, source: system, description: "Load id for SYSTEM events; null for MANUAL. FK -> Load.id; nullable" }
+
+  - name: Trailer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: trailer_no, type: string, source: input, description: "Fleet trailer number; unique" }
+      - { name: max_gross_weight_lb, type: integer, source: input, description: "GVWR limit; a single load's allocated_weight_lb must be <= this" }
+      - { name: washout_status, type: enum, source: computed, description: "DIRTY if never washed or a delivered load dirtied it after last wash; else STALE if now > last_washed_at + 96h; else CLEAN", constraints: "CLEAN | DIRTY | STALE" }
+      - { name: last_washed_at, type: datetime, source: system, description: "washed_at of most recent WashoutEvent; null if none" }
+      - { name: washout_valid_until, type: datetime, source: computed, description: "last_washed_at + 96 hours; null if never washed" }
+      - { name: dirtied_at, type: datetime, source: system, description: "Set to delivered_at when a load on this trailer is DELIVERED; null otherwise; cleared when a washout is recorded" }
+      - { name: reserved_until, type: datetime, source: computed, description: "Max planned window end (planned_departure_at + planned_duration_hours) over this trailer's loads in ASSIGNED..ARRIVED; null when none" }
+
+  - name: TrailerCompartment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: trailer_id, type: string, source: system, description: "FK -> Trailer.id" }
+      - { name: compartment_index, type: integer, source: input, description: "1-based compartment number; unique per trailer" }
+      - { name: max_head_count, type: integer, source: input, description: "Maximum animals in this compartment (> 0)" }
+      - { name: max_weight_lb, type: integer, source: input, description: "Maximum live weight lb in this compartment (> 0)" }
+      - { name: occupied_head_count, type: integer, source: computed, description: "Sum of head_count over ACTIVE CompartmentAllocation rows for this compartment" }
+      - { name: occupied_weight_lb, type: integer, source: computed, description: "Sum of weight_lb over ACTIVE CompartmentAllocation rows for this compartment" }
+
+  - name: Load
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shipper_id, type: string, source: input, description: "FK -> Shipper.id" }
+      - { name: species, type: enum, source: input, description: "Species hauled (single species per load)", constraints: "CATTLE | SWINE | SHEEP | HORSES" }
+      - { name: declared_head_count, type: integer, source: input, description: "Shipper-declared animal count (> 0)" }
+      - { name: declared_weight_lb, type: integer, source: input, description: "Shipper-declared origin weight lb (> 0)" }
+      - { name: origin, type: string, source: input, description: "Origin location (free text)" }
+      - { name: destination, type: string, source: input, description: "Destination location (free text)" }
+      - { name: planned_departure_at, type: datetime, source: input, description: "Planned departure time (planned window start)" }
+      - { name: planned_duration_hours, type: integer, source: input, description: "Planned trip hours (> 0); planned window end = planned_departure_at + planned_duration_hours" }
+      - { name: rate_per_loaded_mile_cents, type: integer, source: input, description: "Contract rate in cents per loaded mile (> 0)" }
+      - { name: loaded_miles, type: integer, source: input, description: "Contract loaded miles (> 0)" }
+      - { name: shrink_allowance_pct, type: number, source: input, default: null, description: "Optional per-load shrink allowance percent override; null means use shipper default" }
+      - { name: effective_shrink_pct, type: number, source: computed, description: "= shrink_allowance_pct if not null, else Shipper.default_shrink_allowance_pct" }
+      - { name: backhaul_of_load_id, type: string, source: input, default: null, description: "FK -> Load.id; optional self-reference declaring this load the backhaul of a delivered load; nullable" }
+      - { name: is_backhaul, type: boolean, source: computed, description: "= backhaul_of_load_id is not null" }
+      - { name: driver_id, type: string, source: system, default: null, description: "FK -> Driver.id; set by assign-driver, cleared by unassign/cascade; nullable" }
+      - { name: trailer_id, type: string, source: system, default: null, description: "FK -> Trailer.id; bound at finalize-plan from allocations' compartments; nullable" }
+      - { name: status, type: enum, source: system, description: "Load lifecycle", constraints: "DRAFT | PLANNED | PAPERWORK_VERIFIED | ASSIGNED | IN_TRANSIT | WEATHER_HOLD | REST_UNLOAD | ARRIVED | DELIVERED | CANCELLED" }
+      - { name: allocated_head_count, type: integer, source: computed, description: "Sum of head_count over ACTIVE allocations" }
+      - { name: allocated_weight_lb, type: integer, source: computed, description: "Sum of weight_lb over ACTIVE allocations" }
+      - { name: confinement_anchor_at, type: datetime, source: system, default: null, description: "Set at depart; reset at resume-transit; confinement minutes = now - confinement_anchor_at" }
+      - { name: rest_unload_started_at, type: datetime, source: system, default: null, description: "Set when entering REST_UNLOAD" }
+      - { name: departed_at, type: datetime, source: system, default: null, description: "Actual departure time" }
+      - { name: arrived_at, type: datetime, source: system, default: null, description: "Actual arrival time" }
+      - { name: delivered_at, type: datetime, source: system, default: null, description: "Delivery confirmation time" }
+
+  - name: CompartmentAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id" }
+      - { name: trailer_compartment_id, type: string, source: input, description: "FK -> TrailerCompartment.id" }
+      - { name: head_count, type: integer, source: input, description: "Animals placed in the compartment (> 0)" }
+      - { name: avg_weight_lb, type: number, source: input, description: "Average weight per animal lb (> 0)" }
+      - { name: weight_lb, type: integer, source: computed, description: "= round_half_up(head_count * avg_weight_lb) to whole lb; per-allocation rounding is pinned before any summation" }
+      - { name: status, type: enum, source: system, description: "ACTIVE while planned/in service; RELEASED when removed", constraints: "ACTIVE | RELEASED" }
+      - { name: release_reason, type: enum, source: system, default: null, description: "REPLANNED (manual release or reopen-plan) | CANCELLED (load cancelled) | DELIVERED (load delivered); null while ACTIVE", constraints: "REPLANNED | CANCELLED | DELIVERED" }
+
+  - name: HealthPaper
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id" }
+      - { name: cert_number, type: string, source: input, description: "Certificate of veterinary inspection number" }
+      - { name: species, type: enum, source: input, description: "Species covered; must equal Load.species at verify", constraints: "CATTLE | SWINE | SHEEP | HORSES" }
+      - { name: head_count_listed, type: integer, source: input, description: "Head count on certificate; must equal Load.declared_head_count at verify" }
+      - { name: issued_at, type: datetime, source: input, description: "Issue timestamp (<= now)" }
+      - { name: expires_at, type: datetime, source: input, description: "Expiry timestamp; must be > issued_at and > Load.planned_departure_at at verify" }
+      - { name: status, type: enum, source: system, description: "Verification state", constraints: "PENDING | VERIFIED | REJECTED" }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of creator (audit; segregation-of-duties check on verify)" }
+      - { name: verified_by_user_id, type: string, source: system, default: null, description: "X-User-ID of verifier; null until verified" }
+
+  - name: BrandInspection
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id" }
+      - { name: inspection_no, type: string, source: input, description: "Brand inspection certificate number" }
+      - { name: inspected_at, type: datetime, source: input, description: "Inspection timestamp; must be <= now and within 96h before Load.planned_departure_at at verify" }
+      - { name: brand_owner, type: string, source: input, description: "Registered brand owner name" }
+      - { name: head_count_inspected, type: integer, source: input, description: "Head count inspected; must equal Load.declared_head_count at verify" }
+      - { name: status, type: enum, source: system, description: "Verification state", constraints: "PENDING | VERIFIED | REJECTED" }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of creator (audit; segregation-of-duties check on verify)" }
+      - { name: verified_by_user_id, type: string, source: system, default: null, description: "X-User-ID of verifier; null until verified" }
+
+  - name: WashoutEvent
+    parent: null
+    common_fields: false
+    fields:
+      - { name: trailer_id, type: string, source: system, description: "FK -> Trailer.id" }
+      - { name: washed_at, type: datetime, source: input, description: "Wash completion timestamp; must be <= now" }
+      - { name: method, type: enum, source: input, description: "Wash method", constraints: "HIGH_PRESSURE | STEAM | CHEMICAL" }
+      - { name: operator_note, type: string, source: input, default: null, description: "Optional note" }
+
+  - name: WeightTicket
+    parent: null
+    common_fields: false
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id" }
+      - { name: ticket_type, type: enum, source: input, description: "Scale ticket kind", constraints: "ORIGIN | DELIVERY" }
+      - { name: gross_lb, type: integer, source: input, description: "Gross weight lb; must be > tare_lb" }
+      - { name: tare_lb, type: integer, source: input, description: "Tare weight lb (>= 0)" }
+      - { name: net_weight_lb, type: integer, source: computed, description: "= gross_lb - tare_lb" }
+      - { name: weighed_at, type: datetime, source: input, description: "Weigh timestamp; must be <= now" }
+
+  - name: Settlement
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id; unique (1:1 with Load)" }
+      - { name: status, type: enum, source: system, description: "Settlement lifecycle", constraints: "PRELIMINARY | PENDING | DISPUTED | COUNTERED | RESOLVED | PAID" }
+      - { name: base_amount_cents, type: integer, source: computed, description: "= round_half_up(rate_per_loaded_mile_cents * loaded_miles); if is_backhaul then round_half_up(that * 0.85) — pinned order: round product first, then discount, then round again" }
+      - { name: provisional_amount_cents, type: integer, source: computed, description: "= base_amount_cents at depart; provisional assumes on-weight delivery (no shrink penalty, no welfare deduction)" }
+      - { name: shrink_allowance_lb, type: integer, source: computed, description: "= round_half_up(declared_weight_lb * effective_shrink_pct / 100) to whole lb; computed at delivery" }
+      - { name: delivered_weight_lb, type: integer, source: system, default: null, description: "Net lb of latest DELIVERY WeightTicket at delivery; refreshed on reweigh while PENDING" }
+      - { name: effective_delivered_weight_lb, type: integer, source: system, default: null, description: "Weight basis for final calc: delivered_weight_lb, or counter_weight_lb after accept-counter" }
+      - { name: shrink_lb, type: integer, source: computed, description: "= max(0, declared_weight_lb - effective_delivered_weight_lb)" }
+      - { name: excess_shrink_lb, type: integer, source: computed, description: "= max(0, shrink_lb - shrink_allowance_lb)" }
+      - { name: shrink_penalty_cents, type: integer, source: computed, description: "= round_half_up(excess_shrink_lb * 2.5) cents" }
+      - { name: welfare_deduction_cents, type: integer, source: computed, description: "Sum of fine_cents over CLOSED non-waived WelfareIncident rows for this load; recomputed at each incident close" }
+      - { name: dispute_adjustment_cents, type: integer, source: computed, description: "= shrink_penalty_cents as computed at delivery minus shrink_penalty_cents as recomputed at dispute resolution (0 unless resolution changed the weight basis)" }
+      - { name: final_amount_cents, type: integer, source: computed, description: "= max(0, provisional_amount_cents - shrink_penalty_cents - welfare_deduction_cents); identity final == provisional - shrink_penalty - welfare_deduction holds after every mutation" }
+      - { name: dispute_deadline_at, type: datetime, source: system, default: null, description: "= delivered_at + 48 hours; dispute allowed while now <= deadline (inclusive)" }
+      - { name: disputed_weight_lb, type: integer, source: system, default: null, description: "Weight claimed by consignee at latest dispute" }
+      - { name: counter_weight_lb, type: integer, source: system, default: null, description: "Weight countered by dispatcher at latest counter" }
+      - { name: paid_at, type: datetime, source: system, default: null, description: "Set when PAID" }
+
+  - name: WelfareIncident
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: input, description: "FK -> Load.id" }
+      - { name: driver_id, type: string, source: system, description: "FK -> Driver.id; reporter = X-User-ID of Driver role" }
+      - { name: incident_type, type: enum, source: input, description: "Incident kind", constraints: "INJURY | DOWNER | DEAD_ON_ARRIVAL | ESCAPE" }
+      - { name: severity, type: enum, source: input, description: "Severity", constraints: "MINOR | MAJOR | CRITICAL" }
+      - { name: head_count_affected, type: integer, source: input, description: "Animals affected (>= 1)" }
+      - { name: occurred_at, type: datetime, source: input, description: "Incident timestamp; must be <= now" }
+      - { name: description, type: string, source: input, default: null, description: "Optional narrative" }
+      - { name: status, type: enum, source: system, description: "Review state", constraints: "REPORTED | UNDER_REVIEW | CLOSED" }
+      - { name: fine_cents, type: integer, source: computed, description: "At close: 0 if fine_waived else round_half_up(BASE_CENTS[incident_type] * head_count_affected * SEVERITY_MULT[severity]); per-incident rounding pinned before summation" }
+      - { name: fine_waived, type: boolean, source: system, default: false, description: "Set from close input" }
+      - { name: closed_at, type: datetime, source: system, default: null, description: "Set when CLOSED" }
+
+  - name: WeatherHold
+    parent: null
+    common_fields: true
+    fields:
+      - { name: load_id, type: string, source: system, description: "FK -> Load.id" }
+      - { name: hold_type, type: enum, source: input, description: "Hold kind", constraints: "HEAT | COLD" }
+      - { name: temperature_f, type: integer, source: input, description: "Observed temperature F driving the hold" }
+      - { name: reason, type: string, source: input, default: null, description: "Optional narrative" }
+      - { name: status, type: enum, source: computed, description: "ACTIVE while released_at is null, else RELEASED", constraints: "ACTIVE | RELEASED" }
+      - { name: released_at, type: datetime, source: system, default: null, description: "Set by release endpoint" }
+
+# =============================================================================
+# Table 2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Load
+    initial_state: DRAFT
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: PLANNED
+        trigger: "POST /haul/loads/{id}/finalize-plan"
+        actor: Dispatcher
+        preconditions:
+          - "Load.status == DRAFT (ERR_LOAD_NOT_DRAFT)"
+          - "All ACTIVE allocations share one trailer (ERR_MIXED_TRAILER_ALLOCATIONS)"
+          - "allocated_head_count == declared_head_count and allocated_weight_lb == declared_weight_lb (ERR_ALLOCATION_TOTAL_MISMATCH)"
+          - "allocated_weight_lb <= trailer.max_gross_weight_lb (ERR_GVWR_EXCEEDED)"
+          - "At least one ACTIVE allocation exists (ERR_ALLOCATION_TOTAL_MISMATCH)"
+        side_effects:
+          - "Load.trailer_id := the single trailer of its ACTIVE allocations"
+          - "Load.version += 1"
+      - from: PLANNED
+        to: DRAFT
+        trigger: "POST /haul/loads/{id}/reopen-plan"
+        actor: Dispatcher
+        preconditions:
+          - "Load.status == PLANNED (ERR_LOAD_NOT_PLANNED)"
+        side_effects:
+          - "All ACTIVE allocations -> RELEASED with release_reason REPLANNED; compartment occupied_* recomputed"
+          - "Load.trailer_id := null; Load.version += 1"
+      - from: PLANNED
+        to: PAPERWORK_VERIFIED
+        trigger: "POST /haul/loads/{id}/verify-paperwork"
+        actor: ComplianceOfficer
+        preconditions:
+          - "Load.status == PLANNED (ERR_LOAD_NOT_PLANNED)"
+          - ">= 1 VERIFIED HealthPaper for this load with expires_at > planned_departure_at (ERR_PAPERWORK_INCOMPLETE)"
+          - ">= 1 VERIFIED BrandInspection for this load (ERR_PAPERWORK_INCOMPLETE)"
+        side_effects: ["Load.version += 1"]
+      - from: PAPERWORK_VERIFIED
+        to: ASSIGNED
+        trigger: "POST /haul/loads/{id}/assign-driver"
+        actor: Dispatcher
+        preconditions:
+          - "Load.status == PAPERWORK_VERIFIED (ERR_LOAD_NOT_PAPERWORK_VERIFIED)"
+          - "expected_driver_version == Driver.version (ERR_STALE_VERSION)"
+          - "Driver.status == ACTIVE (ERR_DRIVER_SUSPENDED)"
+          - "Driver.hos_status == ELIGIBLE (ERR_DRIVER_NOT_HOS_ELIGIBLE)"
+          - "No other load with driver_id == this driver and status in {ASSIGNED, IN_TRANSIT, WEATHER_HOLD, REST_UNLOAD, ARRIVED} has a planned window touching or overlapping this load's window; windows are CLOSED intervals so windowB.start == windowA.end conflicts (ERR_TRAILER_WINDOW_OVERLAP)"
+          - "No other load with trailer_id == this load's trailer and status in {ASSIGNED, IN_TRANSIT, WEATHER_HOLD, REST_UNLOAD, ARRIVED} has a planned window touching or overlapping this window (closed intervals) (ERR_TRAILER_WINDOW_OVERLAP)"
+        side_effects:
+          - "Load.driver_id := driver; Load.status := ASSIGNED; Load.version += 1"
+          - "Driver.version += 1 (assignment recorded on driver)"
+          - "Trailer.reserved_until recomputed"
+      - from: ASSIGNED
+        to: PAPERWORK_VERIFIED
+        trigger: "POST /haul/loads/{id}/unassign-driver"
+        actor: Dispatcher
+        preconditions:
+          - "Load.status == ASSIGNED (ERR_LOAD_NOT_ASSIGNED)"
+        side_effects:
+          - "Load.driver_id := null; Load.version += 1"
+          - "Driver.version += 1; Trailer.reserved_until recomputed"
+      - from: ASSIGNED
+        to: IN_TRANSIT
+        trigger: "POST /haul/loads/{id}/depart"
+        actor: Driver
+        preconditions:
+          - "Load.status == ASSIGNED (ERR_LOAD_NOT_ASSIGNED)"
+          - "X-User-ID == Load.driver_id (ERR_OWNERSHIP_MISMATCH)"
+          - "Trailer.washout_status == CLEAN at now (ERR_TRAILER_NOT_CLEAN)"
+          - "origin_temperature_f < HEAT_THRESHOLD[species] and origin_temperature_f > COLD_THRESHOLD[species] (ERR_WEATHER_HOLD_REQUIRED)"
+          - "Driver.hos_status == ELIGIBLE at now (ERR_DRIVER_NOT_HOS_ELIGIBLE)"
+          - "A VERIFIED HealthPaper with expires_at > now exists (ERR_PAPER_EXPIRED)"
+          - "A VERIFIED BrandInspection with now - inspected_at <= 96h exists (ERR_BRAND_INSPECTION_STALE)"
+        side_effects:
+          - "departed_at := now; confinement_anchor_at := now; Load.version += 1"
+          - "System DriverDutyEvent DUTY_ON at now if driver off duty, then DRIVING_ON at now (source SYSTEM)"
+          - "Settlement created: status PRELIMINARY, base_amount_cents and provisional_amount_cents computed (provisional_settlement)"
+          - "Trailer.reserved_until recomputed"
+      - from: ASSIGNED
+        to: WEATHER_HOLD
+        trigger: "POST /haul/loads/{id}/weather-holds"
+        actor: "Driver (own load) or Dispatcher"
+        preconditions:
+          - "Load.status in {ASSIGNED, IN_TRANSIT} (ERR_LOAD_NOT_HOLDABLE)"
+        side_effects:
+          - "WeatherHold row created (status ACTIVE); Load.status := WEATHER_HOLD; Load.version += 1"
+      - from: IN_TRANSIT
+        to: WEATHER_HOLD
+        trigger: "POST /haul/loads/{id}/weather-holds"
+        actor: "Driver (own load) or Dispatcher"
+        preconditions:
+          - "Load.status in {ASSIGNED, IN_TRANSIT} (ERR_LOAD_NOT_HOLDABLE)"
+        side_effects:
+          - "System DriverDutyEvent DRIVING_OFF at now (source SYSTEM)"
+          - "WeatherHold row created; Load.status := WEATHER_HOLD; Load.version += 1"
+      - from: WEATHER_HOLD
+        to: ASSIGNED
+        trigger: "POST /haul/weather-holds/{id}/release"
+        actor: "Dispatcher or Driver (own load)"
+        preconditions:
+          - "WeatherHold.status == ACTIVE (ERR_HOLD_NOT_ACTIVE)"
+          - "Load.departed_at is null (load was held before departure)"
+        side_effects:
+          - "WeatherHold.released_at := now; Load.status := ASSIGNED; Load.version += 1"
+      - from: WEATHER_HOLD
+        to: IN_TRANSIT
+        trigger: "POST /haul/weather-holds/{id}/release"
+        actor: "Dispatcher or Driver (own load)"
+        preconditions:
+          - "WeatherHold.status == ACTIVE (ERR_HOLD_NOT_ACTIVE)"
+          - "Load.departed_at is not null (load was held in transit)"
+        side_effects:
+          - "System DriverDutyEvent DRIVING_ON at now (source SYSTEM)"
+          - "WeatherHold.released_at := now; Load.status := IN_TRANSIT; Load.version += 1"
+      - from: IN_TRANSIT
+        to: REST_UNLOAD
+        trigger: "POST /haul/loads/{id}/rest-unload"
+        actor: Driver
+        preconditions:
+          - "Load.status == IN_TRANSIT (ERR_LOAD_NOT_IN_TRANSIT)"
+          - "X-User-ID == Load.driver_id (ERR_OWNERSHIP_MISMATCH)"
+        side_effects:
+          - "System DriverDutyEvent DRIVING_OFF at now"
+          - "rest_unload_started_at := now; Load.version += 1"
+      - from: REST_UNLOAD
+        to: IN_TRANSIT
+        trigger: "POST /haul/loads/{id}/resume-transit"
+        actor: Driver
+        preconditions:
+          - "Load.status == REST_UNLOAD (ERR_LOAD_NOT_REST_UNLOAD)"
+          - "X-User-ID == Load.driver_id (ERR_OWNERSHIP_MISMATCH)"
+          - "now - rest_unload_started_at >= 300 minutes (ERR_INSUFFICIENT_REST_UNLOAD)"
+        side_effects:
+          - "confinement_anchor_at := now (28-hour clock resets after >= 5h rest/unload)"
+          - "System DriverDutyEvent DRIVING_ON at now"
+          - "rest_unload_started_at := null; Load.version += 1"
+      - from: IN_TRANSIT
+        to: ARRIVED
+        trigger: "POST /haul/loads/{id}/arrive"
+        actor: Driver
+        preconditions:
+          - "Load.status == IN_TRANSIT (ERR_LOAD_NOT_IN_TRANSIT)"
+          - "X-User-ID == Load.driver_id (ERR_OWNERSHIP_MISMATCH)"
+          - "now - confinement_anchor_at <= 1680 minutes (ERR_CONFINEMENT_LIMIT_EXCEEDED; exactly 1680 allowed)"
+        side_effects:
+          - "arrived_at := now; System DriverDutyEvent DRIVING_OFF at now; Load.version += 1"
+      - from: ARRIVED
+        to: DELIVERED
+        trigger: "POST /haul/loads/{id}/deliver"
+        actor: ConsigneeAgent
+        preconditions:
+          - "Load.status == ARRIVED (ERR_LOAD_NOT_ARRIVED)"
+          - ">= 1 DELIVERY WeightTicket exists (ERR_NO_DELIVERY_TICKET)"
+        side_effects:
+          - "delivered_at := now; Load.version += 1"
+          - "System DriverDutyEvent DUTY_OFF at now if driver on duty"
+          - "All ACTIVE allocations -> RELEASED with release_reason DELIVERED; compartment occupied_* recomputed (chain link 1)"
+          - "Because the release reason is DELIVERED, Trailer.dirtied_at := now and washout_status recomputes to DIRTY (chain link 2; reason CANCELLED/REPLANNED does NOT dirty the trailer)"
+          - "Settlement: delivered_weight_lb := net of latest DELIVERY ticket (weighed_at DESC, created_at DESC tie-break); effective_delivered_weight_lb := same; shrink/final fields computed (final_settlement); status := PENDING; dispute_deadline_at := delivered_at + 48h"
+          - "Driver clocks recomputed from the appended duty events; if cycle_on_duty_minutes_8d >= 4200 then hos_status becomes CYCLE_EXHAUSTED and every OTHER load with this driver in ASSIGNED is force-unassigned -> PAPERWORK_VERIFIED (driver_id null, Load.version += 1) and its trailer's reserved_until recomputed (chain link 3)"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /haul/loads/{id}/cancel"
+        actor: Dispatcher
+        preconditions:
+          - "Load.status in {DRAFT, PLANNED, PAPERWORK_VERIFIED, ASSIGNED} (ERR_LOAD_NOT_CANCELLABLE)"
+        side_effects:
+          - "All ACTIVE allocations -> RELEASED with release_reason CANCELLED; compartment occupied_* recomputed; trailer NOT dirtied"
+          - "If ASSIGNED: Load.driver_id := null, Driver.version += 1, Trailer.reserved_until recomputed"
+          - "Load.trailer_id := null; Load.version += 1"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /haul/loads/{id}/cancel"
+        actor: Dispatcher
+        preconditions: ["Load.status in {DRAFT, PLANNED, PAPERWORK_VERIFIED, ASSIGNED} (ERR_LOAD_NOT_CANCELLABLE)"]
+        side_effects: ["Same cascade as DRAFT -> CANCELLED"]
+      - from: PAPERWORK_VERIFIED
+        to: CANCELLED
+        trigger: "POST /haul/loads/{id}/cancel"
+        actor: Dispatcher
+        preconditions: ["Load.status in {DRAFT, PLANNED, PAPERWORK_VERIFIED, ASSIGNED} (ERR_LOAD_NOT_CANCELLABLE)"]
+        side_effects: ["Same cascade as DRAFT -> CANCELLED"]
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "POST /haul/loads/{id}/cancel"
+        actor: Dispatcher
+        preconditions: ["Load.status in {DRAFT, PLANNED, PAPERWORK_VERIFIED, ASSIGNED} (ERR_LOAD_NOT_CANCELLABLE)"]
+        side_effects: ["Same cascade as DRAFT -> CANCELLED (driver unassigned, trailer window released)"]
+
+  - entity: Settlement
+    initial_state: PRELIMINARY
+    terminal_states: [PAID]
+    transitions:
+      - from: PRELIMINARY
+        to: PENDING
+        trigger: "system (Load deliver transition)"
+        actor: system
+        preconditions: []
+        side_effects: ["final_settlement computed; dispute_deadline_at := delivered_at + 48h"]
+      - from: PENDING
+        to: DISPUTED
+        trigger: "POST /haul/settlements/{id}/dispute"
+        actor: ConsigneeAgent
+        preconditions:
+          - "Settlement.status == PENDING (ERR_SETTLEMENT_NOT_PENDING)"
+          - "now <= dispute_deadline_at, inclusive (ERR_DISPUTE_WINDOW_CLOSED)"
+        side_effects: ["disputed_weight_lb := input; Settlement.version += 1"]
+      - from: DISPUTED
+        to: RESOLVED
+        trigger: "POST /haul/settlements/{id}/accept-original"
+        actor: ConsigneeAgent
+        preconditions:
+          - "Settlement.status == DISPUTED (ERR_SETTLEMENT_NOT_DISPUTED)"
+        side_effects:
+          - "effective_delivered_weight_lb := delivered_weight_lb; shrink fields recomputed (final_settlement); dispute_adjustment_cents := 0; Settlement.version += 1"
+      - from: DISPUTED
+        to: COUNTERED
+        trigger: "POST /haul/settlements/{id}/counter"
+        actor: Dispatcher
+        preconditions:
+          - "Settlement.status in {DISPUTED, COUNTERED} (ERR_SETTLEMENT_NOT_DISPUTED)"
+          - "expected_settlement_version == Settlement.version (ERR_STALE_VERSION)"
+        side_effects: ["counter_weight_lb := input; Settlement.version += 1"]
+      - from: COUNTERED
+        to: COUNTERED
+        trigger: "POST /haul/settlements/{id}/counter"
+        actor: Dispatcher
+        preconditions:
+          - "Settlement.status in {DISPUTED, COUNTERED} (ERR_SETTLEMENT_NOT_DISPUTED)"
+          - "expected_settlement_version == Settlement.version (ERR_STALE_VERSION)"
+        side_effects: ["counter_weight_lb := input (supersedes previous counter); Settlement.version += 1"]
+      - from: COUNTERED
+        to: DISPUTED
+        trigger: "POST /haul/settlements/{id}/redispute"
+        actor: ConsigneeAgent
+        preconditions:
+          - "Settlement.status == COUNTERED (ERR_SETTLEMENT_NOT_COUNTERED)"
+          - "now <= dispute_deadline_at, inclusive (ERR_DISPUTE_WINDOW_CLOSED)"
+        side_effects: ["disputed_weight_lb := input if provided; Settlement.version += 1"]
+      - from: COUNTERED
+        to: RESOLVED
+        trigger: "POST /haul/settlements/{id}/accept-counter"
+        actor: ConsigneeAgent
+        preconditions:
+          - "Settlement.status == COUNTERED (ERR_SETTLEMENT_NOT_COUNTERED)"
+        side_effects:
+          - "dispute_adjustment_cents := shrink_penalty_cents(at delivery basis) - shrink_penalty_cents(counter basis)"
+          - "effective_delivered_weight_lb := counter_weight_lb; shrink fields recomputed (final_settlement); Settlement.version += 1"
+      - from: RESOLVED
+        to: PAID
+        trigger: "POST /haul/settlements/{id}/pay"
+        actor: CarrierAdmin
+        preconditions:
+          - "Settlement.status in {PENDING, RESOLVED} (ERR_SETTLEMENT_NOT_PAYABLE from PRELIMINARY/PAID; ERR_UNRESOLVED_DISPUTE from DISPUTED/COUNTERED)"
+          - "No WelfareIncident with load_id == this load, severity CRITICAL, status in {REPORTED, UNDER_REVIEW} (ERR_OPEN_CRITICAL_INCIDENT)"
+          - "If status == PENDING: now > dispute_deadline_at, strictly (ERR_DISPUTE_WINDOW_OPEN)"
+        side_effects: ["paid_at := now; Settlement.version += 1"]
+      - from: PENDING
+        to: PAID
+        trigger: "POST /haul/settlements/{id}/pay"
+        actor: CarrierAdmin
+        preconditions:
+          - "Settlement.status in {PENDING, RESOLVED} (ERR_SETTLEMENT_NOT_PAYABLE from PRELIMINARY/PAID; ERR_UNRESOLVED_DISPUTE from DISPUTED/COUNTERED)"
+          - "No CRITICAL incident in {REPORTED, UNDER_REVIEW} for this load (ERR_OPEN_CRITICAL_INCIDENT)"
+          - "now > dispute_deadline_at, strictly (ERR_DISPUTE_WINDOW_OPEN)"
+        side_effects: ["paid_at := now; Settlement.version += 1"]
+
+  - entity: HealthPaper
+    initial_state: PENDING
+    terminal_states: [VERIFIED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /haul/health-papers/{id}/verify"
+        actor: ComplianceOfficer
+        preconditions:
+          - "HealthPaper.status == PENDING (ERR_PAPERWORK_NOT_PENDING)"
+          - "X-User-ID != created_by_user_id (ERR_SOD_VIOLATION)"
+          - "Load.status in {PLANNED, PAPERWORK_VERIFIED} (ERR_LOAD_NOT_PLANNED)"
+          - "species == Load.species and head_count_listed == Load.declared_head_count (ERR_PAPER_MISMATCH)"
+          - "expires_at > Load.planned_departure_at (ERR_PAPER_EXPIRED)"
+        side_effects: ["verified_by_user_id := X-User-ID; HealthPaper.version += 1"]
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /haul/health-papers/{id}/reject"
+        actor: ComplianceOfficer
+        preconditions: ["HealthPaper.status == PENDING (ERR_PAPERWORK_NOT_PENDING)"]
+        side_effects: ["HealthPaper.version += 1"]
+
+  - entity: BrandInspection
+    initial_state: PENDING
+    terminal_states: [VERIFIED, REJECTED]
+    transitions:
+      - from: PENDING
+        to: VERIFIED
+        trigger: "POST /haul/brand-inspections/{id}/verify"
+        actor: ComplianceOfficer
+        preconditions:
+          - "BrandInspection.status == PENDING (ERR_PAPERWORK_NOT_PENDING)"
+          - "X-User-ID != created_by_user_id (ERR_SOD_VIOLATION)"
+          - "Load.status in {PLANNED, PAPERWORK_VERIFIED} (ERR_LOAD_NOT_PLANNED)"
+          - "head_count_inspected == Load.declared_head_count (ERR_PAPER_MISMATCH)"
+          - "inspected_at <= now and Load.planned_departure_at - inspected_at <= 96h (ERR_BRAND_INSPECTION_STALE)"
+        side_effects: ["verified_by_user_id := X-User-ID; BrandInspection.version += 1"]
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /haul/brand-inspections/{id}/reject"
+        actor: ComplianceOfficer
+        preconditions: ["BrandInspection.status == PENDING (ERR_PAPERWORK_NOT_PENDING)"]
+        side_effects: ["BrandInspection.version += 1"]
+
+  - entity: WelfareIncident
+    initial_state: REPORTED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: REPORTED
+        to: UNDER_REVIEW
+        trigger: "POST /haul/incidents/{id}/start-review"
+        actor: ComplianceOfficer
+        preconditions: ["WelfareIncident.status == REPORTED (ERR_INCIDENT_NOT_REPORTED)"]
+        side_effects: ["WelfareIncident.version += 1"]
+      - from: UNDER_REVIEW
+        to: CLOSED
+        trigger: "POST /haul/incidents/{id}/close"
+        actor: ComplianceOfficer
+        preconditions: ["WelfareIncident.status == UNDER_REVIEW (ERR_INCIDENT_NOT_UNDER_REVIEW)"]
+        side_effects:
+          - "fine_cents computed (welfare_fine; 0 if fine_waived); closed_at := now; WelfareIncident.version += 1"
+          - "If the load's Settlement exists and status != PAID: welfare_deduction_cents recomputed and final_amount_cents recomputed (chain link 1: incident -> Settlement)"
+          - "Driver.critical_incident_count_90d recomputed; if >= 2 then Driver.status := SUSPENDED (chain link 2: incident -> Driver)"
+          - "On SUSPENDED: every load with this driver in ASSIGNED is force-unassigned -> PAPERWORK_VERIFIED (Load.driver_id null, Load.version += 1) and its trailer's reserved_until recomputed (chain link 3: Driver -> Load -> Trailer)"
+
+  - entity: WeatherHold
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /haul/weather-holds/{id}/release"
+        actor: "Dispatcher or Driver (own load)"
+        preconditions: ["WeatherHold.status == ACTIVE (ERR_HOLD_NOT_ACTIVE)"]
+        side_effects: ["released_at := now; Load resumes per Load state machine; WeatherHold.version += 1"]
+
+  - entity: CompartmentAllocation
+    initial_state: ACTIVE
+    terminal_states: [RELEASED]
+    transitions:
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /haul/allocations/{id}/release (or system: load cancel / deliver / reopen-plan)"
+        actor: Dispatcher
+        preconditions:
+          - "For manual release: Load.status == DRAFT (ERR_LOAD_NOT_DRAFT) and expected_load_version == Load.version (ERR_STALE_VERSION)"
+        side_effects:
+          - "release_reason := REPLANNED (manual/reopen) | CANCELLED (cancel) | DELIVERED (deliver)"
+          - "TrailerCompartment.occupied_head_count/occupied_weight_lb recomputed; Load.allocated_* recomputed; Load.version += 1"
+
+# =============================================================================
+# Section 1.2.1: Concurrency Rules (OCC on parent version; true races only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: occ-load-plan-allocation
+    parent_entity: Load
+    write_endpoint: "POST /haul/loads/{id}/allocations"
+    occ_field: expected_load_version
+    description: |
+      Creating a CompartmentAllocation against a Load whose version has advanced
+      since the client last observed the plan is rejected. After a reopen-plan
+      or another allocation, the client is allocating against a stale plan.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: occ-load-plan-release
+    parent_entity: Load
+    write_endpoint: "POST /haul/allocations/{id}/release"
+    occ_field: expected_load_version
+    description: |
+      Releasing an allocation against a Load whose version has advanced since
+      the client last observed the plan is rejected as stale.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: occ-driver-assignment
+    parent_entity: Driver
+    write_endpoint: "POST /haul/loads/{id}/assign-driver"
+    occ_field: expected_driver_version
+    description: |
+      Assigning a Driver whose version has advanced since the client last
+      observed the driver's HOS/standing snapshot is rejected: the assignment
+      decision was made on a stale driver view (e.g., new duty events or another
+      assignment were recorded in between).
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: occ-settlement-counter
+    parent_entity: Settlement
+    write_endpoint: "POST /haul/settlements/{id}/counter"
+    occ_field: expected_settlement_version
+    description: |
+      Countering a Settlement whose version has advanced since the client last
+      observed it is rejected; a new counter legitimately supersedes a prior
+      COUNTERED state, so the stale writer must re-read before countering.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: allocation_weight_and_load_totals
+    trigger: "allocation create / release / deliver / cancel / reopen-plan"
+    algorithm: aggregation
+    formula: |
+      Per allocation: weight_lb = round_half_up(head_count * avg_weight_lb) to whole lb.
+      Load totals: allocated_head_count = SUM(head_count), allocated_weight_lb = SUM(weight_lb)
+      over allocations with status == ACTIVE only (RELEASED excluded).
+      Compartment totals: occupied_head_count / occupied_weight_lb = same sums over ACTIVE
+      allocations of that compartment (across ALL loads).
+      Rounding order is pinned: round per allocation FIRST, then sum the rounded integers.
+    input_set: "CompartmentAllocation rows with status == ACTIVE"
+    precision: "whole lb, round_half_up per allocation before summation"
+
+  - name: provisional_settlement
+    trigger: "Load depart transition (Settlement created in PRELIMINARY)"
+    algorithm: tiered_pricing
+    formula: |
+      base_amount_cents = round_half_up(rate_per_loaded_mile_cents * loaded_miles)
+      IF load.is_backhaul: base_amount_cents = round_half_up(base_amount_cents * (1 - BACKHAUL_DISCOUNT_PCT))
+      provisional_amount_cents = base_amount_cents
+      Pinned rounding order: round the rate*miles product FIRST, then apply the backhaul
+      discount and round again. (The alternative order — discount the rate, then multiply —
+      yields different cents and is forbidden.)
+    input_set: "the departing Load"
+    constants:
+      BACKHAUL_DISCOUNT_PCT: 0.15
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: provisional
+        when: "at depart; delivery weight unknown"
+        difference: "assumes on-weight delivery: no shrink penalty, no welfare deduction"
+      - name: final
+        when: "at deliver / reweigh / dispute resolution / incident close (see final_settlement)"
+        difference: "subtracts shrink penalty and welfare deductions; diverges from provisional whenever excess shrink or closed fines exist"
+
+  - name: final_settlement
+    trigger: "Load deliver; DELIVERY reweigh while PENDING; accept-original; accept-counter; incident close"
+    algorithm: constraint_propagation
+    formula: |
+      allowed = round_half_up(declared_weight_lb * effective_shrink_pct / 100)   # whole lb
+      shrink_lb = max(0, declared_weight_lb - effective_delivered_weight_lb)
+      excess_lb = max(0, shrink_lb - allowed)
+      shrink_penalty_cents = round_half_up(excess_lb * EXCESS_SHRINK_PENALTY_CENTS_PER_LB)
+      welfare = SUM(fine_cents) over CLOSED, non-waived WelfareIncident rows for this load
+      final_amount_cents = max(0, provisional_amount_cents - shrink_penalty_cents - welfare)
+      Invariant (money identity): final == provisional - shrink_penalty - welfare_deduction
+      after every mutation; dispute round-trip with counter_weight == delivered_weight MUST
+      reproduce the pre-dispute final exactly.
+      Conditional branches: backhaul discount (in base), excess-shrink branch (only when
+      shrink_lb > allowed), welfare branch (only when closed non-waived fines exist),
+      zero floor via max(0, ...). >= 4 interacting inputs with nested max().
+    input_set: "Load + its Settlement + latest DELIVERY WeightTicket (weighed_at DESC, created_at DESC) + CLOSED non-waived WelfareIncident rows"
+    constants:
+      EXCESS_SHRINK_PENALTY_CENTS_PER_LB: 2.5
+    precision: "integer cents / whole lb, round_half_up"
+    variants:
+      - name: provisional
+        when: "before delivery"
+        difference: "provisional_amount_cents = base only; final applies penalties/deductions — identical inputs pre-delivery vs post-delivery produce different amounts"
+
+  - name: effective_shrink_pct_resolution
+    trigger: "Load create"
+    algorithm: aggregation
+    formula: |
+      effective_shrink_pct = load.shrink_allowance_pct IF not null
+                             ELSE shipper.default_shrink_allowance_pct (itself defaulting to 2.0)
+    input_set: "Load + Shipper"
+    precision: "percent as given"
+
+  - name: driver_hos_replay
+    trigger: "any DriverDutyEvent append; any read of Driver; assign/depart checks"
+    algorithm: chronological
+    formula: |
+      Events sorted by occurred_at ASC, tie-break created_at ASC (never id).
+      Rest: an off-duty gap (DUTY_OFF..next DUTY_ON) >= 600 min resets the session.
+      Session window start = end of last rest >= 600 min (or first event if none).
+      session_driving_minutes = SUM driving minutes (DRIVING_ON..DRIVING_OFF, open interval
+        counts to now) within session window.
+      Break credit: BREAK_START..BREAK_END >= 30 min, or any off-duty gap >= 30 min.
+      driving_since_break_minutes = driving minutes since end of last break credit (or session start).
+      duty_window anchor = latest DUTY_ON preceded by >= 600 min off-duty (or first DUTY_ON);
+        duty_window_expires_at = anchor + 840 min; anchor cleared once off-duty >= 600 min elapses.
+      cycle_on_duty_minutes_8d = SUM on-duty minutes (DUTY_ON..DUTY_OFF, open counts to now)
+        clipped to [now - 8*1440 min, now].
+    input_set: "all DriverDutyEvent rows for the driver"
+    constants:
+      SESSION_DRIVE_LIMIT_MIN: 660
+      LONG_REST_MIN: 600
+      DUTY_WINDOW_MIN: 840
+      BREAK_REQUIRED_AFTER_DRIVE_MIN: 480
+      BREAK_QUALIFYING_MIN: 30
+      CYCLE_ON_DUTY_LIMIT_MIN: 4200
+      CYCLE_WINDOW_MIN: 11520
+    precision: "whole minutes"
+    variants:
+      - name: session_based
+        when: "dispatch/depart eligibility (hos_status)"
+        difference: "driving minutes since last >= 600-min rest"
+      - name: calendar_day
+        when: "calendar_day_driving_minutes field on Driver reads"
+        difference: "driving minutes clipped to current UTC calendar day [midnight, now]; identical event stream yields different minutes when a trip crosses midnight"
+
+  - name: hos_status_evaluation
+    trigger: "with driver_hos_replay"
+    algorithm: threshold
+    formula: |
+      Evaluate in pinned priority order, first match wins:
+        1. CYCLE_EXHAUSTED   if cycle_on_duty_minutes_8d >= 4200
+        2. SESSION_EXHAUSTED if session_driving_minutes >= 660
+        3. WINDOW_CLOSED     if driver on duty and now > duty_window_expires_at
+        4. BREAK_REQUIRED    if driving_since_break_minutes >= 480
+        5. ELIGIBLE
+      All thresholds are >= (at-limit means exhausted/required).
+    input_set: "derived HOS fields of one Driver"
+    precision: "whole minutes"
+
+  - name: confinement_clock
+    trigger: "arrive (check); resume-transit (reset)"
+    algorithm: threshold
+    formula: |
+      confinement_minutes = now - confinement_anchor_at
+      arrive allowed iff confinement_minutes <= 1680 (exactly 1680 allowed).
+      resume-transit allowed iff now - rest_unload_started_at >= 300 (exactly 300 allowed);
+      on resume, confinement_anchor_at := now (28-hour clock restarts).
+      WEATHER_HOLD time counts toward confinement (animals remain on the trailer).
+    input_set: "the Load"
+    constants:
+      MAX_CONFINEMENT_MIN: 1680
+      REST_UNLOAD_MIN: 300
+    precision: "whole minutes"
+
+  - name: washout_validity
+    trigger: "washout create; deliver (dirtying); depart (check); Trailer read"
+    algorithm: threshold
+    formula: |
+      IF dirtied_at is not null AND (last_washed_at is null OR dirtied_at > last_washed_at):
+        washout_status = DIRTY
+      ELIF last_washed_at is null: washout_status = DIRTY
+      ELIF now <= last_washed_at + 96h: washout_status = CLEAN     # inclusive boundary
+      ELSE: washout_status = STALE
+      depart requires washout_status == CLEAN (ERR_TRAILER_NOT_CLEAN otherwise).
+      On washout create: last_washed_at := washed_at; dirtied_at := null.
+    input_set: "Trailer + its latest WashoutEvent"
+    constants:
+      WASHOUT_VALID_HOURS: 96
+    precision: "timestamp comparison, inclusive at exactly +96h"
+
+  - name: weather_hold_required
+    trigger: "depart (origin_temperature_f input)"
+    algorithm: threshold
+    formula: |
+      HEAT: hold required iff origin_temperature_f >= HEAT_THRESHOLD[species]  (>= at threshold)
+      COLD: hold required iff origin_temperature_f <= COLD_THRESHOLD[species]  (<= at threshold)
+      Violation -> ERR_WEATHER_HOLD_REQUIRED.
+    input_set: "the departing Load + origin_temperature_f"
+    constants:
+      HEAT_THRESHOLD: { CATTLE: 95, SWINE: 85, SHEEP: 90, HORSES: 95 }
+      COLD_THRESHOLD: { CATTLE: 0, SWINE: 10, SHEEP: -5, HORSES: 5 }
+    precision: "integer Fahrenheit, inclusive thresholds"
+
+  - name: backhaul_eligibility
+    trigger: "Load create with backhaul_of_load_id present"
+    algorithm: threshold
+    formula: |
+      target = Load[backhaul_of_load_id] (ERR_LOAD_NOT_FOUND if missing)
+      require target.status == DELIVERED
+      require target.destination == this.origin
+      require target.delivered_at <= this.planned_departure_at
+      require this.planned_departure_at - target.delivered_at <= 72h (inclusive at exactly 72h)
+      else ERR_INVALID_BACKHAUL_LINK. On success is_backhaul = true and provisional/final
+      settlement applies BACKHAUL_DISCOUNT_PCT to the rounded base.
+    input_set: "new Load + target Load"
+    constants:
+      BACKHAUL_WINDOW_HOURS: 72
+    precision: "timestamp comparison, inclusive"
+
+  - name: welfare_fine
+    trigger: "incident close (fine_waived false)"
+    algorithm: aggregation
+    formula: |
+      Per incident: fine_cents = round_half_up(BASE_CENTS[incident_type] * head_count_affected * SEVERITY_MULT[severity])
+      Settlement.welfare_deduction_cents = SUM(fine_cents) over CLOSED non-waived incidents of the load.
+      Pinned rounding order: round EACH incident's fine to whole cents FIRST, then sum.
+      (Sum-then-round yields different cents, e.g. two INJURY/MINOR/head=1 fines:
+      per-incident 50000+50000 = 100000 vs sum-then-round round(99999.0...) = 99999.)
+    input_set: "WelfareIncident rows CLOSED with fine_waived == false for the load"
+    constants:
+      BASE_CENTS: { INJURY: 33333, DOWNER: 41667, DEAD_ON_ARRIVAL: 100000, ESCAPE: 25000 }
+      SEVERITY_MULT: { MINOR: 1.5, MAJOR: 2.5, CRITICAL: 4.0 }
+    precision: "integer cents, round_half_up per incident before summation"
+
+  - name: driver_suspension_threshold
+    trigger: "incident close"
+    algorithm: threshold
+    formula: |
+      critical_incident_count_90d = COUNT(WelfareIncident where driver_id = this driver,
+        severity == CRITICAL, status == CLOSED, occurred_at >= now - 90 days)
+      IF count >= 2 AND Driver.status == ACTIVE: Driver.status := SUSPENDED, then cascade
+      unassigns the driver's ASSIGNED loads (see WelfareIncident close side effects).
+    input_set: "CLOSED CRITICAL WelfareIncident rows of the driver within trailing 90 days"
+    constants:
+      SUSPENSION_CRITICAL_COUNT: 2
+      SUSPENSION_WINDOW_DAYS: 90
+    precision: "integer count, >= threshold"
+
+  - name: trailer_window_overlap
+    trigger: "assign-driver"
+    algorithm: interval_merge
+    formula: |
+      window(L) = [planned_departure_at, planned_departure_at + planned_duration_hours]  # CLOSED both ends
+      Conflict iff exists other load L2 with (driver_id == driver OR trailer_id == trailer)
+      AND L2.status in {ASSIGNED, IN_TRANSIT, WEATHER_HOLD, REST_UNLOAD, ARRIVED}
+      AND window(L2).start <= window(L).end AND window(L).start <= window(L2).end.
+      Touching endpoints CONFLICT (no turnaround gap): L.start == L2.end is a conflict.
+    input_set: "loads sharing driver or trailer in active statuses"
+    precision: "timestamp comparison, closed-interval semantics"
+
+  - name: duty_interval_rules
+    trigger: "POST /haul/drivers/{id}/duty-events"
+    algorithm: interval_merge
+    formula: |
+      Duty/driving intervals are HALF-OPEN [start, end): a DUTY_ON whose occurred_at equals the
+      previous DUTY_OFF's occurred_at is legal adjacency (back-to-back shifts allowed).
+      occurred_at must be >= previous event's occurred_at (equal allowed); a smaller occurred_at
+      would create an inverted/overlapping interval -> ERR_DUTY_INTERVAL_OVERLAP.
+      occurred_at must be <= now -> ERR_EVENT_IN_FUTURE.
+      Transition legality (driver duty sub-state): DUTY_ON only while off-duty; DRIVING_ON only
+      while on-duty and not driving; DRIVING_OFF only while driving; BREAK_START only while
+      on-duty, not driving, not on break; BREAK_END only while on break; DUTY_OFF only while
+      on-duty (auto-closes an open driving or break interval at that DUTY_OFF timestamp).
+      Illegal transition -> ERR_DUTY_EVENT_SEQUENCE.
+    input_set: "DriverDutyEvent rows of the driver"
+    precision: "timestamp comparison, half-open semantics"
+
+# =============================================================================
+# Table 4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - { priority: 1, category: auth, check: "X-User-ID and X-User-Role headers present and role recognized", error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http_status: 400, applies_to: "all" }
+  - { priority: 2, category: auth, check: "Role is permitted for this endpoint per §1.5 roles", error_id: ERR_FORBIDDEN_ROLE, http_status: 403, applies_to: "all" }
+  - { priority: 3, category: auth, check: "Ownership: Driver role may only act on resources where X-User-ID == the driver's own id (own duty events) or == Load.driver_id (depart/arrive/rest-unload/resume-transit/weather-holds/incidents)", error_id: ERR_OWNERSHIP_MISMATCH, http_status: 403, applies_to: "Driver-role write endpoints" }
+  - { priority: 4, category: existence, check: "Request body shape: required fields present, types/enum values valid, numeric fields positive; HealthPaper expires_at must be > issued_at", error_id: "ERR_INVALID_REQUEST (ERR_INVALID_TIME_RANGE for expires_at <= issued_at)", http_status: 400, applies_to: "all write endpoints" }
+  - { priority: 29, category: business_constraint, check: "WeightTicket gross_lb must be strictly > tare_lb", error_id: ERR_INVALID_TICKET_WEIGHT, http_status: 422, applies_to: "POST /haul/loads/{id}/weight-tickets" }
+  - { priority: 5, category: existence, check: "Path resource ids exist, validated left-to-right", error_id: "ERR_*_NOT_FOUND by resource", http_status: 404, applies_to: "all endpoints with path ids" }
+  - { priority: 6, category: existence, check: "Body foreign keys exist (shipper_id, trailer_compartment_id, driver_id, backhaul_of_load_id, load_id)", error_id: "ERR_*_NOT_FOUND by referenced resource", http_status: 404, applies_to: "POST /haul/loads, allocations, assign-driver, incidents" }
+  - { priority: 7, category: state, check: "Target resource in required state for the transition (per §1.2 preconditions; includes ERR_UNRESOLVED_DISPUTE for pay from DISPUTED/COUNTERED and ERR_TICKET_STATE_FORBIDDEN for ticket type vs load state)", error_id: "ERR_* state errors", http_status: 409, applies_to: "all state-transition endpoints" }
+  - { priority: 8, category: state, check: "OCC: expected_<parent>_version == current parent version", error_id: ERR_STALE_VERSION, http_status: 412, applies_to: "POST /haul/loads/{id}/allocations, POST /haul/allocations/{id}/release, POST /haul/loads/{id}/assign-driver, POST /haul/settlements/{id}/counter" }
+  - { priority: 9, category: business_safety, check: "Species: no ACTIVE allocation of a different species already occupies the compartment", error_id: ERR_SPECIES_MIX_FORBIDDEN, http_status: 422, applies_to: "POST /haul/loads/{id}/allocations" }
+  - { priority: 10, category: business_safety, check: "Segregation of duties: verifier X-User-ID != created_by_user_id", error_id: ERR_SOD_VIOLATION, http_status: 403, applies_to: "POST /haul/health-papers/{id}/verify, POST /haul/brand-inspections/{id}/verify" }
+  - { priority: 11, category: business_safety, check: "Driver not SUSPENDED", error_id: ERR_DRIVER_SUSPENDED, http_status: 422, applies_to: "POST /haul/loads/{id}/assign-driver, POST /haul/loads/{id}/depart" }
+  - { priority: 12, category: business_safety, check: "Driver hos_status == ELIGIBLE", error_id: ERR_DRIVER_NOT_HOS_ELIGIBLE, http_status: 422, applies_to: "POST /haul/loads/{id}/assign-driver, POST /haul/loads/{id}/depart" }
+  - { priority: 13, category: business_safety, check: "Trailer washout_status == CLEAN at now", error_id: ERR_TRAILER_NOT_CLEAN, http_status: 422, applies_to: "POST /haul/loads/{id}/depart" }
+  - { priority: 14, category: business_safety, check: "Weather: origin_temperature_f within species thresholds", error_id: ERR_WEATHER_HOLD_REQUIRED, http_status: 422, applies_to: "POST /haul/loads/{id}/depart" }
+  - { priority: 15, category: business_safety, check: "Paperwork still valid at actual departure: VERIFIED health paper expires_at > now; VERIFIED brand inspection now - inspected_at <= 96h", error_id: "ERR_PAPER_EXPIRED / ERR_BRAND_INSPECTION_STALE", http_status: 422, applies_to: "POST /haul/loads/{id}/depart" }
+  - { priority: 16, category: business_safety, check: "Confinement: now - confinement_anchor_at <= 1680 min at arrive", error_id: ERR_CONFINEMENT_LIMIT_EXCEEDED, http_status: 422, applies_to: "POST /haul/loads/{id}/arrive" }
+  - { priority: 17, category: business_safety, check: "Rest/unload duration >= 300 min before resume", error_id: ERR_INSUFFICIENT_REST_UNLOAD, http_status: 422, applies_to: "POST /haul/loads/{id}/resume-transit" }
+  - { priority: 18, category: business_safety, check: "No CRITICAL incident in {REPORTED, UNDER_REVIEW} for the load", error_id: ERR_OPEN_CRITICAL_INCIDENT, http_status: 422, applies_to: "POST /haul/settlements/{id}/pay" }
+  - { priority: 19, category: business_safety, check: "Paper content matches load: species and head_count at verify", error_id: ERR_PAPER_MISMATCH, http_status: 422, applies_to: "verify endpoints" }
+  - { priority: 20, category: business_safety, check: "Health paper expires_at > planned_departure_at at verify", error_id: ERR_PAPER_EXPIRED, http_status: 422, applies_to: "POST /haul/health-papers/{id}/verify" }
+  - { priority: 21, category: business_safety, check: "Brand inspection freshness: inspected_at <= now and planned_departure_at - inspected_at <= 96h at verify", error_id: ERR_BRAND_INSPECTION_STALE, http_status: 422, applies_to: "POST /haul/brand-inspections/{id}/verify" }
+  - { priority: 22, category: business_referential, check: "DELIVERY WeightTicket exists before delivery confirmation", error_id: ERR_NO_DELIVERY_TICKET, http_status: 422, applies_to: "POST /haul/loads/{id}/deliver" }
+  - { priority: 23, category: business_referential, check: ">= 1 VERIFIED HealthPaper and >= 1 VERIFIED BrandInspection present", error_id: ERR_PAPERWORK_INCOMPLETE, http_status: 422, applies_to: "POST /haul/loads/{id}/verify-paperwork" }
+  - { priority: 24, category: business_constraint, check: "Compartment head capacity: occupied_head_count + head_count <= max_head_count (exactly at capacity allowed)", error_id: ERR_COMPARTMENT_HEAD_EXCEEDED, http_status: 422, applies_to: "POST /haul/loads/{id}/allocations" }
+  - { priority: 25, category: business_constraint, check: "Compartment weight capacity: occupied_weight_lb + weight_lb <= max_weight_lb", error_id: ERR_COMPARTMENT_WEIGHT_EXCEEDED, http_status: 422, applies_to: "POST /haul/loads/{id}/allocations" }
+  - { priority: 26, category: business_constraint, check: "All ACTIVE allocations share one trailer", error_id: ERR_MIXED_TRAILER_ALLOCATIONS, http_status: 422, applies_to: "POST /haul/loads/{id}/finalize-plan" }
+  - { priority: 27, category: business_constraint, check: "allocated_head_count == declared_head_count AND allocated_weight_lb == declared_weight_lb", error_id: ERR_ALLOCATION_TOTAL_MISMATCH, http_status: 422, applies_to: "POST /haul/loads/{id}/finalize-plan" }
+  - { priority: 28, category: business_constraint, check: "allocated_weight_lb <= trailer.max_gross_weight_lb", error_id: ERR_GVWR_EXCEEDED, http_status: 422, applies_to: "POST /haul/loads/{id}/finalize-plan" }
+  - { priority: 29, category: business_constraint, check: "Driver license_no unique", error_id: ERR_DUPLICATE_LICENSE_NO, http_status: 409, applies_to: "POST /haul/drivers" }
+  - { priority: 30, category: business_constraint, check: "Backhaul link valid (target DELIVERED, destination == origin, within 72h window)", error_id: ERR_INVALID_BACKHAUL_LINK, http_status: 422, applies_to: "POST /haul/loads" }
+  - { priority: 31, category: business_temporal, check: "Duty event occurred_at <= now", error_id: ERR_EVENT_IN_FUTURE, http_status: 422, applies_to: "POST /haul/drivers/{id}/duty-events, washouts, weight-tickets, incidents" }
+  - { priority: 32, category: business_temporal, check: "Duty event occurred_at >= previous event's occurred_at (half-open intervals; adjacency allowed)", error_id: ERR_DUTY_INTERVAL_OVERLAP, http_status: 409, applies_to: "POST /haul/drivers/{id}/duty-events" }
+  - { priority: 33, category: business_temporal, check: "Duty event type legal for the driver's current duty sub-state (DUTY_ON only while off-duty, DRIVING_ON only while on-duty and not driving, etc.)", error_id: ERR_DUTY_EVENT_SEQUENCE, http_status: 409, applies_to: "POST /haul/drivers/{id}/duty-events" }
+  - { priority: 34, category: business_temporal, check: "Planned windows of loads sharing driver or trailer do not touch or overlap (closed intervals)", error_id: ERR_TRAILER_WINDOW_OVERLAP, http_status: 409, applies_to: "POST /haul/loads/{id}/assign-driver" }
+  - { priority: 35, category: business_temporal, check: "Dispute / redispute allowed only while now <= dispute_deadline_at (inclusive)", error_id: ERR_DISPUTE_WINDOW_CLOSED, http_status: 422, applies_to: "POST /haul/settlements/{id}/dispute, POST /haul/settlements/{id}/redispute" }
+  - { priority: 36, category: business_temporal, check: "Pay from PENDING requires now > dispute_deadline_at (strictly)", error_id: ERR_DISPUTE_WINDOW_OPEN, http_status: 422, applies_to: "POST /haul/settlements/{id}/pay" }
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED — verbatim)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 5: API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Shipper ---
+  - { method: POST, path: "/haul/shippers", description: "Create shipper", roles: [CarrierAdmin], code: 201, input: [name, contact_email, "default_shrink_allowance_pct?"], output: Shipper, side_effects: ["default_shrink_allowance_pct defaults to 2.0"] }
+  - { method: GET, path: "/haul/shippers", description: "List shippers", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "Shipper[]", side_effects: [] }
+  - { method: GET, path: "/haul/shippers/{id}", description: "Get shipper", roles: [Any], code: 200, input: [], output: Shipper, side_effects: [] }
+
+  # --- Driver ---
+  - { method: POST, path: "/haul/drivers", description: "Create driver (license_no unique)", roles: [CarrierAdmin], code: 201, input: [name, license_no], output: Driver, side_effects: ["status := ACTIVE", "hos_status := ELIGIBLE"] }
+  - { method: GET, path: "/haul/drivers", description: "List drivers", roles: [Any], code: 200, input: ["limit?", "offset?", "status?", "hos_status?"], output: "Driver[]", side_effects: [] }
+  - { method: GET, path: "/haul/drivers/{id}", description: "Get driver incl. computed HOS fields", roles: [Any], code: 200, input: [], output: Driver, side_effects: ["hos fields recomputed at read"] }
+  - { method: POST, path: "/haul/drivers/{id}/duty-events", description: "Append duty event (Driver: own id only)", roles: [CarrierAdmin, Driver], code: 201, input: [event_type, occurred_at], output: DriverDutyEvent, side_effects: ["driver HOS fields recomputed (driver_hos_replay)", "Driver.version += 1 on resulting field change"] }
+  - { method: GET, path: "/haul/drivers/{id}/duty-events", description: "List duty events (chronological: occurred_at ASC, created_at ASC)", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "DriverDutyEvent[]", side_effects: [] }
+
+  # --- Trailer ---
+  - { method: POST, path: "/haul/trailers", description: "Create trailer with compartments atomically", roles: [CarrierAdmin], code: 201, input: [trailer_no, max_gross_weight_lb, compartments], output: Trailer, side_effects: ["creates TrailerCompartment rows from compartments array", "washout_status := DIRTY (new trailers must be washed before first load)"] }
+  - { method: GET, path: "/haul/trailers", description: "List trailers", roles: [Any], code: 200, input: ["limit?", "offset?", "washout_status?"], output: "Trailer[]", side_effects: [] }
+  - { method: GET, path: "/haul/trailers/{id}", description: "Get trailer (washout_status recomputed at read)", roles: [Any], code: 200, input: [], output: Trailer, side_effects: [] }
+  - { method: GET, path: "/haul/trailers/{id}/compartments", description: "List compartments of trailer, ordered by compartment_index ASC", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "TrailerCompartment[]", side_effects: [] }
+  - { method: POST, path: "/haul/trailers/{id}/washouts", description: "Record biosecurity washout; trailer becomes CLEAN", roles: [WashoutOperator, CarrierAdmin], code: 201, input: [washed_at, method, "operator_note?"], output: WashoutEvent, side_effects: ["Trailer.last_washed_at := washed_at", "Trailer.dirtied_at := null", "washout_valid_until := washed_at + 96h", "washout_status recomputed"] }
+  - { method: GET, path: "/haul/trailers/{id}/washouts", description: "List washout events", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "WashoutEvent[]", side_effects: [] }
+
+  # --- Load & plan ---
+  - { method: POST, path: "/haul/loads", description: "Create load in DRAFT (optional backhaul link validated)", roles: [Dispatcher], code: 201, input: [shipper_id, species, declared_head_count, declared_weight_lb, origin, destination, planned_departure_at, planned_duration_hours, rate_per_loaded_mile_cents, loaded_miles, "shrink_allowance_pct?", "backhaul_of_load_id?"], output: Load, side_effects: ["effective_shrink_pct resolved (effective_shrink_pct_resolution)", "backhaul_eligibility checked", "status := DRAFT"] }
+  - { method: GET, path: "/haul/loads", description: "List loads with filters", roles: [Any], code: 200, input: ["limit?", "offset?", "status?", "shipper_id?", "driver_id?", "trailer_id?", "backhaul_of_load_id?"], output: "Load[]", side_effects: [] }
+  - { method: GET, path: "/haul/loads/{id}", description: "Get load", roles: [Any], code: 200, input: [], output: Load, side_effects: [] }
+  - { method: POST, path: "/haul/loads/{id}/allocations", description: "Allocate animals to a compartment (OCC on Load.version; load must be DRAFT)", roles: [Dispatcher], code: 201, input: [trailer_compartment_id, head_count, avg_weight_lb, expected_load_version], output: CompartmentAllocation, side_effects: ["weight_lb computed (per-allocation rounding)", "compartment occupied_* and Load.allocated_* recomputed", "increments Load.version by 1"] }
+  - { method: GET, path: "/haul/loads/{id}/allocations", description: "List allocations of load, ordered by created_at ASC", roles: [Any], code: 200, input: ["limit?", "offset?", "status?"], output: "CompartmentAllocation[]", side_effects: [] }
+  - { method: GET, path: "/haul/allocations/{id}", description: "Get allocation", roles: [Any], code: 200, input: [], output: CompartmentAllocation, side_effects: [] }
+  - { method: GET, path: "/haul/allocations", description: "List allocations across loads (filterable)", roles: [Any], code: 200, input: ["limit?", "offset?", "trailer_compartment_id?", "load_id?", "status?"], output: "CompartmentAllocation[]", side_effects: [] }
+  - { method: POST, path: "/haul/allocations/{id}/release", description: "Manually release an ACTIVE allocation (load must be DRAFT; OCC on Load.version)", roles: [Dispatcher], code: 200, input: [expected_load_version], output: CompartmentAllocation, side_effects: ["status := RELEASED, release_reason := REPLANNED", "occupied/allocated recomputed", "increments Load.version by 1"] }
+  - { method: POST, path: "/haul/loads/{id}/finalize-plan", description: "DRAFT -> PLANNED; binds trailer from allocations", roles: [Dispatcher], code: 200, input: [], output: Load, side_effects: ["single-trailer / totals / GVWR checks", "Load.trailer_id := bound trailer", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/reopen-plan", description: "PLANNED -> DRAFT; releases allocations (REPLANNED)", roles: [Dispatcher], code: 200, input: [], output: Load, side_effects: ["allocations RELEASED (REPLANNED)", "trailer_id := null", "Load.version += 1"] }
+
+  # --- Paperwork ---
+  - { method: POST, path: "/haul/loads/{id}/health-papers", description: "Attach health paper (CVI) to load", roles: [ComplianceOfficer], code: 201, input: [cert_number, species, head_count_listed, issued_at, expires_at], output: HealthPaper, side_effects: ["status := PENDING", "created_by_user_id := X-User-ID"] }
+  - { method: GET, path: "/haul/loads/{id}/health-papers", description: "List health papers of load", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "HealthPaper[]", side_effects: [] }
+  - { method: POST, path: "/haul/health-papers/{id}/verify", description: "Verify health paper (SoD: verifier != creator)", roles: [ComplianceOfficer], code: 200, input: [], output: HealthPaper, side_effects: ["status := VERIFIED", "verified_by_user_id := X-User-ID", "HealthPaper.version += 1"] }
+  - { method: POST, path: "/haul/health-papers/{id}/reject", description: "Reject health paper", roles: [ComplianceOfficer], code: 200, input: ["reason?"], output: HealthPaper, side_effects: ["status := REJECTED", "HealthPaper.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/brand-inspections", description: "Attach brand inspection to load", roles: [ComplianceOfficer], code: 201, input: [inspection_no, inspected_at, brand_owner, head_count_inspected], output: BrandInspection, side_effects: ["status := PENDING", "created_by_user_id := X-User-ID"] }
+  - { method: GET, path: "/haul/loads/{id}/brand-inspections", description: "List brand inspections of load", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "BrandInspection[]", side_effects: [] }
+  - { method: POST, "path": "/haul/brand-inspections/{id}/verify", description: "Verify brand inspection (SoD; freshness 96h vs planned departure)", roles: [ComplianceOfficer], code: 200, input: [], output: BrandInspection, side_effects: ["status := VERIFIED", "verified_by_user_id := X-User-ID", "BrandInspection.version += 1"] }
+  - { method: POST, path: "/haul/brand-inspections/{id}/reject", description: "Reject brand inspection", roles: [ComplianceOfficer], code: 200, input: ["reason?"], output: BrandInspection, side_effects: ["status := REJECTED", "BrandInspection.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/verify-paperwork", description: "PLANNED -> PAPERWORK_VERIFIED when verified paper + brand inspection present", roles: [ComplianceOfficer], code: 200, input: [], output: Load, side_effects: ["Load.status := PAPERWORK_VERIFIED", "Load.version += 1"] }
+
+  # --- Trip operations ---
+  - { method: POST, path: "/haul/loads/{id}/assign-driver", description: "PAPERWORK_VERIFIED -> ASSIGNED (OCC on Driver.version)", roles: [Dispatcher], code: 200, input: [driver_id, expected_driver_version], output: Load, side_effects: ["driver/trailer planned-window overlap checks (closed intervals)", "Load.driver_id set", "increments Driver.version by 1", "Trailer.reserved_until recomputed", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/unassign-driver", description: "ASSIGNED -> PAPERWORK_VERIFIED (compensates assign)", roles: [Dispatcher], code: 200, input: [], output: Load, side_effects: ["Load.driver_id := null", "Driver.version += 1", "Trailer.reserved_until recomputed", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/depart", description: "ASSIGNED -> IN_TRANSIT; weather/HOS/washout/paperwork checks; creates Settlement (PRELIMINARY)", roles: [Driver], code: 200, input: [origin_temperature_f], output: Load, side_effects: ["departed_at/confinement_anchor_at := now", "system DUTY_ON(if off)+DRIVING_ON events", "Settlement created with provisional_settlement", "Trailer.reserved_until recomputed", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/weather-holds", description: "Place weather hold (ASSIGNED or IN_TRANSIT -> WEATHER_HOLD)", roles: [Driver, Dispatcher], code: 201, input: [hold_type, temperature_f, "reason?"], output: WeatherHold, side_effects: ["if IN_TRANSIT: system DRIVING_OFF event", "Load.status := WEATHER_HOLD", "Load.version += 1"] }
+  - { method: GET, path: "/haul/loads/{id}/weather-holds", description: "List weather holds of load", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "WeatherHold[]", side_effects: [] }
+  - { method: POST, path: "/haul/weather-holds/{id}/release", description: "Release ACTIVE hold; load resumes to ASSIGNED or IN_TRANSIT", roles: [Dispatcher, Driver], code: 200, input: [], output: WeatherHold, side_effects: ["released_at := now", "if resuming IN_TRANSIT: system DRIVING_ON event", "Load.version += 1", "WeatherHold.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/rest-unload", description: "IN_TRANSIT -> REST_UNLOAD (28-hour unload/rest)", roles: [Driver], code: 200, input: [], output: Load, side_effects: ["system DRIVING_OFF event", "rest_unload_started_at := now", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/resume-transit", description: "REST_UNLOAD -> IN_TRANSIT after >= 300 min; resets confinement clock", roles: [Driver], code: 200, input: [], output: Load, side_effects: ["confinement_anchor_at := now", "system DRIVING_ON event", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/arrive", description: "IN_TRANSIT -> ARRIVED; confinement <= 1680 enforced", roles: [Driver], code: 200, input: [], output: Load, side_effects: ["arrived_at := now", "system DRIVING_OFF event", "Load.version += 1"] }
+  - { method: POST, path: "/haul/loads/{id}/weight-tickets", description: "Record scale ticket (ORIGIN: DRAFT..IN_TRANSIT; DELIVERY: ARRIVED, or DELIVERED while settlement PENDING)", roles: [ConsigneeAgent, Driver], code: 201, input: [ticket_type, gross_lb, tare_lb, weighed_at], output: WeightTicket, side_effects: ["net_weight_lb computed", "DELIVERY reweigh while PENDING: delivered/effective weight updated and final_settlement recomputed"] }
+  - { method: GET, path: "/haul/loads/{id}/weight-tickets", description: "List weight tickets of load", roles: [Any], code: 200, input: ["limit?", "offset?"], output: "WeightTicket[]", side_effects: [] }
+  - { method: POST, path: "/haul/loads/{id}/deliver", description: "ARRIVED -> DELIVERED; full cascade (allocations release, trailer dirtied, settlement finalized, HOS cascade)", roles: [ConsigneeAgent], code: 200, input: [], output: Load, side_effects: ["see Load ARRIVED->DELIVERED side effects (deliver cascade incl. driver cycle exhaustion -> force-unassign)"] }
+  - { method: POST, path: "/haul/loads/{id}/cancel", description: "DRAFT/PLANNED/PAPERWORK_VERIFIED/ASSIGNED -> CANCELLED", roles: [Dispatcher], code: 200, input: [], output: Load, side_effects: ["allocations RELEASED (CANCELLED)", "driver unassigned if ASSIGNED", "trailer reserved_until recomputed; trailer NOT dirtied", "Load.version += 1"] }
+
+  # --- Welfare incidents ---
+  - { method: POST, path: "/haul/incidents", description: "Driver reports welfare incident for own load in transit/arrived/delivered states", roles: [Driver], code: 201, input: [load_id, incident_type, severity, head_count_affected, occurred_at, "description?"], output: WelfareIncident, side_effects: ["driver_id := X-User-ID", "status := REPORTED"] }
+  - { method: GET, path: "/haul/incidents", description: "List incidents", roles: [Any], code: 200, input: ["limit?", "offset?", "load_id?", "driver_id?", "status?", "severity?"], output: "WelfareIncident[]", side_effects: [] }
+  - { method: GET, path: "/haul/incidents/{id}", description: "Get incident", roles: [Any], code: 200, input: [], output: WelfareIncident, side_effects: [] }
+  - { method: POST, path: "/haul/incidents/{id}/start-review", description: "REPORTED -> UNDER_REVIEW", roles: [ComplianceOfficer], code: 200, input: [], output: WelfareIncident, side_effects: ["WelfareIncident.version += 1"] }
+  - { method: POST, path: "/haul/incidents/{id}/close", description: "UNDER_REVIEW -> CLOSED; fine posted to settlement; suspension cascade", roles: [ComplianceOfficer], code: 200, input: ["fine_waived?"], output: WelfareIncident, side_effects: ["fine_cents computed (welfare_fine)", "Settlement welfare_deduction_cents + final_amount_cents recomputed if not PAID", "driver critical count recompute -> possible SUSPENDED -> force-unassign cascade"] }
+
+  # --- Settlement ---
+  - { method: GET, path: "/haul/loads/{id}/settlement", description: "Get settlement of load (array of 0 or 1)", roles: [Any], code: 200, input: [], output: "Settlement[]", side_effects: [] }
+  - { method: GET, path: "/haul/settlements", description: "List settlements", roles: [Any], code: 200, input: ["limit?", "offset?", "status?"], output: "Settlement[]", side_effects: [] }
+  - { method: GET, path: "/haul/settlements/{id}", description: "Get settlement", roles: [Any], code: 200, input: [], output: Settlement, side_effects: [] }
+  - { method: POST, path: "/haul/settlements/{id}/dispute", description: "PENDING -> DISPUTED within 48h window (inclusive)", roles: [ConsigneeAgent], code: 200, input: [disputed_weight_lb, "reason?"], output: Settlement, side_effects: ["disputed_weight_lb recorded", "Settlement.version += 1"] }
+  - { method: POST, path: "/haul/settlements/{id}/accept-original", description: "DISPUTED -> RESOLVED on original delivered weight", roles: [ConsigneeAgent], code: 200, input: [], output: Settlement, side_effects: ["final_settlement recomputed on delivered weight", "dispute_adjustment_cents := 0", "Settlement.version += 1"] }
+  - { method: POST, path: "/haul/settlements/{id}/counter", description: "DISPUTED/COUNTERED -> COUNTERED with countered weight (OCC; supersedes prior counter)", roles: [Dispatcher], code: 200, input: [counter_weight_lb, expected_settlement_version], output: Settlement, side_effects: ["counter_weight_lb recorded", "increments Settlement.version by 1"] }
+  - { method: POST, path: "/haul/settlements/{id}/redispute", description: "COUNTERED -> DISPUTED within window", roles: [ConsigneeAgent], code: 200, input: ["disputed_weight_lb?"], output: Settlement, side_effects: ["Settlement.version += 1"] }
+  - { method: POST, path: "/haul/settlements/{id}/accept-counter", description: "COUNTERED -> RESOLVED on countered weight", roles: [ConsigneeAgent], code: 200, input: [], output: Settlement, side_effects: ["effective_delivered_weight_lb := counter_weight_lb", "final_settlement recomputed", "dispute_adjustment_cents computed", "Settlement.version += 1"] }
+  - { method: POST, path: "/haul/settlements/{id}/pay", description: "PENDING (after window) or RESOLVED -> PAID; blocked by open CRITICAL incident", roles: [CarrierAdmin], code: 200, input: [], output: Settlement, side_effects: ["paid_at := now", "Settlement.version += 1"] }
+
+  # --- Test-driving clock ---
+  - { method: POST, path: "/haul/_clock/set_current_utc", description: "Set logical clock. Default at server startup is exactly 2026-08-01T00:00:00Z; before any set call the clock reads this default and never falls back to wall-clock time.", roles: [CarrierAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: ["all timestamp-sensitive checks (washout 96h, confinement, dispute window, HOS windows) evaluate against this clock"] }
+
+# =============================================================================
+# Table 6: Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role missing/invalid" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_OWNERSHIP_MISMATCH, http: 403, condition: "Driver role acting on a resource owned by another driver" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, invalid type/enum, or non-positive numeric input" }
+  - { id: ERR_INVALID_TIME_RANGE, http: 400, condition: "HealthPaper expires_at <= issued_at" }
+  - { id: ERR_INVALID_TICKET_WEIGHT, http: 422, condition: "WeightTicket gross_lb <= tare_lb" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match current parent version (OCC)" }
+  - { id: ERR_SHIPPER_NOT_FOUND, http: 404, condition: "Shipper id not found" }
+  - { id: ERR_DRIVER_NOT_FOUND, http: 404, condition: "Driver id not found" }
+  - { id: ERR_TRAILER_NOT_FOUND, http: 404, condition: "Trailer id not found" }
+  - { id: ERR_COMPARTMENT_NOT_FOUND, http: 404, condition: "TrailerCompartment id not found" }
+  - { id: ERR_LOAD_NOT_FOUND, http: 404, condition: "Load id not found (path or body FK)" }
+  - { id: ERR_ALLOCATION_NOT_FOUND, http: 404, condition: "CompartmentAllocation id not found" }
+  - { id: ERR_HEALTH_PAPER_NOT_FOUND, http: 404, condition: "HealthPaper id not found" }
+  - { id: ERR_BRAND_INSPECTION_NOT_FOUND, http: 404, condition: "BrandInspection id not found" }
+  - { id: ERR_SETTLEMENT_NOT_FOUND, http: 404, condition: "Settlement id not found" }
+  - { id: ERR_INCIDENT_NOT_FOUND, http: 404, condition: "WelfareIncident id not found" }
+  - { id: ERR_HOLD_NOT_FOUND, http: 404, condition: "WeatherHold id not found" }
+  - { id: ERR_LOAD_NOT_DRAFT, http: 409, condition: "Operation requires Load in DRAFT (finalize-plan, allocation create/release)" }
+  - { id: ERR_LOAD_NOT_PLANNED, http: 409, condition: "Operation requires Load in PLANNED (verify-paperwork; paper/brand verify requires PLANNED or PAPERWORK_VERIFIED)" }
+  - { id: ERR_LOAD_NOT_PAPERWORK_VERIFIED, http: 409, condition: "assign-driver requires PAPERWORK_VERIFIED" }
+  - { id: ERR_LOAD_NOT_ASSIGNED, http: 409, condition: "depart/unassign requires ASSIGNED" }
+  - { id: ERR_LOAD_NOT_IN_TRANSIT, http: 409, condition: "arrive/rest-unload require IN_TRANSIT" }
+  - { id: ERR_LOAD_NOT_REST_UNLOAD, http: 409, condition: "resume-transit requires REST_UNLOAD" }
+  - { id: ERR_LOAD_NOT_ARRIVED, http: 409, condition: "deliver requires ARRIVED" }
+  - { id: ERR_LOAD_NOT_HOLDABLE, http: 409, condition: "weather hold requires ASSIGNED or IN_TRANSIT" }
+  - { id: ERR_LOAD_NOT_CANCELLABLE, http: 409, condition: "cancel requires DRAFT/PLANNED/PAPERWORK_VERIFIED/ASSIGNED" }
+  - { id: ERR_LOAD_NOT_REPORTABLE, http: 409, condition: "incident create requires load in IN_TRANSIT/WEATHER_HOLD/REST_UNLOAD/ARRIVED/DELIVERED" }
+  - { id: ERR_TICKET_STATE_FORBIDDEN, http: 409, condition: "ORIGIN ticket requires DRAFT..IN_TRANSIT; DELIVERY ticket requires ARRIVED or (DELIVERED with settlement PENDING)" }
+  - { id: ERR_PAPERWORK_NOT_PENDING, http: 409, condition: "verify/reject requires PENDING paper or brand inspection" }
+  - { id: ERR_INCIDENT_NOT_REPORTED, http: 409, condition: "start-review requires REPORTED" }
+  - { id: ERR_INCIDENT_NOT_UNDER_REVIEW, http: 409, condition: "close requires UNDER_REVIEW" }
+  - { id: ERR_HOLD_NOT_ACTIVE, http: 409, condition: "release requires ACTIVE hold" }
+  - { id: ERR_SETTLEMENT_NOT_PENDING, http: 409, condition: "dispute requires PENDING" }
+  - { id: ERR_SETTLEMENT_NOT_DISPUTED, http: 409, condition: "counter/accept-original require DISPUTED (counter also allows COUNTERED)" }
+  - { id: ERR_SETTLEMENT_NOT_COUNTERED, http: 409, condition: "redispute/accept-counter require COUNTERED" }
+  - { id: ERR_SETTLEMENT_NOT_PAYABLE, http: 409, condition: "pay requires PENDING or RESOLVED" }
+  - { id: ERR_UNRESOLVED_DISPUTE, http: 422, condition: "pay attempted while DISPUTED or COUNTERED" }
+  - { id: ERR_SPECIES_MIX_FORBIDDEN, http: 422, condition: "Compartment already holds an ACTIVE allocation of a different species" }
+  - { id: ERR_SOD_VIOLATION, http: 403, condition: "Verifier is the same user who created the paper/inspection" }
+  - { id: ERR_DRIVER_SUSPENDED, http: 422, condition: "Driver.status == SUSPENDED at assign/depart" }
+  - { id: ERR_DRIVER_NOT_HOS_ELIGIBLE, http: 422, condition: "Driver hos_status != ELIGIBLE at assign/depart" }
+  - { id: ERR_TRAILER_NOT_CLEAN, http: 422, condition: "Trailer washout_status DIRTY or STALE at depart" }
+  - { id: ERR_WEATHER_HOLD_REQUIRED, http: 422, condition: "origin_temperature_f violates species heat/cold threshold at depart" }
+  - { id: ERR_CONFINEMENT_LIMIT_EXCEEDED, http: 422, condition: "Arrival would exceed 1680 minutes since confinement_anchor_at" }
+  - { id: ERR_INSUFFICIENT_REST_UNLOAD, http: 422, condition: "resume-transit before 300 minutes of rest/unload" }
+  - { id: ERR_OPEN_CRITICAL_INCIDENT, http: 422, condition: "Settlement pay blocked by CRITICAL incident in REPORTED/UNDER_REVIEW" }
+  - { id: ERR_PAPER_MISMATCH, http: 422, condition: "Paper/inspection species or head count does not match load" }
+  - { id: ERR_PAPER_EXPIRED, http: 422, condition: "Health paper expires_at <= planned_departure_at (verify) or <= now (depart)" }
+  - { id: ERR_BRAND_INSPECTION_STALE, http: 422, condition: "Brand inspection older than 96h before planned departure (verify) or before now (depart)" }
+  - { id: ERR_PAPERWORK_INCOMPLETE, http: 422, condition: "verify-paperwork lacks >=1 VERIFIED health paper and >=1 VERIFIED brand inspection" }
+  - { id: ERR_NO_DELIVERY_TICKET, http: 422, condition: "deliver requires at least one DELIVERY WeightTicket" }
+  - { id: ERR_COMPARTMENT_HEAD_EXCEEDED, http: 422, condition: "Compartment head capacity exceeded" }
+  - { id: ERR_COMPARTMENT_WEIGHT_EXCEEDED, http: 422, condition: "Compartment weight capacity exceeded" }
+  - { id: ERR_MIXED_TRAILER_ALLOCATIONS, http: 422, condition: "ACTIVE allocations span more than one trailer" }
+  - { id: ERR_ALLOCATION_TOTAL_MISMATCH, http: 422, condition: "Allocated head/weight do not equal declared totals (or no allocations)" }
+  - { id: ERR_GVWR_EXCEEDED, http: 422, condition: "allocated_weight_lb exceeds trailer.max_gross_weight_lb" }
+  - { id: ERR_DUPLICATE_LICENSE_NO, http: 409, condition: "license_no already registered" }
+  - { id: ERR_INVALID_BACKHAUL_LINK, http: 422, condition: "Backhaul target not DELIVERED, destination != origin, or outside 72h window" }
+  - { id: ERR_EVENT_IN_FUTURE, http: 422, condition: "occurred_at/washed_at/weighed_at is after the current logical clock" }
+  - { id: ERR_DUTY_INTERVAL_OVERLAP, http: 409, condition: "Duty event occurred_at precedes the previous event's occurred_at (interval inversion); equal timestamps allowed" }
+  - { id: ERR_DUTY_EVENT_SEQUENCE, http: 409, condition: "Duty event type illegal for the driver's current duty sub-state" }
+  - { id: ERR_TRAILER_WINDOW_OVERLAP, http: 409, condition: "Planned window touches or overlaps another active load sharing the driver or trailer (closed intervals)" }
+  - { id: ERR_DISPUTE_WINDOW_CLOSED, http: 422, condition: "Dispute/redispute after dispute_deadline_at (now > deadline)" }
+  - { id: ERR_DISPUTE_WINDOW_OPEN, http: 422, condition: "Pay from PENDING attempted while now <= dispute_deadline_at" }
+
+# =============================================================================
+# Table 7: RBAC Permission Matrix
+# =============================================================================
+roles:
+  - name: CarrierAdmin
+    description: "Carrier operations administrator: fleet, shippers, drivers, settlement payment, clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /haul/shippers"
+      - "POST /haul/drivers"
+      - "POST /haul/trailers"
+      - "POST /haul/settlements/{id}/pay"
+      - "POST /haul/_clock/set_current_utc"
+    shared_operations:
+      - "POST /haul/drivers/{id}/duty-events (with CarrierAdmin or Driver)"
+      - "POST /haul/trailers/{id}/washouts (with WashoutOperator)"
+      - "All GET endpoints (Any)"
+  - name: Dispatcher
+    description: "Plans loads, allocates compartments, assigns drivers, manages weather holds, counters disputes"
+    identity: opaque
+    exclusive_operations:
+      - "POST /haul/loads"
+      - "POST /haul/loads/{id}/allocations"
+      - "POST /haul/allocations/{id}/release"
+      - "POST /haul/loads/{id}/finalize-plan"
+      - "POST /haul/loads/{id}/reopen-plan"
+      - "POST /haul/loads/{id}/assign-driver"
+      - "POST /haul/loads/{id}/unassign-driver"
+      - "POST /haul/loads/{id}/cancel"
+      - "POST /haul/settlements/{id}/counter"
+    shared_operations:
+      - "POST /haul/loads/{id}/weather-holds (with Driver)"
+      - "POST /haul/weather-holds/{id}/release (with Driver)"
+      - "All GET endpoints (Any)"
+  - name: ComplianceOfficer
+    description: "Verifies health papers and brand inspections (never own uploads), reviews welfare incidents"
+    identity: opaque
+    exclusive_operations:
+      - "POST /haul/loads/{id}/health-papers"
+      - "POST /haul/health-papers/{id}/verify"
+      - "POST /haul/health-papers/{id}/reject"
+      - "POST /haul/loads/{id}/brand-inspections"
+      - "POST /haul/brand-inspections/{id}/verify"
+      - "POST /haul/brand-inspections/{id}/reject"
+      - "POST /haul/loads/{id}/verify-paperwork"
+      - "POST /haul/incidents/{id}/start-review"
+      - "POST /haul/incidents/{id}/close"
+    shared_operations: ["All GET endpoints (Any)"]
+  - name: Driver
+    description: "Entity-backed driver; operates own assigned loads, logs duty events, reports incidents"
+    identity: "entity_backed:Driver"
+    exclusive_operations:
+      - "POST /haul/loads/{id}/depart"
+      - "POST /haul/loads/{id}/rest-unload"
+      - "POST /haul/loads/{id}/resume-transit"
+      - "POST /haul/loads/{id}/arrive"
+      - "POST /haul/incidents"
+    shared_operations:
+      - "POST /haul/drivers/{id}/duty-events (own id only; with CarrierAdmin)"
+      - "POST /haul/loads/{id}/weather-holds (own load; with Dispatcher)"
+      - "POST /haul/weather-holds/{id}/release (own load; with Dispatcher)"
+      - "POST /haul/loads/{id}/weight-tickets (with ConsigneeAgent)"
+      - "All GET endpoints (Any)"
+  - name: ConsigneeAgent
+    description: "Receiving agent at destination: delivery tickets, delivery confirmation, weight disputes"
+    identity: opaque
+    exclusive_operations:
+      - "POST /haul/loads/{id}/deliver"
+      - "POST /haul/settlements/{id}/dispute"
+      - "POST /haul/settlements/{id}/accept-original"
+      - "POST /haul/settlements/{id}/redispute"
+      - "POST /haul/settlements/{id}/accept-counter"
+    shared_operations:
+      - "POST /haul/loads/{id}/weight-tickets (with Driver)"
+      - "All GET endpoints (Any)"
+  - name: WashoutOperator
+    description: "Biosecurity wash station operator"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations:
+      - "POST /haul/trailers/{id}/washouts (with CarrierAdmin)"
+      - "All GET endpoints (Any)"
+  - name: Any
+    description: "Wildcard: every authenticated role may perform these shared read operations"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations: ["All GET endpoints"]

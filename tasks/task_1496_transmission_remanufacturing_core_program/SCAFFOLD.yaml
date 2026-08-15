@@ -1,0 +1,1361 @@
+scenario: "Transmission Remanufacturing & Core Program (ATK/Jasper transmission reman): core intake & completeness inspection, hard-part inventory & interchange catalog, valve body calibration & TCM flash, build spec by year/make/model, dyno & shift-quality test, core deposit invoice/credit lifecycle, installer warranty & labor allowance, defective-return routing"
+
+domain_name: transmission-reman-core-program
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: workflow_orchestration   # reman pipeline with rework loops and gated stages
+  secondary_archetype: ledger_reconciliation  # core deposit invoice/credit lifecycle (provisional vs final)
+  complexity_layers:
+    - optimistic_concurrency      # OCC on RemanOrder.version (resync-spec) and HardPart.version (stock-adjustments)
+    - cascading_side_effects      # dyno final-fail -> release reservations -> promote waiting order; grade -> settle invoice -> close order
+    - dual_variant_calculation    # core credit (provisional vs graded-final); labor allowance (BOOK_HOURS vs ACTUAL_HOURS)
+    - rate_threshold_triggers     # dyno score verdict bands; core grade deduction bands; late-return tiers
+  entity_topology: flat           # peer entities joined by FK references; all reads via flat collections + filters
+  state_machine_shape: cyclic     # RemanOrder rework cycle; CoreDepositInvoice dispute/re-inspection cycle; CoreUnit re-inspection cycle
+  relationship_patterns:
+    - one_to_many                 # RemanOrder -> DynoBooking/DynoTestRun/CoreDepositInvoice
+    - many_to_many                # InterchangeMapping junction: HardPart <-> TransmissionModel
+    - cross_aggregate             # WarrantyClaim references shipped RemanOrder; CoreUnit references CoreDepositInvoice
+  role_model: segregation_of_duties  # calibration verify requires a different Calibrator than the drafter; otherwise peer roles
+  consistency_model: immediate    # every mutation visible in the same request's response
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: TransmissionModel
+    parent: null
+    common_fields: true
+    fields:
+      - { name: model_code, type: string, source: input, description: "Unique catalog code, e.g. '6L80-GM-2014'" , constraints: "unique across all models" }
+      - { name: year_start, type: integer, source: input, description: "First model year this spec applies to" }
+      - { name: year_end, type: integer, source: input, description: "Last model year this spec applies to (must be >= year_start)" }
+      - { name: make, type: string, source: input, description: "Vehicle make, e.g. 'GM'" }
+      - { name: model, type: string, source: input, description: "Vehicle model, e.g. 'Silverado 1500'" }
+      - { name: core_deposit_cents, type: integer, source: input, description: "Core deposit charged at sale for this family; must be > 0" }
+      - { name: flat_rate_hours, type: number, source: input, description: "Flat-rate labor guide hours for a remove-and-replace on this model" }
+      - { name: labor_cap_cents, type: integer, source: input, description: "Maximum labor allowance payable per warranty claim on this model" }
+      - { name: warranty_days, type: integer, source: input, default: 365, description: "Warranty coverage window in days from shipped_at" }
+      - { name: dyno_targets, type: array, source: input, description: "Array of {gear: integer, target_pressure_kpa: number}; dyno scoring iterates ascending by gear" }
+      - { name: required_parts, type: array, source: input, description: "Array of {part_family: string, qty: integer}; the kit spec for one build" }
+      - { name: spec_version, type: integer, source: system, default: 1, description: "Starts at 1; increments by 1 on every PUT; orders pin this at creation" }
+
+  - name: HardPart
+    parent: null
+    common_fields: true
+    fields:
+      - { name: part_number, type: string, source: input, description: "Unique part number", constraints: "unique across all hard parts" }
+      - { name: part_family, type: string, source: input, description: "Functional family used by build specs, e.g. 'PUMP', 'PLANETARY', 'DRUM_3_5'" }
+      - { name: unit_cost_cents, type: integer, source: input, description: "Unit cost; used as allocation ranking key within a tier" }
+      - { name: qty_on_hand, type: integer, source: input, description: "Physical quantity on hand at creation; afterwards mutated only by stock-adjustments, reservation consume/release, and salvage restock; must never go negative" }
+      - { name: qty_reserved, type: integer, source: system, default: 0, description: "Quantity reserved by non-terminal RemanOrders; mutated by kit-reserve, promotion, release, consume" }
+      - { name: availability, type: integer, source: computed, description: "Read-only = qty_on_hand - qty_reserved; allocation eligibility uses availability >= needed" }
+
+  - name: InterchangeMapping
+    parent: null
+    common_fields: false
+    fields:
+      - { name: hard_part_id, type: string, source: input, description: "FK -> HardPart.id; the interchangeable part" }
+      - { name: transmission_model_id, type: string, source: input, description: "FK -> TransmissionModel.id; the model the part fits" }
+      - { name: tier, type: enum, source: input, description: "DIRECT | ADAPTED; ADAPTED adds 30 surcharge labor minutes when picked" , constraints: "DIRECT | ADAPTED; pair (hard_part_id, transmission_model_id) unique" }
+
+  - name: RemanOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: transmission_model_id, type: string, source: input, description: "FK -> TransmissionModel.id; build spec source" }
+      - { name: buyer_ref, type: string, source: input, description: "Opaque buyer/installer reference copied onto the core deposit invoice" }
+      - { name: pinned_spec, type: object, source: system, description: "Snapshot of the model's {required_parts, dyno_targets, flat_rate_hours, labor_cap_cents, core_deposit_cents, warranty_days} taken at creation; later model PUTs do not alter it" }
+      - { name: model_spec_version_pin, type: integer, source: system, description: "TransmissionModel.spec_version at creation or last resync-spec" }
+      - { name: status, type: enum, source: system, default: QUEUED, description: "QUEUED | PART_HOLD | ASSEMBLY | CALIBRATION | DYNO_QUEUE | REWORK | ENGINEERING_REVIEW | DYNO_PASSED | SHIPPED | CANCELLED" }
+      - { name: shortage_parts, type: array, source: system, default: [], description: "Part families that could not be allocated at last kit-reserve attempt" }
+      - { name: reserved_parts, type: array, source: system, default: [], description: "Array of {hard_part_id, part_family, qty, tier} reserved for this build" }
+      - { name: surcharge_labor_minutes, type: integer, source: system, default: 0, description: "+30 per ADAPTED-tier part pick" }
+      - { name: cal_status, type: enum, source: system, default: NONE, description: "NONE | DRAFT | VERIFIED | SUPERSEDED - valve body calibration lifecycle on this order" }
+      - { name: cal_generation, type: integer, source: system, default: 0, description: "Increments each time a calibration draft is (re)written via PUT calibration" }
+      - { name: solenoid_trims, type: array, source: system, description: "Draft solenoid trim values set by PUT calibration" }
+      - { name: tcm_flash_version, type: string, source: system, description: "Draft TCM flash version set by PUT calibration" }
+      - { name: tcm_flash_version_applied, type: string, source: system, description: "Flash version actually applied when calibration was verified; null until first verify" }
+      - { name: cal_created_by_id, type: string, source: system, description: "X-User-ID of the Calibrator who drafted the current calibration; verify requires a different Calibrator" }
+      - { name: cal_created_at, type: datetime, source: system, description: "Logical-clock timestamp of the current calibration draft; verify requires age <= 72h" }
+      - { name: dyno_attempts_used, type: integer, source: system, default: 0, description: "Count of DynoTestRuns recorded against this order; budget is 3" }
+      - { name: last_shift_quality_score, type: number, source: system, description: "Score of the most recent dyno run; null before first run" }
+      - { name: core_settlement_status, type: enum, source: system, default: PENDING, description: "PENDING | CLOSED; set CLOSED by cascade when the linked invoice reaches SETTLED_FULL or SETTLED_ADJUSTED" }
+      - { name: shipped_at, type: datetime, source: system, description: "Logical-clock timestamp of ship; null until SHIPPED" }
+
+  - name: DynoBooking
+    parent: null
+    common_fields: false
+    fields:
+      - { name: reman_order_id, type: string, source: input, description: "FK -> RemanOrder.id; order must be in DYNO_QUEUE at booking time" }
+      - { name: dyno_cell_code, type: string, source: input, description: "Dyno cell resource identifier, e.g. 'DYNO-1'" }
+      - { name: start_utc, type: datetime, source: input, description: "Window start; half-open interval [start_utc, end_utc)" }
+      - { name: end_utc, type: datetime, source: input, description: "Window end; must be > start_utc and > current logical time" }
+      - { name: status, type: enum, source: system, default: BOOKED, description: "BOOKED (immutable record; never transitions)" }
+
+  - name: DynoTestRun
+    parent: null
+    common_fields: false
+    fields:
+      - { name: reman_order_id, type: string, source: input, description: "FK -> RemanOrder.id; order must be in DYNO_QUEUE with a covering BOOKED DynoBooking" }
+      - { name: dyno_booking_id, type: string, source: system, description: "FK -> DynoBooking.id; the covering booking resolved by the server at run creation" }
+      - { name: attempt_number, type: integer, source: system, description: "= count of prior runs for this order + 1" }
+      - { name: gear_pressures_kpa, type: array, source: input, description: "Measured mainline pressure per gear, aligned ascending by gear with pinned_spec.dyno_targets; length must match" }
+      - { name: shift_quality_score, type: number, source: computed, description: "100 minus sum of per-gear penalties (see dyno_shift_quality_score); 2dp round_half_up" }
+      - { name: verdict, type: enum, source: computed, description: "PASS (score >= 90.00) | MARGINAL (>= 80.00) | FAIL (< 80.00)" }
+
+  - name: CoreUnit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: core_deposit_invoice_id, type: string, source: input, description: "FK -> CoreDepositInvoice.id; at most one CoreUnit per invoice" }
+      - { name: dock_code, type: string, source: input, description: "Receiving dock resource identifier, e.g. 'DOCK-1'" }
+      - { name: dock_start_utc, type: datetime, source: input, description: "Dock appointment start; closed interval with 30-minute turnaround buffer" }
+      - { name: dock_end_utc, type: datetime, source: input, description: "Dock appointment end; must be > dock_start_utc" }
+      - { name: received_at, type: datetime, source: system, description: "Logical-clock timestamp of registration" }
+      - { name: days_late, type: integer, source: computed, description: "Whole days between invoice.issued_at and received_at, floor((received_at - issued_at)/86400)" }
+      - { name: case_cracked, type: boolean, source: system, description: "Set from inspect input; true forces grade REJECTED" }
+      - { name: findings, type: array, source: system, description: "Completeness findings recorded at inspect: subset of {TORQUE_CONVERTER_MISSING, VALVE_BODY_MISSING, SENSOR_HARNESS_MISSING, BELL_HOUSING_DAMAGED, PAN_MISSING}" }
+      - { name: deduction_score, type: integer, source: computed, description: "Sum of finding weights (see core_grade_and_credit)" }
+      - { name: grade, type: enum, source: computed, description: "A | B | C | REJECTED; null until first inspect" }
+      - { name: status, type: enum, source: system, default: RECEIVED, description: "RECEIVED | GRADED | REJECTED | RE_INSPECTION" }
+
+  - name: CoreDepositInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: reman_order_id, type: string, source: system, description: "FK -> RemanOrder.id; set by the ship cascade that creates this invoice" }
+      - { name: buyer_ref, type: string, source: system, description: "Copied from the shipped order" }
+      - { name: deposit_cents, type: integer, source: system, description: "Copied from the order's pinned_spec.core_deposit_cents" }
+      - { name: issued_at, type: datetime, source: system, description: "Logical-clock timestamp at ship time" }
+      - { name: provisional_credit_cents, type: integer, source: computed, description: "Estimate at issuance = round_half_up(deposit_cents * 0.8, 0); superseded by final_credit_cents at grade" }
+      - { name: final_credit_cents, type: integer, source: system, description: "Credit granted after inspection/dispute; null until first settlement" }
+      - { name: forfeited_cents, type: integer, source: system, description: "= deposit_cents - final_credit_cents at every settlement; null until first settlement" }
+      - { name: status, type: enum, source: system, default: OPEN, description: "OPEN | AWAITING_GRADE | SETTLED_FULL | SETTLED_PARTIAL | FORFEITED | DISPUTED | SETTLED_ADJUSTED" }
+
+  - name: WarrantyClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: reman_order_id, type: string, source: input, description: "FK -> RemanOrder.id; order must be SHIPPED" }
+      - { name: installer_id, type: string, source: system, description: "= X-User-ID of the filing Installer (opaque identity); ownership checked on return-ship" }
+      - { name: failure_code, type: enum, source: input, description: "CONVERTER_FAILURE | GEAR_CLUNK | PRESSURE_LEAK | ELECTRICAL_TCM" }
+      - { name: claimed_labor_hours, type: number, source: input, description: "Actual labor hours claimed by the installer; must be > 0" }
+      - { name: installer_labor_rate_cents, type: integer, source: input, description: "Installer hourly labor rate in cents; must be > 0" }
+      - { name: allowance_policy, type: enum, source: input, description: "BOOK_HOURS | ACTUAL_HOURS; selects the labor allowance variant at approve time" }
+      - { name: labor_allowance_cents, type: integer, source: computed, description: "Computed at approve per warranty_labor_allowance; null until APPROVED" }
+      - { name: routing_type, type: enum, source: computed, description: "RETURN_TO_PLANT | RETURN_TO_DISTRIBUTOR | LOCAL_SCRAP; computed at approve by the routing selector" }
+      - { name: return_required, type: boolean, source: computed, description: "true unless routing_type == LOCAL_SCRAP" }
+      - { name: claim_status, type: enum, source: system, default: SUBMITTED, description: "SUBMITTED | APPROVED | DENIED | PAID" }
+      - { name: return_status, type: enum, source: system, default: NONE, description: "NONE | ISSUED | IN_TRANSIT | DISPOSITIONED; parallel dimension to claim_status" }
+      - { name: deny_reason, type: string, source: system, description: "Reason recorded at deny; null otherwise" }
+      - { name: salvaged_parts, type: array, source: system, default: [], description: "Array of {hard_part_id, qty} restocked at return-receive" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: RemanOrder
+    initial_state: QUEUED
+    terminal_states: [SHIPPED, CANCELLED, ENGINEERING_REVIEW]
+    transitions:
+      - from: QUEUED
+        to: ASSEMBLY
+        trigger: "POST /api/reman-orders/{id}/kit-reserve"
+        actor: RemanPlanner
+        preconditions:
+          - "status == QUEUED (ERR_ORDER_NOT_READY_FOR_KIT)"
+          - "full allocation succeeds for every pinned_spec.required_parts line (parts_reservation_allocation)"
+        side_effects:
+          - "per picked part: HardPart.qty_reserved += qty"
+          - "surcharge_labor_minutes += 30 per ADAPTED-tier pick"
+          - "reserved_parts set; shortage_parts = []"
+          - "increments RemanOrder.version by 1"
+
+      - from: QUEUED
+        to: PART_HOLD
+        trigger: "POST /api/reman-orders/{id}/kit-reserve"
+        actor: RemanPlanner
+        preconditions:
+          - "status == QUEUED (ERR_ORDER_NOT_READY_FOR_KIT)"
+          - "at least one required_parts line has no allocatable candidate (all-or-nothing: no partial reservation)"
+        side_effects:
+          - "shortage_parts = unallocatable part families; reserved_parts unchanged ([])"
+
+      - from: PART_HOLD
+        to: ASSEMBLY
+        trigger: "system (promotion scan after any availability-increasing event: positive stock-adjustment, reservation release, salvage restock) or POST /api/reman-orders/{id}/kit-reserve retry"
+        actor: system
+        preconditions:
+          - "full allocation now succeeds for all shortage_parts"
+          - "promotion scans PART_HOLD orders in created_at ASC order, promoting every resolvable order, re-checking availability after each promotion"
+        side_effects:
+          - "per picked part: HardPart.qty_reserved += qty"
+          - "surcharge_labor_minutes += 30 per ADAPTED-tier pick"
+          - "shortage_parts = []"
+
+      - from: ASSEMBLY
+        to: CALIBRATION
+        trigger: "POST /api/reman-orders/{id}/complete-assembly"
+        actor: RemanTechnician
+        preconditions:
+          - "status == ASSEMBLY (ERR_ORDER_NOT_READY_FOR_ASSEMBLY)"
+        side_effects: []
+
+      - from: CALIBRATION
+        to: DYNO_QUEUE
+        trigger: "POST /api/reman-orders/{id}/verify-calibration"
+        actor: Calibrator
+        preconditions:
+          - "status == CALIBRATION (ERR_ORDER_NOT_READY_FOR_CALIBRATION)"
+          - "cal_status == DRAFT (ERR_CAL_NOT_DRAFT)"
+          - "X-User-ID != cal_created_by_id (ERR_SOD_VERIFICATION_FORBIDDEN, segregation of duties)"
+          - "logical now - cal_created_at <= 72h (ERR_CAL_STALE)"
+        side_effects:
+          - "cal_status: DRAFT -> VERIFIED"
+          - "tcm_flash_version_applied = tcm_flash_version (TCM flash applied)"
+
+      - from: REWORK
+        to: DYNO_QUEUE
+        trigger: "POST /api/reman-orders/{id}/verify-calibration"
+        actor: Calibrator
+        preconditions:
+          - "status == REWORK (ERR_ORDER_NOT_READY_FOR_CALIBRATION)"
+          - "cal_status == DRAFT (ERR_CAL_NOT_DRAFT)"
+          - "X-User-ID != cal_created_by_id (ERR_SOD_VERIFICATION_FORBIDDEN)"
+          - "logical now - cal_created_at <= 72h (ERR_CAL_STALE)"
+        side_effects:
+          - "cal_status: DRAFT -> VERIFIED"
+          - "tcm_flash_version_applied = tcm_flash_version"
+
+      - from: DYNO_QUEUE
+        to: REWORK
+        trigger: "POST /api/dyno-test-runs with verdict FAIL and attempt_number < 3"
+        actor: DynoOperator
+        preconditions:
+          - "status == DYNO_QUEUE (ERR_ORDER_NOT_IN_DYNO_QUEUE)"
+          - "covering BOOKED DynoBooking exists for this order (ERR_NO_ACTIVE_DYNO_BOOKING)"
+          - "dyno_attempts_used < 3 before the run (ERR_DYNO_ATTEMPT_EXHAUSTED)"
+        side_effects:
+          - "dyno_attempts_used += 1; last_shift_quality_score set"
+          - "cascade: cal_status VERIFIED -> SUPERSEDED (re-calibration required; reservations are kept)"
+
+      - from: DYNO_QUEUE
+        to: ENGINEERING_REVIEW
+        trigger: "POST /api/dyno-test-runs with verdict FAIL and attempt_number == 3"
+        actor: DynoOperator
+        preconditions:
+          - "status == DYNO_QUEUE (ERR_ORDER_NOT_IN_DYNO_QUEUE)"
+          - "covering BOOKED DynoBooking exists (ERR_NO_ACTIVE_DYNO_BOOKING)"
+          - "dyno_attempts_used < 3 before the run (ERR_DYNO_ATTEMPT_EXHAUSTED)"
+        side_effects:
+          - "dyno_attempts_used += 1; last_shift_quality_score set"
+          - "cascade link 1: cal_status VERIFIED -> SUPERSEDED"
+          - "cascade link 2: release all reserved_parts (HardPart.qty_reserved -= qty per line); reserved_parts = []"
+          - "cascade link 3: availability increase fires the promotion scan - oldest resolvable PART_HOLD order (created_at ASC) auto-promotes PART_HOLD -> ASSEMBLY with fresh reservations"
+
+      - from: DYNO_QUEUE
+        to: DYNO_PASSED
+        trigger: "POST /api/dyno-test-runs with verdict PASS"
+        actor: DynoOperator
+        preconditions:
+          - "status == DYNO_QUEUE (ERR_ORDER_NOT_IN_DYNO_QUEUE)"
+          - "covering BOOKED DynoBooking exists (ERR_NO_ACTIVE_DYNO_BOOKING)"
+          - "dyno_attempts_used < 3 before the run (ERR_DYNO_ATTEMPT_EXHAUSTED)"
+        side_effects:
+          - "dyno_attempts_used += 1; last_shift_quality_score set"
+
+      - from: DYNO_QUEUE
+        to: DYNO_QUEUE
+        trigger: "POST /api/dyno-test-runs with verdict MARGINAL"
+        actor: DynoOperator
+        preconditions:
+          - "status == DYNO_QUEUE (ERR_ORDER_NOT_IN_DYNO_QUEUE)"
+          - "covering BOOKED DynoBooking exists (ERR_NO_ACTIVE_DYNO_BOOKING)"
+          - "dyno_attempts_used < 3 before the run (ERR_DYNO_ATTEMPT_EXHAUSTED)"
+        side_effects:
+          - "dyno_attempts_used += 1; last_shift_quality_score set; cal_status stays VERIFIED"
+
+      - from: DYNO_PASSED
+        to: SHIPPED
+        trigger: "POST /api/reman-orders/{id}/ship"
+        actor: RemanPlanner
+        preconditions:
+          - "status == DYNO_PASSED (ERR_ORDER_NOT_SHIPPABLE)"
+        side_effects:
+          - "shipped_at = logical now"
+          - "cascade: create CoreDepositInvoice {reman_order_id, buyer_ref, deposit_cents = pinned_spec.core_deposit_cents, issued_at = now, provisional_credit_cents = round_half_up(deposit_cents * 0.8, 0), status OPEN}"
+          - "consume reservations: per reserved_parts line HardPart.qty_reserved -= qty AND HardPart.qty_on_hand -= qty"
+
+      - from: QUEUED
+        to: CANCELLED
+        trigger: "POST /api/reman-orders/{id}/cancel"
+        actor: RemanPlanner
+        preconditions:
+          - "status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION} (ERR_ORDER_NOT_CANCELLABLE)"
+        side_effects:
+          - "release any reserved_parts (HardPart.qty_reserved -= qty per line); promotion scan fires"
+
+      - from: PART_HOLD
+        to: CANCELLED
+        trigger: "POST /api/reman-orders/{id}/cancel"
+        actor: RemanPlanner
+        preconditions:
+          - "status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION} (ERR_ORDER_NOT_CANCELLABLE)"
+        side_effects: []
+
+      - from: ASSEMBLY
+        to: CANCELLED
+        trigger: "POST /api/reman-orders/{id}/cancel"
+        actor: RemanPlanner
+        preconditions:
+          - "status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION} (ERR_ORDER_NOT_CANCELLABLE)"
+        side_effects:
+          - "release all reserved_parts (HardPart.qty_reserved -= qty per line); promotion scan fires"
+
+      - from: CALIBRATION
+        to: CANCELLED
+        trigger: "POST /api/reman-orders/{id}/cancel"
+        actor: RemanPlanner
+        preconditions:
+          - "status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION} (ERR_ORDER_NOT_CANCELLABLE)"
+        side_effects:
+          - "release all reserved_parts (HardPart.qty_reserved -= qty per line); cal_status -> SUPERSEDED if DRAFT; promotion scan fires"
+
+  - entity: CoreUnit
+    initial_state: RECEIVED
+    terminal_states: []
+    transitions:
+      - from: RECEIVED
+        to: GRADED
+        trigger: "POST /api/core-units/{id}/inspect"
+        actor: CoreInspector
+        preconditions:
+          - "status in {RECEIVED, RE_INSPECTION} (ERR_CORE_NOT_INSPECTABLE)"
+          - "computed grade in {A, B, C}"
+        side_effects:
+          - "case_cracked, findings, deduction_score, grade recorded"
+          - "cascade link 1: CoreDepositInvoice AWAITING_GRADE -> SETTLED_FULL (credit == deposit) or SETTLED_PARTIAL (0 < credit < deposit); final_credit_cents and forfeited_cents = deposit - credit set"
+          - "cascade link 2: if invoice reached SETTLED_FULL, RemanOrder.core_settlement_status PENDING -> CLOSED"
+
+      - from: RECEIVED
+        to: REJECTED
+        trigger: "POST /api/core-units/{id}/inspect"
+        actor: CoreInspector
+        preconditions:
+          - "status in {RECEIVED, RE_INSPECTION} (ERR_CORE_NOT_INSPECTABLE)"
+          - "computed grade == REJECTED (deduction_score > 30 or case_cracked) or core arrived > 45 days late"
+        side_effects:
+          - "grade = REJECTED recorded"
+          - "cascade: CoreDepositInvoice AWAITING_GRADE -> FORFEITED; final_credit_cents = 0; forfeited_cents = deposit_cents"
+
+      - from: RE_INSPECTION
+        to: GRADED
+        trigger: "POST /api/core-units/{id}/inspect"
+        actor: CoreInspector
+        preconditions:
+          - "status in {RECEIVED, RE_INSPECTION} (ERR_CORE_NOT_INSPECTABLE)"
+        side_effects:
+          - "same credit + invoice + order cascades as RECEIVED -> GRADED (re-settlement overwrites prior final_credit_cents/forfeited_cents)"
+
+      - from: RE_INSPECTION
+        to: REJECTED
+        trigger: "POST /api/core-units/{id}/inspect"
+        actor: CoreInspector
+        preconditions:
+          - "status in {RECEIVED, RE_INSPECTION} (ERR_CORE_NOT_INSPECTABLE)"
+        side_effects:
+          - "same forfeiture cascade as RECEIVED -> REJECTED"
+
+      - from: GRADED
+        to: RE_INSPECTION
+        trigger: "system (cascade from POST /api/core-deposit-invoices/{id}/resolve-dispute with action REINSPECT)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+      - from: REJECTED
+        to: RE_INSPECTION
+        trigger: "system (cascade from POST /api/core-deposit-invoices/{id}/resolve-dispute with action REINSPECT)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  - entity: CoreDepositInvoice
+    initial_state: OPEN
+    terminal_states: [SETTLED_FULL, SETTLED_ADJUSTED]
+    transitions:
+      - from: OPEN
+        to: AWAITING_GRADE
+        trigger: "system (cascade from POST /api/core-units registering a core against this invoice)"
+        actor: system
+        preconditions:
+          - "status == OPEN (ERR_INVOICE_NOT_OPEN); since registration atomically flips OPEN -> AWAITING_GRADE, OPEN also guarantees no other CoreUnit references this invoice"
+        side_effects: []
+
+      - from: AWAITING_GRADE
+        to: SETTLED_FULL
+        trigger: "system (cascade from CoreUnit inspect, grade A/B/C with late factor producing credit == deposit_cents)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "final_credit_cents = computed credit; forfeited_cents = deposit_cents - final_credit_cents"
+          - "cascade: RemanOrder.core_settlement_status PENDING -> CLOSED"
+
+      - from: AWAITING_GRADE
+        to: SETTLED_PARTIAL
+        trigger: "system (cascade from CoreUnit inspect, 0 < credit < deposit_cents)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "final_credit_cents = computed credit; forfeited_cents = deposit_cents - final_credit_cents"
+
+      - from: AWAITING_GRADE
+        to: FORFEITED
+        trigger: "system (cascade from CoreUnit inspect, credit == 0: grade REJECTED or days_late > 45)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "final_credit_cents = 0; forfeited_cents = deposit_cents"
+
+      - from: SETTLED_PARTIAL
+        to: DISPUTED
+        trigger: "POST /api/core-deposit-invoices/{id}/dispute"
+        actor: CoreIntakeClerk
+        preconditions:
+          - "status in {SETTLED_PARTIAL, FORFEITED} (ERR_INVOICE_NOT_DISPUTABLE)"
+        side_effects: []
+
+      - from: FORFEITED
+        to: DISPUTED
+        trigger: "POST /api/core-deposit-invoices/{id}/dispute"
+        actor: CoreIntakeClerk
+        preconditions:
+          - "status in {SETTLED_PARTIAL, FORFEITED} (ERR_INVOICE_NOT_DISPUTABLE)"
+        side_effects: []
+
+      - from: DISPUTED
+        to: AWAITING_GRADE
+        trigger: "POST /api/core-deposit-invoices/{id}/resolve-dispute with action REINSPECT"
+        actor: ProgramAdmin
+        preconditions:
+          - "status == DISPUTED (ERR_INVOICE_NOT_DISPUTED)"
+        side_effects:
+          - "cascade: linked CoreUnit GRADED|REJECTED -> RE_INSPECTION"
+
+      - from: DISPUTED
+        to: SETTLED_ADJUSTED
+        trigger: "POST /api/core-deposit-invoices/{id}/resolve-dispute with action ADJUST"
+        actor: ProgramAdmin
+        preconditions:
+          - "status == DISPUTED (ERR_INVOICE_NOT_DISPUTED)"
+          - "0 <= adjusted_credit_cents <= deposit_cents (ERR_ADJUSTMENT_OUT_OF_RANGE)"
+        side_effects:
+          - "final_credit_cents = adjusted_credit_cents; forfeited_cents = deposit_cents - adjusted_credit_cents"
+          - "cascade: RemanOrder.core_settlement_status PENDING -> CLOSED"
+
+  - entity: WarrantyClaim
+    initial_state: SUBMITTED
+    terminal_states: [PAID, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /api/warranty-claims/{id}/approve"
+        actor: WarrantyAdjuster
+        preconditions:
+          - "claim_status == SUBMITTED (ERR_CLAIM_NOT_REVIEWABLE)"
+        side_effects:
+          - "labor_allowance_cents computed per warranty_labor_allowance variant selected by allowance_policy"
+          - "routing_type computed by the routing selector (ELECTRICAL_TCM -> RETURN_TO_DISTRIBUTOR; else allowance >= 50000 -> RETURN_TO_PLANT; else LOCAL_SCRAP)"
+          - "if return_required: return_status NONE -> ISSUED (defective return routing opened)"
+
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /api/warranty-claims/{id}/deny"
+        actor: WarrantyAdjuster
+        preconditions:
+          - "claim_status == SUBMITTED (ERR_CLAIM_NOT_REVIEWABLE)"
+        side_effects:
+          - "deny_reason recorded"
+
+      - from: APPROVED
+        to: PAID
+        trigger: "POST /api/warranty-claims/{id}/pay"
+        actor: WarrantyAdjuster
+        preconditions:
+          - "claim_status == APPROVED (ERR_CLAIM_NOT_PAYABLE)"
+          - "if return_required: return_status == DISPOSITIONED (ERR_RETURN_NOT_RECEIVED)"
+        side_effects: []
+
+  - entity: WarrantyClaimReturn
+    note: "Parallel state dimension return_status on the WarrantyClaim row (claim_status x return_status evolve independently once APPROVED)."
+    initial_state: NONE
+    terminal_states: [DISPOSITIONED]
+    transitions:
+      - from: NONE
+        to: ISSUED
+        trigger: "system (cascade from claim approve when return_required)"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+      - from: ISSUED
+        to: IN_TRANSIT
+        trigger: "POST /api/warranty-claims/{id}/return-ship"
+        actor: Installer
+        preconditions:
+          - "claim_status == APPROVED and return_status == ISSUED (ERR_RETURN_NOT_SHIPPABLE)"
+          - "X-User-ID == installer_id (ownership)"
+        side_effects: []
+
+      - from: IN_TRANSIT
+        to: DISPOSITIONED
+        trigger: "POST /api/warranty-claims/{id}/return-receive"
+        actor: WarrantyAdjuster
+        preconditions:
+          - "return_status == IN_TRANSIT (ERR_RETURN_NOT_RECEIVABLE)"
+        side_effects:
+          - "salvaged_parts restocked: per line HardPart.qty_on_hand += qty"
+          - "cascade: availability increase fires the PART_HOLD promotion scan (created_at ASC, all resolvable orders promoted)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: reman-order-resync-stale-version
+    parent_entity: RemanOrder
+    write_endpoint: "POST /api/reman-orders/{id}/resync-spec"
+    occ_field: expected_reman_order_version
+    description: |
+      Re-pinning a RemanOrder to the model's current spec is rejected when the
+      client's expected_reman_order_version no longer matches the order's
+      current version. The product semantics allow any number of resyncs to
+      legitimately succeed in sequence (each re-pins to the latest spec), so a
+      second sequential request observes no state-field rejection; the stale
+      version is the only signal that the client's view of the order (its
+      pinned spec and status) is out of date.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+  - rule_id: hard-part-adjust-stale-version
+    parent_entity: HardPart
+    write_endpoint: "POST /api/hard-parts/{id}/stock-adjustments"
+    occ_field: expected_hard_part_version
+    description: |
+      Applying a qty_on_hand adjustment is rejected when the client's
+      expected_hard_part_version no longer matches the part's current version.
+      Two sequential adjustments would both naturally succeed, so the version
+      check is the only deterministic signal that the writer based its delta
+      on a stale qty_on_hand/qty_reserved view.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: core_provisional_credit
+    trigger: "RemanOrder ship cascade (CoreDepositInvoice creation)"
+    algorithm: aggregation
+    formula: |
+      provisional_credit_cents = round_half_up(deposit_cents * PROVISIONAL_CREDIT_FACTOR, 0)
+      deposit_cents is copied from the order's pinned_spec.core_deposit_cents.
+    input_set: "The single invoice being created; deposit from the order's pinned spec (never the live model record)."
+    constants:
+      PROVISIONAL_CREDIT_FACTOR: 0.8
+    precision: "0 decimal places (integer cents), round_half_up"
+    variants:
+      - name: provisional_estimate
+        when: "at invoice issuance (ship)"
+        difference: "assumes a complete grade-A-equivalent return discounted by the factor; takes no inspection input"
+
+  - name: core_grade_and_credit
+    trigger: "POST /api/core-units/{id}/inspect (initial and re-inspection)"
+    algorithm: threshold
+    formula: |
+      1. deduction_score = sum(WEIGHT[f] for f in findings)
+      2. grade: case_cracked == true  => REJECTED
+                deduction_score <= GRADE_A_MAX  => A
+                deduction_score <= GRADE_B_MAX  => B
+                deduction_score <= GRADE_C_MAX  => C
+                else                            => REJECTED
+      3. days_late = floor((received_at - invoice.issued_at) / 86400)
+      4. late_factor: days_late <= ON_TIME_DAYS      => 1.0
+                      days_late <= LATE_CUTOFF_DAYS  => LATE_CREDIT_FACTOR
+                      else                           => forfeit (credit 0)
+      5. if grade == REJECTED or late_factor == forfeit:
+           final_credit_cents = 0                          (invoice FORFEITED)
+         else:
+           raw = deposit_cents * GRADE_MULTIPLIER[grade] * late_factor
+           final_credit_cents = round_half_up(raw, 0)
+           invoice status: final == deposit => SETTLED_FULL, else SETTLED_PARTIAL
+      6. forfeited_cents = deposit_cents - final_credit_cents
+      7. order closure: SETTLED_FULL or SETTLED_ADJUSTED cascades
+         RemanOrder.core_settlement_status -> CLOSED.
+    input_set: "The inspected CoreUnit and its single linked CoreDepositInvoice in AWAITING_GRADE."
+    constants:
+      WEIGHT_TORQUE_CONVERTER_MISSING: 20
+      WEIGHT_VALVE_BODY_MISSING: 25
+      WEIGHT_SENSOR_HARNESS_MISSING: 10
+      WEIGHT_BELL_HOUSING_DAMAGED: 15
+      WEIGHT_PAN_MISSING: 5
+      GRADE_A_MAX: 5
+      GRADE_B_MAX: 15
+      GRADE_C_MAX: 30
+      GRADE_MULTIPLIER_A: 1.0
+      GRADE_MULTIPLIER_B: 0.75
+      GRADE_MULTIPLIER_C: 0.5
+      ON_TIME_DAYS: 30
+      LATE_CUTOFF_DAYS: 45
+      LATE_CREDIT_FACTOR: 0.75
+    precision: "0 decimal places (integer cents), round_half_up"
+    variants:
+      - name: final_graded_credit
+        when: "at core inspection / re-inspection"
+        difference: "uses observed findings, case flag, and actual lateness; replaces the provisional estimate and can diverge arbitrarily from it"
+
+  - name: dyno_shift_quality_score
+    trigger: "POST /api/dyno-test-runs"
+    algorithm: weighted_scoring
+    formula: |
+      targets = order.pinned_spec.dyno_targets sorted ascending by gear
+      for each gear i: penalty_i = round_half_up(|gear_pressures_kpa[i] - targets[i].target_pressure_kpa| * PENALTY_PER_KPA, 2)
+      shift_quality_score = max(0, round_half_up(100 - sum(penalty_i), 2))
+      verdict: score >= PASS_MIN => PASS; score >= MARGINAL_MIN => MARGINAL; else FAIL
+      Rounding order is pinned: round each per-gear penalty to 2dp FIRST, then
+      sum the rounded penalties, then subtract from 100. Summing raw penalties
+      before rounding is forbidden and yields different cents.
+    input_set: "The new run's gear_pressures_kpa against the order's pinned_spec.dyno_targets (pinned snapshot, not the live model)."
+    constants:
+      PENALTY_PER_KPA: 2.0
+      PASS_MIN: 90.0
+      MARGINAL_MIN: 80.0
+      MAX_DYNO_ATTEMPTS: 3
+    precision: "2 decimal places per penalty and for the score, round_half_up"
+
+  - name: warranty_labor_allowance
+    trigger: "POST /api/warranty-claims/{id}/approve"
+    algorithm: tiered_pricing
+    formula: |
+      base: BOOK_HOURS    => hours = pinned_spec.flat_rate_hours
+            ACTUAL_HOURS  => hours = min(claimed_labor_hours, pinned_spec.flat_rate_hours)
+      allowance = round_half_up(hours * installer_labor_rate_cents, 0)
+      labor_allowance_cents = min(allowance, pinned_spec.labor_cap_cents)
+      Cap comparison is >= : an uncapped value exactly equal to the cap pays the cap value.
+    input_set: "The claim being approved; labor guide and cap come from the order's pinned_spec."
+    constants:
+      ROUTING_VALUE_THRESHOLD_CENTS: 50000
+    precision: "0 decimal places (integer cents), round_half_up"
+    variants:
+      - name: book_hours
+        when: "claim.allowance_policy == BOOK_HOURS"
+        difference: "pays the full flat-rate guide hours regardless of hours actually claimed"
+      - name: actual_hours
+        when: "claim.allowance_policy == ACTUAL_HOURS"
+        difference: "pays min(claimed, flat-rate) hours; identical inputs produce a lower payout whenever claimed < flat-rate"
+
+  - name: defective_return_routing
+    trigger: "POST /api/warranty-claims/{id}/approve (after labor_allowance_cents is computed)"
+    algorithm: constraint_propagation
+    formula: |
+      Selector, evaluated top to bottom; first matching rule wins:
+      1. failure_code == ELECTRICAL_TCM                      => RETURN_TO_DISTRIBUTOR
+      2. labor_allowance_cents >= ROUTING_VALUE_THRESHOLD_CENTS => RETURN_TO_PLANT
+      3. otherwise                                            => LOCAL_SCRAP
+      return_required = (routing_type != LOCAL_SCRAP)
+    input_set: "The claim being approved (its failure_code and freshly computed labor_allowance_cents)."
+    constants:
+      ROUTING_VALUE_THRESHOLD_CENTS: 50000
+    precision: "integer cents comparison; threshold is inclusive (>=)"
+
+  - name: parts_reservation_allocation
+    trigger: "POST /api/reman-orders/{id}/kit-reserve and every availability-increasing event (positive stock-adjustment, reservation release on cancel/ENGINEERING_REVIEW, salvage restock) for the promotion scan"
+    algorithm: waterfall_allocation
+    formula: |
+      Process pinned_spec.required_parts sorted by part_family ASC.
+      For each line with needed = qty:
+        candidates = HardPart p where p.part_family == line.part_family
+          AND exists InterchangeMapping(hard_part_id = p.id,
+               transmission_model_id = order.transmission_model_id)
+          AND (p.qty_on_hand - p.qty_reserved) >= needed
+        rank: tier DIRECT before ADAPTED;
+              within tier unit_cost_cents ASC;
+              tie-break p.created_at ASC (never id).
+        pick the first candidate; if the candidate set is empty the line is a shortage.
+      All-or-nothing: if any line is a shortage, reserve nothing,
+      shortage_parts = unallocatable families, order -> PART_HOLD.
+      Otherwise reserve every pick (qty_reserved += qty) and add
+      ADAPTED_SURCHARGE_MINUTES per ADAPTED pick; order -> ASSEMBLY.
+      Promotion scan: after any availability-increasing event, iterate
+      PART_HOLD orders in created_at ASC order; for each, re-run the full
+      allocation; promote (PART_HOLD -> ASSEMBLY) every order that fully
+      resolves, re-checking availability after each promotion.
+    input_set: "The kitting order plus all HardParts mapped to its model; promotion scans all PART_HOLD orders."
+    constants:
+      ADAPTED_SURCHARGE_MINUTES: 30
+    precision: "integer quantities"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and non-empty"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role is permitted to call this endpoint per §1.5 roles"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: existence
+    check: "Request body shape: required fields present, enums valid, types correct, end_utc > start_utc, year_end >= year_start, quantities/rates/deposits positive"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all endpoints"
+
+  - priority: 4
+    category: existence
+    check: "Resource ids in path, then FK ids in body, exist (validated left-to-right)"
+    error_id: "ERR_MODEL_NOT_FOUND | ERR_PART_NOT_FOUND | ERR_INTERCHANGE_NOT_FOUND | ERR_ORDER_NOT_FOUND | ERR_BOOKING_NOT_FOUND | ERR_DYNO_RUN_NOT_FOUND | ERR_CORE_NOT_FOUND | ERR_INVOICE_NOT_FOUND | ERR_CLAIM_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with resource ids"
+
+  - priority: 5
+    category: state
+    check: "OCC: expected_<parent>_version equals the parent's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /api/reman-orders/{id}/resync-spec; POST /api/hard-parts/{id}/stock-adjustments"
+
+  - priority: 6
+    category: state
+    check: "Target entity in a state permitted for the operation (per §1.2 preconditions); sibling-state gates: covering BOOKED dyno booking; invoice OPEN and unlinked for core registration"
+    error_id: "ERR_ORDER_NOT_READY_FOR_KIT | ERR_ORDER_NOT_READY_FOR_ASSEMBLY | ERR_ORDER_NOT_READY_FOR_CALIBRATION | ERR_CAL_NOT_DRAFT | ERR_ORDER_NOT_IN_DYNO_QUEUE | ERR_NO_ACTIVE_DYNO_BOOKING | ERR_ORDER_NOT_SHIPPABLE | ERR_ORDER_NOT_CANCELLABLE | ERR_ORDER_NOT_RESYNCABLE | ERR_INVOICE_NOT_OPEN | ERR_CORE_NOT_INSPECTABLE | ERR_INVOICE_NOT_DISPUTABLE | ERR_INVOICE_NOT_DISPUTED | ERR_ORDER_NOT_SHIPPED | ERR_CLAIM_NOT_REVIEWABLE | ERR_CLAIM_NOT_PAYABLE | ERR_RETURN_NOT_SHIPPABLE | ERR_RETURN_NOT_RECEIVABLE | ERR_RETURN_NOT_RECEIVED"
+    http_status: 409
+    applies_to: "state transition and state-gated endpoints"
+
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: verify-calibration X-User-ID must differ from cal_created_by_id"
+    error_id: ERR_SOD_VERIFICATION_FORBIDDEN
+    http_status: 403
+    applies_to: "POST /api/reman-orders/{id}/verify-calibration"
+
+  - priority: 8
+    category: business_temporal
+    check: "Temporal guards: dyno booking window must end after logical now; calibration draft age <= 72h at verify; warranty claim filed <= warranty_days after shipped_at"
+    error_id: "ERR_BOOKING_IN_PAST | ERR_CAL_STALE | ERR_WARRANTY_WINDOW_EXPIRED"
+    http_status: 422
+    applies_to: "POST /api/dyno-bookings; POST /api/reman-orders/{id}/verify-calibration; POST /api/warranty-claims"
+
+  - priority: 9
+    category: business_constraint
+    check: "Constraint checks: duplicate (hard_part_id, transmission_model_id) mapping; dyno cell half-open overlap; dock closed-interval+30m-buffer overlap; dyno attempt budget (dyno_attempts_used < 3)"
+    error_id: "ERR_DUPLICATE_INTERCHANGE | ERR_DYNO_CELL_OVERLAP | ERR_DOCK_OVERLAP | ERR_DYNO_ATTEMPT_EXHAUSTED"
+    http_status: 409
+    applies_to: "POST /api/interchange-mappings; POST /api/dyno-bookings; POST /api/core-units; POST /api/dyno-test-runs"
+    note: "ERR_DYNO_ATTEMPT_EXHAUSTED returns http 422; the rest return 409 - see §1.6 for the authoritative per-error status."
+
+  - priority: 10
+    category: business_fiscal
+    check: "Fiscal floors: stock adjustment must not drive qty_on_hand negative; dispute adjustment within [0, deposit_cents]"
+    error_id: "ERR_NEGATIVE_STOCK | ERR_ADJUSTMENT_OUT_OF_RANGE"
+    http_status: 422
+    applies_to: "POST /api/hard-parts/{id}/stock-adjustments; POST /api/core-deposit-invoices/{id}/resolve-dispute"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- TransmissionModel ---
+  - method: POST
+    path: "/api/transmission-models"
+    description: "Create a transmission model with its build spec (year/make/model, dyno targets, required parts, deposit, labor guide)"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [model_code, year_start, year_end, make, model, core_deposit_cents, flat_rate_hours, labor_cap_cents, "warranty_days?", dyno_targets, required_parts]
+    output: TransmissionModel
+    side_effects: ["spec_version = 1"]
+
+  - method: PUT
+    path: "/api/transmission-models/{id}"
+    description: "Update a model's build spec; bumps spec_version by 1 (existing orders keep their pinned snapshot)"
+    roles: [ProgramAdmin]
+    code: 200
+    input: ["core_deposit_cents?", "flat_rate_hours?", "labor_cap_cents?", "warranty_days?", "dyno_targets?", "required_parts?"]
+    output: TransmissionModel
+    side_effects: ["spec_version += 1", "increments TransmissionModel.version by 1"]
+
+  - method: GET
+    path: "/api/transmission-models/{id}"
+    description: "Get one model"
+    roles: [Any]
+    code: 200
+    input: []
+    output: TransmissionModel
+    side_effects: []
+
+  # --- HardPart ---
+  - method: POST
+    path: "/api/hard-parts"
+    description: "Create a hard-part inventory record"
+    roles: [InventoryPlanner]
+    code: 201
+    input: [part_number, part_family, unit_cost_cents, qty_on_hand]
+    output: HardPart
+    side_effects: ["qty_reserved = 0"]
+
+  - method: GET
+    path: "/api/hard-parts/{id}"
+    description: "Get one hard part"
+    roles: [Any]
+    code: 200
+    input: []
+    output: HardPart
+    side_effects: []
+
+  - method: POST
+    path: "/api/hard-parts/{id}/stock-adjustments"
+    description: "Adjust qty_on_hand by a signed delta under OCC; positive deltas fire the PART_HOLD promotion scan"
+    roles: [InventoryPlanner]
+    code: 200
+    input: [qty_delta, expected_hard_part_version]
+    output: HardPart
+    side_effects:
+      - "qty_on_hand += qty_delta (must stay >= 0, ERR_NEGATIVE_STOCK)"
+      - "increments HardPart.version by 1"
+      - "if qty_delta > 0: promotion scan over PART_HOLD orders (created_at ASC)"
+
+  # --- InterchangeMapping ---
+  - method: POST
+    path: "/api/interchange-mappings"
+    description: "Declare that a hard part fits a transmission model at a given tier"
+    roles: [InventoryPlanner]
+    code: 201
+    input: [hard_part_id, transmission_model_id, tier]
+    output: InterchangeMapping
+    side_effects: []
+
+  - method: GET
+    path: "/api/interchange-mappings"
+    description: "List interchange mappings with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["hard_part_id?", "transmission_model_id?", "limit?", "offset?"]
+    output: "InterchangeMapping[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/interchange-mappings/{id}"
+    description: "Get one interchange mapping"
+    roles: [Any]
+    code: 200
+    input: []
+    output: InterchangeMapping
+    side_effects: []
+
+  # --- RemanOrder ---
+  - method: POST
+    path: "/api/reman-orders"
+    description: "Create a reman order; pins the model's current spec snapshot"
+    roles: [RemanPlanner]
+    code: 201
+    input: [transmission_model_id, buyer_ref]
+    output: RemanOrder
+    side_effects:
+      - "pinned_spec snapshot + model_spec_version_pin = model.spec_version"
+      - "status QUEUED; core_settlement_status PENDING; cal_status NONE; dyno_attempts_used 0"
+
+  - method: GET
+    path: "/api/reman-orders"
+    description: "List reman orders with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["transmission_model_id?", "status?", "limit?", "offset?"]
+    output: "RemanOrder[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/reman-orders/{id}"
+    description: "Get one reman order"
+    roles: [Any]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects: []
+
+  - method: POST
+    path: "/api/reman-orders/{id}/kit-reserve"
+    description: "Allocate and reserve all spec parts (all-or-nothing); success ASSEMBLY, shortage PART_HOLD"
+    roles: [RemanPlanner]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects:
+      - "on success: HardPart.qty_reserved += qty per pick; surcharge_labor_minutes += 30 per ADAPTED pick; status ASSEMBLY"
+      - "on shortage: shortage_parts recorded; status PART_HOLD; nothing reserved"
+
+  - method: POST
+    path: "/api/reman-orders/{id}/complete-assembly"
+    description: "Mark assembly complete; order moves to CALIBRATION awaiting a calibration draft"
+    roles: [RemanTechnician]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects: ["status ASSEMBLY -> CALIBRATION"]
+
+  - method: PUT
+    path: "/api/reman-orders/{id}/calibration"
+    description: "Write/replace the valve-body calibration draft (solenoid trims + TCM flash version); allowed in CALIBRATION or REWORK"
+    roles: [Calibrator]
+    code: 200
+    input: [solenoid_trims, tcm_flash_version]
+    output: RemanOrder
+    side_effects:
+      - "cal_status -> DRAFT; cal_generation += 1"
+      - "cal_created_by_id = X-User-ID; cal_created_at = logical now"
+
+  - method: POST
+    path: "/api/reman-orders/{id}/verify-calibration"
+    description: "Verify the calibration draft (segregation of duties: verifier != drafter; draft age <= 72h); applies TCM flash and advances to DYNO_QUEUE"
+    roles: [Calibrator]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects:
+      - "cal_status DRAFT -> VERIFIED"
+      - "tcm_flash_version_applied = tcm_flash_version"
+      - "status CALIBRATION|REWORK -> DYNO_QUEUE"
+
+  - method: POST
+    path: "/api/reman-orders/{id}/resync-spec"
+    description: "Re-pin the order to the model's current spec under OCC on the order version"
+    roles: [RemanPlanner]
+    code: 200
+    input: [expected_reman_order_version]
+    output: RemanOrder
+    side_effects:
+      - "pinned_spec = model's current spec; model_spec_version_pin = model.spec_version"
+      - "increments RemanOrder.version by 1"
+
+  - method: POST
+    path: "/api/reman-orders/{id}/ship"
+    description: "Ship a dyno-passed unit; issues the core deposit invoice (OPEN) and consumes reserved parts"
+    roles: [RemanPlanner]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects:
+      - "status DYNO_PASSED -> SHIPPED; shipped_at = logical now"
+      - "create CoreDepositInvoice (deposit from pinned_spec, provisional credit 0.8x deposit)"
+      - "consume reservations: per line HardPart.qty_reserved -= qty and qty_on_hand -= qty"
+
+  - method: POST
+    path: "/api/reman-orders/{id}/cancel"
+    description: "Cancel an order before dyno; releases reservations and fires the promotion scan"
+    roles: [RemanPlanner]
+    code: 200
+    input: []
+    output: RemanOrder
+    side_effects:
+      - "status -> CANCELLED from QUEUED|PART_HOLD|ASSEMBLY|CALIBRATION"
+      - "release any reserved_parts; promotion scan over PART_HOLD orders"
+
+  # --- DynoBooking ---
+  - method: POST
+    path: "/api/dyno-bookings"
+    description: "Book a dyno cell window for an order in DYNO_QUEUE; half-open interval [start_utc, end_utc); adjacent windows allowed; overlapping windows on the same cell rejected"
+    roles: [RemanTechnician]
+    code: 201
+    input: [reman_order_id, dyno_cell_code, start_utc, end_utc]
+    output: DynoBooking
+    side_effects: ["status BOOKED"]
+
+  - method: GET
+    path: "/api/dyno-bookings"
+    description: "List dyno bookings with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["reman_order_id?", "dyno_cell_code?", "limit?", "offset?"]
+    output: "DynoBooking[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/dyno-bookings/{id}"
+    description: "Get one dyno booking"
+    roles: [Any]
+    code: 200
+    input: []
+    output: DynoBooking
+    side_effects: []
+
+  # --- DynoTestRun ---
+  - method: POST
+    path: "/api/dyno-test-runs"
+    description: "Record a dyno run: computes shift_quality_score and verdict, consumes one attempt, and drives the order's dyno transitions (PASS -> DYNO_PASSED; MARGINAL -> stay; FAIL -> REWORK or ENGINEERING_REVIEW with release+promotion cascade)"
+    roles: [DynoOperator]
+    code: 201
+    input: [reman_order_id, gear_pressures_kpa]
+    output: DynoTestRun
+    side_effects:
+      - "attempt_number = prior runs + 1; dyno_attempts_used += 1; last_shift_quality_score set"
+      - "verdict PASS: order DYNO_QUEUE -> DYNO_PASSED"
+      - "verdict MARGINAL: order stays DYNO_QUEUE"
+      - "verdict FAIL attempt < 3: order -> REWORK; cal VERIFIED -> SUPERSEDED"
+      - "verdict FAIL attempt == 3: order -> ENGINEERING_REVIEW; cal SUPERSEDED; reservations released; PART_HOLD promotion scan fires"
+
+  - method: GET
+    path: "/api/dyno-test-runs"
+    description: "List dyno test runs with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["reman_order_id?", "dyno_booking_id?", "limit?", "offset?"]
+    output: "DynoTestRun[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/dyno-test-runs/{id}"
+    description: "Get one dyno test run"
+    roles: [Any]
+    code: 200
+    input: []
+    output: DynoTestRun
+    side_effects: []
+
+  # --- CoreUnit ---
+  - method: POST
+    path: "/api/core-units"
+    description: "Register a returned core against an OPEN invoice; dock appointment uses closed intervals with a 30-minute turnaround buffer (adjacent appointments within the buffer rejected)"
+    roles: [CoreIntakeClerk]
+    code: 201
+    input: [core_deposit_invoice_id, dock_code, dock_start_utc, dock_end_utc]
+    output: CoreUnit
+    side_effects:
+      - "status RECEIVED; received_at = logical now; days_late computed"
+      - "cascade: invoice OPEN -> AWAITING_GRADE"
+
+  - method: GET
+    path: "/api/core-units"
+    description: "List core units with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["core_deposit_invoice_id?", "status?", "limit?", "offset?"]
+    output: "CoreUnit[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/core-units/{id}"
+    description: "Get one core unit"
+    roles: [Any]
+    code: 200
+    input: []
+    output: CoreUnit
+    side_effects: []
+
+  - method: POST
+    path: "/api/core-units/{id}/inspect"
+    description: "Record completeness findings; computes grade, settles the invoice (credit/forfeit cascade), and closes the order's core settlement on full settlement"
+    roles: [CoreInspector]
+    code: 200
+    input: [case_cracked, findings]
+    output: CoreUnit
+    side_effects:
+      - "deduction_score and grade computed; status -> GRADED or REJECTED"
+      - "invoice cascade: SETTLED_FULL | SETTLED_PARTIAL | FORFEITED with final_credit_cents/forfeited_cents"
+      - "on SETTLED_FULL: RemanOrder.core_settlement_status -> CLOSED"
+
+  # --- CoreDepositInvoice ---
+  - method: GET
+    path: "/api/core-deposit-invoices"
+    description: "List core deposit invoices with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["reman_order_id?", "status?", "limit?", "offset?"]
+    output: "CoreDepositInvoice[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/core-deposit-invoices/{id}"
+    description: "Get one core deposit invoice"
+    roles: [Any]
+    code: 200
+    input: []
+    output: CoreDepositInvoice
+    side_effects: []
+
+  - method: POST
+    path: "/api/core-deposit-invoices/{id}/dispute"
+    description: "Dispute a partial settlement or forfeiture"
+    roles: [CoreIntakeClerk]
+    code: 200
+    input: []
+    output: CoreDepositInvoice
+    side_effects: ["status -> DISPUTED from SETTLED_PARTIAL|FORFEITED"]
+
+  - method: POST
+    path: "/api/core-deposit-invoices/{id}/resolve-dispute"
+    description: "Resolve a dispute: REINSPECT reopens grading (core -> RE_INSPECTION, invoice -> AWAITING_GRADE); ADJUST settles at an adjusted credit honoring the deposit invariant"
+    roles: [ProgramAdmin]
+    code: 200
+    input: [action, "adjusted_credit_cents?"]
+    output: CoreDepositInvoice
+    side_effects:
+      - "REINSPECT: invoice DISPUTED -> AWAITING_GRADE; linked CoreUnit -> RE_INSPECTION"
+      - "ADJUST: final_credit_cents = adjusted_credit_cents; forfeited_cents = deposit - adjusted; status SETTLED_ADJUSTED; RemanOrder.core_settlement_status -> CLOSED"
+
+  # --- WarrantyClaim ---
+  - method: POST
+    path: "/api/warranty-claims"
+    description: "File an installer warranty claim against a shipped unit within its warranty window"
+    roles: [Installer]
+    code: 201
+    input: [reman_order_id, failure_code, claimed_labor_hours, installer_labor_rate_cents, allowance_policy]
+    output: WarrantyClaim
+    side_effects: ["claim_status SUBMITTED; return_status NONE; installer_id = X-User-ID"]
+
+  - method: GET
+    path: "/api/warranty-claims"
+    description: "List warranty claims with optional filters"
+    roles: [Any]
+    code: 200
+    input: ["reman_order_id?", "claim_status?", "limit?", "offset?"]
+    output: "WarrantyClaim[]"
+    side_effects: []
+
+  - method: GET
+    path: "/api/warranty-claims/{id}"
+    description: "Get one warranty claim"
+    roles: [Any]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: []
+
+  - method: POST
+    path: "/api/warranty-claims/{id}/approve"
+    description: "Approve a claim: computes labor allowance per policy variant, runs the defective-return routing selector, opens the return leg when required"
+    roles: [WarrantyAdjuster]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects:
+      - "claim_status SUBMITTED -> APPROVED"
+      - "labor_allowance_cents, routing_type, return_required computed"
+      - "if return_required: return_status NONE -> ISSUED"
+
+  - method: POST
+    path: "/api/warranty-claims/{id}/deny"
+    description: "Deny a claim with a reason"
+    roles: [WarrantyAdjuster]
+    code: 200
+    input: ["reason?"]
+    output: WarrantyClaim
+    side_effects: ["claim_status SUBMITTED -> DENIED; deny_reason recorded"]
+
+  - method: POST
+    path: "/api/warranty-claims/{id}/pay"
+    description: "Pay an approved claim; gated on the return leg being DISPOSITIONED when a return is required"
+    roles: [WarrantyAdjuster]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["claim_status APPROVED -> PAID"]
+
+  - method: POST
+    path: "/api/warranty-claims/{id}/return-ship"
+    description: "Installer ships the defective unit back (owner-only)"
+    roles: [Installer]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["return_status ISSUED -> IN_TRANSIT"]
+
+  - method: POST
+    path: "/api/warranty-claims/{id}/return-receive"
+    description: "Receive and disposition the returned unit; salvaged parts restock inventory and fire the PART_HOLD promotion scan"
+    roles: [WarrantyAdjuster]
+    code: 200
+    input: ["salvaged_parts?"]
+    output: WarrantyClaim
+    side_effects:
+      - "return_status IN_TRANSIT -> DISPOSITIONED"
+      - "per salvaged_parts line: HardPart.qty_on_hand += qty"
+      - "promotion scan over PART_HOLD orders (created_at ASC)"
+
+  # --- Logical clock (test-driving endpoint) ---
+  - method: POST
+    path: "/api/_clock/set_current_utc"
+    description: "Set the server's logical clock. Startup default before any call is exactly 2026-08-01T00:00:00Z; the logical clock never falls back to wall-clock time. All timestamps (created_at, issued_at, shipped_at, received_at, cal_created_at) read this clock."
+    roles: [ProgramAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: null
+    side_effects: ["logical clock := to_iso8601"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing or empty" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role not permitted for this endpoint" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, invalid enum, bad type, end <= start, year_end < year_start, or non-positive quantity/rate/deposit" }
+
+  - { id: ERR_MODEL_NOT_FOUND, http: 404, condition: "TransmissionModel id does not exist" }
+  - { id: ERR_PART_NOT_FOUND, http: 404, condition: "HardPart id does not exist" }
+  - { id: ERR_INTERCHANGE_NOT_FOUND, http: 404, condition: "InterchangeMapping id does not exist" }
+  - { id: ERR_ORDER_NOT_FOUND, http: 404, condition: "RemanOrder id does not exist" }
+  - { id: ERR_BOOKING_NOT_FOUND, http: 404, condition: "DynoBooking id does not exist" }
+  - { id: ERR_DYNO_RUN_NOT_FOUND, http: 404, condition: "DynoTestRun id does not exist" }
+  - { id: ERR_CORE_NOT_FOUND, http: 404, condition: "CoreUnit id does not exist" }
+  - { id: ERR_INVOICE_NOT_FOUND, http: 404, condition: "CoreDepositInvoice id does not exist" }
+  - { id: ERR_CLAIM_NOT_FOUND, http: 404, condition: "WarrantyClaim id does not exist" }
+
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_<parent>_version does not match the parent's current version (OCC)" }
+
+  - { id: ERR_ORDER_NOT_READY_FOR_KIT, http: 409, condition: "kit-reserve requires status QUEUED or PART_HOLD" }
+  - { id: ERR_ORDER_NOT_READY_FOR_ASSEMBLY, http: 409, condition: "complete-assembly requires status ASSEMBLY" }
+  - { id: ERR_ORDER_NOT_READY_FOR_CALIBRATION, http: 409, condition: "calibration draft/verify requires status CALIBRATION or REWORK" }
+  - { id: ERR_CAL_NOT_DRAFT, http: 409, condition: "verify-calibration requires cal_status DRAFT" }
+  - { id: ERR_ORDER_NOT_IN_DYNO_QUEUE, http: 409, condition: "dyno booking or run requires status DYNO_QUEUE" }
+  - { id: ERR_NO_ACTIVE_DYNO_BOOKING, http: 409, condition: "no BOOKED DynoBooking for this order covers the current logical time (start_utc <= now < end_utc)" }
+  - { id: ERR_ORDER_NOT_SHIPPABLE, http: 409, condition: "ship requires status DYNO_PASSED" }
+  - { id: ERR_ORDER_NOT_CANCELLABLE, http: 409, condition: "cancel requires status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION}" }
+  - { id: ERR_ORDER_NOT_RESYNCABLE, http: 409, condition: "resync-spec requires status in {QUEUED, PART_HOLD, ASSEMBLY, CALIBRATION, REWORK}" }
+  - { id: ERR_INVOICE_NOT_OPEN, http: 409, condition: "core registration requires invoice status OPEN" }
+  - { id: ERR_CORE_NOT_INSPECTABLE, http: 409, condition: "inspect requires core status RECEIVED or RE_INSPECTION" }
+  - { id: ERR_INVOICE_NOT_DISPUTABLE, http: 409, condition: "dispute requires status SETTLED_PARTIAL or FORFEITED" }
+  - { id: ERR_INVOICE_NOT_DISPUTED, http: 409, condition: "resolve-dispute requires status DISPUTED" }
+  - { id: ERR_ORDER_NOT_SHIPPED, http: 409, condition: "warranty claim requires order status SHIPPED" }
+  - { id: ERR_CLAIM_NOT_REVIEWABLE, http: 409, condition: "approve/deny require claim_status SUBMITTED" }
+  - { id: ERR_CLAIM_NOT_PAYABLE, http: 409, condition: "pay requires claim_status APPROVED" }
+  - { id: ERR_RETURN_NOT_SHIPPABLE, http: 409, condition: "return-ship requires claim APPROVED with return_status ISSUED" }
+  - { id: ERR_RETURN_NOT_RECEIVABLE, http: 409, condition: "return-receive requires return_status IN_TRANSIT" }
+  - { id: ERR_RETURN_NOT_RECEIVED, http: 409, condition: "pay on a return-required claim requires return_status DISPOSITIONED" }
+
+  - { id: ERR_SOD_VERIFICATION_FORBIDDEN, http: 403, condition: "verify-calibration X-User-ID equals cal_created_by_id (segregation of duties)" }
+  - { id: ERR_CAL_STALE, http: 422, condition: "calibration draft older than 72h at verify time" }
+  - { id: ERR_BOOKING_IN_PAST, http: 422, condition: "dyno booking end_utc is not after the current logical time" }
+  - { id: ERR_WARRANTY_WINDOW_EXPIRED, http: 422, condition: "claim filed after shipped_at + warranty_days" }
+  - { id: ERR_DUPLICATE_INTERCHANGE, http: 409, condition: "(hard_part_id, transmission_model_id) mapping already exists" }
+  - { id: ERR_DYNO_CELL_OVERLAP, http: 409, condition: "half-open dyno window overlaps an existing BOOKED window on the same cell" }
+  - { id: ERR_DOCK_OVERLAP, http: 409, condition: "closed dock interval plus 30-minute turnaround buffer conflicts with an existing appointment on the same dock" }
+  - { id: ERR_DYNO_ATTEMPT_EXHAUSTED, http: 422, condition: "dyno_attempts_used already equals MAX_DYNO_ATTEMPTS (3)" }
+  - { id: ERR_NEGATIVE_STOCK, http: 422, condition: "stock adjustment would drive qty_on_hand below zero" }
+  - { id: ERR_ADJUSTMENT_OUT_OF_RANGE, http: 422, condition: "adjusted_credit_cents outside [0, deposit_cents]" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ProgramAdmin
+    description: "Owns the model catalog, dispute resolution, and the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/transmission-models"
+      - "PUT /api/transmission-models/{id}"
+      - "POST /api/core-deposit-invoices/{id}/resolve-dispute"
+      - "POST /api/_clock/set_current_utc"
+    shared_operations: ["all GET endpoints"]
+
+  - name: InventoryPlanner
+    description: "Owns hard-part inventory and the interchange catalog"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/hard-parts"
+      - "POST /api/hard-parts/{id}/stock-adjustments"
+      - "POST /api/interchange-mappings"
+    shared_operations: ["all GET endpoints"]
+
+  - name: RemanPlanner
+    description: "Plans builds: creates orders, reserves kits, resyncs specs, ships, cancels"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/reman-orders"
+      - "POST /api/reman-orders/{id}/kit-reserve"
+      - "POST /api/reman-orders/{id}/resync-spec"
+      - "POST /api/reman-orders/{id}/ship"
+      - "POST /api/reman-orders/{id}/cancel"
+    shared_operations: ["all GET endpoints"]
+
+  - name: RemanTechnician
+    description: "Builds units and books dyno cells"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/reman-orders/{id}/complete-assembly"
+      - "POST /api/dyno-bookings"
+    shared_operations: ["all GET endpoints"]
+
+  - name: Calibrator
+    description: "Drafts and verifies valve-body calibrations; verification is segregation-of-duties controlled (verifier != drafter)"
+    identity: opaque
+    exclusive_operations:
+      - "PUT /api/reman-orders/{id}/calibration"
+      - "POST /api/reman-orders/{id}/verify-calibration"
+    shared_operations: ["all GET endpoints"]
+
+  - name: DynoOperator
+    description: "Runs dynamometer tests and records shift-quality results"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/dyno-test-runs"
+    shared_operations: ["all GET endpoints"]
+
+  - name: CoreIntakeClerk
+    description: "Registers returned cores and files deposit disputes"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/core-units"
+      - "POST /api/core-deposit-invoices/{id}/dispute"
+    shared_operations: ["all GET endpoints"]
+
+  - name: CoreInspector
+    description: "Performs completeness inspection and grading of cores"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/core-units/{id}/inspect"
+    shared_operations: ["all GET endpoints"]
+
+  - name: Installer
+    description: "Files warranty claims and ships defective units back; return-ship restricted to the claim's installer_id"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/warranty-claims"
+      - "POST /api/warranty-claims/{id}/return-ship"
+    shared_operations: ["all GET endpoints"]
+
+  - name: WarrantyAdjuster
+    description: "Adjudicates claims, pays allowances, receives defective returns"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/warranty-claims/{id}/approve"
+      - "POST /api/warranty-claims/{id}/deny"
+      - "POST /api/warranty-claims/{id}/pay"
+      - "POST /api/warranty-claims/{id}/return-receive"
+    shared_operations: ["all GET endpoints"]
+
+  - name: Any
+    description: "Wildcard role standing in for any authenticated caller on read endpoints"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations: ["all GET endpoints"]

@@ -1,0 +1,1128 @@
+scenario: |
+  Union Dues & Membership Administration (local union office): membership status & dues rate by classification, employer checkoff remittance & reconciliation, working dues percentage vs flat rate calculation, delinquency notice & reinstatement, per-capita tax to parent body, dues objector (agency fee) handling & rebate calculation, member transfer between locals, election eligibility based on good standing
+
+domain_name: union-dues-membership-administration
+api_prefix: /api
+
+# =============================================================================
+# Step 0: Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: ledger_reconciliation      # employer checkoff remitted vs union-assessed; provisional-vs-final dues diverge for identical inputs
+  secondary_archetype: compliance_audit          # segregation of duties on remittance posting and per-capita approval, notice cure windows, tamper-evident ledger
+  complexity_layers:
+    - optimistic_concurrency      # OCC on Member.version (transfer create) and Local.version (per-capita report create-with-supersede)
+    - dual_variant_calculation    # provisional vs final assessed dues; projected vs actual objector rebate
+    - rate_threshold_triggers     # delinquency threshold (>=), suspension-count expulsion cap, dues min/max clamps
+    - derived_field_reconciliation # Member.arrears_cents / credit_balance_cents derived from append-only LedgerEntry stream
+    - ops_run_checkpoint          # monthly assessment run finalizes stale PROVISIONALs; delinquency sweep advances notices/suspensions/expulsions
+
+  entity_topology: flat            # peer entities joined by FK references; no URL nesting for ownership (only action sub-paths and reverse-lookup sub-resources)
+  state_machine_shape: hybrid      # Member is cyclic (ACTIVE→DELINQUENT→ACTIVE, SUSPENDED→ACTIVE); CheckoffRemittance has parallel dims (status × dispute_status); ObjectorCase has an appeal cycle; others linear
+  relationship_patterns:
+    - one_to_many        # Local→Member, Member→DuesAssessment/LedgerEntry/Notice/Case/Transfer, CheckoffRemittance→RemittanceLine
+    - cross_aggregate    # RemittanceLine→Member, ElectionEligibility→Member, MemberTransfer→Local (twice)
+    - self_referential   # MemberTransfer ties two Local rows (from_local_id / to_local_id) around one Member
+  role_model: segregation_of_duties  # remittance receiver cannot post; per-capita creator cannot approve (X-User-ID compared)
+  consistency_model: immediate       # all cascades and recomputes visible in the same request's response
+
+# =============================================================================
+# Table 1.0: Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 1.1: Entity-Relationship Table (15 entities)
+# =============================================================================
+entities:
+  - name: Local
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Local union name" }
+      - { name: dues_method, type: enum, source: input, description: "PERCENTAGE_OF_GROSS | FLAT_RATE — selects working-dues formula branch" }
+      - { name: default_dues_percent_bp, type: integer, source: input, description: "Default working-dues rate in basis points of gross wages (e.g. 200 = 2.00%)" }
+      - { name: default_flat_dues_cents, type: integer, source: input, description: "Default flat monthly dues in cents" }
+      - { name: per_capita_rate_cents, type: integer, source: input, description: "Per-capita tax owed to parent body per countable member per period" }
+      - { name: delinquency_threshold_cents, type: integer, source: input, description: "Arrears at or above this (>=) make a member delinquency-eligible at sweep" }
+      - { name: grace_periods, type: integer, source: input, description: "Delinquency requires the oldest unpaid FINAL assessment's period <= current_period - grace_periods (month arithmetic)" }
+      - { name: notice_cure_days, type: integer, source: input, description: "Cure window length: cure_deadline = sent_at + notice_cure_days days (half-open [sent_at, cure_deadline))" }
+      - { name: reinstatement_base_fee_cents, type: integer, source: input, description: "Base reinstatement fee; actual fee = base x suspension_count at reinstatement time" }
+      - { name: max_suspensions, type: integer, source: input, description: "A suspension that would raise suspension_count to >= max_suspensions expels the member instead" }
+      - { name: expel_after_months, type: integer, source: input, description: "Continuously suspended members are expelled by sweep once suspended_since + expel_after_months (calendar months) <= current date" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | CLOSED", default: "ACTIVE" }
+
+  - name: MemberClassification
+    parent: null
+    common_fields: true
+    fields:
+      - { name: local_id, type: string, source: input, description: "FK -> Local.id; owning local" }
+      - { name: code, type: enum, source: input, description: "JOURNEYMAN | APPRENTICE | PROBATIONARY | RETIREE; unique within local" }
+      - { name: dues_percent_bp, type: integer, source: input, description: "Optional classification override of local default percent (basis points); null = inherit local default", default: null }
+      - { name: flat_dues_cents, type: integer, source: input, description: "Optional classification override of local flat dues; null = inherit local default", default: null }
+      - { name: min_monthly_dues_cents, type: integer, source: input, description: "Floor applied after percentage multiplication (also the dues when gross wages are 0)" }
+      - { name: max_monthly_dues_cents, type: integer, source: input, description: "Cap applied after percentage multiplication; null = uncapped", default: null }
+      - { name: per_capita_exempt, type: boolean, source: input, description: "Members of this classification are excluded from per-capita headcount", default: false }
+
+  - name: Employer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Employer name (checkoff agreement holder)" }
+
+  - name: Member
+    parent: null
+    common_fields: true
+    fields:
+      - { name: local_id, type: string, source: input, description: "FK -> Local.id; current home local (rewritten by completed transfer)" }
+      - { name: classification_id, type: string, source: input, description: "FK -> MemberClassification.id; must belong to the same local" }
+      - { name: employer_id, type: string, source: input, description: "FK -> Employer.id; null = self-pay member (never appears on a checkoff roster)", default: null }
+      - { name: full_name, type: string, source: input, description: "Member full name" }
+      - { name: member_number, type: string, source: input, description: "Union card number; unique within local" }
+      - { name: joined_at, type: string, source: input, description: "ISO date the member joined" }
+      - { name: status, type: enum, source: system, description: "ACTIVE | DELINQUENT | SUSPENDED | WITHDRAWN | EXPELLED", default: "ACTIVE" }
+      - { name: arrears_cents, type: integer, source: computed, description: "max(0, ledger_balance) where ledger_balance = sum of signed LedgerEntry.amount_cents" }
+      - { name: credit_balance_cents, type: integer, source: computed, description: "max(0, -ledger_balance) — over-deductions and rebates beyond arrears land here and are consumed by later charges" }
+      - { name: suspension_count, type: integer, source: system, description: "Number of times this member has been suspended; incremented at each DELINQUENT->SUSPENDED transition", default: 0 }
+      - { name: suspended_since, type: datetime, source: system, description: "Logical-clock timestamp of the current suspension; null when not suspended", default: null }
+      - { name: last_suspension_ended_at, type: datetime, source: system, description: "Logical-clock timestamp of the most recent reinstatement; null if never reinstated", default: null }
+      - { name: good_standing, type: boolean, source: computed, description: "status == ACTIVE AND arrears_cents == 0" }
+      - { name: chargeable_share_pct, type: integer, source: computed, description: "Chargeable-share percent from the member's non-terminal ObjectorCase in RATE_SET/REBATE_ISSUED/APPEALED; null when no active case" }
+
+  - name: DuesAssessment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; assessed member" }
+      - { name: period, type: string, source: system, description: "Assessment period, format YYYY-MM; unique together with member_id" }
+      - { name: status, type: enum, source: system, description: "PROVISIONAL -> FINAL (terminal)", default: "PROVISIONAL" }
+      - { name: gross_wages_cents, type: integer, source: system, description: "Wage base used: provisional = prior FINAL assessment's gross (0 if none); final = reported remittance-line gross (0 when finalized without a line)" }
+      - { name: assessed_cents, type: integer, source: system, description: "Dues charged for the period per the assessed_dues calculation" }
+      - { name: rate_bp_applied, type: integer, source: system, description: "Resolved percent rate used (classification override ?? local default); null when FLAT_RATE branch used" }
+      - { name: flat_applied_cents, type: integer, source: system, description: "Resolved flat dues used; null when PERCENTAGE_OF_GROSS branch used" }
+      - { name: min_applied_cents, type: integer, source: system, description: "Floor in force at computation" }
+      - { name: max_applied_cents, type: integer, source: system, description: "Cap in force at computation; null = uncapped" }
+      - { name: paid_cents, type: integer, source: computed, description: "Portion of assessed_cents covered by credit entries per the payment_waterfall replay" }
+      - { name: finalized_at, type: datetime, source: system, description: "Logical-clock timestamp of PROVISIONAL->FINAL; null while PROVISIONAL", default: null }
+
+  - name: LedgerEntry
+    parent: null
+    common_fields: false   # append-only financial log: id + created_at only; never updated
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; owning member" }
+      - { name: entry_type, type: enum, source: system, description: "ASSESSMENT_CHARGE | SUPPLEMENTAL_CHARGE | ADJUSTMENT_CREDIT | CHECKOFF_CREDIT | DIRECT_PAYMENT | REINSTATEMENT_FEE | REBATE_CREDIT | VOID_REVERSAL" }
+      - { name: amount_cents, type: integer, source: system, description: "Signed amount: charges positive, credits negative" }
+      - { name: period, type: string, source: system, description: "Dues period the entry pertains to (YYYY-MM)" }
+      - { name: memo, type: string, source: system, description: "Provenance note (e.g. remittance id, notice id, rebate quarter)" }
+
+  - name: CheckoffRemittance
+    parent: null
+    common_fields: true
+    fields:
+      - { name: employer_id, type: string, source: input, description: "FK -> Employer.id; remitting employer" }
+      - { name: local_id, type: string, source: input, description: "FK -> Local.id; receiving local office" }
+      - { name: period, type: string, source: input, description: "Remittance period YYYY-MM; unique together with employer_id" }
+      - { name: remitted_cents, type: integer, source: input, description: "Header amount the employer's check covers" }
+      - { name: status, type: enum, source: system, description: "RECEIVED -> RECONCILED -> POSTED -> VOID (state dimension 1)", default: "RECEIVED" }
+      - { name: dispute_status, type: enum, source: system, description: "NONE -> DISPUTED -> RESOLVED (state dimension 2, independent of status)", default: "NONE" }
+      - { name: expected_total_cents, type: integer, source: computed, description: "Sum over roster members of FINAL assessed_cents for the period, computed at reconcile" }
+      - { name: header_variance_cents, type: integer, source: computed, description: "remitted_cents - sum(lines.deducted_cents)" }
+      - { name: missing_member_ids, type: array, source: computed, description: "Roster members (employer_id == this employer, local_id == this local, status in {ACTIVE, DELINQUENT}) with a non-terminal assessment for the period but no remittance line" }
+      - { name: auto_cured_member_ids, type: array, source: system, description: "Members whose DELINQUENT->ACTIVE auto-cure was caused by posting this remittance (used by void compensation)", default: "[]" }
+      - { name: received_by_user_id, type: string, source: system, description: "X-User-ID of the OfficeClerk who created the remittance" }
+      - { name: posted_by_user_id, type: string, source: system, description: "X-User-ID of the SecretaryTreasurer who posted; must differ from received_by_user_id", default: null }
+      - { name: posted_at, type: datetime, source: system, description: "Logical-clock timestamp of posting; null until POSTED", default: null }
+
+  - name: RemittanceLine
+    parent: null
+    common_fields: true
+    fields:
+      - { name: remittance_id, type: string, source: system, description: "FK -> CheckoffRemittance.id; owning remittance (path-scoped at creation)" }
+      - { name: member_id, type: string, source: input, description: "FK -> Member.id; must be on this employer's roster for this local (member.employer_id == remittance.employer_id and member.local_id == remittance.local_id)" }
+      - { name: deducted_cents, type: integer, source: input, description: "Amount the employer deducted for this member this period" }
+      - { name: gross_wages_cents, type: integer, source: input, description: "Reported gross wages that drive final percentage-dues computation" }
+      - { name: variance_cents, type: integer, source: computed, description: "deducted_cents - FINAL assessed_cents for the member+period; null until reconcile", default: null }
+      - { name: line_status, type: enum, source: computed, description: "MATCHED | UNDER_DEDUCTED | OVER_DEDUCTED; null until reconcile", default: null }
+
+  - name: DelinquencyNotice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; noticed member" }
+      - { name: arrears_at_notice_cents, type: integer, source: system, description: "Arrears snapshot when the DRAFT was created" }
+      - { name: sent_at, type: datetime, source: system, description: "Logical-clock timestamp when sent; null while DRAFT", default: null }
+      - { name: cure_deadline, type: datetime, source: computed, description: "sent_at + Local.notice_cure_days days; null while DRAFT; cure window is half-open [sent_at, cure_deadline)", default: null }
+      - { name: status, type: enum, source: system, description: "DRAFT -> SENT -> CURED | EXPIRED", default: "DRAFT" }
+
+  - name: ObjectorCase
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; objecting member (path-scoped at creation)" }
+      - { name: filed_at, type: datetime, source: system, description: "Logical-clock timestamp of filing" }
+      - { name: status, type: enum, source: system, description: "FILED -> RATE_SET -> REBATE_ISSUED -> APPEALED -> RATE_SET (appeal cycle) ; FILED|REBATE_ISSUED -> CLOSED", default: "FILED" }
+      - { name: chargeable_share_pct, type: integer, source: input, description: "Percent of dues that is chargeable to the objector (0..100); set by set-rate; null until RATE_SET", default: null }
+      - { name: rate_set_at, type: datetime, source: system, description: "Logical-clock timestamp of the most recent set-rate", default: null }
+      - { name: last_rebated_period, type: string, source: system, description: "Latest period included in an issued rebate; null until first rebate", default: null }
+      - { name: cumulative_rebate_cents, type: integer, source: system, description: "Running total of issued rebates", default: 0 }
+
+  - name: MemberTransfer
+    parent: null
+    common_fields: true
+    fields:
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; transferring member (path-scoped at creation)" }
+      - { name: from_local_id, type: string, source: system, description: "FK -> Local.id; origin local (member's local at initiation)" }
+      - { name: to_local_id, type: string, source: input, description: "FK -> Local.id; target local (must be ACTIVE and != origin)" }
+      - { name: effective_period, type: string, source: input, description: "First period (YYYY-MM) the member counts at the target local; must be >= current clock period" }
+      - { name: status, type: enum, source: system, description: "INITIATED -> PENDING_TARGET -> ACCEPTED_BY_TARGET -> COMPLETED ; PENDING_TARGET -> REJECTED_BY_TARGET ; INITIATED|PENDING_TARGET -> CANCELLED ; INITIATED|PENDING_TARGET|ACCEPTED_BY_TARGET -> SUPERSEDED", default: "INITIATED" }
+      - { name: reject_reason, type: string, source: input, description: "Optional reason recorded on rejection", default: null }
+
+  - name: PerCapitaReport
+    parent: null
+    common_fields: true
+    fields:
+      - { name: local_id, type: string, source: system, description: "FK -> Local.id; reporting local (path-scoped at creation)" }
+      - { name: period, type: string, source: input, description: "Report period YYYY-MM" }
+      - { name: member_count, type: integer, source: system, description: "Countable headcount snapshot per the per_capita_tax calculation at creation" }
+      - { name: rate_cents, type: integer, source: system, description: "Per-capita rate pinned from Local.per_capita_rate_cents at creation" }
+      - { name: tax_due_cents, type: integer, source: system, description: "member_count x rate_cents" }
+      - { name: status, type: enum, source: system, description: "DRAFT -> APPROVED -> SUBMITTED -> PAID ; DRAFT -> SUPERSEDED (a new DRAFT for the same local+period supersedes)", default: "DRAFT" }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of the creator; the approver must differ (segregation of duties)" }
+      - { name: approved_by_user_id, type: string, source: system, description: "X-User-ID of the approving LocalAdmin", default: null }
+
+  - name: Election
+    parent: null
+    common_fields: true
+    fields:
+      - { name: local_id, type: string, source: system, description: "FK -> Local.id; electing local (path-scoped at creation)" }
+      - { name: title, type: string, source: input, description: "Election title" }
+      - { name: nomination_open_at, type: datetime, source: input, description: "Nomination window open (closed-interval start)" }
+      - { name: nomination_close_at, type: datetime, source: input, description: "Nomination window close (closed-interval end; must be > open)" }
+      - { name: eligibility_cutoff_at, type: datetime, source: input, description: "Good-standing reference instant for eligibility (must be > close)" }
+      - { name: required_good_standing_months, type: integer, source: input, description: "Suspension-free months required before the cutoff", default: 12 }
+      - { name: status, type: enum, source: system, description: "SCHEDULED -> NOMINATION_OPEN -> ELIGIBILITY_FROZEN -> CONCLUDED", default: "SCHEDULED" }
+
+  - name: ElectionEligibility
+    parent: null
+    common_fields: false   # immutable snapshot pinned at freeze: id + created_at only
+    fields:
+      - { name: election_id, type: string, source: system, description: "FK -> Election.id; owning election" }
+      - { name: member_id, type: string, source: system, description: "FK -> Member.id; member evaluated" }
+      - { name: eligible, type: boolean, source: system, description: "True iff all eligibility predicates pass at freeze" }
+      - { name: ineligibility_reasons, type: array, source: system, description: "Ordered subset of [NOT_ACTIVE, ARREARS_OUTSTANDING, INSUFFICIENT_STANDING_MONTHS]; empty when eligible" }
+      - { name: arrears_at_freeze_cents, type: integer, source: system, description: "Member arrears snapshot at freeze" }
+      - { name: last_suspension_ended_at, type: datetime, source: system, description: "Member's last_suspension_ended_at snapshot at freeze; null if never suspended", default: null }
+
+  - name: AssessmentRun
+    parent: null
+    common_fields: false   # immutable batch record: id + created_at only
+    fields:
+      - { name: local_id, type: string, source: input, description: "FK -> Local.id; local whose membership is assessed" }
+      - { name: period, type: string, source: input, description: "Run period YYYY-MM; unique together with local_id; must be <= current clock period" }
+      - { name: assessments_created_count, type: integer, source: system, description: "PROVISIONAL assessments created for this period" }
+      - { name: assessments_finalized_count, type: integer, source: system, description: "Stale PROVISIONAL assessments (periods < run period, no wages reported) finalized at floor wages=0" }
+
+# =============================================================================
+# Table 1.2: State Machine Table (9 machines)
+# =============================================================================
+state_machines:
+  - entity: Local
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: CLOSED
+        trigger: POST /api/locals/{id}/close
+        actor: ParentBodyAdmin
+        preconditions: []
+        side_effects:
+          - "No new classifications, elections, per-capita reports, assessment runs, or inbound transfers may be created for a CLOSED local (ERR_LOCAL_NOT_ACTIVE / ERR_TARGET_LOCAL_UNAVAILABLE)"
+
+  - entity: Member
+    initial_state: ACTIVE
+    terminal_states: [WITHDRAWN, EXPELLED]
+    transitions:
+      - from: ACTIVE
+        to: DELINQUENT
+        trigger: POST /api/system/sweeps/delinquency
+        actor: system
+        preconditions:
+          - "arrears_cents >= Local.delinquency_threshold_cents (boundary is inclusive)"
+          - "oldest unpaid FINAL DuesAssessment has period <= current clock period - Local.grace_periods"
+        side_effects:
+          - "Create a DelinquencyNotice (DRAFT) with arrears_at_notice_cents snapshot, unless a DRAFT notice already exists for this member (a SENT notice does not block a new DRAFT)"
+      - from: DELINQUENT
+        to: ACTIVE
+        trigger: "system (auto-cure on any credit posting: POST /api/members/{id}/payments, POST /api/members/{id}/reinstate, remittance post, objector rebate)"
+        actor: system
+        preconditions:
+          - "arrears_cents < Local.delinquency_threshold_cents after the credit is applied"
+        side_effects:
+          - "Any SENT DelinquencyNotice for this member -> CURED; any DRAFT DelinquencyNotice for this member is deleted"
+          - "The posting remittance (when cause is a remittance post) records this member in auto_cured_member_ids"
+      - from: DELINQUENT
+        to: SUSPENDED
+        trigger: POST /api/system/sweeps/delinquency
+        actor: system
+        preconditions:
+          - "A SENT DelinquencyNotice for this member has cure_deadline <= current clock time (window closed)"
+          - "arrears_cents >= Local.delinquency_threshold_cents at sweep time"
+          - "suspension_count + 1 < Local.max_suspensions (otherwise the member is EXPELLED instead)"
+        side_effects:
+          - "The SENT notice -> EXPIRED"
+          - "suspension_count += 1; suspended_since = current clock time"
+          - "Any MemberTransfer for this member in INITIATED or PENDING_TARGET -> CANCELLED (cascade: suspension breaks the good-standing precondition)"
+      - from: DELINQUENT
+        to: EXPELLED
+        trigger: POST /api/system/sweeps/delinquency
+        actor: system
+        preconditions:
+          - "Same as DELINQUENT -> SUSPENDED, but suspension_count + 1 >= Local.max_suspensions"
+        side_effects:
+          - "The SENT notice -> EXPIRED"
+          - "Any non-terminal MemberTransfer (INITIATED, PENDING_TARGET, ACCEPTED_BY_TARGET) -> CANCELLED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: POST /api/members/{id}/reinstate
+        actor: SecretaryTreasurer
+        preconditions:
+          - "Member is SUSPENDED (ERR_MEMBER_NOT_SUSPENDED otherwise)"
+          - "amount_cents == reinstatement_due total_due_cents (arrears + fee) exactly (ERR_REINSTATEMENT_AMOUNT_MISMATCH)"
+        side_effects:
+          - "Post LedgerEntry REINSTATEMENT_FEE(+fee) then DIRECT_PAYMENT(-amount_cents) for the current clock period"
+          - "arrears_cents recomputes to 0; suspended_since = null; last_suspension_ended_at = current clock time"
+      - from: SUSPENDED
+        to: EXPELLED
+        trigger: POST /api/system/sweeps/delinquency
+        actor: system
+        preconditions:
+          - "suspended_since + Local.expel_after_months calendar months <= current clock date"
+        side_effects:
+          - "Any non-terminal MemberTransfer -> CANCELLED; any FILED/RATE_SET ObjectorCase remains but rebates may no longer be issued (ERR_MEMBER_STATE_FORBIDDEN)"
+      - from: ACTIVE
+        to: WITHDRAWN
+        trigger: POST /api/members/{id}/withdraw
+        actor: Member
+        preconditions:
+          - "arrears_cents == 0 (ERR_ARREARS_OUTSTANDING)"
+        side_effects:
+          - "Any non-terminal MemberTransfer -> CANCELLED; any DRAFT DelinquencyNotice is deleted (never SENT)"
+      - from: DELINQUENT
+        to: WITHDRAWN
+        trigger: POST /api/members/{id}/withdraw
+        actor: Member
+        preconditions:
+          - "arrears_cents == 0 (ERR_ARREARS_OUTSTANDING) — a delinquent member must clear arrears before withdrawing"
+        side_effects:
+          - "Any non-terminal MemberTransfer -> CANCELLED; any DRAFT notice is deleted; any SENT notice -> CURED"
+
+  - entity: DuesAssessment
+    initial_state: PROVISIONAL
+    terminal_states: [FINAL]
+    transitions:
+      - from: PROVISIONAL
+        to: FINAL
+        trigger: "system: (a) remittance reconcile reporting the member's wages, or (b) a later AssessmentRun finalizing stale PROVISIONALs with gross_wages_cents = 0"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Recompute assessed_cents with the final variant (actual gross wages)"
+          - "Post LedgerEntry SUPPLEMENTAL_CHARGE(+delta) when final > provisional, ADJUSTMENT_CREDIT(-delta) when final < provisional; delta == 0 posts nothing"
+          - "Member.arrears_cents / credit_balance_cents recomputed; Member.version increments"
+
+  - entity: CheckoffRemittance
+    initial_state: RECEIVED   # parallel dims: status (RECEIVED->RECONCILED->POSTED->VOID) x dispute_status (NONE->DISPUTED->RESOLVED)
+    terminal_states: [VOID]   # POSTED is terminal for forward flow; dispute RESOLVED is terminal for dim 2
+    transitions:
+      - from: RECEIVED
+        to: RECONCILED
+        trigger: POST /api/remittances/{id}/reconcile
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == RECEIVED (ERR_REMITTANCE_NOT_RECEIVED)"
+          - "Every line's member is on the roster (ERR_MEMBER_NOT_ON_ROSTER)"
+          - "remitted_cents == sum(lines.deducted_cents) (ERR_REMITTANCE_UNBALANCED)"
+          - "Every line variance == 0 AND missing_member_ids empty (otherwise dispute instead)"
+        side_effects:
+          - "Finalize each lined member's PROVISIONAL assessment using line.gross_wages_cents (post SUPPLEMENTAL_CHARGE/ADJUSTMENT_CREDIT deltas now)"
+          - "Synthesize a FINAL assessment (gross 0 -> floor dues) for any lined member with no assessment for the period"
+          - "Set line.variance_cents / line.line_status; set expected_total_cents and header_variance_cents"
+      - from: RECEIVED
+        to: RECEIVED
+        trigger: POST /api/remittances/{id}/reconcile
+        actor: SecretaryTreasurer
+        preconditions:
+          - "Any line variance != 0 OR missing_member_ids non-empty"
+        side_effects:
+          - "dispute_status: NONE -> DISPUTED (status stays RECEIVED); assessments still finalize and deltas post as above"
+        note: "Parallel-dimension transition: only dim 2 moves"
+      - from: RECEIVED
+        to: RECONCILED
+        trigger: POST /api/remittances/{id}/resolve-dispute
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == RECEIVED (ERR_REMITTANCE_NOT_RECEIVED)"
+          - "dispute_status == DISPUTED (ERR_DISPUTE_NOT_ACTIVE)"
+        side_effects:
+          - "dispute_status -> RESOLVED; resolution accepts union-assessed FINAL amounts: UNDER_DEDUCTED remainders stay in member arrears as self-pay; OVER_DEDUCTED excesses flow to member credit_balance at post; missing members' assessments finalize at floor (gross 0)"
+      - from: RECONCILED
+        to: POSTED
+        trigger: POST /api/remittances/{id}/post
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == RECONCILED (ERR_REMITTANCE_NOT_RECONCILED) — a DISPUTED remittance is still RECEIVED, so dispute blocking is subsumed by this status guard"
+          - "Every other remittance of the same employer with a strictly earlier period is POSTED or VOID (ERR_PRIOR_PERIOD_UNPOSTED)"
+          - "posted_by_user_id (caller) != received_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "For each matched/under/over line: post LedgerEntry CHECKOFF_CREDIT(-deducted_cents) to the member"
+          - "Apply payment_waterfall per member; recompute arrears_cents / credit_balance_cents"
+          - "Auto-cure cascade: any member whose arrears drop below the delinquency threshold transitions DELINQUENT -> ACTIVE and their SENT notices -> CURED; record cured members in auto_cured_member_ids"
+          - "posted_at = current clock time; posted_by_user_id = caller; Member.version increments per affected member"
+      - from: POSTED
+        to: VOID
+        trigger: POST /api/remittances/{id}/void
+        actor: LocalAdmin
+        preconditions:
+          - "status == POSTED (ERR_REMITTANCE_NOT_POSTED)"
+          - "No remittance of the same employer with a strictly later period is POSTED (ERR_PRIOR_PERIOD_UNPOSTED — unwind is strictly reverse-chronological)"
+          - "No PerCapitaReport for the same local+period in SUBMITTED or PAID (ERR_PERIOD_LOCKED)"
+        side_effects:
+          - "Post LedgerEntry VOID_REVERSAL entries negating each CHECKOFF_CREDIT and each finalize-delta entry this remittance produced"
+          - "Recompute member balances; members listed in auto_cured_member_ids return ACTIVE -> DELINQUENT (compensation restores pre-post state); Member.version increments"
+
+  - entity: DelinquencyNotice
+    initial_state: DRAFT
+    terminal_states: [CURED, EXPIRED]
+    transitions:
+      - from: DRAFT
+        to: SENT
+        trigger: POST /api/members/{id}/notices/{noticeId}/send
+        actor: OfficeClerk
+        preconditions:
+          - "status == DRAFT (ERR_NOTICE_STATE_FORBIDDEN)"
+          - "No other SENT notice for this member whose half-open window [sent_at, cure_deadline) contains the current clock time (ERR_NOTICE_WINDOW_OPEN)"
+        side_effects:
+          - "sent_at = current clock time; cure_deadline = sent_at + Local.notice_cure_days days"
+      - from: SENT
+        to: CURED
+        trigger: "system (auto-cure cascade when member arrears fall below threshold)"
+        actor: system
+        preconditions:
+          - "Member arrears_cents < Local.delinquency_threshold_cents"
+        side_effects: []
+      - from: SENT
+        to: EXPIRED
+        trigger: POST /api/system/sweeps/delinquency
+        actor: system
+        preconditions:
+          - "cure_deadline <= current clock time"
+          - "Member arrears_cents >= Local.delinquency_threshold_cents (else CURED instead)"
+        side_effects:
+          - "Member DELINQUENT -> SUSPENDED (or -> EXPELLED when suspension cap reached); see Member machine"
+
+  - entity: ObjectorCase
+    initial_state: FILED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: FILED
+        to: RATE_SET
+        trigger: POST /api/objector-cases/{caseId}/set-rate
+        actor: LocalAdmin
+        preconditions:
+          - "status in {FILED, APPEALED} (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+          - "0 <= chargeable_share_pct <= 100 (ERR_PCT_OUT_OF_RANGE)"
+        side_effects:
+          - "rate_set_at = current clock time; Member.chargeable_share_pct becomes pct"
+      - from: APPEALED
+        to: RATE_SET
+        trigger: POST /api/objector-cases/{caseId}/set-rate
+        actor: LocalAdmin
+        preconditions:
+          - "status in {FILED, APPEALED} (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+        side_effects:
+          - "Same as FILED -> RATE_SET (appeal cycle: re-rate resets the basis for subsequent rebates)"
+      - from: RATE_SET
+        to: REBATE_ISSUED
+        trigger: POST /api/objector-cases/{caseId}/issue-rebate
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == RATE_SET (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+          - "Member status not in {WITHDRAWN, EXPELLED} (ERR_MEMBER_TERMINAL_STATE); not SUSPENDED (ERR_MEMBER_STATE_FORBIDDEN)"
+        side_effects:
+          - "Compute quarterly-style actual rebate per objector_rebate (actual variant): sum over FINAL assessments after last_rebated_period"
+          - "Post LedgerEntry REBATE_CREDIT(-rebate) for the current clock period; waterfall applies; excess flows to credit_balance_cents"
+          - "cumulative_rebate_cents += rebate; last_rebated_period = latest included period; Member.version increments; may trigger auto-cure cascade"
+      - from: REBATE_ISSUED
+        to: APPEALED
+        trigger: POST /api/objector-cases/{caseId}/appeal
+        actor: Member
+        preconditions:
+          - "status == REBATE_ISSUED (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+          - "Caller is the case's member (ERR_NOT_RESOURCE_OWNER)"
+        side_effects: []
+      - from: FILED
+        to: CLOSED
+        trigger: POST /api/objector-cases/{caseId}/close
+        actor: LocalAdmin
+        preconditions:
+          - "status in {FILED, REBATE_ISSUED} (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+        side_effects:
+          - "Member.chargeable_share_pct cleared to null"
+      - from: REBATE_ISSUED
+        to: CLOSED
+        trigger: POST /api/objector-cases/{caseId}/close
+        actor: LocalAdmin
+        preconditions:
+          - "status in {FILED, REBATE_ISSUED} (ERR_OBJECTOR_CASE_STATE_FORBIDDEN)"
+        side_effects:
+          - "Member.chargeable_share_pct cleared to null"
+
+  - entity: MemberTransfer
+    initial_state: INITIATED
+    terminal_states: [REJECTED_BY_TARGET, COMPLETED, CANCELLED, SUPERSEDED]
+    transitions:
+      - from: INITIATED
+        to: PENDING_TARGET
+        trigger: POST /api/transfers/{transferId}/certify
+        actor: OfficeClerk
+        preconditions:
+          - "status == INITIATED (ERR_TRANSFER_STATE_FORBIDDEN)"
+          - "Member.good_standing == true at certify time (ERR_NOT_GOOD_STANDING)"
+        side_effects: []
+      - from: PENDING_TARGET
+        to: ACCEPTED_BY_TARGET
+        trigger: POST /api/transfers/{transferId}/accept
+        actor: OfficeClerk
+        preconditions:
+          - "status == PENDING_TARGET (ERR_TRANSFER_STATE_FORBIDDEN)"
+          - "Target local still ACTIVE (ERR_TARGET_LOCAL_UNAVAILABLE)"
+        side_effects: []
+      - from: PENDING_TARGET
+        to: REJECTED_BY_TARGET
+        trigger: POST /api/transfers/{transferId}/reject
+        actor: OfficeClerk
+        preconditions:
+          - "status == PENDING_TARGET (ERR_TRANSFER_STATE_FORBIDDEN)"
+        side_effects: []
+      - from: ACCEPTED_BY_TARGET
+        to: COMPLETED
+        trigger: POST /api/transfers/{transferId}/complete
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == ACCEPTED_BY_TARGET (ERR_TRANSFER_STATE_FORBIDDEN)"
+          - "Current clock period >= effective_period (ERR_TRANSFER_NOT_READY)"
+          - "Member.status == ACTIVE and arrears_cents == 0 (ERR_NOT_GOOD_STANDING / ERR_ARREARS_OUTSTANDING)"
+        side_effects:
+          - "Member.local_id = to_local_id; Member.version increments"
+          - "Per-capita headcount shifts per per_capita_tax (origin counts member for periods < effective_period; target for periods >= effective_period)"
+      - from: INITIATED
+        to: CANCELLED
+        trigger: "POST /api/transfers/{transferId}/cancel, or system cascade (member suspended/expelled/withdrawn)"
+        actor: Member | OfficeClerk | system
+        preconditions:
+          - "status in {INITIATED, PENDING_TARGET} for the explicit endpoint (ERR_TRANSFER_STATE_FORBIDDEN)"
+        side_effects: []
+      - from: PENDING_TARGET
+        to: CANCELLED
+        trigger: "POST /api/transfers/{transferId}/cancel, or system cascade"
+        actor: Member | OfficeClerk | system
+        preconditions:
+          - "status in {INITIATED, PENDING_TARGET} for the explicit endpoint (ERR_TRANSFER_STATE_FORBIDDEN)"
+        side_effects: []
+      - from: INITIATED
+        to: SUPERSEDED
+        trigger: POST /api/members/{id}/transfers (a fresh create supersedes any non-terminal transfer)
+        actor: Member | OfficeClerk
+        preconditions: []
+        side_effects:
+          - "Prior non-terminal transfer (INITIATED|PENDING_TARGET|ACCEPTED_BY_TARGET) -> SUPERSEDED"
+      - from: PENDING_TARGET
+        to: SUPERSEDED
+        trigger: POST /api/members/{id}/transfers
+        actor: Member | OfficeClerk
+        preconditions: []
+        side_effects: []
+      - from: ACCEPTED_BY_TARGET
+        to: SUPERSEDED
+        trigger: POST /api/members/{id}/transfers
+        actor: Member | OfficeClerk
+        preconditions: []
+        side_effects: []
+
+  - entity: PerCapitaReport
+    initial_state: DRAFT
+    terminal_states: [PAID, SUPERSEDED]
+    transitions:
+      - from: DRAFT
+        to: APPROVED
+        trigger: POST /api/per-capita-reports/{reportId}/approve
+        actor: LocalAdmin
+        preconditions:
+          - "status == DRAFT (ERR_REPORT_STATE_FORBIDDEN)"
+          - "approved_by (caller X-User-ID) != created_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "Local.per_capita_rate_cents == report.rate_cents at approval time (ERR_STALE_PER_CAPITA_RATE — a rate change after creation forces re-creation)"
+        side_effects:
+          - "approved_by_user_id = caller"
+      - from: APPROVED
+        to: SUBMITTED
+        trigger: POST /api/per-capita-reports/{reportId}/submit
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == APPROVED (ERR_REPORT_STATE_FORBIDDEN)"
+        side_effects:
+          - "Locks the period: remittances for this local+period can no longer be voided (ERR_PERIOD_LOCKED)"
+      - from: SUBMITTED
+        to: PAID
+        trigger: POST /api/per-capita-reports/{reportId}/mark-paid
+        actor: SecretaryTreasurer
+        preconditions:
+          - "status == SUBMITTED (ERR_REPORT_STATE_FORBIDDEN)"
+        side_effects: []
+      - from: DRAFT
+        to: SUPERSEDED
+        trigger: POST /api/locals/{id}/per-capita-reports (new DRAFT for same local+period)
+        actor: SecretaryTreasurer
+        preconditions: []
+        side_effects:
+          - "Existing DRAFT for the same local+period -> SUPERSEDED; creating when an APPROVED/SUBMITTED/PAID report exists for the period -> ERR_REPORT_STATE_FORBIDDEN"
+
+  - entity: Election
+    initial_state: SCHEDULED
+    terminal_states: [CONCLUDED]
+    transitions:
+      - from: SCHEDULED
+        to: NOMINATION_OPEN
+        trigger: POST /api/elections/{id}/open-nominations
+        actor: LocalAdmin
+        preconditions:
+          - "status == SCHEDULED (ERR_ELECTION_STATE_FORBIDDEN)"
+          - "Current clock time >= nomination_open_at (ERR_ELECTION_STATE_FORBIDDEN)"
+        side_effects: []
+      - from: NOMINATION_OPEN
+        to: ELIGIBILITY_FROZEN
+        trigger: POST /api/elections/{id}/freeze-eligibility
+        actor: LocalAdmin
+        preconditions:
+          - "status == NOMINATION_OPEN (ERR_ELECTION_STATE_FORBIDDEN)"
+          - "Current clock time >= nomination_close_at (ERR_ELECTION_STATE_FORBIDDEN)"
+        side_effects:
+          - "Create one ElectionEligibility snapshot per member of the local with status in {ACTIVE, DELINQUENT} (electorate), computing eligible per election_eligibility"
+      - from: ELIGIBILITY_FROZEN
+        to: CONCLUDED
+        trigger: POST /api/elections/{id}/conclude
+        actor: LocalAdmin
+        preconditions:
+          - "status == ELIGIBILITY_FROZEN (ERR_ELECTION_STATE_FORBIDDEN)"
+        side_effects: []
+
+# =============================================================================
+# Table 1.2.1: Concurrency Rules (true races only, OCC-resolved)
+# =============================================================================
+concurrency_rules:
+  - rule_id: transfer-create-stale-member
+    parent_entity: Member
+    write_endpoint: "POST /api/members/{id}/transfers"
+    occ_field: "expected_member_version"
+    description: |
+      Creating a MemberTransfer against a Member whose version has advanced since
+      the client last observed it is rejected. Creating a transfer legitimately
+      supersedes any non-terminal transfer of the same member, so a writer working
+      from a stale member snapshot would silently supersede a transfer it never saw.
+    error_id: ERR_STALE_MEMBER_VERSION
+    http_status: 412
+  - rule_id: percapita-report-create-stale-local
+    parent_entity: Local
+    write_endpoint: "POST /api/locals/{id}/per-capita-reports"
+    occ_field: "expected_local_version"
+    description: |
+      Creating a PerCapitaReport against a Local whose version has advanced since
+      the client last observed it is rejected. Creating a report legitimately
+      supersedes the existing DRAFT for the same local+period, so a stale writer
+      would supersede a DRAFT it never saw.
+    error_id: ERR_STALE_LOCAL_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 1.3: Calculation Rules Table (8 rules)
+# =============================================================================
+calculations:
+  - name: assessed_dues
+    trigger: "DuesAssessment creation (provisional variant) and PROVISIONAL->FINAL finalization (final variant)"
+    algorithm: tiered_pricing
+    formula: |
+      Rate resolution (fallback chain):
+        bp   = classification.dues_percent_bp   ?? local.default_dues_percent_bp
+        flat = classification.flat_dues_cents   ?? local.default_flat_dues_cents
+        lo   = classification.min_monthly_dues_cents
+        hi   = classification.max_monthly_dues_cents      # null = uncapped
+      Branch on local.dues_method:
+        FLAT_RATE:            base = flat
+        PERCENTAGE_OF_GROSS:  base = round_half_up(gross_wages_cents * bp / 10000)
+      Clamp:
+        assessed = max(base, lo);  if hi is not null: assessed = min(assessed, hi)
+      Wage base by variant:
+        provisional: gross = gross_wages_cents of the member's most recent FINAL
+                     assessment (period < current), else 0  => typically the floor
+        final:       gross = remittance line gross_wages_cents, or 0 when finalized
+                     without a line
+      Pin rate_bp_applied / flat_applied_cents / min_applied_cents / max_applied_cents
+      on the assessment at computation time.
+    input_set: "The single DuesAssessment row; Member + its MemberClassification + Local config at computation time"
+    constants:
+      BASIS_POINTS_DENOMINATOR: 10000
+    precision: "integer cents; round_half_up applied exactly once, at the percent multiplication"
+    variants:
+      - name: provisional
+        when: "assessment creation by an AssessmentRun"
+        difference: "wage base is the prior FINAL assessment's gross (0 if none) — forward-looking estimate"
+      - name: final
+        when: "remittance reconcile (line wages) or stale-finalize at a later AssessmentRun (wages 0)"
+        difference: "wage base is actual reported gross — chronological actual; supplemental delta entry posted for the difference"
+
+  - name: payment_waterfall
+    trigger: "any credit LedgerEntry posting (payments, reinstate, remittance post, rebate) and any read of paid_cents"
+    algorithm: waterfall_allocation
+    formula: |
+      Buckets, in strict allocation order:
+        1. REINSTATEMENT_FEE entries (oldest first, by created_at ASC)
+        2. Non-terminal DuesAssessments, ordered by period ASC, then created_at ASC
+      Replay the member's full LedgerEntry stream in created_at ASC order:
+        each credit entry (-amount) fills the earliest open bucket until exhausted;
+        each charge entry (+amount) opens/increases its bucket.
+      paid_cents(assessment) = credit applied to that bucket (capped at assessed_cents).
+      ledger_balance = sum(all signed amounts);
+      arrears_cents = max(0, ledger_balance);  credit_balance_cents = max(0, -ledger_balance).
+      When a new charge posts while credit_balance_cents > 0, the stored credits
+      immediately consume it (credit_balance drains before arrears grow).
+    input_set: "All LedgerEntry rows of one member (no status filter — VOID_REVERSAL entries negate their originals); all non-terminal DuesAssessments of the member"
+    precision: "integer cents; no rounding"
+    note: "Order-sensitive by construction; ties broken by created_at ASC — never by id"
+
+  - name: delinquency_evaluation
+    trigger: "POST /api/system/sweeps/delinquency"
+    algorithm: threshold
+    formula: |
+      For each member of the local with status in {ACTIVE, DELINQUENT, SUSPENDED}:
+        aged = exists a FINAL DuesAssessment with remaining balance > 0 whose
+               period <= (current clock period - Local.grace_periods)   # month arithmetic
+        over = arrears_cents >= Local.delinquency_threshold_cents      # inclusive boundary
+      ACTIVE   and aged and over         -> DELINQUENT + create DRAFT notice (if no DRAFT exists)
+      DELINQUENT and not (aged and over) -> ACTIVE (auto-cure)         # defensive; normally cured at posting time
+      SENT notice with cure_deadline <= now and over      -> EXPIRED + member DELINQUENT -> SUSPENDED
+          (suspension_count+1 >= Local.max_suspensions    -> EXPELLED instead)
+      SENT notice with cure_deadline <= now and not over  -> CURED (member -> ACTIVE if DELINQUENT)
+      SUSPENDED and suspended_since + Local.expel_after_months <= current date -> EXPELLED
+    input_set: "Members of the local in non-terminal status; their FINAL unpaid DuesAssessments; their DRAFT/SENT notices"
+    constants: {}
+    precision: "integer cents; threshold comparison is >="
+    note: "Deterministic sweep: processes members in created_at ASC order; each member's outcome is independent"
+
+  - name: reinstatement_due
+    trigger: "GET /api/members/{id}/reinstatement-quote and POST /api/members/{id}/reinstate"
+    algorithm: constraint_propagation
+    formula: |
+      Evaluation order is pinned (circular-looking dependency made explicit):
+        1. arrears = member.arrears_cents BEFORE any fee posting (from payment_waterfall)
+        2. fee     = Local.reinstatement_base_fee_cents * member.suspension_count
+                     (suspension_count was already incremented at suspension time and
+                      is NOT modified by the quote or by the fee posting)
+        3. total_due_cents = arrears + fee
+      The reinstate endpoint then posts REINSTATEMENT_FEE(+fee) FIRST and
+      DIRECT_PAYMENT(-amount_cents) SECOND; amount_cents must equal total_due_cents
+      exactly. The fee enters arrears only through its own ledger entry, so a quote
+      taken after a failed attempt is unchanged.
+    input_set: "Single SUSPENDED member; Local config"
+    constants: {}
+    precision: "integer cents; no rounding"
+    note: "POST reinstate recomputes the quote at call time; a stale amount is rejected (ERR_REINSTATEMENT_AMOUNT_MISMATCH)"
+
+  - name: remittance_reconciliation
+    trigger: "POST /api/remittances/{id}/reconcile"
+    algorithm: aggregation
+    formula: |
+      Per line (member resolvable and on-roster):
+        finalize the member's PROVISIONAL assessment for the period with
+          gross = line.gross_wages_cents  (assessed_dues final variant);
+        synthesize FINAL assessment (gross = line.gross_wages_cents) when none exists;
+        variance_cents = line.deducted_cents - assessed_cents(FINAL)
+        line_status: ==0 MATCHED, <0 UNDER_DEDUCTED, >0 OVER_DEDUCTED
+      Roster re-validation runs before any variance is computed: a line whose member
+        no longer qualifies (e.g. member WITHDRAWN after line creation) makes reconcile
+        REJECT with ERR_MEMBER_NOT_ON_ROSTER (validation, not an outcome status).
+      expected_total_cents = sum of FINAL assessed_cents over all roster members with a
+        non-terminal assessment for the period.
+      missing_member_ids = roster members (member.employer_id == remittance.employer_id,
+        member.local_id == remittance.local_id, status in {ACTIVE, DELINQUENT}) having a
+        non-terminal assessment for the period but no line — sorted by created_at ASC.
+      header_variance_cents = remitted_cents - sum(lines.deducted_cents); != 0 -> ERR_REMITTANCE_UNBALANCED.
+      Outcome: all variances 0 and no missing members -> RECONCILED (dispute stays NONE);
+        otherwise status stays RECEIVED and dispute_status -> DISPUTED.
+    input_set: "The remittance's lines; roster members of (employer, local) in {ACTIVE, DELINQUENT}; their assessments for the period"
+    precision: "integer cents; no rounding"
+
+  - name: objector_rebate
+    trigger: "GET rebate-projection (projected variant); POST issue-rebate (actual variant)"
+    algorithm: aggregation
+    formula: |
+      Actual variant (issue-rebate):
+        included = the member's FINAL DuesAssessments with period > case.last_rebated_period
+                   (or >= period of rate_set_at when never rebated) AND paid_cents > 0
+        per line: agency_fee = round_half_up(assessed_cents * chargeable_share_pct / 100)
+                  line_rebate = min(paid_cents, assessed_cents) - agency_fee, floored at 0
+        rebate = sum(line_rebate)            # ROUND PER LINE, THEN SUM (pinned order)
+      Projected variant (rebate-projection read):
+        projected_year_rebate = actual_rebate_to_date
+          + sum over each remaining calendar period P of the filing year (the calendar
+            year of the current clock) after the latest FINAL assessment period:
+            (floor_assessed - round_half_up(floor_assessed * pct / 100))
+          where floor_assessed = assessed_dues for the member's classification at
+            gross_wages_cents = 0 (FLAT_RATE branch: the resolved flat dues;
+            PERCENTAGE_OF_GROSS branch: the floor min_monthly_dues_cents).
+      The two variants answer different questions and differ numerically for the same case.
+    input_set: "Member's FINAL assessments (per filters above), payment_waterfall paid_cents, case chargeable_share_pct"
+    constants: {}
+    precision: "integer cents; round_half_up per assessment line, then sum — never sum-then-round"
+    variants:
+      - name: actual
+        when: "POST issue-rebate"
+        difference: "chronological over posted collections only; posts REBATE_CREDIT"
+      - name: projected
+        when: "GET rebate-projection"
+        difference: "forward-looking: assumes floor dues for every remaining period of the calendar year; read-only"
+
+  - name: per_capita_tax
+    trigger: "POST /api/locals/{id}/per-capita-reports (snapshot pinned at creation)"
+    algorithm: aggregation
+    formula: |
+      For report (local L, period P):
+        base = { members m : m.local_id == L }
+               union { m : exists COMPLETED MemberTransfer t with t.from_local_id == L,
+                            t.member_id == m.id, t.effective_period > P }
+        countable = { m in base : m.status in {ACTIVE, DELINQUENT}
+                      AND classification(m).per_capita_exempt == false
+                      AND NOT exists COMPLETED MemberTransfer t with t.to_local_id == L,
+                            t.member_id == m.id, t.effective_period > P }
+        member_count = |countable|
+        rate_cents   = Local.per_capita_rate_cents   # pinned at creation
+        tax_due_cents = member_count * rate_cents
+      Boundary: a transfer with effective_period == P counts the member at the TARGET
+        for P (condition is strict >), at the origin for all periods < P.
+    input_set: "Members whose current local is L plus members with a COMPLETED transfer out of L effective after P; COMPLETED transfers into L; classifications"
+    precision: "integer cents; no rounding"
+    note: "Snapshot is pinned at creation; later membership changes do not mutate an existing report (create a superseding DRAFT instead)"
+
+  - name: election_eligibility
+    trigger: "POST /api/elections/{id}/freeze-eligibility (snapshot per electorate member)"
+    algorithm: threshold
+    formula: |
+      For each member of the election's local with status in {ACTIVE, DELINQUENT}:
+        reasons = []
+        if status != ACTIVE:                 reasons += [NOT_ACTIVE]
+        if arrears_cents != 0:               reasons += [ARREARS_OUTSTANDING]
+        if last_suspension_ended_at is not null
+           and date(last_suspension_ended_at) + required_good_standing_months calendar months
+               > date(eligibility_cutoff_at):
+                                             reasons += [INSUFFICIENT_STANDING_MONTHS]
+        eligible = (reasons == [])
+      Boundary: the standing window is INCLUSIVE — a suspension that ended exactly
+        required_good_standing_months before the cutoff date satisfies the requirement.
+        Comparison is at DATE granularity (time-of-day ignored).
+    input_set: "Electorate = local members in {ACTIVE, DELINQUENT} at freeze time; member arrears and last_suspension_ended_at snapshots"
+    precision: "dates at calendar-day granularity; months are calendar months"
+    note: "reasons order is pinned: NOT_ACTIVE, ARREARS_OUTSTANDING, INSUFFICIENT_STANDING_MONTHS"
+
+# =============================================================================
+# Table 1.4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present; X-User-Role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER
+    http_status: 400
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Role is permitted on this endpoint per the RBAC matrix"
+    error_id: ERR_INSUFFICIENT_PERMISSIONS
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: auth
+    check: "Ownership: role Member may only act on resources whose member_id equals X-User-ID (payments, withdraw, objector-case file/appeal, transfer initiate/cancel)"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "POST /api/members/{id}/payments, /withdraw, /objector-cases, /transfers, POST /api/objector-cases/{id}/appeal, POST /api/transfers/{id}/cancel (Member caller)"
+  - priority: 4
+    category: existence
+    check: "Path template ids exist, validated left-to-right (local, then member, then child)"
+    error_id: "ERR_LOCAL_NOT_FOUND | ERR_MEMBER_NOT_FOUND | ERR_EMPLOYER_NOT_FOUND | ERR_CLASSIFICATION_NOT_FOUND | ERR_REMITTANCE_NOT_FOUND | ERR_NOTICE_NOT_FOUND | ERR_OBJECTOR_CASE_NOT_FOUND | ERR_TRANSFER_NOT_FOUND | ERR_PER_CAPITA_REPORT_NOT_FOUND | ERR_ELECTION_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path parameters"
+  - priority: 5
+    category: state
+    check: "Optimistic-concurrency precondition: expected_<parent>_version equals the parent's current version"
+    error_id: "ERR_STALE_MEMBER_VERSION | ERR_STALE_LOCAL_VERSION"
+    http_status: 412
+    applies_to: "POST /api/members/{id}/transfers, POST /api/locals/{id}/per-capita-reports"
+  - priority: 6
+    category: state
+    check: "Target entity state permits the transition (member terminal/state guards, remittance/notice/case/transfer/report/election state guards, local ACTIVE)"
+    error_id: "ERR_MEMBER_TERMINAL_STATE | ERR_MEMBER_NOT_SUSPENDED | ERR_NOT_GOOD_STANDING | ERR_MEMBER_STATE_FORBIDDEN | ERR_LOCAL_NOT_ACTIVE | ERR_REMITTANCE_NOT_RECEIVED | ERR_REMITTANCE_NOT_RECONCILED | ERR_REMITTANCE_NOT_POSTED | ERR_NOTICE_STATE_FORBIDDEN | ERR_OBJECTOR_CASE_STATE_FORBIDDEN | ERR_TRANSFER_STATE_FORBIDDEN | ERR_REPORT_STATE_FORBIDDEN | ERR_ELECTION_STATE_FORBIDDEN"
+    http_status: 409
+    applies_to: "all state-transition and state-guarded endpoints"
+  - priority: 7
+    category: business_referential
+    check: "Body-referenced entities resolve and are consistent: classification belongs to local, employer exists, remittance-line member is on the (employer, local) roster, transfer target local exists and is ACTIVE and != origin"
+    error_id: "ERR_MEMBER_NOT_FOUND | ERR_CLASSIFICATION_NOT_FOUND | ERR_EMPLOYER_NOT_FOUND (body refs, 422) | ERR_MEMBER_NOT_ON_ROSTER | ERR_TARGET_LOCAL_UNAVAILABLE"
+    http_status: 422
+    applies_to: "POST /api/members, POST /api/remittances, POST /api/remittances/{id}/lines, POST /api/members/{id}/transfers, POST /api/assessment-runs, POST /api/locals/{id}/classifications"
+  - priority: 8
+    category: business_temporal
+    check: "Temporal rules: assessment-run period <= current clock period and well-formed YYYY-MM; remittance posting strictly chronological per employer (earlier periods POSTED/VOID first) and voiding strictly reverse-chronological; notice send respects the open half-open cure window; election nomination windows of one local never overlap (closed intervals, touching counts as overlap); transfer completion only in/after effective_period; election open/freeze respect window times"
+    error_id: "ERR_INVALID_PERIOD | ERR_PRIOR_PERIOD_UNPOSTED | ERR_NOTICE_WINDOW_OPEN | ERR_ELECTION_WINDOW_OVERLAP | ERR_TRANSFER_NOT_READY | ERR_ELECTION_STATE_FORBIDDEN"
+    http_status: 409
+    applies_to: "POST /api/assessment-runs, POST /api/remittances/{id}/post, POST /api/remittances/{id}/void, POST /api/members/{id}/notices/{nid}/send, POST /api/locals/{id}/elections, POST /api/transfers/{id}/complete, POST /api/elections/{id}/open-nominations, POST /api/elections/{id}/freeze-eligibility"
+    note: "ERR_INVALID_PERIOD and ERR_ELECTION_STATE_FORBIDDEN are 422/409 respectively; the rest are 409"
+  - priority: 9
+    category: business_constraint
+    check: "Uniqueness and ranges: classification code unique per local; member_number unique per local; one remittance per employer+period; one remittance line per member per remittance; one assessment run per local+period; one non-terminal objector case per member; chargeable_share_pct in [0,100]; payment amount_cents > 0; election open < close < cutoff"
+    error_id: "ERR_DUPLICATE_CLASSIFICATION | ERR_DUPLICATE_MEMBER_NUMBER | ERR_REMITTANCE_EXISTS | ERR_DUPLICATE_REMITTANCE_LINE | ERR_ASSESSMENT_RUN_EXISTS | ERR_OBJECTOR_CASE_EXISTS | ERR_PCT_OUT_OF_RANGE | ERR_PAYMENT_INVALID_AMOUNT | ERR_INVALID_REQUEST"
+    http_status: 409
+    applies_to: "creation and configuration endpoints"
+    note: "ERR_PCT_OUT_OF_RANGE, ERR_PAYMENT_INVALID_AMOUNT and ERR_INVALID_REQUEST are 422/400; duplicates and existence conflicts are 409"
+  - priority: 10
+    category: business_fiscal
+    check: "Money rules: remittance header equals sum of lines; withdrawal/transfer-completion require arrears == 0; reinstatement amount equals the quoted total exactly; per-capita approval requires the pinned rate to still match the local's current rate; remittance void blocked once the period's per-capita report is SUBMITTED/PAID"
+    error_id: "ERR_REMITTANCE_UNBALANCED | ERR_ARREARS_OUTSTANDING | ERR_REINSTATEMENT_AMOUNT_MISMATCH | ERR_STALE_PER_CAPITA_RATE | ERR_PERIOD_LOCKED"
+    http_status: 409
+    applies_to: "POST /api/remittances/{id}/reconcile, /post, /void, POST /api/members/{id}/withdraw, POST /api/transfers/{id}/complete, POST /api/members/{id}/reinstate, POST /api/per-capita-reports/{id}/approve"
+    note: "ERR_REINSTATEMENT_AMOUNT_MISMATCH is 422"
+
+# =============================================================================
+# Table 1.6: Error Code Catalog
+# =============================================================================
+errors:
+  # --- Auth ---
+  - { id: ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER, http: 400, condition: "X-User-ID or X-User-Role header missing, or role value not declared" }
+  - { id: ERR_INSUFFICIENT_PERMISSIONS, http: 403, condition: "Role not permitted to call this endpoint" }
+  - { id: ERR_NOT_RESOURCE_OWNER, http: 403, condition: "Member-role caller's X-User-ID does not match the member the resource belongs to" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Same X-User-ID attempted both sides of a controlled step: remittance receive+post, or per-capita create+approve" }
+  # --- Existence (404 path / 422 body-ref) ---
+  - { id: ERR_LOCAL_NOT_FOUND, http: 404, condition: "Referenced local does not exist (422 when referenced in a request body)" }
+  - { id: ERR_MEMBER_NOT_FOUND, http: 404, condition: "Referenced member does not exist (422 when referenced in a request body)" }
+  - { id: ERR_EMPLOYER_NOT_FOUND, http: 404, condition: "Referenced employer does not exist (422 when referenced in a request body)" }
+  - { id: ERR_CLASSIFICATION_NOT_FOUND, http: 404, condition: "Referenced classification does not exist or belongs to a different local (422 when referenced in a request body)" }
+  - { id: ERR_REMITTANCE_NOT_FOUND, http: 404, condition: "Referenced remittance does not exist" }
+  - { id: ERR_NOTICE_NOT_FOUND, http: 404, condition: "Referenced notice does not exist (or does not belong to the member in the path)" }
+  - { id: ERR_OBJECTOR_CASE_NOT_FOUND, http: 404, condition: "Referenced objector case does not exist" }
+  - { id: ERR_TRANSFER_NOT_FOUND, http: 404, condition: "Referenced transfer does not exist" }
+  - { id: ERR_PER_CAPITA_REPORT_NOT_FOUND, http: 404, condition: "Referenced per-capita report does not exist" }
+  - { id: ERR_ELECTION_NOT_FOUND, http: 404, condition: "Referenced election does not exist" }
+  # --- Generic request ---
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing required field, type mismatch, invalid enum value, malformed period (YYYY-MM), or election window not strictly ordered (open < close < cutoff)" }
+  # --- OCC ---
+  - { id: ERR_STALE_MEMBER_VERSION, http: 412, condition: "expected_member_version != member's current version on transfer create" }
+  - { id: ERR_STALE_LOCAL_VERSION, http: 412, condition: "expected_local_version != local's current version on per-capita report create" }
+  # --- State ---
+  - { id: ERR_MEMBER_TERMINAL_STATE, http: 409, condition: "Operation requires a non-terminal member; member is WITHDRAWN or EXPELLED" }
+  - { id: ERR_MEMBER_NOT_SUSPENDED, http: 409, condition: "Reinstatement requires member status SUSPENDED" }
+  - { id: ERR_NOT_GOOD_STANDING, http: 409, condition: "Operation requires good standing (status ACTIVE and arrears_cents == 0); used by transfer initiate/certify/complete" }
+  - { id: ERR_MEMBER_STATE_FORBIDDEN, http: 409, condition: "Member's current status forbids this operation (e.g. objector case filed while SUSPENDED, rebate issued for SUSPENDED member, notice created for non-DELINQUENT member)" }
+  - { id: ERR_LOCAL_NOT_ACTIVE, http: 409, condition: "Operation requires an ACTIVE local (local is CLOSED)" }
+  - { id: ERR_REMITTANCE_NOT_RECEIVED, http: 409, condition: "Line creation / reconcile / resolve-dispute require status RECEIVED (resolve additionally requires dispute_status DISPUTED)" }
+  - { id: ERR_REMITTANCE_NOT_RECONCILED, http: 409, condition: "Post requires status RECONCILED" }
+  - { id: ERR_REMITTANCE_NOT_POSTED, http: 409, condition: "Void requires status POSTED" }
+  - { id: ERR_DISPUTE_NOT_ACTIVE, http: 409, condition: "Resolve-dispute requires dispute_status DISPUTED; remittance dispute is NONE or already RESOLVED" }
+  - { id: ERR_NOTICE_STATE_FORBIDDEN, http: 409, condition: "Notice send requires DRAFT status" }
+  - { id: ERR_OBJECTOR_CASE_STATE_FORBIDDEN, http: 409, condition: "Objector-case action not valid from the case's current status" }
+  - { id: ERR_TRANSFER_STATE_FORBIDDEN, http: 409, condition: "Transfer action not valid from the transfer's current status" }
+  - { id: ERR_REPORT_STATE_FORBIDDEN, http: 409, condition: "Per-capita action not valid from the report's current status; also raised when creating a DRAFT while an APPROVED/SUBMITTED/PAID report exists for the period" }
+  - { id: ERR_ELECTION_STATE_FORBIDDEN, http: 409, condition: "Election action not valid from the election's current status or before/after its window times" }
+  # --- Referential ---
+  - { id: ERR_MEMBER_NOT_ON_ROSTER, http: 422, condition: "Remittance line references a member whose employer_id/local_id do not match the remittance (or member is terminal)" }
+  - { id: ERR_TARGET_LOCAL_UNAVAILABLE, http: 409, condition: "Transfer target local is missing, CLOSED, or equals the origin local" }
+  # --- Temporal ---
+  - { id: ERR_INVALID_PERIOD, http: 422, condition: "Period is not a valid YYYY-MM string or lies after the current clock period" }
+  - { id: ERR_PRIOR_PERIOD_UNPOSTED, http: 409, condition: "Remittance posting requires all earlier same-employer periods POSTED/VOID; voiding requires all later same-employer periods non-POSTED" }
+  - { id: ERR_NOTICE_WINDOW_OPEN, http: 409, condition: "A notice cannot be created while a DRAFT/SENT notice exists, nor sent while another SENT notice's half-open cure window still contains the current clock time" }
+  - { id: ERR_ELECTION_WINDOW_OVERLAP, http: 409, condition: "Nomination window [open, close] (closed interval) intersects another election's window for the same local; touching endpoints count as overlap" }
+  - { id: ERR_TRANSFER_NOT_READY, http: 409, condition: "Transfer completion before the current clock period reaches effective_period" }
+  # --- Constraint ---
+  - { id: ERR_DUPLICATE_CLASSIFICATION, http: 409, condition: "Classification code already exists within the local" }
+  - { id: ERR_DUPLICATE_MEMBER_NUMBER, http: 409, condition: "member_number already exists within the local" }
+  - { id: ERR_REMITTANCE_EXISTS, http: 409, condition: "A remittance already exists for this employer+period" }
+  - { id: ERR_DUPLICATE_REMITTANCE_LINE, http: 409, condition: "A line for this member already exists in the remittance" }
+  - { id: ERR_ASSESSMENT_RUN_EXISTS, http: 409, condition: "An assessment run already exists for this local+period" }
+  - { id: ERR_OBJECTOR_CASE_EXISTS, http: 409, condition: "Member already has a non-terminal objector case" }
+  - { id: ERR_PCT_OUT_OF_RANGE, http: 422, condition: "chargeable_share_pct outside [0,100]" }
+  - { id: ERR_PAYMENT_INVALID_AMOUNT, http: 422, condition: "Payment amount_cents <= 0" }
+  # --- Fiscal ---
+  - { id: ERR_REMITTANCE_UNBALANCED, http: 409, condition: "remitted_cents != sum of line deducted_cents at reconcile" }
+  - { id: ERR_ARREARS_OUTSTANDING, http: 409, condition: "Withdrawal or transfer completion requires arrears_cents == 0" }
+  - { id: ERR_REINSTATEMENT_AMOUNT_MISMATCH, http: 422, condition: "Reinstatement amount_cents != quoted total_due_cents (arrears + fee) at call time" }
+  - { id: ERR_STALE_PER_CAPITA_RATE, http: 409, condition: "Local.per_capita_rate_cents changed since the DRAFT was created; the DRAFT must be superseded" }
+  - { id: ERR_PERIOD_LOCKED, http: 409, condition: "Remittance void blocked: the period's per-capita report is SUBMITTED or PAID" }
+
+# =============================================================================
+# Table 1.5: API Endpoint Table (63 endpoints)
+# =============================================================================
+endpoints:
+  # --- Test-driving clock (outside the business surface) ---
+  - { method: POST, path: "/_clock/set_current_utc", description: "Set the server's logical clock. Startup default (before any set) is exactly 2026-08-01T00:00:00Z; the clock never falls back to wall-clock time. All sent_at/deadline/window/suspension timestamps and current-period arithmetic read this clock.", roles: [ParentBodyAdmin], code: 200, input: [to_iso8601], output: "{ current_utc: string }", side_effects: [] }
+
+  # --- Ops-run sweep ---
+  - { method: POST, path: "/api/system/sweeps/delinquency", description: "Run the delinquency sweep for one local: promote ACTIVE members past threshold+grace to DELINQUENT (creating DRAFT notices), expire overdue SENT notices (CUREd when arrears dropped, else suspend or expel), expel long-suspended members", roles: [LocalAdmin], code: 200, input: [local_id], output: "{ newly_delinquent_member_ids: array, notices_created: integer, notices_expired: integer, notices_cured: integer, newly_suspended_member_ids: array, expelled_member_ids: array }", side_effects: ["delinquency_evaluation", "cascade: member status flips, notices, transfer cancellations"] }
+
+  # --- Local ---
+  - { method: POST, path: "/api/locals", description: "Parent body charters a local with its dues/per-capita/delinquency configuration", roles: [ParentBodyAdmin], code: 201, input: [name, dues_method, default_dues_percent_bp, default_flat_dues_cents, per_capita_rate_cents, delinquency_threshold_cents, grace_periods, notice_cure_days, reinstatement_base_fee_cents, max_suspensions, expel_after_months], output: Local, side_effects: ["status ACTIVE; version 1"] }
+  - { method: GET, path: "/api/locals/{id}", description: "Get a local", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: Local, side_effects: [] }
+  - { method: PATCH, path: "/api/locals/{id}", description: "Update local configuration (e.g. per-capita rate change); every mutation increments version and refreshes updated_at", roles: [ParentBodyAdmin], code: 200, input: ["default_dues_percent_bp?", "default_flat_dues_cents?", "per_capita_rate_cents?", "delinquency_threshold_cents?", "grace_periods?", "notice_cure_days?", "reinstatement_base_fee_cents?"], output: Local, side_effects: ["increments Local.version by 1", "renders existing DRAFT per-capita reports stale (ERR_STALE_PER_CAPITA_RATE at approve)"] }
+  - { method: POST, path: "/api/locals/{id}/close", description: "Close a local (ACTIVE -> CLOSED)", roles: [ParentBodyAdmin], code: 200, input: [], output: Local, side_effects: ["status -> CLOSED; increments Local.version by 1"] }
+
+  # --- MemberClassification ---
+  - { method: POST, path: "/api/locals/{id}/classifications", description: "Define a dues classification for the local", roles: [LocalAdmin], code: 201, input: [code, min_monthly_dues_cents, "dues_percent_bp?", "flat_dues_cents?", "max_monthly_dues_cents?", "per_capita_exempt?"], output: MemberClassification, side_effects: ["ERR_DUPLICATE_CLASSIFICATION when code already used in this local"] }
+  - { method: GET, path: "/api/locals/{id}/classifications", description: "List classifications of a local", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["limit?", "offset?"], output: "MemberClassification[]", side_effects: [] }
+
+  # --- Member ---
+  - { method: POST, path: "/api/members", description: "Register a member (status ACTIVE, arrears 0)", roles: [OfficeClerk], code: 201, input: [local_id, classification_id, full_name, member_number, joined_at, "employer_id?"], output: Member, side_effects: ["ERR_DUPLICATE_MEMBER_NUMBER; classification must belong to local_id"] }
+  - { method: GET, path: "/api/members", description: "List members with filters", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["local_id?", "classification_id?", "employer_id?", "status?", "limit?", "offset?"], output: "Member[]", side_effects: [] }
+  - { method: GET, path: "/api/members/{id}", description: "Get a member (includes computed arrears_cents, credit_balance_cents, good_standing, chargeable_share_pct)", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: Member, side_effects: [] }
+  - { method: POST, path: "/api/members/{id}/payments", description: "Record a direct dues payment (office entry by SecretaryTreasurer, or self-service by the member)", roles: [SecretaryTreasurer, Member], code: 201, input: [amount_cents], output: LedgerEntry, side_effects: ["posts DIRECT_PAYMENT(-amount_cents) for the current clock period", "payment_waterfall reallocates; arrears_cents/credit_balance_cents recompute", "auto-cure cascade (DELINQUENT->ACTIVE, SENT notice->CURED) when arrears drop below threshold", "increments Member.version by 1"] }
+  - { method: POST, path: "/api/members/{id}/withdraw", description: "Voluntary withdrawal (requires arrears_cents == 0)", roles: [Member], code: 200, input: [], output: Member, side_effects: ["status -> WITHDRAWN; cancels non-terminal transfers; deletes DRAFT notices; CURES SENT notices; increments Member.version by 1"] }
+  - { method: GET, path: "/api/members/{id}/reinstatement-quote", description: "Computed read: current reinstatement quote (arrears + fee, evaluation order per reinstatement_due)", roles: [SecretaryTreasurer], code: 200, input: [], output: "{ arrears_cents: integer, reinstatement_fee_cents: integer, total_due_cents: integer }", side_effects: [] }
+  - { method: POST, path: "/api/members/{id}/reinstate", description: "Reinstate a SUSPENDED member; amount must equal the recomputed quote exactly", roles: [SecretaryTreasurer], code: 200, input: [amount_cents], output: Member, side_effects: ["posts REINSTATEMENT_FEE then DIRECT_PAYMENT", "status -> ACTIVE; suspended_since null; last_suspension_ended_at = now", "increments Member.version by 1"] }
+  - { method: GET, path: "/api/members/{id}/assessments", description: "List a member's dues assessments", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["period?", "status?", "limit?", "offset?"], output: "DuesAssessment[]", side_effects: [] }
+  - { method: GET, path: "/api/members/{id}/ledger", description: "List a member's append-only ledger entries (chronological, created_at ASC)", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["period?", "entry_type?", "limit?", "offset?"], output: "LedgerEntry[]", side_effects: [] }
+  - { method: GET, path: "/api/members/{id}/remittance-lines", description: "List remittance lines referencing this member (payment history)", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["period?", "limit?", "offset?"], output: "RemittanceLine[]", side_effects: [] }
+
+  # --- AssessmentRun ---
+  - { method: POST, path: "/api/assessment-runs", description: "Monthly assessment run for a local+period: creates PROVISIONAL assessments for members in {ACTIVE, DELINQUENT, SUSPENDED} and finalizes stale PROVISIONALs of earlier periods at gross 0", roles: [SecretaryTreasurer], code: 201, input: [local_id, period], output: AssessmentRun, side_effects: ["assessed_dues (provisional variant) per member; posts ASSESSMENT_CHARGE entries", "finalizes stale PROVISIONALs (final variant, wages 0) posting supplemental deltas", "increments Member.version for each assessed/finalized member"] }
+  - { method: GET, path: "/api/locals/{id}/assessment-runs", description: "List assessment runs of a local", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["period?", "limit?", "offset?"], output: "AssessmentRun[]", side_effects: [] }
+
+  # --- Employer ---
+  - { method: POST, path: "/api/employers", description: "Register a checkoff employer", roles: [OfficeClerk], code: 201, input: [name], output: Employer, side_effects: [] }
+  - { method: GET, path: "/api/employers/{employerId}", description: "Get an employer", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: Employer, side_effects: [] }
+
+  # --- CheckoffRemittance / RemittanceLine ---
+  - { method: POST, path: "/api/remittances", description: "Receive an employer checkoff remittance (header)", roles: [OfficeClerk], code: 201, input: [employer_id, local_id, period, remitted_cents], output: CheckoffRemittance, side_effects: ["received_by_user_id = caller", "ERR_REMITTANCE_EXISTS for duplicate employer+period"] }
+  - { method: GET, path: "/api/remittances", description: "List remittances with filters", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["employer_id?", "local_id?", "period?", "status?", "limit?", "offset?"], output: "CheckoffRemittance[]", side_effects: [] }
+  - { method: GET, path: "/api/remittances/{id}", description: "Get a remittance (includes computed expected_total_cents, header_variance_cents, missing_member_ids)", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: CheckoffRemittance, side_effects: [] }
+  - { method: POST, path: "/api/remittances/{id}/lines", description: "Add a per-member deduction line (RECEIVED remittances only)", roles: [OfficeClerk], code: 201, input: [member_id, deducted_cents, gross_wages_cents], output: RemittanceLine, side_effects: ["ERR_DUPLICATE_REMITTANCE_LINE for a second line of the same member", "ERR_MEMBER_NOT_ON_ROSTER for off-roster or terminal members"] }
+  - { method: GET, path: "/api/remittances/{id}/lines", description: "List a remittance's lines", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["limit?", "offset?"], output: "RemittanceLine[]", side_effects: [] }
+  - { method: POST, path: "/api/remittances/{id}/reconcile", description: "Reconcile: finalize lined members' assessments, compute per-line variance, expected totals, missing members; clean -> RECONCILED, else dispute_status -> DISPUTED", roles: [SecretaryTreasurer], code: 200, input: [], output: CheckoffRemittance, side_effects: ["remittance_reconciliation", "assessed_dues final variant per lined member", "SUPPLEMENTAL_CHARGE/ADJUSTMENT_CREDIT delta entries", "increments Member.version per affected member; increments CheckoffRemittance.version"] }
+  - { method: POST, path: "/api/remittances/{id}/resolve-dispute", description: "Resolve a DISPUTED remittance accepting union-assessed FINAL amounts (under-deductions become member self-pay; over-deductions credit the member at post)", roles: [SecretaryTreasurer], code: 200, input: [resolution_note], output: CheckoffRemittance, side_effects: ["dispute_status -> RESOLVED; status -> RECONCILED; increments CheckoffRemittance.version"] }
+  - { method: POST, path: "/api/remittances/{id}/post", description: "Post a reconciled remittance: apply CHECKOFF_CREDITs, waterfall, auto-cure cascade", roles: [SecretaryTreasurer], code: 200, input: [], output: CheckoffRemittance, side_effects: ["CHECKOFF_CREDIT per line", "payment_waterfall per member", "auto-cure cascade with auto_cured_member_ids", "increments Member.version per affected member and CheckoffRemittance.version"] }
+  - { method: POST, path: "/api/remittances/{id}/void", description: "Void a POSTED remittance with compensating VOID_REVERSAL entries (reverse-chronological unwind; blocked once the period's per-capita report is SUBMITTED/PAID)", roles: [LocalAdmin], code: 200, input: [], output: CheckoffRemittance, side_effects: ["VOID_REVERSAL entries negate this remittance's credits and deltas", "members in auto_cured_member_ids revert ACTIVE -> DELINQUENT", "increments Member.version per affected member and CheckoffRemittance.version"] }
+
+  # --- DelinquencyNotice ---
+  - { method: POST, path: "/api/members/{id}/notices", description: "Manually draft a delinquency notice (member must be DELINQUENT; blocked only while another DRAFT exists — a SENT notice does not block drafting)", roles: [OfficeClerk], code: 201, input: [], output: DelinquencyNotice, side_effects: ["arrears_at_notice_cents snapshot"] }
+  - { method: GET, path: "/api/members/{id}/notices", description: "List a member's delinquency notices", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["status?", "limit?", "offset?"], output: "DelinquencyNotice[]", side_effects: [] }
+  - { method: POST, path: "/api/members/{id}/notices/{noticeId}/send", description: "Send a DRAFT notice (starts the half-open cure window [sent_at, cure_deadline))", roles: [OfficeClerk], code: 200, input: [], output: DelinquencyNotice, side_effects: ["sent_at = now; cure_deadline = sent_at + notice_cure_days", "ERR_NOTICE_WINDOW_OPEN while another SENT window covers now"] }
+
+  # --- ObjectorCase ---
+  - { method: POST, path: "/api/members/{id}/objector-cases", description: "Member files a dues-objection (agency fee) case", roles: [Member], code: 201, input: [], output: ObjectorCase, side_effects: ["status FILED; filed_at = now", "ERR_OBJECTOR_CASE_EXISTS when a non-terminal case exists", "ERR_MEMBER_STATE_FORBIDDEN when SUSPENDED; ERR_MEMBER_TERMINAL_STATE when WITHDRAWN/EXPELLED"] }
+  - { method: GET, path: "/api/objector-cases", description: "List objector cases with filters", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["member_id?", "status?", "limit?", "offset?"], output: "ObjectorCase[]", side_effects: [] }
+  - { method: GET, path: "/api/objector-cases/{caseId}", description: "Get an objector case", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: ObjectorCase, side_effects: [] }
+  - { method: GET, path: "/api/objector-cases/{caseId}/rebate-projection", description: "Computed read: actual rebate to date (lifetime line-rebate sum over FINAL paid assessments with period <= current clock period, ignoring last_rebated_period) vs forward-looking year-end projection (objector_rebate variants)", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: "{ actual_rebate_to_date_cents: integer, projected_year_rebate_cents: integer }", side_effects: [] }
+  - { method: POST, path: "/api/objector-cases/{caseId}/set-rate", description: "Set (or re-set after appeal) the chargeable-share percent", roles: [LocalAdmin], code: 200, input: [chargeable_share_pct], output: ObjectorCase, side_effects: ["status FILED|APPEALED -> RATE_SET; rate_set_at = now; increments ObjectorCase.version"] }
+  - { method: POST, path: "/api/objector-cases/{caseId}/issue-rebate", description: "Issue the actual rebate for all eligible FINAL paid assessments since last_rebated_period; posts REBATE_CREDIT", roles: [SecretaryTreasurer], code: 200, input: [], output: ObjectorCase, side_effects: ["objector_rebate actual variant", "REBATE_CREDIT ledger entry; waterfall; possible auto-cure cascade", "cumulative_rebate_cents and last_rebated_period advance; increments Member.version"] }
+  - { method: POST, path: "/api/objector-cases/{caseId}/appeal", description: "Member appeals the issued rebate (REBATE_ISSUED -> APPEALED)", roles: [Member], code: 200, input: [], output: ObjectorCase, side_effects: ["increments ObjectorCase.version"] }
+  - { method: POST, path: "/api/objector-cases/{caseId}/close", description: "Close a FILED or REBATE_ISSUED case (member no longer treated as objector)", roles: [LocalAdmin], code: 200, input: [], output: ObjectorCase, side_effects: ["Member.chargeable_share_pct cleared; increments ObjectorCase.version"] }
+
+  # --- MemberTransfer ---
+  - { method: POST, path: "/api/members/{id}/transfers", description: "Initiate a transfer to another local (OCC on Member.version; supersedes any non-terminal transfer)", roles: [Member, OfficeClerk], code: 201, input: [to_local_id, effective_period, expected_member_version], output: MemberTransfer, side_effects: ["prior non-terminal transfer -> SUPERSEDED", "increments Member.version by 1", "requires good standing at initiation (ERR_NOT_GOOD_STANDING)"] }
+  - { method: GET, path: "/api/transfers", description: "List transfers with filters", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["member_id?", "from_local_id?", "to_local_id?", "status?", "limit?", "offset?"], output: "MemberTransfer[]", side_effects: [] }
+  - { method: GET, path: "/api/transfers/{transferId}", description: "Get a transfer", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: MemberTransfer, side_effects: [] }
+  - { method: POST, path: "/api/transfers/{transferId}/certify", description: "Origin office certifies the member's good standing (re-checked at this moment)", roles: [OfficeClerk], code: 200, input: [], output: MemberTransfer, side_effects: ["status INITIATED -> PENDING_TARGET"] }
+  - { method: POST, path: "/api/transfers/{transferId}/accept", description: "Target side accepts the transfer", roles: [OfficeClerk], code: 200, input: [], output: MemberTransfer, side_effects: ["status PENDING_TARGET -> ACCEPTED_BY_TARGET"] }
+  - { method: POST, path: "/api/transfers/{transferId}/reject", description: "Target side rejects the transfer", roles: [OfficeClerk], code: 200, input: ["reason?"], output: MemberTransfer, side_effects: ["status PENDING_TARGET -> REJECTED_BY_TARGET"] }
+  - { method: POST, path: "/api/transfers/{transferId}/complete", description: "Complete an accepted transfer in/after its effective period; member.local_id flips and per-capita counts shift", roles: [SecretaryTreasurer], code: 200, input: [], output: MemberTransfer, side_effects: ["Member.local_id = to_local_id; increments Member.version by 1", "ERR_TRANSFER_NOT_READY before effective_period; ERR_ARREARS_OUTSTANDING / ERR_NOT_GOOD_STANDING re-checked"] }
+  - { method: POST, path: "/api/transfers/{transferId}/cancel", description: "Cancel an INITIATED or PENDING_TARGET transfer", roles: [Member, OfficeClerk], code: 200, input: [], output: MemberTransfer, side_effects: ["status -> CANCELLED"] }
+
+  # --- PerCapitaReport ---
+  - { method: POST, path: "/api/locals/{id}/per-capita-reports", description: "Create a DRAFT per-capita report for a period (OCC on Local.version; supersedes existing DRAFT for the same period; snapshot count and pinned rate)", roles: [SecretaryTreasurer], code: 201, input: [period, expected_local_version], output: PerCapitaReport, side_effects: ["per_capita_tax snapshot", "existing DRAFT for local+period -> SUPERSEDED", "increments Local.version by 1"] }
+  - { method: GET, path: "/api/locals/{id}/per-capita-reports", description: "List a local's per-capita reports", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["period?", "status?", "limit?", "offset?"], output: "PerCapitaReport[]", side_effects: [] }
+  - { method: POST, path: "/api/per-capita-reports/{reportId}/approve", description: "Approve a DRAFT (approver != creator; pinned rate must still match the local's current rate)", roles: [LocalAdmin], code: 200, input: [], output: PerCapitaReport, side_effects: ["approved_by_user_id = caller; increments PerCapitaReport.version"] }
+  - { method: POST, path: "/api/per-capita-reports/{reportId}/submit", description: "Submit an APPROVED report to the parent body (locks the period against remittance voids)", roles: [SecretaryTreasurer], code: 200, input: [], output: PerCapitaReport, side_effects: ["increments PerCapitaReport.version"] }
+  - { method: POST, path: "/api/per-capita-reports/{reportId}/mark-paid", description: "Mark a SUBMITTED report paid", roles: [SecretaryTreasurer], code: 200, input: [], output: PerCapitaReport, side_effects: ["increments PerCapitaReport.version"] }
+
+  # --- Election / ElectionEligibility ---
+  - { method: POST, path: "/api/locals/{id}/elections", description: "Schedule an election with nomination window and eligibility cutoff (windows of one local never overlap; closed intervals)", roles: [LocalAdmin], code: 201, input: [title, nomination_open_at, nomination_close_at, eligibility_cutoff_at, "required_good_standing_months?"], output: Election, side_effects: ["ERR_ELECTION_WINDOW_OVERLAP on closed-interval intersection (touching counts)"] }
+  - { method: GET, path: "/api/elections", description: "List elections with filters", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["local_id?", "status?", "limit?", "offset?"], output: "Election[]", side_effects: [] }
+  - { method: GET, path: "/api/elections/{id}", description: "Get an election", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: [], output: Election, side_effects: [] }
+  - { method: POST, path: "/api/elections/{id}/open-nominations", description: "Open nominations (clock must be >= nomination_open_at)", roles: [LocalAdmin], code: 200, input: [], output: Election, side_effects: ["increments Election.version"] }
+  - { method: POST, path: "/api/elections/{id}/freeze-eligibility", description: "Freeze eligibility: snapshot one ElectionEligibility per electorate member (status in {ACTIVE, DELINQUENT}); clock must be >= nomination_close_at", roles: [LocalAdmin], code: 200, input: [], output: Election, side_effects: ["election_eligibility snapshot per member"] }
+  - { method: POST, path: "/api/elections/{id}/conclude", description: "Conclude a frozen election", roles: [LocalAdmin], code: 200, input: [], output: Election, side_effects: ["increments Election.version"] }
+  - { method: GET, path: "/api/elections/{id}/eligibilities", description: "List eligibility snapshots of an election", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["member_id?", "eligible?", "limit?", "offset?"], output: "ElectionEligibility[]", side_effects: [] }
+  - { method: GET, path: "/api/members/{id}/eligibilities", description: "List a member's eligibility snapshots across elections", roles: [ParentBodyAdmin, LocalAdmin, SecretaryTreasurer, OfficeClerk, Member], code: 200, input: ["election_id?", "limit?", "offset?"], output: "ElectionEligibility[]", side_effects: [] }
+
+# =============================================================================
+# Table 1.7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: ParentBodyAdmin
+    description: "Parent-body administrator; charters and configures locals, drives the logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+      - "POST /api/locals, PATCH /api/locals/{id}, POST /api/locals/{id}/close"
+    shared_operations: ["All GET endpoints"]
+
+  - name: LocalAdmin
+    description: "Local union administrator; classifications, elections, objector rates, remittance voids, per-capita approval, delinquency sweep"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/system/sweeps/delinquency"
+      - "POST /api/locals/{id}/classifications"
+      - "POST /api/remittances/{id}/void"
+      - "POST /api/objector-cases/{id}/set-rate, POST /api/objector-cases/{id}/close"
+      - "POST /api/per-capita-reports/{id}/approve"
+      - "POST /api/locals/{id}/elections, POST /api/elections/{id}/open-nominations, /freeze-eligibility, /conclude"
+    shared_operations: ["All GET endpoints"]
+
+  - name: SecretaryTreasurer
+    description: "Financial officer; assessment runs, remittance reconcile/resolve/post, payments entry, reinstatement, rebates, per-capita create/submit/pay, transfer completion"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/assessment-runs"
+      - "POST /api/remittances/{id}/reconcile, /resolve-dispute, /post"
+      - "POST /api/members/{id}/reinstate, GET /api/members/{id}/reinstatement-quote"
+      - "POST /api/objector-cases/{id}/issue-rebate"
+      - "POST /api/locals/{id}/per-capita-reports, POST /api/per-capita-reports/{id}/submit, /mark-paid"
+      - "POST /api/transfers/{id}/complete"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/members/{id}/payments (shared with Member self-service)"
+
+  - name: OfficeClerk
+    description: "Front-office intake; registers members/employers, receives remittances and lines, drafts and sends notices, certifies/accepts/rejects/cancels transfers"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/members, POST /api/employers"
+      - "POST /api/remittances, POST /api/remittances/{id}/lines"
+      - "POST /api/members/{id}/notices, POST /api/members/{id}/notices/{nid}/send"
+      - "POST /api/transfers/{id}/certify, /accept, /reject"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/members/{id}/transfers, POST /api/transfers/{id}/cancel (shared with Member)"
+
+  - name: Member
+    description: "Union member self-service; may act only on own resources (X-User-ID == member id)"
+    identity: "entity_backed:Member"
+    exclusive_operations:
+      - "POST /api/members/{id}/withdraw"
+      - "POST /api/members/{id}/objector-cases"
+      - "POST /api/objector-cases/{id}/appeal"
+    shared_operations:
+      - "All GET endpoints"
+      - "POST /api/members/{id}/payments (shared with SecretaryTreasurer)"
+      - "POST /api/members/{id}/transfers, POST /api/transfers/{id}/cancel (shared with OfficeClerk)"

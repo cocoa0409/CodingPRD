@@ -1,0 +1,67 @@
+"""Error type + the error catalog (id -> HTTP status)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=''):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+ERR = {
+    'ERR_UNAUTHENTICATED': 401,
+    'ERR_FORBIDDEN_ROLE': 403,
+    'ERR_VALIDATION': 400,
+    'ERR_INVALID_ENUM': 400,
+    'ERR_EMPLOYEE_NOT_FOUND': 404,
+    'ERR_AGENT_NOT_FOUND': 404,
+    'ERR_TEAM_NOT_FOUND': 404,
+    'ERR_CATEGORY_NOT_FOUND': 404,
+    'ERR_SLA_POLICY_NOT_FOUND': 404,
+    'ERR_ARTICLE_NOT_FOUND': 404,
+    'ERR_TICKET_NOT_FOUND': 404,
+    'ERR_DCR_NOT_FOUND': 404,
+    'ERR_SURVEY_NOT_FOUND': 404,
+    'ERR_WINDOW_NOT_FOUND': 404,
+    'ERR_SHIFT_NOT_FOUND': 404,
+    'ERR_TICKET_INVALID_STATE': 409,
+    'ERR_DCR_INVALID_STATE': 409,
+    'ERR_ARTICLE_INVALID_STATE': 409,
+    'ERR_SURVEY_INVALID_STATE': 409,
+    'ERR_WINDOW_INVALID_STATE': 409,
+    'ERR_SHIFT_INVALID_STATE': 409,
+    'ERR_EMPLOYEE_INVALID_STATE': 409,
+    'ERR_CONFIDENTIALITY_CLEARANCE_REQUIRED': 403,
+    'ERR_FRAUD_VERIFICATION_REQUIRED': 409,
+    'ERR_FRAUD_VERIFICATION_LOCKED': 409,
+    'ERR_FRAUD_EVIDENCE_MISMATCH': 422,
+    'ERR_EMPLOYEE_INACTIVE': 422,
+    'ERR_SELF_APPROVAL_FORBIDDEN': 403,
+    'ERR_VERIFIER_CANNOT_APPROVE': 403,
+    'ERR_AUTHOR_CANNOT_PUBLISH': 403,
+    'ERR_AGENT_AT_CAPACITY': 409,
+    'ERR_AGENT_TIER_INSUFFICIENT': 409,
+    'ERR_NO_ELIGIBLE_SPECIALIST': 422,
+    'ERR_SHIFT_OVERLAP': 409,
+    'ERR_WINDOW_OVERLAP': 409,
+    'ERR_SLA_POLICY_DUPLICATE': 409,
+    'ERR_DUPLICATE_DATA_CHANGE_PENDING': 409,
+    'ERR_DUPLICATE_EMPLOYEE_NUMBER': 409,
+    'ERR_DUPLICATE_CATEGORY_CODE': 409,
+    'ERR_REOPEN_WINDOW_PASSED': 409,
+    'ERR_SURVEY_EXPIRED': 409,
+    'ERR_INVALID_TIME_RANGE': 422,
+    'ERR_SHIFT_OUTSIDE_WINDOW': 422,
+    'ERR_RESOLUTION_ARTICLE_NOT_PUBLISHED': 422,
+    'ERR_CATEGORY_INACTIVE': 422,
+    'ERR_STALE_TICKET_VERSION': 412,
+    'ERR_STALE_EMPLOYEE_VERSION': 412,
+    # Not in the catalogue; used only for undeclared routes / unknown audit ids.
+    'ERR_AUDIT_ENTRY_NOT_FOUND': 404,
+    'ERR_NOT_FOUND': 404,
+}
+
+
+def raise_err(error_id, message=''):
+    raise ApiError(error_id, ERR.get(error_id, 400), message or error_id)

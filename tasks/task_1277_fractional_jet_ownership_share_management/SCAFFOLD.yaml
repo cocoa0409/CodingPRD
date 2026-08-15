@@ -1,0 +1,1891 @@
+scenario: "Fractional Jet Ownership & Share Management (NetJets style program): share size to annual flight-hour entitlement, monthly management fee & occupied-hour billing, interchange fleet assignment & upgrade/downgrade rules, peak-day surcharge & advance-notice tiers, share resale/repurchase at market value, maintenance allocation across owners, tax depreciation pass-through, program exit & buyout formula"
+
+domain_name: fractional-jet-ownership
+api_prefix: ""
+
+# =============================================================================
+# Complexity Profile (§0.3) — Expert tier; density over volume
+# =============================================================================
+complexity_profile:
+  primary_archetype: quota_allocation        # share-based annual flight-hour pool competed by bookings
+  secondary_archetype: pricing_engine        # occupied-hour billing, tiered surcharges, interchange upgrade rules
+  complexity_layers:
+    - optimistic_concurrency                 # OCC on Share.version for booking-with-supersede; on TransferListing.version for accept-with-supersede
+    - cascading_side_effects                 # flight completion → hours debit → invoice line → invoice re-aggregation → owner standing
+    - dual_variant_calculation               # provisional vs final interchange rate; estimated vs actual occupied hours
+    - rate_threshold_triggers                # advance-notice tiers, peak-day surcharge bands, entitlement exhaustion
+  entity_topology: flat                      # peer entities joined by FKs, no URL nesting
+  state_machine_shape: compound              # Share posture is derived; BookingRequest has parallel dims (scheduling × billing); Invoice is cyclic via dispute loop
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: segregation_of_duties          # Owner requests flights; FleetOps assigns tails; FinanceOps approves exits; ProgramAdmin configures — no single role spans request + approve
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Program
+    parent: null
+    common_fields: true
+    fields:
+      - name: program_code
+        type: string
+        source: input
+        description: "Unique program code, e.g. 'FJX-2026'"
+        constraints: "immutable after creation"
+      - name: currency
+        type: string
+        source: input
+        description: "ISO 4217 currency code; all monetary cents fields use this currency"
+        constraints: "immutable after creation"
+      - name: program_posture
+        type: enum
+        source: computed
+        description: "ACTIVE | SUSPENDED | WINDING_DOWN | CLOSED — SUSPENDED blocks new bookings; WINDING_DOWN blocks new shares and new bookings but allows exits; CLOSED is terminal"
+      - name: contract_year_start_month
+        type: integer
+        source: input
+        description: "Month (1-12) on which every share's contract year begins"
+        constraints: "1..12, immutable after creation"
+      - name: peak_day_calendar
+        type: array
+        source: input
+        description: "List of ISO dates designated peak days for surcharge assessment"
+        constraints: "dates must be distinct"
+
+  - name: AircraftClass
+    parent: null
+    common_fields: true
+    fields:
+      - name: class_code
+        type: string
+        source: input
+        description: "Fleet class code, e.g. 'LIGHT', 'MID', 'SUPER_MID', 'HEAVY'"
+        constraints: "unique within program; immutable"
+      - name: program_id
+        type: string
+        source: system
+        description: "FK -> Program.id; owning program"
+      - name: hourly_rate_cents
+        type: integer
+        source: input
+        description: "Occupied-hour billing rate for this class, cents per block hour"
+        constraints: "> 0"
+      - name: interchange_upgrade_multiplier_bp
+        type: integer
+        source: input
+        description: "Basis points (10000 = 1.0x) applied to the REQUESTED class hourly rate when a larger aircraft is substituted as an upgrade"
+        constraints: ">= 10000; upgrade billing never exceeds flying-class rack rate"
+      - name: monthly_fee_base_cents
+        type: integer
+        source: input
+        description: "Full-share (1/1) monthly management fee; prorated by share fraction at invoice time"
+        constraints: "> 0"
+      - name: seats
+        type: integer
+        source: input
+        description: "Certified passenger seat count used by interchange eligibility ranking"
+        constraints: "> 0"
+
+  - name: Aircraft
+    parent: null
+    common_fields: true
+    fields:
+      - name: tail_number
+        type: string
+        source: input
+        description: "Registration tail number, e.g. 'N300FJ'"
+        constraints: "unique within program; immutable"
+      - name: program_id
+        type: string
+        source: system
+        description: "FK -> Program.id; owning program"
+      - name: class_id
+        type: string
+        source: input
+        description: "FK -> AircraftClass.id; class this tail belongs to"
+      - name: aircraft_status
+        type: enum
+        source: system
+        description: "IN_SERVICE | IN_MAINTENANCE | GROUNDED — only IN_SERVICE tails are assignable"
+      - name: total_hours_flown
+        type: number
+        source: computed
+        description: "Cumulative block hours across completed FlightLegs on this tail"
+        constraints: "2 decimal places"
+
+  - name: Owner
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: "Owner legal entity name"
+      - name: program_id
+        type: string
+        source: system
+        description: "FK -> Program.id; program the owner belongs to"
+      - name: owner_standing
+        type: enum
+        source: computed
+        description: "GOOD | DELINQUENT | SUSPENDED | EXITED — DELINQUENT when any invoice is PAST_DUE; SUSPENDED set manually; EXITED when all shares CLOSED"
+      - name: deposit_balance_cents
+        type: integer
+        source: computed
+        description: "Refundable security deposit ledger; exit buyout net settlement draws against it"
+        constraints: ">= 0"
+
+  - name: Share
+    parent: null
+    common_fields: true
+    fields:
+      - name: owner_id
+        type: string
+        source: system
+        description: "FK -> Owner.id; share owner"
+      - name: class_id
+        type: string
+        source: input
+        description: "FK -> AircraftClass.id; home fleet class of this share"
+        constraints: "immutable after activation"
+      - name: fraction_numerator
+        type: integer
+        source: input
+        description: "Numerator of ownership fraction (e.g. 1 for 1/16)"
+        constraints: ">= 1; fraction_numerator <= fraction_denominator"
+      - name: fraction_denominator
+        type: integer
+        source: input
+        description: "Denominator of ownership fraction; allowed values 4, 8, 16, 32"
+        constraints: "in {4, 8, 16, 32}"
+      - name: annual_entitlement_hours
+        type: number
+        source: computed
+        description: "fraction * ENTITLEMENT_FULL_SHARE_HOURS, where full share = 800 block hours per contract year"
+        constraints: "2 decimal places"
+      - name: hours_remaining_cy
+        type: number
+        source: computed
+        description: "Entitlement hours remaining in the current contract year; debited on booking confirmation, re-credited on cancel, finally debited at flight completion reconciliation"
+        constraints: "2 decimal places; may go negative into overdraft only via final-actual-hours reconciliation"
+      - name: contract_year_index
+        type: integer
+        source: system
+        description: "Monotonic counter of contract years elapsed since activation; 0 until first rollover"
+      - name: share_status
+        type: enum
+        source: system
+        description: "PENDING_ACTIVATION | ACTIVE | LISTED | IN_EXIT | CLOSED"
+      - name: purchase_price_cents
+        type: integer
+        source: input
+        description: "Original acquisition price of the share; basis for depreciation pass-through and buyout floor"
+        constraints: "> 0"
+
+  - name: BookingRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: share_id
+        type: string
+        source: system
+        description: "FK -> Share.id; share funding this booking"
+      - name: requested_class_id
+        type: string
+        source: input
+        description: "FK -> AircraftClass.id; class requested by the owner"
+      - name: scheduled_departure_utc
+        type: datetime
+        source: input
+        description: "Planned departure instant (ISO 8601 UTC)"
+      - name: estimated_block_hours
+        type: number
+        source: input
+        description: "Owner's estimate of occupied block hours; provisional debit basis"
+        constraints: "> 0, 2 decimal places"
+      - name: notice_tier
+        type: enum
+        source: computed
+        description: "TIER_24H | TIER_72H | TIER_7D — derived from (scheduled_departure_utc - booking creation clock): <72h → TIER_24H, >=72h and <168h → TIER_72H, >=168h → TIER_7D"
+      - name: booking_status
+        type: enum
+        source: system
+        description: "REQUESTED | CONFIRMED | COMPLETED | CANCELLED | EXPIRED"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "UNBILLED | PROVISIONALLY_BILLED | FINALLY_BILLED — parallel dimension, independent of booking_status"
+      - name: assigned_aircraft_id
+        type: string
+        source: system
+        description: "FK -> Aircraft.id; null until FleetOps assigns"
+      - name: interchange_direction
+        type: enum
+        source: system
+        description: "NONE | UPGRADE | DOWNGRADE — NONE until assignment; set by assignment rule"
+      - name: expected_share_version
+        type: integer
+        source: input
+        description: "OCC field: Share.version the client last observed when submitting the booking"
+        constraints: "required on POST /bookings"
+
+  - name: FlightLeg
+    parent: null
+    common_fields: false
+    fields:
+      - name: booking_id
+        type: string
+        source: system
+        description: "FK -> BookingRequest.id; parent booking (exactly one leg per completed booking)"
+      - name: aircraft_id
+        type: string
+        source: system
+        description: "FK -> Aircraft.id; tail that flew the leg"
+      - name: actual_block_hours
+        type: number
+        source: input
+        description: "Recorded block hours, wheels-up to wheels-down plus taxi allowance"
+        constraints: "> 0, 2 decimal places"
+      - name: peak_day_flag
+        type: boolean
+        source: computed
+        description: "True when scheduled departure date (UTC calendar day) is in Program.peak_day_calendar"
+      - name: completed_at
+        type: datetime
+        source: system
+        description: "Clock instant when leg completion was recorded"
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: owner_id
+        type: string
+        source: system
+        description: "FK -> Owner.id; billed owner"
+      - name: billing_period
+        type: string
+        source: input
+        description: "Calendar month 'YYYY-MM' this invoice covers"
+        constraints: "format YYYY-MM; unique per owner"
+      - name: invoice_status
+        type: enum
+        source: system
+        description: "OPEN | ISSUED | PAID | PAST_DUE | DISPUTED | SETTLED_AFTER_DISPUTE"
+      - name: management_fee_cents
+        type: integer
+        source: computed
+        description: "Sum of per-share monthly management fee lines"
+      - name: occupied_hours_fee_cents
+        type: integer
+        source: computed
+        description: "Sum of occupied-hour lines including interchange adjustments and peak surcharges"
+      - name: total_due_cents
+        type: integer
+        source: computed
+        description: "management_fee_cents + occupied_hours_fee_cents + tax_adjustment_cents - applied_credit_cents"
+      - name: tax_adjustment_cents
+        type: integer
+        source: computed
+        description: "Net depreciation pass-through tax adjustment for the period (may be negative)"
+      - name: issued_at
+        type: datetime
+        source: system
+        description: "Clock instant when invoice issued; null while OPEN"
+
+  - name: InvoiceLine
+    parent: null
+    common_fields: false
+    fields:
+      - name: invoice_id
+        type: string
+        source: system
+        description: "FK -> Invoice.id; parent invoice"
+      - name: line_kind
+        type: enum
+        source: system
+        description: "MANAGEMENT_FEE | OCCUPIED_HOURS | PEAK_SURCHARGE | INTERCHANGE_ADJUSTMENT | MAINTENANCE_ALLOCATION | DEPRECIATION_PASSTHROUGH"
+      - name: booking_id
+        type: string
+        source: system
+        description: "FK -> BookingRequest.id; set only for flight-derived lines (OCCUPIED_HOURS, PEAK_SURCHARGE, INTERCHANGE_ADJUSTMENT)"
+      - name: share_id
+        type: string
+        source: system
+        description: "FK -> Share.id; share this line is attributed to"
+      - name: quantity_hours
+        type: number
+        source: computed
+        description: "Hours the line prices (0 for MANAGEMENT_FEE)"
+        constraints: "2 decimal places"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "Line amount in cents; negative for credits (INTERCHANGE_ADJUSTMENT on downgrade, DEPRECIATION_PASSTHROUGH)"
+
+  - name: TransferListing
+    parent: null
+    common_fields: true
+    fields:
+      - name: share_id
+        type: string
+        source: system
+        description: "FK -> Share.id; share offered for resale"
+      - name: asking_price_cents
+        type: integer
+        source: input
+        description: "Seller's asking price; market value anchor"
+        constraints: "> 0"
+      - name: listing_status
+        type: enum
+        source: system
+        description: "LISTED | UNDER_OFFER | SOLD | WITHDRAWN | EXPIRED"
+      - name: buyer_owner_id
+        type: string
+        source: system
+        description: "FK -> Owner.id; purchasing owner, null until offer accepted"
+      - name: program_repurchase_flag
+        type: boolean
+        source: input
+        description: "When true, the program itself repurchases at market value formula instead of waiting for a third-party buyer"
+      - name: expected_share_version
+        type: integer
+        source: input
+        description: "OCC field: Share.version the seller last observed when listing"
+        constraints: "required on POST /transfer-listings"
+      - name: expected_listing_version
+        type: integer
+        source: input
+        description: "OCC field: TransferListing.version the buyer last observed when accepting"
+        constraints: "required on POST /transfer-listings/{id}/accept"
+
+  - name: MaintenanceEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: aircraft_id
+        type: string
+        source: system
+        description: "FK -> Aircraft.id; tail under maintenance"
+      - name: window_start_utc
+        type: datetime
+        source: input
+        description: "Maintenance window start (ISO 8601 UTC); half-open interval [start, end)"
+      - name: window_end_utc
+        type: datetime
+        source: input
+        description: "Maintenance window end; must be strictly greater than start"
+      - name: event_status
+        type: enum
+        source: system
+        description: "SCHEDULED | IN_PROGRESS | COMPLETED | CANCELLED"
+      - name: cost_cents
+        type: integer
+        source: input
+        description: "Total maintenance cost allocated across owners of this class"
+        constraints: ">= 0"
+      - name: unscheduled_flag
+        type: boolean
+        source: input
+        description: "Unscheduled events use a different allocation basis than scheduled events"
+
+  - name: DepreciationSchedule
+    parent: null
+    common_fields: false
+    fields:
+      - name: share_id
+        type: string
+        source: system
+        description: "FK -> Share.id; share being depreciated"
+      - name: schedule_method
+        type: enum
+        source: input
+        description: "STRAIGHT_LINE | DOUBLE_DECLINING — two valid tax depreciation variants producing different annual amounts"
+      - name: recovery_years
+        type: integer
+        source: input
+        description: "MACRS-style recovery period in years"
+        constraints: "in {5, 7}"
+      - name: basis_cents
+        type: integer
+        source: computed
+        description: "Depreciable basis, equal to Share.purchase_price_cents at activation"
+      - name: accumulated_depreciation_cents
+        type: integer
+        source: computed
+        description: "Sum of all posted annual depreciation amounts"
+      - name: current_year_allowance_cents
+        type: integer
+        source: computed
+        description: "Depreciation allowance for the current tax year under schedule_method"
+
+  - name: ExitRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: share_id
+        type: string
+        source: system
+        description: "FK -> Share.id; share being exited"
+      - name: exit_status
+        type: enum
+        source: system
+        description: "SUBMITTED | VALUED | APPROVED | SETTLED | REJECTED | WITHDRAWN"
+      - name: buyout_amount_cents
+        type: integer
+        source: computed
+        description: "Program buyout formula output; null until VALUED"
+      - name: early_exit_penalty_cents
+        type: integer
+        source: computed
+        description: "Penalty when exit occurs before minimum hold period; null until VALUED"
+      - name: settlement_cents
+        type: integer
+        source: computed
+        description: "Final net settlement: buyout minus penalty minus outstanding invoice balance plus deposit balance"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Program
+    initial_state: ACTIVE
+    terminal_states: [CLOSED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /programs/{id}/suspend"
+        actor: ProgramAdmin
+        preconditions:
+          - "program_posture == ACTIVE"
+        side_effects:
+          - "All BookingRequests in REQUESTED remain, but confirm/assign operations are rejected while SUSPENDED"
+
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /programs/{id}/resume"
+        actor: ProgramAdmin
+        preconditions:
+          - "program_posture == SUSPENDED"
+          - "No MaintenanceEvent in IN_PROGRESS on more than half of IN_SERVICE aircraft"
+        side_effects: []
+
+      - from: [ACTIVE, SUSPENDED]
+        to: WINDING_DOWN
+        trigger: "POST /programs/{id}/wind-down"
+        actor: ProgramAdmin
+        preconditions:
+          - "program_posture in {ACTIVE, SUSPENDED}"
+        side_effects:
+          - "New Share creation rejected"
+          - "New BookingRequest creation rejected"
+          - "BookingRequests in REQUESTED → EXPIRED"
+          - "TransferListings in LISTED → EXPIRED (cascade from wind-down)"
+
+      - from: WINDING_DOWN
+        to: CLOSED
+        trigger: "POST /programs/{id}/close"
+        actor: ProgramAdmin
+        preconditions:
+          - "program_posture == WINDING_DOWN"
+          - "No Share in status ACTIVE or LISTED"
+          - "No ExitRequest in {SUBMITTED, VALUED, APPROVED}"
+          - "No Invoice in {OPEN, ISSUED, PAST_DUE, DISPUTED}"
+        side_effects:
+          - "All Owners → EXITED"
+
+  - entity: Owner
+    initial_state: GOOD
+    terminal_states: [EXITED]
+    transitions:
+      - from: GOOD
+        to: DELINQUENT
+        trigger: "system (an Invoice for this owner transitions ISSUED → PAST_DUE)"
+        actor: system
+        preconditions:
+          - "At least one invoice with owner_id == Owner.id enters PAST_DUE"
+        side_effects:
+          - "Booking confirmation rejected while DELINQUENT (cross-entity gate)"
+
+      - from: DELINQUENT
+        to: GOOD
+        trigger: "system (last PAST_DUE invoice is PAID or SETTLED_AFTER_DISPUTE)"
+        actor: system
+        preconditions:
+          - "No Invoice for owner_id remains in PAST_DUE"
+        side_effects: []
+
+      - from: [GOOD, DELINQUENT]
+        to: SUSPENDED
+        trigger: "POST /owners/{id}/suspend"
+        actor: ProgramAdmin
+        preconditions:
+          - "owner_standing != EXITED"
+        side_effects:
+          - "All Owner's Shares' bookings rejected while SUSPENDED"
+
+      - from: SUSPENDED
+        to: GOOD
+        trigger: "POST /owners/{id}/reinstate"
+        actor: ProgramAdmin
+        preconditions:
+          - "No Invoice for owner_id in PAST_DUE"
+        side_effects: []
+
+      - from: [GOOD, DELINQUENT, SUSPENDED]
+        to: EXITED
+        trigger: "system (final Share of owner reaches CLOSED)"
+        actor: system
+        preconditions:
+          - "Every Share with owner_id == Owner.id is CLOSED"
+        side_effects:
+          - "deposit_balance_cents must be 0 (settled via exit)"
+
+  - entity: Share
+    initial_state: PENDING_ACTIVATION
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING_ACTIVATION
+        to: ACTIVE
+        trigger: "POST /shares/{id}/activate"
+        actor: ProgramAdmin
+        preconditions:
+          - "share_status == PENDING_ACTIVATION"
+          - "Program.program_posture == ACTIVE"
+          - "Owner.owner_standing in {GOOD, DELINQUENT}"
+        side_effects:
+          - "annual_entitlement_hours = (fraction_numerator / fraction_denominator) * 800, 2 decimal places"
+          - "hours_remaining_cy = annual_entitlement_hours"
+          - "Creates DepreciationSchedule with basis_cents = purchase_price_cents (if not provided at create)"
+
+      - from: ACTIVE
+        to: LISTED
+        trigger: "POST /transfer-listings (cascade)"
+        actor: Owner
+        preconditions:
+          - "share_status == ACTIVE"
+          - "No TransferListing in {LISTED, UNDER_OFFER} for this share"
+        side_effects:
+          - "Booking creation still allowed but completion blocked while LISTED"
+
+      - from: LISTED
+        to: ACTIVE
+        trigger: "system (TransferListing → WITHDRAWN or EXPIRED)"
+        actor: system
+        preconditions:
+          - "The covering TransferListing has left {LISTED, UNDER_OFFER}"
+        side_effects: []
+
+      - from: [ACTIVE, LISTED]
+        to: IN_EXIT
+        trigger: "POST /shares/{id}/exit (creates ExitRequest)"
+        actor: Owner
+        preconditions:
+          - "share_status in {ACTIVE, LISTED}"
+          - "No ExitRequest in {SUBMITTED, VALUED, APPROVED} for this share"
+          - "If LISTED: covering TransferListing must be WITHDRAWN or EXPIRED first"
+        side_effects:
+          - "All BookingRequests of this share in REQUESTED → EXPIRED"
+          - "All BookingRequests of this share in CONFIRMED → CANCELLED with hours re-credit (compensating action)"
+
+      - from: IN_EXIT
+        to: CLOSED
+        trigger: "system (ExitRequest → SETTLED)"
+        actor: system
+        preconditions:
+          - "Covering ExitRequest.exit_status == SETTLED"
+        side_effects:
+          - "If this was the owner's last non-CLOSED share: Owner → EXITED"
+
+      - from: IN_EXIT
+        to: ACTIVE
+        trigger: "system (ExitRequest → REJECTED or WITHDRAWN)"
+        actor: system
+        preconditions:
+          - "Covering ExitRequest.exit_status in {REJECTED, WITHDRAWN}"
+        side_effects:
+          - "Share returns to ACTIVE; previously expired bookings are NOT restored"
+
+  - entity: BookingRequest
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, CANCELLED, EXPIRED]
+    transitions:
+      - from: REQUESTED
+        to: CONFIRMED
+        trigger: "POST /bookings/{id}/confirm"
+        actor: Owner
+        preconditions:
+          - "booking_status == REQUESTED"
+          - "Share.share_status == ACTIVE"
+          - "Owner.owner_standing == GOOD"
+          - "Program.program_posture == ACTIVE"
+          - "Share.hours_remaining_cy >= estimated_block_hours (entitlement gate, >= boundary: exact equality allowed)"
+          - "scheduled_departure_utc strictly after current clock"
+        side_effects:
+          - "Share.hours_remaining_cy -= estimated_block_hours (provisional debit)"
+          - "Share.version += 1"
+          - "billing_status → PROVISIONALLY_BILLED"
+          - "notice_tier frozen at confirm-time clock"
+
+      - from: CONFIRMED
+        to: CONFIRMED
+        trigger: "POST /bookings/{id}/assign"
+        actor: FleetOps
+        preconditions:
+          - "booking_status == CONFIRMED"
+          - "Assigned aircraft aircraft_status == IN_SERVICE"
+          - "Aircraft has no overlapping CONFIRMED booking window or IN_PROGRESS maintenance window (half-open interval overlap)"
+        side_effects:
+          - "assigned_aircraft_id set; interchange_direction computed by interchange rule"
+          - "If aircraft.class != requested_class: INTERCHANGE_ADJUSTMENT line prepared for next invoice aggregation"
+
+      - from: [REQUESTED, CONFIRMED]
+        to: CANCELLED
+        trigger: "POST /bookings/{id}/cancel"
+        actor: Owner
+        preconditions:
+          - "booking_status in {REQUESTED, CONFIRMED}"
+        side_effects:
+          - "If was CONFIRMED: Share.hours_remaining_cy += estimated_block_hours (compensating re-credit, restores entitlement invariant)"
+          - "billing_status → UNBILLED; any provisional lines for this booking voided on next aggregation"
+
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /bookings/{id}/complete with actual_block_hours (creates FlightLeg)"
+        actor: FleetOps
+        preconditions:
+          - "booking_status == CONFIRMED"
+          - "assigned_aircraft_id IS NOT NULL"
+          - "Share.share_status == ACTIVE (completion blocked while LISTED or IN_EXIT)"
+        side_effects:
+          - "Creates FlightLeg with peak_day_flag"
+          - "Reconciliation: Share.hours_remaining_cy += estimated_block_hours - actual_block_hours (delta adjust; may drive negative into overdraft)"
+          - "Aircraft.total_hours_flown += actual_block_hours"
+          - "billing_status → FINALLY_BILLED"
+          - "Invoice aggregation recalculated for the invoice covering completed_at month"
+
+      - from: REQUESTED
+        to: EXPIRED
+        trigger: "system (clock passes scheduled_departure_utc while still REQUESTED)"
+        actor: system
+        preconditions:
+          - "Current clock >= scheduled_departure_utc"
+        side_effects: []
+
+  - entity: Invoice
+    initial_state: OPEN
+    terminal_states: [PAID, SETTLED_AFTER_DISPUTE]
+    transitions:
+      - from: OPEN
+        to: ISSUED
+        trigger: "POST /invoices/{id}/issue"
+        actor: FinanceOps
+        preconditions:
+          - "invoice_status == OPEN"
+          - "Billing period has ended relative to current clock"
+          - "Owner.owner_standing != EXITED"
+        side_effects:
+          - "Aggregates management fee, occupied hours, surcharges, maintenance allocation, depreciation pass-through into total_due_cents"
+          - "issued_at stamped from clock"
+
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /invoices/{id}/pay"
+        actor: Owner
+        preconditions:
+          - "invoice_status == ISSUED"
+          - "payment amount_cents == total_due_cents exactly"
+        side_effects:
+          - "If owner had no other PAST_DUE invoice: Owner DELINQUENT → GOOD (bubble up)"
+
+      - from: ISSUED
+        to: PAST_DUE
+        trigger: "system (clock passes issued_at + 30 days while ISSUED)"
+        actor: system
+        preconditions:
+          - "invoice_status == ISSUED"
+        side_effects:
+          - "Owner GOOD → DELINQUENT (bubble up)"
+
+      - from: [ISSUED, PAST_DUE]
+        to: DISPUTED
+        trigger: "POST /invoices/{id}/dispute"
+        actor: Owner
+        preconditions:
+          - "invoice_status in {ISSUED, PAST_DUE}"
+        side_effects:
+          - "If was PAST_DUE: Owner remains DELINQUENT until dispute resolves"
+
+      - from: DISPUTED
+        to: SETTLED_AFTER_DISPUTE
+        trigger: "POST /invoices/{id}/resolve-dispute"
+        actor: FinanceOps
+        preconditions:
+          - "invoice_status == DISPUTED"
+          - "adjusted_total_cents >= 0"
+        side_effects:
+          - "total_due_cents replaced by adjusted_total_cents"
+          - "If owner had no other PAST_DUE invoice: Owner DELINQUENT → GOOD"
+
+      - from: DISPUTED
+        to: ISSUED
+        trigger: "POST /invoices/{id}/resolve-dispute with reject_adjustment=true"
+        actor: FinanceOps
+        preconditions:
+          - "invoice_status == DISPUTED"
+        side_effects:
+          - "Invoice returns to ISSUED unchanged; if it had been PAST_DUE before dispute, returns to PAST_DUE instead"
+
+  - entity: TransferListing
+    initial_state: LISTED
+    terminal_states: [SOLD, WITHDRAWN, EXPIRED]
+    transitions:
+      - from: LISTED
+        to: UNDER_OFFER
+        trigger: "POST /transfer-listings/{id}/accept"
+        actor: Owner
+        preconditions:
+          - "listing_status == LISTED"
+          - "buyer_owner_id != share's current owner_id (no self-dealing)"
+          - "Buyer Owner.owner_standing == GOOD"
+          - "Program.program_posture == ACTIVE"
+          - "OCC: expected_listing_version == TransferListing.version"
+        side_effects:
+          - "buyer_owner_id recorded"
+          - "Share remains LISTED pending closing"
+
+      - from: UNDER_OFFER
+        to: SOLD
+        trigger: "POST /transfer-listings/{id}/close-sale"
+        actor: FinanceOps
+        preconditions:
+          - "listing_status == UNDER_OFFER"
+        side_effects:
+          - "Share.owner_id reassigned to buyer_owner_id"
+          - "Share.hours_remaining_cy carried over unchanged (entitlement follows the share)"
+          - "DepreciationSchedule rebased: new basis = final sale price; accumulated_depreciation reset to 0 for buyer"
+          - "Share LISTED → ACTIVE under new owner"
+
+      - from: [LISTED, UNDER_OFFER]
+        to: WITHDRAWN
+        trigger: "POST /transfer-listings/{id}/withdraw"
+        actor: Owner
+        preconditions:
+          - "listing_status in {LISTED, UNDER_OFFER}"
+          - "Acting owner is the share's current owner_id"
+        side_effects:
+          - "Share LISTED → ACTIVE (only when share not IN_EXIT)"
+
+      - from: LISTED
+        to: EXPIRED
+        trigger: "system (clock passes listing created_at + 180 days, or program WINDING_DOWN cascade)"
+        actor: system
+        preconditions:
+          - "listing_status == LISTED"
+        side_effects:
+          - "Share LISTED → ACTIVE (only when share not IN_EXIT)"
+
+  - entity: MaintenanceEvent
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "POST /maintenance-events/{id}/start"
+        actor: FleetOps
+        preconditions:
+          - "event_status == SCHEDULED"
+          - "No other MaintenanceEvent in IN_PROGRESS for same aircraft"
+        side_effects:
+          - "Aircraft IN_SERVICE → IN_MAINTENANCE"
+          - "Any CONFIRMED booking assigned to this aircraft with overlapping window → assigned_aircraft_id cleared (interchange reassignment required)"
+
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /maintenance-events/{id}/complete"
+        actor: FleetOps
+        preconditions:
+          - "event_status == IN_PROGRESS"
+          - "Current clock >= window_end_utc OR FleetOps override flag"
+        side_effects:
+          - "Aircraft IN_MAINTENANCE → IN_SERVICE"
+          - "cost_cents allocated across owners holding ACTIVE shares in that aircraft's class → MAINTENANCE_ALLOCATION invoice lines"
+
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /maintenance-events/{id}/cancel"
+        actor: FleetOps
+        preconditions:
+          - "event_status == SCHEDULED"
+        side_effects: []
+
+  - entity: ExitRequest
+    initial_state: SUBMITTED
+    terminal_states: [SETTLED, REJECTED, WITHDRAWN]
+    transitions:
+      - from: SUBMITTED
+        to: VALUED
+        trigger: "POST /exit-requests/{id}/value"
+        actor: FinanceOps
+        preconditions:
+          - "exit_status == SUBMITTED"
+          - "Share has no CONFIRMED bookings (IN_EXIT cascade cancels them first)"
+        side_effects:
+          - "buyout_amount_cents and early_exit_penalty_cents computed by buyout formula"
+
+      - from: VALUED
+        to: APPROVED
+        trigger: "POST /exit-requests/{id}/approve"
+        actor: FinanceOps
+        preconditions:
+          - "exit_status == VALUED"
+          - "Approver FinanceOps identity != the FinanceOps identity that ran value (segregation of duties)"
+        side_effects: []
+
+      - from: APPROVED
+        to: SETTLED
+        trigger: "POST /exit-requests/{id}/settle"
+        actor: FinanceOps
+        preconditions:
+          - "exit_status == APPROVED"
+        side_effects:
+          - "settlement_cents computed (buyout - penalty - outstanding + deposit); outstanding_invoice_balance_cents = sum of total_due_cents over the owner's invoices in {OPEN, ISSUED, PAST_DUE, DISPUTED} as of the settle clock, and those invoices are force-closed (netted into the settlement)"
+          - "Owner.deposit_balance_cents → 0"
+          - "Share IN_EXIT → CLOSED (cascade)"
+
+      - from: [SUBMITTED, VALUED]
+        to: REJECTED
+        trigger: "POST /exit-requests/{id}/reject"
+        actor: FinanceOps
+        preconditions:
+          - "exit_status in {SUBMITTED, VALUED}"
+        side_effects:
+          - "Share IN_EXIT → ACTIVE (cascade)"
+
+      - from: [SUBMITTED, VALUED]
+        to: WITHDRAWN
+        trigger: "POST /exit-requests/{id}/withdraw"
+        actor: Owner
+        preconditions:
+          - "exit_status in {SUBMITTED, VALUED}"
+        side_effects:
+          - "Share IN_EXIT → ACTIVE (cascade)"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: booking-create-stale-share
+    parent_entity: Share
+    write_endpoint: "POST /bookings"
+    occ_field: expected_share_version
+    description: |
+      Creating a BookingRequest against a Share whose version has advanced since
+      the client last observed it is rejected. This captures the case where
+      another writer has just confirmed or cancelled a booking on the same
+      share (which legitimately moved hours_remaining_cy) and the current
+      writer's view of the remaining entitlement is therefore stale.
+    error_id: ERR_STALE_SHARE_VERSION
+    http_status: 412
+
+  - rule_id: listing-accept-stale-listing
+    parent_entity: TransferListing
+    write_endpoint: "POST /transfer-listings/{id}/accept"
+    occ_field: expected_listing_version
+    description: |
+      Accepting a TransferListing whose version has advanced since the buyer
+      last observed it is rejected. This captures the case where the seller
+      has just amended the asking price and the buyer's accepted price view
+      is therefore stale.
+    error_id: ERR_STALE_LISTING_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: annual_entitlement_hours
+    trigger: "share activation"
+    algorithm: aggregation
+    formula: |
+      annual_entitlement_hours = (fraction_numerator / fraction_denominator) * FULL_SHARE_HOURS
+      FULL_SHARE_HOURS = 800
+      hours_remaining_cy initialized to annual_entitlement_hours at activation
+    input_set: "The Share being activated"
+    constants:
+      FULL_SHARE_HOURS: 800
+    precision: "2 decimal places, round_half_up"
+
+  - name: notice_tier_classification
+    trigger: "booking confirmation (frozen at confirm-time clock)"
+    algorithm: threshold
+    formula: |
+      delta_hours = (scheduled_departure_utc - confirm_clock) in hours
+      if delta_hours < 72:  notice_tier = TIER_24H
+      elif delta_hours < 168: notice_tier = TIER_72H
+      else: notice_tier = TIER_7D
+      Boundary: exactly 72h → TIER_72H (>= boundary); exactly 168h → TIER_7D
+    input_set: "The BookingRequest being confirmed"
+    constants:
+      TIER_72H_HOURS: 72
+      TIER_7D_HOURS: 168
+
+  - name: occupied_hours_billing
+    trigger: "invoice aggregation for a billing period"
+    algorithm: tiered_pricing
+    formula: |
+      For each FINALLY_BILLED booking of the owner whose FlightLeg.completed_at
+      falls in the billing period [period_start, period_end) (half-open):
+        base_cents = round_half_up(actual_block_hours * class_hourly_rate_cents)
+        peak_cents = if peak_day_flag then round_half_up(base_cents * PEAK_SURCHARGE_BP / 10000) else 0
+        line_total = base_cents + peak_cents
+      Rounding order is PINNED: round each component per-line first
+      (base, then peak), then sum lines. Summing raw values then rounding once
+      at the invoice level is FORBIDDEN and produces different cents.
+    input_set: "FlightLegs with completed_at in the half-open billing month, whose booking billing_status == FINALLY_BILLED and booking share owned by invoice owner"
+    constants:
+      PEAK_SURCHARGE_BP: 1500
+    precision: "2 decimal places on hours; integer cents, round_half_up per line"
+    variants:
+      - name: provisional_estimate_billing
+        when: "Preview quote at booking confirmation time (GET /bookings/{id}/quote)"
+        difference: "Uses estimated_block_hours instead of actual_block_hours and the REQUESTED class rate regardless of any later interchange; produces a different number than final billing whenever actuals differ or interchange occurred"
+
+  - name: interchange_adjustment
+    trigger: "aircraft assignment when assigned class != requested class"
+    algorithm: constraint_propagation
+    formula: |
+      Let req_rate = requested class hourly_rate_cents
+      Let fly_rate = assigned class hourly_rate_cents
+      UPGRADE (fly_rate > req_rate):
+        effective_rate = min(fly_rate, round_half_up(req_rate * AircraftClass[assigned].interchange_upgrade_multiplier_bp / 10000))
+        adjustment_cents = round_half_up((effective_rate - req_rate) * hours)   # positive surcharge
+      DOWNGRADE (fly_rate < req_rate):
+        effective_rate = fly_rate
+        adjustment_cents = round_half_up((fly_rate - req_rate) * hours)          # negative credit
+      Eligibility selector for auto-suggestion (GET /bookings/{id}/suggest-aircraft):
+        candidate tails = Aircraft where aircraft_status == IN_SERVICE
+          AND no overlapping CONFIRMED booking window or IN_PROGRESS maintenance window
+        rank by (abs(class seats - requested class seats) ASC, then total_hours_flown ASC, then created_at ASC)
+        fallback when candidate set empty: ERR_NO_AIRCRAFT_AVAILABLE
+    input_set: "The BookingRequest being assigned; Aircraft pool of the program"
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: owner_friendly_upgrade_cap
+        when: "UPGRADE direction only"
+        difference: "Billed at the capped multiplier of the REQUESTED rate, never the flying class's full rack rate — two valid readings of 'upgrade at no more than X%' produce different cents unless the min() cap is applied"
+
+  - name: monthly_management_fee
+    trigger: "invoice aggregation"
+    algorithm: aggregation
+    formula: |
+      For each share of the owner in status in {ACTIVE, LISTED, IN_EXIT} at any
+      point during the billing period:
+        fee_cents = round_half_up(monthly_fee_base_cents * fraction_numerator / fraction_denominator)
+      Shares in PENDING_ACTIVATION or CLOSED for the whole period contribute 0.
+      Mid-period activation is billed for the full month (no proration).
+    input_set: "Shares owned by the invoice owner; status evaluated at period end instant"
+    precision: "integer cents, round_half_up per share line, then summed"
+
+  - name: maintenance_allocation
+    trigger: "MaintenanceEvent → COMPLETED"
+    algorithm: waterfall_allocation
+    formula: |
+      pool = MaintenanceEvent.cost_cents
+      owners = owners holding >=1 ACTIVE share in the event aircraft's class at completion clock
+      if unscheduled_flag == false:
+        weight(owner) = sum of fraction (numerator/denominator) over owner's ACTIVE shares in the class
+      else:
+        weight(owner) = sum of (fraction * share hours_remaining_cy consumed this contract year) — usage-weighted basis
+      allocate pool pro-rata by weight:
+        raw_i = pool * weight_i / sum(weights)
+        floor each raw_i to cents; distribute the rounding remainder cents one-by-one
+        to owners in order of (weight DESC, then owner created_at ASC) until exhausted
+      if owners set is empty: allocation is deferred; cost held on the event until a share activates (no line emitted)
+    input_set: "MaintenanceEvent being completed; ACTIVE shares of the aircraft's class"
+    precision: "integer cents; floor + deterministic remainder distribution"
+    variants:
+      - name: usage_weighted_unscheduled
+        when: "unscheduled_flag == true"
+        difference: "Weighting basis switches from pure share fraction to fraction × year-to-date hours consumed, producing different allocations for identical ownership structures"
+
+  - name: depreciation_pass_through
+    trigger: "invoice aggregation for the final billing period of a tax year (period month == 12)"
+    algorithm: chronological
+    formula: |
+      For each share with a DepreciationSchedule:
+        STRAIGHT_LINE: current_year_allowance = round_half_up(basis_cents / recovery_years)
+        DOUBLE_DECLINING: current_year_allowance = min(
+            round_half_up(2 * (basis_cents - accumulated_depreciation_cents) / recovery_years),
+            basis_cents - accumulated_depreciation_cents)
+      allowance is capped so accumulated never exceeds basis.
+      tax_adjustment_cents on the December invoice = -(sum of allowances) (a credit).
+      Evaluation order PINNED: compute per-share allowance using the accumulated
+      value BEFORE this year's posting; only after all shares are computed are
+      the schedules updated. Interleaving compute-and-update would corrupt
+      schedules for owners with multiple shares.
+    input_set: "DepreciationSchedules of shares owned by the invoice owner that are not in terminal CLOSED-with-settled-exit state"
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: double_declining_balance
+        when: "DepreciationSchedule.schedule_method == DOUBLE_DECLINING"
+        difference: "Accelerated schedule front-loads allowance; produces a larger first-year credit than STRAIGHT_LINE for identical basis and recovery_years"
+
+  - name: exit_buyout_formula
+    trigger: "ExitRequest → VALUED"
+    algorithm: combinatorial
+    formula: |
+      market_value_cents = round_half_up(purchase_price_cents * MARKET_VALUE_BP / 10000)
+      # MARKET_VALUE_BP tracks class residual index; pinned constant for determinism
+      years_held = full contract years elapsed since activation (contract_year_index)
+      if years_held >= MIN_HOLD_YEARS:
+        early_exit_penalty_cents = 0
+      else:
+        early_exit_penalty_cents = round_half_up(market_value_cents * EARLY_EXIT_BP * (MIN_HOLD_YEARS - years_held) / (10000 * MIN_HOLD_YEARS))
+      buyout_amount_cents = market_value_cents - early_exit_penalty_cents
+      settlement_cents = buyout_amount_cents - outstanding_invoice_balance_cents + deposit_balance_cents
+      Circular-looking dependency pinned: outstanding_invoice_balance uses the
+      invoice totals as of valuation clock, which EXCLUDES any line generated by
+      the exit itself; the exit never feeds its own valuation.
+    input_set: "Share, its Owner's unpaid invoices, deposit ledger"
+    constants:
+      MARKET_VALUE_BP: 8200
+      EARLY_EXIT_BP: 2000
+      MIN_HOLD_YEARS: 3
+    precision: "integer cents, round_half_up at each pinned step"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers present and role is a declared role"
+    error_id: ERR_MISSING_OR_INVALID_CONTEXT
+    http_status: 400
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "Role permitted for this endpoint per RBAC matrix"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: existence
+    check: "Path resource ids exist, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all resource endpoints"
+
+  - priority: 4
+    category: state
+    check: "Entity in a valid state for the requested transition"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+
+  - priority: 5
+    category: state
+    check: "Program posture gate: booking/transfer actions require ACTIVE; exits allowed in WINDING_DOWN"
+    error_id: ERR_PROGRAM_POSTURE_BLOCKS
+    http_status: 409
+    applies_to: "POST /bookings, POST /bookings/{id}/confirm, POST /transfer-listings, POST /transfer-listings/{id}/accept"
+
+  - priority: 6
+    category: business_safety
+    check: "Owner standing gate: confirm requires Owner GOOD; listing accept requires buyer GOOD"
+    error_id: ERR_OWNER_STANDING_BLOCKS
+    http_status: 422
+    applies_to: "POST /bookings/{id}/confirm, POST /transfer-listings/{id}/accept"
+
+  - priority: 7
+    category: business_temporal
+    check: "scheduled_departure_utc strictly after current clock; maintenance window_end > window_start"
+    error_id: ERR_TEMPORAL_INVALID
+    http_status: 422
+    applies_to: "POST /bookings, POST /bookings/{id}/confirm, POST /maintenance-events"
+
+  - priority: 8
+    category: business_constraint
+    check: "Aircraft double-booking: assigned tail has no overlapping CONFIRMED booking window or IN_PROGRESS maintenance window (half-open intervals)"
+    error_id: ERR_AIRCRAFT_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /bookings/{id}/assign"
+
+  - priority: 9
+    category: business_referential
+    check: "Share class consistency: booking requested class must exist in program; transfer listing share must not be referenced by another live listing; exit requires no CONFIRMED bookings"
+    error_id: ERR_REFERENTIAL_CONFLICT
+    http_status: 409
+    applies_to: "POST /transfer-listings, POST /shares/{id}/exit, POST /exit-requests/{id}/value"
+
+  - priority: 10
+    category: business_fiscal
+    check: "Entitlement gate: Share.hours_remaining_cy >= estimated_block_hours at confirm (>= boundary allows exact equality, leaving zero)"
+    error_id: ERR_ENTITLEMENT_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /bookings/{id}/confirm"
+
+  - priority: 11
+    category: business_fiscal
+    check: "Payment exactness: invoice pay amount must equal total_due_cents exactly"
+    error_id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /invoices/{id}/pay"
+
+  - priority: 12
+    category: business_constraint
+    check: "OCC precondition: expected_share_version / expected_listing_version match current versions"
+    error_id: "ERR_STALE_SHARE_VERSION / ERR_STALE_LISTING_VERSION"
+    http_status: 412
+    applies_to: "POST /bookings, POST /transfer-listings/{id}/accept"
+
+  - priority: 13
+    category: business_constraint
+    check: "Fraction validity: denominator in {4,8,16,32}, numerator >= 1 and <= denominator"
+    error_id: ERR_INVALID_FRACTION
+    http_status: 422
+    applies_to: "POST /shares"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Clock (test-driving; mandatory default) ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the logical server clock. Server startup default is exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time."
+    roles: [ProgramAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects:
+      - "Advances clock; triggers system transitions: booking expiry, listing expiry, invoice PAST_DUE sweep, program cascades"
+      - "Contract-year rollover: when the clock crosses a program's contract-year anniversary (month == contract_year_start_month, day 1, 00:00Z), every ACTIVE share's contract_year_index += 1 and hours_remaining_cy is reset to annual_entitlement_hours (unused hours do NOT roll over)"
+
+  # --- Programs ---
+  - method: POST
+    path: "/programs"
+    description: "Create a program"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [program_code, currency, contract_year_start_month, peak_day_calendar]
+    output: Program
+    side_effects: ["program_posture=ACTIVE"]
+
+  - method: GET
+    path: "/programs/{id}"
+    description: "Get program"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: Program
+    side_effects: []
+
+  - method: POST
+    path: "/programs/{id}/suspend"
+    description: "Suspend program"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["program_posture → SUSPENDED"]
+
+  - method: POST
+    path: "/programs/{id}/resume"
+    description: "Resume program"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["program_posture → ACTIVE"]
+
+  - method: POST
+    path: "/programs/{id}/wind-down"
+    description: "Wind down program; cascades REQUESTED bookings and LISTED listings to EXPIRED"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["program_posture → WINDING_DOWN", "BookingRequests REQUESTED → EXPIRED", "TransferListings LISTED → EXPIRED"]
+
+  - method: POST
+    path: "/programs/{id}/close"
+    description: "Close program (terminal)"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Program
+    side_effects: ["program_posture → CLOSED", "All Owners → EXITED"]
+
+  # --- Aircraft Classes ---
+  - method: POST
+    path: "/aircraft-classes"
+    description: "Create an aircraft class in a program"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [program_id, class_code, hourly_rate_cents, interchange_upgrade_multiplier_bp, monthly_fee_base_cents, seats]
+    output: AircraftClass
+    side_effects: []
+
+  - method: GET
+    path: "/aircraft-classes/{id}"
+    description: "Get aircraft class"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: AircraftClass
+    side_effects: []
+
+  - method: GET
+    path: "/aircraft-classes"
+    description: "List aircraft classes (filterable by program_id)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["program_id?"]
+    output: "AircraftClass[]"
+    side_effects: []
+
+  # --- Aircraft ---
+  - method: POST
+    path: "/aircraft"
+    description: "Register a tail"
+    roles: [FleetOps]
+    code: 201
+    input: [program_id, tail_number, class_id]
+    output: Aircraft
+    side_effects: ["aircraft_status=IN_SERVICE", "total_hours_flown=0"]
+
+  - method: GET
+    path: "/aircraft/{id}"
+    description: "Get aircraft"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: Aircraft
+    side_effects: []
+
+  - method: GET
+    path: "/aircraft"
+    description: "List aircraft (filterable by program_id, class_id, aircraft_status)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["program_id?", "class_id?", "aircraft_status?"]
+    output: "Aircraft[]"
+    side_effects: []
+
+  # --- Owners ---
+  - method: POST
+    path: "/owners"
+    description: "Create an owner"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [program_id, legal_name, initial_deposit_cents]
+    output: Owner
+    side_effects: ["owner_standing=GOOD", "deposit_balance_cents=initial_deposit_cents"]
+
+  - method: GET
+    path: "/owners/{id}"
+    description: "Get owner"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: Owner
+    side_effects: []
+
+  - method: GET
+    path: "/owners"
+    description: "List owners (filterable by program_id, owner_standing)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["program_id?", "owner_standing?"]
+    output: "Owner[]"
+    side_effects: []
+
+  - method: POST
+    path: "/owners/{id}/suspend"
+    description: "Suspend owner"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Owner
+    side_effects: ["owner_standing → SUSPENDED"]
+
+  - method: POST
+    path: "/owners/{id}/reinstate"
+    description: "Reinstate owner"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Owner
+    side_effects: ["owner_standing → GOOD if no PAST_DUE invoices"]
+
+  # --- Shares ---
+  - method: POST
+    path: "/shares"
+    description: "Create a share"
+    roles: [ProgramAdmin]
+    code: 201
+    input: [owner_id, class_id, fraction_numerator, fraction_denominator, purchase_price_cents, schedule_method, recovery_years]
+    output: Share
+    side_effects: ["share_status=PENDING_ACTIVATION", "DepreciationSchedule created with given method/years and basis=purchase_price_cents"]
+
+  - method: GET
+    path: "/shares/{id}"
+    description: "Get share"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: Share
+    side_effects: []
+
+  - method: GET
+    path: "/shares"
+    description: "List shares (filterable by owner_id, class_id, share_status)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["owner_id?", "class_id?", "share_status?"]
+    output: "Share[]"
+    side_effects: []
+
+  - method: POST
+    path: "/shares/{id}/activate"
+    description: "Activate share: computes entitlement, starts contract year 0"
+    roles: [ProgramAdmin]
+    code: 200
+    input: []
+    output: Share
+    side_effects: ["share_status → ACTIVE", "annual_entitlement_hours computed", "hours_remaining_cy initialized", "increments Share.version by 1"]
+
+  - method: POST
+    path: "/shares/{id}/exit"
+    description: "Open exit request on the share"
+    roles: [Owner]
+    code: 201
+    input: []
+    output: ExitRequest
+    side_effects: ["Share ACTIVE|LISTED → IN_EXIT", "REQUESTED bookings → EXPIRED", "CONFIRMED bookings → CANCELLED with hours re-credit"]
+
+  # --- Bookings ---
+  - method: POST
+    path: "/bookings"
+    description: "Create a booking request (OCC on Share.version)"
+    roles: [Owner]
+    code: 201
+    input: [share_id, requested_class_id, scheduled_departure_utc, estimated_block_hours, expected_share_version]
+    output: BookingRequest
+    side_effects: ["booking_status=REQUESTED", "billing_status=UNBILLED", "increments Share.version by 1"]
+
+  - method: GET
+    path: "/bookings/{id}"
+    description: "Get booking"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: BookingRequest
+    side_effects: []
+
+  - method: GET
+    path: "/bookings"
+    description: "List bookings (filterable by share_id, requested_class_id, assigned_aircraft_id, booking_status, billing_status)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["share_id?", "requested_class_id?", "assigned_aircraft_id?", "booking_status?", "billing_status?"]
+    output: "BookingRequest[]"
+    side_effects: []
+
+  - method: GET
+    path: "/flight-legs"
+    description: "List flight legs (filterable by booking_id, aircraft_id)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["booking_id?", "aircraft_id?"]
+    output: "FlightLeg[]"
+    side_effects: []
+
+  - method: GET
+    path: "/flight-legs/{id}"
+    description: "Get flight leg"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: FlightLeg
+    side_effects: []
+
+  - method: GET
+    path: "/bookings/{id}/quote"
+    description: "Provisional billing preview using estimated hours and requested class rate"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: { provisional_total_cents: integer, notice_tier: string }
+    side_effects: []
+
+  - method: GET
+    path: "/bookings/{id}/suggest-aircraft"
+    description: "Ranked candidate tails per interchange selector rule"
+    roles: [FleetOps]
+    code: 200
+    input: []
+    output: "Aircraft[]"
+    side_effects: []
+
+  - method: POST
+    path: "/bookings/{id}/confirm"
+    description: "Confirm booking: entitlement gate, notice tier frozen, provisional debit"
+    roles: [Owner]
+    code: 200
+    input: []
+    output: BookingRequest
+    side_effects: ["booking_status → CONFIRMED", "Share.hours_remaining_cy -= estimated_block_hours", "billing_status → PROVISIONALLY_BILLED", "increments Share.version by 1"]
+
+  - method: POST
+    path: "/bookings/{id}/assign"
+    description: "Assign aircraft; computes interchange direction"
+    roles: [FleetOps]
+    code: 200
+    input: [aircraft_id]
+    output: BookingRequest
+    side_effects: ["assigned_aircraft_id set", "interchange_direction computed"]
+
+  - method: POST
+    path: "/bookings/{id}/cancel"
+    description: "Cancel booking; compensating re-credit of provisional hours"
+    roles: [Owner]
+    code: 200
+    input: []
+    output: BookingRequest
+    side_effects: ["booking_status → CANCELLED", "Share.hours_remaining_cy += estimated_block_hours if was CONFIRMED", "billing_status → UNBILLED", "increments Share.version by 1"]
+
+  - method: POST
+    path: "/bookings/{id}/complete"
+    description: "Complete booking with actual hours; creates FlightLeg; reconciles entitlement delta"
+    roles: [FleetOps]
+    code: 201
+    input: [actual_block_hours]
+    output: FlightLeg
+    side_effects: ["booking_status → COMPLETED", "billing_status → FINALLY_BILLED", "Share.hours_remaining_cy += (estimated - actual)", "Aircraft.total_hours_flown += actual_block_hours", "increments Share.version by 1", "increments Aircraft.version by 1"]
+
+  # --- Invoices ---
+  - method: POST
+    path: "/invoices"
+    description: "Open an invoice for an owner and billing period"
+    roles: [FinanceOps]
+    code: 201
+    input: [owner_id, billing_period]
+    output: Invoice
+    side_effects: ["invoice_status=OPEN"]
+
+  - method: GET
+    path: "/invoices/{id}"
+    description: "Get invoice"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+
+  - method: GET
+    path: "/invoices"
+    description: "List invoices (filterable by owner_id, invoice_status, billing_period)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["owner_id?", "invoice_status?", "billing_period?"]
+    output: "Invoice[]"
+    side_effects: []
+
+  - method: GET
+    path: "/invoices/{id}/lines"
+    description: "List invoice lines"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: "InvoiceLine[]"
+    side_effects: []
+
+  - method: GET
+    path: "/invoice-lines"
+    description: "List invoice lines across invoices (filterable by invoice_id, booking_id, share_id, line_kind)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["invoice_id?", "booking_id?", "share_id?", "line_kind?"]
+    output: "InvoiceLine[]"
+    side_effects: []
+
+  - method: GET
+    path: "/invoice-lines/{id}"
+    description: "Get invoice line"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: InvoiceLine
+    side_effects: []
+
+  - method: POST
+    path: "/invoices/{id}/issue"
+    description: "Issue invoice: runs all aggregations"
+    roles: [FinanceOps]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["invoice_status → ISSUED", "management_fee_cents, occupied_hours_fee_cents, tax_adjustment_cents, total_due_cents computed", "InvoiceLines persisted", "issued_at stamped"]
+
+  - method: POST
+    path: "/invoices/{id}/pay"
+    description: "Pay invoice; amount must equal total_due_cents exactly"
+    roles: [Owner]
+    code: 200
+    input: [amount_cents]
+    output: Invoice
+    side_effects: ["invoice_status → PAID", "Owner DELINQUENT → GOOD if no other PAST_DUE"]
+
+  - method: POST
+    path: "/invoices/{id}/dispute"
+    description: "Dispute an issued or past-due invoice"
+    roles: [Owner]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["invoice_status → DISPUTED"]
+
+  - method: POST
+    path: "/invoices/{id}/resolve-dispute"
+    description: "Resolve dispute with adjusted total or reject adjustment"
+    roles: [FinanceOps]
+    code: 200
+    input: [adjusted_total_cents, reject_adjustment]
+    output: Invoice
+    side_effects: ["invoice_status → SETTLED_AFTER_DISPUTE or back to ISSUED/PAST_DUE", "Owner DELINQUENT → GOOD if no other PAST_DUE"]
+
+  # --- Transfer Listings ---
+  - method: POST
+    path: "/transfer-listings"
+    description: "List a share for resale (OCC on Share.version)"
+    roles: [Owner]
+    code: 201
+    input: [share_id, asking_price_cents, program_repurchase_flag, expected_share_version]
+    output: TransferListing
+    side_effects: ["listing_status=LISTED", "Share ACTIVE → LISTED", "increments Share.version by 1"]
+
+  - method: GET
+    path: "/transfer-listings/{id}"
+    description: "Get listing"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: TransferListing
+    side_effects: []
+
+  - method: GET
+    path: "/transfer-listings"
+    description: "List transfer listings (filterable by share_id, listing_status, buyer_owner_id)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["share_id?", "listing_status?", "buyer_owner_id?"]
+    output: "TransferListing[]"
+    side_effects: []
+
+  - method: POST
+    path: "/transfer-listings/{id}/accept"
+    description: "Buyer accepts listing (OCC on TransferListing.version)"
+    roles: [Owner]
+    code: 200
+    input: [buyer_owner_id, expected_listing_version]
+    output: TransferListing
+    side_effects: ["listing_status → UNDER_OFFER", "increments TransferListing.version by 1"]
+
+  - method: POST
+    path: "/transfer-listings/{id}/close-sale"
+    description: "Close sale: reassigns share ownership, rebases depreciation"
+    roles: [FinanceOps]
+    code: 200
+    input: [final_sale_price_cents]
+    output: TransferListing
+    side_effects: ["listing_status → SOLD", "Share.owner_id reassigned", "Share LISTED → ACTIVE", "DepreciationSchedule rebased", "increments Share.version by 1"]
+
+  - method: POST
+    path: "/transfer-listings/{id}/withdraw"
+    description: "Seller withdraws listing"
+    roles: [Owner]
+    code: 200
+    input: []
+    output: TransferListing
+    side_effects: ["listing_status → WITHDRAWN", "Share LISTED → ACTIVE when not IN_EXIT"]
+
+  # --- Maintenance Events ---
+  - method: POST
+    path: "/maintenance-events"
+    description: "Schedule a maintenance event on an aircraft"
+    roles: [FleetOps]
+    code: 201
+    input: [aircraft_id, window_start_utc, window_end_utc, cost_cents, unscheduled_flag]
+    output: MaintenanceEvent
+    side_effects: ["event_status=SCHEDULED"]
+
+  - method: GET
+    path: "/maintenance-events/{id}"
+    description: "Get maintenance event"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: MaintenanceEvent
+    side_effects: []
+
+  - method: GET
+    path: "/maintenance-events"
+    description: "List maintenance events (filterable by aircraft_id, event_status)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["aircraft_id?", "event_status?"]
+    output: "MaintenanceEvent[]"
+    side_effects: []
+
+  - method: POST
+    path: "/maintenance-events/{id}/start"
+    description: "Start maintenance; aircraft to IN_MAINTENANCE; unassigns overlapping bookings"
+    roles: [FleetOps]
+    code: 200
+    input: []
+    output: MaintenanceEvent
+    side_effects: ["event_status → IN_PROGRESS", "Aircraft → IN_MAINTENANCE", "overlapping CONFIRMED bookings unassigned", "increments Aircraft.version by 1"]
+
+  - method: POST
+    path: "/maintenance-events/{id}/complete"
+    description: "Complete maintenance; allocates cost across class owners"
+    roles: [FleetOps]
+    code: 200
+    input: ["override_early?"]
+    output: MaintenanceEvent
+    side_effects: ["event_status → COMPLETED", "Aircraft → IN_SERVICE", "MAINTENANCE_ALLOCATION lines prepared", "increments Aircraft.version by 1"]
+
+  - method: POST
+    path: "/maintenance-events/{id}/cancel"
+    description: "Cancel scheduled maintenance"
+    roles: [FleetOps]
+    code: 200
+    input: []
+    output: MaintenanceEvent
+    side_effects: ["event_status → CANCELLED"]
+
+  # --- Depreciation Schedules ---
+  - method: GET
+    path: "/depreciation-schedules/{id}"
+    description: "Get depreciation schedule"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: DepreciationSchedule
+    side_effects: []
+
+  - method: GET
+    path: "/depreciation-schedules"
+    description: "List depreciation schedules (filterable by share_id)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["share_id?"]
+    output: "DepreciationSchedule[]"
+    side_effects: []
+
+  # --- Exit Requests ---
+  - method: GET
+    path: "/exit-requests/{id}"
+    description: "Get exit request"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: []
+
+  - method: GET
+    path: "/exit-requests"
+    description: "List exit requests (filterable by share_id, exit_status)"
+    roles: [ProgramAdmin, FleetOps, FinanceOps, Owner]
+    code: 200
+    input: ["share_id?", "exit_status?"]
+    output: "ExitRequest[]"
+    side_effects: []
+
+  - method: POST
+    path: "/exit-requests/{id}/value"
+    description: "Value the exit: computes buyout and penalty"
+    roles: [FinanceOps]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: ["exit_status → VALUED", "buyout_amount_cents, early_exit_penalty_cents computed"]
+
+  - method: POST
+    path: "/exit-requests/{id}/approve"
+    description: "Approve valued exit (segregation of duties vs valuer)"
+    roles: [FinanceOps]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: ["exit_status → APPROVED"]
+
+  - method: POST
+    path: "/exit-requests/{id}/settle"
+    description: "Settle exit: nets outstanding invoices and deposit; closes share"
+    roles: [FinanceOps]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: ["exit_status → SETTLED", "settlement_cents computed", "Owner.deposit_balance_cents → 0", "Share IN_EXIT → CLOSED", "Owner → EXITED if last share"]
+
+  - method: POST
+    path: "/exit-requests/{id}/reject"
+    description: "Reject exit; share returns to ACTIVE"
+    roles: [FinanceOps]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: ["exit_status → REJECTED", "Share IN_EXIT → ACTIVE"]
+
+  - method: POST
+    path: "/exit-requests/{id}/withdraw"
+    description: "Owner withdraws exit; share returns to ACTIVE"
+    roles: [Owner]
+    code: 200
+    input: []
+    output: ExitRequest
+    side_effects: ["exit_status → WITHDRAWN", "Share IN_EXIT → ACTIVE"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - id: ERR_MISSING_OR_INVALID_CONTEXT
+    http: 400
+    condition: "X-User-ID or X-User-Role header missing/invalid"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "Role not permitted for endpoint"
+  - id: ERR_NOT_FOUND
+    http: 404
+    condition: "Path resource id does not exist"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Malformed body, missing required field, or wrong type"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "Entity not in a state that permits the requested transition"
+  - id: ERR_ALREADY_TERMINAL
+    http: 409
+    condition: "Entity is in a terminal state; no further transitions"
+  - id: ERR_PROGRAM_POSTURE_BLOCKS
+    http: 409
+    condition: "Program SUSPENDED/WINDING_DOWN/CLOSED blocks the action"
+  - id: ERR_PROGRAM_NOT_CLOSABLE
+    http: 409
+    condition: "Close preconditions unmet (live shares, exits, or invoices)"
+  - id: ERR_OWNER_STANDING_BLOCKS
+    http: 422
+    condition: "Owner DELINQUENT/SUSPENDED/EXITED blocks the action"
+  - id: ERR_ENTITLEMENT_EXHAUSTED
+    http: 422
+    condition: "Share.hours_remaining_cy < estimated_block_hours at confirm"
+  - id: ERR_TEMPORAL_INVALID
+    http: 422
+    condition: "Departure in the past, or window_end <= window_start"
+  - id: ERR_AIRCRAFT_WINDOW_CONFLICT
+    http: 409
+    condition: "Aircraft has overlapping CONFIRMED booking or IN_PROGRESS maintenance window"
+  - id: ERR_NO_AIRCRAFT_AVAILABLE
+    http: 409
+    condition: "Candidate pool empty for suggest-aircraft selector"
+  - id: ERR_REFERENTIAL_CONFLICT
+    http: 409
+    condition: "Duplicate live listing for share, exit with CONFIRMED bookings, or listing on non-ACTIVE share"
+  - id: ERR_SELF_DEALING
+    http: 422
+    condition: "Buyer owner equals share's current owner on listing accept"
+  - id: ERR_INVALID_FRACTION
+    http: 422
+    condition: "Fraction denominator not in {4,8,16,32} or numerator out of range"
+  - id: ERR_STALE_SHARE_VERSION
+    http: 412
+    condition: "expected_share_version mismatches current Share.version"
+  - id: ERR_STALE_LISTING_VERSION
+    http: 412
+    condition: "expected_listing_version mismatches current TransferListing.version"
+  - id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http: 422
+    condition: "Invoice pay amount_cents != total_due_cents"
+  - id: ERR_INVOICE_PERIOD_OPEN
+    http: 422
+    condition: "Issue attempted before billing period end"
+  - id: ERR_DUPLICATE_INVOICE_PERIOD
+    http: 409
+    condition: "Invoice already exists for owner + billing_period"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "Exit approve attempted by same FinanceOps identity that valued it"
+  - id: ERR_EXIT_NOT_VALUED
+    http: 409
+    condition: "Approve/settle attempted before valuation"
+  - id: ERR_MAINTENANCE_OVERLAP
+    http: 409
+    condition: "Second IN_PROGRESS maintenance event on same aircraft"
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ProgramAdmin
+    description: "Program operator: configures programs, classes, owners, shares; controls posture; drives the test clock"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /programs, POST /programs/{id}/suspend, resume, wind-down, close"
+      - "POST /aircraft-classes"
+      - "POST /owners, POST /owners/{id}/suspend, POST /owners/{id}/reinstate"
+      - "POST /shares, POST /shares/{id}/activate"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "All GET endpoints"
+
+  - name: FleetOps
+    description: "Fleet operations: registers tails, assigns aircraft, completes flights, manages maintenance"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /aircraft"
+      - "POST /bookings/{id}/assign, POST /bookings/{id}/complete"
+      - "GET /bookings/{id}/suggest-aircraft"
+      - "POST /maintenance-events and all maintenance actions"
+    shared_operations:
+      - "All GET endpoints"
+
+  - name: FinanceOps
+    description: "Finance operations: issues and settles invoices, closes sales, values/approves/settles exits with segregation of duties"
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /invoices, POST /invoices/{id}/issue, POST /invoices/{id}/resolve-dispute"
+      - "POST /transfer-listings/{id}/close-sale"
+      - "POST /exit-requests/{id}/value, approve, settle, reject"
+    shared_operations:
+      - "All GET endpoints"
+
+  - name: Owner
+    description: "Share owner: books flights, pays invoices, lists shares for resale, initiates exits"
+    identity: "entity_backed:Owner"
+    exclusive_operations:
+      - "POST /bookings, POST /bookings/{id}/confirm, POST /bookings/{id}/cancel"
+      - "POST /invoices/{id}/pay, POST /invoices/{id}/dispute"
+      - "POST /transfer-listings, POST /transfer-listings/{id}/accept, POST /transfer-listings/{id}/withdraw"
+      - "POST /shares/{id}/exit, POST /exit-requests/{id}/withdraw"
+    shared_operations:
+      - "GET endpoints for own resources"

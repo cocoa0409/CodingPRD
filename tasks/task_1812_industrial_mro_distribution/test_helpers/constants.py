@@ -1,0 +1,34 @@
+"""Domain thresholds — numeric constants named by the PRD's calculation rules."""
+
+# Logical clock startup default (PRD §2.4)
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+DEFAULT_CLOCK_DATE = "2026-08-01"
+
+# Order total pricing (PRD §3.5)
+FREE_FREIGHT_THRESHOLD_CENTS = 25_000
+SAME_DAY_FREIGHT_CENTS = 1_500
+STANDARD_FREIGHT_CENTS = 795
+HAZMAT_HANDLING_CENTS = 2_500
+
+# Quantity tiers on the resolved unit price (PRD §3.2)
+QTY_TIER_1_THRESHOLD = 10
+QTY_TIER_1_PCT = 0.03
+QTY_TIER_2_THRESHOLD = 50
+QTY_TIER_2_PCT = 0.05
+
+# Returns policy by item class (PRD §3.8)
+STOCKED_RESTOCK_PCT = 0
+STOCKED_WINDOW_DAYS = 60
+SPECIAL_ORDER_RESTOCK_PCT = 20
+SPECIAL_ORDER_WINDOW_DAYS = 30
+
+# Branch same-day cutoff range (PRD §3.3)
+CUTOFF_MIN_MINUTE = 0
+CUTOFF_MAX_MINUTE = 1439
+DEFAULT_CUTOFF_MINUTE = 900  # 15:00 UTC
+
+TEST_DEFAULTS = {
+    "CREDIT_LIMIT_CENTS": 1_000_000,
+    "LIST_PRICE_CENTS": 1_000,
+    "SHIP_TO_STATE": "OH",
+}

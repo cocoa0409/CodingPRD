@@ -1,0 +1,360 @@
+# Commercial Loan Origination API — Product Requirements Document
+
+## 1. Introduction
+
+A commercial bank's lending group lives and dies by the quality of its credit memorandum: the document that assembles a borrower's financial statements, a defensible risk rating, an independent view of collateral, and a committee's recorded judgment into a single decision trail. Today that trail is scattered across spreadsheets, email approvals, and shared drives, which makes policy exceptions hard to track, segregation-of-duties rules hard to prove, and the bank's true exposure to a single borrower hard to state at any moment in time. This document specifies an API that runs the entire origination pipeline as one consistent system — from application intake and financial statement spreading, through risk rating, policy exception handling, collateral appraisal, committee approval, term sheet negotiation, commitment letter issuance, documentation, closing, funding, and post-closing covenant monitoring, to the hold-level decision of how much of a commitment the bank keeps on its own books and how much it sells to participant institutions.
+
+Two design commitments shape everything that follows. First, the system computes rather than trusts: debt-service coverage is derived from spread statements under two different policy conventions, collateral value is derived from accepted appraisals under two different valuation bases, the committee tier is derived from the sized amount and the deal's exception profile, and borrower exposure is derived from the live state of commitment letters and funding authorizations rather than stored as a number anyone can edit. Second, the system enforces the bank's control framework mechanically: the officer who originates a deal may not finalize its spreads, the originator may not vote on it, the officer who requests a funding tranche may not authorize it, and every waiver of policy leaves a signed, reasoned audit record. A test-driving logical clock governs all time-dependent behavior — expirations, session windows, rate locks — so that every temporal rule in this document is deterministic.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the rules, conventions, and boilerplate that apply uniformly across the entire API.
+
+### 2.1. User and Role-Based Access Control
+
+All interactions with the API are authenticated through two mandatory HTTP headers on every request: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the capacity in which they act. The system recognizes exactly eight roles: `BankAdmin`, `RelationshipManager`, `CreditAnalyst`, `AppraisalManager`, `CommitteeChair`, `CommitteeMember`, `CreditPolicyOfficer`, and `CreditAdministrator`. A request missing either header, or carrying a role value outside this set, is rejected with `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER`. An authenticated caller who attempts an operation their role is not permitted to perform is rejected with `ERR_INSUFFICIENT_PERMISSIONS`; this covers not only endpoint-level restrictions but also operation-level ones, such as the rule that only a `CreditPolicyOfficer` may waive a checklist item and only a `CommitteeChair` may cast a REMAND vote.
+
+The meaning of `X-User-ID` depends on the role. When `X-User-Role` is `BankAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it but never compares it to any entity's `id`. When `X-User-Role` is `RelationshipManager`, `CreditAnalyst`, `AppraisalManager`, `CommitteeChair`, `CommitteeMember`, `CreditPolicyOfficer`, or `CreditAdministrator`, `X-User-ID` is the `id` of the acting `BankOfficer`; ownership and segregation-of-duties checks on any resource that references a `BankOfficer` compare the resource's officer foreign-key field to `X-User-ID`. This binding is what makes the recusal, finalize-separation, and self-authorization rules in §2.9 enforceable.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+Endpoints that return lists of resources accept two query parameters. The `limit` parameter caps the number of items returned; it defaults to 10, with a minimum of 1 and a maximum of 100. The `offset` parameter states how many items to skip and defaults to 0. Unless otherwise specified, every list endpoint returns resources sorted by their creation timestamp in ascending order. The `meta` object of a list response carries the pagination fields `limit`, `offset`, `total_count`, and `has_more`.
+
+### 2.4. Resource Identity, Timestamps, and Versioning
+
+Every resource in the system — officers, borrowers, applications, statements, exceptions, appraisers, appraisals, sessions, decisions, term sheets, commitment letters, checklist items, funding authorizations, covenants, and participations — carries a common set of system-managed properties. The `id` is a server-generated unique identifier formatted as a UUID with no type prefix. The `created_at` and `updated_at` fields are ISO 8601 UTC timestamps with three fractional digits; `created_at` is fixed at creation, while `updated_at` refreshes on every modification of the resource. The `version` field is an integer that starts at its initial value on creation and increments by one on every mutation of the resource, including mutations driven by system side effects rather than direct client writes. Four operations in particular are guaranteed to advance a loan application's `version`: finalizing its spreads, submitting it to committee, issuing a term sheet for it, and opening a committee decision against it — the two optimistic-concurrency checkpoints in §2.7 exist precisely so that clients can detect those advances.
+
+### 2.5. Money, Ratios, and Rounding Discipline
+
+Monetary amounts are represented as integer cents throughout the API; fields such as `requested_amount_cents`, `appraised_value_cents`, and `committed_amount_cents` never carry fractional cents. Ratios — the debt-service coverage ratios `dscr_standard` and `dscr_stress`, and ratio-typed covenant thresholds — are carried to exactly four decimal places using round-half-up. The composite risk score behind `risk_rating` is rounded half-up to two decimal places. Where a calculation produces a cap or a valuation (the sizing caps of §3.5, the eligible collateral values of §3.4), the result is floored to whole cents. Where a calculation prices a tiered slice (the origination fee of §3.6), each slice is individually rounded half-up to whole cents before the slices are summed. These conventions are stated once here and invoked by name in the workflow narratives, so that two implementations reading this document produce bit-identical cents.
+
+### 2.6. The Logical Clock and Time-Driven Sweeps
+
+All temporal behavior in the system — session windows, term sheet expiry, commitment expiry, rate locks, tenure measurement — reads from a single logical clock, never from wall-clock time. At server startup the logical clock is set to exactly `2026-08-01T00:00:00Z`, and the server must not fall back to the host's wall clock under any circumstance. A `BankAdmin` may advance the logical clock to a supplied instant `to_iso8601`; this is an admin-only test-driving capability, returns no resource payload, and is the only way time moves.
+
+Each time the clock is set, the server performs a sweep in which three expirations are applied. Any commitment letter still `ISSUED` whose `expiry_date` falls on or before the clock's current date transitions to `EXPIRED` and triggers the three-hop cascade described in §3.6 (application, checklist items, participations). Any term sheet still `ISSUED` whose `expires_at` is strictly earlier than the current clock instant transitions to `EXPIRED`. Any committee session whose `ends_at` is at or before the current clock instant transitions from `SCHEDULED` to `ADJOURNED`, after which its open decisions can no longer receive votes. All such transitions are applied atomically as part of the clock-set request.
+
+### 2.7. Optimistic Concurrency Control on the Loan Application
+
+Two write operations are guarded by optimistic concurrency control against the loan application's `version`: issuing a new term sheet for an application, and opening a committee decision against an application. Each of these requests must carry the field `expected_loan_application_version`, a non-optional input holding the application `version` the client last observed. If the supplied value does not equal the application's current `version`, the request is rejected with `ERR_STALE_VERSION` (HTTP 412). The rationale differs by operation but the mechanism is identical: a term sheet drafted against a superseded view of the deal no longer reflects the application's current state, and a committee convened against a stale credit memorandum must be re-based on the current version before votes are taken. No other endpoint accepts a version field; requests to any other operation never include `expected_loan_application_version`.
+
+### 2.8. The Validation Pipeline
+
+Every request is evaluated against a fixed pipeline of checks in strict priority order; the first failing check determines the error response, and later checks are not evaluated. The pipeline stages, in order, are:
+
+1. **Header presence.** Both `X-User-ID` and `X-User-Role` are present and the role value is recognized, on every endpoint; otherwise `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` (HTTP 400).
+2. **Role permission.** The caller's role is permitted for this operation, including the operation-level restrictions that only a `CreditPolicyOfficer` may drive a checklist item to `WAIVED` and only a `CommitteeChair` may cast a REMAND vote; otherwise `ERR_INSUFFICIENT_PERMISSIONS` (HTTP 403). Applies to every endpoint.
+3. **Path existence.** Every resource identifier appearing in the request path exists, validated left to right; otherwise `ERR_NOT_FOUND` (HTTP 404).
+4. **Body schema.** Required fields are present, types are valid, enum members are valid, and numeric and date ranges hold: monetary amounts strictly greater than zero, `term_months` between 12 and 360 inclusive, all dates parseable, `engagement_end_date` on or after `engagement_start_date`, session `ends_at` strictly after `starts_at`, `waiver_rationale` at least twenty characters wherever it is required, and `rate_lock_expires_at` no later than the end of the day on `expiry_date`; otherwise `ERR_VALIDATION` (HTTP 400). Applies to every endpoint with a request body.
+5. **Optimistic concurrency.** `expected_loan_application_version` equals the application's current `version`; otherwise `ERR_STALE_VERSION` (HTTP 412). Applies only to term-sheet issuance and committee-decision opening, and on those two endpoints it runs after schema validation but before every remaining state and business check.
+6. **Transition legality.** The target entity is in a legal from-state for the requested transition; otherwise `ERR_INVALID_STATE` (HTTP 409). Applies to all action and transition endpoints.
+7. **Amendment window.** The parent application is in a mutable stage for the requested child edit — statement attachment, spread, finalize, and application amendment each require the application to be in `INTAKE`, `SPREADING`, or `EXCEPTION_REVIEW` as specified per endpoint; otherwise `ERR_AMEND_NOT_PERMITTED` (HTTP 409).
+8. **Commitment presence and state.** Participation proposal and participation commit require the application's commitment letter to be `ISSUED`, `ACCEPTED`, or `FUNDED`; funding release requires the letter to be `ACCEPTED` or `FUNDED`; otherwise `ERR_COMMITMENT_NOT_ACCEPTED` (HTTP 409).
+9. **Originator/analyst separation**, checked on spread finalization; otherwise `ERR_SOD_SPREAD_FINALIZE_BY_ORIGINATOR` (HTTP 403).
+10. **Committee recusal**, checked on vote casting; otherwise `ERR_SOD_COMMITTEE_RECUSAL` (HTTP 403).
+11. **Funding self-authorization**, checked on funding authorization; otherwise `ERR_SOD_FUNDING_SELF_AUTHORIZE` (HTTP 403).
+12. **Open high-severity exceptions**, checked at funding release; otherwise `ERR_UNRESOLVED_POLICY_EXCEPTION` (HTTP 403).
+13. **Borrower standing** at application creation; otherwise `ERR_BORROWER_NOT_ACTIVE` (HTTP 409).
+14. **Statement completeness** — at least one statement at submit, and every statement `FINAL` or `SUPERSEDED` with at least one `FINAL` at spread finalization; otherwise `ERR_STATEMENTS_NOT_FINAL` (HTTP 409).
+15. **Open exceptions**, checked when clearing exception review; otherwise `ERR_OPEN_POLICY_EXCEPTIONS` (HTTP 409).
+16. **Accepted collateral** — at least one `ACCEPTED` appraisal at committee submission; otherwise `ERR_NO_ACCEPTED_APPRAISAL` (HTTP 409).
+17. **Settled collateral** — no appraisal still `ENGAGED` or `REPORT_RECEIVED` at committee submission; otherwise `ERR_APPRAISALS_NOT_SETTLED` (HTTP 409).
+18. **Appraiser standing** when ordering an engagement; otherwise `ERR_APPRAISER_NOT_ELIGIBLE` (HTTP 409).
+19. **Appraiser window capacity** when ordering an engagement; otherwise `ERR_APPRAISER_WINDOW_CONFLICT` (HTTP 409).
+20. **Session overlap** when scheduling a committee session; otherwise `ERR_COMMITTEE_SESSION_CONFLICT` (HTTP 409).
+21. **Single open decision** per application when opening a committee decision; otherwise `ERR_DECISION_ALREADY_OPEN` (HTTP 409).
+22. **Duplicate vote**, checked when casting a vote; otherwise `ERR_DUPLICATE_VOTE` (HTTP 409).
+23. **Remand authority**, checked when a REMAND vote is cast; otherwise `ERR_ONLY_CHAIR_MAY_REMAND` (HTTP 403).
+24. **Session level match**, checked when opening a committee decision; otherwise `ERR_SESSION_LEVEL_MISMATCH` (HTTP 422).
+25. **Checklist completeness** — required `DOCUMENT` items at closing submission and required `CLOSING_CONDITION` items at funding release; otherwise `ERR_CHECKLIST_INCOMPLETE` (HTTP 409).
+26. **Waivable severity**, checked when a waiver is attempted on a `CRITICAL` item; otherwise `ERR_CONDITION_NOT_WAIVABLE` (HTTP 422).
+27. **Covenant presence** — at least one covenant before closing submission; otherwise `ERR_NO_COVENANTS_CONFIGURED` (HTTP 409).
+28. **Session window** — a vote must fall inside the session's open window while the session is `SCHEDULED`; otherwise `ERR_COMMITTEE_SESSION_NOT_OPEN` (HTTP 409).
+29. **Commitment unexpired** at letter acceptance; otherwise `ERR_COMMITMENT_EXPIRED` (HTTP 409).
+30. **Rate lock** at funding release; otherwise `ERR_RATE_LOCK_EXPIRED` (HTTP 409).
+31. **Restatement target validity** when attaching a restating statement; otherwise `ERR_RESTATEMENT_TARGET_INVALID` (HTTP 422).
+32. **Single-borrower limit** at application creation; otherwise `ERR_SINGLE_BORROWER_LIMIT` (HTTP 402).
+33. **Participation headroom** at participation proposal; otherwise `ERR_PARTICIPATION_OVERALLOCATION` (HTTP 422).
+34. **Funding cap** at funding release; otherwise `ERR_FUNDING_OVER_COMMITMENT` (HTTP 422).
+35. **Sizeable amount** at committee submission; otherwise `ERR_NO_SIZEABLE_AMOUNT` (HTTP 422).
+
+Where several of these checks guard the same endpoint, the numeric order above governs their relative priority; the workflow narratives in Section 3 restate the evaluation sequence at the busiest gates — for example, funding release evaluates state legality, then open high-severity exceptions, then closing conditions, then the rate lock, then the letter's state, then the cumulative funding cap.
+
+### 2.9. Segregation of Duties and the Officer Audit Spine
+
+Three segregation-of-duties rules are enforced mechanically, each anchored on the officer identity binding of §2.1. The officer who finalizes an application's spreads must not be the application's `originating_officer_id`; a violation is rejected with `ERR_SOD_SPREAD_FINALIZE_BY_ORIGINATOR`. An officer may not vote on a committee decision for an application whose `originating_officer_id` is their own `id`; a violation is rejected with `ERR_SOD_COMMITTEE_RECUSAL`. The officer who authorizes a funding tranche must differ from the tranche's `requested_by_officer_id`; a violation is rejected with `ERR_SOD_FUNDING_SELF_AUTHORIZE`.
+
+Beyond these checks, the system stamps the acting officer onto resources at defined moments so that the audit trail can always answer "who did this." An application records its `originating_officer_id` at creation. A financial statement records `spread_by_officer_id` when it is spread and `finalized_by_officer_id` when it is finalized. A policy exception and a document checklist item each record `waived_by_officer_id` when waived. A funding authorization records `requested_by_officer_id` at request time and `authorized_by_officer_id` at authorization. Every vote cast on a committee decision is recorded with the voting `officer_id` and the instant `cast_at`. Reverse lookups expose this spine: one can list the policy exceptions a given officer has waived, the checklist items a given officer has waived, and the funding authorizations a given officer has requested or authorized.
+
+### 2.10. Flat Collections, Foreign-Key Linkage, and Path Validation
+
+The API is organized as a set of peer resource collections; there is no deep resource hierarchy. Resources reference one another through foreign-key fields carried in request bodies and stored on the child resource — a statement, appraisal, exception, term sheet, letter, checklist item, authorization, covenant, or participation names its application via `loan_application_id`; an application names its borrowing entity via `borrower_id`; an appraisal names its firm via `appraiser_id`; a decision names its convening session via `committee_session_id`; a restating statement names the statement it replaces via `restatement_of_id`. For addressability, nested read paths are provided wherever a reverse traversal is natural (for example, listing the appraisals of an application or the appraisals of an appraiser). Any request path containing resource identifiers is validated left to right, and the request is rejected with `ERR_NOT_FOUND` (HTTP 404) at the first identifier that does not correspond to an existing resource.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Officers, Borrowers, and the Front Door
+
+Before any lending work can occur, a `BankAdmin` registers the bank's officers. Registration requires only a `full_name`; the resulting officer record's `id` becomes the identity anchor that every entity-backed role presents in `X-User-ID`, and against which every segregation-of-duties and ownership check in the system is evaluated.
+
+A `RelationshipManager` opens a borrowing relationship by creating a borrower with its `legal_name`, its six-digit `naics_code`, and the `relationship_since` date (an ISO `YYYY-MM-DD` date on which the banking relationship began, later feeding the tenure factor of the risk rating). The `is_reg_o_insider` flag may be supplied at creation and defaults to `false`; when set, it marks the borrower as a Regulation O insider, which forces a committee-level bump at decision time (§3.5) and an additional liquidation-basis collateral floor test (§3.4 and §3.5). A new borrower's `status` is `ACTIVE`, and its three exposure counters — `committed_exposure_cents`, `funded_exposure_cents`, and `total_exposure_cents` — are initialized to zero. The borrower register can be listed and filtered by `status`, and a borrower's applications can be listed through the borrower.
+
+Those three counters form the bank's single-borrower exposure ledger, and they are never edited directly. `committed_exposure_cents` is the sum, over all of the borrower's applications whose commitment letter is in `ACCEPTED` or `FUNDED` status, of the letter's `committed_amount_cents` minus the application's `funded_amount_cents` — that is, the unfunded committed balance. `funded_exposure_cents` is the sum of `amount_cents` over all funding authorizations in `RELEASED` status across the borrower's applications. `total_exposure_cents` is exactly the sum of the two. The ledger is conserved across the accept-then-fund lifecycle: releasing a funding tranche of a given amount simultaneously reduces the application's committed contribution by that amount and increases funded exposure by that amount, leaving `total_exposure_cents` unchanged; likewise, accepting a letter adds its committed amount, and terminating or withdrawing an unfunded accepted letter subtracts exactly the same amount.
+
+A borrower's `status` moves among `ACTIVE`, `SUSPENDED`, and `EXITED`. A `RelationshipManager` may amend `legal_name`, `naics_code`, `relationship_since`, or `is_reg_o_insider`, and may move `status` between `ACTIVE` and `EXITED` in either direction — but `SUSPENDED` is never settable through an update (an attempt is rejected with `ERR_VALIDATION`), because suspension is system-driven: it is imposed by a covenant breach and lifted by a cure or waiver, as detailed in §3.8.
+
+Against an `ACTIVE` borrower, a `RelationshipManager` originates a loan application by supplying the `borrower_id`, a `product_type` of `CRE_TERM`, `CRE_CONSTRUCTION`, `CI_WORKING_CAPITAL`, `EQUIPMENT`, or `AGRICULTURE`, the `requested_amount_cents` (strictly positive), the `term_months` (between 12 and 360 inclusive), and optionally a free-text `purpose`. Two guards fire at creation: the borrower's `status` must be `ACTIVE` (otherwise `ERR_BORROWER_NOT_ACTIVE`), and the borrower's `total_exposure_cents` plus the new `requested_amount_cents` must not exceed $50,000,000.00 (5,000,000,000 cents) — the bank's single-borrower cap — otherwise the request is refused with `ERR_SINGLE_BORROWER_LIMIT` (HTTP 402). A created application starts in `INTAKE` status, records the caller as its `originating_officer_id`, and carries nulls in its computed underwriting fields (`dscr_standard`, `dscr_stress`, `risk_rating`) until spreads are finalized. The application book can be listed with `borrower_id`, `status`, and `originating_officer_id` filters, and a single application read exposes every computed underwriting field described in the sections that follow.
+
+An application's full lifecycle runs `INTAKE` → `SPREADING` → `EXCEPTION_REVIEW` → `APPRAISAL_REVIEW` → `COMMITTEE_REVIEW` → `TERM_SHEET_NEGOTIATION` → `COMMITMENT` → `DOCUMENTATION` → `CLOSING` → `FUNDED`, with `DECLINED`, `WITHDRAWN`, and `EXPIRED` as terminal outcomes reachable from the stages described below; `EXCEPTION_REVIEW` may be skipped when no policy exceptions fire, and the committee's remand power loops `COMMITTEE_REVIEW` back to `EXCEPTION_REVIEW`.
+
+### 3.2. Intake, Statement Spreading, and the Dual-Variant DSCR
+
+While an application is in `INTAKE`, `SPREADING`, or `EXCEPTION_REVIEW`, a `CreditAnalyst` attaches financial statements to it. Each statement names its application through `loan_application_id` and carries the `period_end_date` (ISO date of fiscal period end) plus the raw figures of the spread: `revenue_cents`, `ebitda_cents` (reported EBITDA before addbacks), `addbacks_cents` (requested discretionary addbacks), `distributions_cents`, `maintenance_capex_cents`, `existing_annual_debt_service_cents`, `total_assets_cents`, and `total_liabilities_cents`. A statement may optionally restate an earlier one by naming it in `restatement_of_id`; a restatement is valid only when the referenced statement exists, belongs to the same application, is in `FINAL` status, and covers the identical `period_end_date` — and a statement may never restate itself — with any violation rejected as `ERR_RESTATEMENT_TARGET_INVALID` (HTTP 422). Attaching a statement while the parent application is outside the mutable window is rejected with `ERR_AMEND_NOT_PERMITTED`. A new statement begins in `SUBMITTED` status. The statement collection can be listed filtered by `loan_application_id`, `restatement_of_id`, `spread_by_officer_id`, or `finalized_by_officer_id`.
+
+When the relationship manager judges intake complete, submitting the application moves it `INTAKE` → `SPREADING`; at least one financial statement must exist for the application at that moment, or the submission is refused with `ERR_STATEMENTS_NOT_FINAL`. The analyst then works each statement through its own lifecycle: spreading moves `SUBMITTED` → `SPREAD` (permitted while the parent application is `INTAKE`, `SPREADING`, or `EXCEPTION_REVIEW`, and stamping `spread_by_officer_id` with the caller's identity), and finalizing moves `SPREAD` → `FINAL` (permitted while the application is `SPREADING` or `EXCEPTION_REVIEW`, stamping `finalized_by_officer_id`). Finalizing a restating statement automatically supersedes its target: the referenced statement moves `FINAL` → `SUPERSEDED`, so that at most one `FINAL` statement ever exists per `period_end_date` per application. Finalizing a statement while the application sits in `EXCEPTION_REVIEW` additionally re-runs the underwriting computation and exception refresh described in §3.3.
+
+The pivotal act of underwriting is the finalization of spreads, performed by a `CreditAnalyst` other than the application's originator — if the caller's identity equals the application's `originating_officer_id`, the request is rejected with `ERR_SOD_SPREAD_FINALIZE_BY_ORIGINATOR`. The application must be in `SPREADING`, and every one of its financial statements must be in `FINAL` or `SUPERSEDED` status with at least one `FINAL`, otherwise `ERR_STATEMENTS_NOT_FINAL`. These guards are evaluated with state legality first, then the segregation-of-duties check, then statement completeness.
+
+Finalizing spreads computes the debt-service coverage ratio twice from the same input — the application's `FINAL` statement with the latest `period_end_date`, a selection that never needs a tie-break because restatement guarantees at most one `FINAL` statement per period. Both variants share the same debt-service denominator: the bank's underwriting rate is a fixed 7.00% per annum, so the monthly rate is 7.00% divided by 12; the constant monthly payment on the requested facility equals `requested_amount_cents` multiplied by that monthly rate and divided by one minus the quantity (one plus the monthly rate) raised to the power of negative `term_months`, with the payment rounded half-up to whole cents; annual debt service equals twelve times that monthly payment plus the statement's `existing_annual_debt_service_cents`. The `BANK_STANDARD` variant then permits addbacks up to a cap — the permitted addback is the lesser of `addbacks_cents` and one quarter of `ebitda_cents` floored to whole cents — so standard cash flow equals `ebitda_cents` plus the permitted addback, minus `distributions_cents`, minus `maintenance_capex_cents`; `dscr_standard` is that cash flow divided by annual debt service, rounded half-up to four decimal places. The `REGULATORY_STRESS` variant instead applies a revenue haircut and forbids addbacks: stressed EBITDA equals `ebitda_cents` minus fifteen percent of `revenue_cents` (the haircut itself rounded half-up to whole cents), stressed cash flow equals stressed EBITDA minus `distributions_cents` minus `maintenance_capex_cents`, and `dscr_stress` is that figure divided by the same annual debt service, again rounded half-up to four decimal places. Both ratios are persisted on the application.
+
+The same act stamps a provisional `risk_rating` with `rating_basis` `PROVISIONAL`. Three of the four rating factors are knowable at this stage. The debt-service-coverage factor's points are tiered off `dscr_standard`: 100 points when the ratio is at least 1.50, 80 when at least 1.35, 60 when at least 1.25, 40 when at least 1.10, and 20 otherwise. The leverage factor uses the ratio of `total_liabilities_cents` to `total_assets_cents`, itself computed to four decimal places with round-half-up: 100 points when the ratio is at most 0.50, 80 when at most 0.65, 60 when at most 0.75, 40 when at most 0.85, and 20 otherwise, with each boundary inclusive. The tenure factor counts whole years elapsed between the borrower's `relationship_since` and the logical clock's current date, discarding any fractional year: 100 points at ten years or more, 75 at five or more, 50 at two or more, and 25 otherwise. Because collateral coverage is not yet knowable, the provisional score excludes the collateral-coverage factor and renormalizes the remaining weights: the score is the sum of 0.40 times the debt-service-coverage points, 0.30 times the leverage points, and 0.10 times the tenure points, all divided by 0.80, rounded half-up to two decimal places. The score maps to `risk_rating` bands — 1 is best, 10 is worst: at least 90 yields 1, at least 80 yields 2, at least 70 yields 3, at least 60 yields 4, at least 50 yields 5, at least 40 yields 6, at least 30 yields 7, at least 20 yields 8, at least 10 yields 9, and anything lower yields 10.
+
+Finally, finalizing spreads auto-creates policy exceptions for any triggered rule: `DSCR_MINIMUM` when `dscr_standard` is below 1.2500, `STRESS_DSCR_MINIMUM` when `dscr_stress` is below 1.0000, `SINGLE_BORROWER_LIMIT` when the borrower's `total_exposure_cents` plus `requested_amount_cents` exceeds the $50,000,000.00 cap, and `REG_O_INSIDER` whenever the borrower's `is_reg_o_insider` flag is set. The branch then forks: if any exception stands `OPEN`, the application moves `SPREADING` → `EXCEPTION_REVIEW`; if none does, it moves `SPREADING` → `APPRAISAL_REVIEW` directly. Either way, the application's `version` increments by one.
+
+While the application remains in `INTAKE`, `SPREADING`, or `EXCEPTION_REVIEW`, the `RelationshipManager` may still amend the request's commercial terms — `requested_amount_cents`, `term_months`, or `purpose` — through an update; outside that window the amendment is rejected with `ERR_AMEND_NOT_PERMITTED`. When such an amendment lands while the application is in `EXCEPTION_REVIEW`, the system recomputes `dscr_standard` and `dscr_stress` from the amended terms and refreshes the auto-created exceptions exactly as the statement-finalize refresh does in §3.3.
+
+### 3.3. Policy Exceptions and the Exception-Review Loop
+
+A policy exception is the system's unit of policy dissent. Each exception is bound to its application, carries a `rule_code` of `DSCR_MINIMUM`, `STRESS_DSCR_MINIMUM`, `SINGLE_BORROWER_LIMIT`, `REG_O_INSIDER`, `LTV_MAXIMUM`, `COLLATERAL_COVERAGE_MIN`, `COVENANT_BREACH`, or `REQUIRED_DOC_WAIVER`, and opens in `OPEN` status with a machine-generated `detail` string capturing the metric values observed at detection. Severity is fixed by rule: `DSCR_MINIMUM`, `SINGLE_BORROWER_LIMIT`, `LTV_MAXIMUM`, `COLLATERAL_COVERAGE_MIN`, and `COVENANT_BREACH` are always `HIGH` severity, while `STRESS_DSCR_MINIMUM`, `REG_O_INSIDER`, and `REQUIRED_DOC_WAIVER` are always `LOW`. An exception's `status` moves from `OPEN` to `WAIVED` when a policy officer waives it, or to `RESOLVED_BY_CHANGE` when the deal changes such that the triggering condition no longer holds; it never returns. An application's exceptions can be listed and filtered by `status` and `rule_code`.
+
+The exception-review loop gives the deal team two ways to clear an `OPEN` exception. A `CreditPolicyOfficer` may waive an exception outright, supplying a `waiver_rationale` of at least twenty characters; the waiver stamps `waived_by_officer_id` with the officer's identity. Alternatively, the deal itself may change — an amended amount, a restated statement — and when the underwriting computation is re-run (by statement finalization or application amendment while the application is in `EXCEPTION_REVIEW`), each `OPEN` auto-created exception whose triggering condition no longer holds is moved to `RESOLVED_BY_CHANGE`, newly triggered conditions create fresh exceptions, and a `WAIVED` exception is never resurrected even if its condition fires again.
+
+Only when no `OPEN` exception remains may a `CreditPolicyOfficer` clear the review, moving the application `EXCEPTION_REVIEW` → `APPRAISAL_REVIEW`; attempting to clear while any exception is still `OPEN` is rejected with `ERR_OPEN_POLICY_EXCEPTIONS`. The remand cycle of §3.5 returns the application to this same loop: a committee that remands sends the application from `COMMITTEE_REVIEW` back to `EXCEPTION_REVIEW`, where exceptions may again be waived or resolved by change before the deal is re-submitted and a new committee decision is opened.
+
+### 3.4. Collateral: Appraiser Capacity and Dual-Basis Valuation
+
+Collateral work begins at the appraiser registry, maintained by the `AppraisalManager`. Registering an appraiser requires a `name` and a state `license_number`; `max_concurrent_engagements` may be supplied to override the default of 2 and must be at least 1. A new appraiser is `ELIGIBLE`; the manager may later update the `name` or move `status` between `ELIGIBLE` and `SUSPENDED`, and suspension blocks any new engagement orders.
+
+Ordering an appraisal engagement names the application (`loan_application_id`), the firm (`appraiser_id`), the `collateral_class` — one of `REAL_ESTATE`, `EQUIPMENT`, `RECEIVABLES`, `INVENTORY`, or `AGRICULTURAL` — and the engagement window `engagement_start_date` through `engagement_end_date`, two ISO dates with the end on or after the start. The parent application must be in `APPRAISAL_REVIEW`, `EXCEPTION_REVIEW`, or `COMMITTEE_REVIEW` — the committee may order additional collateral opinions mid-review — otherwise `ERR_INVALID_STATE`. The chosen appraiser must be `ELIGIBLE`, otherwise `ERR_APPRAISER_NOT_ELIGIBLE`. Capacity is then enforced as an aggregate window rule: engagement windows are closed intervals, so a window whose start equals an existing window's end does overlap it; the count of the appraiser's engagements in `ENGAGED` or `REPORT_RECEIVED` status whose windows intersect the new one must be strictly less than `max_concurrent_engagements`, otherwise the order is refused with `ERR_APPRAISER_WINDOW_CONFLICT`. A successfully ordered appraisal starts in `ENGAGED`. Appraisals can be listed per application or per appraiser.
+
+When the firm's report arrives, the manager records its conclusions — `appraised_value_cents` (the concluded market value) and `orderly_liquidation_value_cents` — moving the appraisal `ENGAGED` → `REPORT_RECEIVED`. The manager then reviews the report with an `outcome` of `ACCEPTED` or `REJECTED`. Acceptance moves the appraisal to `ACCEPTED` and computes its two eligible values from the concluded figures: the lending-basis `eligible_value_cents` is the `appraised_value_cents` multiplied by the advance rate for its `collateral_class` — 0.75 for `REAL_ESTATE`, 0.80 for `EQUIPMENT`, 0.50 for `RECEIVABLES`, 0.50 for `INVENTORY`, and 0.70 for `AGRICULTURAL` — floored to whole cents; the `liquidation_basis_value_cents` is the `orderly_liquidation_value_cents` multiplied by a 0.85 liquidation haircut and then by the same advance rate, also floored to whole cents, and is therefore strictly lower than the lending basis for identical inputs. Each acceptance also recomputes the application's collateral aggregates over its `ACCEPTED` appraisals: `total_appraised_value_cents` sums `appraised_value_cents`, `total_eligible_collateral_cents` sums `eligible_value_cents`, and `total_liquidation_collateral_cents` sums `liquidation_basis_value_cents`. Rejection instead moves the appraisal to `REJECTED`, frees its engagement window so it no longer counts toward the appraiser's overlap capacity, and enables a replacement appraisal to be ordered — the reorder loop. Appraisals still `ENGAGED` or `REPORT_RECEIVED` when the application is declined, withdrawn, or expired are moved to `CANCELLED` by the system, likewise freeing their windows.
+
+### 3.5. Deal Sizing and the Committee Hierarchy
+
+With collateral settled, a `CreditAnalyst` submits the application to committee, moving it `APPRAISAL_REVIEW` → `COMMITTEE_REVIEW`. The gate evaluates, in order: the application must be in `APPRAISAL_REVIEW` (otherwise `ERR_INVALID_STATE`); at least one appraisal must stand `ACCEPTED` (otherwise `ERR_NO_ACCEPTED_APPRAISAL`); no appraisal may remain `ENGAGED` or `REPORT_RECEIVED` (otherwise `ERR_APPRAISALS_NOT_SETTLED`); and the sizing computation below must yield a positive amount (otherwise `ERR_NO_SIZEABLE_AMOUNT`, HTTP 422).
+
+Submission recomputes the three collateral aggregates over `ACCEPTED` appraisals and then sizes the deal. Sizing follows a pinned evaluation order with no iteration back, and it deliberately does not recompute the DSCR on the sized amount — the coverage ratio was computed on the requested amount at spread finalization, and the coverage constraint is instead inverted algebraically into a principal cap. Step one: divide the standard cash flow (the numerator behind `dscr_standard`) by 1.25, floor the result to whole cents, and subtract the statement's `existing_annual_debt_service_cents`; this is the maximum annual debt service the proposed facility may add, and if it is not positive the submission is rejected with `ERR_NO_SIZEABLE_AMOUNT`. Step two: divide that maximum by twelve to obtain the maximum monthly payment, then invert the annuity at the same 7.00%-per-annum monthly underwriting rate over `term_months` — multiply the payment by the quantity one minus (one plus the monthly rate) raised to the negative `term_months` power, divided by the monthly rate — and floor to whole cents, yielding the DSCR principal cap. Step three: multiply `total_appraised_value_cents` by the maximum loan-to-value ratio for the application's `product_type` — 0.80 for `CRE_TERM`, 0.75 for `CRE_CONSTRUCTION`, 0.60 for `CI_WORKING_CAPITAL`, 0.85 for `EQUIPMENT`, and 0.75 for `AGRICULTURE` — floored to whole cents, yielding the LTV principal cap. Step four: subtract the borrower's `total_exposure_cents` from the $50,000,000.00 single-borrower cap to obtain the remaining headroom. The application's `proposed_amount_cents` is the minimum of the requested amount, the DSCR cap, the LTV cap, and the headroom; if that minimum is not positive, the submission is rejected with `ERR_NO_SIZEABLE_AMOUNT`.
+
+Submission also re-tests policy, this time against the deal as asked — the requested amount. An `LTV_MAXIMUM` exception is created when the ratio of `requested_amount_cents` to `total_appraised_value_cents` exceeds the product's maximum loan-to-value ratio (an exactly-at-limit deal passes). A `COLLATERAL_COVERAGE_MIN` exception is created when `total_eligible_collateral_cents` is less than `requested_amount_cents`. And when the borrower is a Regulation O insider, a further liquidation-basis test applies: if the ratio of `requested_amount_cents` to `total_liquidation_collateral_cents` exceeds the maximum loan-to-value ratio, a `COLLATERAL_COVERAGE_MIN` exception is created whose `detail` records that the liquidation basis failed. Finally, submission recomputes the `risk_rating` on the `FULL` basis: the collateral-coverage factor now contributes its tier — 100 points when the ratio of `total_eligible_collateral_cents` to `requested_amount_cents` is at least 1.25, 75 when at least 1.00, 50 when at least 0.75, and 25 otherwise — and the score is 0.40 times the debt-service-coverage points, plus 0.30 times the leverage points, plus 0.20 times the collateral-coverage points, plus 0.10 times the tenure points, rounded half-up to two decimal places and banded as in §3.2, with `rating_basis` recorded as `FULL`. The application's `version` increments by one.
+
+Committee logistics are owned by the `CommitteeChair`, who schedules sessions by supplying a `level` (`SMALL`, `STANDARD`, or `LARGE`), a `starts_at`, and an `ends_at` (both ISO 8601 datetimes, the end strictly after the start). Session windows are half-open intervals — a session occupies its `starts_at` instant up to but not including `ends_at` — so back-to-back scheduling is allowed: a new session conflicts with an existing `SCHEDULED` one exactly when the existing session starts strictly before the new session's end and the new session starts strictly before the existing session's end, and any such conflict is rejected with `ERR_COMMITTEE_SESSION_CONFLICT`. A session moves from `SCHEDULED` to `ADJOURNED` when the logical clock reaches or passes its `ends_at`, after which no votes may be recorded in it. The decisions taken in a session can be listed through the session.
+
+Opening a decision is the second optimistic-concurrency checkpoint: the chair's request must name the `loan_application_id` and `committee_session_id` and carry `expected_loan_application_version` equal to the application's current `version`, otherwise `ERR_STALE_VERSION` (HTTP 412). The application must stand in `COMMITTEE_REVIEW` (otherwise `ERR_INVALID_STATE`), at most one decision may be `OPEN` for an application at any time (otherwise `ERR_DECISION_ALREADY_OPEN`), and the session's `level` must equal the decision's computed `level_required` (otherwise `ERR_SESSION_LEVEL_MISMATCH`, HTTP 422). That level is computed at decision creation from the deal's `proposed_amount_cents`: at most $1,000,000.00 is `SMALL` (a proposed amount of exactly $1,000,000.00 stays `SMALL`), at most $10,000,000.00 is `STANDARD` (exactly $10,000,000.00 stays `STANDARD`), and anything larger is `LARGE`. The level then bumps one tier up — `SMALL` to `STANDARD`, `STANDARD` to `LARGE`, `LARGE` remaining `LARGE` — when the borrower is a Regulation O insider or when any `HIGH`-severity exception exists for the application in `OPEN` or `WAIVED` status. The computed level is stamped on both the decision's `level_required` and the application's `committee_level_required`, along with the quorum size the level implies, and opening the decision increments the application's `version` by one.
+
+Quorum and closure rules derive from the level. A `SMALL` decision is a committee of 2 requiring 2 approvals and falling to a single decline vote; a `STANDARD` decision is a committee of 3 requiring 2 approvals and falling to 2 decline votes; a `LARGE` decision is a committee of 5 requiring 4 approvals, falling to 2 decline votes, and additionally requiring the chair's approval. These sizes are stamped at creation as the decision's `votes_required`, and the decision tracks `votes_for`, `votes_against`, and `chair_approved` as votes arrive. The decision's `votes` array records each ballot as a structure of `officer_id`, `vote`, and `cast_at`.
+
+A `CommitteeMember` or the `CommitteeChair` casts a `vote` of `APPROVE`, `DECLINE`, or `REMAND` on an `OPEN` decision. The ballot is accepted only after the pipeline's checks: the decision must be `OPEN`; the voting officer must not be the application's originator (recusal, `ERR_SOD_COMMITTEE_RECUSAL`); the officer must not already have a ballot recorded on this decision (`ERR_DUPLICATE_VOTE`); a `REMAND` may be cast only by the `CommitteeChair` (`ERR_ONLY_CHAIR_MAY_REMAND`, HTTP 403); and the logical clock must lie within the session's window — on or after `starts_at` and strictly before `ends_at` — while the session is still `SCHEDULED` (`ERR_COMMITTEE_SESSION_NOT_OPEN`). After each accepted vote the closure rules are evaluated with the approval rule first: the decision closes `APPROVED` when `votes_for` reaches `votes_required` and, for a `LARGE` decision only, `chair_approved` has become true through a chair's `APPROVE`; otherwise it closes `DECLINED` when `votes_against` reaches the level's decline threshold; and a chair's `REMAND` closes it `REMANDED` immediately, regardless of tally. Closure drives the application: an `APPROVED` decision moves it `COMMITTEE_REVIEW` → `TERM_SHEET_NEGOTIATION`; a `DECLINED` decision moves it to `DECLINED` and cancels every appraisal still `ENGAGED` or `REPORT_RECEIVED`, freeing those engagement windows; a `REMANDED` decision returns it to `EXCEPTION_REVIEW` for the exception loop of §3.3, after which re-submission may open a fresh decision. A withdrawn application's open decision is deliberately left `OPEN` rather than remanded — but because the application is no longer in a state where its sessions accept work, subsequent votes against it are rejected by the session-window and state checks.
+
+### 3.6. Term Sheets, Commitment Letters, and the Origination Fee
+
+With an approval in hand, a `RelationshipManager` issues a term sheet. This is the first optimistic-concurrency checkpoint: the request must carry `expected_loan_application_version` equal to the application's current `version` — a sheet drafted against a view of the deal that the system has since advanced (another sheet issued, terms re-sized after a remand) is rejected with `ERR_STALE_VERSION` (HTTP 412). The application must be in `TERM_SHEET_NEGOTIATION` (otherwise `ERR_INVALID_STATE`), and the offered `amount_cents` must equal the application's `proposed_amount_cents` exactly (otherwise `ERR_VALIDATION`). The sheet also carries the offered fixed rate `rate_bps` in basis points (between 1 and 3000 inclusive), the offered `term_months`, and an `expires_at` instant after which the offer lapses.
+
+Issuance computes the sheet's `origination_fee_cents` on a tiered schedule applied to the offered amount: the first $1,000,000.00 is charged at 1.00%, the next $4,000,000.00 at 0.75%, and any portion above $5,000,000.00 at 0.50%. Each tier's slice is rounded half-up to whole cents individually, and the three rounded slices are then summed in tier order — tier one, tier two, tier three — so downstream fee allocation has a single canonical total. Issuing a new sheet supersedes the application's currently `ISSUED` sheet if one exists, moving it to `SUPERSEDED`, and advances the application's `version` by one. A sheet begins in `ISSUED` status and can be listed per application.
+
+The borrower's answer is recorded by a `RelationshipManager` responding on the sheet with an `outcome`. An `ACCEPTED` response requires the sheet to be `ISSUED` and the application in `TERM_SHEET_NEGOTIATION`; it moves the sheet to `ACCEPTED`, advances the application `TERM_SHEET_NEGOTIATION` → `COMMITMENT`, and creates a commitment letter in `DRAFT` status that mirrors the sheet's economics — the letter's `committed_amount_cents`, `rate_bps`, `term_months`, and `origination_fee_cents` equal the accepted sheet's. A `DECLINED` response requires only that the sheet be `ISSUED`; the sheet moves to `DECLINED`, the application remains in `TERM_SHEET_NEGOTIATION`, and a replacement sheet may be issued. Independently, the clock sweep moves any sheet still `ISSUED` whose `expires_at` is strictly before the current instant to `EXPIRED`.
+
+A `CreditAdministrator` then issues the draft letter by setting its `expiry_date` (an ISO date) and `rate_lock_expires_at` (an ISO 8601 datetime), with the rate lock required to fall no later than 23:59:59 UTC on the expiry date (otherwise `ERR_VALIDATION`); issuance moves the letter `DRAFT` → `ISSUED`. Letters can be listed and filtered by `loan_application_id`. The borrower's acceptance, recorded by a `CreditAdministrator`, requires the letter `ISSUED` and the logical clock's current date strictly earlier than the `expiry_date` — acceptance on or after that date is refused with `ERR_COMMITMENT_EXPIRED`. Acceptance moves the letter `ISSUED` → `ACCEPTED`, advances the application `COMMITMENT` → `DOCUMENTATION`, and adds the letter's `committed_amount_cents` to the borrower's `committed_exposure_cents`, with `total_exposure_cents` recomputing as ever from its two components.
+
+If the letter is never accepted in time, the clock sweep expires it: a letter still `ISSUED` whose `expiry_date` falls on or before the clock's current date moves to `EXPIRED`, and the expiry cascades three hops — the application moves `COMMITMENT` → `EXPIRED`; every checklist item of the application in `PENDING`, `RECEIVED`, or `REJECTED` status moves to `CANCELLED`; and every participation in `PROPOSED` or `COMMITTED` status moves to `RELEASED`, returning its allocated headroom to the bank's hold.
+
+### 3.7. Documentation, Closing, and the Funding Pipeline
+
+During `COMMITMENT`, `DOCUMENTATION`, and `CLOSING`, a `CreditAdministrator` builds the application's documentation file by adding checklist items. Each item names its application via `loan_application_id`, carries a `category` of `DOCUMENT` (gating the move into closing) or `CLOSING_CONDITION` (gating funding release), a free-text `label` such as "UCC-1 filed", an `is_required` flag defaulting to `true` (optional items never gate any transition), and a `severity` of `STANDARD` or `CRITICAL` defaulting to `STANDARD`. An attempt to add an item while the application is outside `COMMITMENT`, `DOCUMENTATION`, or `CLOSING` is rejected with `ERR_INVALID_STATE`. Items can be listed per application and filtered by `category` and `status`.
+
+A checklist item's lifecycle runs from `PENDING` to `RECEIVED` to either `APPROVED` or `REJECTED`, driven by a `CreditAdministrator` through a transition request naming the target in `to`; a `REJECTED` item may be resubmitted by moving it back to `PENDING`, re-opening the cycle. The waiver branch is special: driving an item from `PENDING` or `RECEIVED` to `WAIVED` is reserved for a `CreditPolicyOfficer` — any other role is refused with `ERR_ONLY_POLICY_OFFICER_MAY_WAIVE` (HTTP 403) — requires a `waiver_rationale` of at least twenty characters, and may never be applied to a `CRITICAL` item (`ERR_CONDITION_NOT_WAIVABLE`, HTTP 422). The officer's identity is stamped on the item's `waived_by_officer_id`. Waiving an item whose `is_required` flag is set also auto-creates a `REQUIRED_DOC_WAIVER` policy exception of `LOW` severity, unless one is already `OPEN` for the same item. The expiry cascade of §3.6 moves items in `PENDING`, `RECEIVED`, or `REJECTED` to `CANCELLED`; `APPROVED` and `WAIVED` items stand.
+
+Before the application may be submitted for closing, covenant monitoring must exist. A `CreditAdministrator` configures covenants while the application is in `DOCUMENTATION`, `CLOSING`, or `FUNDED`, each naming its `loan_application_id`, a `covenant_type` of `DSCR_MIN`, `LEVERAGE_MAX`, `CAPEX_LIMIT`, or `DISTRIBUTION_BLOCK`, a `threshold_value`, and a `frequency` of `ANNUAL` or `QUARTERLY`. The threshold is a ratio carried to four decimal places for `DSCR_MIN` and `LEVERAGE_MAX`, and an integer-cent amount for `CAPEX_LIMIT` and `DISTRIBUTION_BLOCK`. A new covenant starts in `MONITORING`.
+
+Submitting for closing requires the application to be in `DOCUMENTATION` and evaluates two gates: every checklist item in the `DOCUMENT` category whose `is_required` is set must stand `APPROVED` or `WAIVED` (otherwise `ERR_CHECKLIST_INCOMPLETE`), and at least one covenant must exist for the application (otherwise `ERR_NO_COVENANTS_CONFIGURED`). Passing both moves the application `DOCUMENTATION` → `CLOSING`.
+
+Funding is a three-party pipeline by design. A `CreditAdministrator` requests a tranche against an application in `CLOSING` or `FUNDED`, supplying `amount_cents` (strictly positive) and a planned `disbursement_date`; the request stamps `requested_by_officer_id` with the caller's identity and opens the authorization in `REQUESTED`. A `CreditPolicyOfficer` then authorizes it, moving `REQUESTED` → `AUTHORIZED` and stamping `authorized_by_officer_id` — but the authorizer must not be the requester, or the request is rejected with `ERR_SOD_FUNDING_SELF_AUTHORIZE`. An administrator's release then moves `AUTHORIZED` → `RELEASED` after evaluating its gates in this order: the authorization must be `AUTHORIZED` and the application in `CLOSING` or `FUNDED` (otherwise `ERR_INVALID_STATE`); no policy exception with `OPEN` status and `HIGH` severity may exist for the application (otherwise `ERR_UNRESOLVED_POLICY_EXCEPTION`, HTTP 403); every required `CLOSING_CONDITION` checklist item must be `APPROVED` or `WAIVED` (otherwise `ERR_CHECKLIST_INCOMPLETE`); the logical clock must not have passed the letter's `rate_lock_expires_at` (otherwise `ERR_RATE_LOCK_EXPIRED`); the letter must be `ACCEPTED` or `FUNDED` (otherwise `ERR_COMMITMENT_NOT_ACCEPTED`); and the application's `funded_amount_cents` plus this tranche's `amount_cents` must not exceed the letter's `committed_amount_cents` (otherwise `ERR_FUNDING_OVER_COMMITMENT`, HTTP 422).
+
+Each release adds the tranche's `amount_cents` to the application's `funded_amount_cents` and to the borrower's `funded_exposure_cents`; because the committed contribution is defined as `committed_amount_cents` minus `funded_amount_cents`, the same release shrinks the borrower's committed exposure by exactly the released amount, so `total_exposure_cents` does not move — the compensating-pair conservation of §3.1 holds on the first tranche and on every subsequent tranche released while the application is `FUNDED`. The first release carries the full transition set: the letter moves `ACCEPTED` → `FUNDED`, the application moves `CLOSING` → `FUNDED`, and every participation in `COMMITTED` moves to `FUNDED`. Authorizations still `REQUESTED` or `AUTHORIZED` when their application is withdrawn, declined, or expired are moved to `CANCELLED`.
+
+### 3.8. Covenant Monitoring, Breach Cascades, and Participation Sales
+
+Once the application is `FUNDED`, covenant reviews begin. A `CreditAnalyst` records a measurement by supplying the `measured_value` and the `period_end_date` it covers; reviewing requires the application to be `FUNDED` (otherwise `ERR_INVALID_STATE`). The pass rule depends on the covenant type: a `DSCR_MIN` covenant passes when the measured value is greater than or equal to its `threshold_value`, while `LEVERAGE_MAX`, `CAPEX_LIMIT`, and `DISTRIBUTION_BLOCK` pass when the measured value is less than or equal to the threshold. A passing review moves the covenant `MONITORING` → `COMPLIANT` and records the review's `period_end_date` as its `last_reviewed_period`; further passes keep it `COMPLIANT`.
+
+A failing measurement moves the covenant — whether from `MONITORING`, `COMPLIANT`, or `CURED` — to `BREACH_PENDING` and fires a two-hop cascade: the system auto-creates a `COVENANT_BREACH` policy exception of `HIGH` severity for the application, and the borrower's `status` is set to `SUSPENDED`, which blocks any new loan application for that borrower with `ERR_BORROWER_NOT_ACTIVE` until the breach is resolved. Resolution has two paths. A subsequent passing measurement moves `BREACH_PENDING` → `CURED`, moves the linked `OPEN` `COVENANT_BREACH` exception to `RESOLVED_BY_CHANGE`, and restores the borrower to `ACTIVE` provided no other covenant of that borrower remains in `BREACH_PENDING`. Alternatively, a `CreditPolicyOfficer` may waive the breach with a `waiver_rationale` of at least twenty characters, moving `BREACH_PENDING` → `WAIVED`, moving the linked `OPEN` exception to `WAIVED`, and restoring the borrower to `ACTIVE` under the same no-other-breach condition. A `CURED` covenant that fails again re-enters `BREACH_PENDING` with the same cascade; the breach-cure cycle can repeat indefinitely.
+
+The last decision in the pipeline is how much of the commitment the bank retains. While the application is in `COMMITMENT`, `DOCUMENTATION`, `CLOSING`, or `FUNDED` and its letter is `ISSUED`, `ACCEPTED`, or `FUNDED` (otherwise `ERR_COMMITMENT_NOT_ACCEPTED`), a `RelationshipManager` may propose selling a share to a participant institution by naming the `participant_bank_name` and an `allocated_amount_cents` (strictly positive). The allocation may not exceed the application's current unallocated headroom — its `bank_hold_amount_cents` — with exact equality permitted; an over-allocation is rejected with `ERR_PARTICIPATION_OVERALLOCATION` (HTTP 422). A new participation starts in `PROPOSED`, and its allocation immediately reduces the bank's hold.
+
+The hold itself is a derived, conserved quantity. `bank_hold_amount_cents` equals the letter's `committed_amount_cents` minus the sum of `allocated_amount_cents` over all participations in `PROPOSED`, `COMMITTED`, or `FUNDED` status — and is zero until a commitment letter exists. The invariant is that the committed amount always equals the bank's hold plus the total allocated; every create, commit, release, funding, and expiry round-trip conserves it. Releasing a participation — permitted from `PROPOSED` or `COMMITTED` — moves it to `RELEASED` and returns its `allocated_amount_cents` to `bank_hold_amount_cents`.
+
+Committing a participation, which requires the letter to be `ISSUED`, `ACCEPTED`, or `FUNDED`, moves it `PROPOSED` → `COMMITTED` and fixes its share of the origination fee. Each participation in `COMMITTED` or `FUNDED` status, visited in ascending `created_at` order, is assigned a `fee_share_cents` equal to the letter's `origination_fee_cents` multiplied by the participation's `allocated_amount_cents` and divided by the letter's `committed_amount_cents`, with each share rounded half-up to whole cents individually. The bank's retained share, `bank_hold_fee_cents`, is never itself rounded: it is the exact remainder — the letter's `origination_fee_cents` minus the sum of the participant shares — so the shares and the bank remainder always sum back to the letter fee exactly. `bank_hold_fee_cents` is null until a commitment letter exists, and a participation's `fee_share_cents` is null until it commits. When a committed participation is released, its fee share returns to the bank hold — `bank_hold_fee_cents` increases by the released share — and the participation's `fee_share_cents` is cleared; the expiry cascade of §3.6 applies the same release to `PROPOSED` and `COMMITTED` participations. When the first funding tranche is released, every `COMMITTED` participation moves to `FUNDED` and its fee share persists. Participations can be listed per application.
+
+Finally, the relationship manager may withdraw the application at any point before it reaches a terminal state; withdrawing from a terminal state is rejected with `ERR_INVALID_STATE`. Withdrawal moves the application to `WITHDRAWN` and applies the compensation set appropriate to the stage reached. If a commitment letter stands `ACCEPTED`, it moves to `TERMINATED` and the borrower's `committed_exposure_cents` is reduced by the letter's `committed_amount_cents` — pairing exactly with the increment acceptance applied. Appraisals still `ENGAGED` or `REPORT_RECEIVED` move to `CANCELLED`, freeing their engagement windows. Participations in `PROPOSED` or `COMMITTED` move to `RELEASED`, with the compensating return of allocation and fee share to the bank's hold. If the application was in `TERM_SHEET_NEGOTIATION`, its `ISSUED` term sheets move to `SUPERSEDED`. If it was in `CLOSING`, funding authorizations in `REQUESTED` or `AUTHORIZED` move to `CANCELLED`. And if it was in `COMMITTEE_REVIEW`, the open decision is pointedly not remanded: it is left `OPEN`, with later votes rejected by the session-window and state checks described in §3.5.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted under the `/credit` prefix. Operations that create a new resource — including recording a committee vote, which creates a new vote record on the decision — return a `201 Created` status code; operations that modify an existing resource or drive a state transition return `200 OK`. Every `GET` endpoint is open to any authenticated role; write operations are restricted as tabulated below. List endpoints paginate per §2.3, and readers should refer back to §3 for the complete request and response semantics of each operation.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/credit/bank-officers` | Register a bank officer (identity anchor for entity-backed roles) | BankAdmin |
+| GET | `/credit/bank-officers/{id}` | Get one officer | Any authenticated role |
+| GET | `/credit/bank-officers/{id}/policy-exceptions` | List policy exceptions waived by an officer | Any authenticated role |
+| GET | `/credit/bank-officers/{id}/document-checklist-items` | List checklist items waived by an officer | Any authenticated role |
+| GET | `/credit/bank-officers/{id}/funding-authorizations` | List funding authorizations requested or authorized by an officer | Any authenticated role |
+| POST | `/credit/borrowers` | Create a borrower | RelationshipManager |
+| GET | `/credit/borrowers` | List borrowers (filter: `status`) | Any authenticated role |
+| GET | `/credit/borrowers/{id}` | Get one borrower, including computed exposure fields | Any authenticated role |
+| GET | `/credit/borrowers/{id}/loan-applications` | List applications of a borrower | Any authenticated role |
+| PATCH | `/credit/borrowers/{id}` | Update borrower attributes; `status` manually settable only between `ACTIVE` and `EXITED` | RelationshipManager |
+| POST | `/credit/loan-applications` | Create a loan application in `INTAKE` | RelationshipManager |
+| GET | `/credit/loan-applications` | List applications (filters: `borrower_id`, `status`, `originating_officer_id`) | Any authenticated role |
+| GET | `/credit/loan-applications/{id}` | Get one application with all computed underwriting fields | Any authenticated role |
+| PATCH | `/credit/loan-applications/{id}` | Amend request terms while `INTAKE`/`SPREADING`/`EXCEPTION_REVIEW`; re-runs underwriting in `EXCEPTION_REVIEW` | RelationshipManager |
+| POST | `/credit/loan-applications/{id}/submit` | Move `INTAKE` → `SPREADING` | RelationshipManager |
+| POST | `/credit/loan-applications/{id}/finalize-spreads` | Finalize spreads: dual-variant DSCR, provisional rating, auto exceptions; branches to `EXCEPTION_REVIEW` or `APPRAISAL_REVIEW` | CreditAnalyst |
+| POST | `/credit/loan-applications/{id}/clear-exceptions` | Move `EXCEPTION_REVIEW` → `APPRAISAL_REVIEW` when no exceptions are `OPEN` | CreditPolicyOfficer |
+| POST | `/credit/loan-applications/{id}/submit-to-committee` | Move `APPRAISAL_REVIEW` → `COMMITTEE_REVIEW`; aggregates, sizing, LTV/coverage exceptions, full rating | CreditAnalyst |
+| POST | `/credit/loan-applications/{id}/submit-for-closing` | Move `DOCUMENTATION` → `CLOSING` | CreditAdministrator |
+| POST | `/credit/loan-applications/{id}/withdraw` | Withdraw from any non-terminal state, applying the compensation cascades | RelationshipManager |
+| POST | `/credit/financial-statements` | Attach a statement (optionally a restatement) to an application | CreditAnalyst |
+| GET | `/credit/financial-statements` | List statements (filters: `loan_application_id`, `restatement_of_id`, `spread_by_officer_id`, `finalized_by_officer_id`) | Any authenticated role |
+| GET | `/credit/financial-statements/{id}` | Get one statement | Any authenticated role |
+| POST | `/credit/financial-statements/{id}/spread` | Move `SUBMITTED` → `SPREAD` | CreditAnalyst |
+| POST | `/credit/financial-statements/{id}/finalize` | Move `SPREAD` → `FINAL`; supersedes the restatement target; re-runs underwriting in `EXCEPTION_REVIEW` | CreditAnalyst |
+| GET | `/credit/loan-applications/{id}/policy-exceptions` | List exceptions of an application (filters: `status`, `rule_code`) | Any authenticated role |
+| POST | `/credit/policy-exceptions/{id}/waive` | Move an exception `OPEN` → `WAIVED` with a rationale | CreditPolicyOfficer |
+| POST | `/credit/appraisers` | Register an appraiser | AppraisalManager |
+| GET | `/credit/appraisers/{id}` | Get one appraiser | Any authenticated role |
+| PATCH | `/credit/appraisers/{id}` | Update appraiser; `status` between `ELIGIBLE` and `SUSPENDED` | AppraisalManager |
+| POST | `/credit/appraisals` | Order an appraisal engagement (closed-interval, aggregate-capacity overlap rule) | AppraisalManager |
+| GET | `/credit/loan-applications/{id}/appraisals` | List appraisals of an application | Any authenticated role |
+| GET | `/credit/appraisers/{id}/appraisals` | List appraisals of an appraiser | Any authenticated role |
+| POST | `/credit/appraisals/{id}/receive-report` | Move `ENGAGED` → `REPORT_RECEIVED`, recording value conclusions | AppraisalManager |
+| POST | `/credit/appraisals/{id}/review` | Move `REPORT_RECEIVED` → `ACCEPTED` or `REJECTED`; acceptance computes dual-basis eligible values | AppraisalManager |
+| POST | `/credit/committee-sessions` | Schedule a committee session (half-open interval; back-to-back allowed) | CommitteeChair |
+| GET | `/credit/committee-sessions/{id}` | Get one session | Any authenticated role |
+| GET | `/credit/committee-sessions/{id}/committee-decisions` | List decisions taken in a session | Any authenticated role |
+| POST | `/credit/committee-decisions` | Open a committee decision (OCC-guarded); stamps level and quorum | CommitteeChair |
+| GET | `/credit/loan-applications/{id}/committee-decisions` | List decisions of an application | Any authenticated role |
+| POST | `/credit/committee-decisions/{id}/votes` | Cast a vote; auto-closes on quorum/decline thresholds; `REMAND` is chair-only | CommitteeMember, CommitteeChair |
+| POST | `/credit/term-sheets` | Issue a term sheet (OCC-guarded); supersedes the prior `ISSUED` sheet; computes the tiered fee | RelationshipManager |
+| GET | `/credit/loan-applications/{id}/term-sheets` | List term sheets of an application | Any authenticated role |
+| POST | `/credit/term-sheets/{id}/respond` | Record the borrower response: `ACCEPTED` (creates the draft letter) or `DECLINED` | RelationshipManager |
+| GET | `/credit/commitment-letters` | List commitment letters (filter: `loan_application_id`) | Any authenticated role |
+| GET | `/credit/commitment-letters/{id}` | Get one commitment letter | Any authenticated role |
+| POST | `/credit/commitment-letters/{id}/issue` | Move `DRAFT` → `ISSUED`, setting expiry and rate-lock window | CreditAdministrator |
+| POST | `/credit/commitment-letters/{id}/accept` | Move `ISSUED` → `ACCEPTED`; application to `DOCUMENTATION`; committed exposure incremented | CreditAdministrator |
+| POST | `/credit/document-checklist-items` | Add a checklist item (`DOCUMENT` gates closing; `CLOSING_CONDITION` gates funding) | CreditAdministrator |
+| GET | `/credit/loan-applications/{id}/document-checklist-items` | List checklist items of an application (filters: `category`, `status`) | Any authenticated role |
+| POST | `/credit/document-checklist-items/{id}/transition` | Move an item through its lifecycle; `WAIVED` is policy-officer-only | CreditAdministrator, CreditPolicyOfficer |
+| POST | `/credit/funding-authorizations` | Request a funding tranche | CreditAdministrator |
+| GET | `/credit/loan-applications/{id}/funding-authorizations` | List funding authorizations of an application | Any authenticated role |
+| POST | `/credit/funding-authorizations/{id}/authorize` | Move `REQUESTED` → `AUTHORIZED`; authorizer must differ from requester | CreditPolicyOfficer |
+| POST | `/credit/funding-authorizations/{id}/release` | Move `AUTHORIZED` → `RELEASED`; first release funds the loan | CreditAdministrator |
+| POST | `/credit/covenants` | Set up a monitoring covenant | CreditAdministrator |
+| GET | `/credit/loan-applications/{id}/covenants` | List covenants of an application | Any authenticated role |
+| POST | `/credit/covenants/{id}/review` | Record a compliance measurement; pass, cure, or trigger the breach cascade | CreditAnalyst |
+| POST | `/credit/covenants/{id}/waive-breach` | Move `BREACH_PENDING` → `WAIVED`; waives the linked exception; reactivates the borrower if clear | CreditPolicyOfficer |
+| POST | `/credit/participations` | Propose a participation sale against the commitment | RelationshipManager |
+| GET | `/credit/loan-applications/{id}/participations` | List participations of an application | Any authenticated role |
+| POST | `/credit/participations/{id}/commit` | Move `PROPOSED` → `COMMITTED`; fixes the participation's fee share | RelationshipManager |
+| POST | `/credit/participations/{id}/release` | Move `PROPOSED`/`COMMITTED` → `RELEASED`; allocation and fee share return to the bank hold | RelationshipManager |
+| POST | `/credit/_clock/set_current_utc` | Advance the logical clock; applies expiry and adjournment sweeps | BankAdmin |
+
+## 5. Error Code Catalogue
+
+Trigger conditions for each error are specified in §2 and §3 where the corresponding rule lives; this catalogue enumerates only the identifiers and their HTTP status codes.
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER` | 400 Bad Request |
+| `ERR_INSUFFICIENT_PERMISSIONS` | 403 Forbidden |
+| `ERR_VALIDATION` | 400 Bad Request |
+| `ERR_NOT_FOUND` | 404 Not Found |
+| `ERR_STALE_VERSION` | 412 Precondition Failed |
+| `ERR_INVALID_STATE` | 409 Conflict |
+| `ERR_AMEND_NOT_PERMITTED` | 409 Conflict |
+| `ERR_COMMITMENT_NOT_ACCEPTED` | 409 Conflict |
+| `ERR_COMMITMENT_EXPIRED` | 409 Conflict |
+| `ERR_SOD_SPREAD_FINALIZE_BY_ORIGINATOR` | 403 Forbidden |
+| `ERR_SOD_COMMITTEE_RECUSAL` | 403 Forbidden |
+| `ERR_SOD_FUNDING_SELF_AUTHORIZE` | 403 Forbidden |
+| `ERR_UNRESOLVED_POLICY_EXCEPTION` | 403 Forbidden |
+| `ERR_BORROWER_NOT_ACTIVE` | 409 Conflict |
+| `ERR_STATEMENTS_NOT_FINAL` | 409 Conflict |
+| `ERR_OPEN_POLICY_EXCEPTIONS` | 409 Conflict |
+| `ERR_NO_ACCEPTED_APPRAISAL` | 409 Conflict |
+| `ERR_APPRAISALS_NOT_SETTLED` | 409 Conflict |
+| `ERR_APPRAISER_NOT_ELIGIBLE` | 409 Conflict |
+| `ERR_APPRAISER_WINDOW_CONFLICT` | 409 Conflict |
+| `ERR_COMMITTEE_SESSION_CONFLICT` | 409 Conflict |
+| `ERR_COMMITTEE_SESSION_NOT_OPEN` | 409 Conflict |
+| `ERR_DECISION_ALREADY_OPEN` | 409 Conflict |
+| `ERR_DUPLICATE_VOTE` | 409 Conflict |
+| `ERR_ONLY_CHAIR_MAY_REMAND` | 403 Forbidden |
+| `ERR_ONLY_POLICY_OFFICER_MAY_WAIVE` | 403 Forbidden |
+| `ERR_SESSION_LEVEL_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_CHECKLIST_INCOMPLETE` | 409 Conflict |
+| `ERR_CONDITION_NOT_WAIVABLE` | 422 Unprocessable Entity |
+| `ERR_NO_COVENANTS_CONFIGURED` | 409 Conflict |
+| `ERR_RATE_LOCK_EXPIRED` | 409 Conflict |
+| `ERR_RESTATEMENT_TARGET_INVALID` | 422 Unprocessable Entity |
+| `ERR_SINGLE_BORROWER_LIMIT` | 402 Payment Required |
+| `ERR_PARTICIPATION_OVERALLOCATION` | 422 Unprocessable Entity |
+| `ERR_FUNDING_OVER_COMMITMENT` | 422 Unprocessable Entity |
+| `ERR_NO_SIZEABLE_AMOUNT` | 422 Unprocessable Entity |

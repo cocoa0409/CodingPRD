@@ -1,0 +1,74 @@
+"""Error catalog with exact HTTP statuses from the PRD §5 / scaffold §1.6."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERRORS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_VALIDATION": 400,
+    "ERR_MEMBER_NOT_APPLIED": 409,
+    "ERR_MEMBER_NOT_ACTIVE": 409,
+    "ERR_GUARDIAN_NOT_ACTIVE": 409,
+    "ERR_FUND_NOT_OPEN": 409,
+    "ERR_AWARD_NOT_PENDING": 409,
+    "ERR_AWARD_NOT_ACTIVE": 409,
+    "ERR_CLUB_DAY_NOT_OPEN": 409,
+    "ERR_CLUB_DAY_NOT_CLOSED": 409,
+    "ERR_DAY_LOCKED": 409,
+    "ERR_DAY_NOT_TODAY": 409,
+    "ERR_DUPLICATE_CLUB_DAY": 409,
+    "ERR_DUPLICATE_ATTENDANCE": 409,
+    "ERR_ALREADY_SIGNED_OUT": 409,
+    "ERR_ATTENDANCE_FINAL": 409,
+    "ERR_PICKUP_NOT_AUTHORIZED": 422,
+    "ERR_WALKER_NOT_PERMITTED": 422,
+    "ERR_NO_RIDE_FOR_DATE": 422,
+    "ERR_FEE_ARREARS_EXCEEDED": 402,
+    "ERR_OVER_CAPACITY": 409,
+    "ERR_AREA_CAPACITY_EXCEEDED": 422,
+    "ERR_RATIO_VIOLATION": 422,
+    "ERR_STAFF_NOT_COMPLIANT": 422,
+    "ERR_ASSIGNMENT_CONFLICT": 409,
+    "ERR_ASSIGNMENT_NOT_CHECKABLE": 409,
+    "ERR_ASSIGNMENT_NOT_MOVABLE": 409,
+    "ERR_SEAT_CAPACITY_EXCEEDED": 422,
+    "ERR_RIDE_NOT_ACTIVE": 409,
+    "ERR_RIDE_WINDOW_OVERLAP": 409,
+    "ERR_INVALID_DATE_WINDOW": 422,
+    "ERR_FUND_INSUFFICIENT": 422,
+    "ERR_OVERPAYMENT": 422,
+    "ERR_STALE_VERSION": 412,
+    "ERR_MEAL_COUNTS_EXCEED_ATTENDANCE": 422,
+    "ERR_CLAIM_NOT_SUBMITTABLE": 409,
+    "ERR_CLAIM_NO_RECONCILED_DAYS": 409,
+    "ERR_CLAIM_NOT_SUBMITTED": 409,
+    "ERR_DUPLICATE_CLAIM_MONTH": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INCIDENT_NOT_REPORTED": 409,
+    "ERR_INCIDENT_NOT_APPEALABLE": 409,
+    "ERR_APPEAL_NOT_PENDING": 409,
+    "ERR_SUSPENSION_MANDATORY": 422,
+    "ERR_REPORT_NOT_SUBMITTABLE": 409,
+    "ERR_REPORT_NOT_SUBMITTED": 409,
+    "ERR_DUPLICATE_REPORT_MONTH": 409,
+}
+
+
+def err(error_id, message):
+    return ApiError(error_id, ERRORS[error_id], message)
+
+
+def not_found(what="resource"):
+    return err("ERR_NOT_FOUND", "%s not found" % what)
+
+
+def validation(message):
+    return err("ERR_VALIDATION", message)

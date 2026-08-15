@@ -1,0 +1,55 @@
+"""Domain thresholds — numeric constants pinned by PRD §3 prose."""
+
+THRESHOLDS = {
+    # Compensation (PRD §3.7)
+    "COMP_DELAY_THRESHOLD_MINUTES": 180,
+    "REDUCTION_THRESHOLD_MINUTES": 240,
+    "TIER1_MAX_KM": 1500,
+    "TIER2_MAX_KM": 3500,
+    "TIER1_CENTS": 25000,
+    "TIER2_CENTS": 40000,
+    "TIER3_CENTS": 60000,
+    "CREDIT_BONUS_PCT": 10,
+    "ELECTION_WINDOW_HOURS": 72,
+    # Vouchers (PRD §3.6)
+    "HOTEL_WINDOW_THRESHOLD_HOURS": 8,
+    "HOTEL_NIGHT_CAP_CENTS": 15000,
+    "MAX_HOTEL_NIGHTS": 3,
+    "MEAL_WINDOW_HOURS": 4,
+    "MEAL_RATE_CENTS": 1500,
+    "MAX_MEALS": 3,
+    "TRANSPORT_FLAT_CENTS": 5000,
+    "BOOKING_VOUCHER_CAP_CENTS": 40000,
+    # Crew legality (PRD §3.1)
+    "MAX_DUTY_HOURS": 14,
+    "POST_FLIGHT_BUFFER_MINUTES": 30,
+    # Selector / connections (PRD §3.4, §3.5)
+    "MIN_CONNECT_MINUTES": 45,
+    "RECOVERY_WINDOW_HOURS": 48,
+    "MAX_OPTIONS": 3,
+    "INTERLINE_KM_RATE_CENTS": 5,
+    # Communications cadence (PRD §3.8)
+    "REMINDER_CADENCE_MINUTES": 30,
+}
+
+# Priority-score weights (PRD §3.4)
+TIER_WEIGHT = {"NONE": 0, "SILVER": 1, "GOLD": 2, "PLATINUM": 4}
+CABIN_WEIGHT = {"ECONOMY": 1, "PREMIUM": 2, "BUSINESS": 3, "FIRST": 4}
+SSR_BONUS = {"UMNR": 300, "WCHR": 200, "PETC": 50}
+SSR_CAP = 400
+URGENCY_TIER1_MINUTES = 120
+URGENCY_TIER2_MINUTES = 360
+GROUP_PENALTY_PER_EXTRA = 50
+GROUP_PENALTY_MAX_EXTRA = 4
+
+TEST_DEFAULTS = {
+    "FARE_CENTS": 12000,
+    "COST_CAP_CENTS": 1_000_000,
+    "PARTY_SIZE": 1,
+    "CABIN": "ECONOMY",
+    "DISTANCE_KM": 900,
+    "CLOCK_START": "2026-08-10T06:00:00Z",
+}
+
+# Logical clock value the server holds before any set (PRD §2.5).
+CLOCK_INITIAL = "2026-08-01T00:00:00Z"

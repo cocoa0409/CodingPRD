@@ -1,0 +1,1770 @@
+# =============================================================================
+# Scaffold: Stevedoring & Longshore Labor Ordering
+# =============================================================================
+
+scenario: |
+  Stevedoring & Longshore Labor Ordering (ILA/ILWU stevedore): gang order by
+  vessel & shift, labor hall dispatch & seniority rules, productivity (moves
+  per hour) tracking & bonus, equipment assignment & breakdown reassignment,
+  cargo damage & claim documentation, overtime/meal-break rules & payroll
+  rates, safety incident & work stoppage, billing per ton/container/hour
+
+domain_name: stevedoring-labor-ordering
+api_prefix: /api
+
+complexity_profile:
+  primary_archetype: quota / allocation        # finite labor pool allocated to gang slots by seniority
+  secondary_archetype: pricing engine          # tiered payroll rates + per ton/container/hour billing
+  complexity_layers:
+    - optimistic_concurrency                   # OCC on GangOrder / Worker / Invoice versions
+    - cascading_side_effects                   # safety stoppage, suspension-bump, breakdown-reassign chains
+    - dual_variant_calculation                 # provisional-vs-final billing; provisional-vs-final claim liability
+    - rate_threshold_triggers                  # OT/DT breakpoints, MPH bonus threshold, volume-discount tiers
+    - selector_policy                          # dispatch ranking + equipment replacement ranking
+    - derived_field_reconciliation             # filled_headcount, actual_moves, work_posture
+  entity_topology: flat                        # peer resources with FK references, no URL nesting
+  state_machine_shape: cyclic                  # WORKING<->SUSPENDED, REJECTED->resubmit, DISPUTED loop
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate
+  role_model: segregation_of_duties            # reporter != decider; submitter != approver
+  consistency_model: immediate
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# Global list ordering (pins determinism for tests that index into list responses):
+list_ordering: |
+  Every list endpoint returns items ordered by created_at ASC. Items created within a
+  single request (e.g., a dispatch batch creating several OFFERED assignments) keep
+  their creation sequence — which follows the selector's ranking order — as the
+  secondary order when created_at ties.
+
+# =============================================================================
+# §1.1 Entity-Relationship Table (flat topology; FKs in bodies)
+# =============================================================================
+entities:
+  - name: VesselCall
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vessel_name, type: string, source: input, description: "Vessel name" }
+      - { name: voyage_number, type: string, source: input, description: "Voyage reference" }
+      - { name: shipping_line, type: string, source: input, description: "Billing customer" }
+      - { name: eta_utc, type: datetime, source: input, description: "Estimated time of arrival" }
+      - { name: planned_moves, type: integer, source: input, description: "Planned container moves; >= 0; ERR_CARGO_PLAN_REQUIRED unless planned_moves >= 1 or planned_tons > 0" }
+      - { name: planned_tons, type: number, source: input, description: "Planned breakbulk tons; >= 0" }
+      - { name: contracted_mph_target, type: number, source: input, description: "Contracted moves/hour target for gang bonus eligibility; > 0" }
+      - { name: credit_limit_cents, type: integer, source: input, description: "Max issuable invoice total for this call; > 0" }
+      - { name: status, type: enum, source: system, description: "SCHEDULED | BERTHED | WORKING | COMPLETED | CANCELLED" }
+      - { name: work_posture, type: enum, source: computed, description: "NORMAL | PARTIAL_STOPPAGE | FULL_STOPPAGE — derived from open SafetyIncidents per calculation work_posture_derivation" }
+      - { name: actual_moves, type: integer, source: computed, default: 0, description: "Sum of moves_count over RECORDED MoveRecords on gang orders of this vessel's shifts" }
+      - { name: actual_tons, type: number, source: computed, default: 0, description: "Sum of tons_lifted over RECORDED MoveRecords on gang orders of this vessel's shifts" }
+
+  - name: ShiftWindow
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vessel_call_id, type: string, source: input, description: "FK -> VesselCall.id" }
+      - { name: shift_date, type: string, source: input, description: "Local shift date YYYY-MM-DD" }
+      - { name: period, type: enum, source: input, description: "DAY | NIGHT | GRAVEYARD — payroll differential key" }
+      - { name: start_utc, type: datetime, source: input, description: "Shift start; half-open interval start" }
+      - { name: end_utc, type: datetime, source: input, description: "Shift end; half-open interval end; ERR_SHIFT_WINDOW_INVALID unless end > start and duration <= 960 minutes" }
+      - { name: status, type: enum, source: system, description: "PLANNED | OPEN_FOR_ORDERS | IN_PROGRESS | CLOSED" }
+
+  - name: GangOrder
+    parent: null
+    common_fields: true
+    fields:
+      - { name: shift_window_id, type: string, source: input, description: "FK -> ShiftWindow.id" }
+      - { name: gang_type, type: enum, source: input, description: "CRANE_GANG | HOLD_GANG | LASHING_GANG | DRIVING_GANG | GENERAL" }
+      - { name: required_classification, type: enum, source: input, description: "CRANE_OPERATOR | HOLDMAN | LASHER | DRIVER | CLERK — dispatch eligibility class" }
+      - { name: required_headcount, type: integer, source: input, description: "Slots to fill; >= 1" }
+      - { name: required_equipment_type, type: enum, source: input, description: "SHIP_CRANE | RTG | FORKLIFT | TRACTOR" }
+      - { name: required_equipment_count, type: integer, source: input, description: "Units of required_equipment_type that must be covered; >= 0" }
+      - { name: filled_headcount, type: integer, source: computed, default: 0, description: "Count of DispatchAssignments with status IN {CHECKED_IN, WORKING}" }
+      - { name: offered_count, type: integer, source: computed, default: 0, description: "Count of DispatchAssignments with status OFFERED" }
+      - { name: status, type: enum, source: system, description: "PLACED | DISPATCHING | MANNED | SHORT_MANNED | WORKING | SUSPENDED | COMPLETED | CANCELLED" }
+      - { name: assigned_equipment_ok, type: boolean, source: computed, default: false, description: "true iff count of EquipmentAssignments status IN {RESERVED, ACTIVE} whose unit type == required_equipment_type >= required_equipment_count" }
+      - { name: suspension_count, type: integer, source: system, default: 0, description: "Increments on every WORKING -> SUSPENDED transition; drives invoice stoppage credit" }
+      - { name: actual_mph, type: number, source: computed, default: 0, description: "Moves per productive hour, computed at completion per calculation moves_per_hour" }
+      - { name: bonus_eligible, type: boolean, source: computed, default: false, description: "actual_mph >= vessel.contracted_mph_target at completion" }
+      - { name: bonus_pool_cents, type: integer, source: computed, default: 0, description: "Productivity bonus pool per calculation productivity_bonus" }
+      - { name: bonus_per_worker_cents, type: integer, source: computed, default: 0, description: "Frozen per-timesheet bonus share, set at completion" }
+
+  - name: Worker
+    parent: null
+    common_fields: true
+    fields:
+      - { name: full_name, type: string, source: input, description: "Worker name" }
+      - { name: registration_number, type: string, source: input, description: "Labor-hall registration number; unique across all workers (ERR_DUPLICATE_REGISTRATION)" }
+      - { name: classification, type: enum, source: input, description: "CRANE_OPERATOR | HOLDMAN | LASHER | DRIVER | CLERK" }
+      - { name: registered_on, type: string, source: input, description: "Seniority date YYYY-MM-DD; earlier = more senior" }
+      - { name: base_hourly_rate_cents, type: integer, source: input, description: "Straight-time hourly rate in cents; > 0" }
+      - { name: status, type: enum, source: system, default: ACTIVE, description: "ACTIVE | SUSPENDED | INACTIVE" }
+      - { name: seniority_rank, type: integer, source: computed, description: "1-based rank within classification ordered by registered_on ASC, tie-break created_at ASC; recomputed on every worker create or status change" }
+
+  - name: DispatchAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: gang_order_id, type: string, source: system, description: "FK -> GangOrder.id" }
+      - { name: worker_id, type: string, source: system, description: "FK -> Worker.id; chosen by dispatch_selection, never client-supplied at creation" }
+      - { name: status, type: enum, source: system, description: "OFFERED | CHECKED_IN | WORKING | COMPLETED | NO_SHOW | BUMPED | CANCELLED" }
+      - { name: seniority_rank_at_dispatch, type: integer, source: system, description: "Snapshot of worker.seniority_rank at offer time; bump ordering key" }
+
+  - name: EquipmentUnit
+    parent: null
+    common_fields: true
+    fields:
+      - { name: unit_code, type: string, source: input, description: "Unique unit identifier" }
+      - { name: equipment_type, type: enum, source: input, description: "SHIP_CRANE | RTG | FORKLIFT | TRACTOR" }
+      - { name: status, type: enum, source: system, default: AVAILABLE, description: "AVAILABLE | ASSIGNED | DOWN" }
+      - { name: total_breakdowns, type: integer, source: system, default: 0, description: "Increments on every report-breakdown against an assignment of this unit" }
+
+  - name: EquipmentAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: gang_order_id, type: string, source: input, description: "FK -> GangOrder.id" }
+      - { name: equipment_unit_id, type: string, source: input, description: "FK -> EquipmentUnit.id" }
+      - { name: window_start_utc, type: datetime, source: input, description: "Booking window start; 30-minute turnaround buffer applies between bookings of the same unit" }
+      - { name: window_end_utc, type: datetime, source: input, description: "Booking window end; must be > window_start_utc" }
+      - { name: status, type: enum, source: system, description: "RESERVED | ACTIVE | RELEASED | DOWN" }
+      - { name: replaced_by_assignment_id, type: string, source: system, description: "Nullable; id of the auto-created replacement EquipmentAssignment when this one goes DOWN" }
+
+  - name: MoveRecord
+    parent: null
+    common_fields: true
+    fields:
+      - { name: gang_order_id, type: string, source: input, description: "FK -> GangOrder.id" }
+      - { name: recorded_by_worker_id, type: string, source: system, description: "Acting foreman's X-User-ID (a Worker.id); audit only" }
+      - { name: period_start_utc, type: datetime, source: input, description: "Recording period start; half-open; must not overlap another RECORDED period on the same gang order (ERR_MOVE_PERIOD_OVERLAP)" }
+      - { name: period_end_utc, type: datetime, source: input, description: "Recording period end; must be > period_start_utc" }
+      - { name: moves_count, type: integer, source: input, description: "Container moves in period; >= 0" }
+      - { name: tons_lifted, type: number, source: input, description: "Tons lifted in period; >= 0" }
+      - { name: stoppage_minutes, type: integer, source: input, default: 0, description: "Minutes of the period lost to stoppage; excluded from productive hours; >= 0 and <= period length" }
+      - { name: status, type: enum, source: system, description: "RECORDED | VOIDED" }
+
+  - name: DamageClaim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: gang_order_id, type: string, source: input, description: "FK -> GangOrder.id" }
+      - { name: reported_by_worker_id, type: string, source: system, description: "Acting foreman's X-User-ID at creation; segregation-of-duties anchor" }
+      - { name: cargo_ref, type: string, source: input, description: "Container/cargo reference" }
+      - { name: damage_description, type: string, source: input, description: "Damage narrative" }
+      - { name: estimated_amount_cents, type: integer, source: input, description: "Claimed damage amount; > 0" }
+      - { name: status, type: enum, source: system, description: "REPORTED | ACCEPTED | DENIED | SETTLED" }
+      - { name: provisional_stevedore_share_cents, type: integer, source: computed, description: "round_half_up(estimated_amount_cents * 0.50), set at creation" }
+      - { name: fault_pct, type: integer, source: input, description: "Stevedore fault percentage 0-100; required on decide when decision == ACCEPTED (ERR_FAULT_PCT_OUT_OF_RANGE outside 0..100)" }
+      - { name: final_stevedore_liability_cents, type: integer, source: computed, description: "Set at settle: max(0, min(round_half_up(estimated_amount_cents * fault_pct / 100), 25000000) - 50000); 0 when DENIED" }
+      - { name: decided_by_user_id, type: string, source: system, description: "ClaimsAdjuster X-User-ID at decide; must differ from reported_by_worker_id (ERR_SEGREGATION_OF_DUTIES)" }
+
+  - name: SafetyIncident
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vessel_call_id, type: string, source: input, description: "FK -> VesselCall.id" }
+      - { name: gang_order_id, type: string, source: input, description: "FK -> GangOrder.id; required iff scope == GANG (ERR_VALIDATION otherwise)" }
+      - { name: scope, type: enum, source: input, description: "GANG | VESSEL | TERMINAL" }
+      - { name: severity, type: enum, source: input, description: "MINOR | MAJOR | CRITICAL" }
+      - { name: description, type: string, source: input, description: "Incident narrative" }
+      - { name: status, type: enum, source: system, description: "REPORTED | CLEARED" }
+
+  - name: TimesheetEntry
+    parent: null
+    common_fields: true
+    fields:
+      - { name: gang_order_id, type: string, source: input, description: "FK -> GangOrder.id" }
+      - { name: worker_id, type: string, source: input, description: "FK -> Worker.id; must hold an assignment on this gang order with status IN {CHECKED_IN, WORKING, COMPLETED} (ERR_WORKER_NOT_ON_GANG)" }
+      - { name: work_minutes, type: integer, source: input, description: "Minutes worked; >= 0; ERR_TIMESHEET_EXCEEDS_SHIFT when greater than shift duration + 120" }
+      - { name: meal_break_taken, type: boolean, source: input, default: false, description: "Whether the worker took the meal break" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SUBMITTED | REJECTED | APPROVED" }
+      - { name: rate_cents_snapshot, type: integer, source: system, description: "Worker.base_hourly_rate_cents copied at creation" }
+      - { name: straight_minutes, type: integer, source: computed, description: "min(work_minutes, 480), set at approve" }
+      - { name: ot_minutes, type: integer, source: computed, description: "min(max(work_minutes - 480, 0), 240), set at approve" }
+      - { name: dt_minutes, type: integer, source: computed, description: "max(work_minutes - 720, 0), set at approve" }
+      - { name: meal_penalty_minutes, type: integer, source: computed, description: "60 when work_minutes > 300 and meal_break_taken == false, else 0; set at approve" }
+      - { name: gross_pay_cents, type: integer, source: computed, description: "Per calculation payroll_gross_pay; set at approve" }
+      - { name: bonus_cents, type: integer, source: computed, default: 0, description: "GangOrder.bonus_per_worker_cents attached at approve" }
+      - { name: submitted_by_user_id, type: string, source: system, description: "Foreman X-User-ID at submit; approver must differ (ERR_SEGREGATION_OF_DUTIES)" }
+
+  - name: Invoice
+    parent: null
+    common_fields: true
+    fields:
+      - { name: vessel_call_id, type: string, source: input, description: "FK -> VesselCall.id; exactly one non-VOIDED invoice per vessel call" }
+      - { name: status, type: enum, source: system, description: "DRAFT | FINALIZED | ISSUED | DISPUTED | PAID" }
+      - { name: rate_variant, type: enum, source: computed, description: "PROVISIONAL while DRAFT; FINAL after finalize" }
+      - { name: container_line_cents, type: integer, source: computed, description: "Marginal tiered container charges per calculation invoice_calculation" }
+      - { name: tonnage_line_cents, type: integer, source: computed, description: "Per-ton charges" }
+      - { name: manhour_line_cents, type: integer, source: computed, description: "Per-man-hour labor charges" }
+      - { name: equipment_line_cents, type: integer, source: computed, description: "Equipment window charges (50% factor for DOWN assignments)" }
+      - { name: stoppage_credit_cents, type: integer, source: computed, description: "Negative credit: -9000 per gang-order suspension" }
+      - { name: subtotal_cents, type: integer, source: computed, description: "Sum of the five rounded line values" }
+      - { name: discount_cents, type: integer, source: computed, description: "Volume discount keyed on pre-discount subtotal tiers" }
+      - { name: adjustment_total_cents, type: integer, source: computed, default: 0, description: "Sum of manual adjustments applied via PATCH" }
+      - { name: total_cents, type: integer, source: computed, description: "subtotal_cents - discount_cents + adjustment_total_cents" }
+      - { name: amount_paid_cents, type: integer, source: computed, default: 0, description: "Sum of recorded payments" }
+      - { name: remaining_balance_cents, type: integer, source: computed, description: "total_cents - amount_paid_cents" }
+      - { name: dispute_reason, type: string, source: input, description: "Required on dispute" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: VesselCall
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: BERTHED
+        trigger: "POST /api/vessel-calls/{id}/berth"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects: []
+      - from: BERTHED
+        to: WORKING
+        trigger: "system (automatic when the first ShiftWindow of this vessel enters IN_PROGRESS)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: WORKING
+        to: COMPLETED
+        trigger: "POST /api/vessel-calls/{id}/complete"
+        actor: StevedoreSuperintendent
+        preconditions:
+          - "Every ShiftWindow with vessel_call_id == this vessel has status == CLOSED (ERR_INVALID_STATE otherwise)"
+        side_effects: []
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /api/vessel-calls/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions:
+          - "No GangOrder on any shift of this vessel in a non-terminal state (ERR_INVALID_STATE otherwise)"
+        side_effects: []
+      - from: BERTHED
+        to: CANCELLED
+        trigger: "POST /api/vessel-calls/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions:
+          - "No GangOrder on any shift of this vessel in a non-terminal state (ERR_INVALID_STATE otherwise)"
+        side_effects: []
+
+  - entity: ShiftWindow
+    initial_state: PLANNED
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PLANNED
+        to: OPEN_FOR_ORDERS
+        trigger: "POST /api/shift-windows/{id}/open-for-orders"
+        actor: StevedoreSuperintendent
+        preconditions:
+          - "VesselCall.status IN {BERTHED, WORKING} (ERR_INVALID_STATE otherwise)"
+        side_effects: []
+      - from: OPEN_FOR_ORDERS
+        to: IN_PROGRESS
+        trigger: "POST /api/shift-windows/{id}/start"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "If this is the vessel's first IN_PROGRESS shift and VesselCall.status == BERTHED: VesselCall.status -> WORKING"
+      - from: IN_PROGRESS
+        to: CLOSED
+        trigger: "system (automatic when every GangOrder with shift_window_id == this shift reaches a terminal state COMPLETED or CANCELLED, and at least one gang order exists)"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "Bubble-up: child gang-order completion closes the shift."
+
+  - entity: GangOrder
+    initial_state: PLACED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: PLACED
+        to: DISPATCHING
+        trigger: "POST /api/gang-orders/{id}/dispatch-batch (first batch)"
+        actor: LaborHallDispatcher
+        preconditions:
+          - "ShiftWindow.status IN {OPEN_FOR_ORDERS, IN_PROGRESS} (ERR_INVALID_STATE otherwise)"
+          - "VesselCall.work_posture != FULL_STOPPAGE (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "expected_gang_order_version == current version (ERR_STALE_GANG_ORDER_VERSION)"
+        side_effects:
+          - "Run calculation dispatch_selection; create OFFERED DispatchAssignments for the top min(open_slots, eligible_count) candidates, where open_slots = required_headcount - filled_headcount - offered_count"
+          - "Each created assignment snapshots seniority_rank_at_dispatch"
+          - "If filled_headcount + offered_count >= required_headcount after the batch: stay/become DISPATCHING; else status -> SHORT_MANNED"
+          - "Increments GangOrder.version by 1"
+      - from: DISPATCHING
+        to: DISPATCHING
+        trigger: "POST /api/gang-orders/{id}/dispatch-batch (top-up batch)"
+        actor: LaborHallDispatcher
+        preconditions:
+          - "ShiftWindow.status IN {OPEN_FOR_ORDERS, IN_PROGRESS}"
+          - "VesselCall.work_posture != FULL_STOPPAGE (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "expected_gang_order_version == current version (ERR_STALE_GANG_ORDER_VERSION)"
+        side_effects:
+          - "Same selection and creation side effects as the first batch"
+          - "If filled_headcount + offered_count >= required_headcount: stay DISPATCHING; else status -> SHORT_MANNED"
+          - "Increments GangOrder.version by 1"
+      - from: SHORT_MANNED
+        to: DISPATCHING
+        trigger: "POST /api/gang-orders/{id}/dispatch-batch (retry after new workers register or headcount amended)"
+        actor: LaborHallDispatcher
+        preconditions:
+          - "ShiftWindow.status IN {OPEN_FOR_ORDERS, IN_PROGRESS}"
+          - "VesselCall.work_posture != FULL_STOPPAGE (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "expected_gang_order_version == current version (ERR_STALE_GANG_ORDER_VERSION)"
+        side_effects:
+          - "Same selection and creation side effects as the first batch"
+          - "Increments GangOrder.version by 1"
+      - from: DISPATCHING
+        to: MANNED
+        trigger: "system (automatic on check-in when filled_headcount reaches required_headcount)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: SHORT_MANNED
+        to: MANNED
+        trigger: "system (automatic on check-in when filled_headcount reaches required_headcount)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: MANNED
+        to: DISPATCHING
+        trigger: "system (automatic when filled_headcount drops below required_headcount after a bump or suspension cascade, and open offers do not cover the gap)"
+        actor: system
+        preconditions: []
+        side_effects: []
+        note: "State regression; GangOrder machine is deliberately non-linear."
+      - from: MANNED
+        to: SHORT_MANNED
+        trigger: "system (automatic when filled_headcount drops below required_headcount and the eligible pool is exhausted)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: MANNED
+        to: WORKING
+        trigger: "POST /api/gang-orders/{id}/start-work"
+        actor: GangForeman
+        preconditions:
+          - "ShiftWindow.status == IN_PROGRESS (ERR_INVALID_STATE otherwise)"
+          - "VesselCall.work_posture == NORMAL (ERR_WORK_STOPPAGE_ACTIVE; PARTIAL_STOPPAGE also blocks start-work)"
+          - "assigned_equipment_ok == true (ERR_NO_EQUIPMENT_ASSIGNED)"
+        side_effects:
+          - "DispatchAssignments with status CHECKED_IN on this order -> WORKING"
+          - "EquipmentAssignments with status RESERVED on this order -> ACTIVE"
+      - from: SHORT_MANNED
+        to: WORKING
+        trigger: "POST /api/gang-orders/{id}/start-work"
+        actor: GangForeman
+        preconditions:
+          - "ShiftWindow.status == IN_PROGRESS"
+          - "VesselCall.work_posture == NORMAL (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "assigned_equipment_ok == true (ERR_NO_EQUIPMENT_ASSIGNED)"
+          - "filled_headcount >= 1"
+        side_effects:
+          - "DispatchAssignments with status CHECKED_IN on this order -> WORKING"
+          - "EquipmentAssignments with status RESERVED on this order -> ACTIVE"
+      - from: WORKING
+        to: SUSPENDED
+        trigger: "system (automatic when VesselCall.work_posture becomes FULL_STOPPAGE)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "suspension_count += 1"
+          - "EquipmentAssignments on this order with status IN {RESERVED, ACTIVE} -> RELEASED; each such EquipmentUnit ASSIGNED -> AVAILABLE"
+          - "assigned_equipment_ok recomputed (becomes false unless surplus equipment remains)"
+        note: "Cascade hop 3 of the safety-stoppage chain."
+      - from: SUSPENDED
+        to: WORKING
+        trigger: "POST /api/gang-orders/{id}/start-work (resume)"
+        actor: GangForeman
+        preconditions:
+          - "VesselCall.work_posture == NORMAL (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "assigned_equipment_ok == true (ERR_NO_EQUIPMENT_ASSIGNED) — equipment released on suspension must be re-acquired"
+        side_effects:
+          - "EquipmentAssignments with status RESERVED on this order -> ACTIVE"
+        note: "Cycle WORKING -> SUSPENDED -> WORKING."
+      - from: WORKING
+        to: COMPLETED
+        trigger: "POST /api/gang-orders/{id}/complete"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {CHECKED_IN, WORKING} -> COMPLETED; OFFERED -> CANCELLED"
+          - "EquipmentAssignments with status IN {RESERVED, ACTIVE} -> RELEASED; their units ASSIGNED -> AVAILABLE"
+          - "Compute actual_mph, bonus_eligible, bonus_pool_cents, bonus_per_worker_cents per calculations moves_per_hour and productivity_bonus"
+          - "If every gang order of the shift is now terminal: ShiftWindow -> CLOSED (bubble-up)"
+      - from: PLACED
+        to: CANCELLED
+        trigger: "POST /api/gang-orders/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {OFFERED, CHECKED_IN} -> CANCELLED"
+          - "EquipmentAssignments with status RESERVED -> RELEASED; units freed"
+      - from: DISPATCHING
+        to: CANCELLED
+        trigger: "POST /api/gang-orders/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {OFFERED, CHECKED_IN} -> CANCELLED"
+          - "EquipmentAssignments with status RESERVED -> RELEASED; units freed"
+      - from: MANNED
+        to: CANCELLED
+        trigger: "POST /api/gang-orders/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {OFFERED, CHECKED_IN} -> CANCELLED"
+          - "EquipmentAssignments with status RESERVED -> RELEASED; units freed"
+      - from: SHORT_MANNED
+        to: CANCELLED
+        trigger: "POST /api/gang-orders/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {OFFERED, CHECKED_IN} -> CANCELLED"
+          - "EquipmentAssignments with status RESERVED -> RELEASED; units freed"
+      - from: WORKING
+        to: CANCELLED
+        trigger: "POST /api/gang-orders/{id}/cancel"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "DispatchAssignments with status IN {OFFERED, CHECKED_IN, WORKING} -> CANCELLED"
+          - "EquipmentAssignments with status IN {RESERVED, ACTIVE} -> RELEASED; units freed"
+
+  - entity: DispatchAssignment
+    initial_state: OFFERED
+    terminal_states: [COMPLETED, NO_SHOW, BUMPED, CANCELLED]
+    transitions:
+      - from: OFFERED
+        to: CHECKED_IN
+        trigger: "POST /api/dispatch-assignments/{id}/check-in"
+        actor: LaborHallDispatcher
+        preconditions:
+          - "ShiftWindow.status == IN_PROGRESS (ERR_INVALID_STATE otherwise)"
+          - "VesselCall.work_posture != FULL_STOPPAGE (ERR_WORK_STOPPAGE_ACTIVE)"
+          - "Worker.status == ACTIVE (ERR_WORKER_INELIGIBLE)"
+          - "GangOrder.filled_headcount < required_headcount (ERR_GANG_FULL when filled == required)"
+        side_effects:
+          - "GangOrder.filled_headcount recomputed; if it reaches required_headcount: GangOrder DISPATCHING/SHORT_MANNED -> MANNED"
+      - from: CHECKED_IN
+        to: WORKING
+        trigger: "system (automatic when the GangOrder enters WORKING via start-work)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: WORKING
+        to: COMPLETED
+        trigger: "POST /api/dispatch-assignments/{id}/complete"
+        actor: LaborHallDispatcher
+        preconditions: []
+        side_effects:
+          - "GangOrder.filled_headcount recomputed"
+      - from: OFFERED
+        to: NO_SHOW
+        trigger: "POST /api/dispatch-assignments/{id}/no-show"
+        actor: LaborHallDispatcher
+        preconditions:
+          - "ShiftWindow.status == IN_PROGRESS (ERR_INVALID_STATE otherwise)"
+        side_effects:
+          - "Auto-offer: run dispatch_selection for a single slot with the no-show worker excluded from this gang order's candidate pool; create one OFFERED assignment if a candidate exists"
+          - "GangOrder manning status recomputed"
+      - from: OFFERED
+        to: BUMPED
+        trigger: "POST /api/dispatch-assignments/{id}/bump"
+        actor: LaborHallDispatcher
+        preconditions: []
+        side_effects:
+          - "Auto-offer to the next eligible candidate (bumped worker excluded from this gang order's pool); one OFFERED assignment created if a candidate exists"
+          - "GangOrder manning status recomputed"
+      - from: CHECKED_IN
+        to: BUMPED
+        trigger: "POST /api/dispatch-assignments/{id}/bump"
+        actor: LaborHallDispatcher
+        preconditions: []
+        side_effects:
+          - "GangOrder.filled_headcount recomputed (drops by 1)"
+          - "Auto-offer to the next eligible candidate (bumped worker excluded from this gang order's pool)"
+          - "GangOrder manning status recomputed (MANNED may regress to DISPATCHING or SHORT_MANNED)"
+      - from: CHECKED_IN
+        to: BUMPED
+        trigger: "system (amendment bump waterfall: PATCH /api/gang-orders/{id} reducing required_headcount below filled_headcount bumps least-senior CHECKED_IN/WORKING assignments — highest seniority_rank_at_dispatch first, tie-break assignment created_at DESC — until filled == new required)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Amendment-driven bumps do NOT auto-offer (headcount is being reduced)"
+          - "GangOrder manning status recomputed"
+      - from: WORKING
+        to: BUMPED
+        trigger: "system (amendment bump waterfall; see CHECKED_IN -> BUMPED system transition)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Amendment-driven bumps do NOT auto-offer"
+          - "GangOrder manning status recomputed"
+      - from: OFFERED
+        to: BUMPED
+        trigger: "system (worker suspension cascade: PATCH /api/workers/{id} to SUSPENDED bumps every OFFERED assignment of that worker)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Auto-offer to the next eligible candidate (suspended worker excluded)"
+          - "GangOrder manning status recomputed"
+        note: "Cascade hop 2 of the worker-suspension chain."
+
+  - entity: EquipmentUnit
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: ASSIGNED
+        trigger: "system (when an EquipmentAssignment is created for this unit)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ASSIGNED
+        to: AVAILABLE
+        trigger: "system (when the unit's last non-terminal EquipmentAssignment is RELEASED)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: ASSIGNED
+        to: DOWN
+        trigger: "system (when report-breakdown fires on an assignment of this unit)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "total_breakdowns += 1"
+      - from: DOWN
+        to: AVAILABLE
+        trigger: "POST /api/equipment-units/{id}/repair-complete"
+        actor: StevedoreAdmin
+        preconditions: []
+        side_effects: []
+
+  - entity: EquipmentAssignment
+    initial_state: RESERVED
+    terminal_states: [RELEASED, DOWN]
+    transitions:
+      - from: RESERVED
+        to: ACTIVE
+        trigger: "system (when the GangOrder enters WORKING)"
+        actor: system
+        preconditions: []
+        side_effects: []
+      - from: RESERVED
+        to: RELEASED
+        trigger: "POST /api/equipment-assignments/{id}/release, or system (gang cancel/suspend/complete cascade)"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "EquipmentUnit -> AVAILABLE when no other non-terminal assignment holds it"
+          - "GangOrder.assigned_equipment_ok recomputed"
+      - from: ACTIVE
+        to: RELEASED
+        trigger: "POST /api/equipment-assignments/{id}/release, or system (gang cancel/suspend/complete cascade)"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "EquipmentUnit -> AVAILABLE when no other non-terminal assignment holds it"
+          - "GangOrder.assigned_equipment_ok recomputed"
+      - from: RESERVED
+        to: DOWN
+        trigger: "POST /api/equipment-assignments/{id}/report-breakdown"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "EquipmentUnit ASSIGNED -> DOWN; total_breakdowns += 1"
+          - "Run calculation equipment_replacement_selection; if a unit is found, create a replacement EquipmentAssignment (same window, status RESERVED) and set replaced_by_assignment_id; the new unit AVAILABLE -> ASSIGNED"
+          - "GangOrder.assigned_equipment_ok recomputed"
+        note: "Cascade hop 2 of the breakdown chain."
+      - from: ACTIVE
+        to: DOWN
+        trigger: "POST /api/equipment-assignments/{id}/report-breakdown"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "EquipmentUnit ASSIGNED -> DOWN; total_breakdowns += 1"
+          - "Run calculation equipment_replacement_selection; if a unit is found, create a replacement EquipmentAssignment (same window, status RESERVED) and set replaced_by_assignment_id; the new unit AVAILABLE -> ASSIGNED"
+          - "GangOrder.assigned_equipment_ok recomputed"
+
+  - entity: MoveRecord
+    initial_state: RECORDED
+    terminal_states: [VOIDED]
+    transitions:
+      - from: RECORDED
+        to: VOIDED
+        trigger: "POST /api/move-records/{id}/void"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "VesselCall.actual_moves and actual_tons recomputed excluding VOIDED records"
+
+  - entity: DamageClaim
+    initial_state: REPORTED
+    terminal_states: [DENIED, SETTLED]
+    transitions:
+      - from: REPORTED
+        to: ACCEPTED
+        trigger: "POST /api/damage-claims/{id}/decide with decision == ACCEPTED"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "decided_by (X-User-ID) != reported_by_worker_id (ERR_SEGREGATION_OF_DUTIES)"
+          - "fault_pct present and within 0..100 (ERR_FAULT_PCT_OUT_OF_RANGE)"
+        side_effects: []
+      - from: REPORTED
+        to: DENIED
+        trigger: "POST /api/damage-claims/{id}/decide with decision == DENIED"
+        actor: ClaimsAdjuster
+        preconditions:
+          - "decided_by (X-User-ID) != reported_by_worker_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "final_stevedore_liability_cents = 0"
+      - from: ACCEPTED
+        to: SETTLED
+        trigger: "POST /api/damage-claims/{id}/settle"
+        actor: ClaimsAdjuster
+        preconditions: []
+        side_effects:
+          - "final_stevedore_liability_cents computed per calculation damage_liability (fault-weighted, capped, deductible)"
+
+  - entity: SafetyIncident
+    initial_state: REPORTED
+    terminal_states: [CLEARED]
+    transitions:
+      - from: REPORTED
+        to: CLEARED
+        trigger: "POST /api/safety-incidents/{id}/clear"
+        actor: StevedoreSuperintendent
+        preconditions: []
+        side_effects:
+          - "VesselCall.work_posture recomputed; SUSPENDED gang orders remain SUSPENDED until explicitly resumed via start-work"
+
+  - entity: TimesheetEntry
+    initial_state: DRAFT
+    terminal_states: [APPROVED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /api/timesheet-entries/{id}/submit"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "submitted_by_user_id = acting foreman X-User-ID"
+      - from: REJECTED
+        to: SUBMITTED
+        trigger: "POST /api/timesheet-entries/{id}/submit (resubmission)"
+        actor: GangForeman
+        preconditions: []
+        side_effects:
+          - "submitted_by_user_id refreshed to the resubmitting foreman's X-User-ID"
+        note: "Cycle SUBMITTED -> REJECTED -> SUBMITTED."
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /api/timesheet-entries/{id}/approve"
+        actor: PayrollClerk
+        preconditions:
+          - "approver X-User-ID != submitted_by_user_id (ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "Compute straight_minutes, ot_minutes, dt_minutes, meal_penalty_minutes, gross_pay_cents per calculation payroll_gross_pay"
+          - "bonus_cents = GangOrder.bonus_per_worker_cents (0 when the gang order is not yet completed or not bonus-eligible)"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /api/timesheet-entries/{id}/reject"
+        actor: PayrollClerk
+        preconditions: []
+        side_effects: []
+
+  - entity: Invoice
+    initial_state: DRAFT
+    terminal_states: [PAID]
+    transitions:
+      - from: DRAFT
+        to: FINALIZED
+        trigger: "POST /api/invoices/{id}/finalize"
+        actor: BillingClerk
+        preconditions:
+          - "VesselCall.status == COMPLETED (ERR_INVOICE_NOT_FINALIZABLE otherwise)"
+        side_effects:
+          - "Recompute all lines from actuals (rate_variant PROVISIONAL -> FINAL) per calculation invoice_calculation"
+      - from: FINALIZED
+        to: ISSUED
+        trigger: "POST /api/invoices/{id}/issue"
+        actor: BillingClerk
+        preconditions:
+          - "total_cents <= VesselCall.credit_limit_cents (ERR_INVOICE_CREDIT_LIMIT otherwise)"
+        side_effects: []
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /api/invoices/{id}/record-payment when amount_paid_cents reaches total_cents"
+        actor: BillingClerk
+        preconditions:
+          - "payment amount_cents <= remaining_balance_cents (ERR_PAYMENT_EXCEEDS_BALANCE)"
+        side_effects:
+          - "amount_paid_cents += amount; remaining_balance_cents recomputed; status -> PAID exactly when remaining_balance_cents == 0"
+      - from: ISSUED
+        to: DISPUTED
+        trigger: "POST /api/invoices/{id}/dispute"
+        actor: BillingClerk
+        preconditions:
+          - "dispute_reason present (ERR_VALIDATION otherwise)"
+        side_effects: []
+      - from: DISPUTED
+        to: FINALIZED
+        trigger: "PATCH /api/invoices/{id} (adjustment applied to a disputed invoice)"
+        actor: BillingClerk
+        preconditions:
+          - "expected_invoice_version == current version (ERR_STALE_INVOICE_VERSION)"
+        side_effects:
+          - "adjustment_total_cents += adjustment_cents; totals recomputed; status -> FINALIZED (re-issuable)"
+        note: "Cycle ISSUED -> DISPUTED -> FINALIZED -> ISSUED."
+      - from: DRAFT
+        to: DRAFT
+        trigger: "PATCH /api/invoices/{id} (adjustment on a provisional draft)"
+        actor: BillingClerk
+        preconditions:
+          - "expected_invoice_version == current version (ERR_STALE_INVOICE_VERSION)"
+        side_effects:
+          - "adjustment_total_cents += adjustment_cents; totals recomputed"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on parent version; true create-with-supersede races only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: dispatch-batch-stale-gang-order
+    parent_entity: GangOrder
+    write_endpoint: "POST /api/gang-orders/{id}/dispatch-batch"
+    occ_field: expected_gang_order_version
+    description: |
+      A dispatch batch submitted against a GangOrder whose version has advanced
+      since the dispatcher last observed it (e.g., an amendment changed
+      required_headcount, or an earlier batch already filled slots) is rejected.
+      A sequential second batch carrying the stale version would otherwise
+      legitimately succeed and over-offer the gang, so rejection is expressed
+      as a stale-version precondition, not a state error.
+    error_id: ERR_STALE_GANG_ORDER_VERSION
+    http_status: 412
+
+  - rule_id: gang-order-amend-stale
+    parent_entity: GangOrder
+    write_endpoint: "PATCH /api/gang-orders/{id}"
+    occ_field: expected_gang_order_version
+    description: |
+      Amending a GangOrder (required_headcount / required_equipment_count)
+      supersedes the prior order terms. An amendment carrying a version the
+      server has already advanced past (e.g., a dispatch batch bumped the
+      version after the client read it) is rejected as stale.
+    error_id: ERR_STALE_GANG_ORDER_VERSION
+    http_status: 412
+
+  - rule_id: worker-status-stale
+    parent_entity: Worker
+    write_endpoint: "PATCH /api/workers/{id}"
+    occ_field: expected_worker_version
+    description: |
+      A status change (ACTIVE/SUSPENDED/INACTIVE) supersedes the prior status
+      and cascades to open dispatch assignments. A request whose observed
+      version predates an intervening status change is rejected as stale so
+      that a reinstate never silently overwrites a newer suspension.
+    error_id: ERR_STALE_WORKER_VERSION
+    http_status: 412
+
+  - rule_id: invoice-adjust-stale
+    parent_entity: Invoice
+    write_endpoint: "PATCH /api/invoices/{id}"
+    occ_field: expected_invoice_version
+    description: |
+      Applying an adjustment supersedes the invoice's current totals. An
+      adjustment carrying a version advanced by a prior adjustment, finalize,
+      or payment is rejected as stale so two sequential adjustments cannot
+      both apply against the same baseline.
+    error_id: ERR_STALE_INVOICE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: seniority_rank
+    trigger: "worker creation; worker status change; any dispatch selection run"
+    algorithm: chronological
+    formula: |
+      For each classification c:
+        candidates = all Workers with classification == c (any status)
+        order by registered_on ASC, tie-break created_at ASC
+        seniority_rank = 1-based position
+      Rank is retained while SUSPENDED (suspension removes eligibility, not rank).
+    input_set: "all Workers sharing a classification, regardless of status"
+    precision: "integer rank, deterministic total order"
+
+  - name: dispatch_selection
+    trigger: "POST /api/gang-orders/{id}/dispatch-batch; auto-offer after no-show / bump / suspension cascade (single-slot mode)"
+    algorithm: aggregation
+    formula: |
+      eligibility(w):
+        w.status == ACTIVE
+        AND w.classification == gang.required_classification
+        AND NOT EXISTS DispatchAssignment a on THIS gang order with a.worker_id == w.id
+            AND a.status IN {OFFERED, CHECKED_IN, WORKING, NO_SHOW, BUMPED}   # retry exclusion
+        AND NOT EXISTS DispatchAssignment a on ANOTHER gang order g2 with a.worker_id == w.id
+            AND a.status IN {OFFERED, CHECKED_IN, WORKING}
+            AND half_open_overlap(shift(g2).window, shift(this).window)
+            where half_open_overlap([s1,e1),[s2,e2)) == (s1 < e2 AND s2 < e1)  # adjacency (e1 == s2) is allowed
+      If payload.worker_ids is present: restrict candidates to those ids; any listed id failing
+        eligibility raises ERR_WORKER_INELIGIBLE (or ERR_WORKER_DOUBLE_BOOKED when the only failing
+        clause is the overlap clause) instead of being silently skipped.
+      ranking: seniority_rank ASC, tie-break created_at ASC
+      selection: top min(open_slots, |eligible|), open_slots = required_headcount - filled_headcount - offered_count
+      empty-pool fallback: create nothing; gang -> SHORT_MANNED when filled+offered < required
+    input_set: "all Workers; eligibility filter above; DispatchAssignments in non-terminal states plus terminal NO_SHOW/BUMPED for this-order exclusion"
+    precision: "deterministic; no randomness; created_at is the only tie-break"
+
+  - name: filled_headcount
+    trigger: "any DispatchAssignment status change on the gang order"
+    algorithm: aggregation
+    formula: |
+      filled_headcount = count(assignments on this gang order with status IN {CHECKED_IN, WORKING})
+      offered_count   = count(assignments on this gang order with status IN {OFFERED})
+      manning derivation after any recompute:
+        if filled_headcount >= required_headcount -> MANNED
+        else if filled_headcount + offered_count >= required_headcount -> DISPATCHING
+        else if eligible pool known-empty (set by last dispatch_selection run) -> SHORT_MANNED
+        else -> DISPATCHING
+      (MANNED/SHORT_MANNED/DISPATCHING only while the order is pre-WORKING; WORKING+ states are unaffected.)
+    input_set: "DispatchAssignments of this GangOrder in the listed statuses"
+
+  - name: moves_per_hour
+    trigger: "POST /api/gang-orders/{id}/complete"
+    algorithm: aggregation
+    formula: |
+      records = MoveRecords of this gang order with status == RECORDED
+      total_moves = sum(records.moves_count)
+      productive_minutes = sum( (period_end_utc - period_start_utc in minutes) - stoppage_minutes )
+      if productive_minutes <= 0: actual_mph = 0
+      else: actual_mph = round_half_up(total_moves * 60 / productive_minutes, 2)
+    input_set: "MoveRecords with status RECORDED only; VOIDED excluded"
+    precision: "2 decimal places, round_half_up"
+
+  - name: productivity_bonus
+    trigger: "POST /api/gang-orders/{id}/complete, immediately after moves_per_hour"
+    algorithm: threshold
+    formula: |
+      vessel = the VesselCall reached via gang.shift_window_id -> ShiftWindow.vessel_call_id
+      bonus_eligible = (actual_mph >= vessel.contracted_mph_target)   # exact equality qualifies
+      productive_hours = productive_minutes / 60  (from moves_per_hour, unrounded)
+      target_moves = ceil(vessel.contracted_mph_target * productive_hours)
+      excess_moves = max(0, total_moves - target_moves)
+      bonus_pool_cents = excess_moves * BONUS_PER_EXCESS_MOVE_CENTS
+      workers_at_completion = count(DispatchAssignments of this gang with status COMPLETED after completion cascade)
+      bonus_per_worker_cents = 0 if bonus_pool_cents == 0
+                               else round_half_up(bonus_pool_cents / max(1, workers_at_completion))
+      Frozen on the gang order at completion; each APPROVED TimesheetEntry later attaches bonus_per_worker_cents.
+    constants:
+      BONUS_PER_EXCESS_MOVE_CENTS: 1500
+    precision: "integer cents, round_half_up on the per-worker split only"
+    variants:
+      - name: at_threshold
+        when: "actual_mph == contracted_mph_target exactly"
+        difference: "bonus_eligible is true (>= semantics) but excess_moves is 0, so the pool is 0"
+
+  - name: payroll_gross_pay
+    trigger: "POST /api/timesheet-entries/{id}/approve"
+    algorithm: tiered_pricing
+    formula: |
+      shift = GangOrder.shift_window_id -> ShiftWindow
+      mult = PERIOD_MULTIPLIER[shift.period]
+      eff_base = rate_cents_snapshot * mult                       # unrounded
+      straight_minutes = min(work_minutes, OT_START_MINUTES)
+      ot_minutes = min(max(work_minutes - OT_START_MINUTES, 0), DT_START_MINUTES - OT_START_MINUTES)
+      dt_minutes = max(work_minutes - DT_START_MINUTES, 0)
+      meal_penalty_minutes = 60 if (work_minutes > MEAL_THRESHOLD_MINUTES and not meal_break_taken) else 0
+      paid_minutes = straight_minutes*1.0 + ot_minutes*1.5 + dt_minutes*2.0 + meal_penalty_minutes*1.0
+      gross_pay_cents = round_half_up(paid_minutes * eff_base / 60)
+      OT boundary: exactly 480 minutes yields ot_minutes == 0 (overtime accrues only ABOVE 480).
+      Meal boundary: exactly 300 minutes without a break yields NO penalty (penalty requires > 300).
+    constants:
+      OT_START_MINUTES: 480
+      DT_START_MINUTES: 720
+      MEAL_THRESHOLD_MINUTES: 300
+      MEAL_PENALTY_MINUTES: 60
+      PERIOD_MULTIPLIER: { DAY: 1.00, NIGHT: 1.10, GRAVEYARD: 1.20 }
+    precision: "integer cents; per-minute rate kept unrounded; single round_half_up at the end"
+
+  - name: work_posture_derivation
+    trigger: "SafetyIncident creation; SafetyIncident clear"
+    algorithm: aggregation
+    formula: |
+      open = SafetyIncidents of this vessel with status == REPORTED
+      FULL_STOPPAGE if any open incident has:
+          severity == CRITICAL (any scope)
+          OR (severity == MAJOR AND scope IN {VESSEL, TERMINAL})
+      else PARTIAL_STOPPAGE if any open incident has:
+          severity == MAJOR AND scope == GANG
+      else NORMAL
+      Entering FULL_STOPPAGE cascades: every GangOrder of this vessel's shifts in WORKING -> SUSPENDED.
+      Leaving FULL_STOPPAGE does NOT auto-resume; SUSPENDED orders need explicit start-work.
+    input_set: "SafetyIncidents with vessel_call_id == this vessel, status == REPORTED"
+
+  - name: damage_liability
+    trigger: "DamageClaim creation (provisional); POST /api/damage-claims/{id}/settle (final)"
+    algorithm: threshold
+    formula: |
+      provisional_stevedore_share_cents = round_half_up(estimated_amount_cents * 0.50)
+      final (ACCEPTED -> SETTLED):
+        raw = round_half_up(estimated_amount_cents * fault_pct / 100)
+        capped = min(raw, STEVEDORE_CAP_CENTS)
+        final_stevedore_liability_cents = max(0, capped - DEDUCTIBLE_CENTS)
+      final (DENIED): 0
+      Evaluation order pinned: percentage -> cap -> deductible.
+    constants:
+      PROVISIONAL_SHARE_PCT: 50
+      STEVEDORE_CAP_CENTS: 25000000
+      DEDUCTIBLE_CENTS: 50000
+    precision: "integer cents, round_half_up"
+    variants:
+      - name: provisional
+        when: "from creation until settle"
+        difference: "flat 50% of estimated amount, no cap, no deductible"
+      - name: final
+        when: "at settle"
+        difference: "fault_pct-weighted, capped at STEVEDORE_CAP_CENTS, DEDUCTIBLE_CENTS subtracted with floor 0"
+
+  - name: equipment_replacement_selection
+    trigger: "POST /api/equipment-assignments/{id}/report-breakdown"
+    algorithm: aggregation
+    formula: |
+      eligibility(u):
+        u.equipment_type == failed_unit.equipment_type
+        AND u.status == AVAILABLE
+        AND window [failed.window_start_utc, failed.window_end_utc) satisfies the 30-minute buffer rule
+            against every EquipmentAssignment of u with status IN {RESERVED, ACTIVE}
+      ranking: count of u's assignments with status IN {RESERVED, ACTIVE} ASC (least utilized first),
+               tie-break u.created_at ASC
+      selection: top 1; create replacement EquipmentAssignment with the failed assignment's window,
+                 status RESERVED; set failed.replaced_by_assignment_id
+      empty-pool fallback: no replacement created; gang remains under-covered
+        (assigned_equipment_ok recomputes to false when coverage < required_equipment_count)
+    input_set: "all EquipmentUnits"
+    precision: "deterministic; created_at tie-break only"
+
+  - name: equipment_window_conflict
+    trigger: "POST /api/equipment-assignments (creation)"
+    algorithm: interval_merge
+    formula: |
+      BUFFER_MINUTES = 30 turnaround between bookings of the same unit
+      For unit u, existing assignment a (status IN {RESERVED, ACTIVE}) with window [s, e):
+        buffered interval is [s - 30min, e + 30min)
+      new window [ns, ne) conflicts iff ns < e + 30min AND ne > s - 30min
+      A gap of exactly 30 minutes (ns == e + 30min) is ALLOWED (strict inequality).
+    constants:
+      BUFFER_MINUTES: 30
+    input_set: "EquipmentAssignments of the same unit with status IN {RESERVED, ACTIVE}"
+
+  - name: invoice_calculation
+    trigger: "POST /api/invoices (provisional); POST /api/invoices/{id}/finalize (final); PATCH /api/invoices/{id} (recompute totals after adjustment)"
+    algorithm: tiered_pricing
+    formula: |
+      ROUNDING ORDER (pinned): each line is computed unrounded, rounded half-up to integer cents,
+      THEN summed. Summing unrounded lines and rounding once is FORBIDDEN.
+
+      container_line(moves):  marginal tiers
+        t1 = min(moves, 500) * 4500
+        t2 = min(max(moves-500, 0), 500) * 4200
+        t3 = max(moves-1000, 0) * 3900
+        line = t1 + t2 + t3
+      tonnage_line(tons) = round_half_up(tons * 620)
+      manhour_line(minutes) = round_half_up(total_approved_work_minutes * 6500 / 60)
+        # total over ALL APPROVED TimesheetEntries of the vessel's gang orders, summed FIRST, rounded ONCE
+      equipment_line: per equipment type, billable_minutes =
+          sum(window minutes of assignments status IN {ACTIVE, RELEASED})
+          + 0.5 * sum(window minutes of assignments status DOWN)
+        type_line = round_half_up(billable_minutes * EQUIP_RATE_CENTS[type] / 60)
+        equipment_line = sum(type_line over types)
+      stoppage_credit_line = -9000 * sum(suspension_count over the vessel's gang orders)
+      subtotal = container + tonnage + manhour + equipment + stoppage_credit   (of ROUNDED lines)
+      discount tier (keyed on PRE-discount subtotal — circular-looking order pinned):
+        if subtotal >= DISCOUNT_TIER2_SUBTOTAL_CENTS: rate = 0.08
+        elif subtotal >= DISCOUNT_TIER1_SUBTOTAL_CENTS: rate = 0.05
+        else: rate = 0
+        discount = round_half_up(subtotal * rate) when subtotal > 0 else 0
+      total = subtotal - discount + adjustment_total_cents
+
+      provisional (DRAFT) inputs: container_line(planned_moves), tonnage_line(planned_tons),
+        manhour = round_half_up( sum over CURRENT gang orders of required_headcount * 480 * 6500 / 60 ),
+        equipment = 0, stoppage_credit = 0
+      final (FINALIZED+) inputs: actual_moves, actual_tons, APPROVED timesheets, equipment assignments,
+        suspension_count sums as above.
+    constants:
+      TIER1_MOVES: 500
+      TIER1_RATE_CENTS: 4500
+      TIER2_MOVES: 1000
+      TIER2_RATE_CENTS: 4200
+      TIER3_RATE_CENTS: 3900
+      TON_RATE_CENTS: 620
+      MANHOUR_RATE_CENTS: 6500
+      EQUIP_RATE_CENTS: { SHIP_CRANE: 25000, RTG: 12000, FORKLIFT: 6000, TRACTOR: 5500 }
+      DOWN_BILLING_FACTOR: 0.5
+      STOPPAGE_CREDIT_PER_SUSPENSION_CENTS: 9000
+      DISCOUNT_TIER1_SUBTOTAL_CENTS: 3000000
+      DISCOUNT_TIER2_SUBTOTAL_CENTS: 6000000
+      DISCOUNT_TIER1_RATE: 0.05
+      DISCOUNT_TIER2_RATE: 0.08
+    precision: "integer cents; per-line round_half_up then sum"
+    variants:
+      - name: provisional
+        when: "invoice in DRAFT"
+        difference: "computed from planned_moves / planned_tons / required_headcount estimates; equipment and stoppage lines are 0"
+      - name: final
+        when: "invoice FINALIZED or later"
+        difference: "computed from actual move records, APPROVED timesheets, real equipment windows, and suspension counts"
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority; first failure wins)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and role is a declared role"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "Acting role is listed in the endpoint's roles (RBAC)"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: existence
+    check: "Every path id and request-body FK references an existing resource, validated left-to-right"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: all
+  - priority: 4
+    category: schema
+    check: "Required fields present; enums in range; numeric ranges valid. Includes ERR_CARGO_PLAN_REQUIRED (vessel create with planned_moves == 0 AND planned_tons == 0), ERR_SHIFT_WINDOW_INVALID (end <= start or duration > 960 minutes), ERR_FAULT_PCT_OUT_OF_RANGE (fault_pct outside 0..100 on claim accept)"
+    error_id: ERR_VALIDATION
+    http_status: 400
+    applies_to: all
+  - priority: 5
+    category: concurrency
+    check: "expected_<parent>_version request field equals the parent entity's current version (OCC rules §1.2.1)"
+    error_id: ERR_STALE_GANG_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /api/gang-orders/{id}/dispatch-batch; PATCH /api/gang-orders/{id}; PATCH /api/workers/{id} (ERR_STALE_WORKER_VERSION); PATCH /api/invoices/{id} (ERR_STALE_INVOICE_VERSION)"
+  - priority: 6
+    category: state
+    check: "Target entity is in a state that permits the operation per §1.2. Includes ERR_SHIFT_NOT_OPEN_FOR_ORDERS (gang-order create against a shift not OPEN_FOR_ORDERS) and ERR_INVOICE_NOT_FINALIZABLE (finalize against a vessel not COMPLETED)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: all state-transition endpoints
+  - priority: 7
+    category: business_safety
+    check: "Work-stoppage posture gates: FULL_STOPPAGE blocks dispatch-batch, check-in, start-work; PARTIAL_STOPPAGE blocks start-work"
+    error_id: ERR_WORK_STOPPAGE_ACTIVE
+    http_status: 409
+    applies_to: "POST /api/gang-orders/{id}/dispatch-batch; POST /api/dispatch-assignments/{id}/check-in; POST /api/gang-orders/{id}/start-work"
+  - priority: 8
+    category: business_referential
+    check: "Cross-entity referential conditions: timesheet worker must hold an assignment on the gang order (ERR_WORKER_NOT_ON_GANG); start-work requires assigned_equipment_ok (ERR_NO_EQUIPMENT_ASSIGNED)"
+    error_id: ERR_WORKER_NOT_ON_GANG
+    http_status: 422
+    applies_to: "POST /api/timesheet-entries; POST /api/gang-orders/{id}/start-work"
+  - priority: 9
+    category: business_temporal
+    check: "Interval rules: worker double-booking across overlapping shift windows (ERR_WORKER_DOUBLE_BOOKED, half-open semantics, adjacency allowed); equipment 30-minute buffered window conflict (ERR_EQUIPMENT_WINDOW_CONFLICT, exactly-30-minute gap allowed); move-record period overlap on the same gang order (ERR_MOVE_PERIOD_OVERLAP, half-open); timesheet work_minutes exceeding shift duration + 120 (ERR_TIMESHEET_EXCEEDS_SHIFT)"
+    error_id: ERR_WORKER_DOUBLE_BOOKED
+    http_status: 409
+    applies_to: "POST /api/gang-orders/{id}/dispatch-batch; POST /api/dispatch-assignments/{id}/check-in; POST /api/equipment-assignments; POST /api/move-records; POST /api/timesheet-entries"
+  - priority: 10
+    category: business_constraint
+    check: "Capacity/uniqueness/segregation constraints: check-in when filled_headcount == required_headcount (ERR_GANG_FULL); equipment unit is DOWN at assignment create (ERR_EQUIPMENT_UNAVAILABLE — a unit that is merely ASSIGNED may take additional disjoint bookings that satisfy the buffered-window rule); duplicate worker registration_number (ERR_DUPLICATE_REGISTRATION); claim decider == reporter or timesheet approver == submitter (ERR_SEGREGATION_OF_DUTIES); forced dispatch of an ineligible worker or check-in of a non-ACTIVE worker (ERR_WORKER_INELIGIBLE)"
+    error_id: ERR_GANG_FULL
+    http_status: 409
+    applies_to: "check-in, dispatch-batch, equipment-assignments create, workers create, damage-claims decide, timesheet-entries approve"
+  - priority: 11
+    category: business_fiscal
+    check: "Fiscal limits: issue with total_cents > vessel credit_limit_cents (ERR_INVOICE_CREDIT_LIMIT); payment exceeding remaining_balance_cents (ERR_PAYMENT_EXCEEDS_BALANCE)"
+    error_id: ERR_INVOICE_CREDIT_LIMIT
+    http_status: 402
+    applies_to: "POST /api/invoices/{id}/issue; POST /api/invoices/{id}/record-payment"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- VesselCall ---
+  - method: POST
+    path: "/api/vessel-calls"
+    description: "Register a vessel call"
+    roles: [StevedoreAdmin]
+    code: 201
+    input: [vessel_name, voyage_number, shipping_line, eta_utc, planned_moves, planned_tons, contracted_mph_target, credit_limit_cents]
+    output: VesselCall
+    side_effects: ["status=SCHEDULED, work_posture=NORMAL, actual_moves=0, actual_tons=0"]
+  - method: GET
+    path: "/api/vessel-calls"
+    description: "List vessel calls"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: VesselCall[]
+    side_effects: []
+  - method: GET
+    path: "/api/vessel-calls/{id}"
+    description: "Get a vessel call"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: []
+    output: VesselCall
+    side_effects: []
+  - method: POST
+    path: "/api/vessel-calls/{id}/berth"
+    description: "Mark vessel berthed (SCHEDULED -> BERTHED)"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: VesselCall
+    side_effects: ["status -> BERTHED"]
+  - method: POST
+    path: "/api/vessel-calls/{id}/complete"
+    description: "Complete the vessel call (WORKING -> COMPLETED)"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: VesselCall
+    side_effects: ["status -> COMPLETED"]
+  - method: POST
+    path: "/api/vessel-calls/{id}/cancel"
+    description: "Cancel a vessel call (SCHEDULED/BERTHED -> CANCELLED)"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: VesselCall
+    side_effects: ["status -> CANCELLED"]
+
+  # --- ShiftWindow ---
+  - method: POST
+    path: "/api/shift-windows"
+    description: "Create a shift window on a vessel"
+    roles: [StevedoreSuperintendent]
+    code: 201
+    input: [vessel_call_id, shift_date, period, start_utc, end_utc]
+    output: ShiftWindow
+    side_effects: ["status=PLANNED"]
+  - method: GET
+    path: "/api/shift-windows"
+    description: "List shift windows (FK reverse-reachability for ShiftWindow.vessel_call_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: ["vessel_call_id?", "status?", "limit?", "offset?"]
+    output: ShiftWindow[]
+    side_effects: []
+  - method: GET
+    path: "/api/shift-windows/{id}"
+    description: "Get a shift window"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: []
+    output: ShiftWindow
+    side_effects: []
+  - method: POST
+    path: "/api/shift-windows/{id}/open-for-orders"
+    description: "Open a shift for gang orders (PLANNED -> OPEN_FOR_ORDERS)"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: ShiftWindow
+    side_effects: ["status -> OPEN_FOR_ORDERS"]
+  - method: POST
+    path: "/api/shift-windows/{id}/start"
+    description: "Start a shift (OPEN_FOR_ORDERS -> IN_PROGRESS); first start berths-to-working the vessel"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: ShiftWindow
+    side_effects: ["status -> IN_PROGRESS", "VesselCall BERTHED -> WORKING when first shift"]
+
+  # --- GangOrder ---
+  - method: POST
+    path: "/api/gang-orders"
+    description: "Place a gang order on a shift (created directly in PLACED)"
+    roles: [StevedoreSuperintendent]
+    code: 201
+    input: [shift_window_id, gang_type, required_classification, required_headcount, required_equipment_type, required_equipment_count]
+    output: GangOrder
+    side_effects: ["status=PLACED", "filled_headcount=0, offered_count=0, assigned_equipment_ok=false"]
+  - method: GET
+    path: "/api/gang-orders"
+    description: "List gang orders (FK reverse-reachability for GangOrder.shift_window_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: ["shift_window_id?", "status?", "limit?", "offset?"]
+    output: GangOrder[]
+    side_effects: []
+  - method: GET
+    path: "/api/gang-orders/{id}"
+    description: "Get a gang order"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: []
+    output: GangOrder
+    side_effects: []
+  - method: PATCH
+    path: "/api/gang-orders/{id}"
+    description: "Amend headcount / equipment requirement (PLACED/DISPATCHING/SHORT_MANNED/MANNED only); reducing below filled triggers the amendment bump waterfall; OCC-guarded"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: ["required_headcount?", "required_equipment_count?", expected_gang_order_version]
+    output: GangOrder
+    side_effects:
+      - "Increments GangOrder.version by 1"
+      - "If new required_headcount < filled_headcount: bump least-senior CHECKED_IN/WORKING assignments (seniority_rank_at_dispatch DESC, tie created_at DESC) until filled == required; amendment bumps do NOT auto-offer"
+      - "Outstanding OFFERED assignments are NOT cancelled by an amendment (they are bounced later at check-in via ERR_GANG_FULL when the gang is already full)"
+      - "Manning status recomputed (MANNED may regress to DISPATCHING)"
+  - method: POST
+    path: "/api/gang-orders/{id}/cancel"
+    description: "Cancel a gang order from any non-terminal state"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: GangOrder
+    side_effects: ["status -> CANCELLED", "non-terminal assignments -> CANCELLED", "RESERVED/ACTIVE equipment assignments -> RELEASED, units freed"]
+  - method: POST
+    path: "/api/gang-orders/{id}/start-work"
+    description: "Start work (MANNED/SHORT_MANNED -> WORKING) or resume (SUSPENDED -> WORKING)"
+    roles: [GangForeman]
+    code: 200
+    input: []
+    output: GangOrder
+    side_effects: ["status -> WORKING", "CHECKED_IN assignments -> WORKING", "RESERVED equipment assignments -> ACTIVE"]
+  - method: POST
+    path: "/api/gang-orders/{id}/complete"
+    description: "Complete a WORKING gang order; computes MPH and bonus; bubbles up to shift close"
+    roles: [GangForeman]
+    code: 200
+    input: []
+    output: GangOrder
+    side_effects:
+      - "status -> COMPLETED"
+      - "CHECKED_IN/WORKING assignments -> COMPLETED; OFFERED -> CANCELLED"
+      - "RESERVED/ACTIVE equipment assignments -> RELEASED; units freed"
+      - "actual_mph, bonus_eligible, bonus_pool_cents, bonus_per_worker_cents computed"
+      - "ShiftWindow -> CLOSED when all sibling gang orders terminal"
+  - method: POST
+    path: "/api/gang-orders/{id}/dispatch-batch"
+    description: "Run labor-hall dispatch selection for open slots; OCC-guarded; optional forced worker list"
+    roles: [LaborHallDispatcher]
+    code: 200
+    input: [expected_gang_order_version, "worker_ids?"]
+    output: GangOrder
+    side_effects:
+      - "Create OFFERED DispatchAssignments per calculation dispatch_selection"
+      - "Manning status transitions PLACED->DISPATCHING / ->SHORT_MANNED / ->MANNED per filled_headcount derivation"
+      - "Increments GangOrder.version by 1"
+  - method: GET
+    path: "/api/gang-orders/{id}/productivity"
+    description: "Computed read: live MPH and bonus projection for this gang order"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, PayrollClerk]
+    code: 200
+    input: []
+    output: "{ gang_order_id: string, total_moves: integer, productive_minutes: integer, actual_mph: number, mph_target: number, bonus_eligible_now: boolean }"
+    side_effects: []
+
+  # --- Worker ---
+  - method: POST
+    path: "/api/workers"
+    description: "Register a longshore worker"
+    roles: [StevedoreAdmin]
+    code: 201
+    input: [full_name, registration_number, classification, registered_on, base_hourly_rate_cents]
+    output: Worker
+    side_effects: ["status=ACTIVE", "seniority_rank computed within classification"]
+  - method: GET
+    path: "/api/workers"
+    description: "List workers"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: ["classification?", "status?", "limit?", "offset?"]
+    output: Worker[]
+    side_effects: []
+  - method: GET
+    path: "/api/workers/{id}"
+    description: "Get a worker"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, ClaimsAdjuster, PayrollClerk, BillingClerk]
+    code: 200
+    input: []
+    output: Worker
+    side_effects: []
+  - method: PATCH
+    path: "/api/workers/{id}"
+    description: "Change worker status (ACTIVE/SUSPENDED/INACTIVE); OCC-guarded; suspension cascades to OFFERED assignments"
+    roles: [StevedoreAdmin]
+    code: 200
+    input: [status, expected_worker_version]
+    output: Worker
+    side_effects:
+      - "Increments Worker.version by 1"
+      - "Precondition: suspending a worker with assignments IN {CHECKED_IN, WORKING} -> ERR_INVALID_STATE"
+      - "To SUSPENDED: OFFERED assignments -> BUMPED with auto-offer to next eligible; gang manning recomputed"
+      - "seniority_rank recomputed across the classification"
+
+  # --- DispatchAssignment ---
+  - method: GET
+    path: "/api/dispatch-assignments"
+    description: "List dispatch assignments (FK reverse-reachability for gang_order_id and worker_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, PayrollClerk]
+    code: 200
+    input: ["gang_order_id?", "worker_id?", "status?", "limit?", "offset?"]
+    output: DispatchAssignment[]
+    side_effects: []
+  - method: GET
+    path: "/api/dispatch-assignments/{id}"
+    description: "Get a dispatch assignment"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, PayrollClerk]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: []
+  - method: POST
+    path: "/api/dispatch-assignments/{id}/check-in"
+    description: "Check in an offered worker (OFFERED -> CHECKED_IN)"
+    roles: [LaborHallDispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["status -> CHECKED_IN", "gang filled_headcount recomputed; may flip gang to MANNED"]
+  - method: POST
+    path: "/api/dispatch-assignments/{id}/complete"
+    description: "Complete a WORKING assignment (WORKING -> COMPLETED)"
+    roles: [LaborHallDispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["status -> COMPLETED", "gang filled_headcount recomputed"]
+  - method: POST
+    path: "/api/dispatch-assignments/{id}/no-show"
+    description: "Mark an OFFERED assignment no-show; auto-offer to next eligible (no-show worker excluded)"
+    roles: [LaborHallDispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["status -> NO_SHOW", "auto-offer creates one OFFERED assignment if a candidate exists", "gang manning recomputed"]
+  - method: POST
+    path: "/api/dispatch-assignments/{id}/bump"
+    description: "Bump an OFFERED or CHECKED_IN assignment; auto-offer to next eligible (bumped worker excluded)"
+    roles: [LaborHallDispatcher]
+    code: 200
+    input: []
+    output: DispatchAssignment
+    side_effects: ["status -> BUMPED", "auto-offer creates one OFFERED assignment if a candidate exists", "gang manning recomputed"]
+
+  # --- EquipmentUnit ---
+  - method: POST
+    path: "/api/equipment-units"
+    description: "Register an equipment unit"
+    roles: [StevedoreAdmin]
+    code: 201
+    input: [unit_code, equipment_type]
+    output: EquipmentUnit
+    side_effects: ["status=AVAILABLE"]
+  - method: GET
+    path: "/api/equipment-units"
+    description: "List equipment units"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman]
+    code: 200
+    input: ["equipment_type?", "status?", "limit?", "offset?"]
+    output: EquipmentUnit[]
+    side_effects: []
+  - method: GET
+    path: "/api/equipment-units/{id}"
+    description: "Get an equipment unit"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman]
+    code: 200
+    input: []
+    output: EquipmentUnit
+    side_effects: []
+  - method: POST
+    path: "/api/equipment-units/{id}/repair-complete"
+    description: "Return a DOWN unit to service (DOWN -> AVAILABLE)"
+    roles: [StevedoreAdmin]
+    code: 200
+    input: []
+    output: EquipmentUnit
+    side_effects: ["status -> AVAILABLE"]
+
+  # --- EquipmentAssignment ---
+  - method: POST
+    path: "/api/equipment-assignments"
+    description: "Book an equipment unit for a gang order over a window (buffered-overlap validated)"
+    roles: [StevedoreSuperintendent]
+    code: 201
+    input: [gang_order_id, equipment_unit_id, window_start_utc, window_end_utc]
+    output: EquipmentAssignment
+    side_effects: ["status=RESERVED", "unit AVAILABLE -> ASSIGNED (stays ASSIGNED if already booked)", "gang assigned_equipment_ok recomputed"]
+  - method: GET
+    path: "/api/equipment-assignments"
+    description: "List equipment assignments (FK reverse-reachability for gang_order_id and equipment_unit_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman]
+    code: 200
+    input: ["gang_order_id?", "equipment_unit_id?", "status?", "limit?", "offset?"]
+    output: EquipmentAssignment[]
+    side_effects: []
+  - method: GET
+    path: "/api/equipment-assignments/{id}"
+    description: "Get an equipment assignment"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman]
+    code: 200
+    input: []
+    output: EquipmentAssignment
+    side_effects: []
+  - method: POST
+    path: "/api/equipment-assignments/{id}/report-breakdown"
+    description: "Report the assigned unit broken down (RESERVED/ACTIVE -> DOWN); triggers replacement selection cascade"
+    roles: [GangForeman]
+    code: 200
+    input: []
+    output: EquipmentAssignment
+    side_effects: ["status -> DOWN", "unit -> DOWN, total_breakdowns += 1", "replacement EquipmentAssignment auto-created when a unit qualifies", "gang assigned_equipment_ok recomputed"]
+  - method: POST
+    path: "/api/equipment-assignments/{id}/release"
+    description: "Release a RESERVED/ACTIVE equipment assignment early"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: EquipmentAssignment
+    side_effects: ["status -> RELEASED", "unit freed when no other non-terminal assignment holds it", "gang assigned_equipment_ok recomputed"]
+
+  # --- MoveRecord ---
+  - method: POST
+    path: "/api/move-records"
+    description: "Log a productivity period for a gang order (gang must be WORKING or SUSPENDED)"
+    roles: [GangForeman]
+    code: 201
+    input: [gang_order_id, period_start_utc, period_end_utc, moves_count, tons_lifted, "stoppage_minutes?"]
+    output: MoveRecord
+    side_effects: ["status=RECORDED", "recorded_by_worker_id = acting X-User-ID", "vessel actual_moves/actual_tons recomputed"]
+  - method: GET
+    path: "/api/move-records"
+    description: "List move records (FK reverse-reachability for gang_order_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, PayrollClerk, BillingClerk]
+    code: 200
+    input: ["gang_order_id?", "status?", "limit?", "offset?"]
+    output: MoveRecord[]
+    side_effects: []
+  - method: GET
+    path: "/api/move-records/{id}"
+    description: "Get a move record"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, LaborHallDispatcher, GangForeman, PayrollClerk, BillingClerk]
+    code: 200
+    input: []
+    output: MoveRecord
+    side_effects: []
+  - method: POST
+    path: "/api/move-records/{id}/void"
+    description: "Void a recorded period (RECORDED -> VOIDED); vessel actuals recompute"
+    roles: [GangForeman]
+    code: 200
+    input: []
+    output: MoveRecord
+    side_effects: ["status -> VOIDED", "vessel actual_moves/actual_tons recomputed excluding this record"]
+
+  # --- DamageClaim ---
+  - method: POST
+    path: "/api/damage-claims"
+    description: "Report cargo damage on a gang order; provisional 50/50 share computed"
+    roles: [GangForeman]
+    code: 201
+    input: [gang_order_id, cargo_ref, damage_description, estimated_amount_cents]
+    output: DamageClaim
+    side_effects: ["status=REPORTED", "reported_by_worker_id = acting X-User-ID", "provisional_stevedore_share_cents computed"]
+  - method: GET
+    path: "/api/damage-claims"
+    description: "List damage claims (FK reverse-reachability for gang_order_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman, ClaimsAdjuster]
+    code: 200
+    input: ["gang_order_id?", "status?", "limit?", "offset?"]
+    output: DamageClaim[]
+    side_effects: []
+  - method: GET
+    path: "/api/damage-claims/{id}"
+    description: "Get a damage claim"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman, ClaimsAdjuster]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: []
+  - method: POST
+    path: "/api/damage-claims/{id}/decide"
+    description: "Accept (with fault_pct) or deny a REPORTED claim; segregation of duties enforced"
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: [decision, "fault_pct?"]
+    output: DamageClaim
+    side_effects: ["status -> ACCEPTED or DENIED", "decided_by_user_id recorded"]
+  - method: POST
+    path: "/api/damage-claims/{id}/settle"
+    description: "Settle an ACCEPTED claim; computes final fault-weighted liability"
+    roles: [ClaimsAdjuster]
+    code: 200
+    input: []
+    output: DamageClaim
+    side_effects: ["status -> SETTLED", "final_stevedore_liability_cents computed"]
+
+  # --- SafetyIncident ---
+  - method: POST
+    path: "/api/safety-incidents"
+    description: "Report a safety incident; may flip vessel work_posture and cascade to SUSPENDED"
+    roles: [StevedoreSuperintendent, GangForeman]
+    code: 201
+    input: [vessel_call_id, scope, severity, description, "gang_order_id?"]
+    output: SafetyIncident
+    side_effects: ["status=REPORTED", "work_posture recomputed", "FULL_STOPPAGE cascades WORKING gang orders -> SUSPENDED (suspension_count += 1, equipment released)"]
+  - method: GET
+    path: "/api/safety-incidents"
+    description: "List safety incidents (FK reverse-reachability for vessel_call_id and gang_order_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman]
+    code: 200
+    input: ["vessel_call_id?", "gang_order_id?", "status?", "limit?", "offset?"]
+    output: SafetyIncident[]
+    side_effects: []
+  - method: GET
+    path: "/api/safety-incidents/{id}"
+    description: "Get a safety incident"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman]
+    code: 200
+    input: []
+    output: SafetyIncident
+    side_effects: []
+  - method: POST
+    path: "/api/safety-incidents/{id}/clear"
+    description: "Clear an incident (REPORTED -> CLEARED); posture recomputes; suspended gangs stay suspended"
+    roles: [StevedoreSuperintendent]
+    code: 200
+    input: []
+    output: SafetyIncident
+    side_effects: ["status -> CLEARED", "work_posture recomputed"]
+
+  # --- TimesheetEntry ---
+  - method: POST
+    path: "/api/timesheet-entries"
+    description: "Foreman enters a worker's hours for a gang order"
+    roles: [GangForeman]
+    code: 201
+    input: [gang_order_id, worker_id, work_minutes, "meal_break_taken?"]
+    output: TimesheetEntry
+    side_effects: ["status=DRAFT", "rate_cents_snapshot copied from worker"]
+  - method: GET
+    path: "/api/timesheet-entries"
+    description: "List timesheets (FK reverse-reachability for gang_order_id and worker_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman, PayrollClerk]
+    code: 200
+    input: ["gang_order_id?", "worker_id?", "status?", "limit?", "offset?"]
+    output: TimesheetEntry[]
+    side_effects: []
+  - method: GET
+    path: "/api/timesheet-entries/{id}"
+    description: "Get a timesheet"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, GangForeman, PayrollClerk]
+    code: 200
+    input: []
+    output: TimesheetEntry
+    side_effects: []
+  - method: POST
+    path: "/api/timesheet-entries/{id}/submit"
+    description: "Submit a DRAFT or REJECTED timesheet"
+    roles: [GangForeman]
+    code: 200
+    input: []
+    output: TimesheetEntry
+    side_effects: ["status -> SUBMITTED", "submitted_by_user_id recorded"]
+  - method: POST
+    path: "/api/timesheet-entries/{id}/approve"
+    description: "Approve a SUBMITTED timesheet; computes pay breakdown; segregation of duties enforced"
+    roles: [PayrollClerk]
+    code: 200
+    input: []
+    output: TimesheetEntry
+    side_effects: ["status -> APPROVED", "straight/ot/dt/meal_penalty minutes and gross_pay_cents computed", "bonus_cents attached from gang order"]
+  - method: POST
+    path: "/api/timesheet-entries/{id}/reject"
+    description: "Reject a SUBMITTED timesheet"
+    roles: [PayrollClerk]
+    code: 200
+    input: []
+    output: TimesheetEntry
+    side_effects: ["status -> REJECTED"]
+
+  # --- Invoice ---
+  - method: POST
+    path: "/api/invoices"
+    description: "Create a provisional DRAFT invoice for a vessel call (allowed once vessel is BERTHED or later)"
+    roles: [BillingClerk]
+    code: 201
+    input: [vessel_call_id]
+    output: Invoice
+    side_effects: ["status=DRAFT, rate_variant=PROVISIONAL", "provisional lines computed per invoice_calculation"]
+  - method: GET
+    path: "/api/invoices"
+    description: "List invoices (FK reverse-reachability for vessel_call_id)"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, BillingClerk]
+    code: 200
+    input: ["vessel_call_id?", "status?", "limit?", "offset?"]
+    output: Invoice[]
+    side_effects: []
+  - method: GET
+    path: "/api/invoices/{id}"
+    description: "Get an invoice"
+    roles: [StevedoreAdmin, StevedoreSuperintendent, BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: []
+  - method: PATCH
+    path: "/api/invoices/{id}"
+    description: "Apply a manual adjustment (DRAFT stays DRAFT; DISPUTED -> FINALIZED); OCC-guarded"
+    roles: [BillingClerk]
+    code: 200
+    input: [adjustment_cents, reason, expected_invoice_version]
+    output: Invoice
+    side_effects: ["adjustment_total_cents += adjustment_cents", "totals recomputed", "DISPUTED -> FINALIZED", "increments Invoice.version by 1"]
+  - method: POST
+    path: "/api/invoices/{id}/finalize"
+    description: "Recompute a DRAFT invoice from actuals (DRAFT -> FINALIZED; requires vessel COMPLETED)"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["rate_variant PROVISIONAL -> FINAL", "all lines recomputed from actuals"]
+  - method: POST
+    path: "/api/invoices/{id}/issue"
+    description: "Issue a FINALIZED invoice (credit-limit gate)"
+    roles: [BillingClerk]
+    code: 200
+    input: []
+    output: Invoice
+    side_effects: ["status -> ISSUED"]
+  - method: POST
+    path: "/api/invoices/{id}/record-payment"
+    description: "Record a payment against an ISSUED invoice; PAID when balance reaches 0"
+    roles: [BillingClerk]
+    code: 200
+    input: [amount_cents]
+    output: Invoice
+    side_effects: ["amount_paid_cents += amount_cents", "remaining_balance_cents recomputed", "status -> PAID when remaining == 0"]
+  - method: POST
+    path: "/api/invoices/{id}/dispute"
+    description: "Dispute an ISSUED invoice"
+    roles: [BillingClerk]
+    code: 200
+    input: [dispute_reason]
+    output: Invoice
+    side_effects: ["status -> DISPUTED"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "Missing or invalid X-User-Role / X-User-ID headers" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not permitted on this endpoint" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id or body FK references a non-existent resource" }
+  - { id: ERR_VALIDATION, http: 400, condition: "Missing required field, unknown enum member, or out-of-range numeric value" }
+  - { id: ERR_CARGO_PLAN_REQUIRED, http: 400, condition: "Vessel create with planned_moves == 0 AND planned_tons == 0" }
+  - { id: ERR_SHIFT_WINDOW_INVALID, http: 400, condition: "Shift end <= start, or duration > 960 minutes" }
+  - { id: ERR_FAULT_PCT_OUT_OF_RANGE, http: 400, condition: "fault_pct outside 0..100 (or missing on an ACCEPTED decision)" }
+  - { id: ERR_STALE_GANG_ORDER_VERSION, http: 412, condition: "expected_gang_order_version does not match the gang order's current version (OCC)" }
+  - { id: ERR_STALE_WORKER_VERSION, http: 412, condition: "expected_worker_version does not match the worker's current version (OCC)" }
+  - { id: ERR_STALE_INVOICE_VERSION, http: 412, condition: "expected_invoice_version does not match the invoice's current version (OCC)" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "Entity state does not permit the requested transition (generic state precondition)" }
+  - { id: ERR_SHIFT_NOT_OPEN_FOR_ORDERS, http: 409, condition: "Gang-order create against a ShiftWindow not in OPEN_FOR_ORDERS" }
+  - { id: ERR_INVOICE_NOT_FINALIZABLE, http: 409, condition: "Invoice finalize while vessel call is not COMPLETED" }
+  - { id: ERR_WORK_STOPPAGE_ACTIVE, http: 409, condition: "Vessel work_posture blocks the operation (FULL_STOPPAGE: dispatch-batch/check-in/start-work; PARTIAL_STOPPAGE: start-work)" }
+  - { id: ERR_NO_EQUIPMENT_ASSIGNED, http: 409, condition: "start-work while assigned_equipment_ok is false" }
+  - { id: ERR_WORKER_NOT_ON_GANG, http: 422, condition: "Timesheet for a worker without an assignment on the gang order in {CHECKED_IN, WORKING, COMPLETED}" }
+  - { id: ERR_WORKER_DOUBLE_BOOKED, http: 409, condition: "Worker already assigned (OFFERED/CHECKED_IN/WORKING) to another gang order whose shift window overlaps (half-open)" }
+  - { id: ERR_EQUIPMENT_WINDOW_CONFLICT, http: 409, condition: "Equipment unit booking violates the 30-minute buffered-window rule against an existing RESERVED/ACTIVE assignment" }
+  - { id: ERR_MOVE_PERIOD_OVERLAP, http: 409, condition: "Move-record period overlaps another RECORDED period on the same gang order (half-open)" }
+  - { id: ERR_TIMESHEET_EXCEEDS_SHIFT, http: 422, condition: "work_minutes exceeds shift duration minutes + 120" }
+  - { id: ERR_GANG_FULL, http: 409, condition: "Check-in while filled_headcount == required_headcount" }
+  - { id: ERR_EQUIPMENT_UNAVAILABLE, http: 409, condition: "Equipment assignment create against a unit whose status is DOWN (ASSIGNED units accept further disjoint bookings subject to the buffered-window rule)" }
+  - { id: ERR_DUPLICATE_REGISTRATION, http: 409, condition: "Worker registration_number already exists" }
+  - { id: ERR_SEGREGATION_OF_DUTIES, http: 403, condition: "Claim decider equals reporter, or timesheet approver equals submitter" }
+  - { id: ERR_INVOICE_CREDIT_LIMIT, http: 402, condition: "Issue with total_cents exceeding the vessel call's credit_limit_cents" }
+  - { id: ERR_PAYMENT_EXCEEDS_BALANCE, http: 422, condition: "record-payment amount_cents greater than remaining_balance_cents" }
+  - { id: ERR_WORKER_INELIGIBLE, http: 409, condition: "Forced worker_ids entry fails dispatch eligibility (status not ACTIVE, wrong classification, or prior NO_SHOW/BUMPED exclusion on this gang order)" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: StevedoreAdmin
+    description: "Stevedore company administrator; registers vessels, workers, and equipment; repairs units"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/vessel-calls"
+      - "POST /api/workers"
+      - "PATCH /api/workers/{id}"
+      - "POST /api/equipment-units"
+      - "POST /api/equipment-units/{id}/repair-complete"
+    shared_operations: ["All GET list/detail endpoints"]
+  - name: StevedoreSuperintendent
+    description: "Port superintendent; owns shift scheduling, gang ordering, equipment booking, safety incidents"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/vessel-calls/{id}/berth, /complete, /cancel"
+      - "POST /api/shift-windows and /open-for-orders, /start"
+      - "POST /api/gang-orders, PATCH /api/gang-orders/{id}, POST /api/gang-orders/{id}/cancel"
+      - "POST /api/equipment-assignments, /release"
+      - "POST /api/safety-incidents/{id}/clear"
+    shared_operations: ["All GET list/detail endpoints", "POST /api/safety-incidents (shared with GangForeman)"]
+  - name: LaborHallDispatcher
+    description: "Union labor-hall dispatcher; runs dispatch batches and manages assignment lifecycle"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/gang-orders/{id}/dispatch-batch"
+      - "POST /api/dispatch-assignments/{id}/check-in, /complete, /no-show, /bump"
+    shared_operations: ["All GET list/detail endpoints"]
+  - name: GangForeman
+    description: "Working foreman (a registered Worker); logs moves and hours, reports damage and breakdowns, starts/completes gang work"
+    identity: "entity_backed:Worker"
+    exclusive_operations:
+      - "POST /api/gang-orders/{id}/start-work, /complete"
+      - "POST /api/move-records, /void"
+      - "POST /api/damage-claims"
+      - "POST /api/equipment-assignments/{id}/report-breakdown"
+      - "POST /api/timesheet-entries, /submit"
+    shared_operations: ["All GET list/detail endpoints", "POST /api/safety-incidents (shared with StevedoreSuperintendent)"]
+  - name: ClaimsAdjuster
+    description: "Independent claims adjudicator; must not adjudicate claims they reported (segregation of duties)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/damage-claims/{id}/decide, /settle"
+    shared_operations: ["All GET list/detail endpoints"]
+  - name: PayrollClerk
+    description: "Payroll clerk; approves/rejects timesheets; must not approve timesheets they submitted (segregation of duties)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/timesheet-entries/{id}/approve, /reject"
+    shared_operations: ["All GET list/detail endpoints"]
+  - name: BillingClerk
+    description: "Billing clerk; owns invoice lifecycle from draft to payment"
+    identity: opaque
+    exclusive_operations:
+      - "POST /api/invoices, PATCH /api/invoices/{id}"
+      - "POST /api/invoices/{id}/finalize, /issue, /record-payment, /dispute"
+    shared_operations: ["All GET list/detail endpoints"]

@@ -1,0 +1,47 @@
+"""Domain thresholds and numeric constants from the PRD (§3.1, §3.5, §3.6, §3.9)."""
+
+# Logical clock defaults (PRD §2.4: startup clock is exactly 2026-08-01T00:00:00Z)
+CLOCK_STARTUP = "2026-08-01T00:00:00Z"
+DEFAULT_CLOCK = "2026-08-10T00:00:00Z"
+
+# Standard inspection-cycle window used by most setups
+CYCLE_START = "2026-08-01T00:00:00Z"
+CYCLE_END = "2026-09-01T00:00:00Z"
+SCHEDULED_AT = "2026-08-10T06:00:00Z"
+
+# Technician certification validity used by default setups
+CERT_VALID_UNTIL = "2027-01-01T00:00:00Z"
+
+# District policy defaults (PRD §3.1)
+DEFAULT_NOTICE_LEAD_HOURS = 48
+DEFAULT_WARRANTY_MONTHS = 12
+
+# Mobilization fee schedule (PRD §3.5), integer cents
+MOB_SMALL_CENTS = 150000      # diameter_mm < 300 (and length_m <= 300)
+MOB_STANDARD_CENTS = 400000   # 300 <= diameter_mm < 600 (and length_m <= 300)
+MOB_LARGE_CENTS = 900000      # diameter_mm >= 600 OR length_m > 300
+MOB_LARGE_DIAMETER_MM = 600
+MOB_LARGE_LENGTH_M = 300
+MOB_STANDARD_DIAMETER_MM = 300
+
+# Bypass pump sizing (PRD §3.6): 25 gpm per inch of diameter, inches = ceil(diameter_mm / 25.4)
+PUMP_GPM_PER_INCH = 25
+MM_PER_INCH = 25.4
+BYPASS_BUFFER_MINUTES = 30
+
+# Flow monitoring (PRD §3.9)
+MONITORING_MIN_HOURS = 168
+
+THRESHOLDS = {
+    "MOB_SMALL_CENTS": MOB_SMALL_CENTS,
+    "MOB_STANDARD_CENTS": MOB_STANDARD_CENTS,
+    "MOB_LARGE_CENTS": MOB_LARGE_CENTS,
+    "MOB_LARGE_DIAMETER_MM": MOB_LARGE_DIAMETER_MM,
+    "MOB_LARGE_LENGTH_M": MOB_LARGE_LENGTH_M,
+    "MOB_STANDARD_DIAMETER_MM": MOB_STANDARD_DIAMETER_MM,
+    "PUMP_GPM_PER_INCH": PUMP_GPM_PER_INCH,
+    "BYPASS_BUFFER_MINUTES": BYPASS_BUFFER_MINUTES,
+    "MONITORING_MIN_HOURS": MONITORING_MIN_HOURS,
+    "DEFAULT_NOTICE_LEAD_HOURS": DEFAULT_NOTICE_LEAD_HOURS,
+    "DEFAULT_WARRANTY_MONTHS": DEFAULT_WARRANTY_MONTHS,
+}

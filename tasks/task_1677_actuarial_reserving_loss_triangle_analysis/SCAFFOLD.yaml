@@ -1,0 +1,993 @@
+# =============================================================================
+# PRD Benchmark Scaffold — Actuarial Reserving & Loss Triangle Analysis
+# §1.0–§1.7 (difficulty design and corner design live in sibling files)
+# =============================================================================
+
+scenario: |
+  Actuarial Reserving & Loss Triangle Analysis (P&C insurer actuarial department): claim data aggregation by accident/report period, development factor selection & tail estimation, method reconciliation (chain ladder/Bornhuetter-Ferguson) & selection, IBNR calculation & case reserve adequacy, reserve variability & range determination, quarterly roll-forward & actual-vs-expected analysis, large-loss & catastrophe segregation, statement of actuarial opinion
+
+domain_name: actuarial-reserving
+api_prefix: /actuarial
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation   # chain ladder vs Bornhuetter-Ferguson: same triangle, two algorithms, divergent ultimates
+  secondary_archetype: compliance_audit      # statement of actuarial opinion with segregation of duties and filing deadline
+  complexity_layers:
+    - dual_variant_calculation   # CL vs BF on ReserveRun; development vs benchmark adequacy on Claim
+    - cascading_side_effects     # transaction -> claim -> triangle -> run -> study staleness chain
+    - optimistic_concurrency     # OCC on ReservingStudy.version for PATCH
+    - ops_run_checkpoint         # study approval advances segment.last_closed_quarter, gating back-dated transactions
+  entity_topology: flat          # peer collections under /actuarial with FK references; one event-log child (ClaimTransaction)
+  state_machine_shape: cyclic    # Claim OPEN->CLOSED->REOPENED loop; ReservingStudy DRAFT<->IN_REVIEW revision loop
+  relationship_patterns:
+    - one_to_many
+    - cross_aggregate            # study resolved to run by (segment, quarter, method, basis) selector, not by stored FK
+  role_model: segregation_of_duties  # preparer cannot review; opinion drafter cannot sign
+  consistency_model: immediate   # all side effects and derived fields are consistent within the triggering request
+
+# =============================================================================
+# §1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# Quarter labels are strings "YYYY-Qn" (e.g. "2025-Q3"); lexicographic order
+# equals chronological order. Dates are ISO "YYYY-MM-DD"; datetimes ISO 8601 UTC.
+# =============================================================================
+entities:
+  - name: ReservingSegment
+    parent: null
+    common_fields: true
+    fields:
+      - { name: name, type: string, source: input, description: "Segment display name" }
+      - { name: line_of_business, type: enum, source: input, description: "COMMERCIAL_AUTO | GENERAL_LIABILITY | WORKERS_COMP | PROPERTY" }
+      - { name: large_loss_threshold_cents, type: integer, source: input, description: "Claims with reported_incurred_cents >= this value are segregated from the bulk triangle", constraints: "> 0" }
+      - { name: max_range_width_pct, type: number, source: input, description: "Max allowed (range_high - range_low)/selected_ibnr on study approval without chief_actuary_override", constraints: "> 0" }
+      - { name: benchmark_open_severity_cents, type: integer, source: input, description: "Schedule benchmark of indicated case outstanding per open claim (benchmark adequacy variant)", constraints: ">= 0" }
+      - { name: last_closed_quarter, type: string, source: computed, description: "Maximum valuation_quarter over APPROVED studies of this segment; null when no study approved. Transactions whose effective_quarter <= last_closed_quarter are rejected", default: null }
+
+  - name: CatastropheEvent
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id; owning segment" }
+      - { name: name, type: string, source: input, description: "Event name (e.g. Hurricane Idalia)" }
+      - { name: start_date, type: string, source: input, description: "First accident date of the event, CLOSED interval start (YYYY-MM-DD)" }
+      - { name: end_date, type: string, source: input, description: "Last accident date of the event, CLOSED interval end; must be >= start_date" }
+
+  - name: Claim
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id; owning segment" }
+      - { name: claim_number, type: string, source: input, description: "Business claim number" }
+      - { name: accident_date, type: string, source: input, description: "Date of loss (YYYY-MM-DD); determines accident_quarter" }
+      - { name: report_date, type: string, source: input, description: "Date reported (YYYY-MM-DD); must be >= accident_date" }
+      - { name: catastrophe_event_id, type: string, source: input, description: "FK -> CatastropheEvent.id; nullable; set/cleared via PATCH. Accident date must fall inside the event's closed [start_date, end_date]", default: null }
+      - { name: status, type: enum, source: system, description: "OPEN | CLOSED | REOPENED", default: OPEN }
+      - { name: paid_to_date_cents, type: integer, source: computed, description: "Sum of PAYMENT amounts minus PAYMENT_REVERSAL amounts", default: 0 }
+      - { name: case_outstanding_cents, type: integer, source: computed, description: "Latest CASE_RESERVE_SET value (absolute), 0 if none", default: 0 }
+      - { name: reported_incurred_cents, type: integer, source: computed, description: "paid_to_date_cents + case_outstanding_cents (invariant)", default: 0 }
+      - { name: is_large_loss, type: boolean, source: computed, description: "reported_incurred_cents >= segment.large_loss_threshold_cents (>= is the pinned boundary)", default: false }
+      - { name: is_segregated, type: boolean, source: computed, description: "is_large_loss OR catastrophe_event_id != null", default: false }
+      - { name: adequacy_ratio_development, type: number, source: computed, description: "case_outstanding_cents / development-indicated outstanding; 4dp round_half_up; null when claim CLOSED, indicated outstanding is 0, or no as-of pattern context", default: null }
+      - { name: adequacy_ratio_benchmark, type: number, source: computed, description: "case_outstanding_cents / segment.benchmark_open_severity_cents; 4dp; null when claim CLOSED or benchmark is 0", default: null }
+
+  - name: ClaimTransaction
+    parent: Claim
+    common_fields: false   # append-only event log: id + created_at only
+    fields:
+      - { name: claim_id, type: string, source: system, description: "FK -> Claim.id; parent claim from path" }
+      - { name: type, type: enum, source: input, description: "PAYMENT | PAYMENT_REVERSAL | CASE_RESERVE_SET" }
+      - { name: transaction_date, type: string, source: input, description: "ISO 8601 datetime; determines effective_quarter" }
+      - { name: effective_quarter, type: string, source: computed, description: "Quarter label YYYY-Qn of transaction_date" }
+      - { name: amount_cents, type: integer, source: input, description: "Required when type is PAYMENT or PAYMENT_REVERSAL; must be > 0", default: null }
+      - { name: case_value_cents, type: integer, source: input, description: "Required when type is CASE_RESERVE_SET; must be >= 0", default: null }
+
+  - name: LossTriangle
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id" }
+      - { name: basis, type: enum, source: input, description: "PAID | INCURRED" }
+      - { name: valuation_quarter, type: string, source: input, description: "Quarter label; cells include transactions with effective_quarter <= valuation_quarter" }
+      - { name: cells, type: array, source: computed, description: "Cumulative cells over NON-segregated claims: [{accident_quarter, dev_quarter (integer, 0-based quarters since accident_quarter), amount_cents}]; dev_quarter only up to the valuation diagonal" }
+      - { name: large_loss_cells, type: array, source: computed, description: "Same cell shape over segregated claims (is_segregated = true)" }
+      - { name: is_stale, type: boolean, source: computed, description: "true after any claim mutation (transaction post, catastrophe assignment) with effective_quarter <= this triangle's valuation_quarter lands in this segment; cleared by re-aggregation (POST /actuarial/triangles)", default: false }
+
+  - name: DevelopmentPattern
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id" }
+      - { name: basis, type: enum, source: input, description: "PAID | INCURRED; must match the triangle the factors are derived from" }
+      - { name: valuation_quarter, type: string, source: input, description: "Triangle snapshot the factors are computed from" }
+      - { name: effective_from_quarter, type: string, source: input, description: "Half-open window start (inclusive)" }
+      - { name: effective_to_quarter, type: string, source: input, description: "Half-open window end (exclusive); must be > effective_from_quarter" }
+      - { name: selected_factors, type: array, source: computed, description: "Volume-weighted average link ratios per development age, each rounded to 4dp round_half_up BEFORE any downstream use; empty array when no accident quarter pair is fully developed" }
+      - { name: tail_factor, type: number, source: computed, description: "Geometric mean of the last 3 selected (rounded) factors, 4dp; exactly 1.0000 when fewer than 3 selected factors exist" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SELECTED | WITHDRAWN", default: DRAFT }
+
+  - name: ReserveRun
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id" }
+      - { name: development_pattern_id, type: string, source: system, description: "FK -> DevelopmentPattern.id; the SELECTED pattern covering (segment, basis, valuation_quarter) at computation time" }
+      - { name: valuation_quarter, type: string, source: input, description: "Valuation quarter the run estimates as of" }
+      - { name: method, type: enum, source: input, description: "CHAIN_LADDER | BORNHUETTER_FERGUSON" }
+      - { name: basis, type: enum, source: input, description: "PAID | INCURRED; must equal the pattern's basis" }
+      - { name: earned_exposure_cents, type: integer, source: input, description: "Required when method = BORNHUETTER_FERGUSON (per accident quarter); ignored for CHAIN_LADDER", default: null }
+      - { name: a_priori_loss_ratio, type: number, source: input, description: "Required when method = BORNHUETTER_FERGUSON; ignored for CHAIN_LADDER", default: null }
+      - { name: ultimate_cents, type: integer, source: computed, description: "Total estimated ultimate (bulk layer + large-loss layer), integer cents" }
+      - { name: ibnr_cents, type: integer, source: computed, description: "ultimate_cents - total latest diagonal (bulk + large). On PAID basis this is total unpaid; on INCURRED basis it is pure IBNR" }
+      - { name: range_low_cents, type: integer, source: computed, description: "round_half_up(ibnr_cents * 0.75)" }
+      - { name: range_high_cents, type: integer, source: computed, description: "round_half_up(ibnr_cents * 1.50)" }
+      - { name: ultimate_by_accident_quarter, type: array, source: computed, description: "[{accident_quarter, age_at_valuation, cdf, ultimate_cents}] for the bulk layer; cdf as used (4dp rounded)" }
+      - { name: is_stale, type: boolean, source: computed, description: "true when the underlying triangle was re-aggregated or marked stale after this run was computed, or when the pattern used was later WITHDRAWN. Stale runs are immutable; recompute by creating a new run", default: false }
+
+  - name: ReservingStudy
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id" }
+      - { name: valuation_quarter, type: string, source: input, description: "Quarter under review" }
+      - { name: selected_method, type: enum, source: input, description: "CHAIN_LADDER | BORNHUETTER_FERGUSON; changeable via PATCH while DRAFT" }
+      - { name: selected_basis, type: enum, source: input, description: "PAID | INCURRED; changeable via PATCH while DRAFT" }
+      - { name: status, type: enum, source: system, description: "DRAFT | IN_REVIEW | APPROVED | LOCKED | WITHDRAWN", default: DRAFT }
+      - { name: stale_data_flag, type: boolean, source: system, description: "Set true when a staleness cascade reverts the study from IN_REVIEW to DRAFT; cleared by PATCH (analyst acknowledgement)", default: false }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of the creator (segregation of duties input)" }
+      - { name: reviewed_by_user_id, type: string, source: system, description: "X-User-ID of the most recent reviewer (approve or reject)", default: null }
+      - { name: opinion_id, type: string, source: system, description: "FK -> ActuarialOpinion.id; set by attach-study, cleared on study withdraw", default: null }
+      - { name: selected_ultimate_cents, type: integer, source: computed, description: "ultimate_cents of the matched run: the unique non-stale run with (segment_id, valuation_quarter, selected_method, selected_basis); null when no match", default: null }
+      - { name: selected_ibnr_cents, type: integer, source: computed, description: "ibnr_cents of the matched run; null when no match", default: null }
+      - { name: selected_range_low_cents, type: integer, source: computed, description: "range_low_cents of the matched run; null when no match", default: null }
+      - { name: selected_range_high_cents, type: integer, source: computed, description: "range_high_cents of the matched run; null when no match", default: null }
+      - { name: reconciliation_variance_pct, type: number, source: computed, description: "abs(ultimate_CL - ultimate_BF) / ((ultimate_CL + ultimate_BF)/2) over the latest non-stale runs of each method for (segment, valuation_quarter, selected_basis); 4dp round_half_up; null when either method's run is missing", default: null }
+
+  - name: ActuarialOpinion
+    parent: null
+    common_fields: true
+    fields:
+      - { name: statement_date, type: string, source: input, description: "Statement date the opinion covers (YYYY-MM-DD)" }
+      - { name: opinion_scope, type: enum, source: input, description: "REASONABLE | DEFICIENT | REDUNDANT | NO_OPINION" }
+      - { name: status, type: enum, source: system, description: "DRAFT | SIGNED", default: DRAFT }
+      - { name: created_by_user_id, type: string, source: system, description: "X-User-ID of the drafter" }
+      - { name: signed_by_user_id, type: string, source: system, description: "X-User-ID of the signing actuary", default: null }
+      - { name: signed_at, type: string, source: system, description: "Logical-clock timestamp of signing", default: null }
+      - { name: filing_deadline_date, type: string, source: computed, description: "statement_date + 60 calendar days; signing after this date (by logical clock) is rejected" }
+
+  - name: RollForward
+    parent: null
+    common_fields: true
+    fields:
+      - { name: segment_id, type: string, source: input, description: "FK -> ReservingSegment.id" }
+      - { name: valuation_quarter, type: string, source: input, description: "The NEW quarter Q being rolled into" }
+      - { name: prior_valuation_quarter, type: string, source: computed, description: "Quarter immediately before valuation_quarter" }
+      - { name: basis, type: enum, source: computed, description: "Copied from the prior approved study's selected_basis" }
+      - { name: expected_emergence_cents, type: integer, source: computed, description: "Sum over prior-run accident quarters of ultimate_AQ * (1/CDF(age+1) - 1/CDF(age)); CDF beyond the oldest factored age is 1.0" }
+      - { name: actual_emergence_cents, type: integer, source: computed, description: "Net payments (PAYMENT minus PAYMENT_REVERSAL) over non-segregated claims of the segment with effective_quarter == valuation_quarter (PAID basis); for INCURRED basis, incurred at end of Q minus incurred at end of Q-1 for accident quarters <= prior quarter" }
+      - { name: ave_variance_cents, type: integer, source: computed, description: "actual_emergence_cents - expected_emergence_cents" }
+      - { name: ave_variance_ratio, type: number, source: computed, description: "ave_variance_cents / expected_emergence_cents, 4dp round_half_up; null when expected_emergence_cents == 0" }
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Claim
+    initial_state: OPEN
+    terminal_states: []
+    transitions:
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /actuarial/claims/{id}/status (target_status=CLOSED)"
+        actor: ClaimsExaminer
+        preconditions:
+          - "case_outstanding_cents == 0 (ERR_CLAIM_NOT_CLOSEABLE)"
+        side_effects:
+          - "adequacy_ratio_development and adequacy_ratio_benchmark become null"
+      - from: REOPENED
+        to: CLOSED
+        trigger: "POST /actuarial/claims/{id}/status (target_status=CLOSED)"
+        actor: ClaimsExaminer
+        preconditions:
+          - "case_outstanding_cents == 0 (ERR_CLAIM_NOT_CLOSEABLE)"
+        side_effects:
+          - "adequacy ratios become null"
+      - from: CLOSED
+        to: REOPENED
+        trigger: "POST /actuarial/claims/{id}/status (target_status=REOPENED)"
+        actor: ClaimsExaminer
+        preconditions: []
+        side_effects:
+          - "adequacy ratios resume being computed on read"
+
+  - entity: DevelopmentPattern
+    initial_state: DRAFT
+    terminal_states: [WITHDRAWN]
+    transitions:
+      - from: DRAFT
+        to: SELECTED
+        trigger: "POST /actuarial/development-patterns/{id}/select"
+        actor: ActuarialAnalyst
+        preconditions:
+          - "No other SELECTED pattern for the same (segment_id, basis) whose half-open [effective_from_quarter, effective_to_quarter) intersects this pattern's window: overlap iff new.from < existing.to AND existing.from < new.to; adjacency (new.from == existing.to) is ALLOWED (ERR_PATTERN_PERIOD_OVERLAP)"
+        side_effects: []
+      - from: DRAFT
+        to: WITHDRAWN
+        trigger: "POST /actuarial/development-patterns/{id}/withdraw"
+        actor: ActuarialAnalyst
+        preconditions: []
+        side_effects: []
+      - from: SELECTED
+        to: WITHDRAWN
+        trigger: "POST /actuarial/development-patterns/{id}/withdraw"
+        actor: ActuarialAnalyst
+        preconditions:
+          - "No APPROVED or LOCKED ReservingStudy for the same segment_id whose valuation_quarter lies in this pattern's window (ERR_PATTERN_IN_USE)"
+        side_effects:
+          - "Cascade link 1 (pattern -> run): every ReserveRun with development_pattern_id == this pattern and valuation_quarter inside the window gets is_stale = true"
+          - "Cascade link 2 (run -> study): every ReservingStudy of the same segment in IN_REVIEW whose matched run turned stale reverts to DRAFT with stale_data_flag = true"
+
+  - entity: ReservingStudy
+    initial_state: DRAFT
+    terminal_states: [LOCKED, WITHDRAWN]
+    transitions:
+      - from: DRAFT
+        to: IN_REVIEW
+        trigger: "POST /actuarial/studies/{id}/submit"
+        actor: ActuarialAnalyst
+        preconditions:
+          - "stale_data_flag == false (ERR_STUDY_STALE_DATA)"
+          - "The matched run exists: a ReserveRun with (segment_id, valuation_quarter, selected_method, selected_basis); if none exists -> ERR_NO_SELECTED_RUN; if all matches have is_stale == true -> ERR_RUN_STALE"
+        side_effects: []
+      - from: IN_REVIEW
+        to: APPROVED
+        trigger: "POST /actuarial/studies/{id}/review (decision=APPROVE)"
+        actor: PeerReviewer
+        preconditions:
+          - "reviewer X-User-ID != created_by_user_id (ERR_SOD_REVIEWER_IS_PREPARER)"
+          - "range width gate: (selected_range_high_cents - selected_range_low_cents) / selected_ibnr_cents <= segment.max_range_width_pct, unless chief_actuary_override == true (ERR_RANGE_WIDTH_EXCEEDED)"
+        side_effects:
+          - "reviewed_by_user_id = reviewer X-User-ID"
+          - "segment.last_closed_quarter = max(last_closed_quarter, study.valuation_quarter) (lexicographic; null counts as smallest) — ops-run checkpoint; later transactions with effective_quarter <= last_closed_quarter are rejected with ERR_QUARTER_CLOSED"
+      - from: IN_REVIEW
+        to: DRAFT
+        trigger: "POST /actuarial/studies/{id}/review (decision=REJECT)"
+        actor: PeerReviewer
+        preconditions:
+          - "reviewer X-User-ID != created_by_user_id (ERR_SOD_REVIEWER_IS_PREPARER)"
+        side_effects:
+          - "reviewed_by_user_id = reviewer X-User-ID (revision loop: study may be re-submitted)"
+      - from: IN_REVIEW
+        to: DRAFT
+        trigger: "system (staleness cascade: a claim transaction or catastrophe assignment dirties the matched run's triangle, or the matched run's pattern is withdrawn)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "stale_data_flag = true"
+          - "updated_at refreshed; version incremented"
+      - from: DRAFT
+        to: WITHDRAWN
+        trigger: "POST /actuarial/studies/{id}/withdraw"
+        actor: ActuarialAnalyst
+        preconditions: []
+        side_effects: []
+      - from: IN_REVIEW
+        to: WITHDRAWN
+        trigger: "POST /actuarial/studies/{id}/withdraw"
+        actor: ActuarialAnalyst
+        preconditions: []
+        side_effects: []
+      - from: APPROVED
+        to: WITHDRAWN
+        trigger: "POST /actuarial/studies/{id}/withdraw"
+        actor: ActuarialAnalyst
+        preconditions:
+          - "opinion_id == null (ERR_STUDY_ATTACHED)"
+        side_effects: []
+      - from: APPROVED
+        to: LOCKED
+        trigger: "system (an ActuarialOpinion covering this study is signed)"
+        actor: system
+        preconditions: []
+        side_effects:
+          - "Study becomes immutable; no further transitions"
+
+  - entity: ActuarialOpinion
+    initial_state: DRAFT
+    terminal_states: [SIGNED]
+    transitions:
+      - from: DRAFT
+        to: SIGNED
+        trigger: "POST /actuarial/opinions/{id}/sign"
+        actor: AppointedActuary
+        preconditions:
+          - "At least one study attached (ERR_OPINION_NO_STUDIES)"
+          - "Every attached study has status == APPROVED (ERR_STUDY_NOT_APPROVED)"
+          - "Segregation of duties: signer X-User-ID != created_by_user_id of the opinion AND signer X-User-ID not in {created_by_user_id, reviewed_by_user_id} of any attached study (ERR_SOD_SIGNER_CONFLICT)"
+          - "Logical clock date <= filing_deadline_date (ERR_FILING_DEADLINE_PASSED)"
+        side_effects:
+          - "signed_by_user_id = signer X-User-ID; signed_at = current logical clock"
+          - "Every attached study transitions APPROVED -> LOCKED"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: study-patch-stale-version
+    parent_entity: ReservingStudy
+    write_endpoint: "PATCH /actuarial/studies/{id}"
+    occ_field: "expected_study_version"
+    description: |
+      Updating a DRAFT study's selected_method/selected_basis is a legitimate
+      repeatable operation that does not change the study's state, so a second
+      sequential PATCH carrying the version the client last observed cannot be
+      rejected by any state precondition. It is rejected instead because
+      ReservingStudy.version has advanced since that observation: the request
+      is stale and would silently overwrite the intervening selection change.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# All money math in integer cents; ratios 4dp round_half_up unless stated.
+# =============================================================================
+calculations:
+  - name: triangle_aggregation
+    trigger: "POST /actuarial/triangles (create or re-aggregate of the (segment_id, basis, valuation_quarter) upsert key)"
+    algorithm: aggregation
+    formula: |
+      For each claim of the segment, accident_quarter = quarter of accident_date.
+      Let S_bulk = claims with is_segregated == false, S_large = claims with is_segregated == true.
+      For a claim, dev index of a transaction = quarterDiff(accident_quarter, effective_quarter).
+      Cumulative cell (aq, d) for a layer:
+        PAID basis:     sum of amount_cents over (PAYMENT +, PAYMENT_REVERSAL -) with dev index <= d, over layer claims with accident_quarter == aq.
+        INCURRED basis: cumulative paid as above PLUS the latest CASE_RESERVE_SET case_value_cents set at dev index <= d (0 if none), summed over layer claims with accident_quarter == aq.
+      Cells are emitted only for d <= quarterDiff(aq, valuation_quarter) (diagonal cut) and only for claims with accident_quarter <= valuation_quarter.
+      All amounts integer cents; no rounding anywhere in aggregation.
+    input_set: "Claims of the segment regardless of status (OPEN | CLOSED | REOPENED); layer split by is_segregated at aggregation time; transactions with effective_quarter <= valuation_quarter"
+    precision: "integer cents, no rounding"
+    variants: []
+
+  - name: development_factor_selection
+    trigger: "POST /actuarial/development-patterns (computed at creation from the (segment_id, basis, valuation_quarter) triangle's bulk cells)"
+    algorithm: weighted_scoring
+    formula: |
+      For each adjacent dev column pair (d, d+1):
+        eligible accident quarters = those having cells at BOTH d and d+1 in the bulk layer.
+        If none, no factor for index d.
+        raw_ratio_d = (sum of cell[aq, d+1] over eligible aq) / (sum of cell[aq, d] over eligible aq)
+        selected_factors[d] = round_half_up(raw_ratio_d, 4dp)
+      PINNED ROUNDING ORDER: each factor is rounded to 4dp BEFORE it is used in any CDF product;
+      using unrounded ratios downstream is a different (forbidden) rule and yields different cents.
+    input_set: "Bulk-layer cells of the (segment, basis, valuation_quarter) triangle; triangle must exist and be non-stale at pattern creation"
+    precision: "4 decimal places per factor, round_half_up, applied per factor before CDF multiplication"
+    variants: []
+
+  - name: tail_factor_estimation
+    trigger: "POST /actuarial/development-patterns (with development_factor_selection)"
+    algorithm: projection
+    formula: |
+      Let F = selected_factors (already 4dp-rounded), n = len(F).
+      If n >= 3: tail_factor = round_half_up( (F[n-3] * F[n-2] * F[n-1])^(1/3), 4dp )
+      If n < 3:  tail_factor = 1.0000 exactly (no extrapolation possible).
+    input_set: "selected_factors of the same pattern"
+    precision: "4 decimal places, round_half_up"
+    variants: []
+
+  - name: cdf_lookup
+    trigger: "Used by chain_ladder_ultimate, bornhuetter_ferguson_ultimate, rollforward_actual_vs_expected"
+    algorithm: aggregation
+    formula: |
+      With selected_factors F (rounded) and tail_factor T (rounded):
+        CDF(d) = round_half_up( product(F[i] for i in d..n-1) * T, 4dp )   for d < n
+        CDF(d) = round_half_up( T, 4dp )                                   for d == n
+        CDF(d) = 1.0000                                                    for d > n
+      (Product is computed from the ROUNDED factors, then the product itself is rounded to 4dp.)
+    input_set: "the pattern's selected_factors and tail_factor"
+    precision: "4 decimal places, round_half_up per CDF value"
+    variants: []
+
+  - name: chain_ladder_ultimate
+    trigger: "POST /actuarial/reserve-runs with method=CHAIN_LADDER"
+    algorithm: forward_looking
+    formula: |
+      For each layer L in {bulk (cells), large (large_loss_cells)}:
+        For each accident_quarter aq on the latest diagonal (d_aq = quarterDiff(aq, valuation_quarter)):
+          ultimate_AQ = round_half_up( cell[aq, d_aq] * CDF(d_aq), 0dp to integer cents )
+      ultimate_cents = sum over layers and accident quarters.
+      ibnr_cents = ultimate_cents - (sum of latest-diagonal cells over both layers).
+    input_set: "non-stale triangle (both layers) for (segment, basis, valuation_quarter); SELECTED pattern whose window covers valuation_quarter"
+    constants: {}
+    precision: "ultimate per accident quarter rounded half_up to integer cents; totals are sums of those integers"
+    variants:
+      - name: large_loss_layer
+        when: "triangle.large_loss_cells is non-empty"
+        difference: "large layer uses the SAME selected factors/CDF as bulk but its own diagonal; layer ultimates are summed"
+
+  - name: bornhuetter_ferguson_ultimate
+    trigger: "POST /actuarial/reserve-runs with method=BORNHUETTER_FERGUSON"
+    algorithm: forward_looking
+    formula: |
+      Bulk layer, per accident_quarter aq at age d_aq:
+        ultimate_AQ = round_half_up( cell[aq, d_aq] + earned_exposure_cents * a_priori_loss_ratio * (1 - 1/CDF(d_aq)), 0dp )
+      Large-loss layer: BF is not credibility-weighted per claim; pin ultimate_AQ = chain-ladder ultimate of the large layer
+        (same formula as chain_ladder_ultimate applied to large_loss_cells).
+      ultimate_cents = sum over layers; ibnr_cents = ultimate_cents - total latest diagonal.
+      (3+ interacting inputs — exposure, a-priori ratio, CDF — with a conditional layer branch: when no
+      segregated claims exist the large layer contributes exactly 0 and earned_exposure applies fully to bulk.)
+    input_set: "same as chain_ladder_ultimate, plus run inputs earned_exposure_cents and a_priori_loss_ratio (per accident quarter)"
+    precision: "integer cents per accident quarter, round_half_up"
+    variants:
+      - name: no_large_layer
+        when: "no segregated claims"
+        difference: "ultimate equals the bulk-only BF estimate"
+
+  - name: case_reserve_adequacy
+    trigger: "computed on Claim reads (GET /actuarial/claims/{id}, GET /actuarial/claims)"
+    algorithm: forward_looking
+    formula: |
+      As-of quarter V = valuation_quarter of the segment's latest (greatest valuation_quarter) non-stale PAID triangle;
+      if none, both ratios are null. Let P = the SELECTED PAID pattern covering V; if none, ratios are null.
+      Claim age d = quarterDiff(accident_quarter, V).
+      Variant development_indicated: indicated_outstanding = paid_to_date_cents * (CDF(d) - 1);
+        adequacy_ratio_development = round_half_up(case_outstanding_cents / indicated_outstanding, 4dp);
+        null when indicated_outstanding == 0.
+      Variant schedule_benchmark: adequacy_ratio_benchmark = round_half_up(case_outstanding_cents / segment.benchmark_open_severity_cents, 4dp);
+        null when benchmark_open_severity_cents == 0.
+      Both null when claim status == CLOSED.
+    input_set: "single claim; segment config; latest non-stale PAID triangle; covering SELECTED PAID pattern"
+    precision: "4 decimal places, round_half_up"
+    variants:
+      - name: development_indicated
+        when: "always (claim OPEN or REOPENED)"
+        difference: "indicated outstanding derives from the claim's own paid-to-date and the paid development curve"
+      - name: schedule_benchmark
+        when: "always (claim OPEN or REOPENED)"
+        difference: "indicated outstanding is the segment's flat schedule severity, independent of the claim's payment history"
+
+  - name: reserve_range_determination
+    trigger: "POST /actuarial/reserve-runs (with the ultimate calculation)"
+    algorithm: threshold
+    formula: |
+      range_low_cents  = round_half_up(ibnr_cents * 0.75, 0dp)
+      range_high_cents = round_half_up(ibnr_cents * 1.50, 0dp)
+      range_width_pct  = (range_high_cents - range_low_cents) / ibnr_cents when ibnr_cents > 0 (else 0)
+    input_set: "the run's ibnr_cents"
+    constants:
+      RANGE_LOW_FACTOR: 0.75
+      RANGE_HIGH_FACTOR: 1.50
+    precision: "integer cents, round_half_up"
+    variants: []
+
+  - name: method_reconciliation
+    trigger: "computed on ReservingStudy reads (GET /actuarial/studies/{id}, GET /actuarial/studies)"
+    algorithm: aggregation
+    formula: |
+      Let R_CL = the unique non-stale run for (segment, valuation_quarter, CHAIN_LADDER, selected_basis);
+      R_BF likewise for BORNHUETTER_FERGUSON. Uniqueness is enforced at run creation
+      (ERR_RUN_ALREADY_EXISTS), so no ordering or tie-break is ever needed.
+      reconciliation_variance_pct = round_half_up( abs(R_CL.ultimate_cents - R_BF.ultimate_cents) / ((R_CL.ultimate_cents + R_BF.ultimate_cents)/2), 4dp ); null if either run missing.
+      selected_* fields copy the matched run's fields (matched by selected_method + selected_basis); null when no non-stale match.
+    input_set: "non-stale runs of the study's (segment, valuation_quarter, selected_basis)"
+    precision: "4 decimal places, round_half_up"
+    variants: []
+
+  - name: rollforward_actual_vs_expected
+    trigger: "POST /actuarial/roll-forwards"
+    algorithm: chronological
+    formula: |
+      Let Q = valuation_quarter, Q-1 = prior quarter label (quarter arithmetic on YYYY-Qn).
+      Prior study = the unique non-WITHDRAWN ReservingStudy for (segment, Q-1) — uniqueness enforced at study
+      creation (ERR_STUDY_ALREADY_EXISTS); it must have status APPROVED, otherwise ERR_NO_APPROVED_PRIOR_STUDY (409).
+      R = prior study's matched selected run (must be non-stale, else ERR_RUN_STALE); P = R's pattern.
+      expected_emergence_cents = sum over R.ultimate_by_accident_quarter entries:
+          round_half_up( ultimate_AQ * (1/CDF(age_at_valuation + 1) - 1/CDF(age_at_valuation)), 0dp )
+        where CDF comes from P (CDF beyond the oldest factored age = 1.0).
+      actual_emergence_cents (PAID basis) = sum of amount_cents over PAYMENT minus PAYMENT_REVERSAL transactions
+        of the segment's NON-segregated claims with effective_quarter == Q.
+      ave_variance_cents = actual - expected; ave_variance_ratio = round_half_up(variance / expected, 4dp), null when expected == 0.
+    input_set: "prior approved study + its selected run + pattern; current-quarter transactions of bulk claims"
+    precision: "integer cents for emergence; ratio 4dp round_half_up"
+    variants: []
+
+  - name: quarter_close_checkpoint
+    trigger: "ReservingStudy transition IN_REVIEW -> APPROVED"
+    algorithm: threshold
+    formula: |
+      segment.last_closed_quarter = max(segment.last_closed_quarter, study.valuation_quarter)
+      using lexicographic order over YYYY-Qn labels (null treated as smallest).
+      Gate: new ClaimTransaction with effective_quarter <= segment.last_closed_quarter is rejected (ERR_QUARTER_CLOSED).
+    input_set: "the approved study; the segment"
+    precision: "exact string comparison"
+    variants: []
+
+# =============================================================================
+# §1.4 Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and one of the declared roles; X-User-ID header present on all mutating requests"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "The declared role is in the endpoint's roles list"
+    error_id: ERR_FORBIDDEN
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: business_constraint
+    check: "Request shape: required fields present; types valid; enum values in domain; quarter labels match YYYY-Qn; dates ISO; amount_cents > 0 for PAYMENT/PAYMENT_REVERSAL; case_value_cents present for CASE_RESERVE_SET; BF runs carry earned_exposure_cents and a_priori_loss_ratio; report_date >= accident_date; bodies containing server-managed fields (id, created_at, updated_at, version, or any source: computed field) are rejected"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all write endpoints"
+  - priority: 4
+    category: existence
+    check: "Path ids and body FK ids (segment_id, catastrophe_event_id, study_id) exist; a catastrophe_event_id referencing another segment's event is NOT_FOUND for this claim"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: state
+    check: "State-machine from-state preconditions (close/reopen from a valid status; submit only from DRAFT; review only from IN_REVIEW; withdraw not from terminal; select/withdraw only from DRAFT-or-SELECTED as declared; sign only from DRAFT)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+  - priority: 6
+    category: business_constraint
+    check: "OCC: expected_study_version equals the study's current version"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "PATCH /actuarial/studies/{id}"
+  - priority: 7
+    category: business_safety
+    check: "Segregation of duties: reviewer != study creator; opinion signer != opinion drafter and != any attached study's creator or reviewer"
+    error_id: ERR_SOD_REVIEWER_IS_PREPARER
+    http_status: 403
+    applies_to: "POST /actuarial/studies/{id}/review (also ERR_SOD_SIGNER_CONFLICT on POST /actuarial/opinions/{id}/sign)"
+  - priority: 8
+    category: business_referential
+    check: "Referential integrity of derived/linked objects: covering SELECTED pattern exists for run creation (ERR_NO_SELECTED_PATTERN); triangle non-stale for run creation (ERR_TRIANGLE_STALE); matched fresh run exists for submit (ERR_NO_SELECTED_RUN / ERR_RUN_STALE); stale_data_flag false for submit (ERR_STUDY_STALE_DATA); no APPROVED/LOCKED study in window for pattern withdraw (ERR_PATTERN_IN_USE); attached study APPROVED for attach/sign (ERR_STUDY_NOT_APPROVED); study unattached for attach and APPROVED-study withdraw (ERR_STUDY_ATTACHED); >=1 attached study for sign (ERR_OPINION_NO_STUDIES); claim accident_date inside assigned event window (ERR_CLAIM_OUTSIDE_CAT_WINDOW); approved prior-quarter study exists for roll-forward (ERR_NO_APPROVED_PRIOR_STUDY)"
+    error_id: ERR_NO_SELECTED_PATTERN
+    http_status: 409
+    applies_to: "run creation, study submit, pattern withdraw, opinion attach/sign, claim PATCH, roll-forward creation"
+  - priority: 9
+    category: business_constraint
+    check: "Uniqueness: at most one non-stale run per (segment_id, valuation_quarter, method, basis) (ERR_RUN_ALREADY_EXISTS); at most one non-WITHDRAWN study per (segment_id, valuation_quarter) (ERR_STUDY_ALREADY_EXISTS)"
+    error_id: ERR_RUN_ALREADY_EXISTS
+    http_status: 409
+    applies_to: "POST /actuarial/reserve-runs, POST /actuarial/studies"
+  - priority: 10
+    category: business_temporal
+    check: "Temporal rules: transaction effective_quarter > segment.last_closed_quarter (ERR_QUARTER_CLOSED); pattern effective_from_quarter < effective_to_quarter (ERR_INVALID_PATTERN_WINDOW); no half-open window overlap among SELECTED patterns of same (segment, basis) (ERR_PATTERN_PERIOD_OVERLAP); no closed-interval overlap (touching counts) among catastrophe events of same segment (ERR_CAT_EVENT_DATE_OVERLAP); opinion sign not after filing_deadline_date (ERR_FILING_DEADLINE_PASSED)"
+    error_id: ERR_QUARTER_CLOSED
+    http_status: 409
+    applies_to: "transaction posting, pattern create/select, catastrophe event creation, opinion sign"
+  - priority: 11
+    category: business_fiscal
+    check: "Fiscal guards: case_value_cents >= 0 (ERR_CASE_OUTSTANDING_NEGATIVE); reversal amount <= paid_to_date_cents (ERR_PAYMENT_REVERSAL_EXCEEDS_PAID); claim close requires case_outstanding_cents == 0 (ERR_CLAIM_NOT_CLOSEABLE); study approve range width within segment.max_range_width_pct unless chief_actuary_override (ERR_RANGE_WIDTH_EXCEEDED)"
+    error_id: ERR_CASE_OUTSTANDING_NEGATIVE
+    http_status: 422
+    applies_to: "transaction posting, claim status, study review"
+
+# =============================================================================
+# §1.5 API Endpoint Table (36 endpoints)
+# =============================================================================
+endpoints:
+  # --- ReservingSegment ---
+  - method: POST
+    path: "/actuarial/segments"
+    description: "Create a reserving segment"
+    roles: [AppointedActuary]
+    code: 201
+    input: [name, line_of_business, large_loss_threshold_cents, max_range_width_pct, benchmark_open_severity_cents]
+    output: ReservingSegment
+    side_effects: ["last_closed_quarter initialized to null"]
+  - method: GET
+    path: "/actuarial/segments/{id}"
+    description: "Get a segment (includes computed last_closed_quarter)"
+    roles: [ClaimsExaminer, ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: ReservingSegment
+    side_effects: []
+
+  # --- CatastropheEvent ---
+  - method: POST
+    path: "/actuarial/catastrophe-events"
+    description: "Create a catastrophe event for a segment; closed-interval [start_date, end_date]; touching or overlapping another event of the same segment is rejected (ERR_CAT_EVENT_DATE_OVERLAP)"
+    roles: [AppointedActuary]
+    code: 201
+    input: [segment_id, name, start_date, end_date]
+    output: CatastropheEvent
+    side_effects: []
+  - method: GET
+    path: "/actuarial/segments/{id}/catastrophe-events"
+    description: "List catastrophe events of a segment (FK reverse reachability)"
+    roles: [ClaimsExaminer, ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "CatastropheEvent[]"
+    side_effects: []
+
+  # --- Claim ---
+  - method: POST
+    path: "/actuarial/claims"
+    description: "Create a claim in a segment; starts OPEN with zero financials"
+    roles: [ClaimsExaminer]
+    code: 201
+    input: [segment_id, claim_number, accident_date, report_date]
+    output: Claim
+    side_effects: ["status=OPEN; paid_to_date_cents=0; case_outstanding_cents=0"]
+  - method: GET
+    path: "/actuarial/claims/{id}"
+    description: "Get a claim including computed financials, segregation flags, and adequacy ratios"
+    roles: [ClaimsExaminer, ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: Claim
+    side_effects: []
+  - method: GET
+    path: "/actuarial/claims"
+    description: "List/filter claims (FK reverse reachability for segment_id and catastrophe_event_id); paginated"
+    roles: [ClaimsExaminer, ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["segment_id?", "catastrophe_event_id?", "status?", "limit?", "offset?"]
+    output: "Claim[]"
+    side_effects: []
+  - method: PATCH
+    path: "/actuarial/claims/{id}"
+    description: "Assign or clear the claim's catastrophe event (catastrophe_event_id nullable); accident_date must fall inside the event's closed window (ERR_CLAIM_OUTSIDE_CAT_WINDOW). Triggers the staleness cascade because layer membership changes."
+    roles: [ClaimsExaminer]
+    code: 200
+    input: ["catastrophe_event_id?"]
+    output: Claim
+    side_effects:
+      - "Claim.is_segregated recomputed; claim.version incremented"
+      - "Staleness cascade: every LossTriangle of the segment -> is_stale=true; every ReserveRun built on those triangles -> is_stale=true; every IN_REVIEW ReservingStudy of the segment whose matched run turned stale -> DRAFT with stale_data_flag=true"
+  - method: POST
+    path: "/actuarial/claims/{id}/status"
+    description: "Claim lifecycle transition: target_status CLOSED (from OPEN/REOPENED, requires case_outstanding_cents == 0) or REOPENED (from CLOSED)"
+    roles: [ClaimsExaminer]
+    code: 200
+    input: [target_status]
+    output: Claim
+    side_effects: ["status transition per Claim state machine; claim.version incremented"]
+  - method: POST
+    path: "/actuarial/claims/{id}/transactions"
+    description: "Append a financial event to the claim. PAYMENT: amount_cents required >0, paid += amount. PAYMENT_REVERSAL: amount_cents required >0 and <= paid_to_date_cents, paid -= amount. CASE_RESERVE_SET: case_value_cents required >=0, case_outstanding := value. effective_quarter derived from transaction_date; rejected when effective_quarter <= segment.last_closed_quarter (ERR_QUARTER_CLOSED)."
+    roles: [ClaimsExaminer]
+    code: 201
+    input: [type, transaction_date, "amount_cents?", "case_value_cents?"]
+    output: ClaimTransaction
+    side_effects:
+      - "Claim paid_to_date_cents / case_outstanding_cents / reported_incurred_cents updated by type"
+      - "Claim is_large_loss / is_segregated recomputed (threshold: reported_incurred_cents >= segment.large_loss_threshold_cents)"
+      - "Staleness cascade link 2 (claim -> triangle): every LossTriangle of the segment with valuation_quarter >= effective_quarter -> is_stale=true"
+      - "Staleness cascade link 3 (triangle -> run): every ReserveRun referencing such a triangle -> is_stale=true"
+      - "Staleness cascade link 4 (run -> study): every IN_REVIEW ReservingStudy of the segment whose matched run turned stale -> DRAFT with stale_data_flag=true"
+  - method: GET
+    path: "/actuarial/claims/{id}/transactions"
+    description: "List the claim's transaction log in created_at order (FK reverse reachability)"
+    roles: [ClaimsExaminer, ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: "ClaimTransaction[]"
+    side_effects: []
+
+  # --- LossTriangle ---
+  - method: POST
+    path: "/actuarial/triangles"
+    description: "Create or re-aggregate (upsert on (segment_id, basis, valuation_quarter)) a loss triangle per triangle_aggregation; 201 on first creation, 200 on recompute; recompute clears is_stale and bumps version"
+    roles: [ActuarialAnalyst]
+    code: 201
+    input: [segment_id, basis, valuation_quarter]
+    output: LossTriangle
+    side_effects: ["cells and large_loss_cells recomputed; is_stale=false; runs computed from earlier aggregation remain is_stale=true"]
+  - method: GET
+    path: "/actuarial/triangles/{id}"
+    description: "Get a triangle with cells"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: LossTriangle
+    side_effects: []
+  - method: GET
+    path: "/actuarial/triangles"
+    description: "List/filter triangles (FK reverse reachability for segment_id)"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["segment_id?", "basis?", "valuation_quarter?", "limit?", "offset?"]
+    output: "LossTriangle[]"
+    side_effects: []
+
+  # --- DevelopmentPattern ---
+  - method: POST
+    path: "/actuarial/development-patterns"
+    description: "Create a DRAFT pattern: selected_factors + tail_factor computed from the (segment_id, basis, valuation_quarter) triangle (must exist and be non-stale, else ERR_NOT_FOUND / ERR_TRIANGLE_STALE); window must satisfy effective_from_quarter < effective_to_quarter (ERR_INVALID_PATTERN_WINDOW)"
+    roles: [ActuarialAnalyst]
+    code: 201
+    input: [segment_id, basis, valuation_quarter, effective_from_quarter, effective_to_quarter]
+    output: DevelopmentPattern
+    side_effects: ["development_factor_selection and tail_factor_estimation run; status=DRAFT"]
+  - method: GET
+    path: "/actuarial/development-patterns/{id}"
+    description: "Get a pattern"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: DevelopmentPattern
+    side_effects: []
+  - method: GET
+    path: "/actuarial/development-patterns"
+    description: "List/filter patterns (FK reverse reachability for segment_id)"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["segment_id?", "basis?", "status?", "limit?", "offset?"]
+    output: "DevelopmentPattern[]"
+    side_effects: []
+  - method: POST
+    path: "/actuarial/development-patterns/{id}/select"
+    description: "Select a DRAFT pattern; half-open window overlap with another SELECTED pattern of same (segment, basis) rejected (ERR_PATTERN_PERIOD_OVERLAP); adjacency allowed"
+    roles: [ActuarialAnalyst]
+    code: 200
+    input: []
+    output: DevelopmentPattern
+    side_effects: ["status DRAFT -> SELECTED"]
+  - method: POST
+    path: "/actuarial/development-patterns/{id}/withdraw"
+    description: "Withdraw a DRAFT or SELECTED pattern; SELECTED withdrawal blocked when an APPROVED/LOCKED study exists in its window (ERR_PATTERN_IN_USE); withdrawal fires the pattern->run->study staleness cascade"
+    roles: [ActuarialAnalyst]
+    code: 200
+    input: []
+    output: DevelopmentPattern
+    side_effects:
+      - "status -> WITHDRAWN"
+      - "ReserveRuns using this pattern with valuation_quarter in window -> is_stale=true"
+      - "IN_REVIEW studies of the segment whose matched run turned stale -> DRAFT with stale_data_flag=true"
+
+  # --- ReserveRun ---
+  - method: POST
+    path: "/actuarial/reserve-runs"
+    description: "Compute a reserve run (CHAIN_LADDER or BORNHUETTER_FERGUSON) for (segment_id, valuation_quarter, basis). Requires a covering SELECTED pattern (ERR_NO_SELECTED_PATTERN) and a non-stale triangle (ERR_TRIANGLE_STALE); at most one non-stale run per (segment, quarter, method, basis) (ERR_RUN_ALREADY_EXISTS)"
+    roles: [ActuarialAnalyst]
+    code: 201
+    input: [segment_id, valuation_quarter, method, basis, "earned_exposure_cents?", "a_priori_loss_ratio?"]
+    output: ReserveRun
+    side_effects: ["chain_ladder_ultimate or bornhuetter_ferguson_ultimate + reserve_range_determination run; development_pattern_id bound to the covering SELECTED pattern"]
+  - method: GET
+    path: "/actuarial/reserve-runs/{id}"
+    description: "Get a run"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: ReserveRun
+    side_effects: []
+  - method: GET
+    path: "/actuarial/reserve-runs"
+    description: "List/filter runs (FK reverse reachability for segment_id and development_pattern_id)"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["segment_id?", "development_pattern_id?", "valuation_quarter?", "method?", "basis?", "limit?", "offset?"]
+    output: "ReserveRun[]"
+    side_effects: []
+
+  # --- ReservingStudy ---
+  - method: POST
+    path: "/actuarial/studies"
+    description: "Create a DRAFT reserving study for (segment_id, valuation_quarter) with an initial selected_method/selected_basis; at most one non-WITHDRAWN study per (segment, quarter) (ERR_STUDY_ALREADY_EXISTS)"
+    roles: [ActuarialAnalyst]
+    code: 201
+    input: [segment_id, valuation_quarter, selected_method, selected_basis]
+    output: ReservingStudy
+    side_effects: ["status=DRAFT; created_by_user_id from X-User-ID; stale_data_flag=false"]
+  - method: GET
+    path: "/actuarial/studies/{id}"
+    description: "Get a study including computed selected_* and reconciliation_variance_pct"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: ReservingStudy
+    side_effects: []
+  - method: GET
+    path: "/actuarial/studies"
+    description: "List/filter studies (FK reverse reachability for segment_id and opinion_id)"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["segment_id?", "opinion_id?", "status?", "valuation_quarter?", "limit?", "offset?"]
+    output: "ReservingStudy[]"
+    side_effects: []
+  - method: PATCH
+    path: "/actuarial/studies/{id}"
+    description: "Update selected_method/selected_basis while DRAFT; acknowledges (clears) stale_data_flag; OCC guard on expected_study_version"
+    roles: [ActuarialAnalyst]
+    code: 200
+    input: [expected_study_version, "selected_method?", "selected_basis?"]
+    output: ReservingStudy
+    side_effects:
+      - "increments ReservingStudy.version by 1"
+      - "stale_data_flag=false; selected_* fields recompute from the newly matched run"
+  - method: POST
+    path: "/actuarial/studies/{id}/submit"
+    description: "Submit a DRAFT study for peer review; check order inside the referential tier: stale_data_flag first (ERR_STUDY_STALE_DATA), then matched-run existence (ERR_NO_SELECTED_RUN), then matched-run freshness (ERR_RUN_STALE)"
+    roles: [ActuarialAnalyst]
+    code: 200
+    input: []
+    output: ReservingStudy
+    side_effects: ["status DRAFT -> IN_REVIEW"]
+  - method: POST
+    path: "/actuarial/studies/{id}/review"
+    description: "Peer review decision on an IN_REVIEW study: APPROVE (range-width gate ERR_RANGE_WIDTH_EXCEEDED unless chief_actuary_override=true) or REJECT (returns to DRAFT). Segregation of duties: reviewer must differ from creator (ERR_SOD_REVIEWER_IS_PREPARER)."
+    roles: [PeerReviewer]
+    code: 200
+    input: [decision, "chief_actuary_override?"]
+    output: ReservingStudy
+    side_effects:
+      - "APPROVE: status -> APPROVED; reviewed_by_user_id set; segment.last_closed_quarter advances via quarter_close_checkpoint"
+      - "REJECT: status -> DRAFT; reviewed_by_user_id set"
+  - method: POST
+    path: "/actuarial/studies/{id}/withdraw"
+    description: "Withdraw a study from DRAFT/IN_REVIEW/APPROVED; APPROVED studies attached to an opinion are rejected (ERR_STUDY_ATTACHED); LOCKED/WITHDRAWN are terminal (ERR_INVALID_STATE)"
+    roles: [ActuarialAnalyst]
+    code: 200
+    input: []
+    output: ReservingStudy
+    side_effects: ["status -> WITHDRAWN; opinion_id cleared if set (only reachable for non-APPROVED studies)"]
+
+  # --- ActuarialOpinion ---
+  - method: POST
+    path: "/actuarial/opinions"
+    description: "Draft a statement of actuarial opinion; filing_deadline_date = statement_date + 60 days"
+    roles: [AppointedActuary]
+    code: 201
+    input: [statement_date, opinion_scope]
+    output: ActuarialOpinion
+    side_effects: ["status=DRAFT; created_by_user_id from X-User-ID"]
+  - method: GET
+    path: "/actuarial/opinions/{id}"
+    description: "Get an opinion"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: []
+    output: ActuarialOpinion
+    side_effects: []
+  - method: POST
+    path: "/actuarial/opinions/{id}/attach-study"
+    description: "Attach an APPROVED study to a DRAFT opinion (ERR_STUDY_NOT_APPROVED; ERR_STUDY_ATTACHED when the study already has an opinion)"
+    roles: [AppointedActuary]
+    code: 200
+    input: [study_id]
+    output: ActuarialOpinion
+    side_effects: ["study.opinion_id = this opinion id"]
+  - method: POST
+    path: "/actuarial/opinions/{id}/sign"
+    description: "Sign a DRAFT opinion: needs >=1 attached APPROVED study, segregation of duties (ERR_SOD_SIGNER_CONFLICT), and logical clock on/before filing_deadline_date (ERR_FILING_DEADLINE_PASSED)"
+    roles: [AppointedActuary]
+    code: 200
+    input: []
+    output: ActuarialOpinion
+    side_effects: ["status -> SIGNED; signed_by_user_id/signed_at set; attached studies APPROVED -> LOCKED"]
+
+  # --- RollForward ---
+  - method: POST
+    path: "/actuarial/roll-forwards"
+    description: "Compute the quarterly roll-forward / actual-vs-expected analysis into valuation_quarter; requires the unique APPROVED study of the prior quarter (ERR_NO_APPROVED_PRIOR_STUDY) whose selected run is non-stale (ERR_RUN_STALE)"
+    roles: [ActuarialAnalyst]
+    code: 201
+    input: [segment_id, valuation_quarter]
+    output: RollForward
+    side_effects: ["rollforward_actual_vs_expected runs"]
+  - method: GET
+    path: "/actuarial/segments/{id}/roll-forwards"
+    description: "List roll-forwards of a segment (FK reverse reachability)"
+    roles: [ActuarialAnalyst, PeerReviewer, AppointedActuary]
+    code: 200
+    input: ["valuation_quarter?", "limit?", "offset?"]
+    output: "RollForward[]"
+    side_effects: []
+
+  # --- Logical clock (test-driving endpoint) ---
+  - method: POST
+    path: "/actuarial/_clock/set_current_utc"
+    description: "Set the logical clock used for filing-deadline checks and signed_at. Server startup default (before any set) is exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time."
+    roles: [AppointedActuary]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["logical clock advanced"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role missing/invalid, or X-User-ID missing on a mutating request" }
+  - { id: ERR_FORBIDDEN, http: 403, condition: "Role not in the endpoint's roles list" }
+  - { id: ERR_INVALID_REQUEST, http: 400, condition: "Missing/invalid field, bad enum, malformed quarter label or date, non-positive payment amount, server-managed field supplied in body, BF run missing exposure/a-priori, report_date before accident_date" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "Path id or body FK id does not exist (segment, claim, transaction parent, pattern, run, study, opinion, catastrophe event); cross-segment catastrophe reference is NOT_FOUND" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "State-machine from-state mismatch (close a CLOSED claim, submit an IN_REVIEW study, review a DRAFT study, sign a SIGNED opinion, act on terminal LOCKED/WITHDRAWN/SIGNED resources)" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_study_version does not match the study's current version (OCC)" }
+  - { id: ERR_SOD_REVIEWER_IS_PREPARER, http: 403, condition: "Peer reviewer X-User-ID equals the study's created_by_user_id" }
+  - { id: ERR_SOD_SIGNER_CONFLICT, http: 403, condition: "Opinion signer equals the opinion drafter or any attached study's creator/reviewer" }
+  - { id: ERR_NO_SELECTED_PATTERN, http: 409, condition: "Run creation: no SELECTED pattern for (segment, basis) whose half-open window covers valuation_quarter" }
+  - { id: ERR_TRIANGLE_STALE, http: 409, condition: "Run creation or pattern creation: the (segment, basis, valuation_quarter) triangle is stale" }
+  - { id: ERR_RUN_STALE, http: 409, condition: "Study submit or roll-forward: the matched/prior run exists only in stale form" }
+  - { id: ERR_NO_SELECTED_RUN, http: 409, condition: "Study submit: no run exists for (segment, valuation_quarter, selected_method, selected_basis)" }
+  - { id: ERR_STUDY_STALE_DATA, http: 409, condition: "Study submit while stale_data_flag is true (cascade not yet acknowledged via PATCH)" }
+  - { id: ERR_PATTERN_IN_USE, http: 409, condition: "Withdrawing a SELECTED pattern whose window covers the valuation_quarter of an APPROVED or LOCKED study" }
+  - { id: ERR_STUDY_NOT_APPROVED, http: 409, condition: "Opinion attach-study on a non-APPROVED study, or sign with a non-APPROVED attached study" }
+  - { id: ERR_STUDY_ATTACHED, http: 409, condition: "Withdrawing an APPROVED study that is attached to an opinion, or attaching a study that already has opinion_id set" }
+  - { id: ERR_OPINION_NO_STUDIES, http: 409, condition: "Signing an opinion with zero attached studies" }
+  - { id: ERR_CLAIM_OUTSIDE_CAT_WINDOW, http: 409, condition: "PATCH claim: accident_date outside the catastrophe event's closed [start_date, end_date]" }
+  - { id: ERR_NO_APPROVED_PRIOR_STUDY, http: 409, condition: "Roll-forward: no unique APPROVED study exists for (segment, valuation_quarter - 1)" }
+  - { id: ERR_RUN_ALREADY_EXISTS, http: 409, condition: "A non-stale run already exists for (segment, valuation_quarter, method, basis)" }
+  - { id: ERR_STUDY_ALREADY_EXISTS, http: 409, condition: "A non-WITHDRAWN study already exists for (segment, valuation_quarter)" }
+  - { id: ERR_QUARTER_CLOSED, http: 409, condition: "Transaction effective_quarter <= segment.last_closed_quarter" }
+  - { id: ERR_PATTERN_PERIOD_OVERLAP, http: 409, condition: "Selecting a pattern whose half-open window intersects another SELECTED pattern of the same (segment, basis); adjacency allowed" }
+  - { id: ERR_INVALID_PATTERN_WINDOW, http: 422, condition: "effective_from_quarter >= effective_to_quarter" }
+  - { id: ERR_CAT_EVENT_DATE_OVERLAP, http: 409, condition: "Catastrophe event's closed interval touches or overlaps another event of the same segment" }
+  - { id: ERR_FILING_DEADLINE_PASSED, http: 409, condition: "Logical clock date is after the opinion's filing_deadline_date at sign time" }
+  - { id: ERR_CASE_OUTSTANDING_NEGATIVE, http: 422, condition: "CASE_RESERVE_SET with case_value_cents < 0" }
+  - { id: ERR_PAYMENT_REVERSAL_EXCEEDS_PAID, http: 422, condition: "PAYMENT_REVERSAL amount_cents > claim.paid_to_date_cents" }
+  - { id: ERR_CLAIM_NOT_CLOSEABLE, http: 409, condition: "Closing a claim whose case_outstanding_cents != 0" }
+  - { id: ERR_RANGE_WIDTH_EXCEEDED, http: 409, condition: "Approving a study whose IBNR range width ratio exceeds segment.max_range_width_pct without chief_actuary_override=true" }
+
+# =============================================================================
+# §1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: ClaimsExaminer
+    description: "Claims-side operator: owns claim intake, financial transactions, claim lifecycle, catastrophe assignment"
+    identity: opaque
+    exclusive_operations:
+      - "POST /actuarial/claims"
+      - "PATCH /actuarial/claims/{id}"
+      - "POST /actuarial/claims/{id}/status"
+      - "POST /actuarial/claims/{id}/transactions"
+    shared_operations:
+      - "GET claim/transaction/segment/catastrophe-event reads"
+  - name: ActuarialAnalyst
+    description: "Actuarial preparer: triangles, development patterns, reserve runs, studies (create/patch/submit/withdraw), roll-forwards"
+    identity: opaque
+    exclusive_operations:
+      - "POST /actuarial/triangles"
+      - "POST /actuarial/development-patterns (+ /select, /withdraw)"
+      - "POST /actuarial/reserve-runs"
+      - "POST /actuarial/studies, PATCH /actuarial/studies/{id}, /submit, /withdraw"
+      - "POST /actuarial/roll-forwards"
+    shared_operations:
+      - "All GET reads except none restricted"
+  - name: PeerReviewer
+    description: "Independent reviewer: approves or rejects submitted studies; cannot review own work (SoD)"
+    identity: opaque
+    exclusive_operations:
+      - "POST /actuarial/studies/{id}/review"
+    shared_operations:
+      - "All GET reads"
+  - name: AppointedActuary
+    description: "Signing actuary and department administrator: segments, catastrophe events, opinions (draft/attach/sign), logical clock"
+    identity: opaque
+    exclusive_operations:
+      - "POST /actuarial/segments"
+      - "POST /actuarial/catastrophe-events"
+      - "POST /actuarial/opinions (+ /attach-study, /sign)"
+      - "POST /actuarial/_clock/set_current_utc"
+    shared_operations:
+      - "All GET reads"
+  - name: Anonymous
+    description: "Pseudo-role for recipes: denotes a request sent without valid auth headers (X-User-Role / X-User-ID absent); never appears in any endpoint's roles list, so every Anonymous call must fail with ERR_UNAUTHENTICATED"
+    identity: opaque
+    exclusive_operations: []
+    shared_operations: []

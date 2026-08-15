@@ -1,0 +1,49 @@
+"""Error types and error-id constants for the Aircraft Leasing Returns API."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_FORBIDDEN = "ERR_FORBIDDEN"
+ERR_NOT_FOUND = "ERR_NOT_FOUND"
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+ERR_STALE_VERSION = "ERR_STALE_VERSION"
+ERR_INVALID_STATE = "ERR_INVALID_STATE"
+ERR_CLAIM_NOT_PAYABLE = "ERR_CLAIM_NOT_PAYABLE"
+ERR_RECORDS_INCOMPLETE = "ERR_RECORDS_INCOMPLETE"
+ERR_LEASE_PERIOD_OVERLAP = "ERR_LEASE_PERIOD_OVERLAP"
+ERR_SLOT_WINDOW_CONFLICT = "ERR_SLOT_WINDOW_CONFLICT"
+ERR_INSPECTOR_DOUBLE_BOOKED = "ERR_INSPECTOR_DOUBLE_BOOKED"
+ERR_DUPLICATE_REPORT_PERIOD = "ERR_DUPLICATE_REPORT_PERIOD"
+ERR_CHECKLIST_INCOMPLETE = "ERR_CHECKLIST_INCOMPLETE"
+ERR_PROPOSER_ALTERNATION = "ERR_PROPOSER_ALTERNATION"
+ERR_REINSPECTION_LIMIT = "ERR_REINSPECTION_LIMIT"
+ERR_SOD_VIOLATION = "ERR_SOD_VIOLATION"
+ERR_CURE_DEADLINE_NOT_PASSED = "ERR_CURE_DEADLINE_NOT_PASSED"
+ERR_BOOKING_REQUIRED = "ERR_BOOKING_REQUIRED"
+ERR_DEFAULT_CASE_OPEN = "ERR_DEFAULT_CASE_OPEN"
+ERR_AIRCRAFT_NOT_AVAILABLE = "ERR_AIRCRAFT_NOT_AVAILABLE"
+ERR_LESSEE_NOT_ACTIVE = "ERR_LESSEE_NOT_ACTIVE"
+ERR_RESERVE_BALANCE_EXCEEDED = "ERR_RESERVE_BALANCE_EXCEEDED"
+
+
+def bad_request(msg):
+    return ApiError(ERR_INVALID_REQUEST, msg, 400)
+
+
+def forbidden(msg="Role not permitted for this endpoint, or ownership check failed"):
+    return ApiError(ERR_FORBIDDEN, msg, 403)
+
+
+def not_found(msg="A path identifier does not resolve"):
+    return ApiError(ERR_NOT_FOUND, msg, 404)
+
+
+def invalid_state(msg="Transition attempted from a disallowed state"):
+    return ApiError(ERR_INVALID_STATE, msg, 409)

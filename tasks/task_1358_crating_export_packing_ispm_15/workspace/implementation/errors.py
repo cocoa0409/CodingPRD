@@ -1,0 +1,66 @@
+"""Error classes and error ID constants (SCAFFOLD §1.6 / PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                    # 401
+ERR_FORBIDDEN = "ERR_FORBIDDEN"                                # 403
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                    # 400
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                                # 404
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                        # 412
+ERR_JOB_INVALID_STATE = "ERR_JOB_INVALID_STATE"                # 409
+ERR_CUSTOMER_SUSPENDED = "ERR_CUSTOMER_SUSPENDED"              # 409
+ERR_DESIGN_INVALID_STATE = "ERR_DESIGN_INVALID_STATE"          # 409
+ERR_CRATE_INVALID_STATE = "ERR_CRATE_INVALID_STATE"            # 409
+ERR_DECLARATION_INVALID_STATE = "ERR_DECLARATION_INVALID_STATE"  # 409
+ERR_DOC_INVALID_STATE = "ERR_DOC_INVALID_STATE"                # 409
+ERR_CONTAINER_INVALID_STATE = "ERR_CONTAINER_INVALID_STATE"    # 409
+ERR_CLAIM_INVALID_STATE = "ERR_CLAIM_INVALID_STATE"            # 409
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                        # 409
+ERR_NO_APPROVED_DESIGN = "ERR_NO_APPROVED_DESIGN"              # 409
+ERR_PERMIT_REQUIRED = "ERR_PERMIT_REQUIRED"                    # 409
+ERR_DOCS_NOT_RELEASED = "ERR_DOCS_NOT_RELEASED"                # 409
+ERR_OPEN_CLAIMS = "ERR_OPEN_CLAIMS"                            # 409
+ERR_ITEM_NOT_CAPTURABLE = "ERR_ITEM_NOT_CAPTURABLE"            # 409
+ERR_ITEM_HAS_CRATE = "ERR_ITEM_HAS_CRATE"                      # 409
+ERR_HAZMAT_DECLARATION_REQUIRED = "ERR_HAZMAT_DECLARATION_REQUIRED"  # 422
+ERR_BATCH_NOT_ACTIVE = "ERR_BATCH_NOT_ACTIVE"                  # 409
+ERR_DG_SEGREGATION_VIOLATION = "ERR_DG_SEGREGATION_VIOLATION"  # 422
+ERR_INDICATOR_MISMATCH = "ERR_INDICATOR_MISMATCH"              # 422
+ERR_BARRIER_MISMATCH = "ERR_BARRIER_MISMATCH"                  # 422
+ERR_CREW_UNQUALIFIED = "ERR_CREW_UNQUALIFIED"                  # 422
+ERR_CLAIM_WINDOW_EXPIRED = "ERR_CLAIM_WINDOW_EXPIRED"          # 422
+ERR_CREW_DOUBLE_BOOKED = "ERR_CREW_DOUBLE_BOOKED"              # 409
+ERR_PERMIT_WINDOW_CONFLICT = "ERR_PERMIT_WINDOW_CONFLICT"      # 409
+ERR_DUPLICATE = "ERR_DUPLICATE"                                # 409
+ERR_DOC_CRATE_MISMATCH = "ERR_DOC_CRATE_MISMATCH"              # 422
+ERR_DOC_QUANTITY_MISMATCH = "ERR_DOC_QUANTITY_MISMATCH"        # 422
+ERR_DOC_WEIGHT_MISMATCH = "ERR_DOC_WEIGHT_MISMATCH"            # 422
+ERR_INVOICE_UNDERVALUED = "ERR_INVOICE_UNDERVALUED"            # 422
+ERR_SOD_VIOLATION = "ERR_SOD_VIOLATION"                        # 403
+ERR_CREDIT_LIMIT_EXCEEDED = "ERR_CREDIT_LIMIT_EXCEEDED"        # 422
+ERR_INSUFFICIENT_WOOD = "ERR_INSUFFICIENT_WOOD"                # 422
+ERR_STAMPS_EXHAUSTED = "ERR_STAMPS_EXHAUSTED"                  # 422
+ERR_CONTAINER_OVERWEIGHT = "ERR_CONTAINER_OVERWEIGHT"          # 422
+
+
+def bad_request(msg):
+    return ApiError(ERR_INVALID_REQUEST, msg, 400)
+
+
+def not_found(msg):
+    return ApiError(ERR_NOT_FOUND, msg, 404)
+
+
+def conflict(error_id, msg):
+    return ApiError(error_id, msg, 409)
+
+
+def unprocessable(error_id, msg):
+    return ApiError(error_id, msg, 422)

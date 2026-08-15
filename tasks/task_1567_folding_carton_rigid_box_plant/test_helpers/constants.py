@@ -1,0 +1,73 @@
+"""Domain thresholds and fixture constants from the PRD's calculation rules.
+
+Money is integer cents; linear measures are integer hundredths of an inch (cin);
+delta-E is integer milli-units; weight is integer grams.
+"""
+
+# --- Routing ---
+DIGITAL_MAX_QTY = 2500  # quantity_ordered <= 2500 routes DIGITAL (inclusive)
+
+# --- Provisional quote / final settlement ---
+MIN_BILLING_QTY = 1000
+TIER_1_QTY = 2500
+TIER_1_RATE_CENTS = 38
+TIER_2_QTY = 5000
+TIER_2_RATE_CENTS = 30
+TIER_3_QTY = 10000
+TIER_3_RATE_CENTS = 24
+BASE_RATE_CENTS = 45
+REFERENCE_SHEET_COST_CENTS = 320
+RATE_PER_M_COAT_CENTS = 950
+RATE_PER_M_FOIL_CENTS = 2650
+RATE_PER_M_EMBOSS_CENTS = 1775
+MAKE_READY_OFFSET_CENTS = 180000
+MAKE_READY_DIGITAL_CENTS = 25000
+MAKE_READY_WAIVER_THRESHOLD_CENTS = 400000
+MIN_ORDER_CENTS = 750000
+
+# --- Kitting settlement ---
+KIT_LABOR_CENTS_PER_MIN = 150
+KIT_FEE_PER_KIT_CENTS = 85
+
+# --- Standard quoting sheet (provisional board line) ---
+STD_SHEET_W_CIN = 4000
+STD_SHEET_H_CIN = 2800
+STD_GUTTER_CIN = 25
+STD_EDGE_MARGIN_CIN = 50
+STD_GRIPPER_CIN = 75
+
+# --- Spoilage uplift (per route) ---
+OFFSET_SPOILAGE_NUM = 108
+DIGITAL_SPOILAGE_NUM = 103
+SPOILAGE_DEN = 100
+
+# --- Retail-ready pallet limits ---
+PALLET_W_CIN = 12192
+PALLET_D_CIN = 10160
+MAX_PALLET_HEIGHT_CIN = 15240
+MAX_PALLET_WEIGHT_G = 680389
+
+# --- Standard fixture geometry (shared across fixtures) ---
+# blanks 900x600 on sheet 4800x3600 g30 e60 gr90 -> usable 4680x3450,
+# ups 25 (5x5 NORMAL vs 7x3 ROTATED); qty 3000 -> net 120, OFFSET gross 130.
+FIXTURE_BLANK_W_CIN = 900
+FIXTURE_BLANK_H_CIN = 600
+FIXTURE_SHEET_W_CIN = 4800
+FIXTURE_SHEET_H_CIN = 3600
+FIXTURE_GUTTER_CIN = 30
+FIXTURE_EDGE_MARGIN_CIN = 60
+FIXTURE_GRIPPER_CIN = 90
+FIXTURE_UPS = 25
+FIXTURE_SUBSTRATE_CODE = "SBS18"
+FIXTURE_CALIPER_PTS = 18
+FIXTURE_STOCK_SHEETS = 5000
+FIXTURE_STOCK_UNIT_COST_CENTS = 300
+FIXTURE_INK_SLOT = "BRAND_RED"
+FIXTURE_TOLERANCE_DELTA_E_MILLI = 200
+
+# Logical clock startup default per PRD; booking windows must be at/after it.
+CLOCK_DEFAULT_UTC = "2026-08-01T00:00:00Z"
+WINDOW_PRESS_START = "2026-08-10T08:00:00Z"
+WINDOW_PRESS_END = "2026-08-10T09:00:00Z"
+WINDOW_FINISH_START = "2026-08-11T08:00:00Z"
+WINDOW_FINISH_END = "2026-08-11T09:00:00Z"

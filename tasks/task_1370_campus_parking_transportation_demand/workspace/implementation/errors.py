@@ -1,0 +1,108 @@
+"""Error classes and error ID constants (from SCAFFOLD §1.6 / PRD §5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id: str, http_status: int, message: str):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+# --- Auth ---
+ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER = "ERR_MISSING_OR_INVALID_USER_CONTEXT_HEADER"  # 401
+ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"  # 403
+ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"  # 403
+
+# --- Existence ---
+ERR_PATRON_NOT_FOUND = "ERR_PATRON_NOT_FOUND"  # 404
+ERR_LOT_NOT_FOUND = "ERR_LOT_NOT_FOUND"  # 404
+ERR_ALLOCATION_NOT_FOUND = "ERR_ALLOCATION_NOT_FOUND"  # 404
+ERR_ENTRY_NOT_FOUND = "ERR_ENTRY_NOT_FOUND"  # 404
+ERR_PERMIT_NOT_FOUND = "ERR_PERMIT_NOT_FOUND"  # 404
+ERR_CITATION_NOT_FOUND = "ERR_CITATION_NOT_FOUND"  # 404
+ERR_CLOSURE_NOT_FOUND = "ERR_CLOSURE_NOT_FOUND"  # 404
+ERR_ROUTE_NOT_FOUND = "ERR_ROUTE_NOT_FOUND"  # 404
+ERR_INCENTIVE_ACCOUNT_NOT_FOUND = "ERR_INCENTIVE_ACCOUNT_NOT_FOUND"  # 404
+ERR_FUND_NOT_FOUND = "ERR_FUND_NOT_FOUND"  # 404
+
+# --- OCC ---
+ERR_STALE_VERSION = "ERR_STALE_VERSION"  # 412
+
+# --- Request shape ---
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"  # 400
+ERR_INVALID_INTERVAL = "ERR_INVALID_INTERVAL"  # 400
+ERR_FALLBACK_LOT_REQUIRED = "ERR_FALLBACK_LOT_REQUIRED"  # 400
+
+# --- State ---
+ERR_ALLOCATION_NOT_OPEN = "ERR_ALLOCATION_NOT_OPEN"  # 409
+ERR_ALLOCATION_NOT_WAITLISTING = "ERR_ALLOCATION_NOT_WAITLISTING"  # 409
+ERR_OFFER_NOT_PENDING = "ERR_OFFER_NOT_PENDING"  # 409
+ERR_PERMIT_NOT_ACTIVE = "ERR_PERMIT_NOT_ACTIVE"  # 409
+ERR_CITATION_NOT_ISSUED = "ERR_CITATION_NOT_ISSUED"  # 409
+ERR_CLOSURE_INVALID_STATE = "ERR_CLOSURE_INVALID_STATE"  # 409
+ERR_ROUTE_INVALID_STATE = "ERR_ROUTE_INVALID_STATE"  # 409
+
+# --- Business referential ---
+ERR_PLATE_NOT_REGISTERED = "ERR_PLATE_NOT_REGISTERED"  # 422
+
+# --- Temporal ---
+ERR_CLOSURE_OVERLAP = "ERR_CLOSURE_OVERLAP"  # 409
+ERR_DUPLICATE_ACTIVE_PERMIT = "ERR_DUPLICATE_ACTIVE_PERMIT"  # 409
+ERR_FLEET_WINDOW_CONFLICT = "ERR_FLEET_WINDOW_CONFLICT"  # 409
+ERR_OFFER_EXPIRED = "ERR_OFFER_EXPIRED"  # 422
+
+# --- Eligibility & duties ---
+ERR_PATRON_INELIGIBLE = "ERR_PATRON_INELIGIBLE"  # 403
+ERR_INELIGIBLE_COMMUTE_MODE = "ERR_INELIGIBLE_COMMUTE_MODE"  # 403
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"  # 403
+
+# --- Uniqueness ---
+ERR_DUPLICATE_ALLOCATION_CODE = "ERR_DUPLICATE_ALLOCATION_CODE"  # 409
+ERR_ALREADY_WAITLISTED = "ERR_ALREADY_WAITLISTED"  # 409
+ERR_APPEAL_ALREADY_EXISTS = "ERR_APPEAL_ALREADY_EXISTS"  # 409
+ERR_ACCOUNT_EXISTS = "ERR_ACCOUNT_EXISTS"  # 409
+
+# --- Fiscal / capacity ---
+ERR_PATRON_BLOCKED = "ERR_PATRON_BLOCKED"  # 402
+ERR_INSUFFICIENT_CREDIT = "ERR_INSUFFICIENT_CREDIT"  # 422
+ERR_DISPLACEMENT_OVER_CAPACITY = "ERR_DISPLACEMENT_OVER_CAPACITY"  # 409
+ERR_INSUFFICIENT_FUNDING = "ERR_INSUFFICIENT_FUNDING"  # 402
+ERR_INSUFFICIENT_SHUTTLE_CAPACITY = "ERR_INSUFFICIENT_SHUTTLE_CAPACITY"  # 422
+ERR_INSUFFICIENT_POINTS = "ERR_INSUFFICIENT_POINTS"  # 422
+
+
+def bad_request(message: str) -> ApiError:
+    return ApiError(ERR_INVALID_REQUEST, 400, message)
+
+
+def invalid_interval(message: str) -> ApiError:
+    return ApiError(ERR_INVALID_INTERVAL, 400, message)
+
+
+def fallback_lot_required(message: str) -> ApiError:
+    return ApiError(ERR_FALLBACK_LOT_REQUIRED, 400, message)
+
+
+def not_found(error_id: str, message: str) -> ApiError:
+    return ApiError(error_id, 404, message)
+
+
+def conflict(error_id: str, message: str) -> ApiError:
+    return ApiError(error_id, 409, message)
+
+
+def stale_version(message: str = "Stale allocation version") -> ApiError:
+    return ApiError(ERR_STALE_VERSION, 412, message)
+
+
+def forbidden(error_id: str, message: str) -> ApiError:
+    return ApiError(error_id, 403, message)
+
+
+def payment_required(error_id: str, message: str) -> ApiError:
+    return ApiError(error_id, 402, message)
+
+
+def unprocessable(error_id: str, message: str) -> ApiError:
+    return ApiError(error_id, 422, message)

@@ -1,0 +1,52 @@
+"""Domain thresholds — numeric constants from the PRD calculation rules (§3)."""
+
+# Panel SCCR weakest-link (PRD §3.2)
+SCCR_MIN_LABELABLE_KA = 5
+CONTROL_BRANCH_FLOOR_KA = 25
+CURRENT_LIMITING_THRESHOLD_KA = 100
+
+# Substitution lead-time delta (PRD §3.3)
+RISK_PAD_DAYS = 7
+
+# Warranty liability (PRD §3.9)
+TIER_RATE_CENTS = {
+    "TIER_LOCAL": 9500,
+    "TIER_REGIONAL": 14500,
+    "TIER_NATIONAL": 21000,
+}
+LIABILITY_CAP_CENTS = 500000
+LIABILITY_DEDUCTIBLE_CENTS = 10000
+PARTS_ALLOWANCE_CENTS = 25000
+
+# Change-order pricing tiers (PRD §3.8)
+CO_TIER_T1_MIN_CENTS = 100000
+CO_TIER_T2_MIN_CENTS = 500000
+CO_TIER_FLOORS = {"T0": 0.00, "T1": 0.05, "T2": 0.10}
+CO_DISCOUNT_PCT_MAX = 0.5
+
+# Startup labor billing (PRD §3.7)
+STARTUP_INCLUDED_BASE_HOURS = 8
+STARTUP_OT_CAP_HOURS = 16
+STARTUP_BASE_RATE_CENTS = 18533
+STARTUP_OT_RATE_CENTS = 27800  # round_half_up(18533 * 1.5) — rate-first rounding
+STARTUP_EMERGENCY_MULT = 2
+STARTUP_WEEKEND_MULT = 1.25
+PANEL_TURNOVER_HOURS = 24
+
+# As-built completeness weights (PRD §3.6)
+AB_W_WIRING = 0.35
+AB_W_PROGRAM = 0.25
+AB_W_TEST = 0.25
+AB_W_LABEL = 0.15
+
+# Job constraints (PRD §3.1)
+WARRANTY_MONTHS_MAX = 60
+
+TEST_DEFAULTS = {
+    "QUOTED_PRICE_CENTS": 1000000,
+    "WARRANTY_MONTHS": 12,
+    "SITE_STATE_CODE": "UT",
+}
+
+# Server logical clock epoch (PRD §2.5)
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"

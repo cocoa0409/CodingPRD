@@ -1,0 +1,52 @@
+"""Error catalog (SCAFFOLD Table 6 / PRD section 5) — exact ids and HTTP statuses."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_FORBIDDEN_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_ACTIVE_REVISION_EXISTS": 409,
+    "ERR_PATTERN_NOT_ACTIVE": 409,
+    "ERR_PATTERN_HAS_OPEN_MOLDS": 409,
+    "ERR_HEAT_NOT_CERTIFIED": 409,
+    "ERR_HEAT_NOT_TAPPED": 409,
+    "ERR_FURNACE_CAPACITY_EXCEEDED": 422,
+    "ERR_FURNACE_WINDOW_CONFLICT": 409,
+    "ERR_SLOT_WINDOW_CONFLICT": 409,
+    "ERR_SLOT_IN_PAST": 409,
+    "ERR_SLOT_NOT_IN_WINDOW": 409,
+    "ERR_LINE_MINUTES_EXCEEDED": 422,
+    "ERR_METAL_INSUFFICIENT": 422,
+    "ERR_SAND_INSUFFICIENT": 422,
+    "ERR_SAND_BATCH_INACTIVE": 409,
+    "ERR_SAND_MASS_MISMATCH": 422,
+    "ERR_CASTING_NOT_INSPECTABLE": 409,
+    "ERR_DISPOSITION_RULE_VIOLATED": 422,
+    "ERR_DISPOSITION_EXISTS": 409,
+    "ERR_RETURN_LOT_NOT_ASSAYED": 409,
+    "ERR_RETURN_LOT_INSUFFICIENT": 422,
+    "ERR_ORDER_QUANTITY_EXCEEDED": 422,
+    "ERR_WARRANTY_BUDGET_EXCEEDED": 422,
+    "ERR_CLAIM_WINDOW_EXPIRED": 409,
+    "ERR_APPEAL_ALREADY_USED": 409,
+    "ERR_FOUNDRY_EMBARGO": 409,
+    "ERR_FOUNDRY_CURTAILED": 409,
+}
+
+
+def fail(error_id, message):
+    raise ApiError(error_id, ERROR_HTTP[error_id], message)

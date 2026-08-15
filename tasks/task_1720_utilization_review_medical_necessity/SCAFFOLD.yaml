@@ -1,0 +1,1804 @@
+scenario: |
+  Utilization Review & Medical Necessity Determination (hospital utilization review): admission status (inpatient vs observation) review against criteria, two-midnight benchmark documentation, payer authorization request & clinical submission, concurrent review cadence & continued-stay approval, peer-to-peer scheduling on adverse determination, condition-code-44 status change process, avoidable-day tracking & escalation, denial handoff to appeals
+
+domain_name: utilization-review-medical-necessity
+api_prefix: "/api"
+
+# =============================================================================
+# Step 0: Complexity Profile
+# =============================================================================
+complexity_profile:
+  primary_archetype: compliance_audit        # two-midnight benchmark, condition-code-44 gating, SoD, append-only audit trail
+  secondary_archetype: workflow_orchestration # admission review -> auth -> concurrent reviews -> denial -> P2P -> appeal pipeline
+  complexity_layers:
+    - optimistic_concurrency                  # OCC on UtilizationCase.version for auth-request / CC44 create-with-supersede
+    - cascading_side_effects                  # denial -> DenialCase -> auth flip -> case-axis flip; CC44 -> status flip -> auth withdrawal -> interval retag
+    - rate_threshold_triggers                 # two-midnight >= 2, necessity score >= 60, escalation tiers 2/4/6, cadence deadlines
+    - scheduled_actions                       # P2P window deadline, appeal deadline, concurrent-review due timestamps, lazy EXPIRED/CLOSED_NO_APPEAL materialization
+  entity_topology: hybrid                     # case-rooted tree + cross-cutting physician/payer references (flat peer FKs)
+  state_machine_shape: parallel               # UtilizationCase carries two independent axes (review_status x auth_status); cyclic + branching machines elsewhere
+  relationship_patterns:
+    - one_to_many                             # case -> reviews/auths/days/denials/escalations/audit
+    - cross_aggregate                         # PeerToPeerConference -> Physician (advisor calendar), DenialCase -> AuthorizationRequest
+  role_model: segregation_of_duties           # attending physician may not serve as CC44 committee reviewer / advisor reviewer on own case
+  consistency_model: immediate                # every mutation + cascaded side effect visible in the same request's response
+
+# =============================================================================
+# Table 1: Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Payer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Payer display name"
+      - name: plan_class
+        type: enum
+        source: input
+        description: "Plan class; MEDICARE and MANAGED_MEDICARE form the Medicare family for CC44 eligibility and comorbidity weighting"
+        constraints: "one of {MEDICARE, MANAGED_MEDICARE, MEDICAID, COMMERCIAL}"
+      - name: requires_inpatient_auth
+        type: boolean
+        source: input
+        default: true
+        description: "Whether inpatient level-of-care requires prior authorization"
+      - name: concurrent_review_cadence_hours
+        type: integer
+        source: input
+        description: "Hours between a continued-stay review anchor (last approval decision) and the next review deadline"
+        constraints: ">= 1"
+      - name: p2p_window_hours
+        type: integer
+        source: input
+        description: "Hours from adverse determination (denial decided_at) during which a peer-to-peer conference may be scheduled"
+        constraints: ">= 1"
+      - name: appeal_deadline_days
+        type: integer
+        source: input
+        description: "Calendar days from denial decided_at to the appeal filing deadline"
+        constraints: ">= 1"
+      - name: bed_day_budget_per_case
+        type: integer
+        source: input
+        description: "Maximum cumulative certified bed days the payer will certify for one UtilizationCase"
+        constraints: ">= 1"
+      - name: avoidable_attribution_method
+        type: enum
+        source: input
+        description: "Selects the avoidable_day_attribution variant for this payer's cases: FIRST_CAUSE (chronological) or DOMINANT_CAUSE (weighted)"
+        constraints: "one of {FIRST_CAUSE, DOMINANT_CAUSE}"
+
+  - name: Physician
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Physician full name"
+      - name: specialty
+        type: string
+        source: input
+        description: "Specialty label"
+      - name: is_advisor
+        type: boolean
+        source: input
+        default: false
+        description: "True when this physician may act as PhysicianAdvisor (P2P medical-director counterpart, CC44 committee reviewer, advisor second-level review)"
+
+  - name: UtilizationCase
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_mrn
+        type: string
+        source: input
+        description: "Patient medical record number"
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; the payer whose policy governs this stay"
+      - name: attending_physician_id
+        type: string
+        source: input
+        description: "FK -> Physician.id; the attending of record (ownership anchor for P2P and CC44 concurrence)"
+      - name: admit_at
+        type: datetime
+        source: input
+        description: "Admission timestamp (ISO8601 UTC)"
+      - name: expected_discharge_at
+        type: datetime
+        source: input
+        description: "Physician-documented expected discharge timestamp; feeds the PROVISIONAL two-midnight benchmark"
+      - name: discharge_at
+        type: datetime
+        source: system
+        description: "Actual discharge timestamp set by the discharge action; null while the case is open"
+      - name: requested_admission_status
+        type: enum
+        source: input
+        description: "Physician admission order at intake"
+        constraints: "one of {INPATIENT, OBSERVATION}"
+      - name: current_admission_status
+        type: enum
+        source: system
+        description: "Effective status; initialized from requested_admission_status; flipped INPATIENT->OBSERVATION by CC44 approval and restored by rescind"
+        constraints: "one of {INPATIENT, OBSERVATION}"
+      - name: review_status
+        type: enum
+        source: system
+        description: "Lifecycle axis 1: INTAKE -> ADMISSION_REVIEWED -> MONITORING -> CLOSED"
+        constraints: "one of {INTAKE, ADMISSION_REVIEWED, MONITORING, CLOSED}"
+      - name: auth_status
+        type: enum
+        source: system
+        description: "Lifecycle axis 2 (independent of review_status): AUTH_PENDING -> AUTH_IN_PROGRESS -> AUTHORIZED, AUTHORIZED|AUTH_IN_PROGRESS -> DENIED, DENIED -> AUTHORIZED on overturn"
+        constraints: "one of {AUTH_PENDING, AUTH_IN_PROGRESS, AUTHORIZED, DENIED}"
+      - name: expected_midnight_count
+        type: integer
+        source: computed
+        description: "Provisional midnight crossings: calendar-date difference between expected_discharge_at and admit_at"
+      - name: actual_midnight_count
+        type: integer
+        source: computed
+        description: "Final midnight crossings from discharge_at; null until discharge"
+      - name: two_midnight_benchmark_met
+        type: enum
+        source: computed
+        description: "MET when the variant-selected midnight count >= 2, else NOT_MET"
+        constraints: "one of {MET, NOT_MET}"
+      - name: benchmark_basis
+        type: enum
+        source: system
+        description: "Which variant currently backs two_midnight_benchmark_met: PROVISIONAL (expected dates) before discharge, FINAL (actual dates) after"
+        constraints: "one of {PROVISIONAL, FINAL}"
+      - name: certified_day_count
+        type: integer
+        source: computed
+        description: "Sum of lengths of all certified day-intervals on this case (both levels of care)"
+      - name: certified_inpatient_day_count
+        type: integer
+        source: computed
+        description: "Sum of lengths of certified intervals tagged INPATIENT"
+      - name: certified_observation_day_count
+        type: integer
+        source: computed
+        description: "Sum of lengths of certified intervals tagged OBSERVATION"
+      - name: open_avoidable_day_count
+        type: integer
+        source: computed
+        description: "Count of distinct day_date values having at least one AvoidableDay with status OPEN on this case"
+      - name: escalation_tier
+        type: integer
+        source: computed
+        description: "Raw tier from open_avoidable_day_count: >=6 -> 3, >=4 -> 2, >=2 -> 1, else 0 (pre-credit)"
+
+  - name: AdmissionReview
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> UtilizationCase.id; the stay under review"
+      - name: criteria_set
+        type: enum
+        source: input
+        description: "Medical-necessity criteria edition applied"
+        constraints: "one of {INTERQUAL, MCG}"
+      - name: severity_of_illness_points
+        type: integer
+        source: input
+        description: "Severity-of-illness points, 0..20"
+        constraints: "0 <= v <= 20"
+      - name: intensity_of_service_points
+        type: integer
+        source: input
+        description: "Intensity-of-service points, 0..20"
+        constraints: "0 <= v <= 20"
+      - name: comorbidity_count
+        type: integer
+        source: input
+        description: "Active comorbidity count, 0..10"
+        constraints: "0 <= v <= 10"
+      - name: two_midnight_attestation
+        type: boolean
+        source: input
+        description: "Physician attestation that the stay is expected to span at least two midnights"
+      - name: necessity_score
+        type: integer
+        source: computed
+        description: "Output of medical_necessity_score at submit time; null while DRAFT"
+      - name: determination
+        type: enum
+        source: system
+        description: "PENDING while DRAFT; CRITERIA_MET or CRITERIA_NOT_MET computed at submit; REVERSE advisor review rewrites NOT_MET to CRITERIA_MET"
+        constraints: "one of {PENDING, CRITERIA_MET, CRITERIA_NOT_MET}"
+      - name: recommended_status
+        type: enum
+        source: computed
+        description: "INPATIENT when determination == CRITERIA_MET and the case provisional benchmark is MET, else OBSERVATION; null while DRAFT"
+        constraints: "one of {INPATIENT, OBSERVATION}"
+      - name: status
+        type: enum
+        source: system
+        description: "DRAFT -> SUBMITTED -> ADVISOR_REVIEWED"
+        constraints: "one of {DRAFT, SUBMITTED, ADVISOR_REVIEWED}"
+      - name: submitted_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the submit transition; null while DRAFT"
+
+  - name: AuthorizationRequest
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> UtilizationCase.id"
+      - name: level_of_care
+        type: enum
+        source: input
+        description: "Level of care being authorized"
+        constraints: "one of {INPATIENT, OBSERVATION}"
+      - name: requested_day_count
+        type: integer
+        source: input
+        description: "Number of bed days requested"
+        constraints: ">= 1"
+      - name: clinical_summary
+        type: string
+        source: input
+        description: "Clinical submission packet narrative; must be at least 50 characters (completeness gate)"
+      - name: submission_round
+        type: integer
+        source: system
+        description: "1 at creation; increments by 1 on every resubmit (cycle counter)"
+      - name: status
+        type: enum
+        source: system
+        description: "SUBMITTED -> PENDED -> SUBMITTED cycle; SUBMITTED -> APPROVED | DENIED; DENIED -> APPROVED on overturn; SUBMITTED|PENDED -> WITHDRAWN; APPROVED stays until WITHDRAWN by CC44/discharge cascade or SUPERSEDED"
+        constraints: "one of {SUBMITTED, PENDED, APPROVED, DENIED, WITHDRAWN, SUPERSEDED}"
+      - name: certified_day_start
+        type: integer
+        source: system
+        description: "Start (inclusive, 1-based hospital-day index) of the certified interval granted on the latest APPROVED transition; null until first approval"
+      - name: certified_day_end
+        type: integer
+        source: system
+        description: "End (exclusive) of the certified interval; interval is the half-open range [certified_day_start, certified_day_end)"
+      - name: denial_reason_code
+        type: enum
+        source: system
+        description: "Set on the DENIED transition"
+        constraints: "one of {CRITERIA_NOT_MET, DOC_INSUFFICIENT, LEVEL_OF_CARE}"
+      - name: decided_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the latest payer decision (approve, pend, or deny)"
+      - name: denial_is_final
+        type: boolean
+        source: computed
+        description: "True when status == DENIED and no linked PeerToPeerConference has status SCHEDULED; gates appeal filing"
+
+  - name: ConcurrentReview
+    parent: AuthorizationRequest
+    common_fields: true
+    fields:
+      - name: authorization_request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; parent authorization (must be APPROVED at creation)"
+      - name: sequence_index
+        type: integer
+        source: system
+        description: "1-based ordinal among reviews of the same authorization request"
+      - name: clinical_update
+        type: string
+        source: input
+        description: "Continued-stay clinical update narrative"
+      - name: requested_additional_day_count
+        type: integer
+        source: input
+        description: "Additional certified days requested"
+        constraints: ">= 1"
+      - name: review_due_at
+        type: datetime
+        source: computed
+        description: "Deadline = anchor + payer.concurrent_review_cadence_hours; anchor is the parent auth's APPROVED decided_at for sequence_index 1, else the previous review's decided_at; a new review may only be created once the previous review is decided"
+      - name: submitted_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp at creation"
+      - name: status
+        type: enum
+        source: system
+        description: "SUBMITTED -> APPROVED | PARTIALLY_APPROVED | DENIED"
+        constraints: "one of {SUBMITTED, APPROVED, PARTIALLY_APPROVED, DENIED}"
+      - name: approved_day_count
+        type: integer
+        source: system
+        description: "Days granted; equals requested on APPROVED, strictly less on PARTIALLY_APPROVED, 0 on DENIED"
+      - name: certified_day_start
+        type: integer
+        source: system
+        description: "Start (inclusive) of the appended certified interval on APPROVED/PARTIALLY_APPROVED"
+      - name: certified_day_end
+        type: integer
+        source: system
+        description: "End (exclusive) of the appended certified interval"
+      - name: decided_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the payer decision; null while SUBMITTED"
+      - name: denial_reason_code
+        type: enum
+        source: system
+        description: "Set when DENIED"
+        constraints: "one of {CRITERIA_NOT_MET, DOC_INSUFFICIENT, LEVEL_OF_CARE}"
+
+  - name: PeerToPeerConference
+    parent: AuthorizationRequest
+    common_fields: true
+    fields:
+      - name: authorization_request_id
+        type: string
+        source: input
+        description: "FK -> AuthorizationRequest.id; the denied authorization under discussion"
+      - name: attending_physician_id
+        type: string
+        source: system
+        description: "FK -> Physician.id; set from X-User-ID of the creating AttendingPhysician"
+      - name: advisor_physician_id
+        type: string
+        source: input
+        description: "FK -> Physician.id; the payer-side physician advisor whose calendar hosts the conference (must have is_advisor true)"
+      - name: scheduled_start_at
+        type: datetime
+        source: input
+        description: "Conference start (ISO8601 UTC); must be <= window_deadline_at"
+      - name: scheduled_end_at
+        type: datetime
+        source: input
+        description: "Conference end; must be strictly after start with duration >= 15 minutes"
+      - name: window_deadline_at
+        type: datetime
+        source: computed
+        description: "authorization_request.decided_at (of the DENIED transition) + payer.p2p_window_hours"
+      - name: reschedule_count
+        type: integer
+        source: system
+        description: "Starts at 0; increments on reschedule; hard cap 2"
+      - name: status
+        type: enum
+        source: system
+        description: "SCHEDULED -> COMPLETED | CANCELLED | EXPIRED; SCHEDULED -> SCHEDULED on reschedule; EXPIRED is materialized lazily when read or mutated after window_deadline_at"
+        constraints: "one of {SCHEDULED, COMPLETED, CANCELLED, EXPIRED}"
+      - name: outcome
+        type: enum
+        source: system
+        description: "NONE until COMPLETED; then UPHELD or OVERTURNED"
+        constraints: "one of {NONE, UPHELD, OVERTURNED}"
+
+  - name: ConditionCode44Request
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> UtilizationCase.id"
+      - name: rationale
+        type: string
+        source: input
+        description: "UR rationale for the inpatient-to-observation status change"
+      - name: service_lines
+        type: array
+        source: input
+        description: "Rebill basis lines, each {description, charge_cents, rate_milli}; rate_milli is the contracted rate x 1000 (e.g., 385 = 38.5%)"
+      - name: rebill_estimate_cents
+        type: integer
+        source: computed
+        description: "Output of cc44_rebill_estimate at creation (per-line rounding, then sum)"
+      - name: attending_concurrence
+        type: enum
+        source: system
+        description: "PENDING -> CONCURRED | DECLINED"
+        constraints: "one of {PENDING, CONCURRED, DECLINED}"
+      - name: committee_reviewer_id
+        type: string
+        source: system
+        description: "FK -> Physician.id; the PhysicianAdvisor who rendered the committee decision (set on committee-review)"
+      - name: status
+        type: enum
+        source: system
+        description: "CONCURRENCE_PENDING -> COMMITTEE_PENDING -> APPROVED | REJECTED; CONCURRENCE_PENDING -> DECLINED_CLOSED; APPROVED -> RESCINDED"
+        constraints: "one of {CONCURRENCE_PENDING, COMMITTEE_PENDING, APPROVED, REJECTED, DECLINED_CLOSED, RESCINDED}"
+      - name: effective_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the APPROVED transition; null otherwise"
+
+  - name: AvoidableDay
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> UtilizationCase.id"
+      - name: day_date
+        type: string
+        source: input
+        description: "Hospital calendar day (YYYY-MM-DD) the barrier occupied"
+      - name: barrier_code
+        type: enum
+        source: input
+        description: "Root-cause barrier"
+        constraints: "one of {PLACEMENT_DELAY, PAYER_AUTH_DELAY, TRANSPORT_DELAY, FAMILY_DECISION, PHYSICIAN_DELAY}"
+      - name: barrier_weight
+        type: integer
+        source: input
+        description: "Barrier acuity weight 1..5 used by the DOMINANT_CAUSE attribution variant"
+        constraints: "1 <= v <= 5"
+      - name: is_attributed
+        type: boolean
+        source: computed
+        description: "True when this record owns its (case, day_date) under the payer's avoidable_attribution_method; exactly one non-OVERTURNED record per day is attributed"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN -> MITIGATED (mitigate action) | OVERTURNED (appeal decision cascade)"
+        constraints: "one of {OPEN, MITIGATED, OVERTURNED}"
+      - name: mitigation_note
+        type: string
+        source: system
+        description: "Set on the MITIGATED transition"
+
+  - name: EscalationCase
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> UtilizationCase.id"
+      - name: tier
+        type: integer
+        source: system
+        description: "Raw escalation tier at last recompute (from open_avoidable_day_count before credits); upgrades only, never auto-downgrades"
+      - name: trigger_open_day_count
+        type: integer
+        source: system
+        description: "open_avoidable_day_count at the moment this escalation was created"
+      - name: director_credit_days
+        type: integer
+        source: system
+        description: "Cumulative mitigation credits applied by URDirector via apply-credit; starts at 0"
+      - name: effective_tier
+        type: integer
+        source: computed
+        description: "Tier recomputed from (open_avoidable_day_count - director_credit_days), floored at 0"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN -> ACKNOWLEDGED -> RESOLVED; discharge cascade may resolve from OPEN or ACKNOWLEDGED"
+        constraints: "one of {OPEN, ACKNOWLEDGED, RESOLVED}"
+      - name: resolution_note
+        type: string
+        source: system
+        description: "Set on RESOLVED"
+
+  - name: DenialCase
+    parent: UtilizationCase
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: system
+        description: "FK -> UtilizationCase.id; copied from the denied authorization request"
+      - name: authorization_request_id
+        type: string
+        source: system
+        description: "FK -> AuthorizationRequest.id; the denied authorization"
+      - name: denial_type
+        type: enum
+        source: system
+        description: "INITIAL_AUTH when created by an AuthorizationRequest denial; CONCURRENT when created by a ConcurrentReview denial"
+        constraints: "one of {INITIAL_AUTH, CONCURRENT}"
+      - name: denied_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the denial decision"
+      - name: denied_day_count
+        type: integer
+        source: system
+        description: "Days denied: requested_day_count for INITIAL_AUTH, requested_additional_day_count for CONCURRENT"
+      - name: appeal_deadline_at
+        type: datetime
+        source: computed
+        description: "denied_at + payer.appeal_deadline_days; immutable once set (P2P scheduling does not extend it)"
+      - name: status
+        type: enum
+        source: system
+        description: "OPEN -> P2P_SCHEDULED -> OPEN (cancel/expire); OPEN|P2P_SCHEDULED -> RESOLVED_OVERTURNED; OPEN -> APPEAL_FILED -> RESOLVED_UPHELD | RESOLVED_OVERTURNED | RESOLVED_PARTIAL; OPEN -> CLOSED_NO_APPEAL (lazy, after appeal_deadline_at)"
+        constraints: "one of {OPEN, P2P_SCHEDULED, APPEAL_FILED, RESOLVED_UPHELD, RESOLVED_OVERTURNED, RESOLVED_PARTIAL, CLOSED_NO_APPEAL}"
+
+  - name: AppealCase
+    parent: DenialCase
+    common_fields: true
+    fields:
+      - name: denial_id
+        type: string
+        source: input
+        description: "FK -> DenialCase.id"
+      - name: appeal_level
+        type: integer
+        source: input
+        description: "Appeal level (1 = internal, 2 = external)"
+        constraints: "1 <= v <= 2"
+      - name: argument_summary
+        type: string
+        source: input
+        description: "Appeal argument narrative"
+      - name: filed_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp at creation"
+      - name: status
+        type: enum
+        source: system
+        description: "FILED -> DECIDED_UPHELD | DECIDED_OVERTURNED | DECIDED_PARTIAL"
+        constraints: "one of {FILED, DECIDED_UPHELD, DECIDED_OVERTURNED, DECIDED_PARTIAL}"
+      - name: decided_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the decision; null while FILED"
+      - name: overturned_day_count
+        type: integer
+        source: system
+        description: "Days restored: equals denial.denied_day_count on DECIDED_OVERTURNED; the granted amount on DECIDED_PARTIAL; 0 on DECIDED_UPHELD"
+
+  - name: AuditEvent
+    parent: UtilizationCase
+    common_fields: false
+    fields:
+      - name: case_id
+        type: string
+        source: system
+        description: "FK -> UtilizationCase.id; aggregate scope of the audited mutation"
+      - name: event_type
+        type: string
+        source: system
+        description: "Machine-name of the mutation (e.g., CASE_OPENED, REVIEW_SUBMITTED, AUTH_APPROVED, AUTH_DENIED, P2P_COMPLETED, CC44_APPROVED, CC44_RESCINDED, APPEAL_DECIDED)"
+      - name: actor_role
+        type: string
+        source: system
+        description: "X-User-Role header of the mutating call"
+      - name: actor_id
+        type: string
+        source: system
+        description: "X-User-ID header of the mutating call"
+      - name: payload_summary
+        type: string
+        source: system
+        description: "One-line summary of the mutation and its primary side effects"
+
+# =============================================================================
+# Table 2: State Machine Table
+# =============================================================================
+state_machines:
+  - entity: UtilizationCase
+    initial_state: "review_status=INTAKE, auth_status=AUTH_PENDING (two independent axes on one entity)"
+    terminal_states: ["review_status=CLOSED"]
+    transitions:
+      - from: "review_status=INTAKE"
+        to: "review_status=ADMISSION_REVIEWED"
+        trigger: "system: an AdmissionReview of this case completes DRAFT -> SUBMITTED"
+        actor: system
+        preconditions: ["AdmissionReview submit succeeded"]
+        side_effects: ["increments UtilizationCase.version by 1", "AuditEvent REVIEW_SUBMITTED appended"]
+        note: "A further AdmissionReview submitted while review_status is MONITORING causes no axis transition (re-review is free-standing)."
+      - from: "review_status=ADMISSION_REVIEWED"
+        to: "review_status=MONITORING"
+        trigger: "system: any AuthorizationRequest of this case transitions to APPROVED"
+        actor: system
+        preconditions: ["AuthorizationRequest payer-decision APPROVE succeeded"]
+        side_effects: ["increments UtilizationCase.version by 1", "AuditEvent AUTH_APPROVED appended"]
+      - from: "auth_status=AUTH_PENDING"
+        to: "auth_status=AUTH_IN_PROGRESS"
+        trigger: "system: first AuthorizationRequest created for this case"
+        actor: system
+        preconditions: ["POST /api/utilization-cases/{caseId}/authorization-requests succeeded"]
+        side_effects: ["increments UtilizationCase.version by 1"]
+      - from: "auth_status=AUTH_IN_PROGRESS"
+        to: "auth_status=AUTHORIZED"
+        trigger: "system: AuthorizationRequest payer-decision APPROVE"
+        actor: system
+        preconditions: ["target AuthorizationRequest.status becomes APPROVED"]
+        side_effects: ["certified_day_count / certified_inpatient_day_count / certified_observation_day_count recomputed", "increments UtilizationCase.version by 1"]
+      - from: "auth_status in {AUTH_IN_PROGRESS, AUTHORIZED}"
+        to: "auth_status=DENIED"
+        trigger: "system: AuthorizationRequest payer-decision DENY or ConcurrentReview payer-decision DENY"
+        actor: system
+        preconditions: ["a denial decision succeeded"]
+        side_effects: ["increments UtilizationCase.version by 1", "AuditEvent AUTH_DENIED appended"]
+      - from: "auth_status=DENIED"
+        to: "auth_status=AUTHORIZED"
+        trigger: "system: PeerToPeerConference completed OVERTURNED or AppealCase decided OVERTURNED/PARTIAL"
+        actor: system
+        preconditions: ["overturn cascade fired"]
+        side_effects: ["certified day counts recomputed", "increments UtilizationCase.version by 1"]
+      - from: "review_status in {INTAKE, ADMISSION_REVIEWED, MONITORING}"
+        to: "review_status=CLOSED"
+        trigger: "POST /api/utilization-cases/{caseId}/discharge"
+        actor: URNurse
+        preconditions: ["review_status != CLOSED"]
+        side_effects:
+          - "discharge_at set from input; actual_midnight_count computed; two_midnight_benchmark_met recomputed under the FINAL variant; benchmark_basis set to FINAL"
+          - "every AuthorizationRequest in {SUBMITTED, PENDED} transitions to WITHDRAWN"
+          - "every EscalationCase in {OPEN, ACKNOWLEDGED} transitions to RESOLVED with resolution_note 'auto: case discharged'"
+          - "increments UtilizationCase.version by 1"
+          - "AuditEvent CASE_DISCHARGED appended"
+
+  - entity: AdmissionReview
+    initial_state: DRAFT
+    terminal_states: [ADVISOR_REVIEWED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /api/admission-reviews/{reviewId}/submit"
+        actor: URNurse
+        preconditions:
+          - "status == DRAFT"
+          - "parent UtilizationCase.review_status != CLOSED"
+          - "if computed recommended_status would be INPATIENT then two_midnight_attestation must be true (else ERR_TWO_MIDNIGHT_DOC_REQUIRED)"
+        side_effects:
+          - "necessity_score computed via medical_necessity_score"
+          - "determination set to CRITERIA_MET when necessity_score >= 60 else CRITERIA_NOT_MET"
+          - "recommended_status computed (INPATIENT when CRITERIA_MET and case.two_midnight_benchmark_met == MET, else OBSERVATION)"
+          - "submitted_at set to logical clock"
+          - "parent UtilizationCase.review_status INTAKE -> ADMISSION_REVIEWED (no-op if MONITORING)"
+          - "AuditEvent REVIEW_SUBMITTED appended"
+      - from: SUBMITTED
+        to: ADVISOR_REVIEWED
+        trigger: "POST /api/admission-reviews/{reviewId}/advisor-review"
+        actor: PhysicianAdvisor
+        preconditions:
+          - "status == SUBMITTED"
+          - "determination == CRITERIA_NOT_MET"
+          - "segregation of duties: X-User-ID != parent case.attending_physician_id (else ERR_SOD_ROLE_CONFLICT)"
+        side_effects:
+          - "on advisor_decision == REVERSE: determination rewritten to CRITERIA_MET and recommended_status recomputed"
+          - "on advisor_decision == UPHOLD: determination stays CRITERIA_NOT_MET"
+          - "AuditEvent ADVISOR_REVIEW_COMPLETED appended"
+
+  - entity: AuthorizationRequest
+    initial_state: SUBMITTED
+    terminal_states: [WITHDRAWN, SUPERSEDED]
+    transitions:
+      - from: SUBMITTED
+        to: PENDED
+        trigger: "POST /api/authorization-requests/{authRequestId}/payer-decision with decision=PEND"
+        actor: PayerReviewer
+        preconditions: ["status == SUBMITTED"]
+        side_effects: ["decided_at set", "AuditEvent AUTH_PENDED appended"]
+      - from: PENDED
+        to: SUBMITTED
+        trigger: "POST /api/authorization-requests/{authRequestId}/resubmit"
+        actor: URNurse
+        preconditions: ["status == PENDED", "clinical_summary passes completeness gate (>= 50 characters)"]
+        side_effects: ["submission_round += 1", "clinical_summary replaced", "AuditEvent AUTH_RESUBMITTED appended"]
+        note: "cycle: SUBMITTED -> PENDED -> SUBMITTED may repeat without bound"
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /api/authorization-requests/{authRequestId}/payer-decision with decision=APPROVE"
+        actor: PayerReviewer
+        preconditions:
+          - "status == SUBMITTED"
+          - "certified_day_start and certified_day_count provided"
+          - "half-open interval [certified_day_start, certified_day_start+certified_day_count) does not overlap any existing certified interval on the case (adjacency allowed)"
+          - "case.certified_day_count + certified_day_count <= payer.bed_day_budget_per_case"
+        side_effects:
+          - "certified interval stored on the request, tagged with level_of_care"
+          - "case.certified_day_count / certified_inpatient_day_count / certified_observation_day_count recomputed"
+          - "case.auth_status -> AUTHORIZED; case.review_status ADMISSION_REVIEWED -> MONITORING if applicable"
+          - "decided_at set; increments case.version by 1; AuditEvent AUTH_APPROVED appended"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /api/authorization-requests/{authRequestId}/payer-decision with decision=DENY"
+        actor: PayerReviewer
+        preconditions: ["status == SUBMITTED", "denial_reason_code provided"]
+        side_effects:
+          - "denial_reason_code stored; decided_at set"
+          - "DenialCase created (denial_type=INITIAL_AUTH, denied_day_count=requested_day_count, status=OPEN)"
+          - "case.auth_status -> DENIED; increments case.version by 1"
+          - "AuditEvent AUTH_DENIED appended"
+      - from: DENIED
+        to: APPROVED
+        trigger: "system: PeerToPeerConference complete with outcome=OVERTURNED, or AppealCase decision OVERTURNED/PARTIAL"
+        actor: system
+        preconditions: ["overturning conference/appeal references this request's DenialCase"]
+        side_effects:
+          - "certified interval appended at the case frontier: [max_existing_certified_end, max_existing_certified_end + granted_day_count)"
+          - "case.auth_status -> AUTHORIZED; certified counts recomputed; increments case.version by 1"
+      - from: "SUBMITTED or PENDED"
+        to: WITHDRAWN
+        trigger: "POST /api/authorization-requests/{authRequestId}/withdraw, or cascade from discharge, or cascade from CC44 APPROVED (level_of_care == INPATIENT requests only)"
+        actor: "URNurse | system"
+        preconditions: ["status in {SUBMITTED, PENDED}"]
+        side_effects: ["AuditEvent AUTH_WITHDRAWN appended"]
+      - from: "SUBMITTED or PENDED"
+        to: SUPERSEDED
+        trigger: "system: a new AuthorizationRequest is created for the same case"
+        actor: system
+        preconditions: ["new request creation succeeded"]
+        side_effects: ["AuditEvent AUTH_SUPERSEDED appended"]
+
+  - entity: ConcurrentReview
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, PARTIALLY_APPROVED, DENIED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision with decision=APPROVE"
+        actor: PayerReviewer
+        preconditions:
+          - "status == SUBMITTED"
+          - "certified_day_start and approved_day_count provided; approved_day_count == requested_additional_day_count on APPROVE"
+          - "interval [certified_day_start, certified_day_start+approved_day_count) does not overlap existing certified intervals on the case (adjacency allowed)"
+          - "case.certified_day_count + approved_day_count <= payer.bed_day_budget_per_case"
+        side_effects: ["certified interval stored and tagged with parent auth level_of_care", "case certified counts recomputed", "decided_at set; increments case.version by 1", "AuditEvent CONCURRENT_REVIEW_APPROVED appended"]
+      - from: SUBMITTED
+        to: PARTIALLY_APPROVED
+        trigger: "POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision with decision=PARTIAL"
+        actor: PayerReviewer
+        preconditions: ["status == SUBMITTED", "1 <= approved_day_count < requested_additional_day_count", "same interval overlap and budget rules as APPROVED"]
+        side_effects: ["same as APPROVED but with approved_day_count days", "decided_at set", "AuditEvent CONCURRENT_REVIEW_PARTIAL appended"]
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision with decision=DENY"
+        actor: PayerReviewer
+        preconditions: ["status == SUBMITTED", "denial_reason_code provided"]
+        side_effects:
+          - "DenialCase created (denial_type=CONCURRENT, denied_day_count=requested_additional_day_count, status=OPEN)"
+          - "case.auth_status -> DENIED; increments case.version by 1"
+          - "AuditEvent CONCURRENT_REVIEW_DENIED appended"
+
+  - entity: PeerToPeerConference
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED, EXPIRED]
+    transitions:
+      - from: SCHEDULED
+        to: SCHEDULED
+        trigger: "POST /api/peer-to-peer-conferences/{conferenceId}/reschedule"
+        actor: AttendingPhysician
+        preconditions:
+          - "status == SCHEDULED (cycle: self-loop)"
+          - "reschedule_count < 2"
+          - "logical now <= window_deadline_at and new scheduled_start_at <= window_deadline_at"
+          - "no buffered overlap on the advisor calendar (15-minute clearance on both sides)"
+        side_effects: ["reschedule_count += 1", "AuditEvent P2P_RESCHEDULED appended"]
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /api/peer-to-peer-conferences/{conferenceId}/complete"
+        actor: PhysicianAdvisor
+        preconditions: ["status == SCHEDULED", "logical now <= scheduled_end_at"]
+        side_effects:
+          - "outcome set to UPHELD or OVERTURNED"
+          - "on OVERTURNED: linked AuthorizationRequest DENIED -> APPROVED with certified interval appended at case frontier (certified_day_count provided in payload); linked DenialCase -> RESOLVED_OVERTURNED; case.auth_status -> AUTHORIZED; case certified counts recomputed; increments case.version by 1"
+          - "on UPHELD: linked DenialCase P2P_SCHEDULED -> OPEN"
+          - "AuditEvent P2P_COMPLETED appended"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /api/peer-to-peer-conferences/{conferenceId}/cancel"
+        actor: AttendingPhysician
+        preconditions: ["status == SCHEDULED"]
+        side_effects: ["linked DenialCase P2P_SCHEDULED -> OPEN with appeal_deadline_at unchanged", "AuditEvent P2P_CANCELLED appended"]
+      - from: SCHEDULED
+        to: EXPIRED
+        trigger: "system: lazy materialization — any read or mutation of the conference while logical now > window_deadline_at and status is still SCHEDULED"
+        actor: system
+        preconditions: ["logical now > window_deadline_at"]
+        side_effects: ["linked DenialCase P2P_SCHEDULED -> OPEN", "AuditEvent P2P_EXPIRED appended"]
+
+  - entity: ConditionCode44Request
+    initial_state: CONCURRENCE_PENDING
+    terminal_states: [DECLINED_CLOSED, REJECTED, RESCINDED]
+    transitions:
+      - from: CONCURRENCE_PENDING
+        to: COMMITTEE_PENDING
+        trigger: "POST /api/condition-code-44-requests/{cc44Id}/concurrence with decision=CONCUR"
+        actor: AttendingPhysician
+        preconditions: ["status == CONCURRENCE_PENDING", "X-User-ID == case.attending_physician_id"]
+        side_effects: ["attending_concurrence = CONCURRED", "AuditEvent CC44_CONCURRED appended"]
+      - from: CONCURRENCE_PENDING
+        to: DECLINED_CLOSED
+        trigger: "POST /api/condition-code-44-requests/{cc44Id}/concurrence with decision=DECLINE"
+        actor: AttendingPhysician
+        preconditions: ["status == CONCURRENCE_PENDING", "X-User-ID == case.attending_physician_id"]
+        side_effects: ["attending_concurrence = DECLINED", "case fields unchanged (branch with no flip side effects)", "AuditEvent CC44_DECLINED appended"]
+      - from: COMMITTEE_PENDING
+        to: APPROVED
+        trigger: "POST /api/condition-code-44-requests/{cc44Id}/committee-review with decision=APPROVE"
+        actor: PhysicianAdvisor
+        preconditions:
+          - "status == COMMITTEE_PENDING"
+          - "attending_concurrence == CONCURRED"
+          - "segregation of duties: X-User-ID != case.attending_physician_id (else ERR_SOD_ROLE_CONFLICT)"
+        side_effects:
+          - "committee_reviewer_id set from X-User-ID; effective_at set"
+          - "case.current_admission_status INPATIENT -> OBSERVATION"
+          - "every AuthorizationRequest of the case with level_of_care == INPATIENT and status in {SUBMITTED, PENDED} -> WITHDRAWN; every APPROVED INPATIENT certified interval is re-tagged OBSERVATION (ranges unchanged: certified_day_count conserved, inpatient/observation split moves 1:1)"
+          - "certified_inpatient_day_count and certified_observation_day_count recomputed"
+          - "increments case.version by 1; AuditEvent CC44_APPROVED appended"
+      - from: COMMITTEE_PENDING
+        to: REJECTED
+        trigger: "POST /api/condition-code-44-requests/{cc44Id}/committee-review with decision=REJECT"
+        actor: PhysicianAdvisor
+        preconditions: ["status == COMMITTEE_PENDING", "X-User-ID != case.attending_physician_id"]
+        side_effects: ["committee_reviewer_id set", "case fields unchanged", "AuditEvent CC44_REJECTED appended"]
+      - from: APPROVED
+        to: RESCINDED
+        trigger: "POST /api/condition-code-44-requests/{cc44Id}/rescind"
+        actor: URDirector
+        preconditions: ["status == APPROVED", "case.review_status != CLOSED"]
+        side_effects:
+          - "compensation: case.current_admission_status OBSERVATION -> INPATIENT; certified intervals re-tagged back OBSERVATION -> INPATIENT (certified_day_count conserved across the approve+rescind pair)"
+          - "certified_inpatient_day_count and certified_observation_day_count recomputed"
+          - "increments case.version by 1; AuditEvent CC44_RESCINDED appended"
+
+  - entity: AvoidableDay
+    initial_state: OPEN
+    terminal_states: [MITIGATED, OVERTURNED]
+    transitions:
+      - from: OPEN
+        to: MITIGATED
+        trigger: "POST /api/avoidable-days/{avoidableDayId}/mitigate"
+        actor: CaseManager
+        preconditions: ["status == OPEN"]
+        side_effects:
+          - "mitigation_note set"
+          - "case.open_avoidable_day_count recomputed; case.escalation_tier recomputed; active EscalationCase effective_tier recomputed"
+          - "increments case.version by 1; AuditEvent AVOIDABLE_DAY_MITIGATED appended"
+      - from: OPEN
+        to: OVERTURNED
+        trigger: "system: AppealCase decision OVERTURNED or PARTIAL covering this day"
+        actor: system
+        preconditions: ["appeal decision cascade selected this record (earliest day_date ASC, barrier created_at ASC within the denied window)"]
+        side_effects: ["case.open_avoidable_day_count recomputed", "AuditEvent AVOIDABLE_DAY_OVERTURNED appended"]
+
+  - entity: EscalationCase
+    initial_state: OPEN
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: OPEN
+        to: ACKNOWLEDGED
+        trigger: "POST /api/escalation-cases/{escalationId}/acknowledge"
+        actor: CaseManager
+        preconditions: ["status == OPEN"]
+        side_effects: ["AuditEvent ESCALATION_ACKNOWLEDGED appended"]
+      - from: "OPEN or ACKNOWLEDGED"
+        to: RESOLVED
+        trigger: "POST /api/escalation-cases/{escalationId}/resolve, or discharge cascade"
+        actor: "CaseManager | system"
+        preconditions: ["status in {OPEN, ACKNOWLEDGED}"]
+        side_effects: ["resolution_note set", "AuditEvent ESCALATION_RESOLVED appended"]
+
+  - entity: DenialCase
+    initial_state: OPEN
+    terminal_states: [RESOLVED_UPHELD, RESOLVED_OVERTURNED, RESOLVED_PARTIAL, CLOSED_NO_APPEAL]
+    transitions:
+      - from: OPEN
+        to: P2P_SCHEDULED
+        trigger: "system: PeerToPeerConference created for the linked AuthorizationRequest"
+        actor: system
+        preconditions: ["conference creation succeeded"]
+        side_effects: ["appeal_deadline_at unchanged"]
+      - from: P2P_SCHEDULED
+        to: OPEN
+        trigger: "system: linked conference CANCELLED or EXPIRED"
+        actor: system
+        preconditions: ["conference left SCHEDULED without COMPLETED"]
+        side_effects: ["appeal_deadline_at unchanged (compensating invariant: schedule+cancel pair conserves the deadline)"]
+      - from: "OPEN or P2P_SCHEDULED"
+        to: RESOLVED_OVERTURNED
+        trigger: "system: PeerToPeerConference completed OVERTURNED"
+        actor: system
+        preconditions: ["conference outcome == OVERTURNED"]
+        side_effects: ["AuditEvent DENIAL_OVERTURNED appended"]
+      - from: OPEN
+        to: APPEAL_FILED
+        trigger: "POST /api/denial-cases/{denialId}/appeals"
+        actor: AppealsCoordinator
+        preconditions: ["status == OPEN", "no linked conference with status SCHEDULED (denial_is_final)", "logical now <= appeal_deadline_at", "no existing AppealCase for this denial"]
+        side_effects: ["AppealCase created in FILED", "AuditEvent APPEAL_FILED appended"]
+      - from: APPEAL_FILED
+        to: "RESOLVED_UPHELD | RESOLVED_OVERTURNED | RESOLVED_PARTIAL"
+        trigger: "system: AppealCase decision recorded"
+        actor: system
+        preconditions: ["decision succeeded"]
+        side_effects: ["AuditEvent APPEAL_DECIDED appended"]
+      - from: OPEN
+        to: CLOSED_NO_APPEAL
+        trigger: "system: lazy materialization — any read or mutation of the denial while logical now > appeal_deadline_at and status is still OPEN"
+        actor: system
+        preconditions: ["logical now > appeal_deadline_at"]
+        side_effects: ["AuditEvent DENIAL_CLOSED_NO_APPEAL appended"]
+
+  - entity: AppealCase
+    initial_state: FILED
+    terminal_states: [DECIDED_UPHELD, DECIDED_OVERTURNED, DECIDED_PARTIAL]
+    transitions:
+      - from: FILED
+        to: DECIDED_UPHELD
+        trigger: "POST /api/appeals/{appealId}/decision with decision=UPHELD"
+        actor: PayerReviewer
+        preconditions: ["status == FILED"]
+        side_effects: ["decided_at set; overturned_day_count = 0", "DenialCase APPEAL_FILED -> RESOLVED_UPHELD", "AuditEvent APPEAL_DECIDED appended"]
+      - from: FILED
+        to: DECIDED_OVERTURNED
+        trigger: "POST /api/appeals/{appealId}/decision with decision=OVERTURNED"
+        actor: PayerReviewer
+        preconditions: ["status == FILED"]
+        side_effects:
+          - "decided_at set; overturned_day_count = denial.denied_day_count"
+          - "DenialCase APPEAL_FILED -> RESOLVED_OVERTURNED"
+          - "linked AuthorizationRequest DENIED -> APPROVED with certified interval appended at case frontier covering overturned_day_count days"
+          - "every OPEN AvoidableDay of the case with day_date on/after the denied window start transitions to OVERTURNED (ordered by day_date ASC, created_at ASC)"
+          - "case.auth_status -> AUTHORIZED; certified counts recomputed; increments case.version by 1"
+      - from: FILED
+        to: DECIDED_PARTIAL
+        trigger: "POST /api/appeals/{appealId}/decision with decision=PARTIAL"
+        actor: PayerReviewer
+        preconditions: ["status == FILED", "overturned_day_count provided with 1 <= v < denial.denied_day_count"]
+        side_effects:
+          - "DenialCase APPEAL_FILED -> RESOLVED_PARTIAL"
+          - "linked AuthorizationRequest DENIED -> APPROVED with certified interval appended for overturned_day_count days"
+          - "the earliest overturned_day_count avoidable days (day_date ASC, created_at ASC) among OPEN records on/after the denied window start transition to OVERTURNED"
+          - "case.auth_status -> AUTHORIZED; certified counts recomputed; increments case.version by 1"
+
+# =============================================================================
+# Section 1.2.1: Concurrency Rules (true races only, OCC-resolved)
+# =============================================================================
+concurrency_rules:
+  - rule_id: auth-request-create-stale-case
+    parent_entity: UtilizationCase
+    write_endpoint: "POST /api/utilization-cases/{id}/authorization-requests"
+    occ_field: expected_case_version
+    description: |
+      Creating an AuthorizationRequest against a UtilizationCase whose version
+      has advanced past the caller's observed version is rejected. Creating a
+      request legitimately supersedes the case's non-terminal requests, so a
+      writer acting on a stale view of the case must be refused.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+  - rule_id: cc44-create-stale-case
+    parent_entity: UtilizationCase
+    write_endpoint: "POST /api/utilization-cases/{id}/condition-code-44-requests"
+    occ_field: expected_case_version
+    description: |
+      Creating a ConditionCode44Request against a UtilizationCase whose version
+      has advanced past the caller's observed version is rejected; the CC44
+      approval cascade rewrites case-level status and certified-interval tags,
+      so the create must be gated on a fresh view of the case.
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+
+# =============================================================================
+# Table 3: Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: medical_necessity_score
+    trigger: "AdmissionReview DRAFT -> SUBMITTED transition"
+    algorithm: weighted_scoring
+    formula: |
+      sev  = min(severity_of_illness_points, SEV_CAP) * SEV_W
+      int  = min(intensity_of_service_points, INT_CAP) * INT_W
+      cw   = COMORB_W_MEDICARE if case.payer.plan_class in {MEDICARE, MANAGED_MEDICARE} else COMORB_W_OTHER
+      com  = min(comorbidity_count, COMORB_CAP) * cw
+      necessity_score = min(SCORE_CAP, sev + int + com)
+      determination   = CRITERIA_MET if necessity_score >= MET_THRESHOLD else CRITERIA_NOT_MET
+    input_set: "the submitting AdmissionReview's three point inputs plus the parent case's payer.plan_class"
+    constants:
+      SEV_CAP: 12
+      INT_CAP: 12
+      SEV_W: 5
+      INT_W: 5
+      COMORB_CAP: 3
+      COMORB_W_MEDICARE: 4
+      COMORB_W_OTHER: 2
+      SCORE_CAP: 100
+      MET_THRESHOLD: 60
+    precision: "integer arithmetic; no rounding"
+    note: "Combinatorial mode (a): 4 inputs, nested min caps, conditional branch on plan_class, >= threshold boundary"
+
+  - name: two_midnight_benchmark
+    trigger: "UtilizationCase creation (PROVISIONAL) and discharge (FINAL)"
+    algorithm: threshold
+    formula: |
+      midnight_count(start_ts, end_ts) = (date(end_ts) - date(start_ts)) in whole calendar days
+      # i.e., the number of calendar-date boundaries crossed; times of day do not matter
+      MET when count >= TWO_MIDNIGHT_THRESHOLD else NOT_MET
+    input_set: "PROVISIONAL variant: (admit_at, expected_discharge_at); FINAL variant: (admit_at, discharge_at)"
+    constants:
+      TWO_MIDNIGHT_THRESHOLD: 2
+    precision: "integer day count; >= boundary (exactly 2 midnights is MET)"
+    variants:
+      - name: PROVISIONAL
+        when: "computed at case creation and used until discharge; benchmark_basis == PROVISIONAL"
+        difference: "uses expected_discharge_at, so a stay documented as two midnights can end FINAL NOT_MET when actual discharge occurs earlier"
+      - name: FINAL
+        when: "computed by the discharge action; benchmark_basis set to FINAL"
+        difference: "uses actual discharge_at; identical case data yields a different result than PROVISIONAL whenever actual and expected discharge dates differ"
+
+  - name: cc44_rebill_estimate
+    trigger: "ConditionCode44Request creation"
+    algorithm: aggregation
+    formula: |
+      # PINNED ORDER: round per line first, then sum. Reversing the order (sum raw, then round) is a rejected trap variant.
+      rebill_estimate_cents = sum over service_lines of round_half_up(charge_cents * rate_milli / 1000)
+    input_set: "the CC44 request's service_lines array"
+    constants:
+      RATE_SCALE: 1000
+    precision: "integer cents; round_half_up applied per line, then exact integer sum"
+    variants:
+      - name: per_line_round_then_sum
+        when: "always (pinned)"
+        difference: "round_half_up each line to whole cents first, then sum"
+      - name: sum_then_round
+        when: "never (documented trap)"
+        difference: "summing raw millicents and rounding once yields a different total whenever per-line fractions accumulate past a cent boundary"
+
+  - name: avoidable_day_attribution
+    trigger: "AvoidableDay creation, mitigate, or overturn — re-run for the affected (case, day_date) group"
+    algorithm: chronological
+    formula: |
+      For the set of AvoidableDay records of one case sharing a day_date with status != OVERTURNED:
+      FIRST_CAUSE:    owner = record with earliest created_at; tie-break barrier_code ASC (lexicographic)
+      DOMINANT_CAUSE: owner = record with max barrier_weight; tie-break earliest created_at, then barrier_code ASC
+      owner.is_attributed = true; all others in the group is_attributed = false
+    input_set: "all AvoidableDay records of the case for the given day_date with status in {OPEN, MITIGATED}"
+    constants: {}
+    precision: "boolean attribution; deterministic tie-breaks never use id"
+    variants:
+      - name: FIRST_CAUSE
+        when: "payer.avoidable_attribution_method == FIRST_CAUSE"
+        difference: "chronologically first-recorded barrier owns the day regardless of weight"
+      - name: DOMINANT_CAUSE
+        when: "payer.avoidable_attribution_method == DOMINANT_CAUSE"
+        difference: "highest barrier_weight owns the day; identical records yield a different owner than FIRST_CAUSE whenever the earliest barrier is not the heaviest"
+
+  - name: concurrent_review_cadence_schedule
+    trigger: "ConcurrentReview creation (computes review_due_at)"
+    algorithm: chronological
+    formula: |
+      anchor = (sequence_index == 1) ? parent AuthorizationRequest APPROVED decided_at
+                                     : previous ConcurrentReview's decided_at
+      review_due_at = anchor + payer.concurrent_review_cadence_hours
+      submission rejected with ERR_REVIEW_OVERDUE when logical now > review_due_at (equality allowed)
+    input_set: "parent auth's APPROVED decided_at, prior reviews' decided_at, payer cadence"
+    constants: {}
+    precision: "second-precision ISO8601; <= boundary (submission at exactly review_due_at is on time)"
+
+  - name: escalation_tier_resolution
+    trigger: "AvoidableDay create/mitigate/overturn, and EscalationCase apply-credit"
+    algorithm: threshold
+    formula: |
+      # PINNED EVALUATION ORDER (circular-looking pair: credit eligibility depends on tier, tier depends on net count, net count depends on credits)
+      step 1: raw_count = number of distinct day_date with >= 1 AvoidableDay status == OPEN
+      step 2: raw_tier  = 3 if raw_count >= T3_DAYS else 2 if raw_count >= T2_DAYS else 1 if raw_count >= T1_DAYS else 0
+      step 3: apply-credit eligibility is evaluated against raw_tier (== 3) BEFORE any credit is applied
+      step 4: net_count = raw_count - escalation.director_credit_days (floor 0)
+      step 5: effective_tier = tier(net_count) via the same thresholds; eligibility is NOT re-checked after crediting
+      escalation creation: when raw_tier crosses from 0 to >= 1 and no EscalationCase with status in {OPEN, ACKNOWLEDGED}
+      exists for the case, create one (OPEN, tier=raw_tier); when one exists and raw_tier > its tier, upgrade its tier
+      (never auto-downgrade).
+    input_set: "OPEN AvoidableDay records of the case (distinct day_date), active EscalationCase"
+    constants:
+      T1_DAYS: 2
+      T2_DAYS: 4
+      T3_DAYS: 6
+    precision: "integer counts; >= boundary at each tier edge"
+
+# =============================================================================
+# Table 4: Validation Rules Table (ordered by priority)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present; role is one of the seven declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+  - priority: 2
+    category: auth
+    check: "X-User-Role is listed in the endpoint's roles"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 3
+    category: business_constraint
+    check: "request-shape integrity: required fields present, enum members valid, numeric ranges honored, P2P duration >= 15 minutes and end after start; computed/system fields supplied by the client are rejected"
+    error_id: ERR_VALIDATION_FAILED
+    http_status: 400
+    applies_to: "all"
+  - priority: 4
+    category: existence
+    check: "every path id resolves to an existing resource, validated left-to-right through the path"
+    error_id: ERR_NOT_FOUND
+    http_status: 404
+    applies_to: "all"
+  - priority: 5
+    category: auth
+    check: "ownership: for AttendingPhysician endpoints on a case (P2P create/reschedule/cancel, CC44 concurrence), X-User-ID must equal case.attending_physician_id"
+    error_id: ERR_NOT_CASE_ATTENDING
+    http_status: 403
+    applies_to: "POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences, POST /api/peer-to-peer-conferences/{conferenceId}/reschedule, POST /api/peer-to-peer-conferences/{conferenceId}/cancel, POST /api/condition-code-44-requests/{cc44Id}/concurrence"
+  - priority: 6
+    category: state
+    check: "parent UtilizationCase.review_status != CLOSED for child mutations (reviews, auth requests, concurrent reviews, avoidable days)"
+    error_id: ERR_CASE_CLOSED
+    http_status: 409
+    applies_to: "child-creation/mutation endpoints under a case"
+  - priority: 7
+    category: state
+    check: "state-machine from-state: the target resource's current state permits the requested transition (includes repeated discharge, double decision, terminal-state writes)"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all action endpoints"
+  - priority: 8
+    category: state
+    check: "OCC: expected_case_version equals the case's current version on the two create-with-supersede writers"
+    error_id: ERR_STALE_VERSION
+    http_status: 412
+    applies_to: "POST /api/utilization-cases/{caseId}/authorization-requests, POST /api/utilization-cases/{caseId}/condition-code-44-requests"
+  - priority: 9
+    category: state
+    check: "CC44 creation on a discharged (CLOSED) case is rejected with the domain-specific post-discharge error"
+    error_id: ERR_CC44_POST_DISCHARGE
+    http_status: 409
+    applies_to: "POST /api/utilization-cases/{caseId}/condition-code-44-requests"
+  - priority: 10
+    category: state
+    check: "P2P creation requires the parent AuthorizationRequest.status == DENIED"
+    error_id: ERR_P2P_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences"
+  - priority: 11
+    category: state
+    check: "appeal filing while a linked PeerToPeerConference has status SCHEDULED (denial not yet final); also requires DenialCase.status == OPEN"
+    error_id: ERR_DENIAL_NOT_FINAL
+    http_status: 409
+    applies_to: "POST /api/denial-cases/{denialId}/appeals"
+  - priority: 12
+    category: business_safety
+    check: "clinical documentation completeness: clinical_summary length >= 50 characters on auth create and resubmit"
+    error_id: ERR_CLINICAL_DOC_INCOMPLETE
+    http_status: 422
+    applies_to: "POST /api/utilization-cases/{caseId}/authorization-requests, POST /api/authorization-requests/{authRequestId}/resubmit"
+  - priority: 13
+    category: business_safety
+    check: "segregation of duties: the CC44 committee reviewer or admission advisor reviewer (X-User-ID) must differ from the case attending_physician_id"
+    error_id: ERR_SOD_ROLE_CONFLICT
+    http_status: 422
+    applies_to: "POST /api/condition-code-44-requests/{cc44Id}/committee-review, POST /api/admission-reviews/{reviewId}/advisor-review"
+  - priority: 14
+    category: business_safety
+    check: "two-midnight documentation: an AdmissionReview whose computed recommendation is INPATIENT requires two_midnight_attestation == true"
+    error_id: ERR_TWO_MIDNIGHT_DOC_REQUIRED
+    http_status: 422
+    applies_to: "POST /api/admission-reviews/{reviewId}/submit"
+  - priority: 15
+    category: business_temporal
+    check: "P2P window: logical now <= window_deadline_at and scheduled_start_at <= window_deadline_at (equality allowed)"
+    error_id: ERR_P2P_WINDOW_EXPIRED
+    http_status: 422
+    applies_to: "POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences, POST /api/peer-to-peer-conferences/{conferenceId}/reschedule, POST /api/peer-to-peer-conferences/{conferenceId}/complete"
+  - priority: 16
+    category: business_temporal
+    check: "concurrent review submission deadline: logical now <= review_due_at (equality allowed)"
+    error_id: ERR_REVIEW_OVERDUE
+    http_status: 422
+    applies_to: "POST /api/authorization-requests/{authRequestId}/concurrent-reviews"
+  - priority: 17
+    category: business_temporal
+    check: "appeal filing deadline: logical now <= appeal_deadline_at (equality allowed)"
+    error_id: ERR_APPEAL_DEADLINE_PASSED
+    http_status: 422
+    applies_to: "POST /api/denial-cases/{denialId}/appeals"
+  - priority: 18
+    category: business_constraint
+    check: "at most one ConditionCode44Request per case with status in {CONCURRENCE_PENDING, COMMITTEE_PENDING}"
+    error_id: ERR_CC44_ALREADY_OPEN
+    http_status: 409
+    applies_to: "POST /api/utilization-cases/{caseId}/condition-code-44-requests"
+  - priority: 19
+    category: business_constraint
+    check: "uniqueness of (case_id, day_date, barrier_code) among AvoidableDay records"
+    error_id: ERR_AVOIDABLE_DAY_DUPLICATE
+    http_status: 409
+    applies_to: "POST /api/utilization-cases/{caseId}/avoidable-days"
+  - priority: 20
+    category: business_constraint
+    check: "advisor calendar buffered overlap: new conference must leave >= 15 minutes clearance from every SCHEDULED conference of the same advisor (exactly 15 minutes is allowed)"
+    error_id: ERR_SCHEDULING_OVERLAP
+    http_status: 409
+    applies_to: "POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences, POST /api/peer-to-peer-conferences/{conferenceId}/reschedule"
+  - priority: 21
+    category: business_constraint
+    check: "certified day-interval overlap: new half-open interval must not intersect any existing certified interval of the case; adjacency (start == existing end) is allowed"
+    error_id: ERR_CERTIFIED_DAY_OVERLAP
+    http_status: 409
+    applies_to: "POST /api/authorization-requests/{authRequestId}/payer-decision, POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision"
+  - priority: 22
+    category: business_constraint
+    check: "P2P reschedule hard cap: reschedule_count < 2"
+    error_id: ERR_P2P_RESCHEDULE_LIMIT
+    http_status: 409
+    applies_to: "POST /api/peer-to-peer-conferences/{conferenceId}/reschedule"
+  - priority: 23
+    category: business_constraint
+    check: "at most one AppealCase per DenialCase; a filing attempt when an AppealCase already exists (denial in APPEAL_FILED or RESOLVED_*) is rejected"
+    error_id: ERR_APPEAL_ALREADY_FILED
+    http_status: 409
+    applies_to: "POST /api/denial-cases/{denialId}/appeals"
+  - priority: 24
+    category: business_referential
+    check: "CC44 payer eligibility: case.payer.plan_class in {MEDICARE, MANAGED_MEDICARE}"
+    error_id: ERR_CC44_PAYER_INELIGIBLE
+    http_status: 422
+    applies_to: "POST /api/utilization-cases/{caseId}/condition-code-44-requests"
+  - priority: 25
+    category: business_referential
+    check: "CC44 clinical basis: the case's latest SUBMITTED/ADVISOR_REVIEWED AdmissionReview has determination == CRITERIA_NOT_MET"
+    error_id: ERR_CC44_CRITERIA_STILL_MET
+    http_status: 422
+    applies_to: "POST /api/utilization-cases/{caseId}/condition-code-44-requests"
+  - priority: 26
+    category: business_referential
+    check: "P2P advisor reference: advisor_physician_id resolves to a Physician with is_advisor == true"
+    error_id: ERR_NOT_PHYSICIAN_ADVISOR
+    http_status: 422
+    applies_to: "POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences"
+  - priority: 27
+    category: business_fiscal
+    check: "bed-day budget: case.certified_day_count + newly certified days <= payer.bed_day_budget_per_case; also requested_day_count <= bed_day_budget_per_case on auth create"
+    error_id: ERR_BED_DAY_BUDGET_EXCEEDED
+    http_status: 422
+    applies_to: "POST /api/utilization-cases/{caseId}/authorization-requests, POST /api/authorization-requests/{authRequestId}/payer-decision, POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision"
+
+# =============================================================================
+# 1.0 Response Envelope (FIXED)
+# =============================================================================
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# Table 5: API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Payers (configuration) ---
+  - method: POST
+    path: "/api/payers"
+    description: "Create a payer policy configuration"
+    roles: [URDirector]
+    code: 201
+    input: [name, plan_class, requires_inpatient_auth, concurrent_review_cadence_hours, p2p_window_hours, appeal_deadline_days, bed_day_budget_per_case, avoidable_attribution_method]
+    output: Payer
+    side_effects: []
+  - method: GET
+    path: "/api/payers"
+    description: "List payers (paginated)"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: ["plan_class?"]
+    output: "Payer[]"
+    side_effects: []
+  - method: GET
+    path: "/api/payers/{id}"
+    description: "Get one payer"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: Payer
+    side_effects: []
+
+  # --- Physicians ---
+  - method: POST
+    path: "/api/physicians"
+    description: "Register a physician"
+    roles: [URDirector]
+    code: 201
+    input: [full_name, specialty, "is_advisor?"]
+    output: Physician
+    side_effects: []
+  - method: GET
+    path: "/api/physicians"
+    description: "List physicians (paginated)"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: ["is_advisor?"]
+    output: "Physician[]"
+    side_effects: []
+  - method: GET
+    path: "/api/physicians/{id}"
+    description: "Get one physician"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: Physician
+    side_effects: []
+  - method: GET
+    path: "/api/physicians/{id}/peer-to-peer-conferences"
+    description: "List conferences where the physician is advisor or attendee, ordered by scheduled_start_at ASC, then created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "PeerToPeerConference[]"
+    side_effects: []
+  - method: GET
+    path: "/api/physicians/{id}/condition-code-44-requests"
+    description: "List CC44 requests whose committee_reviewer_id is this physician"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "ConditionCode44Request[]"
+    side_effects: []
+
+  # --- Utilization cases ---
+  - method: POST
+    path: "/api/utilization-cases"
+    description: "Open a utilization case at admission"
+    roles: [URNurse]
+    code: 201
+    input: [patient_mrn, payer_id, attending_physician_id, admit_at, expected_discharge_at, requested_admission_status]
+    output: UtilizationCase
+    side_effects: ["expected_midnight_count computed; two_midnight_benchmark_met computed under PROVISIONAL variant; benchmark_basis=PROVISIONAL; current_admission_status initialized from requested_admission_status; review_status=INTAKE; auth_status=AUTH_PENDING; AuditEvent CASE_OPENED appended"]
+  - method: GET
+    path: "/api/utilization-cases"
+    description: "List utilization cases (paginated, filterable)"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: ["payer_id?", "attending_physician_id?", "review_status?", "auth_status?"]
+    output: "UtilizationCase[]"
+    side_effects: []
+  - method: GET
+    path: "/api/utilization-cases/{id}"
+    description: "Get one utilization case (all computed fields current)"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: UtilizationCase
+    side_effects: []
+  - method: POST
+    path: "/api/utilization-cases/{id}/discharge"
+    description: "Discharge the case; computes the FINAL two-midnight benchmark and cascades closure"
+    roles: [URNurse]
+    code: 200
+    input: [discharge_at]
+    output: UtilizationCase
+    side_effects: ["review_status -> CLOSED; actual_midnight_count + FINAL benchmark computed; non-terminal AuthorizationRequests -> WITHDRAWN; OPEN/ACKNOWLEDGED escalations -> RESOLVED; increments UtilizationCase.version by 1; AuditEvent CASE_DISCHARGED appended"]
+
+  # --- Admission reviews ---
+  - method: POST
+    path: "/api/utilization-cases/{id}/admission-reviews"
+    description: "Create an admission medical-necessity review in DRAFT"
+    roles: [URNurse]
+    code: 201
+    input: [criteria_set, severity_of_illness_points, intensity_of_service_points, comorbidity_count, two_midnight_attestation]
+    output: AdmissionReview
+    side_effects: ["status=DRAFT"]
+  - method: GET
+    path: "/api/utilization-cases/{id}/admission-reviews"
+    description: "List admission reviews of a case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "AdmissionReview[]"
+    side_effects: []
+  - method: GET
+    path: "/api/admission-reviews/{id}"
+    description: "Get one admission review"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: AdmissionReview
+    side_effects: []
+  - method: POST
+    path: "/api/admission-reviews/{id}/submit"
+    description: "Submit the review: computes necessity score, determination, recommended status"
+    roles: [URNurse]
+    code: 200
+    input: []
+    output: AdmissionReview
+    side_effects: ["medical_necessity_score computed; determination + recommended_status set; case.review_status INTAKE -> ADMISSION_REVIEWED; increments case.version by 1; AuditEvent REVIEW_SUBMITTED appended"]
+  - method: POST
+    path: "/api/admission-reviews/{id}/advisor-review"
+    description: "PhysicianAdvisor second-level review of a CRITERIA_NOT_MET determination"
+    roles: [PhysicianAdvisor]
+    code: 200
+    input: [advisor_decision, "advisor_note?"]
+    output: AdmissionReview
+    side_effects: ["status -> ADVISOR_REVIEWED; determination rewritten to CRITERIA_MET on REVERSE; recommended_status recomputed; AuditEvent ADVISOR_REVIEW_COMPLETED appended"]
+
+  # --- Authorization requests ---
+  - method: POST
+    path: "/api/utilization-cases/{id}/authorization-requests"
+    description: "Create and submit a payer authorization request (OCC-guarded create-with-supersede)"
+    roles: [URNurse]
+    code: 201
+    input: [level_of_care, requested_day_count, clinical_summary, expected_case_version]
+    output: AuthorizationRequest
+    side_effects: ["status=SUBMITTED, submission_round=1; existing SUBMITTED/PENDED requests of the case -> SUPERSEDED; case.auth_status AUTH_PENDING -> AUTH_IN_PROGRESS; increments UtilizationCase.version by 1; AuditEvent AUTH_SUBMITTED appended"]
+  - method: GET
+    path: "/api/utilization-cases/{id}/authorization-requests"
+    description: "List authorization requests of a case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "AuthorizationRequest[]"
+    side_effects: []
+  - method: GET
+    path: "/api/authorization-requests/{id}"
+    description: "Get one authorization request"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: []
+  - method: POST
+    path: "/api/authorization-requests/{id}/payer-decision"
+    description: "Payer decision: APPROVE (with certified interval), PEND, or DENY (creates DenialCase)"
+    roles: [PayerReviewer]
+    code: 200
+    input: [decision, "certified_day_start?", "certified_day_count?", "denial_reason_code?", "pend_reason?"]
+    output: AuthorizationRequest
+    side_effects: ["APPROVE: certified interval stored, case axes and certified counts recomputed; PEND: status PENDED; DENY: DenialCase created OPEN, case.auth_status -> DENIED; decided_at set; increments case.version by 1"]
+  - method: POST
+    path: "/api/authorization-requests/{id}/resubmit"
+    description: "Resubmit a PENDED request with a refreshed clinical packet (cycle, submission_round += 1)"
+    roles: [URNurse]
+    code: 200
+    input: [clinical_summary]
+    output: AuthorizationRequest
+    side_effects: ["status PENDED -> SUBMITTED; submission_round += 1; AuditEvent AUTH_RESUBMITTED appended"]
+  - method: POST
+    path: "/api/authorization-requests/{id}/withdraw"
+    description: "Withdraw a non-terminal authorization request"
+    roles: [URNurse]
+    code: 200
+    input: []
+    output: AuthorizationRequest
+    side_effects: ["status -> WITHDRAWN; AuditEvent AUTH_WITHDRAWN appended"]
+  - method: GET
+    path: "/api/authorization-requests/{id}/denial-cases"
+    description: "List denial cases linked to this authorization request"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "DenialCase[]"
+    side_effects: []
+
+  # --- Concurrent reviews (continued stay) ---
+  - method: POST
+    path: "/api/authorization-requests/{id}/concurrent-reviews"
+    description: "Submit a continued-stay concurrent review; requires parent auth APPROVED, no other SUBMITTED review outstanding on the same auth (else ERR_INVALID_STATE), and submission by review_due_at"
+    roles: [URNurse]
+    code: 201
+    input: [clinical_update, requested_additional_day_count]
+    output: ConcurrentReview
+    side_effects: ["status=SUBMITTED; sequence_index assigned; review_due_at computed via concurrent_review_cadence_schedule; AuditEvent CONCURRENT_REVIEW_SUBMITTED appended"]
+  - method: GET
+    path: "/api/authorization-requests/{id}/concurrent-reviews"
+    description: "List concurrent reviews of an authorization request, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "ConcurrentReview[]"
+    side_effects: []
+  - method: POST
+    path: "/api/concurrent-reviews/{id}/payer-decision"
+    description: "Payer decision on a continued-stay review: APPROVE, PARTIAL (reduced days), or DENY (creates DenialCase)"
+    roles: [PayerReviewer]
+    code: 200
+    input: [decision, "approved_day_count?", "certified_day_start?", "denial_reason_code?"]
+    output: ConcurrentReview
+    side_effects: ["APPROVE/PARTIAL: certified interval appended per certified_day_start, case certified counts recomputed, increments case.version by 1; DENY: DenialCase created OPEN (denial_type=CONCURRENT), case.auth_status -> DENIED"]
+
+  # --- Peer-to-peer conferences ---
+  - method: POST
+    path: "/api/authorization-requests/{id}/peer-to-peer-conferences"
+    description: "Schedule a peer-to-peer conference on an adverse determination; advisor calendar overlap and window checks apply"
+    roles: [AttendingPhysician]
+    code: 201
+    input: [advisor_physician_id, scheduled_start_at, scheduled_end_at]
+    output: PeerToPeerConference
+    side_effects: ["status=SCHEDULED; window_deadline_at computed; linked DenialCase OPEN -> P2P_SCHEDULED; AuditEvent P2P_SCHEDULED appended"]
+  - method: GET
+    path: "/api/authorization-requests/{id}/peer-to-peer-conferences"
+    description: "List peer-to-peer conferences of an authorization request, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "PeerToPeerConference[]"
+    side_effects: ["lazy EXPIRED materialization applies to listed rows"]
+  - method: GET
+    path: "/api/peer-to-peer-conferences/{id}"
+    description: "Get one conference; reading after window_deadline_at materializes EXPIRED"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: PeerToPeerConference
+    side_effects: ["lazy EXPIRED materialization when now > window_deadline_at and status SCHEDULED"]
+  - method: POST
+    path: "/api/peer-to-peer-conferences/{id}/reschedule"
+    description: "Reschedule a conference (self-loop, max 2 reschedules, window and calendar checks re-applied)"
+    roles: [AttendingPhysician]
+    code: 200
+    input: [scheduled_start_at, scheduled_end_at]
+    output: PeerToPeerConference
+    side_effects: ["reschedule_count += 1; AuditEvent P2P_RESCHEDULED appended"]
+  - method: POST
+    path: "/api/peer-to-peer-conferences/{id}/complete"
+    description: "Record the conference outcome; OVERTURNED restores the authorization"
+    roles: [PhysicianAdvisor]
+    code: 200
+    input: [outcome, "certified_day_count?"]
+    output: PeerToPeerConference
+    side_effects: ["OVERTURNED: auth DENIED -> APPROVED with certified interval appended at case frontier, DenialCase -> RESOLVED_OVERTURNED, case.auth_status -> AUTHORIZED, increments case.version by 1; UPHELD: DenialCase P2P_SCHEDULED -> OPEN"]
+  - method: POST
+    path: "/api/peer-to-peer-conferences/{id}/cancel"
+    description: "Cancel a scheduled conference; denial returns to OPEN with appeal_deadline_at unchanged"
+    roles: [AttendingPhysician]
+    code: 200
+    input: []
+    output: PeerToPeerConference
+    side_effects: ["status -> CANCELLED; DenialCase P2P_SCHEDULED -> OPEN (appeal_deadline_at conserved); AuditEvent P2P_CANCELLED appended"]
+
+  # --- Condition Code 44 ---
+  - method: POST
+    path: "/api/utilization-cases/{id}/condition-code-44-requests"
+    description: "Initiate a condition-code-44 inpatient-to-observation status change (OCC-guarded; Medicare-family only; requires latest review CRITERIA_NOT_MET)"
+    roles: [URNurse]
+    code: 201
+    input: [rationale, service_lines, expected_case_version]
+    output: ConditionCode44Request
+    side_effects: ["status=CONCURRENCE_PENDING; rebill_estimate_cents computed (per-line rounding then sum); increments UtilizationCase.version by 1; AuditEvent CC44_INITIATED appended"]
+  - method: GET
+    path: "/api/utilization-cases/{id}/condition-code-44-requests"
+    description: "List CC44 requests of a case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "ConditionCode44Request[]"
+    side_effects: []
+  - method: POST
+    path: "/api/condition-code-44-requests/{cc44Id}/concurrence"
+    description: "Attending physician concurrence step (CONCUR advances to committee; DECLINE closes)"
+    roles: [AttendingPhysician]
+    code: 200
+    input: [decision, "concurrence_note?"]
+    output: ConditionCode44Request
+    side_effects: ["CONCUR: -> COMMITTEE_PENDING; DECLINE: -> DECLINED_CLOSED; AuditEvent appended"]
+  - method: POST
+    path: "/api/condition-code-44-requests/{cc44Id}/committee-review"
+    description: "UR committee (PhysicianAdvisor) decision; segregation of duties enforced"
+    roles: [PhysicianAdvisor]
+    code: 200
+    input: [decision, "committee_note?"]
+    output: ConditionCode44Request
+    side_effects: ["APPROVE: case.current_admission_status -> OBSERVATION, non-terminal INPATIENT auth requests -> WITHDRAWN, INPATIENT certified intervals re-tagged OBSERVATION (total certified_day_count conserved), increments case.version by 1; REJECT: terminal with no case mutation"]
+  - method: POST
+    path: "/api/condition-code-44-requests/{cc44Id}/rescind"
+    description: "Rescind an approved CC44 (compensating action: restores INPATIENT status and interval tags)"
+    roles: [URDirector]
+    code: 200
+    input: [rescind_reason]
+    output: ConditionCode44Request
+    side_effects: ["status APPROVED -> RESCINDED; case.current_admission_status -> INPATIENT; OBSERVATION-tagged intervals restored to INPATIENT (certified_day_count conserved across the pair); increments case.version by 1; AuditEvent CC44_RESCINDED appended"]
+
+  # --- Avoidable days ---
+  - method: POST
+    path: "/api/utilization-cases/{id}/avoidable-days"
+    description: "Record an avoidable-day barrier; triggers attribution recompute and escalation-tier evaluation"
+    roles: [URNurse, CaseManager]
+    code: 201
+    input: [day_date, barrier_code, barrier_weight]
+    output: AvoidableDay
+    side_effects: ["status=OPEN; is_attributed computed per payer.avoidable_attribution_method; case.open_avoidable_day_count and escalation_tier recomputed; EscalationCase created or tier-upgraded when a tier threshold is crossed; increments case.version by 1; AuditEvent AVOIDABLE_DAY_RECORDED appended"]
+  - method: GET
+    path: "/api/utilization-cases/{id}/avoidable-days"
+    description: "List avoidable-day records of a case, ordered by day_date ASC then created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: ["status?"]
+    output: "AvoidableDay[]"
+    side_effects: []
+  - method: POST
+    path: "/api/avoidable-days/{id}/mitigate"
+    description: "Record mitigation of an open avoidable day"
+    roles: [CaseManager]
+    code: 200
+    input: [mitigation_note]
+    output: AvoidableDay
+    side_effects: ["status OPEN -> MITIGATED; case.open_avoidable_day_count recomputed; effective_tier recomputed; increments case.version by 1; AuditEvent AVOIDABLE_DAY_MITIGATED appended"]
+
+  # --- Escalations ---
+  - method: GET
+    path: "/api/utilization-cases/{id}/escalation-cases"
+    description: "List escalation cases of a utilization case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "EscalationCase[]"
+    side_effects: []
+  - method: POST
+    path: "/api/escalation-cases/{id}/acknowledge"
+    description: "Acknowledge an open escalation"
+    roles: [CaseManager]
+    code: 200
+    input: []
+    output: EscalationCase
+    side_effects: ["status OPEN -> ACKNOWLEDGED; AuditEvent ESCALATION_ACKNOWLEDGED appended"]
+  - method: POST
+    path: "/api/escalation-cases/{id}/resolve"
+    description: "Resolve an escalation"
+    roles: [CaseManager]
+    code: 200
+    input: [resolution_note]
+    output: EscalationCase
+    side_effects: ["status -> RESOLVED; AuditEvent ESCALATION_RESOLVED appended"]
+  - method: POST
+    path: "/api/escalation-cases/{id}/apply-credit"
+    description: "URDirector mitigation credit; eligibility evaluated against the raw (pre-credit) tier, which must be 3"
+    roles: [URDirector]
+    code: 200
+    input: [credit_days]
+    output: EscalationCase
+    side_effects: ["director_credit_days += credit_days; effective_tier recomputed from net count; tier (raw) unchanged; AuditEvent ESCALATION_CREDIT_APPLIED appended"]
+
+  # --- Denials and appeals ---
+  - method: GET
+    path: "/api/utilization-cases/{id}/denial-cases"
+    description: "List denial cases of a utilization case, ordered by created_at ASC; reading after appeal_deadline_at materializes CLOSED_NO_APPEAL"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "DenialCase[]"
+    side_effects: ["lazy CLOSED_NO_APPEAL materialization"]
+  - method: GET
+    path: "/api/denial-cases/{id}"
+    description: "Get one denial case"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: DenialCase
+    side_effects: ["lazy CLOSED_NO_APPEAL materialization"]
+  - method: POST
+    path: "/api/denial-cases/{id}/appeals"
+    description: "File an appeal on a final denial (denial handoff to appeals)"
+    roles: [AppealsCoordinator]
+    code: 201
+    input: [appeal_level, argument_summary]
+    output: AppealCase
+    side_effects: ["AppealCase created FILED; DenialCase OPEN -> APPEAL_FILED; AuditEvent APPEAL_FILED appended"]
+  - method: GET
+    path: "/api/denial-cases/{id}/appeals"
+    description: "List appeals of a denial case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "AppealCase[]"
+    side_effects: []
+  - method: POST
+    path: "/api/appeals/{id}/decision"
+    description: "Record the appeal decision; OVERTURNED/PARTIAL cascade restores certified days and reclassifies avoidable days"
+    roles: [PayerReviewer]
+    code: 200
+    input: [decision, "overturned_day_count?"]
+    output: AppealCase
+    side_effects: ["denial resolved per decision; OVERTURNED/PARTIAL: auth DENIED -> APPROVED with certified interval appended, OPEN avoidable days in the denied window -> OVERTURNED (day_date ASC, created_at ASC), case.auth_status -> AUTHORIZED, increments case.version by 1; AuditEvent APPEAL_DECIDED appended"]
+
+  # --- Audit trail ---
+  - method: GET
+    path: "/api/utilization-cases/{id}/audit-events"
+    description: "Append-only audit trail of the case, ordered by created_at ASC"
+    roles: [URNurse, AttendingPhysician, PhysicianAdvisor, PayerReviewer, CaseManager, AppealsCoordinator, URDirector]
+    code: 200
+    input: []
+    output: "AuditEvent[]"
+    side_effects: []
+
+  # --- Test-driving logical clock ---
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock. Startup default (before any set call) is exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time; all deadline/window/cadence comparisons read this clock."
+    roles: [URDirector]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["logical clock advanced to to_iso8601 (monotonicity not enforced; tests may rewind)"]
+
+# =============================================================================
+# Table 6: Error Code Catalog
+# =============================================================================
+errors:
+  - { id: ERR_UNAUTHENTICATED, http: 401, condition: "X-User-Role or X-User-ID header missing, or role not recognized" }
+  - { id: ERR_FORBIDDEN_ROLE, http: 403, condition: "Role is authenticated but not listed in the endpoint's roles" }
+  - { id: ERR_NOT_CASE_ATTENDING, http: 403, condition: "AttendingPhysician endpoint called with X-User-ID different from the case's attending_physician_id" }
+  - { id: ERR_VALIDATION_FAILED, http: 400, condition: "Missing required field, invalid enum member, out-of-range value, P2P duration < 15 minutes or end <= start, or client supplied a computed/system field" }
+  - { id: ERR_NOT_FOUND, http: 404, condition: "A path-templated id does not resolve to an existing resource (checked left-to-right)" }
+  - { id: ERR_CASE_CLOSED, http: 409, condition: "Child mutation attempted while the parent UtilizationCase.review_status == CLOSED" }
+  - { id: ERR_INVALID_STATE, http: 409, condition: "The target resource's current state does not permit the requested transition" }
+  - { id: ERR_STALE_VERSION, http: 412, condition: "expected_case_version does not equal the case's current version (OCC on create-with-supersede writers)" }
+  - { id: ERR_CC44_POST_DISCHARGE, http: 409, condition: "CC44 request created after the case was discharged" }
+  - { id: ERR_P2P_NOT_ELIGIBLE, http: 409, condition: "Peer-to-peer requested for an authorization request whose status is not DENIED" }
+  - { id: ERR_DENIAL_NOT_FINAL, http: 409, condition: "Appeal filed while the denial is not final (a peer-to-peer conference is still SCHEDULED)" }
+  - { id: ERR_CLINICAL_DOC_INCOMPLETE, http: 422, condition: "clinical_summary shorter than 50 characters on auth create or resubmit" }
+  - { id: ERR_SOD_ROLE_CONFLICT, http: 422, condition: "Segregation of duties: CC44 committee reviewer or advisor reviewer is the case attending (same X-User-ID)" }
+  - { id: ERR_TWO_MIDNIGHT_DOC_REQUIRED, http: 422, condition: "Review recommends INPATIENT but two_midnight_attestation is false" }
+  - { id: ERR_P2P_WINDOW_EXPIRED, http: 422, condition: "Logical now or scheduled_start_at is past window_deadline_at on P2P create/reschedule, or complete attempted after scheduled_end_at" }
+  - { id: ERR_REVIEW_OVERDUE, http: 422, condition: "Concurrent review submitted after review_due_at" }
+  - { id: ERR_APPEAL_DEADLINE_PASSED, http: 422, condition: "Appeal filed after appeal_deadline_at" }
+  - { id: ERR_CC44_ALREADY_OPEN, http: 409, condition: "A CC44 request in CONCURRENCE_PENDING or COMMITTEE_PENDING already exists for the case" }
+  - { id: ERR_AVOIDABLE_DAY_DUPLICATE, http: 409, condition: "An AvoidableDay with the same (case_id, day_date, barrier_code) already exists" }
+  - { id: ERR_SCHEDULING_OVERLAP, http: 409, condition: "Advisor calendar conflict: less than 15 minutes clearance from another SCHEDULED conference of the same advisor" }
+  - { id: ERR_CERTIFIED_DAY_OVERLAP, http: 409, condition: "Proposed certified day-interval intersects an existing certified interval of the case (half-open comparison; adjacency allowed)" }
+  - { id: ERR_P2P_RESCHEDULE_LIMIT, http: 409, condition: "reschedule_count already equals 2" }
+  - { id: ERR_APPEAL_ALREADY_FILED, http: 409, condition: "An AppealCase already exists for this DenialCase" }
+  - { id: ERR_CC44_PAYER_INELIGIBLE, http: 422, condition: "CC44 requested for a case whose payer plan_class is not MEDICARE or MANAGED_MEDICARE" }
+  - { id: ERR_CC44_CRITERIA_STILL_MET, http: 422, condition: "The case's latest submitted admission review has determination CRITERIA_MET, so the CC44 clinical basis is absent" }
+  - { id: ERR_NOT_PHYSICIAN_ADVISOR, http: 422, condition: "advisor_physician_id resolves to a Physician with is_advisor == false" }
+  - { id: ERR_BED_DAY_BUDGET_EXCEEDED, http: 422, condition: "Requested or newly certified days would push the case past the payer's bed_day_budget_per_case" }
+
+# =============================================================================
+# Table 7: RBAC Matrix
+# =============================================================================
+roles:
+  - name: URNurse
+    description: "Hospital utilization-review nurse; owns intake, admission reviews, payer authorization submission, concurrent reviews, and CC44 initiation"
+    identity: opaque
+    exclusive_operations: ["POST /api/utilization-cases", "POST /api/utilization-cases/{caseId}/discharge", "POST /api/utilization-cases/{caseId}/admission-reviews", "POST /api/admission-reviews/{reviewId}/submit", "POST /api/utilization-cases/{caseId}/authorization-requests", "POST /api/authorization-requests/{authRequestId}/resubmit", "POST /api/authorization-requests/{authRequestId}/withdraw", "POST /api/authorization-requests/{authRequestId}/concurrent-reviews", "POST /api/utilization-cases/{caseId}/condition-code-44-requests"]
+    shared_operations: ["all GET endpoints", "POST /api/utilization-cases/{caseId}/avoidable-days (shared with CaseManager)"]
+  - name: AttendingPhysician
+    description: "Treating physician of record; must act on own cases (X-User-ID == case.attending_physician_id)"
+    identity: "entity_backed:Physician"
+    exclusive_operations: ["POST /api/authorization-requests/{authRequestId}/peer-to-peer-conferences", "POST /api/peer-to-peer-conferences/{conferenceId}/reschedule", "POST /api/peer-to-peer-conferences/{conferenceId}/cancel", "POST /api/condition-code-44-requests/{cc44Id}/concurrence"]
+    shared_operations: ["all GET endpoints"]
+  - name: PhysicianAdvisor
+    description: "Physician advisor; second-level review, CC44 committee member, P2P medical-director counterpart; barred from reviewing own-attended cases (SoD)"
+    identity: "entity_backed:Physician"
+    exclusive_operations: ["POST /api/admission-reviews/{reviewId}/advisor-review", "POST /api/condition-code-44-requests/{cc44Id}/committee-review", "POST /api/peer-to-peer-conferences/{conferenceId}/complete"]
+    shared_operations: ["all GET endpoints"]
+  - name: PayerReviewer
+    description: "Payer-side reviewer; renders authorization, continued-stay, and appeal decisions"
+    identity: opaque
+    exclusive_operations: ["POST /api/authorization-requests/{authRequestId}/payer-decision", "POST /api/concurrent-reviews/{concurrentReviewId}/payer-decision", "POST /api/appeals/{appealId}/decision"]
+    shared_operations: ["all GET endpoints"]
+  - name: CaseManager
+    description: "Hospital case manager; records and mitigates avoidable days, works escalations"
+    identity: opaque
+    exclusive_operations: ["POST /api/avoidable-days/{avoidableDayId}/mitigate", "POST /api/escalation-cases/{escalationId}/acknowledge", "POST /api/escalation-cases/{escalationId}/resolve"]
+    shared_operations: ["all GET endpoints", "POST /api/utilization-cases/{caseId}/avoidable-days (shared with URNurse)"]
+  - name: AppealsCoordinator
+    description: "Appeals office; files appeals on final denials"
+    identity: opaque
+    exclusive_operations: ["POST /api/denial-cases/{denialId}/appeals"]
+    shared_operations: ["all GET endpoints"]
+  - name: URDirector
+    description: "UR department director; administers payer/physician configuration, rescinds CC44s, applies tier-3 mitigation credits, drives the logical clock"
+    identity: opaque
+    exclusive_operations: ["POST /api/payers", "POST /api/physicians", "POST /api/condition-code-44-requests/{cc44Id}/rescind", "POST /api/escalation-cases/{escalationId}/apply-credit", "POST /_clock/set_current_utc"]
+    shared_operations: ["all GET endpoints"]

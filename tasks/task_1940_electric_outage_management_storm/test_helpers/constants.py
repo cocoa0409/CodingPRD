@@ -1,0 +1,62 @@
+"""Domain thresholds and calculation constants (PRD sections 2.11, 2.12, 3)."""
+
+# Logical clock (PRD 2.4): the clock reads exactly this before any set call.
+CLOCK_START_ISO = "2026-08-01T00:00:00Z"
+
+# ETR estimate (PRD 3.3 confirmation formula; 3.4 post-assessment formula).
+BASE_PREP_MINUTES = 120
+PER_CUSTOMER_MINUTES = 2
+CUSTOMER_CAP = 5000
+SWITCHING_OVERHEAD_MINUTES = 45
+CAUSE_FACTOR = {
+    "TREE": 1.5,
+    "LIGHTNING": 1.2,
+    "EQUIPMENT": 1.0,
+    "VEHICLE": 1.3,
+    "UNKNOWN": 1.4,
+}
+
+# ETR revision gates (PRD 2.11).
+MAX_SINGLE_EXTENSION_MINUTES = 360
+PUBLIC_LOCK_MINUTES = 30
+REWORK_EXTENSION_MINUTES = 180  # verify-fail forced revision = now + 180
+
+# Clustering promotion (PRD 3.2).
+CLUSTER_WINDOW_MINUTES = 60
+DEFAULT_CLUSTER_SIGNAL_THRESHOLD = 3
+DEFAULT_CLUSTER_CALL_THRESHOLD = 5
+
+# Priority score (PRD 3.3).
+LIFE_SUPPORT_BONUS = 10000
+CRITICAL_FACILITY_BONUS = 4000
+CUSTOMER_SCORE_CAP = 10000
+AGE_HOURLY_POINTS = 50
+MISSED_ETR_BONUS = 2000
+
+# Crew fatigue (PRD 2.12).
+MAX_CONTINUOUS_WORK_MINUTES = 960
+DEFAULT_ESTIMATE_MINUTES = 120
+
+# Mutual-aid engagement cost (PRD 3.7).
+EARLY_EXIT_PENALTY_PCT = 0.25
+
+# Lodging allocation (PRD 3.7).
+LODGING_TAX_PCT = 0.07
+
+# FEMA eligibility (PRD 3.9).
+ELIGIBILITY_HOURS = 96
+
+TEST_DEFAULTS = {
+    "COUNTY_CODE": "C1",
+    "FEEDER_CODE": "FDR-1",
+    "FEEDER_CUSTOMER_COUNT": 2000,
+    "CREW_HOURLY_RATE_CENTS": 9000,
+    "HOME_BASE": "Depot 1",
+    "MA_DAILY_RATE_CENTS": 40000,
+    "MA_PER_DIEM_CENTS": 5000,
+    "LODGING_NIGHTLY_RATE_CENTS": 10000,
+    "STOCK_WAREHOUSE": "W1",
+    "STOCK_SKU": "SKU-1",
+    "STOCK_ON_HAND": 100,
+    "STOCK_UNIT_COST_CENTS": 500,
+}

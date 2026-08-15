@@ -1,0 +1,35 @@
+"""Error types and the PRD §5 error catalogue."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.status = status
+
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                    # 401
+ERR_FORBIDDEN_ROLE = "ERR_FORBIDDEN_ROLE"                      # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                                # 404
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                    # 400
+ERR_INVALID_STATE_TRANSITION = "ERR_INVALID_STATE_TRANSITION"  # 409
+ERR_PRODUCT_FROZEN = "ERR_PRODUCT_FROZEN"                      # 409
+ERR_CATEGORY_RETIRED = "ERR_CATEGORY_RETIRED"                  # 409
+ERR_TEMPLATE_NOT_ACTIVE = "ERR_TEMPLATE_NOT_ACTIVE"            # 409
+ERR_TEMPLATE_MISMATCH = "ERR_TEMPLATE_MISMATCH"                # 409
+ERR_TEMPLATE_IN_USE = "ERR_TEMPLATE_IN_USE"                    # 409
+ERR_RCA_REQUIRED = "ERR_RCA_REQUIRED"                          # 409
+ERR_RCA_DEADLINE_PASSED = "ERR_RCA_DEADLINE_PASSED"            # 409
+ERR_QA_PASS_REQUIRED = "ERR_QA_PASS_REQUIRED"                  # 409
+ERR_ESCALATION_OPEN = "ERR_ESCALATION_OPEN"                    # 409
+ERR_SOD_SELF_REVIEW = "ERR_SOD_SELF_REVIEW"                    # 409
+ERR_SOD_SELF_APPROVAL = "ERR_SOD_SELF_APPROVAL"                # 409
+ERR_RESTITUTION_OVER_AUTHORITY = "ERR_RESTITUTION_OVER_AUTHORITY"  # 409
+ERR_REFERRAL_OPEN = "ERR_REFERRAL_OPEN"                        # 409
+ERR_REVIEW_NOT_OWNED = "ERR_REVIEW_NOT_OWNED"                  # 409
+ERR_REVIEW_WINDOW_OVERLAP = "ERR_REVIEW_WINDOW_OVERLAP"        # 409
+ERR_SNAPSHOT_WINDOW_OVERLAP = "ERR_SNAPSHOT_WINDOW_OVERLAP"    # 409
+ERR_RETENTION_EXPIRED = "ERR_RETENTION_EXPIRED"                # 409
+ERR_COMPLAINT_NOT_REMEDIABLE = "ERR_COMPLAINT_NOT_REMEDIABLE"  # 409
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                        # 412

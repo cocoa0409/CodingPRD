@@ -1,0 +1,51 @@
+"""Error classes and error ID constants from the scaffold error catalog."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+# Error catalog (SCAFFOLD §1.6 / PRD §5)
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"                # 401
+ERR_FORBIDDEN = "ERR_FORBIDDEN"                            # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                            # 404
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                    # 409
+ERR_SAILING_NOT_BOOKABLE = "ERR_SAILING_NOT_BOOKABLE"      # 409
+ERR_SCHEDULE_WINDOW_CONFLICT = "ERR_SCHEDULE_WINDOW_CONFLICT"  # 409
+ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"          # 403
+ERR_MANNING_SHORTFALL = "ERR_MANNING_SHORTFALL"            # 409
+ERR_VESSEL_SCHEDULE_CONFLICT = "ERR_VESSEL_SCHEDULE_CONFLICT"  # 409
+ERR_CREW_REST_CONFLICT = "ERR_CREW_REST_CONFLICT"          # 409
+ERR_INVALID_PARTY_SPEC = "ERR_INVALID_PARTY_SPEC"          # 400
+ERR_VEHICLE_LENGTH_EXCEEDS = "ERR_VEHICLE_LENGTH_EXCEEDS"  # 422
+ERR_FARE_SCHEDULE_NOT_EFFECTIVE = "ERR_FARE_SCHEDULE_NOT_EFFECTIVE"  # 409
+ERR_CAPACITY_EXCEEDED = "ERR_CAPACITY_EXCEEDED"            # 409
+ERR_STALE_VERSION = "ERR_STALE_VERSION"                    # 412
+ERR_DUPLICATE = "ERR_DUPLICATE"                            # 409
+
+_HTTP = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_FORBIDDEN: 403,
+    ERR_NOT_FOUND: 404,
+    ERR_INVALID_STATE: 409,
+    ERR_SAILING_NOT_BOOKABLE: 409,
+    ERR_SCHEDULE_WINDOW_CONFLICT: 409,
+    ERR_NOT_RESOURCE_OWNER: 403,
+    ERR_MANNING_SHORTFALL: 409,
+    ERR_VESSEL_SCHEDULE_CONFLICT: 409,
+    ERR_CREW_REST_CONFLICT: 409,
+    ERR_INVALID_PARTY_SPEC: 400,
+    ERR_VEHICLE_LENGTH_EXCEEDS: 422,
+    ERR_FARE_SCHEDULE_NOT_EFFECTIVE: 409,
+    ERR_CAPACITY_EXCEEDED: 409,
+    ERR_STALE_VERSION: 412,
+    ERR_DUPLICATE: 409,
+}
+
+
+def raise_error(error_id, message):
+    raise ApiError(error_id, message, _HTTP[error_id])

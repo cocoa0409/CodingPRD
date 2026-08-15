@@ -1,0 +1,45 @@
+# Error catalog: error_id -> HTTP status (PRD section 5 / scaffold section 1.6).
+ERROR_STATUS = {
+    "ERR_MISSING_OR_INVALID_CONTEXT_HEADER": 400,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_SEGREGATION_OF_DUTIES_VIOLATION": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_NOT_FOUND": 404,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_POOL_SUSPENDED": 409,
+    "ERR_STALE_POOL_VERSION": 412,
+    "ERR_PURPOSE_MISMATCH": 422,
+    "ERR_UNDERWATER_SPENDING_BLOCKED": 422,
+    "ERR_FUND_NOT_UNDERWATER": 422,
+    "ERR_CORPUS_INVIOLABLE": 422,
+    "ERR_DUPLICATE_RECORD": 409,
+    "ERR_WINDOW_CONFLICT": 409,
+    "ERR_VALUATION_OUT_OF_ORDER": 409,
+    "ERR_VALUATION_LOCKED": 409,
+    "ERR_INCOMPLETE_FISCAL_YEAR": 422,
+    "ERR_DRIFT_NOT_ACKNOWLEDGED": 422,
+    "ERR_MINIMUM_FUNDING_NOT_MET": 422,
+    "ERR_POLICY_PARAM_OUT_OF_RANGE": 422,
+    "ERR_ALLOCATION_SUM_INVALID": 422,
+    "ERR_MANAGER_REPORT_MISSING": 422,
+    "ERR_POOL_MV_MISMATCH": 422,
+    "ERR_MV_CONTINUITY_BREAK": 422,
+    "ERR_EXCEPTION_AMOUNT_EXCEEDS_REQUESTED": 422,
+    "ERR_ALLOCATION_EXCEEDS_DISTRIBUTION": 422,
+    "ERR_INVALID_SPENT_AMOUNT": 422,
+    "ERR_INSUFFICIENT_UNITS": 422,
+    "ERR_NO_APPLICABLE_POLICY": 422,
+    "ERR_NOT_TERMINABLE": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = ERROR_STATUS[error_id]
+
+
+def raise_err(error_id, message):
+    raise ApiError(error_id, message)

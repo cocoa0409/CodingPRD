@@ -1,0 +1,33 @@
+"""Error catalog: exact error ids and HTTP statuses from the scaffold."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message, http_status):
+        super().__init__(message)
+        self.error_id = error_id
+        self.message = message
+        self.http_status = http_status
+
+
+ERR_MISSING_CONTEXT_HEADER = "ERR_MISSING_CONTEXT_HEADER"        # 400
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"                      # 400
+ERR_INVALID_ENUM = "ERR_INVALID_ENUM"                            # 400
+ERR_UNAUTHORIZED_ROLE = "ERR_UNAUTHORIZED_ROLE"                  # 403
+ERR_NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"                # 403
+ERR_NOT_FOUND = "ERR_NOT_FOUND"                                  # 404
+ERR_INVALID_STATE = "ERR_INVALID_STATE"                          # 409
+ERR_ALREADY_TERMINAL = "ERR_ALREADY_TERMINAL"                    # 409
+ERR_DUPLICATE_BALLOT = "ERR_DUPLICATE_BALLOT"                    # 409 (deprecated/reserved)
+ERR_RESOLUTION_ALREADY_VOTED = "ERR_RESOLUTION_ALREADY_VOTED"    # 409
+ERR_VOTER_ALREADY_CAST = "ERR_VOTER_ALREADY_CAST"                # 409
+ERR_STALE_COOP_VERSION = "ERR_STALE_COOP_VERSION"                # 412
+ERR_ALTERATION_SAFETY_VIOLATION = "ERR_ALTERATION_SAFETY_VIOLATION"  # 422
+ERR_CROSS_ENTITY_VIOLATION = "ERR_CROSS_ENTITY_VIOLATION"        # 422
+ERR_TEMPORAL_CONFLICT = "ERR_TEMPORAL_CONFLICT"                  # 422
+ERR_SUBLET_POLICY_VIOLATION = "ERR_SUBLET_POLICY_VIOLATION"      # 422
+ERR_BUSINESS_CONSTRAINT = "ERR_BUSINESS_CONSTRAINT"              # 422
+ERR_FISCAL_THRESHOLD_VIOLATION = "ERR_FISCAL_THRESHOLD_VIOLATION"  # 422
+ERR_SHARES_MISMATCH = "ERR_SHARES_MISMATCH"                      # 422
+ERR_MEETING_NO_QUORUM = "ERR_MEETING_NO_QUORUM"                  # 422
+ERR_PAYMENT_EXCEEDS_OUTSTANDING = "ERR_PAYMENT_EXCEEDS_OUTSTANDING"  # 422
+ERR_SEPARATION_OF_DUTIES = "ERR_SEPARATION_OF_DUTIES"            # 422

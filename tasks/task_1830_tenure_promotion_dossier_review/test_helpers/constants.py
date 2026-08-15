@@ -1,0 +1,55 @@
+"""Domain thresholds and shared constants from the PRD's calculation rules."""
+
+# --- dossier completeness minima (PRD §3.2) ---
+TEACHING_MIN = 2
+RESEARCH_MIN = 3
+SERVICE_MIN = 1
+PEER_REVIEWED_RESEARCH_MIN = 1
+
+# --- dossier strength index (PRD §3.2) ---
+TEACHING_WEIGHT = 0.30
+RESEARCH_WEIGHT = 0.50
+SERVICE_WEIGHT = 0.20
+RATIO_CAP = 2.0
+
+# --- tenure clock (PRD §2.8, §3.1) ---
+PROBATION_MONTHS = 72
+DAYS_PER_MONTH = 30.4375
+DAY_COUNT_TOTAL = 2192
+MAX_EXTENSION_DAYS = 730
+
+# --- external review (PRD §3.4) ---
+MIN_EXTERNAL_LETTERS = 3
+RESPONSE_DEADLINE_DAYS = 14
+MAX_ACTIVE_ASSIGNMENTS = 2
+
+# --- vote tally (PRD §2.9, §3.6) ---
+SUPERMAJORITY_RATIO = 0.6667
+STRICT_RATIO = 0.5
+DEFAULT_QUORUM_FRACTION = 0.5
+
+# --- recommendation score (PRD §3.6) ---
+DEPT_WEIGHT = 0.25
+COLLEGE_WEIGHT = 0.35
+UNIV_WEIGHT = 0.40
+FAIL_CAP = 0.49
+GRANT_THRESHOLD = 0.60
+
+# --- notification / appeal / retention windows (PRD §3.7, §3.8, §3.9) ---
+NOTIFICATION_WINDOW_DAYS = 10
+APPEAL_WINDOW_DAYS = 30
+RETENTION_DAYS = 2555
+
+# --- logical clock (PRD §2.4) ---
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+
+# --- shared fixture dates ---
+TENURE_CLOCK_START = "2020-08-01"
+ANNIVERSARY_BASE_DATE = "2026-08-01"   # 2020-08-01 + 72 calendar months
+DAY_COUNT_BASE_DATE = "2026-08-02"     # 2020-08-01 + 2192 days
+TERM_START = "2026-01-01"
+TERM_END = "2026-12-31"
+SERVICE_START = "2026-01-01"
+SERVICE_END = "2026-12-31"
+REVIEW_WINDOW_START = "2026-08-10"
+REVIEW_WINDOW_END = "2026-09-10"

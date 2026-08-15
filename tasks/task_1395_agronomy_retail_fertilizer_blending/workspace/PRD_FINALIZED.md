@@ -1,0 +1,355 @@
+# Agronomy Retail Blending API — Product Requirements Document
+
+## 1. Introduction
+
+A retail agronomy branch lives on a tight seasonal clock. Every fall, growers walk in with soil-test results and a financing question; every spring, the same growers want their blended fertilizer priced, batched, trucked, and applied before the planting window closes. Between those two moments the branch has to juggle finite warehouse tonnage, a handful of blenders that each run one batch at a time, a fleet of spreader trucks, seasonal prepay money that locks prices months in advance, and an unforgiving regulatory layer: nutrient management plans that cap how much nitrogen a field may receive in a crop year, phosphorus drawdown rules tied to watershed zoning, and environmental permits that govern where fertilizer may be stored and where a blender may legally operate.
+
+This document specifies the Agronomy Retail Blending API, a single REST service mounted under `/agronomy` that backs that entire operation. The service tracks the grower-to-field-to-soil-test chain and turns lab results into nutrient recommendations; it prices and books custom blend orders against published seasonal price sheets and prepay contracts; it schedules blender windows and delivery routes; and it maintains an append-only credit ledger per grower so that billed balances, prepay balances, and credit exposure are always derivable from recorded events rather than editable numbers. All deadlines, expirations, and timestamps in the system read from a server-side logical clock (see §2.6), never from wall-clock time, so that seasonal behavior is deterministic and testable.
+
+The API is consumed by seven distinct operator roles — from the grower confirming application on their own account to the branch administrator who owns products, price sheets, and prepay programs. Because several writes advance shared financial state (grower credit posture, prepay balances), the service uses optimistic concurrency on a small set of write endpoints (see §2.8) and an immediate consistency model: every mutation, together with all of its cascades, is atomic within the request.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID` and `X-User-Role`. A request missing either header, or carrying an unrecognized role value, is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A request whose role is not permitted for the addressed operation, or a `Grower`-role request whose `X-User-ID` does not own the addressed grower-scoped resource, is rejected with `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+The seven roles, spelled exactly as the `X-User-Role` value must carry them, are `Grower`, `Agronomist`, `PlantOperator`, `LogisticsDispatcher`, `CreditManager`, `ComplianceOfficer`, and `BranchAdmin`.
+
+Role identity semantics differ across the roster and matter for ownership checks. When `X-User-Role` is `Grower`, `X-User-ID` is the `id` of the acting `GrowerAccount`; ownership checks on any resource that references a `GrowerAccount` compare the resource's grower foreign-key field to `X-User-ID`. A `Grower` therefore reads their own account, ledger, exposure, orders, and contracts, creates their own fields, requests soil tests, creates, books, requotes, and cancels their own blend orders, signs their own prepay contracts, and confirms application on their own delivered orders. When `X-User-Role` is any of `Agronomist`, `PlantOperator`, `LogisticsDispatcher`, `CreditManager`, `ComplianceOfficer`, or `BranchAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it for audit purposes but never compares it to an entity's `id`.
+
+All seven roles may read. Mutating capabilities are segregated: soil sampling, lab results, recommendations, and nutrient-plan drafting belong to `Agronomist`; recommendation and plan approval, plan suspension and reinstatement, and the entire environmental permit lifecycle belong to `ComplianceOfficer`; inventory receipts, blenders, and batches belong to `PlantOperator`; trucks, routes, and stops belong to `LogisticsDispatcher`; grower accounts, credit posture, payments, and prepay funding and refunds belong to `CreditManager`; products, price sheets, prepay programs, and the logical clock belong to `BranchAdmin`, who also shares grower, field, and blend-order creation and blender registration with the operational roles.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters: `limit` and `offset`. The `limit` parameter defaults to 10, accepts a minimum of 1 and a maximum of 100; the `offset` parameter defaults to 0. List responses carry `limit`, `offset`, `total_count`, and `has_more` inside the `meta` object. Unless an endpoint states otherwise, list results are sorted by `created_at` ascending. Several list endpoints accept additional filter parameters (for example `credit_status`, `grower_id`, `field_id`, `recommendation_id`, `prepay_contract_id`, `fulfillment_status`, `payment_status`, `status`, `season`, `permit_type`, `site_code`, `truck_id`, `route_date`, `product_id`, `blend_order_id`, `delivery_route_id`, `prepay_program_id`, `blender_id`); these are named alongside the relevant list endpoints in §4 and constrain the returned collection to matching records.
+
+### 2.4. Common Resource Properties and Identity
+
+Every persisted resource except the credit ledger carries four system-managed properties: `id`, a server-minted UUID with no type prefix; `created_at`, an ISO 8601 UTC timestamp with three fractional digits; `updated_at`, refreshed on every mutation; and `version`, an integer that starts at 1 when the resource is created and increments by exactly 1 on every mutation of that resource. The `CreditLedgerEntry` resource is the single exception: as an append-only journal it carries only `id` and `created_at`; both `updated_at` and `version` are absent from it.
+
+Timestamps stamped from business events — `sampled_at` on a soil test, `received_at` on an inventory lot, `issued_at` and `expires_at` on a permit, `invoiced_at` on a blend order, `delivered_at` on a delivery stop — are likewise ISO 8601 UTC instants and, unless an explicit input is accepted (as it is for `sampled_at` and `delivered_at`), are read from the logical clock at the moment of the triggering operation.
+
+### 2.5. Monetary Units, Tonnage, and Rounding Discipline
+
+All money in the system is integer cents — fields such as `credit_limit_cents`, `credit_used_cents`, `prepay_balance_cents`, `price_per_ton_cents`, `lot_cost_cents_per_ton`, `unit_price_cents`, `contract_value_cents`, `deposit_due_cents`, `funded_cents`, `drawn_cents`, `forfeited_cents`, `provisional_total_cents`, `final_total_cents`, `rebate_cents`, `amount_cents`, `line_provisional_cents`, `line_final_cents`, and `final_unit_price_cents` are whole-cent integers. Whenever a monetary computation produces a fractional cent, the result is rounded half-up to the nearest whole cent. Tonnage figures — `acres`-derived line quantities, `received_tons`, `on_hand_tons`, `reserved_tons`, `shipped_tons`, `quantity_tons`, `actual_quantity_tons`, `tons_total`, `stop_tons`, `total_stop_tons`, `season_closed_tons` — are carried at three decimal places with round-half-up rounding where a computation produces them. Blend-line target and actual rates (`target_rate_lbs_per_acre`, `actual_rate_lbs_per_acre`) carry at most one decimal place, round-half-up. Nutrient rates per acre on recommendations are whole pounds, round-half-up; per-line nitrogen contributions on an order are three-decimal pounds per acre, round-half-up. Instant comparisons throughout the system (price windows, blender windows, deadlines) are made at whole-second granularity.
+
+### 2.6. The Logical Clock
+
+The server maintains a logical clock that governs every temporal rule in the system: enrollment windows, funding deadlines, price-sheet windows, permit and recommendation and nutrient-plan expirations, and all system-stamped instants such as `received_at` and `invoiced_at`. At startup, before any clock-setting call, the logical clock reads exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time. A `BranchAdmin` may advance the clock by supplying a `to_iso8601` instant through the clock-setting capability; the response echoes the new `current_utc`. Whenever the clock moves, lazy state re-evaluation for permits, price sheets, nutrient management plans, recommendations, and prepay programs occurs on the next access against the new clock value.
+
+### 2.7. Validation Ordering and Request Hygiene
+
+When several checks could reject the same request, they are evaluated in a fixed priority order so that the surfaced error is deterministic. Authentication comes first (missing or malformed headers yield `ERR_UNAUTHENTICATED`), then authorization (`ERR_FORBIDDEN_ROLE`, including the grower-ownership check), then path-resource existence validated left-to-right (`ERR_RESOURCE_NOT_FOUND`), then request-body shape — required fields present, enum members valid, numeric ranges respected, unknown fields rejected — as `ERR_VALIDATION_FAILED`, then resolution of body-supplied foreign-key references such as `product_id`, `field_id`, `recommendation_id`, `prepay_program_id`, `prepay_contract_id`, `blender_id`, `truck_id`, `blend_order_id`, and any `product_ids` enumerated inside line or actual payloads, again as `ERR_RESOURCE_NOT_FOUND`. Only after those five layers come optimistic-concurrency checks (`ERR_STALE_VERSION`), state-transition legality (`ERR_INVALID_TRANSITION`), and then the business rules in their own documented order: the grower-orderable gate, equipment-availability gates, nutrient-plan presence, nitrogen cap, phosphorus restriction, permit gates, storage capacity, price-window overlap, blender-window conflicts, funding deadlines, current-price availability, recommendation expiry, formulation feasibility, batch variance, truck capacity, duplicate routes, inventory sufficiency, blender form coverage, and finally the referential and fiscal checks — recommendation approval state, recommendation-to-field ownership, recommendation supersession, prepay-contract matching, contract-in-use, program enrollment, credit limits, overpayment, and overfunding — each with the error code named next to it in §3.
+
+### 2.8. Optimistic Concurrency Control
+
+Two write endpoints carry an optimistic-concurrency guard, and only those two take a version field. Creating a prepay contract against a grower requires the request to carry `expected_grower_version` equal to the grower account's current `version`; if another accepted write — a prior contract creation, a funding, a credit transition — has advanced the grower's `version` since the client last observed it, the creation is rejected with `ERR_STALE_VERSION` (HTTP 412), because the client's view of the grower's prepay posture is stale. Updating a quoted blend order's lines or pricing inputs requires the request to carry `expected_blend_order_version` equal to the order's current `version`; a mismatch means another accepted write already recomputed the quoted totals the client is looking at, and the update is rejected with `ERR_STALE_VERSION` (HTTP 412). Endpoints not named in this section do not accept a version field.
+
+### 2.9. Nested Resources and Path Validation
+
+The URL hierarchy mirrors the grower-to-field-to-soil-test tree and the order-to-lines, order-to-batches, route-to-stops, and product-to-price-sheets nests. Path identifiers are validated strictly left to right: a missing grower id is reported before a missing field id beneath it, and any unresolved path id yields `ERR_RESOURCE_NOT_FOUND` (HTTP 404). Body-supplied references are validated after the path and after body shape, in the priority order described in §2.7.
+
+### 2.10. Ledger-Derived Balances and the Credit Journal
+
+A grower's financial position is never edited directly; it is derived from the grower's append-only `CreditLedgerEntry` journal. Each entry records its `grower_id`, an `entry_type` drawn from `PREPAY_FUNDED`, `PREPAY_DRAWN`, `PREPAY_FORFEITED`, `PREPAY_REFUNDED`, `INVOICE_POSTED`, `PAYMENT_RECEIVED`, and `REBATE_CREDIT`; a signed `amount_cents` (funding and invoices positive; payments, rebates, draws, forfeits, and refunds negative); the `reference_id` of the originating blend order or prepay contract; and two snapshots — `resulting_credit_used_cents` and `resulting_prepay_balance_cents` — capturing the grower's derived balances immediately after that entry. The grower's `credit_used_cents` is the sum of `INVOICE_POSTED` amounts minus the absolute amounts of `PAYMENT_RECEIVED` and `REBATE_CREDIT` entries; the grower's `prepay_balance_cents` is the sum of `PREPAY_FUNDED` amounts minus the absolute amounts of `PREPAY_DRAWN`, `PREPAY_FORFEITED`, and `PREPAY_REFUNDED` entries. Any accepted write that changes a grower's credit posture — funding, refund, invoicing, payment, forfeiture, booking, requote, cancellation, credit-state transitions, contract signing — increments the grower's `version` by 1.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Grower Accounts, Credit Terms, and the Payment Waterfall
+
+A grower relationship begins when a `CreditManager` or `BranchAdmin` creates the account with a `legal_name` and a `credit_limit_cents` ceiling that must be zero or greater. The account opens with `credit_status` set to `ACTIVE`, `credit_used_cents`, `prepay_balance_cents`, and `season_closed_tons` all zero. The `season_closed_tons` figure accumulates the `tons_total` of the grower's blend orders as they reach the `CLOSED` fulfillment state and feeds the seasonal volume rebate described in §3.6.
+
+Credit posture is actively managed. A `CreditManager` may revise the limit through the credit-terms update, place an `ACTIVE` account on hold (`ACTIVE → CREDIT_HOLD`), suspend an account from either `ACTIVE` or `CREDIT_HOLD` (`→ SUSPENDED`), and release an account back to `ACTIVE` from `CREDIT_HOLD` or `SUSPENDED`. Release is gated: the grower's `credit_used_cents` must not exceed `credit_limit_cents`, otherwise the release is rejected with `ERR_CREDIT_LIMIT_EXCEEDED` (HTTP 402). Every credit-state transition and every credit-terms update increments the account's `version`. Attempting any of these transitions from an ineligible state yields `ERR_INVALID_TRANSITION`.
+
+New financial commitments are gated on posture: signing a prepay contract, creating a blend order, and booking a blend order all require the grower's `credit_status` to be `ACTIVE`; otherwise the request is rejected with `ERR_GROWER_NOT_ORDERABLE` (HTTP 409).
+
+Payments flow through a strict waterfall. When a `CreditManager` records a payment of `amount_cents` against a grower, the system allocates it across the grower's orders whose `payment_status` is `INVOICED`, ordered by `invoiced_at` ascending with `created_at` ascending as the tie-break, filling each invoice's outstanding amount — its `final_total_cents` less payments already allocated to it — fully before moving to the next. Each fully covered order moves `payment_status` from `INVOICED` to `PAID`, and if that order's `fulfillment_status` is `APPLIED_CONFIRMED` it bubbles up to `CLOSED` with `season_closed_tons` credited at that moment. A single `PAYMENT_RECEIVED` ledger entry is appended with the negative of the payment amount, `credit_used_cents` is recomputed, and the grower's `version` increments. If the payment exceeds the total outstanding across all `INVOICED` orders, the entire payment is rejected with `ERR_OVERPAYMENT` (HTTP 422); no partial application is kept. The ledger itself is readable in chronological order by `Grower` (own account), `CreditManager`, and `BranchAdmin`.
+
+A computed exposure read reports the grower's posture under both credit lenses: `billed_balance_cents` (identical to `credit_used_cents`), `booked_exposure_cents` (the sum of `provisional_total_cents` over the grower's orders with `fulfillment_status` in `BOOKED` or `SCHEDULED` and `payment_status` other than `CANCELLED`), `exposure_balance_cents` (their sum), plus the account's `credit_limit_cents` and the derived `available_credit_cents`. The distinction matters: the billed variant is what the credit-release gate and the ledger consult, while the exposure variant is what the floating-price booking gate in §3.5 enforces.
+
+### 3.2. Fields, Soil Tests, and Nutrient Recommendations
+
+Fields belong to growers. A `Grower` (own account), `Agronomist`, or `BranchAdmin` creates a field under a grower with a `name`, a strictly positive `acres` figure, and an optional `watershed_zone` of `STANDARD`, `PROTECTED`, or `CRITICAL` that defaults to `STANDARD`. Watershed zoning is not cosmetic: it drives the phosphorus restriction computed when a nutrient management plan is approved (§3.3).
+
+Soil testing follows a three-step ladder. Requesting a soil test for a field — by the owning `Grower` or an `Agronomist` — creates it in `REQUESTED` status with an optional `lab_code`. An `Agronomist` then records sampling (`REQUESTED → SAMPLED`), which stamps `sampled_at` from the logical clock unless an explicit `sampled_at` is supplied. Finally the agronomist posts lab results (`SAMPLED → RESULTED`), persisting `p_ppm` (soil phosphorus ppm, Bray-1), `k_ppm` (soil potassium ppm), `ph`, and an optional `organic_matter_pct`. Results are immutable afterwards, and `RESULTED` is terminal; firing either transition from the wrong state yields `ERR_INVALID_TRANSITION`. Until results are posted, `p_ppm` and `k_ppm` are null.
+
+From a `RESULTED` soil test an `Agronomist` drafts a `Recommendation`, supplying `crop` (one of `CORN`, `SOYBEAN`, `WHEAT`), a strictly positive `yield_goal_bu_per_acre`, a `rate_variant` of `BUILD_RATE` or `MAINTENANCE_RATE`, an expiry instant `valid_until`, and optionally `previous_crop` (defaulting to `CORN`) and `manure_credit_n_lbs` (defaulting to 0). The recommendation's `field_id` is denormalized from the soil test for compliance joins, and `soil_test_id` records the source test.
+
+Rate computation at creation follows the nutrient recommendation rules precisely. The phosphorus removal component is 0.37 pounds of P2O5 per bushel multiplied by the yield goal; the potassium removal component is 0.27 pounds of K2O per bushel multiplied by the yield goal. Under `BUILD_RATE`, the phosphate rate is the removal component plus nine pounds for every ppm by which the soil's `p_ppm` falls short of the critical level of 20 ppm (zero when at or above it), and the potash rate is the removal component plus four pounds for every ppm by which `k_ppm` falls short of the critical level of 130 ppm (zero at or above). Under `MAINTENANCE_RATE` there is no build component: the phosphate rate equals the removal component when `p_ppm` is below the drawdown threshold of 40 ppm and is zero otherwise, and the potash rate equals the removal component when `k_ppm` is below the drawdown threshold of 170 ppm and is zero otherwise. Nitrogen is computed at 1.0 pound per bushel multiplied by the yield goal, minus the `manure_credit_n_lbs`, minus a previous-crop credit of 30 pounds per acre when `previous_crop` is `SOYBEAN`; if the result is negative it is floored at zero. Each of `n_lbs_per_acre`, `p2o5_lbs_per_acre`, and `k2o_lbs_per_acre` is rounded half-up to a whole pound per acre.
+
+A recommendation is born `DRAFT`. The agronomist submits it (`DRAFT → PENDING_REVIEW`); a `ComplianceOfficer` then either returns it to `DRAFT` — recording the supplied `reason` into `return_reason` — or approves it (`PENDING_REVIEW → APPROVED`). An approved recommendation may be superseded by the agronomist (`APPROVED → SUPERSEDED`), typically when a corrected recommendation has been approved in its place. Expiry is lazy: whenever the recommendation is read or referenced and the logical clock has passed `valid_until`, it is treated as `EXPIRED`, a terminal state alongside `SUPERSEDED`. From that point, order creation or booking referencing it fails with `ERR_RECOMMENDATION_EXPIRED`; referencing a `SUPERSEDED` recommendation fails with `ERR_RECOMMENDATION_SUPERSEDED`; referencing one still in `DRAFT` or `PENDING_REVIEW` fails with `ERR_RECOMMENDATION_NOT_APPROVED`.
+
+Before committing to an order, an `Agronomist`, `Grower`, or `BranchAdmin` may run a formulation preview against a recommendation, supplying a chosen `product_ids` set. The solver proceeds nutrient by nutrient. First the phosphorus source: among the selected products it chooses the one with the highest `analysis_p2o5_pct` above zero, breaking ties toward the earliest-created product; if the recommendation's P2O5 need is positive and no selected product carries P2O5, the formulation is infeasible and the request is rejected with `ERR_FORMULATION_UNSOLVABLE`. The chosen product's rate is the P2O5 need divided by its P2O5 analysis fraction, rounded half-up to one decimal of pounds per acre. Second, the nitrogen that source contributes — the P-source rate multiplied by its nitrogen analysis fraction, rounded half-up to three decimals — is credited against the N need; if that credit alone exceeds the N need, the formulation is infeasible with `ERR_FORMULATION_UNSOLVABLE`. Third, the potassium source: the selected product with the highest `analysis_k2o_pct` above zero (same tie-break), with its rate computed the same way from the K2O need; a positive K2O need with no K-carrying product is infeasible, and the K-source's nitrogen contribution is credited at three decimals as well. Fourth, any remaining nitrogen need — the N need minus both credited contributions, rounded half-up to three decimals — must be covered by a pure nitrogen source among the selected products: the one with the highest `analysis_n_pct` whose `analysis_p2o5_pct` and `analysis_k2o_pct` are both zero (same tie-break); absence is infeasible, and the N-source rate is the remaining need divided by its nitrogen analysis fraction, rounded half-up to one decimal. The preview answers with `feasible` and a `lines` array whose entries each name the `product_id` and that product's computed rate under `target_rate_lbs_per_acre`; products whose computed rate is zero are omitted from the returned lines. The recommendation may be in any status for a preview.
+
+### 3.3. Nutrient Management Plans and Environmental Permits
+
+A nutrient management plan is drafted by an `Agronomist` under a field, carrying the `crop_year` it governs, a strictly positive `n_cap_lbs_per_acre` regulatory cap, an inclusive validity start `valid_from`, an end `valid_to`, and optional declared credits `manure_credit_n_lbs` and `previous_crop_credit_n_lbs` (both defaulting to 0). The plan ladder runs `DRAFT → SUBMITTED` on agronomist submit, then a `ComplianceOfficer` either returns it to `DRAFT` (with a `reason`) or approves it (`SUBMITTED → APPROVED`). Approval is the moment the phosphorus restriction is computed: `p_restriction_active` becomes true when the field's `watershed_zone` is `PROTECTED` or `CRITICAL` and the field's latest `RESULTED` soil test shows `p_ppm` of at least the drawdown threshold of 40 ppm; it is false when no `RESULTED` soil test exists for the field.
+
+An approved plan may be suspended (`APPROVED → SUSPENDED`) and later reinstated (`SUSPENDED → APPROVED`) by a compliance officer. Expiry is lazy: once the clock passes `valid_to` the plan is treated as `EXPIRED` (terminal). While a field's current-crop-year plan is suspended or expired — or simply absent or unapproved — booking a blend order on that field fails with `ERR_NMP_REQUIRED` (HTTP 422). Each plan mutation increments the plan's `version`.
+
+Environmental permits are a peer resource owned by `ComplianceOfficer`. Creating one records a `permit_type` of `FERTILIZER_STORAGE`, `BLENDER_SITE`, or `ANHYDROUS_STORAGE`; the `site_code` it covers; a strictly positive `setback_ft` distance; and, for `FERTILIZER_STORAGE` permits only, a `max_storage_tons` capacity cap (null for the other types). The permit ladder runs `APPLICATION → UNDER_INSPECTION` on begin-inspection, then activation moves it to `ACTIVE` from either `UNDER_INSPECTION` or `RENEWAL`, stamping `issued_at` from the logical clock and `expires_at` from the supplied input, which must be later than the current clock instant or the activation fails with `ERR_VALIDATION_FAILED`. An `ACTIVE` permit whose `expires_at` the clock has passed is treated as `EXPIRED` lazily on read and on every permit-gated operation; from `EXPIRED` a renewal moves it to `RENEWAL` (a re-inspection waiver), and activation completes the renewal. An `ACTIVE` permit may be revoked (`ACTIVE → REVOKED`, terminal), optionally with a `reason`.
+
+Revocation cascades three hops. First, every `Blender` whose `site_code` matches the revoked permit's `site_code` and whose `status` is `ACTIVE` goes `OUT_OF_SERVICE`. Second, every `BlendBatch` assigned to one of those blenders and still `SCHEDULED` is `VOIDED` with `void_reason` set to `PERMIT_REVOKED`. Third, each blend order whose batch was just voided reverts its `fulfillment_status` from `SCHEDULED` to `BOOKED`, releasing the blender window. Permit expiry has the inverse flavor: while a required permit is not `ACTIVE`, the gated operation fails with `ERR_PERMIT_NOT_ACTIVE` (HTTP 422) — inventory receipts require an `ACTIVE` `FERTILIZER_STORAGE` permit (plus `ANHYDROUS_STORAGE` when the received product's `regulated_flag` is true), and batch creation and batch start require an `ACTIVE` `BLENDER_SITE` permit for the blender's `site_code`. Storage capacity is enforced at receipt: after the receipt, the sum of `on_hand_tons` across all lots must not exceed the `ACTIVE` `FERTILIZER_STORAGE` permit's `max_storage_tons` — exact equality is admitted, any excess is rejected with `ERR_STORAGE_CAPACITY_EXCEEDED` (HTTP 422).
+
+### 3.4. Products, Price Sheets, and Inventory Lots
+
+A `BranchAdmin` registers products with a unique `name`, analysis percentages `analysis_n_pct`, `analysis_p2o5_pct`, and `analysis_k2o_pct` (each between 0 and 100), a `form` of `DRY` or `LIQUID`, and an optional `regulated_flag` (default false) marking products such as anhydrous ammonia that demand the extra permit check at receipt.
+
+Pricing is published as seasonal price sheets under a product. Creating a sheet — a `BranchAdmin` capability — records the `season` tag (`FALL`, `SPRING`, `SUMMER`, or `IN_SEASON`), a strictly positive `price_per_ton_cents`, and a half-open validity window from `effective_from` (inclusive) to `effective_to` (exclusive), which must be later than `effective_from`. Sheets are born `DRAFT`; publishing moves one to `PUBLISHED`, gated on window hygiene: the new window must not intersect any other `PUBLISHED` sheet of the same product under half-open intersection — that is, the new window's start earlier than the existing window's end while the new window's end is later than the existing window's start. Touching windows, where one sheet's `effective_to` equals the other's `effective_from`, are admitted; anything overlapping is rejected with `ERR_PRICE_WINDOW_OVERLAP` (HTTP 409). A `PUBLISHED` sheet may be manually expired (`→ EXPIRED`) by a branch admin, and is lazily treated as `EXPIRED` once the clock reaches `effective_to`. The current price of a product at any instant is the `PUBLISHED` sheet whose window contains that instant — `effective_from` at or before the instant and `effective_to` strictly after it; the publish gate guarantees at most one. When no sheet qualifies at a pricing moment — order quoting, requoting, patching, prepay signing, or final pricing of floating lines at batch completion — the operation fails with `ERR_NO_CURRENT_PRICE` (HTTP 422). After a manual expire, price resolution simply moves to the next qualifying `PUBLISHED` sheet, or fails the same way when none exists.
+
+Inventory arrives as lots. A `PlantOperator` receives a lot naming the `product_id`, a `warehouse_code`, a strictly positive `received_tons`, and the `lot_cost_cents_per_ton` cost basis. The lot's `on_hand_tons` initializes to `received_tons`, `reserved_tons` and `shipped_tons` start at zero, and `received_at` stamps the logical clock — it is the FIFO sort key for allocation. A product-level inventory position read aggregates each product's lots into `product_id`, `on_hand_tons`, `reserved_tons`, `available_tons`, and `shipped_tons`, where per-lot available tonnage is `on_hand_tons` minus `reserved_tons` and the product figures are the sums across its lots. Tonnage throughout inventory is carried at three decimals.
+
+### 3.5. Blend Orders: Quoting, Booking Gates, and Batch Scheduling
+
+A blend order is created under a grower by the owning `Grower`, an `Agronomist`, or a `BranchAdmin`, in the combined initial state `fulfillment_status` of `QUOTED` and `payment_status` of `UNPAID` — two independent state dimensions that evolve in parallel. Creation inputs are the `field_id`, the governing `recommendation_id`, the `acres` to be applied, the `price_mode` (`FLOATING` or `PRICE_LOCKED`), an explicit `lines` payload, and, when the mode is `PRICE_LOCKED`, the `prepay_contract_id` (null otherwise). The order's `acres` must equal the owning field's `acres`, or creation fails with `ERR_VALIDATION_FAILED`. The recommendation must belong to the same field and the field to the path grower, else `ERR_RECOMMENDATION_FIELD_MISMATCH`; and the recommendation must be `APPROVED` and live — pre-approval states yield `ERR_RECOMMENDATION_NOT_APPROVED`, `SUPERSEDED` yields `ERR_RECOMMENDATION_SUPERSEDED`, and a lapsed `valid_until` yields `ERR_RECOMMENDATION_EXPIRED`.
+
+Each line names a `product_id` and a strictly positive `target_rate_lbs_per_acre` of at most one decimal. The line's `quantity_tons` is the target rate multiplied by the order's `acres` and divided by 2000, rounded half-up to three decimals. Provisional unit pricing resolves per line: when the order is `PRICE_LOCKED` and the line's product is the contract's product, `unit_price_cents` is the contract's `unit_price_cents`; otherwise it is the current `PUBLISHED` sheet's `price_per_ton_cents` at quote time. The `line_provisional_cents` is the `quantity_tons` multiplied by the `unit_price_cents`, rounded half-up to whole cents. The order's `provisional_total_cents` obeys a pinned rounding order: each line is rounded to whole cents first, and the total is the exact integer sum of those rounded line amounts — the alternative sum-then-round order is not used, since it can differ by cents when multiple lines carry fractional cents. The order's `tons_total` is the sum of the lines' target `quantity_tons`, and its `n_lbs_per_acre` is the sum over lines of each line's target rate multiplied by the product's `analysis_n_pct` fraction, each contribution rounded half-up to three decimals. Until batch completion, `final_total_cents`, `rebate_cents` (which initializes at zero), and `invoiced_at` remain unset on the order, and each line's `actual_rate_lbs_per_acre`, `actual_quantity_tons`, `final_unit_price_cents`, and `line_final_cents` are null with `variance_flag` false.
+
+While `QUOTED`, the order may be revised by the owning grower or an agronomist: the update accepts `expected_blend_order_version` per §2.8, plus optional `acres`, `price_mode`, `prepay_contract_id`, and replacement `lines`; provisional pricing is recomputed and the order's `version` increments.
+
+Booking is the gatehouse of the whole system, and its checks run in a deliberate order. After the generic layers of §2.7 (including the transition legality check that the order is `QUOTED`), booking enforces, in this sequence: the grower is `ACTIVE` (else `ERR_GROWER_NOT_ORDERABLE`); an `APPROVED`, non-expired nutrient management plan exists for the order's field and the current crop year (else `ERR_NMP_REQUIRED`); the cumulative nitrogen per acre across the field's booked-or-later, non-cancelled orders — fulfillment states `BOOKED`, `SCHEDULED`, `BATCHED`, `LOADED`, `DELIVERED`, `APPLIED_CONFIRMED`, and `CLOSED` — plus this order's `n_lbs_per_acre` does not exceed the plan's `n_cap_lbs_per_acre`, with exact equality admitted and any excess rejected as `ERR_NITROGEN_CAP_EXCEEDED`; when the plan's `p_restriction_active` is true, no line product may carry an `analysis_p2o5_pct` above zero, else `ERR_PHOSPHORUS_RESTRICTED`; the recommendation checks (`ERR_RECOMMENDATION_NOT_APPROVED`, `ERR_RECOMMENDATION_EXPIRED`, `ERR_RECOMMENDATION_SUPERSEDED`); for a `PRICE_LOCKED` order, the referenced contract belongs to the same grower, is `FUNDED`, its product matches at least one line, and its `funded_cents` minus `drawn_cents` is positive — any failure yields `ERR_PREPAY_CONTRACT_MISMATCH`; per-line inventory sufficiency (else `ERR_INSUFFICIENT_INVENTORY`); and for a `FLOATING` order the fiscal gate — the grower's `exposure_balance_cents` plus this order's `provisional_total_cents` must not exceed `credit_limit_cents`, equality admitted, excess rejected with `ERR_CREDIT_LIMIT_EXCEEDED`.
+
+A successful booking reserves inventory FIFO: for each line, the system walks the product's lots ordered by `received_at` ascending with `created_at` ascending as tie-break, taking from each lot the lesser of the remaining need and the lot's available tonnage until the line's `quantity_tons` is fully allocated, adding each allocation to that lot's `reserved_tons`. When the total available across a product's lots falls short of a line's need, booking fails with `ERR_INSUFFICIENT_INVENTORY` and no partial reservation is kept. Payment posture flips in the same atomic step: `PRICE_LOCKED` orders move `payment_status` from `UNPAID` to `PREPAY_APPLIED`; `FLOATING` orders move to `CREDIT_APPROVED`. The grower's `version` increments because the exposure posture changed, and the order's `version` increments.
+
+Requoting unwinds a booking: from `BOOKED` back to `QUOTED`, releasing exactly the recorded lot reservations (each lot's `reserved_tons` reduced by its allocation), returning `payment_status` to `UNPAID` whether it was prepay-applied or credit-approved, recomputing provisional pricing at the current `PUBLISHED` sheets (retaining the contract unit price for a `PRICE_LOCKED` contract product), and incrementing both the order's and the grower's `version`. Cancellation is available from `QUOTED`, `BOOKED`, or `SCHEDULED`, by the owning grower or an agronomist, optionally with a `reason`: it sets `payment_status` to `CANCELLED`; from `BOOKED` it additionally releases all lot reservations; from `SCHEDULED` it voids the order's `SCHEDULED` batch with `void_reason` set to `ORDER_CANCELLED`, releases the blender window and the reservations, and each of the `BOOKED` and `SCHEDULED` variants increments the grower's `version` alongside the order's. Any transition fired from an ineligible state is `ERR_INVALID_TRANSITION`.
+
+Batch scheduling turns a `BOOKED` order over to the plant. Blenders themselves are registered by a `PlantOperator` or `BranchAdmin` with a `name`, the `site_code` that ties the machine to its `BLENDER_SITE` permit, a strictly positive rated throughput `capacity_tons_per_hour`, and a `form_supported` of `DRY`, `LIQUID`, or `BOTH`; a blender starts `ACTIVE` and may be taken out of service and returned (return is blocked while the site's `BLENDER_SITE` permit is not `ACTIVE`). A `PlantOperator` schedules a batch for the order on a chosen `blender_id` with a `scheduled_start` and a strictly later `scheduled_end`. The gates, in §2.7's order: the order must be `BOOKED` and, as a cross-dimension rule, its `payment_status` must be `PREPAY_APPLIED` or `CREDIT_APPROVED` — otherwise `ERR_INVALID_TRANSITION`; the blender must be `ACTIVE` — otherwise `ERR_BLENDER_OUT_OF_SERVICE`; an `ACTIVE` `BLENDER_SITE` permit must exist for the blender's `site_code` — otherwise `ERR_PERMIT_NOT_ACTIVE`; the blender's `form_supported` must cover every line product's `form` (`BOTH` covers all) — otherwise `ERR_BLENDER_FORM_MISMATCH`; and the requested window must survive the occupancy rule — otherwise `ERR_BLENDER_WINDOW_CONFLICT`. Blender occupancy uses closed occupation windows plus a mandatory cleanup buffer of 30 minutes on both sides: a batch occupying a given start-to-end interval blocks the blender from thirty minutes before its start to thirty minutes after its end. A new batch is rejected when its own buffered window intersects any non-`VOIDED` batch's buffered window on the same blender — concretely, when the new start minus the buffer falls before the existing end plus the buffer while the new end plus the buffer falls after the existing start minus the buffer. The consequence at the boundary: a new batch starting exactly at an existing batch's end is rejected because the buffer is not honored, while a new batch starting exactly thirty minutes after the existing batch's end is admitted. `VOIDED` batches free their windows; `SCHEDULED`, `IN_PROGRESS`, and `COMPLETED` batches keep them. A created batch starts in `SCHEDULED`, and its creation drives the order `BOOKED → SCHEDULED` and increments the order's `version`.
+
+### 3.6. Batch Completion: Actuals, Invoicing, Rebates, and the Completion Cascade
+
+On the plant floor, a `PlantOperator` starts a `SCHEDULED` batch (`SCHEDULED → IN_PROGRESS`); starting is gated on the batch being `SCHEDULED`, the blender being `ACTIVE` (else `ERR_BLENDER_OUT_OF_SERVICE`), and an `ACTIVE` `BLENDER_SITE` permit for the blender's site (else `ERR_PERMIT_NOT_ACTIVE`). A batch may instead be voided from `SCHEDULED` — manually by the operator with an optional `reason`, or by the permit-revoke and order-cancel cascades — which releases the blender window and returns the order from `SCHEDULED` to `BOOKED`, incrementing both resources' versions.
+
+Completion is the heaviest operation in the system. The operator posts `actuals` covering every line of the order exactly once — anything else is `ERR_VALIDATION_FAILED`. Each actual entry identifies its line by `blend_line_id` (with `line_id` accepted as an alias) and carries the measured `actual_rate_lbs_per_acre`. Each line's actual rate must sit within five percent of its target, inclusive at the boundary: the absolute difference between actual and target, divided by the target, must not exceed the tolerance of five percent, or completion fails with `ERR_BATCH_VARIANCE_EXCEEDED`. A line exactly at the tolerance boundary is admitted, and its `variance_flag` is true only when the ratio strictly exceeds the tolerance. For `FLOATING` lines, a current `PUBLISHED` price sheet must exist per product at the completion instant, else `ERR_NO_CURRENT_PRICE`.
+
+Completion then fires the full cascade. The batch goes `IN_PROGRESS → COMPLETED`; the order's fulfillment goes `SCHEDULED → BATCHED`. Hop one writes the lines: each line's `actual_rate_lbs_per_acre` from the posted actuals; `actual_quantity_tons` as the actual rate multiplied by the order's `acres` divided by 2000, rounded half-up to three decimals; `final_unit_price_cents` as the contract's `unit_price_cents` for a `PRICE_LOCKED` contract-product line, else the `PUBLISHED` sheet price containing the completion instant; and `line_final_cents` as the `actual_quantity_tons` multiplied by the `final_unit_price_cents`, rounded half-up to whole cents. Hop two aggregates the order: `final_total_cents` is the exact integer sum of the per-line rounded `line_final_cents` (the same pinned per-line-then-sum order as provisional totals), `tons_total` is replaced by the sum of `actual_quantity_tons`, `invoiced_at` stamps the logical clock, and `rebate_cents` is computed per the seasonal volume rebate.
+
+The rebate breaks its apparent tier-versus-total circle with a pinned evaluation order. The tier base tonnage is the grower's `season_closed_tons` — closed orders only — plus this order's final actual `tons_total`. The tier rate is zero when the base is below 50 tons; two percent when the base is at least 50 tons and below 150 tons — a base of exactly 50.000 tons qualifies for this tier; and three and a half percent when the base is at least 150 tons. The rebate is the `final_total_cents` multiplied by the tier rate, rounded half-up to whole cents. The `final_total_cents` is not reduced by the rebate; the rebate posts as a separate `REBATE_CREDIT` ledger entry and never feeds back into the tier base. The grower's `season_closed_tons` itself increments only when an order later reaches `CLOSED`.
+
+Hop three converts inventory and settles money. On the same FIFO lots in the same order, each lot's `on_hand_tons` decreases by its share of the actual tonnage, `reserved_tons` decreases by the recorded reservation, and `shipped_tons` increases by the actual share. For the grower's finances: when the order's `payment_status` is `PREPAY_APPLIED`, the draw is the lesser of the contract's remaining funded amount (`funded_cents` minus `drawn_cents`) and the `final_total_cents`; the contract's `drawn_cents` increases by the draw, a `PREPAY_DRAWN` ledger entry posts for the negative of the draw, and when the draw leaves the contract fully drawn the contract closes as `CLOSED_SETTLED`; any remainder of `final_total_cents` above the draw is invoiced to credit when positive. When the order is `CREDIT_APPROVED`, the full `final_total_cents` is invoiced. An `INVOICE_POSTED` ledger entry posts for the invoiced amount and a `REBATE_CREDIT` entry for the negative of the rebate; `credit_used_cents` and `prepay_balance_cents` are recomputed; and the grower's `version` increments. Finally, payment posture advances: `PREPAY_APPLIED` becomes `PAID` when the draw covers the final total entirely, otherwise `INVOICED`; `CREDIT_APPROVED` becomes `INVOICED`.
+
+### 3.7. Delivery: Trucks, Routes, and Stops
+
+Logistics begins with the fleet: a `LogisticsDispatcher` registers trucks with a `name` and a strictly positive `capacity_tons`, each starting `ACTIVE`. A truck may be taken `OUT_OF_SERVICE` and later returned to service; dispatch rejects an out-of-service truck.
+
+A delivery route pairs a `truck_id` with a `route_date` in `YYYY-MM-DD` form and starts `PLANNED`. At most one non-`CANCELLED` route may exist per truck per date; a duplicate attempt fails with `ERR_DUPLICATE_ROUTE_FOR_TRUCK_DATE` (HTTP 409). Stops are added to a `PLANNED` route, each naming a `blend_order_id` that must currently be `BATCHED`, a `sequence` of at least 1, and a promised window from `window_start` to a strictly later `window_end`. Adding a stop snapshots the order's `tons_total` into `stop_tons`, adds it to the route's `total_stop_tons`, and drives the order `BATCHED → LOADED`. Capacity is enforced at the boundary: the route's `total_stop_tons` after adding the stop must not exceed the truck's `capacity_tons` — equality admitted, excess rejected with `ERR_TRUCK_CAPACITY_EXCEEDED`. The route's `version` increments per stop.
+
+Dispatch (`PLANNED → DISPATCHED`) requires the route to be `PLANNED`, to carry at least one `PLANNED` stop, and to ride an `ACTIVE` truck; violations surface as `ERR_INVALID_TRANSITION`. Completing a stop — allowed only while its route is `DISPATCHED` — moves the stop `PLANNED → DELIVERED`, stamps `delivered_at` from the logical clock or an explicit input, moves the order `LOADED → DELIVERED`, and, when every sibling stop has reached `DELIVERED`, bubbles the route up to `COMPLETED`. Cancelling a `PLANNED` route cascades: every `PLANNED` stop becomes `CANCELLED`, and each stop's order reverts from `LOADED` to `BATCHED`.
+
+### 3.8. Application Confirmation and Order Close-Out
+
+The grower closes the agronomic loop. Once an order is `DELIVERED`, the owning `Grower` — and only the grower — confirms application, moving fulfillment from `DELIVERED` to `APPLIED_CONFIRMED`. If the order's `payment_status` is already `PAID` at that moment, fulfillment continues immediately to `CLOSED` in the same step. Otherwise the close-out waits on money: when the payment waterfall later moves the order to `PAID`, the fulfillment bubbles from `APPLIED_CONFIRMED` to `CLOSED`. Either way, the transition into `CLOSED` credits the grower's `season_closed_tons` with the order's `tons_total` and increments the grower's `version`. Both terminal fulfillment states are `CLOSED` and `CANCELLED`; both terminal payment states are `PAID` and `CANCELLED`.
+
+### 3.9. Seasonal Prepay: Programs, Contracts, Funding, and Settlement
+
+Prepay programs are the branch's seasonal price-positioning instrument. A `BranchAdmin` creates one with a `name`, a `season` of `FALL` or `SPRING`, an inclusive enrollment window from `enrollment_open_on` to `enrollment_close_on`, an inclusive `funding_deadline`, a `deposit_pct` fraction, a `discount_pct` fraction off the published price, and a `default_penalty_pct` fraction forfeited on default. A program opens in `ENROLLMENT_OPEN`; it may be closed manually (`→ ENROLLMENT_CLOSED`) and is lazily treated as `ENROLLMENT_CLOSED` once the clock passes `enrollment_close_on`. Either way, once a program is not `ENROLLMENT_OPEN` — or the clock sits outside the enrollment window — contract signing fails with `ERR_PROGRAM_NOT_ENROLLING`.
+
+A `Grower` (own account) or `CreditManager` signs a prepay contract under a grower, naming the `prepay_program_id`, the `product_id` to price-lock, a strictly positive `committed_tons`, and the `expected_grower_version` per §2.8. Signing requires the grower's `credit_status` to be `ACTIVE` (else `ERR_GROWER_NOT_ORDERABLE`) and a current `PUBLISHED` price sheet for the product (else `ERR_NO_CURRENT_PRICE`). The locked `unit_price_cents` is the current sheet's `price_per_ton_cents` multiplied by one minus the program's `discount_pct`, rounded half-up to whole cents; the `contract_value_cents` is the `unit_price_cents` multiplied by `committed_tons`, rounded half-up; and the `deposit_due_cents` is the `contract_value_cents` multiplied by the program's `deposit_pct`, rounded half-up. The contract is born `SIGNED` with `funded_cents`, `drawn_cents`, and `forfeited_cents` at zero, and signing increments the grower's `version`.
+
+Funding is recorded by a `CreditManager` in `amount_cents` increments. Each funding must arrive while the contract is `SIGNED` or `PARTIALLY_FUNDED` (else `ERR_INVALID_TRANSITION`), at or before the program's `funding_deadline` — the deadline instant itself is admitted and one second past it is rejected with `ERR_PREPAY_FUNDING_DEADLINE_PASSED` — and must not push cumulative `funded_cents` beyond `contract_value_cents` (equality admitted, excess rejected as `ERR_PREPAY_OVERFUND`). Each accepted funding adds to `funded_cents`, appends a `PREPAY_FUNDED` ledger entry for the positive amount, adds the amount to the grower's `prepay_balance_cents`, and increments both the grower's and the contract's `version`. Cumulative funding drives status: any funding short of the full value moves `SIGNED → PARTIALLY_FUNDED`; reaching the full value — whether in one funding or across several — lands the contract at `FUNDED`.
+
+Refund returns the unfunded remainder of a funded position: available from `FUNDED` or `PARTIALLY_FUNDED`, blocked while any blend order references the contract with a `payment_status` other than `PAID` or `CANCELLED` (else `ERR_CONTRACT_IN_USE`). The refund amount is `funded_cents` minus `drawn_cents`; a `PREPAY_REFUNDED` ledger entry posts for the negative of that amount, the grower's `prepay_balance_cents` decreases accordingly, the contract moves to `REFUNDED`, and both versions increment. Separately, a `FUNDED` contract closes itself automatically: the moment an invoicing drawdown leaves `drawn_cents` equal to `funded_cents`, the contract becomes `CLOSED_SETTLED`.
+
+Settlement is the program's end-of-season sweep and is allowed only from `ENROLLMENT_CLOSED` after the funding deadline has passed — attempting it earlier fails with `ERR_INVALID_TRANSITION` carrying the message "funding window still open". Settling cascades three hops. Hop one: every contract of the program in `SIGNED` or `PARTIALLY_FUNDED` moves to `DEFAULTED`. Hop two, per defaulted contract: the forfeited amount is the contract's `funded_cents` multiplied by the program's `default_penalty_pct`, rounded half-up to whole cents; a `PREPAY_FORFEITED` ledger entry posts for the negative of the forfeited amount; the grower's `prepay_balance_cents` decreases by the forfeited amount while the remainder of the funded money stays in the balance; and the grower's `version` increments. Hop three: every blend order whose `prepay_contract_id` names a defaulted contract and whose `payment_status` is `PREPAY_APPLIED` reverts to `UNPAID`, its `price_mode` flips to `FLOATING`, and if its fulfillment was `BOOKED` it drops back to `QUOTED` with its inventory reservations released. Settling increments the program's `version`, and `SETTLED` is terminal.
+
+## 4. Endpoint Definitions
+
+New resources are returned with HTTP 201; modifications, transitions, and computed reads return HTTP 200. The table below is a navigational summary only — request payloads, response shapes, gates, and cascades are defined by the narratives of §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | /agronomy/_clock/set_current_utc | Set the server's logical clock; lazy re-evaluation occurs on next access | BranchAdmin |
+| POST | /agronomy/growers | Create a grower account | CreditManager, BranchAdmin |
+| GET | /agronomy/growers | List grower accounts (filter `credit_status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/growers/{growerId} | Get a grower account (Grower restricted to own id) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| PATCH | /agronomy/growers/{growerId}/credit-terms | Update grower credit limit | CreditManager |
+| POST | /agronomy/growers/{growerId}/credit-hold | Place grower on credit hold | CreditManager |
+| POST | /agronomy/growers/{growerId}/suspend | Suspend grower | CreditManager |
+| POST | /agronomy/growers/{growerId}/credit-release | Release grower to ACTIVE when within limit | CreditManager |
+| POST | /agronomy/growers/{growerId}/payments | Record a payment; waterfall to INVOICED orders oldest first | CreditManager |
+| GET | /agronomy/growers/{id}/credit-ledger | List the grower's append-only credit ledger (chronological) | Grower, CreditManager, BranchAdmin |
+| GET | /agronomy/growers/{growerId}/exposure | Computed credit posture read (billed and exposure variants) | Grower, CreditManager, BranchAdmin |
+| POST | /agronomy/growers/{growerId}/fields | Create a field for a grower | Grower, Agronomist, BranchAdmin |
+| GET | /agronomy/growers/{growerId}/fields | List a grower's fields | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/fields | List fields (filter `grower_id`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/fields/{fieldId} | Get a field | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/fields/{fieldId}/soil-tests | Request a soil test for a field | Grower, Agronomist |
+| GET | /agronomy/fields/{id}/soil-tests | List soil tests of a field | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/soil-tests/{soilTestId} | Get a soil test | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/soil-tests/{soilTestId}/record-sampling | Record field sampling | Agronomist |
+| POST | /agronomy/soil-tests/{soilTestId}/post-results | Post lab results; immutable afterwards | Agronomist |
+| POST | /agronomy/soil-tests/{soilTestId}/recommendations | Create a recommendation from a RESULTED soil test | Agronomist |
+| GET | /agronomy/soil-tests/{id}/recommendations | List recommendations derived from a soil test | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/recommendations | List recommendations (filters `field_id`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/recommendations/{recommendationId} | Get a recommendation (lazy EXPIRED evaluation) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/recommendations/{recommendationId}/submit | Submit recommendation for review | Agronomist |
+| POST | /agronomy/recommendations/{recommendationId}/return | Return recommendation to drafting with reason | ComplianceOfficer |
+| POST | /agronomy/recommendations/{recommendationId}/approve | Approve recommendation | ComplianceOfficer |
+| POST | /agronomy/recommendations/{recommendationId}/supersede | Supersede an APPROVED recommendation | Agronomist |
+| POST | /agronomy/recommendations/{recommendationId}/formulation-preview | Run the formulation solver for a chosen product set | Agronomist, Grower, BranchAdmin |
+| POST | /agronomy/fields/{fieldId}/nutrient-plans | Create a nutrient management plan | Agronomist |
+| GET | /agronomy/fields/{id}/nutrient-plans | List nutrient plans of a field | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/nutrient-plans/{planId} | Get a nutrient plan (lazy EXPIRED evaluation) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/nutrient-plans/{planId}/submit | Submit plan | Agronomist |
+| POST | /agronomy/nutrient-plans/{planId}/return | Return plan to DRAFT | ComplianceOfficer |
+| POST | /agronomy/nutrient-plans/{planId}/approve | Approve plan; computes p_restriction_active | ComplianceOfficer |
+| POST | /agronomy/nutrient-plans/{planId}/suspend | Suspend plan | ComplianceOfficer |
+| POST | /agronomy/nutrient-plans/{planId}/reinstate | Reinstate plan | ComplianceOfficer |
+| POST | /agronomy/environmental-permits | Create a permit application | ComplianceOfficer |
+| GET | /agronomy/environmental-permits | List permits (filters `permit_type`, `status`, `site_code`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/environmental-permits/{permitId} | Get a permit (lazy EXPIRED evaluation) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/environmental-permits/{permitId}/begin-inspection | Begin permit inspection | ComplianceOfficer |
+| POST | /agronomy/environmental-permits/{permitId}/activate | Activate permit; sets issued_at and expires_at | ComplianceOfficer |
+| POST | /agronomy/environmental-permits/{permitId}/renew | Renew an EXPIRED permit | ComplianceOfficer |
+| POST | /agronomy/environmental-permits/{permitId}/revoke | Revoke permit; cascades to blenders, batches, orders | ComplianceOfficer |
+| POST | /agronomy/products | Create a product | BranchAdmin |
+| GET | /agronomy/products | List products | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/products/{productId} | Get a product | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/products/{productId}/price-sheets | Create a price sheet (DRAFT) | BranchAdmin |
+| GET | /agronomy/products/{id}/price-sheets | List a product's price sheets (filter `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/price-sheets/{priceSheetId} | Get a price sheet (lazy EXPIRED evaluation) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/price-sheets/{priceSheetId}/publish | Publish a price sheet (window overlap enforced) | BranchAdmin |
+| POST | /agronomy/price-sheets/{priceSheetId}/expire | Manually expire a PUBLISHED price sheet | BranchAdmin |
+| GET | /agronomy/products/{productId}/inventory-position | Computed product-level inventory position | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/inventory-lots | Receive an inventory lot (permit and capacity gated) | PlantOperator |
+| GET | /agronomy/inventory-lots | List inventory lots (filter `product_id`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/inventory-lots/{lotId} | Get an inventory lot | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/prepay-programs | Create a seasonal prepay program | BranchAdmin |
+| GET | /agronomy/prepay-programs | List prepay programs (filters `season`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/prepay-programs/{programId} | Get a prepay program (lazy ENROLLMENT_CLOSED evaluation) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/prepay-programs/{programId}/close-enrollment | Close enrollment manually | BranchAdmin |
+| POST | /agronomy/prepay-programs/{programId}/settle | Settlement sweep with forfeiture cascade | BranchAdmin |
+| POST | /agronomy/growers/{growerId}/prepay-contracts | Sign a prepay contract (OCC on grower version) | Grower, CreditManager |
+| GET | /agronomy/growers/{growerId}/prepay-contracts | List a grower's prepay contracts (filter `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/prepay-contracts | List prepay contracts (filters `prepay_program_id`, `product_id`, `grower_id`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/prepay-contracts/{contractId} | Get a prepay contract | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/prepay-contracts/{contractId}/fund | Record a funding payment against a contract | CreditManager |
+| POST | /agronomy/prepay-contracts/{contractId}/refund | Refund remaining funded balance | CreditManager |
+| POST | /agronomy/growers/{growerId}/blend-orders | Create a blend order with explicit lines | Grower, Agronomist, BranchAdmin |
+| GET | /agronomy/growers/{growerId}/blend-orders | List a grower's blend orders (filters `fulfillment_status`, `payment_status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-orders | List blend orders (filters `grower_id`, `field_id`, `recommendation_id`, `prepay_contract_id`, `fulfillment_status`, `payment_status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-orders/{orderId} | Get a blend order | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| PATCH | /agronomy/blend-orders/{orderId} | Update a QUOTED order's lines/pricing inputs (OCC on order version) | Grower, Agronomist |
+| POST | /agronomy/blend-orders/{orderId}/book | Book a QUOTED order through the full gate chain | Grower, Agronomist |
+| POST | /agronomy/blend-orders/{orderId}/requote | Requote a BOOKED order; releases reservations and reprices | Grower, Agronomist |
+| POST | /agronomy/blend-orders/{orderId}/cancel | Cancel a QUOTED/BOOKED/SCHEDULED order | Grower, Agronomist |
+| POST | /agronomy/blend-orders/{orderId}/confirm-application | Grower confirms application | Grower |
+| GET | /agronomy/blend-orders/{orderId}/lines | List an order's blend lines | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-lines/{lineId} | Get a blend line | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-lines | List blend lines (filters `product_id`, `blend_order_id`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/blenders | Register a blender | PlantOperator, BranchAdmin |
+| GET | /agronomy/blenders | List blenders (filters `site_code`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blenders/{blenderId} | Get a blender | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/blenders/{blenderId}/out-of-service | Take a blender out of service | PlantOperator |
+| POST | /agronomy/blenders/{blenderId}/return-to-service | Return a blender to service (permit gated) | PlantOperator |
+| POST | /agronomy/blend-orders/{orderId}/batches | Schedule a batch for a BOOKED order | PlantOperator |
+| GET | /agronomy/blend-orders/{id}/batches | List an order's batches | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-batches/{batchId} | Get a batch | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/blend-batches | List batches (filters `blender_id`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/blend-batches/{batchId}/start | Start a scheduled batch | PlantOperator |
+| POST | /agronomy/blend-batches/{batchId}/complete | Complete a batch with scale actuals; full cascade | PlantOperator |
+| POST | /agronomy/blend-batches/{batchId}/void | Void a SCHEDULED batch | PlantOperator |
+| POST | /agronomy/trucks | Register a truck | LogisticsDispatcher |
+| GET | /agronomy/trucks | List trucks | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/trucks/{truckId} | Get a truck | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/trucks/{truckId}/out-of-service | Take a truck out of service | LogisticsDispatcher |
+| POST | /agronomy/trucks/{truckId}/return-to-service | Return a truck to service | LogisticsDispatcher |
+| POST | /agronomy/delivery-routes | Create a delivery route for a truck and date | LogisticsDispatcher |
+| GET | /agronomy/delivery-routes | List delivery routes (filters `truck_id`, `route_date`, `status`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/delivery-routes/{routeId} | Get a delivery route | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/delivery-routes/{routeId}/stops | Add a stop for a BATCHED order to a PLANNED route | LogisticsDispatcher |
+| GET | /agronomy/delivery-routes/{routeId}/stops | List a route's stops | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/delivery-routes/{routeId}/dispatch | Dispatch a route | LogisticsDispatcher |
+| POST | /agronomy/delivery-routes/{routeId}/cancel | Cancel a PLANNED route; stops and orders revert | LogisticsDispatcher |
+| GET | /agronomy/delivery-stops/{stopId} | Get a delivery stop | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| GET | /agronomy/delivery-stops | List delivery stops (filters `blend_order_id`, `delivery_route_id`) | Grower, Agronomist, PlantOperator, LogisticsDispatcher, CreditManager, ComplianceOfficer, BranchAdmin |
+| POST | /agronomy/delivery-stops/{stopId}/complete | Mark a stop delivered; route bubble-up | LogisticsDispatcher |
+
+## 5. Error Code Catalogue
+
+Trigger conditions for each error live in the §2 and §3 narratives beside the workflows they guard; this table is the identifier-to-status reference only.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| ERR_UNAUTHENTICATED | 401 |
+| ERR_FORBIDDEN_ROLE | 403 |
+| ERR_VALIDATION_FAILED | 400 |
+| ERR_RESOURCE_NOT_FOUND | 404 |
+| ERR_STALE_VERSION | 412 |
+| ERR_INVALID_TRANSITION | 409 |
+| ERR_GROWER_NOT_ORDERABLE | 409 |
+| ERR_NMP_REQUIRED | 422 |
+| ERR_NITROGEN_CAP_EXCEEDED | 422 |
+| ERR_PHOSPHORUS_RESTRICTED | 422 |
+| ERR_PERMIT_NOT_ACTIVE | 422 |
+| ERR_STORAGE_CAPACITY_EXCEEDED | 422 |
+| ERR_PRICE_WINDOW_OVERLAP | 409 |
+| ERR_BLENDER_WINDOW_CONFLICT | 409 |
+| ERR_PREPAY_FUNDING_DEADLINE_PASSED | 409 |
+| ERR_NO_CURRENT_PRICE | 422 |
+| ERR_RECOMMENDATION_EXPIRED | 422 |
+| ERR_FORMULATION_UNSOLVABLE | 422 |
+| ERR_BATCH_VARIANCE_EXCEEDED | 422 |
+| ERR_TRUCK_CAPACITY_EXCEEDED | 422 |
+| ERR_DUPLICATE_ROUTE_FOR_TRUCK_DATE | 409 |
+| ERR_INSUFFICIENT_INVENTORY | 422 |
+| ERR_RECOMMENDATION_NOT_APPROVED | 422 |
+| ERR_RECOMMENDATION_FIELD_MISMATCH | 422 |
+| ERR_RECOMMENDATION_SUPERSEDED | 422 |
+| ERR_PREPAY_CONTRACT_MISMATCH | 422 |
+| ERR_CONTRACT_IN_USE | 409 |
+| ERR_PROGRAM_NOT_ENROLLING | 409 |
+| ERR_BLENDER_FORM_MISMATCH | 422 |
+| ERR_BLENDER_OUT_OF_SERVICE | 409 |
+| ERR_CREDIT_LIMIT_EXCEEDED | 402 |
+| ERR_OVERPAYMENT | 422 |
+| ERR_PREPAY_OVERFUND | 422 |

@@ -1,0 +1,54 @@
+"""Domain thresholds and test defaults — numeric constants from the PRD (§2, §3)."""
+
+# Logical clock default before any client interaction (PRD §2.4).
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+CLOCK_DEFAULT_STAMP = "2026-08-01T00:00:00.000Z"
+
+# Deposit schedule constants (PRD §3.7).
+MIN_DEPOSIT_FLOOR_CENTS = 10000
+SAFE_HARBOR_FRACTION_NUM = 1  # one half
+SAFE_HARBOR_FRACTION_DEN = 2
+
+# Late deposit penalty tiers (PRD §3.7).
+TIER1_MAX_DAYS = 5
+TIER2_MAX_DAYS = 15
+TIER1_RATE = 0.02
+TIER2_RATE = 0.05
+TIER3_RATE = 0.10
+DAILY_INTEREST = 0.0005
+
+# Return settlement constants (PRD §3.6).
+UNDERPAYMENT_SAFE_HARBOR_RATIO = 0.9
+UNDERPAYMENT_PENALTY_RATE = 0.10
+LATE_FILING_MONTHLY_RATE = 0.05
+LATE_FILING_CAP_RATE = 0.25
+
+# Credit claim constants (PRD §3.8).
+CLAIM_CAP_CENTS = 5000000
+BAD_DEBT_MIN_AGE_DAYS = 183
+CLAIM_MAX_AGE_DAYS = 731
+
+# Bond requirement constants (PRD §3.1).
+FLOOR_STANDARD_CENTS = 1000000
+FLOOR_AGGRAVATED_CENTS = 2500000
+STANDARD_MULTIPLIER = 3
+AGGRAVATED_MULTIPLIER = 5
+STANDARD_WINDOW_MONTHS = 6
+AGGRAVATED_WINDOW_MONTHS = 12
+
+# Records retention (PRD §3.9).
+RETENTION_YEARS = 7
+
+# Default assessment punitive multiplier (PRD §3.5).
+PUNITIVE_RATE_MULTIPLIER = 1.5
+
+# Shared scenario values used across fixtures.
+TEST_DEFAULTS = {
+    "BOND_PRINCIPAL_CENTS": 1500000,
+    "BOND_EFFECTIVE_FROM": "2026-01-01T00:00:00Z",
+    "BOND_EFFECTIVE_TO": "2027-06-01T00:00:00Z",
+    "RATE_DIESEL_MC": 24300,
+    "RATE_GASOLINE_MC": 41100,
+    "RATE_SPIRITS_MC": 25000,
+    "RATE_EFFECTIVE_FROM": "2026-01-01T00:00:00Z",
+}

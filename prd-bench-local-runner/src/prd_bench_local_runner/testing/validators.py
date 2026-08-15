@@ -133,11 +133,15 @@ def validate_paginated(response: requests.Response) -> tuple:
     return body["data"], meta
 
 
-def get_success_data(response: requests.Response) -> dict:
+def get_success_data(response: requests.Response,
+                     expected_status: Optional[int] = None) -> dict:
     """
     Lenient validator for setup steps — accepts any 2xx status.
     Use in fixtures.py for setup calls where the exact status code
     doesn't matter, but clear error messages on failure do.
+
+    When expected_status is given, the response must carry exactly that
+    (2xx) status; otherwise any 2xx is accepted.
     """
     if not (200 <= response.status_code < 300):
         body = response.json() if response.text else {}
@@ -147,5 +151,10 @@ def get_success_data(response: requests.Response) -> dict:
             error_info = f": {err.get('error_id', '?')} - {err.get('message', '?')}"
         raise AssertionError(
             f"Setup step failed with HTTP {response.status_code}{error_info}"
+        )
+    if expected_status is not None:
+        assert response.status_code == expected_status, (
+            f"Expected {expected_status}, got {response.status_code}: "
+            f"{response.text}"
         )
     return validate_success(response, response.status_code)
