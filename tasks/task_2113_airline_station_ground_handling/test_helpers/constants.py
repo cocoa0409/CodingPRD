@@ -1,0 +1,108 @@
+"""Domain thresholds — the numeric constants the PRD pins for this contract."""
+
+# The logical clock reads exactly this instant before any client moves it.
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# Station registration defaults (PRD §3.1)
+STATION_DEFAULTS = {
+    "otp_target_pct": 85.00,
+    "otp_tolerance_minutes": 15,
+    "gse_reposition_buffer_minutes": 20,
+    "penalty_cap_cents": 5000000,
+    "damage_penalty_multiplier": 1.00,
+}
+
+# Service-level matrix (PRD §3.4)
+REQUIRED_AGENTS = {
+    "TOWING_ONLY": 1,
+    "NARROWBODY_QUICK": 2,
+    "NARROWBODY_STANDARD": 3,
+    "FREIGHTER": 3,
+    "WIDEBODY": 4,
+}
+REQUIRED_GSE = {
+    "TOWING_ONLY": 1,
+    "NARROWBODY_QUICK": 1,
+    "NARROWBODY_STANDARD": 1,
+    "FREIGHTER": 2,
+    "WIDEBODY": 2,
+}
+BASE_RATE_CENTS = {
+    "TOWING_ONLY": 18000,
+    "NARROWBODY_QUICK": 42000,
+    "NARROWBODY_STANDARD": 58000,
+    "FREIGHTER": 110000,
+    "WIDEBODY": 145000,
+}
+STD_GROUND_MINUTES = {
+    "TOWING_ONLY": 20,
+    "NARROWBODY_QUICK": 30,
+    "NARROWBODY_STANDARD": 45,
+    "FREIGHTER": 120,
+    "WIDEBODY": 90,
+}
+
+# Excess ground-time marginal rates (PRD §3.9)
+EXCESS_TIER_1_RATE_CENTS_PER_MIN = 900
+EXCESS_TIER_1_MINUTES = 15
+EXCESS_TIER_2_RATE_CENTS_PER_MIN = 1400
+EXCESS_TIER_2_MINUTES = 30
+EXCESS_TIER_3_RATE_CENTS_PER_MIN = 2100
+
+# Charge multipliers and clamp (PRD §3.9)
+WINTER_MULTIPLIER = 1.15
+SUMMER_MULTIPLIER = 1.00
+SUBCONTRACT_FACTOR = 0.965
+DIRECT_FACTOR = 1.00
+GROSS_CAP_MULTIPLE = 3
+
+# Penalties (PRD §3.9)
+OTP_PENALTY_PCT = 0.12
+DAMAGE_PENALTY_CENTS = {"MINOR": 25000, "MAJOR": 250000, "CRITICAL": 900000}
+
+# Volume rebate (PRD §3.9)
+REBATE_TIER_A_MIN_CENTS = 60000
+REBATE_TIER_B_MIN_CENTS = 150000
+REBATE_PCT = {"NONE": 0.00, "TIER_A": 0.03, "TIER_B": 0.06}
+
+# Subcontractor compliance scoring (PRD §3.2)
+SEVERITY_WEIGHT = {"MINOR": 5, "MAJOR": 15, "CRITICAL": 40}
+DECAY_FULL_MAX_AGE_DAYS = 90
+DECAY_HALF_MAX_AGE_DAYS = 180
+OVERSIGHT_FLAG_THRESHOLD = 60.00
+AUTO_PROBATION_THRESHOLD = 40.00
+REINSTATE_MIN_AUDIT_SCORE = 40.00
+
+# Duty and endorsement rules (PRD §3.5, §3.7)
+MAX_DUTY_MINUTES_PER_DAY = 600
+EXPIRING_WINDOW_DAYS = 30
+REQUIRED_CERTS_BY_ROLE = {
+    "LEAD": ["RAMP_SAFETY", "LOADMASTER"],
+    "RAMP": ["RAMP_SAFETY"],
+    "LOADER": ["RAMP_SAFETY", "BELT_LOADER"],
+    "PUSHBACK_OPERATOR": ["RAMP_SAFETY", "PUSHBACK"],
+    "DEICER": ["RAMP_SAFETY", "DEICING"],
+}
+
+# Oversight posture (PRD §2.10)
+ENHANCED_MIN_COMPLETED_TURNS = 3
+
+# Automatic maintenance hold length after a service interval trips (PRD §3.4)
+AUTO_SERVICE_HOLD_MINUTES = 240
+
+# Staffing coverage conventions (PRD §3.3)
+EMPTY_BANK_COVERAGE_PCT = 100.00
+APPROVE_MIN_COVERAGE_PCT = 100.00
+
+# Incident investigation cycle cap (PRD §3.8)
+MAX_REOPEN_COUNT = 2
+
+TEST_DEFAULTS = {
+    "CLOCK_BASE": "2026-04-01T00:00:00Z",
+    "BANK_WINDOW_START": "2026-04-10T04:00:00Z",
+    "BANK_WINDOW_END": "2026-04-10T22:00:00Z",
+    "PERIOD_WINDOW_START": "2026-04-01T00:00:00Z",
+    "PERIOD_WINDOW_END": "2026-04-30T23:59:00Z",
+    "CERT_ISSUED_AT": "2026-01-01T00:00:00Z",
+    "CERT_EXPIRES_AT": "2027-01-01T00:00:00Z",
+}

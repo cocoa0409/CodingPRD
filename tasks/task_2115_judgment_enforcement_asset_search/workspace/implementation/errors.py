@@ -1,0 +1,72 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_CREDITOR_NOT_FOUND": 404,
+    "ERR_DEBTOR_NOT_FOUND": 404,
+    "ERR_JUDGMENT_NOT_FOUND": 404,
+    "ERR_COUNTY_FILING_NOT_FOUND": 404,
+    "ERR_ASSET_FINDING_NOT_FOUND": 404,
+    "ERR_ENFORCEMENT_ACTION_NOT_FOUND": 404,
+    "ERR_EXEMPTION_CLAIM_NOT_FOUND": 404,
+    "ERR_EXAMINATION_NOT_FOUND": 404,
+    "ERR_SETTLEMENT_OFFER_NOT_FOUND": 404,
+    "ERR_INSTALLMENT_AGREEMENT_NOT_FOUND": 404,
+    "ERR_PAYMENT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_ENUM": 400,
+    "ERR_NON_POSITIVE_AMOUNT": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_CLOCK_REGRESSION": 422,
+    "ERR_STALE_JUDGMENT_VERSION": 412,
+    "ERR_STALE_DEBTOR_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_JUDGMENT_EXPIRED": 409,
+    "ERR_JUDGMENT_SATISFIED": 409,
+    "ERR_ENFORCEMENT_STAYED": 409,
+    "ERR_EXEMPTION_PENDING": 409,
+    "ERR_EXEMPTION_WINDOW_CLOSED": 422,
+    "ERR_RENEWAL_WINDOW_NOT_OPEN": 422,
+    "ERR_EXAM_COOLING_PERIOD": 409,
+    "ERR_LEVY_WINDOW_CONFLICT": 409,
+    "ERR_SUBPOENA_DEADLINE_PASSED": 422,
+    "ERR_PAYMENT_DATE_INVALID": 422,
+    "ERR_NO_PERFECTED_LIEN": 409,
+    "ERR_FINDING_NOT_VERIFIED": 409,
+    "ERR_FINDING_STALE": 409,
+    "ERR_DEBTOR_NOT_LOCATED": 409,
+    "ERR_SAME_PARTY_COUNTER": 409,
+    "ERR_ACTION_ASSET_TYPE_MISMATCH": 409,
+    "ERR_DUPLICATE_CASE_NUMBER": 409,
+    "ERR_DUPLICATE_COUNTY_FILING": 409,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_CONTINUANCE_LIMIT": 409,
+    "ERR_RENEWAL_LIMIT_REACHED": 409,
+    "ERR_REINSTATEMENT_LIMIT": 409,
+    "ERR_SETTLEMENT_BELOW_FLOOR": 422,
+    "ERR_GARNISHMENT_BELOW_FLOOR": 422,
+    "ERR_NO_LEVIABLE_FUNDS": 422,
+    "ERR_PAYMENT_EXCEEDS_PAYOFF": 422,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower().capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

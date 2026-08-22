@@ -1,0 +1,60 @@
+"""Domain thresholds and numeric constants stated by the PRD."""
+
+# The logical clock reads exactly this instant until an administrator moves it.
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00.000Z"
+DEFAULT_CLOCK_INPUT = "2026-08-01T00:00:00Z"
+
+# Readiness posture bands derived from issue_severity_index.
+POSTURE_THRESHOLDS = {
+    "FROZEN_MIN": 40.00,
+    "RESTRICTED_MIN": 16.00,
+    "INDEX_CAP": 100.00,
+}
+
+# Severity index inputs.
+SEVERITY_WEIGHTS = {"S1": 25.0, "S2": 12.0, "S3": 8.0, "S4": 2.0}
+AGING_STEP_DAYS = 14
+AGING_STEP_INCREMENT = 0.25
+AGING_MULTIPLIER_CAP = 2.00
+BLOCKING_MULTIPLIER = 2.0
+
+# Retainage.
+BASE_HOLD_RATES = {"S1": 0.05, "S2": 0.02, "S3": 0.005, "S4": 0.0}
+CRITICALITY_FACTORS = {"LIFE_SAFETY": 1.5, "CRITICAL": 1.2, "STANDARD": 1.0}
+RETAINAGE_CAP_FRACTION = 0.10
+
+# Acceptance completion score blend.
+SUB_SCORE_WEIGHTS = {"PREFUNCTIONAL": 0.30, "FUNCTIONAL": 0.50, "CLOSEOUT": 0.20}
+ACCEPTANCE_SCORE_FLOORS = {"SUBSTANTIAL": 70.00, "FINAL": 95.00}
+
+# Certification credit documentation score.
+TIER_COMPLETENESS_BOUNDS = {"GOLD": 1.00, "SILVER": 0.75, "BRONZE": 0.50}
+TIER_QUALITY_WEIGHTS = {"GOLD": 1.00, "SILVER": 0.85, "BRONZE": 0.60, "NONE": 0.40}
+STALE_EVIDENCE_PENALTY = 15.00
+FINAL_TIER_SCORE_BOUNDS = {"GOLD": 90.00, "SILVER": 70.00, "BRONZE": 50.00}
+TIER_AWARD_FRACTIONS = {"GOLD": 1.00, "SILVER": 0.75, "BRONZE": 0.50, "NONE": 0.00}
+
+# Training coverage.
+TRAINING_COVERAGE_FLOOR = 0.80
+
+# Retro-commissioning savings.
+DEEMED_REALISATION_FACTOR = 0.85
+MEASURED_UNCERTAINTY_FACTOR = 0.90
+
+# Design review.
+MAX_REVIEW_ROUNDS = 3
+
+# Witness calendar geometry.
+WITNESS_BUFFER_MINUTES = 60
+
+# Pagination.
+PAGINATION = {"DEFAULT_LIMIT": 10, "MIN_LIMIT": 1, "MAX_LIMIT": 100, "MIN_OFFSET": 0}
+
+# Convenient defaults reused across fixtures.
+TEST_DEFAULTS = {
+    "PROJECT_CONTRACT_VALUE_CENTS": 100_000_000,
+    "EQUIPMENT_CONTRACT_VALUE_CENTS": 1_000_000,
+    "EQUIPMENT_WEIGHT_UNITS": 10,
+    "REQUIREMENT_TARGET_VALUE": 10_000,
+    "REQUIREMENT_TOLERANCE_PCT": 5,
+}

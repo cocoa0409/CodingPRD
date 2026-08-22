@@ -1,0 +1,68 @@
+"""Domain thresholds and figures the PRD pins numerically."""
+
+# The logical clock reads exactly this before any client has moved it.
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+DEFAULT_CLOCK_DATE = "2026-08-01"
+
+THRESHOLDS = {
+    # Wage garnishment
+    "GARNISHMENT_CAP_BPS": 2500,
+    "GARNISHMENT_HOH_FL_CAP_BPS": 1000,
+    "FEDERAL_MIN_WAGE_CENTS": 725,
+    "FEDERAL_FLOOR_CENTS": 21_750,  # 30 x 725
+    # Bank levy
+    "BANK_AUTO_EXEMPTION_CENTS": 175_000,
+    "SHERIFF_FEE_CENTS": 12_500,
+    "LEVY_WINDOW_DAYS": 120,
+    # Settlement
+    "SETTLEMENT_FLOOR_BPS": 6_000,
+    "MAX_NEGOTIATION_ROUNDS": 4,
+    "MAX_INSTALLMENT_COUNT": 60,
+    "AGREEMENT_FIRST_DUE_LAG_DAYS": 30,
+    "MISSES_TO_DEFAULT": 3,
+    "MAX_REINSTATEMENTS": 1,
+    # Contingency accounting
+    "CONTINGENCY_TIER1_BPS": 4_000,
+    "CONTINGENCY_TIER2_BPS": 3_300,
+    "CONTINGENCY_TIER3_BPS": 2_500,
+    "CONTINGENCY_TIER1_CEILING_CENTS": 1_000_000,
+    "CONTINGENCY_TIER2_CEILING_CENTS": 5_000_000,
+    # Interest / renewal
+    "DAY_BASIS": 365,
+    "MAX_INTEREST_RATE_BPS": 3_000,
+    "JUDGMENT_LIFE_YEARS": 10,
+    "RENEWAL_WINDOW_DAYS": 180,
+    "RENEWAL_FEE_CENTS": 5_000,
+    "MAX_RENEWALS": 2,
+    # Examinations and subpoenas
+    "EXAM_COOLING_DAYS": 120,
+    "EXAM_COOLING_HOURS": 2_880,
+    "SUBPOENA_LEAD_DAYS": 10,
+    "MAX_CONTINUANCES": 2,
+    "EXAM_SERVICE_BACKDATE_DAYS": 30,
+    # Exemption claims
+    "EXEMPTION_FILING_WINDOW_DAYS": 20,
+    "OPPOSITION_WINDOW_DAYS": 10,
+    # Recoverability score
+    "RECOVERABILITY_TARGET_ASSET_CENTS": 5_000_000,
+    "RECOVERABILITY_ASSET_WEIGHT": 60,
+    "RECOVERABILITY_OPEN_DISCOUNT": 0.6,
+    "RECOVERABILITY_LOCATE_POINTS": 20,
+    "RECOVERABILITY_COOPERATION_POINTS": 20,
+    # Pagination
+    "PAGINATION_DEFAULT_LIMIT": 10,
+    "PAGINATION_MAX_LIMIT": 100,
+}
+
+# Values shared by the standard test scenario: a CA judgment entered 2026-01-01
+# for 5,000,000 cents at 1,000 bps with 45,000 cents of taxed filing costs.
+TEST_DEFAULTS = {
+    "STATE_CODE": "CA",
+    "COUNTY_CODE": "CA-LOS-ANGELES",
+    "PRINCIPAL_CENTS": 5_000_000,
+    "INTEREST_RATE_BPS": 1_000,
+    "FILING_COSTS_CENTS": 45_000,
+    "ENTERED_ON": "2026-01-01",
+    "BANK_BALANCE_CENTS": 900_000,
+    "WEEKLY_DISPOSABLE_EARNINGS_CENTS": 100_000,
+}

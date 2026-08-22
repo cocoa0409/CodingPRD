@@ -1,0 +1,82 @@
+"""Error catalogue (PRD 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_PAYER_SCOPE_VIOLATION": 403,
+    "ERR_APPROVAL_TIER_INSUFFICIENT": 403,
+    "ERR_PAYER_NOT_FOUND": 404,
+    "ERR_ACCOUNT_NOT_FOUND": 404,
+    "ERR_TRANSACTION_NOT_FOUND": 404,
+    "ERR_CREDIT_BALANCE_NOT_FOUND": 404,
+    "ERR_ROOT_CAUSE_FINDING_NOT_FOUND": 404,
+    "ERR_REFUND_REQUEST_NOT_FOUND": 404,
+    "ERR_REFUND_APPROVAL_NOT_FOUND": 404,
+    "ERR_REFUND_BATCH_NOT_FOUND": 404,
+    "ERR_CHECK_NOT_FOUND": 404,
+    "ERR_TAKE_BACK_NOTICE_NOT_FOUND": 404,
+    "ERR_OFFSET_APPLICATION_NOT_FOUND": 404,
+    "ERR_MEDICARE_OBLIGATION_NOT_FOUND": 404,
+    "ERR_ESCHEATMENT_RECORD_NOT_FOUND": 404,
+    "ERR_COMPLIANCE_REPORT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_CREDIT_BALANCE_INVALID_STATE": 409,
+    "ERR_REFUND_REQUEST_INVALID_STATE": 409,
+    "ERR_BATCH_INVALID_STATE": 409,
+    "ERR_CHECK_INVALID_STATE": 409,
+    "ERR_NOTICE_INVALID_STATE": 409,
+    "ERR_OBLIGATION_INVALID_STATE": 409,
+    "ERR_ESCHEATMENT_INVALID_STATE": 409,
+    "ERR_REPORT_INVALID_STATE": 409,
+    "ERR_TRANSACTION_ALREADY_REVERSED": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_DUPLICATE_APPROVER": 409,
+    "ERR_MEDICARE_OBLIGATION_OPEN": 409,
+    "ERR_DUE_DILIGENCE_REQUIRED": 409,
+    "ERR_DUE_DILIGENCE_TOO_EARLY": 409,
+    "ERR_DORMANCY_NOT_ELAPSED": 409,
+    "ERR_DISPUTE_WINDOW_CLOSED": 409,
+    "ERR_INVALID_PERIOD": 422,
+    "ERR_INVALID_BATCH_WINDOW": 422,
+    "ERR_BATCH_WINDOW_OVERLAP": 409,
+    "ERR_REPORT_PERIOD_CONFLICT": 409,
+    "ERR_DUPLICATE_PAYER_CODE": 409,
+    "ERR_DUPLICATE_ACCOUNT_NUMBER": 409,
+    "ERR_DUPLICATE_BATCH_NUMBER": 409,
+    "ERR_DUPLICATE_NOTICE_NUMBER": 409,
+    "ERR_ESCHEATMENT_ALREADY_EXISTS": 409,
+    "ERR_ACCOUNT_NOT_REFUNDABLE": 409,
+    "ERR_PAYEE_TYPE_MISMATCH": 422,
+    "ERR_TAKE_BACK_NOT_PERMITTED": 422,
+    "ERR_TRANSACTION_PAYER_REQUIRED": 422,
+    "ERR_REFUND_BELOW_MINIMUM": 422,
+    "ERR_CREDIT_ALREADY_CONSUMED": 409,
+    "ERR_REFUND_EXCEEDS_CREDIT": 422,
+    "ERR_NET_BELOW_MIN_CHECK": 422,
+    "ERR_BATCH_EMPTY": 409,
+    "ERR_NO_ELIGIBLE_CREDIT": 422,
+    "ERR_WRITE_OFF_LIMIT_EXCEEDED": 422,
+    "ERR_MAX_REVISIONS_EXCEEDED": 409,
+    "ERR_ACCOUNT_HAS_OPEN_CREDIT": 409,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be one of the six declared roles.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorised for this endpoint.",
+    "ERR_PAYER_SCOPE_VIOLATION": "A PayerLiaison may only act on take-back notices belonging to its own payer.",
+    "ERR_APPROVAL_TIER_INSUFFICIENT": "The claimed signing authority is below the request's required approval tier.",
+    "ERR_INVALID_REQUEST": "The request body is missing a required field or carries an illegal value.",
+    "ERR_INVALID_PAGINATION": "limit must be an integer in [1, 100] and offset an integer >= 0.",
+    "ERR_STALE_VERSION": "The supplied expected parent version does not match the parent's current version.",
+}

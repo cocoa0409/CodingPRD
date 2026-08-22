@@ -1,0 +1,456 @@
+# Busking Permit Program API — Product Requirements Document
+
+## 1. Introduction
+
+Street performance is one of the cheapest pieces of civic culture a city can buy, and one of the easiest to mismanage. The city's Busking Permit Program exists because three constituencies pull in opposite directions on the same square metre of pavement: performers who need a predictable, fairly allocated place to work; residents and shopkeepers who need the ordinance's sound limits honoured and a credible way to complain when they are not; and the program office, which has to license, vet, bill, schedule and — when necessary — suspend, without ever losing track of who owes what and who is standing where. Today all of that lives in spreadsheets, paper placards and an inbox. This document specifies the API that replaces it.
+
+The system covers the whole arc of a busking season. A performer is enrolled after a city ID check, lodges an application naming the district and act classification they want to work, and is either waved through the review desk or routed into an audition before a vetting panel. An approved application mints a permit and its first invoice; paying that invoice is what actually puts the performer on the street. From there the permit is used to reserve time windows on designated pitches, to enter rotation draws for the scarce premium pitches, and to accumulate a season minute allowance that is spent by bookings and restored by cancellations. Ordinance inspectors meter live sessions against a decibel ceiling that is computed from the district, the pitch, the hour of day, the day of week, whether the act is amplified and whether the permit is already under a compliance warning. Residents file complaints, officers triage and adjudicate them, and upheld complaints drive a conduct score that decays over time and can ultimately bar a performer outright. Special events and roadworks close streets, displacing bookings onto fallback pitches or cancelling them with a minute credit. At the end of the season the permit either renews or expires.
+
+Two engineering constraints shape everything that follows. First, the system is **fully deterministic and clock-driven**: nothing reads wall-clock time, every deadline, proration, expiry, decay and window rule reads a server-held logical clock that tests advance explicitly, and every ranking has a total order with an explicit tie-break. Second, the system is **ledger-honest**: the denormalised minute and money counters carried on a permit are not caches that may drift — they are invariants that must equal their recomputation from the underlying rows after every single operation, including every compensating one. All resources are mounted under the `/busking` prefix, and every request identifies its caller through headers rather than a session.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API — including reads — must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, naming the role that user is acting in. If either header is absent, or if `X-User-Role` is not exactly one of the five role names below, the request is rejected with `ERR_UNAUTHENTICATED` and HTTP 401. If both headers are well formed but the named role is not one of the roles authorised for the endpoint being called (the authorised set for each endpoint is listed in section 4), the request is rejected with `ERR_FORBIDDEN_ROLE` and HTTP 403.
+
+The five roles are `PermitOfficer`, `Performer`, `AuditionPanelist`, `NoiseInspector` and `Resident`.
+
+A `PermitOfficer` is a city busking-program officer. Officers run the register of districts and pitches, the review desk, the vetting panel's paperwork, enforcement, the rotation draws, street closures and the epoch advance. When `X-User-Role` is `PermitOfficer`, `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity; the server records it where a workflow demands an audit trail — as `reviewed_by_user_id` and `decided_by_user_id` on an application, as `finalized_by_user_id` on an audition, and as `triaged_by_user_id` and `adjudicated_by_user_id` on a complaint — but it never compares it to any row's `id`. Officer identifiers are nevertheless compared *to each other*: separation of duties in this program is enforced between officer user ids, not between roles.
+
+When `X-User-Role` is `Performer`, `X-User-ID` is the `id` of the acting `Performer` row, minted when the officer enrolled that performer. Ownership checks on any resource that references a `Performer` compare the resource's performer reference to `X-User-ID`: directly through `performer_id` on a `Performer` row itself and on a `PermitApplication`, and transitively through the permit's `performer_id` for a `Permit`, a `FeeInvoice`, a `LotteryEntry` and a `SessionBooking`. A performer who targets a resource that resolves to a different performer is rejected with `ERR_NOT_RESOURCE_OWNER` and HTTP 403.
+
+When `X-User-Role` is `AuditionPanelist`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server records it as `panelist_user_id` on the score the panelist files, and uses it only to enforce that one panelist files at most one score per sitting. When `X-User-Role` is `NoiseInspector`, `X-User-ID` is likewise an opaque operator identifier not tied to any persisted entity; the server records it as `inspector_user_id` on each metering record but never compares it to any entity's `id`. When `X-User-Role` is `Resident`, `X-User-ID` is an opaque complainant identifier used for the audit trail only; it is never persisted on the complaint and never compared to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every list endpoint accepts two optional query parameters. `limit` controls page size: it defaults to 10 when omitted, may not be smaller than 1, and may not be larger than 100. `offset` controls how many rows are skipped before the page begins: it defaults to 0 and may not be negative. Results are always returned sorted by `created_at` in ascending order, so the oldest matching row is the first element of the first page; where a subsection below calls a listing "newest last", that is the same ordering restated.
+
+List responses carry `limit`, `offset`, `total_count` and `has_more` inside `meta`. `total_count` is the number of rows matching the request's filters before pagination is applied, and `has_more` is true when rows remain beyond the current page. Filter query parameters are combined conjunctively: a listing that receives several filters returns only rows matching all of them.
+
+### 2.4. Common Resource Properties, Versioning and Timestamps
+
+Every resource is identified by an `id` that the server mints as a UUID. Identifiers carry no type prefix and are never supplied by the client; a client that sends `id` in a request body has that key ignored rather than honoured.
+
+Most resources also carry `created_at`, `updated_at` and `version`. `created_at` and `updated_at` are ISO 8601 UTC timestamps with three fractional digits, taken from the program clock described in section 2.5. `version` is an integer that starts at 1 when the row is created and increases by exactly 1 on every mutation of that row, whether the mutation was requested directly by a client or produced as a side effect of an operation on another resource. Whenever a rule below says a row's `version` is incremented, its `updated_at` is refreshed in the same step.
+
+Two resources are deliberately immutable once written and therefore carry only `id` and `created_at`: an `AuditionScore` (a panelist's filed subscores) and a `NoiseReading` (an inspector's metering record). Neither of these two has an `updated_at` field and neither has a `version` field, and no operation in this specification rewrites an already-filed score or reading.
+
+### 2.5. The Program Clock
+
+Nothing in this system reads wall-clock time. The server holds a single logical UTC clock that starts at exactly `2026-08-01T00:00:00Z` when the process boots and stays there until it is moved explicitly; it must never fall back to the host's real time, not even before the first move. Every deadline, due date, proration boundary, expiry test, booking-horizon test, quiet-window test, conduct-decay computation and audit timestamp in this specification reads that clock.
+
+An operations-facing test-driving capability moves the clock: the caller supplies the target instant as `to_iso8601`, and the response reports the new `current_utc` alongside the `previous_utc` it replaced. Moving the clock mutates no entity — it does not lift closures, expire permits, complete bookings or rescore performers. Those consequences happen only when the epoch-advance capability described in section 3.9 is invoked.
+
+### 2.6. Rejection Precedence
+
+A request is validated as an ordered sequence of checks, and the **first** check that fails decides the response; no later check may mask an earlier one, and no earlier check may be skipped because a later one would also fail. The order below is normative and applies across the whole API — a rule simply does not participate when the endpoint being called is outside its scope. Trigger conditions are described in full in the workflow narratives of section 3; this list fixes only their relative order.
+
+1. Both authentication headers present and `X-User-Role` a known role, otherwise `ERR_UNAUTHENTICATED`.
+2. The role is authorised for this endpoint, otherwise `ERR_FORBIDDEN_ROLE`.
+3. Every identifier appearing in the URL path resolves to a live row, validated left to right, otherwise the matching not-found error.
+4. Every foreign key supplied in the request body resolves to a live row, validated in the order the fields appear in that endpoint's input list, otherwise the matching not-found error. This applies to pitch registration, application creation, audition scheduling, draw creation, lottery entry filing, session booking, noise-reading filing, complaint intake and closure-order drafting.
+5. On any endpoint whose authorised roles include `Performer`, a caller acting as `Performer` owns the target resource, otherwise `ERR_NOT_RESOURCE_OWNER`.
+6. The request body is well formed, otherwise `ERR_INVALID_REQUEST`. Applies to every POST endpoint.
+7. The complaint being triaged or adjudicated is not already resolved, otherwise `ERR_COMPLAINT_ALREADY_RESOLVED`. This domain gate deliberately precedes the generic state check below, so acting on a resolved complaint reports `ERR_COMPLAINT_ALREADY_RESOLVED` rather than `ERR_INVALID_STATE`.
+8. Natural-key uniqueness on district code, pitch code and performer email, otherwise `ERR_ZONE_CODE_TAKEN`, `ERR_PITCH_CODE_TAKEN` or `ERR_PERFORMER_EMAIL_TAKEN` respectively.
+9. An approval decision on an application that requires vetting is admitted only from the passed-audition state, otherwise `ERR_AUDITION_REQUIRED`. This gate also deliberately precedes the generic state check, so an approval attempted from any other audition-branch state reports `ERR_AUDITION_REQUIRED` rather than `ERR_INVALID_STATE`.
+10. The target resource is in a state from which the requested transition is declared, otherwise `ERR_INVALID_STATE`. This applies to every action endpoint: submit, review, revise, decide, finalize, pay, renew, revoke, reinstate, enter a draw, execute a draw, cancel a booking, triage, adjudicate and activate a closure.
+11. The permit's lifecycle axis is `ACTIVE`, otherwise `ERR_PERMIT_NOT_ACTIVE`. Applies to session booking and to lottery entry filing.
+12. The permit's compliance axis is not `SUSPENDED`, otherwise `ERR_PERMIT_SUSPENDED`. Applies to session booking, lottery entry filing and renewal.
+13. `expected_application_version` matches the application's current `version`, otherwise `ERR_STALE_APPLICATION_VERSION`.
+14. `expected_permit_version` matches the permit's current `version`, otherwise `ERR_STALE_PERMIT_VERSION`.
+15. The adjudicating officer is not the officer who triaged the complaint, otherwise `ERR_SEGREGATION_OF_DUTIES`.
+16. The deciding officer is not the officer who finalized the application's passed audition, otherwise `ERR_SEGREGATION_OF_DUTIES`.
+17. The audition has at least the minimum number of filed panel scores, otherwise `ERR_AUDITION_PANEL_INCOMPLETE`.
+18. The permit holder is not barred, otherwise `ERR_PERFORMER_BARRED`. Applies to reinstatement.
+19. Amplification is permitted on the pitch, otherwise `ERR_AMPLIFICATION_PROHIBITED`.
+20. Amplification is endorsed on the permit, otherwise `ERR_AMPLIFICATION_NOT_ENDORSED`.
+21. The requested occupation window avoids the district's quiet window, otherwise `ERR_QUIET_HOURS_VIOLATION`. Applies to session booking and to draw creation.
+22. The pitch is open, otherwise `ERR_PITCH_CLOSED`. Applies to session booking and to draw creation.
+23. A supplied fallback pitch belongs to the same district and is not the pitch being registered, otherwise `ERR_PITCH_ZONE_MISMATCH`.
+24. A complaint that names a session names one belonging to the same permit, otherwise `ERR_BOOKING_PERMIT_MISMATCH`.
+25. The occupation is no longer than the pitch's per-session ceiling, otherwise `ERR_SESSION_TOO_LONG`. Applies to session booking and to draw creation.
+26. The booking respects the minimum lead time, otherwise `ERR_BOOKING_LEAD_TIME`.
+27. The booking respects the maximum booking horizon, otherwise `ERR_BOOKING_HORIZON_EXCEEDED`.
+28. A metering instant falls inside its session, otherwise `ERR_READING_OUTSIDE_SESSION`.
+29. A cancellation is attempted before the session begins, otherwise `ERR_SESSION_ALREADY_STARTED`.
+30. Renewal happens inside the renewal window, otherwise `ERR_RENEWAL_WINDOW_CLOSED`.
+31. A lottery entry is filed no later than the draw's entry deadline, otherwise `ERR_ENTRY_DEADLINE_PASSED`.
+32. A draw is executed only after its entry deadline, otherwise `ERR_ENTRY_DEADLINE_NOT_PASSED`.
+33. The pitch occupation does not conflict with an existing occupation under the buffered interval test, otherwise `ERR_PITCH_SLOT_OVERLAP`. Applies to session booking and to draw creation.
+34. Activating a closure does not exceed the district's concurrent-closure ceiling, otherwise `ERR_CLOSURE_WINDOW_CONFLICT`.
+35. The pitch's daily session cap is not already reached for that calendar date, otherwise `ERR_PITCH_DAILY_CAP_REACHED`.
+36. A draw is opened only on a premium pitch, otherwise `ERR_PITCH_NOT_PREMIUM`.
+37. The permit is not already entered in this draw, otherwise `ERR_DUPLICATE_LOTTERY_ENTRY`.
+38. The performer has no other live application for the same season, otherwise `ERR_DUPLICATE_ACTIVE_APPLICATION`.
+39. The panelist has not already filed a score on this sitting, otherwise `ERR_DUPLICATE_PANEL_SCORE`.
+40. The application's revision allowance is not exhausted, otherwise `ERR_REVISION_LIMIT_EXCEEDED`. Applies both to filing a revision and to an officer issuing a further change request.
+41. The draw has at least one filed entry, otherwise `ERR_NO_ELIGIBLE_ENTRIES`.
+42. No invoice on the permit is past due, otherwise `ERR_INVOICE_PAST_DUE`. Applies to session booking and to lottery entry filing.
+43. No invoice on the permit is unpaid in any sense, otherwise `ERR_OUTSTANDING_INVOICE`. Applies to renewal.
+44. The renewal conduct gate is met, otherwise `ERR_RENEWAL_CONDUCT_INSUFFICIENT`.
+45. The tendered payment equals the amount due exactly, otherwise `ERR_PAYMENT_AMOUNT_MISMATCH`.
+46. The booking fits inside the permit's season minute allowance, otherwise `ERR_SEASON_MINUTE_CAP_EXCEEDED`.
+
+Well-formedness at step 6 means: every required field is present; every enumerated value is a member of its declared set; every integer sits inside its declared range; `end_at` is strictly after `start_at`; `ends_at` is strictly after `starts_at`; `entry_deadline_at` is strictly before `slot_start_at`; `decision_note` is present and non-empty when the decision outcome is `CHANGES_REQUESTED`; and the `season_year` supplied on a renewal equals the permit's current `season_year` plus one. Body keys that are not in an endpoint's declared input list — including any attempt to set a computed or system-owned field such as `id`, `version`, `status`, `conduct_score` or `amount_due_cents` — are silently ignored and never raise an error.
+
+### 2.7. Optimistic Concurrency on Applications and Permits
+
+Two write paths in this program are legitimate at any moment their target is in the right state, which means no state precondition can protect a client that is reasoning about a stale copy of the resource. Both are therefore guarded by an explicit version expectation, and on both the version field is a **required** input, not an optional one.
+
+Filing a revision on a permit application requires `expected_application_version`, carrying the `version` the client last observed on that application. If it does not equal the application's current `version`, the revision is rejected with `ERR_STALE_APPLICATION_VERSION` and HTTP 412. A revision legitimately supersedes whatever the officer last saw, so nothing else would stop it; the version check is what tells the applicant that the application has moved on since they read it — a decision, an earlier accepted revision, or an audition cancellation all advance the version.
+
+Creating a session booking requires `expected_permit_version`, carrying the `version` the client last observed on the permit it is booking against. If it does not equal the permit's current `version`, the booking is rejected with `ERR_STALE_PERMIT_VERSION` and HTTP 412. Booking is legitimate whenever the permit is active and clear, so again no state check would catch the problem: the minute ledger, the compliance axis or the amplification endorsement the client reasoned about may have been rewritten since by an earlier booking, a cancellation, a noise reading, a closure cascade or a lottery award.
+
+No other endpoint in this API accepts or requires a version field. In particular, payments, renewals, revocations, reinstatements, decisions, finalizations, triage, adjudication, draw execution, closure activation and booking cancellation take no version expectation and must not reject a request on version grounds.
+
+### 2.8. Units, Precision and Rounding
+
+Money is always an integer count of cents. There are no fractional cents anywhere in the system: where this document quotes a dollar figure, such as a base permit fee of $120.00, the stored value is that figure in whole cents — 12000. Every multiplication or division that produces money is rounded **half up to zero decimal places at the step where it appears**, never accumulated as a floating value and rounded once at the end.
+
+Panel scoring is the one place with fractional output. Scores are carried to two decimal places and rounded **half up**, and the rounding is applied twice: once to each panelist's own composite, and once again to the mean of those already-rounded composites.
+
+Conduct points are whole integers. The only rounding in conduct scoring is a half-up rounding of a halved deduction, so a 25-point charge halves to 13, a 12-point charge halves to 6, and a 5-point charge halves to 3.
+
+Sound levels are whole decibels and every term in the ceiling computation is an integer, so no rounding occurs there. Session durations are whole minutes. Closure and renewal windows are compared at second resolution, exactly as the instants are stored.
+
+### 2.9. Cascade Discipline and the Two Permit Ledgers
+
+Several operations in this program mutate more than one row. When they do, every affected row's `version` is incremented and its `updated_at` refreshed, and the whole cascade is applied atomically: either all of it lands or none of it does. Cascades are described in full where their business trigger lives, but two system-wide invariants govern all of them.
+
+The **minute ledger** invariant: a permit's `season_minutes_used` always equals the sum of `duration_minutes` over that permit's sessions whose `status` is `RESERVED`, `RELOCATED` or `COMPLETED`. Sessions in any cancelled status contribute nothing; relocated and completed sessions still contribute. Every path that cancels a session therefore subtracts that session's `duration_minutes` from `season_minutes_used`, and a cancellation restores the counter to exactly the value it held before the booking was created. A renewal payment resets the counter to 0, re-basing the invariant on the new season.
+
+The **money ledger** invariant: a permit's `net_fees_paid_cents` always equals the sum of `amount_paid_cents` over all of that permit's invoices minus the sum of their `refunded_cents`, evaluated over every invoice of the permit in `created_at` ascending order regardless of status — invoices that are pending, past due or void simply contribute zero on both sides. A payment and a compensating full refund must therefore leave `net_fees_paid_cents` at exactly its pre-payment value, with no drift.
+
+### 2.10. Separation of Duties on the Review Desk
+
+Two decision points in this program require two different human beings, and in both cases the comparison is between `X-User-ID` values of officers, not between roles. An officer whose id was recorded as the `finalized_by_user_id` of an application's passed audition may not issue that application's decision; an officer whose id was recorded as a complaint's `triaged_by_user_id` may not adjudicate that complaint. Both violations are reported as `ERR_SEGREGATION_OF_DUTIES` with HTTP 403. Where an application never went through vetting, there is no finalizer to compare against and the reviewing officer is free to decide it.
+
+### 2.11. Path Resolution and Discovery Listings
+
+Identifiers inside a URL are resolved left to right, and the first one that does not resolve determines the error. A request naming a session and then a reading beneath it, for example, reports `ERR_BOOKING_NOT_FOUND` when the session does not exist, without ever looking at the second segment. The not-found errors are `ERR_ZONE_NOT_FOUND`, `ERR_PITCH_NOT_FOUND`, `ERR_PERFORMER_NOT_FOUND`, `ERR_APPLICATION_NOT_FOUND`, `ERR_AUDITION_NOT_FOUND`, `ERR_PERMIT_NOT_FOUND`, `ERR_INVOICE_NOT_FOUND`, `ERR_DRAW_NOT_FOUND`, `ERR_ENTRY_NOT_FOUND`, `ERR_BOOKING_NOT_FOUND`, `ERR_COMPLAINT_NOT_FOUND` and `ERR_CLOSURE_NOT_FOUND`, each with HTTP 404. The same catalogue is used when a foreign key inside a request body fails to resolve; a request body carrying several foreign keys is checked in the order those fields appear in the endpoint's input list, so the first unresolvable one decides the error.
+
+Because several rows in this program are minted by cascades rather than by direct client calls, the listing endpoints are the discovery channel for them. Pitch listings filter on `zone_id`, on `fallback_pitch_id`, on `tier` and on `availability_status`. Application listings filter on `performer_id`, on `requested_zone_id`, on `status` and on `season_year`. Audition listings filter on `application_id` and on `status`. Permit listings — the only way to find a permit that an approval cascade created — filter on `performer_id`, on `application_id`, on `lifecycle_status`, on `compliance_status` and on `season_year`. A permit's invoice listing, the only way to find a cascade-minted invoice, filters on `status` and on `invoice_kind`. Draw listings filter on `pitch_id`, on `status` and on `season_year`; entry listings filter on `draw_id`, on `permit_id` and on `status`. Session listings filter on `permit_id`, on `pitch_id`, on `lottery_entry_id`, on `relocated_from_pitch_id` and on `status`. A session's noise-reading listing filters on `verdict`. Complaint listings filter on `permit_id`, on `booking_id`, on `status` and on `severity`. Closure listings filter on `zone_id`, on `pitch_id` and on `status`. Every one of these listings also accepts `limit` and `offset` and returns rows in `created_at` ascending order.
+
+## 3. Business Logic & Workflows
+
+### 3.1. The Ordinance Map: Districts and Designated Pitches
+
+Everything in this program hangs off a map that a `PermitOfficer` maintains. The coarse unit is the **district** (a `Zone`), which carries the ordinance parameters for a neighbourhood: a human-readable `name`, a short `code` of one to sixteen characters that must be unique across all districts and is compared case-sensitively, and the sound rules that apply there. Registering a district whose `code` is already in use is refused with `ERR_ZONE_CODE_TAKEN`. A district's `base_noise_cap_db` is its whole-decibel ordinance ceiling and must sit between 55 and 100 inclusive. Because weekend crowds are noisier, a district may grant a `weekend_noise_bonus_db` of up to 10 dB — it defaults to 0 when omitted — which is added to the base ceiling whenever the instant being judged falls on a Saturday or a Sunday in UTC. Conversely, evenings are quieter: `evening_start_minute` is a minute-of-day in UTC between 0 and 1439 at or after which an `evening_penalty_db` of up to 20 dB — also defaulting to 0 — is subtracted. Finally, `max_concurrent_closures`, which defaults to 1 and may not exceed 5, caps how many street closures may cover any single instant in the district, and `active_closure_count` is a computed counter that starts at 0 when the district is registered and tracks the closures currently in force there.
+
+The district also defines a **quiet window**, during which no session may be scheduled at all. It runs from `quiet_hours_start_minute` to `quiet_hours_end_minute`, both minute-of-day values in UTC between 0 and 1439. When the start is greater than the end the window wraps midnight — a window from minute 1380 to minute 360 covers 23:00 through 06:00 — and when the two values are equal the district has no quiet window whatsoever and nothing is ever refused on quiet-hours grounds there.
+
+Inside a district sit **pitches**, the actual pavement slots performers occupy. A pitch is registered with the payload naming its district through `zone_id`, its placard `code` (again one to sixteen characters and unique across all pitches, case-sensitive, refused with `ERR_PITCH_CODE_TAKEN` when taken), its `tier`, and its own `noise_cap_db` between 55 and 100. The `tier` is either `PREMIUM` or `STANDARD`: standard pitches are booked directly, first come first served, while premium pitches are allocated only through rotation draws. Four optional knobs shape how the pitch is used: `amplification_allowed` defaults to false and decides whether any amplified act may occupy the pitch at all; `max_session_minutes` defaults to 120 and must lie between 15 and 240, capping the length of a single session; `daily_session_cap` defaults to 3 and must lie between 1 and 12, capping how many live sessions the pitch may hold on one UTC calendar date; and `premium_slots_per_draw` defaults to 1 and may not exceed 5, fixing how many winners a rotation draw on this pitch awards. A pitch may also nominate a `fallback_pitch_id`, defaulting to null, naming the sibling pitch that displaced sessions are moved to when the street closes. That sibling must belong to the same `zone_id` and must not be the pitch being registered itself; either mistake is refused with `ERR_PITCH_ZONE_MISMATCH`. Newly registered pitches start with `availability_status` of `OPEN`; it becomes `CLOSED` while a closure covers them and returns to `OPEN` only when the last covering closure is lifted.
+
+Those parameters combine into the **effective sound ceiling**, the single number every metering decision is made against. It is evaluated at a specific instant — the start of a session when a booking snapshot is taken, the measurement instant when a reading is graded — and computed in this order. Start with the district allowance: the district's `base_noise_cap_db`, plus its `weekend_noise_bonus_db` when the evaluation instant falls on a Saturday or Sunday in UTC, and nothing extra on the other five days. Take the smaller of that allowance and the pitch's own `noise_cap_db`. If the evaluation instant's minute-of-day in UTC is at or after the district's `evening_start_minute`, subtract the district's `evening_penalty_db`. If the session is amplified, subtract a further 4 dB. If the permit's compliance axis is `WARNED` at the moment of evaluation, subtract another 3 dB. Whatever remains is then raised to an absolute floor of 55 dB: the effective ceiling is the larger of the computed figure and 55, so no combination of penalties can push a pitch below 55 dB. Every term here is a whole decibel and no rounding is involved.
+
+### 3.2. Enrolling a Performer and Lodging an Application
+
+Nobody applies for anything until the program office has enrolled them. A `PermitOfficer` performs the city ID check in person and then creates the performer record with a `legal_name` as printed on the identity document, a `stage_name` for the placard, a contact `email` and an `act_type`. The `act_type` is one of `ACOUSTIC_MUSIC`, `AMPLIFIED_MUSIC`, `STREET_THEATRE`, `VISUAL_ART` or `CIRCUS_SKILL`, and it is the classification the program uses as the fee basis. Email addresses are unique across all performers and are compared case-insensitively; a duplicate is refused with `ERR_PERFORMER_EMAIL_TAKEN`. A freshly enrolled performer starts clean: `conduct_score` 100, `renewal_conduct_score` 100, `standing` `GOOD`, `upheld_complaint_count` 0 and `premium_wins_this_season` 0. The `id` minted here is the value that performer will send as `X-User-ID` from then on.
+
+An application is opened in `DRAFT` by supplying `performer_id`, the `requested_zone_id` naming the district the applicant wants to work, the `season_year` the permit would cover (a calendar year between 2025 and 2035 inclusive), and the `requested_act_type` that will drive the fee. The optional `amplification_requested` flag, false when omitted, asks the program for an amplification endorsement. Either the applicant or an officer may open the application. A performer may hold only one live application per season: if that performer already has another application for the same `season_year` whose status is anything other than `REJECTED`, the new one is refused with `ERR_DUPLICATE_ACTIVE_APPLICATION`, and the same uniqueness condition is re-evaluated when the application is lodged. A new application starts with `revision_count` 0, `requires_audition` false, `assessed_fee_cents` 0, and null values for `change_request_reason`, `reviewed_by_user_id`, `decided_by_user_id`, `submitted_at` and `decided_at`.
+
+Lodging the application — the applicant's own act, permitted only to the `Performer` who owns it — moves it `DRAFT → SUBMITTED`, stamps `submitted_at` with the program clock, and recomputes the `requires_audition` flag. That flag is true when any one of three things holds: the `requested_act_type` is `AMPLIFIED_MUSIC` or `CIRCUS_SKILL`, or `amplification_requested` is true, or the applicant's `standing` is currently `WATCH`. Otherwise it is false. The recomputation happens on every lodgement and on every accepted revision, never once and for all.
+
+When an officer picks the application up, the same review action lands in two different places purely on that computed flag: an application whose `requires_audition` is false goes `SUBMITTED → UNDER_REVIEW` and may be decided directly, while one whose `requires_audition` is true goes `SUBMITTED → AUDITION_REQUIRED` and cannot be approved until a panel has passed it. Both branches record the acting officer's identifier as `reviewed_by_user_id` and increment the application's `version`; neither branch writes anything else.
+
+An officer who wants changes rather than a verdict routes the application to `CHANGES_REQUESTED`, which is possible along exactly two edges — `UNDER_REVIEW → CHANGES_REQUESTED` and `AUDITION_FAILED → CHANGES_REQUESTED`. That routing requires a non-empty `decision_note`, which is copied verbatim onto the application as `change_request_reason`, and it requires that `revision_count` is still below the allowance of two; a change request issued when the applicant has already used both revisions is refused with `ERR_REVISION_LIMIT_EXCEEDED`. When the request is issued out of `AUDITION_FAILED`, the failed sitting stays `FAILED` — it is not reopened, and a fresh sitting can only be scheduled after the revised application has been reviewed again.
+
+The applicant answers a change request by filing a revision, which carries `expected_application_version` and may optionally override `requested_act_type`, `amplification_requested` or `requested_zone_id`; omitted fields keep their current values. An accepted revision applies the overrides, increases `revision_count` by 1, recomputes `requires_audition` from the post-override values, stamps `submitted_at` with the clock, clears `change_request_reason` back to null, cancels any sitting still `SCHEDULED` on this application, and returns the application to `SUBMITTED`. A third revision attempt is refused with `ERR_REVISION_LIMIT_EXCEEDED`. This is the loop that gives the application machine its cycle: `CHANGES_REQUESTED → SUBMITTED → UNDER_REVIEW → CHANGES_REQUESTED`, up to twice.
+
+### 3.3. Vetting: The Audition Panel
+
+An application sitting in `AUDITION_REQUIRED` needs a panel. An officer schedules the sitting with a payload naming the `application_id` and the `scheduled_for` instant, which creates an `Audition` in status `SCHEDULED` with `score_count` 0 and `panel_score` null, and moves the parent application `AUDITION_REQUIRED → AUDITION_SCHEDULED`. Only one live sitting exists at a time: scheduling is admissible only when no audition on that application is currently `SCHEDULED`.
+
+Panelists then file their marks. Each `AuditionPanelist` submits three whole-number subscores between 0 and 10 inclusive: `technical_score` for craft, `suitability_score` for how well the act suits the street, and `safety_score` for public safety. The acting panelist's `X-User-ID` is stored on the filed row as `panelist_user_id`, alongside the `audition_id` of the sitting the row belongs to, and one panelist may file at most one score per sitting — a second filing by the same identifier is refused with `ERR_DUPLICATE_PANEL_SCORE`. Filing also increments the sitting's `score_count` by one.
+
+Each filed row carries its own `composite_score`, and this is where the rounding order matters. The panelist's composite is a weighted average in which the technical mark counts 3, the suitability mark counts 2 and the safety mark counts 2, over a total weight of 7: multiply `technical_score` by 3, `suitability_score` by 2 and `safety_score` by 2, add the three products, divide by 7, and round the result half up to two decimal places. That rounded value is what is persisted on the row.
+
+Closing the sitting is the officer's job, and it is refused with `ERR_AUDITION_PANEL_INCOMPLETE` unless at least three panel scores have been filed. When the panel is complete, the sitting's `panel_score` is the mean of the **already-rounded** per-panelist composites: add up the `composite_score` values of the sitting's filed rows, traversed in `created_at` ascending order, divide by the sitting's `score_count`, and round that mean half up to two decimal places. Summing raw unrounded composites and rounding only at the end produces a different number and is not what this program computes. Every filed row counts exactly once and none is filtered out.
+
+The resulting figure decides the branch. A `panel_score` of 7.00 or more passes: the sitting goes `SCHEDULED → PASSED` and is thereafter `PASSED`, and the parent application goes `AUDITION_SCHEDULED → AUDITION_PASSED`. A score below 7.00 fails: the sitting goes `SCHEDULED → FAILED` and the application goes `AUDITION_SCHEDULED → AUDITION_FAILED`. Exactly 7.00 is a pass. Both branches write the computed `panel_score` onto the sitting, record the closing officer as `finalized_by_user_id`, stamp `finalized_at` with the clock, and increment the sitting's `version` and the application's `version`.
+
+There is one further way a sitting can end. When the parent application leaves the vetting branch without a verdict — because the applicant's revision was accepted, or because the officer rejected the application outright while the sitting was still `SCHEDULED` — the sitting moves `SCHEDULED → CANCELLED`, ending in the terminal status `CANCELLED`, its `panel_score` is left null, and its `version` is incremented. That system-driven edge is the only producer of a cancelled sitting; no client can cancel one directly.
+
+### 3.4. The Decision, the Permit and the Fee Assessment
+
+An officer resolves an application by supplying an `outcome`, which is `APPROVED`, `REJECTED` or `CHANGES_REQUESTED`, together with an optional `decision_note` that becomes mandatory on the change-request branch. Approval is admissible from exactly two places, and in both the application ends in the terminal status `APPROVED`: an application that never needed vetting goes `UNDER_REVIEW → APPROVED`, while an application that did need vetting goes `AUDITION_PASSED → APPROVED` and from nowhere else. Attempting to approve an application whose `requires_audition` is true from `AUDITION_REQUIRED`, `AUDITION_SCHEDULED` or `AUDITION_FAILED` is refused with `ERR_AUDITION_REQUIRED` rather than a generic state error. On the vetted branch the deciding officer must not be the officer recorded as `finalized_by_user_id` on that application's passed sitting; if they are, the decision is refused with `ERR_SEGREGATION_OF_DUTIES`.
+
+Rejection is admissible from four states and always lands in the terminal status `REJECTED`: `UNDER_REVIEW → REJECTED`, `AUDITION_SCHEDULED → REJECTED`, `AUDITION_PASSED → REJECTED` and `AUDITION_FAILED → REJECTED`. Every rejection records `decided_by_user_id` and stamps `decided_at`. Rejecting from `AUDITION_SCHEDULED` additionally cancels the still-scheduled sitting, leaving its `panel_score` null; the other three rejection paths touch no audition, except that a rejection from `UNDER_REVIEW` also cancels any sitting on that application still in `SCHEDULED`. Whichever branch runs, the application's `version` is incremented.
+
+Approval is where the deepest cascade in the program fires, and it runs in three nested levels. First, the approval **mints a permit** for the applicant: its `application_id` points back at the approved application, its `performer_id` at the applicant, its `season_year` is copied from the application's `season_year`, its `amplification_endorsed` flag is copied from the application's `amplification_requested`, its `lifecycle_status` starts at `PENDING_FEE` and its `compliance_status` at `CLEAR`. The permit is stamped with a `permit_number` formatted as `BP-`, the season year, and a zero-padded four-digit sequence number — `BP-2026-0001` for the first permit of the 2026 season. Its counters start empty: `season_minutes_used` 0, `closure_credit_minutes` 0, `noise_violation_count` 0, `net_fees_paid_cents` 0, `next_season_year` null, `activated_at` null and `suspended_at` null. Second, the permit's own creation **mints its first invoice**, with `invoice_kind` `INITIAL` and `status` `PENDING`. Third, the invoice's creation **writes back** onto the application: `assessed_fee_cents` becomes that invoice's `amount_due_cents`. The application, the permit and the invoice are all created or updated in the same atomic step, and the officer's identifier is recorded as `decided_by_user_id` with `decided_at` stamped from the clock.
+
+The charge on an invoice is computed as follows, and the evaluation order is what makes the figure well-defined. Two inputs are resolved first. The act classification is the application's `requested_act_type` for an `INITIAL` invoice, and for a `RENEWAL` invoice it is the `requested_act_type` of the application the permit was minted from. The amplification flag is the application's `amplification_requested` for an `INITIAL` invoice, and the permit's `amplification_endorsed` for a `RENEWAL` one. No other entity contributes anything.
+
+Step one produces `gross_fee_cents`: the base fee for the act classification, plus a flat amplification surcharge of $65.00 when the amplification flag is true and nothing when it is false. All money in this system is stored in whole cents, so a $65.00 surcharge is 6500. The base fees are $90.00 for `VISUAL_ART`, $120.00 for `ACOUSTIC_MUSIC`, $150.00 for `STREET_THEATRE`, $180.00 for `AMPLIFIED_MUSIC` and $210.00 for `CIRCUS_SKILL`.
+
+Step two picks a discount tier from that gross figure — the pre-discount one. A gross of $150.00 or less is tier 1; a gross above $150.00 and up to and including $220.00 is tier 2; anything above $220.00 is tier 3. Both boundaries belong to the lower tier: a gross of exactly 15000 cents is tier 1 while 15001 is tier 2, and exactly 22000 is tier 2 while 22001 is tier 3.
+
+Step three computes `discount_cents` as the gross multiplied by the tier's discount rate — nothing at all in tier 1, 10 percent in tier 2, 15 percent in tier 3 — rounded half up to whole cents. Step four computes `admin_fee_cents` as the same pre-discount gross multiplied by the tier's administration rate — 8 percent in tier 1, 6 percent in tier 2, 5 percent in tier 3 — again rounded half up to whole cents. Both the tier selection and the administration charge are keyed on the gross figure, never on the discounted one; re-tiering on the net total would produce a different and incorrect charge. Step five produces the season total: the gross, minus the discount, plus the administration fee.
+
+Step six applies one of two variants to that season total, and records which one ran in `fee_variant`. A `RENEWAL` invoice is always `FULL_SEASON`. An `INITIAL` invoice is `FULL_SEASON` when the UTC calendar month of its `issued_at` is June or earlier, and `PRORATED` when that month is July or later. Under `FULL_SEASON` the invoice records `coverage_start_month` 1 and `months_covered` 12, and `amount_due_cents` is the season total unchanged — the permit is billed for the whole season no matter how much of it remains. Under `PRORATED` the invoice records `coverage_start_month` as the UTC calendar month of `issued_at` and `months_covered` as 13 minus that month, and `amount_due_cents` is the season total multiplied by `months_covered`, divided by 12, and rounded half up to whole cents. The same application inputs therefore produce a strictly smaller charge late in the year: an amplified music act with an endorsement is charged 22050 under `FULL_SEASON` and 9188 when issued in month 8.
+
+Every invoice is stamped with `issued_at` from the program clock and a `due_at` exactly 14 days later, and starts with `amount_paid_cents` 0, `refunded_cents` 0 and `paid_at` null.
+
+### 3.5. Settling the Money: Payment, Renewal and Revocation
+
+A permit issued by an approval is not yet a licence to perform — it sits in `PENDING_FEE` until its invoice is settled. Payment carries a single field, `amount_cents`, and must match the invoice's `amount_due_cents` exactly; a short or over payment is refused with `ERR_PAYMENT_AMOUNT_MISMATCH`. A performer may only pay their own permit's invoices, though an officer may pay on their behalf. Invoices are payable out of `PENDING` and out of `PAST_DUE`; the two edges behave identically.
+
+Settling an invoice runs its own two-level cascade. The invoice itself becomes `PAID`, its `amount_paid_cents` is set to the tendered `amount_cents`, and `paid_at` is stamped from the clock. That payment then credits the permit: `net_fees_paid_cents` grows by the amount just paid, and the permit's lifecycle axis advances — `PENDING_FEE → ACTIVE` when the settled invoice is the `INITIAL` one, with `activated_at` stamped from the clock, and `RENEWAL_PENDING → ACTIVE` when it is the `RENEWAL` one. Both the invoice's `version` and the permit's `version` are incremented.
+
+Paying a renewal invoice does considerably more than paying an initial one, because it rolls the season over. The permit's `season_year` becomes its `next_season_year` and `next_season_year` is cleared back to null; `season_minutes_used`, `closure_credit_minutes` and `noise_violation_count` are all reset to 0; and the holder's `premium_wins_this_season` is reset to 0 so the rotation priority bands start fresh. This edge closes the renewal cycle `ACTIVE → RENEWAL_PENDING → ACTIVE`.
+
+Opening a renewal is the holder's own act and has a long list of preconditions, each with its own refusal. The permit must be `ACTIVE` on its lifecycle axis and `CLEAR` on its compliance axis — a suspended permit is refused with `ERR_PERMIT_SUSPENDED`. The supplied `season_year` must be exactly one greater than the permit's current `season_year`, and a value that is not is a malformed body. The clock must sit inside the renewal window for the permit's current season, which opens on 1 November of that year at `00:00:00Z` and closes at `23:59:59Z` on 31 December of that year — **both bounds inclusive**, so a renewal filed at exactly `2026-11-01T00:00:00Z` is admitted and one filed at exactly `2026-12-31T23:59:59Z` is still admitted. Outside that window the request is refused with `ERR_RENEWAL_WINDOW_CLOSED`. The permit must carry no unsettled money at all: any invoice on it that is `PENDING` or `PAST_DUE` refuses the renewal with `ERR_OUTSTANDING_INVOICE`. And the holder must clear the conduct gate — a `renewal_conduct_score` of at least 80, judged on the career-weighted figure and never on the live one, refused with `ERR_RENEWAL_CONDUCT_INSUFFICIENT` when it falls short.
+
+A renewal that clears all of that moves the permit `ACTIVE → RENEWAL_PENDING`, records the requested year in `next_season_year`, and mints a second invoice with `invoice_kind` `RENEWAL`. That invoice is always billed as a whole season: `fee_variant` `FULL_SEASON`, `months_covered` 12, `coverage_start_month` 1, `status` `PENDING`.
+
+Revocation is the officer's blunt instrument, and it takes a `reason` plus an optional `refund_mode`. It is admissible from `PENDING_FEE`, from `ACTIVE` and from `RENEWAL_PENDING`. Revoking a permit that never paid — one still in `PENDING_FEE` — simply voids every invoice on it that is `PENDING` or `PAST_DUE` and moves the lifecycle axis to `REVOKED`; there is nothing to refund and no booking to cancel. Revoking an `ACTIVE` or `RENEWAL_PENDING` permit runs the full four-level cascade: the lifecycle axis becomes `REVOKED`; that revocation refunds every `PAID` invoice on the permit, processed in `created_at` ascending order, writing each refund into the invoice's `refunded_cents`, moving that invoice to `REFUNDED` and subtracting the refunded amount from the permit's `net_fees_paid_cents`, while any invoice still `PENDING` or `PAST_DUE` becomes `VOID` and contributes nothing; the revocation also cancels every session on that permit whose `status` is `RESERVED` or `RELOCATED` and whose `start_at` is still in the future into `CANCELLED_BY_REVOCATION`; and each such cancellation in turn credits the permit's `season_minutes_used` back by that session's `duration_minutes`. Finally, every lottery entry of that permit still in `SUBMITTED` becomes `FORFEITED`.
+
+How much comes back depends on `refund_mode`, which is `PRORATED_REFUND` when omitted. Under `FULL_REFUND` the refund is the invoice's entire `amount_paid_cents`, so a payment and its compensating refund leave `net_fees_paid_cents` at exactly its pre-payment value. Under `PRORATED_REFUND` only the whole calendar months after the revocation month come back: count the elapsed months as the UTC calendar month of the clock minus the invoice's `coverage_start_month`, plus one; take the unused months as the invoice's `months_covered` minus those elapsed months, or zero when that difference is negative; then the refund is the invoice's `amount_paid_cents` multiplied by the unused months, divided by `months_covered`, rounded half up to whole cents.
+
+### 3.6. Occupying a Pitch: Session Bookings and the Minute Ledger
+
+A booking is a performer's claim on a specific pitch for a specific window. The payload names the `permit_id` being used, the `pitch_id` being claimed, the `start_at` and `end_at` bounds of the occupation, the `expected_permit_version` described in section 2.7, and an optional `amplification_planned` flag that defaults to false. The `end_at` must be strictly after `start_at`, and the occupation interval is half-open — the session owns `start_at` and every instant up to but not including `end_at`. From those two instants the server computes `duration_minutes`, the whole number of minutes between them. A successful booking is created with `status` `RESERVED`, `origin` `DIRECT`, `noise_violation_count` 0, and null values for `lottery_entry_id` and `relocated_from_pitch_id`; those two are written only when a draw mints the booking or a closure moves it.
+
+The permit itself is checked before anything about the pitch is. A booking may only be made against a permit whose lifecycle axis is `ACTIVE`, otherwise `ERR_PERMIT_NOT_ACTIVE`; whose compliance axis is not `SUSPENDED`, otherwise `ERR_PERMIT_SUSPENDED`; and whose `expected_permit_version` is current, otherwise `ERR_STALE_PERMIT_VERSION`.
+
+Amplification is gated twice and the two gates are different. If `amplification_planned` is true, the pitch must have `amplification_allowed` true — a quiet pitch refuses amplified acts outright with `ERR_AMPLIFICATION_PROHIBITED` — and the permit must have `amplification_endorsed` true, since a permit issued without an endorsement may not amplify anywhere, refused with `ERR_AMPLIFICATION_NOT_ENDORSED`. The pitch gate is evaluated before the permit gate.
+
+The window is then checked against the ordinance and the calendar. No minute of the half-open occupation window may fall inside the district's quiet window, remembering that the window wraps midnight when its start minute is greater than its end minute, and that a district whose two quiet-hour minutes are equal has no quiet window at all; a violation is refused with `ERR_QUIET_HOURS_VIOLATION`. The pitch must have `availability_status` `OPEN`, otherwise `ERR_PITCH_CLOSED`. The `duration_minutes` must not exceed the pitch's `max_session_minutes`, otherwise `ERR_SESSION_TOO_LONG`. The session must start at least one hour after the current program clock — a `start_at` closer than 60 minutes away is refused with `ERR_BOOKING_LEAD_TIME` — and no more than 30 days after it, refused beyond that with `ERR_BOOKING_HORIZON_EXCEEDED`.
+
+Two pitch-level capacity rules follow, and they are independent of each other. The first is geometric. Every pitch carries a set of occupations: its sessions whose `status` is `RESERVED`, `RELOCATED` or `COMPLETED`, plus every rotation draw on that pitch whose `status` is `OPEN` or `DRAWN`, each draw contributing the half-open interval from its `slot_start_at` to its `slot_end_at`. Cancelled sessions and voided draws are not occupations. A mandatory changeover buffer of 15 minutes is then applied on both sides of every comparison: the new occupation conflicts with an existing one when the new `start_at` is earlier than the existing end plus 15 minutes **and** the new `end_at` is later than the existing start minus 15 minutes. Two occupations that merely touch — one ending exactly when the other begins — therefore do conflict, because the buffer swallows the seam. Any conflict is refused with `ERR_PITCH_SLOT_OVERLAP`. The second rule is a simple headcount: the number of sessions already on that pitch with `status` `RESERVED`, `RELOCATED` or `COMPLETED` whose `start_at` falls on the same UTC calendar date as the new one must be strictly below the pitch's `daily_session_cap`, otherwise `ERR_PITCH_DAILY_CAP_REACHED`.
+
+Money and minutes close the sequence. A permit carrying any invoice in `PAST_DUE` cannot book at all, and the attempt is refused with `ERR_INVOICE_PAST_DUE` and HTTP 402. Finally the season allowance is tested: a permit may consume 1800 minutes — thirty hours — of pitch time per season, and the booking is admitted only when `season_minutes_used` plus the new `duration_minutes` is less than or equal to that cap. Landing exactly on the cap is admitted; exceeding it is refused with `ERR_SEASON_MINUTE_CAP_EXCEEDED`. On admission the booking's `duration_minutes` is added to the permit's `season_minutes_used` and the permit's `version` is incremented.
+
+The booking also records an advisory `effective_noise_cap_db`: the effective sound ceiling of section 3.1, evaluated at the session's `start_at`, using the permit's compliance axis as it stands when the booking is created. It is a snapshot for the performer's benefit and nothing more — a metering record recomputes its own ceiling at its own instant and never reads this field.
+
+Releasing a reservation is the compensating action for creating one. Cancellation takes an optional `reason`, is available to the owning performer and to officers, and is admissible only while the session is `RESERVED` or `RELOCATED` and its `start_at` is still strictly in the future; a session that has already begun is refused with `ERR_SESSION_ALREADY_STARTED`. The cancelled session moves to `CANCELLED_BY_PERFORMER`, and its `duration_minutes` is subtracted from the permit's `season_minutes_used`, restoring that counter to exactly its pre-booking value; both the session's `version` and the permit's `version` are incremented. One thing is deliberately not undone: when the session was awarded by a rotation draw, the holder's `premium_wins_this_season` is **not** given back, so a winner cannot cancel their way back into a better priority band.
+
+### 3.7. Rotation Draws for Premium Pitches
+
+Premium pavement is allocated by lottery rather than by speed. An officer opens a draw on a pitch by naming the `pitch_id`, the `season_year` the slot belongs to (between 2026 and 2035 inclusive), the `slot_start_at` and `slot_end_at` bounds of the premium slot being allocated, and the `entry_deadline_at` after which entries close. The `slot_end_at` must be strictly after `slot_start_at`, and `entry_deadline_at` must be strictly before `slot_start_at`. The pitch's `tier` must be `PREMIUM`; opening a draw on a standard pitch is refused with `ERR_PITCH_NOT_PREMIUM`. The slot is subject to the same window rules a session is: it must avoid the district's quiet window (`ERR_QUIET_HOURS_VIOLATION`), the pitch must be `OPEN` (`ERR_PITCH_CLOSED`), the slot must not be longer than the pitch's `max_session_minutes` (`ERR_SESSION_TOO_LONG`), and it must not conflict with any existing occupation under the buffered test (`ERR_PITCH_SLOT_OVERLAP`). A new draw starts `OPEN` with `entry_count` 0, `winner_count` 0, `executed_at` null, and `winner_slots` copied from the pitch's `premium_slots_per_draw`. From the moment it is created the draw's slot window is itself an occupation on that pitch, so a direct booking can no longer be squeezed into it.
+
+Holders enter their own permits. An entry names the `permit_id` competing for the slot and takes its `draw_id` from the draw being entered. Entry requires the permit's lifecycle axis to be `ACTIVE` (`ERR_PERMIT_NOT_ACTIVE`) and its compliance axis not `SUSPENDED` (`ERR_PERMIT_SUSPENDED`), and it must be filed no later than the draw's `entry_deadline_at`; an entry filed at or after that instant is refused with `ERR_ENTRY_DEADLINE_PASSED`. A permit may appear at most once in a draw — a second attempt is refused with `ERR_DUPLICATE_LOTTERY_ENTRY` — and a permit carrying a `PAST_DUE` invoice may not enter at all (`ERR_INVOICE_PAST_DUE`). A filed entry starts in `SUBMITTED` with `priority_band` and `rank_position` both null, and it increments the draw's `entry_count` and the draw's `version`.
+
+Execution is the officer's act and is only possible after the deadline has passed: calling it at or before `entry_deadline_at` is refused with `ERR_ENTRY_DEADLINE_NOT_PASSED`. A draw that has attracted no entries at all — `entry_count` of zero — cannot be executed either, and is refused with `ERR_NO_ELIGIBLE_ENTRIES`, leaving the draw `OPEN`.
+
+The selector then runs in three stages. First it filters the **candidate set**. An entry is a candidate when it belongs to this draw, its own `status` is still `SUBMITTED`, its permit's lifecycle axis is `ACTIVE`, its permit's compliance axis is `CLEAR`, its permit's `season_year` equals the draw's `season_year`, the holder's `standing` is `GOOD` or `WATCH`, the permit's `season_minutes_used` plus the slot's whole-minute duration is less than or equal to the 1800-minute season cap, and no invoice on that permit is `PAST_DUE`. Anything failing any one of those conditions is not a candidate.
+
+Second it ranks the candidates. Each candidate is assigned a `priority_band` from the holder's `premium_wins_this_season`: band 1 when the holder has won nothing this season, band 2 when they have won exactly once, band 3 when they have won twice or more. Candidates are then sorted by `priority_band` ascending — band 1 first — and within a band by the holder's live `conduct_score` descending, so the better-behaved performer outranks the worse. Where both keys tie exactly, the earlier-filed entry wins: the tie-break is the entry's own `created_at` ascending, and the entry's `id` is never consulted.
+
+Third it awards. The first `winner_slots` entries of the ranked candidate list become `WON` and receive `rank_position` 1 upward in order. The remaining candidates become `LOST` and receive their own `rank_position`, continuing the same numbering from `winner_slots` plus one. Entries that were filtered out of the candidate set become `LOST` with `rank_position` left null. The draw records `winner_count` as the number of winners, stamps `executed_at` from the clock, moves `OPEN → DRAWN`, and increments its `version`.
+
+Each win cascades. The winning entry mints a session booking on the draw's pitch with `origin` `LOTTERY` and `status` `RESERVED`, whose `start_at` and `end_at` are the draw's `slot_start_at` and `slot_end_at`, whose `amplification_planned` is copied from the permit's `amplification_endorsed`, and whose `lottery_entry_id` points back at the winning entry. Each minted booking in turn adds its `duration_minutes` to the permit's `season_minutes_used` and increments the permit's `version`, and each win increments the holder's `premium_wins_this_season` by one.
+
+A draw with entries but no eligible ones is not an error. When the candidate set turns out to be empty, the draw moves `OPEN → VOID` with a 200 response, every entry still `SUBMITTED` becomes `LOST` with `rank_position` null, `winner_count` is set to 0, `executed_at` is stamped, no session is minted and the pitch slot is released. This is the case that must be distinguished carefully from a draw with no entries at all, which is the `ERR_NO_ELIGIBLE_ENTRIES` refusal above.
+
+Entries can also die before the draw runs. When the entrant's permit is suspended, revoked or expired while the draw is still `OPEN`, that entry moves `SUBMITTED → FORFEITED`. The draw's `entry_count` is deliberately **not** decremented — a forfeited entry still counts as an entry for the purpose of the no-entries check — but a forfeited entry is not `SUBMITTED` and so is filtered out of the candidate set.
+
+### 3.8. Ordinance Enforcement: Metering, Complaints and Conduct
+
+A permit carries **two independent status axes on one row**, and confusing them is the most common way to get this domain wrong. The lifecycle axis — `PENDING_FEE`, `ACTIVE`, `RENEWAL_PENDING`, `EXPIRED`, `REVOKED` — is about money and seasons. The compliance axis — `CLEAR`, `WARNED`, `SUSPENDED` — is about behaviour. Neither axis constrains the other's transitions: a permit can be suspended while `RENEWAL_PENDING`, and an expiry does not clear a suspension.
+
+A `NoiseInspector` meters a live session by filing a reading against it. The payload names the `booking_id` being metered, the `taken_at` measurement instant and the measured `reading_db`, a whole decibel figure between 0 and 140 inclusive. The measurement instant must fall inside the session's own window — at or after its `start_at` and strictly before its `end_at` — and a reading outside that range is refused with `ERR_READING_OUTSIDE_SESSION`. The reading's `inspector_user_id` is taken from the filing inspector's identity. The server then recomputes the effective sound ceiling of section 3.1 from scratch at `taken_at`, using the session's **current** pitch (the fallback pitch after a relocation, never the pitch recorded in `relocated_from_pitch_id`), that pitch's district, the session's `amplification_planned` flag and the permit's compliance axis at the filing instant, and stores the result as `effective_cap_db`. The `verdict` is `COMPLIANT` when `reading_db` is less than or equal to `effective_cap_db` and `VIOLATION` otherwise — the ceiling is inclusive, so a reading of exactly the cap is compliant.
+
+A `VIOLATION` increments both the session's `noise_violation_count` and the permit's `noise_violation_count`, and then the compliance axis escalates. When the permit's counter reaches exactly two while the axis is `CLEAR`, the permit moves `CLEAR → WARNED`; from that point on, every subsequent ceiling evaluation for that permit subtracts a further 3 dB, which makes a second offence progressively harder to avoid. When the counter reaches four or more while the axis is `WARNED`, the permit moves `WARNED → SUSPENDED`. Suspension is a real cascade: `suspended_at` is stamped from the clock, every session of that permit whose `status` is `RESERVED` or `RELOCATED` and whose `start_at` is still in the future is moved to `CANCELLED_BY_SUSPENSION` with its `duration_minutes` credited back to `season_minutes_used`, and every lottery entry of that permit still `SUBMITTED` is `FORFEITED`. The permit's `version` is incremented, as is each touched session's and entry's.
+
+Complaints arrive from the public. A `Resident` — or an officer filing on someone's behalf — submits the `permit_id` being complained about, a `category` of `NOISE`, `OBSTRUCTION`, `CONDUCT` or `UNPERMITTED_AMPLIFICATION`, a free-text `description`, and optionally the `booking_id` of the session the complaint concerns. When a session is named it must belong to the same permit as the complaint, otherwise the intake is refused with `ERR_BOOKING_PERMIT_MISMATCH`. A new complaint is `OPEN`, with `severity`, `route`, `upheld_at`, `triaged_by_user_id` and `adjudicated_by_user_id` all null and `conduct_deduction` 0.
+
+Triage is the fork. An officer grades the complaint with a `severity` of `MINOR`, `MODERATE` or `MAJOR` and picks a `route`. A `route` of `DIRECT` sends it straight to adjudication and moves it `OPEN → TRIAGED`; a `route` of `MEDIATION` moves it `OPEN → MEDIATION` instead, and the two branches diverge numerically at the join. Either way the chosen severity and route are recorded, the triaging officer's identifier is stored as `triaged_by_user_id`, and the complaint's `version` is incremented. Triaging a complaint that is already `UPHELD` or `DISMISSED` is refused with `ERR_COMPLAINT_ALREADY_RESOLVED`.
+
+Adjudication closes it, and a different officer must do it: an attempt by the officer recorded in `triaged_by_user_id` is refused with `ERR_SEGREGATION_OF_DUTIES`. The payload carries an `outcome` of `UPHELD` or `DISMISSED` plus an optional `resolution_note`. A dismissal from either branch — `TRIAGED → DISMISSED` or `MEDIATION → DISMISSED` — leaves `conduct_deduction` at 0, triggers no rescoring at all, records `adjudicated_by_user_id` and increments the complaint's `version`. An upheld complaint charges points. Out of `TRIAGED` the full severity charge applies: 5 points for `MINOR`, 12 for `MODERATE`, 25 for `MAJOR`. Out of `MEDIATION` the same figure is halved and rounded half up, so `MINOR` charges 3, `MODERATE` charges 6 and `MAJOR` charges 13. Whichever branch it came from, upholding writes the charge into `conduct_deduction`, stamps `upheld_at` from the clock, records `adjudicated_by_user_id`, and increases the performer's `upheld_complaint_count` by one.
+
+That charge then propagates. The deduction forces an immediate rescoring of the performer, which rewrites `conduct_score`, `renewal_conduct_score` and `standing` together. Both scores are computed over the same input set — every complaint in status `UPHELD` whose permit belongs to that performer, traversed in `created_at` ascending order. Complaints that are `OPEN`, `TRIAGED`, `MEDIATION` or `DISMISSED` contribute nothing, and a dismissed complaint never receives a deduction in the first place. Each upheld complaint has an age in whole days, computed as the difference between the current clock and that complaint's `upheld_at` divided by 86400 seconds and rounded down to a whole number of days.
+
+The **live** score, `conduct_score`, uses a rolling 365-day window: a complaint upheld 365 days ago or less charges its full `conduct_deduction`, and a complaint upheld more than 365 days ago charges nothing at all. Sum those charges and subtract from 100; if the result would be negative it is held at 0. The **renewal** score, `renewal_conduct_score`, is computed in the same pass over the same complaints but never forgets: a complaint upheld 365 days ago or less charges its full deduction exactly as before, while a complaint older than that still charges half its deduction, rounded half up. Sum those charges, subtract from 100, and hold the result at 0 if it would be negative. Because the career-weighted figure keeps charging for old offences, the same history can leave a performer comfortably clear on the street and still refused a renewal — one `MAJOR` upheld 500 days ago and one `MODERATE` upheld 31 days ago yields a live score of 88 and a `GOOD` standing, but a renewal score of 75, below the gate of 80.
+
+The `standing` is derived from the live score alone: `GOOD` when `conduct_score` is 80 or more, `WATCH` when it is at least 60 but below 80, and `BARRED` when it is below 60. A score of exactly 80 is `GOOD` and exactly 60 is `WATCH`, while 59 is `BARRED`. Standing is what gates the rest of the program: `WATCH` forces a new application into the audition branch, and `BARRED` is disqualifying.
+
+When rescoring drops a performer to `BARRED`, every permit of that performer whose lifecycle axis is `PENDING_FEE`, `ACTIVE` or `RENEWAL_PENDING` and whose compliance axis is `CLEAR` or `WARNED` moves to `SUSPENDED`, and each such suspension runs the same cascade a noise suspension does — `suspended_at` stamped, future `RESERVED` and `RELOCATED` sessions cancelled into `CANCELLED_BY_SUSPENSION` with their minutes credited back, and `SUBMITTED` lottery entries forfeited. The complaint, the performer, every affected permit, session and entry all have their `version` incremented in the same atomic step.
+
+Recovery is never automatic. Regaining `GOOD` or `WATCH` standing does not lift a suspension by itself; only an officer's reinstatement does, and it takes an optional `note`. Reinstatement is admissible from `WARNED → CLEAR` and from `SUSPENDED → CLEAR`, and is refused with `ERR_PERFORMER_BARRED` while the holder's `standing` is still `BARRED`. Both edges reset `noise_violation_count` to 0; the edge out of `SUSPENDED` additionally clears `suspended_at` back to null. Sessions cancelled during the suspension are **not** restored, and the permit's minute ledger keeps the credits those cancellations produced. Reinstatement is what closes the enforcement cycle `CLEAR → WARNED → SUSPENDED → CLEAR`.
+
+### 3.9. Street Closures, Displacement and the Epoch Advance
+
+Special events, roadworks and emergencies take pavement out of service. An officer drafts a closure naming the `zone_id` it covers, a `reason` of `SPECIAL_EVENT`, `CONSTRUCTION`, `EMERGENCY` or `PARADE`, and the `starts_at` and `ends_at` bounds, with `ends_at` strictly after `starts_at`. An optional `pitch_id` narrows the order to a single pitch; when it is omitted the order covers every pitch in the district. Unlike sessions, closure intervals are **closed** at both ends — an instant equal to `starts_at` or to `ends_at` is inside the closure. A drafted order starts in `DRAFT` with `affected_booking_count`, `relocated_booking_count` and `cancelled_booking_count` all 0, and nothing at all is closed until it is activated.
+
+Activation is capacity-limited rather than mutually exclusive. Two closures intersect when the first one's `starts_at` is at or before the second one's `ends_at` and the first one's `ends_at` is at or after the second one's `starts_at`, so orders that merely touch at an endpoint do intersect. Count the other closure orders in the same district that are currently `ACTIVE` and intersect the order being activated; activation is admitted only while that count is strictly below the district's `max_concurrent_closures`, and is otherwise refused with `ERR_CLOSURE_WINDOW_CONFLICT`. Orders in `DRAFT` or `LIFTED` never consume capacity.
+
+An admitted activation cascades four levels deep. The order moves `DRAFT → ACTIVE` and the district's `active_closure_count` is brought up to the number of `ACTIVE` orders in that district. That activation sets `availability_status` to `CLOSED` on every pitch in scope — the single named pitch when `pitch_id` was supplied, otherwise every pitch in the order's district. Each pitch closure in turn displaces every session on that pitch whose `status` is `RESERVED` or `RELOCATED` and whose half-open occupation window intersects the closure's closed interval. A displaced session is **relocated** when the pitch nominates a `fallback_pitch_id`, that fallback pitch is itself `OPEN`, and the session's window survives the buffered conflict test on the fallback pitch; otherwise it is **cancelled outright**. A relocation writes the old pitch into `relocated_from_pitch_id`, rewrites `pitch_id` to the fallback pitch, recomputes `effective_noise_cap_db` against the fallback pitch, and moves the session `RESERVED → RELOCATED`; the permit's `season_minutes_used` is deliberately unchanged, because a relocated session still consumes its minutes. An outright cancellation moves the session to `CANCELLED_BY_CLOSURE`, and that cancellation itself credits the permit twice over: `season_minutes_used` is reduced by the session's `duration_minutes` and `closure_credit_minutes` grows by the same figure. A session that was already `RELOCATED` can be displaced a second time — when a later activation covers the fallback pitch and no further fallback is usable, it moves `RELOCATED → CANCELLED_BY_CLOSURE` with exactly the same minute credit. When the cascade finishes, the order records `relocated_booking_count`, `cancelled_booking_count` and `affected_booking_count`, the last being the total of the other two.
+
+Everything time-driven in this program happens through a single officer-triggered **epoch advance**, which takes no input and performs five steps in this pinned order. Step one lifts closures: every `ACTIVE` order whose `ends_at` is strictly before the clock moves `ACTIVE → LIFTED`, decrements its district's `active_closure_count` by one, and returns every pitch in its scope that no other `ACTIVE` order still covers to `availability_status` `OPEN`. Sessions that the closure relocated or cancelled are never restored. Step two sweeps money: every invoice still `PENDING` whose `due_at` is strictly before the clock moves `PENDING → PAST_DUE`, which immediately blocks that permit from new bookings and new lottery entries. When the invoice swept this way is a `RENEWAL` invoice, its permit lapses back out of the renewal cycle: it moves `RENEWAL_PENDING → ACTIVE` and its `next_season_year` is cleared to null, while its `season_year`, `season_minutes_used` and compliance axis are all left untouched. The past-due invoice is **not** voided — it goes on blocking bookings and entries, and it goes on blocking a second renewal attempt with `ERR_OUTSTANDING_INVOICE`. This lapse is the only way an `ACTIVE` permit can be carrying a past-due invoice.
+
+Step three expires permits. A permit whose lifecycle axis is `ACTIVE` or `RENEWAL_PENDING` expires once the clock is strictly past the end of its season, which is `23:59:59Z` on 31 December of its `season_year`; at exactly that instant the permit is still live. Expiry moves the lifecycle axis to `EXPIRED`, cancels every session of that permit that is `RESERVED` or `RELOCATED` with a `start_at` still in the future into `CANCELLED_BY_EXPIRY` — each crediting its `duration_minutes` back to `season_minutes_used` — and forfeits every lottery entry of that permit still `SUBMITTED`. A permit expiring out of `RENEWAL_PENDING` additionally voids its unpaid `RENEWAL` invoice. Step four completes work already done: every session whose `status` is `RESERVED` or `RELOCATED` and whose `end_at` is at or before the clock moves to `COMPLETED`, and the permit's `season_minutes_used` is deliberately unchanged, because completed sessions still count against the season allowance. Step five rescores conduct: every performer with an `upheld_complaint_count` above zero has both conduct figures and their `standing` recomputed exactly as described in section 3.8, and anyone who lands on `BARRED` has their permits suspended with the full suspension cascade.
+
+The epoch advance answers with a small report rather than an entity: `processed_at` carrying the clock instant the run executed, and the counters `closures_lifted_count`, `invoices_past_due_count`, `permits_expired_count`, `bookings_completed_count` and `performers_rescored_count`. Every row the run mutates has its `version` incremented in the usual way.
+
+## 4. Endpoint Definitions
+
+Every endpoint below is reached with the two authentication headers of section 2.1 and answers inside the envelope of section 2.2. Creating a brand-new resource answers **201 Created**; every other successful call — reads, state transitions, payments, cancellations, the epoch advance and the clock move — answers **200 OK**. Action endpoints return the resource they acted on, so a caller can read the new state and the new `version` straight out of the response. The request and response payloads themselves are not repeated here; they are specified in the workflow narratives of section 3.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | `/busking/zones` | Register an ordinance district. | `PermitOfficer` |
+| GET | `/busking/zones/{id}` | Read one district. | `PermitOfficer`, `Performer`, `NoiseInspector` |
+| POST | `/busking/pitches` | Register a designated pitch inside a district. | `PermitOfficer` |
+| GET | `/busking/pitches/{id}` | Read one pitch. | `PermitOfficer`, `Performer`, `NoiseInspector` |
+| GET | `/busking/pitches` | List pitches. | `PermitOfficer`, `Performer`, `NoiseInspector` |
+| POST | `/busking/performers` | Enroll a street performer after the city ID check. | `PermitOfficer` |
+| GET | `/busking/performers/{id}` | Read one performer, including both conduct scores and the derived standing. | `PermitOfficer`, `Performer` |
+| POST | `/busking/permit-applications` | Open a DRAFT permit application. | `Performer`, `PermitOfficer` |
+| GET | `/busking/permit-applications/{id}` | Read one application. | `PermitOfficer`, `Performer` |
+| GET | `/busking/permit-applications` | List applications. | `PermitOfficer`, `Performer` |
+| POST | `/busking/permit-applications/{id}/submit` | Lodge the application with the program office. | `Performer` |
+| POST | `/busking/permit-applications/{id}/review` | Officer picks the application up. | `PermitOfficer` |
+| POST | `/busking/permit-applications/{id}/revisions` | Applicant resubmits after a change request. | `Performer` |
+| POST | `/busking/permit-applications/{id}/decision` | Officer issues APPROVED, REJECTED or CHANGES_REQUESTED. | `PermitOfficer` |
+| POST | `/busking/auditions` | Schedule the vetting panel for an application sitting in AUDITION_REQUIRED. | `PermitOfficer` |
+| GET | `/busking/auditions/{id}` | Read one audition sitting. | `PermitOfficer`, `Performer` |
+| GET | `/busking/auditions` | List auditions. | `PermitOfficer`, `Performer` |
+| POST | `/busking/auditions/{id}/scores` | A panelist files their three subscores. | `AuditionPanelist` |
+| GET | `/busking/auditions/{id}/scores` | List the panel's filed scores in created_at ASC order. | `PermitOfficer`, `AuditionPanelist` |
+| POST | `/busking/auditions/{id}/finalize` | Officer closes the sitting; panel_score is averaged from the ALREADY-ROUNDED per-panelist composites and compared to the pass threshold. | `PermitOfficer` |
+| GET | `/busking/permits/{id}` | Read one permit, including both independent status axes and both ledgers. | `PermitOfficer`, `Performer` |
+| GET | `/busking/permits` | List permits. | `PermitOfficer`, `Performer` |
+| POST | `/busking/permits/{id}/renew` | Holder opens the renewal cycle for the following season. | `Performer` |
+| POST | `/busking/permits/{id}/revoke` | Officer revokes a permit and settles the money and minute ledgers. | `PermitOfficer` |
+| POST | `/busking/permits/{id}/reinstate` | Officer clears the enforcement axis, closing the CLEAR -> WARNED -> SUSPENDED -> CLEAR cycle. | `PermitOfficer` |
+| GET | `/busking/permits/{id}/fee-invoices` | List the permit's invoices, newest last (created_at ASC). | `PermitOfficer`, `Performer` |
+| POST | `/busking/fee-invoices/{id}/payments` | Settle an invoice in full. | `Performer`, `PermitOfficer` |
+| POST | `/busking/lottery-draws` | Open a rotation draw for a PREMIUM pitch slot. | `PermitOfficer` |
+| GET | `/busking/lottery-draws/{id}` | Read one draw. | `PermitOfficer`, `Performer` |
+| GET | `/busking/lottery-draws` | List draws. | `PermitOfficer`, `Performer` |
+| POST | `/busking/lottery-draws/{id}/entries` | Holder enters a permit into an open draw. | `Performer` |
+| POST | `/busking/lottery-draws/{id}/execute` | Officer runs the rotation selector after the entry deadline. | `PermitOfficer` |
+| GET | `/busking/lottery-entries/{id}` | Read one entry, including its execute-time priority_band and rank_position. | `PermitOfficer`, `Performer` |
+| GET | `/busking/lottery-entries` | List entries. | `PermitOfficer`, `Performer` |
+| POST | `/busking/session-bookings` | Reserve a pitch time window under an active permit. | `Performer` |
+| GET | `/busking/session-bookings/{id}` | Read one booking. | `PermitOfficer`, `Performer`, `NoiseInspector` |
+| GET | `/busking/session-bookings` | List bookings. | `PermitOfficer`, `Performer`, `NoiseInspector` |
+| POST | `/busking/session-bookings/{id}/cancel` | Release a future reservation. | `Performer`, `PermitOfficer` |
+| POST | `/busking/noise-readings` | Inspector files a metered sound level against a live session. | `NoiseInspector` |
+| GET | `/busking/session-bookings/{id}/noise-readings` | List the readings filed against a booking. | `PermitOfficer`, `NoiseInspector`, `Performer` |
+| POST | `/busking/complaints` | Public complaint intake against a permit, optionally naming a session. | `Resident`, `PermitOfficer` |
+| GET | `/busking/complaints/{id}` | Read one complaint. | `PermitOfficer` |
+| GET | `/busking/complaints` | List complaints. | `PermitOfficer` |
+| POST | `/busking/complaints/{id}/triage` | Officer grades the complaint and forks it to direct adjudication or to mediation. | `PermitOfficer` |
+| POST | `/busking/complaints/{id}/adjudicate` | A DIFFERENT officer resolves the complaint. | `PermitOfficer` |
+| POST | `/busking/closure-orders` | Draft a special-event or works closure over a zone or a single pitch. | `PermitOfficer` |
+| GET | `/busking/closure-orders/{id}` | Read one closure order. | `PermitOfficer`, `Performer` |
+| GET | `/busking/closure-orders` | List closure orders. | `PermitOfficer`, `Performer` |
+| POST | `/busking/closure-orders/{id}/activate` | Bring the closure into force and displace every booking it covers. | `PermitOfficer` |
+| POST | `/busking/ops-runs` | Advance the program epoch. | `PermitOfficer` |
+| POST | `/_clock/set_current_utc` | Test-driving endpoint: move the server's logical clock. | `PermitOfficer` |
+## 5. Error Code Catalogue
+
+Every rejection answers in the error envelope of section 2.2 with the `error_id` below and its fixed HTTP status. The conditions that raise each one are stated in the narratives of sections 2 and 3, and the order in which competing conditions are evaluated is fixed by section 2.6.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN_ROLE` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_ZONE_NOT_FOUND` | 404 |
+| `ERR_PITCH_NOT_FOUND` | 404 |
+| `ERR_PERFORMER_NOT_FOUND` | 404 |
+| `ERR_APPLICATION_NOT_FOUND` | 404 |
+| `ERR_AUDITION_NOT_FOUND` | 404 |
+| `ERR_PERMIT_NOT_FOUND` | 404 |
+| `ERR_INVOICE_NOT_FOUND` | 404 |
+| `ERR_DRAW_NOT_FOUND` | 404 |
+| `ERR_ENTRY_NOT_FOUND` | 404 |
+| `ERR_BOOKING_NOT_FOUND` | 404 |
+| `ERR_COMPLAINT_NOT_FOUND` | 404 |
+| `ERR_CLOSURE_NOT_FOUND` | 404 |
+| `ERR_ZONE_CODE_TAKEN` | 409 |
+| `ERR_PITCH_CODE_TAKEN` | 409 |
+| `ERR_PERFORMER_EMAIL_TAKEN` | 409 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_PERMIT_NOT_ACTIVE` | 409 |
+| `ERR_PERMIT_SUSPENDED` | 409 |
+| `ERR_COMPLAINT_ALREADY_RESOLVED` | 409 |
+| `ERR_STALE_APPLICATION_VERSION` | 412 |
+| `ERR_STALE_PERMIT_VERSION` | 412 |
+| `ERR_AUDITION_REQUIRED` | 409 |
+| `ERR_AUDITION_PANEL_INCOMPLETE` | 409 |
+| `ERR_DUPLICATE_PANEL_SCORE` | 409 |
+| `ERR_DUPLICATE_ACTIVE_APPLICATION` | 409 |
+| `ERR_REVISION_LIMIT_EXCEEDED` | 409 |
+| `ERR_PERFORMER_BARRED` | 409 |
+| `ERR_AMPLIFICATION_PROHIBITED` | 422 |
+| `ERR_AMPLIFICATION_NOT_ENDORSED` | 422 |
+| `ERR_QUIET_HOURS_VIOLATION` | 422 |
+| `ERR_PITCH_CLOSED` | 409 |
+| `ERR_PITCH_ZONE_MISMATCH` | 422 |
+| `ERR_BOOKING_PERMIT_MISMATCH` | 422 |
+| `ERR_SESSION_TOO_LONG` | 422 |
+| `ERR_BOOKING_LEAD_TIME` | 422 |
+| `ERR_BOOKING_HORIZON_EXCEEDED` | 422 |
+| `ERR_READING_OUTSIDE_SESSION` | 422 |
+| `ERR_SESSION_ALREADY_STARTED` | 409 |
+| `ERR_PITCH_SLOT_OVERLAP` | 409 |
+| `ERR_PITCH_DAILY_CAP_REACHED` | 409 |
+| `ERR_CLOSURE_WINDOW_CONFLICT` | 409 |
+| `ERR_PITCH_NOT_PREMIUM` | 422 |
+| `ERR_ENTRY_DEADLINE_PASSED` | 409 |
+| `ERR_ENTRY_DEADLINE_NOT_PASSED` | 409 |
+| `ERR_DUPLICATE_LOTTERY_ENTRY` | 409 |
+| `ERR_NO_ELIGIBLE_ENTRIES` | 409 |
+| `ERR_INVOICE_PAST_DUE` | 402 |
+| `ERR_OUTSTANDING_INVOICE` | 402 |
+| `ERR_PAYMENT_AMOUNT_MISMATCH` | 422 |
+| `ERR_RENEWAL_WINDOW_CLOSED` | 422 |
+| `ERR_RENEWAL_CONDUCT_INSUFFICIENT` | 422 |
+| `ERR_SEASON_MINUTE_CAP_EXCEEDED` | 409 |

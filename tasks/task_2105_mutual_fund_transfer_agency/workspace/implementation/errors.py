@@ -1,0 +1,69 @@
+"""Error catalogue (PRD section 5)."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_ACCOUNT_OWNERSHIP_REQUIRED": 403,
+    "ERR_DEALER_CHANNEL_REQUIRED": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_FUND_NOT_FOUND": 404,
+    "ERR_SHARE_CLASS_NOT_FOUND": 404,
+    "ERR_ACCOUNT_NOT_FOUND": 404,
+    "ERR_POSITION_NOT_FOUND": 404,
+    "ERR_NAV_RECORD_NOT_FOUND": 404,
+    "ERR_TRADE_NOT_FOUND": 404,
+    "ERR_DISTRIBUTION_NOT_FOUND": 404,
+    "ERR_PAYMENT_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_REGISTRATION_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_RECONCILIATION_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_STALE_ACCOUNT_VERSION": 412,
+    "ERR_STALE_NAV_RECORD_VERSION": 412,
+    "ERR_ACCOUNT_NOT_ACTIVE": 409,
+    "ERR_ACCOUNT_RESTRICTED": 409,
+    "ERR_INVALID_TRADE_STATE": 409,
+    "ERR_INVALID_NAV_STATE": 409,
+    "ERR_INVALID_CASE_STATE": 409,
+    "ERR_INVALID_DISTRIBUTION_STATE": 409,
+    "ERR_INVALID_PLAN_STATE": 409,
+    "ERR_INVALID_RECONCILIATION_STATE": 409,
+    "ERR_LATE_TRADE_PROHIBITED": 422,
+    "ERR_AS_OF_FUTURE_DATE": 422,
+    "ERR_AS_OF_WINDOW_EXCEEDED": 422,
+    "ERR_BLUE_SKY_WINDOW_OVERLAP": 409,
+    "ERR_DISTRIBUTION_PERIOD_OVERLAP": 409,
+    "ERR_NAV_DATE_DUPLICATE": 409,
+    "ERR_ROA_LINK_INVALID": 422,
+    "ERR_EXCHANGE_TARGET_INVALID": 422,
+    "ERR_RECON_CHANNEL_INVALID": 422,
+    "ERR_FUND_CLOSED_TO_NEW": 422,
+    "ERR_NAV_NOT_AVAILABLE": 409,
+    "ERR_NAV_NOT_FINAL": 409,
+    "ERR_BLUE_SKY_NOT_REGISTERED": 422,
+    "ERR_BLUE_SKY_CAPACITY_EXCEEDED": 422,
+    "ERR_INSUFFICIENT_SHARES": 422,
+    "ERR_ADJUSTMENT_MISMATCH": 422,
+    "ERR_PLAN_NOT_DUE": 409,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+
+
+def invalid(message="The request payload is invalid."):
+    return ApiError("ERR_INVALID_REQUEST", message)

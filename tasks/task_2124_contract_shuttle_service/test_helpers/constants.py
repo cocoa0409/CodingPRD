@@ -1,0 +1,70 @@
+"""Numeric constants the PRD pins for the shuttle service calculations."""
+
+# Fixed layover buffer added to a trip's scheduled duration when a vehicle's
+# committed block is measured, and the gap a vehicle needs between one arrival
+# and the next departure.
+LAYOVER_BUFFER_MIN = 12
+
+# On-demand wait quoting and its service-level credit.
+BOARDING_LEAD_MINUTES = 3
+WAIT_SLA_GRACE_MINUTES = 2
+WAIT_CREDIT_CENTS_PER_MINUTE = 150
+
+# Period settlement.
+ON_TIME_GRACE_MINUTES = 5
+SLA_TIER_1_MAX_SHORTFALL = 5.00
+SLA_TIER_2_MAX_SHORTFALL = 15.00
+
+# Renewal pricing.
+VOLUME_TIER_1_BOARDINGS = 2000
+VOLUME_TIER_2_BOARDINGS = 5000
+CLAWBACK_PCT = 2.0
+MIN_ESCALATION_PCT = 0.0
+MAX_ESCALATION_PCT = 6.0
+RENEWAL_WINDOW_DAYS = 60
+
+# The credit memo ceiling is three times the contract's per-missed-trip penalty.
+MEMO_CAP_MULTIPLIER = 3
+
+THRESHOLDS = {
+    "LAYOVER_BUFFER_MIN": LAYOVER_BUFFER_MIN,
+    "BOARDING_LEAD_MINUTES": BOARDING_LEAD_MINUTES,
+    "WAIT_SLA_GRACE_MINUTES": WAIT_SLA_GRACE_MINUTES,
+    "WAIT_CREDIT_CENTS_PER_MINUTE": WAIT_CREDIT_CENTS_PER_MINUTE,
+    "ON_TIME_GRACE_MINUTES": ON_TIME_GRACE_MINUTES,
+    "SLA_TIER_1_MAX_SHORTFALL": SLA_TIER_1_MAX_SHORTFALL,
+    "SLA_TIER_2_MAX_SHORTFALL": SLA_TIER_2_MAX_SHORTFALL,
+    "VOLUME_TIER_1_BOARDINGS": VOLUME_TIER_1_BOARDINGS,
+    "VOLUME_TIER_2_BOARDINGS": VOLUME_TIER_2_BOARDINGS,
+    "CLAWBACK_PCT": CLAWBACK_PCT,
+    "MIN_ESCALATION_PCT": MIN_ESCALATION_PCT,
+    "MAX_ESCALATION_PCT": MAX_ESCALATION_PCT,
+    "RENEWAL_WINDOW_DAYS": RENEWAL_WINDOW_DAYS,
+}
+
+# The logical clock reads exactly this instant before any client has moved it.
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+TEST_DEFAULTS = {
+    "CLOCK": "2026-09-01T06:00:00Z",
+    "SERVICE_DATE": "2026-09-02",
+    "TERM_START_DATE": "2026-09-01",
+    "TERM_END_DATE": "2027-08-31",
+    "PERIOD_START_DATE": "2026-09-01",
+    "PERIOD_END_DATE": "2026-09-30",
+    "BASE_RATE_CENTS_PER_SERVICE_HOUR": 9000,
+    "PENALTY_RATE_CENTS_PER_MISSED_TRIP": 4500,
+    "ESCALATION_INDEX_PCT": 3.5,
+    "SLA_ON_TIME_THRESHOLD_PCT": 92.00,
+    "ADA_MIN_ACCESSIBLE_PCT": 25.00,
+    "LOOP_MINUTES": 48,
+    "HEADWAY_MINUTES": 12,
+    "SERVICE_WINDOW_START_MIN": 420,
+    "SERVICE_WINDOW_END_MIN": 456,
+    "REFERENCE_SEAT_CAPACITY": 20,
+    "SEAT_CAPACITY": 20,
+    "MAX_DUTY_MINUTES_PER_DAY": 480,
+    # A clock instant inside the renewal window of a contract whose term ends
+    # 2027-08-31 (the window opens 2027-07-02).
+    "RENEWAL_CLOCK": "2027-07-15T09:00:00Z",
+}
