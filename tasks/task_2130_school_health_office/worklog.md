@@ -192,3 +192,89 @@ All 8 parallel rounds pass 111/111 with zero union failures. Test count is intac
 **Notes for the later PRD-alignment step:**
 - I audited the sibling rounding path (`lot_days_of_supply` / `school_days_of_supply`) against PRD §2.8's contrasting rule — "rounds each lot's own quotient first, sums the already-rounded terms, and then rounds the sum a second time." The implementation already matches, and none of the five `AVG_DAILY_UNITS` divisors can produce a `.xx5` tie, so no half-up boundary is reachable there.
 - No implementation check was removed or weakened, no endpoint/field/side-effect was added, and no assertion was downgraded to an HTTP-status check.
+
+## Step 8: Finalize PRD — 2026-08-22T04:52:00.000Z
+
+PRD_FINALIZED.md written.
+
+**Line counts:** PRD.md 400 → PRD_FINALIZED.md 400 (0.0% line delta; 2 lines revised, +493 chars = +0.52% by size).
+
+**Changes**
+- §2.4 Resource Identity, Versioning and Timestamps — revise — appended a per-operation cap: several hops of one operation touching the same record advance its `version` at most once for the whole operation (not once per hop) and stamp `updated_at` once — `implementation/store.py:165-176` (`touch()` dedupes by record identity in a per-request `flask.g` set).
+- §3.1 The nurse-to-student coverage ratio — revise — pinned the quotient's algebraic form (`enrolled × 2100 ÷ minutes` as one exact expression, no intermediate FTE materialised or truncated) and the half-cent tie example 4.375 → 4.38 — `implementation/calc.py:274-282`.
+
+**Pre-edit search log**
+
+Edit 1 (§2.4)
+- (a) Subject: how many times one record's `version`/`updated_at` advance within a single request/cascade.
+- (b) Enumerated: `grep -rn '"version"' implementation/*.py` → only writers are `store.py:146` (init to 1) and `store.py:176` (increment inside `touch`); all three `expected_*_version` reads (`routes_admin.py:72`, `routes_students.py:153`, `routes_meds.py:269`) are comparisons only. Read `store.py:153-176` (`touched_set`/`touch`), all ~50 `touch(` callsites by file (`cascades.py` 8, `routes_students.py` 8, `routes_records.py` 7, `routes_visits.py`/`routes_meds.py` 6, `routes_admin.py`/`routes_ops.py` 5, `routes_provision.py` 4). Checked the multi-touch paths specifically: `cascades.void_record` → `move_units` + `refresh_lot_state` (two touches of one lot), `supersede_cascade` and `quarantine_cascade` (plan/lot + orders + records), `routes_provision.py:171-173` and `:227-231` (nurse counters vs. block), and the daily checkpoint in `routes_ops.py`. Also confirmed School derived fields are computed live at serialize time (`serializers.py:14`, `calc.py:351`) and the school record is never `touch`ed.
+- (c) Wording adjusted from "advances by exactly one" to "advances **at most once** for the whole operation" so the sentence stays true for records that are never touched at all (schools, whose derived figures recompute on read) while still forbidding the per-hop double-bump; kept the existing "each touched record's own `version` advances" sentence intact so the >=1 half still comes from PRD prose.
+
+Edit 2 (§3.1)
+- (a) Subject: the students-per-nurse-FTE quotient and its rounding point.
+- (b) Enumerated: `grep -rn "coverage_ratio\|per_nurse_fte" implementation/*.py` → `calc.coverage_ratio` is the sole definition with exactly two callsites (`calc.py:363-364`, contracted and delivered) and no route-level duplicate. Read `calc.py:63-68` (`round2` = `quantize("0.01", ROUND_HALF_UP)`), `contracted_weekly_minutes`/`delivered_weekly_minutes` (`calc.py:253-271`) to confirm the ratio consumes the *unrounded* weighted sum while `delivered_weekly_minutes` is separately `round2`-ed for reporting (`calc.py:373`), and the sibling rounding paths `lot_days_of_supply`/`school_days_of_supply` (`calc.py:285-303`) which deliberately round-then-sum-then-round per §2.8.
+- (c) Scoped the new sentence to "the quotient" inside the coverage-ratio paragraph only — no general claim about rounding — so §2.8's contrasting two-stage days-of-supply rule and the separate `round2` applied to reported `delivered_weekly_minutes` are untouched; §2.8's own one-line summary of the ratio was left verbatim.
+
+No other `<step_7_diff>` item produced an edit: the `test_01_provisioning` version assertion was a test-side arithmetic error already determined by §2.4 + §3.1 (the only residual freedom, per-hop double-bumping, is what Edit 1 closes), and no `test_helpers/` or deletion items existed.
+
+## Step 9: Complete PRD — 2026-08-22T04:59:11.621Z
+
+Done. `PRD_COMPLETED.md` is written.
+
+**Orchestrator verification:** `workspace/implementation/` was NOT modified by Step 9 (latest impl mtime 04:41, Step 9 ran 04:49–04:58), so the clean 8-round 111/111 sweep from Step 7 still holds.
+
+## Summary
+
+**Source vs output:** `PRD_FINALIZED.md` 400 lines / 94,432 chars → `PRD_COMPLETED.md` 400 lines / 104,527 chars (**+10,095 chars**, 40 lines revised in place; no new sections, no new paragraphs).
+
+**Counts:** 56 edits — **50 ambiguity-pins**, **6 mismatch-revisions**.
+
+- 2.2 — insert — ambiguity — `api_request_timestamp` is real wall-clock, the one instant not from the logical clock; pagination meta omitted on object/error responses — envelope.py:16
+- 2.3 — insert — ambiguity — non-integer `limit`/`offset` → `ERR_INVALID_FIELD_VALUE`; list tie-break is insertion order; filter values are exact-match and not enum-checked — envelope.py:58, store.py:179
+- 2.4 — revise — mismatch — read-time derived fields (school figures, student tier/flags/pointer, block `status`, `assigned_school_count`, `dispensable`, dose counters, `pending_administration_count`, `quantity_available`, `days_of_supply`) do **not** advance the holder's `version` — serializers.py:6, store.py:165
+- 2.5 — insert — ambiguity — clock accepts any instant incl. backwards; `data` is `{current_utc, previous_utc}` only — routes_ops.py:14
+- 2.5 — insert — ambiguity — `epoch` starts 0 / +1 per sweep; sweep order; arrays ordered by `created_at`; `voided_administration_ids` accumulation order; `school_id` narrows by *student's* building for plans/orders/disclosures but by own `school_id` for lots/screenings; `recomputed_school_ids` lists all in scope — routes_ops.py:28
+- 2.7 — insert — ambiguity — a cross-parent reference miss is also `ERR_RESOURCE_NOT_FOUND` — routes_meds.py:36
+- 2.1 — insert — ambiguity — ownership can't precede a missing row; existence answers instead — routes_students.py:63
+- 3.1 — insert — ambiguity — bad `building_code` shape is position-6 `ERR_INVALID_FIELD_VALUE`, reached before the duplicate check — routes_provision.py:36
+- 3.1 — insert — ambiguity — empty building: days-of-supply 0.00, ratios null; `eligible_stock_student_count`, `base_required_units`, `surge_units`, `contracted_weekly_minutes`, `delivered_weekly_minutes` are response fields — calc.py:366
+- 3.1 — insert — ambiguity — nurse PATCH with neither field supplied still succeeds and still bumps `version` — routes_provision.py:94
+- 3.1 — insert — ambiguity — `delivered_weekly_minutes` reported rounded to 2dp; the unrounded sum feeds the ratio — calc.py:373
+- 3.1 — insert — ambiguity — block-end has no from-state check, no ordering constraint on `effective_to`, and returns minutes exactly once — routes_provision.py:223
+- 3.2 — insert — ambiguity — `date_of_birth` accepts date or timestamp, echoes a full UTC timestamp — serializers.py:68
+- 3.2 — insert — ambiguity — all amendment fields optional; `enrollment_status` may be set back to `ENROLLED`; version bumps regardless — routes_students.py:96
+- 3.2 — insert — ambiguity — screening-declination fires only on the `ENROLLED` → non-`ENROLLED` edge — routes_students.py:115
+- 3.2 — insert — ambiguity — `active_action_plan_id` tie broken by most recently created plan — calc.py:184
+- 3.3 — insert — ambiguity — `supersedes_action_plan_id` need only exist (any student, condition, state) — routes_students.py:139
+- 3.3 — insert — ambiguity — approval's position-17 enrolment check precedes the position-25 consent check — routes_students.py:251
+- 3.3 — insert — ambiguity — plan `note`/`reason_code` stored but not returned — serializers.py:86
+- 3.4 — insert — ambiguity — PRN interval absence = `ERR_MISSING_REQUIRED_FIELD`, presence on `SCHEDULED` = `ERR_INVALID_FIELD_VALUE`; bad validity window = `ERR_INVALID_FIELD_VALUE` — routes_meds.py:55
+- 3.4 — insert — ambiguity — plan under another student = `ERR_RESOURCE_NOT_FOUND` at position 4 — routes_meds.py:36
+- 3.4 — insert — ambiguity — redundant `GRANT`/`WITHDRAW` = `ERR_AUTHORIZATION_INVALID_STATE` at 8 — routes_meds.py:121
+- 3.4 — revise — mismatch — `VERIFY` requires role `SchoolNurse` **and** `RN`; both refusals are `ERR_ROLE_NOT_PERMITTED` at position 2, before the order is looked up; non-`ACTIVE` linked plan = `ERR_PLAN_INVALID_STATE` at 7 — routes_meds.py:145
+- 3.4 — revise — mismatch — `SUSPEND` restricted to `SchoolPhysician` via `ERR_ROLE_NOT_PERMITTED` at 2 — routes_meds.py:151
+- 3.4 — insert — ambiguity — clinical-review `note` accepted and discarded — routes_meds.py:155
+- 3.5 — insert — ambiguity — `units` required for `RECEIVE`/`DISCARD`, ignored by `QUARANTINE`/`RESTORE`; lot `reason_code` not returned — routes_meds.py:254
+- 3.5 — insert — ambiguity — `RESTORE` yields `AVAILABLE` even at zero on hand — routes_meds.py:296
+- 3.5 — insert — ambiguity — `RECEIVE`/`DISCARD` admitted from `AVAILABLE`, `QUARANTINED`, `DEPLETED` — routes_meds.py:265
+- 3.5 — insert — ambiguity — a reservation emptying `quantity_on_hand` does not deplete the lot — routes_admin.py:39
+- 3.5 — insert — ambiguity — lot-selection final tie-break is insertion order — calc.py:476
+- 3.5 — revise — mismatch — selection filters on code, so `ERR_LOT_MEDICATION_MISMATCH` is in practice the order-to-encounter student mismatch — routes_admin.py:105
+- 3.6 — revise — mismatch — student/building mismatch = `ERR_RESOURCE_NOT_FOUND` at 4, before the enrolment check — routes_visits.py:43
+- 3.6 — insert — ambiguity — encounter `nurse_id` need not equal `X-User-ID` — routes_visits.py:60
+- 3.6 — insert — ambiguity — omitted `assessment_note` leaves the stored note standing — routes_visits.py:117
+- 3.6 — insert — ambiguity — `guardian_notified` optional/defaults false; ignored on `RETURN_TO_CLASS` and `REFERRED_EXTERNAL` — routes_visits.py:132
+- 3.6 — revise — mismatch — `REFERRED_EXTERNAL` complaint mismatch = `ERR_VISIT_INVALID_STATE` at 9, ahead of all other disposition rules — routes_visits.py:137
+- 3.6 — insert — ambiguity — reopen evaluates cot (34) → window (36) → round cap (45); `reason_code` not returned — routes_visits.py:216
+- 3.7 — insert — ambiguity — acting `X-User-ID` must name an existing `Nurse` row on all three administration steps, else `ERR_RESOURCE_NOT_FOUND` at 4 — routes_admin.py:57
+- 3.7 — insert — ambiguity — student mismatch checked at 42, after the dose gate and before lot selection — routes_admin.py:105
+- 3.7 — insert — ambiguity — a witness on a non-controlled dose is recorded but never compared — routes_admin.py:116
+- 3.7 — revise — mismatch — emergency stock: credential (20) precedes `ERR_STOCK_PROTOCOL_DISABLED` (30); witness/segregation never reached — routes_admin.py:156
+- 3.7 — insert — ambiguity — outcome requires the witness supplied afresh and overwrites the stored one — routes_admin.py:229
+- 3.7 — insert — ambiguity — void `reason_code` required; window measured from `prepared_at` in every source state; cascade voids write none — routes_admin.py:272, cascades.py:60
+- 3.8 — insert — ambiguity — screening student/building mismatch = `ERR_RESOURCE_NOT_FOUND` at 4 — routes_records.py:34
+- 3.8 — insert — ambiguity — record-result coverage check ignores weekday and minute-of-day — routes_records.py:98
+- 3.8 — insert — ambiguity — conditional `scheduled_for` / `referral_outcome` = `ERR_MISSING_REQUIRED_FIELD` at 5, before the from-state check; `rescreen_due_at` and `referral_due_at` left standing — routes_records.py:130
+- 3.9 — insert — ambiguity — non-tightening `redaction_override` accepted and silently ignored — routes_records.py:286
+- 3.9 — insert — ambiguity — release recomputes the level but never loosens an override-set `PARTIAL`; privacy (29) precedes expiry (38) — routes_records.py:309
+- 4 — revise — mismatch — clock and checkpoint return a report object, not a resource; unmatched path/method = `ERR_RESOURCE_NOT_FOUND` 404 — routes_ops.py:20, app.py:53

@@ -1,0 +1,54 @@
+"""Domain thresholds and shared test literals drawn from the PRD."""
+
+# An id that is a well-formed UUID but never minted by the server.
+MISSING_UUID = "00000000-0000-4000-8000-000000000000"
+
+# The logical clock reads exactly this instant before any operator moves it.
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# Volunteer assembly throughput.
+KITS_PER_VOLUNTEER_HOUR_ASSEMBLY = 6
+KITS_PER_VOLUNTEER_HOUR_SORTING = 0
+FATIGUE_FREE_HOURS = 4
+FATIGUE_STEP = 0.05
+FATIGUE_FLOOR = 0.70
+BINS_TO_KITS = 12
+MINORS_PER_SUPERVISOR = 8
+SITE_TURNOVER_BUFFER_MINUTES = 45
+
+# Purchase-order administration fee tiers.
+ADMIN_TIER_1_CENTS = 50_000
+ADMIN_TIER_2_CENTS = 200_000
+ADMIN_RATE_LOW = 0.09
+ADMIN_RATE_MID = 0.07
+ADMIN_RATE_HIGH = 0.05
+
+# Teacher supplemental budget.
+SUPPLEMENTAL_CAP_PCT = 0.15
+SCHOOL_SHARE_CAP_PCT = 0.40
+SCHOOL_SUBCAP_MIN_PARTNERS = 3
+
+# Impact index weights.
+IMPACT_W_SERVED = 0.55
+IMPACT_W_FILL = 0.30
+IMPACT_W_EQUITY = 0.15
+NO_SHOW_PENALTY = 0.5
+
+# Registration lead times, in hours, by cadence.
+LEAD_TIME_HOURS_BACK_TO_SCHOOL = 48
+LEAD_TIME_HOURS_YEAR_ROUND = 2
+
+# Window literals reused across scenarios.
+CYCLE_WINDOW_START = "2026-07-01T00:00:00Z"
+CYCLE_WINDOW_END = "2026-09-30T23:59:59Z"
+YEAR_ROUND_WINDOW_END = "2027-06-30T23:59:59Z"
+EVENT_WINDOW_START = "2026-08-20T15:00:00Z"
+EVENT_WINDOW_END = "2026-08-20T19:00:00Z"
+
+# Catalogue defaults used by the shared item factories.
+PENCIL_UNIT_COST_CENTS = 250
+PENCIL_PACK_SIZE = 12
+NOTEBOOK_UNIT_COST_CENTS = 180
+NOTEBOOK_PACK_SIZE = 10
+BACKPACK_UNIT_COST_CENTS = 1450
+BACKPACK_PACK_SIZE = 6

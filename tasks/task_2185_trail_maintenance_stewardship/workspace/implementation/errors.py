@@ -1,0 +1,67 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_LAND_MANAGER_NOT_FOUND": 404,
+    "ERR_VOLUNTEER_NOT_FOUND": 404,
+    "ERR_TRAIL_SEGMENT_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_WORK_PLAN_NOT_FOUND": 404,
+    "ERR_CONDITION_REPORT_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_WORK_PARTY_NOT_FOUND": 404,
+    "ERR_SHIFT_NOT_FOUND": 404,
+    "ERR_MATERIAL_ORDER_NOT_FOUND": 404,
+    "ERR_INCIDENT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_WORK_PARTY_VERSION": 412,
+    "ERR_STALE_WORK_PLAN_VERSION": 412,
+    "ERR_SEGMENT_CLOSED": 409,
+    "ERR_WET_WEATHER_RESTRICTED": 409,
+    "ERR_WAIVER_NOT_SIGNED": 422,
+    "ERR_CERTIFICATION_MISSING": 422,
+    "ERR_FIRST_AID_COVERAGE_INSUFFICIENT": 422,
+    "ERR_BRIEFING_INCOMPLETE": 422,
+    "ERR_ENGINEERING_REVIEW_REQUIRED": 422,
+    "ERR_ADOPTION_NOT_ACTIVE": 409,
+    "ERR_WORK_PLAN_NOT_APPROVED": 409,
+    "ERR_PERMIT_NOT_ISSUED": 409,
+    "ERR_PERMIT_LEAD_TIME_INSUFFICIENT": 422,
+    "ERR_PERMIT_WINDOW_MISMATCH": 422,
+    "ERR_SEGMENT_PARTY_OVERLAP": 409,
+    "ERR_VOLUNTEER_DOUBLE_BOOKED": 409,
+    "ERR_VOLUNTEER_DAILY_HOURS_EXCEEDED": 422,
+    "ERR_ROSTER_FULL": 409,
+    "ERR_DUPLICATE_REGISTRATION": 409,
+    "ERR_PARTY_SIZE_EXCEEDS_PERMIT": 422,
+    "ERR_SEGMENT_ALREADY_ADOPTED": 409,
+    "ERR_REVISION_LIMIT_EXCEEDED": 422,
+    "ERR_PRIORITY_TOO_HIGH_TO_DEFER": 422,
+    "ERR_PRIORITY_TOO_LOW_TO_ESCALATE": 422,
+    "ERR_DEFER_DATE_NOT_REACHED": 409,
+    "ERR_LINKED_PARTY_NOT_COMPLETE": 409,
+    "ERR_ESCALATION_NOT_CLEARED": 409,
+    "ERR_PLAN_OVER_COMMITTED": 409,
+    "ERR_PLAN_BUDGET_EXCEEDED": 422,
+    "ERR_CLOCK_REWIND": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

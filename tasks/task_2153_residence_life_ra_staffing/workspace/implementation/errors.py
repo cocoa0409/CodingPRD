@@ -1,0 +1,94 @@
+"""Error catalogue (PRD s5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").lower()
+        )
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_BUILDING_NOT_FOUND": 404,
+    "ERR_FLOOR_NOT_FOUND": 404,
+    "ERR_ROOM_NOT_FOUND": 404,
+    "ERR_STUDENT_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_RA_NOT_FOUND": 404,
+    "ERR_SHIFT_NOT_FOUND": 404,
+    "ERR_INCIDENT_NOT_FOUND": 404,
+    "ERR_CONDUCT_CASE_NOT_FOUND": 404,
+    "ERR_INSPECTION_NOT_FOUND": 404,
+    "ERR_CHARGE_NOT_FOUND": 404,
+    "ERR_ROOM_CHANGE_CASE_NOT_FOUND": 404,
+    "ERR_PROGRAM_EVENT_NOT_FOUND": 404,
+    "ERR_BREAK_REQUEST_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_ROOM_VERSION": 412,
+    "ERR_STALE_STUDENT_VERSION": 412,
+    "ERR_APPLICATION_STATE_INVALID": 409,
+    "ERR_RA_STATE_INVALID": 409,
+    "ERR_SHIFT_STATE_INVALID": 409,
+    "ERR_INCIDENT_STATE_INVALID": 409,
+    "ERR_CONDUCT_CASE_STATE_INVALID": 409,
+    "ERR_INSPECTION_STATE_INVALID": 409,
+    "ERR_CHARGE_STATE_INVALID": 409,
+    "ERR_PLACEMENT_STATE_INVALID": 409,
+    "ERR_MEDIATION_STATE_INVALID": 409,
+    "ERR_PROGRAM_STATE_INVALID": 409,
+    "ERR_PROGRAM_NOT_HELD": 409,
+    "ERR_BREAK_REQUEST_STATE_INVALID": 409,
+    "ERR_INVALID_POSTURE_TRANSITION": 409,
+    "ERR_REVISION_LIMIT_REACHED": 409,
+    "ERR_RETURN_LIMIT_REACHED": 409,
+    "ERR_MEDIATION_ROUND_LIMIT": 409,
+    "ERR_APPEAL_ALREADY_RESOLVED": 409,
+    "ERR_BUILDING_NOT_OPEN": 409,
+    "ERR_ROOM_NOT_AVAILABLE": 409,
+    "ERR_ROOM_AT_CAPACITY": 409,
+    "ERR_RA_NOT_CERTIFIED": 409,
+    "ERR_RA_NOT_ACTIVE": 409,
+    "ERR_TRAINING_CREDITS_INSUFFICIENT": 409,
+    "ERR_MANDATORY_MODULE_MISSING": 409,
+    "ERR_MODULE_ALREADY_COMPLETED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_SELF_REPORT_FORBIDDEN": 422,
+    "ERR_JUDICIAL_HOLD": 409,
+    "ERR_STUDENT_ON_PROBATION": 409,
+    "ERR_BREAK_HOUSING_DISABLED": 409,
+    "ERR_DUTY_COVERAGE_CONFLICT": 409,
+    "ERR_SHIFT_WINDOW_NOT_REACHED": 409,
+    "ERR_HEARING_WINDOW_EXCEEDED": 409,
+    "ERR_APPEAL_WINDOW_CLOSED": 409,
+    "ERR_BREAK_HOUSING_CAPACITY": 409,
+    "ERR_DUPLICATE_BUILDING_CODE": 409,
+    "ERR_DUPLICATE_STUDENT_EMAIL": 409,
+    "ERR_DUPLICATE_FLOOR_NUMBER": 409,
+    "ERR_DUPLICATE_ROOM_NUMBER": 409,
+    "ERR_DUPLICATE_APPLICATION": 409,
+    "ERR_NO_ELIGIBLE_RA": 422,
+    "ERR_CENSUS_EMPTY": 422,
+    "ERR_CONSOLIDATION_NOT_WARRANTED": 409,
+    "ERR_FLOOR_MISMATCH": 422,
+    "ERR_STUDENT_NOT_IN_ROOM": 422,
+    "ERR_PROGRAM_BUDGET_NOT_ALLOCATED": 409,
+    "ERR_FLOOR_BUDGET_EXCEEDED": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and must name a known role.",
+    "ERR_FORBIDDEN_ROLE": "The authenticated role is not permitted for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The caller does not own this resource.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+    "ERR_BUILDING_NOT_OPEN": "The residence hall is not OPEN.",
+    "ERR_ROOM_NOT_AVAILABLE": "The target room is not available.",
+    "ERR_ROOM_AT_CAPACITY": "The target room has no free bed.",
+    "ERR_DUTY_COVERAGE_CONFLICT": "The RA already holds a conflicting duty shift.",
+    "ERR_SHIFT_WINDOW_NOT_REACHED": "The action is outside the shift's clock window.",
+}

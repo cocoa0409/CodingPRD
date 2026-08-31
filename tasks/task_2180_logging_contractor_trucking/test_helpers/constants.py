@@ -1,0 +1,128 @@
+"""Domain thresholds and shared literals taken from the PRD narrative."""
+
+# A syntactically valid UUID that never identifies a persisted resource.
+UNKNOWN_UUID = "00000000-0000-4000-8000-000000000000"
+
+# The logical clock's startup default (PRD §2.4).
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+CLOCK_STARTUP_DATE = "2026-08-01"
+
+# Move-in pricing (PRD §3.3).
+MOVE_IN = {
+    "PIECES_PER_LOWBOY": 2,
+    "TIER_1_MAX_MILES": 25,
+    "TIER_1_CENTS_PER_MILE": 900,
+    "TIER_2_MAX_MILES": 75,
+    "TIER_2_CENTS_PER_MILE": 725,
+    "TIER_3_CENTS_PER_MILE": 610,
+    "ACCESS_MULTIPLIER": {
+        "ALL_SEASON": 1.00,
+        "SUMMER_ONLY": 1.15,
+        "FROZEN_ONLY": 1.35,
+    },
+    "CREW_TYPE_SURCHARGE_CENTS": {
+        "HAND_FALLING": 0,
+        "MECHANIZED_GROUND": 120_000,
+        "CABLE_YARDING": 275_000,
+    },
+    "MIN_MOVE_IN_CENTS": 185_000,
+    "MAX_MOVE_IN_CENTS": 1_250_000,
+}
+
+# Weight ceilings (PRD §3.7).
+WEIGHT = {
+    "FROST_LAW_MULTIPLIER": 0.80,
+    "PERMIT_UPLIFT_LBS": 10_000,
+    "AXLE_CAP_LBS": {
+        "FIVE_AXLE": 80_000,
+        "SIX_AXLE": 91_000,
+        "SEVEN_AXLE": 105_500,
+    },
+    "LBS_PER_TON": 2_000,
+}
+
+# Haul pay (PRD §3.6 and §3.8).
+HAUL_PAY = {
+    "RATE_BAND_1_MAX_MILES": 30,
+    "RATE_BAND_1_CENTS": 26,
+    "RATE_BAND_2_MAX_MILES": 70,
+    "RATE_BAND_2_CENTS": 22,
+    "RATE_BAND_3_CENTS": 19,
+    "FUEL_SURCHARGE_PCT": 0.075,
+    "FREE_WAIT_MINUTES": 45,
+    "DEMURRAGE_CENTS_PER_MINUTE": 150,
+    "INCENTIVE_TIER_A_MIN_CENTS": 120_000,
+    "INCENTIVE_TIER_A_PCT": 0.04,
+    "INCENTIVE_TIER_B_MIN_CENTS": 60_000,
+    "INCENTIVE_TIER_B_PCT": 0.02,
+    "REGRADE_PENALTY_PCT": 0.05,
+}
+
+# Compliance scoring (PRD §3.2).
+COMPLIANCE = {
+    "BASE_SCORE": 100,
+    "SCORE_FLOOR": 0,
+    "SAFETY_LOOKBACK_DAYS": 180,
+    "INSURANCE_PENALTY_POINTS": 25,
+    "REJECT_PENALTY_POINTS": 3,
+    "MIN_DISPATCH_SCORE": 70,
+}
+
+# Settlement rollup (PRD §3.9).
+SETTLEMENT = {
+    "REJECT_DEDUCTION_PCT": 0.35,
+    "HOLDBACK_TIER_A_MIN_SCORE": 90,
+    "HOLDBACK_TIER_A_PCT": 0.00,
+    "HOLDBACK_TIER_B_MIN_SCORE": 80,
+    "HOLDBACK_TIER_B_PCT": 0.02,
+    "HOLDBACK_TIER_C_MIN_SCORE": 70,
+    "HOLDBACK_TIER_C_PCT": 0.05,
+    "HOLDBACK_TIER_D_PCT": 0.10,
+}
+
+# Rehaul selector (PRD §3.8).
+REHAUL = {
+    "MILE_COST_CENTS": 85,
+    "SPEED_MPH": 45,
+    "PERMIT_RANK": {
+        "STANDARD": 1,
+        "DIVISIBLE_LOAD_PERMIT": 2,
+        "LONGER_COMBINATION": 3,
+    },
+}
+
+# Shutdown moisture threshold (PRD §3.5).
+WET_WEATHER_MOISTURE_THRESHOLD = 72
+
+# Crew occupation buffer (PRD §3.3).
+CREW_MOVE_BUFFER_DAYS = 2
+
+TEST_DEFAULTS = {
+    "MILL_NAME": "Cascade Mill A",
+    "MILL_STATE_CODE": "OR",
+    "CARRIER_NAME": "Ridgeline Hauling",
+    "CARRIER_DOT_NUMBER": "DOT-771204",
+    "CARRIER_STATE_CODE": "OR",
+    "TRUCK_UNIT_NUMBER": "T-18",
+    "TRUCK_TARE_WEIGHT_LBS": 31_000,
+    "CREW_NAME": "Crew Alpha",
+    "CREW_EQUIPMENT_PIECES": 4,
+    "CREW_DAILY_RATE_CENTS": 480_000,
+    "TRACT_NAME": "Section 14 NE",
+    "TRACT_LEGAL_DESCRIPTION": "T3S R5W Sec 14 NE1/4",
+    "TRACT_GROSS_ACRES": 120,
+    "TRACT_PLANNED_VOLUME_TONS": 4000,
+    "QUOTA_TONS": 500,
+    "BASE_RATE_CENTS_PER_TON": 4200,
+    "PERIOD_START": "2026-07-01",
+    "PERIOD_END": "2026-09-30",
+    "OVERRUN_TOLERANCE_PCT": 0.05,
+    "ROUTE_DISTANCE_MILES": 52,
+    "ROUTE_LEGAL_GROSS_WEIGHT_LBS": 98_000,
+    "MOVE_IN_MILES": 40,
+    "WINDOW_START": "2026-08-01",
+    "WINDOW_END": "2026-10-15",
+    "INSURANCE_EFFECTIVE_ON": "2026-01-01",
+    "INSURANCE_EXPIRES_ON": "2027-01-01",
+    "INSURANCE_LIMIT_CENTS": 100_000_000,
+}

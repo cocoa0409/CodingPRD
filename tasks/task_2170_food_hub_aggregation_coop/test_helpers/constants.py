@@ -1,0 +1,85 @@
+"""Domain thresholds and numeric constants stated by the PRD."""
+
+# The logical clock reads exactly this instant at server startup (PRD 2.5).
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+
+# Convenience base instant used by tests that drive the clock explicitly.
+CLOCK_BASE = "2026-09-01T00:00:00Z"
+
+REQUIRED_DOC_TYPES = ["GAP_AUDIT", "LIABILITY_INSURANCE", "HACCP_PLAN"]
+AUDITED_EXTRA_DOC_TYPES = ["ORGANIC_CERT", "WATER_TEST"]
+ALL_DOC_TYPES = REQUIRED_DOC_TYPES + AUDITED_EXTRA_DOC_TYPES
+
+THRESHOLDS = {
+    # Membership review loop
+    "MAX_REVIEW_CYCLES": 3,
+    # Margin tiers, in cents of pre-margin producer subtotal
+    "TIER_1_UPPER_EXCLUSIVE_CENTS": 50_000,
+    "TIER_2_UPPER_EXCLUSIVE_CENTS": 200_000,
+    "TIER_3_UPPER_EXCLUSIVE_CENTS": 500_000,
+    "TIER_BP": [1800, 1500, 1250, 1000],
+    # Worst margin rate, used by the buyer price-ceiling screen
+    "MARGIN_BP_CEILING": 1800,
+    # Per-order margin floor
+    "MIN_ORDER_MARGIN_CENTS": 2500,
+    # Cooperative equity
+    "EQUITY_SHARE_UNIT_CENTS": 25_000,
+    "MAX_VOTING_SHARES": 10,
+    "PATRONAGE_CAP_BP": 3000,
+    # Shrink apportionment
+    "TEMP_ABUSE_EXCURSION_BP": 2000,
+    "TEMP_ABUSE_NO_EXCURSION_BP": 8000,
+    "DAMAGE_BP": 5000,
+    "SPEC_MISMATCH_BP": 9000,
+    "SHORT_COUNT_BP": 10000,
+    "LATE_DELIVERY_BP": 0,
+    "AUDITED_TIER_RELIEF_BP": 1500,
+    "PRODUCER_FAULT_CAP_BP": 9000,
+    # Cold chain and cross-dock
+    "TEMP_TOLERANCE_C": 2.0,
+    "DEFAULT_SANITATION_BUFFER_MINUTES": 45,
+    # Settlement
+    "WRITE_OFF_GRACE_DAYS": 30,
+}
+
+TEST_DEFAULTS = {
+    "COMMODITY_CODE": "CARROT_LOOSE",
+    "UNIT_OF_MEASURE": "CASE",
+    "STORAGE_CLASS": "CHILL",
+    "PACK_WEIGHT_LB": 25,
+    "UNITS_PER_PALLET": 40,
+    "PRODUCER_UNIT_PRICE_CENTS": 1800,
+    "QUANTITY_OFFERED": 100,
+    "OFFER_WINDOW_START": "2026-09-01T00:00:00Z",
+    "OFFER_WINDOW_END": "2026-12-01T00:00:00Z",
+    "REQUESTED_DELIVERY_DATE": "2026-09-15T00:00:00Z",
+    "LINE_QUANTITY": 60,
+    "MAX_UNIT_PRICE_CENTS": 2500,
+    "CREDIT_LIMIT_CENTS": 5_000_000,
+    "PAYMENT_TERMS_DAYS": 30,
+    "DOC_ISSUED_ON": "2026-01-01T00:00:00Z",
+    "DOC_EXPIRES_ON": "2027-01-01T00:00:00Z",
+    "ROUTE_DATE": "2026-09-15T00:00:00Z",
+    "DEPOT_DEPARTURE_AT": "2026-09-15T06:00:00Z",
+    "ROUTE_PALLET_CAPACITY": 20,
+    "PLANNED_ARRIVAL_AT": "2026-09-15T10:00:00Z",
+    "SERVICE_MINUTES": 60,
+    "DOCK_WINDOW_START": "2026-09-14T06:00:00Z",
+    "DOCK_WINDOW_END": "2026-09-14T18:00:00Z",
+    "DOCK_PALLET_CAPACITY": 12,
+    "TEMP_SETPOINT_C": 2.0,
+    "ARRIVAL_START": "2026-09-14T08:00:00Z",
+    "ARRIVAL_END": "2026-09-14T09:00:00Z",
+    "APPOINTMENT_PALLETS": 2,
+    "RISK_CLASS": "PRODUCE",
+    "RECORDED_TEMP_C": 1.5,
+}
+
+# Operator identifiers used for the opaque roles.
+HUB_ADMIN_USER_ID = "hub-admin-1"
+VERIFIER_USER_ID = "co-verify-1"
+SECOND_VERIFIER_USER_ID = "co-verify-2"
+APPROVER_USER_ID = "co-approve-9"
+SECOND_APPROVER_USER_ID = "co-approve-8"
+CLAIMS_OFFICER_USER_ID = "co-claims-3"
+BOARD_DIRECTOR_USER_ID = "director-7"

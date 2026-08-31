@@ -1,0 +1,60 @@
+"""Error catalogue and the ApiError exception (PRD section 5)."""
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_DOCK_NOT_FOUND": 404,
+    "ERR_STOP_NOT_FOUND": 404,
+    "ERR_VESSEL_NOT_FOUND": 404,
+    "ERR_CREW_NOT_FOUND": 404,
+    "ERR_SERVICE_DAY_NOT_FOUND": 404,
+    "ERR_TRIP_NOT_FOUND": 404,
+    "ERR_DOCK_SLOT_NOT_FOUND": 404,
+    "ERR_RIDE_PASS_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_REFUND_CLAIM_NOT_FOUND": 404,
+    "ERR_INVALID_TIME_WINDOW": 422,
+    "ERR_SAME_ORIGIN_DESTINATION": 422,
+    "ERR_SERVICE_DAY_DUPLICATE": 409,
+    "ERR_TRIP_NOT_SCHEDULED": 409,
+    "ERR_TRIP_NOT_BOARDING": 409,
+    "ERR_TRIP_NOT_DEPARTED": 409,
+    "ERR_BOOKING_NOT_REQUESTED": 409,
+    "ERR_BOOKING_NOT_OFFERED": 409,
+    "ERR_BOOKING_NOT_CONFIRMED": 409,
+    "ERR_PASS_NOT_ACTIVE": 409,
+    "ERR_REFUND_CLAIM_NOT_OPEN": 409,
+    "ERR_INTERRUPTION_NOT_DECLARABLE": 409,
+    "ERR_STALE_DOCK_VERSION": 412,
+    "ERR_STALE_TRIP_VERSION": 412,
+    "ERR_SERVICE_SUSPENDED": 409,
+    "ERR_VESSEL_IN_LAYUP": 409,
+    "ERR_VESSEL_OUT_OF_SERVICE": 409,
+    "ERR_VESSEL_INSPECTION_INVALID": 422,
+    "ERR_HULL_CLASS_RESTRICTED": 422,
+    "ERR_CREW_CERT_EXPIRED": 422,
+    "ERR_CREW_ENDORSEMENT_INSUFFICIENT": 422,
+    "ERR_UNDER_KEEL_CLEARANCE": 422,
+    "ERR_DOCK_BERTH_CONFLICT": 409,
+    "ERR_SLOT_DOCK_NOT_ON_ROUTE": 422,
+    "ERR_PASS_EXPIRED": 409,
+    "ERR_PASS_ZONE_NOT_COVERED": 422,
+    "ERR_PASS_NO_RIDES_REMAINING": 409,
+    "ERR_NO_ELIGIBLE_TRIP": 409,
+    "ERR_TRIP_CAPACITY_EXCEEDED": 409,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = ERROR_HTTP.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."

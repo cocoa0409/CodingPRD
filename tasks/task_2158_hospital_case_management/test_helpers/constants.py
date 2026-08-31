@@ -1,0 +1,85 @@
+"""Domain thresholds and pinned numeric constants stated in the PRD."""
+
+# The logical clock's value before it has ever been set (PRD §2.6).
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+# Composite readmission-risk model (PRD §3.2).
+RISK = {
+    "PRIOR_ADMIT_CAP": 4,
+    "PRIOR_ADMIT_POINTS": 8,
+    "FUNCTIONAL_WEIGHT": 3,
+    "COGNITIVE_WEIGHT": 2,
+    "SOCIAL_WEIGHT": 2,
+    "LIVES_ALONE_POINTS": 6,
+    "NO_PCP_POINTS": 5,
+    "POLYPHARMACY_THRESHOLD": 10,
+    "POLYPHARMACY_POINTS": 7,
+    "BARRIER_HISTORY_CAP": 5,
+    "BARRIER_HISTORY_POINTS": 3,
+    "PLACEMENT_CREDIT_POINTS": 12,
+    "SCORE_MIN": 0,
+    "SCORE_MAX": 100,
+}
+
+RISK_BAND_THRESHOLDS = {"VERY_HIGH": 70, "HIGH": 50, "MODERATE": 30}
+
+# Barrier posture rollup (PRD §3.3).
+ESCALATION_HOURS = 72
+
+AVOIDABLE_DELAY_CODES = [
+    "AWAITING_BED",
+    "AWAITING_AUTH",
+    "AWAITING_DME",
+    "AWAITING_TRANSPORT",
+    "AWAITING_FAMILY",
+    "AWAITING_PHYSICIAN",
+]
+NON_AVOIDABLE_DELAY_CODES = ["CLINICAL_INSTABILITY", "PATIENT_REFUSAL"]
+
+# Placement search fairness (PRD §3.4).
+MIN_BROADCAST_PROVIDERS = 3
+
+# Placement cost projection (PRD §3.5).
+OUT_OF_NETWORK_MULTIPLIER = 1.25
+TIER1_DAYS = 20
+TIER2_RATE_PCT = 0.85
+
+# Bed-offer rank score (PRD §3.5).
+RANK = {
+    "STAR_WEIGHT": 10,
+    "IN_NETWORK_BONUS": 25,
+    "PROXIMITY_BASE": 20,
+    "COST_PENALTY_DIVISOR": 5000,
+}
+
+# Authorization award (PRD §3.6).
+VOLUME_TIER1_CENTS = 500_000
+VOLUME_TIER2_CENTS = 1_500_000
+VOLUME_TIER1_PCT = 0.03
+VOLUME_TIER2_PCT = 0.05
+MAX_APPEAL_ROUNDS = 2
+
+# Logistics (PRD §3.7).
+DME_ITEM_RATE_CENTS = {
+    "HOSPITAL_BED": 45000,
+    "OXYGEN_CONCENTRATOR": 32000,
+    "WHEELCHAIR": 21000,
+    "WALKER": 8000,
+    "CPAP": 27000,
+}
+TURNAROUND_BUFFER_MINUTES = 45
+
+# Throughput reporting (PRD §3.9).
+ACUITY_MULTIPLIER = {"LOW": 0.90, "MODERATE": 1.00, "HIGH": 1.15, "VERY_HIGH": 1.30}
+GRADE_THRESHOLDS = {"EXEMPLARY": 0.900, "ON_TARGET": 1.050, "ABOVE_TARGET": 1.250}
+
+# Values shared by the composite fixtures.
+TEST_DEFAULTS = {
+    "COINSURANCE_PCT": 0.200,
+    "AUTH_EXPIRY_DAYS": 30,
+    "DRG_CODE": "DRG-291",
+    "DRG_GMLOS_DAYS": 4.5,
+    "ATTENDING_UNIT": "5W",
+    "VEHICLE_BASE_RATE_CENTS": 25000,
+    "VEHICLE_PER_MILE_CENTS": 900,
+}

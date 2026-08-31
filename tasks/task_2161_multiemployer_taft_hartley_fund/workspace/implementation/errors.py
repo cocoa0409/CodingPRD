@@ -1,0 +1,85 @@
+"""Error catalogue and the ApiError exception (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_HTTP[error_id]
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_FUND_NOT_FOUND": 404,
+    "ERR_EMPLOYER_NOT_FOUND": 404,
+    "ERR_PARTICIPANT_NOT_FOUND": 404,
+    "ERR_REPORT_NOT_FOUND": 404,
+    "ERR_COVERAGE_MONTH_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_AUDIT_NOT_FOUND": 404,
+    "ERR_WITHDRAWAL_NOT_FOUND": 404,
+    "ERR_INSTALLMENT_NOT_FOUND": 404,
+    "ERR_MOTION_NOT_FOUND": 404,
+    "ERR_VOTE_NOT_FOUND": 404,
+    "ERR_TRANSFER_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_EMPLOYER_VERSION": 412,
+    "ERR_STALE_FUND_VERSION": 412,
+    "ERR_REPORT_ALREADY_POSTED": 409,
+    "ERR_REPORT_NOT_REMITTABLE": 409,
+    "ERR_ASSESSMENT_INVALID_STATE": 409,
+    "ERR_AUDIT_INVALID_STATE": 409,
+    "ERR_WITHDRAWAL_INVALID_STATE": 409,
+    "ERR_MOTION_INVALID_STATE": 409,
+    "ERR_TRANSFER_INVALID_STATE": 409,
+    "ERR_INSTALLMENT_NOT_PAYABLE": 409,
+    "ERR_EMPLOYER_WITHDRAWN": 409,
+    "ERR_BOARD_APPROVAL_REQUIRED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_MOVER_CANNOT_VOTE": 409,
+    "ERR_TRUSTEE_SEAT_INACTIVE": 409,
+    "ERR_FUND_GOVERNANCE_NOT_OPEN": 409,
+    "ERR_FUND_GOVERNANCE_FROZEN": 409,
+    "ERR_RECIPROCITY_AGREEMENT_NOT_EXECUTED": 409,
+    "ERR_AUDIT_PERIOD_OVERLAP": 409,
+    "ERR_REPORT_NOT_DELINQUENT": 409,
+    "ERR_COVERAGE_HORIZON_EXCEEDED": 409,
+    "ERR_PARTICIPANT_FUND_MISMATCH": 409,
+    "ERR_TRUSTEE_FUND_MISMATCH": 409,
+    "ERR_SISTER_FUND_INVALID": 409,
+    "ERR_MOTION_SUBJECT_INVALID": 409,
+    "ERR_DUPLICATE_WORK_PERIOD": 409,
+    "ERR_AMENDMENT_TARGET_INVALID": 409,
+    "ERR_DUPLICATE_VOTE": 409,
+    "ERR_EMPTY_REPORT": 409,
+    "ERR_AUDIT_ROUND_LIMIT_REACHED": 409,
+    "ERR_QUORUM_NOT_MET": 409,
+    "ERR_REMITTANCE_EXCEEDS_BALANCE": 422,
+    "ERR_SETTLEMENT_EXCEEDS_ASSESSMENT": 422,
+    "ERR_INSTALLMENT_AMOUNT_MISMATCH": 422,
+    "ERR_NO_DELINQUENT_PRINCIPAL": 422,
+    "ERR_UVB_POOL_EXHAUSTED": 422,
+    "ERR_NO_PAYMENT_BASE": 422,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Missing or invalid authentication headers.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not authorized for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting identity does not own the target resource.",
+    "ERR_FUND_NOT_FOUND": "No fund exists for the supplied id.",
+    "ERR_EMPLOYER_NOT_FOUND": "No employer exists for the supplied id.",
+    "ERR_PARTICIPANT_NOT_FOUND": "No participant exists for the supplied id.",
+    "ERR_REPORT_NOT_FOUND": "No contribution report exists for the supplied id.",
+    "ERR_COVERAGE_MONTH_NOT_FOUND": "No coverage month exists for the supplied id.",
+    "ERR_ASSESSMENT_NOT_FOUND": "No delinquency assessment exists for the supplied id.",
+    "ERR_AUDIT_NOT_FOUND": "No payroll audit exists for the supplied id.",
+    "ERR_WITHDRAWAL_NOT_FOUND": "No withdrawal assessment exists for the supplied id.",
+    "ERR_INSTALLMENT_NOT_FOUND": "No payment installment exists for the supplied id.",
+    "ERR_MOTION_NOT_FOUND": "No board motion exists for the supplied id.",
+    "ERR_VOTE_NOT_FOUND": "No motion vote exists for the supplied id.",
+    "ERR_TRANSFER_NOT_FOUND": "No reciprocity transfer exists for the supplied id.",
+    "ERR_INVALID_REQUEST": "The request body or query string is malformed.",
+}

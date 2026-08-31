@@ -1,0 +1,76 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+# error_id -> HTTP status, verbatim from PRD section 5 / scaffold section 1.6
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_INSTITUTION_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INSTITUTION_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_DEMOGRAPHIC_ENTRY_NOT_FOUND": 404,
+    "ERR_GEOCODE_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_CENSUS_TRACT_NOT_FOUND": 404,
+    "ERR_EDIT_RUN_NOT_FOUND": 404,
+    "ERR_EDIT_EXCEPTION_NOT_FOUND": 404,
+    "ERR_SUBMISSION_NOT_FOUND": 404,
+    "ERR_AUDIT_SAMPLE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_INSTITUTION_VERSION": 412,
+    "ERR_STALE_APPLICATION_VERSION": 412,
+    "ERR_INVALID_STAGE_TRANSITION": 409,
+    "ERR_INVALID_SUBMISSION_STATE": 409,
+    "ERR_EXCEPTION_NOT_OPEN": 409,
+    "ERR_GEOCODE_NOT_OVERRIDABLE": 409,
+    "ERR_SAMPLE_NOT_OPEN": 409,
+    "ERR_APPLICATION_ARCHIVED": 409,
+    "ERR_EDIT_RUN_INVALIDATED": 409,
+    "ERR_GEOCODE_UNRESOLVED": 409,
+    "ERR_MISSING_APPLICANT_DEMOGRAPHICS": 409,
+    "ERR_VISUAL_OBSERVATION_NOT_PERMITTED": 422,
+    "ERR_DISAGGREGATED_CODE_NOT_PERMITTED": 422,
+    "ERR_OBSERVATION_REQUIRED_FOR_IN_PERSON": 422,
+    "ERR_NON_NATURAL_PERSON_MISMATCH": 422,
+    "ERR_DENIAL_REASON_REQUIRED": 422,
+    "ERR_DENIAL_REASON_NOT_PERMITTED": 422,
+    "ERR_PURCHASER_TYPE_REQUIRED": 422,
+    "ERR_GEOCODE_TRACT_MISMATCH": 422,
+    "ERR_EDIT_RUN_INSTITUTION_MISMATCH": 422,
+    "ERR_FINDING_APPLICATION_NOT_IN_SAMPLE": 422,
+    "ERR_ACTION_DATE_BEFORE_APPLICATION": 422,
+    "ERR_ACTION_DATE_IN_FUTURE": 422,
+    "ERR_ACTION_DATE_OUTSIDE_ACTIVITY_YEAR": 422,
+    "ERR_INVALID_WINDOW": 422,
+    "ERR_EDIT_RUN_WINDOW_OVERLAP": 409,
+    "ERR_REMEDIATION_WINDOW_OVERLAP": 409,
+    "ERR_DUPLICATE_ULI": 409,
+    "ERR_DUPLICATE_LEI": 409,
+    "ERR_DUPLICATE_DEMOGRAPHIC_ROLE": 409,
+    "ERR_TOO_MANY_RACE_CODES": 422,
+    "ERR_SEVERITY_NOT_VERIFIABLE": 422,
+    "ERR_OPEN_VALIDITY_EDITS": 422,
+    "ERR_VERIFICATION_QUOTA_NOT_MET": 422,
+    "ERR_EMPTY_SAMPLE_POPULATION": 422,
+    "ERR_EMPTY_CONTROL_GROUP": 422,
+}
+
+_DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or the role is not recognised.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorised for this endpoint.",
+    "ERR_INSTITUTION_SCOPE_VIOLATION": "An InstitutionAdmin may only address its own institution.",
+    "ERR_SEGREGATION_OF_DUTIES": "The certifying officer verified an exception on the attached run.",
+    "ERR_INVALID_REQUEST": "The request body or query string is malformed.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, ERROR_STATUS[error_id], message)

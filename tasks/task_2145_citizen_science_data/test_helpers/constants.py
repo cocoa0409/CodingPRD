@@ -1,0 +1,99 @@
+"""Domain thresholds and pinned instants drawn from the PRD's calculations."""
+
+# Logical clock: the value the server reports before any client sets it.
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# The instant most scenarios pin the clock to before building their world.
+BASE_CLOCK = "2026-08-05T09:00:00Z"
+
+THRESHOLDS = {
+    # Quality points
+    "QUALITY_BASE_POINTS": 40,
+    "PHOTO_BONUS_PER_PHOTO": 5,
+    "PHOTO_BONUS_CAP": 20,
+    "TIMELINESS_SAME_DAY_HOURS": 6,
+    "TIMELINESS_NEXT_DAY_HOURS": 24,
+    "TIMELINESS_THREE_DAY_HOURS": 72,
+    "TIMELINESS_FACTOR_FAST": 1.00,
+    "TIMELINESS_FACTOR_DAY": 0.90,
+    "TIMELINESS_FACTOR_THREE_DAY": 0.75,
+    "TIMELINESS_FACTOR_LATE": 0.50,
+    "SITE_FACTOR_MIN": 0.80,
+    "SITE_FACTOR_MAX": 1.50,
+    "CONFIDENCE_BASE": 0.60,
+    "CONFIDENCE_STEP": 0.10,
+    "REVISION_PENALTY_PER_ROUND": 0.15,
+    # Verification consensus
+    "VOTE_WEIGHT_BASE": 0.6,
+    "VOTE_WEIGHT_CONFIDENCE_STEP": 0.1,
+    "QUORUM_MIN_VOTES": 2,
+    "CONFIRM_THRESHOLD": 3.0,
+    "REJECT_THRESHOLD": 3.0,
+    "REVISION_THRESHOLD": 2.0,
+    "MAX_REVISION_ROUNDS": 2,
+    # Volunteer standing
+    "NEUTRAL_QUALITY_SEED": 0.5,
+    "ROLLING_WINDOW_SIZE": 20,
+    "HALF_LIFE_DAYS": 180,
+    "PROBATION_FLOOR": 0.50,
+    "SUSPENSION_CONSECUTIVE_REJECTIONS": 3,
+    "STREAK_INTERVAL": 5,
+    "STREAK_BONUS_POINTS": 5,
+    "MILESTONE_POINTS": 25,
+    # Recognition bands / tiers
+    "TIER_PLATINUM_FLOOR": 0.90,
+    "TIER_GOLD_FLOOR": 0.75,
+    "TIER_SILVER_FLOOR": 0.60,
+    "BAND_MULTIPLIER_PLATINUM": 1.50,
+    "BAND_MULTIPLIER_GOLD": 1.25,
+    "BAND_MULTIPLIER_SILVER": 1.10,
+    "BAND_MULTIPLIER_BRONZE": 1.00,
+    # Coverage
+    "COVERAGE_GAP_CEILING": 0.50,
+    "COVERAGE_MET_RATIO": 1.00,
+    "SATURATION_MULTIPLIER": 2,
+    # Photo screening
+    "PHOTO_TIME_TOLERANCE_HOURS": 2,
+    "PHOTO_GEO_TOLERANCE_METERS": 250.00,
+    "METERS_PER_DEGREE": 111320.0,
+    # Equipment
+    "DRIFT_PPM_PER_HOUR": 0.75,
+    "DAMAGE_PENALTY_PPM": 200.00,
+    "OVERDUE_PENALTY_PPM": 100.00,
+    "QUARANTINE_HOURS": 48,
+    "POST_RETURN_TAIL_HOURS": 48,
+    "CALIBRATION_SERVICE_FLOOR_PPM": 500.00,
+    "CALIBRATION_RETIRE_FLOOR_PPM": 1000.00,
+    "CALIBRATION_VALID_DAYS": 365,
+    # Certification / exam
+    "EXAM_PASS_MARK": 70,
+    "DEFAULT_CERTIFICATION_VALID_DAYS": 365,
+    "LEVEL_RANK": {"BASIC": 1, "ADVANCED": 2, "EXPERT": 3},
+    # Publication
+    "PUBLICATION_MIN_RECORDS": 2,
+    "QUALITY_FLOOR_FACTOR": 0.80,
+    # Campaign archival
+    "ARCHIVE_GRACE_DAYS": 30,
+    # Expert discipline
+    "RETRACTED_CONFIRM_SUSPEND_AT": 2,
+}
+
+TEST_DEFAULTS = {
+    "PROTOCOL_CODE": "BBS-2026",
+    "PROTOCOL_TITLE": "Breeding Bird Survey 2026",
+    "MIN_PHOTO_COUNT": 1,
+    "MAX_SUBMISSION_LAG_HOURS": 96,
+    "CAMPAIGN_NAME": "Autumn Count",
+    "SEASON_START": "2026-08-01",
+    "SEASON_END": "2026-10-31",
+    "TARGET_PER_SITE": 3,
+    "SITE_CODE": "S-HI",
+    "SITE_LAT": 44.0,
+    "SITE_LON": -70.0,
+    "SITE_PRIORITY_WEIGHT": 1.5,
+    "TRAINER_WEIGHT": 1.00,
+    "VERIFIER_WEIGHT": 2.00,
+    "EXAM_SCORE": 88,
+    "SPECIES_CODE": "BAEA",
+    "FAR_FUTURE_CALIBRATION": "2027-01-01T00:00:00Z",
+}

@@ -1,0 +1,65 @@
+"""Domain thresholds and shared test values drawn from the PRD's stated rules."""
+
+# The logical clock's startup value before any explicit set.
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+
+THRESHOLDS = {
+    "MIN_ATTENDANCE_RATIO": 0.80,
+    "DEMO_PASS_SCORE": 70,
+    "MAX_DEMO_ATTEMPTS": 3,
+    "FACILITY_TURNOVER_BUFFER_MINUTES": 30,
+    "CREDENTIAL_BASE_TERM_DAYS": 365,
+    "GRACE_PERIOD_DAYS": 60,
+    "RENEWAL_TIER_HOURS_STANDARD": 8.0,
+    "RENEWAL_TIER_HOURS_WATCH": 12.0,
+    "RENEWAL_TIER_HOURS_PROBATION": 16.0,
+    "EXTENSION_DAYS_PER_SURPLUS_HOUR": 5,
+    "EXTENSION_DAYS_CAP": 90,
+    "DEPRECIATION_PCT_PER_MONTH": 0.015,
+    "RESIDUAL_FLOOR_PCT": 0.40,
+    "DAYS_PER_DEPRECIATION_MONTH": 30,
+    "READINESS_CORE_WEIGHT": 60.0,
+    "READINESS_DEMO_WEIGHT": 40.0,
+    "EXERCISE_BONUS_PER_CREDITED": 2.5,
+    "EXERCISE_BONUS_CAP": 10.0,
+    "IMPUTED_PENDING_DEMO_SCORE": 70,
+    "AAR_MIN_SUMMARY_CHARS": 40,
+}
+
+RECENCY_FACTORS = {
+    "TIER_1_DAYS": 90,
+    "TIER_2_DAYS": 180,
+    "TIER_3_DAYS": 365,
+    "TIER_1": 1.00,
+    "TIER_2": 0.90,
+    "TIER_3": 0.75,
+    "STALE": 0.50,
+}
+
+ROLE_MULTIPLIERS = {
+    "TEAM_LEADER": 1.50,
+    "SEARCH_RESCUE": 1.25,
+    "MEDICAL": 1.25,
+    "LOGISTICS": 1.00,
+    "OBSERVER": 0.50,
+}
+
+RESPONSE_WINDOW_MINUTES = {
+    "ROUTINE": 240,
+    "URGENT": 120,
+    "CRITICAL": 60,
+}
+
+TEST_DEFAULTS = {
+    "PROGRAM_BUDGET_CENTS": 5_000_000,
+    "SEAT_CAPACITY": 2,
+    "FACILITY_CAPACITY": 40,
+    "INSTRUCTOR_MAX_DAILY_HOURS": 8.0,
+    "COHORT_WINDOW_START": "2026-08-01T00:00:00Z",
+    "COHORT_WINDOW_END": "2026-12-31T23:00:00Z",
+    "INSTRUCTOR_CERT_EXPIRY": "2028-01-01T00:00:00Z",
+    "AAR_SUMMARY": "Drill after-action review: objectives met, communications gaps logged for follow-up.",
+}
+
+# A well-formed UUID that matches no row of any entity type.
+UNKNOWN_UUID = "11111111-2222-4333-8444-555555555555"

@@ -1,0 +1,50 @@
+"""Numeric constants the PRD's calculations pin."""
+
+# Logical clock (PRD 2.5)
+CLOCK_START_UTC = "2026-08-01T00:00:00.000Z"
+
+THRESHOLDS = {
+    # Part-time line (PRD 3.2)
+    "MIN_PART_TIME_HOURS": 20,
+    # Adverse-impact statistics (PRD 3.5)
+    "FOUR_FIFTHS_THRESHOLD": 0.80,
+    "SD_THRESHOLD": 2.0,
+    "MIN_FOCAL_CLASS_SIZE": 3,
+    # OWBPA windows (PRD 3.6 / 3.9)
+    "OWBPA_PROTECTED_AGE": 40,
+    "GROUP_CONSIDERATION_DAYS": 45,
+    "INDIVIDUAL_CONSIDERATION_DAYS": 21,
+    "UNPROTECTED_CONSIDERATION_DAYS": 14,
+    "REVOCATION_DAYS": 7,
+    # Severance schedule (PRD 3.8)
+    "WEEKS_CAP": 52,
+    "RELEASE_BONUS_WEEKS": 2,
+    "WEEKS_PER_YEAR_DIVISOR": 52,
+    "NOTICE_DAILY_DIVISOR": 7,
+    "SUBSIDY_TIER_1_CEILING": 1000000,
+    "SUBSIDY_TIER_2_CEILING": 2500000,
+    "SUBSIDY_RATE": 0.65,
+    "OUTPLACEMENT_STANDARD_FEE_CENTS": 120000,
+    "OUTPLACEMENT_PREMIUM_FEE_CENTS": 350000,
+    # Offer cycle (PRD 3.9)
+    "MAX_ISSUE_COUNT": 3,
+    "OFFER_COOLDOWN_DAYS": 1,
+    # Rehire restrictions (PRD 3.10)
+    "RESTRICTION_DAYS": 90,
+    # Weight arithmetic (PRD 3.1)
+    "WEIGHT_TOTAL": 100,
+}
+
+TEST_DEFAULTS = {
+    "SEVERANCE_BUDGET_CENTS": 20000000,
+    "MONTHLY_PREMIUM_CENTS": 90000,
+    "SEPARATION_DATE": "2026-12-01",
+}
+
+# Pagination bounds (PRD 2.3)
+PAGINATION = {
+    "DEFAULT_LIMIT": 10,
+    "MIN_LIMIT": 1,
+    "MAX_LIMIT": 100,
+    "DEFAULT_OFFSET": 0,
+}

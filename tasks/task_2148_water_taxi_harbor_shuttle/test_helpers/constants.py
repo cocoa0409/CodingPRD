@@ -1,0 +1,81 @@
+"""Numeric thresholds and defaults taken from the PRD's rules."""
+
+# Posture ladder (PRD 3.2)
+POSTURE_THRESHOLDS = {
+    "WIND_SUSPEND_KT": 35.0,
+    "WAVE_SUSPEND_M": 2.50,
+    "WIND_RESTRICT_KT": 22.0,
+    "WAVE_RESTRICT_M": 1.20,
+    "LOW_WATER_RESTRICT_M": 1.80,
+}
+
+# Event surge plan (PRD 3.2)
+SURGE = {
+    "ELEVATED_FLOOR": 15000,
+    "PEAK_FLOOR": 30000,
+    "MULTIPLIER_BP_NONE": 10000,
+    "MULTIPLIER_BP_ELEVATED": 12500,
+    "MULTIPLIER_BP_PEAK": 15000,
+    "EXTRA_VESSELS_NONE": 0,
+    "EXTRA_VESSELS_ELEVATED": 1,
+    "EXTRA_VESSELS_PEAK": 2,
+}
+
+# Effective capacity (PRD 3.3)
+CAPACITY = {
+    "POSTURE_FACTOR_NORMAL_PCT": 100,
+    "POSTURE_FACTOR_RESTRICTED_PCT": 70,
+    "POSTURE_FACTOR_SUSPENDED_PCT": 0,
+    "DERATE_CLEARANCE_M": 0.60,
+    "CREW_LIMITED_CAP": 24,
+    "STANDING_BONUS": 12,
+}
+
+# Fare quote (PRD 3.5)
+FARE = {
+    "ZONE_BASE_CENTS": 450,
+    "ZONE_STEP_CENTS": 275,
+    "MODE_MULT_BP_ON_DEMAND": 14000,
+    "MODE_MULT_BP_SCHEDULED": 10000,
+}
+
+# Pass tiers and retail per-ride prices (PRD 3.5)
+ZONE_TIER_MAX_SPAN = {"INNER": 1, "OUTER": 3}
+RETAIL_PER_RIDE_CENTS = {"INNER": 1100, "OUTER": 1800, "ALL_ZONE": 2600}
+
+# Landing fee rebate ladder and monthly cap behaviour (PRD 3.8)
+REBATE = {
+    "TIER1_FLOOR_CENTS": 200000,
+    "TIER1_BP": 800,
+    "TIER2_FLOOR_CENTS": 500000,
+    "TIER2_BP": 1500,
+    "PRE_LOCKED_BP": 10000,
+}
+
+# Safety ladder constants (PRD 3.7)
+SAFETY = {
+    "MIN_UNDER_KEEL_CLEARANCE_M": 0.30,
+    "MAX_DEFICIENCIES_RESTRICTED": 2,
+    "ANNUAL_INSPECTION_VALID_DAYS": 365,
+}
+
+# Dispatch and refunds (PRD 3.6, 3.9)
+MAX_OFFER_ROUNDS = 3
+PARTIAL_LEG_SHARE_BP = 5000
+CASH_REFUND_CAP_CENTS = 5000
+
+# Pagination (PRD 2.3)
+PAGINATION = {"DEFAULT_LIMIT": 10, "MIN_LIMIT": 1, "MAX_LIMIT": 100, "DEFAULT_OFFSET": 0}
+
+# The logical clock's value before any HarborAdmin moves it (PRD 2.5)
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# Values reused across test scenarios.
+TEST_DEFAULTS = {
+    "SERVICE_DATE": "2026-09-12",
+    "CLOCK_UTC": "2026-09-12T13:00:00Z",
+    "CERT_EXPIRES_ON": "2027-12-31",
+    "MEDICAL_EXPIRES_ON": "2027-12-31",
+    "ANNUAL_PERFORMED_ON": "2026-08-01",
+    "PASS_VALID_UNTIL": "2026-12-31",
+}

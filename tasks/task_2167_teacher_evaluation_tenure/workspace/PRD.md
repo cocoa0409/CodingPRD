@@ -1,0 +1,422 @@
+# Teacher Evaluation & Tenure Progression API — Product Requirements Document
+
+## 1. Introduction
+
+District human-resources offices carry an obligation that is unusual among administrative systems: every professional judgement they record about a teacher is simultaneously a personnel action, a contractual act under a collective bargaining agreement, and a data point in a state-reported rating distribution. An evaluation year begins with a district policy that fixes rubric weights, observation quotas and tenure thresholds; it proceeds through scheduled classroom observations that are scored against a four-domain rubric, evidenced by artifacts contributed by both the observer and the observed, and blended with student-growth measures into a single composite rating; and it ends either quietly, in a closed cycle, or noisily, in an improvement plan, an appeal, a union grievance, or a tenure recommendation that a second administrator must independently ratify.
+
+The pain the district feels today is not that any one of those steps is hard. It is that they interact. A principal's certification lapses mid-year and the observations they have already scheduled must disappear without corrupting the cycles that depend on them. An evidence artifact is withdrawn a day before finalization and quietly moves a rating from `EFFECTIVE` to `DEVELOPING`. An appeal panelist turns out to have been one of the observers, which invalidates the panel. A stipend is committed against a building's evaluation budget when an observation is submitted and must be released — exactly, to the cent — when that observation is returned for rescoring. Spreadsheets and email cannot hold these invariants, and when they fail the district is exposed to a grievance it will lose.
+
+This document specifies a REST API for the district evaluation office that holds those invariants mechanically. It covers policy and personnel configuration, evaluator calibration and certification, observation scheduling and rubric scoring, evidence collection, student-growth reporting, the two-variant composite calculation, remediation planning, the appeal and grievance interface, tenure progression under segregation of duties, and rating-distribution reporting. All monetary amounts are integer cents. All instants the system reasons about — deadlines, expiries, service-year arithmetic — are read from a logical district clock rather than from wall-clock time, so that a full evaluation year can be exercised deterministically.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, naming the capacity in which they act. If either header is absent, or if `X-User-Role` does not name one of the five declared roles, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). When both headers are well-formed but the named role is not among the roles authorised for the endpoint being called, the rejection is `ERR_UNAUTHORIZED` (HTTP 403).
+
+The five roles are `HrAdmin`, `Evaluator`, `Teacher`, `AppealPanelist` and `UnionRep`.
+
+An `HrAdmin` is a district human-resources or evaluation-office operator. They own configuration, the cycle lifecycle, observation adjudication, calibration decisions, remediation and tenure. When `X-User-Role` is `HrAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server never compares it to any entity's `id`. It is, however, recorded where a rule needs to distinguish one administrator from another — specifically, a tenure recommendation stamps the recommending operator's `X-User-ID` onto the educator's `tenure_recommended_by_user_id`, and the subsequent grant-or-deny decision compares the deciding operator's `X-User-ID` against that stored value.
+
+When `X-User-Role` is `Evaluator`, `X-User-ID` is the `id` of the acting `Evaluator` record; ownership checks on any resource that references an `Evaluator` compare the resource's foreign-key field to `X-User-ID`. Concretely, an evaluator may conduct, rubric-score and submit only those observations whose `evaluator_id` equals their own `X-User-ID`.
+
+When `X-User-Role` is `Teacher`, `X-User-ID` is the `id` of the acting `Educator`; ownership checks on any resource that references an `Educator` compare the resource's foreign-key field to `X-User-ID`. A teacher acts only on the cycles, observations, evidence artifacts and appeals that trace back — through the owning cycle where necessary — to their own educator record.
+
+When `X-User-Role` is `AppealPanelist`, `X-User-ID` is likewise the `id` of an `Evaluator` record: a certified evaluator seconded to an appeal panel. Ownership checks that name a panelist compare `Appeal.panelist_evaluator_id` to `X-User-ID`.
+
+When `X-User-Role` is `UnionRep`, `X-User-ID` is an opaque operational identifier not tied to any persisted entity, and the server never compares it to any entity's `id`. A union representative files grievances on behalf of educators and may withdraw them, but may not sustain or deny one.
+
+Two further access failures are distinguished from plain authorisation. An entity-backed role acting on a resource whose owning foreign key is not its `X-User-ID` is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403). A request that would breach one of the two segregation-of-duties rules described in §2.11 is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every list endpoint accepts two optional query parameters. `limit` controls page size: it defaults to 10, may not be lower than 1, and may not exceed 100. `offset` controls the starting position within the result set: it defaults to 0 and may not be negative. A `limit` or `offset` outside those bounds, or one that is not an integer, is a malformed request and is rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+
+Unless a specific listing states otherwise, results are ordered by `created_at` ascending. The `meta` object of a list response carries `limit`, `offset`, `total_count` and `has_more`, where `total_count` is the size of the full filtered result set before the page window is applied and `has_more` is true exactly when further records remain beyond the current window.
+
+### 2.4. Resource Identity, Timestamps and Version Semantics
+
+Every resource the API mints carries an `id` that is a server-generated UUID with no type prefix — clients never supply one, and the string never encodes the entity kind. Alongside it, every resource carries `created_at`, an ISO 8601 UTC timestamp with three fractional digits recorded at creation from the logical district clock.
+
+All thirteen resource kinds in this system — evaluation policies, schools, educators, evaluators, evaluation cycles, observations, rubric scores, evidence artifacts, growth measures, improvement plans, appeals, grievances and calibration reviews — additionally carry `updated_at` and `version`. `updated_at` is an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of that resource. `version` is an integer that begins at 1 when the resource is created and increases by exactly 1 on every mutation of that resource, whether the mutation was requested directly or arrived as a cascade from another entity's transition.
+
+The version counter is the backbone of the guarded-write mechanism in §2.7, and it is also the system's audit trail: when a rubric score bumps an observation, when an evidence artifact bumps its cycle, when a suspended evaluator's cascade voids observations and bubbles their cycles backwards, each affected resource's `version` moves and its `updated_at` is refreshed. Where a transition explicitly states that it increments a *parent* resource's version, that increment happens in addition to the child's own.
+
+Two computed convenience fields exist specifically so that a client can chain guarded writes without an intervening read. `RubricScore.observation_version_after` carries the observation's `version` immediately after that score was recorded, and `GrowthMeasure.cycle_version_after` carries the cycle's `version` immediately after that measure was recorded.
+
+### 2.5. The Bound Policy Row Is the Only Source of Constants
+
+Every district-configurable number this system consults is read from the `EvaluationPolicy` row bound to the cycle in question, never from a global default and never from a hard-coded value. A cycle names its policy at creation through `policy_id`, and from that moment every threshold that governs the cycle's arithmetic — rubric domain weights, observation quotas, banding cut points, remediation windows, appeal windows, tenure thresholds, formal-observation spacing, calibration tolerance and the stipend rate — is that policy's.
+
+Where a rule operates on an educator rather than a cycle — tenure eligibility, most obviously — the policy consulted is the one bound to that educator's most recent evaluation cycle, ordered by `school_year` ascending and then by `created_at` ascending. Where a rule operates on an evaluator, the calibration decision names its policy explicitly in the request.
+
+The policy is created with a `school_year` label in `YYYY-YYYY` form, and every other field takes a declared default when omitted. The composite split defaults to 60 percent observation and 40 percent growth: `observation_weight_pct` defaults to 60 and `growth_weight_pct` to 40, each must lie between 0 and 100 inclusive, and the two must sum to exactly 100. The four rubric domain weights default to 22 for `planning_weight_pct`, 23 for `environment_weight_pct`, 33 for `instruction_weight_pct` and 22 for `professionalism_weight_pct`, and they too must sum to exactly 100. `required_formal_count` defaults to 2 and must be at least 1; `required_informal_count` defaults to 1 and must be at least 0. `unannounced_multiplier` defaults to 1.10 and `informal_cap` to 3.50. The three banding cut points default to 3.50 for `highly_effective_threshold`, 2.50 for `effective_threshold` and 1.50 for `developing_threshold`. `evidence_min_artifacts` defaults to 2. `remediation_days` defaults to 90 and `max_plan_extension_days` to 45. `appeal_window_days` defaults to 15. `tenure_required_years` defaults to 3 and `tenure_min_consecutive_effective` to 2. `min_days_between_formals` defaults to 10. `calibration_drift_tolerance` defaults to 0.50 and `calibration_max_consecutive_failures` to 2. `observation_stipend_cents` defaults to 12500 — one hundred and twenty-five dollars per formal observation.
+
+A request that violates any of those bounds — a weight outside 0 to 100, a domain-weight set that does not sum to 100, an observation-and-growth split that does not sum to 100, a `required_formal_count` below 1 — is rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+
+### 2.6. Precision, Rounding and Score Bounds
+
+All rounding in this system is half-up: a value exactly halfway between two representable results rounds away from zero. There is no banker's rounding anywhere.
+
+Three precisions are in play, and they are not interchangeable. A single rubric domain contribution, an observation's `weighted_score`, a calibration `deviation`, an evaluator's two drift figures, a cycle's `composite_score`, an appeal's `adjusted_composite` and every reported percentage all carry **2 decimal places**. A cycle's `observation_component` and `growth_component` carry **4 decimal places** — they are intermediate quantities and are deliberately held at higher precision than the composite they feed. Monetary amounts are **integer cents** with no fractional part.
+
+Every score in the district's professional-practice space lives on a four-point scale whose floor is 1.00 and whose ceiling is 4.00. Wherever a computed score could fall outside that band — most notably after the evidence-sufficiency adjustment described in §3.6 — it is clamped so that it is never below 1.00 and never above 4.00.
+
+### 2.7. Guarded Writes and Stale-Version Rejection
+
+Three write operations are guarded by optimistic concurrency control, because in each case a second write is a perfectly legitimate product operation that supersedes the first, and only a version check can tell a client working from a current view apart from one working from a superseded one.
+
+Recording a rubric domain score against an observation requires `expected_observation_version` in the request body. It is not optional. The value must equal that observation's current `version`; if the observation's version has advanced since the client last read it, the write is rejected with `ERR_STALE_OBSERVATION_VERSION` (HTTP 412).
+
+Reporting a student-growth measure against a cycle requires `expected_cycle_version` in the request body, again non-optional. The value must equal that cycle's current `version`; a mismatch is rejected with `ERR_STALE_CYCLE_VERSION` (HTTP 412).
+
+Extending an improvement plan's remediation deadline requires `expected_plan_version` in the request body, non-optional. The value must equal that plan's current `version`; a mismatch is rejected with `ERR_STALE_PLAN_VERSION` (HTTP 412). Because extension days accumulate against a cap, this guard is what prevents an operator from granting days against a due date that has already moved.
+
+No other write in the system takes a version field, and none may be supplied one.
+
+### 2.8. The Order in Which a Request Is Screened
+
+When several checks could reject the same request, the order in which they are evaluated is fixed, because the error the caller receives must be predictable. Checks are applied in this sequence, and the first one that fails determines the response:
+
+1. **Authentication.** Both headers present and `X-User-Role` a declared role, else `ERR_UNAUTHENTICATED`.
+2. **Role authorisation.** The acting role appears in the endpoint's authorised list, else `ERR_UNAUTHORIZED`.
+3. **Request shape.** Body fields present, correctly typed, inside their declared ranges and drawn from their declared enumerations, else `ERR_INVALID_REQUEST`. This is where a `raw_score` outside the integers 1 through 4, an `index_value` outside 1.00 to 4.00, a `coverage_pct` that is not greater than 0 or is greater than 100, a `scheduled_end` that is not strictly after its `scheduled_start`, an `adjusted_composite` outside 1.00 to 4.00, a rubric domain weight set that does not total 100, or an `observation_weight_pct` and `growth_weight_pct` pair that does not total 100 is caught.
+4. **Existence.** Every resource named in the path and every foreign key in the body must exist. Path segments are resolved left to right, and body foreign keys are then resolved in the order the endpoint declares its input fields. The rejection is the most specific 404 available: `ERR_EDUCATOR_NOT_FOUND`, `ERR_EVALUATOR_NOT_FOUND`, `ERR_CYCLE_NOT_FOUND`, `ERR_OBSERVATION_NOT_FOUND`, `ERR_PLAN_NOT_FOUND` or `ERR_APPEAL_NOT_FOUND` for those six kinds, and `ERR_RESOURCE_NOT_FOUND` for a missing school, policy, growth measure, evidence artifact, grievance or calibration review.
+5. **Resource ownership.** For an entity-backed role, `X-User-ID` must equal the resource's owning foreign key, else `ERR_NOT_RESOURCE_OWNER`. This check guards exactly six operations: scheduling an observation, marking an observation conducted, submitting an observation, attaching an evidence artifact to an observation, withdrawing an evidence artifact, and filing an appeal.
+6. **Segregation of duties**, else `ERR_SEGREGATION_OF_DUTIES`. This check guards exactly two operations: opening review of an appeal, and issuing a tenure grant-or-deny decision.
+7. **Stale version.** The supplied `expected_observation_version`, `expected_cycle_version` or `expected_plan_version` must equal the parent's current `version`, else the corresponding 412 from §2.7. This check guards exactly three operations: recording a rubric score, reporting a growth measure, and extending an improvement plan.
+8. **State.** The target resource must be in a state from which the requested transition is declared, including the guards the parent cycle's `status` and `dispute_state` impose. The rejection is `ERR_OBSERVATION_STATE_INVALID`, `ERR_CYCLE_STATE_INVALID`, `ERR_PLAN_STATE_INVALID`, `ERR_APPEAL_STATE_INVALID`, `ERR_GRIEVANCE_STATE_INVALID` or `ERR_TENURE_STATE_INVALID` according to the entity whose state was wrong, each HTTP 409. This applies to every state-transition endpoint.
+9. **Employee-number uniqueness**, on educator registration only: `ERR_DUPLICATE_EMPLOYEE_NUMBER` (HTTP 409).
+10. **Evaluator certification**, `ERR_EVALUATOR_NOT_CERTIFIED` (HTTP 422), guarding exactly three operations: scheduling an observation, marking an observation conducted, and opening review of an appeal.
+11. **Certification currency**, `ERR_EVALUATOR_CERTIFICATION_LAPSED` (HTTP 422), guarding exactly two operations: scheduling an observation and marking an observation conducted.
+12. **Dispute quiescence**, `ERR_DISPUTE_IN_PROGRESS` (HTTP 409), guarding exactly six scoring-side operations: scheduling an observation, marking an observation conducted, submitting an observation, returning an observation, submitting a cycle, and finalizing a cycle.
+13. **Evaluator window conflict**, `ERR_EVALUATOR_WINDOW_CONFLICT` (HTTP 409), on observation scheduling.
+14. **Formal-observation spacing**, `ERR_FORMAL_SPACING_VIOLATION` (HTTP 409), on observation scheduling.
+15. **Appeal window open**, `ERR_APPEAL_WINDOW_CLOSED` (HTTP 422), on appeal filing.
+16. **Appeal window elapsed**, `ERR_CLOSE_BEFORE_APPEAL_DEADLINE` (HTTP 422), on cycle closure.
+17. **Plan not past due**, `ERR_PLAN_PAST_DUE` (HTTP 422), guarding exactly two operations: extending an improvement plan and closing an improvement plan.
+18. **Cycle observation completeness**, `ERR_CYCLE_OBSERVATIONS_PENDING` (HTTP 422), guarding exactly two operations: submitting a cycle and finalizing a cycle.
+19. **Internal remedy exhausted**, `ERR_APPEAL_NOT_EXHAUSTED` (HTTP 422), on grievance filing.
+20. **Plan extension cap**, `ERR_PLAN_EXTENSION_LIMIT` (HTTP 422), on plan extension.
+21. **Tenure eligibility**, `ERR_TENURE_NOT_ELIGIBLE` (HTTP 422), on tenure recommendation.
+22. **Building budget**, `ERR_EVALUATION_BUDGET_EXCEEDED` (HTTP 402), on observation submission.
+
+Note in particular that ownership precedes segregation of duties, that both precede the stale-version check, and that the stale-version check precedes the state check — a client scoring a stale observation that is also in the wrong state receives the 412, not the 409. Note equally that the state check precedes every business-safety and business-temporal check below it: an observation whose evaluator is uncertified but which is also in a state that forbids the transition is rejected on state.
+
+### 2.9. Path Resolution and Reverse-Reachability Listings
+
+Nested paths are resolved strictly left to right. When a request addresses a growth-measure listing for a cycle, or the rubric scores or evidence artifacts of an observation, the parent is resolved first: a non-existent cycle yields `ERR_CYCLE_NOT_FOUND` and a non-existent observation yields `ERR_OBSERVATION_NOT_FOUND` before the child collection is considered at all. Only once the parent resolves does the child filter apply, and a child that exists but belongs to a different parent is treated as absent.
+
+Because foreign keys are never exposed as separately addressable sub-paths, each relationship in the model has a listing that makes it reachable in the reverse direction. Educators are filterable by `school_id` and `tenure_status`; cycles by `educator_id`, `policy_id`, `school_year`, `status` and `dispute_state`; observations by `cycle_id`, `evaluator_id`, `status` and `observation_type`; rubric scores by `domain_code` within an observation, superseded rows included; evidence artifacts by `status` within an observation; growth measures by `status` and `measure_code` within a cycle; calibration reviews by `outcome` within an evaluator, ordered by `created_at` ascending; improvement plans by `cycle_id`, `educator_id`, `prior_plan_id` and `status`, ordered by `created_at` ascending; appeals by `cycle_id`, `educator_id`, `panelist_evaluator_id` and `status`; and grievances by `appeal_id`, `educator_id` and `status`.
+
+### 2.10. Ledger Invariants
+
+Two ledgers must hold at all times, and both are maintained by exact compensation rather than by recomputation from a log.
+
+The **stipend ledger** binds a building to the observations of the educators it houses. At every instant, a school's `evaluation_budget_committed_cents` equals the sum of `stipend_cents` over all observations whose cycle's educator has that school's `id` as their `school_id` and whose `status` is either `SUBMITTED` or `ACCEPTED`. Observations in any other status contribute nothing and carry a `stipend_cents` of 0. A school's `evaluation_budget_remaining_cents` is always its `evaluation_budget_allocated_cents` minus its `evaluation_budget_committed_cents`; `evaluation_budget_allocated_cents` defaults to 100000 at building creation and may not be negative, and both computed figures start at their derived values of 0 and the full allocation respectively.
+
+The **evidence ledger** binds artifacts to observations and observations to cycles. An observation's `evidence_count` is the number of its evidence artifacts whose `status` is `ATTACHED`; withdrawal is the exact compensating action for attachment and decreases the count by one. A cycle's `evidence_artifact_count` is the sum of `evidence_count` across the cycle's observations whose `status` is not `VOIDED` — so voiding an observation removes its artifacts from the cycle's tally without touching the artifacts themselves.
+
+### 2.11. Segregation of Duties and the Logical District Clock
+
+Two decisions in this system may not be taken by a party with a prior stake in them, and both are enforced by comparing identifiers rather than by policy text.
+
+An appeal panelist may not have evaluated the cycle under appeal. When an `AppealPanelist` opens review, the acting evaluator identified by `X-User-ID` must not be the `evaluator_id` of any observation of the appealed cycle whose `status` is `SUBMITTED` or `ACCEPTED`. A tenure decision may not be taken by the operator who recommended it: the deciding `HrAdmin`'s `X-User-ID` must differ from the educator's stored `tenure_recommended_by_user_id`. Either breach yields `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+Every deadline, expiry, service-year computation and scheduling comparison in this specification reads the server's **logical district clock**, never wall-clock time. Before any operator sets it, the logical clock reads exactly `2026-08-01T00:00:00Z`, and it never falls back to real time. An `HrAdmin` may advance or rewind it through an administrative test-driving capability that takes a single `to_iso8601` instant; every subsequent comparison — completed service years, plan `due_at`, cycle `appeal_deadline`, evaluator certification expiry — reads the new instant.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a District Evaluation Year
+
+An evaluation year starts in the HR office. An `HrAdmin` first writes the district's evaluation policy for the year, supplying a `school_year` label and accepting or overriding each of the configurable constants catalogued in §2.5. Nothing else in the system may be created until a policy exists, because every downstream calculation reads its numbers from a policy row.
+
+Buildings come next. A school is registered with its `name`, a district-unique short `code`, and a `level` drawn from `ELEMENTARY`, `MIDDLE` and `HIGH`. Its stipend purse — `evaluation_budget_allocated_cents` — may be supplied or left to default; from that moment the building's `evaluation_budget_committed_cents` and `evaluation_budget_remaining_cents` are maintained as described in §2.10 and are visible on every read of the building.
+
+Educators are registered against a building. The registration payload carries the `school_id` of that building, the district `employee_number`, the educator's `full_name`, and the `service_start_date` on which continuous district service began, written as a plain `YYYY-MM-DD` date. Employee numbers are unique across the whole district; a second registration reusing one is rejected with `ERR_DUPLICATE_EMPLOYEE_NUMBER`. A newly registered educator's `tenure_status` is `PROBATIONARY`, their `last_composite_rating` is null, their `tenure_recommended_by_user_id` is null, their `tenure_track_hold` is false, and their `consecutive_effective_years` is 0. Their `completed_service_years` is computed immediately against the logical clock: it is the number of whole days elapsed from `service_start_date` to the clock's current date, divided by 365 and rounded down to a whole number of years. That figure, along with `consecutive_effective_years` and `tenure_track_hold`, is recomputed on every read of the educator, so a reader always sees the educator as they stand at the clock's current instant.
+
+Evaluators are registered with nothing more than a `full_name`. A new evaluator's `certification_status` is `PROVISIONAL`, their `certification_expires_on` is null, their `consecutive_failed_calibrations` and `passed_calibration_count` are both 0, and both drift figures — `calibration_drift_rolling` and `calibration_drift_anchor` — are 0. A `PROVISIONAL` evaluator can neither be named on a new observation nor mark one conducted; they must be certified first.
+
+An evaluation cycle is opened by an `HrAdmin` for one educator in one school year. The opening payload names the `educator_id` under evaluation, the `policy_id` whose constants will govern every number the cycle produces, the `school_year` label, and an optional `cycle_type` of `COMPREHENSIVE` or `FOCUSED`, defaulting to `COMPREHENSIVE`. A new cycle begins with `status` of `SCHEDULING` and `dispute_state` of `NONE`. Those two dimensions are genuinely independent: `status` tracks the cycle from scheduling through closure, `dispute_state` tracks appeal and grievance progression, and each advances on triggers that have nothing to do with the other. A cycle can sit at `status` `SCORING` while its `dispute_state` reads `APPEAL_RESOLVED`. All of the cycle's derived quantities — `completed_formal_count`, `completed_informal_count`, `evidence_artifact_count` at 0, and `observation_component`, `growth_component`, `composite_score`, `composite_rating`, `composite_variant`, `finalized_at` and `appeal_deadline` all null, with `evidence_adjustment` at 0 — start empty and are filled by the work described below.
+
+### 3.2. Evaluator Calibration and the Certification Cycle
+
+Certification is earned, kept and lost entirely through calibration. A calibration review is a blind re-score: an `HrAdmin` records that a named evaluator, identified by `evaluator_id`, scored a district anchor lesson identified by a free-text `anchor_lesson_code` at `evaluator_score`, against the master scorers' consensus `anchor_score`. Both scores lie on the four-point scale between 1.00 and 4.00 inclusive. At creation the review's `deviation` is computed as the absolute difference between `evaluator_score` and `anchor_score`, rounded half-up to two decimal places, and the review's `outcome` is left at `PENDING`. Creation alone changes nothing about the evaluator.
+
+Resolving the review is a separate act, and it names the `policy_id` whose `calibration_drift_tolerance` the review is judged against. The review resolves to `PASS` when its `deviation` is at or below that tolerance, and to `FAIL` when the deviation exceeds it — the comparison is inclusive on the passing side, so a deviation exactly equal to the tolerance passes. Resolution assigns the review a `sequence_index`, the 1-based position of this review among the evaluator's decided reviews ordered by `created_at` ascending, and only a review whose `outcome` is still `PENDING` may be resolved — a review that already reads `PASS` or `FAIL` is terminal and cannot be decided again. A calibration review that does not exist at all yields `ERR_RESOURCE_NOT_FOUND`.
+
+Once the review's own outcome is settled, the evaluator's two drift figures are recomputed from all of that evaluator's reviews whose `outcome` is `PASS` or `FAIL`, ordered by `created_at` ascending; reviews still `PENDING` are excluded. The **rolling** figure, `calibration_drift_rolling`, is the arithmetic mean of the `deviation` values of the last three such decided reviews — or of all of them when the evaluator has fewer than three — rounded half-up to two decimal places. The **anchor** figure, `calibration_drift_anchor`, is simply the `deviation` of the single most recent decided review, carried at its own two decimals. The two variants are computed on every resolution and both are exposed on the evaluator, but certification consults the rolling figure only: an evaluator whose latest review was flawless but whose three-review window still averages above tolerance is not certified. Consider deviations of 1.00 followed by 0.10 against a tolerance of 0.50 — the anchor figure reads 0.10 and is comfortably inside tolerance, while the rolling figure reads 0.55 and is not, and the evaluator stays uncertified.
+
+The certification state itself cycles. A `PROVISIONAL` evaluator becomes `CERTIFIED` when a review resolves `PASS` *and* the recomputed `calibration_drift_rolling` is at or below the policy's `calibration_drift_tolerance`; on that transition `certification_expires_on` is set to the logical clock's current date plus a one-year certification term of 365 days, `consecutive_failed_calibrations` is reset to 0, and `passed_calibration_count` increases by 1. A `PROVISIONAL` evaluator stays `PROVISIONAL` when a review resolves `PASS` while the rolling figure is still above tolerance, or when it resolves `FAIL` without reaching the suspension threshold; in that case the drift figures are recomputed and the failure counter is updated but `certification_status` does not move.
+
+A `CERTIFIED` evaluator is suspended when a review resolves `FAIL` and, counting that review, `consecutive_failed_calibrations` reaches the policy's `calibration_max_consecutive_failures` — two consecutive failures by default, with the comparison satisfied at or above that count. Suspension clears `certification_expires_on` to null and triggers the system's widest cascade: every observation of that evaluator whose `status` is `SCHEDULED`, `CONDUCTED`, `SCORED` or `RETURNED` transitions to `VOIDED` with `void_reason` set to the literal string `EVALUATOR_SUSPENDED`, and each such voiding then bubbles its cycle from `SCORING` back to `SCHEDULING` whenever no observation of that cycle remains in `CONDUCTED`, `SCORED`, `SUBMITTED`, `RETURNED` or `ACCEPTED`. Observations already `SUBMITTED` or `ACCEPTED` are untouched by the suspension cascade. A `CERTIFIED` evaluator remains `CERTIFIED` when a review resolves `PASS`, or resolves `FAIL` while the consecutive-failure count stays strictly below the suspension threshold; `certification_expires_on` is refreshed to the clock date plus 365 days only on a `PASS`.
+
+A `SUSPENDED` evaluator is restored to `CERTIFIED` by a review that resolves `PASS` while the recomputed `calibration_drift_rolling` is at or below tolerance, which resets `consecutive_failed_calibrations` to 0, increases `passed_calibration_count` by 1, and sets `certification_expires_on` to the clock date plus 365 days. A `SUSPENDED` evaluator stays `SUSPENDED` when a review resolves `FAIL`, or resolves `PASS` while the rolling figure remains above tolerance; the drift figures and failure counter are updated either way. This is the certification cycle in full: `CERTIFIED` to `SUSPENDED` and back to `CERTIFIED`, driven by nothing but calibration outcomes.
+
+### 3.3. Scheduling and Conducting Observations
+
+Scheduling an observation is the point at which the calendar, the certification register and the cycle's dispute posture all have to agree. Either an `Evaluator` or an `HrAdmin` may schedule one; the payload names the `cycle_id` the observation will score, the `evaluator_id` who will conduct it, an `observation_type` of `FORMAL` or `INFORMAL`, and the window as `scheduled_start` and `scheduled_end`, both ISO 8601 UTC instants, with `scheduled_end` strictly after `scheduled_start`. An optional `announced` flag defaults to true; setting it to false marks the visit unannounced, which matters later because only an *unannounced* `FORMAL` observation earns the policy's `unannounced_multiplier`. When an `Evaluator` schedules, their `X-User-ID` must be the `evaluator_id` named in the payload.
+
+Four business checks then apply, in the order §2.8 fixes. The named evaluator's `certification_status` must read `CERTIFIED` — a `PROVISIONAL` or `SUSPENDED` evaluator yields `ERR_EVALUATOR_NOT_CERTIFIED`. The logical clock's date must be on or before that evaluator's `certification_expires_on`; a date after it yields `ERR_EVALUATOR_CERTIFICATION_LAPSED`. The cycle's `dispute_state` must read `NONE`, because scoring-side work stops while a dispute is live; anything else yields `ERR_DISPUTE_IN_PROGRESS`. And the calendar must be clear.
+
+Calendar clearance has two parts. First, the requested window occupies the evaluator's calendar as a half-open interval — the instant at `scheduled_start` is occupied, the instant at `scheduled_end` is not — and it must not intersect the window of any other non-`VOIDED` observation of the same evaluator. Two windows that merely touch, where one ends at precisely the instant the other begins, are adjacent rather than overlapping and are permitted. An intersection yields `ERR_EVALUATOR_WINDOW_CONFLICT`. Second, formal observations of a single educator must be spread out: for a `FORMAL` observation, no other non-`VOIDED` `FORMAL` observation belonging to *any* cycle of that same educator may have a `scheduled_start` closer than the policy's `min_days_between_formals` whole days away. The comparison is strict, so two formals exactly `min_days_between_formals` days apart are acceptable and only a strictly smaller separation is rejected, with `ERR_FORMAL_SPACING_VIOLATION`. Informal observations carry no spacing rule.
+
+A newly scheduled observation begins at `status` `SCHEDULED`, with `scored_domain_count`, `evidence_count`, `stipend_cents` and `return_count` all 0, `weighted_score` null, and `return_reason` and `void_reason` null.
+
+Marking the visit as having happened advances the observation from `SCHEDULED` to `CONDUCTED`, and only the assigned evaluator may do it — the acting `X-User-ID` must equal the observation's `evaluator_id`. That evaluator must still be `CERTIFIED` and still be inside their `certification_expires_on` date at the moment they act, so an evaluator suspended between scheduling and the classroom visit cannot proceed. The owning cycle's `status` must be `SCHEDULING` or `SCORING` and its `dispute_state` must be `NONE`. The first observation of a cycle to reach `CONDUCTED` pulls its cycle from `SCHEDULING` up to `SCORING`, which increments the cycle's `version`; subsequent conducted observations find the cycle already at `SCORING` and leave it alone.
+
+### 3.4. Rubric Scoring, the Revision Loop, and Evidence
+
+The district rubric has exactly four domains, and each is scored once per observation. Recording a domain score is an evaluator-only act guarded by the observation's version: the payload carries a `domain_code` drawn from `PLANNING`, `ENVIRONMENT`, `INSTRUCTION` and `PROFESSIONALISM`, a `raw_score` that is a whole number from 1 through 4 inclusive on the district four-point scale, and the `expected_observation_version` described in §2.7. Every rubric row is written with `superseded` false. Posting a domain that already carries a score is a legitimate correction rather than an error: the earlier row for that observation and that `domain_code` has its `superseded` flag flipped to true, and a superseded row never enters any arithmetic again. The new row records the `observation_id` of the observation it scores, its own `weighted_contribution`, the observation's refreshed `scored_domain_count`, and — as `observation_version_after` — the observation's `version` immediately after the write, so that the client can chain the next domain without an intervening read. Each rubric-score write increments the observation's `version` by 1.
+
+A domain's `weighted_contribution` is the domain's `raw_score` multiplied by that domain's policy weight in percent, multiplied by a factor, divided by 100, and rounded half-up to two decimal places. The domain weights are `planning_weight_pct` for `PLANNING`, `environment_weight_pct` for `ENVIRONMENT`, `instruction_weight_pct` for `INSTRUCTION` and `professionalism_weight_pct` for `PROFESSIONALISM`. The factor is the policy's `unannounced_multiplier` when the observation's `observation_type` is `FORMAL` and its `announced` flag is false, and is exactly 1.00 in every other case — an unannounced `INFORMAL` visit earns no multiplier.
+
+**The rounding order is pinned and it is not negotiable.** Each of the four domain contributions is rounded to two decimal places *first*, and the observation's `weighted_score` is then the sum of those four already-rounded contributions, in the fixed evaluation order `PLANNING`, `ENVIRONMENT`, `INSTRUCTION`, `PROFESSIONALISM`, with no further rounding applied to the sum. Summing the unrounded contributions and rounding once at the end is the wrong order and produces a different result in the common case. To make the difference concrete: raw scores of 3, 2, 4 and 3 across the four domains on an unannounced formal observation, under domain weights of 22, 23, 33 and 22 and a multiplier of 1.10, give per-domain contributions of 0.73, 0.51, 1.45 and 0.73, which sum to 3.42 — whereas summing first to 3.10, applying the multiplier and rounding once would give 3.41.
+
+Two ceilings then apply. An `INFORMAL` observation's `weighted_score` is capped at the policy's `informal_cap`, taking the lower of the summed contributions and that cap. Every other observation is capped at the score ceiling of 4.00. Only the four non-superseded rubric rows, one per domain, contribute.
+
+The observation reaches `SCORED` at the moment the fourth distinct `domain_code` is present, and that is a system transition rather than an operator action: from `CONDUCTED` to `SCORED` when the fourth domain is first recorded, and from `RETURNED` back to `SCORED` when a returned observation — which already carries all four domains — receives a replacement score for any one of them. The `RETURNED` to `SCORED` leg is the return path of the revision loop; it supersedes the prior row for the replaced domain, recomputes `weighted_score`, increments the observation's `version`, and deliberately preserves `return_count` so that the history of how many times the work came back is never erased.
+
+Evidence artifacts hang off observations, and both parties may contribute them: the observing `Evaluator` and the observed `Teacher` can each attach. An artifact records the `observation_id` it evidences, an `artifact_type` drawn from `LESSON_PLAN`, `STUDENT_WORK`, `REFLECTION` and `VIDEO`, and a short `title`. Its `status` begins at `ATTACHED`, and its `submitted_by_role` is recorded from the `X-User-Role` header at attach time as either `EVALUATOR` or `TEACHER`. Attaching increases the owning observation's `evidence_count` by 1, recomputes the cycle's `evidence_artifact_count`, and increments the cycle's `version` by 1.
+
+Withdrawal is the exact compensating action. It moves the artifact from `ATTACHED` to `WITHDRAWN`, decreases the observation's `evidence_count` by 1, recomputes the cycle's `evidence_artifact_count`, and increments the cycle's `version` by 1. Either the evaluator or the teacher may withdraw, subject to the ownership rule of §2.8. Withdrawal is refused when the owning observation's `status` is `VOIDED`, and is permitted only while the owning cycle's `status` is `SCHEDULING`, `SCORING` or `SUBMITTED` — once a cycle is `FINALIZED` or `CLOSED`, its evidence record is frozen. Because a cycle's evidence tally is what the finalization adjustment in §3.6 keys on, a withdrawal in the last hours before finalization can and does move the final rating.
+
+### 3.5. Adjudicating Observations and the Stipend Ledger
+
+A fully scored observation is submitted by the evaluator who owns it — the acting `X-User-ID` must equal the observation's `evaluator_id` — moving it from `SCORED` to `SUBMITTED`. Because only a `SCORED` observation can be submitted, an observation with fewer than four domains is still `CONDUCTED` and is turned away on the state check with `ERR_OBSERVATION_STATE_INVALID`. The owning cycle's `status` must be `SCHEDULING` or `SCORING` and its `dispute_state` must be `NONE`.
+
+Submission is also the moment money moves. The observation's `stipend_cents` is set to the policy's `observation_stipend_cents` when its `observation_type` is `FORMAL`, and to two fifths of that figure — the informal rate is 0.4 of the formal one, rounded half-up to a whole cent — when the type is `INFORMAL`. That amount is then committed: the building's `evaluation_budget_committed_cents` increases by it and `evaluation_budget_remaining_cents` is recomputed. The commitment is checked before it is made, and the building funding an observation is the one named by the `school_id` of the cycle's educator. If committing the stipend would push the school's committed total above its `evaluation_budget_allocated_cents`, the submission is refused with `ERR_EVALUATION_BUDGET_EXCEEDED` (HTTP 402) and nothing moves. A committed total exactly equal to the allocation is permitted; only exceeding it is refused. Submission also refreshes the cycle's `completed_formal_count` and `completed_informal_count`, refreshes `evidence_artifact_count`, recomputes the cycle's `observation_component`, and increments the cycle's `version` by 1.
+
+An `HrAdmin` adjudicates what the evaluator submitted. **Returning** an observation for rescoring moves it from `SUBMITTED` to `RETURNED`, requires a `return_reason` in the payload which is stored on the observation, increases `return_count` by 1, and releases the money: the building's `evaluation_budget_committed_cents` decreases by the observation's `stipend_cents` and that `stipend_cents` is reset to 0. This is exact compensation, not an approximation of one. The cycle's completed counts and `observation_component` are recomputed and the cycle's `version` increments. Return requires the cycle's `status` to be `SCHEDULING` or `SCORING` and its `dispute_state` to be `NONE`. **Accepting** an observation moves it from `SUBMITTED` to `ACCEPTED` and is permitted while the cycle's `status` is `SCHEDULING`, `SCORING` or `SUBMITTED`; acceptance moves no money and disturbs no counter, because a `SUBMITTED` observation's stipend and its contribution to the cycle's counters are already reflected.
+
+**Voiding** removes an observation from the record entirely and is available from every non-terminal state — `SCHEDULED`, `CONDUCTED`, `SCORED`, `RETURNED`, `SUBMITTED` and `ACCEPTED` — provided the owning cycle's `status` is not `CLOSED`. The payload carries a `void_reason`, which is stored; when the void arrives as the cascade from an evaluator's suspension rather than from an operator, the stored reason is the literal `EVALUATOR_SUSPENDED`. Voiding an observation that had not yet committed money — one in `SCHEDULED`, `CONDUCTED`, `SCORED` or `RETURNED` — moves no cents. Voiding one in `SUBMITTED` or `ACCEPTED` releases its stipend exactly as a return does, decreasing the building's `evaluation_budget_committed_cents` by `stipend_cents` and resetting `stipend_cents` to 0, refreshes the cycle's `evidence_artifact_count` so that the voided observation's artifacts leave the cycle's tally, refreshes `completed_formal_count` and `completed_informal_count`, recomputes `observation_component`, and increments the cycle's `version`. In every void, if no observation of the cycle remains in `CONDUCTED`, `SCORED`, `SUBMITTED`, `RETURNED` or `ACCEPTED`, a cycle sitting at `SCORING` bubbles back down to `SCHEDULING`, which increments the cycle's `version`. When that reversion leaves both `completed_formal_count` and `completed_informal_count` at 0, the cycle's `observation_component` is set back to null.
+
+The **observation component** is the cycle's blended picture of classroom practice, and it is recomputed whenever an observation enters or leaves the counted set — that is, on every submit, return, accept and void — and again during cycle submission and finalization. Only observations whose `status` is `SUBMITTED` or `ACCEPTED` count; `SCHEDULED`, `CONDUCTED`, `SCORED`, `RETURNED` and `VOIDED` observations are excluded. Within the counted set the formal observations are taken in `created_at` ascending order and only the earliest `required_formal_count` of them score the cycle; the informal observations are likewise taken in `created_at` ascending order and only the earliest `required_informal_count` of them score the cycle. Observations beyond those quotas are recorded and remain readable but do not enter the average.
+
+From those two pools, a formal average and an informal average are each computed as the arithmetic mean of the pool's `weighted_score` values, rounded half-up to four decimal places; a pool with no entries yields no average at all rather than a zero. When both averages exist, the `observation_component` is three quarters of the formal average plus one quarter of the informal average — the formal share is 0.75 and the informal share is 0.25 — rounded half-up to four decimal places. When only one of the two averages exists, that average *is* the `observation_component`, unblended and unpenalised. When neither exists, `observation_component` is null.
+
+One variant-dependent step sits inside that calculation and is described in §3.6: when the component is being computed for the final composite rather than the provisional one, each pool is first padded up to its required count with a floor value of 1.00 for every observation the cycle is short.
+
+### 3.6. Student Growth, the Two Composite Variants, and Closure
+
+Student-growth measures are reported against a cycle by an `HrAdmin`, guarded by the cycle's version. The payload names the `cycle_id`, a `measure_code` drawn from `STATE_ASSESSMENT`, `SLO` and `SCHOOLWIDE`, an `index_value` on the four-point scale between 1.00 and 4.00 inclusive carrying at most two decimals, a `coverage_pct` stating what share of the educator's roster the measure covers — strictly greater than 0 and at most 100 — and the `expected_cycle_version` of §2.7. A new measure begins at `status` `REPORTED` and records `cycle_version_after`, the cycle's `version` immediately after the write, so a client can chain further guarded writes without re-reading.
+
+Growth measures supersede one another by family. When a new measure is created for a cycle that already holds a measure with the same `measure_code`, that existing measure — whether it was `REPORTED` or `CERTIFIED` — transitions to `EXCLUDED`, and the cycle's growth component is recomputed. Certification is a separate `HrAdmin` act that moves a measure from `REPORTED` to `CERTIFIED` and is permitted only while the cycle's `status` is `SCHEDULING` or `SCORING`; it recomputes the growth component and increments the cycle's `version`. Reporting a measure also increments the cycle's `version`.
+
+The **growth component** is computed from the cycle's measures whose `status` is `CERTIFIED`; `REPORTED` and `EXCLUDED` measures never enter it. When no certified measure exists the component is null and the cycle is treated as growth-exempt — it is emphatically not scored as zero. Otherwise, let the coverage total be the sum of `coverage_pct` across the certified measures. The weighted index is the sum, across those measures, of `index_value` multiplied by `coverage_pct`, divided by that coverage total; it is carried at full precision into the next step rather than rounded. The reliability factor is the coverage total capped at 100 and then divided by 100, further capped at 1.00, and then floored at 0.60 — so a cycle whose certified measures cover only a fifth of the roster still receives a reliability of 0.60, and one covering the whole roster or more receives 1.00. The `growth_component` is then 1.00 plus the reliability factor multiplied by the amount by which the weighted index exceeds 1.00, rounded half-up to four decimal places. For example, certified measures of index 3.2 at 50 percent coverage and index 2.4 at 30 percent coverage give a coverage total of 80, a weighted index of 2.9, a reliability of 0.80, and a growth component of 2.5200.
+
+**Submitting the cycle** advances it from `SCORING` to `SUBMITTED` and may be done by either an `Evaluator` or an `HrAdmin`. The cycle's `dispute_state` must be `NONE`. Two completeness conditions apply together: `completed_formal_count` must be at least 1, and no observation of the cycle may still be sitting in `SCHEDULED`, `CONDUCTED`, `SCORED` or `RETURNED`; a failure of either is `ERR_CYCLE_OBSERVATIONS_PENDING`. Submission recomputes the growth component, then computes the composite under the **`PROVISIONAL`** variant, sets `composite_variant` to `PROVISIONAL`, leaves `evidence_adjustment` at 0.00, assigns `composite_rating` from the band of the resulting `composite_score`, and increments the cycle's `version`.
+
+**Finalizing the cycle** advances it from `SUBMITTED` to `FINALIZED` and is an `HrAdmin` act. The cycle's `composite_variant` must currently read `PROVISIONAL`, no observation may be left in `SCHEDULED`, `CONDUCTED`, `SCORED` or `RETURNED` — again `ERR_CYCLE_OBSERVATIONS_PENDING` — and the `dispute_state` must be `NONE`. Finalization recomputes the composite under the **`FINAL`** variant, applies the evidence-sufficiency adjustment on top of it, sets `composite_variant` to `FINAL`, assigns `composite_rating` from the band of the adjusted score, stamps `finalized_at` with the logical clock instant, sets `appeal_deadline` to `finalized_at` plus the policy's `appeal_window_days`, and increments the cycle's `version`.
+
+The composite itself blends the two components under the policy's split. Let the observation share be `observation_weight_pct` divided by 100 and the growth share be `growth_weight_pct` divided by 100. When both components exist, the raw composite is the observation component multiplied by the observation share plus the growth component multiplied by the growth share. When one component is null it is **removed rather than scored as zero**, and the surviving component becomes the raw composite in its entirety, unmultiplied. When both are null the raw composite is null. That raw figure is then rounded half-up to two decimal places exactly once, yielding the pre-adjustment composite.
+
+The two variants differ in precisely two ways, and they differ enough that the same stored observations and growth measures will produce different numbers under each. Under `PROVISIONAL`, the observation component runs **without** floor padding — a cycle short of its required observation counts is scored on what it actually has — and no evidence adjustment is applied, so `evidence_adjustment` stays 0.00 and the `composite_score` is simply the pre-adjustment composite. Under `FINAL`, each observation pool is first padded up to its required count with a floor value of 1.00 for every missing observation, and the evidence-sufficiency adjustment is then applied on top of the pre-adjustment composite. Consider a policy requiring two formals and one informal, a cycle carrying one formal weighted 3.33 and one informal weighted 3.00, one certified growth measure of index 3.00 at 100 percent coverage giving a growth component of 3.0000, and a 60/40 split: under `PROVISIONAL` the formal average is 3.3300 and the informal 3.0000, giving an observation component of 3.2475 and a composite of 3.15; under `FINAL` the formal pool becomes 3.33 and 1.00, averaging 2.1650, giving an observation component of 2.3738 and a pre-adjustment composite of 2.62.
+
+**Banding** turns a score into a rating. A score at or above the policy's `highly_effective_threshold` bands as `HIGHLY_EFFECTIVE`; otherwise a score at or above `effective_threshold` bands as `EFFECTIVE`; otherwise a score at or above `developing_threshold` bands as `DEVELOPING`; anything below that bands as `INEFFECTIVE`. Every comparison is inclusive at the threshold.
+
+The **evidence-sufficiency adjustment** applies only during finalization, immediately after the `FINAL` pre-adjustment composite is computed and before `composite_rating` is assigned, and its evaluation order is pinned. The adjustment is keyed on the band of the *pre-adjustment* composite; the stored `composite_rating` is keyed on the band of the *post-adjustment* composite. The two bands may legitimately differ, and the adjustment is never recomputed against the post-adjustment band. If the cycle's `evidence_artifact_count` is at or above the policy's `evidence_min_artifacts`, the cycle earns a bonus of 0.05 when its pre-adjustment band is `DEVELOPING` or `INEFFECTIVE`, and 0.00 otherwise — a well-evidenced strong performance receives nothing extra. If the count falls short of `evidence_min_artifacts`, the cycle takes a penalty of 0.10 subtracted from its score when its pre-adjustment band is `EFFECTIVE` or `HIGHLY_EFFECTIVE`, and 0.00 otherwise. The resulting `evidence_adjustment` is stored on the cycle. The `composite_score` is then the pre-adjustment composite plus that adjustment, clamped so that it is never below 1.00 and never above 4.00, rounded half-up to two decimal places, and `composite_rating` is the band of that final figure. A pre-adjustment composite of 2.55 with one attached artifact against a minimum of two bands `EFFECTIVE` before adjustment, takes the 0.10 penalty, lands at 2.45 and is therefore stored as `DEVELOPING`; the same cycle with two attached artifacts takes no adjustment, stays at 2.55, and is stored as `EFFECTIVE`.
+
+Finalization has consequences beyond the cycle. The educator's `last_composite_rating` and `consecutive_effective_years` are recomputed as described in §3.9. And if the stored `composite_rating` is `INEFFECTIVE`, the district's remediation obligation is triggered immediately: an improvement plan is created for that cycle and educator with `status` `ACTIVE`, `trigger_reason` of `INEFFECTIVE_RATING` and `escalation_level` of 1, and the creation of that plan sets the educator's `tenure_track_hold` to true.
+
+**Closing the cycle** moves it from `FINALIZED` to `CLOSED` and is an `HrAdmin` act. The logical clock must be strictly after the cycle's `appeal_deadline` — closing on or before the deadline is refused with `ERR_CLOSE_BEFORE_APPEAL_DEADLINE` — and the cycle's `dispute_state` must be one of `NONE`, `APPEAL_RESOLVED` or `GRIEVANCE_RESOLVED`, so a live `APPEALED` or `GRIEVED` posture blocks closure. Closure increments the cycle's `version`. `CLOSED` is terminal for the `status` dimension.
+
+### 3.7. Remediation: Improvement Plans and Escalation
+
+Improvement plans are never created directly by an operator. A plan comes into existence in exactly two ways: when a cycle finalizes to an `INEFFECTIVE` rating, and when a first plan closes in failure. Either way the new plan records the `cycle_id` of the cycle whose rating triggered it and the `educator_id` of the educator under remediation, begins at `status` `ACTIVE` with `extension_days_used` at 0, stamps `started_at` with the logical clock instant at creation, and sets `due_at` to `started_at` plus the policy's `remediation_days`, which is ninety calendar days by default.
+
+A plan created by a finalized `INEFFECTIVE` rating carries `trigger_reason` of `INEFFECTIVE_RATING`, `escalation_level` of 1, and a null `prior_plan_id`. A plan created by the failure of an earlier plan carries `trigger_reason` of `PRIOR_PLAN_FAILED`, `escalation_level` of 2, and a `prior_plan_id` pointing at the plan it escalates from. While any plan of an educator sits at `ACTIVE` or `EXTENDED`, that educator's `tenure_track_hold` reads true, and tenure progression is frozen.
+
+An `HrAdmin` may buy the educator more time. Extending a plan carries `additional_days` and the `expected_plan_version` guard of §2.7, moves an `ACTIVE` plan to `EXTENDED`, and leaves an already-`EXTENDED` plan at `EXTENDED` so that further extensions inside the cap are possible. Two conditions gate every extension. The logical clock must be on or before the plan's current `due_at`; a plan already past its date cannot be extended and yields `ERR_PLAN_PAST_DUE`. And `extension_days_used` plus the requested `additional_days` must not exceed the policy's `max_plan_extension_days` — forty-five days cumulative by default — with an exact hit on the cap permitted and only an overshoot rejected, with `ERR_PLAN_EXTENSION_LIMIT`. An accepted extension advances `due_at` by `additional_days`, increases `extension_days_used` by the same amount, and increments the plan's `version` by 1.
+
+Closing a plan carries an `outcome` of either `SUCCESS` or `FAIL`, is available from both `ACTIVE` and `EXTENDED`, and likewise requires the logical clock to be on or before the plan's `due_at`, failing with `ERR_PLAN_PAST_DUE` otherwise. A `SUCCESS` outcome moves the plan to `COMPLETED_SUCCESS` and clears the educator's `tenure_track_hold` to false, provided no other plan of that educator remains in `ACTIVE` or `EXTENDED`.
+
+A `FAIL` outcome moves the plan to `COMPLETED_FAIL`, and what happens next depends entirely on the plan's `escalation_level`. At level 1 the district escalates rather than dismisses: a successor plan is created immediately, with `prior_plan_id` set to the plan that just failed, `escalation_level` of 2, `trigger_reason` of `PRIOR_PLAN_FAILED`, `status` `ACTIVE`, `started_at` at the current logical clock and `due_at` at `started_at` plus the policy's `remediation_days`; because a plan of the educator is again open, `tenure_track_hold` stays true. At level 2 the remedy is exhausted: the educator's `tenure_status` is set to `NON_RENEWED` and their `tenure_track_hold` is cleared to false. `COMPLETED_SUCCESS`, `COMPLETED_FAIL` and `VOIDED` are all terminal for a plan.
+
+A plan may also be voided by the system rather than closed by an operator, from either `ACTIVE` or `EXTENDED`. Voiding happens when the plan's cycle is re-rated or reverted by a dispute outcome — an appeal decided `MODIFIED` to a rating other than `INEFFECTIVE`, an appeal decided `REMANDED`, or a grievance sustained with a remedy of `PLAN_VOIDED` or `RATING_VACATED`. Each such voiding clears the educator's `tenure_track_hold` to false provided no other plan of that educator remains in `ACTIVE` or `EXTENDED`, and recomputes the educator's `consecutive_effective_years`.
+
+### 3.8. Disputes: Appeals, Grievances and Their Cascades
+
+The dispute dimension of a cycle starts at `NONE` and advances only on appeal and grievance triggers. It runs alongside the `status` dimension and never drives it directly, except through the two explicit reversion cascades below.
+
+A `Teacher` files an appeal against their own finalized rating. The filing names the `cycle_id` under challenge, the `grounds` — one of `PROCEDURAL`, `EVIDENTIARY` and `SCORING` — and a written `statement`. The `educator_id` is copied onto the appeal from the cycle at filing time rather than supplied. Filing requires the cycle's `status` to read `FINALIZED` and the logical clock to be on or before the cycle's `appeal_deadline`; filing after the deadline has passed is refused with `ERR_APPEAL_WINDOW_CLOSED`. A successful filing creates the appeal at `status` `FILED` with `panelist_evaluator_id`, `adjusted_composite` and `decided_at` all null, moves the cycle's `dispute_state` from `NONE` to `APPEALED`, and increments the cycle's `version`. Because most scoring-side work requires `dispute_state` of `NONE`, an open appeal freezes the cycle's scoring surface.
+
+Opening review of a filed appeal is an `AppealPanelist` act that moves it from `FILED` to `UNDER_REVIEW`. The acting panelist's evaluator record must have `certification_status` of `CERTIFIED`, failing which the rejection is `ERR_EVALUATOR_NOT_CERTIFIED`, and must satisfy the segregation-of-duties rule of §2.11. Opening review stamps `panelist_evaluator_id` with the acting `X-User-ID`.
+
+Deciding the appeal is reserved to the panelist who opened it — the acting `X-User-ID` must equal the appeal's `panelist_evaluator_id`. The decision carries an `outcome` of `UPHELD`, `MODIFIED` or `REMANDED`, plus an `adjusted_composite` that is required for `MODIFIED` and absent otherwise, and it must lie between 1.00 and 4.00 inclusive. Every decision stamps `decided_at` with the logical clock instant, moves the cycle's `dispute_state` from `APPEALED` to `APPEAL_RESOLVED`, and increments the cycle's `version`. The three outcomes then diverge sharply, and each carries its own full set of consequences.
+
+An **`UPHELD`** appeal upholds the district's original determination. Nothing about the rating changes: `composite_score`, `composite_rating`, `composite_variant` and the cycle's `status` all stand exactly as they were, and no improvement plan is disturbed. `UPHELD` is nevertheless the gateway to the union process, because only an exhausted internal remedy may be escalated.
+
+A **`MODIFIED`** appeal replaces the number. The appeal's `adjusted_composite` is stored on the appeal, the cycle's `composite_score` is set to that value, and the cycle's `composite_rating` is reassigned from the band of that value under the policy thresholds. That cycle mutation recomputes the educator's `last_composite_rating` and `consecutive_effective_years`. And if the new `composite_rating` is anything other than `INEFFECTIVE`, every improvement plan of that cycle sitting at `ACTIVE` or `EXTENDED` transitions to `VOIDED`, and that voiding clears the educator's `tenure_track_hold` to false. The cycle's `status` remains `FINALIZED`.
+
+A **`REMANDED`** appeal sends the work back. The cycle takes its reversion from `FINALIZED` back to `SCORING`, and in doing so `composite_score`, `composite_rating`, `composite_variant`, `finalized_at` and `appeal_deadline` are all cleared to null and `evidence_adjustment` is reset to 0. Every improvement plan of that cycle sitting at `ACTIVE` or `EXTENDED` transitions to `VOIDED`; that plan voiding clears the educator's `tenure_track_hold` to false and recomputes the educator's `consecutive_effective_years` and `last_composite_rating`. Note the resulting posture, which is exactly the point of the two-dimension design: the cycle now reads `status` `SCORING` with `dispute_state` `APPEAL_RESOLVED`, and because scoring-side writes require `dispute_state` of `NONE`, the cycle cannot simply be re-scored — the dispute record persists.
+
+Once an appeal has been decided `UPHELD`, and only then, a `UnionRep` may escalate to a contractual grievance. The filing names the `appeal_id` being escalated and the `article_code` invoked, one of `ART_12_EVALUATION` and `ART_14_DISCIPLINE`; the `educator_id` is copied from the appeal. Filing against an appeal in any other status — `FILED`, `UNDER_REVIEW`, `MODIFIED` or `REMANDED` — is refused with `ERR_APPEAL_NOT_EXHAUSTED`. A successful filing creates the grievance at `status` `FILED` with `remedy` of `NONE`, moves the cycle's `dispute_state` from `APPEAL_RESOLVED` to `GRIEVED`, and increments the cycle's `version`.
+
+A grievance is decided from `FILED` only, and the decision carries an `outcome` of `SUSTAIN`, `DENY` or `WITHDRAW` plus an optional `remedy`. An `HrAdmin` may sustain or deny; a `UnionRep` may only withdraw the grievance they represent. Every outcome moves the cycle's `dispute_state` from `GRIEVED` to `GRIEVANCE_RESOLVED` — the terminal state of that dimension — and increments the cycle's `version`. A `DENY` moves the grievance to `DENIED` and leaves `remedy` at `NONE`; a `WITHDRAW` moves it to `WITHDRAWN` and likewise leaves `remedy` at `NONE`; in both cases the rating and any open plan stand untouched.
+
+A `SUSTAIN` moves the grievance to `SUSTAINED` and stores the requested `remedy`, which is either `RATING_VACATED` or `PLAN_VOIDED`, and the two remedies differ in reach. `RATING_VACATED` is the heavier one: the cycle takes its `FINALIZED` to `SCORING` reversion with the full clearing of `composite_score`, `composite_rating`, `composite_variant`, `finalized_at` and `appeal_deadline` and the reset of `evidence_adjustment` to 0, and that reversion cascades every `ACTIVE` or `EXTENDED` improvement plan of the cycle to `VOIDED`, which in turn clears the educator's `tenure_track_hold`. `PLAN_VOIDED` reaches only as far as the remediation: every improvement plan of the cycle in `ACTIVE` or `EXTENDED` transitions to `VOIDED` and the educator's `tenure_track_hold` is cleared, but the rating itself stands and the cycle stays `FINALIZED`.
+
+### 3.9. Tenure Progression, Distribution Reporting, and Driving the Clock
+
+Tenure eligibility is a standing computation over an educator's whole record, not a snapshot taken at recommendation time. It is refreshed whenever a cycle finalizes, whenever an appeal decided `MODIFIED` or `REMANDED` cascades into the educator, and again as a precondition when a recommendation is attempted.
+
+Three quantities make it up. `completed_service_years` is the number of whole days from the educator's `service_start_date` to the logical clock's current date, divided by 365 and rounded down to a whole number — so an educator who started on 2 August 2023, read against a clock at 1 August 2026, has accumulated 1095 days and therefore 3 completed service years, while the same educator read one day earlier has 1094 days and therefore 2. Next, take the educator's cycles whose `status` is `FINALIZED` or `CLOSED`, ordered by `school_year` ascending and then by `created_at` ascending; cycles still in `SCHEDULING`, `SCORING` or `SUBMITTED` never contribute. `consecutive_effective_years` is the length of the trailing run of that history whose `composite_rating` is `EFFECTIVE` or `HIGHLY_EFFECTIVE`, counted backwards from the most recent entry and stopping at the first entry that is neither. `last_composite_rating` is the `composite_rating` of the most recent entry of that history, or null when the history is empty.
+
+An educator is eligible for a tenure recommendation when `completed_service_years` is at or above the policy's `tenure_required_years`, `consecutive_effective_years` is at or above the policy's `tenure_min_consecutive_effective`, and `tenure_track_hold` is false. Both numeric comparisons are inclusive, so an educator sitting at exactly the required number of years qualifies. The policy consulted is the one bound to the educator's most recent cycle, ordered by `school_year` ascending and then `created_at` ascending.
+
+An `HrAdmin` acts on a probationary educator by issuing a `recommendation` of either `RECOMMEND` or `NON_RENEW`. A `RECOMMEND` moves `tenure_status` from `PROBATIONARY` to `RECOMMENDED` and stamps the acting operator's `X-User-ID` onto `tenure_recommended_by_user_id`; it is refused with `ERR_TENURE_NOT_ELIGIBLE` when any of the three eligibility conditions fails — insufficient service years, an insufficient run of effective ratings, or a live improvement-plan hold. A `NON_RENEW` moves `tenure_status` from `PROBATIONARY` to `NON_RENEWED` and clears `tenure_track_hold` to false; when an operator initiates it, the educator's `last_composite_rating` must be `INEFFECTIVE` or `DEVELOPING`. The same `NON_RENEWED` state is also reachable without any operator action at all, through the failure of a level-2 improvement plan described in §3.7. An educator whose `tenure_status` is not `PROBATIONARY` cannot be recommended or non-renewed again, and the refusal is `ERR_TENURE_STATE_INVALID`.
+
+The second half of the tenure act belongs to a different administrator. A `decision` of `GRANT` moves a `RECOMMENDED` educator to `TENURED`; a `decision` of `DENY` moves them to `DENIED`. Both require the deciding operator's `X-User-ID` to differ from the stored `tenure_recommended_by_user_id`, and both are available only from `RECOMMENDED`. `TENURED`, `DENIED` and `NON_RENEWED` are terminal.
+
+Rating distribution is the district's compliance-facing view of its own severity. The report is scoped to a required `school_year` and, optionally, to a single building through `school_id`; it is readable by an `HrAdmin` or a `UnionRep`. The population is every cycle whose `status` is `FINALIZED` or `CLOSED` with the requested `school_year`, further restricted to cycles whose educator belongs to the named building when one is supplied. Cycles still carrying a provisional composite are excluded, so a `SUBMITTED` cycle never appears. The report echoes `school_year` and `school_id`, reports `total_count` as the size of that population, and reports one count and one percentage per band: `ineffective_count` and `ineffective_pct`, `developing_count` and `developing_pct`, `effective_count` and `effective_pct`, `highly_effective_count` and `highly_effective_pct`. Each count is the number of population cycles whose `composite_rating` equals that band. Each percentage is that count multiplied by 100 and divided by `total_count`, rounded half-up to two decimal places. An empty population is reported as `total_count` of 0, four percentages of 0.00, and an `outlier_flag` of false rather than as an error. Otherwise `outlier_flag` is true exactly when `highly_effective_pct` is strictly greater than 35.00 — a district flagging more than thirty-five percent of its finalized cycles as highly effective is an outlier under state guidance, and a figure of exactly 35.00 is not flagged.
+
+Finally, because every deadline in this specification is measured against the logical district clock rather than wall-clock time, an `HrAdmin` holds an administrative test-driving capability that sets that clock to a supplied `to_iso8601` instant. It is the only way to move time in this system. Every subsequent comparison — `completed_service_years`, a plan's `due_at`, a cycle's `appeal_deadline`, an evaluator's `certification_expires_on` — reads the new instant, and until the capability is first used the clock reads exactly `2026-08-01T00:00:00Z`.
+
+## 4. Endpoint Definitions
+
+Creating a new resource returns HTTP 201 with the created resource in `data`. Every other successful call — reads, listings, and every operation that modifies or transitions an existing resource — returns HTTP 200 with the affected resource, or with the report payload for the distribution report. The table below is a routing summary only: request payloads, response fields and side effects are specified in the narratives of §2 and §3, and callers should reconstruct them from there.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/evaluation-policies` | Create the evaluation policy for a school year. Every omitted field takes its declared default. | HrAdmin |
+| GET | `/evaluation-policies/{id}` | Read one policy. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/schools` | Create a building and its evaluation stipend budget. | HrAdmin |
+| GET | `/schools/{id}` | Read one building, including its committed and remaining stipend budget. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/educators` | Register an educator against a building. | HrAdmin |
+| GET | `/educators/{id}` | Read one educator, with completed_service_years, consecutive_effective_years and tenure_track_hold recomputed against the logical clock. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| GET | `/educators` | List educators, optionally filtered by building or tenure status. Reverse-reachability channel for Educator.school_id. | HrAdmin, Evaluator, AppealPanelist, UnionRep |
+| POST | `/educators/{id}/tenure-recommendation` | Issue a tenure recommendation or a non-renewal for a probationary educator. | HrAdmin |
+| POST | `/educators/{id}/tenure-decision` | Grant or deny tenure to a recommended educator. The deciding operator must differ from the recommending operator. | HrAdmin |
+| POST | `/evaluators` | Register an evaluator. New evaluators start PROVISIONAL and cannot schedule or conduct observations until a calibration review certifies them. | HrAdmin |
+| GET | `/evaluators/{id}` | Read one evaluator, including both calibration drift variants. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/calibration-reviews` | Record a blind anchor-lesson re-score for an evaluator. Creation computes deviation and leaves the review PENDING. | HrAdmin |
+| GET | `/evaluators/{id}/calibration-reviews` | List an evaluator's calibration reviews, ordered by created_at ASC. Reverse-reachability channel for CalibrationReview.evaluator_id. | HrAdmin, Evaluator, AppealPanelist |
+| POST | `/calibration-reviews/{id}/decide` | Resolve a pending calibration review against the policy tolerance and apply the certification consequences. | HrAdmin |
+| POST | `/evaluation-cycles` | Open an evaluation cycle for an educator under a policy. | HrAdmin |
+| GET | `/evaluation-cycles/{id}` | Read one cycle, including both state dimensions, all component scores and the current version for OCC. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| GET | `/evaluation-cycles` | List cycles with filters. Reverse-reachability channel for EvaluationCycle.educator_id and EvaluationCycle.policy_id. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/evaluation-cycles/{id}/submit` | Submit the cycle for review, computing the PROVISIONAL composite from the observations actually counted. | Evaluator, HrAdmin |
+| POST | `/evaluation-cycles/{id}/finalize` | Finalize the cycle, computing the FINAL composite with missing-observation flooring and the evidence-sufficiency adjustment. | HrAdmin |
+| POST | `/evaluation-cycles/{id}/close` | Close a finalized cycle after its appeal window has strictly elapsed. | HrAdmin |
+| POST | `/observations` | Schedule an observation window for an evaluator against a cycle. | Evaluator, HrAdmin |
+| GET | `/observations/{id}` | Read one observation, including weighted_score, evidence_count, stipend_cents and the current version for OCC. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| GET | `/observations` | List observations with filters. Reverse-reachability channel for Observation.cycle_id and Observation.evaluator_id. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/observations/{id}/conduct` | Mark a scheduled observation as conducted. Requires a currently certified, unexpired evaluator. | Evaluator |
+| POST | `/observations/{id}/rubric-scores` | Record or replace one rubric domain score. Guarded by the observation's version; the response carries the observation's version after the write so a client can chain the next score. | Evaluator |
+| GET | `/observations/{id}/rubric-scores` | List an observation's rubric scores, superseded rows included. Reverse-reachability channel for RubricScore.observation_id. | HrAdmin, Evaluator, Teacher, AppealPanelist |
+| POST | `/observations/{id}/evidence-artifacts` | Attach an evidence artifact to an observation. Both the observing evaluator and the observed teacher may attach. | Evaluator, Teacher |
+| GET | `/observations/{id}/evidence-artifacts` | List an observation's artifacts. Reverse-reachability channel for EvidenceArtifact.observation_id. | HrAdmin, Evaluator, Teacher, AppealPanelist |
+| POST | `/evidence-artifacts/{id}/withdraw` | Withdraw an attached artifact — the exact compensating action for an attach. | Evaluator, Teacher |
+| POST | `/observations/{id}/submit` | Submit a fully scored observation, committing its stipend against the school budget. | Evaluator |
+| POST | `/observations/{id}/return` | Return a submitted observation for rescoring, releasing its stipend. | HrAdmin |
+| POST | `/observations/{id}/accept` | Accept a submitted observation as final for the cycle. | HrAdmin |
+| POST | `/observations/{id}/void` | Void an observation, releasing any committed stipend and detaching its evidence from the cycle ledger. | HrAdmin |
+| POST | `/growth-measures` | Report a student-growth measure against a cycle. Guarded by the cycle's version; the response carries the cycle's version after the write. | HrAdmin |
+| GET | `/evaluation-cycles/{id}/growth-measures` | List a cycle's growth measures. Reverse-reachability channel for GrowthMeasure.cycle_id. | HrAdmin, Evaluator, Teacher, AppealPanelist, UnionRep |
+| POST | `/growth-measures/{id}/certify` | Certify a reported growth measure so that it enters the growth component. | HrAdmin |
+| GET | `/improvement-plans/{id}` | Read one improvement plan, including due_at, extension_days_used, escalation_level and the current version for OCC. | HrAdmin, Teacher, UnionRep, Evaluator |
+| GET | `/improvement-plans` | List improvement plans with filters. Reverse-reachability channel for ImprovementPlan.cycle_id, ImprovementPlan.educator_id and the self-referential ImprovementPlan.prior_plan_id. Ordered by created_at ASC. | HrAdmin, Teacher, UnionRep, Evaluator |
+| POST | `/improvement-plans/{id}/extend` | Extend a plan's remediation deadline inside the cumulative policy cap. Guarded by the plan's version. | HrAdmin |
+| POST | `/improvement-plans/{id}/close` | Close a plan as successful or failed. A failed first plan spawns an escalated successor; a failed escalated plan non-renews the educator. | HrAdmin |
+| POST | `/appeals` | File an appeal against a finalized rating inside the appeal window. | Teacher |
+| GET | `/appeals/{id}` | Read one appeal. | HrAdmin, Teacher, AppealPanelist, UnionRep, Evaluator |
+| GET | `/appeals` | List appeals with filters. Reverse-reachability channel for Appeal.cycle_id, Appeal.educator_id and Appeal.panelist_evaluator_id. | HrAdmin, Teacher, AppealPanelist, UnionRep, Evaluator |
+| POST | `/appeals/{id}/review` | Open review of a filed appeal. The acting panelist must be certified and must not have evaluated the cycle. | AppealPanelist |
+| POST | `/appeals/{id}/decide` | Decide an appeal under review. UPHELD leaves the rating alone; MODIFIED replaces the composite; REMANDED reverts the cycle to SCORING. | AppealPanelist |
+| POST | `/grievances` | File a union grievance once the internal appeal remedy is exhausted. | UnionRep |
+| GET | `/grievances/{id}` | Read one grievance. | HrAdmin, UnionRep, Teacher |
+| GET | `/grievances` | List grievances with filters. Reverse-reachability channel for Grievance.appeal_id and Grievance.educator_id. | HrAdmin, UnionRep, Teacher |
+| POST | `/grievances/{id}/decide` | Sustain, deny or withdraw a filed grievance. SUSTAIN applies the requested remedy. | HrAdmin, UnionRep |
+| GET | `/reports/rating-distribution` | Rating distribution over the finalized and closed cycles of a school year, optionally scoped to one building. | HrAdmin, UnionRep |
+| POST | `/_clock/set_current_utc` | Set the server's logical UTC clock, which every deadline, expiry, service-year and window rule reads. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z; it never falls back to real wall-clock time. | HrAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_EDUCATOR_NOT_FOUND` | 404 |
+| `ERR_EVALUATOR_NOT_FOUND` | 404 |
+| `ERR_CYCLE_NOT_FOUND` | 404 |
+| `ERR_OBSERVATION_NOT_FOUND` | 404 |
+| `ERR_PLAN_NOT_FOUND` | 404 |
+| `ERR_APPEAL_NOT_FOUND` | 404 |
+| `ERR_RESOURCE_NOT_FOUND` | 404 |
+| `ERR_DUPLICATE_EMPLOYEE_NUMBER` | 409 |
+| `ERR_STALE_OBSERVATION_VERSION` | 412 |
+| `ERR_STALE_CYCLE_VERSION` | 412 |
+| `ERR_STALE_PLAN_VERSION` | 412 |
+| `ERR_OBSERVATION_STATE_INVALID` | 409 |
+| `ERR_CYCLE_STATE_INVALID` | 409 |
+| `ERR_PLAN_STATE_INVALID` | 409 |
+| `ERR_APPEAL_STATE_INVALID` | 409 |
+| `ERR_GRIEVANCE_STATE_INVALID` | 409 |
+| `ERR_TENURE_STATE_INVALID` | 409 |
+| `ERR_DISPUTE_IN_PROGRESS` | 409 |
+| `ERR_EVALUATOR_NOT_CERTIFIED` | 422 |
+| `ERR_EVALUATOR_CERTIFICATION_LAPSED` | 422 |
+| `ERR_EVALUATOR_WINDOW_CONFLICT` | 409 |
+| `ERR_FORMAL_SPACING_VIOLATION` | 409 |
+| `ERR_APPEAL_WINDOW_CLOSED` | 422 |
+| `ERR_CLOSE_BEFORE_APPEAL_DEADLINE` | 422 |
+| `ERR_PLAN_PAST_DUE` | 422 |
+| `ERR_CYCLE_OBSERVATIONS_PENDING` | 422 |
+| `ERR_APPEAL_NOT_EXHAUSTED` | 422 |
+| `ERR_PLAN_EXTENSION_LIMIT` | 422 |
+| `ERR_TENURE_NOT_ELIGIBLE` | 422 |
+| `ERR_EVALUATION_BUDGET_EXCEEDED` | 402 |
+

@@ -1,0 +1,98 @@
+"""Numeric constants the PRD pins for this domain."""
+
+# The logical clock's startup default, before any explicit clock write.
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00.000Z"
+
+# The instant most scenarios pin the clock to before doing anything else.
+DEFAULT_CLOCK = "2026-08-03T09:00:00Z"
+
+THRESHOLDS = {
+    # Net cost
+    "ADA_TAX_CREDIT_RATE": 0.26,
+    "RECURRING_AMORTISATION_MONTHS": 24,
+    # Undue hardship
+    "BUDGET_RATIO_CAP": 0.05,
+    "IMPLEMENTATION_LAG_CAP_DAYS": 60,
+    "BUDGET_WEIGHT": 0.65,
+    "DISRUPTION_WEIGHT": 0.20,
+    "LAG_WEIGHT": 0.15,
+    "NORM_CEILING": 100.0000,
+    "UNDUE_SCORE_THRESHOLD": 70.00,
+    "BORDERLINE_SCORE_THRESHOLD": 45.00,
+    # Coverage
+    "MIN_COVERAGE_RATIO_FOR_GRANT": 0.60,
+    # Documentation budget
+    "BASE_DOC_REQUEST_LIMIT": 2,
+    "INEFFECTIVE_TRIAL_DOC_BONUS": 1,
+    "RENEWAL_DOC_BONUS": 1,
+    "ABSOLUTE_DOC_REQUEST_CEILING": 4,
+    # Trials
+    "MIN_TRIAL_REVIEWS": 3,
+    "EFFECTIVE_THRESHOLD": 7.00,
+    "TRIAL_WASHOUT_DAYS": 7,
+    "MAX_TRIAL_EXTENSIONS": 1,
+    "TRIAL_EXTENSION_DAYS": 30,
+    "DEFAULT_CHECKIN_CADENCE_DAYS": 14,
+    # Effectiveness weights
+    "RATING_WEIGHT": 0.6,
+    "OBJECTIVE_WEIGHT": 0.4,
+    "RECENCY_WEIGHTS": (0.5, 0.3, 0.2),
+    # Renewal cadence
+    "BASE_REVIEW_CADENCE_DAYS": 365,
+    "BORDERLINE_REVIEW_CADENCE_DAYS": 180,
+    "ABSENCE_LINKED_REVIEW_CADENCE_DAYS": 90,
+    "TRIAL_GRANT_REVIEW_CADENCE_DAYS": 120,
+    # Appeals
+    "APPEAL_WINDOW_DAYS": 30,
+    "MAX_APPEAL_SUPPLEMENTS": 2,
+    "APPEAL_MANDATORY_REMAND_THRESHOLD": 60,
+    # Interactive process
+    "MAX_INTERACTIVE_ROUNDS": 2,
+    "MAX_OPEN_CASES_PER_EMPLOYEE": 2,
+    # Absence
+    "INTERMITTENT_WEEKLY_DAY_CAP": 5,
+    # Integrity score
+    "INTEGRITY_BASE": 100,
+    "INTEGRITY_FLOOR": 0,
+    "DOC_OVERREACH_PENALTY": 25,
+    "UNAUTHORIZED_DISCLOSURE_PENALTY": 30,
+    "LAPSED_WINDOW_PENALTY": 10,
+    "MISSED_RENEWAL_PENALTY": 15,
+    "MISSED_RENEWAL_GRACE_DAYS": 30,
+}
+
+TEST_DEFAULTS = {
+    "DEPARTMENT_BUDGET_CENTS": 1_500_000,
+    "EMPLOYER_BUDGET_CENTS": 800_000_000,
+    "CRITICALITY_WEIGHT": 5,
+    "FREQUENCY_PER_WEEK": 20,
+    "ANNUAL_SALARY_CENTS": 4_800_000,
+    "PROFILE_VERSION_LABEL": "2026.1",
+    # An option at one_time 40000 / recurring 0 nets 29600 cents.
+    "CHEAP_ONE_TIME_CENTS": 40_000,
+    "CHEAP_NET_CENTS": 29_600,
+    # An option at one_time 50000 / recurring 0 nets 37000 cents.
+    "MID_ONE_TIME_CENTS": 50_000,
+    "MID_NET_CENTS": 37_000,
+    # An option at one_time 121995 / 60 days on a 2_000_000 department budget
+    # scores exactly 70.00 and is UNDUE.
+    "UNDUE_ONE_TIME_CENTS": 121_995,
+    "UNDUE_NET_CENTS": 90_276,
+    "UNDUE_DEPARTMENT_BUDGET_CENTS": 2_000_000,
+}
+
+# Path ids that resolve to nothing, one per resource family.
+UNKNOWN_IDS = {
+    "employee": "00000000-0000-4000-8000-000000000001",
+    "job_profile": "00000000-0000-4000-8000-00000000aaaa",
+    "essential_function": "00000000-0000-4000-8000-000000000002",
+    "request": "00000000-0000-4000-8000-000000000003",
+    "doc_request": "00000000-0000-4000-8000-000000000004",
+    "function_analysis": "00000000-0000-4000-8000-000000000005",
+    "option": "00000000-0000-4000-8000-000000000006",
+    "trial": "00000000-0000-4000-8000-000000000007",
+    "denial": "00000000-0000-4000-8000-000000000008",
+    "appeal": "00000000-0000-4000-8000-000000000009",
+    "absence": "00000000-0000-4000-8000-00000000000a",
+    "actor": "00000000-0000-4000-8000-0000000000ff",
+}
