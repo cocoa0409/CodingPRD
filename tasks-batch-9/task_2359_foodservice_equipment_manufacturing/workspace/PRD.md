@@ -1,0 +1,517 @@
+# Foodservice Equipment Manufacturing API — Product Requirements Document
+
+## 1. Introduction
+
+A commercial kitchen equipment manufacturer lives at the intersection of four regulated disciplines that most product organisations get to keep apart. A fryer cannot be sold until a listing agency has granted it sanitation, gas and electrical certification; a national restaurant chain will not accept it until its own options, controls package and branding treatment have been engineered, throughput-tested against real menu items and signed off; the factory cannot build it until a line interval has been reserved against a construction or remodel programme whose delivery dates have already been promised to the chain's real-estate team; and once the unit is installed, it becomes a connected appliance with recipes, telemetry, firmware and a warranty reserve administered through an authorised third-party service network. Today those four disciplines run on four disconnected systems, and the seams between them are where the company loses money: a suspended agency listing is discovered only after the units have shipped, a quote is written against a base price that engineering has since revised, a technician files a warranty claim for a model they were never certified on.
+
+This document specifies a single API that makes those seams explicit and enforceable. The system treats agency certification as the root of trust: a model's **certification posture** is never asserted by an operator but derived continuously from its live listing applications and the logical clock, and when a listing is suspended the consequences propagate all the way down through released configurations, reserved factory slots, line capacity ledgers, site orders and programme-level delivery postures in one deterministic cascade. Configuration pricing is dual-variant, so the indicative number a dealer quotes and the firm number stamped at release differ by a documented rule rather than by accident. Cooking-performance validation publishes two throughput figures — the certified best-window number that gates approval and the as-tested full-series number published to the chain — because conflating them is how throughput specifications get oversold.
+
+The API is designed to be driven deterministically in test: every date-sensitive rule reads a server-held logical clock rather than wall time, and every derived posture is recomputed whenever that clock moves. Readers should treat this document as the complete behavioural contract; where a rule mentions a threshold, a rounding step, an ordering or an error code, that detail is normative.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contracts that hold across the whole API: authentication, envelope shape, pagination, time, precision, concurrency, derived-state propagation and the order in which a request's checks are applied.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, declaring the capacity it is acting in. A request missing either header, or naming a role the system does not recognise, is rejected with `ERR_UNAUTHENTICATED`. A recognised role that does not appear in the called endpoint's authorised-role list (see §4) is rejected with `ERR_ROLE_NOT_PERMITTED`.
+
+Eleven roles exist, spelled exactly as follows: `ComplianceEngineer`, `ListingReviewer`, `ApplicationEngineer`, `EngineeringApprover`, `ChainAdmin`, `ProductionPlanner`, `ConnectedOpsEngineer`, `ChannelManager`, `ServicePartnerUser`, `WarrantyAdjudicator` and `PlatformAdmin`. `ComplianceEngineer` owns the manufacturer catalogue and files listing applications. `ListingReviewer` records agency decisions, suspensions and reinstatements. `ApplicationEngineer` authors chain configurations, runs cooking-performance validation and releases approved configurations. `EngineeringApprover` approves or returns configurations. `ChainAdmin` acts for one restaurant chain. `ProductionPlanner` owns build lines, production slots and shipping events. `ConnectedOpsEngineer` runs the connected-equipment platform. `ChannelManager` owns the dealer and consultant channel plus service-network onboarding. `ServicePartnerUser` acts for one service partner. `WarrantyAdjudicator` administers coverage and adjudicates claims. `PlatformAdmin` is an operator superset that appears in every endpoint's authorised-role list so that any state is readable and drivable.
+
+Two roles are entity-backed. When `X-User-Role` is `ChainAdmin`, `X-User-ID` is the `id` of the acting `ChainAccount`; ownership checks compare the targeted resource's owning account to `X-User-ID` — directly through `ChainConfiguration.chain_account_id` or `ConstructionProgram.chain_account_id`, and for a site order through the `chain_account_id` of the `ConstructionProgram` it belongs to. A mismatch is rejected with `ERR_CHAIN_SCOPE_VIOLATION`, and that check guards exactly twelve operations: `GET /chain-accounts/{id}`, `GET /chain-configurations`, `GET /chain-configurations/{id}`, `GET /chain-configurations/{id}/price-quote`, `POST /chain-configurations/{id}/branding-signoff`, `POST /construction-programs`, `GET /construction-programs`, `GET /construction-programs/{id}`, `POST /site-orders`, `GET /site-orders`, `GET /site-orders/{id}` and `POST /site-orders/{id}/commitment-waiver`. When `X-User-Role` is `ServicePartnerUser`, `X-User-ID` is the `id` of the acting `ServicePartner`; ownership checks compare `TechnicianCertification.service_partner_id`, `WarrantyClaim.service_partner_id` and any `service_partner_id` supplied in a request body to `X-User-ID`, and a mismatch is rejected with `ERR_PARTNER_SCOPE_VIOLATION`. That check guards exactly seven operations: `GET /service-partners/{id}`, `POST /technician-certifications`, `GET /technician-certifications`, `GET /technician-certifications/{id}`, `POST /warranty-claims`, `GET /warranty-claims` and `GET /warranty-claims/{id}`.
+
+The remaining nine roles — `ComplianceEngineer`, `ListingReviewer`, `ApplicationEngineer`, `EngineeringApprover`, `ProductionPlanner`, `ConnectedOpsEngineer`, `ChannelManager`, `WarrantyAdjudicator` and `PlatformAdmin` — carry an opaque operator identifier in `X-User-ID` that is not tied to any persisted entity. The server records that identifier where a transition writes it — `submitted_by_user_id` and `decided_by_user_id` on a certification listing, `submitted_by_user_id` and `approved_by_user_id` on a chain configuration, `adjudicated_by_user_id` on a warranty claim — but never compares it to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and List Filters
+
+List endpoints accept two pagination query parameters. `limit` caps the number of items returned; it defaults to 10 when omitted, has a minimum of 1 and a maximum of 100. `offset` is the number of items to skip; it defaults to 0 and may not be negative. A `limit` outside the range 1 through 100 or a negative `offset` is a malformed request and is rejected with `ERR_INVALID_REQUEST`.
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending. Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the envelope's `meta` object.
+
+Beyond pagination, list endpoints expose filters that narrow the collection without changing its ordering. Catalogue listings accept `category`, `energy_type` and `certification_posture`; certification listings accept `equipment_model_id`, `agency_code` and `status`; chain configurations accept `chain_account_id`, `equipment_model_id` and `status`; performance validations accept `chain_configuration_id`, `menu_item_code` and `status`; construction programmes accept `chain_account_id`, `program_type` and `commit_posture`; site orders accept `construction_program_id`, `chain_configuration_id`, `fulfillment_status` and `commitment_status`; build lines accept `plant_code`; production slots accept `build_line_id`, `site_order_id` and `status`; connected units accept `equipment_model_id`, `site_order_id` and `service_program_status`; firmware campaigns accept `equipment_model_id` and `status`; service partners accept `region_code` and `status`; technician certifications accept `service_partner_id`, `equipment_model_id` and `status`; and warranty claims accept `connected_unit_id`, `service_partner_id`, `technician_certification_id` and `status`.
+
+### 2.4. Common Resource Properties
+
+Every resource type in this system — equipment models, certification listings, chain accounts, chain configurations, performance validations, construction programmes, site orders, build lines, production slots, connected units, firmware campaigns, service partners, technician certifications and warranty claims — carries the same four system-managed properties:
+
+- **`id`** (string): a server-minted UUID. It carries no type prefix.
+- **`created_at`** (string): an ISO 8601 timestamp in UTC with three fractional digits (for example `2026-08-01T00:00:00.000Z`), recorded when the row was first created.
+- **`updated_at`** (string): an ISO 8601 UTC timestamp, refreshed on every mutation of the resource, including mutations the server performs on its own initiative while reconciling derived state.
+- **`version`** (integer): a system-managed counter that begins at 1 and increments by one on every mutation of that resource. There is no entity in this system that omits `updated_at` or `version`.
+
+Because derived fields are real mutations, a change to a model's `certification_posture`, a programme's `commit_posture`, a line's `committed_units` or a unit's reserve ledger each refreshes that resource's `updated_at` and increments its `version` — even when no client asked for a change to that particular row.
+
+### 2.5. The Logical Clock
+
+Every date-sensitive rule in this system reads a server-held logical UTC clock, never wall-clock time. At startup the clock reads exactly `2026-08-01T00:00:00Z`, and it must not fall back to real time before it has been set. A `PlatformAdmin` moves it by supplying `to_iso8601` to `POST /_clock/set_current_utc`; no plausible business endpoint can set a regulator's calendar, so this is a declared test-driving capability rather than a product feature.
+
+Moving the clock is a substantive event, not a bookkeeping one. Each advance re-derives `certification_posture` and `covered_scopes` for every equipment model, because a listing whose `expires_on` has been reached stops covering its scopes; re-derives `authorized_model_ids` for every service partner, because a technician certification whose `expires_on` has been reached stops counting; re-evaluates the lazy coverage-expiry transitions on every connected unit; and recomputes `projected_delivery_date`, `slack_days` and `commitment_status` on every site order together with the `commit_posture` of its construction programme.
+
+Time comparisons are strict where the scaffold's business intent is that a term has run out at its boundary: a certification listing covers its scopes only while the clock is strictly earlier than `expires_on`, and a technician certification counts only while the clock is strictly earlier than its `expires_on`. In both cases, a clock reading exactly equal to `expires_on` no longer counts.
+
+### 2.6. Money, Rounding and Measurement Precision
+
+All monetary amounts in this system are integer counts of cents and are never represented as decimal currency. Wherever a percentage or a rate produces a fractional cent, the amount is rounded half up to a whole cent, and each such rounding step happens exactly where this document says it does — never earlier and never later, because moving a rounding step changes the result. `base_price_cents`, `indicative_unit_price_cents`, `firm_unit_price_cents`, `parts_cost_cents`, `adjudicated_amount_cents`, `reserve_initial_cents`, `reserve_balance_cents` and `claims_paid_cents` are all integer cents.
+
+Non-monetary precision rules: both throughput figures on a performance validation are rounded half up to two decimal places, applied once to each figure's final rate and never to an intermediate window rate; a campaign's `success_rate` is rounded to four decimal places; a unit's `health_score` is an integer clamped into the inclusive range 0 through 100, with the clamp applied once after all adjustments; and a site order's `slack_days` is a whole-day integer obtained by taking the floor of the day difference between two dates. `coinsurance_pct` is a fraction (for example `0.10`), and the reserve-utilisation comparison that selects it is an exact rational comparison, so a utilisation of exactly `0.60` falls into the ten-percent band rather than the zero band.
+
+### 2.7. Stale-Parent Rejection on Configuration and Validation Creates
+
+Two creates in this system silently destroy work if they run against a parent the client has not actually observed, so both require the client to echo the parent's version and both reject a mismatch.
+
+A `POST /chain-configurations` request must carry `expected_chain_account_version` as a required input field, holding the `version` of the target `ChainAccount` as the client last read it. If that value does not equal the account's current `version`, the create is rejected with `ERR_STALE_CHAIN_ACCOUNT_VERSION` and HTTP 412. The reason is concrete: a new configuration for the same chain account and equipment model legitimately supersedes any prior pre-release configuration for that pair, so a writer holding a stale view of the account would discard work it never saw. Forcing a re-read first makes that impossible.
+
+A `POST /performance-validations` request must likewise carry `expected_chain_configuration_version` as a required input field, holding the `version` of the target `ChainConfiguration` as the client last read it. A mismatch with the configuration's current `version` is rejected with `ERR_STALE_CONFIGURATION_VERSION` and HTTP 412, because a new validation for the same configuration and menu item supersedes the prior one, and a writer working from a stale configuration view would supersede a validation produced against a configuration revision it never saw.
+
+No other endpoint in this system takes a version field. Endpoints not named above are processed without any stale-version check.
+
+### 2.8. Derived Postures and the Cascade Discipline
+
+Two status dimensions in this system are never written by a client and have no endpoint of their own: an equipment model's `certification_posture` and a construction programme's `commit_posture`. Both are recomputed from their children whenever any input to them changes, and each recomputation that lands on a different value is a mutation of the parent that increments its `version` by one.
+
+A third dimension pair deserves special mention. A site order carries two independent status dimensions on one row: `fulfillment_status` tracks physical progress and is driven by production-slot transitions plus shipping events, while `commitment_status` tracks the delivery-date promise and is recomputed whenever the slot set, the clock or the fulfilment dimension changes. Neither dimension constrains the other's value; reserving a slot for a site order that has already advanced past `PENDING` leaves the fulfilment dimension alone while still refreshing the commitment dimension.
+
+Cascades in this system are ordered and complete. When a hop mutates a second entity, that mutation happens in full — its own derived fields are refreshed, its `updated_at` is bumped and its `version` increments — before the next hop reads it. The deepest cascade, six hops long, is triggered by an agency suspension and is described end-to-end in §3.2.
+
+### 2.9. Path Resolution and the Order of Request Checks
+
+Path identifiers are resolved left to right, and the first identifier that names no existing row determines the 404 the caller receives; the server does not look further right in the path once a segment has failed. When a request body names a foreign resource as well as the path, the path is resolved first and the body's references afterwards.
+
+Beyond path resolution, the checks a request undergoes are strictly ordered, and the first failing check determines the response. Two checks that would both fail must produce the earlier one's error, which is why the ordering below is normative rather than descriptive:
+
+1. Authentication — `X-User-ID` and `X-User-Role` present and the role recognised. Applies to every endpoint. `ERR_UNAUTHENTICATED`.
+2. Role permission — the acting role appears in the called endpoint's authorised-role list. Applies to every endpoint. `ERR_ROLE_NOT_PERMITTED`.
+3. Chain ownership scope, on the twelve operations named in §2.1. `ERR_CHAIN_SCOPE_VIOLATION`.
+4. Partner ownership scope, on the seven operations named in §2.1. `ERR_PARTNER_SCOPE_VIOLATION`.
+5. Payload well-formedness — required fields present, enum members valid, integers inside their declared bounds, datetimes ISO 8601 UTC, `window_end` strictly later than `window_start`, `limit` between 1 and 100 inclusive, `offset` at least 0, and array-valued fields free of duplicate elements. Applies to every endpoint. `ERR_INVALID_REQUEST`.
+6. The `equipment_model_id` named in the path or body resolves. Applies to `GET /equipment-models/{id}`, `PATCH /equipment-models/{id}`, `POST /certification-listings`, `POST /chain-configurations`, `POST /connected-units`, `POST /firmware-campaigns` and `POST /technician-certifications`. `ERR_EQUIPMENT_MODEL_NOT_FOUND`.
+7. The certification listing named in the path resolves. Applies to `GET /certification-listings/{id}`, `POST /certification-listings/{id}/submissions` and `POST /certification-listings/{id}/agency-decisions`. `ERR_COMPLIANCE_RESOURCE_NOT_FOUND`.
+8. The chain account, chain configuration, performance validation, construction programme or site order named in the path or body resolves. Applies to `GET /chain-accounts/{id}`, `PATCH /chain-accounts/{id}`, `POST /chain-configurations`, `GET /chain-configurations/{id}`, `GET /chain-configurations/{id}/price-quote`, `POST /chain-configurations/{id}/submissions`, `POST /chain-configurations/{id}/engineering-decisions`, `POST /chain-configurations/{id}/branding-signoff`, `POST /chain-configurations/{id}/release`, `POST /performance-validations`, `GET /performance-validations/{id}`, `POST /performance-validations/{id}/test-runs`, `POST /performance-validations/{id}/conclusion`, `POST /performance-validations/{id}/retest`, `POST /construction-programs`, `GET /construction-programs/{id}`, `POST /site-orders`, `GET /site-orders/{id}`, `POST /site-orders/{id}/commitment-waiver`, `POST /site-orders/{id}/fulfillment-events`, `POST /production-slots` and `POST /connected-units`. `ERR_CHAIN_RESOURCE_NOT_FOUND`.
+9. The build line or production slot named in the path or body resolves. Applies to `GET /build-lines/{id}`, `POST /production-slots`, `GET /production-slots/{id}`, `POST /production-slots/{id}/build-progress` and `POST /production-slots/{id}/cancellation`. `ERR_PRODUCTION_RESOURCE_NOT_FOUND`.
+10. The connected unit or firmware campaign named in the path or body resolves. Applies to `GET /connected-units/{id}`, `POST /connected-units/{id}/telemetry`, `POST /connected-units/{id}/recipe-pushes`, `POST /connected-units/{id}/coverage-actions`, `GET /firmware-campaigns/{id}`, `POST /firmware-campaigns/{id}/schedule`, `POST /firmware-campaigns/{id}/start`, `POST /firmware-campaigns/{id}/unit-results`, `POST /firmware-campaigns/{id}/close` and `POST /warranty-claims`. `ERR_CONNECTED_RESOURCE_NOT_FOUND`.
+11. The service partner or technician certification named in the path or body resolves. Applies to `GET /service-partners/{id}`, `POST /service-partners/{id}/authorization`, `POST /technician-certifications`, `GET /technician-certifications/{id}`, `POST /technician-certifications/{id}/grade` and `POST /warranty-claims`. `ERR_CHANNEL_RESOURCE_NOT_FOUND`.
+12. The warranty claim named in the path resolves. Applies to `GET /warranty-claims/{id}`, `POST /warranty-claims/{id}/adjudication` and `POST /warranty-claims/{id}/reversal`. `ERR_WARRANTY_CLAIM_NOT_FOUND`.
+13. `expected_chain_account_version` matches, on `POST /chain-configurations`. `ERR_STALE_CHAIN_ACCOUNT_VERSION`.
+14. `expected_chain_configuration_version` matches, on `POST /performance-validations`. `ERR_STALE_CONFIGURATION_VERSION`.
+15. Segregation of duties, on `POST /certification-listings/{id}/agency-decisions` and `POST /chain-configurations/{id}/engineering-decisions`. `ERR_SEGREGATION_OF_DUTIES`.
+16. The listing's `status` admits the requested move, on `POST /certification-listings/{id}/submissions` and `POST /certification-listings/{id}/agency-decisions`. `ERR_LISTING_STATE_INVALID`.
+17. The configuration's `status` admits the requested move, on `POST /chain-configurations/{id}/submissions`, `POST /chain-configurations/{id}/engineering-decisions`, `POST /chain-configurations/{id}/branding-signoff`, `POST /chain-configurations/{id}/release` and `POST /performance-validations`. `ERR_CONFIGURATION_STATE_INVALID`.
+18. The validation's `status` admits the requested operation, on `POST /performance-validations/{id}/test-runs`, `POST /performance-validations/{id}/conclusion` and `POST /performance-validations/{id}/retest`. `ERR_VALIDATION_STATE_INVALID`.
+19. The slot's `status` admits the requested progress and the site order's `fulfillment_status` admits the requested event, on `POST /production-slots/{id}/build-progress`, `POST /production-slots/{id}/cancellation` and `POST /site-orders/{id}/fulfillment-events`. `ERR_PRODUCTION_STATE_INVALID`.
+20. The unit's coverage dimension or the campaign's `status` admits the requested operation, on `POST /connected-units/{id}/recipe-pushes`, `POST /connected-units/{id}/coverage-actions`, `POST /firmware-campaigns/{id}/schedule`, `POST /firmware-campaigns/{id}/start`, `POST /firmware-campaigns/{id}/unit-results` and `POST /firmware-campaigns/{id}/close`. `ERR_CONNECTED_STATE_INVALID`.
+21. The partner's or certification's `status` admits the requested operation, on `POST /service-partners/{id}/authorization`, `POST /technician-certifications` and `POST /technician-certifications/{id}/grade`. `ERR_CHANNEL_STATE_INVALID`.
+22. The claim's `status` admits the requested decision, on `POST /warranty-claims/{id}/adjudication` and `POST /warranty-claims/{id}/reversal`. `ERR_CLAIM_STATE_INVALID`.
+23. The referenced unit's coverage is live, evaluated after the lazy expiry re-evaluation, on `POST /warranty-claims` and `POST /warranty-claims/{id}/adjudication`. `ERR_UNIT_COVERAGE_NOT_ACTIVE`.
+24. The site order's configuration is released, on `POST /site-orders`, `POST /production-slots` and `POST /production-slots/{id}/build-progress`. `ERR_CONFIGURATION_NOT_RELEASED`.
+25. The referenced model's posture is not suspended, on `POST /chain-configurations`, `POST /chain-configurations/{id}/engineering-decisions`, `POST /chain-configurations/{id}/release`, `POST /connected-units/{id}/coverage-actions` and `POST /firmware-campaigns/{id}/schedule`. `ERR_MODEL_LISTING_SUSPENDED`.
+26. The referenced model's posture is fully listed, on `POST /chain-configurations/{id}/engineering-decisions` and `POST /chain-configurations/{id}/release`. `ERR_MODEL_NOT_LISTED`.
+27. A passed performance validation exists, on `POST /chain-configurations/{id}/submissions`. `ERR_PERFORMANCE_VALIDATION_NOT_PASSED`.
+28. Every requested scope is within the chosen agency's remit, on `POST /certification-listings` and `POST /certification-listings/{id}/submissions`. `ERR_AGENCY_SCOPE_NOT_COVERED`.
+29. The requested controls package is supported by the model, on `POST /chain-configurations`. `ERR_CONTROLS_PACKAGE_UNSUPPORTED`.
+30. The model's energy type is tooled on the line, on `POST /production-slots`. `ERR_LINE_ENERGY_INCOMPATIBLE`.
+31. The configuration's pinned model version is still current, on `POST /chain-configurations/{id}/release`. `ERR_MODEL_VERSION_PIN_STALE`.
+32. The filing partner is authorised for the unit's model, on `POST /warranty-claims` and `POST /warranty-claims/{id}/adjudication`. `ERR_PARTNER_NOT_AUTHORIZED_FOR_CLAIMS`.
+33. The named technician certification is a live, matching certification of the filing partner, on `POST /warranty-claims`. `ERR_TECHNICIAN_NOT_CERTIFIED`.
+34. The requested build interval does not collide on the line, on `POST /production-slots`. `ERR_BUILD_SLOT_OVERLAP`.
+35. The rollout window is not already saturated for the model, on `POST /firmware-campaigns/{id}/schedule`. `ERR_CAMPAIGN_WINDOW_SATURATED`.
+36. The rollout window is open right now, on `POST /firmware-campaigns/{id}/start`. `ERR_CAMPAIGN_WINDOW_NOT_OPEN`.
+37. No competing live application exists for the same model and agency, on `POST /certification-listings/{id}/submissions`. `ERR_DUPLICATE_LISTING_APPLICATION`.
+38. The serial number is unused, on `POST /connected-units`. `ERR_DUPLICATE_SERIAL_NUMBER`.
+39. The supplied business code is unique in its declared scope, on `POST /equipment-models`, `POST /chain-accounts`, `POST /chain-configurations`, `POST /construction-programs`, `POST /site-orders`, `POST /build-lines`, `POST /firmware-campaigns`, `POST /service-partners`, `POST /technician-certifications` and `POST /warranty-claims`. `ERR_DUPLICATE_RESOURCE_CODE`.
+40. The listing's revision budget is not exhausted, on `POST /certification-listings/{id}/submissions`. `ERR_LISTING_REVISION_LIMIT`.
+41. The validation's attempt budget is not exhausted, on `POST /performance-validations/{id}/conclusion` and `POST /performance-validations/{id}/retest`. `ERR_RETEST_LIMIT_EXCEEDED`.
+42. Enough test runs have been recorded, on `POST /performance-validations/{id}/conclusion`. `ERR_MIN_TEST_RUNS_NOT_MET`.
+43. The partner has at least one model it is technically authorised for, on `POST /service-partners/{id}/authorization`. `ERR_INSUFFICIENT_CERTIFIED_TECHNICIANS`.
+44. The technician's documented training hours meet the minimum, on `POST /technician-certifications/{id}/grade`. `ERR_TRAINING_HOURS_NOT_MET`.
+45. The partner's parts stocking commitment is sufficient, on `POST /service-partners/{id}/authorization`. `ERR_PARTS_STOCKING_INSUFFICIENT`.
+46. The programme has room for another site, on `POST /site-orders`. `ERR_PROGRAM_SITE_CAPACITY_EXCEEDED`.
+47. Enough eligible units exist for the cohort, on `POST /firmware-campaigns/{id}/schedule`. `ERR_NO_ELIGIBLE_UNITS`.
+48. The reported unit belongs to the cohort and has not already reported, on `POST /firmware-campaigns/{id}/unit-results`. `ERR_UNIT_NOT_IN_COHORT`.
+49. The slot's unit count fits the line's capacity over the interval, on `POST /production-slots`. `ERR_BUILD_CAPACITY_EXCEEDED`.
+50. The computed payout fits inside the unit's remaining reserve, on `POST /warranty-claims/{id}/adjudication`. `ERR_WARRANTY_RESERVE_EXHAUSTED`.
+51. The campaign is closable, on `POST /firmware-campaigns/{id}/close`. `ERR_CAMPAIGN_SUCCESS_RATE_TOO_LOW`.
+
+The substance of each of these checks — the actual threshold, set membership or arithmetic being tested — is described in §3 alongside the workflow it guards.
+
+### 2.10. Segregation of Duties Across Review Gates
+
+Two review gates in this system are two-person controls, and both compare the acting `X-User-ID` against a user identifier the system recorded earlier. On a certification listing, the operator recording an agency decision must not be the operator who last submitted the application: the acting `X-User-ID` must differ from `submitted_by_user_id`, for every disposition the decision endpoint accepts. On a chain configuration, the `EngineeringApprover` deciding the package must not be the `ApplicationEngineer` who submitted it: the acting `X-User-ID` must differ from `submitted_by_user_id`. Either violation is rejected with `ERR_SEGREGATION_OF_DUTIES` and HTTP 409.
+
+Note the asymmetry with roles: segregation of duties is a comparison between user identifiers, not between roles. A `PlatformAdmin` operating both sides of a gate is subject to exactly the same check, because the recorded `submitted_by_user_id` does not remember which role wrote it.
+
+### 2.11. Conserved Ledgers: Line Capacity and Warranty Reserve
+
+Two quantities in this system are conserved, meaning every operation that moves them must be matched by an operation that moves them back, with no drift.
+
+The first is a build line's `committed_units`, which must at all times equal the sum of `units` over that line's production slots whose `status` is `RESERVED`, `CONFIRMED` or `IN_BUILD`. Reserving a slot adds its `units`; completing a build subtracts them, because the units have left the forward commitment and become physical inventory; cancelling a reserved or confirmed slot subtracts them, restoring the invariant exactly. Confirming a slot moves it between two counted states and therefore leaves `committed_units` unchanged.
+
+The second is a connected unit's warranty reserve, where `reserve_balance_cents` plus `claims_paid_cents` must at all times equal `reserve_initial_cents`. Coverage activation stamps all three; an approved claim moves money from balance to paid; a reversal moves exactly the same amount back; and buying a coverage extension raises `reserve_initial_cents` and `reserve_balance_cents` by the same amount so the identity survives. Voiding coverage is the one deliberate exception: it zeroes `reserve_balance_cents` and leaves `claims_paid_cents` untouched, because a voided programme is not a settled one.
+
+## 3. Business Logic & Workflows
+
+### 3.1. The Model Catalogue and the Path to a Listed Posture
+
+Everything in this system hangs off an **equipment model** in the manufacturer catalogue. A `ComplianceEngineer` creates one by supplying a `model_code` (between 1 and 32 characters, unique across the catalogue; a collision is rejected with `ERR_DUPLICATE_RESOURCE_CODE`), a marketing `name`, a `category` drawn from `FRYER`, `COMBI_OVEN`, `GRIDDLE`, `DISHWASHER` and `HOLDING_CABINET`, an `energy_type` of `GAS`, `ELECTRIC` or `DUAL`, a `base_price_cents` of at least 1, a non-empty `supported_controls_packages` array drawn from `STANDARD_DIAL`, `TOUCH_PRO` and `CONNECT_PLUS` (`STANDARD_DIAL` is always an allowed member), and a `rated_throughput_units_per_hour` greater than zero that acts as the ceiling on every menu-item throughput target later written against the model.
+
+The energy source is what determines the model's regulatory obligations. On creation the system computes `required_scopes` from `energy_type`: sanitation is always required, so `SANITATION` is always present; `GAS` is added when the energy type is `GAS` or `DUAL`; `ELECTRICAL` is added when the energy type is `ELECTRIC` or `DUAL`. The array is emitted in that fixed order — `SANITATION`, then `GAS`, then `ELECTRICAL` — so a dual-fuel model requires all three and an electric-only model requires exactly `SANITATION` and `ELECTRICAL`. A brand-new model starts with `covered_scopes` empty and a `certification_posture` of `UNLISTED`.
+
+`covered_scopes` is the union of the `scopes` arrays of the model's certification listings that are currently `LISTED` and whose `expires_on` is strictly later than the logical clock, de-duplicated and sorted in that same fixed order of `SANITATION`, `GAS`, `ELECTRICAL`. Listings in `DRAFT`, `SUBMITTED`, `UNDER_REVIEW`, `CONDITIONS_REQUESTED` or `REJECTED` contribute nothing. From those two arrays the posture follows deterministically, and the four cases are evaluated in this order: if any listing child of the model is `SUSPENDED` the posture is `SUSPENDED` regardless of how much coverage survives; otherwise, if every required scope appears among the covered scopes the posture is `LISTED`; otherwise, if at least one scope is covered the posture is `PARTIAL`; otherwise it is `UNLISTED`. This recomputation runs on model creation, on every listing status change, and on every clock advance, and any change of value increments the model's `version` by one.
+
+Because the posture is derived rather than stored by an operator, a model walks through its posture states without any endpoint naming them. Granting the first partial listing takes the model `UNLISTED → PARTIAL` when the newly covered scopes form a non-empty proper subset of the required ones and no listing child is suspended; granting the listing that closes the last gap takes it `PARTIAL → LISTED`, and a single listing that covers every required scope at once takes it `UNLISTED → LISTED` directly, both under the same rule that no listing child may be suspended. Time runs the transitions in reverse: when the clock reaches or passes the `expires_on` of a `LISTED` child whose scopes were being counted, and the surviving coverage is still a non-empty proper subset of the requirement, the model moves `LISTED → PARTIAL` and `covered_scopes` is recomputed excluding every listing whose `expires_on` is at or before the clock; when no `LISTED` child has an `expires_on` still ahead of the clock, the model moves `LISTED → UNLISTED` and `covered_scopes` is set to empty. Every one of these re-derivations increments the model's `version`.
+
+A `ComplianceEngineer` may also revise a model's commercial and capability attributes, supplying any of `base_price_cents`, `supported_controls_packages` and `rated_throughput_units_per_hour`. Any successful revision increments the model's `version` by one and deliberately leaves the `pinned_model_version` of every already-approved configuration untouched, so a revision made between engineering approval and release is caught at release time with `ERR_MODEL_VERSION_PIN_STALE` rather than silently shipping an unreviewed revision.
+
+**Filing with an agency.** A `ComplianceEngineer` opens a listing application by naming the `equipment_model_id` it covers, the `agency_code` it is filed with, and the `scopes` requested. Three agencies exist and their remits differ: `AGENCY_ALPHA` may grant only `SANITATION`, `AGENCY_BETA` may grant `GAS` and `ELECTRICAL`, and `AGENCY_GAMMA` may grant all three of `SANITATION`, `GAS` and `ELECTRICAL`. `scopes` must be a non-empty array of distinct members drawn from those three values, and every member must be within the chosen agency's remit — asking `AGENCY_ALPHA` for `GAS` is rejected with `ERR_AGENCY_SCOPE_NOT_COVERED`, both when the application is created and again when it is submitted. A new application starts in `DRAFT` with `revision` at 0, `conditions_note`, `listed_on`, `expires_on`, `submitted_by_user_id` and `decided_by_user_id` all null.
+
+Submitting the application drives it `DRAFT → SUBMITTED`. Two preconditions apply: the requested scopes must be within the agency's remit, and no other listing of the same model with the same `agency_code` may be in `SUBMITTED`, `UNDER_REVIEW`, `CONDITIONS_REQUESTED` or `LISTED` — a competing live application is rejected with `ERR_DUPLICATE_LISTING_APPLICATION`. The submission records the acting `X-User-ID` in `submitted_by_user_id`, which is the value the two-person control in §2.10 later reads.
+
+The agency side of the loop is recorded by a `ListingReviewer` through a single decision operation that carries a `decision` and, for two of its dispositions, a `conditions_note`. `ACKNOWLEDGE_REVIEW` takes the application `SUBMITTED → UNDER_REVIEW`. `CONDITIONS` takes it `UNDER_REVIEW → CONDITIONS_REQUESTED`, requires a non-empty `conditions_note`, and stores that text on the listing. `GRANT` takes it `UNDER_REVIEW → LISTED`, stamps `listed_on` with the current logical clock and `expires_on` with `listed_on` plus a full listing term of 365 days, and re-derives the model's posture and covered scopes. `REJECT` takes it `UNDER_REVIEW → REJECTED`, which is terminal. Every disposition records the acting `X-User-ID` in `decided_by_user_id`, and every disposition is subject to the segregation-of-duties comparison against `submitted_by_user_id`. A disposition asked for from a state that does not admit it — acknowledging a `DRAFT`, granting a listing that is not `UNDER_REVIEW`, suspending one that is not `LISTED`, reinstating one that is not `SUSPENDED` — is rejected with `ERR_LISTING_STATE_INVALID`.
+
+When the agency comes back with conditions, the revision loop reopens: re-submitting takes the application `CONDITIONS_REQUESTED → SUBMITTED`, increments `revision` by one and re-records `submitted_by_user_id`. The loop is bounded — a re-submission is permitted only while `revision` is still below three, so an application may make three round trips through conditions and no more; the fourth attempt is rejected with `ERR_LISTING_REVISION_LIMIT`. Note the asymmetry between the two submission paths: the `DRAFT → SUBMITTED` path does not touch `revision`, while the `CONDITIONS_REQUESTED → SUBMITTED` path always increments it.
+
+### 3.2. Suspension, Reinstatement, and the Compliance Cascade
+
+A listing agency can pull a listing after the fact, and this is the single most consequential event in the system. A `ListingReviewer` records it as a `SUSPEND` disposition with a non-empty `conditions_note` explaining the agency's finding, against a listing that is currently `LISTED`. What follows is a six-hop cascade, and each hop is caused by the one before it:
+
+- **Hop one.** The listing moves `LISTED → SUSPENDED` and its `conditions_note` is set to the supplied text.
+- **Hop two.** The model's `certification_posture` is re-derived. Because any suspended listing child forces the suspended posture, the model lands on `SUSPENDED` from wherever it was — `LISTED → SUSPENDED` or `PARTIAL → SUSPENDED` — and its `version` increments by one.
+- **Hop three.** Every chain configuration of that model whose `status` is `RELEASED` moves `RELEASED → COMPLIANCE_HOLD`. Configurations in any other state are untouched.
+- **Hop four.** Every production slot whose `status` is `RESERVED` or `CONFIRMED` and whose site order references one of those newly held configurations moves to `CANCELLED`, and the slot's `units` are subtracted from its build line's `committed_units`, restoring the capacity invariant of §2.11.
+- **Hop five.** Each site order left with no slot in `RESERVED`, `CONFIRMED`, `IN_BUILD` or `COMPLETED` is reset: `fulfillment_status` back to `PENDING`, `commitment_status` back to `UNSCHEDULED`, and `projected_delivery_date` and `slack_days` back to null.
+- **Hop six.** The `commit_posture` of each affected construction programme is re-derived from its surviving site-order children.
+
+Reinstatement is deliberately not a full inverse. A `REINSTATE` disposition takes the listing `SUSPENDED → LISTED`, and is permitted only while the logical clock is still strictly earlier than the listing's `expires_on` — an expired suspension cannot be revived, only replaced by a fresh application. The model's posture then leaves `SUSPENDED`: with no suspended child remaining, it becomes `LISTED` when the covered scopes cover every required scope (`SUSPENDED → LISTED`) and `PARTIAL` when the surviving coverage is a non-empty proper subset of the requirement (`SUSPENDED → PARTIAL`), incrementing the model's `version` either way. Every configuration of that model sitting in `COMPLIANCE_HOLD` returns `COMPLIANCE_HOLD → RELEASED`, keeping its `firm_unit_price_cents` unchanged at the value stamped at its original release — a compliance hold does not re-price a configuration. What reinstatement does **not** do is un-cancel the production slots hop four killed or restore the site orders hop five reset; the factory schedule must be rebuilt by reserving new slots.
+
+While a model's posture is `SUSPENDED`, five operations refuse to touch it, all with `ERR_MODEL_LISTING_SUSPENDED`: creating a chain configuration for it, deciding one in engineering review, releasing one, activating warranty coverage on one of its units, and scheduling a firmware campaign over its fleet.
+
+### 3.3. Chain Accounts, Configuration Authoring, and Quote Support
+
+A `ChannelManager` opens a **chain account** with an `account_code` unique across all accounts, the chain's legal `name`, a `contracted_unit_volume` of zero or more, and optionally a `dealer_of_record` — the dealer whose specification-writing influence is credited on quotes for the chain — and a `consultant_firm`, the kitchen consultant named on the chain's specification package. Both channel attributions default to null. The same role may later revise `contracted_unit_volume`, `dealer_of_record` and `consultant_firm`; any such revision increments the account's `version` by one, which is precisely the movement a stale configuration create observes under §2.7.
+
+An `ApplicationEngineer` authors a **chain configuration** — a chain-specific build of a base model — by naming the `chain_account_id` it belongs to and the `equipment_model_id` being customised, giving it a `config_code` that must be unique within that chain account, choosing `option_codes` from `SPLIT_TANK`, `HIGH_ALT`, `LEFT_HINGE` and `ENERGY_SAVER` (the array may be empty and may not repeat a code), selecting a `controls_package` from `STANDARD_DIAL`, `TOUCH_PRO` and `CONNECT_PLUS`, and selecting a `branding_kit` from `NONE`, `LOGO_BADGE` and `FULL_WRAP`. The controls package must be a member of the model's `supported_controls_packages`; asking for `TOUCH_PRO` on a model that supports only `STANDARD_DIAL` is rejected with `ERR_CONTROLS_PACKAGE_UNSUPPORTED`. The model's posture must not be `SUSPENDED`. And the create must carry `expected_chain_account_version` per §2.7.
+
+The create is a busy operation. It increments the parent chain account's `version` by one. It sets the new configuration's `status` to `DRAFT` with `revision` at 0, `revision_note` null, `branding_signed_off` false, `firm_unit_price_cents` null and `pinned_model_version` null. It stamps `indicative_unit_price_cents` using the indicative pricing variant described below. And it supersedes prior work: any earlier configuration for the same chain account and equipment model whose `status` is `DRAFT` or `REVISION_REQUESTED` moves to `SUPERSEDED` (`DRAFT → SUPERSEDED` or `REVISION_REQUESTED → SUPERSEDED`), and every performance validation child of that superseded configuration moves to `SUPERSEDED` as well — `IN_PROGRESS → SUPERSEDED`, `PASSED → SUPERSEDED` or `FAILED → SUPERSEDED` — with its `test_runs` frozen at their current contents. Configurations already past revision — `ENG_REVIEW`, `ENG_APPROVED`, `RELEASED` or `COMPLIANCE_HOLD` — are never superseded by a newer sibling.
+
+**Unit pricing.** A configuration's price is built in a pinned order, and the order matters because rounding happens more than once. Start from the referenced model's `base_price_cents`. Then compute the option uplift: each selected option contributes its own percentage of the base price — `SPLIT_TANK` seven and a half percent, `HIGH_ALT` three and a quarter percent, `LEFT_HINGE` one and a half percent, `ENERGY_SAVER` four and a quarter percent — and each contribution is rounded half up to a whole cent **independently**, considering the options in the fixed order `SPLIT_TANK`, `HIGH_ALT`, `LEFT_HINGE`, `ENERGY_SAVER`, before the rounded contributions are summed. Adding the percentages together and rounding once at the end is a different number of cents and is wrong. Next add the controls uplift, which is nothing for `STANDARD_DIAL`, one hundred eighty-five thousand cents for `TOUCH_PRO` and three hundred forty thousand cents for `CONNECT_PLUS`. The base price, the summed option uplift and the controls uplift together form the discountable subtotal — branding is deliberately outside it.
+
+The volume discount comes from the parent chain account's `contracted_unit_volume`, in three inclusive tiers: a contracted volume of at least 500 units earns twelve percent, at least 200 earns eight percent, at least 50 earns four percent, and anything below 50 earns nothing. The discount amount is the discountable subtotal multiplied by that percentage, rounded half up to a whole cent exactly once, and subtracted from the subtotal to give the discounted amount.
+
+The two variants then diverge on branding, which is worth nothing for `NONE`, forty-two thousand cents for `LOGO_BADGE` and one hundred fifty-six thousand cents for `FULL_WRAP`. The **indicative** variant excludes the branding charge entirely, because at quoting time the artwork has not been signed off and branding is quoted separately; its result is stored in `indicative_unit_price_cents`. The **firm** variant adds the branding charge *after* the volume discount, so the branding charge is never discounted; its result is stored in `firm_unit_price_cents`. The indicative figure is stamped when the configuration is created and recomputed on every quote-support read, so a dealer always sees a number consistent with the model's current `base_price_cents` and the chain's current `contracted_unit_volume`. The firm figure is stamped once, at release.
+
+Quote support is the channel's read path: a `ChannelManager`, `ApplicationEngineer` or `ChainAdmin` can pull a configuration together with its freshly recomputed `indicative_unit_price_cents` and, once the configuration has been released, its `firm_unit_price_cents`. Neither the option set, the controls package nor the branding kit of an existing configuration is editable; a chain that wants a different build gets a new configuration, which supersedes the old one under the rules above. No site order or production slot data participates in pricing.
+
+### 3.4. Proving the Menu: Cooking-Performance Validation
+
+Before a configuration can go to engineering review, at least one of the chain's menu items must have been throughput-tested on it. An `ApplicationEngineer` opens a **performance validation** against a `chain_configuration_id`, naming the `menu_item_code` under test (1 to 32 characters), the `target_throughput_units_per_hour` the item must meet, and the `hold_temp_target_c` in Celsius the item must be held at. The target must be greater than zero and no greater than the referenced model's `rated_throughput_units_per_hour` — a chain cannot specify a throughput the catalogue never rated the machine for — and the hold temperature target must be greater than zero; either violation is a malformed request. Validations may only be opened while the parent configuration is in `DRAFT` or `REVISION_REQUESTED`, and the create must carry `expected_chain_configuration_version` per §2.7.
+
+Opening a validation increments the parent configuration's `version` by one, sets the new row's `status` to `IN_PROGRESS` with `attempt_count` at 0 and `test_runs` an empty array, leaves `certified_throughput_units_per_hour`, `as_tested_throughput_units_per_hour` and `failure_reason` null, and supersedes any prior validation for the same configuration and `menu_item_code`, moving it `IN_PROGRESS → SUPERSEDED`, `PASSED → SUPERSEDED` or `FAILED → SUPERSEDED` as the case may be and freezing its `test_runs` where they stood. A validation also reaches `SUPERSEDED` transitively when its parent configuration is superseded.
+
+Test data arrives one run at a time while the validation is `IN_PROGRESS`. Each run submission carries `units_produced`, the `minutes` the run took, and the measured `hold_temp_c`, and the server appends an object to the append-only `test_runs` array holding `run_index`, `units_produced`, `minutes`, `hold_temp_c` and `recorded_at`, where `run_index` is one greater than the number of runs already present (so indices run 1, 2, 3, … in append order) and `recorded_at` is the current logical clock. Appending a run to a validation that is not `IN_PROGRESS` is rejected with `ERR_VALIDATION_STATE_INVALID`.
+
+**Concluding an attempt** computes two different throughput figures from the same runs, ordered by `run_index` ascending, and stamps both. The **certified** figure — the one that gates approval — is the best three-run window: for every group of three consecutive runs, take the total `units_produced` across those three runs, multiply by sixty, divide by the total `minutes` across those same three runs, and keep the largest such rate across all windows; round that maximum half up to two decimal places, and round only that final maximum, never the individual window rates. It is stored in `certified_throughput_units_per_hour`. The **as-tested** figure pools the whole series instead: total `units_produced` across every run multiplied by sixty, divided by total `minutes` across every run, rounded half up to two decimal places, and stored in `as_tested_throughput_units_per_hour`. The as-tested number is what the chain is shown, and because weak runs drag it down it is normally the lower of the two; it is never used as the pass/fail gate.
+
+Concluding requires at least three runs on the validation — fewer is rejected with `ERR_MIN_TEST_RUNS_NOT_MET` — and an `attempt_count` still below three, the retest ceiling; a fourth attempt is rejected with `ERR_RETEST_LIMIT_EXCEEDED`. The conclusion increments `attempt_count` by one and stamps both figures regardless of the outcome. Two gates then decide the outcome. The throughput gate passes when the certified figure is greater than or equal to `target_throughput_units_per_hour`. The hold-temperature gate passes when every run's `hold_temp_c` differs from `hold_temp_target_c` by no more than two degrees Celsius in absolute terms, so a target of 74 degrees admits measurements from 72 through 76 inclusive. When both gates pass, the validation moves `IN_PROGRESS → PASSED`, which is terminal. When either fails, it moves `IN_PROGRESS → FAILED` and `failure_reason` is set to `THROUGHPUT_BELOW_TARGET` if the throughput gate was the one that failed, and otherwise to `HOLD_TEMP_OUT_OF_TOLERANCE` — so a run series that fails both gates records the throughput reason.
+
+A failed validation can be reopened for a fresh series. Retesting takes it `FAILED → IN_PROGRESS`, is permitted only while `attempt_count` is still below three and only while the parent configuration is in `DRAFT` or `REVISION_REQUESTED`, and wipes the slate: `test_runs` is cleared back to an empty array and `certified_throughput_units_per_hour`, `as_tested_throughput_units_per_hour` and `failure_reason` are all cleared to null. `attempt_count` is deliberately **not** cleared, which is what makes the retest loop finite.
+
+### 3.5. Engineering Review, Branding Sign-Off, and Release
+
+Submitting a configuration for engineering review takes it `DRAFT → ENG_REVIEW`, or `REVISION_REQUESTED → ENG_REVIEW` when it has been round-tripped, and is the `ApplicationEngineer`'s act. It requires that at least one performance validation child of the configuration be `PASSED`; a configuration with only in-progress or failed menu-item tests is rejected with `ERR_PERFORMANCE_VALIDATION_NOT_PASSED`. Both submission paths record the acting `X-User-ID` in `submitted_by_user_id`; only the `REVISION_REQUESTED → ENG_REVIEW` path increments `revision` by one.
+
+The review itself is a fork, and the two branches carry disjoint consequences. An `EngineeringApprover` supplies a `decision` and, on one branch, a `revision_note`. Both branches require that the acting `X-User-ID` differ from `submitted_by_user_id` per §2.10.
+
+- **Approving** takes the configuration `ENG_REVIEW → ENG_APPROVED`. It additionally requires the referenced model's `certification_posture` to be exactly `LISTED` — a `PARTIAL` or `UNLISTED` model is rejected with `ERR_MODEL_NOT_LISTED`, and a `SUSPENDED` one with `ERR_MODEL_LISTING_SUSPENDED`. Approval writes `pinned_model_version` with the model's current `version`, capturing exactly which model revision was reviewed, and records the acting `X-User-ID` in `approved_by_user_id`.
+- **Requesting a revision** takes the configuration `ENG_REVIEW → REVISION_REQUESTED`. It requires a non-empty `revision_note`, stores that text on the configuration, sets `branding_signed_off` back to false so the chain must re-approve artwork against the revised package, and deliberately leaves `pinned_model_version` null — nothing was reviewed to completion, so nothing is pinned.
+
+Branding is the chain's own gate. A `ChainAdmin` signs off the artwork by supplying an `approved_artwork_ref`, which sets `branding_signed_off` to true. Sign-off is accepted while the configuration is in `DRAFT`, `ENG_REVIEW` or `ENG_APPROVED` and rejected with `ERR_CONFIGURATION_STATE_INVALID` in any other state, so a chain may pre-approve artwork before engineering has even looked at the package, but cannot re-open branding on a released or superseded one.
+
+**Release** is the moment a configuration becomes buildable, and it is the `ApplicationEngineer`'s act. It moves the configuration `ENG_APPROVED → RELEASED` and is guarded by three conditions beyond the state itself. First, `branding_signed_off` must be true; a release attempted from a state other than `ENG_APPROVED`, or with the branding gate still open, is rejected with `ERR_CONFIGURATION_STATE_INVALID`. Second, the model's posture must still be `LISTED` — `ERR_MODEL_LISTING_SUSPENDED` when it is suspended, `ERR_MODEL_NOT_LISTED` when it is merely partial or unlisted, which is exactly what happens if the covering listing reached its `expires_on` between approval and release. Third, `pinned_model_version` must still equal the model's current `version`; if the catalogue was revised in between, the release is rejected with `ERR_MODEL_VERSION_PIN_STALE` and the configuration must go back through review. On success, `firm_unit_price_cents` is stamped using the firm pricing variant of §3.3, adding the branding charge after the volume discount.
+
+Released configurations are not immune from compliance. As §3.2 describes, a suspension of the model's listing pushes them `RELEASED → COMPLIANCE_HOLD`, and a reinstatement pulls them `COMPLIANCE_HOLD → RELEASED` with their firm price intact. `SUPERSEDED` is the configuration lifecycle's terminal state.
+
+### 3.6. Construction Programmes, Site Orders, and the Delivery Commitment
+
+A `ChainAdmin` runs the chain's build and remodel work as **construction programmes**. Opening one requires the `chain_account_id`, a `program_code` unique within that chain, a `program_type` of either `NEW_BUILD` or `REMODEL`, and a `site_count_planned` of at least one, which is the hard ceiling on how many sites the programme will admit. A new programme's `commit_posture` starts at `ON_TRACK`, which is also what an empty programme always reports.
+
+Each restaurant in the programme is a **site order**, added by the same role with the `construction_program_id` it belongs to, the `chain_configuration_id` to be built for it, a `site_code` unique within the programme, the `committed_delivery_date` promised to the chain, and a `unit_count` of at least one. Two gates apply: the referenced configuration's `status` must be `RELEASED`, otherwise `ERR_CONFIGURATION_NOT_RELEASED` — a chain cannot commit a delivery date against a build the factory is not cleared to make — and the programme must not already hold `site_count_planned` site orders, otherwise `ERR_PROGRAM_SITE_CAPACITY_EXCEEDED`. A new site order starts at `fulfillment_status` `PENDING` and `commitment_status` `UNSCHEDULED`, with `projected_delivery_date`, `slack_days` and `waiver_reason` all null, and its creation re-derives the programme's `commit_posture`.
+
+**The commitment dimension** answers one question: will this site get its equipment when we said it would? It is recomputed whenever the site order's slot set changes, whenever a delivery is recorded, and whenever the logical clock moves. The computation first picks the one slot that drives the projection: among the site order's production slots whose `status` is `RESERVED`, `CONFIRMED`, `IN_BUILD` or `COMPLETED` — cancelled slots are excluded entirely — take the slot with the latest `window_end`, breaking a tie by the earliest `created_at`; the resource identifier is never a decision input. If no such slot exists, `projected_delivery_date` and `slack_days` are null and `commitment_status` is `UNSCHEDULED`. Otherwise `projected_delivery_date` is that slot's `window_end` plus one week of transit — seven days — and `slack_days` is the floor of the whole-day difference obtained by subtracting the projected date from the `committed_delivery_date`, so positive slack means the projection lands before the promise.
+
+`slack_days` then selects the status against a three-day grace: zero or more days of slack means `COMMITTED`; a shortfall of one, two or three days means `AT_RISK`; a shortfall of four days or more means `BREACHED`. Both boundaries are inclusive on the tighter side — slack of exactly zero is `COMMITTED`, and slack of exactly negative three is `AT_RISK` while negative four is `BREACHED`. Because the calculation is a pure function of the current slot set and clock, the dimension moves freely in both directions: `UNSCHEDULED → COMMITTED`, `UNSCHEDULED → AT_RISK` and `UNSCHEDULED → BREACHED` on the first slot reservation, then `COMMITTED → AT_RISK`, `AT_RISK → BREACHED`, `AT_RISK → COMMITTED` and `BREACHED → COMMITTED` or `BREACHED → AT_RISK` as slots are re-planned. Cancelling the last surviving slot returns it to the unscheduled state — `COMMITTED → UNSCHEDULED`, `AT_RISK → UNSCHEDULED` or `BREACHED → UNSCHEDULED` — clearing `projected_delivery_date` and `slack_days` to null. Every one of these movements re-derives the parent programme's `commit_posture`.
+
+There is one operator override. When a site is `AT_RISK` or `BREACHED`, the `ChainAdmin` may waive the delivery commitment by supplying a non-empty `waiver_reason`, taking the dimension `AT_RISK → WAIVED` or `BREACHED → WAIVED`. `WAIVED` is terminal and sticky: the commitment calculation continues to refresh `projected_delivery_date` and `slack_days` on that site order but never overwrites `commitment_status` again. The waiver also re-derives the programme's posture, which from then on ignores this site order entirely — that is the whole point of a waiver.
+
+**The programme posture** aggregates the commitment dimension across sites, considering only children whose `commitment_status` is `COMMITTED`, `AT_RISK` or `BREACHED`; `UNSCHEDULED` children (no slot held yet) and `WAIVED` children (commitment released by the chain) are excluded from consideration. If any considered child is `BREACHED` the posture is `BREACHED`; otherwise if any considered child is `AT_RISK` the posture is `AT_RISK`; otherwise it is `ON_TRACK`, which is also the answer when the considered set is empty. So the posture walks `ON_TRACK → AT_RISK`, `ON_TRACK → BREACHED`, `AT_RISK → BREACHED`, `AT_RISK → ON_TRACK`, `BREACHED → AT_RISK` and `BREACHED → ON_TRACK` purely as a consequence of its children, whether the trigger was a slot change, a waiver or a slot cancellation, and each landing on a new value increments the programme's `version` by one.
+
+### 3.7. Build Lines, Slot Reservation, and Fulfilment Progress
+
+A `ProductionPlanner` registers a **build line** with a `line_code` unique across all lines, the `plant_code` it sits in, a `daily_capacity_units` of at least one, and a non-empty `supported_energy_types` array drawn from `GAS`, `ELECTRIC` and `DUAL` describing what the line is tooled for. A new line's `committed_units` starts at zero and thereafter obeys the conservation rule of §2.11.
+
+Reserving a **production slot** is the act that ties the factory to the chain's calendar. The planner names the `build_line_id` and the `site_order_id`, gives the inclusive `window_start` and `window_end` of the build interval — the end must be strictly later than the start — and states the `units` to be built in that interval, at least one. Four business gates apply beyond the well-formedness check.
+
+The site order's configuration must still be `RELEASED`, otherwise `ERR_CONFIGURATION_NOT_RELEASED`; a configuration sitting in `COMPLIANCE_HOLD` cannot attract new factory capacity. The referenced model's `energy_type` must be a member of the line's `supported_energy_types`, otherwise `ERR_LINE_ENERGY_INCOMPATIBLE` — a gas fryer cannot be built on an electric-only line.
+
+The interval must not collide with another commitment on the same line, and the collision test is deliberately generous because a line needs changeover time between products. Every existing slot on the same `build_line_id` whose `status` is `RESERVED`, `CONFIRMED` or `IN_BUILD` is padded by twelve hours on each side, and the requested interval is rejected with `ERR_BUILD_SLOT_OVERLAP` if its start is at or before that padded end **and** its end is at or after that padded start. Because the comparison is inclusive on both sides and the pad is applied on both sides, two back-to-back windows that merely touch at an instant are rejected, and so is a window that begins less than twelve hours after another ends. Cancelled and completed slots are invisible to this test.
+
+Finally the interval must be physically buildable: the requested `units` may not exceed the line's `daily_capacity_units` multiplied by the interval's span in days, where the span is the floor of the whole-day difference between `window_end` and `window_start`, plus one, because the interval is closed at both ends and a window that starts and ends on the same day still gives the line one day of capacity. Exceeding that product is rejected with `ERR_BUILD_CAPACITY_EXCEEDED`.
+
+A successful reservation sets the slot's `status` to `RESERVED`, adds its `units` to the line's `committed_units`, moves the site order's fulfilment dimension `PENDING → SCHEDULED` (a no-op when the site order has already advanced past `PENDING`, which is how the two site-order dimensions move independently), recomputes the site order's `projected_delivery_date`, `slack_days` and `commitment_status`, and re-derives the programme's `commit_posture`.
+
+**Advancing a slot** is a single operation carrying a `progress` value with three settings, and each one both moves the slot and drives the site order:
+
+- `CONFIRM` takes the slot `RESERVED → CONFIRMED` and requires the site order's configuration to still be `RELEASED`. Because both `RESERVED` and `CONFIRMED` are counted states, the line's `committed_units` is unchanged.
+- `START` takes the slot `CONFIRMED → IN_BUILD`, requires the logical clock to have reached or passed the slot's `window_start`, and requires the configuration to still be `RELEASED`. It carries the site order `SCHEDULED → IN_BUILD` and refreshes its `updated_at`.
+- `COMPLETE` takes the slot `IN_BUILD → COMPLETED`, which is terminal, and likewise requires the clock to have reached or passed `window_start`. It subtracts the slot's `units` from the line's `committed_units`, because the units are now built rather than committed, and carries the site order `IN_BUILD → BUILT`.
+
+A `progress` value the slot's current `status` does not admit, or an attempt to start or complete a build before the clock has reached `window_start`, is rejected with `ERR_PRODUCTION_STATE_INVALID`.
+
+**Cancelling a slot** requires a `cancellation_reason` and takes the slot `RESERVED → CANCELLED` or `CONFIRMED → CANCELLED`, which is terminal. It subtracts the slot's `units` from the line's `committed_units`, restoring the capacity invariant, and if the site order is left with no slot in `RESERVED`, `CONFIRMED`, `IN_BUILD` or `COMPLETED`, resets that site order's fulfilment dimension `SCHEDULED → PENDING` and its commitment dimension to `UNSCHEDULED`, clearing `projected_delivery_date` and `slack_days` to null, and then re-derives the programme's `commit_posture`. This is exactly the reset that hop four of the compliance cascade performs at scale.
+
+Once the units are built, the `ProductionPlanner` records the two shipping milestones by supplying an `event`. `SHIP` takes the site order `BUILT → SHIPPED` and refreshes its `updated_at`. `DELIVER` takes it `SHIPPED → DELIVERED`, which is terminal on the fulfilment dimension, and recomputes the site order's `commitment_status` and its programme's `commit_posture` — delivery is the last moment the promise can be re-scored. An `event` the current fulfilment state does not admit is rejected with `ERR_PRODUCTION_STATE_INVALID`.
+
+### 3.8. The Connected Fleet: Monitoring, Recipes, and Firmware Rollout
+
+A `ConnectedOpsEngineer` registers a **connected unit** into the monitoring fleet with its `equipment_model_id`, its factory `serial_number` (unique across the fleet; a collision is rejected with `ERR_DUPLICATE_SERIAL_NUMBER`), the `service_tier` purchased for it — either `BASE` or `EXTENDED_PLUS` — and optionally the `site_order_id` that shipped it, which is null for an aftermarket unit registered outside any construction programme. A new unit reports `service_program_status` `PENDING_INSTALL`, `firmware_version` `1.0.0`, `recipe_book_version` 1, `fault_count_30d` and `missed_heartbeat_count` at zero, `coverage_start_date`, `coverage_end_date` and `grace_expires_on` null, and `reserve_initial_cents`, `reserve_balance_cents` and `claims_paid_cents` all at zero, with its `health_score` computed immediately.
+
+**Monitoring.** Telemetry arrives as a pair of counters — `fault_count_30d`, the faults the unit reported in the trailing thirty days, and `missed_heartbeat_count` — and posting them recomputes `health_score`. The score starts from a perfect 100, subtracts seven points for each fault in the trailing window and three points for each missed heartbeat, then adds a five-point currency bonus when the unit is running the reference firmware. The reference firmware is well defined even when several campaigns have run: among firmware campaigns for the unit's own `equipment_model_id` whose `status` is `COMPLETED`, take the one with the latest `window_start`, breaking ties by earliest `created_at`, and use its `target_firmware_version`; campaigns in `DRAFT`, `SCHEDULED`, `RUNNING` or `ROLLED_BACK` contribute nothing, and when no completed campaign exists for the model there is no reference and no bonus. The result is then clamped into the inclusive range 0 through 100, once, after the bonus has been applied — so a unit with many faults floors at 0 rather than going negative, and a fault-free unit running the reference firmware caps at 100 rather than reaching 105. The score is recomputed on unit registration, on every telemetry post, and for every cohort unit when a firmware campaign closes.
+
+**Recipes.** Pushing a recipe book generation sets the unit's `recipe_book_version` to the supplied value, and is permitted only while the unit's `service_program_status` is `ACTIVE` or `EXTENDED`; an uninstalled, expired, in-grace or voided unit is rejected with `ERR_CONNECTED_STATE_INVALID`.
+
+**Firmware campaigns.** A campaign is drafted against a model's fleet with the `equipment_model_id`, a `campaign_code` unique across all campaigns, the `target_firmware_version` the cohort will be moved to, the rollout window's `window_start` and `window_end` — where the start is inclusive, the end is exclusive, and the end must be strictly later than the start — and a `cohort_scope` of either `CANARY` or `BROAD`, which sizes the cohort at three units or five units respectively. A draft campaign reports `status` `DRAFT`, an empty `cohort_unit_ids`, `success_count` and `failure_count` at zero and `success_rate` null.
+
+Scheduling takes the campaign `DRAFT → SCHEDULED` and does the cohort selection. Three gates apply. The model's posture must not be `SUSPENDED`. The window must not be saturated: count the other campaigns for the same `equipment_model_id` whose `status` is `SCHEDULED` or `RUNNING` and whose half-open window strictly intersects this campaign's half-open window, and reject with `ERR_CAMPAIGN_WINDOW_SATURATED` when that count already stands at two or more, since a model tolerates at most two concurrent rollouts. Because both windows are half-open and unpadded, a campaign that starts exactly at another's `window_end` does not intersect it and is accepted — the deliberate opposite of the padded, closed-interval rule that governs factory slots. Finally the fleet must have enough eligible units: a unit is eligible when it belongs to the campaign's model, its `service_program_status` is `ACTIVE` or `EXTENDED`, and its `firmware_version` is not already the `target_firmware_version`; fewer eligible units than the cohort size is rejected with `ERR_NO_ELIGIBLE_UNITS`. On success, `cohort_unit_ids` is set to the first three or five eligible unit identifiers ordered by `health_score` ascending and then `created_at` ascending — the sickest units go first, because they are the ones the update is meant to help.
+
+Starting the campaign takes it `SCHEDULED → RUNNING` and is permitted only while the clock has reached or passed `window_start` and is still strictly before `window_end`; outside that half-open window the start is rejected with `ERR_CAMPAIGN_WINDOW_NOT_OPEN`. Starting resets `success_count` and `failure_count` to zero.
+
+Each cohort unit then reports back with its `connected_unit_id` and an `outcome` of `SUCCESS` or `FAILURE`, incrementing `success_count` or `failure_count` by one respectively. Results are accepted only while the campaign is `RUNNING`, and only for a unit that is in `cohort_unit_ids` and has not already reported in this run; anything else is rejected with `ERR_UNIT_NOT_IN_COHORT`.
+
+Closing carries a `disposition` and forks into two disjoint outcomes. Both require that every cohort unit has reported — `success_count` plus `failure_count` must equal the number of identifiers in `cohort_unit_ids` — and both stamp `success_rate`, computed as `success_count` divided by the cohort size and rounded to four decimal places.
+
+- `COMPLETE` takes the campaign `RUNNING → COMPLETED` and additionally requires `success_rate` to be at least 0.80; a partially-reported cohort or a completion below that floor is rejected with `ERR_CAMPAIGN_SUCCESS_RATE_TOO_LOW`. It then sets `firmware_version` to the campaign's `target_firmware_version` on every cohort unit that reported `SUCCESS`, and leaves `firmware_version` unchanged on every cohort unit that reported `FAILURE`.
+- `ROLL_BACK` takes the campaign `RUNNING → ROLLED_BACK` with no success-rate floor at all, leaves `firmware_version` unchanged on every cohort unit including the successful ones, and instead increments `recipe_book_version` by one on every cohort unit that reported `SUCCESS`, recording the recipe re-sync that a rollback forces on units which had already moved.
+
+Either disposition recomputes `health_score` for every cohort unit, which matters because a completed campaign may have just become the model's reference firmware and changed the currency bonus for the whole fleet. Both `COMPLETED` and `ROLLED_BACK` are terminal.
+
+### 3.9. Service Network Authorisation, Technician Training, and Warranty Administration
+
+Warranty work is performed by third-party partners, and the system will not pay a partner it has not authorised for the model in question.
+
+**Onboarding a partner.** A `ChannelManager` registers a **service partner** with a `partner_code` unique across all partners, the partner's legal `name`, the `region_code` it covers, and a `parts_stocking_level` of either `BASIC` or `FULL` describing its parts distribution commitment. A new partner sits at `status` `APPLIED` with an empty `authorized_model_ids`.
+
+**Technician training.** A `ServicePartnerUser` or a `ChannelManager` enrols a technician against one model by naming the `service_partner_id` employing them, the `equipment_model_id` they will be trained on, a `technician_code` unique within that partner-and-model pair, and the `training_hours` documented so far, which may be zero or more. Enrolment is refused when the partner's `status` is `TERMINATED`, with `ERR_CHANNEL_STATE_INVALID`. A new certification sits at `status` `ENROLLED` with `exam_score`, `certified_on` and `expires_on` null.
+
+Grading is the `ChannelManager`'s act and carries the `exam_score`. It is permitted only while the certification is `ENROLLED`, and only once the technician has logged at least twenty-four documented `training_hours`; a grade recorded against an under-trained technician is rejected with `ERR_TRAINING_HOURS_NOT_MET`. A score of at least eighty takes the certification `ENROLLED → PASSED`, storing `exam_score`, stamping `certified_on` with the current logical clock and `expires_on` with `certified_on` plus a two-year term counted as 730 days. A score below eighty takes it `ENROLLED → FAILED`, which is terminal, storing `exam_score` and leaving `certified_on` and `expires_on` null. Either way the grade re-derives the partner's claim authority.
+
+**Claim authority** is the partner's derived `authorized_model_ids`, and it is a per-model headcount rule. For each distinct `equipment_model_id` appearing among the partner's technician certifications, count the certifications for that model whose `status` is `PASSED` and whose `expires_on` is strictly later than the logical clock; certifications in `ENROLLED` or `FAILED` never count, and a passed certification stops counting the instant the clock reaches its `expires_on`. A model qualifies once that count reaches two, and `authorized_model_ids` lists every qualifying model identifier ordered by the equipment model's own `created_at` ascending. It is recomputed on every grade, on every authorisation action, and on every clock advance — which means a partner can silently lose authority for a model simply because a certification aged out.
+
+**Authorisation** advances the partner's network status through a single operation carrying an `action`. `PROVISION` takes it `APPLIED → PROVISIONAL` and requires at least one `PASSED` technician certification child. `AUTHORIZE` takes it `PROVISIONAL → AUTHORIZED` and requires two things: a non-empty `authorized_model_ids`, meaning at least one model has reached the two-certified-technician bar, and a `parts_stocking_level` of `FULL`, since an authorised partner must carry the full parts distribution kit — the stocking failure is reported as `ERR_PARTS_STOCKING_INSUFFICIENT`, while the technician shortfall on either `PROVISION`, `AUTHORIZE` or `REINSTATE` is reported as `ERR_INSUFFICIENT_CERTIFIED_TECHNICIANS`. `SUSPEND` takes it `AUTHORIZED → SUSPENDED`; claim children already in `SUBMITTED` stay `SUBMITTED` but become unapprovable while the partner is suspended. `REINSTATE` takes it `SUSPENDED → AUTHORIZED` and again requires a non-empty `authorized_model_ids`. `TERMINATE` takes it `PROVISIONAL → TERMINATED` or `SUSPENDED → TERMINATED`, is refused while any claim child is still `SUBMITTED`, and sets `authorized_model_ids` to empty; `TERMINATED` is terminal. Every action except termination re-derives `authorized_model_ids`. An action the partner's current `status` does not admit — provisioning an already-authorised partner, terminating one that is still `APPLIED` or `AUTHORIZED`, or terminating one with an open claim — is rejected with `ERR_CHANNEL_STATE_INVALID`.
+
+**Coverage administration** is the `WarrantyAdjudicator`'s domain and runs through a single operation carrying an `action` and, for one of them, a `void_reason`. `ACTIVATE` takes a unit `PENDING_INSTALL → ACTIVE` and requires the unit's model to hold real agency coverage — its `certification_posture` must be `LISTED` or `PARTIAL`, and a `SUSPENDED` or `UNLISTED` model is rejected with `ERR_MODEL_LISTING_SUSPENDED`. Activation stamps `coverage_start_date` with the current logical clock and `coverage_end_date` with that instant plus the tier's term — a full year of 365 days for a `BASE` unit, two years counted as 730 days for an `EXTENDED_PLUS` unit — and stamps both `reserve_initial_cents` and `reserve_balance_cents` with the tier's reserve, two hundred fifty thousand cents for `BASE` and six hundred thousand cents for `EXTENDED_PLUS`, with `claims_paid_cents` at zero.
+
+`EXTEND` takes a unit `ACTIVE → EXTENDED` and is available only to an `EXTENDED_PLUS` unit whose coverage has not yet run out, so the clock must still be strictly before `coverage_end_date`; a `BASE`-tier unit or one whose term has already elapsed is rejected with `ERR_CONNECTED_STATE_INVALID`. Extension pushes `coverage_end_date` out by another 365 days and adds three hundred thousand cents to both `reserve_balance_cents` and `reserve_initial_cents`, which is what keeps the reserve identity of §2.11 intact.
+
+`VOID` requires a non-empty `void_reason` and takes the unit `ACTIVE → VOIDED`, `EXTENDED → VOIDED` or `GRACE → VOIDED`. It sets `reserve_balance_cents` to zero and leaves `claims_paid_cents` at whatever has already been paid. `VOIDED` is terminal, and so is `EXPIRED`.
+
+Expiry is evaluated lazily rather than swept: on any read or write that touches a unit, and on every clock advance, a unit moves `ACTIVE → EXPIRED` or `EXTENDED → EXPIRED` once the clock has reached or passed `coverage_end_date`, and a unit in the grace state moves `GRACE → EXPIRED` once the clock has reached or passed `grace_expires_on`; either transition refreshes the unit's `updated_at`. This is why listing and reading connected units are described as having effects at all.
+
+**Filing a claim.** A `ServicePartnerUser` files against a covered unit by naming the `connected_unit_id`, its own `service_partner_id`, the `technician_certification_id` of the technician who did the work, a `claim_code` unique across all claims, the `parts_cost_cents` consumed (zero or more) and the `labor_hours` claimed (strictly greater than zero). Three business gates apply after the ownership and existence checks. The unit's coverage must be live — `service_program_status` `ACTIVE` or `EXTENDED`, evaluated after the lazy expiry re-evaluation above — otherwise `ERR_UNIT_COVERAGE_NOT_ACTIVE`. The filing partner must be `AUTHORIZED` and the unit's `equipment_model_id` must appear in that partner's `authorized_model_ids`, otherwise `ERR_PARTNER_NOT_AUTHORIZED_FOR_CLAIMS`. And the named certification must belong to the filing partner, be `PASSED` with an `expires_on` still strictly later than the clock, and be held for the same `equipment_model_id` as the unit, otherwise `ERR_TECHNICIAN_NOT_CERTIFIED`. A filed claim sits at `status` `SUBMITTED` with `coinsurance_pct`, `adjudicated_amount_cents`, `denial_reason` and `adjudicated_by_user_id` null.
+
+**Adjudication** carries a `decision` and, on one branch, a `denial_reason`, and is permitted only while the claim is `SUBMITTED`. Denying takes the claim `SUBMITTED → DENIED`, requires a non-empty `denial_reason`, stores it along with the acting `X-User-ID` in `adjudicated_by_user_id`, leaves `adjudicated_amount_cents` null, and leaves the unit's `reserve_balance_cents` and `claims_paid_cents` untouched. `DENIED` is terminal.
+
+Approving takes the claim `SUBMITTED → APPROVED` and runs the payout calculation in a pinned order, because the coinsurance band depends on how much of the reserve has already been consumed and this very claim is about to change that. The order below is normative.
+
+1. Measure utilisation on the **pre-claim** ledger: the unit's `claims_paid_cents` divided by its `reserve_initial_cents`, both as they stand immediately before this adjudication. Claims in `SUBMITTED`, `DENIED` or `REVERSED` contribute nothing to `claims_paid_cents`.
+2. Select `coinsurance_pct` from that utilisation, with the band lower bounds inclusive: below sixty percent utilisation the partner bears nothing and the fraction is `0.00`; from sixty percent up to but not including eighty-five percent the fraction is `0.10`; at eighty-five percent utilisation or above it is `0.25`. A utilisation of exactly `0.60` therefore lands in the ten-percent band, and exactly `0.85` in the twenty-five-percent band.
+3. Cap the parts: the covered parts amount is the lesser of the claim's `parts_cost_cents` and one hundred eighty thousand cents.
+4. Value the labour: the claim's `labor_hours` multiplied by the unit's tier rate — nine thousand cents per hour for a `BASE` unit, eleven thousand cents per hour for an `EXTENDED_PLUS` unit — rounded half up to a whole cent.
+5. Add the two to obtain the gross amount.
+6. Withhold coinsurance from the gross: `adjudicated_amount_cents` is the gross amount minus the gross amount multiplied by `coinsurance_pct`, that product rounded half up to a whole cent once. These are the only two roundings in the whole calculation.
+7. Only now compare the result against the unit's `reserve_balance_cents`. A payout larger than the remaining reserve is rejected outright with `ERR_WARRANTY_RESERVE_EXHAUSTED` — it is never truncated to fit.
+
+Approval then cascades in three hops. Hop one stamps `coinsurance_pct` and `adjudicated_amount_cents` on the claim and records the acting `X-User-ID` in `adjudicated_by_user_id`. Hop two, caused by hop one, subtracts `adjudicated_amount_cents` from the unit's `reserve_balance_cents` and adds the same amount to its `claims_paid_cents`, preserving the reserve identity. Hop three, caused by hop two, applies when the reserve has been driven exactly to zero: the unit moves `ACTIVE → GRACE` or `EXTENDED → GRACE` and `grace_expires_on` is set to the current clock plus a thirty-day grace window, during which the unit is still nominally covered but has no money behind it. Approval also requires, at the moment of decision, that the filing partner still be `AUTHORIZED` for the model and that the unit's coverage still be `ACTIVE` or `EXTENDED` — a partner suspended between filing and adjudication makes its open claims unapprovable, reported as `ERR_PARTNER_NOT_AUTHORIZED_FOR_CLAIMS`, and a unit whose coverage lapsed in between is reported as `ERR_UNIT_COVERAGE_NOT_ACTIVE`.
+
+**Reversal** is the exact compensation of an approval. It is permitted only on an `APPROVED` claim, requires a non-empty `reversal_reason`, and is refused when the unit's coverage has been `VOIDED`, in which case the request is rejected with `ERR_CLAIM_STATE_INVALID`. Reversal takes the claim `APPROVED → REVERSED`, which is terminal, adds `adjudicated_amount_cents` back to the unit's `reserve_balance_cents` and subtracts the same amount from `claims_paid_cents`, leaving `reserve_balance_cents` plus `claims_paid_cents` equal to `reserve_initial_cents` with no drift. If the unit had been pushed into `GRACE` by the very claim now being reversed, and the restored `reserve_balance_cents` is greater than zero while the clock is still strictly before `grace_expires_on`, the unit returns `GRACE → ACTIVE` and `grace_expires_on` is cleared to null.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return `201 Created`. Every other operation — state advances, decisions, sign-offs, telemetry posts, appends to a resource's internal collection, reads and lists — returns `200 OK`. Request and response payloads are not restated here; the fields each operation accepts, and the effects it has, are specified in §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical UTC clock | PlatformAdmin |
+| POST | `/equipment-models` | Create an equipment model in the manufacturer catalogue | ComplianceEngineer, PlatformAdmin |
+| GET | `/equipment-models` | List equipment models | ComplianceEngineer, ListingReviewer, ApplicationEngineer, EngineeringApprover, ProductionPlanner, ConnectedOpsEngineer, ChannelManager, PlatformAdmin |
+| GET | `/equipment-models/{id}` | Read one equipment model including its derived certification posture | ComplianceEngineer, ListingReviewer, ApplicationEngineer, EngineeringApprover, ProductionPlanner, ConnectedOpsEngineer, ChannelManager, ServicePartnerUser, ChainAdmin, WarrantyAdjudicator, PlatformAdmin |
+| PATCH | `/equipment-models/{id}` | Revise a model's commercial and capability attributes | ComplianceEngineer, PlatformAdmin |
+| POST | `/certification-listings` | File a listing application with an agency for a model's sanitation, gas and electrical scopes | ComplianceEngineer, PlatformAdmin |
+| GET | `/certification-listings` | List certification listings, filterable by model, agency and status | ComplianceEngineer, ListingReviewer, ApplicationEngineer, EngineeringApprover, PlatformAdmin |
+| GET | `/certification-listings/{id}` | Read one certification listing | ComplianceEngineer, ListingReviewer, ApplicationEngineer, EngineeringApprover, PlatformAdmin |
+| POST | `/certification-listings/{id}/submissions` | Submit or re-submit the listing application to the agency | ComplianceEngineer, PlatformAdmin |
+| POST | `/certification-listings/{id}/agency-decisions` | Record the agency's decision, or a post-listing suspension or reinstatement | ListingReviewer, PlatformAdmin |
+| POST | `/chain-accounts` | Open a restaurant chain account with its dealer of record and consultant firm | ChannelManager, PlatformAdmin |
+| GET | `/chain-accounts` | List chain accounts | ChannelManager, ApplicationEngineer, EngineeringApprover, PlatformAdmin |
+| GET | `/chain-accounts/{id}` | Read one chain account, including the version a configuration create must echo | ChannelManager, ApplicationEngineer, EngineeringApprover, ChainAdmin, PlatformAdmin |
+| PATCH | `/chain-accounts/{id}` | Revise the chain's contracted volume or channel attribution | ChannelManager, PlatformAdmin |
+| POST | `/chain-configurations` | Create a chain-specific configuration of a base model | ApplicationEngineer, PlatformAdmin |
+| GET | `/chain-configurations` | List chain configurations, filterable by chain account, model and status | ApplicationEngineer, EngineeringApprover, ChannelManager, ChainAdmin, ProductionPlanner, PlatformAdmin |
+| GET | `/chain-configurations/{id}` | Read one chain configuration, including its version and pinned model version | ApplicationEngineer, EngineeringApprover, ChannelManager, ChainAdmin, ProductionPlanner, PlatformAdmin |
+| GET | `/chain-configurations/{id}/price-quote` | Quote-support read that refreshes the indicative unit price | ChannelManager, ApplicationEngineer, ChainAdmin, PlatformAdmin |
+| POST | `/chain-configurations/{id}/submissions` | Submit the configuration for engineering review | ApplicationEngineer, PlatformAdmin |
+| POST | `/chain-configurations/{id}/engineering-decisions` | Approve the configuration or return it for revision | EngineeringApprover, PlatformAdmin |
+| POST | `/chain-configurations/{id}/branding-signoff` | The chain signs off the branding artwork | ChainAdmin, PlatformAdmin |
+| POST | `/chain-configurations/{id}/release` | Release the configuration to production, stamping the firm price | ApplicationEngineer, PlatformAdmin |
+| POST | `/performance-validations` | Open a cooking-performance validation for one menu item | ApplicationEngineer, PlatformAdmin |
+| GET | `/performance-validations` | List performance validations, filterable by configuration, menu item and status | ApplicationEngineer, EngineeringApprover, ChainAdmin, PlatformAdmin |
+| GET | `/performance-validations/{id}` | Read one performance validation including its runs and both throughput figures | ApplicationEngineer, EngineeringApprover, ChainAdmin, PlatformAdmin |
+| POST | `/performance-validations/{id}/test-runs` | Append one menu-item test run to the validation | ApplicationEngineer, PlatformAdmin |
+| POST | `/performance-validations/{id}/conclusion` | Conclude the validation attempt and decide pass or fail | ApplicationEngineer, PlatformAdmin |
+| POST | `/performance-validations/{id}/retest` | Re-open a failed validation for another test series | ApplicationEngineer, PlatformAdmin |
+| POST | `/construction-programs` | Open a construction or remodel programme for a chain | ChainAdmin, PlatformAdmin |
+| GET | `/construction-programs` | List construction programmes, filterable by chain account, type and posture | ChainAdmin, ProductionPlanner, ChannelManager, PlatformAdmin |
+| GET | `/construction-programs/{id}` | Read one construction programme including its derived commit posture | ChainAdmin, ProductionPlanner, ChannelManager, PlatformAdmin |
+| POST | `/site-orders` | Add a restaurant site to the programme with a committed delivery date | ChainAdmin, PlatformAdmin |
+| GET | `/site-orders` | List site orders, filterable by programme, configuration and either status dimension | ChainAdmin, ProductionPlanner, ConnectedOpsEngineer, PlatformAdmin |
+| GET | `/site-orders/{id}` | Read one site order including both of its independent status dimensions | ChainAdmin, ProductionPlanner, ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/site-orders/{id}/commitment-waiver` | The chain waives the delivery-date commitment for a site | ChainAdmin, PlatformAdmin |
+| POST | `/site-orders/{id}/fulfillment-events` | Record a shipping or delivery event on the fulfilment dimension | ProductionPlanner, PlatformAdmin |
+| POST | `/build-lines` | Register a production line with its daily capacity and tooled energy types | ProductionPlanner, PlatformAdmin |
+| GET | `/build-lines` | List production lines | ProductionPlanner, PlatformAdmin |
+| GET | `/build-lines/{id}` | Read one production line including its committed-units ledger | ProductionPlanner, PlatformAdmin |
+| POST | `/production-slots` | Reserve a closed build interval on a line for a site order | ProductionPlanner, PlatformAdmin |
+| GET | `/production-slots` | List production slots, filterable by line, site order and status | ProductionPlanner, ChainAdmin, PlatformAdmin |
+| GET | `/production-slots/{id}` | Read one production slot | ProductionPlanner, ChainAdmin, PlatformAdmin |
+| POST | `/production-slots/{id}/build-progress` | Advance the slot through confirm, start and complete | ProductionPlanner, PlatformAdmin |
+| POST | `/production-slots/{id}/cancellation` | Cancel a reserved or confirmed slot, releasing the line capacity it held | ProductionPlanner, PlatformAdmin |
+| POST | `/connected-units` | Register a shipped or aftermarket connected unit into the monitoring fleet | ConnectedOpsEngineer, PlatformAdmin |
+| GET | `/connected-units` | List connected units, filterable by model, site order and coverage status | ConnectedOpsEngineer, WarrantyAdjudicator, ServicePartnerUser, ChainAdmin, PlatformAdmin |
+| GET | `/connected-units/{id}` | Read one connected unit including its warranty reserve ledger and health score | ConnectedOpsEngineer, WarrantyAdjudicator, ServicePartnerUser, ChainAdmin, PlatformAdmin |
+| POST | `/connected-units/{id}/telemetry` | Post monitoring telemetry for the unit | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/connected-units/{id}/recipe-pushes` | Push a recipe book generation to a covered unit | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/connected-units/{id}/coverage-actions` | Activate, extend or void the unit's warranty and extended service coverage | WarrantyAdjudicator, PlatformAdmin |
+| POST | `/firmware-campaigns` | Draft a firmware rollout campaign over a half-open window | ConnectedOpsEngineer, PlatformAdmin |
+| GET | `/firmware-campaigns` | List firmware campaigns, filterable by model and status | ConnectedOpsEngineer, PlatformAdmin |
+| GET | `/firmware-campaigns/{id}` | Read one firmware campaign including its selected cohort | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/firmware-campaigns/{id}/schedule` | Schedule the campaign and select its cohort | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/firmware-campaigns/{id}/start` | Start the scheduled campaign while its window is open | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/firmware-campaigns/{id}/unit-results` | Report one cohort unit's firmware update outcome | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/firmware-campaigns/{id}/close` | Close the running campaign, completing it or rolling it back | ConnectedOpsEngineer, PlatformAdmin |
+| POST | `/service-partners` | Register a service network partner application | ChannelManager, PlatformAdmin |
+| GET | `/service-partners` | List service network partners | ChannelManager, WarrantyAdjudicator, PlatformAdmin |
+| GET | `/service-partners/{id}` | Read one service partner including its derived model authority | ChannelManager, WarrantyAdjudicator, ServicePartnerUser, PlatformAdmin |
+| POST | `/service-partners/{id}/authorization` | Advance the partner's service network authorisation | ChannelManager, PlatformAdmin |
+| POST | `/technician-certifications` | Enrol a partner technician in the training programme for one model | ServicePartnerUser, ChannelManager, PlatformAdmin |
+| GET | `/technician-certifications` | List technician certifications, filterable by partner, model and status | ServicePartnerUser, ChannelManager, WarrantyAdjudicator, PlatformAdmin |
+| GET | `/technician-certifications/{id}` | Read one technician certification | ServicePartnerUser, ChannelManager, WarrantyAdjudicator, PlatformAdmin |
+| POST | `/technician-certifications/{id}/grade` | Record the certification exam grade for an enrolled technician | ChannelManager, PlatformAdmin |
+| POST | `/warranty-claims` | File a warranty claim against a covered unit for parts and labour | ServicePartnerUser, PlatformAdmin |
+| GET | `/warranty-claims` | List warranty claims, filterable by unit, partner, certification and status | ServicePartnerUser, WarrantyAdjudicator, ChannelManager, PlatformAdmin |
+| GET | `/warranty-claims/{id}` | Read one warranty claim including its stamped coinsurance and payout | ServicePartnerUser, WarrantyAdjudicator, ChannelManager, PlatformAdmin |
+| POST | `/warranty-claims/{id}/adjudication` | Approve or deny the claim | WarrantyAdjudicator, PlatformAdmin |
+| POST | `/warranty-claims/{id}/reversal` | Reverse an approved claim, restoring the unit's warranty reserve | WarrantyAdjudicator, PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_ROLE_NOT_PERMITTED` | 403 Forbidden |
+| `ERR_CHAIN_SCOPE_VIOLATION` | 403 Forbidden |
+| `ERR_PARTNER_SCOPE_VIOLATION` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_EQUIPMENT_MODEL_NOT_FOUND` | 404 Not Found |
+| `ERR_COMPLIANCE_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_CHAIN_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_PRODUCTION_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_CONNECTED_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_CHANNEL_RESOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_WARRANTY_CLAIM_NOT_FOUND` | 404 Not Found |
+| `ERR_STALE_CHAIN_ACCOUNT_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_CONFIGURATION_VERSION` | 412 Precondition Failed |
+| `ERR_SEGREGATION_OF_DUTIES` | 409 Conflict |
+| `ERR_LISTING_STATE_INVALID` | 409 Conflict |
+| `ERR_CONFIGURATION_STATE_INVALID` | 409 Conflict |
+| `ERR_VALIDATION_STATE_INVALID` | 409 Conflict |
+| `ERR_PRODUCTION_STATE_INVALID` | 409 Conflict |
+| `ERR_CONNECTED_STATE_INVALID` | 409 Conflict |
+| `ERR_CHANNEL_STATE_INVALID` | 409 Conflict |
+| `ERR_CLAIM_STATE_INVALID` | 409 Conflict |
+| `ERR_UNIT_COVERAGE_NOT_ACTIVE` | 409 Conflict |
+| `ERR_CONFIGURATION_NOT_RELEASED` | 409 Conflict |
+| `ERR_MODEL_LISTING_SUSPENDED` | 422 Unprocessable Entity |
+| `ERR_MODEL_NOT_LISTED` | 422 Unprocessable Entity |
+| `ERR_PERFORMANCE_VALIDATION_NOT_PASSED` | 422 Unprocessable Entity |
+| `ERR_AGENCY_SCOPE_NOT_COVERED` | 422 Unprocessable Entity |
+| `ERR_CONTROLS_PACKAGE_UNSUPPORTED` | 422 Unprocessable Entity |
+| `ERR_LINE_ENERGY_INCOMPATIBLE` | 422 Unprocessable Entity |
+| `ERR_MODEL_VERSION_PIN_STALE` | 422 Unprocessable Entity |
+| `ERR_PARTNER_NOT_AUTHORIZED_FOR_CLAIMS` | 422 Unprocessable Entity |
+| `ERR_TECHNICIAN_NOT_CERTIFIED` | 422 Unprocessable Entity |
+| `ERR_BUILD_SLOT_OVERLAP` | 409 Conflict |
+| `ERR_CAMPAIGN_WINDOW_SATURATED` | 409 Conflict |
+| `ERR_CAMPAIGN_WINDOW_NOT_OPEN` | 409 Conflict |
+| `ERR_DUPLICATE_LISTING_APPLICATION` | 409 Conflict |
+| `ERR_DUPLICATE_SERIAL_NUMBER` | 409 Conflict |
+| `ERR_DUPLICATE_RESOURCE_CODE` | 409 Conflict |
+| `ERR_LISTING_REVISION_LIMIT` | 422 Unprocessable Entity |
+| `ERR_RETEST_LIMIT_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_MIN_TEST_RUNS_NOT_MET` | 422 Unprocessable Entity |
+| `ERR_INSUFFICIENT_CERTIFIED_TECHNICIANS` | 422 Unprocessable Entity |
+| `ERR_TRAINING_HOURS_NOT_MET` | 422 Unprocessable Entity |
+| `ERR_PARTS_STOCKING_INSUFFICIENT` | 422 Unprocessable Entity |
+| `ERR_PROGRAM_SITE_CAPACITY_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_NO_ELIGIBLE_UNITS` | 422 Unprocessable Entity |
+| `ERR_UNIT_NOT_IN_COHORT` | 422 Unprocessable Entity |
+| `ERR_BUILD_CAPACITY_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_WARRANTY_RESERVE_EXHAUSTED` | 422 Unprocessable Entity |
+| `ERR_CAMPAIGN_SUCCESS_RATE_TOO_LOW` | 422 Unprocessable Entity |

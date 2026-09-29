@@ -1,0 +1,105 @@
+"""Error catalogue (PRD section 5) and the exception type routes raise."""
+
+ERROR_STATUS = {
+    # auth / authorisation
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_SUPPLIER_SCOPE_VIOLATION": 403,
+    "ERR_CLAIM_SELF_REVIEW": 403,
+    "ERR_RUN_SELF_APPROVAL": 403,
+    "ERR_ESCALATION_ROLE_INSUFFICIENT": 403,
+    # well-formedness
+    "ERR_INVALID_REQUEST": 422,
+    # existence
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_GAP_NOT_FOUND": 404,
+    "ERR_SUPPLIER_NOT_FOUND": 404,
+    "ERR_PLANT_LINE_NOT_FOUND": 404,
+    "ERR_AUDIT_NOT_FOUND": 404,
+    "ERR_ITEM_NOT_FOUND": 404,
+    "ERR_COST_MODEL_NOT_FOUND": 404,
+    "ERR_STUDY_NOT_FOUND": 404,
+    "ERR_ARTWORK_ROUND_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_SPECIFICATION_NOT_FOUND": 404,
+    "ERR_RUN_NOT_FOUND": 404,
+    "ERR_COMPLAINT_NOT_FOUND": 404,
+    "ERR_CHANGE_REQUEST_NOT_FOUND": 404,
+    # optimistic concurrency
+    "ERR_STALE_ITEM_VERSION": 412,
+    "ERR_STALE_COST_MODEL_VERSION": 412,
+    # program gates and state
+    "ERR_PROGRAM_CLOSED": 409,
+    "ERR_PROGRAM_RELAUNCH_FROZEN": 409,
+    "ERR_NO_LAUNCHED_ITEMS": 409,
+    "ERR_RELAUNCH_INCOMPLETE": 409,
+    "ERR_ACTIVE_RUNS_PRESENT": 409,
+    # per-entity state
+    "ERR_GAP_STATE_INVALID": 409,
+    "ERR_GAP_NOT_ANALYZED": 409,
+    "ERR_GAP_NOT_TIER_APPROVED": 409,
+    "ERR_SUPPLIER_STATE_INVALID": 409,
+    "ERR_AUDIT_NOT_SCHEDULED": 409,
+    "ERR_COST_MODEL_NOT_SUBMITTED": 409,
+    "ERR_STUDY_NOT_DRAFT": 409,
+    "ERR_ARTWORK_STATE_INVALID": 409,
+    "ERR_CLAIM_NOT_PENDING": 409,
+    "ERR_SPECIFICATION_NOT_DRAFT": 409,
+    "ERR_RUN_STATE_INVALID": 409,
+    "ERR_CHANGE_REQUEST_STATE_INVALID": 409,
+    "ERR_ITEM_STATE_INVALID": 409,
+    "ERR_FIRST_PRODUCTION_INCOMPLETE": 409,
+    "ERR_RELAUNCH_PRECONDITION_UNMET": 409,
+    # business rules
+    "ERR_ITEM_QUALITY_SUSPENDED": 422,
+    "ERR_SUPPLIER_NOT_QUALIFIED": 422,
+    "ERR_GFSI_CERTIFICATE_EXPIRED": 422,
+    "ERR_AUDIT_BASIS_INVALID": 422,
+    "ERR_SUBSTANTIATION_REQUIRED": 422,
+    "ERR_NUTRITION_PANEL_INVALID": 422,
+    "ERR_UNAPPROVED_CLAIM_PRESENT": 422,
+    "ERR_TIER_MISMATCH": 409,
+    "ERR_PIN_ITEM_MISMATCH": 409,
+    "ERR_PIN_VERSION_STALE": 409,
+    "ERR_SPECIFICATION_ITEM_MISMATCH": 409,
+    "ERR_SPECIFICATION_NOT_LOCKED": 409,
+    "ERR_PLANT_LINE_SUPPLIER_MISMATCH": 409,
+    "ERR_COST_MODEL_NOT_ACCEPTED": 409,
+    "ERR_REPLACEMENT_ITEM_INVALID": 409,
+    "ERR_WINDOW_INVALID": 422,
+    "ERR_LINE_WINDOW_CONFLICT": 409,
+    "ERR_AUDIT_CAPACITY_EXCEEDED": 409,
+    "ERR_RUN_WINDOW_NOT_ELAPSED": 409,
+    "ERR_SHELF_SLOT_QUOTA_EXCEEDED": 409,
+    "ERR_OVERRIDE_JUSTIFICATION_REQUIRED": 422,
+    "ERR_DUPLICATE_LINE_CODE": 409,
+    "ERR_DRAFT_SPECIFICATION_EXISTS": 409,
+    "ERR_OPEN_CHANGE_REQUEST_EXISTS": 409,
+    "ERR_SUBSTITUTION_DESC_REQUIRED": 422,
+    "ERR_NEGOTIATION_ROUND_LIMIT": 409,
+    "ERR_BELOW_MOQ": 422,
+    "ERR_LINE_CAPACITY_EXCEEDED": 409,
+    "ERR_PROGRAM_BUDGET_EXCEEDED": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_MISSING_AUTH_HEADERS": "Both X-User-ID and X-User-Role headers are required.",
+    "ERR_UNKNOWN_ROLE": "X-User-Role does not name one of the six known roles.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this endpoint.",
+    "ERR_INVALID_REQUEST": "The request body or query string is malformed.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super(ApiError, self).__init__(error_id)
+        self.error_id = error_id
+        self.status = ERROR_STATUS.get(error_id, 400)
+        if message is None:
+            message = DEFAULT_MESSAGES.get(error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + ".")
+        self.message = message
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

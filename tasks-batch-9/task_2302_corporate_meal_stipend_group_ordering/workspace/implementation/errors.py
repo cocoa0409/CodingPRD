@@ -1,0 +1,77 @@
+"""Error catalogue (PRD §5 / scaffold §1.6)."""
+
+ERROR_STATUS = {
+    # auth / shape / generic state
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_RESOURCE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_STATE": 409,
+    # existence
+    "ERR_MEAL_PROGRAM_NOT_FOUND": 404,
+    "ERR_EMPLOYEE_GROUP_NOT_FOUND": 404,
+    "ERR_BUDGET_RULE_NOT_FOUND": 404,
+    "ERR_EMPLOYEE_NOT_FOUND": 404,
+    "ERR_BENEFIT_PERIOD_NOT_FOUND": 404,
+    "ERR_RESTAURANT_NOT_FOUND": 404,
+    "ERR_DELIVERY_LOCATION_NOT_FOUND": 404,
+    "ERR_GROUP_ORDER_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_CREDIT_CLAIM_NOT_FOUND": 404,
+    "ERR_EXPENSE_EXPORT_NOT_FOUND": 404,
+    # cross-entity state gates
+    "ERR_PERIOD_NOT_OPEN": 409,
+    "ERR_EMPLOYEE_INACTIVE": 409,
+    "ERR_RESTAURANT_NOT_ELIGIBLE": 409,
+    "ERR_GROUP_ORDER_NOT_COLLECTING": 409,
+    "ERR_GROUP_ORDER_EMPTY": 409,
+    "ERR_RULE_NOT_EFFECTIVE": 409,
+    # optimistic concurrency
+    "ERR_STALE_PERIOD_VERSION": 412,
+    "ERR_STALE_EMPLOYEE_GROUP_VERSION": 412,
+    "ERR_STALE_ORDER_VERSION": 412,
+    # safety
+    "ERR_TAX_MONTH_LOCKED": 409,
+    "ERR_PERIOD_HAS_OPEN_ORDERS": 409,
+    "ERR_EMPLOYEE_HAS_OPEN_ORDERS": 409,
+    # temporal
+    "ERR_OUTSIDE_ELIGIBLE_WEEKDAY": 422,
+    "ERR_OUTSIDE_ELIGIBLE_WINDOW": 422,
+    "ERR_GROUP_CUTOFF_PASSED": 409,
+    "ERR_DOCK_WINDOW_CONFLICT": 409,
+    "ERR_RESTAURANT_CAPACITY_EXCEEDED": 409,
+    # referential
+    "ERR_PERIOD_EMPLOYEE_MISMATCH": 422,
+    "ERR_PROGRAM_SCOPE_MISMATCH": 422,
+    "ERR_GROUP_ORDER_MISMATCH": 422,
+    "ERR_NO_ACTIVE_BUDGET_RULE": 409,
+    "ERR_PREDECESSOR_NOT_CLOSED": 409,
+    "ERR_PREDECESSOR_ALREADY_CONSUMED": 409,
+    # constraint
+    "ERR_DUPLICATE_PERIOD_MONTH": 409,
+    "ERR_DUPLICATE_NAME": 409,
+    "ERR_RESTAURANT_OUT_OF_RANGE": 422,
+    "ERR_CUISINE_NOT_ELIGIBLE": 422,
+    "ERR_DAILY_MEAL_LIMIT_EXCEEDED": 409,
+    "ERR_PER_PERSON_LIMIT_EXCEEDED": 422,
+    "ERR_REOPEN_LIMIT_EXCEEDED": 409,
+    "ERR_LINE_INDEX_INVALID": 422,
+    "ERR_CLAIM_EXCEEDS_ORDER": 422,
+    # fiscal
+    "ERR_OVERAGE_NOT_PERMITTED": 409,
+    "ERR_PERIOD_BUDGET_EXCEEDED": 409,
+    "ERR_PERSONAL_CARD_REQUIRED": 402,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."

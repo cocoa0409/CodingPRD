@@ -1,0 +1,671 @@
+# Export Trade Documentation API — Product Requirements Document
+
+## 1. Introduction
+
+An export management company sits between a domestic manufacturer and an overseas buyer, and it earns its fee by absorbing the paperwork risk that neither party wants. A documentary credit that says "FOB Busan, latest shipment 30 September, presentation within 21 days" is a contract whose breach costs real money: a single mismatched weight figure on a packing list turns a clean drawing into a discrepant presentation, and a discrepant presentation turns a guaranteed payment into an unsecured receivable. This API is the system of record for that risk. It governs the whole arc of an export transaction — buyer onboarding and denied-party screening, letter-of-credit terms review, incoterm-based cost allocation, commercial invoice and certificate-of-origin generation, export-control classification and license consumption, freight booking and bill-of-lading issuance, document presentation and payment collection, foreign-buyer credit insurance, and finally dispute negotiation when a shipment falls short.
+
+Two design pressures shape everything that follows. The first is **segregation of duties**: the operator who captures a credit's terms may not be the operator who reviews them, and the operator who generates a document may not be the reviewer who examines the presentation containing it. The second is **conservation**: three separate ledgers — a sailing's booked weight, an export license's consumed value, and an insurance policy's utilised limit — must return to their exact prior figures when a booking is cancelled, an order is blocked, or a receivable is written off. Compensating actions are not approximations; a create-then-cancel pair leaves no residue.
+
+An export order therefore carries **two independent lifecycles rather than one**. Its `fulfillment_status` tracks the physical and compliance axis (goods, screening, booking, shipment); its `settlement_status` tracks the money axis (credit acceptance, presentation, payment, claim, indemnity, write-off). Neither dimension implies a movement in the other unless a rule in this document says so explicitly. Every path named in this document is absolute and rooted directly at the API host; there is no shared resource prefix.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contract-level rules that hold across every endpoint: authentication, response shape, pagination, resource identity, versioning, precision, and the fixed order in which validations are evaluated.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers. `X-User-ID` identifies the acting user, and `X-User-Role` declares the operational capacity under which they act. If either header is absent or empty, the request is rejected with `ERR_MISSING_AUTH_HEADERS` (401). If `X-User-Role` carries a value that is not one of the six roles below, the rejection is `ERR_UNKNOWN_ROLE` (401). If the role is recognised but is not listed among the authorised roles for the endpoint being called (see the table in §4), the rejection is `ERR_ROLE_NOT_PERMITTED` (403).
+
+The six roles are `ExportOpsCoordinator`, `TradeComplianceOfficer`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `ForeignBuyer`, and `PlatformAdmin`.
+
+- An `ExportOpsCoordinator` prepares export orders and shipment lines, captures documentary-credit terms and applies amendments, generates, issues, regenerates and voids trade documents, books and confirms and cancels freight, issues bills of lading, and lodges and cures document presentations. This role is barred from reviewing the credits it captured and from examining presentations containing documents it generated.
+- A `TradeComplianceOfficer` owns buyer onboarding, the restricted-party flag, export-control classification decisions, license recording and license-based clearance. This role never prepares or issues commercial documents and never moves money.
+- A `DocumentaryCreditReviewer` opens terms reviews on credits, records terms findings, submits review recommendations, and examines document presentations. It cannot capture credits, generate documents, or settle funds.
+- A `FinanceCollectionsOfficer` records funds received against presentations, records bank refusals, writes off unrecoverable receivables, writes credit insurance policies, files claims, and makes settlement offers from the seller side. It cannot examine documents or make compliance decisions.
+- A `ForeignBuyer` is the overseas buyer itself. It waives presentation discrepancies, opens short-shipment and quality disputes, counters settlement offers, and accepts offers standing against it.
+- A `PlatformAdmin` is the operator role. It drives the logical clock, publishes sailings, onboards buyers, breaks negotiation deadlocks on escalated disputes, and is authorised on **every** read endpoint declared in §4.
+
+Identity semantics differ between the roles, and this difference is load-bearing. When `X-User-Role` is `ForeignBuyer`, `X-User-ID` is the `id` of the acting `ForeignBuyer` row; ownership checks on any resource that references a `ForeignBuyer` compare the resource's buyer reference to `X-User-ID`. If a caller claims `ForeignBuyer` but `X-User-ID` is not the `id` of an existing `ForeignBuyer` row, the request is rejected with `ERR_BUYER_IDENTITY_NOT_FOUND` (403). If the identity resolves but the targeted resource belongs to a different buyer — that is, the `buyer_id` of the `ExportOrder` reached through the target resource differs from `X-User-ID` — the rejection is `ERR_BUYER_SCOPE_VIOLATION` (403). This scope check guards exactly six operations: opening a dispute (`POST /dispute-cases`), countering an offer (`POST /dispute-cases/{dispute_id}/counter`), accepting an offer (`POST /dispute-cases/{dispute_id}/accept`), waiving a finding (`POST /discrepancy-findings/{finding_id}/waiver`), and the two buyer-visible list reads (`GET /export-orders` and `GET /dispute-cases`), where it manifests as scoping rather than rejection: a `ForeignBuyer` caller sees only rows belonging to its own orders.
+
+For the other five roles — `ExportOpsCoordinator`, `TradeComplianceOfficer`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, and `PlatformAdmin` — `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it where a rule says so (as `prepared_by_user_id` on an export order, `captured_by_user_id` on a credit, `reviewer_user_id` on a terms review, `generated_by_user_id` on a trade document, `presented_by_user_id` and `examined_by_user_id` on a presentation, `decided_by_user_id` on a screening, and `waived_by_buyer_id` on a waived finding) but never compares it to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` sets the maximum number of rows returned; it defaults to 10, its minimum accepted value is 1 and its maximum is 100. `offset` sets how many rows to skip and defaults to 0; its minimum accepted value is 0. A `limit` that is not an integer within 1 through 100 inclusive, or an `offset` that is not an integer of at least 0, is rejected with `ERR_INVALID_PAGINATION` (422).
+
+Unless a specific endpoint says otherwise, list results are sorted by `created_at` ascending. Two families read in a domain order instead: shipment-line listings are returned in ascending `line_no` order (and, when the listing spans several orders, in ascending `line_no` order within each order), while presentation document links are returned in ascending `created_at` order as usual.
+
+Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope, where `total_count` is the number of rows matching the filters before pagination is applied and `has_more` indicates whether rows remain beyond the current window.
+
+### 2.4. Common Resource Properties
+
+Almost every resource in this system — foreign buyers, export orders, letters of credit, terms reviews, discrepancy findings, shipment lines, trade documents, export control screenings, export licenses, vessel sailings, freight bookings, document presentations, credit insurance policies and dispute cases — carries the same four system-managed fields:
+
+- **`id`** (string): a server-minted UUID. It carries no type prefix and no domain-specific encoding; a document id and a booking id are indistinguishable by shape.
+- **`created_at`** (string): the ISO 8601 UTC timestamp with three fractional digits at which the row was first persisted.
+- **`updated_at`** (string): the ISO 8601 UTC timestamp with three fractional digits at which the row was last modified. Recomputing a derived money figure counts as a modification; so does a status change driven by a cascade rather than by a direct client request against that row.
+- **`version`** (integer): a monotonically increasing counter that is incremented by one on every mutation of the row, including mutations the client did not directly request. This counter is the substrate for the optimistic-concurrency rules of §2.6 and for the version-pinning rules of §2.7.
+
+The single exception is the **presentation document link**, the junction row that records which exact document revision was tendered on which presentation. Because a link is written once and thereafter only re-statused by the system, it carries only `id` and `created_at`: it has **no** `updated_at` field and **no** `version` field, and neither may be synthesised for it.
+
+Path parameters are resolved left to right, and the first identifier in the path that does not resolve determines the 404 that is returned. A request naming both a screening and a license, for example, fails with `ERR_SCREENING_NOT_FOUND` before the license is even looked up. The path identifiers used across the API are `buyer_id`, `export_order_id`, `shipment_line_id`, `lc_id`, `review_id`, `finding_id`, `document_id`, `link_id`, `screening_id`, `export_license_id`, `vessel_sailing_id`, `booking_id`, `presentation_id`, `policy_id` and `dispute_id`, and each maps to its own not-found code: `ERR_BUYER_NOT_FOUND`, `ERR_ORDER_NOT_FOUND`, `ERR_LC_NOT_FOUND`, `ERR_REVIEW_NOT_FOUND`, `ERR_FINDING_NOT_FOUND`, `ERR_DOCUMENT_NOT_FOUND`, `ERR_SCREENING_NOT_FOUND`, `ERR_LICENSE_NOT_FOUND`, `ERR_SAILING_NOT_FOUND`, `ERR_BOOKING_NOT_FOUND`, `ERR_PRESENTATION_NOT_FOUND`, `ERR_POLICY_NOT_FOUND` and `ERR_DISPUTE_NOT_FOUND`. A shipment line is read by its own id and reports `ERR_ORDER_NOT_FOUND` for an unresolvable order, and a presentation document link is read by `link_id`. The same code family covers unresolvable foreign keys inside a request body, which are checked in the order the endpoint's input fields are declared: `buyer_id`, `export_order_id`, `letter_of_credit_id`, `supersedes_lc_id`, `supersedes_document_id`, `trade_document_id`, the elements of `trade_document_ids` and `replacement_document_ids`, `export_license_id`, `export_control_screening_id`, `vessel_sailing_id`, `credit_insurance_policy_id`, `lc_terms_review_id`, `document_presentation_id`, `waived_by_buyer_id` and `dispute_case_id` all resolve against their own tables before any business rule is consulted.
+
+### 2.5. The Logical Clock
+
+Nothing in this system reads wall-clock time. Every deadline, validity window, expiry rule and elapsed-days computation reads a **logical clock** that a `PlatformAdmin` advances explicitly by supplying a `current_utc` instant. Before the clock has ever been set, it reads exactly `2026-08-01T00:00:00Z`, and it never falls back to the host's real time.
+
+Advancing the clock runs a four-step sweep, and the steps run in the stated order; within each step, affected rows are processed in ascending `created_at` order, and every row the sweep mutates has its `version` incremented by one.
+
+1. Every letter of credit whose `status` is `RECEIVED`, `UNDER_REVIEW`, `AMENDMENT_REQUESTED` or `ACCEPTED` and whose `expiry_date` falls strictly before the new instant moves to `EXPIRED`, carrying the per-state side effects described in §3.4.
+2. Every export license whose `status` is `ISSUED`, `ACTIVE` or `EXHAUSTED` and whose `valid_to` falls strictly before the new instant moves to `EXPIRED`.
+3. Every credit insurance policy whose `status` is `ACTIVE` or `EXHAUSTED` and whose `effective_to` falls strictly before the new instant moves to `EXPIRED`.
+4. Every vessel sailing whose `status` is `OPEN` or `FULL` moves to `CUTOFF_PASSED` once the new instant is at or after its `cutoff_at`, and then on to `DEPARTED` once the new instant is at or after its `etd`. A single clock advance that jumps past both instants therefore lands the sailing in `DEPARTED`.
+
+The clock-advance call returns 200 and carries no resource payload.
+
+### 2.6. Optimistic Concurrency on Trade Parents
+
+Five write operations reach across an aggregate boundary and mutate — or make decisions from — a parent row that other writers legitimately move. Each of those five requires the client to declare which version of that parent it last observed, as a **non-optional** input field. If the declared value does not equal the parent row's current `version`, the write is refused; the client must re-read the parent and decide again. No endpoint other than these five accepts a version field.
+
+- Opening a terms review (`POST /letters-of-credit/{lc_id}/reviews`) requires `expected_letter_of_credit_version` to equal the target credit's current `version`. A mismatch is rejected with `ERR_STALE_LC_VERSION` (412). The case this guards is an amendment that has already been applied in place to the credit, bumping `amendment_round`, `max_drawable_usd` and `version`: a review opened on the pre-amendment view would pin `reviewed_lc_version` to terms the credit has already left behind.
+- Applying an amendment (`POST /letters-of-credit/{lc_id}/amendments`) likewise requires `expected_letter_of_credit_version` to equal the credit's current `version`, and a mismatch is rejected with `ERR_STALE_LC_VERSION` (412). Because each amendment legitimately supersedes the prior terms, an amendment computed against a stale view would overwrite the amendment of record and leave `amendment_round` inconsistent with the applied field values.
+- Booking freight (`POST /freight-bookings`) requires `expected_vessel_sailing_version` to equal the target sailing's current `version`, and a mismatch is rejected with `ERR_STALE_SAILING_VERSION` (412). Several orders share one sailing, so another booking may already have consumed part of `capacity_weight_kg`; the remaining headroom the client used to size this booking would be a figure the sailing has already left behind.
+- Lodging a document presentation (`POST /document-presentations`) requires `expected_export_order_version` to equal the target order's current `version`, and a mismatch is rejected with `ERR_STALE_ORDER_VERSION` (412). A regenerated document revision or a final cost reallocation legitimately supersedes the figures the client used to choose which revisions to tender, so the tender would pin revisions that are no longer the revisions of record.
+- Filing an insurance claim (`POST /credit-insurance-policies/{policy_id}/claims`) requires `expected_credit_insurance_policy_version` to equal the policy's current `version`, and a mismatch is rejected with `ERR_STALE_POLICY_VERSION` (412). Settlements and write-offs on other orders legitimately move `utilized_usd` and `available_limit_usd`, so the coverage headroom the client used to size the claim would be stale.
+
+### 2.7. Version Pinning Inside Approval Chains
+
+Distinct from the client-supplied concurrency fields above, three rows pin a parent version **at creation time** and are validated against it later, with no client input involved.
+
+A terms review stores `reviewed_lc_version` equal to the credit's `version` at the moment the review was opened. When the review is submitted, that pinned value must still equal the credit's current `version`; if an amendment has moved the credit in the meantime, the submit does not proceed. A trade document stores `pinned_order_version` equal to the export order's `version` at generation time; issuing that document requires the pinned value to still equal the order's current `version`, and a mismatch is refused with `ERR_DOCUMENT_STALE_SOURCE` (409). A presentation document link stores `pinned_document_revision` equal to the tendered document's `revision` at link creation; a later revision of the same document does not retroactively change what was tendered.
+
+The practical consequence is a deliberate serialisation point. Any operation that bumps an export order's `version` — adding a shipment line, clearing compliance, booking freight, issuing a bill of lading — invalidates every unissued document generated before it, and the operator must regenerate rather than force the issue.
+
+### 2.8. Segregation of Duties
+
+Three duty boundaries are enforced by comparing `X-User-ID` against a user id recorded on a row, and all three surface as `ERR_SEGREGATION_OF_DUTIES` (409).
+
+The operator who captured a credit's terms may not review them: opening a terms review requires `X-User-ID` to differ from the credit's `captured_by_user_id`. The operator who generated a tendered document may not examine the presentation that contains it: examining a presentation requires `X-User-ID` to differ from the `generated_by_user_id` of **every** trade document linked to that presentation with `link_status` `ACTIVE`. And the two role surfaces themselves are disjoint by construction — compliance decisions and license clearance belong to `TradeComplianceOfficer` alone, while freight and document preparation belong to `ExportOpsCoordinator` alone, so no single user can both clear an order and ship it.
+
+This check sits deliberately high in the validation ladder of §2.11, above the referential checks on tendered document revisions. An examination attempted by the document's own preparer against a superseded revision therefore reports the duty breach, not the revision problem.
+
+### 2.9. Precision, Rounding, and the Order of Operations
+
+Every monetary figure in this system is denominated in USD, carries exactly 2 decimal places, and is rounded half up. Quantities carry 3 decimal places; weights carry 3 decimal places; unit prices carry 4 decimal places; and the FX rate carries exactly 6 decimal places. Wherever this document says a figure is "rounded to two decimal places", it means rounded half up at two decimal places — never truncated, never rounded half to even.
+
+The **order** in which rounding is applied is part of the specification, not an implementation detail, because the same inputs yield different cents under different orders. Three orderings are pinned throughout:
+
+- **Round the parts, then add.** Each trade-cost bucket in the incoterm allocation is rounded to two decimal places on its own and only then summed into a side's total. Each per-line invoice figure is rounded to two decimal places on its own and only then summed into the invoice subtotal. Each discrepancy contribution is rounded to two decimal places on its own and only then summed into a risk score. Summing raw expressions and rounding once at the end is explicitly not the rule anywhere these three appear.
+- **Convert once, at the end.** The USD invoice total is assembled from already-rounded USD components without any further USD rounding, and the FX multiplication is the single rounding applied to a total.
+- **Drive the residual to one named place.** Where a pool is apportioned pro rata across lines, or a settlement is split across buckets, the difference between the pool and the sum of the rounded parts is assigned to exactly one designated recipient, chosen by a rule that never consults `id`.
+
+Integer conversions are equally pinned. Freight units are obtained by rounding the chargeable weight in kilograms divided by 1000 **up** to the next whole number, so a shipment of 8,001 kilograms occupies nine freight units. Elapsed-day counts are obtained by taking the whole number of complete days and discarding the remainder.
+
+### 2.10. Two Independent Lifecycles and Cascade Propagation
+
+An export order's compliance-and-goods axis is `fulfillment_status`, whose values are `DRAFT`, `COMPLIANCE_PENDING`, `COMPLIANCE_CLEARED`, `COMPLIANCE_BLOCKED`, `BOOKED`, `SHIPPED`, `SHORT_SHIPPED`, `CLOSED` and `CANCELLED`. It starts at `DRAFT`; `CLOSED` and `CANCELLED` are terminal. Its money axis is `settlement_status`, whose values are `UNSECURED`, `LC_ACCEPTED`, `DOCS_PRESENTED`, `PAID`, `DISHONORED`, `CLAIM_FILED`, `INDEMNIFIED` and `WRITTEN_OFF`. It starts at `UNSECURED`; `PAID`, `INDEMNIFIED` and `WRITTEN_OFF` are terminal. A movement on one axis never implies a movement on the other unless a rule in §3 states the coupling explicitly, and an attempt to drive either axis from a state where the requested transition is not declared is rejected with `ERR_ORDER_STATE_INVALID` (409).
+
+Three cascades run deeper than one hop, and each hop is a real mutation of a real row: each affected row's `updated_at` is refreshed and its `version` is incremented, exactly as if a client had written to it directly. The server transitions parent and child rows on its own when a criterion is met, without requiring a client request against the row being transitioned.
+
+The first cascade begins when a buyer is flagged as a restricted party and runs four links deep, from buyer to orders to bookings to sailings and licenses (§3.1). The second begins when an issued document is voided and runs three links deep, from link to presentation to the order's money axis (§3.5). The third begins when funds are received against a complying presentation and runs three links deep, from presentation to order to policy to buyer exposure (§3.8). In all three, the deeper links fire **because** the shallower link fired, not because the client asked for them.
+
+One coupling runs in the opposite direction: whenever the money axis reaches `PAID`, `INDEMNIFIED` or `WRITTEN_OFF`, the goods axis auto-advances from `SHIPPED` to `CLOSED` or from `SHORT_SHIPPED` to `CLOSED`, provided that dimension's own preconditions hold. Closing from `SHORT_SHIPPED` additionally requires that the order have no dispute case whose `status` is `OPEN`, `OFFERED`, `COUNTERED` or `ESCALATED`. Every close decrements the buyer's `open_order_count` by one.
+
+### 2.11. The Validation Precedence Ladder
+
+All checks are evaluated in ascending priority order, and the **first** failure wins: once a check fails, the request is rejected with that check's error and no later check is evaluated. This matters because several requests can fail two ways at once, and the code the client sees is determined entirely by this ladder.
+
+1. Both `X-User-Role` and `X-User-ID` are present and non-empty, on every endpoint — otherwise `ERR_MISSING_AUTH_HEADERS` (401).
+2. `X-User-Role` names one of the six declared roles, on every endpoint — otherwise `ERR_UNKNOWN_ROLE` (401).
+3. The named role appears in the target endpoint's authorised-role list, on every endpoint — otherwise `ERR_ROLE_NOT_PERMITTED` (403).
+4. When the caller claims `ForeignBuyer`, `X-User-ID` is the `id` of an existing buyer row; this applies on every endpoint whose authorised roles include `ForeignBuyer` — otherwise `ERR_BUYER_IDENTITY_NOT_FOUND` (403).
+5. Every path parameter resolves to an existing row, validated left to right, on every endpoint that has path parameters — otherwise the matching 404 from the family listed in §2.4.
+6. Every foreign-key id in the request body resolves to an existing row, validated in the order the endpoint declares its input fields, on every endpoint that carries foreign keys in its body — otherwise the matching 404 from the same family.
+7. When the caller claims `ForeignBuyer`, `X-User-ID` equals the `buyer_id` of the export order reached through the target resource. This guards the six operations named in §2.1 — otherwise `ERR_BUYER_SCOPE_VIOLATION` (403).
+8. Body field types, enum membership, decimal scale and numeric ranges match the field constraints described in §3, on every endpoint — otherwise `ERR_VALIDATION` (422).
+9. `limit` is an integer within 1 through 100 inclusive and `offset` is an integer of at least 0, on every list endpoint — otherwise `ERR_INVALID_PAGINATION` (422).
+10. Cross-field consistency **inside one body** holds: `usance_days` is 0 when `availability` is `SIGHT` and at least 30 when it is `USANCE`; `valid_to` is strictly after `valid_from`; `effective_to` is strictly after `effective_from`; `etd` is strictly after `cutoff_at` and `eta` strictly after `etd`; `required_document_types` includes `COMMERCIAL_INVOICE`; and `gross_weight_kg` is at least `net_weight_kg`. This applies to credit capture, credit amendment, license recording, policy creation, sailing publication and shipment-line creation — otherwise `ERR_INCONSISTENT_TERMS` (422).
+11. The target row is in a state from which the requested transition is declared, on every state-changing endpoint — otherwise the owning entity's state error: `ERR_ORDER_STATE_INVALID`, `ERR_LC_STATE_INVALID`, `ERR_REVIEW_ALREADY_SUBMITTED`, `ERR_DOCUMENT_STATE_INVALID`, `ERR_SCREENING_STATE_INVALID`, `ERR_BOOKING_STATE_INVALID`, `ERR_PRESENTATION_STATE_INVALID` or `ERR_DISPUTE_STATE_INVALID`, all 409.
+12. Cross-entity state preconditions hold. Booking freight requires the order's screening to be `CLEARED` (`ERR_ORDER_NOT_COMPLIANCE_CLEARED`) and the sailing to be bookable (`ERR_SAILING_NOT_OPEN`); confirming a booking requires the sailing not to have passed its cut-off or departed (`ERR_SAILING_NOT_OPEN`); lodging a presentation requires the credit to be `ACCEPTED` (`ERR_LC_NOT_ACCEPTED`); issuing a bill of lading requires the booking to be `CONFIRMED` (`ERR_BOOKING_NOT_CONFIRMED`); filing a claim requires the policy to be `ACTIVE` (`ERR_POLICY_NOT_ACTIVE`). All are 409. **Conflict A:** a booking request against an order that is *not* compliance cleared *and* a sailing with no headroom left reports this priority-12 error, and the capacity check at priority 31 is never reached.
+13. The supplied `expected_letter_of_credit_version`, `expected_vessel_sailing_version`, `expected_export_order_version` or `expected_credit_insurance_policy_version` equals the parent row's current `version`, on the five endpoints named in §2.6 — otherwise `ERR_STALE_LC_VERSION`, `ERR_STALE_SAILING_VERSION`, `ERR_STALE_ORDER_VERSION` or `ERR_STALE_POLICY_VERSION`, all 412. **Conflict B:** because state and concurrency checks precede compliance checks, a review request that is both stale *and* aimed at a restricted-party buyer reports `ERR_STALE_LC_VERSION` (412).
+14. The order's buyer has `restricted_party_flag` false. This guards seven operations: compliance submission, credit capture, opening a terms review, booking freight, generating a trade document, issuing a trade document, and lodging a presentation — otherwise `ERR_RESTRICTED_PARTY_BLOCKED` (409). This is **Conflict B's loser side**: it is never reached when the same request also carries a stale expected credit version.
+15. The buyer's `sanctions_tier` is not `EMBARGOED`, and the order's `destination_country_code` is not on the embargoed-destination list derived from that tier. This guards compliance submission, the screening decision and freight booking — otherwise `ERR_PROHIBITED_DESTINATION` (409).
+16. An order whose screening carries `license_determination` `LICENSE_REQUIRED` may not be booked while the screening's `export_license_id` is still absent. This guards freight booking — otherwise `ERR_EXPORT_LICENSE_REQUIRED` (409).
+17. The segregation-of-duties comparisons of §2.8 hold, on opening a terms review and on examining a presentation — otherwise `ERR_SEGREGATION_OF_DUTIES` (409). **Conflict C:** an examination by the document's own preparer against a superseded revision reports this error, not the priority-27 revision error.
+18. A submitted `recommendation` is compatible with the computed risk score, on review submission — otherwise `ERR_RECOMMENDATION_NOT_PERMITTED` (409).
+19. The logical clock is strictly before the credit's `expiry_date`. This guards opening a terms review, applying an amendment, lodging a presentation, examining a presentation and curing a presentation — otherwise `ERR_LC_EXPIRED` (409). **Conflict D:** an examination on an expired credit whose invoice also over-draws reports `ERR_LC_EXPIRED`, not the priority-33 amount error.
+20. A presentation's `days_after_on_board` is at most the credit's `presentation_period_days`, with equality accepted. This guards lodging, examining and curing a presentation — otherwise `ERR_PRESENTATION_PERIOD_ELAPSED` (409).
+21. A bill of lading's `on_board_date` is at or before both the credit's `latest_shipment_date` and the order's `ship_by_date`, on bill-of-lading issuance — otherwise `ERR_LATEST_SHIPMENT_DATE_PASSED` (409).
+22. The logical clock is at or after the license's `valid_from` and at or before its `valid_to`, both bounds inclusive, on license-based clearance — otherwise `ERR_LICENSE_NOT_VALID_AT_DATE` (409).
+23. The logical clock is strictly before the sailing's `cutoff_at`, on freight booking — otherwise `ERR_SAILING_CUTOFF_PASSED` (409).
+24. No other export license for the same buyer and the same `eccn`, in status `ISSUED`, `ACTIVE` or `EXHAUSTED`, has a validity interval intersecting the requested one, treating both endpoints as inclusive so that touching intervals **do** overlap. This applies to license recording — otherwise `ERR_LICENSE_WINDOW_OVERLAP` (409).
+25. The new booking's occupation interval does not intersect the interval of any live booking of the same order, treating the interval as half-open so that touching endpoints do **not** overlap. This applies to freight booking — otherwise `ERR_BOOKING_WINDOW_OVERLAP` (409).
+26. Uniqueness holds: `lc_number` across credits whose `status` is neither `REJECTED` nor `EXPIRED` (`ERR_DUPLICATE_LC_NUMBER`); `license_number` globally (`ERR_DUPLICATE_LICENSE_NUMBER`); `policy_number` globally (`ERR_DUPLICATE_POLICY_NUMBER`); `line_no` within an order (`ERR_DUPLICATE_LINE_NO`); `voyage_no` within a `carrier_scac` (`ERR_DUPLICATE_VOYAGE`); and at most one issued trade document per order and `doc_type` (`ERR_DUPLICATE_ISSUED_DOCUMENT`). These guard credit capture, license recording, policy creation, shipment-line creation, sailing publication and document issuance respectively; all are 409.
+27. Every tendered document has `status` `ISSUED`, belongs to the presentation's own order, and does not duplicate an already-`ACTIVE` link of the same `doc_type` at the current round. This guards lodging, curing and examining a presentation — otherwise `ERR_DOCUMENT_REVISION_SUPERSEDED` (409). This is **Conflict C's loser side**: never reached when the examining user is also the document's preparer.
+28. A document's `pinned_order_version` still equals the order's current `version`, on document issuance — otherwise `ERR_DOCUMENT_STALE_SOURCE` (409).
+29. Every `doc_type` listed in the credit's `required_document_types` has an `ACTIVE` link on the presentation. This guards lodging and examining a presentation — otherwise `ERR_REQUIRED_DOCUMENT_MISSING` (409).
+30. Collections that must not be empty are not empty: an order has at least one shipment line before compliance submission (`ERR_NO_SHIPMENT_LINES`); `trade_document_ids` is non-empty on a presentation (`ERR_PRESENTATION_NO_DOCUMENTS`); `replacement_document_ids` is non-empty on a cure (`ERR_NO_REPLACEMENT_DOCUMENTS`); and `shipped_lines` is non-empty with every shipped quantity strictly above zero on a bill of lading (`ERR_ZERO_SHIPPED_QUANTITY`). All are 422.
+31. The sailing's current `booked_weight_kg` plus the requested `booked_weight_kg` is at most `capacity_weight_kg`, with equality accepted and only strict excess rejected, on freight booking — otherwise `ERR_SAILING_CAPACITY_EXCEEDED` (409). This is **Conflict A's winner only when the order is already compliance cleared**; otherwise priority 12 has already fired.
+32. The license's `consumed_value_usd` plus the order's ordered goods value, rounded to two decimal places, is at most `licensed_value_usd`, with equality accepted. This guards license-based clearance and freight booking — otherwise `ERR_LICENSE_VALUE_EXHAUSTED` (409).
+33. A presentation's `presented_amount_usd` is at most the credit's `max_drawable_usd`, with equality accepted; and at settlement, `received_amount_usd` is additionally at most `negotiable_amount_usd`. These guard examination and settlement — otherwise `ERR_LC_AMOUNT_EXCEEDED` (409). This is **Conflict D's loser side**: never reached when the credit has already expired.
+34. A policy's `available_limit_usd` covers the exposure the request would charge (`ERR_CREDIT_LIMIT_EXCEEDED`), and a claim's implied indemnity is at most `credit_limit_usd` minus `indemnified_total_usd` (`ERR_CLAIM_EXCEEDS_COVERAGE`). These guard claim filing; both are 409.
+35. Dispute money bounds hold: `claimed_amount_usd` is at most the order's `ordered_goods_value_usd`, and for a `SHORT_SHIPMENT` dispute additionally at most the order's `short_shipped_value_usd` (`ERR_CLAIM_AMOUNT_INVALID`); an offer is at most `claimed_amount_usd` and, when made from `COUNTERED`, additionally at most the standing `current_offer_usd`; a counter is strictly above the standing `current_offer_usd` and at most `claimed_amount_usd` (`ERR_OFFER_AMOUNT_INVALID`). These guard dispute opening, offers and counters; both codes are 422.
+36. On a counter, the incremented negotiation round is still within the round bound; once the bound is reached the case is forced to `ESCALATED` instead of accepting a further counter, and a counter attempted thereafter is rejected with `ERR_NEGOTIATION_ROUNDS_EXHAUSTED` (409).
+37. A presentation's `presentation_round` is strictly below the cure-round bound, on a cure — otherwise `ERR_CURE_ROUNDS_EXHAUSTED` (409).
+
+### 2.12. Conserved Ledgers
+
+Three aggregate figures in this system are **conserved quantities**: they are always recomputed as the sum over their contributing rows and never decremented in place, so that a create-then-release pair returns them to their exact prior values.
+
+A sailing's `booked_weight_kg` always equals the sum of `booked_weight_kg` over its bookings whose `status` is `BOOKED`, `CONFIRMED` or `SHIPPED`; a `CANCELLED` booking contributes 0.000. An export license's `consumed_value_usd` plus its `remaining_value_usd` always equals its `licensed_value_usd`, and `remaining_value_usd` is never negative. An insurance policy's `utilized_usd` plus its `available_limit_usd` always equals its `credit_limit_usd`, and `utilized_usd` always equals the sum of `insured_exposure_usd` over the buyer's orders charged to that policy. The buyer's `aggregate_exposure_usd` in turn always equals the sum of `utilized_usd` over that buyer's policies whose `status` is `ACTIVE` or `EXHAUSTED`; policies in `EXPIRED` are excluded from that sum.
+
+Exhaustion is decided on exact equality with zero, not on a tolerance: a policy becomes `EXHAUSTED` when `available_limit_usd` is exactly 0.00 and returns to `ACTIVE` the moment it becomes strictly greater than 0.00, and a license becomes `EXHAUSTED` when `remaining_value_usd` is exactly 0.00 and steps back to `ACTIVE` when it becomes strictly greater than 0.00.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Overseas Buyers and the Restricted-Party Switch
+
+A foreign buyer is the counterparty record every other resource in the system eventually hangs from. A `TradeComplianceOfficer` registers one by supplying a `legal_name` of 1 to 200 characters, a `country_code` of exactly two uppercase letters denoting the buyer's domicile under ISO 3166-1 alpha-2, and a `credit_rating` drawn from `AAA`, `AA`, `A`, `BBB`, `BB`, `B` and `CCC` — the grade that later selects the rating multiplier in the premium assessment of §3.8. Two further compliance fields may be supplied at registration and both carry defaults: `sanctions_tier`, one of `NONE`, `WATCHLIST` or `EMBARGOED`, defaults to `NONE`; and `restricted_party_flag`, a boolean, defaults to false. A `restricted_party_reason` is optional free text and must be null while the flag is false.
+
+Two figures on the buyer are maintained by the system and never accepted from a client. `aggregate_exposure_usd` starts at 0.00 and always equals the sum of `utilized_usd` across that buyer's policies in status `ACTIVE` or `EXHAUSTED`. `open_order_count` starts at 0 and always equals the count of that buyer's orders whose `fulfillment_status` is neither `CLOSED` nor `CANCELLED`; it rises by one when an order is created and falls by one every time an order closes or is cancelled.
+
+A buyer record is otherwise immutable once written: there is no operation for correcting `legal_name`, `country_code`, `credit_rating` or `sanctions_tier`. The **only** field of a buyer that can ever be changed after registration is the restricted-party switch, which has its own dedicated operation restricted to a `TradeComplianceOfficer` and takes `restricted_party_flag` together with an optional `restricted_party_reason`. Setting the flag true without a reason is accepted, but the reason must be recorded as null whenever the flag is false.
+
+**The four-link cascade.** Setting `restricted_party_flag` to true is the single most destructive act in this API, and it propagates four links deep on its own, without the client naming a single downstream row:
+
+- **Link 1 — orders.** Every export order of that buyer whose `fulfillment_status` is `COMPLIANCE_CLEARED` or `BOOKED` moves to `COMPLIANCE_BLOCKED`. Orders in `DRAFT`, `COMPLIANCE_PENDING`, `SHIPPED`, `SHORT_SHIPPED`, `CLOSED` or `CANCELLED` are untouched: goods already on the water are not recalled by a list designation, and drafts are already unshippable.
+- **Link 2 — bookings.** For each order that just moved, every freight booking of that order whose `status` is `BOOKED` or `CONFIRMED` moves to `CANCELLED` with `cancel_reason` set to the literal string `'RESTRICTED_PARTY_CASCADE'`. Bookings already in `SHIPPED` or `CANCELLED` are left alone.
+- **Link 3 — sailings.** Because those bookings are no longer live, each affected sailing's `booked_weight_kg` is recomputed as the sum over its remaining live bookings, and a sailing that had been driven to `FULL` returns to `OPEN` when the recomputed figure falls strictly below `capacity_weight_kg`. The freed capacity is genuinely freed: it becomes available to other orders immediately.
+- **Link 3, second branch — licenses.** For any order that was in `BOOKED` — and only for those, because only a booked order has ever charged a license — `licensed_value_allocated_usd` is reset to 0.00 and the charged license's `consumed_value_usd` and `remaining_value_usd` are recomputed from the remaining charged orders. A license that had reached `EXHAUSTED` returns to `ACTIVE` when its recomputed `remaining_value_usd` becomes strictly greater than 0.00.
+- **Link 4 — screenings.** For every order that moved, the order's screening moves from `CLEARED` back to `INITIATED`, its `ruleset_version` is incremented by one, and its `cleared_at` is reset to null. The clearance is not merely suspended; it is withdrawn, and the order must be screened again from scratch under the new ruleset generation.
+
+Every row touched at every link has its `updated_at` refreshed and its `version` incremented by one, so an order blocked by this cascade invalidates all of its unissued documents by the pinning rule of §2.7.
+
+**Recovery.** Lifting the flag — setting `restricted_party_flag` back to false — does **not** unwind the cascade. Blocked orders stay blocked, cancelled bookings stay cancelled, and freed capacity stays freed. The only way forward is the re-screen loop: with the flag now false, a `TradeComplianceOfficer` records a fresh decision on the re-opened `INITIATED` screening, which moves the order from `COMPLIANCE_BLOCKED` to `COMPLIANCE_PENDING` and, on the same decision reaching `CLEARED`, onward to `COMPLIANCE_CLEARED`. Freight must then be booked again, and each document regenerated against the order's new `version`.
+
+While the flag stands true, seven operations against that buyer's orders are refused outright with a 409: submitting an order for compliance, capturing a credit against it, opening a terms review on that credit, booking freight, generating a trade document, issuing a trade document, and lodging a presentation. Notice what is **not** on that list — settlement, dishonour, claim filing, write-off, and dispute handling all remain available, because a restricted-party designation must not strand money already owed.
+
+Separately from the flag, a `sanctions_tier` of `EMBARGOED` blocks compliance submission, the screening decision and freight booking with a distinct 409, as does an order whose `destination_country_code` falls on the embargoed-destination list implied by that tier. A buyer on `WATCHLIST` is not blocked by that rule; the watchlist posture is informational and feeds the compliance officer's own judgement.
+
+Registration is open to a `TradeComplianceOfficer` or a `PlatformAdmin`. A buyer record may be read individually by a `TradeComplianceOfficer`, `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer` or `PlatformAdmin` — note that a `ForeignBuyer` cannot read even its own buyer row, and there is no buyer collection listing at all. Buyer-facing visibility runs entirely through the order, finding and dispute collections, each scoped to the caller's own orders.
+
+### 3.2. Export Orders and Their Shipment Lines
+
+An `ExportOpsCoordinator` creates an export order by naming the `buyer_id` it belongs to, the commercial terms, and the shipment geography. The system records the creating user's `X-User-ID` into `prepared_by_user_id` — a field no client ever supplies, and the anchor of the duty separations of §2.8.
+
+The commercial terms are the `incoterm`, one of `EXW`, `FCA`, `FOB`, `CFR`, `CIF`, `DAP` or `DDP`, together with a free-text `incoterm_named_place` qualifying it, such as the port named in "FOB Busan". The geography is an `origin_country_code` naming the country of manufacture — the value that will be printed on the certificate of origin — a `destination_country_code` naming the country of final destination, and a `destination_zone` of `ZONE_1`, `ZONE_2` or `ZONE_3` that selects the ocean-freight rate tier. The money terms are an `invoice_currency` in ISO 4217 form, defaulting to `USD`, and an `fx_rate_usd_to_invoice` carrying exactly six decimal places, defaulting to 1.000000 and required to be exactly 1.000000 whenever `invoice_currency` is `USD`. Finally, `ship_by_date` records the contractual latest on-board date agreed with the buyer, as an ISO 8601 UTC instant.
+
+A new order is born with `fulfillment_status` `DRAFT` and `settlement_status` `UNSECURED`, and with every derived money figure at 0.00: `ordered_goods_value_usd`, `shipped_goods_value_usd`, `provisional_seller_cost_usd`, `provisional_buyer_cost_usd`, `final_seller_cost_usd`, `final_buyer_cost_usd`, `cost_allocation_variance_usd`, `outstanding_receivable_usd`, `licensed_value_allocated_usd`, `insured_exposure_usd` and `short_shipped_value_usd`. Creating the order increments the buyer's `open_order_count` by one.
+
+An order, like a buyer, has no correction surface: once created, `incoterm`, `incoterm_named_place`, `origin_country_code`, `destination_country_code`, `destination_zone`, `invoice_currency`, `fx_rate_usd_to_invoice` and `ship_by_date` are fixed for its lifetime. An order whose terms are wrong must be cancelled and re-created while it is still cancellable. This is deliberate: the `incoterm` is the input to a cost allocation and the `fx_rate_usd_to_invoice` is the input to an invoice total, both of which are stored on rows the buyer's bank will rely on.
+
+**Shipment lines.** Each line of the eventual invoice is a shipment line, created against the order by an `ExportOpsCoordinator` while the order is in `DRAFT`. A line carries a `line_no`, a 1-based ordinal that must be at least 1 and must be unique within the order; a duplicate is refused with a 409. That ordinal is the sole tie-break key for the rounding-residual assignment of §3.5, so it is a functional field, not a cosmetic one. A line further carries a `goods_description` — the wording that must appear identically on the invoice and in the credit — an `hs_code` of exactly 6 or exactly 10 digits, a `quantity` strictly greater than zero at 3 decimal places, a `uom` from `EA`, `KG`, `LTR`, `MTR` and `SET`, a `unit_price_usd` strictly greater than zero at 4 decimal places, and a `line_discount_pct` at 2 decimal places that defaults to 0.00 and must lie between 0.00 and 40.00 inclusive. Physical fields are `net_weight_kg` strictly greater than zero at 3 decimal places, `gross_weight_kg` at 3 decimal places that must be at least `net_weight_kg` — equality is accepted, for unpacked bulk — and `package_count`, an integer of at least 1 that is printed on the packing list.
+
+An order may carry at most **50** shipment lines, since 50 is the ceiling the commercial invoice can express; an attempt to add the fifty-first is refused as a field-constraint failure with `ERR_VALIDATION` (422). Lines are append-only: there is no operation for correcting a line and none for removing one, so a mistaken line can only be escaped by cancelling the order.
+
+Three per-line figures are derived and never supplied. `line_extended_usd` is the quantity multiplied by the unit price, rounded to two decimal places — and this per-line rounding is pinned to happen **before** any summation, which is why summing raw products and rounding once produces the wrong invoice. `line_net_usd` is `line_extended_usd` less the discount, where the discount is itself `line_extended_usd` multiplied by `line_discount_pct` divided by 100 and then rounded to two decimal places: two independent roundings, not one. `apportioned_freight_usd` holds the share of seller-borne main carriage assigned to this line by the invoice totalling of §3.5, and stays at 0.00 whenever the incoterm leaves main carriage to the buyer. A fourth field, `shipped_quantity`, is system-maintained, starts at 0.000, and is written only by bill-of-lading issuance.
+
+The order's `ordered_goods_value_usd` is the sum of `line_extended_usd` over all its lines, and its `shipped_goods_value_usd` is the sum, over all lines, of each line's `shipped_quantity` multiplied by its `unit_price_usd` and rounded to two decimal places per line before summing. `shipped_goods_value_usd` stays at 0.00 until a bill of lading is issued.
+
+**Submitting for compliance.** An `ExportOpsCoordinator` submits a `DRAFT` order for compliance, moving it to `COMPLIANCE_PENDING`. The order must have at least one shipment line — an empty order is refused with a 422 — and every line must have `quantity` strictly greater than zero. The buyer must have `restricted_party_flag` false and `sanctions_tier` other than `EMBARGOED`. The submission creates exactly one screening for the order, with `status` `INITIATED` and `ruleset_version` 1, recomputes `ordered_goods_value_usd` from the lines, and increments the order's `version` by one.
+
+**Cancelling.** An `ExportOpsCoordinator` may cancel an order from `DRAFT`, from `COMPLIANCE_PENDING` or from `COMPLIANCE_BLOCKED`, and in all three cases the sole precondition is that the order has no trade document in status `ISSUED`. Cancellation is terminal, decrements the buyer's `open_order_count` by one, and increments the order's `version` by one. Cancelling from `COMPLIANCE_PENDING` deliberately leaves the order's screening alone: a screening in `INITIATED` or `PENDING_LICENSE` is simply orphaned and thereafter gates nothing. An order that has reached `BOOKED`, `SHIPPED` or `SHORT_SHIPPED` cannot be cancelled at all; the exit from those states runs through the settlement axis to `CLOSED`.
+
+The order collection may be listed by all six roles — an `ExportOpsCoordinator`, `TradeComplianceOfficer`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `ForeignBuyer` or `PlatformAdmin` — with a `ForeignBuyer` caller seeing only orders whose `buyer_id` equals its own `X-User-ID`. An individual order may be read by the five staff roles but **not** by a `ForeignBuyer`: the buyer's window on its own orders is the scoped collection, not the item read. Shipment lines may be listed per order or across orders, and read individually, by an `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `TradeComplianceOfficer` or `PlatformAdmin`; lines are always returned in ascending `line_no` order within each order.
+
+### 3.3. Export Control Screening, Licensing, and License Value
+
+Submitting an order for compliance opens exactly one screening case, and that case is the only gate between a drafted order and a bookable one. The case is born with `status` `INITIATED`, `ruleset_version` 1, `denied_party_hits` 0, and with `eccn`, `decided_by_user_id`, `license_determination`, `export_license_id` and `cleared_at` all null. No client ever creates a screening directly.
+
+**The three-way decision fork.** A `TradeComplianceOfficer` records the classification decision on an `INITIATED` case, supplying a `license_determination` of `NLR`, `LICENSE_REQUIRED` or `PROHIBITED`, an optional `eccn` matching the pattern of one digit, then one letter from A through E, then exactly three digits, a `denied_party_hits` count that defaults to 0, and an optional free-text `notes` string that is accepted and retained for audit but never read by any rule. The decision stores the officer's `X-User-ID` into `decided_by_user_id` and forks into three branches whose side-effect sets are disjoint:
+
+- **`NLR` — no license required.** Permitted only when `denied_party_hits` equals 0, the buyer's `sanctions_tier` is not `EMBARGOED`, and the order's `fulfillment_status` is `COMPLIANCE_PENDING` or `COMPLIANCE_BLOCKED`. The case moves to `CLEARED`, `cleared_at` is stamped with the current logical clock, and the order moves to `COMPLIANCE_CLEARED` — passing through `COMPLIANCE_PENDING` first when it had been `COMPLIANCE_BLOCKED`, which is the recovery leg of the re-screen loop.
+- **`LICENSE_REQUIRED`.** Permitted only when `denied_party_hits` equals 0 and an `eccn` is present in the body; a `LICENSE_REQUIRED` decision without an `eccn` is refused, because there is nothing for a license to authorise. The case moves to `PENDING_LICENSE` and the order **stays** in `COMPLIANCE_PENDING`: no clearance whatsoever is granted by this branch.
+- **`PROHIBITED`.** Reachable from `INITIATED` when the order is in `COMPLIANCE_PENDING` or `COMPLIANCE_BLOCKED`, and also from `PENDING_LICENSE` when the order is in `COMPLIANCE_PENDING` — the license application having failed. The case moves to `BLOCKED` and the order to `COMPLIANCE_BLOCKED`. A decision recording `denied_party_hits` strictly greater than zero also lands here regardless of the submitted determination, and carries one extra consequence: the buyer's own `restricted_party_flag` is set true with `restricted_party_reason` set to the literal string `'DENIED_PARTY_SCREENING_HIT'`, which fires the entire four-link cascade of §3.1 across every other order of that buyer.
+
+Every branch increments the screening's `version` by one.
+
+**Recording a license.** Where the determination was `LICENSE_REQUIRED`, a `TradeComplianceOfficer` records the authority-issued license against the screening. The license carries a `license_number` unique across all licenses, an `authority` of `BIS`, `DDTC`, `OFAC` or `NATIONAL_OTHER`, an `eccn` that must equal the screening's own `eccn`, a `valid_from` and a `valid_to` where `valid_to` must be strictly after `valid_from`, and a `licensed_value_usd` strictly greater than zero at 2 decimal places that caps the aggregate shipment value the license authorises. Both validity bounds are **inclusive**: a license valid from the first of the month to the last is usable on both of those instants. The license is created with `status` `ISSUED`, `consumed_value_usd` 0.00 and `remaining_value_usd` equal to `licensed_value_usd`.
+
+Licenses do not overlap. No other license for the same buyer and the same `eccn`, in `status` `ISSUED`, `ACTIVE` or `EXHAUSTED`, may have a validity interval that intersects the requested one, and because both endpoints are inclusive, **touching intervals do overlap**: a license running to the last instant of March conflicts with one starting at that same instant. A license already in `EXPIRED` is excluded from the comparison, so the same window may be re-licensed after the old authorisation lapses. Note the deliberate asymmetry against the booking-window rule of §3.6, where touching intervals are accepted; the two rules are geometrically opposite and each is stated on purpose.
+
+**Clearing with a license.** A `TradeComplianceOfficer` clears a `PENDING_LICENSE` screening by naming an `export_license_id`. Five conditions must all hold: the license's `eccn` equals the screening's `eccn`; the order of the license's own originating screening belongs to the **same buyer** as this screening's order, so a license issued for one buyer can never clear another's shipment; the license's `status` is `ISSUED` or `ACTIVE`; the logical clock is at or after `valid_from` and at or before `valid_to`, both bounds inclusive; and the license's `remaining_value_usd` is at least the order's `ordered_goods_value_usd`, equality being accepted.
+
+Clearance sets the screening's `export_license_id`, stamps `cleared_at` with the logical clock, moves the license from `ISSUED` to `ACTIVE`, moves the order from `COMPLIANCE_PENDING` to `COMPLIANCE_CLEARED`, and increments both the screening's and the license's `version` by one. This is the fork rejoining: the `LICENSE_REQUIRED` path arrives at exactly the same `CLEARED` state as the `NLR` path, but it has bound a license the `NLR` path never touches.
+
+**License value as a conserved ledger.** A license's `consumed_value_usd` is never incremented in place. It is always recomputed as the sum of `licensed_value_allocated_usd` over the qualifying orders — those whose screening's `export_license_id` equals this license's `id` and whose `fulfillment_status` is `BOOKED`, `SHIPPED`, `SHORT_SHIPPED` or `CLOSED`. Orders in `DRAFT`, `COMPLIANCE_PENDING`, `COMPLIANCE_CLEARED`, `COMPLIANCE_BLOCKED` or `CANCELLED` contribute 0.00. For each qualifying order, `licensed_value_allocated_usd` is that order's `ordered_goods_value_usd` rounded to two decimal places. `remaining_value_usd` is then `licensed_value_usd` less `consumed_value_usd`, and is never negative.
+
+Note carefully **which** value is charged: the **ordered** value, not the shipped value. An order that short-ships still consumes the full ordered value against the license, and a subsequent short shipment does not hand any value back. The two variants of this rule are the charge and the release. The charge fires when an order with determination `LICENSE_REQUIRED` enters `BOOKED`. The release fires when the order leaves `BOOKED` — by booking cancellation or by the restricted-party cascade — at which point `licensed_value_allocated_usd` returns to 0.00 and the license steps back from `EXHAUSTED` to `ACTIVE` once its recomputed `remaining_value_usd` becomes strictly greater than 0.00.
+
+The charge is gated: the license's current `consumed_value_usd` plus the order's `ordered_goods_value_usd` rounded to two decimal places must be at most `licensed_value_usd`. Equality is accepted — a booking that exactly exhausts the license succeeds and drives it to `EXHAUSTED` — and only a strict excess is refused with a 409. The license's status is otherwise `EXHAUSTED` whenever `remaining_value_usd` is exactly 0.00, `ACTIVE` when it has cleared at least one screening, and `ISSUED` when it has not. A utilisation figure of 90.00 percent of `licensed_value_usd` is the point at which a license is treated as nearly drawn down for reporting purposes; crossing it changes no status and blocks nothing.
+
+Because both `consumed_value_usd` and `remaining_value_usd` are recomputed from the same sum on every charge and every release, a book-then-cancel pair returns the license to its exact prior figures and its exact prior status. Nothing is decremented in place, so no drift accumulates over repeated cycles.
+
+The clock sweep moves any license in `ISSUED`, `ACTIVE` or `EXHAUSTED` to `EXPIRED` once the logical clock passes strictly beyond its `valid_to`. `EXPIRED` is not recoverable, and a license in `EXPIRED` may not clear a screening. Screenings and licenses may be listed and read by an `ExportOpsCoordinator`, `TradeComplianceOfficer` or `PlatformAdmin`.
+
+### 3.4. Documentary Credits: Capture, Review, and Amendment Rounds
+
+**Capture.** An `ExportOpsCoordinator` captures the terms of an incoming documentary credit against an order by supplying the `export_order_id`, an `lc_number` issued by the issuing bank, an `issuing_bank_swift` of exactly 8 or exactly 11 uppercase alphanumerics, an `amount_usd` strictly greater than zero at 2 decimal places, an `availability` of `SIGHT` or `USANCE`, an `expiry_date`, a `latest_shipment_date`, and a non-empty `required_document_types` array whose elements are drawn from `COMMERCIAL_INVOICE`, `PACKING_LIST`, `CERTIFICATE_OF_ORIGIN`, `BILL_OF_LADING`, `INSURANCE_CERTIFICATE` and `INSPECTION_CERTIFICATE`, and which **must** contain `COMMERCIAL_INVOICE`. Five further fields are optional and carry defaults: `tolerance_pct` defaults to 0.00 and must lie between 0.00 and 10.00 inclusive at 2 decimal places; `usance_days` defaults to 0; `presentation_period_days` defaults to 21 and must lie between 1 and 60 inclusive; `partial_shipment_allowed` defaults to false; and `transshipment_allowed` defaults to false. A `supersedes_lc_id` may be supplied to point at an earlier credit whose `status` is `REJECTED` or `EXPIRED`, forming a replacement chain; it is null for an original credit.
+
+`usance_days` and `availability` must agree inside the same body: `usance_days` must be exactly 0 when `availability` is `SIGHT`, and at least 30 when `availability` is `USANCE`. A `SIGHT` credit with a non-zero tenor and a `USANCE` credit with a tenor below 30 are both refused with a 422.
+
+The credit's `lc_number` must be unique across all credits whose `status` is neither `REJECTED` nor `EXPIRED`, so a reference freed by a rejection or an expiry may be reused. Capture stores the coordinator's `X-User-ID` into `captured_by_user_id`, sets `status` to `RECEIVED`, `amendment_round` to 0 and `drawn_amount_usd` to 0.00, and computes the two drawing bounds: `max_drawable_usd` is `amount_usd` multiplied by the quantity one plus `tolerance_pct` divided by 100, rounded to two decimal places; `min_drawable_usd` is `amount_usd` multiplied by the quantity one minus `tolerance_pct` divided by 100, rounded to two decimal places. Both are recomputed whenever `amount_usd` or `tolerance_pct` changes. Capture is refused when the order's buyer carries `restricted_party_flag` true.
+
+**Opening a review.** A `DocumentaryCreditReviewer` opens a terms review on a credit in `RECEIVED`, supplying only `expected_letter_of_credit_version`. Four preconditions apply: the declared version equals the credit's current `version`; the reviewer's `X-User-ID` differs from the credit's `captured_by_user_id`; the order's buyer has `restricted_party_flag` false; and the logical clock is strictly before `expiry_date`. Opening the review creates one review row with `status` `DRAFTING`, `reviewer_user_id` taken from `X-User-ID`, `reviewed_lc_version` pinned to the credit's `version`, `recommendation` null, `terms_risk_score` 0.00 and `finding_count` 0; moves any other review of this credit still in `DRAFTING` to `SUPERSEDED`, so at most one review is ever open; moves the credit from `RECEIVED` to `UNDER_REVIEW`; and increments the credit's `version` by one.
+
+**Recording terms findings.** While a review is `DRAFTING`, the reviewer records findings on it. Each finding carries a `code` from `AMOUNT_MISMATCH`, `EXPIRY_UNWORKABLE`, `LATEST_SHIPMENT_UNWORKABLE`, `PARTIAL_SHIPMENT_BARRED`, `DOC_TYPE_MISSING`, `DESCRIPTION_MISMATCH`, `WEIGHT_MISMATCH`, `ORIGIN_MISMATCH`, `LATE_PRESENTATION`, `SHORT_DRAWING` and `DOC_VOIDED`; a `severity` of `CRITICAL`, `MAJOR` or `MINOR`; a `clause_ref` of `AMOUNT`, `EXPIRY`, `LATEST_SHIPMENT`, `DOCUMENTS`, `GOODS` or `OTHER`; and a `detail` describing the discrepancy in words. The system sets `source` to `TERMS`, copies `letter_of_credit_id` from the review, sets `cure_status` to `OPEN` and `raised_in_round` to 0, leaves `document_presentation_id`, `waived_by_buyer_id` and `buyer_reference` null, and recomputes the review's `finding_count`.
+
+**The risk score.** Submitting a review computes `terms_risk_score`. The score begins from a severity weight of 40 for `CRITICAL`, 15 for `MAJOR` and 5 for `MINOR`. That weight is multiplied by a clause multiplier of 1.5 when the finding's `clause_ref` is `AMOUNT`, `EXPIRY` or `LATEST_SHIPMENT`, and 1.0 for `DOCUMENTS`, `GOODS` and `OTHER`. It is then multiplied by a carryover factor. Each finding's product is rounded to two decimal places **individually**, in ascending `created_at` order; only then are the rounded contributions summed; and the sum is finally capped at a ceiling of 100.00, so no score ever exceeds 100.00 however many findings are raised. Findings whose `cure_status` is `WAIVED` contribute exactly 0.00 but are still counted in `finding_count`, and findings belonging to a review already in `SUPERSEDED` are excluded from scoring altogether.
+
+The scoring rule has two variants that disagree on the same finding set. For a **terms review**, the selected findings are those with `source` `TERMS` whose `lc_terms_review_id` equals the submitting review's `id` and whose `cure_status` is `OPEN` or `CURED`; the carryover factor is always 1.0, because a terms review has no round concept; and `MINOR` findings always count. For a **presentation examination**, described in §3.7, the selection widens and the factors change, so the two variants can and do produce different numbers from the same underlying findings.
+
+**Submitting the review.** The reviewer submits a `recommendation` of `ACCEPT`, `AMEND` or `REJECT`. In all three cases the review's `status` becomes `SUBMITTED`, and its `terms_risk_score` and `finding_count` are stored; a second submit on the same review is refused with a 409. The review's pinned `reviewed_lc_version` must still equal the credit's current `version`, or the submit does not proceed. The three branches then diverge completely:
+
+- **`ACCEPT`** requires the credit to be in `UNDER_REVIEW`, requires **zero** findings on the review with `severity` `CRITICAL` and `cure_status` `OPEN`, and requires the computed score to be **strictly below 45.00**. The credit moves `UNDER_REVIEW` to `ACCEPTED`, its drawing bounds are recomputed, and the order's `settlement_status` moves `UNSECURED` to `LC_ACCEPTED` — which is the moment insured exposure is charged, per §3.8.
+- **`AMEND`** requires at least one finding on the review with `cure_status` `OPEN`. The credit moves `UNDER_REVIEW` to `AMENDMENT_REQUESTED` and the order's money axis is left entirely untouched.
+- **`REJECT`** requires either at least one finding with `severity` `CRITICAL` and `cure_status` `OPEN`, or a score **at or above 60.00**. The credit moves `UNDER_REVIEW` to `REJECTED`, terminally; the order's `settlement_status` stays `UNSECURED`, and the way forward is to capture a replacement credit whose `supersedes_lc_id` points at the rejected row.
+
+A `recommendation` incompatible with the computed score — an `ACCEPT` at a score of 45.00 or above, or an `ACCEPT` or `AMEND` at a score of 60.00 or above, where only `REJECT` is permitted — is refused with a 409. The band between 45.00 and 60.00 admits `AMEND` and `REJECT` but not `ACCEPT`.
+
+**Amendment rounds.** An `ExportOpsCoordinator` applies an amendment in place, from `AMENDMENT_REQUESTED` or from `ACCEPTED`, supplying `expected_letter_of_credit_version` together with at least one amendable field: `amount_usd`, `tolerance_pct`, `expiry_date`, `latest_shipment_date`, `presentation_period_days`, `partial_shipment_allowed`, `transshipment_allowed` or `required_document_types`. An amendment body carrying only the version and no amendable field is refused. The logical clock must be strictly before `expiry_date`. Amending from `ACCEPTED` additionally requires that the order have **no** presentation in `PRESENTED`, `CURING`, `COMPLIED` or `HONOURED`: a credit whose documents are already in the bank's hands may not have its terms rewritten underneath them.
+
+The amendment applies the submitted fields in place, increments `amendment_round` by one, recomputes `max_drawable_usd` and `min_drawable_usd`, moves the credit back to `RECEIVED`, moves **every** review of the credit in `SUBMITTED` to `SUPERSEDED`, marks every finding of the credit with `source` `TERMS` and `cure_status` `OPEN` as `CURED`, and increments the credit's `version` by one. Amending from `ACCEPTED` also moves the order's `settlement_status` from `LC_ACCEPTED` back to `UNSECURED`, releasing insured exposure — provided the order has no presentation in `PRESENTED`, `CURING` or `COMPLIED`. The credit is now back at the start of the loop: it must be reviewed again, and again by someone other than `captured_by_user_id`. The cycle from `UNSECURED` to `LC_ACCEPTED` and back repeats once per amendment round.
+
+**Utilisation and expiry.** A credit in `ACCEPTED` moves to `UTILISED` when a settlement drives `drawn_amount_usd` — the sum of `received_amount_usd` over that credit's presentations in `HONOURED` — to at least `min_drawable_usd`. `UTILISED` is terminal, as are `REJECTED` and `EXPIRED`.
+
+The clock sweep expires credits in `RECEIVED`, `UNDER_REVIEW`, `AMENDMENT_REQUESTED` and `ACCEPTED` once the clock passes strictly beyond `expiry_date`, and the four branches carry different consequences. From `RECEIVED` and from `AMENDMENT_REQUESTED`, only the credit's own status and `version` change. From `UNDER_REVIEW`, the credit's `DRAFTING` review additionally moves to `SUPERSEDED`. From `ACCEPTED`, expiry is permitted only when the order has no presentation in `COMPLIED` or `HONOURED` — a complying tender is protected from the clock — and it additionally moves the order's `settlement_status` from `LC_ACCEPTED` back to `UNSECURED` when the order has no presentation in `PRESENTED`, `CURING` or `COMPLIED`, and moves every presentation of that credit in `PRESENTED`, `CURING` or `DISCREPANT` to `REFUSED` with `refusal_reason` set to the literal string `'CREDIT_EXPIRED'`.
+
+Credits may be listed and read by an `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer` or `PlatformAdmin`, with the credit list filterable by `export_order_id`, by `supersedes_lc_id` to walk a replacement chain, and by `status`. Reviews may be listed and read by a `DocumentaryCreditReviewer`, `ExportOpsCoordinator` or `PlatformAdmin`, filterable by `letter_of_credit_id` and `status`. Findings may be listed and read by a `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `ForeignBuyer` or `PlatformAdmin`, filterable by `letter_of_credit_id`, `lc_terms_review_id`, `document_presentation_id`, `waived_by_buyer_id`, `source`, `severity` and `cure_status`.
+
+### 3.5. Trade Documents and the Invoice Totalling Chain
+
+**Generation.** An `ExportOpsCoordinator` generates a trade document by naming the `export_order_id` and a `doc_type` from `COMMERCIAL_INVOICE`, `PACKING_LIST`, `CERTIFICATE_OF_ORIGIN`, `BILL_OF_LADING`, `INSURANCE_CERTIFICATE` and `INSPECTION_CERTIFICATE`. The document is created in `status` `DRAFT` with `revision` 1, `supersedes_document_id` null, `void_reason` null, `generated_by_user_id` taken from `X-User-ID`, and `pinned_order_version` set to the order's current `version`. Generation is refused when the order's buyer carries `restricted_party_flag` true.
+
+Five figures are snapshotted at generation. `total_gross_weight_kg` is the sum of `gross_weight_kg` over the order's lines with a positive quantity, at 3 decimal places — the figure the packing list and the bill of lading print. `total_package_count` is the sum of `package_count` over the order's lines. `origin_country_code` is copied from the order's own `origin_country_code`, which is what a certificate of origin attests. `declared_total_usd` and `declared_total_invoice_currency` are computed by the invoice totalling chain below and are 0.00 for every `doc_type` other than `COMMERCIAL_INVOICE` and `INSURANCE_CERTIFICATE`. An `on_board_date` is stamped only on a `BILL_OF_LADING` and is null on every other type.
+
+**The invoice totalling chain.** The chain runs over the order's lines whose billable quantity is strictly greater than zero, processed in ascending `line_no` order. The billable quantity is each line's `shipped_quantity` when the order's `fulfillment_status` is `SHIPPED`, `SHORT_SHIPPED` or `CLOSED`, and each line's `quantity` otherwise. A line whose billable quantity is zero is excluded from **every** step, including the apportionment denominator. The seven steps run in this exact order:
+
+1. **Per-line rounding first.** For each line, `line_extended_usd` is the billable quantity multiplied by `unit_price_usd`, rounded to two decimal places. The line discount is `line_extended_usd` multiplied by `line_discount_pct` divided by 100, rounded to two decimal places. `line_net_usd` is `line_extended_usd` less that rounded discount.
+2. **Subtotal as an exact sum of rounded parts.** The invoice subtotal is the exact sum of the already-rounded `line_net_usd` values. Summing the raw products and rounding once is explicitly not the rule, and the two orders differ in cents on realistic data.
+3. **The freight pool.** The pool to spread is the main-carriage bucket from the cost allocation of §3.6, but only when that bucket falls to the seller under the order's `incoterm`; otherwise the pool is exactly 0.00. Before a bill of lading is issued the provisional variant supplies the figure; afterwards the final variant does.
+4. **Pro-rata apportionment with a single residual sink.** For each line in ascending `line_no` order, `apportioned_freight_usd` is the pool multiplied by that line's `line_net_usd` divided by the invoice subtotal, rounded to two decimal places. The residual is then the pool less the sum of those rounded shares, itself rounded to two decimal places, and it is added to exactly **one** line: the line with the **greatest** `line_net_usd`, with ties broken by the **smaller** `line_no`. The residual is never split, never distributed, and the sink is never chosen by `id`.
+5. **The insurance addend.** The marine-insurance bucket from §3.6 is added when it falls to the seller under the order's `incoterm`, and is exactly 0.00 otherwise.
+6. **Totals without re-rounding.** `declared_total_usd` is the invoice subtotal plus the freight pool plus the insurance addend. All three are already rounded; no further USD rounding is applied.
+7. **A single FX conversion at the end.** `declared_total_invoice_currency` is `declared_total_usd` multiplied by the order's `fx_rate_usd_to_invoice`, rounded to two decimal places. This is the only rounding ever applied to a total.
+
+Note that the order's `ordered_goods_value_usd` is always the sum over **all** lines of the ordered quantity multiplied by the unit price, rounded per line — it is not affected by the billable-quantity substitution, so it does not shrink on a short shipment even though the invoice does.
+
+The chain has two variants. The **pre-shipment invoice**, generated while the order's `fulfillment_status` is not `SHIPPED`, `SHORT_SHIPPED` or `CLOSED`, uses each line's `quantity` as the billable quantity and draws the freight pool from the provisional cost variant. The **post-shipment invoice**, generated or regenerated after a bill of lading is issued, uses each line's `shipped_quantity`. The consequence is sharper than a smaller total: a line whose `shipped_quantity` is 0.000 drops out of the apportionment denominator entirely, and because the residual sink is chosen by the greatest `line_net_usd`, the residual can land on a **different line** than it occupied before shipment.
+
+**Issuance.** An `ExportOpsCoordinator` issues a `DRAFT` document. Four preconditions apply: the document's `pinned_order_version` must still equal the order's current `version`, or the issue is refused with a 409 and the document must be regenerated; the order's `fulfillment_status` must not be `COMPLIANCE_BLOCKED` or `CANCELLED`; no other document of the same `doc_type` on that order may already be in `ISSUED`; and for a `CERTIFICATE_OF_ORIGIN`, the document's snapshotted `origin_country_code` must still equal the order's `origin_country_code`. Issuance moves the document to `ISSUED`, recomputes the order's `outstanding_receivable_usd` when the type is `COMMERCIAL_INVOICE`, and increments both the document's and the order's `version` by one. Issuance is also refused when the order's buyer carries `restricted_party_flag` true.
+
+`outstanding_receivable_usd` is the `declared_total_usd` of the order's `ISSUED` commercial invoice less the sum of `received_amount_usd` over that order's presentations in `HONOURED`, and it is 0.00 whenever no commercial invoice is issued.
+
+**Regeneration.** Regeneration is the sanctioned way out of a stale pin. An `ExportOpsCoordinator` regenerates from `DRAFT` or from `ISSUED`, supplying a `reason`. The predecessor moves to `SUPERSEDED` and a new row of the same `doc_type` is created with `revision` incremented by one, `status` `DRAFT`, `supersedes_document_id` pointing at the predecessor, and `pinned_order_version` set to the order's **current** `version`; the new revision's money and weight figures are recomputed through the full chain above. The order must not be in `CANCELLED`. Regenerating from `ISSUED` additionally moves every link referencing the predecessor with `link_status` `ACTIVE` to `REPLACED`, and is refused when such a link belongs to a presentation already in `HONOURED` — a document that has been paid against cannot be revised.
+
+**Voiding, and the three-link cascade.** An `ExportOpsCoordinator` voids a document with a `void_reason`. Voiding a `DRAFT` document requires that it have no links at all, and does nothing beyond recording the reason and bumping the document's `version`. Voiding an `ISSUED` document is refused when an `ACTIVE` link to it belongs to a presentation in `HONOURED`, and otherwise fires three links:
+
+- **Link 1 — links.** Every link referencing the voided document with `link_status` `ACTIVE` moves to `INVALIDATED`.
+- **Link 2 — presentations.** Because a link was invalidated, each presentation owning such a link and sitting in `PRESENTED` moves to `DISCREPANT`, and the system raises a finding of its own accord with `source` `DOCUMENT`, `code` `DOC_VOIDED`, `severity` `CRITICAL`, `clause_ref` `DOCUMENTS`, `cure_status` `OPEN` and `raised_in_round` equal to that presentation's current `presentation_round`. Because the finding is `CRITICAL` with a `DOCUMENTS` clause, it contributes 40 multiplied by a clause multiplier of 1.0 to the examination score.
+- **Link 3 — the order's money axis.** Because the presentation became `DISCREPANT`, the order's `settlement_status` moves from `DOCS_PRESENTED` back to `LC_ACCEPTED`, provided the order has no presentation in `COMPLIED` or `HONOURED`.
+
+Each of the three links increments the `version` of the row it touches: the document, the presentation and the order.
+
+Both `SUPERSEDED` and `VOIDED` are terminal for a document; neither can be reissued, and the only way forward is a further revision.
+
+Documents may be listed and read by an `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer` or `PlatformAdmin`, with the list filterable by `export_order_id`, by `supersedes_document_id` to walk the revision chain, by `doc_type` and by `status`. Presentation document links may be listed and read by a `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer` or `PlatformAdmin`, filterable by `document_presentation_id`, `trade_document_id` and `link_status`, and are returned in ascending `created_at` order.
+
+### 3.6. Sailings, Freight Booking, and Incoterm Cost Allocation
+
+**Publishing a sailing.** An `ExportOpsCoordinator` or `PlatformAdmin` publishes a sailing with a `carrier_scac` of exactly 4 uppercase letters, a `vessel_name`, a `voyage_no` that must be unique **within** that `carrier_scac` — the same voyage number on a different carrier is fine — a `port_of_loading` and `port_of_discharge` as UN/LOCODEs, a `destination_zone` of `ZONE_1`, `ZONE_2` or `ZONE_3`, three instants `cutoff_at`, `etd` and `eta` where `etd` must be strictly after `cutoff_at` and `eta` strictly after `etd`, a `capacity_weight_kg` strictly greater than zero at 3 decimal places, and a `tariff_rate_per_1000kg_usd` strictly greater than zero at 2 decimal places. The sailing is created with `booked_weight_kg` 0.000 and `status` `OPEN`. `cutoff_at` is the inclusive start of the loading window and `etd` its exclusive end.
+
+**Booking space.** An `ExportOpsCoordinator` books space by naming the `export_order_id`, the `vessel_sailing_id`, a `booked_weight_kg` strictly greater than zero at 3 decimal places, a `container_type` of `LCL`, `DRY_20`, `DRY_40` or `REEFER_40`, and `expected_vessel_sailing_version`. The gate is long: the order's screening must be in `CLEARED`; the sailing must be `OPEN`; the sailing's `destination_zone` must equal the order's `destination_zone`; the logical clock must be strictly before `cutoff_at`; the buyer must not be restricted or embargoed; where the screening's `license_determination` is `LICENSE_REQUIRED`, the screening's `export_license_id` must be present, the license must have value left, and the license window must cover the clock; the sailing must have capacity headroom; and the new booking must not collide with the order's own live bookings.
+
+The booking is created in `status` `BOOKED` with three derived fields. `effective_window_start` is copied from the sailing's `cutoff_at`. `effective_window_end` is the sailing's `etd` plus **24** hours — a documentation buffer that keeps a booking occupying the order for a day after departure. `chargeable_weight_kg` is the greater of `booked_weight_kg` and the container minimum for the booked equipment, at 3 decimal places, where the minimums are 0 kilograms for `LCL`, 8,000 for `DRY_20`, 15,000 for `DRY_40` and 12,000 for `REEFER_40`. Booking a 3,000-kilogram consignment in a `DRY_40` therefore charges freight on 15,000 kilograms.
+
+**Two different overlap geometries.** The capacity check is aggregate: the sailing's current `booked_weight_kg` plus the requested `booked_weight_kg` must be at most `capacity_weight_kg`, equality accepted, and only a strict excess is refused. The order-level check is geometric: the new booking's occupation interval, running from `effective_window_start` inclusive to `effective_window_end` **exclusive**, must not intersect the interval of any booking of that same order in `BOOKED`, `CONFIRMED` or `SHIPPED`. Because the interval is half-open, **touching endpoints do not overlap** — a booking beginning at the exact instant another ends is accepted. This is the deliberate opposite of the closed-interval license rule of §3.3.
+
+Booking adds the weight to the sailing's `booked_weight_kg` and moves the sailing from `OPEN` to `FULL` once that figure is at or above `capacity_weight_kg`; note the capacity gate uses a strict excess while the `FULL` posture uses at-or-above, so a sailing booked to exactly its capacity is accepted **and** becomes `FULL`. Booking also moves the order from `COMPLIANCE_CLEARED` to `BOOKED`, stores the provisional cost allocation, charges the license ledger where a license applies, and increments the sailing's and the order's `version` by one each. `CUTOFF_PASSED` and `DEPARTED` are set only by the clock sweep and are never overwritten by the capacity ledger.
+
+**The eight cost buckets.** The cost allocation begins from a weight basis and a value basis that differ per variant. The chargeable weight is the greater of the weight basis and the container minimum. The freight-unit count is that chargeable weight in kilograms divided by 1000, rounded **up** to the next whole number. Each of eight buckets is then rounded to two decimal places on its own, before any summation:
+
+- **Inland origin haulage**: 42.00 USD per freight unit.
+- **Export clearance**: a flat 180.00 USD.
+- **Terminal handling at origin**: a flat 320.00 USD.
+- **Main carriage**: the greater of 450.00 USD and the sailing's `tariff_rate_per_1000kg_usd` multiplied by the zone multiplier multiplied by the freight-unit count, rounded to two decimal places. The zone multiplier is 1.00 for `ZONE_1`, 1.15 for `ZONE_2` and 1.35 for `ZONE_3`.
+- **Marine insurance**: the greater of 75.00 USD and 0.35 percent of the value basis multiplied by a cover factor of 1.10, rounded to two decimal places.
+- **Terminal handling at destination**: a flat 295.00 USD.
+- **Inland destination haulage**: 55.00 USD per freight unit.
+- **Import duty**: 6.50 percent of the value basis, rounded to two decimal places.
+
+The seller owns a bucket set that is a step function of the `incoterm`, and the buyer owns exactly the complement. Under `EXW` the seller owns **nothing**. `FCA` adds inland origin haulage and export clearance. `FOB` adds terminal handling at origin. `CFR` adds main carriage. `CIF` adds marine insurance. `DAP` adds terminal handling at destination and inland destination haulage. `DDP` adds import duty and so leaves the buyer with nothing. Each side's total is the exact sum of its already-rounded buckets — summing the raw bucket expressions and rounding once at the end is not the rule.
+
+**Provisional versus final.** The **provisional** variant is stored at booking time into `provisional_seller_cost_usd` and `provisional_buyer_cost_usd`. Its weight basis is the sum of `gross_weight_kg` over the order's lines with a positive `quantity`, ignoring `shipped_quantity` entirely, and its value basis is `ordered_goods_value_usd`. The **final** variant is stored at bill-of-lading issuance into `final_seller_cost_usd` and `final_buyer_cost_usd`. Its weight basis is the sum, over lines with `shipped_quantity` strictly greater than zero, of `gross_weight_kg` multiplied by `shipped_quantity` divided by `quantity`, each term rounded to three decimal places; its value basis is `shipped_goods_value_usd`. `cost_allocation_variance_usd` is `final_seller_cost_usd` less `provisional_seller_cost_usd` and may be negative.
+
+On a full shipment the two variants agree only when the freight-unit count rounds up to the same integer under both weight bases. On a short shipment they diverge in five buckets at once — inland origin, main carriage, marine insurance, inland destination and import duty — and the divergence is **not** proportional to the shipped-value ratio, because export clearance and both terminal-handling charges are flat while main carriage and marine insurance carry floors. Only lines with a positive quantity and a booking in `BOOKED`, `CONFIRMED` or `SHIPPED` enter any bucket; a `CANCELLED` booking and a zero-quantity line never do. An `ExportOpsCoordinator`, `FinanceCollectionsOfficer` or `PlatformAdmin` may ask for both variants of an order's allocation to be recomputed and returned without persisting either.
+
+**Confirming.** An `ExportOpsCoordinator` confirms a `BOOKED` booking. Four conditions must hold: the order's `fulfillment_status` is `BOOKED`; the sailing's `status` is `OPEN` or `FULL`, so a sailing that has passed its cut-off or departed can no longer be confirmed against; and the order must have both a `COMMERCIAL_INVOICE` and a `PACKING_LIST` in `ISSUED`. The carrier will not accept the container without that pair, and the gate makes that refusal explicit. Confirmation increments only the booking's `version`.
+
+**Cancelling.** An `ExportOpsCoordinator` cancels a booking from `BOOKED` or from `CONFIRMED`, supplying a `cancel_reason`. The sailing must not be in `DEPARTED`. Cancelling from `CONFIRMED` additionally requires that the order have no `BILL_OF_LADING` in `ISSUED`. Cancellation is the exact compensating action for booking: the sailing's `booked_weight_kg` is recomputed from its remaining live bookings and the sailing returns from `FULL` to `OPEN` when the recomputed figure is strictly below `capacity_weight_kg` **and** the clock is still strictly before `cutoff_at`; the order returns from `BOOKED` to `COMPLIANCE_CLEARED`; `licensed_value_allocated_usd` is released to 0.00 and the license's ledger is recomputed, moving it from `EXHAUSTED` back to `ACTIVE` once `remaining_value_usd` becomes strictly greater than 0.00. The booking's, the sailing's, the license's and the order's `version` are each incremented by one. A book-then-cancel pair leaves both ledgers at their exact prior values.
+
+**Issuing the bill of lading.** An `ExportOpsCoordinator` issues the bill of lading from a `CONFIRMED` booking, supplying an `on_board_date` and a non-empty `shipped_lines` collection giving each line's actual `shipped_quantity`. Every shipped quantity must be strictly greater than zero, and an empty collection or a zero quantity is refused with a 422. The order must be in `fulfillment_status` `BOOKED`; the sailing may be in any of `OPEN`, `FULL`, `CUTOFF_PASSED` or `DEPARTED`, because goods are often loaded after the documentation cut-off; and the `on_board_date` must be at or before both the credit's `latest_shipment_date`, when an `ACCEPTED` credit exists, and the order's own `ship_by_date`. Equality with either date is accepted; a later date is refused with a 409.
+
+Issuance creates the `BILL_OF_LADING` document with `status` `ISSUED`, `revision` 1 and `on_board_date` stamped; writes each `shipped_quantity` onto its line and recomputes `shipped_goods_value_usd`; moves the booking from `CONFIRMED` to `SHIPPED`, which leaves the sailing's `booked_weight_kg` **unchanged** because shipped cargo still occupies capacity; and stores the final cost allocation together with `cost_allocation_variance_usd`.
+
+**The divergent shipment branches.** The same act forks on a single predicate. When **every** line appears in `shipped_lines` with `shipped_quantity` exactly equal to its `quantity`, the order moves from `BOOKED` to `SHIPPED` and `short_shipped_value_usd` is set to 0.00. When **at least one** line has `shipped_quantity` strictly less than its `quantity` — every shipped quantity still being strictly positive — the order moves from `BOOKED` to `SHORT_SHIPPED` and `short_shipped_value_usd` is set to `ordered_goods_value_usd` less `shipped_goods_value_usd`. The short-shipment branch carries one further consequence: when the order's credit has `partial_shipment_allowed` false, the order's commercial-invoice revision is left behind by the bumped order `version`, so it is stale and must be regenerated before it can be tendered — the credit does not permit a partial drawing on the old figures.
+
+Sailings may be read individually by an `ExportOpsCoordinator`, `FinanceCollectionsOfficer` or `PlatformAdmin`. Bookings may be listed and read by an `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer` or `PlatformAdmin`, filterable by `export_order_id`, `vessel_sailing_id` and `status`.
+
+### 3.7. Presentation, Examination, and the Cure Loop
+
+**Lodging.** An `ExportOpsCoordinator` lodges a presentation by naming the `letter_of_credit_id`, the `export_order_id`, a non-empty `trade_document_ids` collection of the exact document revisions being tendered, and `expected_export_order_version`. An empty `trade_document_ids` is refused with a 422. The credit must be in `ACCEPTED`, the order's `fulfillment_status` must be `SHIPPED` or `SHORT_SHIPPED`, the buyer must not be restricted, the logical clock must be strictly before the credit's `expiry_date`, every `doc_type` in the credit's `required_document_types` must be present among the tendered documents, and every tendered document must be in `status` `ISSUED` and belong to that same order.
+
+The presentation is created in `status` `PRESENTED` with `presentation_round` 1, `presented_by_user_id` from `X-User-ID`, `presented_at` stamped from the logical clock, `examined_by_user_id` null, `examination_risk_score` 0.00, `negotiable_amount_usd` 0.00, `open_finding_count` 0, and `received_amount_usd`, `value_date` and `refusal_reason` all null. One link is created per tendered document, in `link_status` `ACTIVE`, with `doc_type` copied from the document, `pinned_document_revision` set to the document's `revision` and `linked_in_round` 1. The order's `settlement_status` moves from `LC_ACCEPTED` to `DOCS_PRESENTED`.
+
+Two figures are computed at lodgement. `days_after_on_board` is the number of **whole** days between the linked bill of lading's `on_board_date` and `presented_at`, discarding any partial day, and is null when no bill of lading is linked. `presented_amount_usd` is the `declared_total_usd` of the linked commercial-invoice revision at the current `presentation_round`; exactly one `ACTIVE` link of that type exists at any round, and a link in `REPLACED` or `INVALIDATED` is never read. `days_after_on_board` must be at most the credit's `presentation_period_days`, equality accepted, and a later tender is refused with a 409.
+
+**Examination.** A `DocumentaryCreditReviewer` examines a `PRESENTED` tender, submitting a `findings` collection describing what the examination turned up. The examiner's `X-User-ID` must differ from the `generated_by_user_id` of **every** document linked with `link_status` `ACTIVE`; a single self-prepared document on the tender bars the whole examination. The logical clock must be strictly before the credit's `expiry_date`; `days_after_on_board` must be at most `presentation_period_days`; every required `doc_type` must have an `ACTIVE` link; and `presented_amount_usd` must be at most the credit's `max_drawable_usd`.
+
+Every submitted finding is persisted with `source` `DOCUMENT`, `document_presentation_id` set to this presentation, `lc_terms_review_id` null, `cure_status` `OPEN` and `raised_in_round` equal to the current `presentation_round`. `examined_by_user_id` and `examination_risk_score` are stored on both branches.
+
+The **examination variant** of the risk score differs from the terms variant of §3.4 in three ways. Its selection is wider: findings with `source` `DOCUMENT` whose `document_presentation_id` is this presentation, **plus** findings with `source` `TERMS` on the same `letter_of_credit_id` whose `cure_status` is still `OPEN`. Its carryover factor is 1.0 for a finding whose `raised_in_round` equals the presentation's current `presentation_round`, and **0.5** for one raised in an earlier round — a stale discrepancy weighs half as much. And once `presentation_round` reaches 2 or more, findings of `severity` `MINOR` are excluded from the selection **entirely**, not merely down-weighted. The consequences are worth stating plainly: the same finding set scores strictly lower here from round 2 onward, and the two variants disagree even at round 1 whenever an unresolved terms finding is still `OPEN`.
+
+**The examination fork.** The two branches split on the severity of what was found. When the examination raises **zero** findings of `severity` `CRITICAL` or `MAJOR`, the presentation moves `PRESENTED` to `COMPLIED`, any `MINOR` findings are persisted with `cure_status` `OPEN`, and `negotiable_amount_usd` is priced. When the examination raises **at least one** finding of `severity` `CRITICAL` or `MAJOR`, the presentation moves `PRESENTED` to `DISCREPANT`, `open_finding_count` is stored, and the order's `settlement_status` moves from `DOCS_PRESENTED` back to `LC_ACCEPTED`. The complying branch prices the drawing; the discrepant branch reverts the money axis. Both increment the presentation's `version` by one.
+
+**Pricing the drawing.** The drawing bounds are the credit's `max_drawable_usd` and `min_drawable_usd`, both derived from `amount_usd` and `tolerance_pct` as described in §3.4. Over-drawing is a hard rejection with equality accepted: `presented_amount_usd` strictly greater than `max_drawable_usd` is refused with a 409, while a tender exactly at the ceiling is accepted.
+
+Under-drawing is never a rejection; it raises a finding. The effective floor is `min_drawable_usd` when the credit has `partial_shipment_allowed` false. When partial shipment **is** allowed, the floor is `amount_usd` multiplied by the quantity one minus the greater of `tolerance_pct` and 5.00 divided by 100, rounded to two decimal places — so a credit with a 2.00 percent tolerance that permits partial shipment tolerates a drawing down to 95.00 percent of face, and one with an 8.00 percent tolerance keeps its own wider 92.00 percent floor. A `presented_amount_usd` strictly below the effective floor raises a finding with `code` `SHORT_DRAWING`, `severity` `MAJOR` and `clause_ref` `AMOUNT` — which, being `MAJOR`, drives the examination to `DISCREPANT` and contributes 15 multiplied by the 1.5 amount-clause multiplier to the score.
+
+The gross drawing is the lesser of `presented_amount_usd` and `max_drawable_usd`. Two deductions are then computed, **both from that gross figure and never from a running balance**. The negotiation fee is the greater of 150.00 USD and 0.125 percent of gross rounded to two decimal places. The usance discount is exactly 0.00 when `availability` is `SIGHT`, and otherwise gross multiplied by 4.75 percent multiplied by `usance_days` divided by a 360-day basis, rounded to two decimal places; the day fraction is not rounded before the multiplication. `negotiable_amount_usd` is then gross less the fee less the discount, floored at 0.00 so it is never negative. The two variants are exactly these branches: a **sight** drawing deducts the fee alone, and a **usance** drawing deducts the discount in addition, scaling linearly with `usance_days` so that a tenor of 360 days deducts the full 4.75 percent of gross.
+
+**Curing.** An `ExportOpsCoordinator` cures a `DISCREPANT` presentation by supplying a non-empty `replacement_document_ids` collection; an empty collection is refused with a 422. The credit must be in `ACCEPTED`, the logical clock must be strictly before `expiry_date`, `presentation_round` must be strictly below **3**, and every replacement must reference a document in `status` `ISSUED` on the same order. A cure attempted at round 3 is refused with a 409: three rounds is the ceiling, so a presentation gets its initial tender plus two cures.
+
+The cure moves the presentation from `DISCREPANT` to `CURING` and then from `CURING` back to `PRESENTED` within the same request. Every link whose `doc_type` matches a replacement and whose `link_status` is `ACTIVE` or `INVALIDATED` moves to `REPLACED` — note that an invalidated link is curable, which is how the void cascade of §3.5 is recovered from. Every finding of the presentation with `cure_status` `OPEN` whose `clause_ref` is addressed by a replacement `doc_type` is marked `CURED`. Then `presentation_round` is incremented by one, `presented_at` is re-stamped from the logical clock, one `ACTIVE` link is created per replacement document with `pinned_document_revision` and `linked_in_round` set to the new round, `presented_amount_usd` is recomputed from the newly linked commercial invoice, `days_after_on_board` is recomputed against the re-stamped `presented_at`, and the order's `settlement_status` moves from `LC_ACCEPTED` back to `DOCS_PRESENTED`. The return to `PRESENTED` requires that at least one new `ACTIVE` link was actually written. The presentation is now examinable again — and from this round onward its `MINOR` findings no longer count.
+
+**Waiver as the other exit from discrepancy.** A `ForeignBuyer` may waive a discrepancy instead of demanding a cure, supplying a `buyer_reference`. The waiver sets the finding's `cure_status` to `WAIVED` and its `waived_by_buyer_id` to the caller's `X-User-ID`, then recomputes the owning presentation's `open_finding_count`. When that count reaches **exactly 0**, the presentation moves from `DISCREPANT` straight to `COMPLIED` — provided the logical clock is strictly before the credit's `expiry_date` — `negotiable_amount_usd` is priced, and the order's `settlement_status` moves from `LC_ACCEPTED` to `DOCS_PRESENTED`. The presentation's and the order's `version` are incremented only when that transition actually occurs; a waiver that leaves other findings open touches only the finding. A waived finding contributes exactly 0.00 to any score but is still counted in `finding_count`.
+
+**Refusal.** A presentation in `DISCREPANT` may be refused outright, and the clock sweep refuses presentations in `PRESENTED`, `CURING` or `DISCREPANT` when their credit expires. Both `HONOURED` and `REFUSED` are terminal.
+
+Presentations may be listed and read by a `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer` or `PlatformAdmin`, filterable by `letter_of_credit_id`, `export_order_id` and `status`.
+
+### 3.8. Collection, Credit Insurance, and Write-off
+
+**Writing a policy.** A `FinanceCollectionsOfficer` writes a buyer credit insurance policy by naming the `buyer_id`, a `policy_number` unique across all policies, a `credit_limit_usd` strictly greater than zero at 2 decimal places capping the insured receivable outstanding at any instant, an `insured_pct` between 50.00 and 95.00 inclusive at 2 decimal places giving the share of a covered loss the insurer indemnifies, a `deductible_usd` of at least 0.00 at 2 decimal places borne by the seller on each claim, and an `effective_from` and `effective_to` where `effective_to` must be strictly after `effective_from`. Both cover bounds are inclusive.
+
+**Pricing the premium, in a pinned order.** The rate band is keyed on an exposure figure that this very policy will contribute to once orders are charged against it, so the evaluation order is fixed and the tier is never recomputed later. The seven steps are:
+
+1. Read the exposure that exists **before** this policy row is inserted: the sum of `utilized_usd` over the buyer's policies whose `status` is `ACTIVE` or `EXHAUSTED`. Policies in `EXPIRED` are excluded. This equals the buyer's current `aggregate_exposure_usd`.
+2. Form the tier basis as that prior exposure **plus this policy's own `credit_limit_usd`**, and select `exposure_tier`: `TIER_1` when the basis is at or below 250,000.00 USD, `TIER_2` when it is above that but at or below 1,000,000.00 USD, and `TIER_3` otherwise. Both ceilings are inclusive, so a basis of exactly 250,000.00 is `TIER_1` and exactly 1,000,000.00 is `TIER_2`. The tier rate is 0.85 percent for `TIER_1`, 1.15 percent for `TIER_2` and 1.60 percent for `TIER_3`.
+3. Take the rating multiplier from the buyer's `credit_rating`: 0.80 for `AAA`, 0.85 for `AA`, 0.90 for `A`, 1.00 for `BBB`, 1.20 for `BB`, 1.45 for `B` and 1.80 for `CCC`.
+4. Compute the base premium as `credit_limit_usd` multiplied by `insured_pct` divided by 100, multiplied by the tier rate divided by 100, multiplied by the rating multiplier — rounded to two decimal places **once**, at the end of that product.
+5. Compute the policy fee. It is exactly 0.00 when `exposure_tier` is `TIER_1` **and** `deductible_usd` is at least 5,000.00 USD. Otherwise it is the greater of 250.00 USD and 0.10 percent of `credit_limit_usd` rounded to two decimal places.
+6. `premium_usd` is the base premium plus the policy fee. Both addends are already rounded and the sum is never re-rounded.
+7. Persist the policy with `utilized_usd` 0.00, `available_limit_usd` equal to `credit_limit_usd`, `indemnified_total_usd` 0.00 and `status` `ACTIVE`, and **then** recompute the buyer's `aggregate_exposure_usd` including this new row, incrementing the buyer's `version` by one.
+
+Both `exposure_tier` and `premium_usd` are frozen for the life of the policy. The two variants are precisely the fee branches: on the **waived** branch, `TIER_1` with a deductible of at least 5,000.00, `premium_usd` equals the base premium exactly; on the **charged** branch — `TIER_2`, `TIER_3`, or any tier with a deductible below 5,000.00 — the fee is added. Note the coupling this creates: a buyer's second policy can land in a higher tier than the first purely because the first policy's limit is inside the basis, and no later event ever re-prices either.
+
+**The exposure ledger.** Insured exposure is charged when an order's `settlement_status` moves from `UNSECURED` to `LC_ACCEPTED`, and released on every one of `LC_ACCEPTED` back to `UNSECURED`, `DOCS_PRESENTED` to `PAID`, `CLAIM_FILED` to `INDEMNIFIED`, `DISHONORED` to `WRITTEN_OFF` and `CLAIM_FILED` to `WRITTEN_OFF`.
+
+The charge amount is the order's `ordered_goods_value_usd` rounded to two decimal places. The candidate policies are those whose `buyer_id` matches the order's buyer, whose `status` is `ACTIVE`, whose cover window contains the logical clock with both bounds inclusive, and whose `available_limit_usd` is at least the required charge. They are ranked by `available_limit_usd` **descending**, with ties broken by `created_at` **ascending** — never by `id` — and the first candidate is charged. The order's `insured_exposure_usd` becomes the full required charge, the policy's `utilized_usd` rises by it, `available_limit_usd` is recomputed as `credit_limit_usd` less `utilized_usd`, and the policy becomes `EXHAUSTED` when `available_limit_usd` is **exactly** 0.00 and stays `ACTIVE` otherwise.
+
+When the candidate set is **empty** — no active in-window policy has enough headroom — nothing is charged and no error is raised. The order's `insured_exposure_usd` stays 0.00 and it proceeds uninsured. That is the second variant of this rule, and it has a consequence that surfaces much later: a later claim on such an order is impossible, and only the write-off path can close it.
+
+On release, the policy's `utilized_usd` falls by the order's `insured_exposure_usd`, that field returns to 0.00, `available_limit_usd` is recomputed, the policy returns from `EXHAUSTED` to `ACTIVE` when `available_limit_usd` becomes strictly greater than 0.00, and the buyer's `aggregate_exposure_usd` is recomputed as the sum of `utilized_usd` over that buyer's `ACTIVE` and `EXHAUSTED` policies. After every charge and every release, `utilized_usd` plus `available_limit_usd` equals `credit_limit_usd` exactly, and `utilized_usd` equals the sum of `insured_exposure_usd` over the buyer's orders charged to that policy.
+
+**Settlement, and the three-link money cascade.** A `FinanceCollectionsOfficer` records funds against a `COMPLIED` presentation, supplying `received_amount_usd` and a `value_date`. The received amount must be at most the credit's `max_drawable_usd` **and** at most the presentation's `negotiable_amount_usd`, both with equality accepted. Settlement stores both fields, moves the presentation from `COMPLIED` to `HONOURED`, and increases the credit's `drawn_amount_usd` by the received amount. Then:
+
+- **Link 1 — the order.** `settlement_status` moves from `DOCS_PRESENTED` to `PAID` and `outstanding_receivable_usd` is recomputed.
+- **Link 2 — the policy.** Because the order became `PAID`, its `insured_exposure_usd` is released to 0.00 and the charged policy's `utilized_usd` and `available_limit_usd` are recomputed.
+- **Link 3 — the buyer.** Because that policy's `utilized_usd` fell, the buyer's `aggregate_exposure_usd` is recomputed, and a policy that had been `EXHAUSTED` returns to `ACTIVE` once `available_limit_usd` becomes strictly greater than 0.00.
+
+Alongside the cascade, the credit moves from `ACCEPTED` to `UTILISED` when `drawn_amount_usd` reaches at least `min_drawable_usd`, and the order's `fulfillment_status` auto-advances from `SHIPPED` or `SHORT_SHIPPED` to `CLOSED` when that dimension's own preconditions hold. The presentation's, the credit's, the order's, the policy's and the buyer's `version` are each incremented by one.
+
+**Dishonour.** A `FinanceCollectionsOfficer` records the issuing bank's refusal against a presentation in `COMPLIED` or `DISCREPANT`, supplying a `refusal_reason`. The presentation moves to `REFUSED` and the order's `settlement_status` moves from `DOCS_PRESENTED` to `DISHONORED`. Both `version` counters are incremented by one. Note the asymmetry with settlement: dishonour releases **nothing**. The insured exposure stays charged, because a dishonoured receivable is precisely the exposure the policy exists to cover.
+
+**Filing a claim.** A `FinanceCollectionsOfficer` files a non-payment claim against a policy, supplying the `dispute_case_id` and `expected_credit_insurance_policy_version`. Four conditions apply: the policy's `status` must be `ACTIVE`; the order's `insured_exposure_usd` must be strictly greater than 0.00, which is exactly why an uninsured order can never claim; a dispute of `dispute_type` `NON_PAYMENT` in `status` `OPEN`, `OFFERED`, `COUNTERED` or `ESCALATED` must exist for that order; and the claim's implied indemnity must be at most `credit_limit_usd` less `indemnified_total_usd`. Filing sets the dispute's `credit_insurance_policy_id` to the policy, moves the order's `settlement_status` from `DISHONORED` to `CLAIM_FILED`, and increments the policy's, the dispute's and the order's `version` by one.
+
+**Indemnification.** When the linked dispute reaches `SETTLED` with an `insurance_indemnity_usd` strictly greater than 0.00, the order's `settlement_status` moves from `CLAIM_FILED` to `INDEMNIFIED` on the system's own initiative. That indemnity is added to the policy's `indemnified_total_usd`, the order's `insured_exposure_usd` is released to 0.00, the policy's `utilized_usd` and the buyer's `aggregate_exposure_usd` are recomputed, and the order's `fulfillment_status` auto-advances to `CLOSED` when that dimension's preconditions hold. `INDEMNIFIED` is terminal.
+
+**Write-off.** A `FinanceCollectionsOfficer` writes off an unrecoverable receivable, supplying a `reason`. The order's `settlement_status` moves from `DISHONORED` or from `CLAIM_FILED` to `WRITTEN_OFF`. From `DISHONORED`, the order must either have no policy charged — `insured_exposure_usd` exactly 0.00 — or have its linked dispute in `CLOSED_NO_SETTLEMENT`. From `CLAIM_FILED`, the linked dispute must be in `CLOSED_NO_SETTLEMENT`: an open claim cannot be written off while the insurer might still pay. Write-off releases `insured_exposure_usd` to 0.00, recomputes the policy's `utilized_usd`, `available_limit_usd` and `status` and the buyer's `aggregate_exposure_usd`, auto-advances `fulfillment_status` to `CLOSED` where that dimension permits, and increments the order's `version` by one. `WRITTEN_OFF` is terminal.
+
+The clock sweep moves policies in `ACTIVE` or `EXHAUSTED` to `EXPIRED` once the clock passes strictly beyond `effective_to`. An `EXPIRED` policy is excluded from the buyer's `aggregate_exposure_usd`, is never a charge candidate, and cannot take a claim.
+
+Policies may be listed and read by a `FinanceCollectionsOfficer`, `ExportOpsCoordinator` or `PlatformAdmin`, filterable by `buyer_id` and `status`.
+
+### 3.9. Disputes and the Three-Bucket Settlement Waterfall
+
+**Opening a case.** A dispute is opened against an order with an `export_order_id`, a `dispute_type` of `SHORT_SHIPMENT`, `QUALITY` or `NON_PAYMENT`, and a `claimed_amount_usd` strictly greater than zero at 2 decimal places. Who may open depends on the type: a `ForeignBuyer` opens `SHORT_SHIPMENT` and `QUALITY` cases, and a `FinanceCollectionsOfficer` opens `NON_PAYMENT` cases. The system records `opened_by_role` from the caller's `X-User-Role`, sets `status` to `OPEN` and `negotiation_round` to 0, leaves `current_offer_usd`, `settlement_amount_usd` and `credit_insurance_policy_id` null, and sets all three waterfall buckets — `receivable_offset_usd`, `insurance_indemnity_usd` and `seller_credit_note_usd` — to 0.00.
+
+The claimed amount is bounded: it must be at most the order's `ordered_goods_value_usd`, and for a `SHORT_SHIPMENT` dispute it must additionally be at most the order's `short_shipped_value_usd`. A buyer cannot claim more for a short shipment than the value that was actually short. A `ForeignBuyer` opening a case must be the order's own buyer, or the request is refused with a 403.
+
+**The bounded negotiation loop.** A `FinanceCollectionsOfficer` puts an offer on the table, supplying `offer_amount_usd`, from `OPEN` or from `COUNTERED`. From `OPEN`, the offer must be at most `claimed_amount_usd`, and for a `SHORT_SHIPMENT` dispute additionally at most the order's `short_shipped_value_usd`. From `COUNTERED`, the offer must be at most the standing `current_offer_usd` — the seller may only come down or hold, never raise, once the buyer has countered — and `negotiation_round` must still be strictly below 3. Either way the offer is stored into `current_offer_usd` and the case moves to `OFFERED`.
+
+A `ForeignBuyer`, who must be the order's own buyer, counters an `OFFERED` case with a `counter_amount_usd` that must be **strictly greater** than `current_offer_usd` and at most `claimed_amount_usd`. A counter equal to the standing offer is refused with a 422 — accepting is the way to agree to a figure. The counter is stored into `current_offer_usd`, `negotiation_round` is incremented by one, and the case moves to `COUNTERED`.
+
+The loop from `OFFERED` to `COUNTERED` and back repeats at most **3** times. When a counter arrives while `negotiation_round` already equals 3, the case is not rejected: it is forced from `COUNTERED` to `ESCALATED`, leaving `current_offer_usd` at its last value. A further counter attempted on an escalated case is refused with a 409, because `ESCALATED` is not a state a counter is declared from.
+
+**Three ways to accept.** Acceptance runs the waterfall and requires only that `current_offer_usd` be non-null, but **who** may accept depends on where the case sits — the three branches are symmetric in effect and disjoint in actor. From `OFFERED`, the `ForeignBuyer` accepts, and must be the order's own buyer. From `COUNTERED`, the `FinanceCollectionsOfficer` accepts, taking up the buyer's counter. From `ESCALATED`, only a `PlatformAdmin` accepts, imposing the last figure on the table. In all three cases `settlement_amount_usd` is set to `current_offer_usd`, the three buckets are allocated, and the case moves to `SETTLED`, which is terminal.
+
+**The three-bucket waterfall.** The accepted settlement is distributed across three buckets, filled strictly in order, so that the three always re-sum to the settlement amount exactly with no tolerance:
+
+1. **Receivable offset.** `receivable_offset_usd` is the lesser of the settlement amount and the order's `outstanding_receivable_usd`. What the buyer still owes is netted first. The remainder after this bucket carries forward.
+2. **Insurer indemnity.** When the case has a `credit_insurance_policy_id`, the covered loss is the lesser of the carried-forward remainder and the order's `insured_exposure_usd`; when it has no policy, the covered loss is 0.00. `insurance_indemnity_usd` is then the **smallest** of three figures: the carried-forward remainder; the indemnity cap, which is the policy's `credit_limit_usd` less its `indemnified_total_usd`; and the covered loss less the policy's `deductible_usd`, floored at 0.00, multiplied by `insured_pct` divided by 100 and rounded to two decimal places. This is the **only** bucket that rounds.
+3. **Seller credit note.** `seller_credit_note_usd` takes whatever remains after the first two buckets. Because buckets 1 and 3 are exact subtractions and only bucket 2 rounds, the entire rounding residual lands here by construction, and every bucket is at least 0.00.
+
+The two variants follow from whether a policy is attached. On the **insured** branch — `credit_insurance_policy_id` set and `insured_exposure_usd` strictly greater than 0.00 — bucket 2 can be positive, and because the deductible is subtracted **before** `insured_pct` is applied, a settlement at or below the deductible yields exactly 0.00 indemnity and pushes everything into bucket 3. On the **uninsured** branch, bucket 2 is exactly 0.00 and bucket 3 takes the whole remainder after bucket 1.
+
+Acceptance reduces the order's `outstanding_receivable_usd` by `receivable_offset_usd`. Where a policy is attached, it adds `insurance_indemnity_usd` to that policy's `indemnified_total_usd`, moves the order's `settlement_status` from `CLAIM_FILED` to `INDEMNIFIED`, releases the order's `insured_exposure_usd` per §3.8, and auto-advances `fulfillment_status` to `CLOSED` where that dimension permits. The dispute's, the order's and the policy's `version` are each incremented by one.
+
+**Closing without settlement.** A `PlatformAdmin` closes an `ESCALATED` case with a `reason`. All three buckets are set to 0.00 and the case moves to `CLOSED_NO_SETTLEMENT`, which is terminal. This is the state a write-off from `CLAIM_FILED` requires, so it is the deliberate release valve for a claim the insurer will not pay.
+
+Note the interaction with the goods axis: an order in `SHORT_SHIPPED` cannot auto-advance to `CLOSED` while it still has a dispute in `OPEN`, `OFFERED`, `COUNTERED` or `ESCALATED`. A settled or closed-without-settlement case unblocks the close; a live one holds the order open even after its money axis has reached a terminal state.
+
+Dispute cases may be listed and read by a `ForeignBuyer`, `FinanceCollectionsOfficer`, `ExportOpsCoordinator` or `PlatformAdmin`, filterable by `export_order_id`, `credit_insurance_policy_id` and `status`. A `ForeignBuyer` listing disputes sees only cases on its own orders.
+
+### 3.10. Advancing the Clock
+
+A `PlatformAdmin` advances the logical clock by supplying `current_utc`. There is no other way to move time, and no operation anywhere in the system consults the host's real clock. The four-step sweep and its per-step criteria are specified in §2.5; each step's downstream consequences are the same consequences a client-driven transition would carry, as detailed in §3.3 for licenses, §3.4 for credits and presentations, §3.6 for sailings and §3.8 for policies. The response returns 200 with an empty data object.
+
+## 4. Endpoint Definitions
+
+Endpoints that bring a new resource into existence return **201 Created** and carry the created resource in `data`. Endpoints that transition or modify an existing resource return **200 OK** and carry the updated resource. Note two rows that read as creations but are typed as modifications because their primary effect is a transition of an existing row: applying a credit amendment returns 200, since it mutates the credit in place rather than creating a new credit; and issuing a document returns 200, since the document already exists in `DRAFT`. Conversely, regenerating a document returns 201, because it genuinely mints the next revision, and issuing a bill of lading returns 201, because it mints the bill-of-lading document. Every `GET` returns 200. Advancing the clock returns 200 with an empty `data` object.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| `POST` | `/_clock/set_current_utc` | Sets the server's logical clock and runs the four-step expiry sweep | `PlatformAdmin` |
+| `POST` | `/foreign-buyers` | Onboards an overseas buyer with its sanctions posture and credit grade | `TradeComplianceOfficer`, `PlatformAdmin` |
+| `GET` | `/foreign-buyers/{buyer_id}` | Reads a buyer including its computed aggregate_exposure_usd and open_order_count | `TradeComplianceOfficer`, `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `PATCH` | `/foreign-buyers/{buyer_id}/restricted-party-flag` | Sets or lifts the denied/restricted party flag; setting it true starts the four-link compliance cascade | `TradeComplianceOfficer` |
+| `POST` | `/export-orders` | Creates an export order in DRAFT with its incoterm and destination profile | `ExportOpsCoordinator` |
+| `GET` | `/export-orders` | Lists export orders; ForeignBuyer callers see only their own orders | `ExportOpsCoordinator`, `TradeComplianceOfficer`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `ForeignBuyer`, `PlatformAdmin` |
+| `GET` | `/export-orders/{export_order_id}` | Reads one export order including both cost-allocation variants, the variance and the current version for optimistic concurrency | `ExportOpsCoordinator`, `TradeComplianceOfficer`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `GET` | `/export-orders/{export_order_id}/cost-allocation` | Recomputes and returns both incoterm cost-allocation variants for the order without persisting them | `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/export-orders/{export_order_id}/shipment-lines` | Adds a shipment line to a DRAFT order | `ExportOpsCoordinator` |
+| `GET` | `/export-orders/{export_order_id}/shipment-lines` | Lists the order's shipment lines in line_no ASC order | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `POST` | `/export-orders/{export_order_id}/submit-for-compliance` | Moves the order from DRAFT to COMPLIANCE_PENDING and opens its export control screening | `ExportOpsCoordinator` |
+| `POST` | `/export-orders/{export_order_id}/cancel` | Cancels an order that has no ISSUED trade document | `ExportOpsCoordinator` |
+| `POST` | `/export-orders/{export_order_id}/write-off` | Writes off an unrecoverable receivable, releasing insured exposure | `FinanceCollectionsOfficer` |
+| `GET` | `/export-control-screenings` | Lists export control screening cases | `TradeComplianceOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/export-control-screenings/{screening_id}` | Reads one screening case with its license determination and linked license | `TradeComplianceOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `POST` | `/export-control-screenings/{screening_id}/decision` | Records the classification decision, forking the case to CLEARED, PENDING_LICENSE or BLOCKED | `TradeComplianceOfficer` |
+| `POST` | `/export-control-screenings/{screening_id}/licenses` | Records an export license obtained for a PENDING_LICENSE screening | `TradeComplianceOfficer` |
+| `POST` | `/export-control-screenings/{screening_id}/clear-with-license` | Clears a PENDING_LICENSE screening against a valid license with enough remaining value | `TradeComplianceOfficer` |
+| `GET` | `/export-licenses` | Lists export licenses with their consumption ledger figures | `TradeComplianceOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/export-licenses/{export_license_id}` | Reads one export license with consumed_value_usd and remaining_value_usd | `TradeComplianceOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `POST` | `/letters-of-credit` | Captures the terms of an incoming documentary credit in RECEIVED; may replace a REJECTED or EXPIRED credit via supersedes_lc_id | `ExportOpsCoordinator` |
+| `GET` | `/letters-of-credit` | Lists documentary credits; the supersedes_lc_id filter walks the replacement chain | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `GET` | `/letters-of-credit/{lc_id}` | Reads one credit including drawing bounds and the current version for optimistic concurrency | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/letters-of-credit/{lc_id}/reviews` | Opens a terms review on a RECEIVED credit; the reviewer may not be the user who captured the credit | `DocumentaryCreditReviewer` |
+| `POST` | `/letters-of-credit/{lc_id}/amendments` | Applies an amendment in place, returning the credit to RECEIVED and superseding its submitted reviews | `ExportOpsCoordinator` |
+| `GET` | `/lc-terms-reviews` | Lists terms reviews with their risk scores | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/lc-terms-reviews/{review_id}` | Reads one terms review with its pinned reviewed_lc_version and risk score | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `POST` | `/lc-terms-reviews/{review_id}/findings` | Records a terms finding on a DRAFTING review | `DocumentaryCreditReviewer` |
+| `POST` | `/lc-terms-reviews/{review_id}/submit` | Submits the review with a recommendation, forking the credit to ACCEPTED, AMENDMENT_REQUESTED or REJECTED | `DocumentaryCreditReviewer` |
+| `GET` | `/discrepancy-findings` | Lists discrepancy findings raised on credits and presentations | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `ForeignBuyer`, `PlatformAdmin` |
+| `GET` | `/discrepancy-findings/{finding_id}` | Reads one discrepancy finding with its severity, clause and cure status | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `ForeignBuyer`, `PlatformAdmin` |
+| `POST` | `/discrepancy-findings/{finding_id}/waiver` | Buyer waives a presentation discrepancy; the last waiver moves the presentation from DISCREPANT to COMPLIED | `ForeignBuyer` |
+| `POST` | `/trade-documents` | Generates a trade document in DRAFT from the order's current shipment lines, pinning the order version | `ExportOpsCoordinator` |
+| `GET` | `/trade-documents` | Lists trade documents; the supersedes_document_id filter walks the revision chain | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `GET` | `/trade-documents/{document_id}` | Reads one trade document revision with its pinned_order_version | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `POST` | `/trade-documents/{document_id}/issue` | Issues a DRAFT document; refused when the pinned order version is stale | `ExportOpsCoordinator` |
+| `POST` | `/trade-documents/{document_id}/regenerate` | Creates the next revision of a document against the current order version and supersedes the predecessor | `ExportOpsCoordinator` |
+| `POST` | `/trade-documents/{document_id}/void` | Voids a document; voiding an ISSUED document tendered on a live presentation starts the three-link discrepancy cascade | `ExportOpsCoordinator` |
+| `GET` | `/presentation-document-links` | Lists the pinned document tenders of presentations, in created_at ASC order | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `GET` | `/presentation-document-links/{link_id}` | Reads one document tender with its pinned_document_revision | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/vessel-sailings` | Publishes a sailing with its loading window, aggregate capacity and tariff rate | `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/vessel-sailings/{vessel_sailing_id}` | Reads a sailing including booked_weight_kg and the current version for optimistic concurrency | `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/freight-bookings` | Books space on a sailing for a compliance-cleared order; charges the sailing capacity ledger and the export license ledger | `ExportOpsCoordinator` |
+| `GET` | `/freight-bookings` | Lists freight bookings with their occupation windows | `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `GET` | `/freight-bookings/{booking_id}` | Reads one freight booking with its occupation window and bill-of-lading link | `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `POST` | `/freight-bookings/{booking_id}/confirm` | Confirms a booking with the carrier; requires the ISSUED commercial invoice and packing list | `ExportOpsCoordinator` |
+| `POST` | `/freight-bookings/{booking_id}/cancel` | Cancels a booking, releasing sailing capacity and license value exactly | `ExportOpsCoordinator` |
+| `POST` | `/freight-bookings/{booking_id}/bill-of-lading` | Issues the bill of lading from a CONFIRMED booking, stamping shipped quantities and switching the order to the final cost allocation | `ExportOpsCoordinator` |
+| `POST` | `/document-presentations` | Lodges a document presentation under an ACCEPTED credit, pinning each tendered document revision | `ExportOpsCoordinator` |
+| `GET` | `/document-presentations` | Lists document presentations with their round and score figures | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `GET` | `/document-presentations/{presentation_id}` | Reads one presentation including its examination score and negotiable amount | `DocumentaryCreditReviewer`, `ExportOpsCoordinator`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/document-presentations/{presentation_id}/examine` | Examines a PRESENTED tender against the credit; forks to COMPLIED or DISCREPANT. The examiner may not have generated any tendered document | `DocumentaryCreditReviewer` |
+| `POST` | `/document-presentations/{presentation_id}/cure` | Replaces discrepant documents and re-presents, incrementing the presentation round | `ExportOpsCoordinator` |
+| `POST` | `/document-presentations/{presentation_id}/settlement` | Records funds received against a COMPLIED presentation, starting the three-link settlement cascade | `FinanceCollectionsOfficer` |
+| `POST` | `/document-presentations/{presentation_id}/dishonour` | Records the issuing bank's refusal to pay | `FinanceCollectionsOfficer` |
+| `POST` | `/credit-insurance-policies` | Writes a buyer credit insurance policy and prices its premium with the pinned evaluation order | `FinanceCollectionsOfficer` |
+| `GET` | `/credit-insurance-policies` | Lists credit insurance policies with their utilisation figures | `FinanceCollectionsOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/credit-insurance-policies/{policy_id}` | Reads one policy including utilized_usd, available_limit_usd and the current version for optimistic concurrency | `FinanceCollectionsOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `POST` | `/credit-insurance-policies/{policy_id}/claims` | Files a non-payment claim against a policy for a dishonoured order, linking the dispute case | `FinanceCollectionsOfficer` |
+| `POST` | `/dispute-cases` | Opens a dispute; SHORT_SHIPMENT and QUALITY are opened by the buyer, NON_PAYMENT by collections | `ForeignBuyer`, `FinanceCollectionsOfficer` |
+| `GET` | `/dispute-cases` | Lists dispute cases; ForeignBuyer callers see only their own | `ForeignBuyer`, `FinanceCollectionsOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `GET` | `/dispute-cases/{dispute_id}` | Reads one dispute case with its three settlement waterfall buckets | `ForeignBuyer`, `FinanceCollectionsOfficer`, `ExportOpsCoordinator`, `PlatformAdmin` |
+| `POST` | `/dispute-cases/{dispute_id}/offers` | Puts a settlement offer on the table, from OPEN or COUNTERED | `FinanceCollectionsOfficer` |
+| `POST` | `/dispute-cases/{dispute_id}/counter` | Buyer counters the offer; the case is forced to ESCALATED once the round bound is reached | `ForeignBuyer` |
+| `POST` | `/dispute-cases/{dispute_id}/accept` | Accepts the offer on the table and runs the three-bucket settlement waterfall | `ForeignBuyer`, `FinanceCollectionsOfficer`, `PlatformAdmin` |
+| `POST` | `/dispute-cases/{dispute_id}/close` | Closes an ESCALATED case without settlement, zeroing the waterfall buckets | `PlatformAdmin` |
+| `GET` | `/shipment-lines` | Lists shipment lines across orders in line_no ASC order within each order | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+| `GET` | `/shipment-lines/{shipment_line_id}` | Reads one shipment line with its computed line_net_usd and apportioned freight | `ExportOpsCoordinator`, `DocumentaryCreditReviewer`, `TradeComplianceOfficer`, `PlatformAdmin` |
+
+## 5. Error Code Catalogue
+
+Every rejection returns the error envelope of Section 2.2 with one of the following identifiers in the `error_id` field, paired with the HTTP status code listed here. When more than one condition holds on a single request, the precedence ladder of Section 2.11 decides which identifier is returned.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| `ERR_MISSING_AUTH_HEADERS` | 401 |
+| `ERR_UNKNOWN_ROLE` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_BUYER_IDENTITY_NOT_FOUND` | 403 |
+| `ERR_BUYER_SCOPE_VIOLATION` | 403 |
+| `ERR_BUYER_NOT_FOUND` | 404 |
+| `ERR_ORDER_NOT_FOUND` | 404 |
+| `ERR_LC_NOT_FOUND` | 404 |
+| `ERR_REVIEW_NOT_FOUND` | 404 |
+| `ERR_FINDING_NOT_FOUND` | 404 |
+| `ERR_DOCUMENT_NOT_FOUND` | 404 |
+| `ERR_SCREENING_NOT_FOUND` | 404 |
+| `ERR_LICENSE_NOT_FOUND` | 404 |
+| `ERR_SAILING_NOT_FOUND` | 404 |
+| `ERR_BOOKING_NOT_FOUND` | 404 |
+| `ERR_PRESENTATION_NOT_FOUND` | 404 |
+| `ERR_POLICY_NOT_FOUND` | 404 |
+| `ERR_DISPUTE_NOT_FOUND` | 404 |
+| `ERR_VALIDATION` | 422 |
+| `ERR_INVALID_PAGINATION` | 422 |
+| `ERR_INCONSISTENT_TERMS` | 422 |
+| `ERR_ORDER_STATE_INVALID` | 409 |
+| `ERR_LC_STATE_INVALID` | 409 |
+| `ERR_REVIEW_ALREADY_SUBMITTED` | 409 |
+| `ERR_DOCUMENT_STATE_INVALID` | 409 |
+| `ERR_SCREENING_STATE_INVALID` | 409 |
+| `ERR_BOOKING_STATE_INVALID` | 409 |
+| `ERR_PRESENTATION_STATE_INVALID` | 409 |
+| `ERR_DISPUTE_STATE_INVALID` | 409 |
+| `ERR_ORDER_NOT_COMPLIANCE_CLEARED` | 409 |
+| `ERR_LC_NOT_ACCEPTED` | 409 |
+| `ERR_BOOKING_NOT_CONFIRMED` | 409 |
+| `ERR_POLICY_NOT_ACTIVE` | 409 |
+| `ERR_SAILING_NOT_OPEN` | 409 |
+| `ERR_STALE_LC_VERSION` | 412 |
+| `ERR_STALE_SAILING_VERSION` | 412 |
+| `ERR_STALE_ORDER_VERSION` | 412 |
+| `ERR_STALE_POLICY_VERSION` | 412 |
+| `ERR_RESTRICTED_PARTY_BLOCKED` | 409 |
+| `ERR_PROHIBITED_DESTINATION` | 409 |
+| `ERR_EXPORT_LICENSE_REQUIRED` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 409 |
+| `ERR_RECOMMENDATION_NOT_PERMITTED` | 409 |
+| `ERR_LC_EXPIRED` | 409 |
+| `ERR_PRESENTATION_PERIOD_ELAPSED` | 409 |
+| `ERR_LATEST_SHIPMENT_DATE_PASSED` | 409 |
+| `ERR_LICENSE_NOT_VALID_AT_DATE` | 409 |
+| `ERR_SAILING_CUTOFF_PASSED` | 409 |
+| `ERR_LICENSE_WINDOW_OVERLAP` | 409 |
+| `ERR_BOOKING_WINDOW_OVERLAP` | 409 |
+| `ERR_DUPLICATE_LC_NUMBER` | 409 |
+| `ERR_DUPLICATE_LICENSE_NUMBER` | 409 |
+| `ERR_DUPLICATE_POLICY_NUMBER` | 409 |
+| `ERR_DUPLICATE_LINE_NO` | 409 |
+| `ERR_DUPLICATE_VOYAGE` | 409 |
+| `ERR_DUPLICATE_ISSUED_DOCUMENT` | 409 |
+| `ERR_NEGOTIATION_ROUNDS_EXHAUSTED` | 409 |
+| `ERR_CURE_ROUNDS_EXHAUSTED` | 409 |
+| `ERR_DOCUMENT_REVISION_SUPERSEDED` | 409 |
+| `ERR_DOCUMENT_STALE_SOURCE` | 409 |
+| `ERR_REQUIRED_DOCUMENT_MISSING` | 409 |
+| `ERR_NO_SHIPMENT_LINES` | 422 |
+| `ERR_PRESENTATION_NO_DOCUMENTS` | 422 |
+| `ERR_NO_REPLACEMENT_DOCUMENTS` | 422 |
+| `ERR_ZERO_SHIPPED_QUANTITY` | 422 |
+| `ERR_SAILING_CAPACITY_EXCEEDED` | 409 |
+| `ERR_LICENSE_VALUE_EXHAUSTED` | 409 |
+| `ERR_LC_AMOUNT_EXCEEDED` | 409 |
+| `ERR_CREDIT_LIMIT_EXCEEDED` | 409 |
+| `ERR_CLAIM_EXCEEDS_COVERAGE` | 409 |
+| `ERR_CLAIM_AMOUNT_INVALID` | 422 |
+| `ERR_OFFER_AMOUNT_INVALID` | 422 |
+

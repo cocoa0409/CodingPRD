@@ -1,0 +1,220 @@
+"""Reference data and calculation constants (PRD SS2.9 / SCAFFOLD constants)."""
+from decimal import Decimal
+
+# ---------------------------------------------------------------- roles / auth
+ROLE_LOCALIZATION_PRODUCER = "LocalizationProducer"
+ROLE_TRANSLATION_VENDOR = "TranslationVendor"
+ROLE_LQA_TESTER = "LqaTester"
+ROLE_COMPLIANCE_OFFICER = "ComplianceOfficer"
+ROLE_RATING_BOARD_LIAISON = "RatingBoardLiaison"
+ROLE_TALENT_AGENT = "TalentAgent"
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+
+ALL_ROLES = [
+    ROLE_LOCALIZATION_PRODUCER,
+    ROLE_TRANSLATION_VENDOR,
+    ROLE_LQA_TESTER,
+    ROLE_COMPLIANCE_OFFICER,
+    ROLE_RATING_BOARD_LIAISON,
+    ROLE_TALENT_AGENT,
+    ROLE_PLATFORM_ADMIN,
+]
+
+HEADER_USER_ID = "X-User-ID"
+HEADER_USER_ROLE = "X-User-Role"
+
+# ------------------------------------------------------------------- reference
+MARKET_CODES = ["JP", "DE", "BR", "US", "AU", "KR"]
+
+MARKET_BOARD = {
+    "JP": "CERO",
+    "DE": "USK",
+    "BR": "DJCTQ",
+    "US": "ESRB",
+    "AU": "ACB",
+    "KR": "GRAC",
+}
+RATING_BOARDS = ["CERO", "USK", "DJCTQ", "ESRB", "ACB", "GRAC"]
+
+MANDATORY_DISCLOSURES = {
+    "JP": [],
+    "DE": ["GAMBLING_SIM"],
+    "BR": [],
+    "US": [],
+    "AU": [],
+    "KR": ["LOOTBOX_PAID"],
+}
+
+RESTRICTED_CODES = {
+    "JP": [],
+    "DE": ["BLOOD"],
+    "BR": [],
+    "US": [],
+    "AU": ["DRUG_REFERENCE"],
+    "KR": ["GAMBLING_SIM"],
+}
+
+FOOTAGE_MANDATORY_CODES = [
+    "VIOLENCE_REALISTIC",
+    "SEXUAL_CONTENT",
+    "GAMBLING_SIM",
+    "LOOTBOX_PAID",
+]
+
+RATING_BANDS = ["ALL_AGES", "TEEN_12", "MATURE_15", "MATURE_17", "ADULTS_ONLY_18"]
+RATING_STRICTNESS = {name: idx for idx, name in enumerate(RATING_BANDS)}
+
+CONTENT_DESCRIPTORS = [
+    "VIOLENCE_REALISTIC",
+    "VIOLENCE_STYLIZED",
+    "BLOOD",
+    "SEXUAL_CONTENT",
+    "LANGUAGE_STRONG",
+    "DRUG_REFERENCE",
+    "GAMBLING_SIM",
+    "LOOTBOX_PAID",
+    "HORROR",
+]
+
+DESCRIPTOR_WEIGHT = {
+    "VIOLENCE_REALISTIC": 25,
+    "VIOLENCE_STYLIZED": 12,
+    "BLOOD": 15,
+    "SEXUAL_CONTENT": 20,
+    "LANGUAGE_STRONG": 10,
+    "DRUG_REFERENCE": 14,
+    "GAMBLING_SIM": 18,
+    "LOOTBOX_PAID": 22,
+    "HORROR": 8,
+}
+
+# ------------------------------------------------------------------- enums
+SOURCE_LANGUAGES = ["EN", "JA"]
+RELEASE_MODES = ["SIMULTANEOUS", "STAGGERED"]
+LOCALIZATION_STATES = ["PLANNING", "STRINGS_LOCKED", "CERT_WINDOW", "SHIPPED"]
+RELEASE_GATE_STATES = ["OPEN", "AT_RISK", "BLOCKED", "CLEARED"]
+
+UI_SURFACES = ["HUD", "MENU", "SUBTITLE", "LEGAL"]
+STRING_KEY_STATUSES = ["EXTRACTED", "LOCKED", "RETIRED"]
+
+SCOPE_TIERS = ["TEXT_ONLY", "SUBTITLED", "FULL_VOICE", "FULL_CULTURAL"]
+MARKET_PLAN_STATUSES = [
+    "DRAFT",
+    "SCOPED",
+    "IN_LOCALIZATION",
+    "LQA",
+    "RELEASE_READY",
+    "BLOCKED",
+]
+BLOCKED_REASONS = ["LEGAL_RESTRICTION", "RATING_TOO_STRICT", "CERT_DEADLINE_MISSED"]
+EFFORT_VARIANTS = ["SCOPE_ESTIMATE", "DELIVERED_ACTUAL"]
+
+TRANSLATION_STATUSES = ["PENDING", "DRAFTED", "DELIVERED"]
+QA_STATUSES = ["NOT_CHECKED", "LING_FLAGGED", "FUNC_FLAGGED", "PASSED"]
+
+LANGUAGE_CODES = ["JA", "DE", "PT_BR", "EN", "KO"]
+MEDIA_SCOPES = ["IN_GAME_ONLY", "IN_GAME_AND_TRAILER", "ALL_MEDIA"]
+CONTRACT_STATUSES = ["DRAFT", "SIGNED", "EXPIRED", "TERMINATED"]
+
+SESSION_STATUSES = ["SCHEDULED", "IN_PROGRESS", "RECORDED", "CANCELLED"]
+SESSION_ACTIVE_STATUSES = ["SCHEDULED", "IN_PROGRESS", "RECORDED"]
+
+PASS_TYPES = ["LINGUISTIC", "FUNCTIONAL"]
+QA_PASS_STATUSES = ["OPEN", "CLOSED"]
+
+BUG_CLASSES = [
+    "TEXT_OVERFLOW",
+    "TRUNCATION",
+    "MISTRANSLATION",
+    "CULTURAL",
+    "LEGAL_TEXT",
+    "FUNCTIONAL_CRASH",
+]
+BUG_AXIS = {
+    "MISTRANSLATION": "LINGUISTIC",
+    "CULTURAL": "LINGUISTIC",
+    "LEGAL_TEXT": "LINGUISTIC",
+    "TEXT_OVERFLOW": "FUNCTIONAL",
+    "TRUNCATION": "FUNCTIONAL",
+    "FUNCTIONAL_CRASH": "FUNCTIONAL",
+}
+SEVERITIES = ["S1", "S2", "S3", "S4"]
+SEVERITY_WEIGHT = {"S1": 8, "S2": 4, "S3": 2, "S4": 1}
+BUG_STATUSES = ["NEW", "TRIAGED", "FIX_SUBMITTED", "VERIFIED", "REJECTED", "DUPLICATE"]
+BUG_OPEN_STATUSES = ["NEW", "TRIAGED", "FIX_SUBMITTED"]
+TRIAGE_ACTIONS = ["ACCEPT", "REJECT", "DUPLICATE"]
+
+SUBMISSION_STATUSES = [
+    "DRAFT",
+    "SUBMITTED",
+    "UNDER_REVIEW",
+    "RATED",
+    "EDITS_REQUIRED",
+    "WITHDRAWN",
+]
+SUBMISSION_NON_TERMINAL = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "EDITS_REQUIRED"]
+BOARD_DECISIONS = ["RATE", "REQUIRE_EDITS"]
+
+EDIT_KINDS = ["REMOVE_CONTENT", "CENSOR_ASSET", "AGE_GATE", "TEXT_REWRITE"]
+CONTENT_EDIT_STATUSES = ["PROPOSED", "APPLIED", "WITHDRAWN"]
+
+# --------------------------------------------------------------- calculations
+SURFACE_UPLIFT = {
+    "LEGAL": Decimal("1.50"),
+    "SUBTITLE": Decimal("1.20"),
+    "HUD": Decimal("1.10"),
+    "MENU": Decimal("1.00"),
+}
+
+SCOPE_MULTIPLIER = {
+    "TEXT_ONLY": Decimal("1.00"),
+    "SUBTITLED": Decimal("1.25"),
+    "FULL_VOICE": Decimal("1.80"),
+    "FULL_CULTURAL": Decimal("2.40"),
+}
+
+TEXT_RATE_CENTS_PER_UNIT = Decimal("4200")
+CULTURAL_PCT = Decimal("0.15")
+# PRD SS3.2: "it is the greater of 1,500,000 cents and fifteen per cent of the
+# sum of the text and voice components rounded half up to whole cents".
+CULTURAL_FLOOR_CENTS = 1500000
+
+DEFECT_DENSITY_CEILING = Decimal("0.0500")
+
+LEGAL_BUG_PENALTY = 6
+PROPOSED_EDIT_PENALTY = 9
+APPLIED_EDIT_CREDIT = 5
+
+BOARD_BASE_FEE_CENTS = {
+    "CERO": 480000,
+    "USK": 350000,
+    "DJCTQ": 300000,
+    "ESRB": 320000,
+    "ACB": 290000,
+    "GRAC": 260000,
+}
+ROUND_SURCHARGE_CENTS = 75000
+EXPEDITE_PCT = Decimal("0.30")
+EXPEDITE_DAY_THRESHOLD = 45
+VOLUME_TIER_1_CENTS = 400000
+VOLUME_TIER_1_PCT = Decimal("0.05")
+VOLUME_TIER_2_CENTS = 600000
+VOLUME_TIER_2_PCT = Decimal("0.10")
+
+CERT_WINDOW_DAYS = 30
+MAX_APPEALS = 2
+
+CLOCK_START_UTC = "2026-08-01T00:00:00Z"
+
+
+def tm_factor(pct):
+    """TM_FACTOR band for a translation-memory match percentage."""
+    if pct is None:
+        pct = 0
+    if pct >= 95:
+        return Decimal("0.10")
+    if pct >= 75:
+        return Decimal("0.45")
+    if pct >= 50:
+        return Decimal("0.75")
+    return Decimal("1.00")

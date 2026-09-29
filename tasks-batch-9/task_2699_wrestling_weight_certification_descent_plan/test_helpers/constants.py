@@ -1,0 +1,290 @@
+"""
+Business values taken from the requirements document.
+
+Everything here is a literal the specification states: the five role names, the
+shipped season constant defaults, the weight-class ladder, every enumeration
+member, and the worked figures the document itself computes (a 159.6 pound
+measurement at 14.0 percent body fat yielding a 137.3 pound lean weight, a
+147.6 pound minimum certified weight and a 150 pound minimum class).
+
+Weights, allowances and body-fat percentages are carried as JSON numbers, never
+as strings: every value below is a Python ``int`` or ``float`` so that request
+bodies serialise to numeric JSON.
+"""
+
+# ── Roles ────────────────────────────────────────────────────────────
+ROLE_STATE_OFFICE = "StateOffice"
+ROLE_ASSESSOR = "Assessor"
+ROLE_TEAM_COACH = "TeamCoach"
+ROLE_WEIGH_IN_OFFICIAL = "WeighInOfficial"
+ROLE_MEDICAL_REVIEWER = "MedicalReviewer"
+
+ALL_ROLES = [
+    ROLE_STATE_OFFICE,
+    ROLE_ASSESSOR,
+    ROLE_TEAM_COACH,
+    ROLE_WEIGH_IN_OFFICIAL,
+    ROLE_MEDICAL_REVIEWER,
+]
+
+# ── The logical clock ────────────────────────────────────────────────
+# "The clock's startup default is exactly 2026-08-01T00:00:00Z."
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+# ── Pagination ───────────────────────────────────────────────────────
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ── Rounding discipline ──────────────────────────────────────────────
+WEIGHT_DECIMAL_PLACES = 1
+AUDIT_DECIMAL_PLACES = 2
+
+# ── Season regulatory constants: the shipped defaults ────────────────
+DEFAULT_WEIGHT_CLASSES = [
+    106, 113, 120, 126, 132, 138, 144, 150, 157, 165, 175, 190, 215, 285,
+]
+DEFAULT_MIN_BODY_FAT_PCT_MALE = 7.0
+DEFAULT_MIN_BODY_FAT_PCT_FEMALE = 12.0
+DEFAULT_HYDRATION_MAX_SPECIFIC_GRAVITY = 1.025
+DEFAULT_MAX_WEEKLY_DESCENT_PCT = 1.5
+DEFAULT_ASSESSOR_MIN_TRAINING_HOURS = 8
+DEFAULT_AUDIT_FAIL_THRESHOLD_PCT = 2.0
+DEFAULT_AUDIT_MIN_SAMPLE_COUNT = 3
+DEFAULT_MAX_CONSECUTIVE_DAY_ALLOWANCE_LBS = 2.0
+DEFAULT_APPEAL_FILING_WINDOW_DAYS = 5
+DEFAULT_MAX_APPEAL_RETEST_ROUNDS = 2
+DEFAULT_ASSESSOR_DAILY_ASSESSMENT_CAPACITY = 3
+DEFAULT_PLAN_BREACH_LIMIT = 2
+
+# ── Season status ────────────────────────────────────────────────────
+SEASON_SETUP = "SETUP"
+SEASON_OPEN = "OPEN"
+SEASON_CLOSED = "CLOSED"
+
+# ── Team compliance posture ──────────────────────────────────────────
+TEAM_CLEAR = "CLEAR"
+TEAM_WATCH = "WATCH"
+TEAM_PROBATION = "PROBATION"
+
+# The posture bands, both bounds inclusive on integer arithmetic.
+WATCH_LOWER_BOUND = 1
+WATCH_UPPER_BOUND = 4
+PROBATION_LOWER_BOUND = 5
+
+# ── Assessor ─────────────────────────────────────────────────────────
+ASSESSOR_PROVISIONAL = "PROVISIONAL"
+ASSESSOR_CERTIFIED = "CERTIFIED"
+ASSESSOR_SUSPENDED = "SUSPENDED"
+ASSESSOR_EXPIRED = "EXPIRED"
+
+METHOD_SKINFOLD = "SKINFOLD"
+METHOD_BIA = "BIA"
+METHOD_HYDROSTATIC = "HYDROSTATIC"
+METHOD_ADP = "ADP"
+ALL_METHODS = [METHOD_SKINFOLD, METHOD_BIA, METHOD_HYDROSTATIC, METHOD_ADP]
+
+# ── Wrestler: the two independent state dimensions ───────────────────
+WRESTLER_UNCERTIFIED = "UNCERTIFIED"
+WRESTLER_PROVISIONAL = "PROVISIONAL"
+WRESTLER_CERTIFIED = "CERTIFIED"
+WRESTLER_SUSPENDED = "SUSPENDED"
+WRESTLER_DISQUALIFIED = "DISQUALIFIED"
+
+ELIGIBILITY_INELIGIBLE = "INELIGIBLE"
+ELIGIBILITY_ELIGIBLE = "ELIGIBLE"
+ELIGIBILITY_RESTRICTED = "RESTRICTED"
+
+SEX_MALE = "M"
+SEX_FEMALE = "F"
+
+HOLD_SOURCE_ASSESSMENT_VOIDED = "SOURCE_ASSESSMENT_VOIDED"
+
+# ── Assessment ───────────────────────────────────────────────────────
+ASSESSMENT_DRAFT = "DRAFT"
+ASSESSMENT_VALIDATED = "VALIDATED"
+ASSESSMENT_HYDRATION_FAILED = "HYDRATION_FAILED"
+ASSESSMENT_VOIDED = "VOIDED"
+ASSESSMENT_SUPERSEDED = "SUPERSEDED"
+
+VOID_REASON_ASSESSOR_SUSPENDED = "ASSESSOR_SUSPENDED"
+VOID_REASON_APPEAL_UPHELD_PREFIX = "APPEAL_UPHELD:"
+VOID_REASON_AUDIT_FAIL_PREFIX = "AUDIT_FAIL:"
+
+# ── Appeal ───────────────────────────────────────────────────────────
+APPEAL_SUBMITTED = "SUBMITTED"
+APPEAL_UNDER_REVIEW = "UNDER_REVIEW"
+APPEAL_RETEST_ORDERED = "RETEST_ORDERED"
+APPEAL_RETEST_COMPLETED = "RETEST_COMPLETED"
+APPEAL_UPHELD = "UPHELD"
+APPEAL_DENIED = "DENIED"
+APPEAL_WITHDRAWN = "WITHDRAWN"
+
+WITHDRAWN_DECISION_NOTE = "WITHDRAWN_ASSESSMENT_VOIDED"
+
+# ── Descent plan ─────────────────────────────────────────────────────
+PLAN_DRAFT = "DRAFT"
+PLAN_CERTIFIED = "CERTIFIED"
+PLAN_BREACHED = "BREACHED"
+PLAN_COMPLETED = "COMPLETED"
+PLAN_CANCELLED = "CANCELLED"
+
+VARIANT_WEEKLY_STEP = "WEEKLY_STEP"
+VARIANT_LINEAR_RATE = "LINEAR_RATE"
+
+CANCEL_REASON_SUPERSEDED = "SUPERSEDED"
+CANCEL_REASON_MINIMUM_RAISED = "MINIMUM_RAISED"
+CANCEL_REASON_WRESTLER_SUSPENDED = "WRESTLER_SUSPENDED"
+CANCEL_REASON_DISQUALIFIED = "DISQUALIFIED"
+
+# ── Descent milestone ────────────────────────────────────────────────
+MILESTONE_SCHEDULED = "SCHEDULED"
+MILESTONE_MET = "MET"
+MILESTONE_MISSED = "MISSED"
+MILESTONE_WAIVED = "WAIVED"
+
+# The milestone evaluation window is half-open and three days long.
+MILESTONE_GRACE_DAYS = 3
+DAYS_PER_WEEK = 7
+
+# ── Event ────────────────────────────────────────────────────────────
+EVENT_SCHEDULED = "SCHEDULED"
+EVENT_WEIGH_IN_OPEN = "WEIGH_IN_OPEN"
+EVENT_WEIGH_IN_CLOSED = "WEIGH_IN_CLOSED"
+EVENT_SEEDED = "SEEDED"
+EVENT_COMPLETED = "COMPLETED"
+EVENT_CANCELLED = "CANCELLED"
+
+EVENT_TYPE_DUAL = "DUAL"
+EVENT_TYPE_TOURNAMENT = "TOURNAMENT"
+EVENT_TYPE_STATE_CHAMPIONSHIP = "STATE_CHAMPIONSHIP"
+
+DEFAULT_COMPETITION_DAYS = 1
+DEFAULT_WEIGH_IN_DAYS = 1
+DEFAULT_CONSECUTIVE_DAY_ALLOWANCE_LBS = 1.0
+
+# ── Tournament entry ─────────────────────────────────────────────────
+ENTRY_ENTERED = "ENTERED"
+ENTRY_WEIGHED_IN = "WEIGHED_IN"
+ENTRY_SEEDED = "SEEDED"
+ENTRY_SCRATCHED = "SCRATCHED"
+ENTRY_DISQUALIFIED = "DISQUALIFIED"
+
+SCRATCH_REASON_NO_WEIGH_IN = "NO_WEIGH_IN"
+SCRATCH_REASON_WEIGH_IN_FAILED = "WEIGH_IN_FAILED"
+SCRATCH_REASON_EVENT_CANCELLED = "EVENT_CANCELLED"
+SCRATCH_REASON_PLAN_CANCELLED = "PLAN_CANCELLED"
+SCRATCH_REASON_UNHEALTHY = "UNHEALTHY_WEIGHT_MANAGEMENT"
+
+# ── Weigh-in ─────────────────────────────────────────────────────────
+WEIGH_IN_PASS = "PASS"
+WEIGH_IN_PASS_WITH_ALLOWANCE = "PASS_WITH_ALLOWANCE"
+WEIGH_IN_FAIL = "FAIL"
+
+# ── Eligibility check outcomes ───────────────────────────────────────
+OUTCOME_CLEARED = "CLEARED"
+OUTCOME_BLOCKED_NOT_CERTIFIED = "BLOCKED_NOT_CERTIFIED"
+OUTCOME_BLOCKED_CLASS_BELOW_MINIMUM = "BLOCKED_CLASS_BELOW_MINIMUM"
+OUTCOME_BLOCKED_PLAN_BREACHED = "BLOCKED_PLAN_BREACHED"
+OUTCOME_BLOCKED_TEAM_PROBATION = "BLOCKED_TEAM_PROBATION"
+OUTCOME_BLOCKED_DISQUALIFIED = "BLOCKED_DISQUALIFIED"
+OUTCOME_BLOCKED_ESCALATED_FLAG = "BLOCKED_ESCALATED_FLAG"
+
+# ── Health flags: severity is pinned per source ──────────────────────
+FLAG_HYDRATION_FAIL = "HYDRATION_FAIL"
+FLAG_WEIGH_IN_DEFICIT = "WEIGH_IN_DEFICIT"
+FLAG_PLAN_BREACH = "PLAN_BREACH"
+FLAG_RAPID_LOSS = "RAPID_LOSS"
+
+FLAG_SEVERITY = {
+    FLAG_HYDRATION_FAIL: 1,
+    FLAG_RAPID_LOSS: 2,
+    FLAG_PLAN_BREACH: 3,
+    FLAG_WEIGH_IN_DEFICIT: 4,
+}
+
+FLAG_OPEN = "OPEN"
+FLAG_REVIEWED = "REVIEWED"
+FLAG_DISMISSED = "DISMISSED"
+FLAG_ESCALATED = "ESCALATED"
+
+# ── Program audit ────────────────────────────────────────────────────
+AUDIT_TYPE_ASSESSOR_SAMPLE = "ASSESSOR_SAMPLE"
+AUDIT_TYPE_TEAM_COMPLIANCE = "TEAM_COMPLIANCE"
+
+SCORING_WORST_CASE = "WORST_CASE"
+SCORING_SAMPLE_MEAN = "SAMPLE_MEAN"
+
+AUDIT_OPEN = "OPEN"
+AUDIT_FINALIZED = "FINALIZED"
+
+AUDIT_PASS = "PASS"
+AUDIT_FAIL = "FAIL"
+AUDIT_INCONCLUSIVE = "INCONCLUSIVE"
+
+# ── The worked example the requirements document computes ────────────
+# A 159.6 pound measurement at 14.0 percent body fat, hydrated at 1.020, for a
+# male wrestler under the 7.0 percent floor:
+#   lean                    = round_half_up(159.6 * (1 - 14.0/100), 1) = 137.3
+#   minimum certified weight = round_half_up(137.3 / (1 - 7.0/100), 1) = 147.6
+#   alpha                    = 159.6 (the measurement, unchanged)
+#   minimum weight class     = smallest class >= 147.6                 = 150
+CANON_MEASURED_WEIGHT_LBS = 159.6
+CANON_BODY_FAT_PCT = 14.0
+CANON_USG_PASS = 1.020
+CANON_USG_FAIL = 1.030
+CANON_LEAN_BODY_WEIGHT_LBS = 137.3
+CANON_MINIMUM_CERTIFIED_WEIGHT_LBS = 147.6
+CANON_ALPHA_WEIGHT_LBS = 159.6
+CANON_MIN_WEIGHT_CLASS_LBS = 150
+CANON_TARGET_CLASS_LBS = 150
+
+# "For a baseline of 159.6 pounds, a rate of 1.5 percent and a target of 150
+# pounds, WEEKLY_STEP produces weekly allowable weights of 159.6, 157.2, 154.8,
+# 152.5, 150.2 and 147.9, arriving in five weeks, while LINEAR_RATE fixes
+# weekly_delta_lbs at 2.4 pounds and produces 159.6, 157.2, 154.8, 152.4 and
+# 150.0, arriving in four."
+WEEKLY_STEP_SCHEDULE = [159.6, 157.2, 154.8, 152.5, 150.2, 147.9]
+WEEKLY_STEP_TOTAL_WEEKS = 5
+WEEKLY_STEP_MILESTONE_COUNT = 6
+
+LINEAR_RATE_SCHEDULE = [159.6, 157.2, 154.8, 152.4, 150.0]
+LINEAR_RATE_TOTAL_WEEKS = 4
+LINEAR_RATE_MILESTONE_COUNT = 5
+LINEAR_RATE_WEEKLY_DELTA_LBS = 2.4
+
+# "deviations of 1.20, 2.40 and 0.60 score 2.40 under WORST_CASE and therefore
+# fail, but score 1.40 under SAMPLE_MEAN and therefore pass"
+AUDIT_SAMPLE_DEVIATIONS = [1.20, 2.40, 0.60]
+AUDIT_WORST_CASE_SCORE = 2.40
+AUDIT_SAMPLE_MEAN_SCORE = 1.40
+
+# ── Dates and instants the composite chains reuse ────────────────────
+SEASON_START_DATE = "2026-11-01"
+SEASON_NAME = "2026-27 State Wrestling Season"
+
+ASSESSMENT_DAY_INSTANT = "2026-11-01T12:00:00Z"
+ASSESSED_AT = "2026-11-01T09:00:00Z"
+PLAN_START_DATE = "2026-11-02"
+
+# The WEEKLY_STEP schedule that starts 2026-11-02 lands its six milestones on
+# these dates, seven days apart, with the projected certification date equal to
+# the start advanced by seven times total_weeks.
+WEEKLY_STEP_MILESTONE_DATES = [
+    "2026-11-02", "2026-11-09", "2026-11-16", "2026-11-23", "2026-11-30", "2026-12-07",
+]
+WEEKLY_STEP_PROJECTED_DATE = "2026-12-07"
+LINEAR_RATE_MILESTONE_DATES = [
+    "2026-11-02", "2026-11-09", "2026-11-16", "2026-11-23", "2026-11-30",
+]
+LINEAR_RATE_PROJECTED_DATE = "2026-11-30"
+
+DEFAULT_TEAM_NAME = "Northgate High"
+SECOND_TEAM_NAME = "Southridge High"
+DEFAULT_ASSESSOR_NAME = "Dana Ruiz"
+DEFAULT_CREDENTIAL_NUMBER = "AS-1001"
+DEFAULT_CREDENTIAL_EXPIRY = "2027-06-30"
+DEFAULT_TRAINING_CODE = "NFHS-BC-101"
+DEFAULT_WRESTLER_NAME = "Alex Mercer"
+DEFAULT_WRESTLER_GRADE = 11

@@ -1,0 +1,109 @@
+"""Error catalogue for the Condominium Association Management API."""
+
+
+def _humanize(error_id):
+    """A readable fallback message derived from the error id itself."""
+    words = str(error_id).replace("ERR_", "", 1).replace("_", " ").lower()
+    return (words[:1].upper() + words[1:] + ".") if words else str(error_id)
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id) or _humanize(error_id)
+        super().__init__(self.message)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_ACTOR_NOT_RECOGNIZED": 403,
+    "ERR_NOT_UNIT_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ASSOCIATION_NOT_FOUND": 404,
+    "ERR_OWNER_NOT_FOUND": 404,
+    "ERR_UNIT_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_BUDGET_NOT_FOUND": 404,
+    "ERR_MEETING_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_ELEMENT_NOT_FOUND": 404,
+    "ERR_CONTRACT_NOT_FOUND": 404,
+    "ERR_WORK_ORDER_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_CERTIFICATE_NOT_FOUND": 404,
+    "ERR_REFERENCED_ENTITY_NOT_FOUND": 404,
+    "ERR_VALIDATION": 422,
+    "ERR_ASSOCIATION_SCOPE_MISMATCH": 409,
+    "ERR_STALE_ASSOCIATION_VERSION": 412,
+    "ERR_STALE_UNIT_VERSION": 412,
+    "ERR_STALE_CONTRACT_VERSION": 412,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_INVALID_BUDGET_STATE": 409,
+    "ERR_INVALID_BALLOT_STATE": 409,
+    "ERR_INVALID_MEETING_STATE": 409,
+    "ERR_INVALID_CONTRACT_STATE": 409,
+    "ERR_INVALID_WORK_ORDER_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_INVALID_CERTIFICATE_STATE": 409,
+    "ERR_CASE_ALREADY_TERMINAL": 409,
+    "ERR_CASE_ALREADY_CURED": 409,
+    "ERR_DUPLICATE_ADOPTED_BUDGET": 409,
+    "ERR_MEETING_NOT_IN_SESSION": 409,
+    "ERR_BOARD_QUORUM_NOT_MET": 409,
+    "ERR_HEARINGS_PENDING": 409,
+    "ERR_BUDGET_NOTICE_PENDING": 409,
+    "ERR_AGENDA_KIND_MISSING": 409,
+    "ERR_NOTICE_PERIOD_NOT_SATISFIED": 409,
+    "ERR_CURE_PERIOD_ACTIVE": 409,
+    "ERR_APPEAL_WINDOW_CLOSED": 409,
+    "ERR_SAME_MEETING_REHEARING": 409,
+    "ERR_HEARING_SLOT_TAKEN": 409,
+    "ERR_SLOT_OUTSIDE_MEETING": 422,
+    "ERR_HEARING_DOCKET_FULL": 409,
+    "ERR_UNIT_DOCKET_LIMIT": 409,
+    "ERR_INTEREST_SUM_INVALID": 422,
+    "ERR_UNIT_LABEL_DUPLICATE": 409,
+    "ERR_PERIOD_ALREADY_BILLED": 409,
+    "ERR_BUDGET_NOT_ADOPTED": 409,
+    "ERR_BALLOT_ALREADY_OPEN": 409,
+    "ERR_NO_ELIGIBLE_VOTERS": 409,
+    "ERR_INSTALLMENTS_EXHAUSTED": 409,
+    "ERR_NO_AFFECTED_UNITS": 422,
+    "ERR_RESPONSIBILITY_MISMATCH": 409,
+    "ERR_APPEAL_LIMIT_REACHED": 409,
+    "ERR_CLAIM_SCOPE_INVALID": 422,
+    "ERR_LITIGATION_FUNDING_MISSING": 409,
+    "ERR_LITIGATION_ACTIVE": 409,
+    "ERR_CLAIM_WORK_OPEN": 409,
+    "ERR_VENDOR_INSURANCE_LAPSED": 409,
+    "ERR_ELEMENT_NOT_SERVICEABLE": 409,
+    "ERR_ELEMENT_CONTRACT_MISMATCH": 409,
+    "ERR_ELEMENT_SPEC_CHANGED": 409,
+    "ERR_CONTRACT_TERM_INVALID": 422,
+    "ERR_WINDOW_OUTSIDE_CONTRACT_TERM": 409,
+    "ERR_ELEMENT_WINDOW_CONFLICT": 409,
+    "ERR_WINDOW_NOT_STARTED": 409,
+    "ERR_WORK_IN_PROGRESS": 409,
+    "ERR_CONTRACT_CAP_EXCEEDED": 409,
+    "ERR_INVOICE_EXCEEDS_TOLERANCE": 409,
+    "ERR_INSUFFICIENT_OPERATING_CASH": 409,
+    "ERR_RESERVE_CONTRIBUTION_TOO_LOW": 422,
+    "ERR_REFUND_EXCEEDS_COLLECTED": 409,
+    "ERR_ENTRY_ALREADY_REVERSED": 409,
+    "ERR_CERT_BLOCKED_BY_FORECLOSURE": 409,
+    "ERR_CERT_CLOSING_DATE_PAST": 422,
+    "ERR_NO_VALID_CERTIFICATE": 409,
+    "ERR_CERTIFICATE_STALE": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Missing or invalid authentication headers.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not permitted for this endpoint.",
+    "ERR_ACTOR_NOT_RECOGNIZED": "The acting user could not be recognized.",
+    "ERR_NOT_UNIT_OWNER": "The acting owner is not the owner of record for this unit.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties prohibits this action.",
+    "ERR_VALIDATION": "Request payload failed validation.",
+}

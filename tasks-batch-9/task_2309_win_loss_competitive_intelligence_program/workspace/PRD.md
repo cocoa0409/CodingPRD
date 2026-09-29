@@ -1,0 +1,490 @@
+# Win-Loss Intelligence API — Product Requirements Document
+
+## 1. Introduction
+
+Business-to-business revenue teams lose deals for reasons that never survive the trip from the buyer's mouth to the company's roadmap. Sales reps record a one-word loss reason in the CRM; nobody interviews the buyer; competitor claims circulate as folklore; and by the time a pattern is visible the quarter is over. This document specifies the API behind a formal **Win-Loss & Competitive Intelligence Program** — a system of record that samples closed deals against declared quotas, interviews the buyers who lived through them, and converts what those buyers said into substantiated competitor battlecards, a governed loss-reason taxonomy, and prioritized product-gap tickets.
+
+The system is built around three tensions that shape almost every rule in this specification. The first is **independence**: research must not be conducted by the people whose deals are under study, so the platform tracks the sales owner of every deal and refuses to let that person's own organisation interview the buyer. The second is **substantiation**: no competitive claim reaches the field without a traceable evidence set of buyer verbatims, a computed substantiation score, and a legal decision on record. The third is **fiscal containment**: buyer incentives are real money drawn from a fixed program budget, and the program's willingness to accept new research work is a derived function of how much of that budget is already committed or paid.
+
+Consequently, the API is not a thin CRUD surface. It is a compliance-and-orchestration engine: resources carry parallel independent status dimensions, a single write can cascade through four levels of dependent recomputation, several numeric outputs have pinned rounding orders that make the difference between two apparently equivalent implementations observable, and a strict validation precedence decides which of several simultaneously-violated rules the caller is told about. Readers should treat §2 as the binding contract for shape and precedence, and §3 as the binding contract for behaviour.
+
+## 2. Global Specifications & System-Wide Principles
+
+All resources are flat, root-level collections mounted directly at the API root and joined by foreign keys. The `Program` record is the scoping root of the domain and the tenancy boundary for every reference check, but it is **not** a URL prefix: a sampling frame, an interview or a battlecard is addressed by its own identifier, never nested under its program.
+
+### 2.1. User and Role-Based Access Control
+
+Every request — including reads and the logical-clock endpoint — must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, declaring the capacity in which that principal is acting. If either header is absent the request is rejected with `ERR_MISSING_AUTH_HEADERS` (HTTP 401). Six roles exist, and their names are matched exactly: `ProgramAdmin`, `ResearchAnalyst`, `LegalReviewer`, `EnablementManager`, `ProductManager` and `SalesRep`. A value outside that set is treated as an authentication failure rather than an authorization failure and returns `ERR_UNKNOWN_ROLE` (HTTP 401). A recognised role that is not on the target operation's authorized list is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403), and this check runs before any path variable is resolved, so an unauthorized caller never learns whether the resource in the URL exists.
+
+Responsibilities are segregated by design. A `ProgramAdmin` owns the program envelope: program lifecycle, the incentive budget, the interview guide, the competitor registry, deal import and the loss-reason taxonomy. A `ResearchAnalyst` performs the research itself: sampling frames and draws, buyer contacts and consent, interview scheduling, completion, no-show handling, rescheduling, cancellation, response capture, loss-attribution authoring and ratification, and battlecard authoring. A `LegalReviewer` is the sole authority over claim decisions and can neither author claims nor submit a card for review, so legal approval can never collapse into self-approval. An `EnablementManager` publishes cleared cards, distributes them to the field and runs the adoption sweep, but cannot author or legally clear a card — and reopening a published card belongs to the `ResearchAnalyst`. A `ProductManager` owns the roadmap side: product-gap intake, triage and promotion. A `SalesRep` is purely a consumer of enablement content and records its own training attempts; the role is deliberately excluded from every research and authoring operation, which is what makes analyst independence from the sales team enforceable in the first place. All six roles may read every retrieval operation and may set the logical clock.
+
+`ResearchAnalyst` is the only entity-backed role. When `X-User-Role` is `ResearchAnalyst`, `X-User-ID` is the `id` of the acting `Analyst` record, and it must resolve to an `Analyst` whose `status` is `ACTIVE`; if it does not, the request fails with `ERR_ANALYST_IDENTITY_INVALID` (HTTP 403). That rule guards every state-writing analyst operation — interview scheduling, interview completion, attribution authoring, attribution ratification, battlecard creation, claim creation, submission for legal review, and sampling draws. Ownership and duty-conflict checks on analyst-facing resources compare stored analyst references such as `authored_by_analyst_id`, `ratified_by_analyst_id` and an interview's `analyst_id` against this `X-User-ID`.
+
+For the other five roles, `X-User-ID` is an opaque operator identifier not tied to any persisted entity, and the server never compares it to an entity's `id`. When `X-User-Role` is `ProgramAdmin`, `LegalReviewer`, `EnablementManager` or `ProductManager`, the identifier is recorded only as request provenance and is not matched against stored data. When `X-User-Role` is `SalesRep`, `X-User-ID` is likewise opaque, but it is compared to the plain string `sales_rep_user_ref` stored on the `EnablementAssignment` being acted on: a rep completing someone else's assignment is rejected with `ERR_SEGREGATION_OF_DUTIES`. The same kind of opaque string appears on a deal as `sales_rep_user_ref`, denoting the `SalesRep` who owned that deal; it is not a foreign key and exists so that it can be compared with an analyst's `linked_user_ref` during the independence check.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and List Ordering
+
+Every list retrieval accepts two optional query parameters. `limit` caps the number of rows returned; it defaults to 10, its minimum accepted value is 1 and its maximum is 100. `offset` is the number of rows to skip; it defaults to 0 and its minimum is 0. A `limit` outside the inclusive range from 1 to 100, or a negative `offset`, is a structural failure and returns `ERR_INVALID_REQUEST`. List responses carry `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope.
+
+Unless a specific collection declares otherwise, rows are ordered by `created_at` ascending. That default governs the loss-attribution list, the battlecard list, the claim list, and the reverse-lookup reads of a program's competitors, analysts and sampling frames. The following collections override it: the deal list orders by `close_date` descending and then by `created_at` ascending; the interview list orders by `scheduled_start_at` ascending and then by `created_at` ascending; both interview-response collections order by `recorded_at` ascending; the loss-reason taxonomy list orders by `depth` ascending and then by `code` ascending; the flat competitor collection orders by `name` ascending; the flat analyst collection orders by `full_name` ascending; the flat sampling-frame collection orders by `window_start` ascending and then by `created_at` ascending; the product-gap list orders by `impact_score` descending and then by `created_at` ascending; and both enablement-assignment collections order by `due_at` ascending and then by `created_at` ascending. No collection is ever ordered by `id`.
+
+### 2.4. Common Resource Properties
+
+Almost every resource in this system carries the same four system-managed properties. `id` is a server-minted UUID with no type prefix. `created_at` is an ISO 8601 UTC timestamp with three fractional digits recording when the row was first written. `updated_at` is an ISO 8601 UTC timestamp refreshed on every mutation of the row, including mutations that only touch computed fields. `version` is an integer that starts at 1 on creation and increments by exactly 1 on every mutation of that row; it is the value optimistic concurrency compares against.
+
+There is one deliberate exception. `InterviewResponse` rows are append-only evidence: once recorded, an answer is never edited and there is no update operation for it. Such a row therefore carries only `id` and `created_at` — both `updated_at` and `version` are absent from it entirely. Every other resource in the system — `Program`, `Competitor`, `Deal`, `Analyst`, `BuyerContact`, `SamplingFrame`, `Interview`, `LossReason`, `LossAttribution`, `Battlecard`, `BattlecardClaim`, `ProductGap` and `EnablementAssignment` — carries the full set.
+
+An important consequence of the derived-field design is that recomputation counts as mutation. When a completed interview moves money between the program's committed and paid ledgers, the program row's `updated_at` is refreshed and its `version` increments even though the caller addressed an interview, not a program. The same is true when a battlecard's risk indices or adoption rate are recalculated, when a sampling frame's slot counters shift, and when a competitor's derived counters change.
+
+### 2.5. The Logical Clock
+
+Nothing in this system reads wall-clock time. Every temporal rule — evidence recency, sampling recency, the buyer cooling-off window, analyst certification expiry, the no-show grace period, training due dates and the recorded instants `assigned_at`, `completed_at`, `decided_at`, `published_at` and `recorded_at` — is evaluated against a server-held **logical UTC clock**. Any role may advance or rewind that clock by submitting a `current_utc` instant, and the response echoes back `current_utc`. Setting the clock mutates no entity; it only changes how subsequent requests evaluate temporal predicates. Before the clock has ever been set, its value is `2026-08-01T00:00:00Z`.
+
+All datetime values accepted or returned by the API are ISO 8601 UTC with three fractional digits. A malformed datetime is a structural failure. An interval whose start is not strictly before its end — a sampling frame where `window_start` is not before `window_end`, a scheduled interview where `scheduled_start_at` is not before `scheduled_end_at`, a completion where `actual_start_at` is not before `actual_end_at`, or an assignment whose `due_at` is not strictly after the `assigned_at` instant the server stamps — is rejected with `ERR_INVALID_TIME_WINDOW` (HTTP 422). Zero-length intervals are rejected by the same rule, because the comparison is strict.
+
+### 2.6. Path Resolution, Tenancy and Reference Integrity
+
+Path variables are resolved strictly left to right, so the outermost missing segment is the one reported. The variable names used across the surface are `program_id`, `competitor_id`, `deal_id`, `analyst_id`, `contact_id`, `frame_id`, `interview_id`, `response_id`, `reason_id`, `attribution_id`, `battlecard_id`, `claim_id`, `gap_id` and `assignment_id`. Each unresolvable variable maps to its own not-found code: `ERR_PROGRAM_NOT_FOUND`, `ERR_COMPETITOR_NOT_FOUND`, `ERR_DEAL_NOT_FOUND`, `ERR_ANALYST_NOT_FOUND`, `ERR_BUYER_CONTACT_NOT_FOUND`, `ERR_SAMPLING_FRAME_NOT_FOUND`, `ERR_INTERVIEW_NOT_FOUND`, `ERR_INTERVIEW_RESPONSE_NOT_FOUND`, `ERR_LOSS_REASON_NOT_FOUND`, `ERR_LOSS_ATTRIBUTION_NOT_FOUND`, `ERR_BATTLECARD_NOT_FOUND`, `ERR_BATTLECARD_CLAIM_NOT_FOUND`, `ERR_PRODUCT_GAP_NOT_FOUND` and `ERR_ENABLEMENT_ASSIGNMENT_NOT_FOUND`, each at HTTP 404. Where a child is addressed beneath a parent, a child that exists but whose stored parent reference does not match the parent segment in the path reports the **child's** not-found error, not the parent's: a buyer contact whose `deal_id` differs from the deal in the path yields `ERR_BUYER_CONTACT_NOT_FOUND`, and a claim whose `battlecard_id` differs from the card in the path yields `ERR_BATTLECARD_CLAIM_NOT_FOUND`.
+
+Foreign keys carried in a request body or query string are resolved only after every path variable, and within the body they are resolved in the order the payload declares its fields. That declared order is: for competitor registration, `program_id`, then `name`, then `tier`; for deal import, `program_id`, `crm_deal_ref`, `outcome`, `acr_usd`, `close_date`, `segment`, `sales_rep_user_ref`, then the optional `primary_competitor_id`; for analyst registration, `program_id`, `full_name`, `linked_user_ref`, `employment_type`, `certified_until`, then the optional `sales_org_member`; for frame definition, `program_id`, `label`, `window_start`, `window_end`, `quota_won`, `quota_lost`, `quota_no_decision`, then `selection_basis`; for interview scheduling, `deal_id`, `buyer_contact_id`, `analyst_id`, `scheduled_start_at`, then `scheduled_end_at`; for taxonomy node creation, `program_id`, `code`, `label`, then the optional `parent_reason_id`; for attribution authoring, `deal_id`, `primary_reason_id`, `weight_primary`, `expected_deal_version`, then the optional `secondary_reason_id`; for battlecard creation, `competitor_id`, `title`, then `version_label`; for claim creation, `claim_text`, `claim_type`, then `evidence_response_ids`; for product-gap intake, `program_id`, `source_response_id`, `gap_summary`, then the optional `additional_response_ids`; and for enablement distribution, `battlecard_id`, `sales_rep_user_ref`, then `due_at`.
+
+The `Program` is the tenancy boundary. A referenced row that exists but belongs to a different program than the operation's scope is a conflict, not a missing resource, and is rejected with `ERR_CROSS_PROGRAM_REFERENCE` (HTTP 409). This applies to interview scheduling, attribution authoring, claim creation, sampling draws, product-gap intake and enablement distribution.
+
+Several scoped uniqueness keys are enforced, all reported as `ERR_DUPLICATE_RESOURCE_KEY` (HTTP 409): a competitor's `name` is unique within its program compared case-insensitively; a deal's `crm_deal_ref` is unique within its program compared case-sensitively; a buyer contact's `email` is unique within its deal compared case-insensitively and is stored lower-cased; a taxonomy node's `code` is unique within its program compared case-insensitively; an enablement assignment's `sales_rep_user_ref` is unique within its battlecard; and a deal may have at most one attribution whose `status` is `PROVISIONAL` or `RATIFIED` at any time.
+
+Structural validation is uniform. Required body fields must be present, JSON types must match, every enum-typed value must be a declared member of its enumeration, arrays that must be non-empty must be non-empty, and datetimes must be well formed; any failure returns `ERR_INVALID_REQUEST` (HTTP 400). Unknown extra fields in a payload are ignored. Fields the server computes or manages itself are also ignored when a client supplies them — never rejected.
+
+### 2.7. Numeric Precision and Rounding Discipline
+
+All rounding in this system is **round half up**, applied at the exact points named below and nowhere else, because several formulas round intermediate values before combining them and would produce different outputs under a different rounding order.
+
+Monetary amounts carry **2 decimal places**: `incentive_budget_usd`, `incentive_committed_usd`, `incentive_paid_usd`, `interview_incentive_cap_usd`, `min_deal_value_usd`, `acr_usd`, `incentive_provisional_usd`, `incentive_final_usd` and `affected_acr_usd`. Attribution weights `weight_primary` and `weight_secondary`, the derived `confidence_score`, the claim's `substantiation_score`, the card's `risk_index_pre` and `risk_index_final`, and a gap's `impact_score` also carry 2 decimal places. Ratios and score fields carry **4 decimal places**: `win_rate_vs`, `coverage_ratio`, `selection_rank_score` and `adoption_rate`, along with the internal budget-utilization ratio, the internal legal discount scale, and the trend shares reported as `share`.
+
+Two rounding orders are pinned and must not be "simplified". First, the buyer-incentive uplift for external-vendor interviewers multiplies an amount that has **already** been rounded to two decimal places, so rounding happens twice in that path. Second, a claim's substantiation score rounds **each** evidence contribution to two decimal places before adding them together, and then rounds the sum again — round-then-sum, never sum-then-round.
+
+### 2.8. Optimistic Concurrency on Parent Records
+
+Two write operations are guarded by optimistic concurrency against the current `version` of a parent record. In both cases the version field is a required, non-optional part of the request body, and a mismatch is reported before any state precondition is evaluated, so a caller working from a stale read is told to re-read rather than being told the state is wrong.
+
+A `POST /loss-attributions` request must carry `expected_deal_version` holding the `version` of the target `Deal` as the client last observed it. If that value differs from the deal's current `version`, the create is rejected with `ERR_STALE_DEAL_VERSION` (HTTP 412). This guard matters because a new attribution legitimately supersedes the deal's prior ratified attribution and therefore carries no state precondition that would stop it on its own; the version check is the only thing that stops an author whose picture of the deal — its interview coverage count, its current attribution — predates another author's supersede.
+
+A `PUT /programs/{program_id}/incentive-budget` request must carry `expected_program_version` holding the `version` of the target `Program` as the client last observed it. If that value differs from the program's current `version`, the replacement is rejected with `ERR_STALE_PROGRAM_VERSION` (HTTP 412). Budget replacement is idempotent by nature and trips no state precondition on repetition, so without this check an operator who read a pre-cascade ledger would silently overwrite a budget that interview scheduling, completion or forfeiture side effects have since moved.
+
+No other operation accepts a version field. Endpoints outside these two never take `expected_deal_version`, `expected_program_version`, or any other expected-version input.
+
+### 2.9. The Incentive Ledger and Program Posture
+
+A program's buyer-incentive money lives in three fields that must stay in agreement at all times. `incentive_budget_usd` is the ceiling set by the `ProgramAdmin`. `incentive_committed_usd` is the sum of `incentive_provisional_usd` over every interview of the program whose `incentive_status` is `COMMITTED`. `incentive_paid_usd` is the sum of `incentive_final_usd` over every interview whose `incentive_status` is `PAID`. Scheduling an interview adds its provisional amount to the committed total; completing it removes the provisional amount from the committed total and adds the final amount to the paid total; forfeiting it at no-show removes the provisional amount from the committed total; cancelling a scheduled interview likewise removes it, returning the ledger to exactly its pre-scheduling value. An interview whose `incentive_status` is `RELEASED` or `FORFEITED` contributes to neither total.
+
+From that ledger the system derives `posture`, a gate over the program's child writes, whose value is one of `OPEN`, `RESTRICTED` or `FROZEN`. Utilization is computed first: when `incentive_budget_usd` is zero, utilization is taken to be 1.0000; otherwise utilization is the committed total plus the paid total, divided by `incentive_budget_usd`, rounded to four decimal places. The rounded utilization is what the thresholds compare against. The ladder is evaluated from the top and its boundaries are inclusive: utilization of at least 1.0000 yields `FROZEN`; otherwise utilization of at least 0.8500 yields `RESTRICTED`; otherwise `OPEN`. The program's own lifecycle then imposes a floor that can only tighten the result: `DRAFT` and `ACTIVE` impose `OPEN`, `CLOSING` imposes `RESTRICTED`, and `CLOSED` imposes `FROZEN`. The stored `posture` is the stricter of the utilization-derived value and the status floor, where `OPEN` is less strict than `RESTRICTED`, which is less strict than `FROZEN`. Posture is recomputed on every write that moves either ledger total, on every program status transition, and on every budget replacement.
+
+A `FROZEN` posture blocks five operations outright with `ERR_PROGRAM_POSTURE_FROZEN` (HTTP 409): sampling draws, interview scheduling, interview rescheduling, battlecard publication and enablement distribution. Note that this gate is distinct from the fiscal ceiling described in §3.4 and §3.5: the posture gate refuses everything once utilization has reached one hundred percent (or the program has closed), while the fiscal ceiling refuses the individual write that would cross the budget from below. Interview completion is deliberately exempt from both, which is the one path by which utilization can pass one hundred percent.
+
+### 2.10. Validation Precedence
+
+When a single request violates several rules, the system reports the violation with the **lowest** precedence number in the following ordered ladder. This ordering is normative; two implementations that check the same set of rules in a different order are not equivalent.
+
+1. Both identity headers present — `ERR_MISSING_AUTH_HEADERS`, on every operation.
+2. `X-User-Role` is one of the six declared roles — `ERR_UNKNOWN_ROLE`, on every operation.
+3. The role is on the operation's authorized list — `ERR_ROLE_NOT_PERMITTED`, on every operation.
+4. An acting `ResearchAnalyst` resolves to an `ACTIVE` analyst — `ERR_ANALYST_IDENTITY_INVALID`, on every state-writing operation the role is authorized for.
+5. Every path variable resolves — the matching not-found code, on every operation with path variables.
+6. Every foreign key in the body or query string resolves — the matching not-found code, on competitor registration, deal import, analyst registration, frame definition, interview scheduling, taxonomy node creation, attribution authoring, battlecard creation, claim creation, product-gap intake, enablement distribution and filtered list reads.
+7. Structural validation of body, enums, arrays, datetimes and pagination bounds — `ERR_INVALID_REQUEST`, on every operation.
+8. Numeric domain checks on well-typed values — `ERR_VALUE_OUT_OF_RANGE` (HTTP 422). `acr_usd` must be greater than zero; `incentive_budget_usd`, `interview_incentive_cap_usd`, `min_deal_value_usd` and each of the three quotas must be at least zero; `max_open_interviews_per_analyst` must be at least 1; a non-null `rating` must be an integer from 1 through 5 inclusive; `quiz_score` must be an integer from 0 through 100 inclusive; `weight_primary` must lie between 0.50 and 1.00 inclusive. The rule guards program creation, budget replacement, deal import, deal correction, frame definition, response capture, attribution authoring and training completion.
+9. Interval well-formedness — `ERR_INVALID_TIME_WINDOW`, on frame definition, the loss-trend read, interview scheduling, rescheduling, completion and enablement distribution.
+10. Same-program tenancy — `ERR_CROSS_PROGRAM_REFERENCE`, on interview scheduling, attribution authoring, claim creation, sampling draws, product-gap intake and enablement distribution.
+11. Scoped uniqueness — `ERR_DUPLICATE_RESOURCE_KEY`, on competitor registration, deal import, buyer-contact creation, taxonomy node creation, attribution authoring and enablement distribution. Checked after existence and structural validation and before optimistic concurrency.
+12. Optimistic concurrency — `ERR_STALE_DEAL_VERSION` on attribution authoring, `ERR_STALE_PROGRAM_VERSION` on budget replacement.
+13. The entity is in a state from which the requested transition exists — one of `ERR_PROGRAM_STATE_INVALID`, `ERR_DEAL_STATE_INVALID`, `ERR_FRAME_STATE_INVALID`, `ERR_INTERVIEW_STATE_INVALID`, `ERR_ATTRIBUTION_STATE_INVALID`, `ERR_BATTLECARD_STATE_INVALID`, `ERR_CLAIM_STATE_INVALID`, `ERR_PRODUCT_GAP_STATE_INVALID` or `ERR_ASSIGNMENT_STATE_INVALID`, on every action operation. This includes terminal-state lockdown: a `CLOSED` program, a `DECLINED` or `SYNTHESIZED` deal, a `COMPLETED` or `CANCELLED` interview, a `WITHDRAWN` card, a `REJECTED` claim, a `PROMOTED` or `DECLINED` gap, and a `TRAINED` or `EXPIRED` assignment all refuse every further transition.
+14. The owning program's `posture` is not `FROZEN` — `ERR_PROGRAM_POSTURE_FROZEN`, on sampling draws, interview scheduling, rescheduling, battlecard publication and enablement distribution. Placed above every business rule so that a frozen program yields one stable error regardless of what else the payload would break.
+15. Segregation of duties — `ERR_SEGREGATION_OF_DUTIES` (HTTP 403), on attribution ratification, claim legal decisions and training completion. Evaluated after state so that a wrongly-staged request reports its state problem first.
+16. Analyst independence under `STRICT` mode — `ERR_INDEPENDENCE_VIOLATION` (HTTP 422), on interview scheduling and rescheduling. The whole rule is skipped when the program's `independence_mode` is `ADVISORY`.
+17. Analyst certification — `ERR_ANALYST_NOT_CERTIFIED` (HTTP 422), on interview scheduling, rescheduling and completion.
+18. Buyer consent granted — `ERR_CONSENT_NOT_GRANTED` (HTTP 422), on interview scheduling and rescheduling. Consent outranks every temporal contact rule below it.
+19. Buyer cooling-off window — `ERR_CONTACT_COOLING_OFF_ACTIVE` (HTTP 409), on interview scheduling and rescheduling.
+20. Analyst buffered slot conflict — `ERR_ANALYST_SLOT_CONFLICT` (HTTP 409), on interview scheduling and rescheduling.
+21. The pinned deal's `close_date` lies inside the frame window — `ERR_DEAL_OUTSIDE_FRAME_WINDOW` (HTTP 422), on a sampling draw that names a specific deal.
+22. Analyst open-workload cap — `ERR_ANALYST_CAPACITY_EXCEEDED` (HTTP 409), on interview scheduling and rescheduling.
+23. Stratum quota availability — `ERR_STRATUM_QUOTA_EXHAUSTED` (HTTP 409), on sampling draws.
+24. A non-empty eligible candidate pool — `ERR_NO_ELIGIBLE_DEALS` (HTTP 422), on sampling draws. This separates "no room left in the quota" (rule 23) from "room exists but nothing qualifies".
+25. Interview-guide coverage — `ERR_GUIDE_COVERAGE_INCOMPLETE` (HTTP 422), on interview completion.
+26. A cited loss reason is a leaf — `ERR_REASON_NOT_LEAF` (HTTP 422), on attribution authoring.
+27. A cited loss reason is active — `ERR_REASON_DEPRECATED` (HTTP 422), on attribution authoring.
+28. Taxonomy depth ceiling of 3 — `ERR_TAXONOMY_DEPTH_EXCEEDED` (HTTP 422), on taxonomy node creation and re-parenting.
+29. Taxonomy acyclicity — `ERR_TAXONOMY_CYCLE` (HTTP 409), on taxonomy node creation and re-parenting.
+30. Attribution weight conservation — `ERR_WEIGHT_SPLIT_INVALID` (HTTP 422), on attribution authoring.
+31. No unsubstantiated claim on the card — `ERR_CLAIM_UNSUBSTANTIATED` (HTTP 422), on submission for legal review.
+32. Publication risk ceiling — `ERR_RISK_CEILING_EXCEEDED` (HTTP 422), on battlecard publication.
+33. Incentive budget ceiling — `ERR_INCENTIVE_BUDGET_EXCEEDED` (HTTP 402), on interview scheduling and rescheduling only.
+34. Adoption gate on the derived competitor's published card — `ERR_ADOPTION_BELOW_THRESHOLD` (HTTP 409), on gap promotion.
+35. Training deadline — `ERR_ASSIGNMENT_PAST_DUE` (HTTP 409), on training completion.
+36. Reschedule ceiling — `ERR_RESCHEDULE_LIMIT_REACHED` (HTTP 409), on rescheduling.
+37. The seeding response is a product-gap verbatim — `ERR_RESPONSE_NOT_PRODUCT_GAP` (HTTP 422), on product-gap intake.
+38. Evidence-set integrity — `ERR_EVIDENCE_SET_INVALID` (HTTP 422), on claim creation.
+
+### 2.11. Cascades and Derived-Field Reconciliation
+
+Consistency is immediate: by the time a response is returned, every derived field the write touched — directly or through a cascade — already holds its new value, and every row whose derived fields changed has had its `updated_at` refreshed and its `version` incremented. The server may transition a parent or a sibling automatically as a consequence of a write addressed elsewhere; three such cascades recur throughout §3 and are named here so the narrative can refer to them.
+
+The **completion posture cascade** starts when an interview is completed: the interview's incentive converts from committed to paid, which moves the program's two ledger totals, which recomputes the program's `posture`, which — when the recomputed posture is `FROZEN` — suspends every `SEALED` sampling frame of that program. Each of those four links is caused by the one before it.
+
+The **attribution supersede cascade** starts when a new attribution is authored on a deal that already has a ratified one: the prior attribution becomes `SUPERSEDED` and the new one is created `PROVISIONAL`; that removes the superseded row's contributions from the loss-reason and competitor counters; that leaves the deal without a ratified attribution and so returns its research dimension from `SYNTHESIZED` to `INTERVIEWED`; and that in turn re-scores every product gap still in an untriaged or evidence-pending state whose linked deal set contains that deal.
+
+The **claim rejection withdrawal cascade** starts when a legal decision rejects a claim: the claim leaves the card's risk input set; if the card was published and that rejection leaves it with no approved claim at all, the card is withdrawn; and every outstanding assignment on that withdrawn card expires while the competitor's published-card counter is decremented.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a Program and Governing Its Interview Guide
+
+A `ProgramAdmin` opens the quarter by creating a program with a human `name`, a `fiscal_quarter` label (a non-empty string whose format the server does not otherwise validate), an `incentive_budget_usd`, an `interview_incentive_cap_usd` that ceilings any single buyer payment, and a `min_deal_value_usd` that sets the inclusive revenue floor for sampling eligibility. Three further inputs are optional. `required_question_keys` declares the interview-guide topics every interview must cover and defaults to the three-topic set `EVALUATION_CRITERIA`, `COMPETITOR_POSITIONING` and `PRICING_PERCEPTION`. `max_open_interviews_per_analyst` caps how many interviews one analyst may hold open at once and defaults to 3. `independence_mode` defaults to `STRICT`, the alternative being `ADVISORY`. A newly created program has `status` `DRAFT`, `posture` `OPEN`, `guide_version` 1, all three ledger fields at 0, and `version` 1.
+
+Activation moves the program `DRAFT → ACTIVE` and is refused unless the program is currently `DRAFT`, its `incentive_budget_usd` is strictly greater than zero, and its `required_question_keys` contains at least the three topics `EVALUATION_CRITERIA`, `COMPETITOR_POSITIONING` and `PRICING_PERCEPTION`. Activation recomputes `posture` — with utilization at 0.0000 and an `ACTIVE` status floor of `OPEN`, the result is `OPEN` — and increments the program's `version`.
+
+Winding down happens in two steps. The `ACTIVE → CLOSING` step requires that no interview belonging to any of the program's deals is still `SCHEDULED`; it recomputes `posture` under the `CLOSING` floor, which forces the result to at least `RESTRICTED`, closes every sampling frame of the program whose `status` is `DRAFT`, `SEALED` or `SUSPENDED`, and increments `version`. The `CLOSING → CLOSED` step requires that no attribution on any of the program's deals is still `PROVISIONAL`; it recomputes `posture` under the `CLOSED` floor, which forces `FROZEN`, transitions every battlecard of the program's competitors whose `status` is `DRAFT`, `LEGAL_REVIEW` or `APPROVED` to `WITHDRAWN`, and increments `version`. `CLOSED` is terminal.
+
+Two further program writes leave `status` where it is but change the program materially. Replacing the incentive budget is permitted while the program is `DRAFT`, `ACTIVE` or `CLOSING`; the request carries the new `incentive_budget_usd` together with `expected_program_version` as described in §2.8, and it is additionally refused when the proposed budget is below the program's current `incentive_paid_usd` — money already paid cannot be un-budgeted. On success the budget is replaced, `posture` is recomputed, and if that recomputation moves the posture out of `FROZEN`, every sampling frame of the program whose `status` is `SUSPENDED` transitions back to `SEALED`; `version` increments.
+
+Replacing the interview guide is permitted while the program is `DRAFT` or `ACTIVE`. The request supplies a new `required_question_keys` array which must still contain at least `EVALUATION_CRITERIA`, `COMPETITOR_POSITIONING` and `PRICING_PERCEPTION`. The stored array is replaced, `guide_version` increments by 1, and `version` increments. Crucially, there is **no** back-propagation: interviews already in `SCHEDULED` keep the `guide_version_pinned` and `required_question_keys_pinned` values they captured at scheduling time, and their completion coverage is judged against that pinned array rather than the program's current one.
+
+### 3.2. The Competitive Registry, the Deal Universe and the Buyers Inside It
+
+Competitors are registered by a `ProgramAdmin` against a `program_id`, with a display `name` unique within the program when compared case-insensitively, and a `tier` of `PRIMARY`, `SECONDARY` or `EMERGING` that expresses competitive importance. A new competitor has `status` `ACTIVE`, all counters at 0 and `win_rate_vs` null. Archiving flips `status` `ACTIVE → ARCHIVED` and increments `version`; from then on, sampling scores treat deals pointing at that competitor as contributing no competitor weight at all.
+
+Three derived numbers hang off a competitor. `published_battlecard_count` is the number of battlecards targeting it whose `status` is `PUBLISHED`. `ratified_loss_count` is the number of deals naming it as primary competitor whose `outcome` is `LOST` or `NO_DECISION` and whose `attribution_status` is `RATIFIED`. `win_rate_vs` is the count of that competitor's deals with `outcome` `WON` divided by the count of its deals whose `outcome` is `WON`, `LOST` or `NO_DECISION`, rounded to four decimal places; when that denominator is zero the field is null.
+
+Deals are imported by a `ProgramAdmin` into the program's sampling universe. Each import supplies the owning `program_id`, a `crm_deal_ref` unique within the program and compared case-sensitively, an `outcome` of `WON`, `LOST` or `NO_DECISION`, the annual contract revenue `acr_usd`, the `close_date` at which the deal closed, a customer `segment` of `ENTERPRISE`, `MIDMARKET` or `SMB`, the opaque `sales_rep_user_ref` of the rep who owned it, and optionally the `primary_competitor_id` the deal was fought against. A fresh deal has `research_status` `NOT_SELECTED`, `attribution_status` `UNATTRIBUTED`, `interview_coverage_count` 0, and null values for `sampling_frame_id`, `stratum` and `selection_rank_score`. If a primary competitor was named, that competitor's `win_rate_vs` is recomputed as part of the import.
+
+Deals carry **two independent status dimensions** on the same row. `research_status` runs `NOT_SELECTED`, `SELECTED`, `DECLINED`, `INTERVIEWED` and `SYNTHESIZED`, with `DECLINED` and `SYNTHESIZED` acting as its terminal values. `attribution_status` runs `UNATTRIBUTED`, `PROVISIONAL` and `RATIFIED`, has no terminal value, and cycles between `RATIFIED` and `PROVISIONAL` as attributions are superseded and re-ratified. The two dimensions evolve independently: nothing in the research dimension is implied by the attribution dimension except where a rule says so explicitly.
+
+Mutable CRM attributes can be corrected by a `ProgramAdmin` while the deal has not yet been synthesized — a correction attempted on a deal whose `research_status` is `SYNTHESIZED` is refused with `ERR_DEAL_STATE_INVALID`. The correction accepts any subset of `acr_usd`, `segment` and `primary_competitor_id`. It recomputes `win_rate_vs` for both the outgoing and the incoming competitor, re-scores every product gap in `NEW` or `TRIAGED` whose linked deal set contains this deal, and increments the deal's `version`.
+
+Buyer-side participants are added to a deal by a `ResearchAnalyst`. Each contact supplies an `email` — stored lower-cased and unique within the deal case-insensitively — a `full_name`, a `title_band` of `ECONOMIC_BUYER`, `CHAMPION`, `PROCUREMENT` or `END_USER`, and optionally an `incentive_eligibility` of `ELIGIBLE`, `INELIGIBLE_PUBLIC_SECTOR` or `INELIGIBLE_POLICY`, defaulting to `ELIGIBLE`. New contacts begin with `consent_status` `NOT_REQUESTED`, `completed_interview_count` 0 and `last_completed_interview_end_at` null. The lower-cased `email` is the **person key**: the same human appearing on two different deals is one person for the purposes of the cooling-off rule in §3.4, and the flat buyer-contact collection exposes an `email` filter that matches case-insensitively precisely so that cross-deal view is observable.
+
+Consent is recorded as its own step by a `ResearchAnalyst`, supplying a `consent_status` of `REQUESTED`, `GRANTED` or `REFUSED`; the write increments the contact's `version`. As the interview lifecycle proceeds, the contact's `completed_interview_count` counts its `COMPLETED` interviews and `last_completed_interview_end_at` holds the greatest `actual_end_at` among them, remaining null while there are none.
+
+Analysts are registered by a `ProgramAdmin` with the owning `program_id`, a `full_name`, the opaque personnel reference `linked_user_ref` of the human behind the record, an `employment_type` of `INTERNAL` or `EXTERNAL_VENDOR`, a `certified_until` expiry instant, and optionally the boolean `sales_org_member`, which defaults to false and marks an analyst who reports into the sales organisation. A new analyst has `status` `ACTIVE`, `open_interview_count` 0 and `committed_minutes` 0. `open_interview_count` is the number of that analyst's interviews still in `SCHEDULED`; `committed_minutes` is the sum, over those same interviews, of the whole minutes between `scheduled_start_at` and `scheduled_end_at` plus a fifteen-minute debrief allowance per interview. Deactivation flips `status` `ACTIVE → INACTIVE` and increments `version`; already-scheduled interviews are untouched and may still be completed, but the analyst can no longer be given new ones.
+
+### 3.3. Sampling Frames, Quotas and the Selector
+
+A sampling frame is the instrument that decides which closed deals get researched. A `ResearchAnalyst` defines one with the owning `program_id`, a `label` naming the sampling wave, a half-open close-date window from an inclusive `window_start` to an exclusive `window_end` that must be strictly later, three per-outcome quotas `quota_won`, `quota_lost` and `quota_no_decision`, and a `selection_basis` of either `STRATIFIED_BY_SEGMENT` or `VALUE_WEIGHTED`. A new frame has `status` `DRAFT` and all slot counters at 0, because open slots are not materialised until the frame is sealed.
+
+Sealing moves the frame `DRAFT → SEALED` and requires that the frame is currently `DRAFT`, that the owning program's `status` is `ACTIVE`, and that the three quotas sum to at least 1. Sealing initialises `open_won_slots`, `open_lost_slots` and `open_no_decision_slots` to `quota_won`, `quota_lost` and `quota_no_decision` respectively, sets `coverage_ratio` to 0.0000, and increments the frame's `version`. Throughout the frame's life, each stratum obeys a conservation invariant: the stratum's quota always equals its selected count plus its open slots. `selected_won_count`, `selected_lost_count` and `selected_no_decision_count` count the frame's deals in the matching `stratum` whose `research_status` is `SELECTED`, `INTERVIEWED` or `SYNTHESIZED`. `coverage_ratio` is the sum of those three selected counts divided by the sum of the three quotas, rounded to four decimal places, and is 0.0000 when the total quota is zero.
+
+Drawing is the operation that turns a frame into a work list. The `ResearchAnalyst` names a `stratum` — `WON`, `LOST` or `NO_DECISION` — optionally a `requested_count` that defaults to 1, and optionally a specific `deal_id` to pin the draw to a single candidate. The frame must be `SEALED` and the owning program's `posture` must not be `FROZEN`. Each drawn deal transitions `NOT_SELECTED → SELECTED`.
+
+**Eligibility comes before scoring.** A deal enters the candidate pool only if every one of the following holds: it belongs to the same program as the frame; its `research_status` is `NOT_SELECTED`; its `outcome` equals the requested stratum; its `acr_usd` is greater than or equal to the program's `min_deal_value_usd`; its `close_date` is on or after the frame's `window_start` and strictly before the frame's `window_end`; and at least one buyer contact on that deal has a `consent_status` of either `REQUESTED` or `GRANTED`. A deal failing any predicate is excluded from the pool entirely and is never scored. When a specific `deal_id` is pinned, that candidate must still satisfy every predicate — and a pinned deal whose `close_date` falls outside the half-open window is the way `ERR_DEAL_OUTSIDE_FRAME_WINDOW` is reached, with a deal closing exactly on `window_end` being out of frame and one closing exactly on `window_start` being in.
+
+Scoring then produces `selection_rank_score` from three component terms, each rounded to four decimal places on its own. The **value term** is the deal's `acr_usd` divided by a normalizer of 250,000 US dollars, capped at 1.0000, rounded to four decimal places. The **recency term** starts from the number of whole days from the deal's `close_date` to the current logical clock instant, discarding any partial day; it is the recency horizon of 180 days minus that day count, divided by 180, floored at 0.0000, and rounded to four decimal places. The **competitor term** is a flat weight read from the tier of the deal's primary competitor: 0.30 for `PRIMARY`, 0.20 for `SECONDARY`, 0.10 for `EMERGING`, and 0.00 when the deal names no primary competitor or when the named competitor's `status` is `ARCHIVED`.
+
+The two selection bases combine those terms differently, which is why the same pool can yield a different drawn set. Under `STRATIFIED_BY_SEGMENT`, the raw score is forty hundredths of the value term plus forty hundredths of the recency term plus the competitor term, and the final `selection_rank_score` is that raw score rounded to four decimal places; the deal's `segment` does not multiply anything here, because stratification is expressed through the ordering rule instead. Under `VALUE_WEIGHTED`, the raw score is sixty-five hundredths of the value term plus fifteen hundredths of the recency term plus the competitor term; that raw score is then multiplied by 1.25 when the deal's `segment` is `ENTERPRISE` and by 1.00 otherwise, and the product is rounded to four decimal places.
+
+Ordering is fully deterministic and differs by basis. Under `STRATIFIED_BY_SEGMENT` the candidates are ordered by score descending, then by segment rank ascending where `ENTERPRISE` ranks 1, `MIDMARKET` ranks 2 and `SMB` ranks 3, then by `close_date` descending, then by `created_at` ascending. Under `VALUE_WEIGHTED` they are ordered by score descending, then by `acr_usd` descending, then by `close_date` descending, then by `created_at` ascending. A deal's `id` is never a tie-break input under either basis. The draw then takes the leading rows of that order, taking whichever is smaller of the stratum's open slots and the `requested_count`; the response lists the drawn deals in selector order rather than identifier order and is returned with a creation status code because it materialises new selections.
+
+Two distinct refusals guard the draw. If the requested stratum's open slots are fewer than `requested_count`, the draw fails with `ERR_STRATUM_QUOTA_EXHAUSTED`; if slots remain but the eligibility filter leaves the pool empty, it fails with `ERR_NO_ELIGIBLE_DEALS`. On success each drawn deal has its `sampling_frame_id` set to the frame, its `stratum` copied from its own `outcome`, and its `selection_rank_score` stored; the frame's selected count for that stratum increases by one per drawn deal and its open slots decrease by the same amount, `coverage_ratio` is recomputed, and both the frame's `version` and each drawn deal's `version` increment.
+
+A selection can be handed back. Declining a selection moves the deal `SELECTED → DECLINED` and is permitted only while no interview on that deal is in `SCHEDULED` or `COMPLETED` and while the owning frame's `status` is `SEALED` or `SUSPENDED`; an optional `decline_note` may accompany it. The decline is a compensating transition: the frame's selected count for the deal's stratum decreases by one and its open slots increase by one, restoring the conservation invariant to exactly its pre-draw value, `coverage_ratio` is recomputed, and `selection_rank_score` is set back to null while `stratum` and `sampling_frame_id` are retained for audit. Both the deal's and the frame's `version` increment. `DECLINED` is terminal on the research dimension.
+
+Frames also move without an analyst asking. When a program's `posture` is recomputed to `FROZEN`, every `SEALED` frame of that program transitions `SEALED → SUSPENDED` and has its `version` incremented; when the posture is later recomputed to `OPEN` or `RESTRICTED` — for instance because the budget was raised — every `SUSPENDED` frame of a program whose `status` is `ACTIVE` or `CLOSING` transitions `SUSPENDED → SEALED`, closing that cycle. A `ResearchAnalyst` may close a frame from either `SEALED` or `SUSPENDED`, which freezes `coverage_ratio` at its current value and increments `version`; and the program's own `ACTIVE → CLOSING` step closes every frame still in `DRAFT`, `SEALED` or `SUSPENDED`. `CLOSED` is terminal for a frame.
+
+### 3.4. Scheduling a Buyer Interview
+
+Scheduling is the most heavily guarded write in the system, because it commits money, blocks a human's calendar, contacts an external buyer and must preserve research independence. A `ResearchAnalyst` requests an interview by supplying the `deal_id` under study, the `buyer_contact_id` of the interviewee, the `analyst_id` of the interviewer, and the planned interval `scheduled_start_at` to `scheduled_end_at`, whose occupation is treated as half-open from the start instant up to but excluding the end instant.
+
+The staging preconditions come first: the deal's `research_status` must be `SELECTED`, the frame named by the deal's `sampling_frame_id` must be `SEALED`, the program's `posture` must not be `FROZEN`, the named buyer contact must belong to that deal, the named analyst must belong to the deal's program and have `status` `ACTIVE`, and the current logical clock instant must be strictly earlier than that analyst's `certified_until`.
+
+**Independence.** When the program's `independence_mode` is `STRICT`, the interviewing analyst must have `sales_org_member` false and must have a `linked_user_ref` different from the deal's `sales_rep_user_ref`; either condition failing yields `ERR_INDEPENDENCE_VIOLATION`. When `independence_mode` is `ADVISORY` the rule is skipped in its entirety and the interview proceeds, the mode value itself being the record that independence was not enforced.
+
+**Consent.** The buyer contact's `consent_status` must be exactly `GRANTED`; `NOT_REQUESTED`, `REQUESTED` and `REFUSED` all yield `ERR_CONSENT_NOT_GRANTED`. Consent is a safety precondition to contacting a buyer at all and therefore outranks the two temporal rules that follow it.
+
+**Contact hygiene.** A buyer person — matched by lower-cased `email` across *all* deals, not merely the deal under study — must not have a `COMPLETED` interview whose `actual_end_at` falls inside the cooling-off window preceding the requested `scheduled_start_at`, nor any other `SCHEDULED` interview inside that same window. The window spans the ninety days before the requested start and is closed at both ends: an interview whose relevant instant lands exactly ninety days before the requested start is still inside the window and blocks the request with `ERR_CONTACT_COOLING_OFF_ACTIVE`. Because matching is by person rather than by contact row, the same buyer appearing on two deals in the program collides with themselves.
+
+**Interviewer calendar.** The requested interval, extended at its end by a fifteen-minute debrief buffer, must not overlap any other `SCHEDULED` interview of the same analyst, itself also extended by fifteen minutes at its end. The comparison is half-open on both sides. Two consequences are worth spelling out: a back-to-back booking with a gap of zero minutes **does** conflict, because the earlier interview's debrief buffer covers the later start; and a gap of exactly fifteen minutes does **not** conflict. A collision returns `ERR_ANALYST_SLOT_CONFLICT`.
+
+**Workload and money.** The analyst's `open_interview_count` must be strictly less than the program's `max_open_interviews_per_analyst`, or the request fails with `ERR_ANALYST_CAPACITY_EXCEEDED` — each individual interview may be legal while the collective open workload is not. Finally, the program's `incentive_committed_usd` plus its `incentive_paid_usd` plus the provisional amount this new interview would commit must not exceed `incentive_budget_usd`; otherwise the request fails with `ERR_INCENTIVE_BUDGET_EXCEEDED`.
+
+On success the interview is created with `status` `SCHEDULED` and `incentive_status` `COMMITTED`, `actual_start_at` and `actual_end_at` null, `incentive_final_usd` null, `coverage_complete` false and `reschedule_count` 0. Its `incentive_provisional_usd` is computed by the provisional variant of the incentive formula described in §3.5. Version pinning happens here: `guide_version_pinned` copies the program's current `guide_version` and `required_question_keys_pinned` copies the program's current `required_question_keys`, and neither is ever re-read from the program afterwards. The program's `incentive_committed_usd` increases by the provisional amount, `posture` is recomputed and the program's `version` increments. The analyst's `open_interview_count` increases by one, its `committed_minutes` increases by the scheduled duration in whole minutes plus fifteen, and its `version` increments.
+
+### 3.5. Running the Interview, Paying the Buyer and Handling No-Shows
+
+While an interview is `SCHEDULED`, the interviewing analyst records structured answers against it, one row per answer. Each answer supplies a `question_key` — one of `EVALUATION_CRITERIA`, `COMPETITOR_POSITIONING`, `PRICING_PERCEPTION`, `LOSS_REASON` or `PRODUCT_GAP` — a non-empty `verbatim_text` holding what the buyer actually said, the `recorded_at` logical-clock instant, and optionally a `rating` (an integer from 1 through 5, otherwise null) and a `competitor_name_verbatim` capturing the competitor's name as the buyer pronounced it. That last field is free text and deliberately not a foreign key. Answers are immutable append-only evidence: there is no update path, and as noted in §2.4 the row carries neither `updated_at` nor `version`. Recording an answer against an interview that is not `SCHEDULED` is refused with `ERR_INTERVIEW_STATE_INVALID`. The growing set of distinct `question_key` values on an interview is exactly what the coverage gate measures at completion, and the pool of recorded answers is what battlecard claims and product gaps later cite.
+
+**The incentive amount.** One formula produces both of an interview's money fields, under two variants that differ only in which interval they measure. It begins with a short circuit: if the buyer contact's `incentive_eligibility` is anything other than `ELIGIBLE`, the amount is 0.00 and no further stage runs. Otherwise a base amount is read from the buyer's `title_band` — 250.00 US dollars for `ECONOMIC_BUYER`, 175.00 for `CHAMPION`, 150.00 for `PROCUREMENT` and 100.00 for `END_USER`. The interval length is taken as the number of whole minutes between its start and end instants, discarding any partial minute, and a duration factor is selected from a ladder evaluated from the top with the first match winning: at least 75 minutes gives a factor of 1.25, otherwise at least 45 minutes gives 1.00, otherwise at least 25 minutes gives 0.60, and anything shorter gives 0.00. The gross amount is the base multiplied by that factor, rounded to two decimal places. If the interviewing analyst's `employment_type` is `EXTERNAL_VENDOR`, that **already-rounded** gross is then multiplied by an uplift of 1.10 and rounded to two decimal places again — the uplift is never folded into the base-times-factor product, because the two orders differ at the second decimal place. The result is finally capped: the amount stored is whichever is smaller of the gross and the program's `interview_incentive_cap_usd`.
+
+The **provisional** variant measures `scheduled_end_at` minus `scheduled_start_at`, stores its output in `incentive_provisional_usd`, and adds that amount to the program's `incentive_committed_usd`. The **final** variant measures `actual_end_at` minus `actual_start_at`, stores its output in `incentive_final_usd`, removes the provisional amount from `incentive_committed_usd` and adds the final amount to `incentive_paid_usd`. Because the extended tier lifts the factor to 1.25 while a booked slot rarely reaches 75 minutes, the final amount can be strictly larger than the provisional one — and since completion is not budget-gated, that overrun is the only route by which a program's `posture` can reach `FROZEN` through a completion rather than through a scheduling refusal.
+
+**Completion.** The interviewing analyst completes an interview by supplying the `actual_start_at` and `actual_end_at` instants, the latter strictly after the former. The interview must be `SCHEDULED`, the logical clock must still be earlier than the analyst's `certified_until`, and the set of distinct `question_key` values recorded on the interview must be a superset of its own `required_question_keys_pinned` — measured against that pinned array, not the program's current guide — or the request is refused with `ERR_GUIDE_COVERAGE_INCOMPLETE`.
+
+Completion is the head of the completion posture cascade. Its first link stores the two actual instants, sets `coverage_complete` to true, computes `incentive_final_usd` by the final variant, moves `incentive_status` `COMMITTED → PAID`, and moves the interview `SCHEDULED → COMPLETED`. The second link, caused by that incentive-status change, decreases the program's `incentive_committed_usd` by the provisional amount, increases its `incentive_paid_usd` by the final amount, and increments the program's `version`. The third link, caused by that ledger change, recomputes the program's `posture`. The fourth link, caused by the third yielding `FROZEN`, transitions every `SEALED` sampling frame of the program to `SUSPENDED`. Alongside the cascade, the buyer contact's `completed_interview_count` increases by one and its `last_completed_interview_end_at` is set to `actual_end_at`; the deal advances `SELECTED → INTERVIEWED` with its `interview_coverage_count` increased by one, which is the count of that deal's `COMPLETED` interviews; and the analyst's `open_interview_count` decreases by one while its `committed_minutes` decreases by the scheduled duration plus fifteen. `COMPLETED` is terminal for the interview.
+
+**No-show.** If the buyer fails to appear, the analyst may declare a no-show once the logical clock has reached or passed the interview's `scheduled_start_at` plus a fifteen-minute grace period; before that instant the declaration is premature. The interview moves `SCHEDULED → NO_SHOW`, its `incentive_status` moves `COMMITTED → FORFEITED`, the program's `incentive_committed_usd` decreases by the provisional amount so the conservation of the ledger is restored, `posture` is recomputed and the program's `version` increments, and the analyst's `open_interview_count` and `committed_minutes` are released by one interview and by the scheduled duration plus fifteen respectively.
+
+**Rescheduling.** A no-show can be rebooked, moving the interview `NO_SHOW → SCHEDULED` on a fresh `scheduled_start_at` and `scheduled_end_at`. The interview must be `NO_SHOW`, its `reschedule_count` must be strictly less than two — a third attempt is refused with `ERR_RESCHEDULE_LIMIT_REACHED`, which is what terminates the `SCHEDULED → NO_SHOW → SCHEDULED` cycle — the program's `posture` must not be `FROZEN`, and the new interval must clear the full scheduling battery again: independence, certification, consent, the buyer cooling-off window, the buffered analyst slot check, the open-workload cap and the incentive budget ceiling all re-run exactly as at first scheduling. On success the interval is replaced, `reschedule_count` increases by one, `incentive_provisional_usd` is recomputed by the provisional variant against the new interval, `incentive_status` moves `FORFEITED → COMMITTED`, the program's `incentive_committed_usd` increases by the new provisional amount with `posture` recomputed and `version` incremented, and the analyst's `open_interview_count` increases by one while `committed_minutes` is re-reserved for the new duration plus fifteen.
+
+**Cancellation.** An interview may be cancelled from either `SCHEDULED` or `NO_SHOW`, optionally with a `cancel_reason`, and `CANCELLED` is terminal. The two source states behave differently, and both behaviours are normative. From `SCHEDULED`, cancellation is a compensating transition: `incentive_status` moves `COMMITTED → RELEASED`, the program's `incentive_committed_usd` decreases by the provisional amount so the ledger returns to exactly its pre-scheduling value, `posture` is recomputed, and the analyst's still-held counters are released. From `NO_SHOW`, `incentive_status` stays `FORFEITED` and the ledger is **not** touched a second time — it was already released when the no-show was declared — and the interview's `version` increments.
+
+### 3.6. The Loss-Reason Taxonomy, Attribution and Trend Analysis
+
+Loss reasons form a tree owned by the `ProgramAdmin`. A node is created with its owning `program_id`, a stable `code` unique within the program compared case-insensitively, a human `label`, and optionally a `parent_reason_id` naming the node above it. `depth` is computed as 1 for a root node and otherwise as one more than the parent's `depth`, and it may never exceed 3 — a creation or re-parenting that would push it past three levels is refused with `ERR_TAXONOMY_DEPTH_EXCEEDED`. `is_leaf` is true exactly when no other node names this node as its parent, so creating a child retroactively turns the parent into a non-leaf and thereby bars the parent from new attributions. Nodes begin `ACTIVE` with `ratified_attribution_count` 0, that counter being the number of ratified attributions citing the node as either primary or secondary reason.
+
+A node can be relabelled or re-parented, supplying a new `label`, a new `parent_reason_id`, or both. The proposed parent may be neither the node itself nor any of its descendants; a cycle would make the root-ancestor walk non-terminating and is refused with `ERR_TAXONOMY_CYCLE`. A successful re-parenting recomputes `depth` for the node and for every one of its descendants, recomputes `is_leaf` for both the old and the new parent, and increments the node's `version`. Deprecation flips `status` `ACTIVE → DEPRECATED` and increments `version`; a deprecated node remains readable and keeps contributing to historical trend analysis, but new attributions may no longer cite it.
+
+**Authoring an attribution.** A `ResearchAnalyst` attributes a deal's outcome by naming the `deal_id`, a dominant `primary_reason_id`, a `weight_primary` share, `expected_deal_version` as described in §2.8, and optionally a contributing `secondary_reason_id`. The deal's `research_status` must be `INTERVIEWED`. Each cited reason must belong to the deal's program, must have `status` `ACTIVE` — otherwise `ERR_REASON_DEPRECATED` — and must have `is_leaf` true, since interior nodes exist only for roll-up and citing one yields `ERR_REASON_NOT_LEAF`. Weight conservation is strict: `weight_primary` lies between 0.50 and 1.00 inclusive at two decimal places; it must equal exactly 1.00 when no secondary reason is supplied; when a secondary reason is supplied it must differ from the primary reason and the two weights must sum to exactly 1.00. Any breach of that arithmetic, or citing the same reason twice, yields `ERR_WEIGHT_SPLIT_INVALID`.
+
+The created attribution has `status` `PROVISIONAL`, `authored_by_analyst_id` set to the acting `X-User-ID`, `ratified_by_analyst_id` null, and `weight_secondary` computed as one minus `weight_primary` rounded to two decimal places — which is 0.00 when there is no secondary reason. Its `confidence_score` is fixed at creation time as `weight_primary` multiplied by a coverage confidence factor, where that factor is forty hundredths plus twenty hundredths per completed interview on the deal as counted by `interview_coverage_count`, capped at 1.00; the product is rounded to two decimal places. The deal's `attribution_status` moves `UNATTRIBUTED → PROVISIONAL` and its `version` increments.
+
+**Ratification and segregation of duties.** A second `ResearchAnalyst` ratifies, moving the attribution `PROVISIONAL → RATIFIED` — and a ratification attempted on an attribution that is `RATIFIED` or `SUPERSEDED` is refused with `ERR_ATTRIBUTION_STATE_INVALID`. The acting `X-User-ID` may be neither the attribution's `authored_by_analyst_id` nor the `analyst_id` of any `COMPLETED` interview on that deal; either conflict yields `ERR_SEGREGATION_OF_DUTIES`. On success `ratified_by_analyst_id` records the ratifier, the deal's `attribution_status` becomes `RATIFIED`, and the deal's research dimension advances `INTERVIEWED → SYNTHESIZED`. The primary reason's `ratified_attribution_count` increases by one, and so does the secondary reason's when one is present. When the deal's `outcome` is `LOST` or `NO_DECISION` and the deal names a `primary_competitor_id`, that competitor's `ratified_loss_count` increases by one. The `version` of the attribution, the deal, each touched loss reason and the touched competitor all increment.
+
+**Superseding.** Authoring a new attribution on a deal whose `attribution_status` is already `RATIFIED` is legitimate and drives the attribution supersede cascade. The same `expected_deal_version` guard and the same reason predicates apply. Link one marks the prior ratified attribution `SUPERSEDED` and creates the new one `PROVISIONAL`, moving the deal `RATIFIED → PROVISIONAL`. Link two, caused by link one, decrements `ratified_attribution_count` for the superseded row's primary reason and, when it had one, its secondary reason, and decrements the competitor's `ratified_loss_count` wherever it had previously been incremented. Link three, caused by the deal now having no ratified attribution, returns the research dimension `SYNTHESIZED → INTERVIEWED`. Link four, caused by link three, re-scores every product gap whose `status` is `NEW` or `TRIAGED` and whose linked deal set contains this deal, recomputing that gap's `affected_acr_usd`, `impact_score` and `roadmap_priority_band`. The deal's `version` increments. Note that a deal may hold at most one attribution in `PROVISIONAL` or `RATIFIED` at a time, so the supersede and the create are one indivisible act.
+
+**Trend analysis.** Any role may read loss-reason trend shares for a program over a close-date window, supplying `window_start` and `window_end` and optionally a `basis` and a `segment` filter. The read collapses the taxonomy tree to its roots before computing shares, and proceeds in five stages. First the input set is chosen: under a `basis` of `RATIFIED_ONLY`, which is the default, only attributions whose `status` is `RATIFIED` participate; under a `basis` of `INCLUDE_PROVISIONAL`, attributions in `PROVISIONAL` join them, changing every denominator and therefore every share. Attributions whose `status` is `SUPERSEDED` are excluded under both bases. The set is then narrowed to attributions whose deal has `outcome` `LOST` or `NO_DECISION` and whose deal's `close_date` is on or after `window_start` and strictly before `window_end`; when a `segment` filter is supplied, only deals in that segment remain. Second, each cited reason is collapsed to its root ancestor by walking `parent_reason_id` upward until a node with no parent is reached. Third, weights are accumulated per pairing of deal segment and root reason: each attribution adds its `weight_primary` to the bucket of its primary reason's root, and when a secondary reason is present adds its `weight_secondary` to the bucket of that reason's root; when primary and secondary collapse to the same root, both contributions are kept and sum into the one bucket. Fourth, each bucket's `share` is its accumulated weight divided by the segment's total accumulated weight, rounded to four decimal places, with the unrounded accumulated weight reported alongside as `weighted_total` at two decimal places; shares inside a segment need not re-sum to exactly 1.0000 after rounding. Fifth, rows inside a segment are ordered by `share` descending, then by `weighted_total` descending, then by the root reason's `code` ascending, never by identifier; segments themselves are reported in the fixed order `ENTERPRISE`, then `MIDMARKET`, then `SMB`, and a segment whose total is zero is omitted from the response entirely. The response reports the effective `basis`, the echoed `window_start` and `window_end`, an `attribution_count` of participating attributions, and a `segments` array whose elements each carry a `segment`, a `segment_total`, and a `rows` array of entries holding `root_reason_id`, `root_reason_code`, `weighted_total` and `share`.
+
+### 3.7. Battlecards: Claim Substantiation and Legal Review
+
+A `ResearchAnalyst` opens a battlecard against a `competitor_id` with a `title` and an author-supplied `version_label`. A new card has `status` `DRAFT`, both risk indices at 0.00, every claim counter at 0, `adoption_rate` 0.0000, `published_at` null and `reopen_count` 0. Its lifecycle runs `DRAFT`, `LEGAL_REVIEW`, `APPROVED`, `PUBLISHED` and `WITHDRAWN`, with `WITHDRAWN` terminal, and it deliberately cycles: rejection or reopening returns the card to `DRAFT`.
+
+Claims are added to a card while it is not in a state that forbids writes, each supplying a non-empty `claim_text` as it will appear on the card, a `claim_type` of `PRICING`, `FEATURE`, `PERFORMANCE` or `REFERENCE`, and an `evidence_response_ids` array. That array is an evidence *set*, not a scalar foreign key: it must hold at least one element after duplicates are removed, and every element must resolve to an interview response belonging to a completed interview whose deal sits in the same program as the card's competitor. Duplicate identifiers inside the array are deduplicated rather than rejected; an array that is empty after deduplication, or one citing a response from outside the card's program, is refused with `ERR_EVIDENCE_SET_INVALID`. A new claim has `legal_status` `PENDING`, `conditions_note` null and `decided_at` null.
+
+**Substantiation scoring.** A claim's `substantiation_score` is built from its evidence set with a pinned rounding order. Each response in the deduplicated set contributes one item. The item starts from a source weight read off the response's `question_key`: 1.00 for `COMPETITOR_POSITIONING`, 0.90 for `PRICING_PERCEPTION`, 0.70 for `EVALUATION_CRITERIA`, 0.50 for `LOSS_REASON` and 0.40 for `PRODUCT_GAP`. It is multiplied by a rating factor, which is 1.00 when the response's `rating` is null and otherwise sixty hundredths plus ten hundredths per rating point — so a rating of 1 gives 0.70 and a rating of 5 gives 1.10. It is multiplied again by a recency factor: the number of whole days from the response's `recorded_at` to the current logical clock instant is computed, discarding any partial day, and the factor is 1.00 when that count is at most 90 and 0.75 otherwise. The product is rounded to two decimal places, **per item, before any addition**. `substantiation_score` is then the sum of those rounded items, itself rounded to two decimal places. Round-then-sum is normative here: a set of many small contributions scores differently from the unrounded sum of the same set.
+
+`substantiation_level` bands that score on a ladder evaluated from the top with inclusive boundaries: at least 2.00 is `CORROBORATED`, otherwise at least 0.90 is `ANECDOTAL`, and anything lower is `UNSUBSTANTIATED`. `risk_class` then combines the claim family with that level: base points are 3 for `PRICING`, 3 for `PERFORMANCE`, 2 for `FEATURE` and 1 for `REFERENCE`; the level adjusts them by adding 1 for `UNSUBSTANTIATED`, adding nothing for `ANECDOTAL`, and subtracting 1 for `CORROBORATED`; the result is clamped into the range 1 through 3 inclusive and mapped to `LOW` at 1, `MEDIUM` at 2 and `HIGH` at 3. Adding a claim recomputes both of the card's risk indices and increments the card's `version`. A card also tracks `corroborated_claim_count`, the number of its claims whose `substantiation_level` is `CORROBORATED`.
+
+**The card risk index.** Two numbers describe a card's legal exposure, and their five evaluation stages are ordered — evaluating them in any other order yields a different index. Stage one fixes the input set as the card's claims whose `legal_status` is anything other than `REJECTED`; a rejected claim is removed from the card's risk entirely. If that set is empty, both `risk_index_pre` and `risk_index_final` are 0.00 and no further stage runs. Stage two computes `risk_index_pre` as the average risk of the input set: 3 points for each `HIGH` claim, 2 for each `MEDIUM` and 1 for each `LOW`, summed and divided by the number of claims in the set, rounded to two decimal places. Stage three selects a legal-review discount keyed on `risk_index_pre` itself, never on the running final value: a `risk_index_pre` of at least 2.50 gives a discount of twenty-five hundredths, otherwise at least 1.50 gives ten hundredths, otherwise none. That discount only applies to the portion of the set legal has already cleared, so a discount scale is computed as the number of claims in the set whose `legal_status` is `APPROVED` or `CONDITIONAL`, divided by the size of the set, rounded to four decimal places. Stage four multiplies the discount by that scale, rounds the product to four decimal places, subtracts it from one, multiplies the rounded `risk_index_pre` by that remainder, and rounds to two decimal places. Stage five adds a surcharge of fifteen hundredths for each claim in the set whose `legal_status` is `CONDITIONAL` — added **after** the discount, not before — caps the result at a ceiling of 3.00, and rounds to two decimal places to produce `risk_index_final`.
+
+**Submission for legal review.** Submitting a card moves it `DRAFT → LEGAL_REVIEW`. The card must be `DRAFT`, must carry at least one claim, must have no claim whose `substantiation_level` is `UNSUBSTANTIATED` — otherwise `ERR_CLAIM_UNSUBSTANTIATED`, whose boundary sits at a `substantiation_score` of exactly 0.90, which passes — and the program owning the card's competitor must have `status` `ACTIVE` and a `posture` other than `FROZEN`. On submission, every claim on the card whose `legal_status` is `REJECTED` keeps that status while all others are set or reset to `PENDING`, both risk indices are recomputed, and the card's `version` increments.
+
+**Legal decisions.** A `LegalReviewer` decides one claim at a time, supplying a `decision` of `APPROVE`, `CONDITIONAL` or `REJECT` and, for a conditional decision, a `conditions_note`. A decision is only accepted while the card's `status` is `LEGAL_REVIEW` or `PUBLISHED`; the reviewer must not be the card's author, or the decision is refused with `ERR_SEGREGATION_OF_DUTIES`; and a claim whose current `legal_status` does not admit the requested decision is refused with `ERR_CLAIM_STATE_INVALID` — `REJECTED` is terminal for a claim, and a `CONDITIONAL` claim accepts only a subsequent `APPROVE`. Every decision stamps `decided_at` with the logical clock, recomputes both risk indices, and increments both the claim's and the card's `version`. The three decisions then diverge, and each branch is spelled out in full.
+
+`APPROVE` on a `PENDING` claim requires that the claim's `substantiation_level` is not `UNSUBSTANTIATED`, moves the claim `PENDING → APPROVED` and increases the card's `approved_claim_count` by one. `APPROVE` on a `CONDITIONAL` claim moves it `CONDITIONAL → APPROVED`, decreases `conditional_claim_count` by one and increases `approved_claim_count` by one, and the recomputed `risk_index_final` loses that claim's conditional surcharge.
+
+`CONDITIONAL` on a `PENDING` claim requires a present and non-empty `conditions_note`, which is stored on the claim; the claim moves `PENDING → CONDITIONAL` and the card's `conditional_claim_count` increases by one. The recomputed `risk_index_final` picks up the conditional surcharge for that claim, which is the concrete divergence from the approve branch.
+
+`REJECT` moves a `PENDING` claim `PENDING → REJECTED`, or a previously approved claim `APPROVED → REJECTED` when the card is `PUBLISHED` and a monitored claim is being re-reviewed. In the first case `rejected_claim_count` increases by one; in the second, `approved_claim_count` decreases by one and `rejected_claim_count` increases by one. Either way the claim leaves the risk input set. This is link one of the claim rejection withdrawal cascade.
+
+Two card-level auto-transitions ride on those decisions, and they are the branches of one fork. When the card is in `LEGAL_REVIEW` and an approve or conditional decision leaves no claim in `PENDING`, with `approved_claim_count` at least 1 and `rejected_claim_count` zero, the card auto-transitions `LEGAL_REVIEW → APPROVED`, recomputing both risk indices and incrementing `version`. When the card is in `LEGAL_REVIEW` and any claim on it is rejected, the card instead auto-transitions `LEGAL_REVIEW → DRAFT`, recomputing both indices and incrementing `version`; no publication side effect fires and the card simply returns to authoring, which closes the `DRAFT → LEGAL_REVIEW → DRAFT` revision cycle. When the card is `PUBLISHED` and a rejection leaves `approved_claim_count` at zero, links two and three of the withdrawal cascade fire instead: the card moves `PUBLISHED → WITHDRAWN` while retaining `published_at` for audit, every assignment on it whose `status` is `ASSIGNED` or `FAILED` transitions to `EXPIRED`, the competitor's `published_battlecard_count` decreases by one, and `adoption_rate`, `assigned_count` and `trained_count` are all recomputed; the card's and the competitor's `version` both increment.
+
+### 3.8. Publication, Field Distribution and Adoption Measurement
+
+Publication belongs to the `EnablementManager` and moves a card `APPROVED → PUBLISHED`. The card must be `APPROVED`, the program owning its competitor must have a `posture` other than `FROZEN`, and `risk_index_final` — recomputed at publish time — must be no greater than the publication ceiling of 2.20. A card that was approved before a later conditional decision added a surcharge can therefore fail here with `ERR_RISK_CEILING_EXCEEDED`. On success `published_at` is stamped with the logical clock, the competitor's `published_battlecard_count` increases by one, `adoption_rate` is recomputed, and both the card's and the competitor's `version` increment.
+
+Distribution to the field creates one assignment per rep. The `EnablementManager` supplies the `battlecard_id`, the opaque `sales_rep_user_ref` of the assignee — unique within that card — and a `due_at` training deadline, which must be strictly later than the `assigned_at` instant the server stamps from the logical clock. The card must be `PUBLISHED` and the program's `posture` must not be `FROZEN`. A new assignment has `status` `ASSIGNED`, `attempt_count` 0, `quiz_score` null and `completed_at` null; the card's `assigned_count` increases, `adoption_rate` is recomputed and the card's `version` increments.
+
+A `SalesRep` records a training attempt by supplying a `quiz_score`, an integer from 0 through 100 inclusive. The assignment must be `ASSIGNED` or `FAILED` — a `TRAINED` or `EXPIRED` assignment refuses further attempts with `ERR_ASSIGNMENT_STATE_INVALID` — the acting `X-User-ID` must equal the assignment's own `sales_rep_user_ref`, the card must still be `PUBLISHED`, and the logical clock must be no later than `due_at`. That deadline boundary is inclusive: an attempt landing exactly at `due_at` succeeds and one second later fails with `ERR_ASSIGNMENT_PAST_DUE`. Every attempt stores the supplied `quiz_score` and increases `attempt_count` by one, and the score then forks the outcome at a pass mark of 80. A score of at least 80 moves the assignment to `TRAINED`, stamps `completed_at` with the logical clock, and increases the card's `trained_count` by one; the fork applies identically whether the assignment was `ASSIGNED → TRAINED` or `FAILED → TRAINED`, and in the latter case `attempt_count` simply keeps accumulating. A score below 80 moves the assignment to `FAILED`, leaves `completed_at` null and leaves `trained_count` unchanged. Both branches recompute the card's `adoption_rate` and increment both the assignment's and the card's `version`.
+
+Adoption is measured as a simple share with one deliberate choice. `assigned_count` is the number of the card's assignments whose `status` is `ASSIGNED`, `FAILED`, `TRAINED` or `EXPIRED`; `trained_count` is the number whose `status` is `TRAINED`; and `adoption_rate` is the trained count divided by the assigned count, rounded to four decimal places, or 0.0000 when the assigned count is zero. Expired assignments deliberately stay in the denominator, because an expired assignment is a missed adoption rather than a void one. The adoption gate used elsewhere in the system is satisfied when `adoption_rate` is at least 0.6000.
+
+Past-due assignments are cleared in bulk by the `EnablementManager` across a whole program. Every assignment whose `status` is `ASSIGNED` or `FAILED` and whose `due_at` is earlier than the logical clock transitions to `EXPIRED`, and every touched card has its `assigned_count`, `trained_count` and `adoption_rate` recomputed; the assignments' and cards' `version` values increment. The sweep has **skip semantics, not rollback**: assignments that are not past due are left untouched and do not cause the call to fail. Its response reports an `expired_count`, an `expired_assignment_ids` array and a `recomputed_battlecard_ids` array.
+
+Assignments can also expire without anyone sweeping. When a published card is reopened, or when it is withdrawn by the claim rejection cascade, every assignment on it in `ASSIGNED` or `FAILED` transitions to `EXPIRED`, `adoption_rate` is recomputed and each assignment's `version` increments. Reopening is the competitive-claim response protocol and belongs to the `ResearchAnalyst`: the card moves `PUBLISHED → DRAFT`, optionally recording a `reopen_reason`, `reopen_count` increases by one, the competitor's `published_battlecard_count` decreases by one, outstanding assignments expire, and `assigned_count`, `trained_count` and `adoption_rate` are recomputed, with both the card's and the competitor's `version` incrementing. Reopening a card whose adoption is below the gate is still permitted; the gate does not guard reopening. `TRAINED` and `EXPIRED` are both terminal for an assignment.
+
+### 3.9. Routing Product Gaps to the Roadmap
+
+The last stage of the pipeline turns buyer complaints into roadmap items. A `ProductManager` opens a gap by naming the owning `program_id`, a `source_response_id` pointing at the originating buyer verbatim, a non-empty `gap_summary` written for a product audience, and optionally an `additional_response_ids` array of further corroborating verbatims, which defaults to empty. The seeding response must have `question_key` `PRODUCT_GAP`; every other topic is evidence for battlecards instead, and citing one yields `ERR_RESPONSE_NOT_PRODUCT_GAP`. Members of `additional_response_ids` are likewise product-gap verbatims. A new gap has `status` `NEW` and `roadmap_epic_ref` null, and its lifecycle runs `NEW`, `TRIAGED`, `ACCEPTED`, `DECLINED` and `PROMOTED`, with `DECLINED` and `PROMOTED` terminal.
+
+The gap's competitor is not supplied — it is **derived** by traversing from the seeding response to its interview and from that interview to its deal, and taking that deal's `primary_competitor_id`; when the deal names no primary competitor, `derived_competitor_id` is null.
+
+**Impact scoring.** The gap's linked deal set is the distinct set of deals reachable from its evidence responses — the seeding response together with every additional response — each response reaching its interview and each interview reaching its deal. `linked_deal_count` is the size of that distinct set, so a deal contributing several verbatims still counts once. `affected_acr_usd` is the sum of `acr_usd` over only those linked deals whose `attribution_status` is `RATIFIED`, each counted once, rounded to two decimal places; that restriction is what makes the fourth link of the attribution supersede cascade observable, since a superseded attribution removes its deal's revenue from the gap again. Two components are then formed. The revenue component takes `affected_acr_usd` divided by a normalizer of 500,000 US dollars, caps that ratio at 1.0000 and rounds it to four decimal places, multiplies it by a weight of 40, and rounds the product to two decimal places. The frequency component takes `linked_deal_count` capped at 10 and multiplies it by a weight of 4. The two components are added, the sum is multiplied by a competitive pressure factor read off the tier of `derived_competitor_id` — 1.30 for `PRIMARY`, 1.10 for `SECONDARY`, 1.00 for `EMERGING` and 1.00 when there is no derived competitor — and the result is rounded to two decimal places to give `impact_score`. `roadmap_priority_band` bands that score on a ladder evaluated from the top with inclusive boundaries: at least 70 is `P0`, otherwise at least 45 is `P1`, otherwise at least 20 is `P2`, and anything lower is `P3`.
+
+**Triage.** The `ProductManager` triages a gap with a `decision` of `ACCEPT`, `NEEDS_EVIDENCE` or `DECLINE`, optionally supplying an `additional_response_ids` array to enlarge the evidence set. When that array is supplied, the evidence set grows and `linked_deal_count`, `affected_acr_usd`, `impact_score` and `roadmap_priority_band` are all recomputed **before** any band gate is evaluated. `ACCEPT` is available from either `NEW` or `TRIAGED` and moves the gap to `ACCEPTED`, but only when the freshly re-scored `roadmap_priority_band` is not `P3`; a gap that still scores `P3` is refused. `NEEDS_EVIDENCE` is available only from `NEW`, moves the gap `NEW → TRIAGED`, and simply defers the accept-or-decline decision to a second triage call. `DECLINE` is available from either `NEW` or `TRIAGED` and moves the gap to `DECLINED`. Every branch increments the gap's `version`.
+
+**Promotion.** Promotion moves the gap `ACCEPTED → PROMOTED` and records the external `roadmap_epic_ref`. The gap must be `ACCEPTED`, its `roadmap_priority_band` must be `P0` or `P1`, and the owning program's `status` must be `ACTIVE`. One further gate closes the loop between enablement adoption and roadmap investment: when the gap's derived competitor has at least one published battlecard, that competitor's most recently published card must have an `adoption_rate` of at least 0.6000, or the promotion is refused with `ERR_ADOPTION_BELOW_THRESHOLD`. The rule is skipped entirely when the derived competitor has no published card — and, by the same token, when there is no derived competitor at all. On success `roadmap_epic_ref` is stored and the gap's `version` increments.
+
+## 4. Endpoint Definitions
+
+Operations that mint a new resource — a program, a competitor, a deal, an analyst, a buyer contact, a sampling frame, an interview, an interview response, a taxonomy node, a loss attribution, a battlecard, a claim, an enablement assignment, a product gap, or the batch of deals produced by a sampling draw — return `201 Created`. Every other operation, including all reads, all state-transition actions, all replacements and the logical-clock setter, returns `200 OK`. In the table below, "Any" means all six roles are authorized.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical UTC clock | Any |
+| POST | `/programs` | Create a win-loss program in DRAFT | ProgramAdmin |
+| GET | `/programs/{program_id}` | Read one program with its ledger and derived posture | Any |
+| POST | `/programs/{program_id}/activate` | Activate a draft program | ProgramAdmin |
+| POST | `/programs/{program_id}/begin-closing` | Begin closing a program and close its sampling frames | ProgramAdmin |
+| POST | `/programs/{program_id}/close` | Close a program and withdraw its unpublished battlecards | ProgramAdmin |
+| PUT | `/programs/{program_id}/incentive-budget` | Replace the incentive budget under optimistic concurrency | ProgramAdmin |
+| PUT | `/programs/{program_id}/interview-guide` | Replace the required guide topics and bump the guide version | ProgramAdmin |
+| GET | `/programs/{program_id}/competitors` | List a program's competitors | Any |
+| GET | `/programs/{program_id}/analysts` | List a program's analysts | Any |
+| GET | `/programs/{program_id}/sampling-frames` | List a program's sampling frames | Any |
+| GET | `/programs/{program_id}/loss-trends` | Computed read of loss-reason trend shares by segment | Any |
+| POST | `/programs/{program_id}/enablement-sweep` | Expire every past-due enablement assignment in the program | EnablementManager |
+| POST | `/competitors` | Register a competitor inside a program | ProgramAdmin |
+| GET | `/competitors/{competitor_id}` | Read one competitor with its derived win rate and counters | Any |
+| POST | `/competitors/{competitor_id}/archive` | Archive a competitor | ProgramAdmin |
+| GET | `/competitors` | Filtered list of competitors | Any |
+| POST | `/deals` | Import a closed deal into the sampling universe | ProgramAdmin |
+| GET | `/deals/{deal_id}` | Read one deal with both parallel status dimensions | Any |
+| GET | `/deals` | Filtered list of deals | Any |
+| PATCH | `/deals/{deal_id}` | Correct a deal's mutable CRM attributes | ProgramAdmin |
+| POST | `/deals/{deal_id}/decline-selection` | Decline a selection and return its quota slot | ResearchAnalyst |
+| POST | `/analysts` | Register a research analyst | ProgramAdmin |
+| GET | `/analysts/{analyst_id}` | Read one analyst with workload counters | Any |
+| POST | `/analysts/{analyst_id}/deactivate` | Deactivate an analyst | ProgramAdmin |
+| GET | `/analysts` | Filtered list of analysts | Any |
+| POST | `/deals/{deal_id}/buyer-contacts` | Add a buyer-side contact to a deal | ResearchAnalyst |
+| GET | `/deals/{deal_id}/buyer-contacts` | List a deal's buyer contacts | Any |
+| GET | `/buyer-contacts/{contact_id}` | Read one buyer contact with its cooling-off anchor | Any |
+| POST | `/deals/{deal_id}/buyer-contacts/{contact_id}/consent` | Record a buyer's interview-consent decision | ResearchAnalyst |
+| GET | `/buyer-contacts` | Filtered list of buyer contacts, including the cross-deal person view | Any |
+| POST | `/sampling-frames` | Define a sampling frame with quotas and a selection basis | ResearchAnalyst |
+| GET | `/sampling-frames/{frame_id}` | Read one frame with quota, slot and coverage counters | Any |
+| POST | `/sampling-frames/{frame_id}/seal` | Seal a frame and materialize its open slots | ResearchAnalyst |
+| POST | `/sampling-frames/{frame_id}/draw` | Run the selector for one outcome stratum and select deals | ResearchAnalyst |
+| POST | `/sampling-frames/{frame_id}/close` | Close a frame and freeze its coverage ratio | ResearchAnalyst |
+| GET | `/sampling-frames` | Filtered list of sampling frames | Any |
+| POST | `/interviews` | Schedule a buyer interview | ResearchAnalyst |
+| GET | `/interviews/{interview_id}` | Read one interview with its pinned guide and both incentive amounts | Any |
+| GET | `/interviews` | Filtered list of interviews | Any |
+| POST | `/interviews/{interview_id}/complete` | Complete an interview and settle its incentive | ResearchAnalyst |
+| POST | `/interviews/{interview_id}/no-show` | Record a buyer no-show and forfeit the incentive | ResearchAnalyst |
+| POST | `/interviews/{interview_id}/reschedule` | Rebook a no-show interview on a new interval | ResearchAnalyst |
+| POST | `/interviews/{interview_id}/cancel` | Cancel an interview and release its commitment | ResearchAnalyst |
+| POST | `/interviews/{interview_id}/responses` | Record one structured interview-guide answer | ResearchAnalyst |
+| GET | `/interviews/{interview_id}/responses` | List an interview's recorded answers | Any |
+| GET | `/interview-responses/{response_id}` | Read one recorded interview response | Any |
+| GET | `/interview-responses` | Filtered list of interview responses | Any |
+| POST | `/loss-reasons` | Add a node to the loss-reason taxonomy | ProgramAdmin |
+| GET | `/loss-reasons/{reason_id}` | Read one taxonomy node with its depth and leaf flag | Any |
+| GET | `/loss-reasons` | Filtered list of taxonomy nodes | Any |
+| PATCH | `/loss-reasons/{reason_id}` | Re-parent or relabel a taxonomy node | ProgramAdmin |
+| POST | `/loss-reasons/{reason_id}/deprecate` | Deprecate a taxonomy node | ProgramAdmin |
+| POST | `/loss-attributions` | Author a loss attribution under optimistic concurrency | ResearchAnalyst |
+| GET | `/loss-attributions/{attribution_id}` | Read one attribution with its weights and confidence score | Any |
+| GET | `/loss-attributions` | Filtered list of loss attributions | Any |
+| POST | `/loss-attributions/{attribution_id}/ratify` | Ratify a provisional attribution | ResearchAnalyst |
+| POST | `/battlecards` | Create a competitor battlecard in DRAFT | ResearchAnalyst |
+| GET | `/battlecards/{battlecard_id}` | Read one battlecard with risk indices and adoption metrics | Any |
+| GET | `/battlecards` | Filtered list of battlecards | Any |
+| POST | `/battlecards/{battlecard_id}/claims` | Add a claim with its interview-response evidence set | ResearchAnalyst |
+| GET | `/battlecards/{battlecard_id}/claims` | List a battlecard's claims | Any |
+| POST | `/battlecards/{battlecard_id}/claims/{claim_id}/legal-decision` | Record the legal decision on one claim | LegalReviewer |
+| POST | `/battlecards/{battlecard_id}/submit-legal` | Submit a draft card for legal review | ResearchAnalyst |
+| POST | `/battlecards/{battlecard_id}/publish` | Publish an approved card to the field | EnablementManager |
+| POST | `/battlecards/{battlecard_id}/reopen` | Reopen a published card for revision | ResearchAnalyst |
+| GET | `/battlecards/{battlecard_id}/enablement-assignments` | List a card's enablement assignments | Any |
+| GET | `/battlecard-claims/{claim_id}` | Read one claim with its substantiation, risk and legal status | Any |
+| GET | `/battlecard-claims` | Filtered list of battlecard claims | Any |
+| POST | `/enablement-assignments` | Distribute a published card to one sales rep | EnablementManager |
+| GET | `/enablement-assignments/{assignment_id}` | Read one assignment with its quiz history | Any |
+| POST | `/enablement-assignments/{assignment_id}/complete` | Record a training quiz attempt | SalesRep |
+| GET | `/enablement-assignments` | Filtered list of enablement assignments | Any |
+| POST | `/product-gaps` | Route a product-gap verbatim into the roadmap pipeline | ProductManager |
+| GET | `/product-gaps/{gap_id}` | Read one gap with its impact score and priority band | Any |
+| GET | `/product-gaps` | Filtered list of product gaps | Any |
+| POST | `/product-gaps/{gap_id}/triage` | Triage a gap with ACCEPT, NEEDS_EVIDENCE or DECLINE | ProductManager |
+| POST | `/product-gaps/{gap_id}/promote` | Promote an accepted gap with a roadmap epic reference | ProductManager |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_AUTH_HEADERS` | 401 Unauthorized |
+| `ERR_UNKNOWN_ROLE` | 401 Unauthorized |
+| `ERR_ROLE_NOT_PERMITTED` | 403 Forbidden |
+| `ERR_ANALYST_IDENTITY_INVALID` | 403 Forbidden |
+| `ERR_PROGRAM_NOT_FOUND` | 404 Not Found |
+| `ERR_COMPETITOR_NOT_FOUND` | 404 Not Found |
+| `ERR_DEAL_NOT_FOUND` | 404 Not Found |
+| `ERR_ANALYST_NOT_FOUND` | 404 Not Found |
+| `ERR_BUYER_CONTACT_NOT_FOUND` | 404 Not Found |
+| `ERR_SAMPLING_FRAME_NOT_FOUND` | 404 Not Found |
+| `ERR_INTERVIEW_NOT_FOUND` | 404 Not Found |
+| `ERR_INTERVIEW_RESPONSE_NOT_FOUND` | 404 Not Found |
+| `ERR_LOSS_REASON_NOT_FOUND` | 404 Not Found |
+| `ERR_LOSS_ATTRIBUTION_NOT_FOUND` | 404 Not Found |
+| `ERR_BATTLECARD_NOT_FOUND` | 404 Not Found |
+| `ERR_BATTLECARD_CLAIM_NOT_FOUND` | 404 Not Found |
+| `ERR_PRODUCT_GAP_NOT_FOUND` | 404 Not Found |
+| `ERR_ENABLEMENT_ASSIGNMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_VALUE_OUT_OF_RANGE` | 422 Unprocessable Entity |
+| `ERR_INVALID_TIME_WINDOW` | 422 Unprocessable Entity |
+| `ERR_CROSS_PROGRAM_REFERENCE` | 409 Conflict |
+| `ERR_DUPLICATE_RESOURCE_KEY` | 409 Conflict |
+| `ERR_STALE_DEAL_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_PROGRAM_VERSION` | 412 Precondition Failed |
+| `ERR_PROGRAM_STATE_INVALID` | 409 Conflict |
+| `ERR_DEAL_STATE_INVALID` | 409 Conflict |
+| `ERR_FRAME_STATE_INVALID` | 409 Conflict |
+| `ERR_INTERVIEW_STATE_INVALID` | 409 Conflict |
+| `ERR_ATTRIBUTION_STATE_INVALID` | 409 Conflict |
+| `ERR_BATTLECARD_STATE_INVALID` | 409 Conflict |
+| `ERR_CLAIM_STATE_INVALID` | 409 Conflict |
+| `ERR_PRODUCT_GAP_STATE_INVALID` | 409 Conflict |
+| `ERR_ASSIGNMENT_STATE_INVALID` | 409 Conflict |
+| `ERR_PROGRAM_POSTURE_FROZEN` | 409 Conflict |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_INDEPENDENCE_VIOLATION` | 422 Unprocessable Entity |
+| `ERR_ANALYST_NOT_CERTIFIED` | 422 Unprocessable Entity |
+| `ERR_CONSENT_NOT_GRANTED` | 422 Unprocessable Entity |
+| `ERR_CONTACT_COOLING_OFF_ACTIVE` | 409 Conflict |
+| `ERR_ANALYST_SLOT_CONFLICT` | 409 Conflict |
+| `ERR_DEAL_OUTSIDE_FRAME_WINDOW` | 422 Unprocessable Entity |
+| `ERR_ANALYST_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_STRATUM_QUOTA_EXHAUSTED` | 409 Conflict |
+| `ERR_NO_ELIGIBLE_DEALS` | 422 Unprocessable Entity |
+| `ERR_GUIDE_COVERAGE_INCOMPLETE` | 422 Unprocessable Entity |
+| `ERR_REASON_NOT_LEAF` | 422 Unprocessable Entity |
+| `ERR_REASON_DEPRECATED` | 422 Unprocessable Entity |
+| `ERR_TAXONOMY_DEPTH_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_TAXONOMY_CYCLE` | 409 Conflict |
+| `ERR_WEIGHT_SPLIT_INVALID` | 422 Unprocessable Entity |
+| `ERR_CLAIM_UNSUBSTANTIATED` | 422 Unprocessable Entity |
+| `ERR_RISK_CEILING_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_INCENTIVE_BUDGET_EXCEEDED` | 402 Payment Required |
+| `ERR_ADOPTION_BELOW_THRESHOLD` | 409 Conflict |
+| `ERR_ASSIGNMENT_PAST_DUE` | 409 Conflict |
+| `ERR_RESCHEDULE_LIMIT_REACHED` | 409 Conflict |
+| `ERR_RESPONSE_NOT_PRODUCT_GAP` | 422 Unprocessable Entity |
+| `ERR_EVIDENCE_SET_INVALID` | 422 Unprocessable Entity |

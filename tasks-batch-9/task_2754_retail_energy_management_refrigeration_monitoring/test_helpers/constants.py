@@ -1,0 +1,92 @@
+"""Domain thresholds and numeric constants stated by the PRD."""
+
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+THRESHOLDS = {
+    # Refrigeration monitoring and food safety
+    "GRACE_READINGS": 2,
+    "ESCALATION_EXPOSURE_MINUTES": 120,
+    "DISPOSITION_EXPOSURE_MINUTES": 240,
+    # Demand response
+    "DR_RECOVERY_GAP_MINUTES": 240,
+    "DR_BASELINE_LOOKBACK_INTERVALS": 10,
+    "DR_BASELINE_TOP_N": 3,
+    "DR_PERFORMANCE_INCENTIVE_FLOOR_PCT": 75.0,
+    "DR_INCENTIVE_RATE_PER_KWH": 0.42,
+    "DR_PENALTY_RATE_PER_KWH": 0.18,
+    "DR_INTERVAL_HOURS": 0.25,
+    "DR_OPTOUT_SUSPEND_COUNT": 3,
+    # Lighting overrides
+    "OVERRIDE_MAX_WINDOW_HOURS": 12,
+    # Faults and work orders
+    "FAULT_URGENT_SCORE": 70.0,
+    "FAULT_SUPPRESSION_CEILING": 50.0,
+    "FAULT_REFRIGERATION_PREMIUM": 15.00,
+    "FAULT_SCORE_CAP": 100.0,
+    "FAULT_LOAD_FACTOR_CAP": 1.25,
+    "FAULT_LOAD_DIVISOR": 200.0,
+    "FAULT_PERSISTENCE_CAP": 10,
+    "WORK_ORDER_STORE_CAPACITY": 2,
+    # Retrofits and measurement
+    "MV_MIN_PERIOD_DAYS": 60,
+    "MV_DAYS_PER_YEAR": 365,
+    "REALIZATION_VERIFY_FLOOR": 0.8000,
+    "PORTFOLIO_DEFAULT_REALIZATION_RATE": 0.85,
+    "REFRIGERATION_FAULT_BONUS_POINTS": 8,
+    "REFRIGERATION_FAULT_BONUS_CAP": 3,
+    "PRIORITY_PAYBACK_MULTIPLIER": 10,
+    # Benchmarking
+    "KWH_TO_KBTU": 3.412,
+    "OUTLIER_MULTIPLIER": 1.30,
+    "BENCHMARK_WINDOW_DAYS": 365,
+    # Tariff economics
+    "TARIFF_SWITCH_SAVINGS_FLOOR_USD": -2500.00,
+    "MONTHS_PER_YEAR": 12,
+    # Bill validation
+    "RIDER_RATE": 0.0375,
+    "SURCHARGE_THRESHOLD_USD": 20000.00,
+    "SURCHARGE_RATE": 0.015,
+    "RATCHET_FRACTION": 0.80,
+    "VARIANCE_FLAG_PCT": 2.00,
+}
+
+FAULT_SEVERITY_BASE = {"INFO": 5, "MINOR": 20, "MAJOR": 45, "CRITICAL": 70}
+
+CLIMATE_FACTORS = {
+    "HOT_HUMID": 1.08,
+    "HOT_DRY": 1.05,
+    "MIXED": 1.00,
+    "MARINE": 0.96,
+    "COLD": 0.93,
+}
+
+STORE_DEFAULTS = {
+    "blended_rate_usd_per_kwh": 0.11,
+    "override_budget_kwh_month": 500.00,
+    "lighting_on_time_local": "05:30",
+    "lighting_off_time_local": "23:00",
+    "daylight_harvest_enabled": True,
+    "occupancy_control_enabled": True,
+    "portfolio_realization_rate": 0.8500,
+    "bms_status": "NOT_DEPLOYED",
+    "energy_posture": "NORMAL",
+}
+
+CLIMATE_ZONES = ["HOT_HUMID", "HOT_DRY", "MIXED", "MARINE", "COLD"]
+STORE_FORMATS = ["SUPERCENTER", "NEIGHBORHOOD", "EXPRESS"]
+SEASONS = ["SUMMER", "WINTER"]
+CASE_TYPES = ["MEDIUM_TEMP", "LOW_TEMP", "ICE_CREAM"]
+PRODUCT_CLASSES = ["DAIRY", "MEAT", "FROZEN", "PRODUCE"]
+LIGHTING_ZONES = ["SALES_FLOOR", "PARKING", "BACKROOM", "EXTERIOR_SIGN"]
+OVERRIDE_TYPES = ["SCHEDULE_EXTEND", "DAYLIGHT_HARVEST_DISABLE", "OCCUPANCY_DISABLE"]
+RATE_FAMILIES = ["TOU_DEMAND", "FLAT_DEMAND"]
+EQUIPMENT_CLASSES = ["REFRIGERATION", "HVAC", "LIGHTING"]
+FAULT_SEVERITIES = ["INFO", "MINOR", "MAJOR", "CRITICAL"]
+DISPOSITIONS = ["RETAIN", "DISCARD"]
+MEASURE_TYPES = [
+    "LED_RETROFIT",
+    "CASE_DOORS",
+    "ECM_MOTORS",
+    "HVAC_RTU_REPLACEMENT",
+    "EMS_UPGRADE",
+]

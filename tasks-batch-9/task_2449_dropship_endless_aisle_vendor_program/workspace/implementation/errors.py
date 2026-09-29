@@ -1,0 +1,58 @@
+"""Error catalogue (PRD section 5) and the exception used to raise them."""
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_VENDOR_NOT_FOUND": 404,
+    "ERR_ITEM_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_LINE_NOT_FOUND": 404,
+    "ERR_RETURN_NOT_FOUND": 404,
+    "ERR_SCORECARD_NOT_FOUND": 404,
+    "ERR_INTEGRATION_TEST_NOT_FOUND": 404,
+    "ERR_BLACKOUT_NOT_FOUND": 404,
+    "ERR_VENDOR_SCOPE_VIOLATION": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_INTERVAL": 422,
+    "ERR_COST_MODEL_FIELD_MISMATCH": 422,
+    "ERR_DUPLICATE_VENDOR_CODE": 409,
+    "ERR_DUPLICATE_ORDER_REF": 409,
+    "ERR_STALE_ITEM_VERSION": 412,
+    "ERR_STALE_VENDOR_VERSION": 412,
+    "ERR_VENDOR_INVALID_STATE": 409,
+    "ERR_ITEM_INVALID_STATE": 409,
+    "ERR_ITEM_NOT_ORDERABLE": 409,
+    "ERR_LINE_INVALID_STATE": 409,
+    "ERR_RETURN_INVALID_STATE": 409,
+    "ERR_SCORECARD_INVALID_STATE": 409,
+    "ERR_INTEGRATION_TEST_INVALID_STATE": 409,
+    "ERR_VENDOR_NOT_ACTIVE": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INTEGRATION_INCOMPLETE": 422,
+    "ERR_NO_SERVICEABILITY_COVERAGE": 422,
+    "ERR_FALLBACK_INVALID": 422,
+    "ERR_ZONE_NOT_SERVICEABLE": 422,
+    "ERR_VENDOR_BLACKOUT": 422,
+    "ERR_SNAPSHOT_WINDOW_OVERLAP": 409,
+    "ERR_BLACKOUT_WINDOW_CONFLICT": 409,
+    "ERR_OUTSIDE_DEFECT_WINDOW": 422,
+    "ERR_RETURN_QUANTITY_EXCEEDS_SHIPPED": 422,
+    "ERR_INVENTORY_STALE": 409,
+    "ERR_INSUFFICIENT_AVAILABILITY": 409,
+    "ERR_NO_ELIGIBLE_FALLBACK_VENDOR": 422,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def api_error(error_id, message=None):
+    raise ApiError(error_id, message)

@@ -1,0 +1,136 @@
+"""Domain thresholds and canonical literals drawn from the PRD.
+
+Every value here is stated verbatim somewhere in the PRD; nothing is inferred.
+"""
+
+# --- Clock (PRD 2.5) -------------------------------------------------------
+CLOCK_DEFAULT_UTC = "2026-08-01T00:00:00Z"
+
+# Canonical test clock instants used across the suite.
+CLOCK_PRE_SESSION = "2027-06-01T00:00:00Z"
+CLOCK_POST_SESSION = "2027-08-02T00:00:00Z"
+
+# --- Roles (PRD 2.1) ------------------------------------------------------
+ROLE_CASE_MANAGER = "CaseManager"
+ROLE_PROGRAM_COORDINATOR = "ProgramCoordinator"
+ROLE_SPED_DIRECTOR = "SpedDirector"
+ROLE_COMPLIANCE_OFFICER = "ComplianceOfficer"
+ROLE_RELATED_SERVICE_PROVIDER = "RelatedServiceProvider"
+ROLE_PARENT_GUARDIAN = "ParentGuardian"
+
+ALL_ROLES = (
+    ROLE_CASE_MANAGER,
+    ROLE_PROGRAM_COORDINATOR,
+    ROLE_SPED_DIRECTOR,
+    ROLE_COMPLIANCE_OFFICER,
+    ROLE_RELATED_SERVICE_PROVIDER,
+    ROLE_PARENT_GUARDIAN,
+)
+
+# --- Pagination (PRD 2.3) -------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Fund waterfall (PRD 2.9) --------------------------------------------
+FUND_PRIORITY = ("IDEA_611_FEDERAL", "IDEA_619_FEDERAL", "LOCAL_GENERAL")
+FEDERAL_INDIRECT_RATE = 0.08
+LOCAL_INDIRECT_RATE = 0.145
+FEDERAL_FUND_SOURCES = ("IDEA_611_FEDERAL", "IDEA_619_FEDERAL")
+# "no more than twenty-five percent of that allocation's
+# authorized_amount_cents may be consumed by compensatory charges"
+FEDERAL_COMPENSATORY_CAP_RATE = 0.25
+
+# --- Eligibility analysis (PRD 3.2) --------------------------------------
+PROBE_BASED_REGRESSION_THRESHOLD = 25.0        # inclusive
+PROBE_BASED_RECOUPMENT_THRESHOLD = 20          # inclusive
+TEAM_JUDGMENT_REGRESSION_THRESHOLD = 25.0      # exclusive
+TEAM_JUDGMENT_RECOUPMENT_THRESHOLD = 20        # exclusive
+TEAM_JUDGMENT_RECOUPMENT_PCT_PER_DAY = 1.2
+SEVERE_REGRESSION_OVERRIDE_PCT = 45.0
+MIN_QUALIFYING_DOMAINS = 2
+MIN_PROBE_DOMAINS = 2
+MIN_TRIALS_FOR_SUFFICIENCY = 3
+MAX_PROBES = 8
+
+# --- Compensatory award (PRD 3.7) ----------------------------------------
+SEVERITY_FACTOR_LOW = 1.00
+SEVERITY_FACTOR_MID = 1.25
+SEVERITY_FACTOR_HIGH = 1.50
+SEVERITY_MID_THRESHOLD_PCT = 25.0
+SEVERITY_HIGH_THRESHOLD_PCT = 45.0
+QUALITATIVE_ROUNDING_UNIT_MINUTES = 15
+ANNUAL_AWARD_CEILING_MINUTES = 3600
+MIN_AWARDABLE_MINUTES = 30
+PROPOSAL_UPPER_MULTIPLIER = 1.5
+MAX_DISPUTE_ROUNDS = 2
+DELIVERY_DEADLINE_DAYS = 180
+DISTRICT_CANCELLATION_EXTENSION_DAYS = 30
+MAX_PARENT_NO_SHOWS = 2
+
+# --- Student ledger (PRD 3.1) --------------------------------------------
+ESY_SERVICE_ALERT_THRESHOLD_MINUTES = 60
+
+# --- Transportation (PRD 3.3) --------------------------------------------
+ROUTE_TURNAROUND_MINUTES = 15
+
+# --- Canonical program calendar (Summer ESY 2027, MON-THU, 2027-06-14 ->
+# 2027-07-23, blackouts 2027-06-30 and 2027-07-05) ------------------------
+CANON_PROGRAM_NAME = "Summer ESY 2027"
+CANON_SCHOOL_YEAR = "2026-2027"
+CANON_SESSION_START = "2027-06-14"
+CANON_SESSION_END = "2027-07-23"
+CANON_WEEKDAYS = ["MON", "TUE", "WED", "THU"]
+CANON_BLACKOUT_DATES = ["2027-06-30", "2027-07-05"]
+CANON_DAILY_MINUTES_CAP = 90
+CANON_INSTRUCTIONAL_DAYS_COUNT = 22
+CANON_INSTRUCTIONAL_WEEK_COUNT = 6
+
+# Canonical commitment pinned plan for iep_weekly_minutes == 250.
+CANON_PLANNED_TOTAL_MINUTES = 1376
+CANON_WEEKLY_MINUTES_COMMITTED = 229
+CANON_DAILY_MINUTES = 57
+
+# Canonical assignment pricing (rate 150 c/min, covered_weekly_minutes 229,
+# effective 2027-06-14..2027-07-23, IDEA_611_FEDERAL at 8 percent).
+CANON_COVERED_TOTAL_MINUTES = 1374
+CANON_BASE_COST_CENTS = 206100
+CANON_INDIRECT_COST_CENTS = 16488
+CANON_TOTAL_CHARGE_CENTS = 222588
+
+# Canonical allocation.
+CANON_AUTHORIZED_AMOUNT_CENTS = 25000000
+CANON_BUDGET_CODE = "611-ESY-01"
+CANON_AVAILABLE_AFTER_ONE_ASSIGNMENT = 24777412
+
+# Canonical instructional dates inside the canonical calendar.
+CANON_DATE_MON_W1 = "2027-06-14"
+CANON_DATE_TUE_W1 = "2027-06-15"
+CANON_DATE_WED_W1 = "2027-06-16"
+CANON_DATE_THU_W1 = "2027-06-17"
+CANON_DATE_MON_W3 = "2027-06-28"
+CANON_DATE_TUE_W3 = "2027-06-29"
+CANON_BLACKOUT_DATE = "2027-06-30"
+CANON_NON_INSTRUCTIONAL_WEEKDAY = "2027-06-19"   # a Saturday
+
+# Canonical eligibility figures (PROBE_BASED probes 80/60/20/4 and
+# 100/74/22/4).
+CANON_MAX_REGRESSION_PCT = 26.0
+CANON_MAX_RECOUPMENT_DAYS = 22
+
+# Canonical award figures.
+CANON_AWARD_COMPUTED_MINUTES_MFM = 85
+CANON_AWARD_COMPUTED_MINUTES_QB = 105
+CANON_AWARD_PROPOSAL_UPPER = 127
+CANON_DELIVERY_DEADLINE_DATE = "2028-01-29"
+
+# Canonical makeup-session charges at rate 150 with 8 percent indirect.
+CANON_MAKEUP_CHARGE_60_MIN = 9720
+CANON_MAKEUP_CHARGE_45_MIN = 7290
+CANON_MAKEUP_CHARGE_30_MIN = 4860
+
+CANON_SESSION_DATE_1 = "2027-09-13"
+CANON_SESSION_DATE_2 = "2027-09-20"
+CANON_SESSION_DATE_3 = "2027-09-27"
+CANON_SESSION_DATE_OUT_OF_WINDOW = "2028-03-01"

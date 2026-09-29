@@ -1,0 +1,478 @@
+# EAS Compliance API — Product Requirements Document
+
+## 1. Introduction
+
+Broadcast stations sit at the last mile of the national emergency alerting chain, and the regulatory burden that comes with that position is unusually unforgiving. A station must continuously monitor a prescribed set of alert sources named in its state plan, forward the alerts its state plan marks as mandatory, log every weekly, monthly and national test transmission and receipt, keep those logs for a fixed retention term, verify that each alert it airs met visual-crawl and audio-loudness accessibility targets, report equipment failures inside a repair deadline, avoid duplicating alerts that a wireless carrier already pushed to the same audience, and produce its public file on demand when a field inspector arrives. Each of those obligations is individually simple. Taken together they interact: a decoder failure silences a monitoring source, which lowers the station's source coverage, which lowers its compliance score, which can suspend its ability to file test results at all — and a suspension retroactively extends the retention term of every log line appended while the suspension holds.
+
+This document specifies the EAS Compliance API, the system of record that broadcast engineering and compliance staff use to discharge those obligations. The API is deliberately built around a single derived number per station — the **compliance score** — and around two independent state dimensions per received alert, one tracking whether the alert was forwarded and one tracking whether it was accessible. It is also built around a *logical clock*: because every retention term, repair deadline, filing deadline, suppression window and test window in the domain is measured in days, hours or seconds against "now", the system exposes an administrative capability to set that "now" so that compliance behaviour is reproducible rather than dependent on wall-clock time.
+
+Three design commitments run through every requirement below. First, **segregation of duties**: the engineer who appends a test log line may never be the officer who certifies that test's results. Second, **compensation**: reversing a filing must return the station's accumulated penalty points to the exact value they held before the filing existed — never an approximation. Third, **deterministic cascades**: when one write mutates several rows, the order of those mutations is pinned in this specification, because a different order yields a different score.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the rules that hold across every endpoint. Where §3 describes a workflow, the rules here still apply to it.
+
+### 2.1. Operator Identity and Role-Based Access Control
+
+Every request — reads included — must carry two headers. `X-User-ID` identifies the acting operator and `X-User-Role` declares the capacity in which they are acting. If either header is absent, or if `X-User-Role` is not one of the four role names below, the request is rejected with `ERR_MISSING_AUTH_HEADERS` (HTTP 401). If the headers are well formed but the declared role is not among the roles authorised for the endpoint being called, the request is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+The four recognised roles are `ComplianceAdmin`, `StationEngineer`, `CertifyingOfficer` and `FieldInspector`.
+
+- A `ComplianceAdmin` is a state-level compliance operator. This role owns state plans and forwarding rules, registers stations, drives the logical clock, runs station log reviews, schedules test events, records wireless alert notices, accepts and reverses filings, verifies or rejects reported equipment restorations, and permanently decommissions devices.
+- A `StationEngineer` works on the station side: registering and readiness-checking equipment, maintaining monitoring assignments, filing outages and their repairs, logging received alerts and test log lines, drafting inspection responses and uploading public-file documents.
+- A `CertifyingOfficer` is the station's certifying official and the only role permitted to file post-test results or to submit an inspection response.
+- A `FieldInspector` is external to the station. This role opens public-file inspection requests and closes them, and holds no other write power.
+
+All four roles may call every read (`GET`) endpoint in the system.
+
+**Identity semantics.** When `X-User-Role` is `ComplianceAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server neither compares it to any row's `id` nor records it. When `X-User-Role` is `StationEngineer`, `X-User-ID` is likewise an opaque operator identifier not tied to any persisted entity's `id`; the server records it as `logged_by_user_id` on each `TestLogEntry` the engineer appends, and it checks membership of that opaque string in the target station's `engineer_user_ids` array. When `X-User-Role` is `CertifyingOfficer`, `X-User-ID` is again an opaque operator identifier not tied to any entity's `id`; the server records it as `filed_by_user_id` on each `FilingRecord` submitted, and it compares that opaque string for equality against the target station's `certification_officer_user_id`. When `X-User-Role` is `FieldInspector`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server neither records it nor compares it to any entity's `id`, and inspection requests carry no inspector-ownership check whatsoever.
+
+**Ownership checks.** For every write endpoint reached by a `StationEngineer`, the acting `X-User-ID` must appear in the `engineer_user_ids` array of the station the write ultimately targets; if it does not, the request is rejected with `ERR_ENGINEER_NOT_ASSIGNED` (HTTP 403). For every write endpoint reached by a `CertifyingOfficer`, the acting `X-User-ID` must be exactly equal to the target station's `certification_officer_user_id`; otherwise the request is rejected with `ERR_NOT_CERTIFYING_OFFICER` (HTTP 403). The target station is reached transitively where necessary: a device's owning station, an assignment's owning station, an outage's device's station, an alert's station, a test event's station, a log line's test event's station, a filing's test event's station, or an inspection request's station. Nothing forbids the same opaque identifier from appearing both in `engineer_user_ids` and as `certification_officer_user_id` — that overlap is legal at station registration time and is precisely what makes the segregation-of-duties rule in §2.12 reachable.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` sets the maximum number of rows returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` sets how many rows to skip before the page begins; when omitted it defaults to 0.
+
+Unless a specific endpoint states otherwise, list results are ordered by `created_at` ascending.
+
+Every list response repeats `limit` and `offset` in the `meta` object alongside `total_count` (the number of rows matching the filters before the page window is applied) and `has_more` (true when rows remain beyond the current page).
+
+### 2.4. The Logical Clock
+
+Nothing in this system reads the host's wall clock. The server maintains a **logical clock** whose value at startup is exactly `2026-08-01T00:00:00Z`, and it keeps reading that default until an administrator moves it; there is no fallback to real time under any circumstance. A `ComplianceAdmin` moves the clock by supplying `to_iso8601`, an ISO 8601 UTC instant, to the administrative clock-setting capability; the call returns 200 OK, mutates no entity, and fires no recompute event of any kind.
+
+Every server-assigned instant in the system is read from this clock at the moment the write executes. That set comprises `notified_at`, `restored_at`, `repair_started_at`, `logged_at`, `filed_at`, `requested_at`, `responded_at`, `activated_at`, `superseded_at`, `last_receipt_at`, `silence_flagged_at`, `last_log_review_at` and `last_readiness_check_at`. By contrast, `detected_at` on an equipment outage, `received_at` on an alert event, `wea_sent_at` on a wireless alert notice, and `window_start_at` / `window_end_at` on a test event are all operator-supplied instants carried in the request body; the system validates them against the logical clock but does not overwrite them.
+
+### 2.5. Record Identity and Audit Fields
+
+Every stored row carries an `id` that the server mints as a UUID with no type prefix, and a `created_at` that is an ISO 8601 UTC timestamp with three fractional digits taken from the logical clock at insert time.
+
+Most resources — state plans, stations, relay rules, EAS devices, monitoring assignments, equipment outages, alert events, test events, filing records and inspection requests — additionally carry `updated_at`, an ISO 8601 UTC timestamp refreshed on every mutation of the row, and `version`, an integer that starts at 1 when the row is created and increases by one on every mutation of that row. Refreshing a derived field counts as a mutation: when a station's `compliance_score` or `accessible_source_count` is recomputed, or a test event's `readiness_score` is cleared by a cascade, that row's `updated_at` is refreshed and its `version` is incremented.
+
+Two resources are immutable once written and therefore carry **neither** `updated_at` **nor** `version`: `WirelessAlertNotice` and `TestLogEntry`. Both expose only `id` and `created_at` among the audit fields. A wireless alert notice is a recorded fact about a carrier transmission and is never edited; a test log line is append-only, which is why the penalty calculation in §3.7 can treat the log as a fixed, status-free set of rows.
+
+### 2.6. Numeric Precision and Rounding
+
+Every score, points figure and hours figure in this system is a decimal number rounded to exactly 2 decimal places using round-half-up, and is returned in JSON as a number rather than a string. That covers `compliance_score`, `readiness_score`, `completeness_score`, `accessibility_deficiency_points`, `entry_subtotal_points`, `lateness_points`, `unconfirmed_relay_points`, `penalty_points`, `penalty_points_total`, `continuous_downtime_hours` and `obligation_downtime_hours`.
+
+Where a formula involves several intermediate terms, **the number of rounding operations and their position is normative, not incidental.** The accessibility evaluation of §3.5 and the readiness evaluation of §3.6 each round exactly once, after all terms have been combined and after the final cap has been applied. The filing penalty of §3.7 does the opposite: it rounds every per-log-line term to two decimals *before* summing them, because summing raw values and rounding once at the end produces a different number of cents, and the per-entry-first order is the one this specification requires.
+
+Counts (`required_source_count`, `accessible_source_count`, `silent_assignment_count`, `logged_entry_count`, `public_file_document_count`, `repair_cycle_count`, `late_days`, `retention_days_applied`, `forward_delay_seconds_applied`, `specificity`, `priority`, `visual_crawl_seconds`) are integers and are never rounded. Relay-rule selection is entirely integer arithmetic and involves no rounding at all. Timestamp comparisons in the duplicate-suppression windows of §3.5 are performed at whole-second granularity. Retention terms are whole calendar days added to a millisecond-precision UTC instant.
+
+### 2.7. Version Guards on Station and Test-Event Writes
+
+Two write endpoints are guarded by optimistic concurrency control against a parent row's `version`. In both cases the version field is a required, non-optional member of the request body: omitting it is a schema failure, and supplying a value that does not match the parent's stored `version` is a precondition failure. No other endpoint in this system accepts a version field of any kind.
+
+**`POST /monitoring-assignments` requires `expected_station_version`,** carrying the client's last observed `version` of the `Station` named by `station_id`. If that value does not equal the station's current `version`, the create is rejected with `ERR_STALE_STATION_VERSION` and HTTP 412. The guard exists because a create for a `source_type` the station already covers legitimately supersedes the prior `ACTIVE` assignment for that same source type (§3.3): a writer holding a stale view of the station would silently retire an assignment it never observed. A successful create increments the station's `version` by one, so a client that reads the station once and then creates two assignments must re-read between them.
+
+**`POST /filing-records` requires `expected_test_event_version`,** carrying the client's last observed `version` of the `TestEvent` named by `test_event_id`. If that value does not equal the test event's current `version`, the filing is rejected with `ERR_STALE_TEST_EVENT_VERSION` and HTTP 412. The guard exists because a second filing against an already-`FILED` event is a legitimate amendment that reverses the prior filing (§3.7): an officer working from a stale view of the event would reverse a filing whose penalty points they never saw. A successful filing increments the test event's `version` by one.
+
+### 2.8. Rejection Precedence: The Validation Ladder
+
+When a single request violates more than one rule, the response reports the violation with the lowest ladder position below. The ladder is evaluated strictly in this order, and a check never runs before every lower-numbered check has passed. Implementers should treat this as the single ordering authority for the whole API; the individual workflow sections in §3 name trigger conditions but do not restate precedence.
+
+1. **Header presence and role validity** — `ERR_MISSING_AUTH_HEADERS`, 401. Applies to every endpoint.
+2. **Role authorisation for the endpoint** — `ERR_UNAUTHORIZED`, 403. Applies to every endpoint.
+3. **Request schema** — `ERR_INVALID_REQUEST`, 400. Applies to every write endpoint. This check covers presence of every required body field, membership of every enum value in its declared set, numeric ranges, array shapes, the requirement that `window_start_at` be strictly earlier than `window_end_at`, and the rule that `source_call_sign` is present on a `RECEIPT` log line and absent on a `TRANSMISSION` log line.
+4. **Existence** — the 404 family. Applies to every endpoint that carries an id in its path or a foreign-key id in its body. Ids are resolved left to right: first every id in the path, in path order, and only then every id in the body. See §2.9.
+5. **Ownership** — `ERR_ENGINEER_NOT_ASSIGNED` or `ERR_NOT_CERTIFYING_OFFICER`, both 403. Applies to every `StationEngineer` and `CertifyingOfficer` write endpoint, using the rules of §2.1.
+6. **Concurrency** — `ERR_STALE_STATION_VERSION` or `ERR_STALE_TEST_EVENT_VERSION`, both 412. Applies to `POST /monitoring-assignments` and `POST /filing-records` respectively, per §2.7.
+7. **State** — the 409 state family. Applies to every state-transition endpoint: the target row must currently be in one of the states the requested transition declares as a legal starting state.
+8. **Posture safety** — 422. Applies to two endpoints: `POST /filing-records` is rejected with `ERR_FILINGS_SUSPENDED` and `POST /test-events` is rejected with `ERR_POSTURE_NOT_TEST_ELIGIBLE`, in both cases when the owning station's `compliance_posture` is `SUSPENDED_FILINGS`.
+9. **Cross-row referential coherence** — 422. Applies to three endpoints: `POST /filing-records` (every source type the plan requires must have at least one receipt log line for the test event, else `ERR_RECEIPT_COVERAGE_INCOMPLETE`), `POST /test-log-entries` (a receipt line's `source_call_sign` must match a monitoring assignment of the station, else `ERR_LOG_ENTRY_SOURCE_UNKNOWN`; and the referenced device must belong to the test event's station, else `ERR_DEVICE_STATION_MISMATCH`), and `POST /monitoring-assignments` (the referenced device must belong to the referenced station, else `ERR_DEVICE_STATION_MISMATCH`).
+10. **Clock-relative windows** — `ERR_TEST_WINDOW_OVERLAP` carries 409; every other member of this group carries 422. Applies to seven endpoints: `POST /test-events`, `POST /test-events/{id}/evaluate-readiness`, `POST /test-log-entries`, `POST /filing-records`, `POST /equipment-outages`, `POST /alert-events` and `POST /inspection-requests/{id}/submit-response`. The members are `ERR_TEST_WINDOW_IN_PAST`, `ERR_TEST_WINDOW_OVERLAP`, `ERR_READINESS_WINDOW_NOT_OPEN`, `ERR_LOGGING_WINDOW_CLOSED`, `ERR_FILING_DEADLINE_PASSED`, `ERR_OUTAGE_DETECTED_IN_FUTURE`, `ERR_ALERT_RECEIVED_IN_FUTURE` and `ERR_INSPECTION_RESPONSE_WINDOW_CLOSED`.
+11. **Uniqueness and separation of duty** — the four uniqueness members carry 409 and `ERR_SEGREGATION_OF_DUTIES` carries 422. Applies to five endpoints: `POST /stations` (`ERR_DUPLICATE_CALL_SIGN`), `POST /relay-rules` (`ERR_DUPLICATE_RELAY_PRIORITY`), `POST /monitoring-assignments/{id}/reinstate` (`ERR_SOURCE_TYPE_ALREADY_COVERED`), `POST /eas-devices/{id}/decommission` (`ERR_DEVICE_HAS_LIVE_ASSIGNMENTS`) and `POST /filing-records` (`ERR_SEGREGATION_OF_DUTIES`).
+12. **Fiscal ceiling** — `ERR_PENALTY_CEILING_EXCEEDED`, 422. Applies to `POST /filing-records` only, and is therefore the very last thing that can stop a filing.
+
+### 2.9. Path Resolution and Not-Found Reporting
+
+Identifier resolution is strictly left to right, and the first identifier that fails to resolve determines the error reported. Path identifiers resolve before body identifiers; among body identifiers, resolution follows the order in which they are listed for that endpoint in §3. Each entity type has its own not-found code so that a caller can tell which reference broke: `ERR_STATE_PLAN_NOT_FOUND`, `ERR_STATION_NOT_FOUND`, `ERR_RELAY_RULE_NOT_FOUND`, `ERR_DEVICE_NOT_FOUND`, `ERR_ASSIGNMENT_NOT_FOUND`, `ERR_OUTAGE_NOT_FOUND`, `ERR_ALERT_EVENT_NOT_FOUND`, `ERR_WEA_NOTICE_NOT_FOUND`, `ERR_TEST_EVENT_NOT_FOUND`, `ERR_LOG_ENTRY_NOT_FOUND`, `ERR_FILING_NOT_FOUND` and `ERR_INSPECTION_NOT_FOUND`. All twelve carry HTTP 404. Concretely: a monitoring-assignment create that names both an unknown `station_id` and an unknown `device_id` reports `ERR_STATION_NOT_FOUND`, because `station_id` is listed first.
+
+### 2.10. Station Recompute Events, Score Bands and Posture
+
+A station's `compliance_posture` is never set by a client. It is derived, every time a **recompute event** fires, from the station's freshly computed `compliance_score`. A station is created in `PROVISIONING` with `compliance_score` null, `compliance_variant_applied` null and `version` 1, and it stays in `PROVISIONING` until the first recompute event fires against it; from that moment on it is always in exactly one of `COMPLIANT`, `WATCH` or `SUSPENDED_FILINGS`.
+
+The band mapping is: a score of 90.00 or greater yields `COMPLIANT`; a score of at least 75.00 but below 90.00 yields `WATCH`; anything below 75.00 yields `SUSPENDED_FILINGS`. Both thresholds are inclusive at their lower bound. Each of those transitions writes `compliance_score` and `compliance_variant_applied`, and `last_log_review_at` is written only when the recompute event was a station log review.
+
+Nine posture transitions are therefore possible, and every one of them is driven by a recompute event rather than by an explicit client request on the posture: `PROVISIONING` → `COMPLIANT`, `PROVISIONING` → `WATCH`, `PROVISIONING` → `SUSPENDED_FILINGS`, `COMPLIANT` → `WATCH`, `COMPLIANT` → `SUSPENDED_FILINGS`, `WATCH` → `COMPLIANT`, `WATCH` → `SUSPENDED_FILINGS`, `SUSPENDED_FILINGS` → `WATCH` and `SUSPENDED_FILINGS` → `COMPLIANT`. A recompute whose band matches the station's current posture simply rewrites `compliance_score` and `compliance_variant_applied` and leaves the posture where it is. `compliance_posture` has no terminal value; a station can cycle between bands indefinitely.
+
+There are eleven recompute events — the enumeration below is **closed**, and no write outside it rescores a station, however similar its row effects may look to one that does — and each of them re-runs the station scoring described in §3.8 in full:
+
+- a station log review;
+- creating a monitoring assignment;
+- decommissioning a monitoring assignment;
+- reinstating a monitoring assignment;
+- recording a receipt against a monitoring assignment through the explicit `POST /monitoring-assignments/{id}/record-receipt` capability;
+- filing an equipment outage (reached as hop 3 of the outage cascade in §2.11);
+- closing an equipment outage;
+- creating a filing record;
+- accepting a filing record;
+- reversing a filing record;
+- the plan-supersede cascade reaching a station (hop 2 in §2.11).
+
+A station log review performs four phases and only a station log review performs the first two. Every other recompute event performs phases 3 and 4 only. The four phases are described in §3.8; the important global consequence is that **any** transition of a station's posture *into* `SUSPENDED_FILINGS` — from `PROVISIONING`, from `COMPLIANT` or from `WATCH` alike — additionally reverts every test event of that station whose status is `READY` back to `READINESS_PENDING` and clears that event's `readiness_score` and `readiness_evaluated_at` to null. Transitions *out of* `SUSPENDED_FILINGS` (to `WATCH` or to `COMPLIANT`) and transitions between `COMPLIANT` and `WATCH` in either direction carry no such revert; they write `compliance_score` and `compliance_variant_applied` and nothing more.
+
+### 2.11. Two Deterministic Cascades
+
+Two writes in this system fan out across several rows. Both are specified as ordered hop sequences, and the order is normative because each hop's output is the next hop's input.
+
+**The outage cascade — four hops, triggered by filing an equipment outage.** Hop 1 is the direct effect of the create: the referenced `EASDevice` transitions to `FAILED` from either `REGISTERED` or `READY`. Hop 2 is caused by the device becoming `FAILED`: every `MonitoringAssignment` referencing that device whose status is `ACTIVE` or `SILENT` transitions to `SUSPENDED`. Hop 3 is caused by those assignments leaving `ACTIVE`: the station's `accessible_source_count` is recomputed and the station scoring re-runs, moving `compliance_posture` per the bands in §2.10. Hop 4 fires only if hop 3 pushed the posture into `SUSPENDED_FILINGS`: every test event of that station in status `READY` reverts to `READINESS_PENDING` with `readiness_score` and `readiness_evaluated_at` cleared to null.
+
+**The plan-supersede cascade — three hops, triggered by activating a state plan.** Hop 1 is caused by the activation: every *other* `StatePlan` with the same `state_code` whose status is `ACTIVE` transitions `ACTIVE` → `SUPERSEDED` and has its `superseded_at` stamped from the logical clock. Hop 2 is caused by that row becoming `SUPERSEDED`, not by the activate call itself: every `Station` whose `state_plan_id` points at the now-superseded plan sets `plan_revalidation_required` to true and re-runs the station scoring, which moves `compliance_posture` per the bands. Hop 3 is caused by hop 2's flag flipping from false to true: every `InspectionRequest` of that station whose status is `RESPONDED` reverts to `RESPONSE_DRAFTED`, with `completeness_score` and `responded_at` cleared to null and `provided_document_kinds` deliberately retained so the station can re-attest against the new plan.
+
+The `plan_revalidation_required` flag, once true, is cleared only by re-pointing the station at a plan whose status is `ACTIVE`; no recompute event clears it on its own, so it keeps costing the station its revalidation deduction until the station's plan reference is corrected.
+
+### 2.12. Segregation of Duties and Public-File Custody
+
+Certification is a control, not a formality. A `CertifyingOfficer` filing post-test results must not be the same operator who produced any of the evidence: if the acting `X-User-ID` equals the `logged_by_user_id` recorded on **any** `TestLogEntry` belonging to that test event, the filing is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 422). Because a station may legitimately list the same opaque identifier both in `engineer_user_ids` and as its `certification_officer_user_id`, this check is the only thing standing between a one-person station and self-certification.
+
+Public-file custody is tracked as a simple counter rather than as document storage. Each upload a `StationEngineer` records against a station names a `document_kind` and a `reference_label`, and increases the station's `public_file_document_count` by one. The counter is informational: it appears in the station's compliance summary and is never an input to any score.
+
+## 3. Business Logic & Workflows
+
+### 3.1. State Plans, Source Requirements and Alert Forwarding Rules
+
+Everything in this system hangs off a **state plan** — the document that tells stations in a given state which alert sources they must monitor and which event codes they must forward. A `ComplianceAdmin` drafts a plan by supplying `state_code`, which must be exactly two uppercase letters; `plan_version_label`, a human-readable revision label such as "2026-R2"; `required_source_types`, a non-empty array of distinct values drawn from `PEP`, `NWS`, `LP1`, `LP2`, `SATELLITE` and `IPAWS`; and `mandatory_relay_event_codes`, an array of event codes each one to six uppercase characters long, which is permitted to be empty. At create time the server derives `required_source_count` as the number of entries in `required_source_types`, sets `status` to `DRAFT`, and leaves both `activated_at` and `superseded_at` null.
+
+A plan in `DRAFT` binds nothing. Activation by a `ComplianceAdmin` moves it `DRAFT` → `ACTIVE`, which is legal only while its `status` is `DRAFT` — activating a plan that is already `ACTIVE` or already `SUPERSEDED` is rejected with `ERR_PLAN_NOT_DRAFT` — and only while `required_source_types` still holds at least one entry. Activation stamps `activated_at` from the logical clock and then fires the plan-supersede cascade described in §2.11: any other plan for the same `state_code` sitting in `ACTIVE` is pushed `ACTIVE` → `SUPERSEDED`, its `superseded_at` is stamped, its stations get `plan_revalidation_required` set to true and rescored, and any `RESPONDED` inspection request of those stations falls back to `RESPONSE_DRAFTED`. `SUPERSEDED` is terminal: a superseded plan never returns to any other status. Plans can be listed with `state_code` and `status` filters.
+
+Forwarding behaviour is expressed as **relay rules** hanging off a plan. A `ComplianceAdmin` creates one by naming the owning plan through `state_plan_id`, the `event_code` it forwards (one to six uppercase alphanumeric characters, for example a tornado warning code or a required weekly test code), the `fips_codes` array that scopes it by location, the `relay_class` — either `MANDATORY` or `OPTIONAL` — and an integer `priority` between 1 and 100 inclusive where a lower number ranks earlier. An optional `forward_delay_seconds` between 0 and 600 inclusive states how long forwarding is deferred when this rule is the one selected; when the field is omitted it is 0. The server derives `specificity` from the location scope: 2 when `fips_codes` holds at least one entry, meaning the rule is county-scoped, and 1 when `fips_codes` is empty, meaning the rule is statewide. New rules begin with `status` set to `ACTIVE`.
+
+Within one plan, no two rules that are both `ACTIVE` may share the same `event_code` and the same `priority`; an attempt to create such a rule is rejected with `ERR_DUPLICATE_RELAY_PRIORITY`. Retirement by a `ComplianceAdmin` moves a rule `ACTIVE` → `RETIRED` and takes it out of the selector's candidate pool for every future alert; retiring a rule that is already `RETIRED` is rejected with `ERR_RELAY_RULE_NOT_ACTIVE`. Rules can be listed filtered by `state_plan_id`, `event_code`, `relay_class` and `status`.
+
+### 3.2. Station Registration and Alert Equipment Readiness
+
+Registering a station is a `ComplianceAdmin` action, and it is where the segregation-of-duties roster is established. The registration payload names the governing plan through `state_plan_id`, the broadcast `call_sign` (three to eight uppercase alphanumeric characters, unique across all stations — a repeat is rejected with `ERR_DUPLICATE_CALL_SIGN`), the `service_type`, which is one of `TV`, `FM`, `AM` or `CABLE`, a non-empty array of distinct opaque operator identifiers in `engineer_user_ids`, and a single opaque operator identifier in `certification_officer_user_id`. A freshly registered station has `compliance_posture` `PROVISIONING`, `compliance_score` and `compliance_variant_applied` both null, `accessible_source_count` 0, `silent_assignment_count` 0, `penalty_points_total` 0, `plan_revalidation_required` false, `public_file_document_count` 0, `last_log_review_at` null and `version` 1. Stations can be listed filtered by `state_plan_id`, `compliance_posture` and `call_sign`.
+
+Alert receiving and encoding equipment is registered by a `StationEngineer` against a station named through `station_id`. Each unit declares a `model_code`, a `device_role` of `DECODER`, `ENCODER` or `MONITOR`, and its installed `firmware_version`. A newly registered unit sits in `REGISTERED` with `readiness_check_passed` false and `last_readiness_check_at` null. Devices can be listed filtered by `station_id`, `status` and `device_role`.
+
+A readiness check is how equipment earns its way into service, and it is deliberately idempotent in both directions. The engineer submits two booleans, `self_test_passed` and `firmware_current`. On a unit in `REGISTERED` where both are true, the unit advances `REGISTERED` → `READY`, `readiness_check_passed` is set to true, and `last_readiness_check_at` is stamped from the logical clock. On a unit in `REGISTERED` where either `self_test_passed` or `firmware_current` is false, the unit stays in `REGISTERED` — `REGISTERED` → `REGISTERED` — with `readiness_check_passed` set to false and `last_readiness_check_at` still stamped; the failed attempt is recorded, not discarded. A re-run against a unit already in `READY` with both flags true keeps it in `READY` — `READY` → `READY` — and refreshes `last_readiness_check_at`. Running a readiness check against a `DECOMMISSIONED` unit is rejected with `ERR_DEVICE_DECOMMISSIONED`.
+
+Retiring equipment permanently is reserved for a `ComplianceAdmin` and is possible from three starting statuses with identical effect: `REGISTERED` → `DECOMMISSIONED`, `READY` → `DECOMMISSIONED` and `FAILED` → `DECOMMISSIONED`. `DECOMMISSIONED` is terminal for a device. Two preconditions guard it: the unit must not already be `DECOMMISSIONED`, otherwise `ERR_DEVICE_DECOMMISSIONED`; and no monitoring assignment referencing the unit may be in `ACTIVE`, `SILENT` or `SUSPENDED`, otherwise `ERR_DEVICE_HAS_LIVE_ASSIGNMENTS`. Decommissioning has one lasting consequence for scoring: a `DECOMMISSIONED` unit leaves the readiness denominator described in §3.6 entirely, whereas units in `REGISTERED`, `READY` and `FAILED` all remain counted there.
+
+Public-file uploads are the station's other engineer-side housekeeping duty. Each recorded upload names a `document_kind` and a `reference_label`, advances the station's `public_file_document_count` by one, and returns the updated station row rather than a document row. Because the upload registers a new public-file item, this operation answers with `201 Created` even though its response body is the station.
+
+### 3.3. Monitoring Obligations: Assignments, Receipts and Silence
+
+A **monitoring assignment** is the row that says "this station covers this required source with this device". A `StationEngineer` creates one by naming `station_id`, the tuned unit through `device_id`, the `source_type` being covered — one of `PEP`, `NWS`, `LP1`, `LP2`, `SATELLITE` or `IPAWS` — and the `source_call_sign` of the monitored source, plus the station version guard `expected_station_version` described in §2.7. The referenced unit must currently be in `READY`, otherwise the create is rejected with `ERR_DEVICE_NOT_READY`, and the unit's `station_id` must equal the `station_id` in the payload, otherwise `ERR_DEVICE_STATION_MISMATCH`.
+
+A successful create lands in `ACTIVE` with `last_receipt_at` and `silence_flagged_at` null, and sets `counts_toward_required_sources` to true exactly when the row's `status` is `ACTIVE` and its `source_type` appears in the governing plan's `required_source_types` — a row covering a source the plan does not require is stored and reported but never contributes coverage. The create then increments the station's `version` by one. If the station already had an `ACTIVE` assignment for the same `source_type`, that older row is pushed `ACTIVE` → `DECOMMISSIONED` and the new row's `superseded_assignment_id` is set to the older row's `id`; when no such row existed, `superseded_assignment_id` stays null. The station's `accessible_source_count` is recomputed exactly once, *after* the supersede has landed, and then the create fires a station recompute event. Assignments can be listed filtered by `station_id`, `device_id`, `source_type`, `status` and `superseded_assignment_id`.
+
+Recording a receipt is the routine act that proves a source is still being heard. It stamps `last_receipt_at` from the logical clock. On a row in `SILENT` it additionally moves the row `SILENT` → `ACTIVE` and clears `silence_flagged_at` back to null; on a row already in `ACTIVE` it leaves the status alone — `ACTIVE` → `ACTIVE` — and only refreshes `last_receipt_at`. Either way a station recompute event fires. Recording a receipt against a row already in `DECOMMISSIONED` is rejected with `ERR_ASSIGNMENT_NOT_ACTIVE`. The same *assignment-row* effect is reachable a second way: appending a test log line of kind `RECEIPT` whose `source_call_sign` equals an assignment's `source_call_sign` stamps that assignment's `last_receipt_at` and, if the assignment was `SILENT`, returns it to `ACTIVE` and clears `silence_flagged_at` back to null. That second path stops at the assignment row: appending a log line is not one of the eleven recompute events of §2.10, so it fires no station recompute, and the station row is not rewritten at all — its `accessible_source_count`, `silent_assignment_count`, `penalty_points_total`, `compliance_score`, `compliance_variant_applied` and `compliance_posture` all keep the values the last recompute event left them at, and its `updated_at` and `version` are not refreshed, until some genuine recompute event next fires. A station whose stored `silent_assignment_count` was 1 therefore still reads 1, and still carries the matching 10.00-point deduction in its last-computed score, immediately after a `RECEIPT` log line has returned that very assignment to `ACTIVE`.
+
+Silence is detected, not reported. During the first phase of a station log review, every assignment in `ACTIVE` whose most recent evidence of life is older than the silence horizon is pushed `ACTIVE` → `SILENT`. The evidence of life is `last_receipt_at` when it is set and the row's `created_at` when `last_receipt_at` is still null, and the horizon is eight days: a row is flagged when that instant is strictly earlier than the current logical clock less eight days. Flagging stamps `silence_flagged_at` with the review instant and forces both `silent_assignment_count` and `accessible_source_count` to be recomputed, because a `SILENT` row no longer counts toward required coverage even though it has not been retired.
+
+Assignments also move for reasons that have nothing to do with receipts. When the referenced unit becomes `FAILED` as hop 1 of the outage cascade, every assignment on that unit in `ACTIVE` or in `SILENT` is pushed to `SUSPENDED` — `ACTIVE` → `SUSPENDED` and `SILENT` → `SUSPENDED` are both hop 2 — and each such departure from `ACTIVE` triggers hop 3, in which the station's `accessible_source_count` is recomputed and the station is rescored. When the outage is later closed and the unit returns to `READY`, every assignment on it sitting in `SUSPENDED` moves `SUSPENDED` → `SILENT` rather than straight back to `ACTIVE`, with `silence_flagged_at` stamped at the close instant and a station recompute event fired; a fresh receipt is required before the row counts toward coverage again.
+
+Deliberate retirement of an assignment by a `StationEngineer` is permitted from three starting statuses with identical effect — `ACTIVE` → `DECOMMISSIONED`, `SILENT` → `DECOMMISSIONED` and `SUSPENDED` → `DECOMMISSIONED` — each recomputing the station's `accessible_source_count` and firing a station recompute event; attempting it on a row already in `DECOMMISSIONED` is rejected with `ERR_ASSIGNMENT_NOT_ACTIVE`. Reinstatement runs the other way, `DECOMMISSIONED` → `ACTIVE`, and carries three preconditions: the row must currently be `DECOMMISSIONED`, otherwise `ERR_ASSIGNMENT_NOT_DECOMMISSIONED`; no other assignment of the same station may be in `ACTIVE` with the same `source_type`, otherwise `ERR_SOURCE_TYPE_ALREADY_COVERED`; and the referenced unit must currently be in `READY`, otherwise `ERR_DEVICE_NOT_READY`. A successful reinstatement likewise recomputes `accessible_source_count` and fires a station recompute event.
+
+### 3.4. Equipment Failure, Repair Cycles and the Two Downtime Clocks
+
+Equipment failure notification is the trigger for the deepest cascade in the system. A `StationEngineer` files an outage by naming the failed unit through `device_id`, the operator-observed `detected_at` instant at which the failure was noticed, and a short `failure_summary`. The reported `detected_at` may not be later than the logical clock's current value — a future-dated detection is rejected with `ERR_OUTAGE_DETECTED_IN_FUTURE` — and the referenced unit must not be `DECOMMISSIONED`, which is rejected with `ERR_DEVICE_DECOMMISSIONED`. A unit is eligible to fail from either `REGISTERED` or `READY`.
+
+The create stamps `notified_at` from the logical clock — note that `notified_at` records when the notification reached the system, while `detected_at` records when the engineer saw the failure, and the two are ordinarily different instants — and opens the row in `OPEN` with `repair_cycle_count` 0, `repair_started_at` and `restored_at` null, `continuous_downtime_hours` and `obligation_downtime_hours` null, and `continuous_clock_breached` and `obligation_breached` both false. It then runs the full four-hop outage cascade of §2.11: the unit becomes `FAILED` (from `REGISTERED` → `FAILED` or `READY` → `FAILED`), its `ACTIVE` and `SILENT` assignments become `SUSPENDED`, the station's `accessible_source_count` is recomputed and the station rescored, and if that rescoring pushes the station into `SUSPENDED_FILINGS`, the station's `READY` test events revert to `READINESS_PENDING` with their readiness figures cleared. Outages can be listed filtered by `device_id`, `status` and `obligation_breached`.
+
+Repair is a cycle, not a straight line. Starting a repair is permitted from two starting statuses — `OPEN` → `REPAIR_IN_PROGRESS` and `VERIFICATION_FAILED` → `REPAIR_IN_PROGRESS`; starting a repair from any other status is rejected with `ERR_OUTAGE_NOT_REPAIRABLE`. Both entries stamp `repair_started_at` from the logical clock, but only the entry from `VERIFICATION_FAILED` increases `repair_cycle_count` by one — the counter measures re-work, so the first repair attempt leaves it at 0. Reporting restoration is permitted only from `REPAIR_IN_PROGRESS`, moving the row `REPAIR_IN_PROGRESS` → `RESTORED`; from any other status it is rejected with `ERR_OUTAGE_NOT_IN_REPAIR`. Restoration stamps `restored_at` from the logical clock and computes both downtime figures and both breach flags described below.
+
+A `ComplianceAdmin` then either rejects or accepts the reported restoration. Rejection moves the row `RESTORED` → `VERIFICATION_FAILED`, may carry an optional `verification_note`, clears `restored_at` back to null, clears both `continuous_downtime_hours` and `obligation_downtime_hours` back to null, and leaves the unit `FAILED`; the outage is then eligible to re-enter `REPAIR_IN_PROGRESS`, closing the cycle `RESTORED` → `VERIFICATION_FAILED` → `REPAIR_IN_PROGRESS` → `RESTORED`. Crucially, `detected_at` is never reset by any of this, so both downtime clocks keep accruing across every repair cycle from the original detection instant. Acceptance moves the row `RESTORED` → `CLOSED`, which is terminal. Both rejection and acceptance are permitted only from `RESTORED`; from any other status either is rejected with `ERR_OUTAGE_NOT_RESTORED`.
+
+Closing an outage is also what returns equipment to service. On close, the referenced unit moves `FAILED` → `READY` provided no *other* outage on that same unit is currently in `OPEN`, `REPAIR_IN_PROGRESS` or `VERIFICATION_FAILED`; if such an outage does remain, this outage still reaches `CLOSED` but the unit stays `FAILED`. When the unit does return to `READY`, every assignment on it in `SUSPENDED` moves to `SILENT` as described in §3.3, and a station recompute event fires.
+
+**The two downtime clocks.** When restoration is reported, the same `detected_at` and `restored_at` pair is measured twice, under two deliberately different conventions, and each produces its own breach flag.
+
+The *continuous* clock counts every wall-clock second that elapsed. Subtract `detected_at` from `restored_at`, divide the resulting number of seconds by 3600, and round half-up to two decimal places; the result is `continuous_downtime_hours`. Then `continuous_clock_breached` is true when `continuous_downtime_hours` is strictly greater than 60 hours — two and a half days of unbroken outage — and false when it equals 60 hours or is less.
+
+The *obligation* clock counts only the hours during which the station actually owed alert reception, which this specification fixes as a daily window running from 08:00:00 UTC up to but not including 20:00:00 UTC. Walk every UTC calendar day from the calendar date of `detected_at` through the calendar date of `restored_at`, inclusive of both endpoints. For each such day, form that day's obligation window from 08:00:00 UTC (included) to 20:00:00 UTC (excluded), and take the overlap between that window and the outage interval: the overlap begins at the later of `detected_at` and the window start, ends at the earlier of `restored_at` and the window end, and contributes zero seconds whenever that end is not after that beginning. Accumulate the day contributions in seconds, divide the accumulated total by 3600, and round half-up to two decimal places to obtain `obligation_downtime_hours`. Then `obligation_breached` is true when `obligation_downtime_hours` is strictly greater than 48 hours — the statutory repair deadline — and false at exactly 48 hours or below. Because overnight hours fall entirely outside every obligation window, an outage detected at 21:00 UTC and restored at 07:00 UTC the following morning accrues ten continuous hours and zero obligation hours. Only the obligation flag feeds station scoring; the continuous flag is reported for engineering review.
+
+### 3.5. Alert Reception: Duplicate Avoidance, Relay Selection and Accessibility
+
+Logging a received alert is a single `StationEngineer` write that resolves an entire decision tree before it returns. The payload names the receiving station through `station_id`, the received `event_code` (one to six uppercase alphanumeric characters), the `originator_sequence` that identifies the originating transmission and serves as the duplicate-detection key, a non-empty `fips_codes` array of five-digit FIPS strings taken from the alert's location field, and the operator-reported `received_at` instant. A `received_at` later than the logical clock's current value is rejected with `ERR_ALERT_RECEIVED_IN_FUTURE`.
+
+Each alert row carries **two independent state dimensions** that advance without constraining each other. The forwarding dimension is `relay_state`, which begins at `RECEIVED` and settles into `RELAY_PENDING`, `UNMATCHED_OPTIONAL` or `SUPPRESSED_DUPLICATE` before the create returns — because the whole decision runs inside that one request, `RECEIVED` is never observable in a response body. `RELAYED`, `UNMATCHED_OPTIONAL` and `SUPPRESSED_DUPLICATE` are terminal for that dimension. The accessibility dimension is `accessibility_state`, which begins at `ACCESSIBILITY_UNVERIFIED` and ends at either `ACCESSIBILITY_PASSED` or `ACCESSIBILITY_FAILED`. Alerts can be listed filtered by `station_id`, `matched_relay_rule_id`, `suppression_reference_alert_id`, `relay_state`, `accessibility_state`, `event_code` and `originator_sequence`.
+
+**Duplicate avoidance runs first, in two phases, and the two phases use deliberately different interval conventions.** Let the reported `received_at` be the reference instant.
+
+Phase A looks for a station repeat. Its pool is every existing alert row of the *same* `station_id` with the *same* `originator_sequence` and the *same* `event_code`, regardless of that row's `relay_state`. The phase A window is **half-open**: it starts 900 seconds — fifteen minutes — before the reference instant, with that lower bound included, and ends at the reference instant itself, with that upper bound excluded. No buffer is applied and no FIPS comparison is made in phase A. If any pool row's `received_at` falls inside that window, the new alert is suppressed by moving `RECEIVED` → `SUPPRESSED_DUPLICATE`: `suppression_source` becomes `STATION_REPEAT`, and `suppression_reference_alert_id` is set to the `id` of the pool row with the greatest `received_at`, breaking a tie on equal `received_at` by taking the row with the earliest `created_at`. Phase A stopping the pipeline means phase B never runs and the relay selector never runs.
+
+Phase B looks for a wireless duplicate. Its pool is every wireless alert notice of the same `station_id` with the same `originator_sequence` and the same `event_code`. For each such notice the phase B window is **closed at both ends**: it starts 120 seconds before that notice's `wea_sent_at` and ends 1800 seconds plus 120 seconds after it — that is, from two minutes before the wireless send to thirty-two minutes after it — with both bounds included. Suppression additionally requires that the notice's `fips_codes` and the alert's `fips_codes` share at least one code; a notice whose window contains the reference instant but whose FIPS set is disjoint from the alert's does not suppress. When both conditions hold, the alert again moves `RECEIVED` → `SUPPRESSED_DUPLICATE`, `suppression_source` becomes `WIRELESS_NOTICE`, and `suppression_reference_alert_id` is left null — the suppressing artefact is a carrier notice, not an alert row, so there is nothing to point at. If neither phase fires, `suppression_source` is `NONE`, and in that case `matched_relay_rule_id` and `relay_class_applied` are decided by the selector rather than being left at their suppressed defaults; a suppressed alert keeps `matched_relay_rule_id` null and `relay_class_applied` `NONE`, since the selector is skipped. All of these timestamp comparisons are performed at whole-second granularity.
+
+A wireless alert notice itself is recorded by a `ComplianceAdmin` and is nothing more than a durable fact: the covered market's `station_id`, the shared `originator_sequence`, the `event_code`, the `wea_sent_at` instant the carrier pushed the message, and the non-empty `fips_codes` array of five-digit strings the wireless alert targeted. Recording a notice mutates no other row; it simply enters phase B for every alert logged afterwards. Notices can be listed filtered by `station_id`, `originator_sequence` and `event_code`.
+
+**Relay rule selection runs only when no suppression fired.** The candidate pool is every relay rule that belongs to the receiving station's plan — that is, whose `state_plan_id` equals the station's `state_plan_id` — whose `status` is `ACTIVE`, whose `event_code` equals the alert's `event_code`, and whose location scope admits the alert: either the rule's `fips_codes` array is empty, making it statewide and therefore always in scope, or the rule's `fips_codes` shares at least one code with the alert's `fips_codes`. Candidates are ranked by `specificity` descending, so that a county-scoped rule with `specificity` 2 always outranks a statewide rule with `specificity` 1; among candidates of equal `specificity` the smaller `priority` integer ranks earlier; and when both `specificity` and `priority` tie, the earlier `created_at` wins. The tie-break is `created_at` and never `id`. The single highest-ranked candidate is selected.
+
+When a rule is selected, the alert moves `RECEIVED` → `RELAY_PENDING`, `matched_relay_rule_id` is set to that rule's `id`, and `forward_delay_seconds_applied` is copied from the rule's `forward_delay_seconds`. The effective `relay_class_applied` is `MANDATORY` when either the selected rule's `relay_class` is `MANDATORY` **or** the alert's `event_code` appears in the governing plan's `mandatory_relay_event_codes`; otherwise it is `OPTIONAL`. That second clause is the statewide override: a plan can force an event code to be mandatory even where the matching rule is written as `OPTIONAL`. When the candidate pool is empty the alert moves `RECEIVED` → `UNMATCHED_OPTIONAL`, `matched_relay_rule_id` stays null, `relay_class_applied` stays `NONE` and `forward_delay_seconds_applied` stays 0. Selection is pure integer work and performs no rounding.
+
+Confirming that the forward actually went out moves the alert `RELAY_PENDING` → `RELAYED`; attempting it on an alert whose `relay_state` is anything else is rejected with `ERR_ALERT_NOT_RELAY_PENDING`. Confirmation touches only the forwarding dimension and leaves `accessibility_state` exactly as it was. Its one downstream effect is fiscal: a confirmed alert leaves the unconfirmed-mandatory-relay pool that the filing penalty of §3.7 counts, so confirming relays promptly is how a station keeps its filing penalties down.
+
+**Accessibility verification** is the other dimension, and it is available on any alert regardless of where its `relay_state` sits — an alert can be verified before it is confirmed, after it is confirmed, or even after it was suppressed. A `StationEngineer` supplies three measurements: `visual_crawl_seconds`, an integer from 0 to 600 inclusive giving the measured on-screen crawl duration; `audio_loudness_lufs`, a number from -60.0 to 0.0 inclusive giving measured loudness; and `caption_interaction`, one of `NONE`, `CAPTION_SUPPRESSED` or `CRAWL_OVERLAP`, describing how the crawl interacted with closed captions. Verification is a once-only act: the alert's `accessibility_state` must be `ACCESSIBILITY_UNVERIFIED`, and a second attempt is rejected with `ERR_ACCESSIBILITY_ALREADY_VERIFIED`.
+
+The three measurements are converted into `accessibility_deficiency_points` as follows, with **exactly one rounding operation, performed at the very end**. The crawl shortfall in seconds is the amount by which the measured `visual_crawl_seconds` falls below the 60-second minimum crawl duration, floored at zero — so a 75-second crawl has a shortfall of zero, and a 40-second crawl has a shortfall of 20. The loudness excess in loudness units is the absolute difference between `audio_loudness_lufs` and the -24.0 LUFS target, reduced by the 2.0-unit tolerance and floored at zero — so a reading of -25.0 is inside tolerance and yields zero excess, while a reading of -30.0 deviates by 6.0 and yields an excess of 4.0. The caption penalty is 0.00 points when `caption_interaction` is `NONE`, 1.50 points when it is `CAPTION_SUPPRESSED`, and 2.00 points when it is `CRAWL_OVERLAP`.
+
+Those three quantities combine both additively and multiplicatively. The base term is the crawl shortfall in seconds multiplied by 0.05 points per second, plus the loudness excess multiplied by 0.10 points per loudness unit. The coupling term multiplies the crawl shortfall in seconds by the loudness excess in loudness units and by a coupling rate of 0.01, then takes the smaller of that product and a coupling ceiling of 3.00 points — audio deviation is amplified when the crawl is also short, but the amplification alone can never exceed 3.00 points. Add the base term, the capped coupling term and the caption penalty; take the smaller of that sum and the overall deficiency ceiling of 8.00 points; and round the result half-up to two decimal places. That value is `accessibility_deficiency_points`, and it is the only rounded quantity in the calculation — the shortfall, the excess, the base term and the coupling term are all carried at full precision until this final step.
+
+The verdict is inclusive at the boundary: `ACCESSIBILITY_UNVERIFIED` → `ACCESSIBILITY_PASSED` when `accessibility_deficiency_points` is 1.00 or less, and `ACCESSIBILITY_UNVERIFIED` → `ACCESSIBILITY_FAILED` when it is strictly greater than 1.00. Both outcomes write the three measurement fields and `accessibility_deficiency_points`, and neither touches `relay_state`.
+
+### 3.6. Test Scheduling, Pre-Test Readiness and Log Retention
+
+Required tests are scheduled ahead of time by a `ComplianceAdmin`, who names the participating station through `station_id`, the `test_type` — `WEEKLY`, `MONTHLY` or `NATIONAL` — and the two bounds of the transmission-and-receipt window, `window_start_at` and `window_end_at`. The two bounds must satisfy `window_start_at` strictly earlier than `window_end_at`, and a payload that does not is a schema failure. The window's start bound is inclusive throughout. Its end bound has two different meanings that must not be conflated: for overlap arithmetic against other windows it is **exclusive**, but for admitting log lines it is an **inclusive** upper bound.
+
+Three further gates apply at scheduling time. A station whose `compliance_posture` is `SUSPENDED_FILINGS` may not have new tests scheduled at all, and the attempt is rejected with `ERR_POSTURE_NOT_TEST_ELIGIBLE`. A `window_start_at` earlier than the logical clock's current value is rejected with `ERR_TEST_WINDOW_IN_PAST`. And the proposed half-open interval running from `window_start_at` up to but not including `window_end_at` must not intersect the same interval of any other test event of that station whose `status` is anything other than `FAILED_UNFILED`; an intersection is rejected with `ERR_TEST_WINDOW_OVERLAP`, which is the one member of the clock-relative family carrying HTTP 409 rather than 422. Because both intervals are half-open, one window ending at exactly the instant the next begins is not an overlap.
+
+A newly scheduled event sits in `SCHEDULED` with `readiness_score` and `readiness_evaluated_at` null, `logged_entry_count` 0 and `retention_until_max` null, and the server derives `filing_deadline_at` at create time as `window_end_at` plus five days. Test events can be listed filtered by `station_id`, `test_type` and `status`.
+
+**Pre-test readiness.** A `StationEngineer` evaluates readiness, which is permitted only while the event is in `SCHEDULED` or `READINESS_PENDING`; from any other status the request is rejected with HTTP 409. The readiness window opens 24 hours before `window_start_at` and closes at `window_end_at`: an evaluation is admitted when the logical clock is at or after `window_start_at` less 24 hours and at or before `window_end_at`, and is otherwise rejected with `ERR_READINESS_WINDOW_NOT_OPEN`.
+
+The readiness figure is a weighted score out of 100 built from three ratios. The **device ratio** is the number of the station's units in `READY` divided by the number of the station's countable units, where countable means units whose `status` is `REGISTERED`, `READY` or `FAILED`; `DECOMMISSIONED` units leave the denominator entirely, and the denominator is treated as 1 whenever the countable count is 0, so a station with no equipment scores a device ratio of 0 rather than failing to compute. The **coverage ratio** is the station's `accessible_source_count` divided by the plan's `required_source_count`, again with the denominator treated as 1 whenever `required_source_count` is 0, and the whole ratio capped at 1 so that covering more sources than required earns no bonus. The **recent-activity ratio** is the number of the station's alert events, in any `relay_state`, whose `received_at` falls inside the closed interval running from 30 days before the current logical clock through the current logical clock, divided by a target of 3 recent alerts, and likewise capped at 1. The score is 40 times the device ratio plus 40 times the coverage ratio plus 20 times the recent-activity ratio, rounded half-up to two decimal places once, after the weighted sum has been formed. That value is written to `readiness_score` and the evaluation instant is written to `readiness_evaluated_at`.
+
+The threshold is inclusive at exactly 80.00. A score of 80.00 or greater advances the event to `READY`, whether it came from `SCHEDULED` → `READY` or from `READINESS_PENDING` → `READY` on a re-run; a score below 80.00 leaves the event in `READINESS_PENDING`, reached as `SCHEDULED` → `READINESS_PENDING` on a first evaluation or as `READINESS_PENDING` → `READINESS_PENDING` on a re-run that still falls short. Every evaluation overwrites both `readiness_score` and `readiness_evaluated_at`, so a re-run replaces rather than supplements the earlier figures. Readiness can also be *lost* without any client action: a station whose posture transitions into `SUSPENDED_FILINGS` drags every one of its `READY` events back `READY` → `READINESS_PENDING`, clearing both `readiness_score` and `readiness_evaluated_at` to null.
+
+**Logging the test.** Once an event is `READY`, a `StationEngineer` appends log lines to it. Each line names its event through `test_event_id`, the unit that transmitted or received through `device_id`, and an `entry_kind` of either `TRANSMISSION` or `RECEIPT`. `source_call_sign` is required on a `RECEIPT` line, naming the monitored source's call sign, and is forbidden on a `TRANSMISSION` line; violating either half of that rule is a schema failure. The event must currently be in `READY`, otherwise `ERR_TEST_NOT_READY`. The logical clock must lie inside the **closed** interval from `window_start_at` through `window_end_at` inclusive — this is where the end bound is inclusive — and a line offered outside it is rejected with `ERR_LOGGING_WINDOW_CLOSED`. The named unit must belong to the event's station, otherwise `ERR_DEVICE_STATION_MISMATCH`. And a `RECEIPT` line's `source_call_sign` must match the `source_call_sign` of at least one monitoring assignment of that station, otherwise `ERR_LOG_ENTRY_SOURCE_UNKNOWN`.
+
+An accepted line stamps `logged_at` from the logical clock and records the acting `X-User-ID` as `logged_by_user_id` — the value the segregation-of-duties check of §2.12 later compares against. It raises the event's `logged_entry_count` by one. A `RECEIPT` line additionally refreshes the matching assignment's `last_receipt_at` and, if that assignment was `SILENT`, returns it to `ACTIVE` and clears its `silence_flagged_at` back to null — the same writes the explicit receipt of §3.3 makes to the assignment row. The resemblance to an explicit receipt stops there, and does not extend to the explicit receipt's two other consequences. First, appending a log line is **not** one of the eleven recompute events of §2.10: no station recompute runs on this path, and the station's derived counts, `compliance_score`, `compliance_variant_applied` and `compliance_posture` are all left exactly as they stood. Second, the log-line path carries no assignment-status gate of its own: a matching assignment sitting in a status other than `SILENT` simply keeps the status it had, and the line is accepted either way. Log lines can be listed filtered by `test_event_id`, `device_id`, `entry_kind` and `source_call_sign`. They are append-only and carry no status of their own, which is why the penalty calculation of §3.7 treats every line of an event as an input with no filtering.
+
+Each line's retention term is decided at logging time and never revisited. The base term is 1095 days — three years — when the owning event's `test_type` is `NATIONAL`, and 730 days — two years — for `WEEKLY` and `MONTHLY` alike. If, at that moment, the owning station's `compliance_posture` is `SUSPENDED_FILINGS`, a further 365 days is added; under any other posture nothing is added. The resulting figure is stored as `retention_days_applied`, and `retention_until` is `logged_at` advanced by that many whole calendar days in UTC. The event's `retention_until_max` holds the greatest `retention_until` across the event's lines, and is refreshed when the logging phase closes.
+
+Closing the logging phase moves the event `READY` → `LOGGED`. It is permitted only from `READY`, otherwise `ERR_TEST_NOT_READY`, and only when the event has at least one log line — an event whose `logged_entry_count` is 0 is rejected with `ERR_TEST_NO_ENTRIES`. Closing refreshes `retention_until_max` from the event's lines.
+
+Finally, an event can fail by neglect. During the second phase of a station log review, every event of that station whose `status` is `READY` or `LOGGED` and whose `filing_deadline_at` is strictly earlier than the current logical clock is pushed to `FAILED_UNFILED` — `READY` → `FAILED_UNFILED` and `LOGGED` → `FAILED_UNFILED` are both phase-2 outcomes — and from there it counts against the station's score under the certified scoring variant of §3.8. `FILED` and `FAILED_UNFILED` are the two terminal statuses of a test event.
+
+### 3.7. Post-Test Filing, Penalty Points, Acceptance and Reversal
+
+Filing results is the `CertifyingOfficer`'s act and the most heavily guarded write in the system. The payload names the event through `test_event_id`, carries the version guard `expected_test_event_version` from §2.7, and carries the officer's `attestation_note`. Six substantive gates apply once the identity, schema, existence, ownership and version checks of §2.8 have passed, and they are evaluated in the ladder order given there.
+
+The event's `status` must be `LOGGED` or `FILED`; anything else is rejected with `ERR_TEST_NOT_LOGGED`, except that an event already in `FAILED_UNFILED` is rejected with the more specific `ERR_TEST_ALREADY_FAILED_UNFILED`. The owning station's `compliance_posture` must not be `SUSPENDED_FILINGS`, otherwise `ERR_FILINGS_SUSPENDED`. Every source type listed in the governing plan's `required_source_types` must have at least one `RECEIPT` log line on that event; if any required source type has none, the filing is rejected with `ERR_RECEIPT_COVERAGE_INCOMPLETE`. The logical clock must be at or before `filing_deadline_at` plus a ten-day grace period; past that the filing is rejected with `ERR_FILING_DEADLINE_PASSED`. The acting `X-User-ID` must not equal the `logged_by_user_id` of any log line on that event, otherwise `ERR_SEGREGATION_OF_DUTIES`. And last of all, the fiscal ceiling of §2.6 and §2.8 applies: the station's existing `penalty_points_total` plus the `penalty_points` this filing would compute must not exceed 5.00 points, otherwise `ERR_PENALTY_CEILING_EXCEEDED`. That ordering matters — a filing that is both late enough to blow the ceiling and offered by the wrong officer reports the segregation failure, not the ceiling failure.
+
+**Computing the penalty.** The filing stamps `filed_at` from the logical clock and records the acting `X-User-ID` as `filed_by_user_id`. Lateness comes first: `late_days` is 0 when `filed_at` is at or before the event's `filing_deadline_at`, and otherwise the number of whole days obtained by dividing the elapsed time between `filing_deadline_at` and `filed_at` by 86400 seconds and rounding that quotient **up** to the next whole number — so any part of a day late counts as a full day late.
+
+Three point terms are then formed, and the rounding order is pinned. Each log line of the event carries a kind weight: 1.0 for a `RECEIPT` line and 1.8 for a `TRANSMISSION` line. For each log line — taking every line whose `test_event_id` matches, in `created_at` ascending order, with no status filter whatsoever since log lines have no status — multiply `late_days` by a per-entry late rate of 0.065 points and by that line's kind weight, and **round that per-line product half-up to two decimal places immediately**. Sum the rounded per-line values to obtain `entry_subtotal_points`. Rounding per line before summing is normative: summing the raw per-line products and rounding the sum once produces a different number of cents and is not what this system does.
+
+`lateness_points` is `late_days` multiplied by 0.75 points per late day, rounded half-up to two decimals. `unconfirmed_relay_points` charges 0.50 points for each mandatory relay the station still has not confirmed: count the station's alert events whose `relay_class_applied` is `MANDATORY`, whose `relay_state` is still `RELAY_PENDING`, and whose `received_at` falls inside the **closed** interval running from 30 days before `filed_at` through `filed_at` itself, multiply that count by 0.50, and round half-up to two decimals. Alerts already moved to `RELAYED`, alerts whose effective class is `OPTIONAL` or `NONE`, and alerts received more than 30 days before the filing are all outside the pool.
+
+`penalty_points` is then the smaller of a per-filing cap of 25.00 points and the sum of `entry_subtotal_points`, `lateness_points` and `unconfirmed_relay_points`, rounded half-up to two decimal places. Finally the station's ledger is resynchronised: `penalty_points_total` becomes the sum of `penalty_points` across all of that station's filing records whose `status` is `SUBMITTED` or `ACCEPTED`, rounded half-up to two decimal places. Filings whose `status` is `REVERSED` contribute nothing to that sum, which is the mechanism that makes reversal an exact compensation rather than an approximate one.
+
+A successful filing is stored in `SUBMITTED` with `reversal_reason` null, increments the event's `version` by one, and advances the event to `FILED`. Both `LOGGED` → `FILED` and `FILED` → `FILED` are legal: the second is an **amendment**. An amendment reverses whichever earlier filing for the same event is still in `SUBMITTED` or `ACCEPTED`, moving that earlier row to `REVERSED` with its `reversal_reason` set to the literal string `SUPERSEDED_BY_AMENDMENT`, and sets the new filing's `superseded_filing_id` to the reversed row's `id`; a first filing on an event leaves `superseded_filing_id` null. Either way the station's `penalty_points_total` is recomputed and a station recompute event fires. Filings can be listed filtered by `test_event_id`, `status` and `superseded_filing_id`.
+
+A `ComplianceAdmin` reviews submitted filings. Acceptance moves a filing `SUBMITTED` → `ACCEPTED` and is permitted only from `SUBMITTED`; from any other status it is rejected with `ERR_FILING_NOT_SUBMITTED`. Acceptance fires a station recompute event, and its consequence is significant: an accepted filing is what makes the station eligible for the certified scoring variant of §3.8, so a station scoring a perfect 100.00 provisionally can drop two posture bands the moment its first filing is accepted.
+
+Reversal by a `ComplianceAdmin` carries an explicit `reversal_reason` in the payload and is permitted from two starting statuses with identical effect — `SUBMITTED` → `REVERSED` and `ACCEPTED` → `REVERSED`; a filing already in `REVERSED` is rejected with `ERR_FILING_NOT_REVERSIBLE`, and `REVERSED` is terminal. The amendment supersede described above reaches the same two transitions by the system path rather than by an explicit reversal call. Reversal writes the supplied `reversal_reason`, removes the row from the `penalty_points_total` input set so that the station's total returns to its exact pre-filing value, and fires a station recompute event. Reversing from `ACCEPTED` has the additional consequence that the station loses certified eligibility unless some other filing of that station is still `ACCEPTED` with a `filed_at` inside the trailing 365-day certification window.
+
+### 3.8. Station Log Review and Compliance Scoring
+
+The station log review is the compliance officer's periodic sweep, and it is the only recompute event that changes anything before it scores. A `ComplianceAdmin` runs it against one station, and it executes **four phases in exactly this order**, because phase 1's output feeds one deduction and phase 2's output feeds another; a different order yields a different score.
+
+- **Phase 1 — silence sweep.** Every monitoring assignment of the station whose `status` is `ACTIVE` and whose last evidence of life is strictly earlier than the current logical clock less eight days is pushed `ACTIVE` → `SILENT`, with `silence_flagged_at` stamped. Last evidence of life is `last_receipt_at` when set, and the assignment's `created_at` when `last_receipt_at` is still null.
+- **Phase 2 — unfiled sweep.** Every test event of the station whose `status` is `READY` or `LOGGED` and whose `filing_deadline_at` is strictly earlier than the current logical clock is pushed to `FAILED_UNFILED`.
+- **Phase 3 — derived-field refresh.** `accessible_source_count`, `silent_assignment_count` and `penalty_points_total` are all recomputed from current rows.
+- **Phase 4 — variant, score, posture.** The scoring variant is chosen, `compliance_score` and `compliance_variant_applied` are written, `compliance_posture` is set from the score bands, and `last_log_review_at` is stamped from the logical clock.
+
+The ten other recompute events listed in §2.10 execute **phases 3 and 4 only** — they never sweep for silence and never mark events unfiled — and they never write `last_log_review_at`.
+
+**The five inputs.** `accessible_source_count` is the number of *distinct* `source_type` values among the station's monitoring assignments whose `status` is `ACTIVE` and whose `source_type` appears in the governing plan's `required_source_types`; two `ACTIVE` assignments covering the same required source type therefore count once, and assignments in `SILENT`, `SUSPENDED` or `DECOMMISSIONED` do not count at all. `silent_assignment_count` is the plain number of the station's assignments whose `status` is `SILENT`. The outage breach count is the number of equipment outages whose `device_id` belongs to this station, whose `obligation_breached` is true, and whose `status` is `OPEN`, `REPAIR_IN_PROGRESS`, `RESTORED` or `VERIFICATION_FAILED` — a `CLOSED` outage stops counting even if it breached. The unfiled test count is the number of the station's test events whose `status` is `FAILED_UNFILED`, and it is consumed by the certified variant only. Certified eligibility holds when at least one filing record belonging to a test event of this station has `status` `ACCEPTED` with a `filed_at` inside the **closed** interval running from 365 days before the current logical clock through the current logical clock.
+
+**The deductions.** Scoring starts from a base of 100.00 points and subtracts:
+
+- 25.00 points for every required source type the station is missing, where the missing count is the plan's `required_source_count` less the station's `accessible_source_count`, floored at zero so that over-coverage never earns a credit;
+- 10.00 points for each assignment counted in `silent_assignment_count`;
+- a flat 15.00 points when `plan_revalidation_required` is true, and nothing when it is false;
+- 10.00 points for each outage counted in the outage breach count;
+- 20.00 points for each test event counted in the unfiled test count — **certified variant only**;
+- the station's `penalty_points_total` verbatim, point for point — **certified variant only**.
+
+**The two variants.** When the station is not certified-eligible, `compliance_variant_applied` is `PROVISIONAL` and only the first four deductions are applied. When it is certified-eligible, `compliance_variant_applied` is `CERTIFIED` and all six deductions are applied. In both cases the running total is floored at 0.00 — the score never goes negative — and then rounded half-up to two decimal places into `compliance_score`. The posture then follows the bands of §2.10: 90.00 or above yields `COMPLIANT`, at least 75.00 but below 90.00 yields `WATCH`, and below 75.00 yields `SUSPENDED_FILINGS`. If that posture change is an entry into `SUSPENDED_FILINGS`, the `READY` test events of the station revert as described in §2.10 and §3.6.
+
+A dedicated read exposes every input the current score consumed, so that a station can see *why* it scored what it scored rather than only the result. That summary reports `station_id`, `compliance_posture`, `compliance_score`, `compliance_variant_applied`, `required_source_count`, `accessible_source_count`, `missing_source_count`, `silent_assignment_count`, `outage_breach_count`, `unfiled_test_count`, `penalty_points_total`, `plan_revalidation_required`, `public_file_document_count` and `last_log_review_at`. The three names that exist only here — `missing_source_count`, `outage_breach_count` and `unfiled_test_count` — are the intermediate figures described above: `missing_source_count` is the floored difference between `required_source_count` and `accessible_source_count`, `outage_breach_count` is the obligation-breached outage count over non-closed outages, and `unfiled_test_count` is the count of `FAILED_UNFILED` test events. All three are reported regardless of which variant was applied, even though the last one only ever affects a `CERTIFIED` score.
+
+### 3.9. Public File Obligations and Inspection Response
+
+A `FieldInspector` opens an inspection by naming the station through `station_id` and listing what it wants in `requested_document_kinds`, a non-empty array of distinct values drawn from `STATION_LOG`, `TEST_LOGS`, `PLAN_COPY`, `OUTAGE_LOG` and `ACCESSIBILITY_ATTESTATION`. The request opens in `OPEN` with `requested_at` stamped from the logical clock, `provided_document_kinds` an empty array, `responded_at` null and `completeness_score` null, and the server derives `response_due_at` as `requested_at` plus seven days. Inspections can be listed filtered by `station_id` and `status`.
+
+The station answers in two steps, deliberately split between two roles. A `StationEngineer` drafts by supplying `provided_document_kinds`, an array whose members are drawn from the same five document kinds. Drafting is permitted from `OPEN` and from `RESPONSE_DRAFTED`, both landing in `RESPONSE_DRAFTED` — `OPEN` → `RESPONSE_DRAFTED` on the first draft and `RESPONSE_DRAFTED` → `RESPONSE_DRAFTED` on any re-draft — and each draft **overwrites** `provided_document_kinds` wholesale rather than merging into it. Drafting from any other status is rejected with `ERR_INSPECTION_NOT_DRAFTABLE`.
+
+A `CertifyingOfficer` then submits, moving the request `RESPONSE_DRAFTED` → `RESPONDED`. The request must currently be in `RESPONSE_DRAFTED` and `provided_document_kinds` must hold at least one entry; a submission that fails either condition is rejected with `ERR_INSPECTION_NOT_DRAFTED`. Submission is also time-boxed: when the logical clock has passed `response_due_at` plus a further seven days, the submission is rejected outright with `ERR_INSPECTION_RESPONSE_WINDOW_CLOSED`. Submission stamps `responded_at` from the logical clock and computes `completeness_score`.
+
+Completeness is the fraction of what was asked for that was actually produced, with a flat lateness penalty. Count the distinct document kinds that appear in both `provided_document_kinds` and `requested_document_kinds`; multiply that matched count by 100, divide by the number of entries in `requested_document_kinds` — treating that divisor as 1 if it is somehow 0 — and round half-up to two decimal places to obtain the raw figure. Producing a kind nobody asked for adds nothing, and listing the same kind twice counts once. If `responded_at` is at or before `response_due_at`, `completeness_score` is that raw figure unchanged. If `responded_at` is later than `response_due_at`, `completeness_score` is the raw figure less a flat 20.00 points, floored at 0.00 and rounded half-up to two decimals. Note the two distinct deadlines: passing `response_due_at` costs 20.00 points, while passing `response_due_at` plus seven days blocks the submission entirely.
+
+Closing is the inspector's call, permitted only from `RESPONDED` and rejected with `ERR_INSPECTION_NOT_RESPONDED` otherwise. The outcome is decided by the score alone and is inclusive at the boundary: a `completeness_score` of 100.00 or greater closes the request `RESPONDED` → `CLOSED_SATISFIED`, and anything below 100.00 closes it `RESPONDED` → `CLOSED_DEFICIENT`. Both closed statuses are terminal. Since the satisfied threshold is a full 100.00 and a late response loses a flat 20.00 points, a station that produces every requested document but produces it late can only ever close deficient.
+
+One thing can undo a submitted response. When the station's governing plan is superseded and `plan_revalidation_required` flips from false to true, hop 3 of the plan-supersede cascade pulls every `RESPONDED` inspection request of that station back `RESPONDED` → `RESPONSE_DRAFTED`, clearing `completeness_score` and `responded_at` to null while retaining `provided_document_kinds` so the engineer can re-attest against the new plan without re-listing everything. The `response_due_at` deadline is not extended by that revert.
+
+## 4. Endpoint Definitions
+
+Every collection in this API is mounted at the top level; there are no nested resource paths. Operations that create a new stored row return `201 Created`; operations that mutate an existing row, run a computation, drive a state transition or set the logical clock return `200 OK`. Reads return `200 OK`. In the Authorized Role(s) column, "Any" means all four declared roles — `ComplianceAdmin`, `StationEngineer`, `CertifyingOfficer` and `FieldInspector` — may call the endpoint.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock to a supplied instant | ComplianceAdmin |
+| POST | `/state-plans` | Create a DRAFT state plan | ComplianceAdmin |
+| GET | `/state-plans/{id}` | Read one state plan | Any |
+| GET | `/state-plans` | List state plans | Any |
+| POST | `/state-plans/{id}/activate` | Activate a DRAFT plan and supersede the prior ACTIVE plan for the same state | ComplianceAdmin |
+| POST | `/stations` | Register a station under a state plan | ComplianceAdmin |
+| GET | `/stations/{id}` | Read one station, including its current version for concurrency use | Any |
+| GET | `/stations` | List stations, filterable by plan, posture and call sign | Any |
+| GET | `/stations/{id}/compliance-summary` | Read every input the station's current compliance score consumed | Any |
+| POST | `/stations/{id}/run-log-review` | Run the four-phase station log review and rescore the station | ComplianceAdmin |
+| POST | `/stations/{id}/public-file-documents` | Record a public-file document upload against the station | StationEngineer |
+| POST | `/relay-rules` | Create an ACTIVE alert-forwarding rule on a plan | ComplianceAdmin |
+| GET | `/relay-rules/{id}` | Read one relay rule | Any |
+| GET | `/relay-rules` | List relay rules | Any |
+| POST | `/relay-rules/{id}/retire` | Retire a relay rule so it leaves the selector candidate pool | ComplianceAdmin |
+| POST | `/eas-devices` | Register an alert receiving/encoding unit at a station | StationEngineer |
+| GET | `/eas-devices/{id}` | Read one device | Any |
+| GET | `/eas-devices` | List devices | Any |
+| POST | `/eas-devices/{id}/readiness-check` | Run a pre-test readiness check on a device | StationEngineer |
+| POST | `/eas-devices/{id}/decommission` | Retire a device permanently | ComplianceAdmin |
+| POST | `/monitoring-assignments` | Assign a device to monitor a source for a station | StationEngineer |
+| GET | `/monitoring-assignments/{id}` | Read one monitoring assignment | Any |
+| GET | `/monitoring-assignments` | List monitoring assignments | Any |
+| POST | `/monitoring-assignments/{id}/record-receipt` | Record a monitored-source receipt, clearing a silence flag | StationEngineer |
+| POST | `/monitoring-assignments/{id}/decommission` | Decommission a monitoring assignment | StationEngineer |
+| POST | `/monitoring-assignments/{id}/reinstate` | Reinstate a decommissioned monitoring assignment | StationEngineer |
+| POST | `/equipment-outages` | File an equipment failure notification | StationEngineer |
+| GET | `/equipment-outages/{id}` | Read one outage, including both downtime figures | Any |
+| GET | `/equipment-outages` | List outages | Any |
+| POST | `/equipment-outages/{id}/start-repair` | Start, or restart after a failed verification, the repair | StationEngineer |
+| POST | `/equipment-outages/{id}/restore` | Report service restored and compute both downtime figures | StationEngineer |
+| POST | `/equipment-outages/{id}/fail-verification` | Reject a reported restoration and send the outage back around the repair cycle | ComplianceAdmin |
+| POST | `/equipment-outages/{id}/close` | Close a verified restoration and return the device to service | ComplianceAdmin |
+| POST | `/alert-events` | Log a received alert, running duplicate suppression then relay selection | StationEngineer |
+| GET | `/alert-events/{id}` | Read one alert event with both state dimensions | Any |
+| GET | `/alert-events` | List alert events | Any |
+| POST | `/alert-events/{id}/confirm-relay` | Confirm the alert was forwarded | StationEngineer |
+| POST | `/alert-events/{id}/verify-accessibility` | Record crawl, loudness and caption measurements and evaluate accessibility | StationEngineer |
+| POST | `/wireless-alert-notices` | Record a wireless emergency alert notice for duplicate avoidance | ComplianceAdmin |
+| GET | `/wireless-alert-notices/{id}` | Read one wireless alert notice | Any |
+| GET | `/wireless-alert-notices` | List wireless alert notices | Any |
+| POST | `/test-events` | Schedule a weekly, monthly or national test window for a station | ComplianceAdmin |
+| GET | `/test-events/{id}` | Read one test event, including its version for concurrency use | Any |
+| GET | `/test-events` | List test events | Any |
+| POST | `/test-events/{id}/evaluate-readiness` | Evaluate pre-test readiness and set the event ready or pending | StationEngineer |
+| POST | `/test-events/{id}/close-logging` | Close the logging phase of a test event | StationEngineer |
+| POST | `/test-log-entries` | Append a transmission or receipt line to a ready test event | StationEngineer |
+| GET | `/test-log-entries/{id}` | Read one log line | Any |
+| GET | `/test-log-entries` | List log lines | Any |
+| POST | `/filing-records` | File post-test results for a test event | CertifyingOfficer |
+| GET | `/filing-records/{id}` | Read one filing record | Any |
+| GET | `/filing-records` | List filing records | Any |
+| POST | `/filing-records/{id}/accept` | Accept a submitted filing | ComplianceAdmin |
+| POST | `/filing-records/{id}/reverse` | Reverse a filing and compensate the station's penalty total | ComplianceAdmin |
+| POST | `/inspection-requests` | Open a public-file inspection request against a station | FieldInspector |
+| GET | `/inspection-requests/{id}` | Read one inspection request | Any |
+| GET | `/inspection-requests` | List inspection requests | Any |
+| POST | `/inspection-requests/{id}/draft-response` | Attach the document kinds the station will produce | StationEngineer |
+| POST | `/inspection-requests/{id}/submit-response` | Submit the drafted response and score its completeness | CertifyingOfficer |
+| POST | `/inspection-requests/{id}/close` | Close the request as satisfied or deficient | FieldInspector |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_AUTH_HEADERS` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_STATE_PLAN_NOT_FOUND` | 404 Not Found |
+| `ERR_STATION_NOT_FOUND` | 404 Not Found |
+| `ERR_RELAY_RULE_NOT_FOUND` | 404 Not Found |
+| `ERR_DEVICE_NOT_FOUND` | 404 Not Found |
+| `ERR_ASSIGNMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_OUTAGE_NOT_FOUND` | 404 Not Found |
+| `ERR_ALERT_EVENT_NOT_FOUND` | 404 Not Found |
+| `ERR_WEA_NOTICE_NOT_FOUND` | 404 Not Found |
+| `ERR_TEST_EVENT_NOT_FOUND` | 404 Not Found |
+| `ERR_LOG_ENTRY_NOT_FOUND` | 404 Not Found |
+| `ERR_FILING_NOT_FOUND` | 404 Not Found |
+| `ERR_INSPECTION_NOT_FOUND` | 404 Not Found |
+| `ERR_ENGINEER_NOT_ASSIGNED` | 403 Forbidden |
+| `ERR_NOT_CERTIFYING_OFFICER` | 403 Forbidden |
+| `ERR_STALE_STATION_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_TEST_EVENT_VERSION` | 412 Precondition Failed |
+| `ERR_PLAN_NOT_DRAFT` | 409 Conflict |
+| `ERR_RELAY_RULE_NOT_ACTIVE` | 409 Conflict |
+| `ERR_DEVICE_NOT_READY` | 409 Conflict |
+| `ERR_DEVICE_DECOMMISSIONED` | 409 Conflict |
+| `ERR_ASSIGNMENT_NOT_ACTIVE` | 409 Conflict |
+| `ERR_ASSIGNMENT_NOT_DECOMMISSIONED` | 409 Conflict |
+| `ERR_OUTAGE_NOT_REPAIRABLE` | 409 Conflict |
+| `ERR_OUTAGE_NOT_IN_REPAIR` | 409 Conflict |
+| `ERR_OUTAGE_NOT_RESTORED` | 409 Conflict |
+| `ERR_ALERT_NOT_RELAY_PENDING` | 409 Conflict |
+| `ERR_ACCESSIBILITY_ALREADY_VERIFIED` | 409 Conflict |
+| `ERR_TEST_NOT_READY` | 409 Conflict |
+| `ERR_TEST_NOT_LOGGED` | 409 Conflict |
+| `ERR_TEST_ALREADY_FAILED_UNFILED` | 409 Conflict |
+| `ERR_TEST_NO_ENTRIES` | 409 Conflict |
+| `ERR_FILING_NOT_REVERSIBLE` | 409 Conflict |
+| `ERR_FILING_NOT_SUBMITTED` | 409 Conflict |
+| `ERR_INSPECTION_NOT_DRAFTABLE` | 409 Conflict |
+| `ERR_INSPECTION_NOT_DRAFTED` | 409 Conflict |
+| `ERR_INSPECTION_NOT_RESPONDED` | 409 Conflict |
+| `ERR_FILINGS_SUSPENDED` | 422 Unprocessable Entity |
+| `ERR_POSTURE_NOT_TEST_ELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_RECEIPT_COVERAGE_INCOMPLETE` | 422 Unprocessable Entity |
+| `ERR_LOG_ENTRY_SOURCE_UNKNOWN` | 422 Unprocessable Entity |
+| `ERR_DEVICE_STATION_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_TEST_WINDOW_IN_PAST` | 422 Unprocessable Entity |
+| `ERR_TEST_WINDOW_OVERLAP` | 409 Conflict |
+| `ERR_READINESS_WINDOW_NOT_OPEN` | 422 Unprocessable Entity |
+| `ERR_LOGGING_WINDOW_CLOSED` | 422 Unprocessable Entity |
+| `ERR_FILING_DEADLINE_PASSED` | 422 Unprocessable Entity |
+| `ERR_OUTAGE_DETECTED_IN_FUTURE` | 422 Unprocessable Entity |
+| `ERR_ALERT_RECEIVED_IN_FUTURE` | 422 Unprocessable Entity |
+| `ERR_INSPECTION_RESPONSE_WINDOW_CLOSED` | 422 Unprocessable Entity |
+| `ERR_DUPLICATE_CALL_SIGN` | 409 Conflict |
+| `ERR_DUPLICATE_RELAY_PRIORITY` | 409 Conflict |
+| `ERR_SOURCE_TYPE_ALREADY_COVERED` | 409 Conflict |
+| `ERR_DEVICE_HAS_LIVE_ASSIGNMENTS` | 409 Conflict |
+| `ERR_SEGREGATION_OF_DUTIES` | 422 Unprocessable Entity |
+| `ERR_PENALTY_CEILING_EXCEEDED` | 422 Unprocessable Entity |

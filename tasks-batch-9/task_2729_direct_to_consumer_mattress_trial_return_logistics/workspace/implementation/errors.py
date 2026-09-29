@@ -1,0 +1,80 @@
+"""Error catalogue: every declared error_id with its HTTP status."""
+
+ERROR_STATUS = {
+    # authentication / authorisation
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_OWNER": 403,
+    "ERR_TRIAL_ABUSE_BLOCK": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_CUSTOMER_NOT_FOUND": 404,
+    "ERR_CATALOG_NOT_FOUND": 404,
+    "ERR_PARTNER_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_RETURN_CASE_NOT_FOUND": 404,
+    "ERR_ROUTE_NOT_FOUND": 404,
+    "ERR_APPOINTMENT_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_REFUND_NOT_FOUND": 404,
+    "ERR_EXCHANGE_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_ATTRIBUTION_CLAIM_NOT_FOUND": 404,
+    # state conflicts
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_RETURN_STATE": 409,
+    "ERR_ROUTE_NOT_PUBLISHED": 409,
+    "ERR_INVALID_APPOINTMENT_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_INVALID_ATTRIBUTION_STATE": 409,
+    "ERR_INVALID_EXCHANGE_STATE": 409,
+    "ERR_INVALID_REFUND_STATE": 409,
+    "ERR_INVALID_ASSIGNMENT_STATE": 409,
+    "ERR_DISPOSITION_NOT_CONFIRMED": 409,
+    "ERR_DUPLICATE_ACTIVE_RETURN": 409,
+    "ERR_SLOT_OVERLAP": 409,
+    "ERR_OPEN_QUALITY_CLAIM": 409,
+    "ERR_REFUND_SUPERSEDE_INVALID": 409,
+    # optimistic concurrency
+    "ERR_STALE_ROUTE_VERSION": 412,
+    "ERR_STALE_RETURN_CASE_VERSION": 412,
+    "ERR_STALE_ORDER_VERSION": 412,
+    # business rules
+    "ERR_BREAK_IN_NOT_ELAPSED": 422,
+    "ERR_TRIAL_WINDOW_EXPIRED": 422,
+    "ERR_RECOVERY_WINDOW_NOT_ELAPSED": 422,
+    "ERR_DAMAGE_REPORT_WINDOW_CLOSED": 422,
+    "ERR_ATTRIBUTION_WINDOW_CLOSED": 422,
+    "ERR_HOUSEHOLD_TRIAL_LIMIT": 422,
+    "ERR_EXCHANGE_LIMIT_REACHED": 422,
+    "ERR_MODEL_SIZE_MISMATCH": 422,
+    "ERR_INSUFFICIENT_EVIDENCE": 422,
+    "ERR_INDENTATION_BELOW_THRESHOLD": 422,
+    "ERR_ROUND_LIMIT_REACHED": 422,
+    "ERR_ATTRIBUTION_CHANNEL_MISMATCH": 422,
+    "ERR_PRICE_MATCH_NOT_OFFERED": 422,
+    "ERR_SLOT_OUTSIDE_ROUTE_WINDOW": 422,
+    "ERR_ROUTE_CAPACITY_EXCEEDED": 422,
+    "ERR_DONATION_INELIGIBLE": 422,
+    "ERR_NO_DISPOSITION_PARTNER": 422,
+    "ERR_PARTNER_INTAKE_CAPACITY_EXCEEDED": 422,
+    "ERR_NO_REFUNDABLE_BALANCE": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or error_id
+        super().__init__(self.message)
+
+
+def api_error(error_id, message=None):
+    return ApiError(error_id, message)
+
+
+def invalid(message):
+    return ApiError("ERR_INVALID_REQUEST", "Invalid request: %s" % message)

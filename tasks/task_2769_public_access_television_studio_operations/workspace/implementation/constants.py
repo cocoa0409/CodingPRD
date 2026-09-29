@@ -1,0 +1,113 @@
+"""Domain constants -- transcribed from the PRD / scaffold constants block."""
+
+# --- certification / training -------------------------------------------------
+PASS_SCORE_MIN = 80
+# PRD 2.11 is authoritative for this vocabulary.
+COMPETENCY_CODES = ["STUDIO_FLOOR", "EDIT_SUITE", "ENG_CAMERA", "AUDIO_BOARD", "LIVE_SWITCHER"]
+COURSE_TIERS = ["BASIC", "ADVANCED", "LIVE"]
+CERTIFICATION_LEVELS = ["NONE", "BASIC", "ADVANCED", "LIVE"]
+
+# --- suspension ---------------------------------------------------------------
+SUSPENSION_THRESHOLD_POINTS = 3
+SUSPENSION_POINTS_BY_SEVERITY = {"MINOR": 1, "MAJOR": 2, "TOTAL_LOSS": 3}
+REPAIR_ESCALATION_CENTS = 50000
+
+# --- review -------------------------------------------------------------------
+MAX_REVISION_ROUNDS = 2
+
+# --- attestations -------------------------------------------------------------
+CURRENT_STATEMENT_VERSION = "2026.1"
+REQUIRED_ATTESTATION_KINDS = ["INDEMNIFICATION", "COPYRIGHT_CLEARANCE", "CONTENT_POLICY"]
+ATTESTATION_KINDS = ["INDEMNIFICATION", "COPYRIGHT_CLEARANCE", "CONTENT_POLICY"]
+INDEMNIFICATION_TERM_DAYS = 365
+
+# --- deposits / reservations ---------------------------------------------------
+RISK_BP_PER_SUSPENSION_POINT = 1500
+RISK_BP_CAP = 4500
+HOURLY_DEPOSIT_RATE_BP = 500
+LIVE_LINK_SURCHARGE_BP = 2000
+LATE_FEE_BP_PER_HOUR = 750
+CHECKOUT_LEAD_SECONDS = 3600
+DEPOSIT_HOLD_CAP_CENTS = 500000
+
+# --- franchise fee allocation --------------------------------------------------
+ADMIN_RESERVE_BP_BASE = 800
+ADMIN_RESERVE_BP_HIGH = 500
+HIGH_TIER_THRESHOLD_CENTS = 5000000
+CAPITAL_RATE_BP = 3500
+
+# --- community impact index ----------------------------------------------------
+WEIGHT_REACH = "0.5"
+WEIGHT_DEMAND = "0.3"
+WEIGHT_VOLUNTEER = "0.2"
+HOUSEHOLD_NORM = 1000
+VIEW_NORM = 500
+VOLUNTEER_TENTHS_NORM = 100
+
+# --- archive retention ---------------------------------------------------------
+RETENTION_MONTHS = {"STANDARD_24M": 24, "EXTENDED_60M": 60, "PERMANENT": None}
+RETENTION_CLASSES = ["STANDARD_24M", "EXTENDED_60M", "PERMANENT"]
+
+# --- series --------------------------------------------------------------------
+SERIES_LAPSE_MISSED_WINDOWS = 2
+SERIES_CADENCES = ["WEEKLY", "BIWEEKLY", "MONTHLY"]
+
+# --- crew ----------------------------------------------------------------------
+SECONDS_PER_TENTH_HOUR = 360
+CREW_ROLES = ["DIRECTOR", "SWITCHER", "AUDIO", "CAMERA", "FLOOR_MANAGER"]
+LIVE_ROLES_REQUIRING_LIVE_CERT = ["DIRECTOR", "SWITCHER"]
+
+# --- content review ------------------------------------------------------------
+UNPROTECTED_FINDING_CATEGORIES = [
+    "OBSCENITY",
+    "DEFAMATION",
+    "TRUE_THREAT",
+    "INCITEMENT_TO_IMMINENT_LAWLESS_ACTION",
+    "CHILD_EXPLOITATION",
+    "COMMERCIAL_ADVERTISING",
+    "COPYRIGHT_INFRINGEMENT",
+    "TECHNICAL_STANDARDS_FAILURE",
+]
+
+# --- clock ---------------------------------------------------------------------
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# --- roles ---------------------------------------------------------------------
+ROLE_PRODUCER = "Producer"
+ROLE_CENTER_ADMIN = "CenterAdmin"
+ROLE_TRAINING_COORDINATOR = "TrainingCoordinator"
+ROLE_SCHEDULING_COORDINATOR = "SchedulingCoordinator"
+ROLE_FACILITIES_MANAGER = "FacilitiesManager"
+ROLE_CONTENT_REVIEWER = "ContentReviewer"
+ROLE_FINANCE_OFFICER = "FinanceOfficer"
+
+ALL_ROLES = [
+    ROLE_PRODUCER,
+    ROLE_CENTER_ADMIN,
+    ROLE_TRAINING_COORDINATOR,
+    ROLE_SCHEDULING_COORDINATOR,
+    ROLE_FACILITIES_MANAGER,
+    ROLE_CONTENT_REVIEWER,
+    ROLE_FINANCE_OFFICER,
+]
+
+# --- enum vocabularies ---------------------------------------------------------
+PRODUCER_STATUSES = ["APPLICANT", "ACTIVE", "SUSPENDED", "REVOKED"]
+ENROLLMENT_STATUSES = ["ENROLLED", "ATTENDED", "PASSED", "FAILED", "WITHDRAWN"]
+SERIES_STATUSES = ["PROPOSED", "ACTIVE", "LAPSED", "RETIRED"]
+REVIEW_STATUSES = ["DRAFT", "SUBMITTED", "UNDER_REVIEW", "APPROVED", "CHANGES_REQUESTED", "REJECTED", "WITHDRAWN"]
+CLEARANCE_STATUSES = ["INCOMPLETE", "CLEARED"]
+CHANNEL_TIERS = ["PUBLIC", "EDUCATIONAL", "GOVERNMENT"]
+SLOT_STATUSES = ["SCHEDULED", "AIRED", "CANCELLED", "PREEMPTED", "WITHDRAWN"]
+BOOKING_TYPES = ["FIRST_COME", "SERIES_HOLD"]
+STAFFING_STATUSES = ["NOT_REQUIRED", "UNDERSTAFFED", "READY"]
+RESOURCE_CLASSES = ["STUDIO_A", "FIELD_CAMERA_KIT", "AUDIO_KIT", "EDIT_SUITE"]
+RESOURCE_STATUSES = ["AVAILABLE", "MAINTENANCE", "RETIRED"]
+RESERVATION_STATUSES = ["REQUESTED", "CONFIRMED", "CHECKED_OUT", "DAMAGE_REVIEW", "SETTLED", "CANCELLED"]
+DAMAGE_SEVERITIES = ["MINOR", "MAJOR", "TOTAL_LOSS"]
+DAMAGE_STATUSES = ["FILED", "FINALIZED", "WAIVED"]
+CREW_STATUSES = ["OFFERED", "CONFIRMED", "COMPLETED", "RELEASED"]
+FUNDING_BASES = ["ACCRUAL", "CASH"]
+FUNDING_REPORT_STATUSES = ["DRAFT", "SUBMITTED", "ACCEPTED", "RETURNED_FOR_REVISION"]
+ARCHIVE_STATUSES = ["PENDING", "PUBLISHED", "WITHDRAWN", "PURGED"]
+IMPACT_VARIANTS = ["PROVISIONAL", "FINAL"]

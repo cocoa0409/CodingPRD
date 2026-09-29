@@ -1,0 +1,3445 @@
+scenario: |
+  2848. Interlibrary Loan & Resource Sharing (academic library resource sharing unit): request intake
+  with local holdings and licensed access checks before borrowing, lender selection from a rota by cost,
+  turnaround and reciprocity agreements, copyright compliance limits on article requests per journal per
+  year, physical item shipping, due dates, renewals and recall handling, unfilled request escalation to
+  purchase-on-demand, patron notification, pickup and electronic delivery expiration, borrowing versus
+  lending balance and invoicing across consortium partners, damaged and lost item billing
+
+domain_name: interlibrary-loan-resource-sharing
+api_prefix: "/ill"
+
+complexity_profile:
+  primary_archetype: multi_party_negotiation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - selector_policy
+    - rate_threshold_triggers
+    - cascading_side_effects
+    - optimistic_concurrency
+
+  entity_topology: graph
+  # Partner / Rota / RotaEntry form a many-to-many junction; ReciprocityAgreement is self-referential
+  # through `supersedes_agreement_id`; IllRequest fans out to five peer children (SupplyOffer,
+  # CopyrightClearance, Shipment, LoanRecord, ElectronicDelivery) while also pointing back at Partner.
+  # There is no single ownership tree: LendingCharge and PartnerInvoice hang off Partner, notifications
+  # hang off IllRequest, and CopyrightClearance is keyed on an (issn, calendar_year) pair that is not an
+  # entity at all.
+
+  state_machine_shape: cyclic
+  # IllRequest is genuinely cyclic in two independent loops:
+  #   (1) SOURCING -> OFFER_PENDING -> SOURCING  (lender declines / offer expires: rota rounds)
+  #   (2) SOURCING -> ESCALATED_POD -> SOURCING  (purchase-on-demand rejected: back to the rota)
+  # LoanRecord carries three parallel state dimensions on one row (custody_status x billing_status x
+  # recall_status). PartnerInvoice is cyclic (ISSUED -> DISPUTED -> ISSUED). Intake is a branching fork
+  # (SUBMITTED -> {SOURCING | COPYRIGHT_HOLD}) with divergent side-effect sets per branch.
+
+  relationship_patterns:
+    - one_to_many          # IllRequest -> SupplyOffer / Shipment / LoanRecord / PatronNotification
+    - many_to_many         # Rota <-> Partner via RotaEntry
+    - self_referential     # ReciprocityAgreement.supersedes_agreement_id -> ReciprocityAgreement.id
+    - cross_aggregate      # IllRequest.committed_partner_id crosses into the Partner aggregate;
+                           # PartnerInvoice reads IllRequest rows and LendingCharge rows together
+
+  role_model: segregation_of_duties
+  # Two enforced separations, both keyed on X-User-ID:
+  #   (a) the AcquisitionsLibrarian who decides a PurchaseOnDemandOrder MUST NOT be the user who
+  #       escalated the request (PurchaseOnDemandOrder.escalated_by_user_id);
+  #   (b) the IllBorrowingStaff who records a ROYALTY_PAID CopyrightClearance MUST NOT be the user who
+  #       took the request in (IllRequest.intake_user_id).
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+  - name: Patron
+    parent: null
+    common_fields: true
+    fields:
+      - name: external_id
+        type: string
+        source: input
+        description: campus-unique patron identifier
+        constraints: "unique across all Patron rows; 1..32 chars"
+      - name: full_name
+        type: string
+        source: input
+        description: patron display name
+      - name: email
+        type: string
+        source: input
+        description: notification destination address
+      - name: patron_type
+        type: enum
+        source: input
+        description: academic standing, recorded for reporting only
+        constraints: "one of {FACULTY, GRAD, UNDERGRAD, STAFF}"
+      - name: department
+        type: string
+        source: input
+        description: owning academic department code
+      - name: status
+        type: enum
+        source: system
+        description: account standing gate for intake
+        default: ACTIVE
+        constraints: "one of {ACTIVE, BLOCKED, WITHDRAWN}; ACTIVE on create; BLOCKED written by PATCH /ill/patrons/{id} and by the standing cascade; WITHDRAWN written only by PATCH /ill/patrons/{id}"
+      - name: max_open_requests
+        type: integer
+        source: input
+        description: ceiling on open_request_count at intake
+        default: 5
+        constraints: ">= 1"
+      - name: max_concurrent_loans
+        type: integer
+        source: input
+        description: ceiling on overlapping LoanRecord occupation windows (see calculations.patron_loan_window_capacity)
+        default: 3
+        constraints: ">= 1"
+      - name: unpaid_balance_cap_cents
+        type: integer
+        source: input
+        description: intake is refused once unpaid_balance_cents strictly exceeds this cap
+        default: 5000
+        constraints: ">= 0"
+      - name: historical_lost_count
+        type: integer
+        source: computed
+        description: migrated LOST infractions; sum of count over POST /ill/patrons/{id}/infraction-records with kind LOST
+        default: 0
+      - name: historical_damaged_count
+        type: integer
+        source: computed
+        description: migrated DAMAGED infractions; sum of count over infraction records with kind DAMAGED
+        default: 0
+      - name: historical_late_return_count
+        type: integer
+        source: computed
+        description: migrated LATE_RETURN infractions; sum of count over infraction records with kind LATE_RETURN
+        default: 0
+      - name: historical_unclaimed_count
+        type: integer
+        source: computed
+        description: migrated UNCLAIMED infractions; sum of count over infraction records with kind UNCLAIMED
+        default: 0
+      - name: historical_unpaid_cents
+        type: integer
+        source: computed
+        description: migrated unpaid charges; sum of unpaid_amount_cents over infraction records with kind UNPAID_CHARGE
+        default: 0
+      - name: lost_count
+        type: integer
+        source: computed
+        description: historical_lost_count + COUNT(LoanRecord of this patron with billing_status == LOST_BILLED)
+        default: 0
+      - name: damaged_count
+        type: integer
+        source: computed
+        description: historical_damaged_count + COUNT(LoanRecord of this patron with billing_status == DAMAGE_BILLED)
+        default: 0
+      - name: late_return_count
+        type: integer
+        source: computed
+        description: historical_late_return_count + COUNT(LoanRecord of this patron with overdue_fine_cents > 0)
+        default: 0
+      - name: unclaimed_count
+        type: integer
+        source: computed
+        description: historical_unclaimed_count + COUNT(IllRequest of this patron with status == UNCLAIMED)
+        default: 0
+      - name: unpaid_balance_cents
+        type: integer
+        source: computed
+        description: historical_unpaid_cents + SUM(LoanRecord.outstanding_cents over this patron's LoanRecord rows with billing_status IN {FINE_ACCRUED, DAMAGE_BILLED, LOST_BILLED})
+        default: 0
+      - name: pending_charge_cents
+        type: integer
+        source: computed
+        description: SUM(IllRequest.net_patron_charge_cents over this patron's IllRequest rows with status NOT IN {CANCELLED, UNFILLED})
+        default: 0
+      - name: open_request_count
+        type: integer
+        source: computed
+        description: COUNT(IllRequest of this patron with status NOT IN {CLOSED, CLOSED_WITH_DAMAGE, CLOSED_LOST, CANCELLED, UNFILLED, FILLED_BY_PURCHASE, UNCLAIMED})
+        default: 0
+      - name: provisional_risk_score
+        type: integer
+        source: computed
+        description: intake-time standing score; see calculations.patron_standing_score variant provisional_standing
+        default: 0
+        constraints: "0..100"
+      - name: final_risk_score
+        type: integer
+        source: computed
+        description: ops-run standing score; see calculations.patron_standing_score variant final_standing
+        default: 0
+        constraints: "0..100"
+
+  - name: Partner
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: consortium-unique partner library code
+        constraints: "unique across all Partner rows; 2..16 chars"
+      - name: name
+        type: string
+        source: input
+        description: partner library display name
+      - name: consortium_code
+        type: string
+        source: input
+        description: consortium this partner settles through
+      - name: base_lending_fee_cents
+        type: integer
+        source: input
+        description: partner list fee, used only as the default when a RotaEntry omits quoted_fee_cents
+        constraints: ">= 0"
+      - name: avg_turnaround_days
+        type: integer
+        source: input
+        description: partner published turnaround, used only as the default when a RotaEntry omits quoted_turnaround_days
+        constraints: ">= 0"
+      - name: ships_physical
+        type: boolean
+        source: input
+        description: partner can supply LOAN (physical) requests
+      - name: supplies_electronic
+        type: boolean
+        source: input
+        description: partner can supply COPY (article scan) requests
+      - name: allows_renewals
+        type: boolean
+        source: input
+        description: partner permits renewals on its loans
+      - name: loan_period_days
+        type: integer
+        source: input
+        description: loan period this partner grants, snapshotted onto IllRequest at offer acceptance
+        constraints: "1..120"
+      - name: max_renewals
+        type: integer
+        source: input
+        description: renewal ceiling this partner grants, snapshotted onto LoanRecord at receipt
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: input
+        description: eligibility gate for lender selection and offer acceptance
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED, WITHDRAWN}; written on create and by PATCH /ill/partners/{id}"
+      - name: borrowed_from_count
+        type: integer
+        source: computed
+        description: COUNT(IllRequest with committed_partner_id == this.id AND status NOT IN {CANCELLED, UNFILLED})
+        default: 0
+      - name: lent_to_count
+        type: integer
+        source: computed
+        description: COUNT(LendingCharge with partner_id == this.id)
+        default: 0
+      - name: net_borrow_imbalance_items
+        type: integer
+        source: computed
+        description: borrowed_from_count - lent_to_count; may be negative
+        default: 0
+      - name: borrow_payable_cents
+        type: integer
+        source: computed
+        description: SUM(IllRequest.committed_fee_cents over IllRequest with committed_partner_id == this.id AND status NOT IN {CANCELLED, UNFILLED}); a conserved quantity — cancelling a committed request must return this field to exactly the value it held before the commitment, with no drift
+        default: 0
+      - name: lend_receivable_cents
+        type: integer
+        source: computed
+        description: SUM(LendingCharge.charge_cents over LendingCharge with partner_id == this.id AND status == OPEN)
+        default: 0
+
+  - name: ReciprocityAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - name: partner_id
+        type: string
+        source: input
+        description: "FK -> Partner.id; the partner this agreement governs"
+      - name: supersedes_agreement_id
+        type: string
+        source: input
+        description: "FK -> ReciprocityAgreement.id; nullable; when present the named agreement is flipped ACTIVE -> SUPERSEDED before the window-overlap check runs"
+        default: null
+      - name: fee_waiver_mode
+        type: enum
+        source: input
+        description: how the partner's quoted fee is reduced for this borrower
+        constraints: "one of {NONE, FULL, CAPPED}"
+      - name: capped_waiver_cents
+        type: integer
+        source: input
+        description: cents deducted from the quoted fee when fee_waiver_mode == CAPPED; ignored otherwise
+        default: 0
+        constraints: ">= 0"
+      - name: balance_tolerance_items
+        type: integer
+        source: input
+        description: net_borrow_imbalance_items strictly above this value adds IMBALANCE_PENALTY_CENTS to the partner's landed cost
+        default: 3
+        constraints: ">= 0"
+      - name: settlement_mode
+        type: enum
+        source: input
+        description: selects the partner_invoice_reconciliation variant (GROSS or NET)
+        constraints: "one of {GROSS, NET}"
+      - name: turnaround_guarantee_days
+        type: integer
+        source: input
+        description: turnaround the partner guarantees under this agreement; recorded for reporting only
+        constraints: ">= 0"
+      - name: effective_from
+        type: datetime
+        source: input
+        description: inclusive start of the agreement occupation window on the partner
+      - name: effective_to
+        type: datetime
+        source: input
+        description: exclusive end of the agreement occupation window on the partner
+        constraints: "strictly after effective_from"
+      - name: status
+        type: enum
+        source: system
+        description: agreement lifecycle state
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED, EXPIRED}; ACTIVE on create; SUPERSEDED written by a superseding create; EXPIRED written by ops-run step 1"
+
+  - name: Rota
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: rota display name
+      - name: material_type
+        type: enum
+        source: input
+        description: the service_type this rota may source; must equal IllRequest.service_type
+        constraints: "one of {LOAN, COPY}"
+      - name: selection_policy
+        type: enum
+        source: input
+        description: which ranking expression lender selection uses
+        constraints: "one of {LANDED_COST, MANUAL_RANK}"
+      - name: max_attempts
+        type: integer
+        source: input
+        description: ceiling on IllRequest.attempt_count before sourcing is refused
+        default: 3
+        constraints: "1..10"
+      - name: auto_escalate_pod
+        type: boolean
+        source: input
+        description: when true, ops-run step 7 sends an attempts-exhausted request to ESCALATED_POD instead of UNFILLED
+        default: false
+      - name: offer_response_hours
+        type: integer
+        source: input
+        description: hours a lender has to answer an offer; sets SupplyOffer.respond_by
+        default: 48
+        constraints: "1..720"
+
+  - name: RotaEntry
+    parent: null
+    common_fields: true
+    fields:
+      - name: rota_id
+        type: string
+        source: input
+        description: "FK -> Rota.id; the rota this entry belongs to"
+      - name: partner_id
+        type: string
+        source: input
+        description: "FK -> Partner.id; the candidate lender this entry quotes"
+      - name: manual_rank
+        type: integer
+        source: input
+        description: operator-assigned rank; primary sort key under selection_policy MANUAL_RANK, third tie-break under LANDED_COST
+        constraints: ">= 1"
+      - name: quoted_fee_cents
+        type: integer
+        source: input
+        description: fee this partner quotes on this rota before reciprocity waivers
+        constraints: ">= 0"
+      - name: quoted_turnaround_days
+        type: integer
+        source: input
+        description: whole days this partner quotes on this rota
+        constraints: ">= 0"
+      - name: is_enabled
+        type: boolean
+        source: input
+        description: false removes the entry from the candidate set without deleting it
+        default: true
+      - name: status
+        type: enum
+        source: system
+        description: entry lifecycle state
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED}; ACTIVE on create; SUPERSEDED written when a later create re-quotes the same (rota_id, partner_id) pair"
+
+  - name: BibItem
+    parent: null
+    common_fields: true
+    fields:
+      - name: title
+        type: string
+        source: input
+        description: title of the requested work
+      - name: item_type
+        type: enum
+        source: input
+        description: bibliographic form
+        constraints: "one of {BOOK, ARTICLE, CHAPTER, THESIS, MEDIA}"
+      - name: issn
+        type: string
+        source: input
+        description: journal ISSN; required when item_type == ARTICLE, else null
+        default: null
+      - name: isbn
+        type: string
+        source: input
+        description: monograph ISBN; null for articles
+        default: null
+      - name: journal_title
+        type: string
+        source: input
+        description: host journal title; null unless item_type == ARTICLE
+        default: null
+      - name: publication_year
+        type: integer
+        source: input
+        description: publication year; drives both the copyright recency window and the licensed-embargo test
+        constraints: "1500..2100"
+      - name: local_holding_status
+        type: enum
+        source: input
+        description: local catalogue holding state
+        default: NONE
+        constraints: "one of {NONE, HELD_AVAILABLE, HELD_CHECKED_OUT, ON_ORDER}; written on create, by the POD approval cascade (-> ON_ORDER) and by the POD receipt cascade (-> HELD_AVAILABLE)"
+      - name: licensed_access_status
+        type: enum
+        source: input
+        description: licensed electronic access state
+        default: NONE
+        constraints: "one of {NONE, LICENSED_FULL, LICENSED_EMBARGOED}"
+      - name: embargo_months
+        type: integer
+        source: input
+        description: months of embargo when licensed_access_status == LICENSED_EMBARGOED; ignored otherwise
+        default: 0
+        constraints: ">= 0"
+      - name: list_price_cents
+        type: integer
+        source: input
+        description: catalogue list price; snapshotted onto PurchaseOnDemandOrder and used as the loan replacement cost when non-zero
+        default: 0
+        constraints: ">= 0"
+
+  - name: IllRequest
+    parent: null
+    common_fields: true
+    fields:
+      - name: patron_id
+        type: string
+        source: input
+        description: "FK -> Patron.id; the requesting patron"
+      - name: bib_item_id
+        type: string
+        source: input
+        description: "FK -> BibItem.id; the work requested"
+      - name: rota_id
+        type: string
+        source: input
+        description: "FK -> Rota.id; the rota lender selection will walk"
+      - name: committed_partner_id
+        type: string
+        source: computed
+        description: "FK -> Partner.id; nullable; set to the accepting lender at offer acceptance, cleared to null on cancellation"
+        default: null
+      - name: service_type
+        type: enum
+        source: input
+        description: LOAN ships a physical item, COPY delivers an electronic article
+        constraints: "one of {LOAN, COPY}; must equal Rota.material_type"
+      - name: delivery_mode
+        type: enum
+        source: input
+        description: how the patron receives the item
+        constraints: "one of {PICKUP, ELECTRONIC, MAIL}; must be ELECTRONIC when service_type == COPY"
+      - name: needed_by
+        type: datetime
+        source: input
+        description: instant after which the item is useless to the patron; drives days_available and the rush surcharge
+        constraints: "strictly after the logical clock at intake"
+      - name: max_supply_fee_cents
+        type: integer
+        source: input
+        description: ceiling on a candidate's effective_fee_cents; candidates above it are removed from the candidate set
+        constraints: ">= 0"
+      - name: pages_requested
+        type: integer
+        source: input
+        description: pages of the article requested; required when service_type == COPY AND BibItem.item_type == ARTICLE, else null
+        default: null
+        constraints: "1..200 when present"
+      - name: intake_user_id
+        type: string
+        source: system
+        description: X-User-ID that created the request; the segregation-of-duties counterparty for ROYALTY_PAID clearances
+      - name: status
+        type: enum
+        source: system
+        description: request lifecycle state; see state_machines.IllRequest
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, COPYRIGHT_HOLD, SOURCING, OFFER_PENDING, SUPPLY_COMMITTED, IN_TRANSIT, ON_HOLD_SHELF, WITH_PATRON, RETURN_IN_TRANSIT, DELIVERED_ELECTRONIC, ESCALATED_POD, CLOSED, CLOSED_WITH_DAMAGE, CLOSED_LOST, UNCLAIMED, CANCELLED, UNFILLED, FILLED_BY_PURCHASE}"
+      - name: unfilled_reason
+        type: enum
+        source: system
+        description: why sourcing stopped
+        default: NONE
+        constraints: "one of {NONE, ATTEMPTS_EXHAUSTED, TRANSIT_LOST}; reset to NONE when a POD rejection returns the request to SOURCING"
+      - name: attempt_count
+        type: integer
+        source: computed
+        description: rota rounds spent; incremented by POST /ill/requests/{id}/source, reset to 0 by a POD rejection
+        default: 0
+      - name: copyright_required
+        type: boolean
+        source: computed
+        description: true when service_type == COPY AND BibItem.item_type == ARTICLE AND BibItem.issn is not null
+        default: false
+      - name: days_available_at_source
+        type: integer
+        source: computed
+        description: floor((needed_by - logical clock) / 86400s) snapshotted at the most recent successful source call
+        default: 0
+      - name: committed_fee_cents
+        type: integer
+        source: computed
+        description: accepted offer's effective_fee_cents; 0 before acceptance and reset to 0 on cancellation
+        default: 0
+      - name: committed_loan_period_days
+        type: integer
+        source: computed
+        description: Partner.loan_period_days snapshotted at offer acceptance
+        default: 0
+      - name: rush_surcharge_cents
+        type: integer
+        source: computed
+        description: RUSH_SURCHARGE_CENTS when days_available_at_source <= RUSH_THRESHOLD_DAYS at acceptance, else 0
+        default: 0
+      - name: royalty_cents
+        type: integer
+        source: computed
+        description: royalty_cents of this request's ACTIVE CopyrightClearance with method ROYALTY_PAID, else 0
+        default: 0
+      - name: gross_charge_cents
+        type: integer
+        source: computed
+        description: committed_fee_cents + rush_surcharge_cents + royalty_cents
+        default: 0
+      - name: subsidy_cents
+        type: integer
+        source: computed
+        description: department subsidy; see calculations.patron_charge_assembly
+        default: 0
+      - name: net_patron_charge_cents
+        type: integer
+        source: computed
+        description: gross_charge_cents - subsidy_cents
+        default: 0
+      - name: fulfilled_at
+        type: datetime
+        source: system
+        description: instant the item reached the borrower (shipment receipt or electronic delivery); the period key for invoicing
+        default: null
+      - name: closed_at
+        type: datetime
+        source: system
+        description: instant the request reached a terminal state
+        default: null
+
+  - name: SupplyOffer
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the request this rota round is offered for"
+      - name: partner_id
+        type: string
+        source: computed
+        description: "FK -> Partner.id; the lender selected by calculations.lender_landed_cost_ranking"
+      - name: attempt_seq
+        type: integer
+        source: computed
+        description: 1-based rota round number; equals IllRequest.attempt_count after the source call
+      - name: quoted_fee_cents
+        type: integer
+        source: computed
+        description: RotaEntry.quoted_fee_cents snapshotted at offer time
+      - name: quoted_turnaround_days
+        type: integer
+        source: computed
+        description: RotaEntry.quoted_turnaround_days snapshotted at offer time
+      - name: effective_fee_cents
+        type: integer
+        source: computed
+        description: quoted fee after the reciprocity waiver; becomes IllRequest.committed_fee_cents on acceptance
+      - name: landed_cost_cents
+        type: integer
+        source: computed
+        description: the winning candidate's ranking value; see calculations.lender_landed_cost_ranking
+      - name: imbalance_penalty_cents
+        type: integer
+        source: computed
+        description: IMBALANCE_PENALTY_CENTS when the partner's net_borrow_imbalance_items exceeded the tolerance at offer time, else 0
+        default: 0
+      - name: offered_at
+        type: datetime
+        source: system
+        description: logical clock at the source call
+      - name: respond_by
+        type: datetime
+        source: computed
+        description: offered_at + Rota.offer_response_hours hours; ops-run step 2 expires the offer at or after this instant
+      - name: status
+        type: enum
+        source: system
+        description: offer lifecycle state
+        default: OFFERED
+        constraints: "one of {OFFERED, ACCEPTED, DECLINED, EXPIRED, CANCELLED}"
+      - name: decline_reason
+        type: enum
+        source: input
+        description: lender's stated reason; NONE until a decline
+        default: NONE
+        constraints: "one of {NONE, NOT_HELD, IN_USE, POLICY, COST}"
+      - name: offered_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the staff member who ran the source call
+
+  - name: CopyrightClearance
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the article request this clearance covers"
+      - name: issn
+        type: string
+        source: computed
+        description: BibItem.issn snapshotted at clearance creation; the first key of the rule-of-five counter
+      - name: calendar_year
+        type: integer
+        source: computed
+        description: calendar year (UTC) of the logical clock at clearance creation; the second key of the counter
+      - name: method
+        type: enum
+        source: computed
+        description: how the copy is cleared
+        constraints: "one of {CONTU_FREE, ROYALTY_PAID, PRE_WINDOW_EXEMPT}; CONTU_FREE and PRE_WINDOW_EXEMPT written at intake, ROYALTY_PAID written by POST /ill/requests/{id}/copyright-clearances"
+      - name: sequence_in_year
+        type: integer
+        source: computed
+        description: 1-based position of this clearance inside the (issn, calendar_year) CONTU_FREE counter; 0 for ROYALTY_PAID and PRE_WINDOW_EXEMPT
+        default: 0
+      - name: royalty_cents
+        type: integer
+        source: computed
+        description: royalty owed; non-zero only when method == ROYALTY_PAID
+        default: 0
+      - name: pages_covered
+        type: integer
+        source: computed
+        description: IllRequest.pages_requested snapshotted at clearance creation
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that recorded a ROYALTY_PAID clearance; null for the two automatic methods
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: clearance validity
+        default: ACTIVE
+        constraints: "one of {ACTIVE, VOIDED}; ACTIVE on create; VOIDED written by the request-cancellation cascade"
+
+  - name: Shipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the request this parcel serves"
+      - name: direction
+        type: enum
+        source: computed
+        description: INBOUND is lender-to-borrower, RETURN is borrower-to-lender
+        constraints: "one of {INBOUND, RETURN}"
+      - name: carrier
+        type: string
+        source: input
+        description: courier name
+      - name: tracking_code
+        type: string
+        source: input
+        description: courier tracking code
+      - name: insured_value_cents
+        type: integer
+        source: input
+        description: declared insured value
+        default: 0
+        constraints: ">= 0"
+      - name: shipped_at
+        type: datetime
+        source: system
+        description: logical clock when the parcel was handed to the courier
+      - name: received_at
+        type: datetime
+        source: system
+        description: logical clock at borrower receipt; INBOUND only
+        default: null
+      - name: confirmed_at
+        type: datetime
+        source: system
+        description: logical clock at lender confirmation; RETURN only
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: parcel lifecycle state
+        default: IN_TRANSIT
+        constraints: "one of {IN_TRANSIT, RECEIVED, CONFIRMED_OK, CONFIRMED_DAMAGED, CONFIRMED_LOST, LOST_IN_TRANSIT}"
+
+  - name: LoanRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the request this physical loan fulfils"
+      - name: inbound_tracking_code
+        type: string
+        source: computed
+        description: Shipment.tracking_code of the INBOUND parcel, copied at receipt for reconciliation
+      - name: received_at
+        type: datetime
+        source: computed
+        description: logical clock at INBOUND receipt; start of the loan occupation window
+      - name: due_at
+        type: datetime
+        source: computed
+        description: current due instant; end of the loan occupation window
+      - name: original_due_at
+        type: datetime
+        source: computed
+        description: received_at + IllRequest.committed_loan_period_days days, never rewritten
+      - name: renewal_count
+        type: integer
+        source: computed
+        description: successful renewals so far
+        default: 0
+      - name: max_renewals
+        type: integer
+        source: computed
+        description: Partner.max_renewals snapshotted at receipt
+      - name: renewals_allowed
+        type: boolean
+        source: computed
+        description: Partner.allows_renewals snapshotted at receipt
+      - name: pickup_expires_at
+        type: datetime
+        source: computed
+        description: received_at + HOLD_SHELF_DAYS days; ops-run step 4 abandons the hold at or after this instant
+      - name: picked_up_at
+        type: datetime
+        source: system
+        description: logical clock at patron pickup
+        default: null
+      - name: return_prepared_at
+        type: datetime
+        source: system
+        description: logical clock at POST /ill/loans/{id}/return; the end instant of the overdue computation
+        default: null
+      - name: custody_status
+        type: enum
+        source: system
+        description: physical-possession dimension
+        default: AWAITING_PICKUP
+        constraints: "one of {AWAITING_PICKUP, WITH_PATRON, RETURN_PREPARED, UNCLAIMED_RETURN_PREPARED, RETURNED_TO_LENDER, DECLARED_LOST}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: money dimension, independent of custody_status
+        default: NO_CHARGE
+        constraints: "one of {NO_CHARGE, FINE_ACCRUED, DAMAGE_BILLED, LOST_BILLED, CHARGE_SETTLED, CHARGE_WAIVED}"
+      - name: recall_status
+        type: enum
+        source: system
+        description: lender-recall dimension, independent of the other two
+        default: NONE
+        constraints: "one of {NONE, RECALL_ISSUED, RECALL_HONORED, RECALL_BREACHED}"
+      - name: recall_due_at
+        type: datetime
+        source: computed
+        description: logical clock at recall + grace_days days; null while recall_status == NONE
+        default: null
+      - name: replacement_cost_cents
+        type: integer
+        source: computed
+        description: BibItem.list_price_cents when non-zero, else DEFAULT_REPLACEMENT_COST_CENTS = 7500; snapshotted at receipt
+      - name: overdue_fine_cents
+        type: integer
+        source: computed
+        description: see calculations.overdue_fine_accrual; written once, at return or at loss declaration
+        default: 0
+      - name: damage_fee_cents
+        type: integer
+        source: computed
+        description: lender-assessed damage fee
+        default: 0
+      - name: lost_replacement_cents
+        type: integer
+        source: computed
+        description: replacement charge when the item is lost
+        default: 0
+      - name: lender_processing_fee_cents
+        type: integer
+        source: computed
+        description: LENDER_PROCESSING_FEE_CENTS = 2500 once a damage or loss charge exists, else 0
+        default: 0
+      - name: total_charge_cents
+        type: integer
+        source: computed
+        description: overdue_fine_cents + damage_fee_cents + lost_replacement_cents + lender_processing_fee_cents
+        default: 0
+      - name: paid_overdue_cents
+        type: integer
+        source: computed
+        description: cents settled into the overdue bucket by the waterfall
+        default: 0
+      - name: paid_damage_cents
+        type: integer
+        source: computed
+        description: cents settled into the damage bucket by the waterfall
+        default: 0
+      - name: paid_lost_cents
+        type: integer
+        source: computed
+        description: cents settled into the replacement bucket by the waterfall
+        default: 0
+      - name: paid_processing_cents
+        type: integer
+        source: computed
+        description: cents settled into the processing-fee bucket by the waterfall
+        default: 0
+      - name: total_paid_cents
+        type: integer
+        source: computed
+        description: paid_overdue_cents + paid_damage_cents + paid_lost_cents + paid_processing_cents
+        default: 0
+      - name: outstanding_cents
+        type: integer
+        source: computed
+        description: total_charge_cents - total_paid_cents; 0 when billing_status == CHARGE_WAIVED
+        default: 0
+
+  - name: ElectronicDelivery
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the COPY request this scan fulfils"
+      - name: file_token
+        type: string
+        source: input
+        description: opaque handle the lender supplies for the scanned file
+      - name: pages_delivered
+        type: integer
+        source: input
+        description: pages actually scanned
+        constraints: "1..200"
+      - name: delivered_at
+        type: datetime
+        source: system
+        description: logical clock at delivery
+      - name: expires_at
+        type: datetime
+        source: computed
+        description: delivered_at + DELIVERY_ACCESS_DAYS = 30 days; access is refused at or after this instant
+      - name: max_downloads
+        type: integer
+        source: computed
+        description: DELIVERY_MAX_DOWNLOADS = 3
+        default: 3
+      - name: download_count
+        type: integer
+        source: computed
+        description: successful downloads so far
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: access lifecycle state
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, EXPIRED, EXHAUSTED}; EXPIRED written by ops-run step 5, EXHAUSTED written when download_count reaches max_downloads"
+
+  - name: PurchaseOnDemandOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the unfilled request this purchase replaces"
+      - name: list_price_cents
+        type: integer
+        source: computed
+        description: BibItem.list_price_cents snapshotted at escalation
+      - name: vendor
+        type: string
+        source: input
+        description: bookseller the order is placed with
+      - name: escalated_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that escalated, or the literal "system" when ops-run step 7 escalated; the segregation-of-duties counterparty for the decision
+      - name: decided_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the AcquisitionsLibrarian who decided
+        default: null
+      - name: decision_note
+        type: string
+        source: input
+        description: free-text rationale recorded with the decision
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: order lifecycle state
+        default: PROPOSED
+        constraints: "one of {PROPOSED, APPROVED, REJECTED, RECEIVED, CANCELLED}; CANCELLED written by the request-cancellation cascade"
+      - name: decided_at
+        type: datetime
+        source: system
+        description: logical clock at the decision
+        default: null
+      - name: received_at
+        type: datetime
+        source: system
+        description: logical clock at receipt into the catalogue
+        default: null
+
+  - name: PartnerInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: partner_id
+        type: string
+        source: computed
+        description: "FK -> Partner.id; the consortium counterparty being settled with"
+      - name: period_month
+        type: string
+        source: input
+        description: settlement period in YYYY-MM form; period_start is its first instant, period_end the first instant of the following month
+        constraints: "matches ^[0-9]{4}-(0[1-9]|1[0-2])$"
+      - name: settlement_variant
+        type: enum
+        source: computed
+        description: which partner_invoice_reconciliation variant produced the amounts
+        constraints: "one of {GROSS, NET}"
+      - name: direction
+        type: enum
+        source: computed
+        description: PAYABLE when the borrower owes the partner, RECEIVABLE when the partner owes the borrower
+        constraints: "one of {PAYABLE, RECEIVABLE}"
+      - name: borrow_line_count
+        type: integer
+        source: computed
+        description: number of IllRequest borrow lines inside the period window
+        default: 0
+      - name: lend_line_count
+        type: integer
+        source: computed
+        description: number of LendingCharge lend lines inside the period window
+        default: 0
+      - name: payable_total_cents
+        type: integer
+        source: computed
+        description: surcharged borrow-line total (round per line, then sum)
+        default: 0
+      - name: receivable_total_cents
+        type: integer
+        source: computed
+        description: surcharged lend-line total (round per line, then sum)
+        default: 0
+      - name: gross_amount_cents
+        type: integer
+        source: computed
+        description: always equals payable_total_cents, in both variants
+        default: 0
+      - name: net_amount_cents
+        type: integer
+        source: computed
+        description: payable_total_cents under GROSS; payable_total_cents - receivable_total_cents under NET
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: invoice lifecycle state
+        default: DRAFT
+        constraints: "one of {DRAFT, SUPERSEDED, ISSUED, PAID, DISPUTED}"
+      - name: issued_at
+        type: datetime
+        source: system
+        description: logical clock at issue
+        default: null
+      - name: settled_at
+        type: datetime
+        source: system
+        description: logical clock at payment
+        default: null
+      - name: dispute_reason
+        type: string
+        source: input
+        description: counterparty's stated dispute rationale
+        default: null
+
+  - name: LendingCharge
+    parent: null
+    common_fields: true
+    fields:
+      - name: partner_id
+        type: string
+        source: input
+        description: "FK -> Partner.id; the partner that borrowed from us and owes this charge"
+      - name: item_title
+        type: string
+        source: input
+        description: title of the item we lent out
+      - name: service_type
+        type: enum
+        source: input
+        description: whether we lent a physical item or supplied a scan
+        constraints: "one of {LOAN, COPY}"
+      - name: charge_cents
+        type: integer
+        source: input
+        description: pre-surcharge amount the partner owes for this item
+        constraints: ">= 0"
+      - name: incurred_at
+        type: datetime
+        source: input
+        description: instant the lending service was rendered; decides which invoice period the line falls into
+      - name: status
+        type: enum
+        source: system
+        description: charge lifecycle state
+        default: OPEN
+        constraints: "one of {OPEN, INVOICED}; INVOICED written when an invoice containing the line is issued"
+
+  - name: PatronNotification
+    parent: null
+    common_fields: false
+    fields:
+      - name: request_id
+        type: string
+        source: computed
+        description: "FK -> IllRequest.id; the request the notice concerns"
+      - name: kind
+        type: enum
+        source: computed
+        description: which lifecycle event produced the notice
+        constraints: "one of {REQUEST_SUBMITTED, COPYRIGHT_HOLD, READY_FOR_PICKUP, ELECTRONIC_DELIVERY_READY, RECALL_ISSUED, UNCLAIMED, DAMAGE_BILLED, LOST_BILLED, REQUEST_UNFILLED, POD_APPROVED, PURCHASE_RECEIVED, DELIVERY_EXPIRED, REQUEST_CANCELLED}"
+      - name: channel
+        type: enum
+        source: computed
+        description: delivery channel; always EMAIL in this release
+        default: EMAIL
+        constraints: "one of {EMAIL}"
+      - name: subject
+        type: string
+        source: computed
+        description: rendered subject line
+      - name: sent_at
+        type: datetime
+        source: system
+        description: logical clock when the notice was emitted
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+  - entity: IllRequest
+    initial_state: SUBMITTED
+    terminal_states: [CLOSED, CLOSED_WITH_DAMAGE, CLOSED_LOST, UNCLAIMED, CANCELLED, UNFILLED, FILLED_BY_PURCHASE]
+    note: |
+      Cyclic in two independent loops — SOURCING -> OFFER_PENDING -> SOURCING (rota rounds) and
+      SOURCING -> ESCALATED_POD -> SOURCING (rejected purchase). SUBMITTED is a transient state that
+      is never observable in any API response: POST /ill/requests performs the branching auto-transition
+      to SOURCING or COPYRIGHT_HOLD inside the same request, so the creation response already carries
+      the post-branch status.
+    transitions:
+      - from: SUBMITTED
+        to: SOURCING
+        trigger: "POST /ill/requests (automatic, same request)"
+        actor: system
+        preconditions:
+          - "copyright_required is false, OR the (issn, calendar_year) rule-of-five counter has room, OR BibItem.publication_year <= current_year - COPYRIGHT_RECENCY_YEARS"
+        side_effects:
+          - "when copyright_required and publication_year <= current_year - COPYRIGHT_RECENCY_YEARS: create CopyrightClearance with method PRE_WINDOW_EXEMPT, sequence_in_year 0"
+          - "when copyright_required and the counter has room: create CopyrightClearance with method CONTU_FREE and sequence_in_year set to the new counter value"
+          - "create PatronNotification kind REQUEST_SUBMITTED"
+          - "recompute Patron.open_request_count and Patron.provisional_risk_score"
+      - from: SUBMITTED
+        to: COPYRIGHT_HOLD
+        trigger: "POST /ill/requests (automatic, same request)"
+        actor: system
+        preconditions:
+          - "copyright_required is true AND BibItem.publication_year > current_year - COPYRIGHT_RECENCY_YEARS AND counted_fill_count(issn, calendar_year) >= COPYRIGHT_LIMIT_FREE_FILLS"
+        side_effects:
+          - "no CopyrightClearance is created on this branch"
+          - "create PatronNotification kind COPYRIGHT_HOLD"
+          - "recompute Patron.open_request_count and Patron.provisional_risk_score"
+      - from: COPYRIGHT_HOLD
+        to: SOURCING
+        trigger: "POST /ill/requests/{id}/copyright-clearances"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "request.status == COPYRIGHT_HOLD"
+          - "X-User-ID != request.intake_user_id (segregation of duties)"
+          - "declared royalty_cents equals calculations.royalty_fee for pages_requested"
+        side_effects:
+          - "create CopyrightClearance method ROYALTY_PAID, approved_by_user_id = X-User-ID, sequence_in_year 0"
+          - "set IllRequest.royalty_cents and recompute gross_charge_cents / subsidy_cents / net_patron_charge_cents"
+      - from: SOURCING
+        to: OFFER_PENDING
+        trigger: "POST /ill/requests/{id}/source"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "request.status == SOURCING"
+          - "attempt_count < Rota.max_attempts"
+          - "the candidate set produced by calculations.lender_landed_cost_ranking is non-empty"
+        side_effects:
+          - "increment attempt_count by 1"
+          - "snapshot days_available_at_source"
+          - "create SupplyOffer for the winning partner with status OFFERED and respond_by = clock + Rota.offer_response_hours"
+      - from: OFFER_PENDING
+        to: SOURCING
+        trigger: "POST /ill/supply-offers/{id}/decline, or ops-run step 2 (respond_by reached)"
+        actor: PartnerAgent | system
+        preconditions:
+          - "offer.status == OFFERED"
+        side_effects:
+          - "offer.status -> DECLINED (decline) or EXPIRED (ops-run)"
+          - "the declining partner is excluded from every later candidate set on this request"
+        note: "This is the rota-round loop; attempt_count is NOT reset, so Rota.max_attempts terminates it."
+      - from: OFFER_PENDING
+        to: SUPPLY_COMMITTED
+        trigger: "POST /ill/supply-offers/{id}/accept"
+        actor: PartnerAgent
+        preconditions:
+          - "offer.status == OFFERED"
+          - "Partner.status == ACTIVE"
+        side_effects:
+          - "offer.status -> ACCEPTED"
+          - "set committed_partner_id, committed_fee_cents = offer.effective_fee_cents, committed_loan_period_days = Partner.loan_period_days"
+          - "set rush_surcharge_cents from days_available_at_source"
+          - "recompute gross_charge_cents / subsidy_cents / net_patron_charge_cents"
+          - "recompute Partner.borrowed_from_count, net_borrow_imbalance_items and borrow_payable_cents"
+      - from: SUPPLY_COMMITTED
+        to: IN_TRANSIT
+        trigger: "POST /ill/supply-offers/{id}/shipments"
+        actor: PartnerAgent
+        preconditions:
+          - "request.service_type == LOAN"
+          - "offer.status == ACCEPTED"
+        side_effects:
+          - "create Shipment direction INBOUND, status IN_TRANSIT, shipped_at = clock"
+      - from: SUPPLY_COMMITTED
+        to: DELIVERED_ELECTRONIC
+        trigger: "POST /ill/requests/{id}/electronic-deliveries"
+        actor: PartnerAgent
+        preconditions:
+          - "request.service_type == COPY"
+          - "the committed Partner.supplies_electronic is true"
+        side_effects:
+          - "create ElectronicDelivery status AVAILABLE, expires_at = clock + DELIVERY_ACCESS_DAYS days"
+          - "set fulfilled_at = clock"
+          - "create PatronNotification kind ELECTRONIC_DELIVERY_READY"
+      - from: IN_TRANSIT
+        to: ON_HOLD_SHELF
+        trigger: "POST /ill/shipments/{id}/receive"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "shipment.direction == INBOUND AND shipment.status == IN_TRANSIT"
+        side_effects:
+          - "shipment.status -> RECEIVED, received_at = clock"
+          - "create LoanRecord (custody AWAITING_PICKUP, billing NO_CHARGE, recall NONE) with due_at = clock + committed_loan_period_days days and pickup_expires_at = clock + HOLD_SHELF_DAYS days"
+          - "set fulfilled_at = clock"
+          - "create PatronNotification kind READY_FOR_PICKUP"
+      - from: IN_TRANSIT
+        to: UNFILLED
+        trigger: "ops-run step 6 (shipped_at + TRANSIT_SLA_DAYS = 14 days reached with no receipt)"
+        actor: system
+        preconditions:
+          - "shipment.direction == INBOUND AND shipment.status == IN_TRANSIT"
+        side_effects:
+          - "shipment.status -> LOST_IN_TRANSIT"
+          - "set unfilled_reason = TRANSIT_LOST, closed_at = clock"
+          - "create PatronNotification kind REQUEST_UNFILLED"
+      - from: ON_HOLD_SHELF
+        to: WITH_PATRON
+        trigger: "POST /ill/loans/{id}/pickup"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "loan.custody_status == AWAITING_PICKUP"
+          - "the request's INBOUND Shipment is in status RECEIVED"
+          - "clock < loan.pickup_expires_at"
+        side_effects:
+          - "loan.custody_status -> WITH_PATRON, picked_up_at = clock"
+      - from: ON_HOLD_SHELF
+        to: UNCLAIMED
+        trigger: "ops-run step 4 (pickup_expires_at reached)"
+        actor: system
+        preconditions:
+          - "loan.custody_status == AWAITING_PICKUP"
+        side_effects:
+          - "loan.custody_status -> UNCLAIMED_RETURN_PREPARED, return_prepared_at = clock"
+          - "create Shipment direction RETURN status IN_TRANSIT"
+          - "set closed_at = clock"
+          - "create PatronNotification kind UNCLAIMED"
+          - "recompute Patron.unclaimed_count, open_request_count and final_risk_score"
+      - from: WITH_PATRON
+        to: RETURN_IN_TRANSIT
+        trigger: "POST /ill/loans/{id}/return"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "loan.custody_status == WITH_PATRON"
+        side_effects:
+          - "loan.custody_status -> RETURN_PREPARED, return_prepared_at = clock"
+          - "write overdue_fine_cents from calculations.overdue_fine_accrual; billing_status -> FINE_ACCRUED when it is > 0"
+          - "recall_status RECALL_ISSUED -> RECALL_HONORED when clock <= recall_due_at, else RECALL_BREACHED"
+          - "create Shipment direction RETURN status IN_TRANSIT"
+      - from: WITH_PATRON
+        to: CLOSED_LOST
+        trigger: "POST /ill/loans/{id}/declare-lost"
+        actor: IllBorrowingStaff
+        preconditions:
+          - "loan.custody_status == WITH_PATRON"
+        side_effects:
+          - "loan.custody_status -> DECLARED_LOST, billing_status -> LOST_BILLED"
+          - "set lost_replacement_cents = replacement_cost_cents, lender_processing_fee_cents = LENDER_PROCESSING_FEE_CENTS, overdue_fine_cents from calculations.overdue_fine_accrual, and recompute total_charge_cents / outstanding_cents"
+          - "set closed_at = clock"
+          - "create PatronNotification kind LOST_BILLED"
+          - "recompute Patron.lost_count, unpaid_balance_cents, open_request_count and final_risk_score"
+      - from: RETURN_IN_TRANSIT
+        to: CLOSED
+        trigger: "POST /ill/shipments/{id}/lender-confirm with condition OK"
+        actor: PartnerAgent
+        preconditions:
+          - "shipment.direction == RETURN AND shipment.status == IN_TRANSIT"
+        side_effects:
+          - "shipment.status -> CONFIRMED_OK, confirmed_at = clock"
+          - "loan.custody_status -> RETURNED_TO_LENDER"
+          - "set closed_at = clock"
+          - "recompute Patron.open_request_count"
+      - from: RETURN_IN_TRANSIT
+        to: CLOSED_WITH_DAMAGE
+        trigger: "POST /ill/shipments/{id}/lender-confirm with condition DAMAGED"
+        actor: PartnerAgent
+        preconditions:
+          - "shipment.direction == RETURN AND shipment.status == IN_TRANSIT"
+          - "declared damage_fee_cents <= loan.replacement_cost_cents"
+        side_effects:
+          - "shipment.status -> CONFIRMED_DAMAGED, confirmed_at = clock"
+          - "loan.custody_status -> RETURNED_TO_LENDER, billing_status -> DAMAGE_BILLED"
+          - "set damage_fee_cents, lender_processing_fee_cents = LENDER_PROCESSING_FEE_CENTS, recompute total_charge_cents / outstanding_cents"
+          - "set closed_at = clock; create PatronNotification kind DAMAGE_BILLED"
+          - "recompute Patron.damaged_count, unpaid_balance_cents, final_risk_score; when final_risk_score >= STANDING_BLOCK_THRESHOLD set Patron.status -> BLOCKED"
+        note: "This is the depth-5 cascade of difficulty rule transitive_cascade instance A."
+      - from: RETURN_IN_TRANSIT
+        to: CLOSED_LOST
+        trigger: "POST /ill/shipments/{id}/lender-confirm with condition LOST"
+        actor: PartnerAgent
+        preconditions:
+          - "shipment.direction == RETURN AND shipment.status == IN_TRANSIT"
+        side_effects:
+          - "shipment.status -> CONFIRMED_LOST, confirmed_at = clock"
+          - "loan.custody_status -> DECLARED_LOST, billing_status -> LOST_BILLED"
+          - "set lost_replacement_cents = replacement_cost_cents, lender_processing_fee_cents = LENDER_PROCESSING_FEE_CENTS, recompute total_charge_cents / outstanding_cents"
+          - "set closed_at = clock; create PatronNotification kind LOST_BILLED"
+          - "recompute Patron.lost_count, unpaid_balance_cents, final_risk_score; when final_risk_score >= STANDING_BLOCK_THRESHOLD set Patron.status -> BLOCKED"
+      - from: DELIVERED_ELECTRONIC
+        to: CLOSED
+        trigger: "ops-run step 5 (ElectronicDelivery.expires_at reached)"
+        actor: system
+        preconditions:
+          - "the request's ElectronicDelivery status is AVAILABLE"
+        side_effects:
+          - "delivery.status -> EXPIRED"
+          - "set closed_at = clock; create PatronNotification kind DELIVERY_EXPIRED"
+          - "recompute Patron.open_request_count"
+      - from: SOURCING
+        to: UNFILLED
+        trigger: "ops-run step 7 (attempt_count >= Rota.max_attempts AND Rota.auto_escalate_pod is false)"
+        actor: system
+        preconditions:
+          - "request.status == SOURCING"
+        side_effects:
+          - "set unfilled_reason = ATTEMPTS_EXHAUSTED, closed_at = clock"
+          - "create PatronNotification kind REQUEST_UNFILLED"
+          - "recompute Patron.open_request_count"
+      - from: SOURCING
+        to: ESCALATED_POD
+        trigger: "POST /ill/requests/{id}/escalate, or ops-run step 7 when Rota.auto_escalate_pod is true"
+        actor: IllBorrowingStaff | system
+        preconditions:
+          - "request.status == SOURCING"
+          - "BibItem.local_holding_status NOT IN {HELD_AVAILABLE, ON_ORDER}"
+        side_effects:
+          - "create PurchaseOnDemandOrder status PROPOSED, list_price_cents = BibItem.list_price_cents, escalated_by_user_id = X-User-ID (or the literal \"system\")"
+      - from: ESCALATED_POD
+        to: SOURCING
+        trigger: "POST /ill/pod-orders/{id}/decision with decision REJECT"
+        actor: AcquisitionsLibrarian
+        preconditions:
+          - "order.status == PROPOSED"
+          - "X-User-ID != order.escalated_by_user_id (segregation of duties)"
+        side_effects:
+          - "order.status -> REJECTED, decided_by_user_id = X-User-ID, decided_at = clock"
+          - "reset attempt_count to 0 and unfilled_reason to NONE"
+        note: "Second cycle: a rejected purchase returns the request to the rota with a fresh attempt budget."
+      - from: ESCALATED_POD
+        to: FILLED_BY_PURCHASE
+        trigger: "POST /ill/pod-orders/{id}/receive"
+        actor: AcquisitionsLibrarian
+        preconditions:
+          - "order.status == APPROVED"
+        side_effects:
+          - "order.status -> RECEIVED, received_at = clock"
+          - "BibItem.local_holding_status -> HELD_AVAILABLE"
+          - "set closed_at = clock; create PatronNotification kind PURCHASE_RECEIVED"
+          - "recompute Patron.open_request_count"
+      - from: COPYRIGHT_HOLD
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel"
+        actor: Patron | IllBorrowingStaff
+        preconditions:
+          - "request.status IN {COPYRIGHT_HOLD, SOURCING, OFFER_PENDING, SUPPLY_COMMITTED, ESCALATED_POD}"
+        side_effects:
+          - "void every ACTIVE CopyrightClearance of this request (status -> VOIDED), releasing the (issn, calendar_year) allowance"
+          - "cancel every OFFERED SupplyOffer (status -> CANCELLED) and every PROPOSED PurchaseOnDemandOrder (status -> CANCELLED)"
+          - "clear committed_partner_id to null and committed_fee_cents / rush_surcharge_cents / royalty_cents / gross_charge_cents / subsidy_cents / net_patron_charge_cents to 0"
+          - "set closed_at = clock; create PatronNotification kind REQUEST_CANCELLED"
+          - "recompute the committed Partner's borrowed_from_count, net_borrow_imbalance_items and borrow_payable_cents"
+      - from: SOURCING
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel"
+        actor: Patron | IllBorrowingStaff
+        preconditions: ["as above"]
+        side_effects: ["as above"]
+      - from: OFFER_PENDING
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel"
+        actor: Patron | IllBorrowingStaff
+        preconditions: ["as above"]
+        side_effects: ["as above"]
+      - from: SUPPLY_COMMITTED
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel"
+        actor: Patron | IllBorrowingStaff
+        preconditions: ["as above"]
+        side_effects: ["as above"]
+      - from: ESCALATED_POD
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel"
+        actor: Patron | IllBorrowingStaff
+        preconditions: ["as above"]
+        side_effects: ["as above"]
+
+  - entity: SupplyOffer
+    initial_state: OFFERED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED, CANCELLED]
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /ill/supply-offers/{id}/accept"
+        actor: PartnerAgent
+        preconditions:
+          - "offer.status == OFFERED"
+          - "X-User-ID == offer.partner_id"
+          - "Partner.status == ACTIVE"
+        side_effects: ["request.status -> SUPPLY_COMMITTED with the commitment snapshot"]
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /ill/supply-offers/{id}/decline"
+        actor: PartnerAgent
+        preconditions:
+          - "offer.status == OFFERED"
+          - "X-User-ID == offer.partner_id"
+        side_effects: ["record decline_reason", "request.status -> SOURCING"]
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "ops-run step 2 (clock >= respond_by)"
+        actor: system
+        preconditions: ["offer.status == OFFERED"]
+        side_effects: ["request.status -> SOURCING"]
+      - from: OFFERED
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel (cascade)"
+        actor: system
+        preconditions: ["offer.status == OFFERED"]
+        side_effects: ["none beyond the request cancellation cascade"]
+
+  - entity: Shipment
+    initial_state: IN_TRANSIT
+    terminal_states: [RECEIVED, CONFIRMED_OK, CONFIRMED_DAMAGED, CONFIRMED_LOST, LOST_IN_TRANSIT]
+    transitions:
+      - from: IN_TRANSIT
+        to: RECEIVED
+        trigger: "POST /ill/shipments/{id}/receive"
+        actor: IllBorrowingStaff
+        preconditions: ["direction == INBOUND", "status == IN_TRANSIT"]
+        side_effects: ["create LoanRecord", "request.status -> ON_HOLD_SHELF"]
+      - from: IN_TRANSIT
+        to: CONFIRMED_OK
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition OK"
+        actor: PartnerAgent
+        preconditions: ["direction == RETURN", "status == IN_TRANSIT"]
+        side_effects: ["loan.custody_status -> RETURNED_TO_LENDER", "request.status -> CLOSED when it is RETURN_IN_TRANSIT"]
+      - from: IN_TRANSIT
+        to: CONFIRMED_DAMAGED
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition DAMAGED"
+        actor: PartnerAgent
+        preconditions: ["direction == RETURN", "status == IN_TRANSIT", "damage_fee_cents <= loan.replacement_cost_cents"]
+        side_effects: ["the depth-5 damage cascade (see IllRequest RETURN_IN_TRANSIT -> CLOSED_WITH_DAMAGE)"]
+      - from: IN_TRANSIT
+        to: CONFIRMED_LOST
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition LOST"
+        actor: PartnerAgent
+        preconditions: ["direction == RETURN", "status == IN_TRANSIT"]
+        side_effects: ["loan billing_status -> LOST_BILLED", "request.status -> CLOSED_LOST when it is RETURN_IN_TRANSIT"]
+      - from: IN_TRANSIT
+        to: LOST_IN_TRANSIT
+        trigger: "ops-run step 6 (clock >= shipped_at + TRANSIT_SLA_DAYS = 14 days)"
+        actor: system
+        preconditions: ["direction == INBOUND", "status == IN_TRANSIT"]
+        side_effects: ["request.status -> UNFILLED with unfilled_reason TRANSIT_LOST"]
+
+  - entity: LoanRecord
+    dimension: custody_status
+    initial_state: AWAITING_PICKUP
+    terminal_states: [RETURNED_TO_LENDER, DECLARED_LOST]
+    note: "Parallel dimension 1 of 3. Advances independently of billing_status and recall_status."
+    transitions:
+      - from: AWAITING_PICKUP
+        to: WITH_PATRON
+        trigger: "POST /ill/loans/{id}/pickup"
+        actor: IllBorrowingStaff
+        preconditions: ["custody_status == AWAITING_PICKUP", "the request's INBOUND Shipment.status == RECEIVED", "clock < pickup_expires_at"]
+        side_effects: ["picked_up_at = clock", "request.status -> WITH_PATRON"]
+      - from: AWAITING_PICKUP
+        to: UNCLAIMED_RETURN_PREPARED
+        trigger: "ops-run step 4 (clock >= pickup_expires_at)"
+        actor: system
+        preconditions: ["custody_status == AWAITING_PICKUP"]
+        side_effects: ["create RETURN Shipment", "request.status -> UNCLAIMED", "Patron.unclaimed_count and final_risk_score recomputed"]
+      - from: WITH_PATRON
+        to: RETURN_PREPARED
+        trigger: "POST /ill/loans/{id}/return"
+        actor: IllBorrowingStaff
+        preconditions: ["custody_status == WITH_PATRON"]
+        side_effects: ["overdue_fine_cents written", "recall dimension resolved", "create RETURN Shipment", "request.status -> RETURN_IN_TRANSIT"]
+      - from: WITH_PATRON
+        to: DECLARED_LOST
+        trigger: "POST /ill/loans/{id}/declare-lost"
+        actor: IllBorrowingStaff
+        preconditions: ["custody_status == WITH_PATRON"]
+        side_effects: ["billing_status -> LOST_BILLED", "request.status -> CLOSED_LOST"]
+      - from: RETURN_PREPARED
+        to: RETURNED_TO_LENDER
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition OK or DAMAGED"
+        actor: PartnerAgent
+        preconditions: ["custody_status == RETURN_PREPARED"]
+        side_effects: ["billing_status -> DAMAGE_BILLED on the DAMAGED branch"]
+      - from: RETURN_PREPARED
+        to: DECLARED_LOST
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition LOST"
+        actor: PartnerAgent
+        preconditions: ["custody_status == RETURN_PREPARED"]
+        side_effects: ["billing_status -> LOST_BILLED"]
+      - from: UNCLAIMED_RETURN_PREPARED
+        to: RETURNED_TO_LENDER
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition OK"
+        actor: PartnerAgent
+        preconditions: ["custody_status == UNCLAIMED_RETURN_PREPARED"]
+        side_effects: ["request.status is NOT changed — it is already terminal at UNCLAIMED"]
+
+  - entity: LoanRecord
+    dimension: billing_status
+    initial_state: NO_CHARGE
+    terminal_states: [CHARGE_SETTLED, CHARGE_WAIVED]
+    note: "Parallel dimension 2 of 3. A loan can sit at custody RETURNED_TO_LENDER while billing is still DAMAGE_BILLED."
+    transitions:
+      - from: NO_CHARGE
+        to: FINE_ACCRUED
+        trigger: "POST /ill/loans/{id}/return with overdue days beyond the grace period"
+        actor: IllBorrowingStaff
+        preconditions: ["calculations.overdue_fine_accrual yields > 0"]
+        side_effects: ["Patron.late_return_count, unpaid_balance_cents and final_risk_score recomputed"]
+      - from: NO_CHARGE
+        to: DAMAGE_BILLED
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition DAMAGED"
+        actor: PartnerAgent
+        preconditions: ["damage_fee_cents <= replacement_cost_cents"]
+        side_effects: ["lender_processing_fee_cents applied", "Patron.damaged_count and unpaid_balance_cents recomputed"]
+      - from: FINE_ACCRUED
+        to: DAMAGE_BILLED
+        trigger: "POST /ill/shipments/{id}/lender-confirm condition DAMAGED after an overdue return"
+        actor: PartnerAgent
+        preconditions: ["billing_status == FINE_ACCRUED"]
+        side_effects: ["the overdue fine is retained inside total_charge_cents; the damage fee is added on top"]
+      - from: NO_CHARGE
+        to: LOST_BILLED
+        trigger: "POST /ill/loans/{id}/declare-lost, or lender-confirm condition LOST"
+        actor: IllBorrowingStaff | PartnerAgent
+        preconditions: ["custody_status IN {WITH_PATRON, RETURN_PREPARED}"]
+        side_effects: ["lost_replacement_cents and lender_processing_fee_cents applied"]
+      - from: FINE_ACCRUED
+        to: LOST_BILLED
+        trigger: "lender-confirm condition LOST after an overdue return"
+        actor: PartnerAgent
+        preconditions: ["billing_status == FINE_ACCRUED"]
+        side_effects: ["the overdue fine is retained inside total_charge_cents"]
+      - from: FINE_ACCRUED
+        to: CHARGE_SETTLED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action PAY covering the full outstanding amount"
+        actor: ConsortiumAccountant
+        preconditions: ["outstanding_cents reaches 0 after the waterfall"]
+        side_effects: ["Patron.unpaid_balance_cents recomputed"]
+      - from: DAMAGE_BILLED
+        to: CHARGE_SETTLED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action PAY covering the full outstanding amount"
+        actor: ConsortiumAccountant
+        preconditions: ["outstanding_cents reaches 0 after the waterfall"]
+        side_effects: ["Patron.unpaid_balance_cents recomputed; Patron.status may return from BLOCKED to ACTIVE only via PATCH /ill/patrons/{id}"]
+      - from: LOST_BILLED
+        to: CHARGE_SETTLED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action PAY covering the full outstanding amount"
+        actor: ConsortiumAccountant
+        preconditions: ["outstanding_cents reaches 0 after the waterfall"]
+        side_effects: ["Patron.unpaid_balance_cents recomputed"]
+      - from: DAMAGE_BILLED
+        to: CHARGE_WAIVED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action WAIVE"
+        actor: LibraryAdmin
+        preconditions: ["billing_status IN {FINE_ACCRUED, DAMAGE_BILLED, LOST_BILLED}"]
+        side_effects: ["outstanding_cents forced to 0 without any payment being recorded"]
+      - from: FINE_ACCRUED
+        to: CHARGE_WAIVED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action WAIVE"
+        actor: LibraryAdmin
+        preconditions: ["billing_status IN {FINE_ACCRUED, DAMAGE_BILLED, LOST_BILLED}"]
+        side_effects: ["outstanding_cents forced to 0"]
+      - from: LOST_BILLED
+        to: CHARGE_WAIVED
+        trigger: "POST /ill/loans/{id}/charge-settlements with action WAIVE"
+        actor: LibraryAdmin
+        preconditions: ["billing_status IN {FINE_ACCRUED, DAMAGE_BILLED, LOST_BILLED}"]
+        side_effects: ["outstanding_cents forced to 0"]
+
+  - entity: LoanRecord
+    dimension: recall_status
+    initial_state: NONE
+    terminal_states: [RECALL_HONORED, RECALL_BREACHED]
+    note: "Parallel dimension 3 of 3. Gates renewals without affecting custody or billing."
+    transitions:
+      - from: NONE
+        to: RECALL_ISSUED
+        trigger: "POST /ill/loans/{id}/recalls"
+        actor: PartnerAgent
+        preconditions: ["recall_status == NONE", "custody_status IN {AWAITING_PICKUP, WITH_PATRON}"]
+        side_effects: ["recall_due_at = clock + grace_days days", "due_at is pulled in to recall_due_at when recall_due_at < due_at", "create PatronNotification kind RECALL_ISSUED"]
+      - from: RECALL_ISSUED
+        to: RECALL_HONORED
+        trigger: "POST /ill/loans/{id}/return at or before recall_due_at"
+        actor: IllBorrowingStaff
+        preconditions: ["clock <= recall_due_at"]
+        side_effects: ["none"]
+      - from: RECALL_ISSUED
+        to: RECALL_BREACHED
+        trigger: "ops-run step 3 (clock > recall_due_at), or POST /ill/loans/{id}/return after recall_due_at"
+        actor: system | IllBorrowingStaff
+        preconditions: ["clock > recall_due_at"]
+        side_effects: ["the overdue fine multiplier RECALL_BREACH_MULTIPLIER applies at return"]
+
+  - entity: ElectronicDelivery
+    initial_state: AVAILABLE
+    terminal_states: [EXPIRED, EXHAUSTED]
+    transitions:
+      - from: AVAILABLE
+        to: EXHAUSTED
+        trigger: "POST /ill/electronic-deliveries/{id}/downloads (the download that reaches max_downloads)"
+        actor: Patron
+        preconditions: ["status is not EXPIRED", "clock < expires_at", "download_count < max_downloads"]
+        side_effects: ["download_count incremented"]
+      - from: AVAILABLE
+        to: EXPIRED
+        trigger: "ops-run step 5 (clock >= expires_at)"
+        actor: system
+        preconditions: ["status == AVAILABLE"]
+        side_effects: ["request.status -> CLOSED", "create PatronNotification kind DELIVERY_EXPIRED"]
+
+  - entity: PurchaseOnDemandOrder
+    initial_state: PROPOSED
+    terminal_states: [REJECTED, RECEIVED, CANCELLED]
+    transitions:
+      - from: PROPOSED
+        to: APPROVED
+        trigger: "POST /ill/pod-orders/{id}/decision with decision APPROVE"
+        actor: AcquisitionsLibrarian
+        preconditions: ["status == PROPOSED", "X-User-ID != escalated_by_user_id", "BibItem.local_holding_status != HELD_AVAILABLE"]
+        side_effects: ["BibItem.local_holding_status -> ON_ORDER", "create PatronNotification kind POD_APPROVED"]
+      - from: PROPOSED
+        to: REJECTED
+        trigger: "POST /ill/pod-orders/{id}/decision with decision REJECT"
+        actor: AcquisitionsLibrarian
+        preconditions: ["status == PROPOSED", "X-User-ID != escalated_by_user_id"]
+        side_effects: ["request.status -> SOURCING with attempt_count reset to 0"]
+      - from: APPROVED
+        to: RECEIVED
+        trigger: "POST /ill/pod-orders/{id}/receive"
+        actor: AcquisitionsLibrarian
+        preconditions: ["status == APPROVED"]
+        side_effects: ["BibItem.local_holding_status -> HELD_AVAILABLE", "request.status -> FILLED_BY_PURCHASE"]
+      - from: PROPOSED
+        to: CANCELLED
+        trigger: "POST /ill/requests/{id}/cancel (cascade)"
+        actor: system
+        preconditions: ["status == PROPOSED"]
+        side_effects: ["none beyond the request cancellation cascade"]
+
+  - entity: PartnerInvoice
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED, PAID]
+    note: "Cyclic: ISSUED -> DISPUTED -> ISSUED."
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /ill/invoices/{id}/issue"
+        actor: ConsortiumAccountant
+        preconditions: ["status == DRAFT", "clock >= period_end (the period is closed)"]
+        side_effects: ["issued_at = clock", "every LendingCharge line inside the period -> INVOICED", "Partner.lend_receivable_cents recomputed"]
+      - from: DRAFT
+        to: SUPERSEDED
+        trigger: "POST /ill/partners/{id}/invoices for the same period_month"
+        actor: ConsortiumAccountant
+        preconditions: ["status == DRAFT", "the request carries the current expected_partner_version"]
+        side_effects: ["the new DRAFT invoice replaces this one"]
+      - from: ISSUED
+        to: PAID
+        trigger: "POST /ill/invoices/{id}/settle with action PAY"
+        actor: ConsortiumAccountant
+        preconditions: ["status == ISSUED"]
+        side_effects: ["settled_at = clock"]
+      - from: ISSUED
+        to: DISPUTED
+        trigger: "POST /ill/invoices/{id}/settle with action DISPUTE"
+        actor: ConsortiumAccountant | PartnerAgent
+        preconditions: ["status == ISSUED", "dispute_reason is present"]
+        side_effects: ["dispute_reason recorded"]
+      - from: DISPUTED
+        to: ISSUED
+        trigger: "POST /ill/invoices/{id}/settle with action REINSTATE"
+        actor: ConsortiumAccountant
+        preconditions: ["status == DISPUTED"]
+        side_effects: ["dispute_reason cleared to null; issued_at is NOT rewritten"]
+
+  - entity: ReciprocityAgreement
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED, EXPIRED]
+    transitions:
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /ill/reciprocity-agreements naming this agreement in supersedes_agreement_id"
+        actor: LibraryAdmin
+        preconditions: ["status == ACTIVE", "the request carries the current expected_partner_version"]
+        side_effects: ["this agreement is excluded from the window-overlap check performed for the new agreement"]
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "ops-run step 1 (clock >= effective_to)"
+        actor: system
+        preconditions: ["status == ACTIVE"]
+        side_effects: ["the partner's fee waiver stops applying to later offers"]
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules  (OCC on the parent entity's `version`, only)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: agreement-create-supersede-stale-partner
+    parent_entity: Partner
+    write_endpoint: "POST /ill/reciprocity-agreements"
+    occ_field: "expected_partner_version"
+    description: |
+      Creating a ReciprocityAgreement against a Partner whose version has advanced since the client
+      last read it is rejected. This captures the case where another writer has already created an
+      agreement that legitimately supersedes the prior one under the supersedes_agreement_id rule, so
+      the current writer's view of the partner's agreement set is stale and its window-overlap
+      decision would have been computed against a superseded picture.
+    error_id: ERR_STALE_PARTNER_VERSION
+    http_status: 412
+
+  - rule_id: rota-entry-requote-stale-rota
+    parent_entity: Rota
+    write_endpoint: "POST /ill/rota-entries"
+    occ_field: "expected_rota_version"
+    description: |
+      Creating a RotaEntry against a Rota whose version has advanced since the client last read it is
+      rejected. A new entry for an existing (rota_id, partner_id) pair legitimately supersedes the
+      previous quote, so a writer holding a stale rota version would re-quote on top of a candidate
+      set it has not observed and would silently displace a newer quote.
+    error_id: ERR_STALE_ROTA_VERSION
+    http_status: 412
+
+  - rule_id: invoice-draft-regenerate-stale-partner
+    parent_entity: Partner
+    write_endpoint: "POST /ill/partners/{id}/invoices"
+    occ_field: "expected_partner_version"
+    description: |
+      Generating a draft PartnerInvoice for a Partner whose version has advanced since the client last
+      read it is rejected. Draft regeneration legitimately supersedes an existing DRAFT for the same
+      period_month, so a writer holding a stale partner version would publish totals derived from a
+      borrowing/lending balance that has since moved.
+    error_id: ERR_STALE_PARTNER_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+  - name: lender_landed_cost_ranking
+    trigger: "POST /ill/requests/{id}/source — picks the single partner the next SupplyOffer goes to"
+    algorithm: selector_ranking
+    formula: |
+      days_available = floor((request.needed_by - clock) / 86400)          # whole days, floor, may be 0
+
+      # -- eligibility (a candidate must satisfy EVERY clause) ------------------
+      candidates = RotaEntry WHERE rota_id == request.rota_id
+                                AND status == ACTIVE
+                                AND is_enabled == true
+        AND partner.status == ACTIVE
+        AND (request.service_type == LOAN  -> partner.ships_physical == true)
+        AND (request.service_type == COPY  -> partner.supplies_electronic == true)
+        AND effective_fee_cents(entry) <= request.max_supply_fee_cents
+        AND partner.id NOT IN { partner_id of this request's SupplyOffer rows
+                                whose status IN {DECLINED, EXPIRED, ACCEPTED} }
+
+      # -- reciprocity waiver ---------------------------------------------------
+      agreement(partner) = the ReciprocityAgreement of that partner with status == ACTIVE
+                           AND effective_from <= clock < effective_to;
+                           when several qualify, the one with the LATEST effective_from,
+                           tie-broken by the EARLIEST created_at
+      effective_fee_cents(entry):
+        agr = agreement(entry.partner)
+        agr is null OR agr.fee_waiver_mode == NONE   -> entry.quoted_fee_cents
+        agr.fee_waiver_mode == FULL                  -> 0
+        agr.fee_waiver_mode == CAPPED                -> max(0, entry.quoted_fee_cents - agr.capped_waiver_cents)
+
+      # -- lateness and imbalance penalties -------------------------------------
+      lateness_days(entry)  = max(0, entry.quoted_turnaround_days - days_available)
+      tolerance(partner)    = agreement(partner).balance_tolerance_items when an agreement applies,
+                              else DEFAULT_BALANCE_TOLERANCE_ITEMS
+      imbalance_penalty(entry) = IMBALANCE_PENALTY_CENTS
+                                 when partner.net_borrow_imbalance_items > tolerance(partner), else 0
+
+      landed_cost(entry) = effective_fee_cents(entry)
+                         + DAY_PENALTY_CENTS * lateness_days(entry)
+                         + imbalance_penalty(entry)
+
+      # -- ranking (pinned, total order) ----------------------------------------
+      Rota.selection_policy == LANDED_COST:
+        landed_cost ASC, then quoted_turnaround_days ASC, then manual_rank ASC, then RotaEntry.created_at ASC
+      Rota.selection_policy == MANUAL_RANK:
+        manual_rank ASC, then landed_cost ASC, then RotaEntry.created_at ASC
+
+      # -- empty pool: NO fallback partner is ever chosen -------------------------
+      candidates is empty -> ERR_NO_ELIGIBLE_LENDER (422); attempt_count is NOT incremented
+                             and no SupplyOffer row is created
+    input_set: "ACTIVE, enabled RotaEntry rows of the request's rota whose partner is ACTIVE, supports the request's service_type, prices at or below max_supply_fee_cents, and has not already declined, expired or accepted on this request"
+    constants:
+      DAY_PENALTY_CENTS: 250
+      IMBALANCE_PENALTY_CENTS: 1500
+      DEFAULT_BALANCE_TOLERANCE_ITEMS: 3
+    precision: "integer cents throughout; no rounding occurs in this rule"
+
+  - name: patron_charge_assembly
+    trigger: "POST /ill/supply-offers/{id}/accept and POST /ill/requests/{id}/copyright-clearances — writes gross_charge_cents, subsidy_cents, net_patron_charge_cents"
+    algorithm: tiered_pricing
+    formula: |
+      # STEP ORDER IS PINNED. The subsidy tier is keyed on GROSS, before any subtraction.
+      1. base            = request.committed_fee_cents
+      2. rush            = RUSH_SURCHARGE_CENTS when request.days_available_at_source <= RUSH_THRESHOLD_DAYS
+                           else 0                                 -> IllRequest.rush_surcharge_cents
+      3. royalty         = royalty_cents of the request's ACTIVE ROYALTY_PAID CopyrightClearance, else 0
+      4. gross           = base + rush + royalty                   -> IllRequest.gross_charge_cents
+      5. rate            = subsidy_rate(gross)                     # keyed on gross, NEVER on net
+                             gross <=  2000            -> 0.80
+                             2001 <= gross <=  6000    -> 0.60
+                             6001 <= gross <= 12000    -> 0.40
+                             gross >  12000            -> 0.25
+      6. subsidy         = min(SUBSIDY_CAP_CENTS, round_half_up(gross * rate))
+                                                                   -> IllRequest.subsidy_cents
+      7. net             = gross - subsidy                         -> IllRequest.net_patron_charge_cents
+      Keying the tier on `net` (or applying the cap before the tier lookup) yields a different answer
+      for the same data; the pinned reading above is the only correct one.
+    input_set: "the single IllRequest being priced; its committed offer fee, its rush eligibility snapshot, and its one ACTIVE ROYALTY_PAID clearance if any"
+    constants:
+      RUSH_SURCHARGE_CENTS: 1200
+      RUSH_THRESHOLD_DAYS: 3
+      SUBSIDY_CAP_CENTS: 4000
+      SUBSIDY_RATE_TIER_1: 0.80
+      SUBSIDY_RATE_TIER_2: 0.60
+      SUBSIDY_RATE_TIER_3: 0.40
+      SUBSIDY_RATE_TIER_4: 0.25
+      TIER_1_MAX_CENTS: 2000
+      TIER_2_MAX_CENTS: 6000
+      TIER_3_MAX_CENTS: 12000
+    precision: "integer cents; exactly one rounding, round_half_up, at step 6"
+
+  - name: copyright_rule_of_five_counter
+    trigger: "POST /ill/requests (intake branch) and POST /ill/requests/{id}/copyright-clearances"
+    algorithm: aggregation
+    formula: |
+      current_year = calendar year (UTC) of the logical clock
+      counts_toward_limit(bib) = bib.publication_year > current_year - COPYRIGHT_RECENCY_YEARS
+      counted_fill_count(issn, year) = COUNT( CopyrightClearance
+                                              WHERE issn == issn
+                                                AND calendar_year == year
+                                                AND method == CONTU_FREE
+                                                AND status == ACTIVE )
+
+      at intake, when request.copyright_required is true:
+        not counts_toward_limit(bib)
+            -> create clearance method PRE_WINDOW_EXEMPT, sequence_in_year 0; status -> SOURCING
+        counted_fill_count < COPYRIGHT_LIMIT_FREE_FILLS
+            -> create clearance method CONTU_FREE,
+               sequence_in_year = counted_fill_count + 1;            status -> SOURCING
+        otherwise
+            -> create NO clearance;                                  status -> COPYRIGHT_HOLD
+
+      The counter is keyed on the (issn, calendar_year) pair, NOT on the patron, NOT on the BibItem row:
+      two distinct BibItem rows sharing an issn share one allowance.
+      Cancelling a request VOIDs its clearance, which returns the allowance to the pool.
+    input_set: "ACTIVE CopyrightClearance rows with method CONTU_FREE sharing the (issn, calendar_year) key; VOIDED rows and ROYALTY_PAID / PRE_WINDOW_EXEMPT rows are excluded"
+    constants:
+      COPYRIGHT_RECENCY_YEARS: 5
+      COPYRIGHT_LIMIT_FREE_FILLS: 5
+    precision: "integer counts"
+
+  - name: royalty_fee
+    trigger: "POST /ill/requests/{id}/copyright-clearances — the declared royalty_cents must equal this value"
+    algorithm: threshold
+    formula: |
+      fee = max(ROYALTY_MIN_CENTS,
+                ROYALTY_BASE_CENTS + ROYALTY_PER_PAGE_CENTS * request.pages_requested)
+      A declared royalty_cents that differs from `fee` is rejected with ERR_ROYALTY_AMOUNT_MISMATCH (422).
+    input_set: "the request's pages_requested only"
+    constants:
+      ROYALTY_BASE_CENTS: 800
+      ROYALTY_PER_PAGE_CENTS: 65
+      ROYALTY_MIN_CENTS: 1500
+    precision: "integer cents; no rounding"
+
+  - name: overdue_fine_accrual
+    trigger: "POST /ill/loans/{id}/return and POST /ill/loans/{id}/declare-lost — writes overdue_fine_cents exactly once"
+    algorithm: threshold
+    formula: |
+      end_instant   = loan.return_prepared_at on the return path, the logical clock on the declare-lost path
+      overdue_days  = max(0, floor((end_instant - loan.due_at) / 86400))
+      billable_days = max(0, overdue_days - GRACE_DAYS)
+      raw           = DAILY_FINE_CENTS * billable_days
+      multiplier    = RECALL_BREACH_MULTIPLIER when the recall dimension resolves to RECALL_BREACHED
+                      at this same call, else 1
+      fine          = min(OVERDUE_FINE_CAP_CENTS, raw * multiplier)
+      The cap is applied AFTER the multiplier, never before.
+    input_set: "the single LoanRecord; its current due_at (already shifted by any renewal or recall pull-in) and its recall dimension"
+    constants:
+      GRACE_DAYS: 2
+      DAILY_FINE_CENTS: 150
+      RECALL_BREACH_MULTIPLIER: 3
+      OVERDUE_FINE_CAP_CENTS: 6000
+    precision: "integer cents; whole-day floor on the elapsed interval"
+
+  - name: charge_waterfall_settlement
+    trigger: "POST /ill/loans/{id}/charge-settlements with action PAY"
+    algorithm: waterfall_allocation
+    formula: |
+      buckets, in this PINNED order:
+        1. overdue     charge = overdue_fine_cents            paid = paid_overdue_cents
+        2. damage      charge = damage_fee_cents              paid = paid_damage_cents
+        3. lost        charge = lost_replacement_cents        paid = paid_lost_cents
+        4. processing  charge = lender_processing_fee_cents   paid = paid_processing_cents
+
+      remaining_i   = charge_i - paid_i
+      total_remaining = SUM(remaining_i)
+
+      payment_cents > total_remaining -> ERR_OVERPAYMENT (422) and NOTHING is applied
+                                          (no partial allocation, no field is written)
+
+      left = payment_cents
+      for bucket i in 1..4:
+        applied = min(left, remaining_i);  paid_i += applied;  left -= applied
+
+      total_paid_cents  = SUM(paid_i)
+      outstanding_cents = total_charge_cents - total_paid_cents
+      billing_status -> CHARGE_SETTLED when outstanding_cents == 0
+    input_set: "the four charge buckets of the single LoanRecord"
+    constants:
+      LENDER_PROCESSING_FEE_CENTS: 2500
+      DEFAULT_REPLACEMENT_COST_CENTS: 7500
+    precision: "integer cents; no rounding, no remainder to distribute"
+
+  - name: partner_invoice_reconciliation
+    trigger: "POST /ill/partners/{id}/invoices — computes every monetary field of the DRAFT PartnerInvoice"
+    algorithm: aggregation
+    formula: |
+      period_start = first instant (UTC) of period_month
+      period_end   = first instant (UTC) of the month AFTER period_month     # half-open [start, end)
+
+      borrow_lines = IllRequest WHERE committed_partner_id == partner.id
+                       AND status NOT IN {CANCELLED, UNFILLED}
+                       AND fulfilled_at is not null
+                       AND period_start <= fulfilled_at < period_end
+      lend_lines   = LendingCharge WHERE partner_id == partner.id
+                       AND status == OPEN
+                       AND period_start <= incurred_at < period_end
+
+      surcharged(x) = x + round_half_up(x * CONSORTIUM_SURCHARGE_PCT)
+
+      # ROUNDING ORDER IS PINNED: round EACH line, THEN sum. Summing first and
+      # rounding once yields a different total.
+      payable_total_cents    = SUM over borrow_lines of surcharged(line.committed_fee_cents)
+      receivable_total_cents = SUM over lend_lines   of surcharged(line.charge_cents)
+
+      gross_amount_cents = payable_total_cents                  # identical in BOTH variants
+      direction          = PAYABLE when net_amount_cents >= 0 else RECEIVABLE
+    input_set: "borrow lines are fulfilled, non-cancelled IllRequest rows committed to this partner whose fulfilled_at falls in the period; lend lines are OPEN LendingCharge rows of this partner whose incurred_at falls in the period"
+    constants:
+      CONSORTIUM_SURCHARGE_PCT: 0.075
+    precision: "integer cents, round_half_up, applied once per line before summation"
+    variants:
+      - name: gross_settlement
+        when: "the partner's applicable ACTIVE ReciprocityAgreement has settlement_mode == GROSS, or no agreement applies"
+        difference: "net_amount_cents = payable_total_cents; the lend side is reported in receivable_total_cents but is NOT netted off, so the borrower pays the full borrow total and invoices the lend side separately"
+      - name: net_settlement
+        when: "the partner's applicable ACTIVE ReciprocityAgreement has settlement_mode == NET"
+        difference: "net_amount_cents = payable_total_cents - receivable_total_cents, which may be negative and then flips direction to RECEIVABLE"
+
+  - name: patron_standing_score
+    trigger: "POST /ill/requests (provisional) and POST /ill/ops-runs step 8 (final)"
+    algorithm: weighted_scoring
+    formula: |
+      base = W_LOST      * patron.lost_count
+           + W_DAMAGED   * patron.damaged_count
+           + W_LATE      * patron.late_return_count
+           + W_UNCLAIMED * patron.unclaimed_count
+           + floor(patron.unpaid_balance_cents / UNPAID_UNIT_CENTS)
+
+      overdue_in_flight_count = COUNT( LoanRecord of this patron
+                                       WHERE custody_status == WITH_PATRON AND clock > due_at )
+      on_time_return_count    = COUNT( LoanRecord of this patron
+                                       WHERE custody_status == RETURNED_TO_LENDER
+                                         AND overdue_fine_cents == 0 )
+      Both counters are clamped into 0..100 after the variant expression is evaluated.
+    input_set: "the patron's own five infraction counters, plus (final variant only) that patron's LoanRecord rows"
+    constants:
+      W_LOST: 25
+      W_DAMAGED: 12
+      W_LATE: 6
+      W_UNCLAIMED: 8
+      UNPAID_UNIT_CENTS: 1000
+      W_OVERDUE_IN_FLIGHT: 6
+      W_ON_TIME_RETURN: 4
+      STANDING_BLOCK_THRESHOLD: 40
+    precision: "integer score, floor division on the unpaid term, clamped to 0..100"
+    variants:
+      - name: provisional_standing
+        when: "evaluated inside POST /ill/requests, before the request row is created"
+        difference: "score = clamp(base); the in-flight overdue and on-time-return terms are NOT applied. Written to Patron.provisional_risk_score. Intake is refused with ERR_PATRON_STANDING_BLOCKED when this score >= STANDING_BLOCK_THRESHOLD."
+      - name: final_standing
+        when: "evaluated inside POST /ill/ops-runs step 8 and after every billing side effect"
+        difference: "score = clamp(base + W_OVERDUE_IN_FLIGHT * overdue_in_flight_count - W_ON_TIME_RETURN * on_time_return_count). Written to Patron.final_risk_score. Patron.status is set to BLOCKED when this score >= STANDING_BLOCK_THRESHOLD. For identical stored data the two variants disagree whenever the patron holds an overdue loan or has on-time returns."
+
+  - name: loan_due_date_and_renewal_projection
+    trigger: "POST /ill/shipments/{id}/receive (initial dates) and POST /ill/loans/{id}/renewals (extension)"
+    algorithm: projection
+    formula: |
+      at receipt:
+        received_at        = clock
+        original_due_at    = due_at = clock + request.committed_loan_period_days days
+        pickup_expires_at  = clock + HOLD_SHELF_DAYS days
+        max_renewals       = partner.max_renewals            # snapshot
+        renewals_allowed   = partner.allows_renewals         # snapshot
+
+      hard_ceiling = received_at + MAX_TOTAL_LOAN_DAYS days
+
+      renewal, preconditions evaluated in EXACTLY this order:
+        custody_status == WITH_PATRON      else ERR_LOAN_INVALID_CUSTODY_STATE   (43)
+        recall_status  == NONE             else ERR_RENEWAL_BLOCKED_BY_RECALL    (70)
+        renewals_allowed is true           else ERR_RENEWALS_NOT_ALLOWED_BY_LENDER (71)
+        renewal_count < max_renewals       else ERR_RENEWAL_CAP_REACHED          (72)
+        proposed = min(due_at + RENEWAL_DAYS days, hard_ceiling)
+        proposed > due_at                  else ERR_RENEWAL_CAP_REACHED          (72)
+      on success: due_at = proposed; renewal_count += 1; original_due_at is NEVER rewritten
+
+      recall pull-in (POST /ill/loans/{id}/recalls):
+        recall_due_at = clock + grace_days days
+        due_at        = min(due_at, recall_due_at)
+    input_set: "the single LoanRecord plus the committed loan period snapshotted on its IllRequest"
+    constants:
+      HOLD_SHELF_DAYS: 7
+      RENEWAL_DAYS: 14
+      MAX_TOTAL_LOAN_DAYS: 84
+      DEFAULT_RECALL_GRACE_DAYS: 7
+    precision: "whole-day arithmetic on UTC instants; the time-of-day component of received_at is preserved"
+
+  - name: licensed_access_embargo_test
+    trigger: "POST /ill/requests — decides whether licensed electronic access already covers the work"
+    algorithm: threshold
+    formula: |
+      current_year = calendar year (UTC) of the logical clock
+      bib.licensed_access_status == NONE
+          -> accessible_now = false
+      bib.licensed_access_status == LICENSED_FULL
+          -> accessible_now = true
+      bib.licensed_access_status == LICENSED_EMBARGOED
+          -> accessible_now = bib.publication_year <= current_year - ceil(bib.embargo_months / 12)
+      accessible_now is true -> intake refused with ERR_LICENSED_ACCESS_AVAILABLE (422)
+      The division is a CEILING on whole years: embargo_months 1..12 costs one year, 13..24 costs two.
+    input_set: "the single BibItem"
+    constants:
+      MONTHS_PER_YEAR: 12
+    precision: "integer years, ceiling division"
+
+  - name: patron_loan_window_capacity
+    trigger: "POST /ill/shipments/{id}/receive — before the LoanRecord is created"
+    algorithm: interval_merge
+    formula: |
+      occupation window of a LoanRecord = the CLOSED interval [received_at, due_at]
+      counted set = LoanRecord rows of this patron with custody_status IN {AWAITING_PICKUP, WITH_PATRON}
+                    (RETURN_PREPARED, UNCLAIMED_RETURN_PREPARED, RETURNED_TO_LENDER and DECLARED_LOST
+                     rows are excluded — the item is no longer in the patron's hands)
+      prospective window = [clock, clock + request.committed_loan_period_days days]
+
+      overlaps(a, b) = a.start <= b.end AND b.start <= a.end
+      # CLOSED intervals: windows that merely TOUCH at an endpoint DO overlap.
+
+      n = COUNT(counted set members whose window overlaps the prospective window)
+      receipt is refused when n + 1 > patron.max_concurrent_loans
+          -> ERR_PATRON_LOAN_WINDOW_CAPACITY (409)
+      This is an AGGREGATE limit: each existing loan is individually legal; only the collective
+      overlap count at the prospective window breaches it.
+    input_set: "the patron's LoanRecord rows in custody_status AWAITING_PICKUP or WITH_PATRON"
+    constants:
+      DEFAULT_MAX_CONCURRENT_LOANS: 3
+    precision: "integer counts; whole-day arithmetic on the window end"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority; lowest number wins)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 10
+    category: auth
+    check: "X-User-ID and X-User-Role headers are both present and X-User-Role is one of the six declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 20
+    category: auth
+    check: "the acting X-User-Role appears in the endpoint's roles list in §1.5"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 25
+    category: auth
+    check: "for an entity_backed role, X-User-ID owns the addressed resource — Patron acts only on IllRequest / LoanRecord / ElectronicDelivery rows whose request.patron_id equals X-User-ID; PartnerAgent acts only on SupplyOffer rows whose partner_id equals X-User-ID, on Shipment / LoanRecord rows whose request.committed_partner_id equals X-User-ID, and on PartnerInvoice rows whose partner_id equals X-User-ID"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "all Patron- and PartnerAgent-accessible endpoints"
+
+  - priority: 28
+    category: auth
+    check: "segregation of duties — X-User-ID must differ from PurchaseOnDemandOrder.escalated_by_user_id on POST /ill/pod-orders/{id}/decision, and from IllRequest.intake_user_id on POST /ill/requests/{id}/copyright-clearances"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /ill/pod-orders/{id}/decision, POST /ill/requests/{id}/copyright-clearances"
+
+  - priority: 30
+    category: existence
+    check: "every id in the path exists, validated left to right"
+    error_id: "ERR_PATRON_NOT_FOUND | ERR_PARTNER_NOT_FOUND | ERR_BIB_ITEM_NOT_FOUND | ERR_ROTA_NOT_FOUND | ERR_REQUEST_NOT_FOUND | ERR_OFFER_NOT_FOUND | ERR_SHIPMENT_NOT_FOUND | ERR_LOAN_NOT_FOUND | ERR_DELIVERY_NOT_FOUND | ERR_POD_ORDER_NOT_FOUND | ERR_INVOICE_NOT_FOUND | ERR_LENDING_CHARGE_NOT_FOUND | ERR_ROTA_ENTRY_NOT_FOUND | ERR_AGREEMENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path id"
+
+  - priority: 32
+    category: existence
+    check: "every FK supplied in the request body references an existing row, validated in the field order declared by the endpoint's input list"
+    error_id: "ERR_PATRON_NOT_FOUND | ERR_PARTNER_NOT_FOUND | ERR_BIB_ITEM_NOT_FOUND | ERR_ROTA_NOT_FOUND | ERR_AGREEMENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "all write endpoints carrying FK fields"
+
+  - priority: 35
+    category: state
+    check: "the body is well formed — required fields present, enum values in range, integers non-negative where §1.1 says so, period_month matching ^[0-9]{4}-(0[1-9]|1[0-2])$, effective_to strictly after effective_from, issn present when item_type is ARTICLE, pages_requested present when service_type is COPY on an ARTICLE, delivery_mode ELECTRONIC when service_type is COPY, pagination limit in 1..100 and offset >= 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+  - priority: 38
+    category: business_referential
+    check: "IllRequest.service_type equals Rota.material_type on the named rota"
+    error_id: ERR_ROTA_MATERIAL_MISMATCH
+    http_status: 422
+    applies_to: "POST /ill/requests"
+
+  - priority: 40
+    category: state
+    check: "IllRequest.status permits the operation, per §1.2"
+    error_id: ERR_REQUEST_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /ill/requests/{id}/{cancel,copyright-clearances,source,escalate,electronic-deliveries}"
+
+  - priority: 41
+    category: state
+    check: "SupplyOffer.status == OFFERED"
+    error_id: ERR_OFFER_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /ill/supply-offers/{id}/{accept,decline,shipments}"
+
+  - priority: 42
+    category: state
+    check: "Shipment.status == IN_TRANSIT and its direction matches the operation (INBOUND for receive, RETURN for lender-confirm)"
+    error_id: ERR_SHIPMENT_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /ill/shipments/{id}/{receive,lender-confirm}"
+
+  - priority: 43
+    category: state
+    check: "LoanRecord.custody_status permits the operation — AWAITING_PICKUP for pickup, WITH_PATRON for renewals / return / declare-lost"
+    error_id: ERR_LOAN_INVALID_CUSTODY_STATE
+    http_status: 409
+    applies_to: "POST /ill/loans/{id}/{pickup,renewals,return,declare-lost}"
+
+  - priority: 44
+    category: state
+    check: "ElectronicDelivery.status is not EXPIRED (an EXHAUSTED row clears this rung and is refused by the download-cap rule at priority 73)"
+    error_id: ERR_DELIVERY_NOT_AVAILABLE
+    http_status: 409
+    applies_to: "POST /ill/electronic-deliveries/{id}/downloads"
+
+  - priority: 45
+    category: state
+    check: "PurchaseOnDemandOrder.status permits the operation — PROPOSED for decision, APPROVED for receive"
+    error_id: ERR_POD_ORDER_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /ill/pod-orders/{id}/{decision,receive}"
+
+  - priority: 46
+    category: state
+    check: "PartnerInvoice.status permits the operation — DRAFT for issue; ISSUED for settle actions PAY and DISPUTE; DISPUTED for settle action REINSTATE"
+    error_id: ERR_INVOICE_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /ill/invoices/{id}/{issue,settle}"
+
+  - priority: 47
+    category: state
+    check: "the ReciprocityAgreement named in supersedes_agreement_id has status ACTIVE"
+    error_id: ERR_AGREEMENT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /ill/reciprocity-agreements"
+
+  - priority: 48
+    category: state
+    check: "expected_partner_version equals the current Partner.version (OCC, §1.2.1)"
+    error_id: ERR_STALE_PARTNER_VERSION
+    http_status: 412
+    applies_to: "POST /ill/reciprocity-agreements, POST /ill/partners/{id}/invoices"
+
+  - priority: 49
+    category: state
+    check: "expected_rota_version equals the current Rota.version (OCC, §1.2.1)"
+    error_id: ERR_STALE_ROTA_VERSION
+    http_status: 412
+    applies_to: "POST /ill/rota-entries"
+
+  - priority: 50
+    category: business_safety
+    check: "the (issn, calendar_year) rule-of-five allowance has room, or the copy is outside the recency window — see calculations.copyright_rule_of_five_counter. Reaching the limit is NOT an error at intake (the request parks in COPYRIGHT_HOLD); this rule fires only where an operation demands a free fill that no longer exists"
+    error_id: ERR_COPYRIGHT_LIMIT_REACHED
+    http_status: 422
+    applies_to: "POST /ill/requests/{id}/source when request.copyright_required is true and the request has no ACTIVE clearance"
+
+  - priority: 51
+    category: business_safety
+    check: "a ROYALTY_PAID clearance may only be recorded for a request whose status is COPYRIGHT_HOLD; a request already covered by a CONTU_FREE or PRE_WINDOW_EXEMPT clearance does not need one"
+    error_id: ERR_COPYRIGHT_CLEARANCE_NOT_REQUIRED
+    http_status: 422
+    applies_to: "POST /ill/requests/{id}/copyright-clearances"
+
+  - priority: 52
+    category: business_safety
+    check: "the declared royalty_cents equals calculations.royalty_fee for the request's pages_requested"
+    error_id: ERR_ROYALTY_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /ill/requests/{id}/copyright-clearances"
+
+  - priority: 55
+    category: business_constraint
+    check: "the BibItem is not already available on the local shelf — local_holding_status must not be HELD_AVAILABLE"
+    error_id: ERR_HELD_LOCALLY
+    http_status: 422
+    applies_to: "POST /ill/requests"
+
+  - priority: 56
+    category: business_constraint
+    check: "licensed electronic access does not already cover the work — see calculations.licensed_access_embargo_test"
+    error_id: ERR_LICENSED_ACCESS_AVAILABLE
+    http_status: 422
+    applies_to: "POST /ill/requests"
+
+  - priority: 58
+    category: business_constraint
+    check: "Patron.status == ACTIVE"
+    error_id: ERR_PATRON_BLOCKED
+    http_status: 403
+    applies_to: "POST /ill/requests"
+
+  - priority: 59
+    category: business_constraint
+    check: "Patron.open_request_count < Patron.max_open_requests"
+    error_id: ERR_PATRON_REQUEST_CAP_REACHED
+    http_status: 409
+    applies_to: "POST /ill/requests"
+
+  - priority: 60
+    category: business_constraint
+    check: "the provisional_standing variant of calculations.patron_standing_score is below STANDING_BLOCK_THRESHOLD"
+    error_id: ERR_PATRON_STANDING_BLOCKED
+    http_status: 403
+    applies_to: "POST /ill/requests"
+
+  - priority: 62
+    category: business_temporal
+    check: "needed_by is strictly after the logical clock"
+    error_id: ERR_NEEDED_BY_IN_PAST
+    http_status: 422
+    applies_to: "POST /ill/requests"
+
+  - priority: 63
+    category: business_temporal
+    check: "the new agreement's half-open window [effective_from, effective_to) does not intersect the window of any other ACTIVE ReciprocityAgreement of the same partner. Intersection is `new.effective_from < other.effective_to AND other.effective_from < new.effective_to`, so adjacency (new.effective_from == other.effective_to) is permitted. An agreement flipped to SUPERSEDED by this same request's supersedes_agreement_id is excluded from the comparison set"
+    error_id: ERR_AGREEMENT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /ill/reciprocity-agreements"
+
+  - priority: 64
+    category: business_temporal
+    check: "the prospective loan occupation window does not push the patron's overlapping-loan count above max_concurrent_loans — see calculations.patron_loan_window_capacity"
+    error_id: ERR_PATRON_LOAN_WINDOW_CAPACITY
+    http_status: 409
+    applies_to: "POST /ill/shipments/{id}/receive"
+
+  - priority: 65
+    category: business_temporal
+    check: "the loan is not past a recall deadline — recall_status must not be RECALL_BREACHED and, when recall_status is RECALL_ISSUED, the clock must be at or before recall_due_at"
+    error_id: ERR_RECALL_OVERDUE
+    http_status: 409
+    applies_to: "POST /ill/loans/{id}/renewals"
+
+  - priority: 66
+    category: business_temporal
+    check: "the logical clock is strictly before ElectronicDelivery.expires_at"
+    error_id: ERR_DELIVERY_EXPIRED
+    http_status: 409
+    applies_to: "POST /ill/electronic-deliveries/{id}/downloads"
+
+  - priority: 67
+    category: business_temporal
+    check: "the invoice's settlement period is closed — the logical clock is at or after period_end"
+    error_id: ERR_INVOICE_PERIOD_NOT_CLOSED
+    http_status: 409
+    applies_to: "POST /ill/invoices/{id}/issue"
+
+  - priority: 68
+    category: business_temporal
+    check: "the hold shelf has not expired — the logical clock is strictly before LoanRecord.pickup_expires_at"
+    error_id: ERR_PICKUP_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /ill/loans/{id}/pickup"
+
+  - priority: 70
+    category: business_constraint
+    check: "the loan is not under an open recall — recall_status == NONE"
+    error_id: ERR_RENEWAL_BLOCKED_BY_RECALL
+    http_status: 409
+    applies_to: "POST /ill/loans/{id}/renewals"
+
+  - priority: 71
+    category: business_constraint
+    check: "LoanRecord.renewals_allowed (the snapshot of Partner.allows_renewals) is true"
+    error_id: ERR_RENEWALS_NOT_ALLOWED_BY_LENDER
+    http_status: 422
+    applies_to: "POST /ill/loans/{id}/renewals"
+
+  - priority: 72
+    category: business_constraint
+    check: "renewal_count < max_renewals AND the projected due date strictly exceeds the current due_at after the MAX_TOTAL_LOAN_DAYS ceiling is applied — see calculations.loan_due_date_and_renewal_projection"
+    error_id: ERR_RENEWAL_CAP_REACHED
+    http_status: 409
+    applies_to: "POST /ill/loans/{id}/renewals"
+
+  - priority: 73
+    category: business_constraint
+    check: "download_count < max_downloads"
+    error_id: ERR_DELIVERY_DOWNLOAD_CAP_REACHED
+    http_status: 409
+    applies_to: "POST /ill/electronic-deliveries/{id}/downloads"
+
+  - priority: 74
+    category: business_constraint
+    check: "IllRequest.attempt_count < Rota.max_attempts"
+    error_id: ERR_ROTA_ATTEMPTS_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /ill/requests/{id}/source"
+
+  - priority: 76
+    category: business_constraint
+    check: "the accepting Partner is ACTIVE and supports the request's service_type"
+    error_id: ERR_PARTNER_NOT_ELIGIBLE
+    http_status: 422
+    applies_to: "POST /ill/supply-offers/{id}/accept"
+
+  - priority: 77
+    category: business_constraint
+    check: "the BibItem is not already HELD_AVAILABLE or ON_ORDER locally"
+    error_id: ERR_ALREADY_HELD_LOCALLY
+    http_status: 422
+    applies_to: "POST /ill/requests/{id}/escalate, POST /ill/pod-orders/{id}/decision with decision APPROVE"
+
+  - priority: 78
+    category: business_constraint
+    check: "the candidate set of calculations.lender_landed_cost_ranking is non-empty"
+    error_id: ERR_NO_ELIGIBLE_LENDER
+    http_status: 422
+    applies_to: "POST /ill/requests/{id}/source"
+
+  - priority: 80
+    category: business_fiscal
+    check: "Patron.unpaid_balance_cents <= Patron.unpaid_balance_cap_cents"
+    error_id: ERR_PATRON_BALANCE_EXCEEDED
+    http_status: 402
+    applies_to: "POST /ill/requests"
+
+  - priority: 81
+    category: business_fiscal
+    check: "payment_cents does not exceed the loan's total remaining across all four charge buckets — see calculations.charge_waterfall_settlement"
+    error_id: ERR_OVERPAYMENT
+    http_status: 422
+    applies_to: "POST /ill/loans/{id}/charge-settlements"
+
+  - priority: 82
+    category: business_fiscal
+    check: "damage_fee_cents <= LoanRecord.replacement_cost_cents"
+    error_id: ERR_DAMAGE_FEE_EXCEEDS_REPLACEMENT
+    http_status: 422
+    applies_to: "POST /ill/shipments/{id}/lender-confirm with condition DAMAGED"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+  # ---- Patron ------------------------------------------------------------
+  - method: POST
+    path: "/ill/patrons"
+    description: "Register a patron account."
+    roles: [LibraryAdmin, IllBorrowingStaff]
+    code: 201
+    input: [external_id, full_name, email, patron_type, department, "max_open_requests?", "max_concurrent_loans?", "unpaid_balance_cap_cents?"]
+    output: Patron
+    side_effects:
+      - "status defaults to ACTIVE; every counter and both risk scores default to 0"
+
+  - method: PATCH
+    path: "/ill/patrons/{id}"
+    description: "Update a patron's standing gate or limits. The only way to move status back from BLOCKED to ACTIVE, and the only producer of WITHDRAWN."
+    roles: [LibraryAdmin]
+    code: 200
+    input: ["status?", "email?", "max_open_requests?", "max_concurrent_loans?", "unpaid_balance_cap_cents?"]
+    output: Patron
+    side_effects:
+      - "increments Patron.version by 1"
+      - "recomputes provisional_risk_score and final_risk_score"
+
+  - method: POST
+    path: "/ill/patrons/{id}/infraction-records"
+    description: "Record migrated borrowing history for a patron — the operational surface the migration tool and the circulation desk use to load prior lost/damaged/late/unclaimed infractions and prior unpaid charges onto an account."
+    roles: [LibraryAdmin]
+    code: 200
+    input: [kind, "count?", "unpaid_amount_cents?"]
+    output: Patron
+    side_effects:
+      - "kind LOST/DAMAGED/LATE_RETURN/UNCLAIMED adds `count` (default 1) to the matching historical_* counter"
+      - "kind UNPAID_CHARGE adds unpaid_amount_cents to historical_unpaid_cents"
+      - "recomputes lost_count / damaged_count / late_return_count / unclaimed_count / unpaid_balance_cents"
+      - "recomputes provisional_risk_score and final_risk_score via calculations.patron_standing_score"
+      - "increments Patron.version by 1"
+
+  - method: GET
+    path: "/ill/patrons/{id}"
+    description: "Read one patron with every derived counter and both risk scores."
+    roles: [Patron, IllBorrowingStaff, AcquisitionsLibrarian, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: Patron
+    side_effects: []
+
+  - method: GET
+    path: "/ill/patrons"
+    description: "List patrons."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "external_id?", "limit?", "offset?"]
+    output: Patron[]
+    side_effects: []
+
+  # ---- Partner -----------------------------------------------------------
+  - method: POST
+    path: "/ill/partners"
+    description: "Register a consortium partner library."
+    roles: [LibraryAdmin]
+    code: 201
+    input: [code, name, consortium_code, base_lending_fee_cents, avg_turnaround_days, ships_physical, supplies_electronic, allows_renewals, loan_period_days, max_renewals, "status?"]
+    output: Partner
+    side_effects:
+      - "status defaults to ACTIVE; every balance counter defaults to 0"
+
+  - method: PATCH
+    path: "/ill/partners/{id}"
+    description: "Update a partner's eligibility flags, published terms or status."
+    roles: [LibraryAdmin]
+    code: 200
+    input: ["status?", "base_lending_fee_cents?", "avg_turnaround_days?", "ships_physical?", "supplies_electronic?", "allows_renewals?", "loan_period_days?", "max_renewals?"]
+    output: Partner
+    side_effects:
+      - "increments Partner.version by 1"
+      - "does NOT rewrite any snapshot already taken onto an IllRequest or LoanRecord"
+
+  - method: GET
+    path: "/ill/partners/{id}"
+    description: "Read one partner with its borrowing/lending balance counters."
+    roles: [PartnerAgent, IllBorrowingStaff, AcquisitionsLibrarian, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: Partner
+    side_effects: []
+
+  - method: GET
+    path: "/ill/partners"
+    description: "List partners."
+    roles: [IllBorrowingStaff, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: ["status?", "consortium_code?", "limit?", "offset?"]
+    output: Partner[]
+    side_effects: []
+
+  # ---- ReciprocityAgreement ---------------------------------------------
+  - method: POST
+    path: "/ill/reciprocity-agreements"
+    description: "Create a reciprocity agreement with a partner, optionally superseding an existing one. Guarded by OCC on the parent Partner (§1.2.1 rule agreement-create-supersede-stale-partner)."
+    roles: [LibraryAdmin]
+    code: 201
+    input: [partner_id, expected_partner_version, fee_waiver_mode, settlement_mode, turnaround_guarantee_days, effective_from, effective_to, "capped_waiver_cents?", "balance_tolerance_items?", "supersedes_agreement_id?"]
+    output: ReciprocityAgreement
+    side_effects:
+      - "increments Partner.version by 1"
+      - "when supersedes_agreement_id is present: that agreement's status -> SUPERSEDED, and it is excluded from the window-overlap check for this new agreement"
+      - "status defaults to ACTIVE"
+
+  - method: GET
+    path: "/ill/reciprocity-agreements/{id}"
+    description: "Read one reciprocity agreement."
+    roles: [PartnerAgent, IllBorrowingStaff, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: ReciprocityAgreement
+    side_effects: []
+
+  - method: GET
+    path: "/ill/reciprocity-agreements"
+    description: "List reciprocity agreements; filterable by partner (reverse reachability for ReciprocityAgreement.partner_id) and by the agreement they supersede (reverse reachability for ReciprocityAgreement.supersedes_agreement_id)."
+    roles: [PartnerAgent, IllBorrowingStaff, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: ["partner_id?", "supersedes_agreement_id?", "status?", "limit?", "offset?"]
+    output: ReciprocityAgreement[]
+    side_effects: []
+
+  # ---- Rota / RotaEntry --------------------------------------------------
+  - method: POST
+    path: "/ill/rotas"
+    description: "Create a lender rota for one material type."
+    roles: [LibraryAdmin, IllBorrowingStaff]
+    code: 201
+    input: [name, material_type, selection_policy, "max_attempts?", "auto_escalate_pod?", "offer_response_hours?"]
+    output: Rota
+    side_effects: []
+
+  - method: GET
+    path: "/ill/rotas/{id}"
+    description: "Read one rota."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: Rota
+    side_effects: []
+
+  - method: POST
+    path: "/ill/rota-entries"
+    description: "Add or re-quote a partner on a rota. Guarded by OCC on the parent Rota (§1.2.1 rule rota-entry-requote-stale-rota)."
+    roles: [LibraryAdmin, IllBorrowingStaff]
+    code: 201
+    input: [rota_id, expected_rota_version, partner_id, manual_rank, quoted_fee_cents, quoted_turnaround_days, "is_enabled?"]
+    output: RotaEntry
+    side_effects:
+      - "increments Rota.version by 1"
+      - "any existing ACTIVE entry for the same (rota_id, partner_id) pair -> SUPERSEDED"
+
+  - method: PATCH
+    path: "/ill/rota-entries/{id}"
+    description: "Enable/disable a rota entry or change its manual rank without re-quoting it."
+    roles: [LibraryAdmin, IllBorrowingStaff]
+    code: 200
+    input: ["is_enabled?", "manual_rank?"]
+    output: RotaEntry
+    side_effects:
+      - "increments RotaEntry.version by 1"
+
+  - method: GET
+    path: "/ill/rota-entries/{id}"
+    description: "Read one rota entry."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: RotaEntry
+    side_effects: []
+
+  - method: GET
+    path: "/ill/rotas/{id}/entries"
+    description: "List a rota's entries in ranking order (reverse reachability for RotaEntry.rota_id)."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RotaEntry[]
+    side_effects: []
+
+  - method: GET
+    path: "/ill/partners/{id}/rota-entries"
+    description: "List every rota entry quoting this partner (reverse reachability for RotaEntry.partner_id)."
+    roles: [PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: RotaEntry[]
+    side_effects: []
+
+  # ---- BibItem -----------------------------------------------------------
+  - method: POST
+    path: "/ill/bib-items"
+    description: "Create a bibliographic record for a requested work."
+    roles: [LibraryAdmin, IllBorrowingStaff, AcquisitionsLibrarian]
+    code: 201
+    input: [title, item_type, publication_year, "issn?", "isbn?", "journal_title?", "local_holding_status?", "licensed_access_status?", "embargo_months?", "list_price_cents?"]
+    output: BibItem
+    side_effects: []
+
+  - method: PATCH
+    path: "/ill/bib-items/{id}"
+    description: "Update local holding or licensed-access facts about a work."
+    roles: [LibraryAdmin, AcquisitionsLibrarian]
+    code: 200
+    input: ["local_holding_status?", "licensed_access_status?", "embargo_months?", "list_price_cents?"]
+    output: BibItem
+    side_effects:
+      - "increments BibItem.version by 1"
+
+  - method: GET
+    path: "/ill/bib-items/{id}"
+    description: "Read one bibliographic record."
+    roles: [Patron, IllBorrowingStaff, AcquisitionsLibrarian, LibraryAdmin]
+    code: 200
+    input: []
+    output: BibItem
+    side_effects: []
+
+  - method: GET
+    path: "/ill/bib-items"
+    description: "List bibliographic records."
+    roles: [IllBorrowingStaff, AcquisitionsLibrarian, LibraryAdmin]
+    code: 200
+    input: ["issn?", "item_type?", "local_holding_status?", "limit?", "offset?"]
+    output: BibItem[]
+    side_effects: []
+
+  # ---- IllRequest --------------------------------------------------------
+  - method: POST
+    path: "/ill/requests"
+    description: "Take in an interlibrary loan request. Runs the full intake gate in §1.4 priority order (local holdings, licensed access, patron standing, request cap, balance, needed_by), then performs the branching auto-transition to SOURCING or COPYRIGHT_HOLD in the same request."
+    roles: [Patron, IllBorrowingStaff]
+    code: 201
+    input: [patron_id, bib_item_id, rota_id, service_type, delivery_mode, needed_by, max_supply_fee_cents, "pages_requested?"]
+    output: IllRequest
+    side_effects:
+      - "sets intake_user_id from X-User-ID"
+      - "sets copyright_required from service_type / item_type / issn"
+      - "on the SOURCING branch with copyright_required: creates a CONTU_FREE or PRE_WINDOW_EXEMPT CopyrightClearance per calculations.copyright_rule_of_five_counter"
+      - "creates PatronNotification kind REQUEST_SUBMITTED (SOURCING branch) or COPYRIGHT_HOLD (hold branch)"
+      - "recomputes Patron.open_request_count, pending_charge_cents and provisional_risk_score"
+
+  - method: GET
+    path: "/ill/requests/{id}"
+    description: "Read one request with its full pricing and status snapshot."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, AcquisitionsLibrarian, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: IllRequest
+    side_effects: []
+
+  - method: GET
+    path: "/ill/requests"
+    description: "List requests; filterable by patron, bib item, rota and committed partner (reverse reachability for all four IllRequest FKs)."
+    roles: [Patron, IllBorrowingStaff, AcquisitionsLibrarian, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: ["patron_id?", "bib_item_id?", "rota_id?", "committed_partner_id?", "status?", "service_type?", "limit?", "offset?"]
+    output: IllRequest[]
+    side_effects: []
+
+  - method: POST
+    path: "/ill/requests/{id}/cancel"
+    description: "Cancel a non-terminal request. Compensating transition: releases every resource the request had reserved."
+    roles: [Patron, IllBorrowingStaff]
+    code: 200
+    input: []
+    output: IllRequest
+    side_effects:
+      - "every ACTIVE CopyrightClearance of the request -> VOIDED, returning the (issn, calendar_year) free-fill allowance"
+      - "every OFFERED SupplyOffer -> CANCELLED; every PROPOSED PurchaseOnDemandOrder -> CANCELLED"
+      - "committed_partner_id -> null and all six money fields -> 0"
+      - "the previously committed Partner's borrowed_from_count, net_borrow_imbalance_items and borrow_payable_cents are recomputed"
+      - "creates PatronNotification kind REQUEST_CANCELLED"
+      - "recomputes Patron.open_request_count and pending_charge_cents"
+
+  - method: POST
+    path: "/ill/requests/{id}/copyright-clearances"
+    description: "Record a paid-royalty copyright clearance so a COPYRIGHT_HOLD request can proceed. The acting user must differ from the request's intake_user_id."
+    roles: [IllBorrowingStaff]
+    code: 201
+    input: [royalty_cents]
+    output: CopyrightClearance
+    side_effects:
+      - "creates CopyrightClearance method ROYALTY_PAID, sequence_in_year 0, approved_by_user_id = X-User-ID"
+      - "request.status -> SOURCING"
+      - "request.royalty_cents set; gross_charge_cents / subsidy_cents / net_patron_charge_cents recomputed via calculations.patron_charge_assembly"
+      - "recomputes Patron.pending_charge_cents"
+
+  - method: GET
+    path: "/ill/requests/{id}/copyright-clearances"
+    description: "List a request's copyright clearances (reverse reachability for CopyrightClearance.request_id). Cascade-created CONTU_FREE and PRE_WINDOW_EXEMPT rows are only discoverable here."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CopyrightClearance[]
+    side_effects: []
+
+  - method: POST
+    path: "/ill/requests/{id}/source"
+    description: "Run one rota round: score every eligible candidate with calculations.lender_landed_cost_ranking and open a SupplyOffer to the winner."
+    roles: [IllBorrowingStaff]
+    code: 201
+    input: []
+    output: SupplyOffer
+    side_effects:
+      - "increments IllRequest.attempt_count by 1 and snapshots days_available_at_source"
+      - "request.status -> OFFER_PENDING"
+      - "creates SupplyOffer status OFFERED with respond_by = clock + Rota.offer_response_hours hours"
+      - "on an empty candidate set nothing is written and ERR_NO_ELIGIBLE_LENDER is returned"
+
+  - method: POST
+    path: "/ill/requests/{id}/escalate"
+    description: "Escalate a request that the rota cannot fill into a purchase-on-demand proposal."
+    roles: [IllBorrowingStaff]
+    code: 201
+    input: [vendor]
+    output: PurchaseOnDemandOrder
+    side_effects:
+      - "request.status -> ESCALATED_POD"
+      - "creates PurchaseOnDemandOrder status PROPOSED with escalated_by_user_id = X-User-ID and list_price_cents snapshotted from the BibItem"
+
+  - method: GET
+    path: "/ill/requests/{id}/pod-orders"
+    description: "List a request's purchase-on-demand orders (reverse reachability for PurchaseOnDemandOrder.request_id)."
+    roles: [IllBorrowingStaff, AcquisitionsLibrarian, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: PurchaseOnDemandOrder[]
+    side_effects: []
+
+  - method: GET
+    path: "/ill/requests/{id}/notifications"
+    description: "List the notices emitted for a request (reverse reachability for PatronNotification.request_id). Notifications are append-only and have no update endpoint."
+    roles: [Patron, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["kind?", "limit?", "offset?"]
+    output: PatronNotification[]
+    side_effects: []
+
+  # ---- SupplyOffer -------------------------------------------------------
+  - method: POST
+    path: "/ill/supply-offers/{id}/accept"
+    description: "The selected lender accepts the offer, committing the fee, the loan period and the rush surcharge onto the request."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 200
+    input: []
+    output: SupplyOffer
+    side_effects:
+      - "offer.status -> ACCEPTED; request.status -> SUPPLY_COMMITTED"
+      - "sets request.committed_partner_id, committed_fee_cents, committed_loan_period_days, rush_surcharge_cents"
+      - "recomputes request gross_charge_cents / subsidy_cents / net_patron_charge_cents via calculations.patron_charge_assembly"
+      - "recomputes Partner.borrowed_from_count, net_borrow_imbalance_items and borrow_payable_cents"
+      - "recomputes Patron.pending_charge_cents"
+
+  - method: POST
+    path: "/ill/supply-offers/{id}/decline"
+    description: "The selected lender declines; the request returns to SOURCING for the next rota round and this partner is permanently excluded from later candidate sets on this request."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 200
+    input: [decline_reason]
+    output: SupplyOffer
+    side_effects:
+      - "offer.status -> DECLINED with decline_reason recorded"
+      - "request.status -> SOURCING; attempt_count is NOT reset"
+
+  - method: GET
+    path: "/ill/supply-offers/{id}"
+    description: "Read one supply offer with its quoted, effective and landed-cost figures."
+    roles: [PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: SupplyOffer
+    side_effects: []
+
+  - method: GET
+    path: "/ill/supply-offers"
+    description: "List supply offers; filterable by request and by partner (reverse reachability for both SupplyOffer FKs)."
+    roles: [PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["request_id?", "partner_id?", "status?", "limit?", "offset?"]
+    output: SupplyOffer[]
+    side_effects: []
+
+  # ---- Shipment ----------------------------------------------------------
+  - method: POST
+    path: "/ill/supply-offers/{id}/shipments"
+    description: "The lender ships the physical item to the borrowing library."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 201
+    input: [carrier, tracking_code, "insured_value_cents?"]
+    output: Shipment
+    side_effects:
+      - "creates Shipment direction INBOUND status IN_TRANSIT with shipped_at = clock"
+      - "request.status -> IN_TRANSIT"
+
+  - method: POST
+    path: "/ill/shipments/{id}/receive"
+    description: "The borrowing library receives the inbound parcel and opens the loan. Enforces calculations.patron_loan_window_capacity before the LoanRecord is created."
+    roles: [IllBorrowingStaff]
+    code: 201
+    input: []
+    output: LoanRecord
+    side_effects:
+      - "shipment.status -> RECEIVED with received_at = clock"
+      - "creates LoanRecord with custody AWAITING_PICKUP, billing NO_CHARGE, recall NONE"
+      - "sets due_at / original_due_at / pickup_expires_at / max_renewals / renewals_allowed / replacement_cost_cents per calculations.loan_due_date_and_renewal_projection"
+      - "copies the parcel's tracking_code onto LoanRecord.inbound_tracking_code"
+      - "request.status -> ON_HOLD_SHELF with fulfilled_at = clock"
+      - "creates PatronNotification kind READY_FOR_PICKUP"
+
+  - method: POST
+    path: "/ill/shipments/{id}/lender-confirm"
+    description: "The lender confirms what came back in the return parcel. condition DAMAGED starts the depth-5 damage cascade that can end with the patron BLOCKED."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 200
+    input: [condition, "damage_fee_cents?"]
+    output: Shipment
+    side_effects:
+      - "shipment.status -> CONFIRMED_OK | CONFIRMED_DAMAGED | CONFIRMED_LOST with confirmed_at = clock"
+      - "loan.custody_status -> RETURNED_TO_LENDER (OK, DAMAGED) or DECLARED_LOST (LOST)"
+      - "loan.billing_status -> DAMAGE_BILLED or LOST_BILLED with lender_processing_fee_cents applied and total_charge_cents / outstanding_cents recomputed"
+      - "request.status -> CLOSED | CLOSED_WITH_DAMAGE | CLOSED_LOST, but ONLY when it is currently RETURN_IN_TRANSIT"
+      - "creates PatronNotification kind DAMAGE_BILLED or LOST_BILLED"
+      - "recomputes Patron.damaged_count / lost_count / unpaid_balance_cents / open_request_count and final_risk_score; sets Patron.status -> BLOCKED when final_risk_score >= STANDING_BLOCK_THRESHOLD"
+
+  - method: GET
+    path: "/ill/shipments/{id}"
+    description: "Read one shipment."
+    roles: [PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: Shipment
+    side_effects: []
+
+  - method: GET
+    path: "/ill/requests/{id}/shipments"
+    description: "List a request's parcels in both directions (reverse reachability for Shipment.request_id). Cascade-created RETURN parcels are only discoverable here."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["direction?", "status?", "limit?", "offset?"]
+    output: Shipment[]
+    side_effects: []
+
+  # ---- LoanRecord --------------------------------------------------------
+  - method: POST
+    path: "/ill/loans/{id}/pickup"
+    description: "The patron collects the item from the hold shelf."
+    roles: [IllBorrowingStaff]
+    code: 200
+    input: []
+    output: LoanRecord
+    side_effects:
+      - "custody_status -> WITH_PATRON with picked_up_at = clock"
+      - "request.status -> WITH_PATRON"
+
+  - method: POST
+    path: "/ill/loans/{id}/renewals"
+    description: "Extend the loan by RENEWAL_DAYS, subject to the recall gate, the lender's renewal policy, the renewal count cap and the MAX_TOTAL_LOAN_DAYS ceiling."
+    roles: [Patron, IllBorrowingStaff]
+    code: 200
+    input: []
+    output: LoanRecord
+    side_effects:
+      - "due_at -> min(due_at + RENEWAL_DAYS days, received_at + MAX_TOTAL_LOAN_DAYS days); renewal_count incremented"
+      - "original_due_at is never rewritten"
+
+  - method: POST
+    path: "/ill/loans/{id}/recalls"
+    description: "The lender recalls the item early, pulling the due date in and locking renewals out."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 200
+    input: ["grace_days?"]
+    output: LoanRecord
+    side_effects:
+      - "recall_status -> RECALL_ISSUED with recall_due_at = clock + grace_days days (default DEFAULT_RECALL_GRACE_DAYS)"
+      - "due_at -> min(due_at, recall_due_at)"
+      - "creates PatronNotification kind RECALL_ISSUED"
+
+  - method: POST
+    path: "/ill/loans/{id}/return"
+    description: "The patron returns the item; the overdue fine is computed once here and the return parcel is created."
+    roles: [IllBorrowingStaff]
+    code: 200
+    input: []
+    output: LoanRecord
+    side_effects:
+      - "custody_status -> RETURN_PREPARED with return_prepared_at = clock"
+      - "writes overdue_fine_cents via calculations.overdue_fine_accrual; billing_status -> FINE_ACCRUED when it is > 0"
+      - "recall_status RECALL_ISSUED -> RECALL_HONORED or RECALL_BREACHED depending on recall_due_at"
+      - "creates Shipment direction RETURN status IN_TRANSIT"
+      - "request.status -> RETURN_IN_TRANSIT"
+      - "recomputes Patron.late_return_count, unpaid_balance_cents and final_risk_score"
+
+  - method: POST
+    path: "/ill/loans/{id}/declare-lost"
+    description: "The borrowing library declares the item lost while it is still with the patron."
+    roles: [IllBorrowingStaff]
+    code: 200
+    input: []
+    output: LoanRecord
+    side_effects:
+      - "custody_status -> DECLARED_LOST, billing_status -> LOST_BILLED"
+      - "sets lost_replacement_cents, lender_processing_fee_cents and overdue_fine_cents; recomputes total_charge_cents / outstanding_cents"
+      - "request.status -> CLOSED_LOST"
+      - "creates PatronNotification kind LOST_BILLED"
+      - "recomputes Patron.lost_count, unpaid_balance_cents, open_request_count and final_risk_score; sets Patron.status -> BLOCKED when final_risk_score >= STANDING_BLOCK_THRESHOLD"
+
+  - method: POST
+    path: "/ill/loans/{id}/charge-settlements"
+    description: "Apply a payment across the loan's four charge buckets in pinned waterfall order, or waive the whole balance."
+    roles: [ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: [action, "payment_cents?"]
+    output: LoanRecord
+    side_effects:
+      - "action PAY: allocates payment_cents per calculations.charge_waterfall_settlement; an amount above the total remaining is rejected with ERR_OVERPAYMENT and NOTHING is written"
+      - "action WAIVE: outstanding_cents -> 0 with no paid_* bucket touched; billing_status -> CHARGE_WAIVED"
+      - "billing_status -> CHARGE_SETTLED when outstanding_cents reaches 0 by payment"
+      - "recomputes Patron.unpaid_balance_cents and final_risk_score"
+
+  - method: GET
+    path: "/ill/loans/{id}"
+    description: "Read one loan with all three state dimensions and all four charge buckets."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: LoanRecord
+    side_effects: []
+
+  - method: GET
+    path: "/ill/requests/{id}/loans"
+    description: "List a request's loans (reverse reachability for LoanRecord.request_id). The LoanRecord is cascade-created by shipment receipt, so this is its discovery channel."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: ["custody_status?", "limit?", "offset?"]
+    output: LoanRecord[]
+    side_effects: []
+
+  # ---- ElectronicDelivery -----------------------------------------------
+  - method: POST
+    path: "/ill/requests/{id}/electronic-deliveries"
+    description: "The lender delivers the scanned article electronically, opening a time- and count-limited access window."
+    roles: [PartnerAgent, IllBorrowingStaff]
+    code: 201
+    input: [file_token, pages_delivered]
+    output: ElectronicDelivery
+    side_effects:
+      - "creates ElectronicDelivery status AVAILABLE with delivered_at = clock, expires_at = clock + DELIVERY_ACCESS_DAYS days, max_downloads = DELIVERY_MAX_DOWNLOADS"
+      - "request.status -> DELIVERED_ELECTRONIC with fulfilled_at = clock"
+      - "creates PatronNotification kind ELECTRONIC_DELIVERY_READY"
+
+  - method: POST
+    path: "/ill/electronic-deliveries/{id}/downloads"
+    description: "The patron downloads the delivered scan; refused once the window has expired or the download allowance is spent."
+    roles: [Patron, IllBorrowingStaff]
+    code: 200
+    input: []
+    output: ElectronicDelivery
+    side_effects:
+      - "download_count incremented by 1"
+      - "status -> EXHAUSTED when download_count reaches max_downloads"
+
+  - method: GET
+    path: "/ill/electronic-deliveries/{id}"
+    description: "Read one electronic delivery."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: ElectronicDelivery
+    side_effects: []
+
+  - method: GET
+    path: "/ill/requests/{id}/electronic-deliveries"
+    description: "List a request's electronic deliveries (reverse reachability for ElectronicDelivery.request_id)."
+    roles: [Patron, PartnerAgent, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ElectronicDelivery[]
+    side_effects: []
+
+  # ---- PurchaseOnDemandOrder --------------------------------------------
+  - method: POST
+    path: "/ill/pod-orders/{id}/decision"
+    description: "An acquisitions librarian approves or rejects the purchase proposal. The acting user must differ from escalated_by_user_id."
+    roles: [AcquisitionsLibrarian]
+    code: 200
+    input: [decision, "decision_note?"]
+    output: PurchaseOnDemandOrder
+    side_effects:
+      - "decision APPROVE: status -> APPROVED, BibItem.local_holding_status -> ON_ORDER, PatronNotification kind POD_APPROVED"
+      - "decision REJECT: status -> REJECTED, request.status -> SOURCING, request.attempt_count -> 0, request.unfilled_reason -> NONE"
+      - "records decided_by_user_id = X-User-ID and decided_at = clock"
+
+  - method: POST
+    path: "/ill/pod-orders/{id}/receive"
+    description: "The purchased copy arrives and is added to the local collection, filling the request without any interlibrary loan."
+    roles: [AcquisitionsLibrarian]
+    code: 200
+    input: []
+    output: PurchaseOnDemandOrder
+    side_effects:
+      - "status -> RECEIVED with received_at = clock"
+      - "BibItem.local_holding_status -> HELD_AVAILABLE"
+      - "request.status -> FILLED_BY_PURCHASE with closed_at = clock"
+      - "creates PatronNotification kind PURCHASE_RECEIVED"
+      - "recomputes Patron.open_request_count"
+
+  - method: GET
+    path: "/ill/pod-orders/{id}"
+    description: "Read one purchase-on-demand order."
+    roles: [IllBorrowingStaff, AcquisitionsLibrarian, LibraryAdmin]
+    code: 200
+    input: []
+    output: PurchaseOnDemandOrder
+    side_effects: []
+
+  # ---- LendingCharge / PartnerInvoice -----------------------------------
+  - method: POST
+    path: "/ill/lending-charges"
+    description: "Record what a consortium partner owes us for an item we lent or a scan we supplied — the lending side of the borrowing/lending balance."
+    roles: [ConsortiumAccountant, IllBorrowingStaff]
+    code: 201
+    input: [partner_id, item_title, service_type, charge_cents, incurred_at]
+    output: LendingCharge
+    side_effects:
+      - "status defaults to OPEN"
+      - "recomputes Partner.lent_to_count, net_borrow_imbalance_items and lend_receivable_cents"
+
+  - method: GET
+    path: "/ill/lending-charges/{id}"
+    description: "Read one lending charge."
+    roles: [ConsortiumAccountant, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: LendingCharge
+    side_effects: []
+
+  - method: GET
+    path: "/ill/partners/{id}/lending-charges"
+    description: "List a partner's lending charges (reverse reachability for LendingCharge.partner_id)."
+    roles: [PartnerAgent, ConsortiumAccountant, IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: LendingCharge[]
+    side_effects: []
+
+  - method: POST
+    path: "/ill/partners/{id}/invoices"
+    description: "Generate a DRAFT settlement invoice for one partner and one month, using the GROSS or NET variant of calculations.partner_invoice_reconciliation. Guarded by OCC on the parent Partner (§1.2.1 rule invoice-draft-regenerate-stale-partner)."
+    roles: [ConsortiumAccountant]
+    code: 201
+    input: [expected_partner_version, period_month]
+    output: PartnerInvoice
+    side_effects:
+      - "increments Partner.version by 1"
+      - "any existing DRAFT invoice for the same (partner_id, period_month) -> SUPERSEDED"
+      - "settlement_variant is taken from the partner's applicable ACTIVE ReciprocityAgreement.settlement_mode, defaulting to GROSS when none applies"
+      - "computes borrow_line_count / lend_line_count / payable_total_cents / receivable_total_cents / gross_amount_cents / net_amount_cents / direction"
+
+  - method: POST
+    path: "/ill/invoices/{id}/issue"
+    description: "Issue a draft invoice once its settlement period has closed."
+    roles: [ConsortiumAccountant]
+    code: 200
+    input: []
+    output: PartnerInvoice
+    side_effects:
+      - "status -> ISSUED with issued_at = clock"
+      - "every OPEN LendingCharge line inside the period -> INVOICED"
+      - "recomputes Partner.lend_receivable_cents"
+
+  - method: POST
+    path: "/ill/invoices/{id}/settle"
+    description: "Pay, dispute or reinstate an issued invoice. REINSTATE closes the ISSUED -> DISPUTED -> ISSUED cycle."
+    roles: [ConsortiumAccountant, PartnerAgent]
+    code: 200
+    input: [action, "dispute_reason?"]
+    output: PartnerInvoice
+    side_effects:
+      - "action PAY: status -> PAID with settled_at = clock"
+      - "action DISPUTE: status -> DISPUTED with dispute_reason recorded"
+      - "action REINSTATE: status -> ISSUED with dispute_reason cleared to null; issued_at is NOT rewritten"
+
+  - method: GET
+    path: "/ill/invoices/{id}"
+    description: "Read one partner invoice with both the gross and the net figures."
+    roles: [PartnerAgent, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: []
+    output: PartnerInvoice
+    side_effects: []
+
+  - method: GET
+    path: "/ill/partners/{id}/invoices"
+    description: "List a partner's invoices (reverse reachability for PartnerInvoice.partner_id)."
+    roles: [PartnerAgent, ConsortiumAccountant, LibraryAdmin]
+    code: 200
+    input: ["period_month?", "status?", "limit?", "offset?"]
+    output: PartnerInvoice[]
+    side_effects: []
+
+  # ---- Computed read -----------------------------------------------------
+  - method: GET
+    path: "/ill/copyright-usage"
+    description: "Computed read of the rule-of-five counter for one journal and one calendar year, so staff can see the remaining free-fill allowance before taking a request in."
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: [issn, calendar_year]
+    output: "{ issn: string, calendar_year: integer, counted_fill_count: integer, free_fills_remaining: integer, royalty_paid_count: integer, pre_window_exempt_count: integer }"
+    side_effects: []
+
+  # ---- Operational sweep -------------------------------------------------
+  - method: POST
+    path: "/ill/ops-runs"
+    description: |
+      Run the nightly operational sweep. Every time-driven transition in this domain happens here and
+      nowhere else, so no test depends on a background scheduler. The eight steps run in EXACTLY this
+      pinned order, each step observing the effects of the previous ones:
+        1. expire ReciprocityAgreement rows with status ACTIVE and clock >= effective_to        -> EXPIRED
+        2. expire SupplyOffer rows with status OFFERED and clock >= respond_by                  -> EXPIRED,
+           cascading each parent IllRequest from OFFER_PENDING back to SOURCING
+        3. mark LoanRecord rows with recall_status RECALL_ISSUED and clock > recall_due_at       -> RECALL_BREACHED
+        4. abandon LoanRecord rows with custody_status AWAITING_PICKUP and clock >= pickup_expires_at
+           -> UNCLAIMED_RETURN_PREPARED, creating a RETURN Shipment, closing the IllRequest as UNCLAIMED
+           and emitting a PatronNotification kind UNCLAIMED
+        5. expire ElectronicDelivery rows with status AVAILABLE and clock >= expires_at          -> EXPIRED,
+           closing the parent IllRequest and emitting a PatronNotification kind DELIVERY_EXPIRED
+        6. mark INBOUND Shipment rows with status IN_TRANSIT and clock >= shipped_at + TRANSIT_SLA_DAYS = 14 days
+           -> LOST_IN_TRANSIT, closing the IllRequest as UNFILLED with unfilled_reason TRANSIT_LOST
+        7. for every IllRequest with status SOURCING and attempt_count >= Rota.max_attempts: escalate to
+           ESCALATED_POD (creating a PROPOSED PurchaseOnDemandOrder with escalated_by_user_id "system")
+           when Rota.auto_escalate_pod is true, otherwise close it UNFILLED with unfilled_reason
+           ATTEMPTS_EXHAUSTED
+        8. recompute every Patron's final_risk_score with the final_standing variant of
+           calculations.patron_standing_score and set Patron.status -> BLOCKED where the score reaches
+           STANDING_BLOCK_THRESHOLD
+      Within each step, rows are processed in ascending created_at order, tie-broken by ascending
+      created_at of the parent IllRequest. The sweep is idempotent: running it twice at the same clock
+      value performs no additional writes on the second run and returns all-zero counters.
+    roles: [IllBorrowingStaff, LibraryAdmin]
+    code: 200
+    input: []
+    output: "{ ran_at: string, agreements_expired: integer, offers_expired: integer, recalls_breached: integer, pickups_abandoned: integer, deliveries_expired: integer, shipments_lost: integer, requests_escalated: integer, requests_unfilled: integer, patrons_blocked: integer }"
+    side_effects:
+      - "the eight sweep steps above, in the pinned order"
+
+  # ---- Test-driving endpoint (§1.5 ladder step 3) ------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: |
+      Set the server's logical UTC clock, which every deadline, expiry and window rule in this domain
+      reads. The server's startup default is exactly 2026-08-01T00:00:00Z: before any call to this
+      endpoint the logical clock reads that instant and MUST NOT fall back to real wall-clock time.
+      The clock may only move forward — a to_iso8601 strictly before the current logical clock is
+      rejected with ERR_INVALID_REQUEST.
+    roles: [LibraryAdmin, IllBorrowingStaff]
+    code: 200
+    input: [to_iso8601]
+    output: "{ current_utc: string }"
+    side_effects:
+      - "no entity is mutated; only the logical clock moves. Time-driven transitions fire on the next POST /ill/ops-runs, never inside this call."
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  # --- auth ---------------------------------------------------------------
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-ID or X-User-Role header missing, empty, or X-User-Role not one of the six declared roles"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "the acting role is not listed in the endpoint's roles in §1.5"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "an entity_backed role addresses a resource it does not own — a Patron acting on another patron's request/loan/delivery, or a PartnerAgent acting on another partner's offer/shipment/invoice"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "X-User-ID equals PurchaseOnDemandOrder.escalated_by_user_id on a POD decision, or equals IllRequest.intake_user_id on a royalty clearance"
+
+  # --- existence ----------------------------------------------------------
+  - id: ERR_PATRON_NOT_FOUND
+    http: 404
+    condition: "no Patron with the given id"
+  - id: ERR_PARTNER_NOT_FOUND
+    http: 404
+    condition: "no Partner with the given id"
+  - id: ERR_BIB_ITEM_NOT_FOUND
+    http: 404
+    condition: "no BibItem with the given id"
+  - id: ERR_ROTA_NOT_FOUND
+    http: 404
+    condition: "no Rota with the given id"
+  - id: ERR_ROTA_ENTRY_NOT_FOUND
+    http: 404
+    condition: "no RotaEntry with the given id"
+  - id: ERR_AGREEMENT_NOT_FOUND
+    http: 404
+    condition: "no ReciprocityAgreement with the given id, including a supersedes_agreement_id that names nothing"
+  - id: ERR_REQUEST_NOT_FOUND
+    http: 404
+    condition: "no IllRequest with the given id"
+  - id: ERR_OFFER_NOT_FOUND
+    http: 404
+    condition: "no SupplyOffer with the given id"
+  - id: ERR_SHIPMENT_NOT_FOUND
+    http: 404
+    condition: "no Shipment with the given id"
+  - id: ERR_LOAN_NOT_FOUND
+    http: 404
+    condition: "no LoanRecord with the given id"
+  - id: ERR_DELIVERY_NOT_FOUND
+    http: 404
+    condition: "no ElectronicDelivery with the given id"
+  - id: ERR_POD_ORDER_NOT_FOUND
+    http: 404
+    condition: "no PurchaseOnDemandOrder with the given id"
+  - id: ERR_INVOICE_NOT_FOUND
+    http: 404
+    condition: "no PartnerInvoice with the given id"
+  - id: ERR_LENDING_CHARGE_NOT_FOUND
+    http: 404
+    condition: "no LendingCharge with the given id"
+
+  # --- shape --------------------------------------------------------------
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "malformed body — missing required field, out-of-range enum, negative money, malformed period_month, effective_to not after effective_from, missing issn on an ARTICLE, missing pages_requested on a COPY of an ARTICLE, delivery_mode other than ELECTRONIC on a COPY, pagination limit outside 1..100 or negative offset, or a logical clock rewind"
+
+  # --- referential --------------------------------------------------------
+  - id: ERR_ROTA_MATERIAL_MISMATCH
+    http: 422
+    condition: "IllRequest.service_type differs from the named Rota.material_type"
+
+  # --- state --------------------------------------------------------------
+  - id: ERR_REQUEST_INVALID_STATE
+    http: 409
+    condition: "IllRequest.status does not permit the operation — e.g. sourcing a COPYRIGHT_HOLD request, cancelling a CLOSED one, escalating an OFFER_PENDING one"
+  - id: ERR_OFFER_NOT_OPEN
+    http: 409
+    condition: "SupplyOffer.status is not OFFERED — already accepted, declined, expired or cancelled"
+  - id: ERR_SHIPMENT_INVALID_STATE
+    http: 409
+    condition: "Shipment.status is not IN_TRANSIT, or its direction does not match the operation (receive needs INBOUND, lender-confirm needs RETURN)"
+  - id: ERR_LOAN_INVALID_CUSTODY_STATE
+    http: 409
+    condition: "LoanRecord.custody_status does not permit the operation — pickup needs AWAITING_PICKUP; renewals, return and declare-lost need WITH_PATRON"
+  - id: ERR_DELIVERY_NOT_AVAILABLE
+    http: 409
+    condition: "ElectronicDelivery.status is EXPIRED or EXHAUSTED"
+  - id: ERR_POD_ORDER_INVALID_STATE
+    http: 409
+    condition: "PurchaseOnDemandOrder.status does not permit the operation — decision needs PROPOSED, receive needs APPROVED"
+  - id: ERR_INVOICE_INVALID_STATE
+    http: 409
+    condition: "PartnerInvoice.status does not permit the operation — issue needs DRAFT, PAY/DISPUTE need ISSUED, REINSTATE needs DISPUTED"
+  - id: ERR_AGREEMENT_NOT_ACTIVE
+    http: 409
+    condition: "the agreement named in supersedes_agreement_id is already SUPERSEDED or EXPIRED"
+
+  # --- optimistic concurrency --------------------------------------------
+  - id: ERR_STALE_PARTNER_VERSION
+    http: 412
+    condition: "expected_partner_version does not equal the current Partner.version (§1.2.1 rules agreement-create-supersede-stale-partner and invoice-draft-regenerate-stale-partner)"
+  - id: ERR_STALE_ROTA_VERSION
+    http: 412
+    condition: "expected_rota_version does not equal the current Rota.version (§1.2.1 rule rota-entry-requote-stale-rota)"
+
+  # --- copyright compliance ----------------------------------------------
+  - id: ERR_COPYRIGHT_LIMIT_REACHED
+    http: 422
+    condition: "sourcing an article request that still has no ACTIVE CopyrightClearance because the (issn, calendar_year) free-fill allowance is spent"
+  - id: ERR_COPYRIGHT_CLEARANCE_NOT_REQUIRED
+    http: 422
+    condition: "a royalty clearance is recorded against a request that is not in COPYRIGHT_HOLD, or that already holds a CONTU_FREE or PRE_WINDOW_EXEMPT clearance"
+  - id: ERR_ROYALTY_AMOUNT_MISMATCH
+    http: 422
+    condition: "declared royalty_cents differs from calculations.royalty_fee for the request's pages_requested"
+
+  # --- intake gates -------------------------------------------------------
+  - id: ERR_HELD_LOCALLY
+    http: 422
+    condition: "the requested BibItem already has local_holding_status HELD_AVAILABLE — borrow it off our own shelf instead"
+  - id: ERR_LICENSED_ACCESS_AVAILABLE
+    http: 422
+    condition: "licensed electronic access already covers the work per calculations.licensed_access_embargo_test"
+  - id: ERR_PATRON_BLOCKED
+    http: 403
+    condition: "Patron.status is BLOCKED or WITHDRAWN"
+  - id: ERR_PATRON_REQUEST_CAP_REACHED
+    http: 409
+    condition: "Patron.open_request_count has already reached Patron.max_open_requests"
+  - id: ERR_PATRON_STANDING_BLOCKED
+    http: 403
+    condition: "the provisional_standing score reaches STANDING_BLOCK_THRESHOLD at intake"
+  - id: ERR_NEEDED_BY_IN_PAST
+    http: 422
+    condition: "needed_by is at or before the logical clock"
+  - id: ERR_PATRON_BALANCE_EXCEEDED
+    http: 402
+    condition: "Patron.unpaid_balance_cents exceeds Patron.unpaid_balance_cap_cents"
+
+  # --- temporal / capacity -----------------------------------------------
+  - id: ERR_AGREEMENT_WINDOW_OVERLAP
+    http: 409
+    condition: "the new agreement's half-open window intersects another ACTIVE agreement window on the same partner; touching endpoints (adjacency) are permitted"
+  - id: ERR_PATRON_LOAN_WINDOW_CAPACITY
+    http: 409
+    condition: "the prospective loan window would push the patron's overlapping-loan count above max_concurrent_loans"
+  - id: ERR_PICKUP_WINDOW_EXPIRED
+    http: 409
+    condition: "the logical clock has reached LoanRecord.pickup_expires_at but the hold has not yet been swept"
+  - id: ERR_RECALL_OVERDUE
+    http: 409
+    condition: "the loan is past its recall deadline (recall_status RECALL_BREACHED, or RECALL_ISSUED with the clock past recall_due_at)"
+  - id: ERR_DELIVERY_EXPIRED
+    http: 409
+    condition: "the logical clock has reached ElectronicDelivery.expires_at but the delivery has not yet been swept to EXPIRED"
+  - id: ERR_INVOICE_PERIOD_NOT_CLOSED
+    http: 409
+    condition: "an invoice is issued before the logical clock reaches the first instant after its period_month"
+
+  # --- policy limits ------------------------------------------------------
+  - id: ERR_RENEWAL_BLOCKED_BY_RECALL
+    http: 409
+    condition: "a renewal is attempted while recall_status is RECALL_ISSUED, RECALL_HONORED or RECALL_BREACHED"
+  - id: ERR_RENEWALS_NOT_ALLOWED_BY_LENDER
+    http: 422
+    condition: "LoanRecord.renewals_allowed (snapshotted from the lender) is false"
+  - id: ERR_RENEWAL_CAP_REACHED
+    http: 409
+    condition: "renewal_count has reached max_renewals, or the MAX_TOTAL_LOAN_DAYS ceiling leaves the projected due date no later than the current due_at"
+  - id: ERR_DELIVERY_DOWNLOAD_CAP_REACHED
+    http: 409
+    condition: "download_count has reached max_downloads"
+  - id: ERR_ROTA_ATTEMPTS_EXHAUSTED
+    http: 409
+    condition: "attempt_count has reached Rota.max_attempts"
+  - id: ERR_PARTNER_NOT_ELIGIBLE
+    http: 422
+    condition: "the accepting partner is SUSPENDED/WITHDRAWN, or does not support the request's service_type"
+  - id: ERR_ALREADY_HELD_LOCALLY
+    http: 422
+    condition: "a purchase escalation or approval targets a BibItem already HELD_AVAILABLE or ON_ORDER"
+  - id: ERR_NO_ELIGIBLE_LENDER
+    http: 422
+    condition: "the rota candidate set is empty after eligibility filtering and prior-attempt exclusion"
+
+  # --- fiscal -------------------------------------------------------------
+  - id: ERR_OVERPAYMENT
+    http: 422
+    condition: "payment_cents exceeds the loan's total remaining across all four charge buckets; nothing is allocated"
+  - id: ERR_DAMAGE_FEE_EXCEEDS_REPLACEMENT
+    http: 422
+    condition: "a lender-declared damage_fee_cents exceeds LoanRecord.replacement_cost_cents"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix  (role_model: segregation_of_duties)
+# ---------------------------------------------------------------------------
+roles:
+  - name: Patron
+    description: "An academic-library borrower acting on their own account."
+    identity: "entity_backed:Patron"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /ill/requests (own patron_id only)"
+      - "POST /ill/requests/{id}/cancel (own requests only)"
+      - "POST /ill/loans/{id}/renewals (own loans only)"
+      - "POST /ill/electronic-deliveries/{id}/downloads (own deliveries only)"
+      - "GET on own patron record, requests, shipments, loans, electronic deliveries and notifications"
+      - "GET /ill/bib-items/{id}"
+
+  - name: IllBorrowingStaff
+    description: "The borrowing-side resource-sharing desk: takes requests in, walks the rota, handles physical custody."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ill/requests/{id}/copyright-clearances  (subject to segregation of duties against intake_user_id)"
+      - "POST /ill/requests/{id}/source"
+      - "POST /ill/requests/{id}/escalate"
+      - "POST /ill/shipments/{id}/receive"
+      - "POST /ill/loans/{id}/pickup"
+      - "POST /ill/loans/{id}/return"
+      - "POST /ill/loans/{id}/declare-lost"
+      - "GET /ill/copyright-usage"
+    shared_operations:
+      - "POST /ill/patrons and GET on patrons"
+      - "POST /ill/rotas, POST /ill/rota-entries, PATCH /ill/rota-entries/{id}"
+      - "POST /ill/bib-items"
+      - "POST /ill/requests, POST /ill/requests/{id}/cancel"
+      - "POST /ill/supply-offers/{id}/accept, /decline, /shipments"
+      - "POST /ill/shipments/{id}/lender-confirm"
+      - "POST /ill/loans/{id}/renewals, /recalls"
+      - "POST /ill/requests/{id}/electronic-deliveries, POST /ill/electronic-deliveries/{id}/downloads"
+      - "POST /ill/lending-charges"
+      - "POST /ill/ops-runs"
+      - "POST /_clock/set_current_utc"
+
+  - name: PartnerAgent
+    description: "A staff member at a lending partner library, acting for that partner only."
+    identity: "entity_backed:Partner"
+    exclusive_operations: []
+    shared_operations:
+      - "POST /ill/supply-offers/{id}/accept and /decline (own offers only)"
+      - "POST /ill/supply-offers/{id}/shipments (own offers only)"
+      - "POST /ill/shipments/{id}/lender-confirm (own requests only)"
+      - "POST /ill/loans/{id}/recalls (own requests only)"
+      - "POST /ill/invoices/{id}/settle with action DISPUTE or REINSTATE (own invoices only)"
+      - "POST /ill/requests/{id}/electronic-deliveries (own requests only)"
+      - "GET on own partner record, rota entries, offers, shipments, loans, invoices and lending charges"
+
+  - name: AcquisitionsLibrarian
+    description: "Collection-development staff who decide purchase-on-demand instead of borrowing."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ill/pod-orders/{id}/decision  (subject to segregation of duties against escalated_by_user_id)"
+      - "POST /ill/pod-orders/{id}/receive"
+    shared_operations:
+      - "POST /ill/bib-items, PATCH /ill/bib-items/{id}"
+      - "GET on bib items, requests, purchase-on-demand orders and patrons"
+
+  - name: ConsortiumAccountant
+    description: "Finance staff who reconcile the borrowing/lending balance and settle with consortium partners."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ill/partners/{id}/invoices"
+      - "POST /ill/invoices/{id}/issue"
+      - "POST /ill/invoices/{id}/settle with action PAY"
+    shared_operations:
+      - "POST /ill/lending-charges"
+      - "POST /ill/loans/{id}/charge-settlements"
+      - "GET on partners, invoices, lending charges, requests and patrons"
+
+  - name: LibraryAdmin
+    description: "Resource-sharing unit administrator; owns partner master data, reciprocity terms and patron standing."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /ill/partners, PATCH /ill/partners/{id}"
+      - "POST /ill/reciprocity-agreements"
+      - "PATCH /ill/patrons/{id}"
+      - "POST /ill/patrons/{id}/infraction-records"
+    shared_operations:
+      - "POST /ill/patrons"
+      - "POST /ill/rotas, POST /ill/rota-entries, PATCH /ill/rota-entries/{id}"
+      - "POST /ill/bib-items, PATCH /ill/bib-items/{id}"
+      - "POST /ill/loans/{id}/charge-settlements"
+      - "POST /ill/ops-runs"
+      - "POST /_clock/set_current_utc"
+      - "GET on every collection in the domain"

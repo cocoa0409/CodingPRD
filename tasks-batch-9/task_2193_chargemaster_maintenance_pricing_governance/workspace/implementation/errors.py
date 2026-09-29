@@ -1,0 +1,97 @@
+"""Error catalogue — PRD.md section 5 verbatim (id -> HTTP status)."""
+
+ERROR_STATUS = {
+    # auth / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_DEPARTMENT_SCOPE_VIOLATION": 403,
+    # existence
+    "ERR_FACILITY_NOT_FOUND": 404,
+    "ERR_CHARGE_ITEM_NOT_FOUND": 404,
+    "ERR_CHANGE_REQUEST_NOT_FOUND": 404,
+    "ERR_CODE_UPDATE_NOT_FOUND": 404,
+    "ERR_CAPTURE_RESOURCE_NOT_FOUND": 404,
+    "ERR_GOVERNANCE_RESOURCE_NOT_FOUND": 404,
+    "ERR_REFERENCED_RESOURCE_NOT_FOUND": 404,
+    "ERR_CROSSWALK_TARGET_NOT_FOUND": 404,
+    # schema
+    "ERR_VALIDATION": 422,
+    # state / posture / OCC
+    "ERR_INVALID_ITEM_LIFECYCLE_STATE": 409,
+    "ERR_INVALID_ITEM_PRICE_STATE": 409,
+    "ERR_INVALID_REQUEST_STATE": 409,
+    "ERR_INVALID_CYCLE_STATE": 409,
+    "ERR_INVALID_ENTRY_STATE": 409,
+    "ERR_INVALID_BATCH_STATE": 409,
+    "ERR_INVALID_FINDING_STATE": 409,
+    "ERR_INVALID_FILE_STATE": 409,
+    "ERR_INVALID_ANALYSIS_STATE": 409,
+    "ERR_FACILITY_FROZEN": 409,
+    "ERR_FACILITY_RESTRICTED": 409,
+    "ERR_STALE_ITEM_VERSION": 412,
+    "ERR_STALE_FACILITY_VERSION": 412,
+    # compliance / segregation of duties
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_REQUEST_NOT_REVIEWED": 409,
+    "ERR_TRANSPARENCY_BLACKOUT": 409,
+    "ERR_UNMAPPED_CODE_ENTRIES": 409,
+    "ERR_ANALYSIS_SIGNOFF_STALE": 409,
+    # referential integrity
+    "ERR_REVENUE_CODE_MAPPING_INVALID": 422,
+    "ERR_DEPARTMENT_REVENUE_CODE_NOT_ALLOWED": 422,
+    "ERR_REVENUE_CODE_RETIRED": 409,
+    "ERR_COMPANION_ITEM_INVALID": 422,
+    "ERR_DUPLICATE_TARGET_INVALID": 422,
+    "ERR_CROSSWALK_TARGET_AMBIGUOUS": 409,
+    "ERR_PINNED_VERSION_STALE": 409,
+    "ERR_RECOVERY_LINE_INVALID": 422,
+    # temporal
+    "ERR_EFFECTIVE_DATE_IN_PAST": 422,
+    "ERR_ITEM_NOT_YET_EFFECTIVE": 409,
+    "ERR_PRICE_RULE_OVERLAP": 409,
+    "ERR_CONTRACT_TERM_OVERLAP": 409,
+    "ERR_CONTRACT_TERM_BUFFER_VIOLATION": 409,
+    "ERR_BATCH_WINDOW_CAPACITY_EXCEEDED": 409,
+    "ERR_SERVICE_DATE_OUTSIDE_WINDOW": 422,
+    # business constraints
+    "ERR_DUPLICATE_CDM_NUMBER": 409,
+    "ERR_DUPLICATE_KEY": 409,
+    "ERR_REVISION_LIMIT_EXCEEDED": 409,
+    "ERR_BATCH_HAS_NO_LINES": 422,
+    "ERR_CYCLE_HAS_NO_ENTRIES": 422,
+    "ERR_CYCLE_HAS_NO_MAPPED_ENTRIES": 422,
+    "ERR_NOTHING_TO_DISPUTE": 422,
+    "ERR_NO_PUBLISHABLE_ITEMS": 422,
+    "ERR_BATCH_LINES_UNRECONCILED": 409,
+    "ERR_FINDINGS_OPEN": 409,
+    "ERR_DEPARTMENT_CAPTURE_HOLD": 409,
+    "ERR_ITEM_IN_OPEN_BATCH": 409,
+    "ERR_ITEM_HAS_OPEN_REQUEST": 409,
+    "ERR_ITEM_PENDING_CODE_UPDATE": 409,
+    "ERR_DUPLICATE_SIMILARITY_TOO_LOW": 422,
+    "ERR_ITEM_PRICE_NOT_CURRENT": 409,
+    "ERR_ITEM_PRICE_FROZEN": 409,
+    "ERR_ITEM_RETIRED_AS_DUPLICATE": 409,
+    # fiscal
+    "ERR_NO_APPLICABLE_PRICE_RULE": 422,
+    "ERR_AGGREGATE_MARKUP_LIMIT": 422,
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in a request; converted to the PRD error envelope."""
+
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS[error_id]
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    human = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return "Request rejected: %s." % human
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

@@ -1,0 +1,106 @@
+"""Domain constants, read straight from the PRD / scaffold calculation tables."""
+
+# ---- Roles (PRD 2.1) --------------------------------------------------------
+ROLE_CONTENT_PRODUCER = "ContentProducer"
+ROLE_ECONOMY_DESIGNER = "EconomyDesigner"
+ROLE_LIVEOPS_COMMANDER = "LiveOpsCommander"
+ROLE_COMPLIANCE_OFFICER = "ComplianceOfficer"
+ROLE_PLAYER = "Player"
+
+ALL_ROLES = (
+    ROLE_CONTENT_PRODUCER,
+    ROLE_ECONOMY_DESIGNER,
+    ROLE_LIVEOPS_COMMANDER,
+    ROLE_COMPLIANCE_OFFICER,
+    ROLE_PLAYER,
+)
+
+OPERATOR_ROLES = (
+    ROLE_CONTENT_PRODUCER,
+    ROLE_ECONOMY_DESIGNER,
+    ROLE_LIVEOPS_COMMANDER,
+    ROLE_COMPLIANCE_OFFICER,
+)
+
+# ---- Enumerations -----------------------------------------------------------
+REGION_CODES = ("NA", "EU", "LATAM", "APAC")
+CURRENCY_CODES = ("HARD_GEM", "SOFT_COIN", "EVENT_TOKEN")
+LEDGER_DIRECTIONS = ("FAUCET", "SINK")
+LEDGER_SOURCE_KINDS = (
+    "EPISODE_GRANT",
+    "PURCHASE_GRANT",
+    "OFFER_SPEND",
+    "EVENT_REWARD",
+    "ADMIN_ADJUSTMENT",
+    "REFUND_REVERSAL",
+    "EPISODE_ROLLBACK_REVERSAL",
+)
+OFFER_TYPES = ("BATTLE_PASS", "BUNDLE", "LIMITED_TIME", "LOOT_BOX")
+PRICE_TIERS = ("T1", "T2", "T3", "T4")
+SEASON_STATUSES = ("PLANNED", "LIVE", "CONCLUDED", "ARCHIVED")
+EPISODE_STATUSES = ("DRAFT", "SCHEDULED", "LIVE", "CONCLUDED", "ROLLED_BACK")
+CLUSTER_STATUSES = ("ACTIVE", "DRAINING", "RETIRED")
+EVENT_STATUSES = ("PLANNED", "APPROVED", "RUNNING", "COMPLETED", "ROLLED_BACK", "CANCELLED")
+OFFER_APPROVAL_STATUSES = ("DRAFT", "IN_REVIEW", "APPROVED")
+OFFER_AVAILABILITY_STATUSES = ("OFFLINE", "LIVE", "SUSPENDED", "WITHDRAWN")
+DISCLOSURE_STATUSES = ("DRAFT", "PUBLISHED", "SUPERSEDED")
+PURCHASE_STATUSES = ("PENDING", "SETTLED", "DENIED", "REFUNDED")
+REFUND_STATUSES = ("SUBMITTED", "APPROVED", "DENIED", "EXECUTED")
+REFUND_REASON_CODES = ("ACCIDENTAL", "MINOR_UNAUTHORIZED", "DISSATISFIED", "TECHNICAL_FAILURE")
+BALANCE_TARGET_KINDS = ("SINK_RATE", "FAUCET_RATE", "DROP_RATE", "PRICE")
+BALANCE_STAGES = ("DRAFT", "SHADOW", "CANARY", "LIVE", "REVERTED", "RETIRED")
+COMMS_CHANNELS = ("PATCH_NOTES", "IN_GAME", "SOCIAL")
+COMMS_STATUSES = ("DRAFT", "PUBLISHED")
+MONITORING_STATUSES = ("OPEN", "COMPUTED", "CERTIFIED", "VOIDED")
+SPEND_STATES = ("UNRESTRICTED", "COOLDOWN", "LOCKED")
+RETENTION_BANDS = ("HEALTHY", "AT_RISK", "CHURN_RISK")
+ECONOMY_HEALTH_BANDS = ("HEALTHY", "WATCH", "INFLATED")
+CONTENT_POSTURES = ("ON_TRACK", "BEHIND")
+DISCLOSURE_STATES = ("NOT_REQUIRED", "REQUIRED_MISSING", "PUBLISHED")
+
+# ---- personalized_offer_quote_minor ----------------------------------------
+REGION_PRICE_MULTIPLIER_BP = {"NA": 10000, "EU": 11000, "LATAM": 6500, "APAC": 8500}
+TIER_DISCOUNT_BP = {"T1": 0, "T2": 500, "T3": 1200, "T4": 2000}
+PERSONALIZATION_CAP_BP = 1500
+
+# ---- offer_fairness_index_bp ------------------------------------------------
+FAIRNESS_FLOOR_BP = 8000
+FAIRNESS_CEILING_BP = 15000
+
+# ---- season_sink_faucet_ratio_bp -------------------------------------------
+ECONOMY_HEALTHY_FLOOR_BP = 6000
+ECONOMY_WATCH_FLOOR_BP = 4000
+RATIO_CEILING_BP = 20000
+
+# ---- player_pacing_bp -------------------------------------------------------
+RETENTION_HEALTHY_FLOOR_BP = 9000
+RETENTION_AT_RISK_FLOOR_BP = 6000
+PACING_CEILING_BP = 20000
+
+# ---- refund_settlement_minor ------------------------------------------------
+RESTOCK_TIER1_CEILING_MINOR = 1000
+RESTOCK_TIER2_CEILING_MINOR = 5000
+GOODWILL_SHARE_BP = 5000
+REFUND_WINDOW_DAYS = 14
+
+# ---- player_rolling_spend_minor --------------------------------------------
+ROLLING_SPEND_WINDOW_DAYS = 30
+MINOR_MONTHLY_CAP_MINOR = 5000
+SPEND_COOLDOWN_THRESHOLD_MINOR = 40000
+SPEND_LOCK_THRESHOLD_MINOR = 75000
+
+# ---- offer_sku_window_conflict ---------------------------------------------
+SKU_COOLDOWN_HOURS = 24
+
+# ---- season_cadence_debt_days ----------------------------------------------
+ROLLBACK_DEBT_DAYS = 3
+CADENCE_DEBT_LIMIT_DAYS = 14
+
+# ---- Pagination (response_envelope.pagination_defaults) --------------------
+PAGE_LIMIT_DEFAULT = 10
+PAGE_LIMIT_MIN = 1
+PAGE_LIMIT_MAX = 100
+PAGE_OFFSET_DEFAULT = 0
+
+# ---- Logical clock ----------------------------------------------------------
+CLOCK_EPOCH_ISO = "2026-08-01T00:00:00Z"

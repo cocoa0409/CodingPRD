@@ -1,0 +1,3383 @@
+scenario: |
+  Generate task harder than expert level!
+
+  2687. Contact Center Workforce Management (customer contact center workforce planning): volume and handle time
+  forecasting by channel, interval and skill with seasonality and marketing event drivers, staffing requirement
+  calculation with service level and occupancy targets including shrinkage assumptions, shift bidding, schedule
+  generation and preference honoring under labor agreements, intraday management with real-time adherence
+  monitoring and reforecasting, overtime, voluntary time off and skill-based routing adjustments during volume
+  swings, outsourced partner allocation with volume commitments and performance requirements, schedule adherence
+  coaching and exception approval, capacity planning for hiring classes and training pipelines
+
+domain_name: contact-center-workforce-management
+api_prefix: "/"
+
+complexity_profile:
+  primary_archetype: temporal_windowing
+  secondary_archetype: quota_allocation
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Every entity is a peer collection at the API root; parentage is expressed only through
+  # `FK -> <Parent>.id` body fields plus filtered-list reads. The single nested write path
+  # (`POST /forecast-groups/{forecast_group_id}/interval-plans`) is a generator action, not a
+  # hierarchy: IntervalPlan is still read at `/interval-plans/{interval_plan_id}`.
+
+  state_machine_shape: parallel
+  # ScheduleShift carries two independent state axes on one row (`publication_status` x
+  # `adherence_status`). Two further non-linear shapes coexist: BidRound is cyclic
+  # (AWARDED -> OPEN -> SCORING -> AWARDED, bounded by `max_reopen_count`), PlanningCycle is
+  # cyclic (SCHEDULE_PUBLISHED <-> INTRADAY_ALERT), and AdherenceException is branching with a
+  # revision loop (SUBMITTED -> INFO_REQUESTED -> SUBMITTED).
+
+  relationship_patterns:
+    - one_to_many          # PlanningCycle -> ForecastGroup / ShiftTemplate / BidRound / HiringClass
+    - many_to_many         # Agent <-> ShiftTemplate through ShiftBid and ScheduleShift
+    - self_referential     # MarketingEvent.supersedes_event_id -> MarketingEvent.id
+    - cross_aggregate      # PartnerAllocation -> IntervalPlan crosses the partner aggregate boundary
+
+  role_model: segregation_of_duties
+  # Two maker-checker separations are enforced on operator identity (`X-User-ID`):
+  #   (1) the TeamCoach deciding an AdherenceException must not be the operator who flagged the
+  #       shift out of adherence (ScheduleShift.flagged_by_user_id);
+  #   (2) the SourcingManager committing a PartnerAllocation must not be the operator who
+  #       proposed it (PartnerAllocation.proposed_by_user_id).
+  # Layered on top of peer ownership: role `Agent` is entity_backed and may only act on its own
+  # bids, exceptions and intraday offers.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+global_constants:
+  DEFAULT_CLOCK_UTC: "2026-08-01T00:00:00Z"
+  ROUNDING_MODE: "ROUND_HALF_UP everywhere; integers are produced by rounding to 0 decimal places unless a formula names floor()/ceil() explicitly"
+  CONFIDENCE_WEIGHT: { HIGH: 1.0, MEDIUM: 0.6, LOW: 0.3 }
+  MAX_EVENT_UPLIFT: 1.50
+  AHT_DRAG_COEFF: 0.30
+  AHT_CEILING_MULT: 1.35
+  SL_UPLIFT_BANDS: "service_level_target_pct >= 0.90 -> 0.35; >= 0.80 -> 0.22; >= 0.70 -> 0.12; else 0.05"
+  REFORECAST_ALPHA: 0.40
+  REFORECAST_MULTIPLIER_FLOOR: 0.50
+  REFORECAST_MULTIPLIER_CEILING: 2.00
+  OT_TIER_1_CEILING_CENTS: 20000
+  OT_TIER_2_CEILING_CENTS: 60000
+  OT_TIER_MULTIPLIERS: { TIER_1: 1.50, TIER_2: 1.75, TIER_3: 2.00 }
+  SHORTFALL_PENALTY_RATE: 0.25
+  COACHING_ADHERENCE_THRESHOLD: 0.8500
+  PARTNER_PERFORMANCE_WINDOW: 3
+  NESTING_PRODUCTIVITY: 0.50
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: PlanningCycle
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: Human label for the planning week (e.g. "W37-2026").
+        constraints: 1..80 chars, required
+      - name: horizon_start_date
+        type: string
+        source: input
+        description: First service date covered by the cycle (ISO date, inclusive).
+        constraints: ISO 8601 date; must be a Monday; required
+      - name: horizon_end_date
+        type: string
+        source: input
+        description: Last service date covered by the cycle (ISO date, inclusive).
+        constraints: ISO 8601 date; must equal horizon_start_date + 6 days
+      - name: interval_minutes
+        type: integer
+        source: input
+        description: Width of one planning interval; every IntervalPlan of this cycle uses it.
+        default: 30
+        constraints: one of {15, 30, 60}
+      - name: requirement_basis
+        type: enum
+        source: input
+        description: Selects which staffing variant is authoritative for IntervalPlan.required_agents.
+        default: MAX_OF_BOTH
+        constraints: one of {SERVICE_LEVEL, OCCUPANCY, MAX_OF_BOTH}
+      - name: ot_budget_cents
+        type: integer
+        source: input
+        description: Hard ceiling on cumulative accepted-overtime spend for the cycle.
+        default: 1000000
+        constraints: integer >= 0
+      - name: intraday_alert_short_threshold
+        type: integer
+        source: input
+        description: short_interval_count value at or above which the posture auto-escalates to INTRADAY_ALERT.
+        default: 3
+        constraints: integer >= 1
+      - name: posture
+        type: enum
+        source: system
+        description: Derived gate over all child operations of the cycle.
+        default: OPEN
+        constraints: one of {OPEN, REQUIREMENTS_LOCKED, SCHEDULE_PUBLISHED, INTRADAY_ALERT, FROZEN}
+      - name: reforecast_generation
+        type: integer
+        source: system
+        description: Count of completed reforecast runs; incremented by POST /planning-cycles/{id}/reforecast.
+        default: 0
+      - name: short_interval_count
+        type: integer
+        source: computed
+        description: Count of IntervalPlan rows of this cycle whose coverage_state == SHORT.
+        default: 0
+      - name: total_scheduled_hours
+        type: number
+        source: computed
+        description: Sum of ScheduleShift.paid_hours over shifts of this cycle with publication_status == PUBLISHED; 2 decimal places.
+        default: 0
+      - name: ot_spend_committed_cents
+        type: integer
+        source: computed
+        description: Sum of IntradayAction.cost_cents over actions of this cycle with kind == OT_OFFER and status == ACCEPTED.
+        default: 0
+      - name: ot_hours_committed
+        type: number
+        source: computed
+        description: Sum of IntradayAction.hours over actions of this cycle with kind == OT_OFFER and status == ACCEPTED; 2 decimal places.
+        default: 0
+      - name: headcount_active
+        type: integer
+        source: computed
+        description: Count of distinct Agent rows with status == ACTIVE that satisfy at least one of (a) the agent holds a ScheduleShift whose planning_cycle_id is this cycle and whose publication_status IN {DRAFT, PUBLISHED}, or (b) Agent.hiring_class_id references a HiringClass whose planning_cycle_id is this cycle and whose status == GRADUATED. See calculations.cycle_headcount_and_pipeline.
+        default: 0
+      - name: pipeline_fte
+        type: number
+        source: computed
+        description: Sum of HiringClass.effective_fte_at_horizon_end over classes of this cycle with status IN {CHARTERED, IN_TRAINING}; 2 decimal places.
+        default: 0
+      - name: requirements_locked_at
+        type: datetime
+        source: system
+        description: Logical-clock instant at which the posture first reached REQUIREMENTS_LOCKED; null before that.
+      - name: published_at
+        type: datetime
+        source: system
+        description: Logical-clock instant at which the posture first reached SCHEDULE_PUBLISHED; null before that.
+
+  - name: LaborAgreement
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: Agreement identifier used in operator prose (e.g. "LA-CORE").
+        constraints: unique across LaborAgreement, 1..40 chars
+      - name: min_rest_hours
+        type: number
+        source: input
+        description: Minimum rest between the end of one shift and the start of the agent's next non-overlapping shift; the comparison is `gap_hours >= min_rest_hours` (equality passes). Overlapping windows are not a rest violation -- they are caught by the overlap rule at priority 115.
+        constraints: number > 0
+      - name: max_weekly_hours
+        type: number
+        source: input
+        description: Ceiling on Agent.scheduled_hours_committed after any additive change.
+        constraints: number > 0
+      - name: max_consecutive_days
+        type: integer
+        source: input
+        description: Maximum number of consecutive service dates on which the agent may hold a non-CANCELLED shift.
+        constraints: integer >= 1
+      - name: vto_min_notice_hours
+        type: number
+        source: input
+        description: Minimum lead time between the logical clock and shift.start_at for a VTO_OFFER acceptance to be legal; comparison is `notice_hours >= vto_min_notice_hours`.
+        constraints: number >= 0
+      - name: preference_honor_floor_pct
+        type: number
+        source: input
+        description: Minimum share of this agreement's awarded bids that must land on the bidder's first-choice template for an award run to be legal.
+        constraints: 0 <= value <= 1, 4 decimal places
+      - name: ot_premium_multiplier
+        type: number
+        source: input
+        description: Per-agreement factor applied on top of the cycle overtime tier multiplier.
+        default: 1.00
+        constraints: number >= 1.00
+      - name: enrolled_agent_count
+        type: integer
+        source: computed
+        description: Count of Agent rows with this labor_agreement_id and status IN {ACTIVE, LEAVE}.
+        default: 0
+
+  - name: ForecastGroup
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose horizon and interval width this group forecasts within.
+      - name: channel
+        type: enum
+        source: input
+        description: Contact channel forecast by this group.
+        constraints: one of {VOICE, CHAT, EMAIL, SOCIAL}
+      - name: skill_code
+        type: string
+        source: input
+        description: Routing skill required to serve this group; matched against Agent.skills and ShiftTemplate.skill_code.
+        constraints: 1..30 chars, uppercase snake
+      - name: base_daily_volume
+        type: integer
+        source: input
+        description: Un-seasonalised contact volume for a full service day.
+        constraints: integer >= 0
+      - name: base_aht_seconds
+        type: integer
+        source: input
+        description: Un-inflated average handle time in seconds.
+        constraints: integer >= 1
+      - name: operating_start_minute
+        type: integer
+        source: input
+        description: Minutes past midnight UTC at which the group's operating window opens (interval 0 starts here).
+        constraints: 0 <= value < 1440, multiple of cycle.interval_minutes
+      - name: operating_end_minute
+        type: integer
+        source: input
+        description: Minutes past midnight UTC at which the operating window closes; the window is half-open [start, end).
+        constraints: operating_start_minute < value <= 1440, multiple of cycle.interval_minutes
+      - name: intraday_curve
+        type: array
+        source: input
+        description: One positive weight per operating interval, ordered by interval index ascending; normalised at read time by dividing by the array sum.
+        constraints: length must equal (operating_end_minute - operating_start_minute) / cycle.interval_minutes; every element > 0
+      - name: dow_multipliers
+        type: array
+        source: input
+        description: Seven seasonality multipliers indexed by ISO weekday with Monday at index 0.
+        constraints: length exactly 7; every element >= 0
+      - name: service_level_target_pct
+        type: number
+        source: input
+        description: Share of contacts to be answered within service_level_seconds; selects the SL_UPLIFT_BANDS tier.
+        constraints: 0 < value <= 1, 4 decimal places
+      - name: service_level_seconds
+        type: integer
+        source: input
+        description: Answer-time target paired with service_level_target_pct; recorded for reporting, not used in the staffing formula.
+        constraints: integer >= 1
+      - name: occupancy_target_pct
+        type: number
+        source: input
+        description: Maximum share of an agent's staffed time that may be spent handling contacts.
+        constraints: 0 < value <= 1, 4 decimal places
+      - name: shrinkage_pct
+        type: number
+        source: input
+        description: Share of staffed time lost to breaks, training, absence and other shrinkage.
+        constraints: 0 <= value < 1, 4 decimal places
+      - name: reforecast_multiplier
+        type: number
+        source: computed
+        description: Latest smoothed actual-to-forecast ratio for this group, clamped to [0.50, 2.00]; 4 decimal places.
+        default: 1.0000
+      - name: interval_count
+        type: integer
+        source: computed
+        description: Count of IntervalPlan rows whose forecast_group_id is this group.
+        default: 0
+
+  - name: MarketingEvent
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose intervals this driver perturbs.
+      - name: forecast_group_id
+        type: string
+        source: input
+        description: FK -> ForecastGroup.id; when present the event applies only to this group. Null means the event applies to every ForecastGroup of the cycle whose channel equals channel_scope.
+        default: null
+      - name: channel_scope
+        type: enum
+        source: input
+        description: Channel targeted when forecast_group_id is null.
+        default: null
+        constraints: one of {VOICE, CHAT, EMAIL, SOCIAL}; required exactly when forecast_group_id is null, forbidden otherwise
+      - name: supersedes_event_id
+        type: string
+        source: input
+        description: FK -> MarketingEvent.id; self-reference to the driver this one replaces. Confirming this event auto-cancels the referenced event when that event is CONFIRMED.
+        default: null
+      - name: name
+        type: string
+        source: input
+        description: Campaign label.
+        constraints: 1..80 chars
+      - name: uplift_pct
+        type: number
+        source: input
+        description: Raw fractional volume uplift claimed by the campaign before confidence weighting (0.50 == +50%).
+        constraints: 0 < value <= 3.0000, 4 decimal places
+      - name: confidence_tier
+        type: enum
+        source: input
+        description: Confidence band selecting the CONFIDENCE_WEIGHT applied to uplift_pct.
+        constraints: one of {HIGH, MEDIUM, LOW}
+      - name: window_start
+        type: datetime
+        source: input
+        description: Inclusive start of the driver window (ISO 8601 UTC).
+      - name: window_end
+        type: datetime
+        source: input
+        description: Exclusive end of the driver window (ISO 8601 UTC); must be strictly after window_start.
+      - name: status
+        type: enum
+        source: system
+        description: Lifecycle state; only CONFIRMED events contribute uplift.
+        default: DRAFT
+        constraints: one of {DRAFT, CONFIRMED, CANCELLED, REALIZED}
+      - name: weighted_uplift_pct
+        type: number
+        source: computed
+        description: uplift_pct * CONFIDENCE_WEIGHT[confidence_tier]; 4 decimal places.
+        default: 0.0000
+
+  - name: IntervalPlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: forecast_group_id
+        type: string
+        source: input
+        description: FK -> ForecastGroup.id; the group whose operating window this interval belongs to.
+      - name: service_date
+        type: string
+        source: input
+        description: ISO date of the interval; must fall inside the cycle horizon (inclusive).
+      - name: interval_index
+        type: integer
+        source: system
+        description: Zero-based position of this interval inside the group's operating window on service_date.
+      - name: interval_start
+        type: datetime
+        source: system
+        description: service_date at (operating_start_minute + interval_index * cycle.interval_minutes) UTC; inclusive.
+      - name: interval_end
+        type: datetime
+        source: system
+        description: interval_start + cycle.interval_minutes; exclusive. All interval arithmetic uses the half-open window [interval_start, interval_end).
+      - name: volume_forecast
+        type: integer
+        source: computed
+        description: Output of calculations.interval_volume_forecast.
+        default: 0
+      - name: aht_forecast_seconds
+        type: integer
+        source: computed
+        description: Output of calculations.interval_aht_forecast.
+        default: 0
+      - name: applied_event_uplift_pct
+        type: number
+        source: computed
+        description: The capped sum of weighted uplifts applied to this interval; 4 decimal places.
+        default: 0.0000
+      - name: required_service_level
+        type: integer
+        source: computed
+        description: Staffing variant SERVICE_LEVEL_FIRST of calculations.staffing_requirement.
+        default: 0
+      - name: required_occupancy_capped
+        type: integer
+        source: computed
+        description: Staffing variant OCCUPANCY_CAPPED of calculations.staffing_requirement.
+        default: 0
+      - name: required_agents
+        type: integer
+        source: computed
+        description: Authoritative requirement selected by cycle.requirement_basis from the two variants above.
+        default: 0
+      - name: scheduled_agents
+        type: integer
+        source: computed
+        description: Count of ScheduleShift rows with publication_status == PUBLISHED whose shift_template.skill_code equals the group's skill_code and whose [start_at, end_at) fully covers [interval_start, interval_end).
+        default: 0
+      - name: routing_inflow_agents
+        type: integer
+        source: computed
+        description: Sum of IntradayAction.agents_shifted over actions with kind == ROUTING_ADJUSTMENT, status == ACCEPTED and target_forecast_group_id equal to this interval's group, whose interval window matches.
+        default: 0
+      - name: routing_outflow_agents
+        type: integer
+        source: computed
+        description: Sum of IntradayAction.agents_shifted over actions with kind == ROUTING_ADJUSTMENT, status == ACCEPTED and source_forecast_group_id equal to this interval's group, whose interval window matches.
+        default: 0
+      - name: effective_scheduled_agents
+        type: integer
+        source: computed
+        description: scheduled_agents + routing_inflow_agents - routing_outflow_agents.
+        default: 0
+      - name: coverage_gap
+        type: integer
+        source: computed
+        description: max(required_agents - effective_scheduled_agents, 0).
+        default: 0
+      - name: coverage_state
+        type: enum
+        source: computed
+        description: COVERED when coverage_gap == 0, SHORT otherwise.
+        default: COVERED
+        constraints: one of {COVERED, SHORT}
+      - name: internal_capacity_volume
+        type: integer
+        source: computed
+        description: Contacts the internally staffed agents can absorb in this interval; see calculations.interval_allocatable_volume.
+        default: 0
+      - name: allocatable_volume
+        type: integer
+        source: computed
+        description: max(volume_forecast - internal_capacity_volume, 0); the ceiling that aggregate committed partner volume may not exceed.
+        default: 0
+      - name: partner_committed_volume
+        type: integer
+        source: computed
+        description: Sum of PartnerAllocation.allocated_volume over allocations of this interval whose status is COMMITTED or SETTLED; PROPOSED and REVOKED rows never count.
+        default: 0
+      - name: unserved_volume
+        type: integer
+        source: computed
+        description: max(allocatable_volume - partner_committed_volume, 0).
+        default: 0
+      - name: actual_volume
+        type: integer
+        source: input
+        description: Observed contact count posted by intraday operations; null until posted.
+        default: null
+      - name: actual_aht_seconds
+        type: integer
+        source: input
+        description: Observed average handle time posted by intraday operations; null until posted.
+        default: null
+      - name: observed_ratio
+        type: number
+        source: computed
+        description: actual_volume / volume_forecast at the instant actuals are posted, 4 decimal places; null until posted; null (not zero) when volume_forecast == 0.
+        default: null
+      - name: smoothed_ratio
+        type: number
+        source: computed
+        description: Running exponentially-smoothed ratio produced by calculations.reforecast_smoothing at the last reforecast run; 4 decimal places; null until the group's first reforecast.
+        default: null
+
+  - name: Agent
+    parent: null
+    common_fields: true
+    fields:
+      - name: labor_agreement_id
+        type: string
+        source: input
+        description: FK -> LaborAgreement.id; the agreement whose safety ceilings gate every additive change to this agent's hours.
+      - name: hiring_class_id
+        type: string
+        source: input
+        description: FK -> HiringClass.id; set by the graduate cascade for agents minted from a class, null for pre-existing staff.
+        default: null
+      - name: employee_code
+        type: string
+        source: input
+        description: Payroll identifier.
+        constraints: unique across Agent, 1..40 chars
+      - name: full_name
+        type: string
+        source: input
+        description: Agent display name.
+        constraints: 1..120 chars
+      - name: skills
+        type: array
+        source: input
+        description: Routing skill codes this agent can serve; membership is checked against ForecastGroup.skill_code and ShiftTemplate.skill_code.
+        constraints: non-empty array of uppercase snake strings
+      - name: seniority_rank
+        type: integer
+        source: input
+        description: Bid-award precedence; 1 is most senior and wins ties over larger values.
+        constraints: integer >= 1
+      - name: weekly_contracted_hours
+        type: number
+        source: input
+        description: Contracted base hours per week, recorded for reporting.
+        constraints: number > 0
+      - name: hourly_rate_cents
+        type: integer
+        source: input
+        description: Straight-time hourly rate in cents, used as the overtime cost base.
+        constraints: integer > 0
+      - name: status
+        type: enum
+        source: system
+        description: Employment state; only ACTIVE agents are eligible for bid awards and intraday offers.
+        default: ACTIVE
+        constraints: one of {ACTIVE, LEAVE, TERMINATED}
+      - name: scheduled_hours_committed
+        type: number
+        source: computed
+        description: Sum of ScheduleShift.paid_hours over this agent's shifts with publication_status == PUBLISHED; 2 decimal places.
+        default: 0
+      - name: adherence_pct
+        type: number
+        source: computed
+        description: Output of calculations.agent_adherence_score; 4 decimal places; 1.0000 when the agent has no scored shift.
+        default: 1.0000
+      - name: coaching_flag_count
+        type: integer
+        source: computed
+        description: Count of this agent's shifts with publication_status == PUBLISHED, adherence_status == OUT_OF_ADHERENCE and shift adherence_pct < COACHING_ADHERENCE_THRESHOLD.
+        default: 0
+      - name: coaching_status
+        type: enum
+        source: system
+        description: NONE until the first flag; COACHING_ACTIVE while coaching_flag_count >= 1; CLEARED when the count falls back to 0 from COACHING_ACTIVE.
+        default: NONE
+        constraints: one of {NONE, COACHING_ACTIVE, CLEARED}
+
+  - name: ShiftTemplate
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose horizon bounds the shifts minted from this template.
+      - name: code
+        type: string
+        source: input
+        description: Template label shown to bidders (e.g. "T-MON-AM").
+        constraints: unique per planning_cycle_id, 1..40 chars
+      - name: skill_code
+        type: string
+        source: input
+        description: Routing skill an agent must hold to bid on or be scheduled against this template.
+        constraints: 1..30 chars
+      - name: start_time_local
+        type: string
+        source: input
+        description: Shift start as "HH:MM" interpreted as UTC (the benchmark runs a single UTC zone).
+        constraints: matches ^([01][0-9]|2[0-3]):[0-5][0-9]$
+      - name: duration_minutes
+        type: integer
+        source: input
+        description: Elapsed shift length in minutes, including the unpaid break.
+        constraints: 60 <= value <= 720
+      - name: unpaid_break_minutes
+        type: integer
+        source: input
+        description: Unpaid break minutes subtracted from duration_minutes to derive paid hours and scheduled seconds.
+        default: 30
+        constraints: 0 <= value < duration_minutes
+      - name: days_of_week
+        type: array
+        source: input
+        description: ISO weekday indexes (Monday == 0) on which the award cascade mints a ScheduleShift for the winning bidder.
+        constraints: non-empty array of distinct integers in 0..6
+      - name: slots_total
+        type: integer
+        source: input
+        description: Number of bidders this template can absorb in an award run.
+        constraints: integer >= 1
+      - name: slots_awarded
+        type: integer
+        source: computed
+        description: Count of ShiftBid rows with status == AWARDED and awarded_shift_template_id equal to this template.
+        default: 0
+
+  - name: BidRound
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose templates are bid on in this round.
+      - name: code
+        type: string
+        source: input
+        description: Round label.
+        constraints: unique per planning_cycle_id, 1..40 chars
+      - name: max_reopen_count
+        type: integer
+        source: input
+        description: Maximum number of times the round may re-enter OPEN after leaving it.
+        default: 2
+        constraints: integer >= 0
+      - name: status
+        type: enum
+        source: system
+        description: Round lifecycle; cyclic through AWARDED -> OPEN.
+        default: DRAFT
+        constraints: one of {DRAFT, OPEN, SCORING, AWARDED, CANCELLED}
+      - name: reopen_count
+        type: integer
+        source: system
+        description: Number of completed re-entries into OPEN (from SCORING or from AWARDED).
+        default: 0
+      - name: preference_honor_rate
+        type: number
+        source: computed
+        description: Output of calculations.bid_award_and_preference_honor for the most recent award run, over all AWARDED bids of the round; 4 decimal places; null before the first award run.
+        default: null
+      - name: awarded_bid_count
+        type: integer
+        source: computed
+        description: Count of ShiftBid rows of this round with status == AWARDED.
+        default: 0
+      - name: unfilled_bid_count
+        type: integer
+        source: computed
+        description: Count of ShiftBid rows of this round with status == UNFILLED.
+        default: 0
+
+  - name: ShiftBid
+    parent: null
+    common_fields: true
+    fields:
+      - name: bid_round_id
+        type: string
+        source: input
+        description: FK -> BidRound.id; the round this bid competes in.
+      - name: agent_id
+        type: string
+        source: input
+        description: FK -> Agent.id; the bidder. Must equal the X-User-ID of the acting Agent role.
+      - name: awarded_shift_template_id
+        type: string
+        source: input
+        description: FK -> ShiftTemplate.id; set by the award run to the template this bid won; null while SUBMITTED, UNFILLED or WITHDRAWN.
+        default: null
+      - name: preference_template_ids
+        type: array
+        source: input
+        description: Ordered ShiftTemplate ids, most-preferred first; index 0 is the bidder's first choice.
+        constraints: non-empty array of distinct ShiftTemplate ids belonging to the round's planning_cycle_id; max length 10
+      - name: awarded_preference_index
+        type: integer
+        source: computed
+        description: Zero-based position inside preference_template_ids that the award run satisfied; null unless status == AWARDED.
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Bid lifecycle.
+        default: SUBMITTED
+        constraints: one of {SUBMITTED, AWARDED, UNFILLED, WITHDRAWN}
+
+  - name: ScheduleShift
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose posture gates publication of this shift.
+      - name: agent_id
+        type: string
+        source: input
+        description: FK -> Agent.id; the scheduled agent.
+      - name: shift_template_id
+        type: string
+        source: input
+        description: FK -> ShiftTemplate.id; supplies start_time_local, duration_minutes, unpaid_break_minutes and skill_code.
+      - name: service_date
+        type: string
+        source: input
+        description: ISO date on which the shift runs; must fall inside the cycle horizon.
+      - name: start_at
+        type: datetime
+        source: system
+        description: service_date at template.start_time_local UTC.
+      - name: end_at
+        type: datetime
+        source: system
+        description: start_at + template.duration_minutes, extended by accepted OT_OFFER hours and shortened by accepted VTO_OFFER hours. Shift occupancy is the half-open window [start_at, end_at).
+      - name: unpaid_break_seconds
+        type: integer
+        source: system
+        description: template.unpaid_break_minutes * 60, frozen at creation.
+      - name: scheduled_seconds
+        type: integer
+        source: computed
+        description: (end_at - start_at) in seconds minus unpaid_break_seconds; recomputed whenever end_at moves.
+        default: 0
+      - name: paid_hours
+        type: number
+        source: computed
+        description: scheduled_seconds / 3600; 2 decimal places. VTO and OT reach this field through end_at, so it never double-counts them.
+        default: 0
+      - name: ot_hours
+        type: number
+        source: computed
+        description: Sum of IntradayAction.hours over ACCEPTED OT_OFFER actions on this shift; 2 decimal places.
+        default: 0
+      - name: vto_hours
+        type: number
+        source: computed
+        description: Sum of IntradayAction.hours over ACCEPTED VTO_OFFER actions on this shift; 2 decimal places.
+        default: 0
+      - name: publication_status
+        type: enum
+        source: system
+        description: First independent state axis of the shift.
+        default: DRAFT
+        constraints: one of {DRAFT, PUBLISHED, CANCELLED}
+      - name: adherence_status
+        type: enum
+        source: system
+        description: Second independent state axis of the shift; evolves without touching publication_status.
+        default: PENDING
+        constraints: one of {PENDING, ON_TRACK, OUT_OF_ADHERENCE, EXCUSED}
+      - name: out_of_adherence_seconds
+        type: integer
+        source: input
+        description: Latest observed non-adherent seconds; replaced wholesale by each adherence observation.
+        default: 0
+      - name: excused_seconds
+        type: integer
+        source: input
+        description: Seconds excused by APPROVED adherence exceptions on this shift; reset to 0 by a fresh observation.
+        default: 0
+      - name: adherence_pct
+        type: number
+        source: computed
+        description: Output of calculations.shift_adherence_score; 4 decimal places.
+        default: 1.0000
+      - name: flagged_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the IntradayController whose observation last set adherence_status to OUT_OF_ADHERENCE; consumed by the segregation-of-duties check on exception decisions.
+        default: null
+
+  - name: AdherenceException
+    parent: null
+    common_fields: true
+    fields:
+      - name: schedule_shift_id
+        type: string
+        source: input
+        description: FK -> ScheduleShift.id; the shift whose non-adherence is being contested.
+      - name: agent_id
+        type: string
+        source: input
+        description: FK -> Agent.id; the requesting agent. Must equal the shift's agent_id and the acting Agent role's X-User-ID.
+      - name: reason_code
+        type: enum
+        source: input
+        description: Coded justification.
+        constraints: one of {SYSTEM_OUTAGE, APPROVED_MEETING, COACHING_SESSION, MEDICAL, TRANSIT_DISRUPTION}
+      - name: duration_seconds
+        type: integer
+        source: input
+        description: Seconds of non-adherence the agent asks to have excused.
+        constraints: integer >= 1 and <= shift.out_of_adherence_seconds
+      - name: narrative
+        type: string
+        source: input
+        description: Free-text justification supplied by the agent.
+        constraints: 1..500 chars
+      - name: coach_note
+        type: string
+        source: input
+        description: Free-text note recorded by the deciding TeamCoach.
+        default: null
+      - name: decided_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the TeamCoach who recorded the terminal decision; null while SUBMITTED or INFO_REQUESTED.
+        default: null
+      - name: info_requested_count
+        type: integer
+        source: system
+        description: Number of completed INFO_REQUESTED -> SUBMITTED revision loops.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Branching lifecycle with a revision loop.
+        default: SUBMITTED
+        constraints: one of {SUBMITTED, INFO_REQUESTED, APPROVED, REJECTED}
+
+  - name: IntradayAction
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose posture gates acceptance and whose overtime ledger the action debits.
+      - name: agent_id
+        type: string
+        source: input
+        description: FK -> Agent.id; the counterparty for OT_OFFER and VTO_OFFER; null for ROUTING_ADJUSTMENT.
+        default: null
+      - name: schedule_shift_id
+        type: string
+        source: input
+        description: FK -> ScheduleShift.id; the shift the OT extends or the VTO shortens; null for ROUTING_ADJUSTMENT.
+        default: null
+      - name: target_forecast_group_id
+        type: string
+        source: input
+        description: FK -> ForecastGroup.id; the group whose shortfall the action covers. Required for OT_OFFER (its skill_code must be in the agent's skills) and for ROUTING_ADJUSTMENT (the inflow side); null for VTO_OFFER.
+        default: null
+      - name: source_forecast_group_id
+        type: string
+        source: input
+        description: FK -> ForecastGroup.id; the group losing staffing on a ROUTING_ADJUSTMENT (the outflow side); null for OT_OFFER and VTO_OFFER.
+        default: null
+      - name: kind
+        type: enum
+        source: input
+        description: Which intraday lever this action pulls.
+        constraints: one of {OT_OFFER, VTO_OFFER, ROUTING_ADJUSTMENT}
+      - name: hours
+        type: number
+        source: input
+        description: Hours added (OT_OFFER) or removed (VTO_OFFER) from the referenced shift; null for ROUTING_ADJUSTMENT.
+        default: null
+        constraints: multiple of 0.5, 0.5 <= value <= 8.0 when present
+      - name: agents_shifted
+        type: integer
+        source: input
+        description: Whole agents rerouted from the source group to the target group on a ROUTING_ADJUSTMENT; null otherwise.
+        default: null
+        constraints: integer >= 1 when present
+      - name: interval_start
+        type: datetime
+        source: input
+        description: For ROUTING_ADJUSTMENT, the interval_start of the IntervalPlan pair the reroute applies to; null for OT_OFFER and VTO_OFFER.
+        default: null
+      - name: expires_at
+        type: datetime
+        source: input
+        description: Logical-clock instant from which a response is refused; the comparison is `now < expires_at` (equality expires).
+      - name: cost_cents
+        type: integer
+        source: computed
+        description: Overtime cost frozen at acceptance by calculations.overtime_cost_tiered; 0 for VTO_OFFER and ROUTING_ADJUSTMENT. Never recomputed after acceptance, so revoke subtracts exactly what accept added.
+        default: 0
+      - name: ot_multiplier_applied
+        type: number
+        source: computed
+        description: The tier multiplier times labor_agreement.ot_premium_multiplier frozen at acceptance; null until accepted or for non-OT kinds.
+        default: null
+      - name: responded_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the Agent who accepted or declined; null for ROUTING_ADJUSTMENT and unanswered offers.
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Offer lifecycle. ROUTING_ADJUSTMENT is auto-advanced OFFERED -> ACCEPTED by the system inside its own creation request.
+        default: OFFERED
+        constraints: one of {OFFERED, ACCEPTED, DECLINED, EXPIRED, REVOKED}
+
+  - name: OutsourcePartner
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: Partner legal entity name.
+        constraints: unique across OutsourcePartner, 1..120 chars
+      - name: skill_codes
+        type: array
+        source: input
+        description: Routing skills the partner is certified to serve; a partner is a waterfall candidate only when this array contains the interval's group skill_code.
+        constraints: non-empty array of uppercase snake strings
+      - name: rate_per_contact_millicents
+        type: integer
+        source: input
+        description: Price per handled contact in thousandths of a cent; also the ascending sort key of the allocation waterfall.
+        constraints: integer > 0
+      - name: interval_max_volume
+        type: integer
+        source: input
+        description: Largest volume the partner will absorb in a single interval; the waterfall cap for an ACTIVE partner.
+        constraints: integer >= 1
+      - name: commitment_floor_volume
+        type: integer
+        source: input
+        description: Contractual minimum volume per committed allocation; also the waterfall cap while the partner is on PROBATION.
+        constraints: 0 <= value <= interval_max_volume
+      - name: performance_threshold_pct
+        type: number
+        source: input
+        description: Rolling service-level attainment the partner must hold; breaching it drives the ACTIVE -> PROBATION -> SUSPENDED ladder.
+        constraints: 0 < value <= 1, 4 decimal places
+      - name: billing_basis
+        type: enum
+        source: input
+        description: Selects which settlement variant is authoritative for PartnerAllocation.settlement_amount_cents.
+        constraints: one of {COMMITMENT_FLOOR, DELIVERED_ONLY}
+      - name: status
+        type: enum
+        source: system
+        description: Eligibility state; SUSPENDED is terminal and revokes all open allocations.
+        default: ACTIVE
+        constraints: one of {ACTIVE, PROBATION, SUSPENDED}
+      - name: performance_report_count
+        type: integer
+        source: system
+        description: Number of performance reports filed for this partner.
+        default: 0
+      - name: latest_sl_attainment_pcts
+        type: array
+        source: system
+        description: Append-only list of {period_end_date, sl_attainment_pct} report records, appended in call order; the rolling window reads the last PARTNER_PERFORMANCE_WINDOW entries.
+        default: []
+      - name: rolling_sl_attainment_pct
+        type: number
+        source: computed
+        description: Output of calculations.partner_rolling_performance; 4 decimal places; null until the first report.
+        default: null
+      - name: consecutive_breach_count
+        type: integer
+        source: computed
+        description: Number of consecutive reports whose rolling attainment breached performance_threshold_pct; reset to 0 by a non-breaching report.
+        default: 0
+      - name: committed_volume_outstanding
+        type: integer
+        source: computed
+        description: Sum of PartnerAllocation.allocated_volume over this partner's allocations with status == COMMITTED. Conserved quantity of the commit/revoke invariant.
+        default: 0
+      - name: invoice_total_cents
+        type: integer
+        source: computed
+        description: Integer sum of PartnerAllocation.settlement_amount_cents over this partner's allocations with status == SETTLED; each line is already rounded to whole cents before summing.
+        default: 0
+
+  - name: PartnerAllocation
+    parent: null
+    common_fields: true
+    fields:
+      - name: outsource_partner_id
+        type: string
+        source: input
+        description: FK -> OutsourcePartner.id; the partner absorbing the volume.
+      - name: interval_plan_id
+        type: string
+        source: input
+        description: FK -> IntervalPlan.id; the single half-open interval this allocation occupies. Allocations on different IntervalPlan rows never aggregate against each other.
+      - name: allocated_volume
+        type: integer
+        source: input
+        description: Contacts routed to the partner in this interval; the value the aggregate-capacity ceiling is tested against and the billing "committed" quantity at settlement.
+        constraints: integer >= 1
+      - name: proposed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the SourcingManager whose create or generate call produced this row; consumed by the segregation-of-duties check on commit.
+      - name: committed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the SourcingManager who committed this row; null until COMMITTED.
+        default: null
+      - name: delivered_volume
+        type: integer
+        source: input
+        description: Contacts the partner actually handled, supplied at settlement; null until SETTLED.
+        default: null
+      - name: settlement_floor_cents
+        type: integer
+        source: computed
+        description: Settlement variant COMMITMENT_FLOOR of calculations.partner_settlement; always stored at settlement regardless of billing_basis.
+        default: null
+      - name: settlement_delivered_cents
+        type: integer
+        source: computed
+        description: Settlement variant DELIVERED_ONLY (line amount only, before the shortfall penalty) of calculations.partner_settlement; always stored at settlement.
+        default: null
+      - name: shortfall_penalty_cents
+        type: integer
+        source: computed
+        description: Under-delivery penalty credited to the buyer under the DELIVERED_ONLY variant; 0 when delivered_volume >= allocated_volume.
+        default: null
+      - name: settlement_amount_cents
+        type: integer
+        source: computed
+        description: Authoritative payable selected by partner.billing_basis from the two variants above.
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: Allocation lifecycle.
+        default: PROPOSED
+        constraints: one of {PROPOSED, COMMITTED, SETTLED, REVOKED}
+
+  - name: HiringClass
+    parent: null
+    common_fields: true
+    fields:
+      - name: planning_cycle_id
+        type: string
+        source: input
+        description: FK -> PlanningCycle.id; the cycle whose pipeline_fte this class contributes to.
+      - name: labor_agreement_id
+        type: string
+        source: input
+        description: FK -> LaborAgreement.id; the agreement every graduate is enrolled under.
+      - name: cohort_name
+        type: string
+        source: input
+        description: Class label.
+        constraints: unique across HiringClass, 1..80 chars
+      - name: skill_code
+        type: string
+        source: input
+        description: Single routing skill every graduate is minted with.
+        constraints: 1..30 chars
+      - name: start_date
+        type: string
+        source: input
+        description: ISO date on which training week 1 begins.
+      - name: seats
+        type: integer
+        source: input
+        description: Number of hires seated in the class.
+        constraints: 1 <= value <= 200
+      - name: training_weeks
+        type: integer
+        source: input
+        description: Classroom weeks during which graduates contribute zero productive FTE.
+        constraints: 1 <= value <= 12
+      - name: nesting_weeks
+        type: integer
+        source: input
+        description: Post-classroom weeks during which graduates contribute NESTING_PRODUCTIVITY of an FTE each.
+        constraints: 0 <= value <= 8
+      - name: expected_attrition_pct
+        type: number
+        source: input
+        description: Share of seats expected not to graduate; graduates = floor(seats * (1 - expected_attrition_pct)).
+        constraints: 0 <= value < 1, 4 decimal places
+      - name: graduate_hourly_rate_cents
+        type: integer
+        source: input
+        description: hourly_rate_cents stamped on every Agent minted by the graduate cascade.
+        constraints: integer > 0
+      - name: graduate_weekly_hours
+        type: number
+        source: input
+        description: weekly_contracted_hours stamped on every Agent minted by the graduate cascade.
+        constraints: number > 0
+      - name: expected_graduates
+        type: integer
+        source: computed
+        description: floor(seats * (1 - expected_attrition_pct)); the exact number of Agent rows the graduate cascade mints.
+        default: 0
+      - name: nesting_from_date
+        type: string
+        source: computed
+        description: start_date + training_weeks * 7 days (ISO date).
+      - name: productive_from_date
+        type: string
+        source: computed
+        description: start_date + (training_weeks + nesting_weeks) * 7 days (ISO date).
+      - name: effective_fte_at_horizon_end
+        type: number
+        source: computed
+        description: Output of calculations.hiring_class_ramp_fte evaluated at the cycle's horizon_end_date; 2 decimal places.
+        default: 0
+      - name: graduated_agent_count
+        type: integer
+        source: computed
+        description: Count of Agent rows whose hiring_class_id is this class.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Class lifecycle.
+        default: PLANNED
+        constraints: one of {PLANNED, CHARTERED, IN_TRAINING, GRADUATED, CANCELLED}
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  - entity: PlanningCycle
+    initial_state: OPEN
+    terminal_states: [FROZEN]
+    transitions:
+      - from: OPEN
+        to: REQUIREMENTS_LOCKED
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=REQUIREMENTS_LOCKED"
+        actor: CapacityPlanner
+        preconditions:
+          - "at least one ForecastGroup of this cycle has interval_count >= 1"
+        side_effects:
+          - "stamp requirements_locked_at with the logical clock"
+          - "recompute short_interval_count over every IntervalPlan of the cycle"
+          - "increment PlanningCycle.version by 1"
+        note: "Locking the requirements is what makes ScheduleShift publication legal; see validations[priority=90]."
+      - from: REQUIREMENTS_LOCKED
+        to: OPEN
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=OPEN"
+        actor: CapacityPlanner
+        preconditions:
+          - "no ScheduleShift of this cycle has publication_status == PUBLISHED"
+        side_effects:
+          - "clear requirements_locked_at to null"
+          - "increment PlanningCycle.version by 1"
+        note: "Revert edge: reopens forecasting after a requirements review."
+      - from: REQUIREMENTS_LOCKED
+        to: SCHEDULE_PUBLISHED
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=SCHEDULE_PUBLISHED"
+        actor: SchedulingManager
+        preconditions:
+          - "at least one ScheduleShift of this cycle has publication_status == PUBLISHED"
+        side_effects:
+          - "stamp published_at with the logical clock"
+          - "increment PlanningCycle.version by 1"
+      - from: SCHEDULE_PUBLISHED
+        to: INTRADAY_ALERT
+        trigger: "system event: any recompute of short_interval_count leaves short_interval_count >= intraday_alert_short_threshold"
+        actor: system
+        preconditions:
+          - "short_interval_count >= intraday_alert_short_threshold after the recompute"
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+        note: "Auto-escalation inside the same request that perturbed the forecast (MarketingEvent confirmation, reforecast, actuals posting, routing adjustment or publication change)."
+      - from: INTRADAY_ALERT
+        to: SCHEDULE_PUBLISHED
+        trigger: "system event: any recompute of short_interval_count leaves short_interval_count < intraday_alert_short_threshold"
+        actor: system
+        preconditions:
+          - "short_interval_count < intraday_alert_short_threshold after the recompute"
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+        note: "De-escalation edge; makes the pair SCHEDULE_PUBLISHED <-> INTRADAY_ALERT cyclic."
+      - from: OPEN
+        to: FROZEN
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=FROZEN"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+      - from: REQUIREMENTS_LOCKED
+        to: FROZEN
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=FROZEN"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+      - from: SCHEDULE_PUBLISHED
+        to: FROZEN
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=FROZEN"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+      - from: INTRADAY_ALERT
+        to: FROZEN
+        trigger: "POST /planning-cycles/{planning_cycle_id}/posture with target_posture=FROZEN"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "increment PlanningCycle.version by 1"
+        note: "FROZEN is terminal: every subsequent write against the cycle or any of its children fails ERR_CYCLE_FROZEN at validations[priority=70], ahead of every business check."
+
+  - entity: MarketingEvent
+    initial_state: DRAFT
+    terminal_states: [CANCELLED, REALIZED]
+    transitions:
+      - from: DRAFT
+        to: CONFIRMED
+        trigger: "POST /marketing-events/{marketing_event_id}/status with target_status=CONFIRMED"
+        actor: WorkforceAnalyst
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "window_end is strictly after window_start"
+        side_effects:
+          - "recompute volume_forecast, aht_forecast_seconds, applied_event_uplift_pct, both staffing variants, required_agents, coverage_gap and coverage_state on every IntervalPlan in scope whose [interval_start, interval_end) overlaps [window_start, window_end)"
+          - "recompute internal_capacity_volume, allocatable_volume and unserved_volume on those intervals"
+          - "recompute cycle.short_interval_count, then evaluate the SCHEDULE_PUBLISHED <-> INTRADAY_ALERT posture edges"
+          - "when supersedes_event_id is set and that event's status == CONFIRMED, transition the superseded event CONFIRMED -> CANCELLED and drop its uplift from the same recompute"
+        note: "Deepest cascade in the scaffold: uplift -> forecast -> requirement -> coverage_state -> cycle.short_interval_count -> cycle.posture."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /marketing-events/{marketing_event_id}/status with target_status=CANCELLED"
+        actor: WorkforceAnalyst
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects: []
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /marketing-events/{marketing_event_id}/status with target_status=CANCELLED, or the system supersede cascade of another event's confirmation"
+        actor: WorkforceAnalyst
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "recompute every IntervalPlan the event overlapped, removing its weighted uplift"
+          - "recompute cycle.short_interval_count and re-evaluate the posture edges"
+      - from: CONFIRMED
+        to: REALIZED
+        trigger: "POST /marketing-events/{marketing_event_id}/status with target_status=REALIZED"
+        actor: WorkforceAnalyst
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "logical clock is at or after window_end"
+        side_effects: []
+        note: "REALIZED freezes the uplift already baked into the intervals: a REALIZED event keeps contributing uplift, unlike CANCELLED."
+
+  - entity: BidRound
+    initial_state: DRAFT
+    terminal_states: [CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: OPEN
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=OPEN"
+        actor: SchedulingManager
+        preconditions:
+          - "cycle.posture IN {OPEN, REQUIREMENTS_LOCKED}"
+          - "at least one ShiftTemplate exists for the round's planning_cycle_id"
+        side_effects: []
+      - from: OPEN
+        to: SCORING
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=SCORING"
+        actor: SchedulingManager
+        preconditions:
+          - "at least one ShiftBid of this round has status == SUBMITTED"
+        side_effects:
+          - "further POST /shift-bids against this round are rejected with ERR_BID_ROUND_NOT_OPEN"
+      - from: SCORING
+        to: OPEN
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=OPEN"
+        actor: SchedulingManager
+        preconditions:
+          - "reopen_count < max_reopen_count"
+        side_effects:
+          - "increment reopen_count by 1"
+      - from: SCORING
+        to: AWARDED
+        trigger: "POST /bid-rounds/{bid_round_id}/award"
+        actor: SchedulingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "calculations.bid_award_and_preference_honor places at least one bid (otherwise ERR_TEMPLATE_SLOTS_EXHAUSTED) and yields preference_honor_rate >= the strictest preference_honor_floor_pct among the labor agreements of the awarded bidders"
+        side_effects:
+          - "set each winning ShiftBid.status to AWARDED with awarded_shift_template_id and awarded_preference_index"
+          - "set each losing ShiftBid.status to UNFILLED"
+          - "mint one DRAFT ScheduleShift per awarded bid per template.days_of_week entry that falls inside the cycle horizon"
+          - "recompute template.slots_awarded, round.awarded_bid_count, round.unfilled_bid_count and round.preference_honor_rate"
+      - from: AWARDED
+        to: OPEN
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=OPEN"
+        actor: SchedulingManager
+        preconditions:
+          - "reopen_count < max_reopen_count"
+          - "no ScheduleShift minted by this round has publication_status == PUBLISHED"
+        side_effects:
+          - "increment reopen_count by 1"
+          - "reset every AWARDED and UNFILLED bid of the round to SUBMITTED with awarded_shift_template_id = null and awarded_preference_index = null"
+          - "cancel every DRAFT ScheduleShift minted by the round (publication_status DRAFT -> CANCELLED)"
+          - "reset round.preference_honor_rate to null, awarded_bid_count and unfilled_bid_count to 0, and recompute template.slots_awarded"
+        note: "Closes the cycle AWARDED -> OPEN -> SCORING -> AWARDED; bounded by max_reopen_count, which rejects with ERR_REOPEN_LIMIT_REACHED."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=CANCELLED"
+        actor: SchedulingManager
+        preconditions: []
+        side_effects: []
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=CANCELLED"
+        actor: SchedulingManager
+        preconditions: []
+        side_effects:
+          - "set every SUBMITTED bid of the round to WITHDRAWN"
+      - from: SCORING
+        to: CANCELLED
+        trigger: "POST /bid-rounds/{bid_round_id}/status with target_status=CANCELLED"
+        actor: SchedulingManager
+        preconditions: []
+        side_effects:
+          - "set every SUBMITTED bid of the round to WITHDRAWN"
+
+  - entity: ShiftBid
+    initial_state: SUBMITTED
+    terminal_states: [WITHDRAWN]
+    transitions:
+      - from: SUBMITTED
+        to: AWARDED
+        trigger: "system event inside POST /bid-rounds/{bid_round_id}/award"
+        actor: system
+        preconditions:
+          - "a template in preference_template_ids still has slots_awarded < slots_total after more senior bidders are placed"
+        side_effects:
+          - "set awarded_shift_template_id and awarded_preference_index"
+          - "mint DRAFT ScheduleShift rows for the awarded template"
+      - from: SUBMITTED
+        to: UNFILLED
+        trigger: "system event inside POST /bid-rounds/{bid_round_id}/award"
+        actor: system
+        preconditions:
+          - "every template in preference_template_ids is exhausted when this bid is processed"
+        side_effects: []
+      - from: SUBMITTED
+        to: WITHDRAWN
+        trigger: "POST /shift-bids/{shift_bid_id}/withdraw"
+        actor: Agent
+        preconditions:
+          - "round.status == OPEN"
+          - "acting X-User-ID equals the bid's agent_id"
+        side_effects: []
+      - from: AWARDED
+        to: SUBMITTED
+        trigger: "system event inside the BidRound AWARDED -> OPEN reopen cascade"
+        actor: system
+        preconditions:
+          - "no ScheduleShift minted for this bid has publication_status == PUBLISHED"
+        side_effects:
+          - "clear awarded_shift_template_id and awarded_preference_index"
+          - "cancel the DRAFT ScheduleShift rows minted for this bid"
+      - from: UNFILLED
+        to: SUBMITTED
+        trigger: "system event inside the BidRound AWARDED -> OPEN reopen cascade"
+        actor: system
+        preconditions: []
+        side_effects: []
+
+  # ---- ScheduleShift axis 1 of 2: publication_status -------------------------
+  - entity: ScheduleShift
+    initial_state: DRAFT
+    terminal_states: [CANCELLED]
+    note: |
+      First of two independent state axes on the ScheduleShift row (field: publication_status).
+      Movement on this axis never reads or writes adherence_status, and vice versa; the observable
+      state of a shift is the pair (publication_status, adherence_status).
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/publication with target_publication_status=PUBLISHED"
+        actor: SchedulingManager
+        preconditions:
+          - "cycle.posture IN {REQUIREMENTS_LOCKED, SCHEDULE_PUBLISHED, INTRADAY_ALERT} (guarded cross-entity edge)"
+          - "agent.status == ACTIVE"
+          - "template.skill_code is a member of agent.skills"
+          - "no other non-CANCELLED shift of the same agent overlaps [start_at, end_at)"
+          - "gap to the agent's neighbouring non-overlapping shifts is >= agreement.min_rest_hours (an overlapping neighbour is not evaluated here; it is refused by the overlap rule at priority 115)"
+          - "agent.scheduled_hours_committed + this shift's paid_hours <= agreement.max_weekly_hours"
+          - "the agent's run of consecutive service dates carrying a non-CANCELLED shift stays <= agreement.max_consecutive_days"
+        side_effects:
+          - "recompute agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+          - "recompute scheduled_agents, effective_scheduled_agents, coverage_gap, coverage_state, internal_capacity_volume, allocatable_volume and unserved_volume on every IntervalPlan the shift covers"
+          - "recompute cycle.short_interval_count, then evaluate the SCHEDULE_PUBLISHED <-> INTRADAY_ALERT posture edges"
+          - "recompute cycle.headcount_active"
+      - from: PUBLISHED
+        to: CANCELLED
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/publication with target_publication_status=CANCELLED"
+        actor: SchedulingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "no IntradayAction on this shift has status == ACCEPTED"
+        side_effects:
+          - "recompute agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+          - "recompute coverage on every IntervalPlan the shift covered and re-evaluate the posture edges"
+          - "recompute agent.coaching_flag_count and agent.adherence_pct (a CANCELLED shift is excluded from both)"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/publication with target_publication_status=CANCELLED, or the system BidRound reopen cascade"
+        actor: SchedulingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects: []
+        note: "A DRAFT shift contributes nothing to coverage, so cancelling it triggers no recompute."
+
+  # ---- ScheduleShift axis 2 of 2: adherence_status --------------------------
+  - entity: ScheduleShift
+    initial_state: PENDING
+    terminal_states: []
+    note: |
+      Second independent state axis on the same row (field: adherence_status). Every transition
+      below leaves publication_status untouched, and a shift may traverse this axis only while
+      publication_status == PUBLISHED.
+    transitions:
+      - from: PENDING
+        to: ON_TRACK
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/adherence-observations with out_of_adherence_seconds whose resulting adherence_pct >= COACHING_ADHERENCE_THRESHOLD"
+        actor: IntradayController
+        preconditions:
+          - "publication_status == PUBLISHED"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "replace out_of_adherence_seconds, reset excused_seconds to 0, recompute adherence_pct"
+          - "recompute agent.adherence_pct and agent.coaching_flag_count"
+      - from: PENDING
+        to: OUT_OF_ADHERENCE
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/adherence-observations with out_of_adherence_seconds whose resulting adherence_pct < COACHING_ADHERENCE_THRESHOLD"
+        actor: IntradayController
+        preconditions:
+          - "publication_status == PUBLISHED"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "replace out_of_adherence_seconds, reset excused_seconds to 0, recompute adherence_pct"
+          - "stamp flagged_by_user_id with the acting X-User-ID"
+          - "recompute agent.adherence_pct and agent.coaching_flag_count; set agent.coaching_status to COACHING_ACTIVE when the count reaches 1 or more"
+      - from: ON_TRACK
+        to: OUT_OF_ADHERENCE
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/adherence-observations with a worse observation"
+        actor: IntradayController
+        preconditions:
+          - "publication_status == PUBLISHED"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "stamp flagged_by_user_id with the acting X-User-ID"
+          - "recompute agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status"
+      - from: OUT_OF_ADHERENCE
+        to: ON_TRACK
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/adherence-observations with a better observation"
+        actor: IntradayController
+        preconditions:
+          - "publication_status == PUBLISHED"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "reset excused_seconds to 0 and recompute adherence_pct"
+          - "recompute agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status (CLEARED when the count falls to 0 from COACHING_ACTIVE)"
+      - from: OUT_OF_ADHERENCE
+        to: EXCUSED
+        trigger: "system event inside POST /adherence-exceptions/{adherence_exception_id}/decision with decision=APPROVE"
+        actor: system
+        preconditions:
+          - "the exception's status == SUBMITTED"
+        side_effects:
+          - "add the exception's duration_seconds to excused_seconds and recompute adherence_pct"
+          - "recompute agent.adherence_pct and agent.coaching_flag_count; set agent.coaching_status to CLEARED when the count falls to 0 from COACHING_ACTIVE"
+        note: "Cross-entity cascade: an approval on one entity moves a state axis on another and can clear coaching three hops away."
+      - from: EXCUSED
+        to: OUT_OF_ADHERENCE
+        trigger: "POST /schedule-shifts/{schedule_shift_id}/adherence-observations with a fresh observation below the threshold"
+        actor: IntradayController
+        preconditions:
+          - "publication_status == PUBLISHED"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "reset excused_seconds to 0 (a fresh observation discards prior excusals) and recompute adherence_pct"
+          - "recompute agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status"
+
+  - entity: AdherenceException
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, REJECTED]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /adherence-exceptions/{adherence_exception_id}/decision with decision=APPROVE"
+        actor: TeamCoach
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "acting X-User-ID differs from shift.flagged_by_user_id (segregation of duties)"
+          - "duration_seconds <= shift.out_of_adherence_seconds"
+        side_effects:
+          - "stamp decided_by_user_id"
+          - "move the shift's adherence axis OUT_OF_ADHERENCE -> EXCUSED and add duration_seconds to shift.excused_seconds"
+          - "recompute shift.adherence_pct, agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /adherence-exceptions/{adherence_exception_id}/decision with decision=REJECT"
+        actor: TeamCoach
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "acting X-User-ID differs from shift.flagged_by_user_id (segregation of duties)"
+        side_effects:
+          - "stamp decided_by_user_id"
+      - from: SUBMITTED
+        to: INFO_REQUESTED
+        trigger: "POST /adherence-exceptions/{adherence_exception_id}/decision with decision=REQUEST_INFO"
+        actor: TeamCoach
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "record coach_note; decided_by_user_id stays null because the branch is non-terminal"
+      - from: INFO_REQUESTED
+        to: SUBMITTED
+        trigger: "POST /adherence-exceptions/{adherence_exception_id}/resubmit"
+        actor: Agent
+        preconditions:
+          - "acting X-User-ID equals the exception's agent_id"
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "replace narrative and duration_seconds with the resubmitted values"
+          - "increment info_requested_count by 1"
+        note: "Revision loop; the branching fork SUBMITTED -> {APPROVED, REJECTED, INFO_REQUESTED} re-opens after every loop."
+
+  - entity: IntradayAction
+    initial_state: OFFERED
+    terminal_states: [ACCEPTED, DECLINED, EXPIRED, REVOKED]
+    transitions:
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "POST /intraday-actions/{intraday_action_id}/response with response=ACCEPT"
+        actor: Agent
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "acting X-User-ID equals the action's agent_id"
+          - "logical clock is strictly before expires_at"
+          - "for kind == OT_OFFER: cycle.ot_spend_committed_cents + this action's cost_cents <= cycle.ot_budget_cents"
+          - "for kind == OT_OFFER: extending the shift keeps the agent's rest gap >= agreement.min_rest_hours and the weekly total <= agreement.max_weekly_hours"
+          - "for kind == VTO_OFFER: (shift.start_at - now) in hours >= agreement.vto_min_notice_hours"
+          - "for kind == VTO_OFFER: releasing the hours must not push any IntervalPlan the shift covers from COVERED to SHORT"
+        side_effects:
+          - "for OT_OFFER: freeze ot_multiplier_applied and cost_cents from calculations.overtime_cost_tiered evaluated against the PRE-acceptance cycle.ot_spend_committed_cents, extend shift.end_at by hours, recompute shift.scheduled_seconds, shift.ot_hours, shift.paid_hours, agent.scheduled_hours_committed, cycle.ot_hours_committed, cycle.ot_spend_committed_cents and cycle.total_scheduled_hours"
+          - "for VTO_OFFER: shorten shift.end_at by hours, recompute shift.scheduled_seconds, shift.vto_hours, shift.paid_hours, agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+          - "for ROUTING_ADJUSTMENT: recompute routing_inflow_agents on the target group's interval and routing_outflow_agents on the source group's interval"
+          - "recompute coverage on every affected IntervalPlan, then cycle.short_interval_count and the posture edges"
+          - "stamp responded_by_user_id for OT_OFFER and VTO_OFFER"
+      - from: OFFERED
+        to: ACCEPTED
+        trigger: "system event inside POST /intraday-actions when kind == ROUTING_ADJUSTMENT"
+        actor: system
+        preconditions:
+          - "agents_shifted <= source interval's effective_scheduled_agents"
+        side_effects:
+          - "apply the routing recompute above inside the creating request; responded_by_user_id stays null"
+        note: "A ROUTING_ADJUSTMENT is an operator lever, not an offer to an agent, so it is auto-accepted at creation and never sits in OFFERED."
+      - from: OFFERED
+        to: DECLINED
+        trigger: "POST /intraday-actions/{intraday_action_id}/response with response=DECLINE"
+        actor: Agent
+        preconditions:
+          - "acting X-User-ID equals the action's agent_id"
+          - "logical clock is strictly before expires_at"
+        side_effects:
+          - "stamp responded_by_user_id"
+      - from: OFFERED
+        to: EXPIRED
+        trigger: "POST /intraday-actions/{intraday_action_id}/response at or after expires_at (the response is refused and the action is expired in the same request)"
+        actor: Agent
+        preconditions:
+          - "logical clock is at or after expires_at"
+        side_effects:
+          - "set status to EXPIRED and return ERR_ACTION_EXPIRED; no ledger field moves"
+      - from: OFFERED
+        to: REVOKED
+        trigger: "POST /intraday-actions/{intraday_action_id}/revoke"
+        actor: IntradayController
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects: []
+      - from: ACCEPTED
+        to: REVOKED
+        trigger: "POST /intraday-actions/{intraday_action_id}/revoke"
+        actor: IntradayController
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "for OT_OFFER: shorten shift.end_at by hours, subtract exactly the frozen cost_cents from cycle.ot_spend_committed_cents and hours from cycle.ot_hours_committed, recompute shift.scheduled_seconds, shift.ot_hours, shift.paid_hours, agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+          - "for VTO_OFFER: restore shift.end_at by adding hours back, then recompute shift.scheduled_seconds, shift.vto_hours, shift.paid_hours, agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+          - "for ROUTING_ADJUSTMENT: drop the inflow and outflow contributions from both intervals"
+          - "recompute coverage on every affected IntervalPlan, then cycle.short_interval_count and the posture edges"
+        note: "Compensating transition: the frozen cost_cents guarantees the OT ledger returns to its exact pre-acceptance value even after the tier multiplier changed."
+
+  - entity: OutsourcePartner
+    initial_state: ACTIVE
+    terminal_states: [SUSPENDED]
+    transitions:
+      - from: ACTIVE
+        to: PROBATION
+        trigger: "system event inside POST /outsource-partners/{outsource_partner_id}/performance-reports"
+        actor: system
+        preconditions:
+          - "rolling_sl_attainment_pct < performance_threshold_pct after the report is appended"
+        side_effects:
+          - "set consecutive_breach_count to 1"
+          - "cap subsequent waterfall participation at commitment_floor_volume instead of interval_max_volume"
+      - from: PROBATION
+        to: ACTIVE
+        trigger: "system event inside POST /outsource-partners/{outsource_partner_id}/performance-reports"
+        actor: system
+        preconditions:
+          - "rolling_sl_attainment_pct >= performance_threshold_pct after the report is appended"
+        side_effects:
+          - "reset consecutive_breach_count to 0"
+      - from: PROBATION
+        to: SUSPENDED
+        trigger: "system event inside POST /outsource-partners/{outsource_partner_id}/performance-reports"
+        actor: system
+        preconditions:
+          - "rolling_sl_attainment_pct < performance_threshold_pct for a second consecutive report (consecutive_breach_count reaches 2)"
+        side_effects:
+          - "set consecutive_breach_count to 2"
+          - "transition every PROPOSED and COMMITTED PartnerAllocation of this partner to REVOKED, restoring committed_volume_outstanding to 0 and recomputing each interval's partner_committed_volume and unserved_volume"
+        note: "SUSPENDED is terminal: the partner is permanently excluded from the allocation waterfall and every write against it fails ERR_PARTNER_NOT_ELIGIBLE."
+
+  - entity: PartnerAllocation
+    initial_state: PROPOSED
+    terminal_states: [SETTLED, REVOKED]
+    transitions:
+      - from: PROPOSED
+        to: COMMITTED
+        trigger: "POST /partner-allocations/{partner_allocation_id}/commit"
+        actor: SourcingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "expected_partner_version matches the partner's current version (see concurrency_rules[allocation-commit-stale-partner])"
+          - "acting X-User-ID differs from proposed_by_user_id (segregation of duties)"
+          - "partner.status != SUSPENDED"
+          - "allocated_volume >= partner.commitment_floor_volume"
+          - "interval.partner_committed_volume + allocated_volume <= interval.allocatable_volume"
+        side_effects:
+          - "stamp committed_by_user_id"
+          - "add allocated_volume to partner.committed_volume_outstanding"
+          - "recompute interval.partner_committed_volume and interval.unserved_volume"
+          - "increment OutsourcePartner.version by 1"
+      - from: COMMITTED
+        to: SETTLED
+        trigger: "POST /partner-allocations/{partner_allocation_id}/settle"
+        actor: SourcingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "for partner.billing_basis == COMMITMENT_FLOOR: delivered_volume >= partner.commitment_floor_volume, else ERR_COMMITMENT_FLOOR_BREACH"
+        side_effects:
+          - "store delivered_volume, settlement_floor_cents, settlement_delivered_cents, shortfall_penalty_cents and settlement_amount_cents from calculations.partner_settlement"
+          - "subtract allocated_volume from partner.committed_volume_outstanding and add settlement_amount_cents to partner.invoice_total_cents"
+      - from: PROPOSED
+        to: REVOKED
+        trigger: "POST /partner-allocations/{partner_allocation_id}/revoke"
+        actor: SourcingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects: []
+      - from: COMMITTED
+        to: REVOKED
+        trigger: "POST /partner-allocations/{partner_allocation_id}/revoke, or the system partner-suspension cascade"
+        actor: SourcingManager
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "subtract allocated_volume from partner.committed_volume_outstanding"
+          - "recompute interval.partner_committed_volume and interval.unserved_volume"
+        note: "Compensating transition on a volume ledger: revoke restores committed_volume_outstanding to exactly its pre-commit value."
+
+  - entity: HiringClass
+    initial_state: PLANNED
+    terminal_states: [GRADUATED, CANCELLED]
+    transitions:
+      - from: PLANNED
+        to: CHARTERED
+        trigger: "POST /hiring-classes/{hiring_class_id}/status with target_status=CHARTERED"
+        actor: CapacityPlanner
+        preconditions:
+          - "cycle.posture != FROZEN"
+        side_effects:
+          - "recompute effective_fte_at_horizon_end and cycle.pipeline_fte"
+      - from: CHARTERED
+        to: IN_TRAINING
+        trigger: "POST /hiring-classes/{hiring_class_id}/status with target_status=IN_TRAINING"
+        actor: CapacityPlanner
+        preconditions:
+          - "logical clock is at or after start_date at 00:00:00Z"
+        side_effects:
+          - "recompute effective_fte_at_horizon_end and cycle.pipeline_fte"
+      - from: IN_TRAINING
+        to: GRADUATED
+        trigger: "POST /hiring-classes/{hiring_class_id}/graduate"
+        actor: CapacityPlanner
+        preconditions:
+          - "cycle.posture != FROZEN"
+          - "logical clock is at or after nesting_from_date at 00:00:00Z"
+        side_effects:
+          - "mint exactly expected_graduates Agent rows with status ACTIVE, hiring_class_id set, skills [skill_code], labor_agreement_id copied from the class, employee_code \"<cohort_name>-001\"..\"<cohort_name>-NNN\" in ascending index order, hourly_rate_cents = graduate_hourly_rate_cents and weekly_contracted_hours = graduate_weekly_hours"
+          - "set graduated_agent_count to expected_graduates"
+          - "recompute agreement.enrolled_agent_count, cycle.headcount_active and cycle.pipeline_fte (a GRADUATED class leaves the pipeline)"
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /hiring-classes/{hiring_class_id}/status with target_status=CANCELLED"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects: []
+      - from: CHARTERED
+        to: CANCELLED
+        trigger: "POST /hiring-classes/{hiring_class_id}/status with target_status=CANCELLED"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "recompute cycle.pipeline_fte"
+      - from: IN_TRAINING
+        to: CANCELLED
+        trigger: "POST /hiring-classes/{hiring_class_id}/status with target_status=CANCELLED"
+        actor: CapacityPlanner
+        preconditions: []
+        side_effects:
+          - "recompute cycle.pipeline_fte"
+
+  - entity: Agent
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: LEAVE
+        trigger: "PATCH /agents/{agent_id} with target_status=LEAVE"
+        actor: SchedulingManager
+        preconditions: []
+        side_effects:
+          - "recompute cycle.headcount_active for every cycle in which the agent holds a DRAFT or PUBLISHED shift"
+      - from: LEAVE
+        to: ACTIVE
+        trigger: "PATCH /agents/{agent_id} with target_status=ACTIVE"
+        actor: SchedulingManager
+        preconditions: []
+        side_effects:
+          - "recompute cycle.headcount_active"
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "PATCH /agents/{agent_id} with target_status=TERMINATED"
+        actor: SchedulingManager
+        preconditions:
+          - "the agent holds no ScheduleShift with publication_status == PUBLISHED"
+        side_effects:
+          - "recompute agreement.enrolled_agent_count and cycle.headcount_active"
+      - from: LEAVE
+        to: TERMINATED
+        trigger: "PATCH /agents/{agent_id} with target_status=TERMINATED"
+        actor: SchedulingManager
+        preconditions:
+          - "the agent holds no ScheduleShift with publication_status == PUBLISHED"
+        side_effects:
+          - "recompute agreement.enrolled_agent_count and cycle.headcount_active"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules
+# =============================================================================
+concurrency_rules:
+  - rule_id: reforecast-stale-cycle
+    parent_entity: PlanningCycle
+    write_endpoint: "POST /planning-cycles/{planning_cycle_id}/reforecast"
+    occ_field: "expected_cycle_version"
+    description: |
+      Starting a reforecast run against a PlanningCycle whose version has advanced since the
+      client last read it is rejected. A reforecast legitimately supersedes the prior generation's
+      multipliers for every ForecastGroup of the cycle, so a writer holding a stale view would
+      overwrite a generation it never observed; the stale-version check forces it to re-read the
+      cycle (and the new reforecast_generation) before writing again.
+    error_id: ERR_STALE_CYCLE_VERSION
+    http_status: 412
+
+  - rule_id: allocation-commit-stale-partner
+    parent_entity: OutsourcePartner
+    write_endpoint: "POST /partner-allocations/{partner_allocation_id}/commit"
+    occ_field: "expected_partner_version"
+    description: |
+      Committing a PartnerAllocation against an OutsourcePartner whose version has advanced since
+      the client last read it is rejected. Commitment consumes partner capacity against
+      committed_volume_outstanding and the eligibility state that performance reports and other
+      commits both move, so a writer whose view of the partner predates those changes is refused
+      until it re-reads the partner.
+    error_id: ERR_STALE_PARTNER_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: interval_volume_forecast
+    trigger: "IntervalPlan generation; any MarketingEvent status change touching the interval; any reforecast run; any actuals posting that changes the group's reforecast_multiplier"
+    algorithm: forward_looking
+    formula: |
+      curve_sum   = sum(group.intraday_curve)
+      share_i     = group.intraday_curve[interval_index] / curve_sum
+      dow         = ISO weekday index of service_date, Monday == 0
+      raw         = group.base_daily_volume * group.dow_multipliers[dow] * share_i
+
+      # Confidence-weighted, capped event uplift. Applies only to events whose window
+      # overlaps the half-open interval window [interval_start, interval_end).
+      per_event   = event.uplift_pct * CONFIDENCE_WEIGHT[event.confidence_tier]
+      applied_event_uplift_pct = min(sum(per_event over in-scope events), MAX_EVENT_UPLIFT)
+
+      # SINGLE final rounding: raw, uplift and multiplier are combined at full precision
+      # and rounded exactly once.
+      volume_forecast = round_half_up(raw
+                                      * (1 + applied_event_uplift_pct)
+                                      * group.reforecast_multiplier, 0)
+    input_set: |
+      Events counted are MarketingEvent rows with status IN {CONFIRMED, REALIZED} whose
+      planning_cycle_id equals the group's cycle AND which are in scope for the group -- either
+      forecast_group_id equals this group, or forecast_group_id is null and channel_scope equals
+      group.channel -- AND whose [window_start, window_end) overlaps [interval_start, interval_end).
+      Events in status DRAFT or CANCELLED contribute nothing.
+    constants:
+      CONFIDENCE_WEIGHT: { HIGH: 1.0, MEDIUM: 0.6, LOW: 0.3 }
+      MAX_EVENT_UPLIFT: 1.50
+    precision: "volume_forecast is an integer, round_half_up at 0 decimal places, applied once to the fully combined product; applied_event_uplift_pct stored at 4 decimal places"
+
+  - name: interval_aht_forecast
+    trigger: "same triggers as interval_volume_forecast"
+    algorithm: threshold
+    formula: |
+      dragged = group.base_aht_seconds * (1 + AHT_DRAG_COEFF * applied_event_uplift_pct)
+      ceiling = group.base_aht_seconds * AHT_CEILING_MULT
+      aht_forecast_seconds = round_half_up(min(dragged, ceiling), 0)
+    input_set: "the same in-scope event set as interval_volume_forecast; the reforecast multiplier does NOT affect handle time"
+    constants:
+      AHT_DRAG_COEFF: 0.30
+      AHT_CEILING_MULT: 1.35
+    precision: "integer seconds, round_half_up at 0 decimal places"
+
+  - name: staffing_requirement
+    trigger: "whenever volume_forecast or aht_forecast_seconds changes on an IntervalPlan"
+    algorithm: threshold
+    formula: |
+      interval_seconds = cycle.interval_minutes * 60
+      workload_erlangs = volume_forecast * aht_forecast_seconds / interval_seconds
+
+      # Service-level uplift band, selected by the group's answer-rate target.
+      if   group.service_level_target_pct >= 0.90: sl_uplift = 0.35
+      elif group.service_level_target_pct >= 0.80: sl_uplift = 0.22
+      elif group.service_level_target_pct >= 0.70: sl_uplift = 0.12
+      else:                                        sl_uplift = 0.05
+
+      required_service_level    = ceil(workload_erlangs * (1 + sl_uplift)
+                                       / (1 - group.shrinkage_pct))
+      required_occupancy_capped = ceil(workload_erlangs / group.occupancy_target_pct
+                                       / (1 - group.shrinkage_pct))
+
+      required_agents = SERVICE_LEVEL  -> required_service_level
+                        OCCUPANCY      -> required_occupancy_capped
+                        MAX_OF_BOTH    -> max(required_service_level,
+                                              required_occupancy_capped)
+                        (selected by cycle.requirement_basis)
+
+      coverage_gap    = max(required_agents - effective_scheduled_agents, 0)
+      coverage_state  = COVERED if coverage_gap == 0 else SHORT
+    input_set: "one IntervalPlan at a time; both variants are always stored, the basis only selects which one is authoritative"
+    constants:
+      SL_UPLIFT_BANDS: ">= 0.90 -> 0.35; >= 0.80 -> 0.22; >= 0.70 -> 0.12; else 0.05"
+    precision: "workload_erlangs carried at full precision; both variants are integers produced by ceil() (never round_half_up), so a fractional agent always rounds up"
+    variants:
+      - name: SERVICE_LEVEL_FIRST
+        when: "cycle.requirement_basis == SERVICE_LEVEL; always stored in required_service_level"
+        difference: "Inflates raw workload by the service-level uplift band and ignores the occupancy ceiling entirely, so it dominates when the answer-rate target is aggressive relative to the occupancy target."
+      - name: OCCUPANCY_CAPPED
+        when: "cycle.requirement_basis == OCCUPANCY; always stored in required_occupancy_capped"
+        difference: "Divides raw workload by the occupancy ceiling and ignores the service-level band, so it dominates when occupancy_target_pct is tight; for identical inputs the two variants disagree (e.g. workload 80 erlangs, slt 0.80, occ 0.85, shrinkage 0.30 -> 140 vs 135)."
+
+  - name: interval_allocatable_volume
+    trigger: "whenever volume_forecast, aht_forecast_seconds, effective_scheduled_agents or partner commitment on an IntervalPlan changes"
+    algorithm: aggregation
+    formula: |
+      interval_seconds         = cycle.interval_minutes * 60
+      internal_capacity_volume = floor(effective_scheduled_agents
+                                       * (1 - group.shrinkage_pct)
+                                       * group.occupancy_target_pct
+                                       * interval_seconds
+                                       / aht_forecast_seconds)
+      allocatable_volume       = max(volume_forecast - internal_capacity_volume, 0)
+      partner_committed_volume = sum(alloc.allocated_volume
+                                     for alloc on this interval
+                                     with alloc.status IN {COMMITTED, SETTLED})
+      unserved_volume          = max(allocatable_volume - partner_committed_volume, 0)
+    input_set: "PartnerAllocation rows of this IntervalPlan with status IN {COMMITTED, SETTLED}; PROPOSED and REVOKED rows are excluded, so settling a commitment leaves the interval's committed volume unchanged while revoking releases it"
+    constants: {}
+    precision: "internal_capacity_volume uses floor() (partial capacity never counts); all four fields are integers"
+
+  - name: bid_award_and_preference_honor
+    trigger: "POST /bid-rounds/{bid_round_id}/award"
+    algorithm: waterfall_allocation
+    formula: |
+      # Deterministic bidder order: seniority first (1 is most senior), then the only
+      # sanctioned tie-break over common fields.
+      order = sort(SUBMITTED bids of the round,
+                   key = (agent.seniority_rank ASC, bid.created_at ASC))
+
+      remaining[t] = t.slots_total - t.slots_awarded   for every template of the cycle
+
+      for bid in order:
+        placed = false
+        for idx, tid in enumerate(bid.preference_template_ids):
+          t = template(tid)
+          if t.skill_code in agent.skills and remaining[t] > 0:
+            bid.status = AWARDED
+            bid.awarded_shift_template_id = tid
+            bid.awarded_preference_index  = idx
+            remaining[t] -= 1
+            placed = true
+            break
+        if not placed:
+          bid.status = UNFILLED
+
+      awarded = bids with status == AWARDED after the sweep
+      first_choice = count(b in awarded where b.awarded_preference_index == 0)
+      preference_honor_rate = round_half_up(first_choice / count(awarded), 4)
+                              (null when count(awarded) == 0)
+
+      # Legality gates, evaluated BEFORE any bid or shift is written, in this order:
+      # (1) a run that can place nobody is refused outright, which is also what keeps
+      #     preference_honor_rate from ever being compared while it is null.
+      reject with ERR_TEMPLATE_SLOTS_EXHAUSTED when count(awarded) == 0
+      # (2) the honour floor.
+      floor_pct = min(agreement.preference_honor_floor_pct
+                      over the labor agreements of the awarded bidders)
+      reject with ERR_PREFERENCE_FLOOR_NOT_MET when preference_honor_rate < floor_pct
+    input_set: "ShiftBid rows of the round with status == SUBMITTED; WITHDRAWN bids are skipped; templates are those of the round's planning_cycle_id"
+    constants: {}
+    precision: "preference_honor_rate at 4 decimal places, round_half_up; the floor comparison is >= (a rate exactly equal to the floor is legal)"
+
+  - name: reforecast_smoothing
+    trigger: "POST /planning-cycles/{planning_cycle_id}/reforecast"
+    algorithm: chronological
+    formula: |
+      # Per ForecastGroup of the cycle, replay the posted actuals in time order.
+      s = 1.0
+      for ip in sorted(scored intervals, key = (interval_start ASC, created_at ASC)):
+        ip.observed_ratio = round_half_up(ip.actual_volume / ip.volume_forecast, 4)
+        s = REFORECAST_ALPHA * (ip.actual_volume / ip.volume_forecast) \
+            + (1 - REFORECAST_ALPHA) * s
+        ip.smoothed_ratio = round_half_up(s, 4)
+
+      group.reforecast_multiplier = clamp(round_half_up(s, 4),
+                                          REFORECAST_MULTIPLIER_FLOOR,
+                                          REFORECAST_MULTIPLIER_CEILING)
+
+      # Then re-run interval_volume_forecast / interval_aht_forecast /
+      # staffing_requirement / interval_allocatable_volume for every IntervalPlan of the
+      # group whose interval_start >= effective_from_interval_start, and increment
+      # cycle.reforecast_generation by 1.
+    input_set: |
+      IntervalPlan rows of the group with actual_volume IS NOT NULL, volume_forecast > 0 and
+      interval_start strictly before the request's effective_from_interval_start (only history is
+      smoothed; the forward window is what gets re-forecast). The accumulator is seeded at 1.0 on
+      every run, so the result depends on the chronological order of the intervals, not on the
+      order in which the actuals were posted.
+    constants:
+      REFORECAST_ALPHA: 0.40
+      REFORECAST_MULTIPLIER_FLOOR: 0.50
+      REFORECAST_MULTIPLIER_CEILING: 2.00
+    precision: "observed_ratio, smoothed_ratio and reforecast_multiplier at 4 decimal places, round_half_up; the accumulator itself is carried at full precision between steps and rounded only when stored"
+
+  - name: partner_allocation_waterfall
+    trigger: "POST /partner-allocations/generate"
+    algorithm: waterfall_allocation
+    formula: |
+      remaining = interval.allocatable_volume - interval.partner_committed_volume
+      candidates = sort(eligible partners,
+                        key = (rate_per_contact_millicents ASC, created_at ASC))
+
+      for p in candidates:
+        if remaining <= 0: break
+        cap  = p.interval_max_volume        if p.status == ACTIVE
+               p.commitment_floor_volume    if p.status == PROBATION
+        take = min(cap, remaining)
+        if take < p.commitment_floor_volume:
+          continue          # cannot honour the contractual minimum -> skip this partner
+        create PartnerAllocation(status = PROPOSED, allocated_volume = take,
+                                 proposed_by_user_id = acting X-User-ID)
+        remaining -= take
+
+      output: the PartnerAllocation rows created, in the order the waterfall created them
+              (empty array when no candidate qualifies)
+    input_set: "OutsourcePartner rows with status IN {ACTIVE, PROBATION} whose skill_codes contains the interval's group skill_code; SUSPENDED partners are excluded"
+    constants: {}
+    precision: "integer volumes; the cheapest partner fills to its cap before the next is considered; the trailing remainder is left unallocated and stays visible in interval.unserved_volume"
+
+  - name: partner_settlement
+    trigger: "POST /partner-allocations/{partner_allocation_id}/settle"
+    algorithm: aggregation
+    formula: |
+      # PER-LINE rounding: each allocation is rounded to whole cents on its own, and
+      # partner.invoice_total_cents is the integer sum of those already-rounded lines.
+      # Summing millicents across lines and rounding once at the end is FORBIDDEN.
+      line_cents(v) = round_half_up(v * partner.rate_per_contact_millicents / 1000, 0)
+
+      settlement_floor_cents     = round_half_up(allocated_volume
+                                     * partner.rate_per_contact_millicents / 1000, 0)
+      settlement_delivered_cents = round_half_up(delivered_volume
+                                     * partner.rate_per_contact_millicents / 1000, 0)
+      shortfall_penalty_cents    = round_half_up(max(allocated_volume - delivered_volume, 0)
+                                     * partner.rate_per_contact_millicents
+                                     * SHORTFALL_PENALTY_RATE / 1000, 0)
+
+      settlement_amount_cents =
+        COMMITMENT_FLOOR -> settlement_floor_cents
+        DELIVERED_ONLY   -> settlement_delivered_cents - shortfall_penalty_cents
+        (selected by partner.billing_basis)
+
+      partner.invoice_total_cents += settlement_amount_cents
+    input_set: "one PartnerAllocation in status COMMITTED; partner.invoice_total_cents aggregates only allocations in status SETTLED"
+    constants:
+      SHORTFALL_PENALTY_RATE: 0.25
+    precision: "every cents field is an integer produced by round_half_up at 0 decimal places on its own line before any summation"
+    variants:
+      - name: COMMITMENT_FLOOR
+        when: "partner.billing_basis == COMMITMENT_FLOOR"
+        difference: "Bills the committed volume regardless of delivery, so under-delivery costs the buyer full price and no penalty is credited."
+      - name: DELIVERED_ONLY
+        when: "partner.billing_basis == DELIVERED_ONLY"
+        difference: "Bills only what was handled and further credits a 25% shortfall penalty, so identical data diverges (allocated 41, delivered 30, rate 12500 millicents -> 513 vs 341)."
+
+  - name: overtime_cost_tiered
+    trigger: "POST /intraday-actions/{intraday_action_id}/response with response=ACCEPT on a kind == OT_OFFER action"
+    algorithm: tiered_pricing
+    formula: |
+      # The tier is chosen from the cycle's PRE-acceptance committed spend. The action being
+      # accepted does not raise its own tier, and the tier is frozen on the action so a later
+      # revoke subtracts exactly what the acceptance added.
+      pre = cycle.ot_spend_committed_cents          # BEFORE this acceptance
+      if   pre <  OT_TIER_1_CEILING_CENTS: tier_multiplier = 1.50   # TIER_1
+      elif pre <  OT_TIER_2_CEILING_CENTS: tier_multiplier = 1.75   # TIER_2
+      else:                                tier_multiplier = 2.00   # TIER_3
+
+      ot_multiplier_applied = tier_multiplier * agreement.ot_premium_multiplier
+      cost_cents = round_half_up(action.hours
+                                 * agent.hourly_rate_cents
+                                 * tier_multiplier
+                                 * agreement.ot_premium_multiplier, 0)
+
+      # Budget gate, evaluated with the freshly computed cost:
+      reject with ERR_OT_BUDGET_EXCEEDED when
+        cycle.ot_spend_committed_cents + cost_cents > cycle.ot_budget_cents
+    input_set: "IntradayAction rows of the cycle with kind == OT_OFFER and status == ACCEPTED feed cycle.ot_spend_committed_cents; OFFERED, DECLINED, EXPIRED and REVOKED actions contribute 0"
+    constants:
+      OT_TIER_1_CEILING_CENTS: 20000
+      OT_TIER_2_CEILING_CENTS: 60000
+      OT_TIER_MULTIPLIERS: { TIER_1: 1.50, TIER_2: 1.75, TIER_3: 2.00 }
+    precision: "cost_cents is an integer, round_half_up at 0 decimal places; the tier boundaries are strict `<` so a pre-state of exactly 20000 lands in TIER_2"
+
+  - name: shift_adherence_score
+    trigger: "every adherence observation on the shift and every APPROVED AdherenceException against it"
+    algorithm: weighted_scoring
+    formula: |
+      scheduled_seconds = (end_at - start_at) in seconds - unpaid_break_seconds
+      adherence_pct = round_half_up(
+                        (scheduled_seconds - out_of_adherence_seconds + excused_seconds)
+                        / scheduled_seconds, 4)
+      # clamped into [0.0000, 1.0000]
+
+      flagged = (publication_status == PUBLISHED
+                 and adherence_status == OUT_OF_ADHERENCE
+                 and adherence_pct < COACHING_ADHERENCE_THRESHOLD)
+    input_set: "a single ScheduleShift; excused_seconds is the sum of duration_seconds over APPROVED AdherenceException rows recorded since the last observation (a fresh observation resets it to 0)"
+    constants:
+      COACHING_ADHERENCE_THRESHOLD: 0.8500
+    precision: "4 decimal places, round_half_up; the flag comparison is strict `<`, so an adherence_pct of exactly 0.8500 is NOT flagged"
+
+  - name: agent_adherence_score
+    trigger: "every change to any of the agent's shift adherence values and every publication change that adds a shift to or removes a shift from the scored set"
+    algorithm: weighted_scoring
+    formula: |
+      # Seconds-weighted across the agent's scored shifts, NOT a mean of percentages.
+      num = sum(s.scheduled_seconds - s.out_of_adherence_seconds + s.excused_seconds)
+      den = sum(s.scheduled_seconds)
+      agent.adherence_pct = 1.0000 if den == 0 else round_half_up(num / den, 4)
+
+      agent.coaching_flag_count = count(scored shifts where the shift is flagged)
+      agent.coaching_status     = COACHING_ACTIVE  when coaching_flag_count >= 1
+                                  CLEARED          when coaching_flag_count drops to 0
+                                                   from COACHING_ACTIVE
+                                  NONE             when it has never been flagged
+    input_set: "the agent's ScheduleShift rows with publication_status == PUBLISHED and adherence_status != PENDING; DRAFT and CANCELLED shifts and unobserved shifts are excluded"
+    constants:
+      COACHING_ADHERENCE_THRESHOLD: 0.8500
+    precision: "4 decimal places, round_half_up, applied once to the pooled ratio so per-shift rounding never accumulates"
+
+  - name: partner_rolling_performance
+    trigger: "POST /outsource-partners/{outsource_partner_id}/performance-reports"
+    algorithm: aggregation
+    formula: |
+      window = last PARTNER_PERFORMANCE_WINDOW entries of latest_sl_attainment_pcts,
+               in append order (fewer than the window size uses everything present)
+      rolling_sl_attainment_pct = round_half_up(sum(window) / count(window), 4)
+
+      breach = rolling_sl_attainment_pct < performance_threshold_pct
+      consecutive_breach_count = consecutive_breach_count + 1 if breach else 0
+      status: ACTIVE -> PROBATION on the first breach
+              PROBATION -> SUSPENDED when consecutive_breach_count reaches 2
+              PROBATION -> ACTIVE on a non-breaching report
+    input_set: "the append-only latest_sl_attainment_pcts list on one OutsourcePartner, truncated to its trailing window"
+    constants:
+      PARTNER_PERFORMANCE_WINDOW: 3
+    precision: "4 decimal places, round_half_up; the breach comparison is strict `<`, so attainment exactly equal to performance_threshold_pct is compliant"
+
+  - name: hiring_class_ramp_fte
+    trigger: "HiringClass creation and every HiringClass status transition"
+    algorithm: threshold
+    formula: |
+      expected_graduates   = floor(seats * (1 - expected_attrition_pct))
+      nesting_from_date    = start_date + training_weeks * 7 days
+      productive_from_date = start_date + (training_weeks + nesting_weeks) * 7 days
+      d                    = cycle.horizon_end_date
+
+      if   d <  nesting_from_date:    effective_fte_at_horizon_end = 0.00
+      elif d <  productive_from_date: effective_fte_at_horizon_end =
+                                        round_half_up(expected_graduates
+                                                      * NESTING_PRODUCTIVITY, 2)
+      else:                           effective_fte_at_horizon_end =
+                                        round_half_up(expected_graduates, 2)
+    input_set: "a single HiringClass, evaluated against its cycle's horizon_end_date"
+    constants:
+      NESTING_PRODUCTIVITY: 0.50
+    precision: "expected_graduates uses floor(); effective_fte_at_horizon_end at 2 decimal places, round_half_up; the date comparisons are strict `<` so a horizon_end_date exactly equal to productive_from_date counts as fully productive"
+
+  - name: cycle_headcount_and_pipeline
+    trigger: "every ScheduleShift publication change, Agent status change and HiringClass status change"
+    algorithm: aggregation
+    formula: |
+      headcount_active = count(distinct a in Agent where a.status == ACTIVE and (
+                           exists ScheduleShift s with s.agent_id == a.id
+                             and s.planning_cycle_id == cycle.id
+                             and s.publication_status IN {DRAFT, PUBLISHED}
+                           or a.hiring_class_id references a HiringClass h with
+                             h.planning_cycle_id == cycle.id and h.status == GRADUATED))
+
+      pipeline_fte = round_half_up(sum(h.effective_fte_at_horizon_end
+                                       for h of this cycle
+                                       with h.status IN {CHARTERED, IN_TRAINING}), 2)
+
+      total_scheduled_hours = round_half_up(sum(s.paid_hours
+                                                for s of this cycle
+                                                with s.publication_status == PUBLISHED), 2)
+    input_set: "Agent, ScheduleShift and HiringClass rows tied to this PlanningCycle; a GRADUATED class leaves pipeline_fte and its graduates enter headcount_active in the same request"
+    constants: {}
+    precision: "headcount_active is an integer count of distinct agents; pipeline_fte and total_scheduled_hours at 2 decimal places, round_half_up"
+
+# =============================================================================
+# 1.4 Validation Rules Table (Ordered by Priority)
+# =============================================================================
+validations:
+  - priority: 10
+    category: auth
+    check: "X-User-Role and X-User-ID headers are present and X-User-Role names a role declared in §1.7"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 20
+    category: auth
+    check: "the acting role appears in the endpoint's roles list"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 25
+    category: business_constraint
+    check: "request body shape: required fields present, types and enum members valid, numeric ranges and array-length constraints from §1.1 satisfied (including intraday_curve length vs the group's operating window, dow_multipliers length 7, hours a multiple of 0.5, and the exactly-one-of rule between forecast_group_id and channel_scope on MarketingEvent)"
+    error_id: ERR_VALIDATION
+    http_status: 422
+    applies_to: "all write endpoints"
+
+  - priority: 28
+    category: business_constraint
+    check: "pagination params are integers within limit 1..100 and offset >= 0"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 400
+    applies_to: "all list endpoints"
+
+  - priority: 30
+    category: existence
+    check: "every path-templated id resolves to an existing row, validated left to right"
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with path parameters"
+
+  - priority: 40
+    category: existence
+    check: "every FK supplied in the body resolves to an existing row, validated in the field order declared in §1.1"
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all write endpoints carrying FK fields"
+
+  - priority: 50
+    category: auth
+    check: "role Agent may act only on its own resources: ShiftBid.agent_id, AdherenceException.agent_id and IntradayAction.agent_id must equal the acting X-User-ID; role PartnerRep may read only rows whose outsource_partner_id equals the acting X-User-ID"
+    error_id: ERR_OWNERSHIP_VIOLATION
+    http_status: 403
+    applies_to: "POST /shift-bids, POST /shift-bids/{shift_bid_id}/withdraw, POST /adherence-exceptions, POST /adherence-exceptions/{adherence_exception_id}/resubmit, POST /intraday-actions/{intraday_action_id}/response, GET /partner-allocations"
+
+  - priority: 60
+    category: auth
+    check: "segregation of duties on operator identity: the TeamCoach deciding an AdherenceException must not equal the shift's flagged_by_user_id, and the SourcingManager committing a PartnerAllocation must not equal its proposed_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /adherence-exceptions/{adherence_exception_id}/decision, POST /partner-allocations/{partner_allocation_id}/commit"
+
+  - priority: 65
+    category: state
+    check: "the supplied expected_<parent>_version equals the parent's current version (see §1.2.1)"
+    error_id: "ERR_STALE_CYCLE_VERSION | ERR_STALE_PARTNER_VERSION"
+    http_status: 412
+    applies_to: "POST /planning-cycles/{planning_cycle_id}/reforecast, POST /partner-allocations/{partner_allocation_id}/commit"
+
+  - priority: 70
+    category: state
+    check: "the PlanningCycle reachable from the target resource has posture != FROZEN"
+    error_id: ERR_CYCLE_FROZEN
+    http_status: 409
+    applies_to: "every write endpoint whose target resource resolves to a PlanningCycle"
+
+  - priority: 80
+    category: state
+    check: "the target resource's own state permits the requested transition, per §1.2 (bid round status, bid status, publication_status, adherence_status, exception status, action status, partner status, allocation status, hiring class status, agent status)"
+    error_id: "ERR_INVALID_STATE | ERR_BID_ROUND_NOT_OPEN | ERR_ALLOCATION_NOT_COMMITTED | ERR_SHIFT_NOT_PUBLISHED | ERR_EXCEPTION_NOT_PENDING | ERR_ACTION_NOT_OFFERED"
+    http_status: 409
+    applies_to: "all state-transition endpoints"
+
+  - priority: 90
+    category: state
+    check: "cross-entity posture gate: publishing a ScheduleShift requires cycle.posture IN {REQUIREMENTS_LOCKED, SCHEDULE_PUBLISHED, INTRADAY_ALERT}; generating IntervalPlan rows, creating ForecastGroup rows and reverting the posture to OPEN require cycle.posture == OPEN"
+    error_id: "ERR_CYCLE_NOT_LOCKED | ERR_CYCLE_NOT_OPEN"
+    http_status: 409
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication, POST /forecast-groups, POST /forecast-groups/{forecast_group_id}/interval-plans"
+
+  - priority: 100
+    category: business_safety
+    check: "the reopen would exceed the round's max_reopen_count"
+    error_id: ERR_REOPEN_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /bid-rounds/{bid_round_id}/status"
+
+  - priority: 110
+    category: business_safety
+    check: "rest between the end of one shift and the start of the agent's next NON-OVERLAPPING shift is >= agreement.min_rest_hours (equality passes); a neighbour whose half-open window overlaps this one is skipped here and refused by the overlap rule at priority 115, so ERR_SHIFT_OVERLAP is always reachable"
+    error_id: ERR_MIN_REST_VIOLATION
+    http_status: 422
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication, POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 115
+    category: business_safety
+    check: "the agent holds no other non-CANCELLED shift whose half-open window [start_at, end_at) overlaps this one"
+    error_id: ERR_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication, POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 120
+    category: business_safety
+    check: "agent.scheduled_hours_committed after the additive change is <= agreement.max_weekly_hours"
+    error_id: ERR_MAX_WEEKLY_HOURS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication, POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 125
+    category: business_safety
+    check: "the agent's longest run of consecutive service dates carrying a non-CANCELLED shift stays <= agreement.max_consecutive_days"
+    error_id: ERR_MAX_CONSECUTIVE_DAYS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication"
+
+  - priority: 130
+    category: business_temporal
+    check: "the logical clock is strictly before the action's expires_at"
+    error_id: ERR_ACTION_EXPIRED
+    http_status: 409
+    applies_to: "POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 135
+    category: business_temporal
+    check: "temporal window sanity: service_date falls inside [cycle.horizon_start_date, cycle.horizon_end_date]; a MarketingEvent window is non-empty (window_end strictly after window_start); a reforecast's effective_from_interval_start falls inside the horizon"
+    error_id: "ERR_INTERVAL_OUTSIDE_HORIZON | ERR_EVENT_WINDOW_INVALID"
+    http_status: 422
+    applies_to: "POST /forecast-groups/{forecast_group_id}/interval-plans, POST /schedule-shifts, POST /marketing-events, POST /planning-cycles/{planning_cycle_id}/reforecast"
+
+  - priority: 140
+    category: business_temporal
+    check: "for a VTO_OFFER acceptance, (shift.start_at - now) in hours is >= agreement.vto_min_notice_hours"
+    error_id: ERR_VTO_NOTICE_TOO_SHORT
+    http_status: 422
+    applies_to: "POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 150
+    category: business_referential
+    check: "skill compatibility: the template's skill_code is a member of the agent's skills for a publication or a bid; the target group's skill_code is a member of the agent's skills for an OT_OFFER"
+    error_id: ERR_SKILL_MISMATCH
+    http_status: 422
+    applies_to: "POST /schedule-shifts/{schedule_shift_id}/publication, POST /shift-bids, POST /intraday-actions"
+
+  - priority: 155
+    category: business_referential
+    check: "the referenced OutsourcePartner has status != SUSPENDED and its skill_codes contains the interval's group skill_code"
+    error_id: ERR_PARTNER_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "POST /partner-allocations, POST /partner-allocations/{partner_allocation_id}/commit"
+
+  - priority: 160
+    category: business_constraint
+    check: "the award run places at least one bid: some template in some SUBMITTED bidder's preference list still has slots_awarded < slots_total and matches that bidder's skills. A run that can place nobody is refused before anything is written"
+    error_id: ERR_TEMPLATE_SLOTS_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /bid-rounds/{bid_round_id}/award"
+
+  - priority: 165
+    category: business_constraint
+    check: "the agent has no other non-WITHDRAWN ShiftBid in the same round"
+    error_id: ERR_DUPLICATE_BID
+    http_status: 409
+    applies_to: "POST /shift-bids"
+
+  - priority: 170
+    category: business_constraint
+    check: "IntervalPlan rows for this forecast_group_id and service_date do not already exist"
+    error_id: ERR_DUPLICATE_INTERVALS
+    http_status: 409
+    applies_to: "POST /forecast-groups/{forecast_group_id}/interval-plans"
+
+  - priority: 175
+    category: business_constraint
+    check: "the award run's preference_honor_rate is >= the strictest preference_honor_floor_pct among the awarded bidders' labor agreements"
+    error_id: ERR_PREFERENCE_FLOOR_NOT_MET
+    http_status: 422
+    applies_to: "POST /bid-rounds/{bid_round_id}/award"
+
+  - priority: 180
+    category: business_constraint
+    check: "accepting a VTO_OFFER must not push any IntervalPlan the shift covers from COVERED to SHORT"
+    error_id: ERR_VTO_WOULD_BREACH_COVERAGE
+    http_status: 409
+    applies_to: "POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 185
+    category: business_constraint
+    check: "a ROUTING_ADJUSTMENT's agents_shifted is <= the source interval's effective_scheduled_agents"
+    error_id: ERR_ROUTING_OUTFLOW_EXCEEDS_STAFFING
+    http_status: 422
+    applies_to: "POST /intraday-actions"
+
+  - priority: 190
+    category: business_constraint
+    check: "aggregate interval capacity: interval.partner_committed_volume + allocated_volume is <= interval.allocatable_volume"
+    error_id: ERR_ALLOCATION_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /partner-allocations/{partner_allocation_id}/commit"
+
+  - priority: 195
+    category: business_constraint
+    check: "allocated_volume is >= partner.commitment_floor_volume and <= the partner's applicable interval cap (interval_max_volume when ACTIVE, commitment_floor_volume when on PROBATION)"
+    error_id: ERR_PARTNER_VOLUME_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /partner-allocations, POST /partner-allocations/{partner_allocation_id}/commit"
+
+  - priority: 200
+    category: business_fiscal
+    check: "cycle.ot_spend_committed_cents + the newly computed cost_cents is <= cycle.ot_budget_cents"
+    error_id: ERR_OT_BUDGET_EXCEEDED
+    http_status: 402
+    applies_to: "POST /intraday-actions/{intraday_action_id}/response"
+
+  - priority: 205
+    category: business_fiscal
+    check: "for a COMMITMENT_FLOOR partner, delivered_volume is >= partner.commitment_floor_volume at settlement"
+    error_id: ERR_COMMITMENT_FLOOR_BREACH
+    http_status: 409
+    applies_to: "POST /partner-allocations/{partner_allocation_id}/settle"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- test-driving surface -------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Sets the server's logical clock, which every deadline, expiry, notice and window rule reads. Before the first call the logical clock reads exactly 2026-08-01T00:00:00Z and never falls back to real wall-clock time."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager]
+    code: 200
+    input: ["to_iso8601"]
+    output: { current_utc: datetime, previous_utc: datetime }
+    side_effects:
+      - "no entity is mutated; subsequent requests evaluate every temporal rule against the new instant"
+
+  # ---- PlanningCycle -------------------------------------------------------
+  - method: POST
+    path: "/planning-cycles"
+    description: "Opens a planning cycle for one seven-day horizon."
+    roles: [CapacityPlanner]
+    code: 201
+    input: ["name", "horizon_start_date", "horizon_end_date", "interval_minutes?", "requirement_basis?", "ot_budget_cents?", "intraday_alert_short_threshold?"]
+    output: PlanningCycle
+    side_effects:
+      - "posture initialised to OPEN, version to 1, every computed aggregate to its zero value"
+
+  - method: GET
+    path: "/planning-cycles/{planning_cycle_id}"
+    description: "Reads one planning cycle including every derived aggregate and the current version."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: []
+    output: PlanningCycle
+    side_effects: []
+
+  - method: GET
+    path: "/planning-cycles"
+    description: "Lists planning cycles."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: ["posture?", "limit?", "offset?"]
+    output: PlanningCycle[]
+    side_effects: []
+
+  - method: POST
+    path: "/planning-cycles/{planning_cycle_id}/posture"
+    description: "Drives the cycle posture state machine (REQUIREMENTS_LOCKED, the OPEN revert, SCHEDULE_PUBLISHED, FROZEN)."
+    roles: [CapacityPlanner, SchedulingManager]
+    code: 200
+    input: ["target_posture"]
+    output: PlanningCycle
+    side_effects:
+      - "runs the PlanningCycle transition declared in §1.2 for the requested target"
+      - "recomputes short_interval_count and stamps requirements_locked_at / published_at on first entry"
+      - "increments PlanningCycle.version by 1"
+
+  - method: POST
+    path: "/planning-cycles/{planning_cycle_id}/reforecast"
+    description: "Runs calculations.reforecast_smoothing over posted actuals and re-forecasts every interval at or after effective_from_interval_start. Guarded by OCC on the cycle version (concurrency_rules[reforecast-stale-cycle])."
+    roles: [WorkforceAnalyst, CapacityPlanner]
+    code: 200
+    input: ["expected_cycle_version", "effective_from_interval_start", "forecast_group_id?"]
+    output: PlanningCycle
+    side_effects:
+      - "recomputes ForecastGroup.reforecast_multiplier and IntervalPlan.observed_ratio / smoothed_ratio"
+      - "re-runs interval_volume_forecast, interval_aht_forecast, staffing_requirement and interval_allocatable_volume for the forward window"
+      - "increments reforecast_generation by 1 and recomputes short_interval_count, then evaluates the SCHEDULE_PUBLISHED <-> INTRADAY_ALERT posture edges"
+      - "increments PlanningCycle.version by 1"
+
+  - method: GET
+    path: "/planning-cycles/{planning_cycle_id}/coverage-summary"
+    description: "Computed read: cycle-wide coverage and outsourcing rollup derived from every IntervalPlan of the cycle."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, SourcingManager]
+    code: 200
+    input: ["service_date?"]
+    output: { planning_cycle_id: string, posture: enum, interval_count: integer, short_interval_count: integer, total_required_agents: integer, total_effective_scheduled_agents: integer, total_coverage_gap: integer, total_allocatable_volume: integer, total_partner_committed_volume: integer, total_unserved_volume: integer }
+    side_effects: []
+
+  # ---- LaborAgreement ------------------------------------------------------
+  - method: POST
+    path: "/labor-agreements"
+    description: "Registers a labor agreement carrying the rest, weekly-hours, consecutive-day, VTO-notice and preference-honor ceilings."
+    roles: [CapacityPlanner]
+    code: 201
+    input: ["code", "min_rest_hours", "max_weekly_hours", "max_consecutive_days", "vto_min_notice_hours", "preference_honor_floor_pct", "ot_premium_multiplier?"]
+    output: LaborAgreement
+    side_effects: []
+
+  - method: GET
+    path: "/labor-agreements/{labor_agreement_id}"
+    description: "Reads one labor agreement."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: []
+    output: LaborAgreement
+    side_effects: []
+
+  - method: GET
+    path: "/labor-agreements"
+    description: "Lists labor agreements."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: ["code?", "limit?", "offset?"]
+    output: LaborAgreement[]
+    side_effects: []
+
+  # ---- ForecastGroup -------------------------------------------------------
+  - method: POST
+    path: "/forecast-groups"
+    description: "Creates a channel/skill forecast group inside an OPEN cycle."
+    roles: [WorkforceAnalyst]
+    code: 201
+    input: ["planning_cycle_id", "channel", "skill_code", "base_daily_volume", "base_aht_seconds", "operating_start_minute", "operating_end_minute", "intraday_curve", "dow_multipliers", "service_level_target_pct", "service_level_seconds", "occupancy_target_pct", "shrinkage_pct"]
+    output: ForecastGroup
+    side_effects:
+      - "reforecast_multiplier initialised to 1.0000 and interval_count to 0"
+
+  - method: GET
+    path: "/forecast-groups/{forecast_group_id}"
+    description: "Reads one forecast group."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: []
+    output: ForecastGroup
+    side_effects: []
+
+  - method: GET
+    path: "/forecast-groups"
+    description: "Lists forecast groups, filterable by cycle, channel or skill."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, SourcingManager, Agent]
+    code: 200
+    input: ["planning_cycle_id?", "channel?", "skill_code?", "limit?", "offset?"]
+    output: ForecastGroup[]
+    side_effects: []
+
+  - method: POST
+    path: "/forecast-groups/{forecast_group_id}/interval-plans"
+    description: "Generates the full interval grid for one service_date across the group's operating window, returned in interval_index order."
+    roles: [WorkforceAnalyst]
+    code: 201
+    input: ["service_date"]
+    output: IntervalPlan[]
+    side_effects:
+      - "creates (operating_end_minute - operating_start_minute) / cycle.interval_minutes IntervalPlan rows"
+      - "runs interval_volume_forecast, interval_aht_forecast, staffing_requirement and interval_allocatable_volume on each row"
+      - "recomputes group.interval_count and cycle.short_interval_count"
+
+  # ---- MarketingEvent ------------------------------------------------------
+  - method: POST
+    path: "/marketing-events"
+    description: "Registers a marketing driver, either scoped to one forecast group or to every group of a channel."
+    roles: [WorkforceAnalyst]
+    code: 201
+    input: ["planning_cycle_id", "name", "uplift_pct", "confidence_tier", "window_start", "window_end", "forecast_group_id?", "channel_scope?", "supersedes_event_id?"]
+    output: MarketingEvent
+    side_effects:
+      - "status initialised to DRAFT and weighted_uplift_pct computed; a DRAFT event perturbs no interval"
+
+  - method: GET
+    path: "/marketing-events/{marketing_event_id}"
+    description: "Reads one marketing event."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, SourcingManager]
+    code: 200
+    input: []
+    output: MarketingEvent
+    side_effects: []
+
+  - method: GET
+    path: "/marketing-events"
+    description: "Lists marketing events, filterable by cycle, group, superseded event or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, SourcingManager]
+    code: 200
+    input: ["planning_cycle_id?", "forecast_group_id?", "supersedes_event_id?", "status?", "limit?", "offset?"]
+    output: MarketingEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/marketing-events/{marketing_event_id}/status"
+    description: "Drives the MarketingEvent lifecycle; CONFIRMED is what injects the confidence-weighted uplift into the forecast cascade."
+    roles: [WorkforceAnalyst]
+    code: 200
+    input: ["target_status"]
+    output: MarketingEvent
+    side_effects:
+      - "on CONFIRMED: recomputes every in-scope overlapping IntervalPlan (volume, aht, both staffing variants, coverage, capacity), then cycle.short_interval_count and the posture edges"
+      - "on CONFIRMED with supersedes_event_id set: cancels the superseded CONFIRMED event and drops its uplift in the same request"
+      - "on CANCELLED from CONFIRMED: reverses the uplift across the same intervals and re-evaluates the posture edges"
+
+  # ---- IntervalPlan --------------------------------------------------------
+  - method: GET
+    path: "/interval-plans/{interval_plan_id}"
+    description: "Reads one interval plan with every forecast, requirement, coverage and outsourcing field."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, SourcingManager, TeamCoach]
+    code: 200
+    input: []
+    output: IntervalPlan
+    side_effects: []
+
+  - method: GET
+    path: "/interval-plans"
+    description: "Lists interval plans, filterable by group, service date or coverage state."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, SourcingManager, TeamCoach]
+    code: 200
+    input: ["forecast_group_id?", "service_date?", "coverage_state?", "limit?", "offset?"]
+    output: IntervalPlan[]
+    side_effects: []
+
+  - method: POST
+    path: "/interval-plans/{interval_plan_id}/actuals"
+    description: "Posts observed volume and handle time for an interval; the input the reforecast smoother replays."
+    roles: [IntradayController, WorkforceAnalyst]
+    code: 200
+    input: ["actual_volume", "actual_aht_seconds"]
+    output: IntervalPlan
+    side_effects:
+      - "stores actual_volume, actual_aht_seconds and observed_ratio; the group multiplier is NOT touched until a reforecast run"
+
+  # ---- Agent ---------------------------------------------------------------
+  - method: POST
+    path: "/agents"
+    description: "Registers an agent under a labor agreement."
+    roles: [SchedulingManager]
+    code: 201
+    input: ["labor_agreement_id", "employee_code", "full_name", "skills", "seniority_rank", "weekly_contracted_hours", "hourly_rate_cents"]
+    output: Agent
+    side_effects:
+      - "status initialised to ACTIVE, adherence_pct to 1.0000, coaching_status to NONE"
+      - "recomputes agreement.enrolled_agent_count"
+
+  - method: GET
+    path: "/agents/{agent_id}"
+    description: "Reads one agent including adherence and coaching rollups."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: Agent
+    side_effects: []
+
+  - method: GET
+    path: "/agents"
+    description: "Lists agents, filterable by labor agreement, hiring class or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["labor_agreement_id?", "hiring_class_id?", "status?", "skill_code?", "limit?", "offset?"]
+    output: Agent[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/agents/{agent_id}"
+    description: "Updates an agent's employment state or attributes; drives the Agent state machine when target_status is supplied."
+    roles: [SchedulingManager]
+    code: 200
+    input: ["target_status?", "skills?", "seniority_rank?", "hourly_rate_cents?"]
+    output: Agent
+    side_effects:
+      - "runs the Agent transition declared in §1.2 when target_status is supplied"
+      - "recomputes agreement.enrolled_agent_count and cycle.headcount_active"
+
+  # ---- ShiftTemplate -------------------------------------------------------
+  - method: POST
+    path: "/shift-templates"
+    description: "Defines a biddable shift pattern inside a cycle."
+    roles: [SchedulingManager]
+    code: 201
+    input: ["planning_cycle_id", "code", "skill_code", "start_time_local", "duration_minutes", "days_of_week", "slots_total", "unpaid_break_minutes?"]
+    output: ShiftTemplate
+    side_effects:
+      - "slots_awarded initialised to 0"
+
+  - method: GET
+    path: "/shift-templates/{shift_template_id}"
+    description: "Reads one shift template."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: ShiftTemplate
+    side_effects: []
+
+  - method: GET
+    path: "/shift-templates"
+    description: "Lists shift templates, filterable by cycle or skill."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["planning_cycle_id?", "skill_code?", "limit?", "offset?"]
+    output: ShiftTemplate[]
+    side_effects: []
+
+  # ---- BidRound ------------------------------------------------------------
+  - method: POST
+    path: "/bid-rounds"
+    description: "Opens a shift-bidding round for a cycle."
+    roles: [SchedulingManager]
+    code: 201
+    input: ["planning_cycle_id", "code", "max_reopen_count?"]
+    output: BidRound
+    side_effects:
+      - "status initialised to DRAFT and reopen_count to 0"
+
+  - method: GET
+    path: "/bid-rounds/{bid_round_id}"
+    description: "Reads one bid round including preference_honor_rate and reopen_count."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: BidRound
+    side_effects: []
+
+  - method: GET
+    path: "/bid-rounds"
+    description: "Lists bid rounds, filterable by cycle or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["planning_cycle_id?", "status?", "limit?", "offset?"]
+    output: BidRound[]
+    side_effects: []
+
+  - method: POST
+    path: "/bid-rounds/{bid_round_id}/status"
+    description: "Drives the BidRound lifecycle, including the AWARDED -> OPEN reopen edge bounded by max_reopen_count."
+    roles: [SchedulingManager]
+    code: 200
+    input: ["target_status"]
+    output: BidRound
+    side_effects:
+      - "runs the BidRound transition declared in §1.2 for the requested target"
+      - "on a reopen: increments reopen_count, resets every AWARDED / UNFILLED bid to SUBMITTED, cancels the DRAFT shifts the round minted, and clears preference_honor_rate, awarded_bid_count, unfilled_bid_count and template.slots_awarded"
+
+  - method: POST
+    path: "/bid-rounds/{bid_round_id}/award"
+    description: "Runs calculations.bid_award_and_preference_honor over the round's SUBMITTED bids and mints the resulting DRAFT shifts."
+    roles: [SchedulingManager]
+    code: 200
+    input: []
+    output: BidRound
+    side_effects:
+      - "sets each winning bid to AWARDED with awarded_shift_template_id and awarded_preference_index, and each loser to UNFILLED"
+      - "mints one DRAFT ScheduleShift per awarded bid per in-horizon template day_of_week"
+      - "recomputes template.slots_awarded, awarded_bid_count, unfilled_bid_count and preference_honor_rate"
+      - "rejects the whole run with ERR_PREFERENCE_FLOOR_NOT_MET before writing anything when the honor rate is below the strictest applicable floor"
+
+  # ---- ShiftBid ------------------------------------------------------------
+  - method: POST
+    path: "/shift-bids"
+    description: "Submits an agent's ranked preference list into an OPEN round."
+    roles: [Agent]
+    code: 201
+    input: ["bid_round_id", "agent_id", "preference_template_ids"]
+    output: ShiftBid
+    side_effects:
+      - "status initialised to SUBMITTED with awarded_shift_template_id and awarded_preference_index null"
+
+  - method: GET
+    path: "/shift-bids/{shift_bid_id}"
+    description: "Reads one bid."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: ShiftBid
+    side_effects: []
+
+  - method: GET
+    path: "/shift-bids"
+    description: "Lists bids, filterable by round, bidder, awarded template or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["bid_round_id?", "agent_id?", "awarded_shift_template_id?", "status?", "limit?", "offset?"]
+    output: ShiftBid[]
+    side_effects: []
+
+  - method: POST
+    path: "/shift-bids/{shift_bid_id}/withdraw"
+    description: "Withdraws the acting agent's own bid while the round is still OPEN."
+    roles: [Agent]
+    code: 200
+    input: []
+    output: ShiftBid
+    side_effects:
+      - "status set to WITHDRAWN; the bid is skipped by every later award run"
+
+  # ---- ScheduleShift -------------------------------------------------------
+  - method: POST
+    path: "/schedule-shifts"
+    description: "Creates a DRAFT shift directly (the manual counterpart of the award cascade)."
+    roles: [SchedulingManager]
+    code: 201
+    input: ["planning_cycle_id", "agent_id", "shift_template_id", "service_date"]
+    output: ScheduleShift
+    side_effects:
+      - "derives start_at, end_at, unpaid_break_seconds and scheduled_seconds from the template"
+      - "publication_status initialised to DRAFT and adherence_status to PENDING; a DRAFT shift contributes nothing to coverage"
+
+  - method: GET
+    path: "/schedule-shifts/{schedule_shift_id}"
+    description: "Reads one shift with both state axes and every adherence field."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: ScheduleShift
+    side_effects: []
+
+  - method: GET
+    path: "/schedule-shifts"
+    description: "Lists shifts, filterable by cycle, agent, template, service date or either state axis."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["planning_cycle_id?", "agent_id?", "shift_template_id?", "service_date?", "publication_status?", "adherence_status?", "limit?", "offset?"]
+    output: ScheduleShift[]
+    side_effects: []
+
+  - method: POST
+    path: "/schedule-shifts/{schedule_shift_id}/publication"
+    description: "Moves the shift along its publication axis (DRAFT -> PUBLISHED -> CANCELLED); the adherence axis is untouched."
+    roles: [SchedulingManager]
+    code: 200
+    input: ["target_publication_status"]
+    output: ScheduleShift
+    side_effects:
+      - "runs the ScheduleShift publication transition declared in §1.2, including every labor-agreement safety check"
+      - "recomputes agent.scheduled_hours_committed, cycle.total_scheduled_hours and cycle.headcount_active"
+      - "recomputes scheduled_agents, effective_scheduled_agents, coverage_gap, coverage_state, internal_capacity_volume, allocatable_volume and unserved_volume on every covered IntervalPlan"
+      - "recomputes cycle.short_interval_count and evaluates the SCHEDULE_PUBLISHED <-> INTRADAY_ALERT posture edges"
+      - "re-runs agent_adherence_score: a CANCELLED shift leaves the scored input set, so agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status are recomputed"
+
+  - method: POST
+    path: "/schedule-shifts/{schedule_shift_id}/adherence-observations"
+    description: "Records a real-time adherence observation, replacing out_of_adherence_seconds and resetting excused_seconds; moves the shift's adherence axis."
+    roles: [IntradayController]
+    code: 200
+    input: ["out_of_adherence_seconds"]
+    output: ScheduleShift
+    side_effects:
+      - "runs calculations.shift_adherence_score and moves adherence_status to ON_TRACK or OUT_OF_ADHERENCE"
+      - "stamps flagged_by_user_id with the acting X-User-ID when the observation lands OUT_OF_ADHERENCE"
+      - "recomputes agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status"
+
+  # ---- AdherenceException --------------------------------------------------
+  - method: POST
+    path: "/adherence-exceptions"
+    description: "Files the acting agent's own exception request against an OUT_OF_ADHERENCE shift."
+    roles: [Agent]
+    code: 201
+    input: ["schedule_shift_id", "agent_id", "reason_code", "duration_seconds", "narrative"]
+    output: AdherenceException
+    side_effects:
+      - "status initialised to SUBMITTED and info_requested_count to 0"
+
+  - method: GET
+    path: "/adherence-exceptions/{adherence_exception_id}"
+    description: "Reads one exception request."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: AdherenceException
+    side_effects: []
+
+  - method: GET
+    path: "/adherence-exceptions"
+    description: "Lists exception requests, filterable by shift, agent or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["schedule_shift_id?", "agent_id?", "status?", "limit?", "offset?"]
+    output: AdherenceException[]
+    side_effects: []
+
+  - method: POST
+    path: "/adherence-exceptions/{adherence_exception_id}/decision"
+    description: "Records the coach's branching decision (APPROVE, REJECT or REQUEST_INFO) under segregation of duties against the shift's flagging operator."
+    roles: [TeamCoach]
+    code: 200
+    input: ["decision", "coach_note?"]
+    output: AdherenceException
+    side_effects:
+      - "on APPROVE: moves the shift's adherence axis OUT_OF_ADHERENCE -> EXCUSED, adds duration_seconds to shift.excused_seconds, recomputes shift.adherence_pct, agent.adherence_pct, agent.coaching_flag_count and agent.coaching_status"
+      - "on APPROVE or REJECT: stamps decided_by_user_id"
+      - "on REQUEST_INFO: records coach_note and leaves decided_by_user_id null"
+
+  - method: POST
+    path: "/adherence-exceptions/{adherence_exception_id}/resubmit"
+    description: "Returns an INFO_REQUESTED exception to SUBMITTED with revised narrative and duration."
+    roles: [Agent]
+    code: 200
+    input: ["narrative", "duration_seconds"]
+    output: AdherenceException
+    side_effects:
+      - "replaces narrative and duration_seconds and increments info_requested_count by 1"
+
+  # ---- IntradayAction ------------------------------------------------------
+  - method: POST
+    path: "/intraday-actions"
+    description: "Creates an intraday lever: an OT_OFFER or VTO_OFFER to one agent, or a ROUTING_ADJUSTMENT that is auto-accepted at creation."
+    roles: [IntradayController]
+    code: 201
+    input: ["planning_cycle_id", "kind", "expires_at", "agent_id?", "schedule_shift_id?", "target_forecast_group_id?", "source_forecast_group_id?", "hours?", "agents_shifted?", "interval_start?"]
+    output: IntradayAction
+    side_effects:
+      - "status initialised to OFFERED with cost_cents 0 and ot_multiplier_applied null"
+      - "for kind == ROUTING_ADJUSTMENT: auto-advances OFFERED -> ACCEPTED, applies the inflow/outflow recompute on both groups' intervals, then recomputes cycle.short_interval_count and the posture edges"
+
+  - method: GET
+    path: "/intraday-actions/{intraday_action_id}"
+    description: "Reads one intraday action including the frozen cost_cents and ot_multiplier_applied."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: []
+    output: IntradayAction
+    side_effects: []
+
+  - method: GET
+    path: "/intraday-actions"
+    description: "Lists intraday actions, filterable by cycle, agent, shift, target group, source group, kind or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, IntradayController, TeamCoach, Agent]
+    code: 200
+    input: ["planning_cycle_id?", "agent_id?", "schedule_shift_id?", "target_forecast_group_id?", "source_forecast_group_id?", "kind?", "status?", "limit?", "offset?"]
+    output: IntradayAction[]
+    side_effects: []
+
+  - method: POST
+    path: "/intraday-actions/{intraday_action_id}/response"
+    description: "The offered agent accepts or declines. Acceptance of an OT_OFFER prices the hours with calculations.overtime_cost_tiered against the PRE-acceptance cycle spend and debits the cycle overtime ledger."
+    roles: [Agent]
+    code: 200
+    input: ["response"]
+    output: IntradayAction
+    side_effects:
+      - "on ACCEPT of OT_OFFER: freezes ot_multiplier_applied and cost_cents, extends shift.end_at, recomputes shift.scheduled_seconds / ot_hours / paid_hours, agent.scheduled_hours_committed, cycle.ot_hours_committed, cycle.ot_spend_committed_cents and cycle.total_scheduled_hours"
+      - "on ACCEPT of VTO_OFFER: shortens shift.end_at by hours (voluntary early release) and recomputes shift.scheduled_seconds / vto_hours / paid_hours, agent.scheduled_hours_committed and cycle.total_scheduled_hours"
+      - "recomputes coverage on every affected IntervalPlan, then cycle.short_interval_count and the posture edges"
+      - "at or after expires_at: sets status to EXPIRED and returns ERR_ACTION_EXPIRED without touching any ledger"
+
+  - method: POST
+    path: "/intraday-actions/{intraday_action_id}/revoke"
+    description: "Revokes an OFFERED or ACCEPTED action, compensating every side effect the acceptance applied."
+    roles: [IntradayController]
+    code: 200
+    input: []
+    output: IntradayAction
+    side_effects:
+      - "on an ACCEPTED OT_OFFER: shortens shift.end_at and subtracts exactly the frozen cost_cents from cycle.ot_spend_committed_cents and hours from cycle.ot_hours_committed"
+      - "on an ACCEPTED VTO_OFFER or ROUTING_ADJUSTMENT: reverses the corresponding hours or routing contributions"
+      - "recomputes coverage on every affected IntervalPlan, then cycle.short_interval_count and the posture edges"
+
+  # ---- OutsourcePartner ----------------------------------------------------
+  - method: POST
+    path: "/outsource-partners"
+    description: "Registers an outsourced partner with its rate, interval cap, commitment floor, performance threshold and billing basis."
+    roles: [SourcingManager]
+    code: 201
+    input: ["legal_name", "skill_codes", "rate_per_contact_millicents", "interval_max_volume", "commitment_floor_volume", "performance_threshold_pct", "billing_basis"]
+    output: OutsourcePartner
+    side_effects:
+      - "status initialised to ACTIVE, version to 1, committed_volume_outstanding and invoice_total_cents to 0"
+
+  - method: GET
+    path: "/outsource-partners/{outsource_partner_id}"
+    description: "Reads one partner including its current version, rolling attainment and outstanding commitment."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, SourcingManager, PartnerRep]
+    code: 200
+    input: []
+    output: OutsourcePartner
+    side_effects: []
+
+  - method: GET
+    path: "/outsource-partners"
+    description: "Lists partners, filterable by status or billing basis."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, SourcingManager]
+    code: 200
+    input: ["status?", "billing_basis?", "skill_code?", "limit?", "offset?"]
+    output: OutsourcePartner[]
+    side_effects: []
+
+  - method: POST
+    path: "/outsource-partners/{outsource_partner_id}/performance-reports"
+    description: "Appends a service-level attainment report and re-evaluates the partner's eligibility ladder via calculations.partner_rolling_performance."
+    roles: [SourcingManager]
+    code: 200
+    input: ["period_end_date", "sl_attainment_pct"]
+    output: OutsourcePartner
+    side_effects:
+      - "appends the report to latest_sl_attainment_pcts, increments performance_report_count and recomputes rolling_sl_attainment_pct and consecutive_breach_count"
+      - "runs the ACTIVE <-> PROBATION -> SUSPENDED transitions declared in §1.2"
+      - "on SUSPENDED: revokes every PROPOSED and COMMITTED allocation of the partner and recomputes each interval's partner_committed_volume and unserved_volume"
+      - "increments OutsourcePartner.version by 1"
+
+  # ---- PartnerAllocation ---------------------------------------------------
+  - method: POST
+    path: "/partner-allocations"
+    description: "Proposes a single partner allocation against one interval."
+    roles: [SourcingManager]
+    code: 201
+    input: ["outsource_partner_id", "interval_plan_id", "allocated_volume"]
+    output: PartnerAllocation
+    side_effects:
+      - "status initialised to PROPOSED and proposed_by_user_id stamped with the acting X-User-ID; no ledger moves until commit"
+
+  - method: POST
+    path: "/partner-allocations/generate"
+    description: "Runs calculations.partner_allocation_waterfall for one interval and returns the PROPOSED allocations it created, cheapest partner first (empty array when no partner qualifies)."
+    roles: [SourcingManager]
+    code: 201
+    input: ["interval_plan_id"]
+    output: PartnerAllocation[]
+    side_effects:
+      - "creates zero or more PROPOSED PartnerAllocation rows, each stamped with proposed_by_user_id"
+
+  - method: GET
+    path: "/partner-allocations/{partner_allocation_id}"
+    description: "Reads one allocation including both settlement variants and the authoritative payable."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, SourcingManager, PartnerRep]
+    code: 200
+    input: []
+    output: PartnerAllocation
+    side_effects: []
+
+  - method: GET
+    path: "/partner-allocations"
+    description: "Lists allocations, filterable by partner, interval or status. A PartnerRep may only filter to its own outsource_partner_id."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, SourcingManager, PartnerRep]
+    code: 200
+    input: ["outsource_partner_id?", "interval_plan_id?", "status?", "limit?", "offset?"]
+    output: PartnerAllocation[]
+    side_effects: []
+
+  - method: POST
+    path: "/partner-allocations/{partner_allocation_id}/commit"
+    description: "Commits a proposed allocation. Guarded by OCC on the partner version (concurrency_rules[allocation-commit-stale-partner]) and by segregation of duties against proposed_by_user_id."
+    roles: [SourcingManager]
+    code: 200
+    input: ["expected_partner_version"]
+    output: PartnerAllocation
+    side_effects:
+      - "stamps committed_by_user_id and adds allocated_volume to partner.committed_volume_outstanding"
+      - "recomputes interval.partner_committed_volume and interval.unserved_volume"
+      - "increments OutsourcePartner.version by 1"
+
+  - method: POST
+    path: "/partner-allocations/{partner_allocation_id}/revoke"
+    description: "Revokes a proposed or committed allocation, restoring the partner's outstanding commitment."
+    roles: [SourcingManager]
+    code: 200
+    input: []
+    output: PartnerAllocation
+    side_effects:
+      - "on a COMMITTED allocation: subtracts allocated_volume from partner.committed_volume_outstanding and recomputes interval.partner_committed_volume and interval.unserved_volume"
+
+  - method: POST
+    path: "/partner-allocations/{partner_allocation_id}/settle"
+    description: "Settles a committed allocation with the delivered volume, storing both settlement variants and the payable selected by the partner's billing basis."
+    roles: [SourcingManager]
+    code: 200
+    input: ["delivered_volume"]
+    output: PartnerAllocation
+    side_effects:
+      - "runs calculations.partner_settlement and stores settlement_floor_cents, settlement_delivered_cents, shortfall_penalty_cents and settlement_amount_cents"
+      - "subtracts allocated_volume from partner.committed_volume_outstanding and adds settlement_amount_cents to partner.invoice_total_cents"
+
+  # ---- HiringClass ---------------------------------------------------------
+  - method: POST
+    path: "/hiring-classes"
+    description: "Plans a hiring class with its training and nesting ramp."
+    roles: [CapacityPlanner]
+    code: 201
+    input: ["planning_cycle_id", "labor_agreement_id", "cohort_name", "skill_code", "start_date", "seats", "training_weeks", "nesting_weeks", "expected_attrition_pct", "graduate_hourly_rate_cents", "graduate_weekly_hours"]
+    output: HiringClass
+    side_effects:
+      - "status initialised to PLANNED; runs calculations.hiring_class_ramp_fte to derive expected_graduates, nesting_from_date, productive_from_date and effective_fte_at_horizon_end"
+
+  - method: GET
+    path: "/hiring-classes/{hiring_class_id}"
+    description: "Reads one hiring class including its ramp dates and effective FTE."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, TeamCoach]
+    code: 200
+    input: []
+    output: HiringClass
+    side_effects: []
+
+  - method: GET
+    path: "/hiring-classes"
+    description: "Lists hiring classes, filterable by cycle, labor agreement or status."
+    roles: [CapacityPlanner, WorkforceAnalyst, SchedulingManager, TeamCoach]
+    code: 200
+    input: ["planning_cycle_id?", "labor_agreement_id?", "status?", "limit?", "offset?"]
+    output: HiringClass[]
+    side_effects: []
+
+  - method: POST
+    path: "/hiring-classes/{hiring_class_id}/status"
+    description: "Drives the HiringClass lifecycle short of graduation (CHARTERED, IN_TRAINING, CANCELLED)."
+    roles: [CapacityPlanner]
+    code: 200
+    input: ["target_status"]
+    output: HiringClass
+    side_effects:
+      - "runs the HiringClass transition declared in §1.2 and recomputes effective_fte_at_horizon_end and cycle.pipeline_fte"
+
+  - method: POST
+    path: "/hiring-classes/{hiring_class_id}/graduate"
+    description: "Graduates an IN_TRAINING class, minting exactly expected_graduates ACTIVE agents."
+    roles: [CapacityPlanner]
+    code: 200
+    input: []
+    output: HiringClass
+    side_effects:
+      - "mints expected_graduates Agent rows with hiring_class_id set, skills [skill_code], the class's labor_agreement_id, employee_code \"<cohort_name>-001\" upward in ascending index order, graduate_hourly_rate_cents and graduate_weekly_hours"
+      - "sets graduated_agent_count, recomputes agreement.enrolled_agent_count, cycle.headcount_active and cycle.pipeline_fte"
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- authentication / authorization ---------------------------------------
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID missing, or X-User-Role names a role not declared in §1.7"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "the acting role is not listed in the endpoint's roles"
+  - id: ERR_OWNERSHIP_VIOLATION
+    http: 403
+    condition: "role Agent acts on a bid, exception or intraday action whose agent_id is not the acting X-User-ID, or role PartnerRep reads allocations of another partner"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the deciding TeamCoach equals the shift's flagged_by_user_id, or the committing SourcingManager equals the allocation's proposed_by_user_id"
+
+  # --- request shape --------------------------------------------------------
+  - id: ERR_VALIDATION
+    http: 422
+    condition: "missing required body field, wrong type, unknown enum member, out-of-range number, wrong array length (intraday_curve vs the operating window, dow_multipliers != 7), hours not a multiple of 0.5, or the exactly-one-of rule between MarketingEvent.forecast_group_id and channel_scope violated"
+  - id: ERR_INVALID_PAGINATION
+    http: 400
+    condition: "limit outside 1..100 or offset negative or non-integer"
+
+  # --- existence ------------------------------------------------------------
+  - id: ERR_PLANNING_CYCLE_NOT_FOUND
+    http: 404
+    condition: "planning_cycle_id in the path or body does not resolve"
+  - id: ERR_LABOR_AGREEMENT_NOT_FOUND
+    http: 404
+    condition: "labor_agreement_id in the path or body does not resolve"
+  - id: ERR_FORECAST_GROUP_NOT_FOUND
+    http: 404
+    condition: "forecast_group_id, target_forecast_group_id or source_forecast_group_id does not resolve"
+  - id: ERR_MARKETING_EVENT_NOT_FOUND
+    http: 404
+    condition: "marketing_event_id or supersedes_event_id does not resolve"
+  - id: ERR_INTERVAL_PLAN_NOT_FOUND
+    http: 404
+    condition: "interval_plan_id does not resolve"
+  - id: ERR_AGENT_NOT_FOUND
+    http: 404
+    condition: "agent_id does not resolve"
+  - id: ERR_SHIFT_TEMPLATE_NOT_FOUND
+    http: 404
+    condition: "shift_template_id or a member of preference_template_ids does not resolve"
+  - id: ERR_BID_ROUND_NOT_FOUND
+    http: 404
+    condition: "bid_round_id does not resolve"
+  - id: ERR_SHIFT_BID_NOT_FOUND
+    http: 404
+    condition: "shift_bid_id does not resolve"
+  - id: ERR_SCHEDULE_SHIFT_NOT_FOUND
+    http: 404
+    condition: "schedule_shift_id does not resolve"
+  - id: ERR_ADHERENCE_EXCEPTION_NOT_FOUND
+    http: 404
+    condition: "adherence_exception_id does not resolve"
+  - id: ERR_INTRADAY_ACTION_NOT_FOUND
+    http: 404
+    condition: "intraday_action_id does not resolve"
+  - id: ERR_OUTSOURCE_PARTNER_NOT_FOUND
+    http: 404
+    condition: "outsource_partner_id does not resolve"
+  - id: ERR_PARTNER_ALLOCATION_NOT_FOUND
+    http: 404
+    condition: "partner_allocation_id does not resolve"
+  - id: ERR_HIRING_CLASS_NOT_FOUND
+    http: 404
+    condition: "hiring_class_id does not resolve"
+
+  # --- optimistic concurrency ----------------------------------------------
+  - id: ERR_STALE_CYCLE_VERSION
+    http: 412
+    condition: "expected_cycle_version does not equal the PlanningCycle's current version on a reforecast run"
+  - id: ERR_STALE_PARTNER_VERSION
+    http: 412
+    condition: "expected_partner_version does not equal the OutsourcePartner's current version on an allocation commit"
+
+  # --- state ----------------------------------------------------------------
+  - id: ERR_CYCLE_FROZEN
+    http: 409
+    condition: "the PlanningCycle reachable from the target resource has posture == FROZEN"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the requested transition is not declared from the resource's current state (including a repeated trigger against a terminal state)"
+  - id: ERR_BID_ROUND_NOT_OPEN
+    http: 409
+    condition: "a bid is submitted or withdrawn while the round is not OPEN"
+  - id: ERR_ALLOCATION_NOT_COMMITTED
+    http: 409
+    condition: "settle is called on an allocation whose status is not COMMITTED"
+  - id: ERR_SHIFT_NOT_PUBLISHED
+    http: 409
+    condition: "an adherence observation or exception targets a shift whose publication_status is not PUBLISHED"
+  - id: ERR_EXCEPTION_NOT_PENDING
+    http: 409
+    condition: "a decision is recorded on an exception that is not SUBMITTED, or resubmit is called on an exception that is not INFO_REQUESTED"
+  - id: ERR_ACTION_NOT_OFFERED
+    http: 409
+    condition: "a response is recorded on an intraday action whose status is not OFFERED, or revoke targets an already terminal action"
+  - id: ERR_CYCLE_NOT_LOCKED
+    http: 409
+    condition: "a shift publication is attempted while cycle.posture is OPEN or FROZEN"
+  - id: ERR_CYCLE_NOT_OPEN
+    http: 409
+    condition: "a forecast group, an interval grid, or the posture revert to OPEN is attempted while the cycle posture is past OPEN"
+
+  # --- safety / labor compliance -------------------------------------------
+  - id: ERR_REOPEN_LIMIT_REACHED
+    http: 409
+    condition: "a reopen would push reopen_count above max_reopen_count"
+  - id: ERR_MIN_REST_VIOLATION
+    http: 422
+    condition: "the gap between the end of one shift and the start of the agent's next non-overlapping shift would fall strictly below agreement.min_rest_hours; overlapping neighbours yield ERR_SHIFT_OVERLAP instead"
+  - id: ERR_SHIFT_OVERLAP
+    http: 409
+    condition: "the agent would hold two non-CANCELLED shifts whose half-open windows overlap"
+  - id: ERR_MAX_WEEKLY_HOURS_EXCEEDED
+    http: 422
+    condition: "the additive change would push agent.scheduled_hours_committed above agreement.max_weekly_hours"
+  - id: ERR_MAX_CONSECUTIVE_DAYS_EXCEEDED
+    http: 422
+    condition: "publication would create a run of consecutive service dates longer than agreement.max_consecutive_days"
+
+  # --- temporal -------------------------------------------------------------
+  - id: ERR_ACTION_EXPIRED
+    http: 409
+    condition: "the logical clock is at or after the intraday action's expires_at when the response arrives"
+  - id: ERR_INTERVAL_OUTSIDE_HORIZON
+    http: 422
+    condition: "service_date or effective_from_interval_start falls outside [cycle.horizon_start_date, cycle.horizon_end_date]"
+  - id: ERR_EVENT_WINDOW_INVALID
+    http: 422
+    condition: "window_end is not strictly after window_start, or REALIZED is requested before the logical clock reaches window_end"
+  - id: ERR_VTO_NOTICE_TOO_SHORT
+    http: 422
+    condition: "(shift.start_at - now) in hours is strictly below agreement.vto_min_notice_hours on a VTO acceptance"
+
+  # --- referential ----------------------------------------------------------
+  - id: ERR_SKILL_MISMATCH
+    http: 422
+    condition: "the template's or target group's skill_code is not a member of the agent's skills"
+  - id: ERR_PARTNER_NOT_ELIGIBLE
+    http: 409
+    condition: "the partner is SUSPENDED, or its skill_codes does not contain the interval's group skill_code"
+
+  # --- business constraints -------------------------------------------------
+  - id: ERR_TEMPLATE_SLOTS_EXHAUSTED
+    http: 409
+    condition: "an award run would place no bid at all because every template referenced by its SUBMITTED bids already has slots_awarded == slots_total (or matches no bidder's skills)"
+  - id: ERR_DUPLICATE_BID
+    http: 409
+    condition: "the agent already holds a non-WITHDRAWN bid in the same round"
+  - id: ERR_DUPLICATE_INTERVALS
+    http: 409
+    condition: "an interval grid already exists for this forecast_group_id and service_date"
+  - id: ERR_PREFERENCE_FLOOR_NOT_MET
+    http: 422
+    condition: "the award run's preference_honor_rate is strictly below the strictest applicable preference_honor_floor_pct"
+  - id: ERR_VTO_WOULD_BREACH_COVERAGE
+    http: 409
+    condition: "accepting the VTO would move an IntervalPlan the shift covers from COVERED to SHORT"
+  - id: ERR_ROUTING_OUTFLOW_EXCEEDS_STAFFING
+    http: 422
+    condition: "agents_shifted exceeds the source interval's effective_scheduled_agents"
+  - id: ERR_ALLOCATION_CAPACITY_EXCEEDED
+    http: 409
+    condition: "interval.partner_committed_volume + allocated_volume would exceed interval.allocatable_volume"
+  - id: ERR_PARTNER_VOLUME_OUT_OF_RANGE
+    http: 422
+    condition: "allocated_volume is below partner.commitment_floor_volume or above the partner's applicable interval cap"
+
+  # --- fiscal ---------------------------------------------------------------
+  - id: ERR_OT_BUDGET_EXCEEDED
+    http: 402
+    condition: "cycle.ot_spend_committed_cents + the newly priced cost_cents would exceed cycle.ot_budget_cents"
+  - id: ERR_COMMITMENT_FLOOR_BREACH
+    http: 409
+    condition: "a COMMITMENT_FLOOR partner is settled with delivered_volume below its commitment_floor_volume"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: CapacityPlanner
+    description: "Owns the planning cycle envelope, labor agreements and the hiring pipeline."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /planning-cycles"
+      - "POST /labor-agreements"
+      - "POST /hiring-classes"
+      - "POST /hiring-classes/{hiring_class_id}/status"
+      - "POST /hiring-classes/{hiring_class_id}/graduate"
+    shared_operations:
+      - "POST /planning-cycles/{planning_cycle_id}/posture (with SchedulingManager)"
+      - "POST /planning-cycles/{planning_cycle_id}/reforecast (with WorkforceAnalyst)"
+      - "POST /_clock/set_current_utc"
+      - "every GET except the PartnerRep-scoped reads"
+
+  - name: WorkforceAnalyst
+    description: "Owns demand: forecast groups, interval grids, marketing drivers and reforecasting."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /forecast-groups"
+      - "POST /forecast-groups/{forecast_group_id}/interval-plans"
+      - "POST /marketing-events"
+      - "POST /marketing-events/{marketing_event_id}/status"
+    shared_operations:
+      - "POST /planning-cycles/{planning_cycle_id}/reforecast (with CapacityPlanner)"
+      - "POST /interval-plans/{interval_plan_id}/actuals (with IntradayController)"
+      - "POST /_clock/set_current_utc"
+      - "every GET except the PartnerRep-scoped reads"
+
+  - name: SchedulingManager
+    description: "Owns supply: agents, templates, bid rounds, awards and shift publication."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /agents"
+      - "PATCH /agents/{agent_id}"
+      - "POST /shift-templates"
+      - "POST /bid-rounds"
+      - "POST /bid-rounds/{bid_round_id}/status"
+      - "POST /bid-rounds/{bid_round_id}/award"
+      - "POST /schedule-shifts"
+      - "POST /schedule-shifts/{schedule_shift_id}/publication"
+    shared_operations:
+      - "POST /planning-cycles/{planning_cycle_id}/posture (with CapacityPlanner)"
+      - "POST /_clock/set_current_utc"
+      - "every GET except the PartnerRep-scoped reads"
+
+  - name: IntradayController
+    description: "Owns real time: actuals, adherence observations and intraday levers."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /schedule-shifts/{schedule_shift_id}/adherence-observations"
+      - "POST /intraday-actions"
+      - "POST /intraday-actions/{intraday_action_id}/revoke"
+    shared_operations:
+      - "POST /interval-plans/{interval_plan_id}/actuals (with WorkforceAnalyst)"
+      - "POST /_clock/set_current_utc"
+      - "every GET except the PartnerRep-scoped reads"
+
+  - name: Agent
+    description: "A frontline agent acting on their own bids, exception requests and intraday offers."
+    identity: "entity_backed:Agent"
+    exclusive_operations:
+      - "POST /shift-bids"
+      - "POST /shift-bids/{shift_bid_id}/withdraw"
+      - "POST /adherence-exceptions"
+      - "POST /adherence-exceptions/{adherence_exception_id}/resubmit"
+      - "POST /intraday-actions/{intraday_action_id}/response"
+    shared_operations:
+      - "read-only GETs over cycles, agreements, groups, templates, rounds, bids, shifts, exceptions and intraday actions"
+
+  - name: TeamCoach
+    description: "Decides adherence exceptions; barred from deciding a case they themselves flagged."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /adherence-exceptions/{adherence_exception_id}/decision"
+    shared_operations:
+      - "POST /_clock/set_current_utc"
+      - "read-only GETs over agents, shifts, exceptions, intervals, templates, rounds, bids and hiring classes"
+
+  - name: SourcingManager
+    description: "Owns the outsourced partner surface: registration, performance reporting, allocation, commitment and settlement."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /outsource-partners"
+      - "POST /outsource-partners/{outsource_partner_id}/performance-reports"
+      - "POST /partner-allocations"
+      - "POST /partner-allocations/generate"
+      - "POST /partner-allocations/{partner_allocation_id}/commit"
+      - "POST /partner-allocations/{partner_allocation_id}/revoke"
+      - "POST /partner-allocations/{partner_allocation_id}/settle"
+    shared_operations:
+      - "POST /_clock/set_current_utc"
+      - "GETs over cycles, groups, intervals, partners and allocations"
+
+  - name: PartnerRep
+    description: "An outsourced partner's own representative; read-only and scoped to their own partner record."
+    identity: "entity_backed:OutsourcePartner"
+    exclusive_operations: []
+    shared_operations:
+      - "GET /outsource-partners/{outsource_partner_id} for their own partner id"
+      - "GET /partner-allocations filtered to their own outsource_partner_id"
+      - "GET /partner-allocations/{partner_allocation_id} for their own allocations"

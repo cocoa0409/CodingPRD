@@ -1,0 +1,225 @@
+"""
+Error catalogue for the design-firm project accounting API.
+
+Every entry is transcribed from the PRD §5 error code catalogue, and the
+mapping is registered with the framework validators at import time so that
+validate_error() cross-checks the HTTP status of every error_id automatically.
+
+The rejection ladder of PRD §2.8 is transcribed as REJECTION_LADDER so tests
+that assert precedence can name the two competing rungs rather than a literal.
+"""
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+# ─── Authentication / authorisation (PRD §2.1) ────────────────────────
+
+ERR_UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+ERR_UNAUTHORIZED = "ERR_UNAUTHORIZED"
+ERR_NOT_PROJECT_MANAGER = "ERR_NOT_PROJECT_MANAGER"
+ERR_NOT_PROJECT_CLIENT = "ERR_NOT_PROJECT_CLIENT"
+ERR_SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+ERR_APPROVAL_LEVEL_INSUFFICIENT = "ERR_APPROVAL_LEVEL_INSUFFICIENT"
+
+# ─── Shape (PRD §2.3, §2.5) ───────────────────────────────────────────
+
+ERR_INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+# ─── Path resolution (PRD §2.9) ───────────────────────────────────────
+
+ERR_CLIENT_NOT_FOUND = "ERR_CLIENT_NOT_FOUND"
+ERR_PROJECT_NOT_FOUND = "ERR_PROJECT_NOT_FOUND"
+ERR_PHASE_NOT_FOUND = "ERR_PHASE_NOT_FOUND"
+ERR_CHARGE_NOT_FOUND = "ERR_CHARGE_NOT_FOUND"
+ERR_SUBCONTRACT_NOT_FOUND = "ERR_SUBCONTRACT_NOT_FOUND"
+ERR_INVOICE_NOT_FOUND = "ERR_INVOICE_NOT_FOUND"
+ERR_WRITE_OFF_NOT_FOUND = "ERR_WRITE_OFF_NOT_FOUND"
+ERR_CERTIFICATION_NOT_FOUND = "ERR_CERTIFICATION_NOT_FOUND"
+ERR_MULTIPLIER_NOT_FOUND = "ERR_MULTIPLIER_NOT_FOUND"
+
+# ─── Body foreign keys / concurrency (PRD §2.7, §2.9) ─────────────────
+
+ERR_INVALID_REFERENCE = "ERR_INVALID_REFERENCE"
+ERR_STALE_PROJECT_VERSION = "ERR_STALE_PROJECT_VERSION"
+
+# ─── State (PRD §3.1-§3.9) ────────────────────────────────────────────
+
+ERR_PROJECT_NOT_ACTIVE = "ERR_PROJECT_NOT_ACTIVE"
+ERR_INVALID_STATE_TRANSITION = "ERR_INVALID_STATE_TRANSITION"
+ERR_PROJECT_UNDER_BILLING_REVIEW = "ERR_PROJECT_UNDER_BILLING_REVIEW"
+
+# ─── Compliance and safety (PRD §2.8 rung 13) ─────────────────────────
+
+ERR_OVERHEAD_RATE_NOT_CERTIFIED = "ERR_OVERHEAD_RATE_NOT_CERTIFIED"
+ERR_MULTIPLIER_ABOVE_CERTIFIED_CEILING = "ERR_MULTIPLIER_ABOVE_CERTIFIED_CEILING"
+ERR_EXPENSE_UNALLOWABLE = "ERR_EXPENSE_UNALLOWABLE"
+
+# ─── Temporal integrity (PRD §2.8 rung 14) ────────────────────────────
+
+ERR_PERIOD_LOCKED = "ERR_PERIOD_LOCKED"
+ERR_RATE_PERIOD_OVERLAP = "ERR_RATE_PERIOD_OVERLAP"
+ERR_MULTIPLIER_BACKDATED = "ERR_MULTIPLIER_BACKDATED"
+
+# ─── Structural constraints (PRD §2.8 rung 15) ────────────────────────
+
+ERR_PHASE_NOT_LEAF = "ERR_PHASE_NOT_LEAF"
+ERR_WBS_CYCLE = "ERR_WBS_CYCLE"
+ERR_WBS_CODE_DUPLICATE = "ERR_WBS_CODE_DUPLICATE"
+ERR_NO_EFFECTIVE_LABOR_RATE = "ERR_NO_EFFECTIVE_LABOR_RATE"
+ERR_NO_EFFECTIVE_MULTIPLIER = "ERR_NO_EFFECTIVE_MULTIPLIER"
+ERR_PAY_WHEN_PAID_NOT_SATISFIED = "ERR_PAY_WHEN_PAID_NOT_SATISFIED"
+ERR_PHASE_HAS_OPEN_CHARGES = "ERR_PHASE_HAS_OPEN_CHARGES"
+ERR_CERTIFICATION_YEAR_DUPLICATE = "ERR_CERTIFICATION_YEAR_DUPLICATE"
+ERR_REVISION_LIMIT_EXCEEDED = "ERR_REVISION_LIMIT_EXCEEDED"
+ERR_BACKUP_DOCUMENTATION_MISSING = "ERR_BACKUP_DOCUMENTATION_MISSING"
+ERR_WBS_FEE_ROLLUP_MISMATCH = "ERR_WBS_FEE_ROLLUP_MISMATCH"
+
+# ─── Fiscal capacity (PRD §2.8 rung 16) ───────────────────────────────
+
+ERR_CONSULTANT_BUDGET_OVERCOMMIT = "ERR_CONSULTANT_BUDGET_OVERCOMMIT"
+ERR_SUBCONTRACT_COMMITMENT_EXCEEDED = "ERR_SUBCONTRACT_COMMITMENT_EXCEEDED"
+ERR_BILLING_EXCEEDS_EARNED = "ERR_BILLING_EXCEEDS_EARNED"
+ERR_NOTHING_TO_INVOICE = "ERR_NOTHING_TO_INVOICE"
+ERR_WRITE_OFF_AMOUNT_NOT_ALLOCATABLE = "ERR_WRITE_OFF_AMOUNT_NOT_ALLOCATABLE"
+ERR_WRITE_OFF_AMOUNT_MISMATCH = "ERR_WRITE_OFF_AMOUNT_MISMATCH"
+
+
+# error_id -> HTTP status, transcribed verbatim from the PRD §5 table.
+ERROR_HTTP_STATUS = {
+    ERR_UNAUTHENTICATED: 401,
+    ERR_UNAUTHORIZED: 403,
+    ERR_NOT_PROJECT_MANAGER: 403,
+    ERR_NOT_PROJECT_CLIENT: 403,
+    ERR_SEGREGATION_OF_DUTIES: 403,
+    ERR_APPROVAL_LEVEL_INSUFFICIENT: 403,
+    ERR_INVALID_REQUEST: 400,
+    ERR_CLIENT_NOT_FOUND: 404,
+    ERR_PROJECT_NOT_FOUND: 404,
+    ERR_PHASE_NOT_FOUND: 404,
+    ERR_CHARGE_NOT_FOUND: 404,
+    ERR_SUBCONTRACT_NOT_FOUND: 404,
+    ERR_INVOICE_NOT_FOUND: 404,
+    ERR_WRITE_OFF_NOT_FOUND: 404,
+    ERR_CERTIFICATION_NOT_FOUND: 404,
+    ERR_MULTIPLIER_NOT_FOUND: 404,
+    ERR_INVALID_REFERENCE: 422,
+    ERR_STALE_PROJECT_VERSION: 412,
+    ERR_PROJECT_NOT_ACTIVE: 409,
+    ERR_INVALID_STATE_TRANSITION: 409,
+    ERR_PROJECT_UNDER_BILLING_REVIEW: 409,
+    ERR_OVERHEAD_RATE_NOT_CERTIFIED: 409,
+    ERR_MULTIPLIER_ABOVE_CERTIFIED_CEILING: 422,
+    ERR_EXPENSE_UNALLOWABLE: 422,
+    ERR_PERIOD_LOCKED: 422,
+    ERR_RATE_PERIOD_OVERLAP: 409,
+    ERR_MULTIPLIER_BACKDATED: 409,
+    ERR_PHASE_NOT_LEAF: 422,
+    ERR_WBS_CYCLE: 422,
+    ERR_WBS_CODE_DUPLICATE: 409,
+    ERR_WBS_FEE_ROLLUP_MISMATCH: 422,
+    ERR_PHASE_HAS_OPEN_CHARGES: 409,
+    ERR_CERTIFICATION_YEAR_DUPLICATE: 409,
+    ERR_NO_EFFECTIVE_LABOR_RATE: 422,
+    ERR_NO_EFFECTIVE_MULTIPLIER: 422,
+    ERR_PAY_WHEN_PAID_NOT_SATISFIED: 409,
+    ERR_CONSULTANT_BUDGET_OVERCOMMIT: 409,
+    ERR_SUBCONTRACT_COMMITMENT_EXCEEDED: 422,
+    ERR_BILLING_EXCEEDS_EARNED: 422,
+    ERR_NOTHING_TO_INVOICE: 422,
+    ERR_BACKUP_DOCUMENTATION_MISSING: 409,
+    ERR_REVISION_LIMIT_EXCEEDED: 409,
+    ERR_WRITE_OFF_AMOUNT_NOT_ALLOCATABLE: 422,
+    ERR_WRITE_OFF_AMOUNT_MISMATCH: 422,
+}
+
+# Register with the framework validators so validate_error() cross-checks status.
+set_error_http_status_map(ERROR_HTTP_STATUS)
+
+
+# The ladder of PRD §2.8, earliest rung first. Each entry is the ordered list of
+# error ids evaluated at that rung.
+REJECTION_LADDER = [
+    [ERR_UNAUTHENTICATED],
+    [ERR_UNAUTHORIZED],
+    [ERR_NOT_PROJECT_MANAGER],
+    [ERR_NOT_PROJECT_CLIENT],
+    [ERR_SEGREGATION_OF_DUTIES],
+    [ERR_APPROVAL_LEVEL_INSUFFICIENT],
+    [ERR_INVALID_REQUEST],
+    [
+        ERR_PROJECT_NOT_FOUND,
+        ERR_PHASE_NOT_FOUND,
+        ERR_CLIENT_NOT_FOUND,
+        ERR_CHARGE_NOT_FOUND,
+        ERR_SUBCONTRACT_NOT_FOUND,
+        ERR_INVOICE_NOT_FOUND,
+        ERR_WRITE_OFF_NOT_FOUND,
+        ERR_CERTIFICATION_NOT_FOUND,
+        ERR_MULTIPLIER_NOT_FOUND,
+    ],
+    [ERR_INVALID_REFERENCE],
+    [ERR_STALE_PROJECT_VERSION],
+    [ERR_PROJECT_NOT_ACTIVE],
+    [ERR_INVALID_STATE_TRANSITION],
+    [
+        ERR_OVERHEAD_RATE_NOT_CERTIFIED,
+        ERR_MULTIPLIER_ABOVE_CERTIFIED_CEILING,
+        ERR_EXPENSE_UNALLOWABLE,
+    ],
+    [ERR_PERIOD_LOCKED, ERR_RATE_PERIOD_OVERLAP, ERR_MULTIPLIER_BACKDATED],
+    [
+        ERR_PHASE_NOT_LEAF,
+        ERR_WBS_CYCLE,
+        ERR_WBS_CODE_DUPLICATE,
+        ERR_NO_EFFECTIVE_LABOR_RATE,
+        ERR_NO_EFFECTIVE_MULTIPLIER,
+        ERR_PAY_WHEN_PAID_NOT_SATISFIED,
+        ERR_PHASE_HAS_OPEN_CHARGES,
+        ERR_CERTIFICATION_YEAR_DUPLICATE,
+        ERR_REVISION_LIMIT_EXCEEDED,
+        ERR_BACKUP_DOCUMENTATION_MISSING,
+        ERR_WBS_FEE_ROLLUP_MISMATCH,
+        ERR_PROJECT_UNDER_BILLING_REVIEW,
+    ],
+    [
+        ERR_CONSULTANT_BUDGET_OVERCOMMIT,
+        ERR_SUBCONTRACT_COMMITMENT_EXCEEDED,
+        ERR_BILLING_EXCEEDS_EARNED,
+        ERR_NOTHING_TO_INVOICE,
+        ERR_WRITE_OFF_AMOUNT_NOT_ALLOCATABLE,
+        ERR_WRITE_OFF_AMOUNT_MISMATCH,
+    ],
+]
+
+
+def ladder_rung(error_id: str) -> int:
+    """Return the zero-based rung index at which an error_id is evaluated."""
+    for index, rung in enumerate(REJECTION_LADDER):
+        if error_id in rung:
+            return index
+    raise KeyError(f"Unknown error_id: {error_id}")
+
+
+def ladder_position(error_id: str) -> int:
+    """
+    Return the zero-based position of an error_id in the ladder's *total* order.
+
+    PRD §2.8 does not merely group errors into rungs — inside a rung it chains
+    them with an explicit "then", e.g. rung 15: "`ERR_PHASE_NOT_LEAF`, then
+    `ERR_WBS_CYCLE`, then `ERR_WBS_CODE_DUPLICATE`, ... then
+    `ERR_WBS_FEE_ROLLUP_MISMATCH`, then `ERR_PROJECT_UNDER_BILLING_REVIEW`".
+    Two codes sharing a rung therefore still have a specified precedence, which a
+    rung-index comparison would wrongly report as a tie. Flattening
+    REJECTION_LADDER preserves both the between-rung and the within-rung order.
+    """
+    position = 0
+    for rung in REJECTION_LADDER:
+        for candidate in rung:
+            if candidate == error_id:
+                return position
+            position += 1
+    raise KeyError(f"Unknown error_id: {error_id}")
+
+
+def outranks(earlier_error_id: str, later_error_id: str) -> bool:
+    """True when earlier_error_id is evaluated strictly ahead of later_error_id."""
+    return ladder_position(earlier_error_id) < ladder_position(later_error_id)

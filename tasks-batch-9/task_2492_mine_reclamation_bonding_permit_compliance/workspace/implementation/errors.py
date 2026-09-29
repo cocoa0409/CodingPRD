@@ -1,0 +1,85 @@
+"""Error catalogue (PRD section 5) and the exception type carrying it."""
+
+ERROR_STATUS = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_OPERATOR_NOT_FOUND": 404,
+    "ERR_MINE_SITE_NOT_FOUND": 404,
+    "ERR_INSPECTOR_PROFILE_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_ESTIMATE_NOT_FOUND": 404,
+    "ERR_INSTRUMENT_NOT_FOUND": 404,
+    "ERR_RELEASE_APPLICATION_NOT_FOUND": 404,
+    "ERR_INSPECTION_NOT_FOUND": 404,
+    "ERR_VIOLATION_NOTICE_NOT_FOUND": 404,
+    "ERR_REVISION_NOT_FOUND": 404,
+    "ERR_PROCEEDING_NOT_FOUND": 404,
+    "ERR_NOT_PERMIT_OPERATOR": 403,
+    "ERR_NOT_ASSIGNED_INSPECTOR": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_STALE_PERMIT_VERSION": 412,
+    "ERR_PERMIT_STATE_INVALID": 409,
+    "ERR_ESTIMATE_STATE_INVALID": 409,
+    "ERR_INSTRUMENT_STATE_INVALID": 409,
+    "ERR_RELEASE_STATE_INVALID": 409,
+    "ERR_INSPECTION_STATE_INVALID": 409,
+    "ERR_NOTICE_STATE_INVALID": 409,
+    "ERR_PENALTY_STATE_INVALID": 409,
+    "ERR_REVISION_STATE_INVALID": 409,
+    "ERR_PROCEEDING_STATE_INVALID": 409,
+    "ERR_SITE_FUNDING_STATE_INVALID": 409,
+    "ERR_OPERATOR_DISQUALIFIED": 409,
+    "ERR_NO_ACCEPTED_ESTIMATE": 409,
+    "ERR_ESTIMATE_EXPIRED": 422,
+    "ERR_ESTIMATE_DATE_IN_FUTURE": 422,
+    "ERR_BOND_BELOW_REQUIRED": 409,
+    "ERR_SELF_BOND_NOT_QUALIFIED": 409,
+    "ERR_SELF_BOND_CAPACITY_EXCEEDED": 409,
+    "ERR_SURETY_RATING_INELIGIBLE": 422,
+    "ERR_COLLATERAL_DETAILS_REQUIRED": 422,
+    "ERR_SUBSTITUTION_TARGET_INVALID": 409,
+    "ERR_PERMIT_NOT_COMPLIANT": 409,
+    "ERR_UNABATED_VIOLATION": 409,
+    "ERR_NOTICE_PERIOD_NOT_ELAPSED": 409,
+    "ERR_NOTICE_WINDOW_CONFLICT": 409,
+    "ERR_OBJECTIONS_UNRESOLVED": 409,
+    "ERR_INSPECTION_NOT_ELIGIBLE": 409,
+    "ERR_INSPECTOR_DOUBLE_BOOKED": 409,
+    "ERR_RELEASE_EXCEEDS_AVAILABLE": 422,
+    "ERR_ACRES_EXCEED_DISTURBED": 422,
+    "ERR_RESCISSION_WINDOW_CLOSED": 409,
+    "ERR_CESSATION_CRITERIA_NOT_MET": 409,
+    "ERR_REVISION_ROUND_LIMIT": 409,
+    "ERR_REVISION_FIELDS_MISMATCH": 422,
+    "ERR_CONTEST_WINDOW_CLOSED": 409,
+    "ERR_CONTEST_WINDOW_OPEN": 409,
+    "ERR_PENALTY_AMOUNT_MISMATCH": 422,
+    "ERR_FUNDING_QUEUE_ORDER": 409,
+    "ERR_LEGACY_FUND_CAP_EXCEEDED": 409,
+    "ERR_PERMIT_HAS_OPEN_PROCEEDING": 409,
+    "ERR_DECISION_REASON_REQUIRED": 422,
+}
+
+
+class ApiError(Exception):
+    """An error that maps onto the PRD error catalogue."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+        super().__init__(self.message)
+
+
+def _default_message(error_id):
+    words = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return "Request rejected: %s." % words
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)
+
+
+def invalid(message):
+    raise ApiError("ERR_INVALID_REQUEST", message)

@@ -1,0 +1,163 @@
+"""Complete error catalogue (66 codes) with the HTTP status each one carries (PRD 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = http_status or STATUS.get(error_id, 400)
+
+
+STATUS = {
+    # --- band 1: identity / authorisation -------------------------------
+    "ERR_UNAUTHORIZED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_MISSING_USER_ID": 400,
+    # --- band 2: structural ---------------------------------------------
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_RANGE": 422,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_DUPLICATE_NATURAL_KEY": 409,
+    # --- band 3: referential -------------------------------------------
+    "ERR_MODEL_NOT_FOUND": 404,
+    "ERR_PART_NOT_FOUND": 404,
+    "ERR_COMPATIBILITY_NOT_FOUND": 404,
+    "ERR_MANUAL_REVISION_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_ORDER_LINE_NOT_FOUND": 404,
+    "ERR_PROVIDER_NOT_FOUND": 404,
+    "ERR_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_RETURN_CASE_NOT_FOUND": 404,
+    "ERR_OBLIGATION_NOT_FOUND": 404,
+    "ERR_ACKNOWLEDGMENT_NOT_FOUND": 404,
+    "ERR_REGION_PROFILE_NOT_FOUND": 404,
+    "ERR_SUPERSESSION_CYCLE": 422,
+    "ERR_SUPERSESSION_CLASS_MISMATCH": 422,
+    # --- band 4: optimistic concurrency --------------------------------
+    "ERR_STALE_MODEL_VERSION": 412,
+    "ERR_STALE_ORDER_VERSION": 412,
+    # --- band 5: caller scope / segregation of duties -------------------
+    "ERR_ORDER_NOT_OWNED": 403,
+    "ERR_PROVIDER_SCOPE_VIOLATION": 403,
+    "ERR_SELF_REVIEW_FORBIDDEN": 403,
+    "ERR_SELF_DECISION_FORBIDDEN": 403,
+    # --- band 6: safety interlocks -------------------------------------
+    "ERR_ORDER_CONTAINS_RESTRICTED_PART": 422,
+    "ERR_AUTHENTICATION_NOT_APPLICABLE": 422,
+    "ERR_AUTHENTICATION_REQUIRED_FIRST": 409,
+    "ERR_CALIBRATION_ATTEMPTS_EXHAUSTED": 409,
+    "ERR_CALIBRATION_INCOMPLETE": 422,
+    # --- band 7: state admissibility -----------------------------------
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_PROVIDER_NOT_ACCEPTING_CERTS": 409,
+    "ERR_TRAINING_COVERAGE_INSUFFICIENT": 409,
+    "ERR_ASSESSMENT_NOT_VALID": 409,
+    "ERR_PROVIDER_NOT_AUTHORIZED": 403,
+    "ERR_ASSESSMENT_BLOCKED": 422,
+    "ERR_REVISION_COVERAGE_GAP": 422,
+    "ERR_PART_NOT_PUBLISHED": 422,
+    "ERR_NO_PUBLISHED_CALIBRATION_PROCEDURE": 422,
+    "ERR_ORDER_HAS_NO_LINES": 422,
+    "ERR_CREDIT_NOT_ALLOWED_FOR_ROOT_CAUSE": 422,
+    "ERR_REVISION_CYCLE_CAP_REACHED": 409,
+    "ERR_SAFETY_WARNINGS_REQUIRED": 422,
+    # --- band 8: compliance interlocks ---------------------------------
+    "ERR_MODEL_ORDER_RESTRICTED": 422,
+    "ERR_PARTS_ACCESS_TIER_INSUFFICIENT": 403,
+    "ERR_DISCLOSURE_MISMATCH": 422,
+    "ERR_LIABILITY_WARNING_STALE": 409,
+    "ERR_DISCLOSURE_NOT_ACKNOWLEDGED": 422,
+    "ERR_ATTESTATION_UNSUPPORTED": 422,
+    # --- band 9: temporal ----------------------------------------------
+    "ERR_ASSESSMENT_EXPIRED": 422,
+    "ERR_PARTS_WINDOW_ELAPSED": 422,
+    "ERR_RENTAL_WINDOW_REQUIRED": 422,
+    "ERR_CORE_RECEIPT_BEFORE_CONFIRM": 422,
+    "ERR_CERTIFICATION_ALREADY_EXPIRED": 422,
+    "ERR_CLOCK_MONOTONICITY": 422,
+    # --- band 10: capacity / quantity ----------------------------------
+    "ERR_TRAINING_CREDIT_INSUFFICIENT": 409,
+    "ERR_RENTAL_CAPACITY_EXCEEDED": 409,
+    "ERR_CORE_DEPOSIT_CAP_EXCEEDED": 422,
+    "ERR_RETURN_QUANTITY_EXCEEDS_LINE": 422,
+    "ERR_COMPATIBILITY_WINDOW_OVERLAP": 409,
+    "ERR_CERTIFICATION_WINDOW_OVERLAP": 409,
+    # --- band 11: conservation ------------------------------------------
+    "ERR_CORE_LEDGER_INVARIANT": 409,
+    "ERR_CREDIT_RESTORE_FORBIDDEN": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHORIZED": "Missing or unknown role header.",
+    "ERR_MISSING_USER_ID": "X-User-ID is required for this operation.",
+    "ERR_FORBIDDEN_ROLE": "This role may not perform this operation.",
+    "ERR_INVALID_REQUEST": "The request body is structurally invalid.",
+    "ERR_INVALID_RANGE": "A numeric field falls outside its admissible range.",
+    "ERR_INVALID_DATE_RANGE": "The supplied date range is inverted.",
+    "ERR_DUPLICATE_NATURAL_KEY": "A record with that natural key already exists.",
+    "ERR_MODEL_NOT_FOUND": "No such product model.",
+    "ERR_PART_NOT_FOUND": "No such catalog part.",
+    "ERR_COMPATIBILITY_NOT_FOUND": "No such compatibility row.",
+    "ERR_MANUAL_REVISION_NOT_FOUND": "No such manual revision.",
+    "ERR_ASSESSMENT_NOT_FOUND": "No such eligibility assessment.",
+    "ERR_ORDER_NOT_FOUND": "No such parts order.",
+    "ERR_ORDER_LINE_NOT_FOUND": "No such order line for this order.",
+    "ERR_PROVIDER_NOT_FOUND": "No such repair provider.",
+    "ERR_CERTIFICATION_NOT_FOUND": "No such training certification.",
+    "ERR_RETURN_CASE_NOT_FOUND": "No such defective return case.",
+    "ERR_OBLIGATION_NOT_FOUND": "No such compliance obligation.",
+    "ERR_ACKNOWLEDGMENT_NOT_FOUND": "No such disclosure acknowledgment.",
+    "ERR_REGION_PROFILE_NOT_FOUND": "No regional compliance profile for that region code.",
+    "ERR_SUPERSESSION_CYCLE": "The supersession chain would become cyclic.",
+    "ERR_SUPERSESSION_CLASS_MISMATCH": "Supersession requires an identical part_class.",
+    "ERR_STALE_MODEL_VERSION": "expected_model_version does not match the stored version.",
+    "ERR_STALE_ORDER_VERSION": "expected_order_version does not match the stored version.",
+    "ERR_ORDER_NOT_OWNED": "The caller does not own this record.",
+    "ERR_PROVIDER_SCOPE_VIOLATION": "The caller is out of provider scope.",
+    "ERR_SELF_REVIEW_FORBIDDEN": "An author may not review their own revision.",
+    "ERR_SELF_DECISION_FORBIDDEN": "The analyst may not decide their own case.",
+    "ERR_ORDER_CONTAINS_RESTRICTED_PART": "The order holds a line for a restricted part.",
+    "ERR_AUTHENTICATION_NOT_APPLICABLE": "This part does not require authentication.",
+    "ERR_AUTHENTICATION_REQUIRED_FIRST": "Authentication must succeed before calibration.",
+    "ERR_CALIBRATION_ATTEMPTS_EXHAUSTED": "No calibration attempts remain.",
+    "ERR_CALIBRATION_INCOMPLETE": "The line's calibration is not complete.",
+    "ERR_INVALID_STATE_TRANSITION": "That transition is not defined from the current state.",
+    "ERR_PROVIDER_NOT_ACCEPTING_CERTS": "The provider is not accepting certifications.",
+    "ERR_TRAINING_COVERAGE_INSUFFICIENT": "Active certification coverage is insufficient.",
+    "ERR_ASSESSMENT_NOT_VALID": "The eligibility assessment is no longer usable.",
+    "ERR_PROVIDER_NOT_AUTHORIZED": "The provider is not AUTHORIZED.",
+    "ERR_ASSESSMENT_BLOCKED": "The eligibility assessment decision is blocking.",
+    "ERR_REVISION_COVERAGE_GAP": "The revision leaves published parts uncovered.",
+    "ERR_PART_NOT_PUBLISHED": "The part is not published or not compatible in-window.",
+    "ERR_NO_PUBLISHED_CALIBRATION_PROCEDURE": "No published CALIBRATION_PROCEDURE exists.",
+    "ERR_ORDER_HAS_NO_LINES": "The order carries no lines.",
+    "ERR_CREDIT_NOT_ALLOWED_FOR_ROOT_CAUSE": "Credit is not allowed for that root cause.",
+    "ERR_REVISION_CYCLE_CAP_REACHED": "The revision has exhausted its rejection cycles.",
+    "ERR_SAFETY_WARNINGS_REQUIRED": "Safety warnings and covered parts are required.",
+    "ERR_MODEL_ORDER_RESTRICTED": "The model's compliance posture is ORDER_RESTRICTED.",
+    "ERR_PARTS_ACCESS_TIER_INSUFFICIENT": "The provider's parts access tier is insufficient.",
+    "ERR_DISCLOSURE_MISMATCH": "The acknowledgment does not match the order.",
+    "ERR_LIABILITY_WARNING_STALE": "The acknowledged liability warning version is stale.",
+    "ERR_DISCLOSURE_NOT_ACKNOWLEDGED": "The order has no covering disclosure acknowledgment.",
+    "ERR_ATTESTATION_UNSUPPORTED": "Attestation is not supported in the current state.",
+    "ERR_ASSESSMENT_EXPIRED": "The eligibility assessment has expired.",
+    "ERR_PARTS_WINDOW_ELAPSED": "The mandated parts availability window has elapsed.",
+    "ERR_RENTAL_WINDOW_REQUIRED": "A valid rental window is required.",
+    "ERR_CORE_RECEIPT_BEFORE_CONFIRM": "received_at is outside the admissible interval.",
+    "ERR_CERTIFICATION_ALREADY_EXPIRED": "The certification is already expired or failing.",
+    "ERR_CLOCK_MONOTONICITY": "The logical clock may only move forward.",
+    "ERR_TRAINING_CREDIT_INSUFFICIENT": "The provider has insufficient training credit.",
+    "ERR_RENTAL_CAPACITY_EXCEEDED": "Concurrent rental capacity would be exceeded.",
+    "ERR_CORE_DEPOSIT_CAP_EXCEEDED": "The consumer core deposit cap would be exceeded.",
+    "ERR_RETURN_QUANTITY_EXCEEDS_LINE": "The return quantity exceeds the line quantity.",
+    "ERR_COMPATIBILITY_WINDOW_OVERLAP": "An overlapping compatibility window exists.",
+    "ERR_CERTIFICATION_WINDOW_OVERLAP": "An overlapping certification window exists.",
+    "ERR_CORE_LEDGER_INVARIANT": "The core-money ledger invariant would be violated.",
+    "ERR_CREDIT_RESTORE_FORBIDDEN": "Training credit may not be restored.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

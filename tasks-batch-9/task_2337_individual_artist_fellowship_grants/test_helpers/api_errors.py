@@ -1,0 +1,117 @@
+"""
+Error catalogue for the Individual Artist Fellowship Grants API.
+
+Mirrors the PRD's error code table exactly (error_id -> HTTP status) and
+registers it with the shared validator so `validate_error()` cross-checks
+the HTTP status whenever a test omits an explicit one.
+"""
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+ERROR_HTTP_STATUS = {
+    # --- identity, authorisation and ownership ---
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_NOT_PANEL_CHAIR": 403,
+    # --- request shape ---
+    "ERR_INVALID_REQUEST": 400,
+    # --- not found, one per entity ---
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_DISCIPLINE_CATEGORY_NOT_FOUND": 404,
+    "ERR_ARTIST_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_WORK_SAMPLE_NOT_FOUND": 404,
+    "ERR_PANEL_NOT_FOUND": 404,
+    "ERR_PANELIST_NOT_FOUND": 404,
+    "ERR_CONFLICT_NOT_FOUND": 404,
+    "ERR_REVIEW_NOT_FOUND": 404,
+    "ERR_SLOT_NOT_FOUND": 404,
+    "ERR_AWARD_NOT_FOUND": 404,
+    "ERR_INSTALLMENT_NOT_FOUND": 404,
+    "ERR_FINAL_REPORT_NOT_FOUND": 404,
+    "ERR_APPEAL_NOT_FOUND": 404,
+    # --- optimistic concurrency ---
+    "ERR_STALE_CYCLE_VERSION": 412,
+    "ERR_STALE_PANEL_VERSION": 412,
+    # --- entity state ---
+    "ERR_CYCLE_STATE_INVALID": 409,
+    "ERR_APPLICATION_STATE_INVALID": 409,
+    "ERR_WORK_SAMPLE_STATE_INVALID": 409,
+    "ERR_PANEL_STATE_INVALID": 409,
+    "ERR_PANELIST_STATE_INVALID": 409,
+    "ERR_CONFLICT_STATE_INVALID": 409,
+    "ERR_REVIEW_STATE_INVALID": 409,
+    "ERR_SLOT_STATE_INVALID": 409,
+    "ERR_AWARD_STATE_INVALID": 409,
+    "ERR_INSTALLMENT_STATE_INVALID": 409,
+    "ERR_FINAL_REPORT_STATE_INVALID": 409,
+    "ERR_APPEAL_STATE_INVALID": 409,
+    # --- cycle posture ---
+    "ERR_CYCLE_POSTURE_FROZEN": 409,
+    "ERR_CYCLE_POSTURE_RESTRICTED": 409,
+    # --- cross-entity state ---
+    "ERR_ARTIST_NOT_IN_GOOD_STANDING": 409,
+    "ERR_ANONYMITY_BREACH_UNRESOLVED": 409,
+    "ERR_CONFLICT_BLOCKS_REVIEW": 409,
+    "ERR_MANDATORY_CONFLICT_NOT_WAIVABLE": 409,
+    # --- temporal ---
+    "ERR_APPLICATION_WINDOW_NOT_OPEN": 409,
+    "ERR_APPLICATION_DEADLINE_PASSED": 409,
+    "ERR_DEADLINE_NOT_REACHED": 409,
+    "ERR_PANELIST_WINDOW_CONFLICT": 409,
+    "ERR_ACCEPTANCE_DEADLINE_PASSED": 409,
+    "ERR_INSTALLMENT_NOT_DUE": 409,
+    "ERR_APPEAL_WINDOW_CLOSED": 409,
+    "ERR_AWARD_PERIOD_COOLING_VIOLATION": 409,
+    "ERR_FINAL_REPORT_NOT_DUE": 409,
+    # --- business rules ---
+    "ERR_DUPLICATE_APPLICATION": 409,
+    "ERR_WORK_SAMPLE_REQUIREMENTS_NOT_MET": 409,
+    "ERR_ELIGIBILITY_CRITERIA_NOT_MET": 409,
+    "ERR_INELIGIBILITY_REASON_UNSUPPORTED": 409,
+    "ERR_INSUFFICIENT_REVIEWS": 409,
+    "ERR_PANEL_NOT_READY": 409,
+    "ERR_SCORE_SPREAD_REQUIRES_ANOTHER_ROUND": 409,
+    "ERR_INCOMPLETE_SLATE": 409,
+    "ERR_SLOTS_PENDING_BOARD_ACTION": 409,
+    "ERR_CYCLE_HAS_OPEN_AWARDS": 409,
+    "ERR_AWARD_HAS_DISBURSEMENTS": 409,
+    "ERR_TAX_CERTIFICATION_REQUIRED": 409,
+    "ERR_NON_PROCEDURAL_APPEAL_GROUNDS": 409,
+    "ERR_REMEDY_NOT_PERMITTED_FOR_GROUNDS": 409,
+    "ERR_DUPLICATE_APPEAL": 409,
+    "ERR_DUPLICATE_FINAL_REPORT": 409,
+    "ERR_MAX_REVISIONS_REACHED": 409,
+    "ERR_DUPLICATE_CONFLICT": 409,
+    "ERR_DUPLICATE_REVIEW": 409,
+    "ERR_CYCLE_HAS_NO_DISCIPLINES": 409,
+    "ERR_PANELIST_NOT_ON_PANEL": 409,
+    "ERR_APPLICATION_NOT_ON_PANEL": 409,
+    "ERR_SLOT_RANK_ORDER_VIOLATION": 409,
+    "ERR_DISCIPLINE_PANEL_CAPACITY": 409,
+    "ERR_DISCIPLINE_ALLOCATION_EXHAUSTED": 409,
+    "ERR_ALLOCATION_EXCEEDS_BUDGET": 409,
+}
+
+# The 404 error each path identifier raises when it names no row.
+NOT_FOUND_BY_PATH_ID = {
+    "cycle_id": "ERR_CYCLE_NOT_FOUND",
+    "discipline_category_id": "ERR_DISCIPLINE_CATEGORY_NOT_FOUND",
+    "artist_id": "ERR_ARTIST_NOT_FOUND",
+    "application_id": "ERR_APPLICATION_NOT_FOUND",
+    "work_sample_id": "ERR_WORK_SAMPLE_NOT_FOUND",
+    "panel_id": "ERR_PANEL_NOT_FOUND",
+    "panelist_id": "ERR_PANELIST_NOT_FOUND",
+    "conflict_declaration_id": "ERR_CONFLICT_NOT_FOUND",
+    "review_id": "ERR_REVIEW_NOT_FOUND",
+    "recommendation_slot_id": "ERR_SLOT_NOT_FOUND",
+    "award_id": "ERR_AWARD_NOT_FOUND",
+    "payment_installment_id": "ERR_INSTALLMENT_NOT_FOUND",
+    "final_report_id": "ERR_FINAL_REPORT_NOT_FOUND",
+    "appeal_id": "ERR_APPEAL_NOT_FOUND",
+}
+
+# Register the mapping once, at import time.
+set_error_http_status_map(ERROR_HTTP_STATUS)

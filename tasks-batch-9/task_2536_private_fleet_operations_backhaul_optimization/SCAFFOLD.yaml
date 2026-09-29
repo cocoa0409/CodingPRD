@@ -1,0 +1,3618 @@
+scenario: |
+  Generate task harder than expert level!
+
+  2536. Private Fleet Operations & Backhaul Optimization (retail private fleet): delivery schedule construction from store replenishment plans with time windows and dock capacity, tractor and trailer assignment with driver hours-of-service planning and domicile balancing, backhaul opportunity identification from vendor pickups and third-party freight with contribution margin analysis, driver pay structure across mileage, activity and hourly components, equipment maintenance scheduling around delivery commitments, fleet cost per case and cost per mile benchmarking against dedicated carriage alternatives, driver recruiting, retention and route bidding by seniority, safety, telematics and coaching programs
+
+domain_name: private-fleet-backhaul-operations
+api_prefix: "/fleet"
+
+complexity_profile:
+  difficulty_level: expert_plus
+  difficulty_rationale: |
+    Expert band (§0.4) extended: the scenario names seven coupled operating
+    surfaces (schedule construction, equipment+driver assignment, backhaul
+    margin, driver pay, maintenance, benchmarking, bidding) that share ONE
+    Trip row. Density, not volume, carries the difficulty: Trip.planned_*
+    fields are re-derived on every stop append, are the input to the HOS gate,
+    the trailer peak-load gate, the dock-capacity gate, the pay engine (two
+    variants), the domicile benchmark (two variants) and the PM projection,
+    so a single wrong rounding order or a single mis-ordered validation is
+    observable in four unrelated endpoints.
+  primary_archetype: temporal_windowing
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - derived_field_reconciliation
+  additional_mechanisms:
+    - selector_policy            # route award by seniority with 2-level tie-break
+    - version_pinning_on_approval # pay plan id+version pinned at POST /trips/{id}/plan
+    - rate_threshold_triggers    # HOS break trigger, PM interval, commission tier, coaching hold
+
+  entity_topology: flat
+  # Every relationship is an explicit FK column on the child; no entity is
+  # addressed through a parent path segment. Trip is the hub but is NOT a URL
+  # parent for TripStop reads (`GET /fleet/trip-stops?trip_id=`), DockAppointment
+  # is deliberately absent (dock capacity is derived from TripStop rows), and
+  # TripStop/DriverPayStatement/RouteBid/TelematicsEvent are all peer
+  # collections reachable by filtered list.
+
+  state_machine_shape: parallel
+  # Trip carries two independent dimensions on the same row:
+  #   plan_status:       DRAFT -> PLANNED -> DISPATCHED -> IN_PROGRESS -> COMPLETED (+ CANCELLED)
+  #   settlement_status: PENDING -> ACCRUED -> SETTLED -> DISPUTED -> ADJUSTED -> ACCRUED (cycle)
+  # plan_status reaches a terminal state (COMPLETED) while settlement_status
+  # keeps cycling on the same row. BackhaulOffer adds a second non-linear
+  # machine (PROPOSED <-> UNDER_REVIEW revision loop, ACCEPTED -> PROPOSED on
+  # linked-trip cancel), MaintenanceWorkOrder a third (SCHEDULED <-> DEFERRED),
+  # Tractor/Trailer a fourth (AVAILABLE <-> ASSIGNED, AVAILABLE <-> IN_SHOP),
+  # and RoutePosting a branching fork (OPEN -> {AWARDED, VACANT, CANCELLED}).
+
+  relationship_patterns:
+    - one_to_many        # Trip -> TripStop, Driver -> DriverPayStatement, RoutePosting -> RouteBid
+    - cross_aggregate    # Trip -> BackhaulOffer, TripStop -> ReplenishmentOrder, Trip -> DriverPayPlan (pinned)
+    - polymorphic        # MaintenanceWorkOrder.asset_kind selects tractor_id XOR trailer_id
+
+  role_model: segregation_of_duties
+  # Operator ids (X-User-ID) are role-agnostic: the same operator id may be
+  # sent with different X-User-Role headers. Two operations therefore require
+  # the acting operator id to DIFFER from the originating operator id:
+  #   - POST /fleet/backhaul-offers/{id}/accept with margin_exception_approved: true
+  #   - POST /fleet/route-postings/{id}/award
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+
+  - name: Store
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: store_code
+        type: string
+        source: input
+        description: External store identifier, unique across all Stores.
+        constraints: "1-16 chars; uniqueness violation -> ERR_DUPLICATE_CODE"
+      - name: region_code
+        type: string
+        source: input
+        description: Operating region used by backhaul origin matching.
+        constraints: "enum-like free text; MIDWEST / SOUTHEAST / WEST used by fixtures"
+      - name: dock_count
+        type: integer
+        source: input
+        description: Number of receiving doors available at the store; the aggregate capacity ceiling for overlapping TripStop occupations.
+        constraints: ">= 1"
+      - name: cases_per_hour_unload_rate
+        type: integer
+        source: input
+        description: Cases the store's crew unloads per hour; divisor of the DELIVERY service-minute formula.
+        constraints: ">= 1"
+      - name: dock_open_minute
+        type: integer
+        source: input
+        description: First minute-of-UTC-day at which a trailer may be at the dock (0-1439).
+        constraints: "0 <= dock_open_minute < dock_close_minute <= 1439"
+      - name: dock_close_minute
+        type: integer
+        source: input
+        description: Last minute-of-UTC-day by which a trailer must be released (0-1439).
+        constraints: "> dock_open_minute"
+      - name: status
+        type: enum
+        source: system
+        description: Store operating posture; SUSPENDED stores may not be planned into a Trip.
+        default: ACTIVE
+        constraints: "{ACTIVE, SUSPENDED}"
+      - name: open_scheduled_cases
+        type: integer
+        source: computed
+        description: "Ledger: sum of ReplenishmentOrder.cases for orders of this store whose status == SCHEDULED. Conserved quantity of the case-commitment invariant."
+        default: 0
+      - name: delivered_cases_total
+        type: integer
+        source: computed
+        description: Lifetime cases whose ReplenishmentOrder reached DELIVERED at this store.
+        default: 0
+
+  - name: Domicile
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: domicile_code
+        type: string
+        source: input
+        description: Terminal/domicile identifier, unique across all Domiciles.
+        constraints: "1-16 chars; unique"
+      - name: region_code
+        type: string
+        source: input
+        description: Operating region of the domicile.
+      - name: tractor_capacity
+        type: integer
+        source: input
+        description: Physical tractor parking capacity at the domicile (reporting only).
+        constraints: ">= 1"
+      - name: driver_headcount_target
+        type: integer
+        source: input
+        description: Budgeted driver headcount; denominator of balance_index.
+        constraints: ">= 1"
+      - name: fixed_ownership_cents_per_day
+        type: integer
+        source: input
+        description: Tractor/trailer ownership cost charged per calendar day; entered ONLY by the FULLY_ALLOCATED benchmark variant.
+        constraints: ">= 0"
+      - name: overhead_cents_per_day
+        type: integer
+        source: input
+        description: Domicile overhead charged per calendar day; entered ONLY by the FULLY_ALLOCATED benchmark variant.
+        constraints: ">= 0"
+      - name: dedicated_rate_cents_per_mile
+        type: integer
+        source: input
+        description: Dedicated-carriage benchmark rate per mile quoted by the alternative carrier.
+        constraints: ">= 0"
+      - name: dedicated_rate_cents_per_case
+        type: integer
+        source: input
+        description: Dedicated-carriage benchmark rate per case quoted by the alternative carrier.
+        constraints: ">= 0"
+      - name: assigned_driver_count
+        type: integer
+        source: computed
+        description: "Count of Driver rows with domicile_id == this Domicile.id AND status == ACTIVE."
+        default: 0
+      - name: balance_index
+        type: number
+        source: computed
+        description: "round_half_up(assigned_driver_count / driver_headcount_target, 4). Gate of the cross-domicile driver borrow rule."
+        default: 0.0
+      - name: accrued_pay_cents
+        type: integer
+        source: computed
+        description: "Ledger: sum of DriverPayStatement.gross_cents over statements whose driver belongs to this Domicile and whose status IN {ACCRUED, SETTLED}. Conserved quantity of the pay-ledger invariant."
+        default: 0
+
+  - name: DriverPayPlan
+    parent: null
+    common_fields: true
+    kind: configuration
+    fields:
+      - name: plan_code
+        type: string
+        source: input
+        description: Pay plan identifier, unique across all DriverPayPlans.
+        constraints: "1-16 chars; unique"
+      - name: mileage_cents_per_mile
+        type: integer
+        source: input
+        description: Mileage component rate applied to Trip.total_miles.
+        constraints: ">= 0"
+      - name: stop_cents_per_stop
+        type: integer
+        source: input
+        description: Activity component rate per paid delivery/pickup stop.
+        constraints: ">= 0"
+      - name: drop_hook_cents
+        type: integer
+        source: input
+        description: Activity component rate per DROP_OFF stop.
+        constraints: ">= 0"
+      - name: hourly_cents_per_minute
+        type: integer
+        source: input
+        description: Hourly (detention) component rate per minute beyond plan + grace.
+        constraints: ">= 0"
+      - name: minimum_daily_cents
+        type: integer
+        source: input
+        description: Daily guarantee floor; makeup pay tops the trip up to this amount.
+        constraints: ">= 0"
+      - name: backhaul_bonus_pct
+        type: number
+        source: input
+        description: Fraction of (mileage_cents + activity_cents) paid as a bonus when the Trip carries an ACCEPTED BackhaulOffer.
+        constraints: "0 <= backhaul_bonus_pct <= 0.50"
+
+  - name: Driver
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: driver_code
+        type: string
+        source: input
+        description: Driver identifier, unique across all Drivers.
+        constraints: "1-16 chars; unique"
+      - name: domicile_id
+        type: string
+        source: input
+        description: "FK -> Domicile.id; the driver's home domicile. Borrowing across domiciles is gated by balance_index."
+      - name: pay_plan_id
+        type: string
+        source: input
+        description: "FK -> DriverPayPlan.id; the driver's CURRENT pay plan. Superseded by POST /fleet/drivers/{driver_id}/pay-plan-assignments."
+      - name: seniority_date
+        type: string
+        source: input
+        description: Company seniority date (YYYY-MM-DD). Primary sort key of the route-award selector.
+        constraints: "ISO date; earlier date == more senior"
+      - name: status
+        type: enum
+        source: system
+        description: Employment status.
+        default: ACTIVE
+        constraints: "{ACTIVE, TERMINATED}"
+      - name: hos_status
+        type: enum
+        source: system
+        description: Duty posture; ON_DUTY between trip dispatch and trip completion/cancel.
+        default: AVAILABLE
+        constraints: "{AVAILABLE, ON_DUTY}"
+      - name: drive_minutes_used_today
+        type: integer
+        source: system
+        description: Driving minutes consumed in the current duty day; summand of the daily drive-limit check.
+        default: 0
+      - name: duty_minutes_used_today
+        type: integer
+        source: system
+        description: On-duty minutes consumed in the current duty day; summand of the daily duty-limit check.
+        default: 0
+      - name: weekly_on_duty_minutes
+        type: integer
+        source: system
+        description: On-duty minutes consumed in the rolling 7-day period; summand of the weekly-limit check.
+        default: 0
+      - name: open_penalty_points
+        type: integer
+        source: computed
+        description: "Sum of TelematicsEvent.penalty_points over this driver's events with coached == false. Conserved quantity of the safety-points invariant."
+        default: 0
+      - name: safety_score
+        type: integer
+        source: computed
+        description: "max(0, 100 - open_penalty_points). Bid eligibility metric."
+        default: 100
+      - name: coaching_hold
+        type: boolean
+        source: computed
+        description: "true iff safety_score < 70. Blocks trip assignment and route bidding; cleared when coaching restores the score to >= 70."
+        default: false
+      - name: ytd_gross_cents
+        type: integer
+        source: computed
+        description: "Sum of DriverPayStatement.gross_cents for this driver over statements with status IN {ACCRUED, SETTLED}."
+        default: 0
+
+  - name: Tractor
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: unit_code
+        type: string
+        source: input
+        description: Power unit number, unique across all Tractors.
+        constraints: "1-16 chars; unique"
+      - name: domicile_id
+        type: string
+        source: input
+        description: "FK -> Domicile.id; the tractor's home domicile. Tractors are NEVER borrowed across domiciles."
+      - name: odometer_miles
+        type: integer
+        source: input
+        description: Current odometer reading; incremented by Trip.total_miles on trip completion.
+        constraints: ">= 0"
+      - name: pm_interval_miles
+        type: integer
+        source: input
+        description: Preventive-maintenance interval in miles.
+        constraints: ">= 1"
+      - name: pm_last_service_odometer
+        type: integer
+        source: input
+        description: Odometer reading at the last completed PM; baseline of miles_since_pm.
+        constraints: "0 <= pm_last_service_odometer <= odometer_miles"
+      - name: miles_since_pm
+        type: integer
+        source: computed
+        description: "odometer_miles - pm_last_service_odometer."
+        default: 0
+      - name: pm_hold
+        type: boolean
+        source: computed
+        description: "true while an auto-generated PM MaintenanceWorkOrder for this tractor is in status SCHEDULED or DEFERRED or IN_SHOP; blocks new trip assignment."
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: Equipment posture.
+        default: AVAILABLE
+        constraints: "{AVAILABLE, ASSIGNED, IN_SHOP}"
+
+  - name: Trailer
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: trailer_code
+        type: string
+        source: input
+        description: Trailer number, unique across all Trailers.
+        constraints: "1-16 chars; unique"
+      - name: domicile_id
+        type: string
+        source: input
+        description: "FK -> Domicile.id; the trailer's home domicile. Trailers are NEVER borrowed across domiciles."
+      - name: trailer_type
+        type: enum
+        source: input
+        description: Equipment class; REEFER is required for any REFRIGERATED load on the trip.
+        constraints: "{DRY_VAN, REEFER}"
+      - name: capacity_cases
+        type: integer
+        source: input
+        description: Case capacity; ceiling of the trip's peak in-transit case load.
+        constraints: ">= 1"
+      - name: inspection_due_at
+        type: datetime
+        source: input
+        description: Next DOT inspection due instant (reporting only).
+      - name: status
+        type: enum
+        source: system
+        description: Equipment posture.
+        default: AVAILABLE
+        constraints: "{AVAILABLE, ASSIGNED, IN_SHOP}"
+
+  - name: ReplenishmentOrder
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: store_id
+        type: string
+        source: input
+        description: "FK -> Store.id; the store to be replenished."
+      - name: cases
+        type: integer
+        source: input
+        description: Case quantity to deliver; drives service minutes, trailer peak load and cost-per-case.
+        constraints: ">= 1"
+      - name: weight_lbs
+        type: integer
+        source: input
+        description: Gross weight of the order (reporting only).
+        constraints: ">= 0"
+      - name: requested_window_start
+        type: datetime
+        source: input
+        description: Earliest instant the store will receive the order.
+      - name: requested_window_end
+        type: datetime
+        source: input
+        description: Latest instant by which the trailer must be released.
+        constraints: "> requested_window_start"
+      - name: temperature_mode
+        type: enum
+        source: input
+        description: Temperature class of the freight; REFRIGERATED requires a REEFER trailer.
+        constraints: "{DRY, REFRIGERATED}"
+      - name: priority
+        type: integer
+        source: input
+        description: Merchandising priority 1 (highest) to 5 (lowest); reporting only.
+        default: 3
+        constraints: "1 <= priority <= 5"
+      - name: status
+        type: enum
+        source: system
+        description: Scheduling lifecycle.
+        default: UNSCHEDULED
+        constraints: "{UNSCHEDULED, SCHEDULED, DELIVERED, CANCELLED}"
+
+  - name: Trip
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: trip_code
+        type: string
+        source: input
+        description: Trip identifier, unique across all Trips.
+        constraints: "1-16 chars; unique"
+      - name: domicile_id
+        type: string
+        source: input
+        description: "FK -> Domicile.id; the domicile that owns the trip and absorbs its cost."
+      - name: planned_start_at
+        type: datetime
+        source: input
+        description: Instant the tractor leaves the domicile; left edge of the equipment occupation interval.
+      - name: driver_id
+        type: string
+        source: system
+        description: "FK -> Driver.id; nullable until POST /fleet/trips/{trip_id}/assignments, cleared on cancel and on coaching-hold cascade."
+        default: null
+      - name: tractor_id
+        type: string
+        source: system
+        description: "FK -> Tractor.id; nullable until assignment; cleared on cancel and on coaching-hold cascade."
+        default: null
+      - name: trailer_id
+        type: string
+        source: system
+        description: "FK -> Trailer.id; nullable until assignment; cleared on cancel and on coaching-hold cascade."
+        default: null
+      - name: backhaul_offer_id
+        type: string
+        source: system
+        description: "FK -> BackhaulOffer.id; nullable; set by POST /fleet/trips/{trip_id}/backhaul-assignments, cleared on trip cancel."
+        default: null
+      - name: pinned_pay_plan_id
+        type: string
+        source: system
+        description: "FK -> DriverPayPlan.id; the pay plan snapshotted at POST /fleet/trips/{trip_id}/plan; null while DRAFT."
+        default: null
+      - name: pinned_pay_plan_version
+        type: integer
+        source: system
+        description: DriverPayPlan.version observed at plan time; the trip settles on this snapshot even after the driver's plan is superseded.
+        default: null
+      - name: plan_status
+        type: enum
+        source: system
+        description: "Dimension 1 of the parallel state machine (operations)."
+        default: DRAFT
+        constraints: "{DRAFT, PLANNED, DISPATCHED, IN_PROGRESS, COMPLETED, CANCELLED}"
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Dimension 2 of the parallel state machine (payroll); cycles independently of plan_status on the same row."
+        default: PENDING
+        constraints: "{PENDING, ACCRUED, SETTLED, DISPUTED, ADJUSTED}"
+      - name: stop_count
+        type: integer
+        source: computed
+        description: Count of TripStop rows with trip_id == this Trip.id (any status).
+        default: 0
+      - name: planned_end_at
+        type: datetime
+        source: computed
+        description: "scheduled_departure_at of the TripStop with the highest sequence; null when stop_count == 0. Right edge of the equipment occupation interval."
+        default: null
+      - name: total_miles
+        type: integer
+        source: computed
+        description: Sum of TripStop.miles_from_prev over all stops of the trip.
+        default: 0
+      - name: loaded_miles
+        type: integer
+        source: computed
+        description: Sum of TripStop.miles_from_prev over stops with segment_loaded == true.
+        default: 0
+      - name: empty_miles
+        type: integer
+        source: computed
+        description: "total_miles - loaded_miles."
+        default: 0
+      - name: planned_drive_minutes
+        type: integer
+        source: computed
+        description: Sum of TripStop.drive_minutes_from_prev over all stops.
+        default: 0
+      - name: planned_service_minutes
+        type: integer
+        source: computed
+        description: Sum of TripStop.service_minutes over all stops (each already rounded up per stop).
+        default: 0
+      - name: planned_break_minutes
+        type: integer
+        source: computed
+        description: "30 when planned_drive_minutes > 480, else 0."
+        default: 0
+      - name: planned_duty_minutes
+        type: integer
+        source: computed
+        description: "planned_drive_minutes + planned_service_minutes + planned_break_minutes."
+        default: 0
+      - name: planned_delivery_cases
+        type: integer
+        source: computed
+        description: Sum of TripStop.cases over stops with stop_type == DELIVERY.
+        default: 0
+      - name: peak_case_load
+        type: integer
+        source: computed
+        description: Maximum in-transit case load observed while walking the stops in sequence order; compared against Trailer.capacity_cases.
+        default: 0
+      - name: delivered_cases
+        type: integer
+        source: computed
+        description: Sum of TripStop.cases over stops with stop_type == DELIVERY AND status == COMPLETED; set at trip completion.
+        default: 0
+      - name: actual_drive_minutes
+        type: integer
+        source: input
+        description: Driving minutes reported at POST /fleet/trips/{trip_id}/complete.
+        default: null
+      - name: actual_duty_minutes
+        type: integer
+        source: input
+        description: On-duty minutes reported at POST /fleet/trips/{trip_id}/complete; basis of the FINAL_SETTLEMENT hourly component.
+        default: null
+      - name: planned_pay_cents
+        type: integer
+        source: computed
+        description: Driver pay under the PLANNED_ACCRUAL variant, computed at POST /fleet/trips/{trip_id}/plan.
+        default: 0
+      - name: driver_pay_cents
+        type: integer
+        source: computed
+        description: Driver pay under the FINAL_SETTLEMENT variant, computed at trip completion; reset to 0 when the statement is reversed.
+        default: 0
+      - name: backhaul_credit_cents
+        type: integer
+        source: computed
+        description: "contribution_margin_cents of the linked BackhaulOffer when that offer.status == ACCEPTED, else 0; credited against domicile cost."
+        default: 0
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: Opaque X-User-ID of the FleetPlanner that created the trip (audit only; not an FK).
+
+  - name: TripStop
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: trip_id
+        type: string
+        source: input
+        description: "FK -> Trip.id; supplied through the path segment of POST /fleet/trips/{trip_id}/stops."
+      - name: sequence
+        type: integer
+        source: input
+        description: Position in the trip; must equal (max existing sequence for the trip) + 1, starting at 1.
+        constraints: ">= 1; unique per trip"
+      - name: stop_type
+        type: enum
+        source: input
+        description: Activity performed at the stop; selects the service-minute rule and the pay component.
+        constraints: "{DELIVERY, VENDOR_PICKUP, THIRD_PARTY_PICKUP, DROP_OFF, FUEL}"
+      - name: store_id
+        type: string
+        source: input
+        description: "FK -> Store.id; required when stop_type == DELIVERY, must be null otherwise."
+        default: null
+      - name: replenishment_order_id
+        type: string
+        source: input
+        description: "FK -> ReplenishmentOrder.id; required when stop_type == DELIVERY, must be null otherwise."
+        default: null
+      - name: scheduled_arrival_at
+        type: datetime
+        source: input
+        description: Planned dock/gate arrival; left edge of the half-open dock occupation interval.
+      - name: scheduled_departure_at
+        type: datetime
+        source: input
+        description: Planned release; right edge (exclusive) of the half-open dock occupation interval.
+        constraints: "> scheduled_arrival_at"
+      - name: drive_minutes_from_prev
+        type: integer
+        source: input
+        description: Driving minutes from the previous stop (or from the domicile for sequence 1).
+        constraints: ">= 0"
+      - name: miles_from_prev
+        type: integer
+        source: input
+        description: Miles from the previous stop (or from the domicile for sequence 1).
+        constraints: ">= 0"
+      - name: segment_loaded
+        type: boolean
+        source: input
+        description: Whether the segment INTO this stop was run loaded; splits total_miles into loaded_miles and empty_miles.
+      - name: cases
+        type: integer
+        source: input
+        description: Cases delivered (DELIVERY, DROP_OFF) or picked up (VENDOR_PICKUP, THIRD_PARTY_PICKUP) at this stop.
+        default: 0
+        constraints: ">= 0"
+      - name: service_minutes
+        type: integer
+        source: computed
+        description: Minutes spent at this stop under the stop-type service rule, rounded UP to a whole minute at this stop before any summation.
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Execution lifecycle of the stop.
+        default: PLANNED
+        constraints: "{PLANNED, ARRIVED, COMPLETED, SKIPPED}"
+
+  - name: BackhaulOffer
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: origin_kind
+        type: enum
+        source: input
+        description: Whether the freight originates at a vendor pickup or from third-party brokered freight.
+        constraints: "{VENDOR_PICKUP, THIRD_PARTY}"
+      - name: shipper_name
+        type: string
+        source: input
+        description: Counterparty name (reporting only).
+      - name: origin_region_code
+        type: string
+        source: input
+        description: Region the freight is picked up in.
+      - name: dest_store_id
+        type: string
+        source: input
+        description: "FK -> Store.id; where the backhaul freight is delivered."
+      - name: revenue_cents
+        type: integer
+        source: input
+        description: Linehaul revenue offered for the movement; denominator of every margin percentage.
+        constraints: ">= 1"
+      - name: cases
+        type: integer
+        source: input
+        description: Case count picked up; multiplied by HANDLING_CENTS_PER_CASE and added to the trip's in-transit load.
+        constraints: ">= 1"
+      - name: weight_lbs
+        type: integer
+        source: input
+        description: Gross weight (reporting only).
+        constraints: ">= 0"
+      - name: deadhead_miles
+        type: integer
+        source: input
+        description: Empty miles required to reach the pickup.
+        constraints: ">= 0"
+      - name: loaded_miles
+        type: integer
+        source: input
+        description: Loaded miles from pickup to destination.
+        constraints: ">= 0"
+      - name: temperature_mode
+        type: enum
+        source: input
+        description: Temperature class of the backhaul freight; REFRIGERATED both adds the reefer surcharge and requires a REEFER trailer on the linked trip.
+        constraints: "{DRY, REFRIGERATED}"
+      - name: pickup_window_start
+        type: datetime
+        source: input
+        description: Earliest pickup instant offered by the shipper.
+      - name: pickup_window_end
+        type: datetime
+        source: input
+        description: Latest pickup instant offered by the shipper.
+        constraints: "> pickup_window_start"
+      - name: offer_expires_at
+        type: datetime
+        source: input
+        description: Instant after which the expiration sweep retires the offer.
+      - name: status
+        type: enum
+        source: system
+        description: Negotiation lifecycle; PROPOSED <-> UNDER_REVIEW is a revision loop.
+        default: PROPOSED
+        constraints: "{PROPOSED, UNDER_REVIEW, ACCEPTED, REJECTED, WITHDRAWN, EXPIRED}"
+      - name: review_round
+        type: integer
+        source: system
+        description: Number of completed revision loops; incremented on UNDER_REVIEW -> PROPOSED.
+        default: 0
+      - name: variable_cost_cents
+        type: integer
+        source: computed
+        description: "line_haul_cost_cents + handling_cost_cents + reefer_cost_cents."
+        default: 0
+      - name: gross_margin_cents
+        type: integer
+        source: computed
+        description: "revenue_cents - variable_cost_cents (pre-commission)."
+        default: 0
+      - name: tier_margin_pct
+        type: number
+        source: computed
+        description: "round_half_up(gross_margin_cents / revenue_cents, 4). The ONLY input to the commission tier decision."
+        default: 0.0
+      - name: commission_cents
+        type: integer
+        source: computed
+        description: Brokerage commission whose rate is selected by tier_margin_pct.
+        default: 0
+      - name: contribution_margin_cents
+        type: integer
+        source: computed
+        description: "gross_margin_cents - commission_cents."
+        default: 0
+      - name: margin_pct
+        type: number
+        source: computed
+        description: "round_half_up(contribution_margin_cents / revenue_cents, 4). Compared against MIN_MARGIN_PCT at acceptance; NEVER feeds the commission tier."
+        default: 0.0
+      - name: margin_exception_approved
+        type: boolean
+        source: system
+        description: Whether acceptance below the margin floor was approved by a second operator.
+        default: false
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: Opaque X-User-ID of the FleetPlanner that created the offer; the acting operator on a margin exception must differ from it (audit only; not an FK).
+
+  - name: MaintenanceWorkOrder
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: asset_kind
+        type: enum
+        source: input
+        description: Selects which asset FK must be populated (polymorphic reference).
+        constraints: "{TRACTOR, TRAILER}"
+      - name: tractor_id
+        type: string
+        source: input
+        description: "FK -> Tractor.id; required when asset_kind == TRACTOR, must be null otherwise."
+        default: null
+      - name: trailer_id
+        type: string
+        source: input
+        description: "FK -> Trailer.id; required when asset_kind == TRAILER, must be null otherwise."
+        default: null
+      - name: service_type
+        type: enum
+        source: input
+        description: Work class; PM_A / PM_B are the auto-generated preventive classes.
+        constraints: "{PM_A, PM_B, INSPECTION, REPAIR}"
+      - name: window_start_at
+        type: datetime
+        source: input
+        description: Shop window start; left edge of a CLOSED interval (adjacency counts as a conflict).
+      - name: window_end_at
+        type: datetime
+        source: input
+        description: Shop window end; right edge of a CLOSED interval (adjacency counts as a conflict).
+        constraints: "> window_start_at"
+      - name: status
+        type: enum
+        source: system
+        description: Shop lifecycle; SCHEDULED <-> DEFERRED is a bounded loop.
+        default: SCHEDULED
+        constraints: "{SCHEDULED, DEFERRED, IN_SHOP, COMPLETED, CANCELLED}"
+      - name: deferral_count
+        type: integer
+        source: system
+        description: Completed deferrals; a third deferral is rejected.
+        default: 0
+      - name: auto_generated
+        type: boolean
+        source: system
+        description: true when the work order was created by the PM-due cascade rather than by a coordinator.
+        default: false
+
+  - name: DriverPayStatement
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: driver_id
+        type: string
+        source: system
+        description: "FK -> Driver.id; the paid driver, copied from Trip.driver_id at accrual."
+      - name: trip_id
+        type: string
+        source: system
+        description: "FK -> Trip.id; the settled trip."
+      - name: pay_plan_id
+        type: string
+        source: system
+        description: "FK -> DriverPayPlan.id; the plan snapshot the statement was computed from (Trip.pinned_pay_plan_id)."
+      - name: pay_plan_version
+        type: integer
+        source: system
+        description: DriverPayPlan.version the statement was computed from.
+      - name: variant
+        type: enum
+        source: system
+        description: Which pay variant produced the amounts; statements are always FINAL_SETTLEMENT.
+        default: FINAL_SETTLEMENT
+        constraints: "{FINAL_SETTLEMENT}"
+      - name: mileage_cents
+        type: integer
+        source: computed
+        description: Mileage component.
+        default: 0
+      - name: activity_cents
+        type: integer
+        source: computed
+        description: Stop + drop-hook activity component.
+        default: 0
+      - name: hourly_cents
+        type: integer
+        source: computed
+        description: Detention component beyond plan + grace.
+        default: 0
+      - name: bonus_cents
+        type: integer
+        source: computed
+        description: Backhaul bonus component.
+        default: 0
+      - name: guarantee_makeup_cents
+        type: integer
+        source: computed
+        description: Top-up to the daily guarantee.
+        default: 0
+      - name: gross_cents
+        type: integer
+        source: computed
+        description: "mileage_cents + activity_cents + hourly_cents + bonus_cents + guarantee_makeup_cents."
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: Payroll lifecycle.
+        default: ACCRUED
+        constraints: "{ACCRUED, SETTLED, REVERSED}"
+      - name: settlement_reference
+        type: string
+        source: input
+        description: Payroll batch reference recorded at settle time.
+        default: null
+
+  - name: RoutePosting
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: route_code
+        type: string
+        source: input
+        description: Bid-board route identifier, unique across all RoutePostings.
+        constraints: "1-16 chars; unique"
+      - name: domicile_id
+        type: string
+        source: input
+        description: "FK -> Domicile.id; only drivers domiciled here are eligible bidders."
+      - name: weekly_miles
+        type: integer
+        source: input
+        description: Advertised weekly miles (reporting only).
+        constraints: ">= 0"
+      - name: weekly_stops
+        type: integer
+        source: input
+        description: Advertised weekly stop count (reporting only).
+        constraints: ">= 0"
+      - name: start_effective_date
+        type: string
+        source: input
+        description: Date (YYYY-MM-DD) the awarded driver starts the route.
+      - name: bid_close_at
+        type: datetime
+        source: input
+        description: Instant bidding closes; awarding before this instant is rejected.
+      - name: status
+        type: enum
+        source: system
+        description: Bid-board lifecycle; OPEN forks into three terminal outcomes with different side-effect sets.
+        default: OPEN
+        constraints: "{OPEN, AWARDED, VACANT, CANCELLED}"
+      - name: awarded_driver_id
+        type: string
+        source: system
+        description: "FK -> Driver.id; winner of the seniority selector; null unless status == AWARDED."
+        default: null
+      - name: bid_count
+        type: integer
+        source: computed
+        description: Count of RouteBid rows for this posting with status == SUBMITTED.
+        default: 0
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: Opaque X-User-ID of the TransportManager that posted the route; the awarding operator must differ from it (audit only; not an FK).
+
+  - name: RouteBid
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: route_posting_id
+        type: string
+        source: input
+        description: "FK -> RoutePosting.id; the posting bid on."
+      - name: driver_id
+        type: string
+        source: system
+        description: "FK -> Driver.id; derived from the X-User-ID header of the bidding Driver, never accepted from the body."
+      - name: seniority_date_snapshot
+        type: string
+        source: computed
+        description: Driver.seniority_date copied at bid time (audit of the ranking input).
+      - name: safety_score_snapshot
+        type: integer
+        source: computed
+        description: Driver.safety_score copied at bid time (audit only; the award selector re-reads the live score).
+      - name: status
+        type: enum
+        source: system
+        description: Bid lifecycle.
+        default: SUBMITTED
+        constraints: "{SUBMITTED, AWARDED, PASSED_OVER, WITHDRAWN}"
+
+  - name: TelematicsEvent
+    parent: null
+    common_fields: false
+    kind: event
+    fields:
+      - name: driver_id
+        type: string
+        source: input
+        description: "FK -> Driver.id; the driver the event is charged to."
+      - name: trip_id
+        type: string
+        source: input
+        description: "FK -> Trip.id; the trip the event occurred on, nullable."
+        default: null
+      - name: event_type
+        type: enum
+        source: input
+        description: Behaviour class; selects the base penalty points.
+        constraints: "{HARD_BRAKE, SPEEDING, FOLLOWING_DISTANCE, SEATBELT}"
+      - name: severity
+        type: integer
+        source: input
+        description: Severity multiplier of the base points.
+        constraints: "1 <= severity <= 3"
+      - name: occurred_at
+        type: datetime
+        source: input
+        description: Instant of the event (reporting and ordering only).
+      - name: penalty_points
+        type: integer
+        source: computed
+        description: "BASE_POINTS[event_type] * severity; fixed at creation and never recomputed."
+        default: 0
+      - name: coached
+        type: boolean
+        source: system
+        description: Whether a coaching session has retired this event's points. The ONLY mutable business field on this append-only entity.
+        default: false
+      - name: coached_at
+        type: datetime
+        source: system
+        description: Instant the coaching session was recorded (logical clock).
+        default: null
+      - name: coached_by_user_id
+        type: string
+        source: system
+        description: Opaque X-User-ID of the SafetyManager that coached the event (audit only; not an FK).
+        default: null
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+
+  # ===== Trip, dimension 1 of 2: operations =================================
+  - entity: Trip
+    dimension: plan_status
+    initial_state: DRAFT
+    terminal_states: [COMPLETED, CANCELLED]
+    note: |
+      Parallel dimension. plan_status may sit in a terminal state (COMPLETED)
+      while the SAME Trip row keeps moving on the settlement_status dimension.
+      No plan_status transition reads settlement_status and no settlement_status
+      transition reads plan_status except PENDING -> ACCRUED, which is fired by
+      the IN_PROGRESS -> COMPLETED side-effect chain.
+    transitions:
+      - from: DRAFT
+        to: PLANNED
+        trigger: "POST /fleet/trips/{trip_id}/plan"
+        actor: FleetPlanner
+        preconditions:
+          - "trip.plan_status == DRAFT (else ERR_TRIP_NOT_DRAFT)"
+          - "trip.driver_id, trip.tractor_id and trip.trailer_id are all non-null (else ERR_TRIP_NOT_STAFFED)"
+          - "count of TripStop with trip_id == trip.id AND stop_type == DELIVERY is >= 1 (else ERR_TRIP_HAS_NO_STOPS)"
+          - "for every TripStop with stop_type == DELIVERY: Store(stop.store_id).status == ACTIVE (else ERR_STORE_SUSPENDED)"
+          - "for every DELIVERY stop: ReplenishmentOrder(stop.replenishment_order_id).status == UNSCHEDULED (else ERR_ORDER_NOT_SCHEDULABLE)"
+          - "dock-hours rule holds for every DELIVERY stop (else ERR_DOCK_HOURS_VIOLATION)"
+          - "delivery-window rule holds for every DELIVERY stop (else ERR_DELIVERY_WINDOW_VIOLATION)"
+          - "dock-capacity rule holds for every DELIVERY stop (else ERR_DOCK_CAPACITY_EXCEEDED)"
+          - "trailer_peak_case_load <= Trailer(trip.trailer_id).capacity_cases (else ERR_TRAILER_CAPACITY_EXCEEDED)"
+          - "hos_feasibility passes against the current Driver counters (else ERR_HOS_DRIVE_LIMIT / ERR_HOS_DUTY_LIMIT / ERR_HOS_WEEKLY_LIMIT)"
+        side_effects:
+          - "recompute calculations.trip_plan_totals and calculations.trailer_peak_case_load on the Trip"
+          - "trip.pinned_pay_plan_id := Driver(trip.driver_id).pay_plan_id; trip.pinned_pay_plan_version := that DriverPayPlan.version"
+          - "trip.planned_pay_cents := calculations.driver_trip_pay variant PLANNED_ACCRUAL"
+          - "every DELIVERY stop's ReplenishmentOrder: UNSCHEDULED -> SCHEDULED"
+          - "each order that turned SCHEDULED raises Store.open_scheduled_cases by that order's cases (link caused by the order transition, not by the plan call)"
+          - "trip.version += 1; trip.updated_at refreshed"
+      - from: PLANNED
+        to: DISPATCHED
+        trigger: "POST /fleet/trips/{trip_id}/dispatch"
+        actor: TransportManager
+        preconditions:
+          - "trip.plan_status == PLANNED (else ERR_INVALID_STATE_TRANSITION)"
+          - "Driver(trip.driver_id).status == ACTIVE (else ERR_DRIVER_NOT_ACTIVE)"
+          - "Driver(trip.driver_id).coaching_hold == false (else ERR_DRIVER_COACHING_HOLD)"
+          - "Tractor(trip.tractor_id).status == ASSIGNED AND Tractor.pm_hold == false (else ERR_TRACTOR_PM_HOLD)"
+        side_effects:
+          - "Driver.hos_status: AVAILABLE -> ON_DUTY"
+          - "trip.version += 1"
+      - from: DISPATCHED
+        to: IN_PROGRESS
+        trigger: "system, on the first POST /fleet/trip-stops/{trip_stop_id}/arrive of any stop of this trip"
+        actor: system
+        preconditions:
+          - "trip.plan_status == DISPATCHED"
+          - "the arriving stop belongs to this trip"
+        side_effects:
+          - "trip.version += 1"
+        note: "Bubble-up: a child TripStop transition drives the parent Trip transition."
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /fleet/trips/{trip_id}/complete"
+        actor: Driver
+        preconditions:
+          - "trip.plan_status == IN_PROGRESS (else ERR_INVALID_STATE_TRANSITION)"
+          - "when X-User-Role == Driver: X-User-ID == trip.driver_id (else ERR_DRIVER_SCOPE_VIOLATION); a TransportManager may close out any trip of the fleet"
+          - "every TripStop of the trip has status IN {COMPLETED, SKIPPED} (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "trip.delivered_cases := sum of cases over DELIVERY stops with status == COMPLETED"
+          - "each COMPLETED DELIVERY stop's ReplenishmentOrder: SCHEDULED -> DELIVERED  [cascade link 1]"
+          - "each order reaching DELIVERED lowers Store.open_scheduled_cases by its cases and raises Store.delivered_cases_total by its cases  [cascade link 2, caused by link 1]"
+          - "Driver.drive_minutes_used_today += actual_drive_minutes; Driver.duty_minutes_used_today += actual_duty_minutes; Driver.weekly_on_duty_minutes += actual_duty_minutes; Driver.hos_status -> AVAILABLE"
+          - "Tractor.odometer_miles += trip.total_miles  [PM cascade link 1]"
+          - "Tractor.miles_since_pm recomputed as odometer_miles - pm_last_service_odometer  [PM cascade link 2, caused by link 1]"
+          - "when the recomputed miles_since_pm >= Tractor.pm_interval_miles, a MaintenanceWorkOrder is created (auto_generated true, status SCHEDULED, service_type by calculations.pm_due_projection, window pinned by that calculation)  [PM cascade link 3, caused by link 2]"
+          - "the creation of that auto-generated work order sets Tractor.pm_hold := true  [PM cascade link 4, caused by link 3]"
+          - "Tractor.status: ASSIGNED -> AVAILABLE; Trailer.status: ASSIGNED -> AVAILABLE"
+          - "trip.settlement_status: PENDING -> ACCRUED (see the settlement dimension)"
+          - "trip.version += 1"
+      - from: PLANNED
+        to: DRAFT
+        trigger: "system, on the coaching-hold cascade fired by POST /fleet/telematics-events"
+        actor: system
+        preconditions:
+          - "Driver(trip.driver_id).coaching_hold flipped false -> true in this request"
+          - "trip.plan_status IN {DRAFT, PLANNED}"
+        side_effects:
+          - "trip.driver_id := null; trip.tractor_id := null; trip.trailer_id := null"
+          - "trip.pinned_pay_plan_id := null; trip.pinned_pay_plan_version := null; trip.planned_pay_cents := 0"
+          - "Tractor.status: ASSIGNED -> AVAILABLE; Trailer.status: ASSIGNED -> AVAILABLE"
+          - "every DELIVERY stop's ReplenishmentOrder: SCHEDULED -> UNSCHEDULED, and each such order lowers Store.open_scheduled_cases by its cases"
+          - "trip.version += 1"
+        note: "Backward transition on an otherwise forward dimension; only fires for trips that had reached PLANNED."
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /fleet/trips/{trip_id}/cancel"
+        actor: FleetPlanner
+        preconditions:
+          - "trip.plan_status == DRAFT"
+        side_effects:
+          - "every TripStop with status IN {PLANNED, ARRIVED} -> SKIPPED  [cascade link 1]"
+          - "Tractor.status -> AVAILABLE and Trailer.status -> AVAILABLE when non-null; trip.driver_id / tractor_id / trailer_id := null"
+          - "trip.version += 1"
+        note: "No ReplenishmentOrder is SCHEDULED while the trip is DRAFT, so the order/store links of the PLANNED cancel do not fire here."
+      - from: PLANNED
+        to: CANCELLED
+        trigger: "POST /fleet/trips/{trip_id}/cancel"
+        actor: FleetPlanner
+        preconditions:
+          - "trip.plan_status == PLANNED"
+        side_effects:
+          - "every TripStop with status IN {PLANNED, ARRIVED} -> SKIPPED  [cascade link 1]"
+          - "each stop that turned SKIPPED and carries a replenishment_order_id whose order.status == SCHEDULED drives that order SCHEDULED -> UNSCHEDULED  [cascade link 2, caused by link 1]"
+          - "each order that turned UNSCHEDULED lowers Store.open_scheduled_cases by its cases  [cascade link 3, caused by link 2]"
+          - "Tractor.status: ASSIGNED -> AVAILABLE; Trailer.status: ASSIGNED -> AVAILABLE; Driver.hos_status -> AVAILABLE; trip.driver_id / tractor_id / trailer_id := null"
+          - "when trip.backhaul_offer_id is non-null: that BackhaulOffer ACCEPTED -> PROPOSED (review_round unchanged, margin_exception_approved := false) or UNDER_REVIEW stays UNDER_REVIEW; trip.backhaul_offer_id := null; trip.backhaul_credit_cents := 0"
+          - "trip.pinned_pay_plan_id := null; trip.pinned_pay_plan_version := null; trip.planned_pay_cents := 0"
+          - "trip.version += 1"
+      - from: DISPATCHED
+        to: CANCELLED
+        trigger: "POST /fleet/trips/{trip_id}/cancel"
+        actor: FleetPlanner
+        preconditions:
+          - "trip.plan_status == DISPATCHED"
+        side_effects:
+          - "identical cascade to PLANNED -> CANCELLED (stops SKIPPED -> orders UNSCHEDULED -> Store.open_scheduled_cases lowered), plus Driver.hos_status ON_DUTY -> AVAILABLE"
+          - "trip.version += 1"
+
+  # ===== Trip, dimension 2 of 2: payroll (cyclic) ===========================
+  - entity: Trip
+    dimension: settlement_status
+    initial_state: PENDING
+    terminal_states: []
+    note: |
+      Cyclic dimension with NO terminal state: ACCRUED -> SETTLED -> DISPUTED ->
+      ADJUSTED -> ACCRUED closes the loop, so a Trip whose plan_status is the
+      terminal COMPLETED can still be mutated indefinitely on this axis.
+    transitions:
+      - from: PENDING
+        to: ACCRUED
+        trigger: "system, inside POST /fleet/trips/{trip_id}/complete"
+        actor: system
+        preconditions:
+          - "trip.plan_status just became COMPLETED"
+          - "trip.pinned_pay_plan_id is non-null"
+        side_effects:
+          - "trip.driver_pay_cents := calculations.driver_trip_pay variant FINAL_SETTLEMENT"
+          - "trip.backhaul_credit_cents := contribution_margin_cents of the linked BackhaulOffer when its status == ACCEPTED, else 0"
+          - "a DriverPayStatement is created (status ACCRUED, variant FINAL_SETTLEMENT, pay_plan_id/pay_plan_version copied from the Trip pin, component amounts from the calculation)  [pay cascade link 1]"
+          - "the created statement raises Domicile.accrued_pay_cents by gross_cents and Driver.ytd_gross_cents by gross_cents  [pay cascade link 2, caused by link 1]"
+      - from: ACCRUED
+        to: SETTLED
+        trigger: "system, inside POST /fleet/pay-statements/{statement_id}/settle"
+        actor: system
+        preconditions:
+          - "the statement's trip.settlement_status == ACCRUED"
+        side_effects:
+          - "DriverPayStatement.status: ACCRUED -> SETTLED; settlement_reference stored"
+          - "Domicile.accrued_pay_cents unchanged (both ACCRUED and SETTLED are inside the ledger's status filter)"
+      - from: SETTLED
+        to: DISPUTED
+        trigger: "POST /fleet/trips/{trip_id}/settlement-dispute"
+        actor: Driver
+        preconditions:
+          - "trip.settlement_status IN {ACCRUED, SETTLED} (else ERR_INVALID_STATE_TRANSITION)"
+          - "when X-User-Role == Driver: X-User-ID == trip.driver_id (else ERR_DRIVER_SCOPE_VIOLATION); a PayrollAnalyst may dispute on the driver's behalf"
+        side_effects:
+          - "trip.version += 1; no monetary field changes"
+      - from: ACCRUED
+        to: DISPUTED
+        trigger: "POST /fleet/trips/{trip_id}/settlement-dispute"
+        actor: Driver
+        preconditions:
+          - "trip.settlement_status == ACCRUED"
+          - "X-User-ID == trip.driver_id"
+        side_effects:
+          - "trip.version += 1"
+      - from: DISPUTED
+        to: ADJUSTED
+        trigger: "system, inside POST /fleet/pay-statements/{statement_id}/reverse"
+        actor: system
+        preconditions:
+          - "the reversed statement's status IN {ACCRUED, SETTLED}"
+        side_effects:
+          - "DriverPayStatement.status -> REVERSED  [reversal cascade link 1]"
+          - "the reversal lowers Domicile.accrued_pay_cents by gross_cents and Driver.ytd_gross_cents by gross_cents  [reversal cascade link 2, caused by link 1]"
+          - "the reversal drives trip.settlement_status -> ADJUSTED and trip.driver_pay_cents := 0  [reversal cascade link 3, caused by link 1]"
+      - from: ACCRUED
+        to: ADJUSTED
+        trigger: "system, inside POST /fleet/pay-statements/{statement_id}/reverse"
+        actor: system
+        preconditions:
+          - "the reversed statement's status == ACCRUED and its trip.settlement_status == ACCRUED"
+        side_effects:
+          - "identical reversal cascade (statement REVERSED -> ledger decrement -> trip ADJUSTED, driver_pay_cents := 0)"
+      - from: ADJUSTED
+        to: ACCRUED
+        trigger: "POST /fleet/trips/{trip_id}/re-accrue"
+        actor: PayrollAnalyst
+        preconditions:
+          - "trip.settlement_status == ADJUSTED (else ERR_INVALID_STATE_TRANSITION)"
+          - "trip.plan_status == COMPLETED"
+          - "no DriverPayStatement of this trip has status IN {ACCRUED, SETTLED}"
+        side_effects:
+          - "trip.actual_duty_minutes / actual_drive_minutes overwritten with the corrected values"
+          - "trip.driver_pay_cents := calculations.driver_trip_pay variant FINAL_SETTLEMENT recomputed on the corrected minutes and the ORIGINAL pinned pay plan version"
+          - "a NEW DriverPayStatement is created (status ACCRUED) and raises Domicile.accrued_pay_cents and Driver.ytd_gross_cents by its gross_cents"
+          - "trip.version += 1"
+        note: "Closes the settlement cycle; the pin is deliberately NOT refreshed, so a superseded pay plan still governs."
+
+  - entity: TripStop
+    initial_state: PLANNED
+    terminal_states: [COMPLETED, SKIPPED]
+    transitions:
+      - from: PLANNED
+        to: ARRIVED
+        trigger: "POST /fleet/trip-stops/{trip_stop_id}/arrive"
+        actor: Driver
+        preconditions:
+          - "stop.status == PLANNED (else ERR_INVALID_STATE_TRANSITION)"
+          - "Trip(stop.trip_id).plan_status IN {DISPATCHED, IN_PROGRESS} (else ERR_INVALID_STATE_TRANSITION)"
+          - "when X-User-Role == Driver: X-User-ID == Trip(stop.trip_id).driver_id (else ERR_DRIVER_SCOPE_VIOLATION); a TransportManager may act on any stop"
+          - "every TripStop of the same trip with a lower sequence has status IN {COMPLETED, SKIPPED} (else ERR_STOP_SEQUENCE_CONFLICT)"
+        side_effects:
+          - "when Trip.plan_status == DISPATCHED it bubbles up to IN_PROGRESS"
+          - "stop.version += 1"
+      - from: ARRIVED
+        to: COMPLETED
+        trigger: "POST /fleet/trip-stops/{trip_stop_id}/complete"
+        actor: Driver
+        preconditions:
+          - "stop.status == ARRIVED (else ERR_INVALID_STATE_TRANSITION)"
+          - "when X-User-Role == Driver: X-User-ID == Trip(stop.trip_id).driver_id (else ERR_DRIVER_SCOPE_VIOLATION); a TransportManager may act on any stop"
+        side_effects:
+          - "stop.cases := cases_handled when supplied, else unchanged; stop.service_minutes recomputed from the (possibly new) cases; Trip.planned_service_minutes / planned_duty_minutes / planned_delivery_cases / peak_case_load recomputed"
+          - "stop.version += 1"
+      - from: PLANNED
+        to: SKIPPED
+        trigger: "system, on Trip cancel or on the coaching-hold cascade"
+        actor: system
+        preconditions:
+          - "the owning Trip is transitioning to CANCELLED"
+        side_effects:
+          - "when the stop carries a replenishment_order_id whose order.status == SCHEDULED, that order goes SCHEDULED -> UNSCHEDULED"
+      - from: ARRIVED
+        to: SKIPPED
+        trigger: "system, on Trip cancel from DISPATCHED"
+        actor: system
+        preconditions:
+          - "the owning Trip is transitioning DISPATCHED -> CANCELLED"
+        side_effects:
+          - "same order release as PLANNED -> SKIPPED"
+
+  - entity: ReplenishmentOrder
+    initial_state: UNSCHEDULED
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: UNSCHEDULED
+        to: SCHEDULED
+        trigger: "system, inside POST /fleet/trips/{trip_id}/plan"
+        actor: system
+        preconditions:
+          - "order.status == UNSCHEDULED (else ERR_ORDER_NOT_SCHEDULABLE)"
+        side_effects:
+          - "Store.open_scheduled_cases += order.cases"
+      - from: SCHEDULED
+        to: DELIVERED
+        trigger: "system, inside POST /fleet/trips/{trip_id}/complete"
+        actor: system
+        preconditions:
+          - "the order's stop status == COMPLETED"
+        side_effects:
+          - "Store.open_scheduled_cases -= order.cases; Store.delivered_cases_total += order.cases"
+      - from: SCHEDULED
+        to: UNSCHEDULED
+        trigger: "system, on Trip cancel or on the coaching-hold cascade"
+        actor: system
+        preconditions:
+          - "the order's stop is transitioning to SKIPPED, or the owning trip is leaving PLANNED for DRAFT"
+        side_effects:
+          - "Store.open_scheduled_cases -= order.cases"
+      - from: UNSCHEDULED
+        to: CANCELLED
+        trigger: "POST /fleet/replenishment-orders/{order_id}/cancel"
+        actor: FleetPlanner
+        preconditions:
+          - "order.status == UNSCHEDULED (else ERR_ORDER_NOT_SCHEDULABLE)"
+        side_effects:
+          - "order.version += 1; Store.open_scheduled_cases unchanged (an UNSCHEDULED order was never inside the ledger filter)"
+
+  - entity: BackhaulOffer
+    initial_state: PROPOSED
+    terminal_states: [REJECTED, WITHDRAWN, EXPIRED]
+    note: "Cyclic: PROPOSED -> UNDER_REVIEW -> PROPOSED is a bounded revision loop, and ACCEPTED -> PROPOSED returns an accepted offer to the market when its trip is cancelled."
+    transitions:
+      - from: PROPOSED
+        to: UNDER_REVIEW
+        trigger: "POST /fleet/backhaul-offers/{offer_id}/submit-review"
+        actor: FleetPlanner
+        preconditions:
+          - "offer.status == PROPOSED (else ERR_OFFER_NOT_UNDER_REVIEW)"
+          - "logical clock now < offer.offer_expires_at (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "calculations.backhaul_contribution_margin runs and writes variable_cost_cents, gross_margin_cents, tier_margin_pct, commission_cents, contribution_margin_cents, margin_pct"
+          - "offer.version += 1"
+      - from: UNDER_REVIEW
+        to: PROPOSED
+        trigger: "POST /fleet/backhaul-offers/{offer_id}/revise"
+        actor: FleetPlanner
+        preconditions:
+          - "offer.status == UNDER_REVIEW (else ERR_OFFER_NOT_UNDER_REVIEW)"
+          - "offer.review_round < 3 (else ERR_REVIEW_ROUND_LIMIT)"
+        side_effects:
+          - "supplied economics fields (revenue_cents, deadhead_miles, loaded_miles, cases) overwritten; omitted fields unchanged"
+          - "offer.review_round += 1"
+          - "calculations.backhaul_contribution_margin re-runs on the revised economics"
+          - "when the offer is linked to a Trip (Trip.backhaul_offer_id == offer.id), that Trip.backhaul_credit_cents := 0 because the offer is no longer ACCEPTED"
+          - "offer.version += 1"
+      - from: UNDER_REVIEW
+        to: ACCEPTED
+        trigger: "POST /fleet/backhaul-offers/{offer_id}/accept"
+        actor: TransportManager
+        preconditions:
+          - "offer.status == UNDER_REVIEW (else ERR_OFFER_NOT_UNDER_REVIEW)"
+          - "exactly one Trip has backhaul_offer_id == offer.id, and that Trip.plan_status IN {PLANNED, DISPATCHED} (else ERR_INVALID_STATE_TRANSITION)"
+          - "Trailer(trip.trailer_id).trailer_type == REEFER when offer.temperature_mode == REFRIGERATED (else ERR_TEMPERATURE_MODE_MISMATCH)"
+          - "offer.margin_pct >= 0.08, unless margin_exception_approved == true in the body (else ERR_MARGIN_BELOW_FLOOR)"
+          - "when margin_exception_approved == true: X-User-ID != offer.created_by_user_id (else ERR_SEGREGATION_OF_DUTIES)"
+        side_effects:
+          - "offer.margin_exception_approved := the supplied flag"
+          - "linked Trip.backhaul_credit_cents := offer.contribution_margin_cents; Trip.version += 1"
+          - "offer.version += 1"
+      - from: UNDER_REVIEW
+        to: REJECTED
+        trigger: "POST /fleet/backhaul-offers/{offer_id}/reject"
+        actor: TransportManager
+        preconditions:
+          - "offer.status == UNDER_REVIEW (else ERR_OFFER_NOT_UNDER_REVIEW)"
+        side_effects:
+          - "when a Trip links this offer: Trip.backhaul_offer_id := null and Trip.backhaul_credit_cents := 0"
+          - "offer.version += 1"
+      - from: PROPOSED
+        to: WITHDRAWN
+        trigger: "POST /fleet/backhaul-offers/{offer_id}/withdraw"
+        actor: FleetPlanner
+        preconditions:
+          - "offer.status == PROPOSED (else ERR_INVALID_STATE_TRANSITION)"
+          - "no Trip has backhaul_offer_id == offer.id (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "offer.version += 1"
+      - from: PROPOSED
+        to: EXPIRED
+        trigger: "POST /fleet/backhaul-offers/expiration-sweep"
+        actor: TransportManager
+        preconditions:
+          - "offer.offer_expires_at <= logical clock now"
+        side_effects:
+          - "when a Trip links this offer: Trip.backhaul_offer_id := null and Trip.backhaul_credit_cents := 0"
+          - "offer.version += 1"
+      - from: UNDER_REVIEW
+        to: EXPIRED
+        trigger: "POST /fleet/backhaul-offers/expiration-sweep"
+        actor: TransportManager
+        preconditions:
+          - "offer.offer_expires_at <= logical clock now"
+        side_effects:
+          - "same unlink side effects as PROPOSED -> EXPIRED"
+      - from: ACCEPTED
+        to: PROPOSED
+        trigger: "system, on POST /fleet/trips/{trip_id}/cancel for the linked trip"
+        actor: system
+        preconditions:
+          - "offer.status == ACCEPTED and the linking Trip is transitioning to CANCELLED"
+        side_effects:
+          - "offer.margin_exception_approved := false; review_round unchanged; computed margin fields unchanged"
+          - "offer.version += 1"
+        note: "Compensating transition: the offer re-enters the market at the same review_round, closing the cycle without resetting negotiation history."
+
+  - entity: Tractor
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: ASSIGNED
+        trigger: "system, inside POST /fleet/trips/{trip_id}/assignments"
+        actor: system
+        preconditions:
+          - "tractor.status == AVAILABLE (else ERR_ASSET_NOT_AVAILABLE)"
+          - "tractor.pm_hold == false (else ERR_TRACTOR_PM_HOLD)"
+          - "tractor.domicile_id == trip.domicile_id (else ERR_DOMICILE_MISMATCH)"
+          - "no SCHEDULED / DEFERRED / IN_SHOP MaintenanceWorkOrder of this tractor collides with the buffered trip interval (else ERR_ASSET_MAINTENANCE_CONFLICT)"
+        side_effects:
+          - "tractor.version += 1"
+      - from: ASSIGNED
+        to: AVAILABLE
+        trigger: "system, on trip completion, trip cancel, coaching-hold cascade, or re-assignment of the trip to a different tractor"
+        actor: system
+        preconditions:
+          - "the releasing Trip currently references this tractor"
+        side_effects:
+          - "on trip completion only: odometer_miles += Trip.total_miles, miles_since_pm recomputed, PM cascade may set pm_hold"
+      - from: AVAILABLE
+        to: IN_SHOP
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/start"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "tractor.status == AVAILABLE (else ERR_ASSET_NOT_AVAILABLE)"
+        side_effects:
+          - "tractor.version += 1"
+      - from: IN_SHOP
+        to: AVAILABLE
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/complete"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "the work order status == IN_SHOP"
+        side_effects:
+          - "when service_type IN {PM_A, PM_B}: pm_last_service_odometer := odometer_miles, miles_since_pm := 0, pm_hold := false"
+          - "tractor.version += 1"
+
+  - entity: Trailer
+    initial_state: AVAILABLE
+    terminal_states: []
+    transitions:
+      - from: AVAILABLE
+        to: ASSIGNED
+        trigger: "system, inside POST /fleet/trips/{trip_id}/assignments"
+        actor: system
+        preconditions:
+          - "trailer.status == AVAILABLE (else ERR_ASSET_NOT_AVAILABLE)"
+          - "trailer.domicile_id == trip.domicile_id (else ERR_DOMICILE_MISMATCH)"
+          - "trailer.trailer_type == REEFER when any DELIVERY stop's order.temperature_mode == REFRIGERATED (else ERR_TEMPERATURE_MODE_MISMATCH)"
+          - "no SCHEDULED / DEFERRED / IN_SHOP MaintenanceWorkOrder of this trailer collides with the buffered trip interval (else ERR_ASSET_MAINTENANCE_CONFLICT)"
+        side_effects:
+          - "trailer.version += 1"
+      - from: ASSIGNED
+        to: AVAILABLE
+        trigger: "system, on trip completion, trip cancel, coaching-hold cascade, or re-assignment"
+        actor: system
+        preconditions:
+          - "the releasing Trip currently references this trailer"
+        side_effects:
+          - "trailer.version += 1"
+      - from: AVAILABLE
+        to: IN_SHOP
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/start"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "trailer.status == AVAILABLE (else ERR_ASSET_NOT_AVAILABLE)"
+        side_effects:
+          - "trailer.version += 1"
+      - from: IN_SHOP
+        to: AVAILABLE
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/complete"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "the work order status == IN_SHOP"
+        side_effects:
+          - "trailer.version += 1"
+
+  - entity: MaintenanceWorkOrder
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED, CANCELLED]
+    transitions:
+      - from: SCHEDULED
+        to: DEFERRED
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/defer"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "work_order.status == SCHEDULED (else ERR_INVALID_STATE_TRANSITION)"
+          - "work_order.deferral_count < 2 (else ERR_DEFERRAL_LIMIT)"
+        side_effects:
+          - "deferral_count += 1"
+          - "the asset's pm_hold stays true for auto-generated PM orders (a deferral does not release the hold)"
+          - "work_order.version += 1"
+      - from: DEFERRED
+        to: SCHEDULED
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/reschedule"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "work_order.status == DEFERRED (else ERR_INVALID_STATE_TRANSITION)"
+          - "the new window does not collide with the buffered interval of any Trip in plan_status IN {PLANNED, DISPATCHED, IN_PROGRESS} that references the asset (else ERR_ASSET_MAINTENANCE_CONFLICT)"
+        side_effects:
+          - "window_start_at / window_end_at overwritten"
+          - "work_order.version += 1"
+      - from: SCHEDULED
+        to: IN_SHOP
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/start"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "work_order.status == SCHEDULED (else ERR_INVALID_STATE_TRANSITION)"
+          - "the asset's status == AVAILABLE (else ERR_ASSET_NOT_AVAILABLE)"
+        side_effects:
+          - "asset status AVAILABLE -> IN_SHOP"
+          - "work_order.version += 1"
+      - from: IN_SHOP
+        to: COMPLETED
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/complete"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "work_order.status == IN_SHOP (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "asset status IN_SHOP -> AVAILABLE"
+          - "for PM_A / PM_B on a tractor: pm_last_service_odometer := odometer_miles, miles_since_pm := 0, pm_hold := false"
+          - "work_order.version += 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /fleet/maintenance-work-orders/{work_order_id}/cancel"
+        actor: MaintenanceCoordinator
+        preconditions:
+          - "work_order.status == SCHEDULED (else ERR_INVALID_STATE_TRANSITION)"
+          - "work_order.auto_generated == false (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "work_order.version += 1"
+        note: "An auto-generated PM order can never be cancelled, only deferred (twice) and then performed."
+
+  - entity: DriverPayStatement
+    initial_state: ACCRUED
+    terminal_states: [REVERSED]
+    transitions:
+      - from: ACCRUED
+        to: SETTLED
+        trigger: "POST /fleet/pay-statements/{statement_id}/settle"
+        actor: PayrollAnalyst
+        preconditions:
+          - "statement.status == ACCRUED (else ERR_STATEMENT_NOT_ACCRUED)"
+          - "Trip(statement.trip_id).settlement_status == ACCRUED (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "settlement_reference stored; Trip.settlement_status ACCRUED -> SETTLED"
+          - "Domicile.accrued_pay_cents unchanged"
+          - "statement.version += 1"
+      - from: ACCRUED
+        to: REVERSED
+        trigger: "POST /fleet/pay-statements/{statement_id}/reverse"
+        actor: PayrollAnalyst
+        preconditions:
+          - "statement.status == ACCRUED (else ERR_STATEMENT_NOT_ACCRUED)"
+        side_effects:
+          - "Domicile.accrued_pay_cents -= gross_cents; Driver.ytd_gross_cents -= gross_cents  [caused by this transition]"
+          - "Trip.settlement_status -> ADJUSTED; Trip.driver_pay_cents := 0  [caused by this transition]"
+          - "statement.version += 1"
+      - from: SETTLED
+        to: REVERSED
+        trigger: "POST /fleet/pay-statements/{statement_id}/reverse"
+        actor: PayrollAnalyst
+        preconditions:
+          - "statement.status == SETTLED"
+        side_effects:
+          - "identical ledger and trip side effects as ACCRUED -> REVERSED"
+          - "statement.version += 1"
+
+  - entity: RoutePosting
+    initial_state: OPEN
+    terminal_states: [AWARDED, VACANT, CANCELLED]
+    note: "Branching fork-join: OPEN forks into three terminal states whose side-effect sets differ (AWARDED touches the winning bid and the driver, VACANT passes over every bid, CANCELLED withdraws every bid)."
+    transitions:
+      - from: OPEN
+        to: AWARDED
+        trigger: "POST /fleet/route-postings/{posting_id}/award"
+        actor: TransportManager
+        preconditions:
+          - "posting.status == OPEN (else ERR_POSTING_NOT_OPEN)"
+          - "logical clock now >= posting.bid_close_at (else ERR_BID_WINDOW_OPEN)"
+          - "X-User-ID != posting.created_by_user_id (else ERR_SEGREGATION_OF_DUTIES)"
+          - "the eligible candidate set of calculations.route_award_selection is non-empty"
+        side_effects:
+          - "posting.awarded_driver_id := the winning driver from calculations.route_award_selection"
+          - "the winning RouteBid: SUBMITTED -> AWARDED"
+          - "every other RouteBid of this posting with status == SUBMITTED: -> PASSED_OVER"
+          - "posting.bid_count := 0 (no SUBMITTED bids remain)"
+          - "posting.version += 1"
+      - from: OPEN
+        to: VACANT
+        trigger: "POST /fleet/route-postings/{posting_id}/award"
+        actor: TransportManager
+        preconditions:
+          - "posting.status == OPEN"
+          - "logical clock now >= posting.bid_close_at"
+          - "X-User-ID != posting.created_by_user_id"
+          - "the eligible candidate set of calculations.route_award_selection is EMPTY (zero bids, or every bid ineligible)"
+        side_effects:
+          - "posting.awarded_driver_id stays null"
+          - "every RouteBid of this posting with status == SUBMITTED: -> PASSED_OVER"
+          - "posting.bid_count := 0"
+          - "posting.version += 1"
+        note: "Empty-candidate-pool fallback of the selector; returns 200, not an error."
+      - from: OPEN
+        to: CANCELLED
+        trigger: "POST /fleet/route-postings/{posting_id}/cancel"
+        actor: TransportManager
+        preconditions:
+          - "posting.status == OPEN (else ERR_POSTING_NOT_OPEN)"
+        side_effects:
+          - "every RouteBid of this posting with status == SUBMITTED: -> WITHDRAWN"
+          - "posting.bid_count := 0; posting.version += 1"
+
+  - entity: RouteBid
+    initial_state: SUBMITTED
+    terminal_states: [AWARDED, PASSED_OVER, WITHDRAWN]
+    transitions:
+      - from: SUBMITTED
+        to: AWARDED
+        trigger: "system, inside POST /fleet/route-postings/{posting_id}/award"
+        actor: system
+        preconditions:
+          - "this bid is the winner of calculations.route_award_selection"
+        side_effects:
+          - "bid.version += 1"
+      - from: SUBMITTED
+        to: PASSED_OVER
+        trigger: "system, inside POST /fleet/route-postings/{posting_id}/award, inside the coaching-hold cascade, or inside POST /fleet/drivers/{driver_id}/termination"
+        actor: system
+        preconditions:
+          - "the posting is being awarded/vacated and this bid is not the winner, OR the bidding driver's coaching_hold flipped false -> true, OR the bidding driver was terminated"
+        side_effects:
+          - "posting.bid_count -= 1 when fired by the coaching-hold cascade or by a driver termination; unchanged when fired by an award, which zeroes bid_count outright"
+          - "bid.version += 1"
+      - from: SUBMITTED
+        to: WITHDRAWN
+        trigger: "POST /fleet/route-bids/{bid_id}/withdraw, or system on posting cancel"
+        actor: Driver
+        preconditions:
+          - "bid.status == SUBMITTED (else ERR_INVALID_STATE_TRANSITION)"
+          - "for the Driver-triggered form: X-User-ID == bid.driver_id (else ERR_DRIVER_SCOPE_VIOLATION)"
+        side_effects:
+          - "posting.bid_count -= 1; posting.version += 1"
+          - "bid.version += 1"
+
+  - entity: Driver
+    dimension: status
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /fleet/drivers/{driver_id}/termination"
+        actor: TransportManager
+        preconditions:
+          - "driver.status == ACTIVE (else ERR_INVALID_STATE_TRANSITION: TERMINATED is terminal)"
+          - "no Trip references this driver with plan_status IN {PLANNED, DISPATCHED, IN_PROGRESS} (else ERR_INVALID_STATE_TRANSITION)"
+        side_effects:
+          - "Domicile.assigned_driver_count -= 1 and Domicile.balance_index recomputed  [caused by the status change]"
+          - "every RouteBid of this driver with status == SUBMITTED: -> PASSED_OVER, and each such bid lowers RoutePosting.bid_count  [caused by the status change]"
+          - "every RoutePosting with awarded_driver_id == this driver keeps status AWARDED (retention history is preserved on purpose)"
+          - "driver.version += 1"
+
+  - entity: Store
+    dimension: status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "POST /fleet/stores/{store_id}/status"
+        actor: TransportManager
+        preconditions:
+          - "store.status == ACTIVE"
+        side_effects:
+          - "no cascade: Trips already PLANNED keep their stops; only NEW plan calls are blocked by ERR_STORE_SUSPENDED"
+          - "store.version += 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "POST /fleet/stores/{store_id}/status"
+        actor: TransportManager
+        preconditions:
+          - "store.status == SUSPENDED"
+        side_effects:
+          - "store.version += 1"
+
+  - entity: TelematicsEvent
+    dimension: coached
+    initial_state: NOT_COACHED
+    terminal_states: [COACHED]
+    note: "Append-only entity with a single one-way coaching flip; modelled as a two-state machine over the `coached` boolean."
+    transitions:
+      - from: NOT_COACHED
+        to: COACHED
+        trigger: "POST /fleet/telematics-events/{event_id}/coach"
+        actor: SafetyManager
+        preconditions:
+          - "event.coached == false (else ERR_ALREADY_COACHED)"
+        side_effects:
+          - "event.coached := true; coached_at := logical clock now; coached_by_user_id := X-User-ID"
+          - "Driver.open_penalty_points -= event.penalty_points  [compensation link 1]"
+          - "Driver.safety_score := max(0, 100 - open_penalty_points)  [compensation link 2, caused by link 1]"
+          - "when the recomputed safety_score >= 70: Driver.coaching_hold := false  [compensation link 3, caused by link 2]"
+          - "Driver.version += 1"
+        note: |
+          Deliberate asymmetry: coaching restores the penalty-point quantity and
+          may clear the hold, but it does NOT restore the trips or bids that the
+          hold cascade released. The conserved quantity of this compensation is
+          penalty points, not trip assignments.
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules (OCC on the parent's `version` only)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: backhaul-link-stale-trip
+    parent_entity: Trip
+    write_endpoint: "POST /fleet/trips/{trip_id}/backhaul-assignments"
+    occ_field: "expected_trip_version"
+    description: |
+      Linking a BackhaulOffer to a Trip whose version has advanced since the
+      client last read it is rejected. Linking legitimately supersedes any
+      previously linked offer (the superseded offer is unlinked and, if it was
+      ACCEPTED, returned to PROPOSED), so a writer holding a stale view of the
+      trip would silently displace a link it never saw. The stale-version check
+      turns that into a deterministic rejection.
+    error_id: ERR_STALE_TRIP_VERSION
+    http_status: 412
+
+  - rule_id: bid-create-stale-posting
+    parent_entity: RoutePosting
+    write_endpoint: "POST /fleet/route-bids"
+    occ_field: "expected_posting_version"
+    description: |
+      Submitting a RouteBid against a RoutePosting whose version has advanced
+      since the client last read it is rejected. Every accepted bid raises the
+      posting's bid_count and version, and an award or a cancel closes the
+      board outright, so the posting version is the bidder's proof that the
+      board they reasoned about - its bid_count, its status and its close time
+      - is still the board they are bidding into.
+    error_id: ERR_STALE_POSTING_VERSION
+    http_status: 412
+
+  - rule_id: payplan-assign-stale-driver
+    parent_entity: Driver
+    write_endpoint: "POST /fleet/drivers/{driver_id}/pay-plan-assignments"
+    occ_field: "expected_driver_version"
+    description: |
+      Assigning a DriverPayPlan to a Driver whose version has advanced since
+      the client last read it is rejected. A pay-plan assignment legitimately
+      supersedes the driver's current plan, so without the stale-version check
+      a writer working from an outdated read would overwrite a plan change it
+      never observed.
+    error_id: ERR_STALE_DRIVER_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+
+  - name: trip_plan_totals
+    trigger: "Every mutation of the trip's stop set or stop fields: POST /fleet/trips/{trip_id}/stops, POST /fleet/trip-stops/{trip_stop_id}/complete (when cases_handled is supplied), and re-run inside POST /fleet/trips/{trip_id}/assignments and POST /fleet/trips/{trip_id}/plan before their gates evaluate."
+    algorithm: aggregation
+    formula: |
+      # Stops are walked in TripStop.sequence ASC order. `sequence` is unique
+      # per trip and must be contiguous from 1, so the order is total and no
+      # tie-break is ever required.
+
+      # --- per-stop service minutes: ROUND UP AT THE STOP, THEN SUM ---------
+      for stop in stops_ordered_by_sequence_asc:
+          if stop.stop_type == DELIVERY:
+              store = Store(stop.store_id)
+              stop.service_minutes = ceil(stop.cases * 60 / store.cases_per_hour_unload_rate)
+                                     + FIXED_DELIVERY_SETUP_MINUTES
+          elif stop.stop_type in (VENDOR_PICKUP, THIRD_PARTY_PICKUP):
+              stop.service_minutes = FIXED_PICKUP_MINUTES
+          elif stop.stop_type == DROP_OFF:
+              stop.service_minutes = FIXED_DROP_OFF_MINUTES
+          else:  # FUEL
+              stop.service_minutes = FIXED_FUEL_MINUTES
+
+      planned_service_minutes = sum(stop.service_minutes for stop in stops)
+      # PINNED ROUNDING ORDER: the ceil() is applied to EACH stop's exact
+      # fractional minutes and the whole-minute results are then summed.
+      # Summing the exact fractions first and rounding the total once is a
+      # DIFFERENT and WRONG answer (e.g. 900 cases @700/h -> 77.142857 and
+      # 500 cases @700/h -> 42.857143: per-stop ceil gives 78+43 = 121,
+      # sum-then-ceil gives ceil(120.0) = 120).
+
+      planned_drive_minutes = sum(stop.drive_minutes_from_prev for stop in stops)
+      planned_break_minutes = (MANDATORY_BREAK_MINUTES
+                               if planned_drive_minutes > BREAK_TRIGGER_DRIVE_MINUTES
+                               else 0)
+      planned_duty_minutes  = planned_drive_minutes + planned_service_minutes + planned_break_minutes
+
+      total_miles  = sum(stop.miles_from_prev for stop in stops)
+      loaded_miles = sum(stop.miles_from_prev for stop in stops if stop.segment_loaded == true)
+      empty_miles  = total_miles - loaded_miles
+
+      planned_delivery_cases = sum(stop.cases for stop in stops if stop.stop_type == DELIVERY)
+      stop_count             = count(stops)
+      planned_end_at         = stops[-1].scheduled_departure_at   # highest sequence; null when stop_count == 0
+    input_set: "All TripStop rows with trip_id == the trip, regardless of status (SKIPPED stops keep contributing to planned_* fields; only delivered_cases filters on status == COMPLETED)."
+    constants:
+      FIXED_DELIVERY_SETUP_MINUTES: 15
+      FIXED_PICKUP_MINUTES: 45
+      FIXED_DROP_OFF_MINUTES: 20
+      FIXED_FUEL_MINUTES: 25
+      MANDATORY_BREAK_MINUTES: 30
+      BREAK_TRIGGER_DRIVE_MINUTES: 480
+    precision: "Whole minutes; ceil() per stop before summation. Miles are integers."
+
+  - name: trailer_peak_case_load
+    trigger: "Recomputed with trip_plan_totals; gated at POST /fleet/trips/{trip_id}/plan."
+    algorithm: chronological
+    formula: |
+      # The trailer leaves the domicile loaded with every case that will be
+      # DELIVERED, then trades cases stop by stop. The binding constraint is the
+      # PEAK load over the walk, not the final or the total load.
+      load = sum(stop.cases for stop in stops if stop.stop_type == DELIVERY)
+      peak = load
+      for stop in stops_ordered_by_sequence_asc:
+          if stop.stop_type == DELIVERY:                       load -= stop.cases
+          elif stop.stop_type in (VENDOR_PICKUP, THIRD_PARTY_PICKUP): load += stop.cases
+          elif stop.stop_type == DROP_OFF:                     load -= stop.cases
+          # FUEL leaves the load unchanged
+          peak = max(peak, load)
+      peak_case_load = peak
+      # Gate: peak_case_load <= Trailer.capacity_cases, else ERR_TRAILER_CAPACITY_EXCEEDED.
+      # `<=` is inclusive: a peak exactly equal to capacity is accepted.
+    input_set: "All TripStop rows of the trip in sequence order, any status."
+    constants: {}
+    precision: "Integer cases; no rounding."
+
+  - name: hos_feasibility
+    trigger: "POST /fleet/trips/{trip_id}/assignments, and re-evaluated inside POST /fleet/trips/{trip_id}/plan against the driver's counters at that instant."
+    algorithm: threshold
+    formula: |
+      driver = Driver(candidate_driver_id)
+      projected_drive  = driver.drive_minutes_used_today + trip.planned_drive_minutes
+      projected_duty   = driver.duty_minutes_used_today  + trip.planned_duty_minutes
+      projected_weekly = driver.weekly_on_duty_minutes   + trip.planned_duty_minutes
+
+      # CHECK ORDER IS PINNED: drive, then duty, then weekly. A trip that busts
+      # two of the three reports the FIRST one in this order.
+      if projected_drive  > MAX_DAILY_DRIVE_MINUTES:     -> ERR_HOS_DRIVE_LIMIT
+      if projected_duty   > MAX_DAILY_DUTY_MINUTES:      -> ERR_HOS_DUTY_LIMIT
+      if projected_weekly > MAX_WEEKLY_ON_DUTY_MINUTES:  -> ERR_HOS_WEEKLY_LIMIT
+      # All three comparisons are strict `>`: a projection landing exactly on a
+      # limit is feasible.
+      # Note planned_duty_minutes already contains planned_break_minutes, so the
+      # 30-minute break both consumes duty and is charged against the weekly
+      # total, while it is NOT charged against the drive limit.
+    input_set: "The trip's own planned_* fields plus the candidate driver's three counter fields as they stand when the request is processed."
+    constants:
+      MAX_DAILY_DRIVE_MINUTES: 660
+      MAX_DAILY_DUTY_MINUTES: 840
+      MAX_WEEKLY_ON_DUTY_MINUTES: 4200
+    precision: "Whole minutes."
+
+  - name: driver_trip_pay
+    trigger: "Variant PLANNED_ACCRUAL runs inside POST /fleet/trips/{trip_id}/plan (writes Trip.planned_pay_cents). Variant FINAL_SETTLEMENT runs inside POST /fleet/trips/{trip_id}/complete and POST /fleet/trips/{trip_id}/re-accrue (writes Trip.driver_pay_cents and the DriverPayStatement components). GET /fleet/trips/{trip_id}/pay-preview evaluates either variant without persisting."
+    algorithm: weighted_scoring
+    formula: |
+      plan = DriverPayPlan(trip.pinned_pay_plan_id)          # after plan-time pinning
+             or DriverPayPlan(Driver(trip.driver_id).pay_plan_id)   # while still DRAFT
+
+      # --- component 1: mileage --------------------------------------------
+      mileage_cents = round_half_up(trip.total_miles * plan.mileage_cents_per_mile)
+
+      # --- component 2: activity (variant-dependent stop set) --------------
+      if variant == FINAL_SETTLEMENT:
+          paid_stops  = [s for s in stops if s.status == COMPLETED
+                         and s.stop_type in (DELIVERY, VENDOR_PICKUP, THIRD_PARTY_PICKUP)]
+          drop_hooks  = [s for s in stops if s.status == COMPLETED and s.stop_type == DROP_OFF]
+          duty_basis  = trip.actual_duty_minutes
+      else:  # PLANNED_ACCRUAL
+          paid_stops  = [s for s in stops if s.status in (PLANNED, ARRIVED, COMPLETED)
+                         and s.stop_type in (DELIVERY, VENDOR_PICKUP, THIRD_PARTY_PICKUP)]
+          drop_hooks  = [s for s in stops if s.status in (PLANNED, ARRIVED, COMPLETED)
+                         and s.stop_type == DROP_OFF]
+          duty_basis  = trip.planned_duty_minutes
+      # FUEL stops are never paid activity under either variant.
+      activity_cents = (len(paid_stops) * plan.stop_cents_per_stop
+                        + len(drop_hooks) * plan.drop_hook_cents)
+
+      # --- component 3: hourly detention ----------------------------------
+      detention_minutes = max(0, duty_basis - trip.planned_duty_minutes - DETENTION_GRACE_MINUTES)
+      hourly_cents      = detention_minutes * plan.hourly_cents_per_minute
+      # Under PLANNED_ACCRUAL duty_basis == planned_duty_minutes, so
+      # detention_minutes is structurally 0 and hourly_cents is always 0.
+
+      # --- component 4: backhaul bonus ------------------------------------
+      if trip.backhaul_offer_id is not null
+         and BackhaulOffer(trip.backhaul_offer_id).status == ACCEPTED:
+          bonus_cents = round_half_up((mileage_cents + activity_cents) * plan.backhaul_bonus_pct)
+      else:
+          bonus_cents = 0
+      # The bonus base excludes hourly_cents on purpose.
+
+      # --- guarantee floor (nested max over the summed components) ---------
+      subtotal_cents          = mileage_cents + activity_cents + hourly_cents + bonus_cents
+      guarantee_makeup_cents  = max(0, plan.minimum_daily_cents - subtotal_cents)
+      gross_cents             = subtotal_cents + guarantee_makeup_cents
+
+      # PINNED EVALUATION ORDER: mileage -> activity -> hourly -> bonus ->
+      # subtotal -> guarantee. Each component is rounded to whole cents on its
+      # own line BEFORE the summation; the guarantee is compared against the
+      # rounded subtotal, never against an unrounded intermediate.
+    input_set: "The trip's stops filtered by the variant's status set; the pinned pay plan (NOT the driver's current plan once pinning has happened); the linked offer only when its status == ACCEPTED."
+    constants:
+      DETENTION_GRACE_MINUTES: 30
+    precision: "Integer cents, round_half_up per component before summation."
+    variants:
+      - name: PLANNED_ACCRUAL
+        when: "At POST /fleet/trips/{trip_id}/plan, and on demand through GET /fleet/trips/{trip_id}/pay-preview?variant=PLANNED_ACCRUAL."
+        difference: "Counts every non-SKIPPED stop as paid activity and uses planned_duty_minutes as the duty basis, so hourly_cents is always 0. Produces a strictly lower or equal amount than FINAL_SETTLEMENT whenever the trip ran long, and a strictly higher amount whenever stops were skipped."
+      - name: FINAL_SETTLEMENT
+        when: "At POST /fleet/trips/{trip_id}/complete and POST /fleet/trips/{trip_id}/re-accrue; the only variant ever persisted on a DriverPayStatement."
+        difference: "Counts only stops whose status == COMPLETED and uses trip.actual_duty_minutes as the duty basis, so detention beyond plan + 30 minutes is paid."
+
+  - name: backhaul_contribution_margin
+    trigger: "POST /fleet/backhaul-offers/{offer_id}/submit-review and POST /fleet/backhaul-offers/{offer_id}/revise."
+    algorithm: tiered_pricing
+    formula: |
+      # STEP ORDER IS PART OF THE CONTRACT. The commission rate is keyed on a
+      # margin tier, and the commission is itself a component of the margin;
+      # the loop is broken by keying the tier on the PRE-COMMISSION margin.
+      #
+      # 1. incremental_miles
+      incremental_miles     = offer.deadhead_miles + offer.loaded_miles
+      # 2. line-haul variable cost
+      line_haul_cost_cents  = round_half_up(incremental_miles * VARIABLE_COST_CENTS_PER_MILE)
+      # 3. handling
+      handling_cost_cents   = round_half_up(offer.cases * HANDLING_CENTS_PER_CASE)
+      # 4. reefer surcharge (loaded miles only)
+      reefer_cost_cents     = (round_half_up(offer.loaded_miles * REEFER_SURCHARGE_CENTS_PER_MILE)
+                               if offer.temperature_mode == REFRIGERATED else 0)
+      # 5. total variable cost
+      variable_cost_cents   = line_haul_cost_cents + handling_cost_cents + reefer_cost_cents
+      # 6. pre-commission margin
+      gross_margin_cents    = offer.revenue_cents - variable_cost_cents
+      # 7. TIER KEY -- pre-commission margin ratio, 4 decimal places
+      tier_margin_pct       = round_half_up(gross_margin_cents / offer.revenue_cents, 4)
+      # 8. commission rate selected from the TIER KEY ONLY
+      commission_pct        = (COMMISSION_PCT_HIGH
+                               if tier_margin_pct >= COMMISSION_TIER_MARGIN_PCT
+                               else COMMISSION_PCT_LOW)
+      # 9. commission
+      commission_cents      = round_half_up(offer.revenue_cents * commission_pct)
+      # 10. reported contribution margin
+      contribution_margin_cents = gross_margin_cents - commission_cents
+      # 11. reported margin ratio -- NEVER re-enters step 8
+      margin_pct            = round_half_up(contribution_margin_cents / offer.revenue_cents, 4)
+      #
+      # Keying step 8 on margin_pct instead of tier_margin_pct is the trap: for
+      # any offer whose tier_margin_pct lands in [0.20, 0.26) the two readings
+      # select different commission rates and therefore different persisted
+      # contribution_margin_cents.
+    input_set: "The offer's own economics fields only. No trip, trailer or store data enters the margin; the trailer only gates ACCEPTANCE."
+    constants:
+      VARIABLE_COST_CENTS_PER_MILE: 185
+      HANDLING_CENTS_PER_CASE: 9
+      REEFER_SURCHARGE_CENTS_PER_MILE: 22
+      COMMISSION_TIER_MARGIN_PCT: 0.20
+      COMMISSION_PCT_HIGH: 0.06
+      COMMISSION_PCT_LOW: 0.03
+      MIN_MARGIN_PCT: 0.08
+    precision: "Integer cents (round_half_up); ratios to 4 decimal places (round_half_up)."
+    variants: []
+
+  - name: domicile_cost_benchmark
+    trigger: "GET /fleet/domiciles/{domicile_id}/cost-benchmark (read-only; nothing is persisted)."
+    algorithm: aggregation
+    formula: |
+      # --- inclusion set (all three filters are mandatory) ------------------
+      included_trips = [t for t in Trip
+                        if t.domicile_id == domicile.id
+                        and t.plan_status == COMPLETED
+                        and t.settlement_status in (ACCRUED, SETTLED)
+                        and window_start <= t.planned_start_at < window_end]   # half-open
+      # Ordered by created_at ASC for a deterministic accumulation order.
+
+      total_miles = sum(t.total_miles for t in included_trips)
+      total_cases = sum(s.cases for t in included_trips
+                        for s in TripStop(trip_id=t.id)
+                        if s.status == COMPLETED and s.stop_type == DELIVERY)
+
+      driver_pay_cents = sum(st.gross_cents for st in DriverPayStatement
+                             if st.trip_id in included_trips
+                             and st.status in (ACCRUED, SETTLED))
+      fuel_cents        = round_half_up(total_miles * FUEL_CENTS_PER_MILE)
+      maintenance_cents = round_half_up(total_miles * MAINTENANCE_CENTS_PER_MILE)
+      backhaul_credit_cents = sum(BackhaulOffer(t.backhaul_offer_id).contribution_margin_cents
+                                  for t in included_trips
+                                  if t.backhaul_offer_id is not null
+                                  and BackhaulOffer(t.backhaul_offer_id).status == ACCEPTED)
+
+      variable_cost_cents = driver_pay_cents + fuel_cents + maintenance_cents - backhaul_credit_cents
+
+      window_days      = floor((window_end - window_start) / 86400 seconds)   # min 1
+      fixed_cost_cents = window_days * (domicile.fixed_ownership_cents_per_day
+                                        + domicile.overhead_cents_per_day)
+
+      if variant == FULLY_ALLOCATED:      total_cost_cents = variable_cost_cents + fixed_cost_cents
+      else:                               total_cost_cents = variable_cost_cents   # INCREMENTAL_VARIABLE
+
+      # --- zero-volume guard (checked BEFORE any division) -----------------
+      if total_cases == 0 or total_miles == 0:  -> ERR_BENCHMARK_NO_VOLUME
+
+      cost_per_case_cents = round_half_up(total_cost_cents / total_cases)
+      cost_per_mile_cents = round_half_up(total_cost_cents / total_miles)
+      dedicated_equivalent_cents_per_case = domicile.dedicated_rate_cents_per_case
+      advantage_cents_per_case = dedicated_equivalent_cents_per_case - cost_per_case_cents
+      # A positive advantage means the private fleet beats dedicated carriage.
+    input_set: "COMPLETED trips of the domicile whose settlement_status IN {ACCRUED, SETTLED} and whose planned_start_at falls in [window_start, window_end); their COMPLETED DELIVERY stops; their non-REVERSED statements; their ACCEPTED offers. Trips in ADJUSTED settlement are excluded on purpose, so a reversal removes a trip from the benchmark entirely."
+    constants:
+      FUEL_CENTS_PER_MILE: 62
+      MAINTENANCE_CENTS_PER_MILE: 19
+    precision: "Integer cents, round_half_up on the two per-unit divisions only."
+    variants:
+      - name: FULLY_ALLOCATED
+        when: "variant=FULLY_ALLOCATED — the benchmark used to compare against a dedicated-carriage quote, which embeds the carrier's equipment and overhead."
+        difference: "Adds window_days * (fixed_ownership_cents_per_day + overhead_cents_per_day) to the numerator, so cost_per_case and cost_per_mile are strictly higher and advantage_cents_per_case strictly lower than under INCREMENTAL_VARIABLE for any window with a positive fixed rate."
+      - name: INCREMENTAL_VARIABLE
+        when: "variant=INCREMENTAL_VARIABLE — the benchmark used to decide whether to take one more load with equipment already owned."
+        difference: "Excludes all fixed and overhead cost; only pay, fuel, maintenance and the backhaul credit enter the numerator."
+
+  - name: domicile_balance_index
+    trigger: "Recomputed whenever a Driver is created, terminated, or has its domicile read for a cross-domicile borrow check; read by POST /fleet/trips/{trip_id}/assignments."
+    algorithm: threshold
+    formula: |
+      assigned_driver_count = count(Driver where domicile_id == domicile.id and status == ACTIVE)
+      balance_index         = round_half_up(assigned_driver_count / domicile.driver_headcount_target, 4)
+
+      # Cross-domicile borrow gate, evaluated only when
+      # Driver.domicile_id != Trip.domicile_id:
+      source = Domicile(driver.domicile_id)
+      target = Domicile(trip.domicile_id)
+      borrow_allowed = (source.balance_index >= REBALANCE_SOURCE_MIN_INDEX
+                        and target.balance_index < REBALANCE_TARGET_MAX_INDEX)
+      if not borrow_allowed: -> ERR_DOMICILE_MISMATCH
+      # `>=` on the source (a source sitting exactly at 1.5000 may lend) and
+      # strict `<` on the target (a target sitting exactly at 1.0000 may not
+      # borrow). Tractors and trailers are NEVER borrowed: their domicile_id
+      # must equal trip.domicile_id outright.
+    input_set: "Driver rows with status == ACTIVE only; TERMINATED drivers leave the numerator immediately."
+    constants:
+      REBALANCE_SOURCE_MIN_INDEX: 1.5000
+      REBALANCE_TARGET_MAX_INDEX: 1.0000
+    precision: "Ratio to 4 decimal places, round_half_up."
+
+  - name: driver_safety_score
+    trigger: "POST /fleet/telematics-events (points added) and POST /fleet/telematics-events/{event_id}/coach (points retired)."
+    algorithm: aggregation
+    formula: |
+      penalty_points(event) = BASE_POINTS[event.event_type] * event.severity   # fixed at creation
+      open_penalty_points   = sum(e.penalty_points for e in TelematicsEvent
+                                 where e.driver_id == driver.id and e.coached == false)
+      safety_score          = max(SAFETY_SCORE_FLOOR, 100 - open_penalty_points)
+      coaching_hold         = (safety_score < COACHING_HOLD_THRESHOLD)
+      # Conservation: while open_penalty_points <= 100 the identity
+      #   safety_score + open_penalty_points == 100
+      # holds after every create and every coach. Below the floor the identity
+      # breaks by design and only open_penalty_points remains conserved.
+    input_set: "All TelematicsEvent rows of the driver with coached == false, regardless of occurred_at or of which trip they belong to."
+    constants:
+      BASE_POINTS: { HARD_BRAKE: 2, SPEEDING: 3, FOLLOWING_DISTANCE: 2, SEATBELT: 4 }
+      SAFETY_SCORE_FLOOR: 0
+      COACHING_HOLD_THRESHOLD: 70
+    precision: "Integer points."
+
+  - name: route_award_selection
+    trigger: "POST /fleet/route-postings/{posting_id}/award."
+    algorithm: weighted_scoring
+    formula: |
+      # (a) eligibility filter -- explicit predicate over entity fields
+      candidates = [b for b in RouteBid
+                    if b.route_posting_id == posting.id
+                    and b.status == SUBMITTED
+                    and Driver(b.driver_id).status == ACTIVE
+                    and Driver(b.driver_id).coaching_hold == false
+                    and Driver(b.driver_id).safety_score >= MIN_BID_SAFETY_SCORE
+                    and Driver(b.driver_id).domicile_id == posting.domicile_id]
+      # The LIVE driver fields are read, not RouteBid.safety_score_snapshot.
+
+      # (b) ranking expression
+      #     primary : Driver.seniority_date ASC   (earlier date == more senior)
+      # (c) tie-breaks, applied in order
+      #     first   : Driver.safety_score DESC
+      #     second  : RouteBid.created_at ASC
+      #     `id` is never consulted.
+      winner = min(candidates, key=lambda b: (Driver(b.driver_id).seniority_date,
+                                              -Driver(b.driver_id).safety_score,
+                                              b.created_at))
+
+      # (d) empty-pool fallback
+      if candidates is empty:
+          posting.status -> VACANT, awarded_driver_id stays null, HTTP 200
+          # not an error: an unbid or wholly ineligible board is a business outcome
+    input_set: "RouteBid rows of this posting with status == SUBMITTED, joined to the live Driver row. WITHDRAWN and PASSED_OVER bids never re-enter."
+    constants:
+      MIN_BID_SAFETY_SCORE: 80
+    precision: "Exact comparisons; no rounding."
+
+  - name: pm_due_projection
+    trigger: "System, inside POST /fleet/trips/{trip_id}/complete after Tractor.odometer_miles has been advanced."
+    algorithm: threshold
+    formula: |
+      miles_since_pm = tractor.odometer_miles - tractor.pm_last_service_odometer
+      if miles_since_pm >= tractor.pm_interval_miles:        # inclusive boundary
+          service_type = (PM_B if miles_since_pm >= 2 * tractor.pm_interval_miles else PM_A)
+          window_start_at = date_trunc_day(logical_clock_now) + 1 day    # next UTC midnight
+          window_end_at   = window_start_at + PM_WINDOW_MINUTES minutes
+          create MaintenanceWorkOrder(asset_kind=TRACTOR, tractor_id=tractor.id,
+                                      service_type=service_type, status=SCHEDULED,
+                                      auto_generated=true, deferral_count=0,
+                                      window_start_at, window_end_at)
+          tractor.pm_hold = true
+      # `>=` is inclusive: a tractor landing exactly on its interval is due.
+      # At most ONE auto-generated PM order exists per tractor at a time: when
+      # pm_hold is already true the projection creates nothing.
+    input_set: "The single Tractor row referenced by the completing trip."
+    constants:
+      PM_WINDOW_MINUTES: 480
+    precision: "Integer miles; window pinned to the next UTC midnight so the projection never depends on wall-clock time."
+
+  - name: dock_capacity_occupancy
+    trigger: "POST /fleet/trips/{trip_id}/plan, once per DELIVERY stop of the trip being planned."
+    algorithm: interval_merge
+    formula: |
+      # HALF-OPEN interval semantics: a stop occupies [scheduled_arrival_at,
+      # scheduled_departure_at). Back-to-back stops (departure == next arrival)
+      # DO NOT collide.
+      candidate = [stop.scheduled_arrival_at, stop.scheduled_departure_at)
+      occupants = [s for s in TripStop
+                   if s.store_id == stop.store_id
+                   and s.stop_type == DELIVERY
+                   and s.status in (PLANNED, ARRIVED)
+                   and Trip(s.trip_id).plan_status in (PLANNED, DISPATCHED, IN_PROGRESS)
+                   and s.id != stop.id
+                   and s.scheduled_arrival_at < candidate.end
+                   and s.scheduled_departure_at > candidate.start]     # strict overlap
+      # AGGREGATE CAPACITY, not pairwise exclusion: overlap is tolerated up to
+      # the door count.
+      if len(occupants) + 1 > Store(stop.store_id).dock_count:
+          -> ERR_DOCK_CAPACITY_EXCEEDED
+      # Equivalently: reject when the number of already-committed overlapping
+      # stops has reached dock_count.
+    input_set: "TripStop rows at the same store with status IN {PLANNED, ARRIVED} whose owning trip is in plan_status IN {PLANNED, DISPATCHED, IN_PROGRESS}. Stops of DRAFT, COMPLETED and CANCELLED trips, and SKIPPED stops, are excluded."
+    constants: {}
+    precision: "Instant comparison at second granularity."
+
+  - name: asset_maintenance_conflict
+    trigger: "POST /fleet/trips/{trip_id}/assignments (per tractor and per trailer), and POST /fleet/maintenance-work-orders plus POST /fleet/maintenance-work-orders/{work_order_id}/reschedule in the reverse direction (the proposed shop window against every already-committed trip of that asset)."
+    algorithm: interval_merge
+    formula: |
+      # BUFFERED CLOSED interval semantics -- deliberately different geometry
+      # from dock_capacity_occupancy.
+      trip_occupation = [trip.planned_start_at  - SHOP_BUFFER_MINUTES minutes,
+                         trip.planned_end_at    + SHOP_BUFFER_MINUTES minutes]   # CLOSED
+      for wo in MaintenanceWorkOrder where asset matches the tractor_id/trailer_id
+              and wo.status in (SCHEDULED, DEFERRED, IN_SHOP):
+          shop_window = [wo.window_start_at, wo.window_end_at]                   # CLOSED
+          if trip_occupation.start <= shop_window.end
+             and shop_window.start <= trip_occupation.end:      # <= on BOTH sides
+              -> ERR_ASSET_MAINTENANCE_CONFLICT
+      # Because both edges are inclusive, touching intervals COLLIDE: a shop
+      # window starting exactly at planned_end_at + 120 minutes is rejected,
+      # while one starting a single minute later is accepted. This is the
+      # opposite adjacency rule from the dock, on a different resource entity.
+      # A trip with planned_end_at == null (no stops) can never be assigned,
+      # so the interval is always well defined here.
+    input_set: "Trip-side direction: MaintenanceWorkOrder rows of the same asset with status IN {SCHEDULED, DEFERRED, IN_SHOP}; COMPLETED and CANCELLED orders are ignored. Work-order-side direction: Trip rows referencing that asset with plan_status IN {PLANNED, DISPATCHED, IN_PROGRESS}; DRAFT, COMPLETED and CANCELLED trips reserve nothing. The buffered-closed geometry is identical in both directions."
+    constants:
+      SHOP_BUFFER_MINUTES: 120
+    precision: "Instant comparison at second granularity."
+
+  - name: driver_rest_gap
+    trigger: "POST /fleet/trips/{trip_id}/assignments, evaluated for the candidate driver against every other trip that already references them."
+    algorithm: interval_merge
+    formula: |
+      # GAP semantics -- a third distinct interval geometry: the two intervals
+      # must not only be disjoint, they must be separated by a minimum rest.
+      for other in Trip where other.driver_id == candidate_driver_id
+                          and other.id != trip.id
+                          and other.plan_status in (PLANNED, DISPATCHED, IN_PROGRESS):
+          if trip.planned_start_at >= other.planned_end_at:
+              gap_minutes = (trip.planned_start_at - other.planned_end_at) / 60
+          elif other.planned_start_at >= trip.planned_end_at:
+              gap_minutes = (other.planned_start_at - trip.planned_end_at) / 60
+          else:
+              gap_minutes = 0        # the two duty periods overlap outright
+          if gap_minutes < MIN_REST_MINUTES:  -> ERR_DRIVER_REST_GAP
+      # Strict `<`: a gap of exactly 600 minutes is legal, 599 is not.
+    input_set: "Trip rows referencing the same driver with plan_status IN {PLANNED, DISPATCHED, IN_PROGRESS}. DRAFT, COMPLETED and CANCELLED trips impose no rest requirement."
+    constants:
+      MIN_REST_MINUTES: 600
+    precision: "Whole minutes; the difference of two instants divided by 60 with no rounding (all fixtures use minute-aligned instants)."
+
+  - name: dock_hours_and_window_fit
+    trigger: "POST /fleet/trips/{trip_id}/plan, once per DELIVERY stop."
+    algorithm: threshold
+    formula: |
+      store = Store(stop.store_id)
+      order = ReplenishmentOrder(stop.replenishment_order_id)
+
+      # (1) dock hours -- minute-of-UTC-day, same calendar day required
+      arrival_minute   = hour(stop.scheduled_arrival_at) * 60 + minute(stop.scheduled_arrival_at)
+      departure_minute = hour(stop.scheduled_departure_at) * 60 + minute(stop.scheduled_departure_at)
+      if date(stop.scheduled_arrival_at) != date(stop.scheduled_departure_at)
+         or arrival_minute < store.dock_open_minute
+         or departure_minute > store.dock_close_minute:
+          -> ERR_DOCK_HOURS_VIOLATION
+
+      # (2) merchandising window fit -- both edges inclusive against the order
+      if stop.scheduled_arrival_at < order.requested_window_start
+         or stop.scheduled_departure_at > order.requested_window_end:
+          -> ERR_DELIVERY_WINDOW_VIOLATION
+
+      # Check order is pinned: dock hours first, window fit second. A stop that
+      # violates both reports ERR_DOCK_HOURS_VIOLATION.
+    input_set: "The stop's own instants plus its store's dock hours and its order's requested window."
+    constants: {}
+    precision: "Minute-of-day integers; instant comparison at second granularity."
+
+# ---------------------------------------------------------------------------
+# 1.4 Validation Rules (evaluated in strict ascending `priority` order; the
+#     FIRST violated rule short-circuits the request and no later rule runs,
+#     no side effect is applied, and no version is incremented)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: authentication
+    rule: "X-User-Role header must be present and must be one of the six roles declared in §1.7."
+    error_id: ERR_UNAUTHENTICATED
+    applies_to: ["ALL endpoints"]
+    notes: "Runs before path parameters are even looked up, so a missing role on a request for a non-existent id still returns 401."
+
+  - priority: 2
+    category: authorization
+    rule: "The supplied X-User-Role must appear in the target endpoint's `roles` list."
+    error_id: ERR_UNAUTHORIZED
+    applies_to: ["ALL endpoints"]
+    notes: "Beats existence (priority 4/5): a forbidden role probing a random UUID gets 403, never 404. This is the low side of the priority pair with rule 4."
+
+  - priority: 3
+    category: authorization
+    rule: "Segregation of duties: on POST /fleet/backhaul-offers/{offer_id}/accept when margin_exception_approved is true, X-User-ID must differ from BackhaulOffer.created_by_user_id; on POST /fleet/route-postings/{posting_id}/award, X-User-ID must differ from RoutePosting.created_by_user_id."
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    applies_to:
+      - "POST /fleet/backhaul-offers/{offer_id}/accept"
+      - "POST /fleet/route-postings/{posting_id}/award"
+    notes: "Requires the target row, so the 404 checks for the path entity itself run first in practice; the rule is expressed at priority 3 because it outranks every other check on the entity's own state. On /accept the check is conditional: without margin_exception_approved the offer's own creator may accept it."
+
+  - priority: 4
+    category: existence
+    rule: "The entity addressed by the final path parameter must exist."
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    applies_to: ["ALL endpoints with a path parameter"]
+    notes: "Per-entity codes: ERR_STORE_NOT_FOUND, ERR_DOMICILE_NOT_FOUND, ERR_PAY_PLAN_NOT_FOUND, ERR_DRIVER_NOT_FOUND, ERR_TRACTOR_NOT_FOUND, ERR_TRAILER_NOT_FOUND, ERR_ORDER_NOT_FOUND, ERR_TRIP_NOT_FOUND, ERR_TRIP_STOP_NOT_FOUND, ERR_OFFER_NOT_FOUND, ERR_WORK_ORDER_NOT_FOUND, ERR_STATEMENT_NOT_FOUND, ERR_POSTING_NOT_FOUND, ERR_BID_NOT_FOUND, ERR_EVENT_NOT_FOUND."
+
+  - priority: 5
+    category: existence
+    rule: "Every foreign key supplied in the request body must resolve to an existing row. When several are unresolvable, the codes are reported in the declared body-field order of §1.5 for that endpoint."
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    applies_to:
+      - "POST /fleet/drivers"
+      - "POST /fleet/tractors"
+      - "POST /fleet/trailers"
+      - "POST /fleet/replenishment-orders"
+      - "POST /fleet/trips"
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/drivers/{driver_id}/pay-plan-assignments"
+      - "POST /fleet/backhaul-offers"
+      - "POST /fleet/maintenance-work-orders"
+      - "POST /fleet/route-postings"
+      - "POST /fleet/route-bids"
+      - "POST /fleet/telematics-events"
+
+  - priority: 6
+    category: ownership
+    rule: "A nested resource must belong to the parent named in its path, and a body reference must belong to the addressed aggregate: TripStop.trip_id must equal {trip_id}; the replenishment_order referenced by a stop must not already be attached to a different trip; RouteBid.route_posting_id must equal {posting_id} on withdraw."
+    error_id: ERR_PARENT_MISMATCH
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "POST /fleet/trip-stops/{trip_stop_id}/arrive"
+      - "POST /fleet/trip-stops/{trip_stop_id}/complete"
+      - "POST /fleet/route-bids/{bid_id}/withdraw"
+    notes: "Returns 403 because the row exists but is not addressable through this path."
+
+  - priority: 7
+    category: request_shape
+    rule: "Required body fields must be present and non-null; enum fields must carry a declared value; integers declared non-negative must be >= 0; instant fields must parse as RFC3339 UTC; a window's start must be strictly before its end; pagination limit must be in [1, 100]."
+    error_id: ERR_INVALID_REQUEST
+    applies_to: ["ALL endpoints with a request body or query parameters"]
+    notes: "Unknown body keys are ignored, not rejected. Fields declared `source: computed` or `source: system` in §1.1 are silently ignored when supplied."
+
+  - priority: 8
+    category: state
+    rule: "The addressed entity's own state must permit the requested transition, per §1.2."
+    error_id: ERR_INVALID_STATE_TRANSITION
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/trips/{trip_id}/dispatch"
+      - "POST /fleet/trips/{trip_id}/complete"
+      - "POST /fleet/trips/{trip_id}/cancel"
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/trips/{trip_id}/re-accrue"
+      - "POST /fleet/trips/{trip_id}/settlement-dispute"
+      - "POST /fleet/trip-stops/{trip_stop_id}/arrive"
+      - "POST /fleet/trip-stops/{trip_stop_id}/complete"
+      - "POST /fleet/backhaul-offers/{offer_id}/submit-review"
+      - "POST /fleet/backhaul-offers/{offer_id}/revise"
+      - "POST /fleet/backhaul-offers/{offer_id}/accept"
+      - "POST /fleet/backhaul-offers/{offer_id}/reject"
+      - "POST /fleet/backhaul-offers/{offer_id}/withdraw"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/defer"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/reschedule"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/start"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/complete"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/cancel"
+      - "POST /fleet/pay-statements/{statement_id}/settle"
+      - "POST /fleet/pay-statements/{statement_id}/reverse"
+      - "POST /fleet/route-postings/{posting_id}/award"
+      - "POST /fleet/route-postings/{posting_id}/cancel"
+      - "POST /fleet/route-bids/{bid_id}/withdraw"
+      - "POST /fleet/replenishment-orders/{order_id}/cancel"
+      - "POST /fleet/drivers/{driver_id}/termination"
+      - "POST /fleet/telematics-events/{event_id}/coach"
+    notes: "Beats every capacity/constraint check (priority 15): deferring a work order that is ALREADY DEFERRED and whose deferral_count has reached 2 reports ERR_INVALID_STATE_TRANSITION, never ERR_DEFERRAL_LIMIT. This is the low side of the priority pair with rule 15."
+
+  - priority: 9
+    category: concurrency
+    rule: "When the endpoint declares an OCC field in §1.2.1, the supplied expected_<parent>_version must equal the parent's current version."
+    error_id: "per §1.2.1 (ERR_STALE_TRIP_VERSION | ERR_STALE_POSTING_VERSION | ERR_STALE_DRIVER_VERSION)"
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/route-bids"
+      - "POST /fleet/drivers/{driver_id}/pay-plan-assignments"
+    notes: "Runs after the entity's own state check (8) and before every cross-entity check (10+): a stale version on an otherwise doomed request still returns 412."
+
+  - priority: 10
+    category: cross_entity_state
+    rule: "A referenced entity in a different aggregate must be in an admissible state: an assigned Tractor/Trailer must be AVAILABLE; an assigned Driver must be ACTIVE; a Store referenced by a new order must be ACTIVE; a linked BackhaulOffer must not be REJECTED, WITHDRAWN or EXPIRED (a PROPOSED or UNDER_REVIEW offer may be pre-linked and simply credits 0 until it is accepted) and must not already be linked to a different trip; a bid's RoutePosting must be OPEN; a coached TelematicsEvent's Driver must not be TERMINATED; a settling DriverPayStatement's Trip must be COMPLETED."
+    error_id: "ERR_ASSET_NOT_AVAILABLE | ERR_TRACTOR_PM_HOLD | ERR_DRIVER_NOT_ACTIVE | ERR_STORE_SUSPENDED | ERR_OFFER_NOT_ACCEPTED | ERR_POSTING_NOT_OPEN | ERR_STATEMENT_NOT_ACCRUED"
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/replenishment-orders"
+      - "POST /fleet/route-bids"
+      - "POST /fleet/telematics-events/{event_id}/coach"
+      - "POST /fleet/pay-statements/{statement_id}/settle"
+
+  - priority: 11
+    category: eligibility
+    rule: "A driver whose coaching_hold is true, or whose safety_score is below MIN_BID_SAFETY_SCORE (80), may not be assigned to a trip nor place a bid. A driver's domicile must match the trip's domicile unless the domicile_balance_index borrow gate (source >= 1.5000 AND target < 1.0000) permits the loan."
+    error_id: "ERR_DRIVER_COACHING_HOLD | ERR_DRIVER_SAFETY_INELIGIBLE | ERR_DOMICILE_MISMATCH"
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/route-bids"
+    notes: "Codes are evaluated in the listed order: coaching hold, then safety score, then domicile."
+
+  - priority: 12
+    category: hours_of_service
+    rule: "The trip's projected drive, duty and rolling-weekly minutes must all stay within the hos_feasibility thresholds for the assigned driver."
+    error_id: "ERR_HOS_DRIVE_LIMIT | ERR_HOS_DUTY_LIMIT | ERR_HOS_WEEKLY_LIMIT"
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/trips/{trip_id}/dispatch"
+    notes: "Beats the rest-gap temporal check (priority 14): a driver who both blows the 840-minute duty ceiling and has only 300 minutes of rest since their previous trip reports ERR_HOS_DUTY_LIMIT. This is the low side of the priority pair with rule 14."
+
+  - priority: 13
+    category: referential
+    rule: "Structural completeness of the aggregate being acted on: a DELIVERY TripStop must carry BOTH store_id and replenishment_order_id while every other stop_type must carry NEITHER; a trip being planned must have >= 1 stop and contiguous stop sequences starting at 1; a trip being dispatched must have a driver, a tractor and a trailer; a trip being completed must have every stop in a terminal stop status; a trip being re-accrued must still have its original pay-plan pin."
+    error_id: ERR_REFERENTIAL_INCOMPLETE
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/trips/{trip_id}/dispatch"
+      - "POST /fleet/trips/{trip_id}/complete"
+      - "POST /fleet/trips/{trip_id}/re-accrue"
+    notes: "Structural completeness is checked only after the entity's own state admits the trigger, so ERR_TRIP_NOT_DRAFT always beats ERR_TRIP_HAS_NO_STOPS and ERR_TRIP_NOT_STAFFED."
+
+  - priority: 14
+    category: temporal
+    rule: "Interval geometry: stop windows must fit store dock hours and the order's requested window; the store's dock_count must not be over-subscribed; an assigned asset must not collide with a buffered maintenance window; a driver must have MIN_REST_MINUTES (600) between consecutive trips; stop instants must be non-decreasing across sequence numbers."
+    error_id: "ERR_DOCK_HOURS_VIOLATION | ERR_DELIVERY_WINDOW_VIOLATION | ERR_DOCK_CAPACITY_EXCEEDED | ERR_ASSET_MAINTENANCE_CONFLICT | ERR_DRIVER_REST_GAP | ERR_STOP_SEQUENCE_DISORDER"
+    applies_to:
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/maintenance-work-orders"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/reschedule"
+    notes: "Loses to HOS at priority 12. This is the high side of that priority pair. Within the rule the order is: sequence order, dock hours, window fit, dock capacity, maintenance conflict, rest gap."
+
+  - priority: 15
+    category: constraint
+    rule: "Capacity and uniqueness limits: the trip's peak_case_load must not exceed Trailer.capacity_cases (inclusive, so a peak exactly equal to capacity passes); a ReplenishmentOrder.temperature_mode of REFRIGERATED requires Trailer.trailer_type == REEFER; store_code, domicile_code, plan_code, driver_code, unit_code, trailer_code, trip_code and route_code must be globally unique; one SUBMITTED bid per (driver, posting); MaintenanceWorkOrder.deferral_count must not exceed MAX_DEFERRALS (2); a BackhaulOffer may be referenced by at most one Trip."
+    error_id: "ERR_TRAILER_CAPACITY_EXCEEDED | ERR_TEMPERATURE_MODE_MISMATCH | ERR_DUPLICATE_CODE | ERR_DUPLICATE_BID | ERR_DEFERRAL_LIMIT | ERR_BACKHAUL_ALREADY_LINKED"
+    applies_to:
+      - "POST /fleet/stores"
+      - "POST /fleet/domiciles"
+      - "POST /fleet/driver-pay-plans"
+      - "POST /fleet/drivers"
+      - "POST /fleet/tractors"
+      - "POST /fleet/trailers"
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/route-bids"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/defer"
+    notes: "Loses to the state check at priority 8. This is the high side of that priority pair."
+
+  - priority: 16
+    category: fiscal
+    rule: "Money floors and ceilings: an accepted BackhaulOffer's margin_pct must be >= MIN_MARGIN_PCT (0.08) unless margin_exception_approved is true; a settled DriverPayStatement's gross_cents must be > 0; a benchmark window must contain volume."
+    error_id: "ERR_MARGIN_BELOW_FLOOR | ERR_ZERO_PAY_SETTLEMENT | ERR_BENCHMARK_NO_VOLUME"
+    applies_to:
+      - "POST /fleet/backhaul-offers/{offer_id}/accept"
+      - "POST /fleet/pay-statements/{statement_id}/settle"
+      - "GET /fleet/domiciles/{domicile_id}/cost-benchmark"
+    notes: "Last of all: every structural, temporal and capacity objection is reported before the money objection."
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table   (api_prefix = /fleet)
+#   Header contract on EVERY endpoint: X-User-Role (required, one of §1.7),
+#   X-User-ID (required; opaque operator id, except for role Driver where it
+#   MUST equal the Driver.id it acts as).
+# ---------------------------------------------------------------------------
+endpoints:
+
+  # ===== Store ==============================================================
+  - method: POST
+    path: "/fleet/stores"
+    description: "Register a store that receives replenishment deliveries."
+    roles: [FleetPlanner]
+    code: 201
+    input: [store_code, region_code, dock_count, cases_per_hour_unload_rate, dock_open_minute, dock_close_minute]
+    output: Store
+    side_effects:
+      - "status := ACTIVE; open_scheduled_cases := 0; delivered_cases_total := 0"
+
+  - method: GET
+    path: "/fleet/stores/{store_id}"
+    description: "Read one store, including the two case ledgers."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Store
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/stores"
+    description: "List stores, optionally filtered by region or operating status."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["region_code?", "status?", "limit?", "offset?"]
+    output: Store[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/stores/{store_id}/status"
+    description: "Suspend or reinstate a store; SUSPENDED stores may not be planned into new trips."
+    roles: [TransportManager]
+    code: 200
+    input: [status]
+    output: Store
+    side_effects:
+      - "Store.status transition per §1.2 (no cascade to already-planned trips)"
+
+  # ===== Domicile ===========================================================
+  - method: POST
+    path: "/fleet/domiciles"
+    description: "Register a driver/equipment domicile with its fixed cost rates and its dedicated-carriage comparison rates."
+    roles: [FleetPlanner]
+    code: 201
+    input: [domicile_code, region_code, tractor_capacity, driver_headcount_target, fixed_ownership_cents_per_day, overhead_cents_per_day, dedicated_rate_cents_per_mile, dedicated_rate_cents_per_case]
+    output: Domicile
+    side_effects:
+      - "assigned_driver_count := 0; balance_index := 0.0; accrued_pay_cents := 0"
+
+  - method: GET
+    path: "/fleet/domiciles/{domicile_id}"
+    description: "Read one domicile, including assigned_driver_count, balance_index and accrued_pay_cents."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Domicile
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/domiciles"
+    description: "List domiciles."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["region_code?", "limit?", "offset?"]
+    output: Domicile[]
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/domiciles/{domicile_id}/cost-benchmark"
+    description: "Computed read: fleet cost per case and per mile over a half-open window, under either the FULLY_ALLOCATED or the INCREMENTAL_VARIABLE variant, plus the advantage against the domicile's dedicated-carriage rates. Nothing is persisted."
+    roles: [TransportManager, PayrollAnalyst]
+    code: 200
+    input: [variant, window_start, window_end]
+    output: { variant: string, window_start: string, window_end: string, window_days: integer, trip_count: integer, total_miles: integer, total_cases: integer, driver_pay_cents: integer, fuel_cents: integer, maintenance_cents: integer, backhaul_credit_cents: integer, variable_cost_cents: integer, fixed_cost_cents: integer, total_cost_cents: integer, cost_per_case_cents: integer, cost_per_mile_cents: integer, dedicated_equivalent_cents_per_case: integer, advantage_cents_per_case: integer }
+    side_effects: []
+
+  # ===== DriverPayPlan ======================================================
+  - method: POST
+    path: "/fleet/driver-pay-plans"
+    description: "Create an immutable-by-supersession pay plan combining mileage, activity and hourly components with a daily guarantee."
+    roles: [PayrollAnalyst]
+    code: 201
+    input: [plan_code, mileage_cents_per_mile, stop_cents_per_stop, drop_hook_cents, hourly_cents_per_minute, minimum_daily_cents, backhaul_bonus_pct]
+    output: DriverPayPlan
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/driver-pay-plans/{pay_plan_id}"
+    description: "Read one pay plan (including its `version`, which trips pin at plan time)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: DriverPayPlan
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/driver-pay-plans"
+    description: "List pay plans."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: DriverPayPlan[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/fleet/driver-pay-plans/{pay_plan_id}"
+    description: "Amend a pay plan's rates. Raises the plan's `version`, which is exactly what makes a trip's pinned_pay_plan_version stale for later settlements."
+    roles: [PayrollAnalyst]
+    code: 200
+    input: ["mileage_cents_per_mile?", "stop_cents_per_stop?", "drop_hook_cents?", "hourly_cents_per_minute?", "minimum_daily_cents?", "backhaul_bonus_pct?"]
+    output: DriverPayPlan
+    side_effects:
+      - "plan.version += 1; NO recomputation of any already-pinned Trip or DriverPayStatement"
+
+  # ===== Driver =============================================================
+  - method: POST
+    path: "/fleet/drivers"
+    description: "Hire a driver into a domicile on a pay plan."
+    roles: [TransportManager]
+    code: 201
+    input: [driver_code, domicile_id, pay_plan_id, seniority_date]
+    output: Driver
+    side_effects:
+      - "status := ACTIVE; hos_status := AVAILABLE; all three HOS counters := 0"
+      - "open_penalty_points := 0; safety_score := 100; coaching_hold := false; ytd_gross_cents := 0"
+      - "Domicile.assigned_driver_count += 1 and Domicile.balance_index recomputed"
+
+  - method: GET
+    path: "/fleet/drivers/{driver_id}"
+    description: "Read one driver, including the live safety score, coaching hold and HOS counters."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Driver
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/drivers"
+    description: "List drivers; filters cover both FKs (domicile_id, pay_plan_id) for reverse reachability."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["domicile_id?", "pay_plan_id?", "status?", "coaching_hold?", "limit?", "offset?"]
+    output: Driver[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/drivers/{driver_id}/pay-plan-assignments"
+    description: "Supersede the driver's current pay plan. OCC-guarded on the Driver row (§1.2.1 payplan-assign-stale-driver)."
+    roles: [PayrollAnalyst]
+    code: 200
+    input: [pay_plan_id, expected_driver_version]
+    output: Driver
+    side_effects:
+      - "driver.pay_plan_id := pay_plan_id; driver.version += 1"
+      - "no already-planned Trip's pinned_pay_plan_id changes"
+
+  - method: POST
+    path: "/fleet/drivers/{driver_id}/hos-reset"
+    description: "Record a completed rest period: DAILY zeroes the two daily counters, WEEKLY (34-hour restart) zeroes all three."
+    roles: [TransportManager]
+    code: 200
+    input: [reset_kind]
+    output: Driver
+    side_effects:
+      - "reset_kind == DAILY: drive_minutes_used_today := 0, duty_minutes_used_today := 0"
+      - "reset_kind == WEEKLY: the two daily counters AND weekly_on_duty_minutes := 0"
+      - "hos_status := AVAILABLE; driver.version += 1"
+
+  - method: POST
+    path: "/fleet/drivers/{driver_id}/duty-log-adjustments"
+    description: "Operator correction of the driver's HOS counters (the business surface used to place a driver near a limit)."
+    roles: [TransportManager]
+    code: 200
+    input: ["drive_minutes_used_today?", "duty_minutes_used_today?", "weekly_on_duty_minutes?"]
+    output: Driver
+    side_effects:
+      - "supplied counters overwritten, omitted counters unchanged; hos_status re-derived; driver.version += 1"
+
+  - method: POST
+    path: "/fleet/drivers/{driver_id}/termination"
+    description: "Terminate a driver; cascades to their open bids and to the domicile headcount ledger."
+    roles: [TransportManager]
+    code: 200
+    input: ["termination_reason?"]
+    output: Driver
+    side_effects:
+      - "Driver.status ACTIVE -> TERMINATED with the full cascade of §1.2"
+
+  # ===== Tractor ============================================================
+  - method: POST
+    path: "/fleet/tractors"
+    description: "Add a tractor to a domicile with its odometer and PM interval."
+    roles: [MaintenanceCoordinator]
+    code: 201
+    input: [unit_code, domicile_id, odometer_miles, pm_interval_miles, pm_last_service_odometer]
+    output: Tractor
+    side_effects:
+      - "miles_since_pm := odometer_miles - pm_last_service_odometer; pm_hold := (miles_since_pm >= pm_interval_miles); status := AVAILABLE"
+
+  - method: GET
+    path: "/fleet/tractors/{tractor_id}"
+    description: "Read one tractor, including miles_since_pm and pm_hold."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Tractor
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/tractors"
+    description: "List tractors, filterable by domicile (FK reverse reachability) and status."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["domicile_id?", "status?", "pm_hold?", "limit?", "offset?"]
+    output: Tractor[]
+    side_effects: []
+
+  - method: PATCH
+    path: "/fleet/tractors/{tractor_id}"
+    description: "Correct a tractor's odometer or PM interval; re-derives miles_since_pm and pm_hold."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: ["odometer_miles?", "pm_interval_miles?", "pm_last_service_odometer?"]
+    output: Tractor
+    side_effects:
+      - "miles_since_pm and pm_hold re-derived; NO MaintenanceWorkOrder is auto-created by this path (only trip completion projects PM)"
+      - "tractor.version += 1"
+
+  # ===== Trailer ============================================================
+  - method: POST
+    path: "/fleet/trailers"
+    description: "Add a trailer to a domicile with its equipment type and case capacity."
+    roles: [MaintenanceCoordinator]
+    code: 201
+    input: [trailer_code, domicile_id, trailer_type, capacity_cases, inspection_due_at]
+    output: Trailer
+    side_effects:
+      - "status := AVAILABLE"
+
+  - method: GET
+    path: "/fleet/trailers/{trailer_id}"
+    description: "Read one trailer."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Trailer
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/trailers"
+    description: "List trailers, filterable by domicile (FK reverse reachability), type and status."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["domicile_id?", "trailer_type?", "status?", "limit?", "offset?"]
+    output: Trailer[]
+    side_effects: []
+
+  # ===== ReplenishmentOrder =================================================
+  - method: POST
+    path: "/fleet/replenishment-orders"
+    description: "Register a store replenishment requirement with its merchandising time window."
+    roles: [FleetPlanner]
+    code: 201
+    input: [store_id, cases, weight_lbs, requested_window_start, requested_window_end, temperature_mode, priority]
+    output: ReplenishmentOrder
+    side_effects:
+      - "status := UNSCHEDULED (the order is NOT yet inside Store.open_scheduled_cases)"
+
+  - method: GET
+    path: "/fleet/replenishment-orders/{order_id}"
+    description: "Read one replenishment order."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: ReplenishmentOrder
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/replenishment-orders"
+    description: "List replenishment orders, filterable by store (FK reverse reachability) and status."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["store_id?", "status?", "temperature_mode?", "limit?", "offset?"]
+    output: ReplenishmentOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/replenishment-orders/{order_id}/cancel"
+    description: "Cancel an order that has not been planned onto a trip."
+    roles: [FleetPlanner]
+    code: 200
+    input: ["reason_code?"]
+    output: ReplenishmentOrder
+    side_effects:
+      - "status UNSCHEDULED -> CANCELLED; Store.open_scheduled_cases unchanged"
+
+  # ===== Trip: construction =================================================
+  - method: POST
+    path: "/fleet/trips"
+    description: "Open a DRAFT trip for a domicile with its intended dispatch instant."
+    roles: [FleetPlanner]
+    code: 201
+    input: [trip_code, domicile_id, planned_start_at]
+    output: Trip
+    side_effects:
+      - "plan_status := DRAFT; settlement_status := PENDING; created_by_user_id := X-User-ID"
+      - "stop_count := 0; every mileage/minute/case aggregate := 0; planned_end_at := null"
+
+  - method: GET
+    path: "/fleet/trips/{trip_id}"
+    description: "Read one trip with all 14 recomputed aggregates and both status dimensions."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: Trip
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/trips"
+    description: "List trips. Every Trip FK is exposed as a filter, which is the reverse-reachability channel for domicile, driver, tractor, trailer, backhaul offer and pinned pay plan."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["domicile_id?", "driver_id?", "tractor_id?", "trailer_id?", "backhaul_offer_id?", "pinned_pay_plan_id?", "plan_status?", "settlement_status?", "limit?", "offset?"]
+    output: Trip[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/stops"
+    description: "Append a stop to a DRAFT trip. DELIVERY stops require store_id + replenishment_order_id; VENDOR_PICKUP / THIRD_PARTY_PICKUP / DROP_OFF / FUEL stops require both to be null. Either shape violation is ERR_REFERENTIAL_INCOMPLETE (§1.4 priority 13)."
+    roles: [FleetPlanner]
+    code: 201
+    input: [sequence, stop_type, "store_id?", "replenishment_order_id?", scheduled_arrival_at, scheduled_departure_at, drive_minutes_from_prev, miles_from_prev, segment_loaded, "cases?"]
+    output: TripStop
+    side_effects:
+      - "stop.service_minutes computed per stop_type (DELIVERY uses the store's unload rate, everything else uses a fixed constant)"
+      - "trip.stop_count, planned_end_at, total_miles, loaded_miles, empty_miles, planned_drive_minutes, planned_service_minutes, planned_break_minutes, planned_duty_minutes, planned_delivery_cases and peak_case_load all recomputed by calculations.trip_plan_totals"
+      - "trip.version += 1"
+
+  - method: GET
+    path: "/fleet/trips/{trip_id}/stops"
+    description: "Sub-resource listing of a trip's stops in ascending sequence."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TripStop[]
+    side_effects: []
+
+  - method: DELETE
+    path: "/fleet/trips/{trip_id}/stops/{trip_stop_id}"
+    description: "Remove a stop from a DRAFT trip and renumber the remaining stops to stay contiguous from 1."
+    roles: [FleetPlanner]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "surviving stops' `sequence` values are compacted; all trip aggregates recomputed; trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/plan"
+    description: "Commit the trip's schedule: dock hours, merchandising windows, dock capacity, HOS feasibility and the pay-plan pin are all evaluated here."
+    roles: [FleetPlanner]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "plan_status DRAFT -> PLANNED"
+      - "pinned_pay_plan_id / pinned_pay_plan_version snapshotted from the assigned driver's current plan when a driver is already assigned, else from the domicile's default resolution rule stated in §1.2"
+      - "planned_pay_cents := calculations.driver_trip_pay variant PLANNED_ACCRUAL"
+      - "every DELIVERY stop's ReplenishmentOrder UNSCHEDULED -> SCHEDULED, raising Store.open_scheduled_cases"
+      - "trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/assignments"
+    description: "Assign (or re-assign) driver, tractor and trailer to the trip. Runs the eligibility, HOS, rest-gap, maintenance-conflict, capacity and temperature gates."
+    roles: [TransportManager]
+    code: 200
+    input: [driver_id, tractor_id, trailer_id]
+    output: Trip
+    side_effects:
+      - "Tractor and Trailer AVAILABLE -> ASSIGNED; any previously assigned tractor/trailer released back to AVAILABLE"
+      - "trip.driver_id / tractor_id / trailer_id set; trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/backhaul-assignments"
+    description: "Link an ACCEPTED-eligible BackhaulOffer to the trip. Permitted only while plan_status is DRAFT, PLANNED, DISPATCHED or IN_PROGRESS; a COMPLETED or CANCELLED trip rejects the link with ERR_INVALID_STATE_TRANSITION. Re-linking supersedes the trip's current offer instead of failing: the superseded offer is unlinked and, if it was ACCEPTED, returned to PROPOSED. OCC-guarded on the Trip row (§1.2.1 backhaul-link-stale-trip)."
+    roles: [TransportManager]
+    code: 200
+    input: [backhaul_offer_id, expected_trip_version]
+    output: Trip
+    side_effects:
+      - "any offer previously linked to this trip is unlinked and, if ACCEPTED, returned to PROPOSED"
+      - "trip.backhaul_offer_id := backhaul_offer_id; trip.backhaul_credit_cents := offer.contribution_margin_cents when offer.status == ACCEPTED, else 0"
+      - "trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/dispatch"
+    description: "Release the trip to the driver; re-checks HOS against the driver's counters at dispatch time."
+    roles: [TransportManager]
+    code: 200
+    input: []
+    output: Trip
+    side_effects:
+      - "plan_status PLANNED -> DISPATCHED; Driver.hos_status := ON_DUTY; trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/complete"
+    description: "Close out the trip with the driver's actual minutes; drives the FINAL_SETTLEMENT pay variant, the odometer/PM cascade and the order-delivery cascade. A Driver may only close out their own trip; a TransportManager may close out any."
+    roles: [Driver, TransportManager]
+    code: 200
+    input: [actual_drive_minutes, actual_duty_minutes]
+    output: Trip
+    side_effects:
+      - "plan_status IN_PROGRESS -> COMPLETED; settlement_status PENDING -> ACCRUED"
+      - "driver_pay_cents := calculations.driver_trip_pay variant FINAL_SETTLEMENT on the PINNED plan version"
+      - "a DriverPayStatement (status ACCRUED) is created; Domicile.accrued_pay_cents and Driver.ytd_gross_cents rise by its gross_cents"
+      - "Tractor.odometer_miles += trip.total_miles, then calculations.pm_due_projection may create an auto PM MaintenanceWorkOrder and set pm_hold"
+      - "Tractor/Trailer ASSIGNED -> AVAILABLE; every COMPLETED DELIVERY stop's order SCHEDULED -> DELIVERED"
+      - "Driver HOS counters advanced by the actual minutes; trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/cancel"
+    description: "Cancel a trip from DRAFT, PLANNED or DISPATCHED; releases equipment, skips stops, un-schedules orders and returns any ACCEPTED backhaul offer to the market."
+    roles: [FleetPlanner, TransportManager]
+    code: 200
+    input: ["reason_code?"]
+    output: Trip
+    side_effects:
+      - "the full cancel cascade of §1.2 (stops -> SKIPPED, orders -> UNSCHEDULED, assets -> AVAILABLE, offer ACCEPTED -> PROPOSED)"
+
+  - method: GET
+    path: "/fleet/trips/{trip_id}/pay-preview"
+    description: "Computed read of calculations.driver_trip_pay under either variant without persisting anything; the channel that exposes the PLANNED_ACCRUAL vs FINAL_SETTLEMENT divergence."
+    roles: [PayrollAnalyst, TransportManager]
+    code: 200
+    input: [variant]
+    output: { variant: string, pay_plan_id: string, pay_plan_version: integer, mileage_cents: integer, activity_cents: integer, hourly_cents: integer, bonus_cents: integer, subtotal_cents: integer, guarantee_makeup_cents: integer, gross_cents: integer }
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/re-accrue"
+    description: "Re-accrue a disputed or adjusted trip on corrected minutes, still against the ORIGINAL pinned pay plan version."
+    roles: [PayrollAnalyst]
+    code: 200
+    input: [actual_drive_minutes, actual_duty_minutes]
+    output: Trip
+    side_effects:
+      - "settlement_status DISPUTED|ADJUSTED -> ACCRUED; a NEW ACCRUED DriverPayStatement is created; both ledgers rise again"
+      - "the pay-plan pin is deliberately NOT refreshed; trip.version += 1"
+
+  - method: POST
+    path: "/fleet/trips/{trip_id}/settlement-dispute"
+    description: "Open a settlement dispute on an ACCRUED or SETTLED trip."
+    roles: [PayrollAnalyst, Driver]
+    code: 200
+    input: ["dispute_note?"]
+    output: Trip
+    side_effects:
+      - "settlement_status ACCRUED|SETTLED -> DISPUTED; plan_status untouched (parallel dimensions); trip.version += 1"
+
+  # ===== TripStop ===========================================================
+  - method: GET
+    path: "/fleet/trip-stops/{trip_stop_id}"
+    description: "Read one stop with its computed service_minutes."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: TripStop
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/trip-stops"
+    description: "List stops; filters cover all three TripStop FKs (trip_id, store_id, replenishment_order_id)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["trip_id?", "store_id?", "replenishment_order_id?", "stop_type?", "status?", "limit?", "offset?"]
+    output: TripStop[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/trip-stops/{trip_stop_id}/arrive"
+    description: "Driver check-in at a stop; bubbles the trip DISPATCHED -> IN_PROGRESS on the first arrival and enforces sequence order."
+    roles: [Driver, TransportManager]
+    code: 200
+    input: ["actual_arrival_at?"]
+    output: TripStop
+    side_effects:
+      - "stop.status PLANNED -> ARRIVED; Trip.plan_status DISPATCHED -> IN_PROGRESS on the first arrival"
+
+  - method: POST
+    path: "/fleet/trip-stops/{trip_stop_id}/complete"
+    description: "Driver check-out at a stop, optionally correcting the cases actually handled, which re-derives service minutes and every dependent trip aggregate."
+    roles: [Driver, TransportManager]
+    code: 200
+    input: ["cases_handled?", "actual_departure_at?"]
+    output: TripStop
+    side_effects:
+      - "stop.status ARRIVED -> COMPLETED; stop.cases and service_minutes updated when cases_handled is supplied"
+      - "Trip.planned_service_minutes / planned_duty_minutes / planned_delivery_cases / peak_case_load recomputed"
+
+  # ===== BackhaulOffer ======================================================
+  - method: POST
+    path: "/fleet/backhaul-offers"
+    description: "Register a backhaul opportunity — a vendor pickup or a third-party freight offer — with its revenue and mileage economics."
+    roles: [FleetPlanner]
+    code: 201
+    input: [origin_kind, shipper_name, origin_region_code, dest_store_id, revenue_cents, cases, weight_lbs, deadhead_miles, loaded_miles, temperature_mode, pickup_window_start, pickup_window_end, offer_expires_at]
+    output: BackhaulOffer
+    side_effects:
+      - "status := PROPOSED; review_round := 0; margin_exception_approved := false; created_by_user_id := X-User-ID"
+      - "all six margin fields := 0 (they are computed only when the offer enters review)"
+
+  - method: GET
+    path: "/fleet/backhaul-offers/{offer_id}"
+    description: "Read one offer including the full contribution-margin breakdown."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: BackhaulOffer
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/backhaul-offers"
+    description: "List offers, filterable by destination store (FK reverse reachability), origin kind and status."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["dest_store_id?", "origin_kind?", "origin_region_code?", "status?", "limit?", "offset?"]
+    output: BackhaulOffer[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/backhaul-offers/{offer_id}/submit-review"
+    description: "Move an offer into review, which is when calculations.backhaul_contribution_margin runs for the first time."
+    roles: [FleetPlanner]
+    code: 200
+    input: []
+    output: BackhaulOffer
+    side_effects:
+      - "status PROPOSED -> UNDER_REVIEW; the six margin fields written"
+
+  - method: POST
+    path: "/fleet/backhaul-offers/{offer_id}/revise"
+    description: "Send an offer back to the shipper with revised economics; bounded to 3 review rounds."
+    roles: [FleetPlanner]
+    code: 200
+    input: ["revenue_cents?", "cases?", "deadhead_miles?", "loaded_miles?"]
+    output: BackhaulOffer
+    side_effects:
+      - "status UNDER_REVIEW -> PROPOSED; review_round += 1; margins recomputed; any linked Trip.backhaul_credit_cents := 0"
+
+  - method: POST
+    path: "/fleet/backhaul-offers/{offer_id}/accept"
+    description: "Accept an offer under review. Enforces the 8% contribution-margin floor unless a second operator approves a margin exception (segregation of duties)."
+    roles: [TransportManager]
+    code: 200
+    input: ["margin_exception_approved?"]
+    output: BackhaulOffer
+    side_effects:
+      - "status UNDER_REVIEW -> ACCEPTED; linked Trip.backhaul_credit_cents := contribution_margin_cents"
+
+  - method: POST
+    path: "/fleet/backhaul-offers/{offer_id}/reject"
+    description: "Reject an offer under review and unlink it from any trip."
+    roles: [TransportManager]
+    code: 200
+    input: ["reason_code?"]
+    output: BackhaulOffer
+    side_effects:
+      - "status UNDER_REVIEW -> REJECTED; linked Trip.backhaul_offer_id := null and backhaul_credit_cents := 0"
+
+  - method: POST
+    path: "/fleet/backhaul-offers/{offer_id}/withdraw"
+    description: "Withdraw an unlinked PROPOSED offer from the market."
+    roles: [FleetPlanner]
+    code: 200
+    input: ["reason_code?"]
+    output: BackhaulOffer
+    side_effects:
+      - "status PROPOSED -> WITHDRAWN"
+
+  - method: POST
+    path: "/fleet/backhaul-offers/expiration-sweep"
+    description: "Bulk action: expire every PROPOSED or UNDER_REVIEW offer whose offer_expires_at is at or before the logical clock, unlinking each from its trip. Offers not yet expired are skipped, not failed."
+    roles: [TransportManager]
+    code: 200
+    input: []
+    output: "{ expired_count: integer, expired_offer_ids: string[], unlinked_trip_ids: string[] }"
+    side_effects:
+      - "per swept offer: status -> EXPIRED; linked Trip.backhaul_offer_id := null and backhaul_credit_cents := 0"
+
+  # ===== MaintenanceWorkOrder ===============================================
+  - method: POST
+    path: "/fleet/maintenance-work-orders"
+    description: "Schedule shop time for a tractor or a trailer in a closed window; rejected when the window collides with a buffered trip commitment of the same asset."
+    roles: [MaintenanceCoordinator]
+    code: 201
+    input: [asset_kind, "tractor_id?", "trailer_id?", service_type, window_start_at, window_end_at]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status := SCHEDULED; deferral_count := 0; auto_generated := false"
+
+  - method: GET
+    path: "/fleet/maintenance-work-orders/{work_order_id}"
+    description: "Read one work order."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: MaintenanceWorkOrder
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/maintenance-work-orders"
+    description: "List work orders; filters cover both asset FKs (tractor_id, trailer_id) and the auto_generated flag, which is how a test discovers a cascade-created PM order."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["tractor_id?", "trailer_id?", "asset_kind?", "service_type?", "status?", "auto_generated?", "limit?", "offset?"]
+    output: MaintenanceWorkOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/maintenance-work-orders/{work_order_id}/defer"
+    description: "Defer a scheduled work order; at most two deferrals, and a deferral never releases an auto PM hold."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: ["reason_code?"]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status SCHEDULED -> DEFERRED; deferral_count += 1; asset pm_hold unchanged"
+
+  - method: POST
+    path: "/fleet/maintenance-work-orders/{work_order_id}/reschedule"
+    description: "Give a deferred work order a new shop window; runs the maintenance-conflict check in the reverse direction (work order vs committed trips)."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: [window_start_at, window_end_at]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status DEFERRED -> SCHEDULED; window overwritten"
+
+  - method: POST
+    path: "/fleet/maintenance-work-orders/{work_order_id}/start"
+    description: "Take the asset into the shop."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status SCHEDULED -> IN_SHOP; asset AVAILABLE -> IN_SHOP"
+
+  - method: POST
+    path: "/fleet/maintenance-work-orders/{work_order_id}/complete"
+    description: "Release the asset from the shop; a completed PM resets the tractor's PM baseline and clears pm_hold."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: ["performed_odometer_miles?"]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status IN_SHOP -> COMPLETED; asset IN_SHOP -> AVAILABLE"
+      - "for PM_A / PM_B on a tractor: pm_last_service_odometer := odometer_miles, miles_since_pm := 0, pm_hold := false"
+
+  - method: POST
+    path: "/fleet/maintenance-work-orders/{work_order_id}/cancel"
+    description: "Cancel a manually scheduled work order. Auto-generated PM orders can never be cancelled."
+    roles: [MaintenanceCoordinator]
+    code: 200
+    input: ["reason_code?"]
+    output: MaintenanceWorkOrder
+    side_effects:
+      - "status SCHEDULED -> CANCELLED"
+
+  # ===== DriverPayStatement =================================================
+  - method: GET
+    path: "/fleet/pay-statements/{statement_id}"
+    description: "Read one pay statement with its four pay components, guarantee make-up and gross."
+    roles: [PayrollAnalyst, TransportManager, Driver]
+    code: 200
+    input: []
+    output: DriverPayStatement
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/pay-statements"
+    description: "List pay statements; filters cover all three FKs (driver_id, trip_id, pay_plan_id). This is the only discovery channel for the statements that trip completion and re-accrual create."
+    roles: [PayrollAnalyst, TransportManager, Driver]
+    code: 200
+    input: ["driver_id?", "trip_id?", "pay_plan_id?", "status?", "variant?", "limit?", "offset?"]
+    output: DriverPayStatement[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/pay-statements/{statement_id}/settle"
+    description: "Pay an accrued statement and move the trip's settlement dimension to SETTLED."
+    roles: [PayrollAnalyst]
+    code: 200
+    input: [settlement_reference]
+    output: DriverPayStatement
+    side_effects:
+      - "status ACCRUED -> SETTLED; Trip.settlement_status ACCRUED -> SETTLED; Domicile.accrued_pay_cents unchanged"
+
+  - method: POST
+    path: "/fleet/pay-statements/{statement_id}/reverse"
+    description: "Reverse an accrued or settled statement; unwinds both money ledgers and pushes the trip's settlement dimension to ADJUSTED."
+    roles: [PayrollAnalyst]
+    code: 200
+    input: ["reason_code?"]
+    output: DriverPayStatement
+    side_effects:
+      - "status -> REVERSED; Domicile.accrued_pay_cents -= gross_cents; Driver.ytd_gross_cents -= gross_cents"
+      - "Trip.settlement_status -> ADJUSTED; Trip.driver_pay_cents := 0"
+
+  # ===== RoutePosting / RouteBid ============================================
+  - method: POST
+    path: "/fleet/route-postings"
+    description: "Post a route up for seniority bidding at a domicile."
+    roles: [TransportManager]
+    code: 201
+    input: [route_code, domicile_id, weekly_miles, weekly_stops, start_effective_date, bid_close_at]
+    output: RoutePosting
+    side_effects:
+      - "status := OPEN; bid_count := 0; awarded_driver_id := null; created_by_user_id := X-User-ID"
+
+  - method: GET
+    path: "/fleet/route-postings/{posting_id}"
+    description: "Read one posting with its live bid count."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: RoutePosting
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/route-postings"
+    description: "List postings; filters cover both FKs (domicile_id, awarded_driver_id)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["domicile_id?", "awarded_driver_id?", "status?", "limit?", "offset?"]
+    output: RoutePosting[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/route-postings/{posting_id}/award"
+    description: "Close the board and award the route by the seniority selector. An empty eligible pool is not an error: the posting goes VACANT with HTTP 200. A second operator must run the award (segregation of duties)."
+    roles: [TransportManager]
+    code: 200
+    input: []
+    output: RoutePosting
+    side_effects:
+      - "OPEN -> AWARDED (winner's bid -> AWARDED, all other SUBMITTED bids -> PASSED_OVER) or OPEN -> VACANT (every SUBMITTED bid -> PASSED_OVER)"
+      - "bid_count := 0"
+
+  - method: POST
+    path: "/fleet/route-postings/{posting_id}/cancel"
+    description: "Pull a posting off the board; every open bid is withdrawn rather than passed over."
+    roles: [TransportManager]
+    code: 200
+    input: ["reason_code?"]
+    output: RoutePosting
+    side_effects:
+      - "OPEN -> CANCELLED; every SUBMITTED bid -> WITHDRAWN; bid_count := 0"
+
+  - method: POST
+    path: "/fleet/route-bids"
+    description: "Place a seniority bid on an open posting. driver_id is taken from X-User-ID, never from the body. OCC-guarded on the RoutePosting row (§1.2.1 bid-create-stale-posting)."
+    roles: [Driver]
+    code: 201
+    input: [route_posting_id, expected_posting_version]
+    output: RouteBid
+    side_effects:
+      - "driver_id := X-User-ID; seniority_date_snapshot and safety_score_snapshot copied from the live Driver row"
+      - "status := SUBMITTED; RoutePosting.bid_count += 1; RoutePosting.version += 1"
+
+  - method: GET
+    path: "/fleet/route-bids/{bid_id}"
+    description: "Read one bid with its audit snapshots."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: RouteBid
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/route-bids"
+    description: "List bids; filters cover both FKs (route_posting_id, driver_id)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["route_posting_id?", "driver_id?", "status?", "limit?", "offset?"]
+    output: RouteBid[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/route-bids/{bid_id}/withdraw"
+    description: "A driver pulls their own bid; lowers the posting's bid_count."
+    roles: [Driver]
+    code: 200
+    input: []
+    output: RouteBid
+    side_effects:
+      - "status SUBMITTED -> WITHDRAWN; RoutePosting.bid_count -= 1; RoutePosting.version += 1"
+
+  # ===== TelematicsEvent ====================================================
+  - method: POST
+    path: "/fleet/telematics-events"
+    description: "Record a telematics exception against a driver. Fixes penalty_points at creation and may fire the coaching-hold cascade."
+    roles: [SafetyManager]
+    code: 201
+    input: [driver_id, "trip_id?", event_type, severity, occurred_at]
+    output: TelematicsEvent
+    side_effects:
+      - "penalty_points := BASE_POINTS[event_type] * severity; coached := false"
+      - "Driver.open_penalty_points += penalty_points; Driver.safety_score recomputed; Driver.coaching_hold set when the score drops below 70"
+      - "coaching-hold cascade when the hold flips false -> true: every PLANNED trip of the driver reverts to DRAFT and is stripped of driver/tractor/trailer, its stops go SKIPPED, its orders go UNSCHEDULED, its assets go AVAILABLE, and every SUBMITTED RouteBid of the driver goes PASSED_OVER"
+
+  - method: GET
+    path: "/fleet/telematics-events/{event_id}"
+    description: "Read one telematics event (append-only; no version field)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: []
+    output: TelematicsEvent
+    side_effects: []
+
+  - method: GET
+    path: "/fleet/telematics-events"
+    description: "List telematics events; filters cover both FKs (driver_id, trip_id)."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: ["driver_id?", "trip_id?", "event_type?", "coached?", "limit?", "offset?"]
+    output: TelematicsEvent[]
+    side_effects: []
+
+  - method: POST
+    path: "/fleet/telematics-events/{event_id}/coach"
+    description: "Record a coaching session that retires an event's penalty points. Compensating action: it restores the points and may clear the hold, but never restores the trips or bids the hold released."
+    roles: [SafetyManager]
+    code: 200
+    input: ["coaching_note?"]
+    output: TelematicsEvent
+    side_effects:
+      - "coached := true; coached_at := logical clock now; coached_by_user_id := X-User-ID"
+      - "Driver.open_penalty_points -= penalty_points; safety_score recomputed; coaching_hold cleared when the score is back at or above 70"
+
+  # ===== Test-driving surface ================================================
+  - method: POST
+    path: "/fleet/_clock/set_current_utc"
+    description: "Set the server's logical UTC clock, which drives offer expiry, bid-close comparisons, coached_at and the PM window projection. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z and MUST NOT fall back to real wall-clock time."
+    roles: [FleetPlanner, TransportManager, Driver, PayrollAnalyst, SafetyManager, MaintenanceCoordinator]
+    code: 200
+    input: [current_utc]
+    output: { current_utc: string }
+    side_effects:
+      - "no entity is mutated; only subsequent time-dependent evaluations shift"
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog (every code is triggerable through §1.5)
+# ---------------------------------------------------------------------------
+errors:
+
+  # --- authentication / authorization --------------------------------------
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role header missing, empty, or not one of the six declared roles."
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "The supplied role is not in the target endpoint's `roles` list."
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "X-User-ID equals the creator of the record being approved: accepting one's own backhaul offer with margin_exception_approved=true, or awarding one's own route posting."
+  - id: ERR_DRIVER_SCOPE_VIOLATION
+    http: 403
+    condition: "A caller with role Driver acts on a trip, stop or bid that does not belong to them (X-User-ID != the owning driver_id)."
+  - id: ERR_PARENT_MISMATCH
+    http: 403
+    condition: "A nested resource does not belong to the parent named in the path, or a referenced replenishment order is already attached to a different trip."
+
+  # --- existence -----------------------------------------------------------
+  - id: ERR_STORE_NOT_FOUND
+    http: 404
+    condition: "store_id in the path or body resolves to no Store."
+  - id: ERR_DOMICILE_NOT_FOUND
+    http: 404
+    condition: "domicile_id in the path or body resolves to no Domicile."
+  - id: ERR_PAY_PLAN_NOT_FOUND
+    http: 404
+    condition: "pay_plan_id in the path or body resolves to no DriverPayPlan."
+  - id: ERR_DRIVER_NOT_FOUND
+    http: 404
+    condition: "driver_id in the path or body resolves to no Driver."
+  - id: ERR_TRACTOR_NOT_FOUND
+    http: 404
+    condition: "tractor_id in the path or body resolves to no Tractor."
+  - id: ERR_TRAILER_NOT_FOUND
+    http: 404
+    condition: "trailer_id in the path or body resolves to no Trailer."
+  - id: ERR_ORDER_NOT_FOUND
+    http: 404
+    condition: "replenishment_order_id in the path or body resolves to no ReplenishmentOrder."
+  - id: ERR_TRIP_NOT_FOUND
+    http: 404
+    condition: "trip_id in the path or body resolves to no Trip."
+  - id: ERR_TRIP_STOP_NOT_FOUND
+    http: 404
+    condition: "trip_stop_id in the path resolves to no TripStop."
+  - id: ERR_OFFER_NOT_FOUND
+    http: 404
+    condition: "backhaul_offer_id in the path or body resolves to no BackhaulOffer."
+  - id: ERR_WORK_ORDER_NOT_FOUND
+    http: 404
+    condition: "work_order_id in the path resolves to no MaintenanceWorkOrder."
+  - id: ERR_STATEMENT_NOT_FOUND
+    http: 404
+    condition: "statement_id in the path resolves to no DriverPayStatement."
+  - id: ERR_POSTING_NOT_FOUND
+    http: 404
+    condition: "posting_id in the path or route_posting_id in the body resolves to no RoutePosting."
+  - id: ERR_BID_NOT_FOUND
+    http: 404
+    condition: "bid_id in the path resolves to no RouteBid."
+  - id: ERR_EVENT_NOT_FOUND
+    http: 404
+    condition: "event_id in the path resolves to no TelematicsEvent."
+
+  # --- request shape -------------------------------------------------------
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "A required body field is absent or null, an enum carries an undeclared value, a numeric constraint of §1.1 is violated, an instant does not parse as RFC3339 UTC, a window's start is not strictly before its end, a DELIVERY stop omits store_id/replenishment_order_id (or a non-DELIVERY stop supplies them), asset_kind does not agree with which of tractor_id/trailer_id is supplied, or `limit` falls outside [1, 100]."
+  - id: ERR_DUPLICATE_CODE
+    http: 422
+    condition: "store_code, domicile_code, plan_code, driver_code, unit_code, trailer_code, trip_code or route_code duplicates an existing row's."
+
+  # --- own-state / transition ---------------------------------------------
+  - id: ERR_INVALID_STATE_TRANSITION
+    http: 409
+    condition: "The addressed entity's current state has no transition for the requested trigger — including a second identical action (idempotency is NOT provided), acting on a terminal state, cancelling an auto-generated PM work order, withdrawing an offer that a trip already links, submitting an expired offer for review, or completing a trip whose stops are not all terminal."
+  - id: ERR_TRIP_NOT_DRAFT
+    http: 409
+    condition: "POST /fleet/trips/{trip_id}/plan or POST /fleet/trips/{trip_id}/stops on a trip whose plan_status is not DRAFT."
+  - id: ERR_TRIP_NOT_STAFFED
+    http: 409
+    condition: "POST /fleet/trips/{trip_id}/plan on a trip missing any of driver_id, tractor_id, trailer_id."
+  - id: ERR_TRIP_HAS_NO_STOPS
+    http: 409
+    condition: "POST /fleet/trips/{trip_id}/plan on a trip with zero DELIVERY stops."
+  - id: ERR_REFERENTIAL_INCOMPLETE
+    http: 422
+    condition: "A structural precondition of the aggregate is unmet in a way not covered by a more specific code: a DELIVERY stop created without store_id or without replenishment_order_id, a non-DELIVERY stop created WITH either of them, or re-accruing a trip whose pinned pay plan row no longer resolves."
+  - id: ERR_OFFER_NOT_UNDER_REVIEW
+    http: 409
+    condition: "A review-stage action (submit-review, revise, accept, reject) is attempted from the wrong offer status."
+  - id: ERR_OFFER_NOT_ACCEPTED
+    http: 409
+    condition: "POST /fleet/trips/{trip_id}/backhaul-assignments references an offer whose status is not ACCEPTED, PROPOSED or UNDER_REVIEW (i.e. a REJECTED, WITHDRAWN or EXPIRED offer can never be linked)."
+  - id: ERR_ORDER_NOT_SCHEDULABLE
+    http: 409
+    condition: "A ReplenishmentOrder is expected to be UNSCHEDULED but is SCHEDULED, DELIVERED or CANCELLED."
+  - id: ERR_POSTING_NOT_OPEN
+    http: 409
+    condition: "POST /fleet/route-bids references a RoutePosting whose status is not OPEN. Awarding or cancelling a posting that is not OPEN is the posting's OWN state check and reports ERR_INVALID_STATE_TRANSITION instead."
+  - id: ERR_BID_WINDOW_OPEN
+    http: 409
+    condition: "POST /fleet/route-postings/{posting_id}/award before the logical clock reaches bid_close_at."
+  - id: ERR_STATEMENT_NOT_ACCRUED
+    http: 409
+    condition: "Settling or reversing a DriverPayStatement whose status is neither ACCRUED nor (for reverse) SETTLED."
+  - id: ERR_ALREADY_COACHED
+    http: 409
+    condition: "POST /fleet/telematics-events/{event_id}/coach on an event whose coached flag is already true."
+  - id: ERR_REVIEW_ROUND_LIMIT
+    http: 409
+    condition: "POST /fleet/backhaul-offers/{offer_id}/revise when review_round has reached 3."
+  - id: ERR_DEFERRAL_LIMIT
+    http: 409
+    condition: "POST /fleet/maintenance-work-orders/{work_order_id}/defer when deferral_count has reached 2."
+  - id: ERR_STOP_SEQUENCE_CONFLICT
+    http: 409
+    condition: "POST /fleet/trip-stops/{trip_stop_id}/arrive while an earlier-sequence stop of the same trip is still PLANNED or ARRIVED."
+  - id: ERR_STOP_SEQUENCE_DISORDER
+    http: 422
+    condition: "A stop is appended with a sequence that is not exactly stop_count + 1, or with a scheduled_arrival_at earlier than the previous stop's scheduled_departure_at."
+
+  # --- optimistic concurrency ---------------------------------------------
+  - id: ERR_STALE_TRIP_VERSION
+    http: 412
+    condition: "expected_trip_version does not equal the Trip's current version on POST /fleet/trips/{trip_id}/backhaul-assignments."
+  - id: ERR_STALE_POSTING_VERSION
+    http: 412
+    condition: "expected_posting_version does not equal the RoutePosting's current version on POST /fleet/route-bids."
+  - id: ERR_STALE_DRIVER_VERSION
+    http: 412
+    condition: "expected_driver_version does not equal the Driver's current version on POST /fleet/drivers/{driver_id}/pay-plan-assignments."
+
+  # --- cross-entity state -------------------------------------------------
+  - id: ERR_ASSET_NOT_AVAILABLE
+    http: 409
+    condition: "A Tractor or Trailer being assigned, or being taken into the shop, is not in status AVAILABLE."
+  - id: ERR_TRACTOR_PM_HOLD
+    http: 409
+    condition: "A Tractor with pm_hold == true is assigned to a trip or the trip is dispatched on it."
+  - id: ERR_DRIVER_NOT_ACTIVE
+    http: 409
+    condition: "A TERMINATED driver is assigned to a trip, dispatched, coached against, or places a bid. Terminating an already TERMINATED driver is the driver's own state check and reports ERR_INVALID_STATE_TRANSITION instead."
+  - id: ERR_STORE_SUSPENDED
+    http: 409
+    condition: "POST /fleet/trips/{trip_id}/plan with a DELIVERY stop at a SUSPENDED store, or a new ReplenishmentOrder for a SUSPENDED store."
+  - id: ERR_BACKHAUL_ALREADY_LINKED
+    http: 422
+    condition: "The BackhaulOffer referenced by POST /fleet/trips/{trip_id}/backhaul-assignments is already linked to a DIFFERENT Trip. The trip's own current link is never a conflict: re-linking supersedes it."
+
+  # --- eligibility ---------------------------------------------------------
+  - id: ERR_DRIVER_COACHING_HOLD
+    http: 422
+    condition: "A driver whose coaching_hold is true is assigned to a trip, dispatched, or places a bid."
+  - id: ERR_DRIVER_SAFETY_INELIGIBLE
+    http: 422
+    condition: "A driver whose safety_score is below MIN_BID_SAFETY_SCORE (80) is assigned to a trip or places a bid, while coaching_hold is still false."
+  - id: ERR_DOMICILE_MISMATCH
+    http: 422
+    condition: "A tractor's or trailer's domicile differs from the trip's, or a driver is borrowed across domiciles while the source balance_index is below 1.5000 or the target's is at or above 1.0000."
+
+  # --- hours of service ----------------------------------------------------
+  - id: ERR_HOS_DRIVE_LIMIT
+    http: 422
+    condition: "Projected drive minutes exceed MAX_DRIVE_MINUTES (660)."
+  - id: ERR_HOS_DUTY_LIMIT
+    http: 422
+    condition: "Projected on-duty minutes (including the mandatory 30-minute break) exceed MAX_DUTY_MINUTES (840)."
+  - id: ERR_HOS_WEEKLY_LIMIT
+    http: 422
+    condition: "Projected rolling weekly on-duty minutes exceed MAX_WEEKLY_MINUTES (4200)."
+
+  # --- temporal ------------------------------------------------------------
+  - id: ERR_DOCK_HOURS_VIOLATION
+    http: 422
+    condition: "A DELIVERY stop's occupation falls outside [dock_open_minute, dock_close_minute] of its store, or straddles a UTC date boundary."
+  - id: ERR_DELIVERY_WINDOW_VIOLATION
+    http: 422
+    condition: "A DELIVERY stop's occupation is not fully inside its ReplenishmentOrder's requested window (both edges inclusive)."
+  - id: ERR_DOCK_CAPACITY_EXCEEDED
+    http: 409
+    condition: "The number of half-open-overlapping committed DELIVERY stops at the store would exceed Store.dock_count."
+  - id: ERR_ASSET_MAINTENANCE_CONFLICT
+    http: 409
+    condition: "A tractor's or trailer's buffered trip interval (planned window +/- 120 minutes) touches or overlaps a SCHEDULED / DEFERRED / IN_SHOP work-order window of the same asset."
+  - id: ERR_DRIVER_REST_GAP
+    http: 422
+    condition: "The gap between the candidate trip and any other committed trip of the same driver is under MIN_REST_MINUTES (600)."
+
+  # --- capacity / constraint ----------------------------------------------
+  - id: ERR_TRAILER_CAPACITY_EXCEEDED
+    http: 422
+    condition: "The trip's peak_case_load exceeds the assigned trailer's capacity_cases."
+  - id: ERR_TEMPERATURE_MODE_MISMATCH
+    http: 422
+    condition: "A REFRIGERATED order or backhaul offer is carried on a trailer whose trailer_type is not REEFER."
+  - id: ERR_DUPLICATE_BID
+    http: 422
+    condition: "The driver already has a SUBMITTED bid on this posting."
+
+  # --- fiscal --------------------------------------------------------------
+  - id: ERR_MARGIN_BELOW_FLOOR
+    http: 422
+    condition: "An offer whose margin_pct is below MIN_MARGIN_PCT (0.08) is accepted without margin_exception_approved."
+  - id: ERR_ZERO_PAY_SETTLEMENT
+    http: 422
+    condition: "POST /fleet/pay-statements/{statement_id}/settle on a statement whose gross_cents is 0."
+  - id: ERR_BENCHMARK_NO_VOLUME
+    http: 422
+    condition: "GET /fleet/domiciles/{domicile_id}/cost-benchmark over a window whose included trips carry zero delivered cases or zero miles."
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+
+  - name: FleetPlanner
+    identity: opaque
+    description: "Builds the delivery schedule: stores, domiciles, replenishment orders, trips, stops, plan commitment, and the sourcing side of the backhaul market."
+    exclusive_operations:
+      - "POST /fleet/stores"
+      - "POST /fleet/domiciles"
+      - "POST /fleet/replenishment-orders"
+      - "POST /fleet/replenishment-orders/{order_id}/cancel"
+      - "POST /fleet/trips"
+      - "POST /fleet/trips/{trip_id}/stops"
+      - "DELETE /fleet/trips/{trip_id}/stops/{trip_stop_id}"
+      - "POST /fleet/trips/{trip_id}/plan"
+      - "POST /fleet/backhaul-offers"
+      - "POST /fleet/backhaul-offers/{offer_id}/submit-review"
+      - "POST /fleet/backhaul-offers/{offer_id}/revise"
+      - "POST /fleet/backhaul-offers/{offer_id}/withdraw"
+    shared_operations:
+      - "POST /fleet/trips/{trip_id}/cancel (with TransportManager)"
+      - "all GET endpoints except the pay-statement reads and the cost benchmark"
+      - "POST /fleet/_clock/set_current_utc"
+
+  - name: TransportManager
+    identity: opaque
+    description: "Owns execution and the commercial decisions: equipment and driver assignment, dispatch, close-out, offer accept/reject, the route board, and the cost benchmark."
+    exclusive_operations:
+      - "POST /fleet/stores/{store_id}/status"
+      - "POST /fleet/drivers"
+      - "POST /fleet/drivers/{driver_id}/hos-reset"
+      - "POST /fleet/drivers/{driver_id}/duty-log-adjustments"
+      - "POST /fleet/drivers/{driver_id}/termination"
+      - "POST /fleet/trips/{trip_id}/assignments"
+      - "POST /fleet/trips/{trip_id}/backhaul-assignments"
+      - "POST /fleet/trips/{trip_id}/dispatch"
+      - "POST /fleet/backhaul-offers/{offer_id}/accept"
+      - "POST /fleet/backhaul-offers/{offer_id}/reject"
+      - "POST /fleet/backhaul-offers/expiration-sweep"
+      - "POST /fleet/route-postings"
+      - "POST /fleet/route-postings/{posting_id}/award"
+      - "POST /fleet/route-postings/{posting_id}/cancel"
+    shared_operations:
+      - "POST /fleet/trips/{trip_id}/cancel (with FleetPlanner)"
+      - "POST /fleet/trips/{trip_id}/complete (with Driver)"
+      - "POST /fleet/trip-stops/{trip_stop_id}/arrive and .../complete (with Driver)"
+      - "GET /fleet/domiciles/{domicile_id}/cost-benchmark and GET /fleet/trips/{trip_id}/pay-preview (with PayrollAnalyst)"
+      - "all pay-statement GETs (with PayrollAnalyst and Driver)"
+      - "POST /fleet/_clock/set_current_utc"
+    notes: "Cannot create or amend a pay plan, cannot assign a pay plan, and cannot settle or reverse money — that is PayrollAnalyst's exclusive ground."
+
+  - name: Driver
+    identity: "entity_backed:Driver"
+    description: "The driver executing the work. X-User-ID MUST equal the acting Driver.id; every driver-scoped write is checked against the owning driver_id."
+    exclusive_operations:
+      - "POST /fleet/route-bids"
+      - "POST /fleet/route-bids/{bid_id}/withdraw"
+    shared_operations:
+      - "POST /fleet/trip-stops/{trip_stop_id}/arrive and .../complete (own trip only; shared with TransportManager)"
+      - "POST /fleet/trips/{trip_id}/complete (own trip only; shared with TransportManager)"
+      - "POST /fleet/trips/{trip_id}/settlement-dispute (with PayrollAnalyst)"
+      - "GET /fleet/pay-statements and GET /fleet/pay-statements/{statement_id} (with PayrollAnalyst and TransportManager)"
+      - "the general reference GETs (stores, domiciles, drivers, tractors, trailers, orders, trips, stops, offers, work orders, postings, bids, events)"
+      - "POST /fleet/_clock/set_current_utc"
+    notes: "A Driver may never assign equipment, dispatch, plan, price a backhaul, award a posting, or touch money."
+
+  - name: PayrollAnalyst
+    identity: opaque
+    description: "Owns pay structure and settlement: pay plans, plan assignment, statements, re-accrual, and the money side of the benchmark."
+    exclusive_operations:
+      - "POST /fleet/driver-pay-plans"
+      - "PATCH /fleet/driver-pay-plans/{pay_plan_id}"
+      - "POST /fleet/drivers/{driver_id}/pay-plan-assignments"
+      - "POST /fleet/pay-statements/{statement_id}/settle"
+      - "POST /fleet/pay-statements/{statement_id}/reverse"
+      - "POST /fleet/trips/{trip_id}/re-accrue"
+    shared_operations:
+      - "POST /fleet/trips/{trip_id}/settlement-dispute (with Driver)"
+      - "GET /fleet/domiciles/{domicile_id}/cost-benchmark and GET /fleet/trips/{trip_id}/pay-preview (with TransportManager)"
+      - "all pay-statement GETs (with TransportManager and Driver)"
+      - "the general reference GETs"
+      - "POST /fleet/_clock/set_current_utc"
+
+  - name: SafetyManager
+    identity: opaque
+    description: "Owns telematics and coaching. The only role that can charge penalty points or retire them."
+    exclusive_operations:
+      - "POST /fleet/telematics-events"
+      - "POST /fleet/telematics-events/{event_id}/coach"
+    shared_operations:
+      - "the general reference GETs"
+      - "POST /fleet/_clock/set_current_utc"
+    notes: "Fires the most far-reaching cascade in the domain (coaching hold) without holding any operational or financial authority."
+
+  - name: MaintenanceCoordinator
+    identity: opaque
+    description: "Owns the equipment roster and the shop schedule."
+    exclusive_operations:
+      - "POST /fleet/tractors"
+      - "PATCH /fleet/tractors/{tractor_id}"
+      - "POST /fleet/trailers"
+      - "POST /fleet/maintenance-work-orders"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/defer"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/reschedule"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/start"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/complete"
+      - "POST /fleet/maintenance-work-orders/{work_order_id}/cancel"
+    shared_operations:
+      - "the general reference GETs"
+      - "POST /fleet/_clock/set_current_utc"
+    notes: "Cannot assign equipment to a trip; it can only make equipment (un)available through the shop lifecycle."

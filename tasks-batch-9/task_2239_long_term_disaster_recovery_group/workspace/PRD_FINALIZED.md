@@ -1,0 +1,575 @@
+# Long-Term Disaster Recovery Group API — Product Requirements Document
+
+## 1. Introduction
+
+When a federally declared disaster passes out of the news cycle, the households that were hit hardest are usually the ones still living in a damaged dwelling eighteen months later. A Long-Term Recovery Group (LTRG) exists to close that gap. It is a coalition — faith communities, civic clubs, foundations, local government — that pools money and volunteer labour, and then decides together, case by case, who gets what. This API is the system of record for that coalition.
+
+The operational problem the API solves is arithmetic plus governance. On the arithmetic side, a household's *unmet need* is not simply the cost of the damage: it is what remains after insurance settlements, federal individual assistance, disaster loans and every other outside award have been counted, purpose by purpose. Getting that number wrong in either direction is harmful — too low and the household stays broken, too high and the LTRG commits money it does not have or duplicates a benefit the household already received, which is a compliance failure with real consequences. On the governance side, no single person may both prepare a case and decide its award, and no single person may both request a payment and approve it. Those separations are enforced by the server, not by convention.
+
+Around that core the system also tracks the practical work of recovery: construction phases with permits and predecessors, visiting volunteer groups matched to the trades a project actually needs, beds in host churches and bunkhouses, restricted donations that may only be spent on the purpose the donor named, and the long tail of follow-up contacts that determine whether a case can honestly be called closed. Every monetary figure in the system is an integer number of cents, every date comparison runs against a server-controlled logical clock, and every state change is auditable.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contracts that hold for every endpoint in the API. Where §3 tells the story of a workflow, §2 fixes the shape of the envelope, the identity model, the arithmetic conventions and the order in which rules fire.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the capacity they act in. If either header is absent, or if `X-User-Role` is not one of the eight role names below, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If the headers are well-formed but the declared role is not among the roles authorized for the requested endpoint, the request is rejected with `ERR_UNAUTHORIZED_ROLE` (HTTP 403). Authentication is always evaluated before authorization, and both precede any inspection of the request body.
+
+The eight recognized roles are `IntakeSpecialist`, `CaseManager`, `UnmetNeedsChair`, `MemberOrgDelegate`, `DisbursementOfficer`, `ConstructionManager`, `VolunteerCoordinator` and `LTRGAdmin`.
+
+- An `IntakeSpecialist` takes survivor intake and opens recovery cases. They see no money and no table decisions.
+- A `CaseManager` owns a case: documenting damage, recording outside assistance, running determinations, queueing the case at the table, requeueing a deferred presentation, logging follow-up contacts, and driving closure review.
+- An `UnmetNeedsChair` chairs the unmet needs table: scheduling and opening sessions, calling presentations, opening the pledge window, and recording the award, deferral or denial.
+- A `MemberOrgDelegate` speaks for one seated member organization, pledging and rescinding only on that organization's behalf.
+- A `DisbursementOfficer` requests assistance payments, resolves duplication-of-benefits findings, pays approved payments and voids requests that were never approved.
+- A `ConstructionManager` verifies documented damage costs by inspection and drives repair and rebuild phases through their lifecycle.
+- A `VolunteerCoordinator` registers volunteer groups and lodging sites, matches skills to project needs, deploys crews and hosts them.
+- An `LTRGAdmin` administers the group: assembling funding sources, seating member organizations, approving and reversing disbursements, closing and reopening cases, and driving the logical clock. `LTRGAdmin` is authorized on the entire write surface of the other seven roles, with one carve-out — segregation of duties still bars an `LTRGAdmin` from approving a disbursement they themselves requested.
+
+Identity semantics differ by role, and this is what ties `X-User-ID` to resource ownership. When `X-User-Role` is `MemberOrgDelegate`, `X-User-ID` is the `id` of the acting `MemberOrganization`; ownership checks on any resource that references a member organization compare that resource's organization reference to `X-User-ID`. Concretely, a delegate creating a pledge must supply a `member_org_id` equal to their own `X-User-ID`, and a delegate rescinding a pledge must be the delegate of that pledge's `member_org_id`; a mismatch is rejected with `ERR_ORG_IDENTITY_MISMATCH` (HTTP 403). The pledge records the acting identity in `pledged_by_user_id`, which by this identity rule equals the pledge's `member_org_id`.
+
+When `X-User-Role` is `IntakeSpecialist`, `CaseManager`, `UnmetNeedsChair`, `DisbursementOfficer`, `ConstructionManager`, `VolunteerCoordinator` or `LTRGAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it wherever a transition writes an actor — as `assigned_case_manager_user_id` on a recovery case, `verified_by_user_id` on a damage item, `prepared_by_user_id` on a determination snapshot and on a presentation, `chaired_by_user_id` on a table session, `decided_by_user_id` on a presentation decision, `requested_by_user_id` and `approved_by_user_id` on a disbursement, and `recorded_by_user_id` on a follow-up contact — but it never compares those values to any entity's `id`. Comparisons between opaque identifiers are always string equality against another stored opaque identifier, never against a resource key.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` caps the number of records returned; it defaults to 10, may not be smaller than 1, and may not be larger than 100. `offset` is the number of records to skip and defaults to 0; it may not be negative. A `limit` outside the range 1 through 100 inclusive, or a negative `offset`, is rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+
+Unless a subsection of §3 states otherwise for a specific list, records are returned sorted by `created_at` in ascending order.
+
+Every list response reports `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope, where `total_count` is the number of records matching the filters before pagination is applied and `has_more` indicates whether records remain beyond the current window.
+
+### 2.4. Record Identity, Timestamps and the Logical Clock
+
+Most resources in this system carry four system-managed properties:
+
+- `id` — a server-minted UUID with no type prefix.
+- `created_at` — an ISO 8601 UTC timestamp with three fractional digits, written once when the record is created.
+- `updated_at` — an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of the record, including mutations that only change a derived roll-up field.
+- `version` — an integer that starts at 1 on creation and increases by exactly 1 on every mutation of that record.
+
+Two resource kinds are deliberately leaner because they are immutable once written: an unmet-need determination snapshot and a follow-up contact record. Both carry only `id` and `created_at`. Neither carries `updated_at` and neither carries `version`; those two fields are absent from their responses entirely.
+
+Time is not read from the host. The server keeps a **logical clock** whose value at startup is exactly `2026-08-01T00:00:00Z`, and until the clock is explicitly set it reads that default rather than falling back to real wall-clock time. Every date comparison in the system — funding-source expiry, deployment and lodging window validation, the `decided_at` stamp on a presentation decision, the `released_at` stamp on a housing release — resolves against this clock. An `LTRGAdmin` may advance or rewind it through an administrative test-driving capability that accepts a `to_iso8601` instant and answers with the new `current_utc` together with `expired_funding_source_ids`, the list of funding sources the move expired. Setting the clock moves every funding source that is `OPEN` and whose `expires_on` falls strictly before the new current date into `EXPIRED`.
+
+### 2.5. The Two Independent Axes of a Recovery Case
+
+A recovery case carries two state fields that advance independently of one another on the same record. `case_status` tracks the casework lifecycle and takes one of `INTAKE`, `ASSESSED`, `PRESENTED`, `ACTIVE_RECOVERY`, `CLOSURE_PENDING`, `CLOSED` or `INACTIVE`, starting at `INTAKE`. Only `INACTIVE` is terminal — `CLOSED` is not, because a closed case can be reopened. `funding_status` tracks the money and takes one of `UNFUNDED`, `PARTIALLY_COMMITTED`, `FULLY_COMMITTED`, `DISBURSING` or `SATISFIED`, starting at `UNFUNDED`; it has no terminal value.
+
+Neither axis gates the other. A case may sit in `ACTIVE_RECOVERY` while its `funding_status` is still `PARTIALLY_COMMITTED`, and `funding_status` may move `FULLY_COMMITTED → DISBURSING` with no change to `case_status` at all.
+
+`funding_status` is never set directly by any caller. It is derived, and the derivation is re-run on exactly four events: a presentation moving `DELIBERATING → AWARDED`, a disbursement moving `APPROVED → PAID`, a disbursement moving `PAID → REVERSED`, and a funding commitment moving `CONFIRMED → RESCINDED`. Each re-run first refreshes three roll-ups on the case:
+
+- `total_committed_cents` is the sum of `pledged_cents` over every funding commitment reachable through this case's presentations whose status is `CONFIRMED` or `DISBURSED`, plus the sum of `bridge_authorized_cents` over every presentation of this case whose status is `AWARDED`. Commitments that are still `PLEDGED`, and commitments that have been `RESCINDED`, contribute nothing.
+- `total_net_disbursed_cents` is the sum of `net_cents` over this case's disbursements whose status is `PAID`. Disbursements in any other status contribute nothing.
+- `reference_unmet_cents` is the `unmet_need_total_cents` of the determination snapshot pinned to the `AWARDED` presentation of this case with the greatest `decided_at`; when two awarded presentations share that instant, the one with the earlier `created_at` wins. When the case has no `AWARDED` presentation at all, `reference_unmet_cents` is 0.
+- `residual_unmet_cents` is then `reference_unmet_cents` less `total_committed_cents`, floored at zero — that is, zero whenever committed money has caught up with or passed the reference need.
+
+The derivation then walks five clauses **strictly top to bottom, and the first clause that matches wins**:
+
+1. If `total_committed_cents` is 0, `funding_status` becomes `UNFUNDED`.
+2. Otherwise, if `total_net_disbursed_cents` is greater than or equal to `total_committed_cents`, `funding_status` becomes `SATISFIED`.
+3. Otherwise, if `total_net_disbursed_cents` is greater than 0, `funding_status` becomes `DISBURSING`.
+4. Otherwise, if `total_committed_cents` is greater than or equal to `reference_unmet_cents`, `funding_status` becomes `FULLY_COMMITTED`.
+5. Otherwise, `funding_status` becomes `PARTIALLY_COMMITTED`.
+
+The clause order is normative, and clause 2 deliberately precedes clause 4: a case whose paid net has met its committed total is `SATISFIED` even though the committed total also exceeds the reference need.
+
+Because the derivation is total, the axis moves in both directions. Awarding at the table drives `UNFUNDED → PARTIALLY_COMMITTED` when committed money falls short of `reference_unmet_cents`, or `UNFUNDED → FULLY_COMMITTED` when it reaches or exceeds it. Paying a disbursement drives `PARTIALLY_COMMITTED → DISBURSING` or `FULLY_COMMITTED → DISBURSING` while the paid net remains above zero and below the committed total, and drives `FULLY_COMMITTED → SATISFIED` or `DISBURSING → SATISFIED` once the paid net reaches the committed total. Reversing a payment drives `SATISFIED → FULLY_COMMITTED` when the paid net returns to zero and the committed total still covers the reference need, or `SATISFIED → DISBURSING` when other paid rows remain. Rescinding a confirmed pledge, or reversing the last paid row, drives `DISBURSING → PARTIALLY_COMMITTED` when the paid net is back to zero and the committed total has fallen below the reference need, and `PARTIALLY_COMMITTED → UNFUNDED` once the committed total is 0.
+
+### 2.6. Cascade Discipline and Compensating Actions
+
+Several operations in this system touch more than one record. When they do, every affected record is mutated in the same request, and each mutated record independently refreshes its own `updated_at` and increments its own `version`. There is no deferred reconciliation and no eventual consistency: by the time a 2xx response is written, every derived roll-up named in §3 already reflects the change.
+
+Three of these multi-record operations are **compensating actions** — they are designed to undo an earlier operation exactly, restoring the conserved quantities of §2.9 to the values they held before. Rescinding a confirmed pledge undoes the confirmation. Reversing a paid disbursement undoes the payment. Both are described hop by hop in §3, and both share a structural consequence: because they can pull a case's `funding_status` back off `SATISFIED`, they also rewind `case_status` from `CLOSURE_PENDING` to `ACTIVE_RECOVERY` when the case was awaiting closure, since the closure precondition no longer holds.
+
+Not every cascade is reversible, and where it is not, this document says so plainly. Suspending a construction project cancels its live volunteer deployments and releases the housing those crews held; resuming the project afterwards does **not** restore the cancelled deployments or the released housing assignments. The coordinator must create them again.
+
+### 2.7. Segregation of Duties
+
+Two separations of duty are enforced by the server on every affected request, and both answer with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+First, at the table: the chair recording a decision on a presentation must not be the case's assigned case manager. The acting `X-User-ID` is compared against the `assigned_case_manager_user_id` of the presented case, and equality is refused. This applies to all three decision branches — award, deferral and denial alike.
+
+Second, at the till: the administrator approving a disbursement must not be the officer who requested it. The acting `X-User-ID` is compared against the disbursement's `requested_by_user_id`, and equality is refused. This holds even for an `LTRGAdmin`, whose broad authority does not exempt them.
+
+A third, related identity check guards case preparation but carries its own code. When a presentation is queued, the `prepared_by_user_id` in the request must equal both the acting `X-User-ID` and the case's `assigned_case_manager_user_id`; if either equality fails, the request is rejected with `ERR_CASE_MANAGER_MISMATCH` (HTTP 403). A case manager may only present their own cases, and may not present them under someone else's name.
+
+### 2.8. Money, Basis Points and Rounding Order
+
+Every field whose name ends in `_cents` holds an integer number of cents, where one dollar is one hundred cents. No monetary value is ever stored or returned as a decimal fraction. Where a constant in this document is quoted in dollars for readability, the stored value is that figure multiplied by one hundred.
+
+Percentages are expressed in basis points, where ten thousand basis points is one hundred percent. Two rate constants matter: the administrative retention the LTRG keeps on each drawn funding line is 350 basis points, that is three and one-half percent; and the minimum acceptable volunteer skill-fit score is 6000 basis points, that is sixty percent. Skill-fit scores themselves are reported in basis points as integers in `skill_fit_score_bps`.
+
+Wherever a percentage of an integer cent amount does not divide evenly, the result is rounded **half up** to the nearest whole cent; skill-fit scores are likewise rounded half up to the nearest whole basis point. Two rounding orders are pinned and must not be swapped:
+
+- **Damage caps are applied per item, before summation.** A case's verified damage total is the sum of already-capped per-item figures, not the cap applied to a sum.
+- **Administrative retention is rounded per allocation line, and the rounded line values are then summed.** Summing the net amounts first and rounding the retention once over the total produces a different figure and is incorrect. For example, two lines of 1500100 and 1499900 cents yield per-line retentions of 52504 and 52497 cents, totalling 105001 cents, whereas rounding three and one-half percent of 3000000 cents once would yield 105000 cents. The per-line total is the correct one.
+
+### 2.9. Conserved Quantities
+
+Three quantities in this system are conserved identities rather than free-standing counters. Each is recomputed from its constituent records on every event that could change it, and each must satisfy its identity at the end of every request.
+
+**Pledge capacity.** For a member organization, `committed_cents` is the sum of `pledged_cents` over its commitments whose status is `PLEDGED` or `CONFIRMED`, and `disbursed_cents` is the sum over its commitments whose status is `DISBURSED`. The conserved identity is that `remaining_pledge_capacity_cents` equals `annual_pledge_cap_cents` less the sum of `committed_cents` and `disbursed_cents`. Note that `committed_cents` spans both `PLEDGED` and `CONFIRMED`, so confirming a pledge moves no money between these buckets and leaves remaining capacity untouched; paying it does, shifting the amount from `committed_cents` to `disbursed_cents` while remaining capacity again stays the same.
+
+**Restricted funds.** For a funding source, `available_cents` equals `total_cents` less `committed_cents`, less `disbursed_cents`, less `admin_retained_cents`. Approval of a disbursement adds gross amounts to `committed_cents` and therefore lowers availability; payment moves those gross amounts out of `committed_cents` and into `disbursed_cents` and `admin_retained_cents`, leaving `available_cents` unchanged; reversal removes them from `disbursed_cents` and `admin_retained_cents`, restoring availability.
+
+**Bed nights.** For a lodging site, `peak_committed_beds` is the largest value, taken over every night covered by any of that site's housing assignments whose status is `ACTIVE`, of the summed `beds_requested` of the assignments covering that night. `available_beds` is `bed_capacity` less `peak_committed_beds` and is never negative — it is the number of beds still free on the site's worst night.
+
+Each of the three has a status derived from it, and each derivation is re-evaluated on every recompute rather than only when a status-changing endpoint is called. A member organization is `CAPPED` whenever `remaining_pledge_capacity_cents` reaches 0 and reverts to `ACTIVE` the instant capacity is restored — this derivation fires on pledge creation, on confirmation, on rescission and on disbursement alike. The states `SUSPENDED` and `WITHDRAWN` are never derived; only an `LTRGAdmin` sets them, and only an `LTRGAdmin` reinstates an organization to `ACTIVE`. A funding source is `OPEN` while `available_cents` is greater than 0 and the source is unexpired, `EXHAUSTED` once `available_cents` reaches 0, and `EXPIRED` once the logical clock passes its `expires_on`. A lodging site is `FULL` when `peak_committed_beds` is greater than or equal to `bed_capacity` and `OPEN` otherwise.
+
+### 2.10. Stale-Version Guards on Pledges and Payment Requests
+
+Two write operations in this system are sized by the client against a figure the client last read, and both are guarded by optimistic concurrency control on the *parent* record's `version`. In both cases the version field is a required input, not an optional one, and no other endpoint in this API accepts a version field of any kind.
+
+A `POST /funding-commitments` request must carry `expected_presentation_version` holding the client's last observed `version` of the target `CasePresentation`. If it does not match the presentation's current `version`, the create is rejected with `ERR_STALE_PRESENTATION_VERSION` (HTTP 412). The reason is business, not mechanical: a delegate sizes a pledge against the gap they saw on the presentation, and a pledge recorded by another delegate since that read has already changed `pledged_total_cents` and therefore the remaining gap. A second pledge on the same presentation is perfectly legitimate behaviour, so this is not a state precondition — only the stale version distinguishes the rejected write from the accepted one.
+
+A `POST /disbursements` request must carry `expected_case_version` holding the client's last observed `version` of the target `RecoveryCase`. If it does not match the case's current `version`, the create is rejected with `ERR_STALE_CASE_VERSION` (HTTP 412). Again the reason is business: the officer sizes the request against `total_committed_cents`, `total_net_disbursed_cents` and the case's assistance records, all of which move the case's `version`. Multiple disbursements per case are legitimate, so only the stale version distinguishes the rejected write.
+
+### 2.11. Path Resolution and Validation Precedence
+
+When a request path carries a resource identifier, that identifier is resolved before anything else in the request is examined, and when a path carries more than one identifier they are resolved strictly left to right. The response names the first identifier that failed to resolve, using the code for that entity kind: `ERR_SURVIVOR_NOT_FOUND`, `ERR_CASE_NOT_FOUND`, `ERR_DAMAGE_ITEM_NOT_FOUND`, `ERR_SESSION_NOT_FOUND`, `ERR_PRESENTATION_NOT_FOUND`, `ERR_COMMITMENT_NOT_FOUND`, `ERR_MEMBER_ORG_NOT_FOUND`, `ERR_FUNDING_SOURCE_NOT_FOUND`, `ERR_DISBURSEMENT_NOT_FOUND`, `ERR_PROJECT_NOT_FOUND`, `ERR_VOLUNTEER_GROUP_NOT_FOUND`, `ERR_DEPLOYMENT_NOT_FOUND`, `ERR_LODGING_SITE_NOT_FOUND` or `ERR_HOUSING_ASSIGNMENT_NOT_FOUND`, each with HTTP 404.
+
+Foreign keys carried in a request *body* are resolved next, and they too are resolved in a fixed declaration order: `survivor_id`, then `case_id`, then `session_id`, then `assessment_id`, then `presentation_id`, then `member_org_id`, then `project_id`, then `commitment_id`, then `group_id`, then `lodging_site_id`, then `predecessor_project_id`. An unresolvable body reference answers with the same per-entity 404 code — `ERR_ASSESSMENT_NOT_FOUND` for an `assessment_id`, `ERR_MEMBER_ORG_NOT_FOUND` for any member-organization reference including a member named inside `attending_member_org_ids`, and so on. This body-reference resolution applies to the creation of recovery cases, case presentations, funding commitments, disbursements, construction projects, volunteer deployments and housing assignments.
+
+The full precedence ladder, evaluated in this order on every request, is:
+
+1. **Authentication** — headers present and the role recognized (`ERR_UNAUTHENTICATED`, 401). Applies to every endpoint.
+2. **Authorization** — the acting role appears in the endpoint's role list (`ERR_UNAUTHORIZED_ROLE`, 403). Applies to every endpoint.
+3. **Request shape** — well-formed JSON, required fields present, enum values legal, constrained integers within their bounds, and `limit`/`offset` within the pagination range (`ERR_INVALID_REQUEST`, 400). Applies to every endpoint.
+4. **Path-parameter existence**, left to right, as described above (404).
+5. **Body foreign-key existence**, in declaration order, as described above (404).
+6. **Assessment ownership** — the pinned determination belongs to the case named in the same request (`ERR_ASSESSMENT_CASE_MISMATCH`, 422), on presentation creation.
+7. **Delegate organization identity** (`ERR_ORG_IDENTITY_MISMATCH`, 403), on pledge creation and pledge rescission.
+8. **Case-manager identity** (`ERR_CASE_MANAGER_MISMATCH`, 403), on presentation creation.
+9. **Segregation of duties** (`ERR_SEGREGATION_OF_DUTIES`, 403), on presentation decisions and on disbursement approval.
+10. **Declared source state** — the target record is in a state from which the requested transition is declared, answering with the code for that entity kind: `ERR_CASE_INVALID_STATE`, `ERR_PRESENTATION_INVALID_STATE`, `ERR_COMMITMENT_INVALID_STATE`, `ERR_DISBURSEMENT_INVALID_STATE`, `ERR_PROJECT_INVALID_TRANSITION`, `ERR_DEPLOYMENT_INVALID_TRANSITION`, `ERR_HOUSING_ALREADY_RELEASED` or `ERR_DAMAGE_ITEM_ALREADY_VERIFIED`, each with HTTP 409. Applies to every action endpoint.
+11. **Case assessability** (`ERR_CASE_NOT_ASSESSABLE`, 409), on documenting a damage item, recording an assistance record, and running a determination.
+12. **Pledge window open** (`ERR_PRESENTATION_NOT_ACCEPTING_PLEDGES`, 409), on pledge creation.
+13. **Session in session** (`ERR_SESSION_NOT_IN_SESSION`, 409), on calling a presentation, on opening deliberation, on recording a decision, and on pledge creation.
+14. **Session accepting queue** (`ERR_SESSION_NOT_ACCEPTING_QUEUE`, 409), on presentation creation and on requeueing.
+15. **Pledging organization active** (`ERR_MEMBER_ORG_NOT_ACTIVE`, 409), on pledge creation.
+16. **Project payable** (`ERR_PROJECT_NOT_PAYABLE`, 409), on disbursement approval.
+17. **Project accepting volunteers** (`ERR_PROJECT_NOT_ACCEPTING_VOLUNTEERS`, 409), on deployment creation and on deployment transitions.
+18. **Predecessor phase complete** (`ERR_PREDECESSOR_NOT_COMPLETE`, 409), on the permit transition of a construction project.
+19. **Exclusivity** — no presentation in the session is `PRESENTING` or `DELIBERATING` when adjourning (`ERR_SESSION_HAS_ACTIVE_PRESENTATION`, 409), and the case has no other presentation in `QUEUED`, `PRESENTING` or `DELIBERATING` when queueing a new one (`ERR_PRESENTATION_ALREADY_ACTIVE`, 409).
+20. **Stale version** (`ERR_STALE_PRESENTATION_VERSION` on pledge creation, `ERR_STALE_CASE_VERSION` on disbursement creation, both 412).
+21. **Duplication of benefits at approval** (`ERR_DUPLICATION_OF_BENEFITS`, 422), on disbursement approval.
+22. **Date ordering** (`ERR_INVALID_DATE_RANGE`, 422), on deployment creation and housing assignment creation.
+23. **Deployment window conflict** (`ERR_DEPLOYMENT_WINDOW_CONFLICT`, 409), on deployment creation.
+24. **Lodging capacity** (`ERR_LODGING_CAPACITY_EXCEEDED`, 409), on housing assignment creation.
+25. **Queue head** (`ERR_NOT_AT_QUEUE_HEAD`, 409), on calling a presentation.
+26. **Quorum** (`ERR_QUORUM_NOT_MET`, 409), on opening a session.
+27. **Organization seated in this session** (`ERR_ORG_NOT_IN_SESSION`, 409), on pledge creation.
+28. **Deferral ceiling** (`ERR_MAX_DEFERRALS_REACHED`, 409), on a decision whose branch is deferral.
+29. **Verified damage present** (`ERR_NO_VERIFIED_DAMAGE`, 422), on running a determination.
+30. **Determination variant eligible** (`ERR_ASSESSMENT_VARIANT_NOT_ELIGIBLE`, 422), on presentation creation.
+31. **Determination not overtaken** (`ERR_ASSESSMENT_STALE`, 409), on presentation creation and on requeueing.
+32. **Restriction match** (`ERR_RESTRICTION_MISMATCH`, 422), on disbursement approval.
+33. **Predecessor belongs to the same case** (`ERR_PREDECESSOR_CASE_MISMATCH`, 422), on construction project creation.
+34. **Skill-fit floor** (`ERR_SKILL_FIT_BELOW_MINIMUM`, 422), on deployment creation.
+35. **Pledge cap** (`ERR_PLEDGE_CAP_EXCEEDED`, 422), on pledge creation.
+36. **Award within need** (`ERR_AWARD_EXCEEDS_UNMET_NEED`, 422), on a decision whose branch is award.
+37. **Non-zero award** (`ERR_AWARD_ZERO`, 422), on a decision whose branch is award.
+38. **Disbursement within commitment** (`ERR_DISBURSEMENT_EXCEEDS_COMMITMENT`, 422), on disbursement approval.
+39. **Funds cover the request** (`ERR_INSUFFICIENT_RESTRICTED_FUNDS`, 422), on disbursement approval.
+40. **Closure criteria** (`ERR_CLOSURE_CRITERIA_NOT_MET`, 409), on closure review and on closing a case.
+
+The practical consequence for disbursement approval, where five checks stack, is that the ordering is: segregation of duties first, then the source state, then project payability, then the duplication-of-benefits re-run, then restriction match, then the commitment ceiling, and finally waterfall coverage. A request that fails two of these reports the earlier one.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Household Intake and the Vulnerability Priority Score
+
+Recovery begins with a household. An `IntakeSpecialist` records a survivor with a `household_name` used as the case label, a `primary_contact_phone` for later follow-up, a `household_size` counting the persons in the household at the time of the disaster, an `income_band`, and the `head_of_household_age` in years. Household size must be at least 1 and the head of household must be at least 18 years old. Four consent and circumstance flags round out the record: `has_member_with_disability`, true when at least one member has a documented disability, defaulting to false; `is_uninsured`, true when the household carried no property insurance at the time of the disaster, defaulting to false; `consent_on_file`, the signed release permitting the LTRG to share the case at the unmet needs table, defaulting to false; and `follow_up_opt_in`, the survivor's consent to long-term follow-up contact after closure, defaulting to true. The `income_band` is a HUD-style band and must be one of `ELI`, `VLI`, `LOW`, `MODERATE` or `ABOVE`.
+
+From those inputs the server computes a vulnerability `priority_score` between 0 and 100 inclusive, which is what orders the queue at the table. The score is the sum of five terms. The income term contributes 40 points for `ELI`, 30 for `VLI`, 20 for `LOW`, 10 for `MODERATE` and 0 for `ABOVE`. The household-size term contributes 4 points for each household member beyond the first, so a household of one contributes nothing, and the term is capped at 20 points, which is reached at a household of six or more. A documented disability in the household adds 15 points. A head of household aged 65 or older adds 10 points; at 64 this term contributes nothing. Being uninsured adds 15 points. The five terms are added and the total is then capped at 100, so `priority_score` never exceeds 100. Every term is an integer, so no rounding arises. The score is recomputed whenever any of the household fields feeding it changes, and it is frozen into a presentation's `priority_score_snapshot` at the moment that presentation is created.
+
+Alongside the score the server maintains `open_case_count`, the number of recovery cases belonging to this survivor whose `case_status` is neither `CLOSED` nor `INACTIVE`. A survivor record is created with that count at 0.
+
+Opening a case is a separate step, also performed by an `IntakeSpecialist`. The payload names the `survivor_id`, the `disaster_code` under which the case is opened — a federal or state declaration code such as DR-4801 — the `assigned_case_manager_user_id` identifying which case manager owns the case, and the `primary_residence_status` describing the tenure of the damaged dwelling as one of `OWNER_OCCUPIED`, `RENTER`, `MOBILE_HOME` or `OTHER`. An optional `temporary_housing_need_cents`, defaulting to 0 and never negative, records documented temporary-housing need; it is the *sole* source of the temporary-housing bucket in every determination, and no damage item ever contributes to that bucket. A new case starts with `case_status` at `INTAKE` and `funding_status` at `UNFUNDED`, with `verified_damage_total_cents`, `reference_unmet_cents`, `total_committed_cents`, `total_net_disbursed_cents`, `residual_unmet_cents` and `reopen_count` all 0, and `closure_waiver_reason` and `withdrawn_reason` both null. Creating the case increments the survivor's `open_case_count`.
+
+Recovery cases can be listed and filtered by `survivor_id`, by either state dimension via `case_status` or `funding_status`, and by `disaster_code`.
+
+### 3.2. Documenting Damage and Verifying It by Inspection
+
+A `CaseManager` documents damage one line item at a time. Each item carries a `category` — one of `STRUCTURE`, `ROOF`, `HVAC`, `PLUMBING`, `ELECTRICAL`, `CONTENTS` or `ACCESSIBILITY` — a free-text `item_description`, a `documented_cost_cents` figure as the case manager estimates it before inspection, an optional `photo_count` of attached photographs defaulting to 0, and an optional `is_habitability_critical` flag, defaulting to false, marking damage that makes the dwelling uninhabitable. Neither cost may be negative. Damage may only be documented while the case's `case_status` is `INTAKE`, `ASSESSED`, `PRESENTED` or `ACTIVE_RECOVERY`; attempting it on a case that has reached `CLOSURE_PENDING`, `CLOSED` or `INACTIVE` is refused with `ERR_CASE_NOT_ASSESSABLE`. The same gate guards recording outside assistance and running a determination.
+
+A new damage item is created with `verification_status` at `UNVERIFIED`, `verified_cost_cents` null, `verified_by_user_id` null and `capped_cost_cents` at 0. The server also derives `purpose_bucket` from the category at creation: `STRUCTURE`, `ROOF`, `HVAC`, `PLUMBING` and `ELECTRICAL` all map to `STRUCTURE_REPAIR`; `CONTENTS` maps to `CONTENTS_REPLACEMENT`; `ACCESSIBILITY` maps to `ACCESSIBILITY_MOD`. Those three, plus `TEMPORARY_HOUSING`, are the four purpose buckets the whole system reasons in. A case's damage items can be listed and filtered by `verification_status` and by `category`.
+
+Only a `ConstructionManager` may turn a documented cost into a verified one. Recording an inspection supplies a `verification_status` of `VERIFIED` or `REJECTED` together with the inspected `verified_cost_cents`, and the server stamps `verified_by_user_id` from the acting identity. Verification is a one-shot act: a second attempt on an item whose `verification_status` is no longer `UNVERIFIED` is refused with `ERR_DAMAGE_ITEM_ALREADY_VERIFIED`. On a `VERIFIED` outcome the server sets `capped_cost_cents` to the smaller of `verified_cost_cents` and the per-category ceiling; on a `REJECTED` outcome `capped_cost_cents` stays 0.
+
+The per-category ceilings exist because the coalition will not underwrite unlimited exposure in any one category. Structural damage is capped at $120,000 per item; a roof at $35,000; HVAC at $12,000; plumbing at $9,000; electrical at $9,000; contents at $15,000; and accessibility work at $25,000. The cap is applied to each item individually, before any summation.
+
+Verification then refreshes the case: `verified_damage_total_cents` becomes the sum, over every damage item on the case whose `verification_status` is `VERIFIED`, of the smaller of that item's `verified_cost_cents` and its category ceiling. Items that are `UNVERIFIED` or `REJECTED` contribute nothing. Because the sum is integer addition, the order of accumulation is irrelevant and no tie-break is needed. Recording a verification increments the case's `version`, which matters later: it is what makes an earlier determination snapshot go stale, and it is what invalidates a disbursement request an officer sized before the inspection landed.
+
+### 3.3. Outside Assistance and the Unmet-Need Determination
+
+Long-term recovery money is last money in, so the case manager must record what the household already received. An assistance record names a `source_type` — one of `INSURANCE_SETTLEMENT`, `FEMA_IA`, `SBA_LOAN`, `NONPROFIT_GRANT`, `STATE_PROGRAM`, `CROWDFUNDING` or `OTHER` — a `purpose_code` naming the bucket the award was earmarked for, an `awarded_cents` amount that may not be negative, and `received_on`, the calendar date the award was received. An optional `documentation_status`, defaulting to `UNDOCUMENTED`, records how well the award is evidenced and must be one of `UNDOCUMENTED`, `DOCUMENTED` or `DISPUTED`. Records are created with `is_excluded_from_dob` false and `exclusion_note` null; only a duplication-of-benefits resolution ever sets those, and setting them never changes how the record offsets unmet need. Assistance records can be listed for a case and filtered by `purpose_code` and `documentation_status`. Recording assistance increments the case's `version`.
+
+Documentation status is doing two different jobs and the distinction is load-bearing. Only `DOCUMENTED` rows offset unmet need. Both `DOCUMENTED` and `DISPUTED` rows enter the cross-case duplication-of-benefits pool. `UNDOCUMENTED` rows do neither.
+
+A `CaseManager` then runs a determination, which produces an immutable snapshot. The request supplies only a `variant`, which must be `PURPOSE_MATCHED` or `POOLED`. The case must have at least one damage item in `verification_status` `VERIFIED`, or the request is refused with `ERR_NO_VERIFIED_DAMAGE`. The snapshot records the `case_id`, the `variant`, the acting `prepared_by_user_id`, a `bucket_need_cents` map, a `bucket_offset_cents` map, a snapshot `verified_damage_total_cents`, a `total_documented_assistance_cents` figure, and the headline `unmet_need_total_cents`.
+
+The determination proceeds in three steps.
+
+**Step one — need per bucket.** The `STRUCTURE_REPAIR` need is the sum, over the case's `VERIFIED` damage items whose category maps to `STRUCTURE_REPAIR`, of the smaller of the item's `verified_cost_cents` and its category ceiling. The `CONTENTS_REPLACEMENT` need is the same sum restricted to items mapping to `CONTENTS_REPLACEMENT`, and the `ACCESSIBILITY_MOD` need the same restricted to items mapping to `ACCESSIBILITY_MOD`. The `TEMPORARY_HOUSING` need is simply the case's `temporary_housing_need_cents`. All four keys are always present in `bucket_need_cents`, carrying 0 where nothing applies.
+
+**Step two — offset per bucket.** For each of the four buckets, the offset is the sum of `awarded_cents` over the case's assistance records whose `documentation_status` is `DOCUMENTED` and whose `purpose_code` names that bucket. `UNDOCUMENTED` and `DISPUTED` rows are excluded, and `is_excluded_from_dob` is irrelevant here — it affects only the duplication-of-benefits check described in §3.6. All four keys are always present in `bucket_offset_cents`, carrying 0 where nothing applies.
+
+**Step three — the variant-specific reduction.** This is where the two variants diverge, and the difference is the whole point of having two.
+
+- Under `PURPOSE_MATCHED`, the buckets are reduced independently and each result is floored at zero before they are added: for each bucket in the fixed order `STRUCTURE_REPAIR`, `CONTENTS_REPLACEMENT`, `ACCESSIBILITY_MOD`, `TEMPORARY_HOUSING`, take that bucket's need less that bucket's offset, treat any negative result as zero, and sum the four floored figures into `unmet_need_total_cents`. Because the floor is applied per bucket, a surplus in one purpose — federal temporary-housing money exceeding the housing need, say — cannot subsidise a deficit in another. This is the authoritative determination, and it is the only variant a presentation may pin.
+- Under `POOLED`, all four needs are added into one total, all four offsets are added into one total, the offset total is subtracted from the need total, and the single result is floored at zero into `unmet_need_total_cents`. Netting before flooring lets a bucket surplus silently absorb another bucket's deficit, so the reported unmet need is smaller. `POOLED` is an advisory triage figure produced on demand and is never eligible for presentation to the table. For identical inputs the `PURPOSE_MATCHED` result is always greater than or equal to the `POOLED` result.
+
+Both variants also write two auxiliary figures. The snapshot's `verified_damage_total_cents` is the sum of the `STRUCTURE_REPAIR`, `CONTENTS_REPLACEMENT` and `ACCESSIBILITY_MOD` needs only — the temporary-housing bucket is excluded, because that figure exists to be compared against the case's own verified damage roll-up. And `total_documented_assistance_cents` is the sum of all four offsets, that is, all of the case's `DOCUMENTED` assistance regardless of purpose.
+
+The first successful determination on a case moves it `INTAKE → ASSESSED` and increments the case's `version`. Later determinations on an already-assessed case leave `case_status` where it is. A case's snapshots can be listed and filtered by `variant`.
+
+### 3.4. The Unmet Needs Table: Sessions, the Queue and Pledges
+
+The coalition meets as a **table**. An `UnmetNeedsChair` schedules a meeting with a `session_label` and the calendar date it meets in `scheduled_for`, optionally overriding `quorum_min_member_orgs`, the minimum number of attending member organizations required to open the meeting, which defaults to 3 and must be at least 1. A scheduled session starts with `status` at `SCHEDULED`, an empty `attending_member_org_ids` array, `chaired_by_user_id` null, and both `awarded_total_cents` and `queued_count` at 0. Session status takes one of `SCHEDULED`, `IN_SESSION`, `ADJOURNED` or `CANCELLED`; the last two are terminal.
+
+Member organizations are seated by an `LTRGAdmin`, who records an `org_name`, an `org_type` from `FAITH_BASED`, `NONPROFIT`, `GOVERNMENT`, `CIVIC_CLUB` or `FOUNDATION`, a delegate `contact_email`, and an `annual_pledge_cap_cents` ceiling on the sum of live pledges the organization may carry, which may not be negative. A newly seated organization has `status` `ACTIVE`, `committed_cents` and `disbursed_cents` at 0, `remaining_pledge_capacity_cents` equal to its `annual_pledge_cap_cents`, and `suspension_reason` null. An `LTRGAdmin` may later set `status` to `SUSPENDED` or `WITHDRAWN`, recording a `suspension_reason`, or reinstate it to `ACTIVE`.
+
+Opening a session moves it `SCHEDULED → IN_SESSION`. The chair supplies `attending_member_org_ids`, the list of organizations physically at the table. The list must contain at least `quorum_min_member_orgs` entries or the request is refused with `ERR_QUORUM_NOT_MET`, and every id in it must resolve to a member organization whose `status` is either `ACTIVE` or `CAPPED` — a list naming a `SUSPENDED` or `WITHDRAWN` organization is refused with `ERR_MEMBER_ORG_NOT_ACTIVE`. On success the server stores the attendance list and stamps `chaired_by_user_id` from the acting identity. Only organizations on that list may pledge in that session.
+
+Queueing a case onto a session is the case manager's act, not the chair's. The payload names the `case_id`, the `session_id` of the target meeting, the `assessment_id` of the determination snapshot being pinned, the `prepared_by_user_id`, and a `narrative` to be read aloud. Five gates apply. The pinned snapshot must belong to the same case, or `ERR_ASSESSMENT_CASE_MISMATCH` results. The `prepared_by_user_id` must equal both the acting identity and the case's `assigned_case_manager_user_id`, per §2.7. The case's `case_status` must be `ASSESSED` or already `PRESENTED`, and the case must have no other presentation in `QUEUED`, `PRESENTING` or `DELIBERATING` — a second live presentation is refused with `ERR_PRESENTATION_ALREADY_ACTIVE`. The target session's `status` must be `SCHEDULED` or `IN_SESSION`, or `ERR_SESSION_NOT_ACCEPTING_QUEUE` results. The pinned snapshot's `variant` must be `PURPOSE_MATCHED`, since a `POOLED` figure may not be presented, and a `POOLED` pin is refused with `ERR_ASSESSMENT_VARIANT_NOT_ELIGIBLE`. Finally the pinned snapshot must not have been overtaken by later inspection work: its own `verified_damage_total_cents` must still equal the case's current `verified_damage_total_cents`, and a mismatch is refused with `ERR_ASSESSMENT_STALE`.
+
+On success the presentation is created in `QUEUED` with `priority_score_snapshot` copied from the survivor's current `priority_score`, `pledged_total_cents` at 0, `bridge_tier` null, `bridge_authorized_cents`, `awarded_cents` and `shortfall_cents` at 0, `deferral_count` at 0, and `decided_at`, `decided_by_user_id` and `decision_note` all null. The case moves `ASSESSED → PRESENTED` and its `version` increments. Presentation status takes one of `QUEUED`, `PRESENTING`, `DELIBERATING`, `AWARDED`, `DEFERRED` or `DENIED`, with `AWARDED` and `DENIED` terminal.
+
+The queue is ordered by vulnerability, then by size of need. A presentation's `queue_position` is its 1-based rank among the `QUEUED` presentations *of the same session*, ranked by `priority_score_snapshot` descending, then by the pinned snapshot's `unmet_need_total_cents` descending, then by `created_at` ascending. A presentation whose status is anything other than `QUEUED` carries `queue_position` 0. Positions are recomputed for every `QUEUED` presentation of the affected session whenever a presentation joins, leaves or is called, and the session's `queued_count` — the number of its presentations still in `QUEUED` — is kept in step. Presentations can be listed and filtered by `case_id`, `session_id`, `assessment_id` and `status`.
+
+Calling a presentation moves it `QUEUED → PRESENTING`. It is the chair's act, it requires the session to be `IN_SESSION` — otherwise `ERR_SESSION_NOT_IN_SESSION` — and it requires the presentation to be at the head of the queue: `queue_position` must be exactly 1, and calling any other presentation is refused with `ERR_NOT_AT_QUEUE_HEAD`. On success `queue_position` becomes 0, the remaining `QUEUED` presentations of the session are re-ranked, and the session's `queued_count` decrements. The chair then opens the pledge window by moving the presentation `PRESENTING → DELIBERATING`, which again requires the session to be `IN_SESSION`.
+
+Pledges are only possible during that window. A `MemberOrgDelegate` records a pledge naming the `presentation_id`, their own `member_org_id`, the `pledged_cents` amount, which must be strictly greater than 0, the `purpose_code` the pledge is earmarked for, and `expected_presentation_version` per §2.10. Five business gates stack on top of the identity and version checks. The presentation's `status` must be `DELIBERATING`, or `ERR_PRESENTATION_NOT_ACCEPTING_PLEDGES` results. The presentation's session must be `IN_SESSION`, or `ERR_SESSION_NOT_IN_SESSION` results. The pledging organization's `status` must be exactly `ACTIVE` — a `CAPPED`, `SUSPENDED` or `WITHDRAWN` organization may not pledge, and the attempt is refused with `ERR_MEMBER_ORG_NOT_ACTIVE`. The organization must appear in the session's `attending_member_org_ids`, or `ERR_ORG_NOT_IN_SESSION` results — being seated at the coalition is not the same as being in the room. And `pledged_cents` may not exceed the organization's `remaining_pledge_capacity_cents`, or `ERR_PLEDGE_CAP_EXCEEDED` results.
+
+A successful pledge is created in `PLEDGED` with `pledged_by_user_id` set and `rescission_reason` null. Commitment status takes one of `PLEDGED`, `CONFIRMED`, `DISBURSED` or `RESCINDED`, with `RESCINDED` terminal. Creating it recomputes the organization's `committed_cents` and `remaining_pledge_capacity_cents`, and if remaining capacity has reached 0 the organization moves `ACTIVE → CAPPED`, which stops it pledging on any other presentation until capacity returns. The presentation's `pledged_total_cents` — the sum of `pledged_cents` over its commitments in `PLEDGED`, `CONFIRMED` or `DISBURSED` — is recomputed, and the presentation's `version` increments, which is precisely what makes the next delegate's stale view detectable. Pledges can be listed and filtered by `presentation_id`, `member_org_id` and `status`.
+
+### 3.5. The Chair's Decision: Award, Defer, Deny
+
+With the pledge window open, the chair records the table's `decision`, which must be `AWARD`, `DEFER` or `DENY`, optionally with a `decision_note`. All three branches require the presentation to be `DELIBERATING`, require its session to be `IN_SESSION`, and are barred to the case's own case manager per §2.7. All three stamp `decided_at` from the logical clock and `decided_by_user_id` from the acting identity, and all three increment the presentation's `version`. Beyond that the three branches have deliberately disjoint effects: award confirms pledges and moves money, deferral only bumps a counter, and denial releases pledges and rewinds the case.
+
+**The award branch** moves the presentation `DELIBERATING → AWARDED` and assembles the award in five pinned steps. The tier key is taken from the *pinned snapshot's* `unmet_need_total_cents`, never from `awarded_cents` — this is what resolves the apparent circularity in which the award depends on the bridge, the bridge on the tier, and the tier seemingly on the award. Evaluation runs step one through step five once and is never iterated to a fixed point.
+
+1. Read the pinned snapshot's `unmet_need_total_cents`. Call it the determined need.
+2. Select `bridge_tier` from the determined need using half-open bands: `TIER_A` when the determined need is strictly less than $5,000; otherwise `TIER_B` when it is strictly less than $25,000; otherwise `TIER_C`. A determined need of exactly $5,000 is `TIER_B`, and exactly $25,000 is `TIER_C`.
+3. Sum `pledged_cents` over the commitments on this presentation whose status is `PLEDGED` — and only those, so `CONFIRMED`, `DISBURSED` and `RESCINDED` commitments are excluded from this figure. Call it the pledged total. The gap is the determined need less the pledged total, floored at zero.
+4. The bridge cap is a tier-dependent percentage of the determined need, rounded half up to the nearest cent: 50 percent under `TIER_A`, 30 percent under `TIER_B` and 15 percent under `TIER_C`. The bridge pool is the sum of `available_cents` over every funding source whose `restriction_code` is `UNRESTRICTED`, whose `status` is `OPEN`, and which is unexpired against the logical clock — that is, whose `expires_on` is null or falls on or after the clock's current date. `bridge_authorized_cents` is then the smallest of three quantities: the gap, the bridge cap and the bridge pool.
+5. `awarded_cents` is the pledged total plus `bridge_authorized_cents`, and `shortfall_cents` is the determined need less `awarded_cents`, floored at zero.
+
+The bridge is an *authorization only*. No funding source field is touched at award time; unrestricted money is actually drawn later, at disbursement approval. Two fiscal gates guard the branch: the pledged total may not exceed the determined need, or `ERR_AWARD_EXCEEDS_UNMET_NEED` results; and the computed `awarded_cents` must be strictly greater than 0, or `ERR_AWARD_ZERO` results — the table may not record an award of nothing.
+
+The award then cascades in four hops. First, every commitment on this presentation whose status is `PLEDGED` moves `PLEDGED → CONFIRMED`, each incrementing its own `version`. Second, because those commitments are now confirmed and the bridge has been authorized, the case's `reference_unmet_cents` is set to the determined need and its `total_committed_cents` and `residual_unmet_cents` are recomputed. Third, because `total_committed_cents` has risen above 0, the case's `funding_status` moves `UNFUNDED → PARTIALLY_COMMITTED` or `UNFUNDED → FULLY_COMMITTED` according to the clause ladder of §2.5. Fourth, because the case is now funded, `case_status` moves `PRESENTED → ACTIVE_RECOVERY` — and this is the hop that unblocks construction permitting and disbursement approval downstream. Each pledging organization's `committed_cents`, `disbursed_cents` and `remaining_pledge_capacity_cents` are also recomputed; note that because `committed_cents` spans both `PLEDGED` and `CONFIRMED`, these values do not actually change here, so no organization flips between `ACTIVE` and `CAPPED` on confirmation alone. The session's `awarded_total_cents` — the sum of `awarded_cents` over its `AWARDED` presentations — is recomputed, and the case's `version` increments.
+
+**The deferral branch** moves the presentation `DELIBERATING → DEFERRED` and does almost nothing else, by design. It increments `deferral_count` by 1 and leaves every commitment on the presentation in `PLEDGED`, so the pledges survive to the next meeting. It does not change the case's `case_status`, its `funding_status` or its `total_committed_cents`, and it consumes no organization capacity beyond the hold the existing `PLEDGED` commitments already represent. Deferral is bounded: the branch is refused with `ERR_MAX_DEFERRALS_REACHED` once `deferral_count` has already reached 3. This is the guard that terminates the deferral cycle — the fourth attempt to defer fails and the presentation stays in `DELIBERATING` for the chair to award or deny instead.
+
+**The denial branch** moves the presentation `DELIBERATING → DENIED` and sets `awarded_cents` to 0, so `shortfall_cents` becomes the whole determined need. Unlike deferral, it releases the pledges rather than holding them: every commitment on the presentation whose status is `PLEDGED` moves `PLEDGED → RESCINDED` with `rescission_reason` recorded as `PRESENTATION_DENIED`, and each affected organization's `committed_cents` and `remaining_pledge_capacity_cents` are recomputed, which returns any organization whose capacity was fully consumed from `CAPPED` to `ACTIVE`. The case's `case_status` moves `PRESENTED → ASSESSED` so the household can be brought back to a later meeting on a fresh presentation. Because nothing was ever confirmed, the case's `total_committed_cents`, `residual_unmet_cents` and `funding_status` are unchanged, no `bridge_tier` or `bridge_authorized_cents` is selected, and no funding source is touched. `DENIED` is terminal — a denied presentation cannot be requeued.
+
+A deferred presentation is put back in front of the table by its case manager, who supplies a `new_session_id`. Requeueing moves it `DEFERRED → QUEUED`, and this leg is deliberately *unguarded* by `deferral_count` — the ceiling lives on the deferral leg, not here. Two gates apply: the target session's `status` must be `SCHEDULED` or `IN_SESSION`, or `ERR_SESSION_NOT_ACCEPTING_QUEUE` results; and the pinned snapshot's `verified_damage_total_cents` must still equal the case's current `verified_damage_total_cents`, or `ERR_ASSESSMENT_STALE` results, because inspections completed during the deferral have changed the arithmetic. On success the presentation's `session_id` becomes the new session, `queue_position` is recomputed for every `QUEUED` presentation of both the old and the new session, `queued_count` increments on the new session and decrements on the old one, and the presentation's `version` increments. The full cycle `QUEUED → PRESENTING → DELIBERATING → DEFERRED → QUEUED` may therefore run up to the deferral ceiling.
+
+Adjourning closes a meeting, and adjournment is where the deferral ceiling bites hardest. Moving a session `IN_SESSION → ADJOURNED` requires that no presentation in that session is `PRESENTING` or `DELIBERATING`; an attempt while one is mid-flight is refused with `ERR_SESSION_HAS_ACTIVE_PRESENTATION`. An `LTRGAdmin` or chair may also pass `cancel_instead` as true to move a still-`SCHEDULED` session `SCHEDULED → CANCELLED` instead, and either way an optional `minutes_note` may be recorded. Both adjournment and cancellation cascade over every presentation of the session still in `QUEUED`, and the cascade forks on `deferral_count`:
+
+- A queued presentation whose `deferral_count` is still below 3 moves `QUEUED → DEFERRED` and its `deferral_count` increments by 1. Its commitments are left in `PLEDGED` so the pledges survive to the next meeting, no organization's `committed_cents` or `remaining_pledge_capacity_cents` changes, the case's `case_status` stays `PRESENTED`, and the session's `queued_count` decrements. The presentation's `version` increments.
+- A queued presentation whose `deferral_count` has already reached 3 cannot be deferred again and moves `QUEUED → DENIED` instead, with `awarded_cents` set to 0. That denial then cascades further: every commitment on it whose status is `PLEDGED` moves `PLEDGED → RESCINDED` with `rescission_reason` recorded as `MAX_DEFERRALS_REACHED`; each affected organization's `committed_cents` and `remaining_pledge_capacity_cents` are recomputed and any organization whose capacity has been restored moves `CAPPED → ACTIVE`; and because no live presentation remains for that case, its `case_status` moves `PRESENTED → ASSESSED`.
+
+After the cascade the session's `queued_count` is 0 and its `awarded_total_cents` is recomputed, and the session's `version` increments. The case-level rewind `PRESENTED → ASSESSED` — whether it follows a denial at the table or a max-deferral denial at adjournment — fires only when no presentation of that case remains in `QUEUED`, `PRESENTING` or `DELIBERATING`.
+
+A delegate may also withdraw a pledge outright, supplying a `rescission_reason`. Rescinding a `PLEDGED` commitment moves it `PLEDGED → RESCINDED`, recomputes the organization's `committed_cents` and `remaining_pledge_capacity_cents`, and recomputes the presentation's `pledged_total_cents`. Rescinding a `CONFIRMED` commitment is the compensating action of §2.6 and carries one extra precondition: no disbursement may reference that commitment with a status of `APPROVED` or `PAID`, and an attempt against such a commitment is refused with `ERR_COMMITMENT_INVALID_STATE`, as is any attempt against a commitment already `RESCINDED` or `DISBURSED`. Either an `LTRGAdmin` or the owning organization's own delegate may rescind. The confirmed rescission unwinds in four hops: the organization's `committed_cents` and `remaining_pledge_capacity_cents` are recomputed so that the pledge-capacity identity of §2.9 holds again; because remaining capacity has risen above 0, the organization moves `CAPPED → ACTIVE`; because the organization released capacity, the presentation's `awarded_cents` — which is recomputed downward — and `shortfall_cents`, and the case's `total_committed_cents`, `residual_unmet_cents` and `funding_status` are all recomputed; and because `funding_status` may no longer be `SATISFIED`, a case sitting in `CLOSURE_PENDING` moves `CLOSURE_PENDING → ACTIVE_RECOVERY`. The commitment's `version` increments.
+
+### 3.6. Assembling Funds, Clearing Duplication of Benefits, and Paying
+
+Money enters the system as **funding sources**, registered by an `LTRGAdmin` with a `label`, a `source_type` from `INDIVIDUAL_DONATION`, `FOUNDATION_GRANT`, `GOVERNMENT_GRANT`, `IN_KIND_MATERIAL` or `MEMBER_ORG_TRANSFER`, a donor-imposed `restriction_code`, a face `total_cents` that may not be negative, an optional `expires_on` date after which the source may no longer be drawn (null meaning no expiry), and an optional `admin_retention_allowed` flag, defaulting to true, recording whether the donor permits the administrative retention on each drawn line. A new source has `committed_cents`, `disbursed_cents` and `admin_retained_cents` at 0, `available_cents` equal to `total_cents`, and `status` `OPEN`.
+
+The `restriction_code` is one of `UNRESTRICTED`, `STRUCTURE_REPAIR_ONLY`, `CONTENTS_ONLY`, `ACCESSIBILITY_ONLY`, `TEMPORARY_HOUSING_ONLY` or `MATERIALS_ONLY`, and from it the server derives two fields. `eligible_purpose_codes` lists the purposes the source may be spent on: an `UNRESTRICTED` source covers all four of `STRUCTURE_REPAIR`, `CONTENTS_REPLACEMENT`, `ACCESSIBILITY_MOD` and `TEMPORARY_HOUSING`; `STRUCTURE_REPAIR_ONLY` covers `STRUCTURE_REPAIR` alone; `CONTENTS_ONLY` covers `CONTENTS_REPLACEMENT` alone; `ACCESSIBILITY_ONLY` covers `ACCESSIBILITY_MOD` alone; `TEMPORARY_HOUSING_ONLY` covers `TEMPORARY_HOUSING` alone; and `MATERIALS_ONLY`, since donated materials go into the building, covers `STRUCTURE_REPAIR` alone. `restriction_specificity` is 0 for an `UNRESTRICTED` source and 1 for every other restriction code, and it is the primary sort key of the drawing waterfall. Funding sources can be listed and filtered by `restriction_code`, `status` and `source_type`.
+
+A `DisbursementOfficer` requests a payment naming the `case_id`, the `purpose_code` the payment is applied to, the `requested_cents` **net** amount that must reach the survivor or vendor, a `payee_name` for the cheque, and `expected_case_version` per §2.10. A `project_id` is required when `purpose_code` is `STRUCTURE_REPAIR` and is null otherwise. A `commitment_id` optionally names the member-organization pledge this payment retires; a bridge-funded payment leaves it null. The row is created with `dob_resolution_note` and `reversal_reason` null, `allocation_lines` empty, `net_cents`, `admin_retained_cents`, `gross_cents`, `dob_pool_cents` and `dob_exposure_cents` at 0, `approved_by_user_id` null, and `requested_by_user_id` stamped from the acting identity. Disbursement status takes one of `REQUESTED`, `DOB_CLEARED`, `DOB_FLAGGED`, `APPROVED`, `PAID`, `REVERSED` or `VOIDED`, with `REVERSED` and `VOIDED` terminal. Disbursements can be listed and filtered by `case_id`, `project_id`, `commitment_id`, `status` and `purpose_code`.
+
+Duplication of benefits is evaluated immediately at creation, and it looks across the survivor's *whole* portfolio rather than the single case. The check runs in five moves:
+
+1. Resolve the survivor behind the disbursement's case, then collect the sibling case set: the ids of every recovery case belonging to that survivor whose `case_status` is not `INACTIVE`. The target case is itself a member of this set. Withdrawn cases are excluded, which is exactly why moving a case to `INACTIVE` removes it from every cross-case pool.
+2. `dob_pool_cents` is the sum of `awarded_cents` over the assistance records on those sibling cases whose `purpose_code` matches the disbursement's `purpose_code`, whose `documentation_status` is `DOCUMENTED` or `DISPUTED`, and whose `is_excluded_from_dob` is false.
+3. The prior-disbursed figure is the sum of `requested_cents` over the disbursements on those sibling cases whose `purpose_code` matches, whose status is `APPROVED` or `PAID`, and which are not the row under evaluation.
+4. The bucket need is the step-one need for the disbursement's `purpose_code`, computed by the determination arithmetic of §3.3 for the **target case only**.
+5. `dob_exposure_cents` is `dob_pool_cents` plus the prior-disbursed figure plus this request's `requested_cents`, less the bucket need, floored at zero.
+
+The fork is strict: exposure of exactly 0 clears, and exposure of a single cent flags. On a clear the row moves `REQUESTED → DOB_CLEARED`; on a flag it moves `REQUESTED → DOB_FLAGGED`. Both branches store `dob_pool_cents` and `dob_exposure_cents` and increment the case's `version`. The flagged branch's distinguishing property is what it does *not* do: no funding source field is touched, the case's `total_committed_cents` is unchanged, and the request cannot be approved until the finding is resolved or the request is voided.
+
+Resolving a flag is the officer's job. The request supplies a `dob_resolution_note` justifying the resolution and `excluded_assistance_record_ids`, the assistance records to be taken out of the pool. Every id in that list must resolve to an assistance record whose case belongs to the *same survivor* as this disbursement's case. On success each listed record has `is_excluded_from_dob` set to true and its `exclusion_note` recorded; the disbursement's `dob_resolution_note` is stored and its status returns to `REQUESTED`; and the duplication-of-benefits check is immediately re-run, forking the row on to `DOB_CLEARED` or straight back to `DOB_FLAGGED`. The cycle `REQUESTED → DOB_FLAGGED → REQUESTED` may repeat as long as exposure remains. Excluding a record never changes how it offsets unmet need — the offset arithmetic of §3.3 ignores `is_excluded_from_dob` entirely. The disbursement's `version` increments.
+
+An officer may abandon a request that was never approved, supplying a `void_reason`. That `void_reason` is a request input only — it is required and must be a non-empty string, but it is not persisted: the disbursement resource carries no `void_reason` field, and none appears in the voided row's response. Voiding is declared from two source states with identical effects: `DOB_FLAGGED → VOIDED` and `DOB_CLEARED → VOIDED`. No funding source or case money field changes, because nothing was ever reserved. The row's `version` increments.
+
+Approval belongs to an `LTRGAdmin` and may carry an optional `approval_note`. It requires the row to be in `DOB_CLEARED`, requires the approver to differ from `requested_by_user_id` per §2.7, and then applies four further gates in the order given in §2.11. The duplication-of-benefits check is re-run from scratch and must still yield exposure of 0, or `ERR_DUPLICATION_OF_BENEFITS` results — a record documented since the request was created can flag a row that cleared earlier. When `purpose_code` is `STRUCTURE_REPAIR`, the named construction project's `status` must be `PERMITTED`, `IN_PROGRESS` or `PUNCHLIST`, or `ERR_PROJECT_NOT_PAYABLE` results. The disbursement's `purpose_code` must appear in the `eligible_purpose_codes` of at least one `OPEN` unexpired funding source, or `ERR_RESTRICTION_MISMATCH` results. And the case may not be overdrawn: the sum of `net_cents` over this case's disbursements already in `APPROVED` or `PAID`, plus this request's `requested_cents`, may not exceed the case's `total_committed_cents`, or `ERR_DISBURSEMENT_EXCEEDS_COMMITMENT` results.
+
+Approval then runs the **restricted-fund waterfall**, which is how donor restrictions are actually honoured. The candidate pool is every funding source whose `status` is `OPEN`, whose `eligible_purpose_codes` contains the disbursement's `purpose_code`, which is unexpired against the logical clock — `expires_on` null or falling on or after the clock's current date — and whose `available_cents` is greater than 0. Sources that are `EXHAUSTED` or `EXPIRED` are excluded, and an empty candidate pool means the request cannot be covered.
+
+The pool is then ordered by `restriction_specificity` descending, so restricted money is spent before unrestricted money and the flexible unrestricted balance is preserved for the cases that need it most; then by `expires_on` ascending with sources having no expiry ordered last, so money nearest to lapsing is used first; then by `created_at` ascending as the tie-break. The tie-break is `created_at`, never `id`.
+
+Walking that order, the server draws lines until the requested net is covered. Begin with a remaining net equal to `requested_cents`. For each source in turn, stop once the remaining net is 0. Determine the source's net capacity: when `admin_retention_allowed` is true, the net capacity is the largest net amount whose sum with its own retention — three and one-half percent of that net amount, rounded half up to the nearest cent — does not exceed the source's `available_cents`; when `admin_retention_allowed` is false, the net capacity is simply `available_cents`. The line's net is the smaller of the remaining net and that net capacity; if that comes to 0 the source is skipped and the walk continues. The line's retention is three and one-half percent of the line's net, rounded half up to the nearest cent, when the source permits retention, and 0 when it does not. The line's gross is its net plus its retention. The line is appended to `allocation_lines` as an object carrying `funding_source_id`, `net_cents`, `retention_cents` and `gross_cents`, and the remaining net is reduced by the line's net.
+
+If any remaining net is left once the ordered pool is exhausted, the approval fails with `ERR_INSUFFICIENT_RESTRICTED_FUNDS` and nothing is written. Otherwise the disbursement's `net_cents` is the sum of the lines' net amounts — which by construction equals `requested_cents` — its `admin_retained_cents` is the sum of the lines' *individually rounded* retentions per the pinned rounding order of §2.8, and its `gross_cents` is `net_cents` plus `admin_retained_cents`. For every drawn line the corresponding funding source's `committed_cents` increases by that line's gross and its `available_cents` is recomputed; any drawn source whose `available_cents` has reached 0 moves `OPEN → EXHAUSTED`. The row stores `approved_by_user_id`, moves `DOB_CLEARED → APPROVED`, and increments its `version`.
+
+Paying is the officer's act again, optionally recording a `payment_reference`, and it is declared only from `APPROVED`. For every allocation line the funding source's `committed_cents` decreases by that line's gross while its `disbursed_cents` increases by the line's net and its `admin_retained_cents` increases by the line's retention — so `available_cents` is unchanged, exactly as §2.9 requires. When the row names a `commitment_id`, that commitment moves `CONFIRMED → DISBURSED`, which shifts the amount from the organization's `committed_cents` to its `disbursed_cents` and leaves `remaining_pledge_capacity_cents` unchanged, and increments the commitment's `version`. The case's `total_net_disbursed_cents` and `funding_status` are recomputed per §2.5. The row moves `APPROVED → PAID` and increments its `version`.
+
+Reversal is the compensating action, restricted to an `LTRGAdmin`, declared only from `PAID`, and requiring a non-empty `reversal_reason`. It unwinds in four hops. First, for every allocation line the funding source's `disbursed_cents` decreases by the line's net and its `admin_retained_cents` decreases by the line's retention. Second, because those decrements raised `available_cents` above 0, any such source moves `EXHAUSTED → OPEN`. Third, because the case's `total_net_disbursed_cents` has fallen, its `funding_status` is recomputed downward from `SATISFIED` per the clause ladder. Fourth, because `funding_status` is no longer `SATISFIED`, a case sitting in `CLOSURE_PENDING` moves `CLOSURE_PENDING → ACTIVE_RECOVERY`. When the row names a `commitment_id`, that commitment moves `DISBURSED → CONFIRMED`, restoring the organization's `committed_cents`. The row moves `PAID → REVERSED`, stores its `reversal_reason` and increments its `version`.
+
+For planning ahead of a request, a computed read exposes the same duplication-of-benefits arithmetic for a case. It takes a `purpose_code` and an optional `requested_cents` to test against, and answers with `case_id`, `survivor_id`, `purpose_code`, `dob_pool_cents`, `prior_disbursed_cents`, `bucket_need_cents`, `dob_exposure_cents` and `sibling_case_ids`, the last being the ids of the non-`INACTIVE` cases that formed the pool.
+
+### 3.7. Construction Phases: Permits, Predecessors and the Suspension Cycle
+
+Repair and rebuild work is organized into **phases**, each a construction project scoped by a `ConstructionManager` against a `case_id`. A phase declares a `scope_code` from `ROOF_REPLACEMENT`, `STRUCTURE_REBUILD`, `INTERIOR_REPAIR`, `ACCESSIBILITY_RAMP` or `MECHANICAL_REPAIR`, a `required_trade_hours` map from trade code to required labour hours, and an `estimated_material_cents` figure for the phase's materials, which may not be negative. Trade codes are drawn from `FRAMING`, `ROOFING`, `DRYWALL`, `ELECTRICAL`, `PLUMBING`, `PAINTING` and `GENERAL_LABOR`. An optional `critical_trades` array, defaulting to empty, names the subset of the `required_trade_hours` keys that carry extra weight in skill matching. An optional `predecessor_project_id` chains this phase behind an earlier one; it is null for a first phase, and when supplied it must name a project belonging to the same case, or the creation is refused with `ERR_PREDECESSOR_CASE_MISMATCH`. A new phase starts at `status` `SCOPED` with `permit_number` and `suspension_reason` null, `volunteer_hours_logged` at 0 and `confirmed_deployment_count` at 0. Projects can be listed and filtered by `case_id`, `predecessor_project_id`, `status` and `scope_code`. Project status takes one of `SCOPED`, `PERMITTED`, `IN_PROGRESS`, `SUSPENDED`, `PUNCHLIST`, `CLOSED_OUT` or `CANCELLED`, with `CLOSED_OUT` and `CANCELLED` terminal.
+
+Phases advance through a single transition capability that takes an `action` naming one of `PERMIT`, `START`, `SUSPEND`, `RESUME`, `PUNCHLIST`, `CLOSE_OUT` or `CANCEL`, plus an optional `reason` and an optional `permit_number`. Any action not declared from the project's current status is refused with `ERR_PROJECT_INVALID_TRANSITION`, and every accepted action increments the project's `version`.
+
+`PERMIT` moves the phase `SCOPED → PERMITTED` and records the `permit_number`. It requires two things beyond the source state: the predecessor chain must be clear — `predecessor_project_id` is null, or the predecessor's `status` is `CLOSED_OUT`, otherwise `ERR_PREDECESSOR_NOT_COMPLETE` results — and the owning case must not have wound down, so its `case_status` may not be `CLOSURE_PENDING`, `CLOSED` or `INACTIVE`. `START` moves the phase `PERMITTED → IN_PROGRESS`.
+
+`SUSPEND` moves the phase `IN_PROGRESS → SUSPENDED`, requires a non-empty `reason`, and stores it as `suspension_reason`. It then cascades in three hops. First, every volunteer deployment on this project whose status is `REQUESTED` or `CONFIRMED` moves to `CANCELLED` with `cancellation_reason` recorded as `PROJECT_SUSPENDED`. Second, because those deployments were cancelled, each affected volunteer group's housing assignments whose `status` is `ACTIVE` and whose night interval intersects the cancelled deployment's window move `ACTIVE → RELEASED` with `release_reason` recorded as `DEPLOYMENT_CANCELLED`. Third, because those assignments were released, each affected lodging site's `peak_committed_beds` and `available_beds` are recomputed and any site whose recomputed peak has fallen below its `bed_capacity` moves `FULL → OPEN`. The project's `confirmed_deployment_count` and each affected group's `active_deployment_count` are recomputed.
+
+`RESUME` moves the phase `SUSPENDED → IN_PROGRESS` and clears `suspension_reason`. It does **not** restore the cancelled deployments or the released housing assignments; the coordinator must rebook. The cycle `IN_PROGRESS → SUSPENDED → IN_PROGRESS` may repeat without bound.
+
+`PUNCHLIST` moves the phase `IN_PROGRESS → PUNCHLIST` and requires that no deployment on the project remains in `REQUESTED` or `CONFIRMED` — a punchlist while crews are still booked is refused with `ERR_PROJECT_INVALID_TRANSITION`. `CLOSE_OUT` moves the phase `PUNCHLIST → CLOSED_OUT` and requires that no disbursement targeting this project sits in `REQUESTED`, `DOB_CLEARED`, `DOB_FLAGGED` or `APPROVED`; an unpaid payment against the phase blocks close-out with the same code. Reaching `CLOSED_OUT` is what unblocks the `PERMIT` action of any successor phase naming this project as its predecessor.
+
+`CANCEL` is declared from three source states — `SCOPED`, `PERMITTED` and `SUSPENDED` — and requires a non-empty `reason` in all three. From `SCOPED` it moves `SCOPED → CANCELLED` and, symmetrically with suspension, cancels every deployment on the project whose status is `REQUESTED` or `CONFIRMED`. From `PERMITTED` it moves `PERMITTED → CANCELLED`, and from `SUSPENDED` it moves `SUSPENDED → CANCELLED`. In all three cases the project's `version` increments.
+
+The project's `volunteer_hours_logged` is the cumulative `hours_logged` over its deployments whose status is `COMPLETED`, and its `confirmed_deployment_count` is the number of its deployments whose status is `REQUESTED` or `CONFIRMED`.
+
+### 3.8. Volunteer Groups, Skill Matching and Hosting
+
+A `VolunteerCoordinator` registers a visiting group with a `group_name`, the sending `home_organization` — a congregation, employer or club — a `member_count` of at least 1 giving the number of volunteers travelling, and a `skill_profile` mapping trade code to the count of qualified members, drawn from the same trade vocabulary as a project's `required_trade_hours`. Two flags follow: `requires_housing`, true when the group must be hosted at a lodging site, defaulting to true; and `brings_own_tools`, true when the group supplies its own tools, defaulting to false. A new group has `active_deployment_count` at 0; that field is the number of its deployments whose status is `REQUESTED` or `CONFIRMED`. Note that `member_count` doubles as the number of beds the group needs.
+
+Deploying a crew names the `group_id`, the `project_id`, and a closed work window given by `arrival_date` and `departure_date`. Both ends of the deployment window are **inclusive**: the crew works on the arrival date and on the departure date. The server computes `day_count` as the number of days from arrival to departure plus one, and `crew_hours_committed` as the group's `member_count` multiplied by six volunteer hours per day multiplied by `day_count`.
+
+Three gates guard the booking, in the order of §2.11. First, the dates must be sane: `departure_date` must fall on or after `arrival_date`, and `arrival_date` must fall on or after the logical clock's current date; a violation is refused with `ERR_INVALID_DATE_RANGE`. Second, the window must not collide with another booking of the same group once a mandatory rest and travel turnaround of one day is applied. Concretely, the request is refused with `ERR_DEPLOYMENT_WINDOW_CONFLICT` when the group already has a deployment whose status is `REQUESTED`, `CONFIRMED` or `COMPLETED` such that the new `arrival_date` falls on or before that existing deployment's `departure_date` advanced by one day, **and** the new `departure_date` advanced by one day falls on or after that existing deployment's `arrival_date`. Back-to-back windows with no rest day between them therefore collide, and the buffer applies on both sides. Third, the project must be accepting volunteers: its `status` must be `PERMITTED` or `IN_PROGRESS`, or `ERR_PROJECT_NOT_ACCEPTING_VOLUNTEERS` results — a `SCOPED`, `SUSPENDED`, `PUNCHLIST`, `CLOSED_OUT` or `CANCELLED` phase takes no crews.
+
+The fourth gate is the match itself. The server computes `skill_fit_score_bps` in the `COVERAGE_WEIGHTED` variant and stores it on the deployment, and refuses the booking with `ERR_SKILL_FIT_BELOW_MINIMUM` when the score is below 6000 basis points. The floor is inclusive: a score of exactly 6000 is accepted.
+
+The score answers a weighted-coverage question over the trades the project declares. The trades considered are exactly the keys of the project's `required_trade_hours`. Each trade carries a weight of 3 when it appears in the project's `critical_trades` and 1 otherwise.
+
+- Under `COVERAGE_WEIGHTED`, the crew's capacity for a trade is the count of members qualified in that trade — taken from the group's `skill_profile`, treated as 0 when the trade is absent from the profile — multiplied by six volunteer hours per day, multiplied by `day_count`. The hours covered for that trade is the smaller of the project's required hours for that trade and that capacity. The numerator is the sum over all trades of the trade's weight multiplied by its covered hours; the denominator is the sum over all trades of the trade's weight multiplied by its required hours. This variant measures how many of the project's weighted required *hours* the crew can actually cover in the requested window, so a small crew of well-qualified people scores low even when every trade is represented. It is the authoritative gate, computed on every booking and stored on the row.
+- Under `HEADCOUNT_WEIGHTED`, the numerator is the sum over all trades of the trade's weight multiplied by one when the group has at least one qualified member in that trade and zero when it has none; the denominator is the sum over all trades of the trade's weight. This variant measures weighted trade *representation* and ignores hours and window length entirely, so it scores far higher than `COVERAGE_WEIGHTED` for undersized crews. It is advisory only, never stored, and never gates a booking.
+
+In both variants the score is ten thousand multiplied by the numerator, divided by the denominator, rounded half up to the nearest whole basis point. A project that declares no required trade hours at all has a denominator of zero; in that case the score is 10000 basis points. The score depends only on the single group-and-project pair named in the request together with the requested date window — the group's other commitments do not enter it.
+
+A read-only preview capability exposes the same arithmetic against a project without creating anything. It takes a `group_id`, a `variant` naming `COVERAGE_WEIGHTED` or `HEADCOUNT_WEIGHTED`, and an `arrival_date` and `departure_date` window, and answers with `project_id`, `group_id`, `variant`, `day_count`, `weighted_covered`, `weighted_required`, `score_bps` and `meets_minimum`, where `weighted_covered` and `weighted_required` are the numerator and denominator described above and `meets_minimum` reports whether the score reaches the 6000 basis-point floor.
+
+A successful booking is created in `REQUESTED` with `hours_logged` at 0 and `cancellation_reason` null, and both the project's `confirmed_deployment_count` and the group's `active_deployment_count` are recomputed. Deployment status takes one of `REQUESTED`, `CONFIRMED`, `CANCELLED` or `COMPLETED`, with `CANCELLED` and `COMPLETED` terminal. Deployments can be listed and filtered by `group_id`, `project_id` and `status`.
+
+Deployments advance through a transition capability taking an `action` of `CONFIRM`, `CANCEL` or `COMPLETE`, plus an optional `hours_logged` and an optional `cancellation_reason`. An action not declared from the current status is refused with `ERR_DEPLOYMENT_INVALID_TRANSITION`, and every accepted action increments the deployment's `version`.
+
+`CONFIRM` moves the deployment `REQUESTED → CONFIRMED`. It requires the project's `status` to be `PERMITTED` or `IN_PROGRESS`, again answering `ERR_PROJECT_NOT_ACCEPTING_VOLUNTEERS` otherwise, and when the group's `requires_housing` is true it additionally requires that at least one housing assignment with `status` `ACTIVE` exists for that group covering every night of the deployment window from the arrival date up to but not including the departure date. Confirmation recomputes the project's `confirmed_deployment_count` and the group's `active_deployment_count`.
+
+`COMPLETE` moves the deployment `CONFIRMED → COMPLETED` and requires a supplied `hours_logged` of 0 or more. It stores the reported hours, increases the project's `volunteer_hours_logged` by that amount, and recomputes the project's `confirmed_deployment_count` and the group's `active_deployment_count`.
+
+`CANCEL` is declared from two source states with deliberately different reach. From `REQUESTED` it moves the deployment `REQUESTED → CANCELLED`, records the `cancellation_reason`, and recomputes the project's `confirmed_deployment_count` and the group's `active_deployment_count` — no housing is touched, because a merely requested crew held nothing. From `CONFIRMED` it moves the deployment `CONFIRMED → CANCELLED`, records the `cancellation_reason`, and additionally releases the group's housing assignments with `status` `ACTIVE` whose night interval intersects the window from the arrival date up to but not including the departure date, with `release_reason` recorded as `DEPLOYMENT_CANCELLED`; each affected lodging site's `peak_committed_beds`, `available_beds` and `status` are then recomputed, and the project's `confirmed_deployment_count` and the group's `active_deployment_count` are recomputed as well. The same cancellations happen system-driven when a project is suspended or cancelled, and the recorded `cancellation_reason` is then the cascade's own reason.
+
+Hosting runs on **lodging sites**, registered with a `site_name`, a `bed_capacity` of at least 1 giving the beds available on any single night, an optional `has_showers` flag defaulting to false, and an optional `nightly_cost_cents` per bed-night charged to the LTRG, defaulting to 0. A new site has `peak_committed_beds` at 0, `available_beds` equal to `bed_capacity`, and `status` `OPEN`.
+
+A housing assignment hosts one group at one site over a **half-open** night interval given by `check_in_date` and `check_out_date`: the night of the check-out date is *not* occupied. The server copies `beds_requested` from the group's `member_count` at creation and computes `night_count` as the number of days from check-in to check-out. Two gates apply. The dates must be sane: `check_out_date` must fall strictly after `check_in_date`, and `check_in_date` must fall on or after the logical clock's current date, or `ERR_INVALID_DATE_RANGE` results. And the site must have room on every night of the interval: for each night from the check-in date up to but not including the check-out date, the sum of `beds_requested` over that site's `ACTIVE` housing assignments covering that night, plus this group's `member_count`, may not exceed the site's `bed_capacity`; a violation on any single night is refused with `ERR_LODGING_CAPACITY_EXCEEDED`. Because the interval is half-open, adjacency is not a conflict — one group checking out on the same date another checks in is fine, and the two never contend for the same night.
+
+A successful assignment is created with `status` `ACTIVE`, `released_at` null and `release_reason` null. Assignment status is either `ACTIVE`, meaning it occupies beds, or `RELEASED`, meaning it has freed them. Creating it recomputes the site's `peak_committed_beds` and `available_beds` and moves the site `OPEN → FULL` when the peak reaches capacity, and increments the site's `version`. Assignments can be listed and filtered by `group_id`, `lodging_site_id` and `status`.
+
+Releasing an assignment supplies a `release_reason`, moves it `ACTIVE → RELEASED`, stamps `released_at` from the logical clock, recomputes the site's `peak_committed_beds` and `available_beds`, moves the site `FULL → OPEN` when the recomputed peak falls below `bed_capacity`, and increments the site's `version`. Releasing an assignment that is already `RELEASED` is refused with `ERR_HOUSING_ALREADY_RELEASED`.
+
+### 3.9. Follow-Up, Closure, Withdrawal and Reopening
+
+Long-term recovery does not end at the last cheque, so a `CaseManager` logs follow-up contacts throughout. Each contact records a `contact_type` naming which touchpoint it is — one of `CHECK_IN_30_DAY`, `CHECK_IN_90_DAY`, `CLOSURE_REVIEW`, `ANNIVERSARY` or `REFERRAL` — the `contacted_on` date, an `outcome` of `REACHED`, `NO_ANSWER`, `DECLINED` or `NEEDS_REOPENED`, and free-text `notes`. The server stamps `recorded_by_user_id` from the acting identity. Contact records are immutable once written and, per §2.4, carry only `id` and `created_at`. They can be listed for a case and filtered by `contact_type`.
+
+Closure runs in two stages, and both answer `ERR_CLOSURE_CRITERIA_NOT_MET` when their criteria are unmet.
+
+The first stage is **closure review**, driven by the case manager with an optional `review_note`, moving the case `ACTIVE_RECOVERY → CLOSURE_PENDING`. Three criteria must hold: the case's `funding_status` must be `SATISFIED`; every construction project on the case must have `status` `CLOSED_OUT` or `CANCELLED`; and at least one follow-up contact must exist on the case. The case's `version` increments.
+
+The second stage is **closing**, restricted to an `LTRGAdmin`, moving the case `CLOSURE_PENDING → CLOSED`. Two criteria apply here. Either `residual_unmet_cents` must be 0, or the request must supply a non-empty `closure_waiver_reason` justifying closure with residual need still on the books — the waiver is written to the case. And the case must carry at least one follow-up contact whose `contact_type` is exactly `CLOSURE_REVIEW`; a case with only thirty-day check-ins may not be closed. Closing decrements the survivor's `open_case_count` and increments the case's `version`.
+
+A case that never made it to the table is **withdrawn** rather than closed. Supplying a non-empty `withdrawn_reason` in the same closing request moves the case to `INACTIVE`, which is the only terminal `case_status`. Two legs are declared. The `INTAKE → INACTIVE` leg additionally requires that the case have no presentation in `QUEUED`, `PRESENTING`, `DELIBERATING` or `AWARDED` — a household already before the table cannot be quietly withdrawn. The `ASSESSED → INACTIVE` leg requires only the non-empty `withdrawn_reason`. Both legs set `case_status` to `INACTIVE`, store the `withdrawn_reason`, decrement the survivor's `open_case_count` and increment the case's `version`. Both also remove the case from every cross-case duplication-of-benefits pool, since the pool is drawn from the survivor's non-`INACTIVE` cases only.
+
+Closure is not final. An `LTRGAdmin` may reopen a closed case with a `reopen_reason`, moving it `CLOSED → ACTIVE_RECOVERY`, incrementing `reopen_count` by 1, incrementing the survivor's `open_case_count` again, and incrementing the case's `version`. The cycle `CLOSED → ACTIVE_RECOVERY → CLOSURE_PENDING → CLOSED` may repeat without bound, which is why `CLOSED` is not a terminal state. A case may also be pulled back off the closure runway without any operator action at all: reversing a paid disbursement or rescinding a confirmed pledge moves a `CLOSURE_PENDING` case back to `ACTIVE_RECOVERY`, because the criterion that `funding_status` be `SATISFIED` no longer holds.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return `201 Created`. Operations that modify an existing resource — including every state transition, every cascade-bearing action and the administrative clock capability — return `200 OK`. Read operations return `200 OK`. Request and response payloads are not tabulated here; the fields each operation accepts and the effects it produces are specified in the narratives of §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/survivors` | Intake a survivor household | IntakeSpecialist, LTRGAdmin |
+| GET | `/survivors/{id}` | Read one survivor household | IntakeSpecialist, CaseManager, UnmetNeedsChair, DisbursementOfficer, LTRGAdmin |
+| POST | `/recovery-cases` | Open a recovery case for a survivor under a disaster declaration | IntakeSpecialist, LTRGAdmin |
+| GET | `/recovery-cases/{id}` | Read one recovery case including both state dimensions and all money roll-ups | IntakeSpecialist, CaseManager, UnmetNeedsChair, DisbursementOfficer, ConstructionManager, LTRGAdmin |
+| GET | `/recovery-cases` | List recovery cases, filterable by survivor and by either state dimension | IntakeSpecialist, CaseManager, UnmetNeedsChair, DisbursementOfficer, LTRGAdmin |
+| POST | `/recovery-cases/{id}/damage-items` | Document a damage line item on the case | CaseManager, LTRGAdmin |
+| GET | `/recovery-cases/{id}/damage-items` | List the documented damage items of a case | CaseManager, ConstructionManager, UnmetNeedsChair, LTRGAdmin |
+| POST | `/damage-items/{id}/verification` | Record the inspection outcome and verified cost for a damage item | ConstructionManager, LTRGAdmin |
+| POST | `/recovery-cases/{id}/assistance-records` | Record assistance the household received from another source | CaseManager, LTRGAdmin |
+| GET | `/recovery-cases/{id}/assistance-records` | List the outside assistance recorded on a case | CaseManager, DisbursementOfficer, UnmetNeedsChair, LTRGAdmin |
+| POST | `/recovery-cases/{id}/assessments` | Run an unmet-needs determination and store the immutable snapshot | CaseManager, LTRGAdmin |
+| GET | `/recovery-cases/{id}/assessments` | List the determination snapshots of a case | CaseManager, UnmetNeedsChair, DisbursementOfficer, LTRGAdmin |
+| GET | `/recovery-cases/{id}/dob-report` | Computed read: duplication-of-benefits exposure for a purpose code across every non-INACTIVE case of the same survivor | CaseManager, DisbursementOfficer, LTRGAdmin |
+| POST | `/recovery-cases/{id}/closure-review` | Move an active case into closure review | CaseManager, LTRGAdmin |
+| POST | `/recovery-cases/{id}/close` | Close a case, or mark an un-presented case INACTIVE when withdrawn_reason is supplied | LTRGAdmin |
+| POST | `/recovery-cases/{id}/reopen` | Reopen a closed case for further long-term recovery work | LTRGAdmin |
+| POST | `/recovery-cases/{id}/follow-ups` | Log a long-term follow-up contact with the survivor | CaseManager, LTRGAdmin |
+| GET | `/recovery-cases/{id}/follow-ups` | List the follow-up contacts logged on a case | CaseManager, LTRGAdmin |
+| POST | `/member-organizations` | Seat a member organization at the unmet needs table | LTRGAdmin |
+| GET | `/member-organizations/{id}` | Read one member organization including its live pledge capacity | UnmetNeedsChair, MemberOrgDelegate, CaseManager, LTRGAdmin |
+| POST | `/member-organizations/{id}/status` | Suspend, withdraw or reinstate a member organization | LTRGAdmin |
+| POST | `/table-sessions` | Schedule an unmet needs table meeting | UnmetNeedsChair, LTRGAdmin |
+| GET | `/table-sessions/{id}` | Read one table session including quorum and roll-up totals | UnmetNeedsChair, CaseManager, MemberOrgDelegate, LTRGAdmin |
+| POST | `/table-sessions/{id}/open` | Open the session, recording the attending member organizations | UnmetNeedsChair, LTRGAdmin |
+| POST | `/table-sessions/{id}/adjourn` | Adjourn (or cancel) the session, deferring every presentation still queued | UnmetNeedsChair, LTRGAdmin |
+| POST | `/case-presentations` | Queue a case with a pinned determination onto a table session | CaseManager, LTRGAdmin |
+| GET | `/case-presentations/{id}` | Read one presentation including queue position, pledged total, bridge and award | CaseManager, UnmetNeedsChair, MemberOrgDelegate, DisbursementOfficer, LTRGAdmin |
+| GET | `/case-presentations` | List presentations, filterable by case, session, pinned assessment and status | CaseManager, UnmetNeedsChair, MemberOrgDelegate, DisbursementOfficer, LTRGAdmin |
+| POST | `/case-presentations/{id}/present` | Call the queue-head presentation before the table | UnmetNeedsChair, LTRGAdmin |
+| POST | `/case-presentations/{id}/deliberate` | Open the pledge window on the presentation | UnmetNeedsChair, LTRGAdmin |
+| POST | `/case-presentations/{id}/decision` | Record the table's decision: AWARD, DEFER or DENY (branching, with disjoint side-effect sets) | UnmetNeedsChair, LTRGAdmin |
+| POST | `/case-presentations/{id}/requeue` | Requeue a deferred presentation onto another session (closes the deferral cycle) | CaseManager, LTRGAdmin |
+| POST | `/funding-commitments` | Record a member organization's pledge against a deliberating presentation (OCC-guarded on the presentation) | MemberOrgDelegate, LTRGAdmin |
+| GET | `/funding-commitments/{id}` | Read one pledge | UnmetNeedsChair, MemberOrgDelegate, DisbursementOfficer, CaseManager, LTRGAdmin |
+| GET | `/funding-commitments` | List pledges, filterable by presentation, member organization and status | UnmetNeedsChair, MemberOrgDelegate, DisbursementOfficer, CaseManager, LTRGAdmin |
+| POST | `/funding-commitments/{id}/rescind` | Rescind a pledge; on a CONFIRMED pledge this is the compensating action that restores pledge capacity exactly | MemberOrgDelegate, LTRGAdmin |
+| POST | `/funding-sources` | Register assembled funding: a donation, foundation grant, government grant, in-kind material lot or member transfer | LTRGAdmin |
+| GET | `/funding-sources/{id}` | Read one funding source including the restricted-use ledger | DisbursementOfficer, LTRGAdmin, UnmetNeedsChair |
+| GET | `/funding-sources` | List funding sources, filterable by restriction and status | DisbursementOfficer, LTRGAdmin, UnmetNeedsChair |
+| POST | `/disbursements` | Request an assistance payment; duplication-of-benefits is evaluated immediately and forks the row to DOB_CLEARED or DOB_FLAGGED (OCC-guarded on the case) | DisbursementOfficer, LTRGAdmin |
+| GET | `/disbursements/{id}` | Read one disbursement including its duplication-of-benefits figures and waterfall allocation lines | DisbursementOfficer, LTRGAdmin, CaseManager |
+| GET | `/disbursements` | List disbursements, filterable by case, project, retired commitment and status | DisbursementOfficer, LTRGAdmin, CaseManager |
+| POST | `/disbursements/{id}/dob-resolution` | Resolve a duplication-of-benefits flag by excluding named assistance records, then re-evaluate | DisbursementOfficer, LTRGAdmin |
+| POST | `/disbursements/{id}/approve` | Approve a cleared request, running the restricted-fund waterfall (segregation of duties: approver must differ from requester) | LTRGAdmin |
+| POST | `/disbursements/{id}/pay` | Pay an approved disbursement, converting committed funds into disbursed funds and retention | DisbursementOfficer, LTRGAdmin |
+| POST | `/disbursements/{id}/reverse` | Reverse a paid disbursement; the compensating action must leave every drawn funding source's conservation identity intact | LTRGAdmin |
+| POST | `/disbursements/{id}/void` | Void a request that was never approved | DisbursementOfficer, LTRGAdmin |
+| POST | `/construction-projects` | Scope a repair or rebuild phase for a case, optionally chained behind a predecessor phase | ConstructionManager, LTRGAdmin |
+| GET | `/construction-projects/{id}` | Read one construction project | ConstructionManager, VolunteerCoordinator, CaseManager, DisbursementOfficer, LTRGAdmin |
+| GET | `/construction-projects` | List construction projects, filterable by case, predecessor phase and status | ConstructionManager, VolunteerCoordinator, CaseManager, DisbursementOfficer, LTRGAdmin |
+| POST | `/construction-projects/{id}/transition` | Advance a project: PERMIT, START, SUSPEND, RESUME, PUNCHLIST, CLOSE_OUT or CANCEL | ConstructionManager, LTRGAdmin |
+| GET | `/construction-projects/{id}/skill-fit` | Computed read: skill-fit score of a volunteer group against this project for a date window, in either variant | VolunteerCoordinator, ConstructionManager, LTRGAdmin |
+| POST | `/volunteer-groups` | Register a visiting volunteer group with its skill profile and housing need | VolunteerCoordinator, LTRGAdmin |
+| GET | `/volunteer-groups/{id}` | Read one volunteer group | VolunteerCoordinator, ConstructionManager, LTRGAdmin |
+| POST | `/volunteer-deployments` | Deploy a volunteer group to a project for a closed date window, gated by the COVERAGE_WEIGHTED skill-fit score and the turnaround-buffer overlap rule | VolunteerCoordinator, LTRGAdmin |
+| GET | `/volunteer-deployments/{id}` | Read one deployment | VolunteerCoordinator, ConstructionManager, LTRGAdmin |
+| GET | `/volunteer-deployments` | List deployments, filterable by group, project and status | VolunteerCoordinator, ConstructionManager, LTRGAdmin |
+| POST | `/volunteer-deployments/{id}/transition` | Advance a deployment: CONFIRM, CANCEL or COMPLETE | VolunteerCoordinator, LTRGAdmin |
+| POST | `/lodging-sites` | Register a host lodging site for volunteer group hosting | VolunteerCoordinator, LTRGAdmin |
+| GET | `/lodging-sites/{id}` | Read one lodging site including its peak committed beds | VolunteerCoordinator, LTRGAdmin |
+| POST | `/housing-assignments` | Host a volunteer group at a lodging site over a half-open night interval, gated by per-night aggregate bed capacity | VolunteerCoordinator, LTRGAdmin |
+| GET | `/housing-assignments/{id}` | Read one housing assignment | VolunteerCoordinator, LTRGAdmin |
+| GET | `/housing-assignments` | List housing assignments, filterable by group, site and status | VolunteerCoordinator, LTRGAdmin |
+| POST | `/housing-assignments/{id}/release` | Release a housing assignment, freeing the beds it held | VolunteerCoordinator, LTRGAdmin |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock and expire any funding source whose expiry date has passed | LTRGAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED_ROLE` | 403 Forbidden |
+| `ERR_ORG_IDENTITY_MISMATCH` | 403 Forbidden |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_CASE_MANAGER_MISMATCH` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_SURVIVOR_NOT_FOUND` | 404 Not Found |
+| `ERR_CASE_NOT_FOUND` | 404 Not Found |
+| `ERR_DAMAGE_ITEM_NOT_FOUND` | 404 Not Found |
+| `ERR_ASSESSMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_MEMBER_ORG_NOT_FOUND` | 404 Not Found |
+| `ERR_SESSION_NOT_FOUND` | 404 Not Found |
+| `ERR_PRESENTATION_NOT_FOUND` | 404 Not Found |
+| `ERR_COMMITMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_FUNDING_SOURCE_NOT_FOUND` | 404 Not Found |
+| `ERR_DISBURSEMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_PROJECT_NOT_FOUND` | 404 Not Found |
+| `ERR_VOLUNTEER_GROUP_NOT_FOUND` | 404 Not Found |
+| `ERR_DEPLOYMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_LODGING_SITE_NOT_FOUND` | 404 Not Found |
+| `ERR_HOUSING_ASSIGNMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_CASE_NOT_ASSESSABLE` | 409 Conflict |
+| `ERR_CASE_INVALID_STATE` | 409 Conflict |
+| `ERR_SESSION_NOT_ACCEPTING_QUEUE` | 409 Conflict |
+| `ERR_SESSION_NOT_IN_SESSION` | 409 Conflict |
+| `ERR_SESSION_HAS_ACTIVE_PRESENTATION` | 409 Conflict |
+| `ERR_PRESENTATION_INVALID_STATE` | 409 Conflict |
+| `ERR_PRESENTATION_ALREADY_ACTIVE` | 409 Conflict |
+| `ERR_PRESENTATION_NOT_ACCEPTING_PLEDGES` | 409 Conflict |
+| `ERR_COMMITMENT_INVALID_STATE` | 409 Conflict |
+| `ERR_DISBURSEMENT_INVALID_STATE` | 409 Conflict |
+| `ERR_PROJECT_INVALID_TRANSITION` | 409 Conflict |
+| `ERR_DEPLOYMENT_INVALID_TRANSITION` | 409 Conflict |
+| `ERR_HOUSING_ALREADY_RELEASED` | 409 Conflict |
+| `ERR_DAMAGE_ITEM_ALREADY_VERIFIED` | 409 Conflict |
+| `ERR_MEMBER_ORG_NOT_ACTIVE` | 409 Conflict |
+| `ERR_PROJECT_NOT_PAYABLE` | 409 Conflict |
+| `ERR_PROJECT_NOT_ACCEPTING_VOLUNTEERS` | 409 Conflict |
+| `ERR_PREDECESSOR_NOT_COMPLETE` | 409 Conflict |
+| `ERR_PREDECESSOR_CASE_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_STALE_PRESENTATION_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_CASE_VERSION` | 412 Precondition Failed |
+| `ERR_NO_VERIFIED_DAMAGE` | 422 Unprocessable Entity |
+| `ERR_ASSESSMENT_STALE` | 409 Conflict |
+| `ERR_ASSESSMENT_VARIANT_NOT_ELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_ASSESSMENT_CASE_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_QUORUM_NOT_MET` | 409 Conflict |
+| `ERR_ORG_NOT_IN_SESSION` | 409 Conflict |
+| `ERR_NOT_AT_QUEUE_HEAD` | 409 Conflict |
+| `ERR_MAX_DEFERRALS_REACHED` | 409 Conflict |
+| `ERR_DUPLICATION_OF_BENEFITS` | 422 Unprocessable Entity |
+| `ERR_RESTRICTION_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_INSUFFICIENT_RESTRICTED_FUNDS` | 422 Unprocessable Entity |
+| `ERR_DISBURSEMENT_EXCEEDS_COMMITMENT` | 422 Unprocessable Entity |
+| `ERR_PLEDGE_CAP_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_AWARD_EXCEEDS_UNMET_NEED` | 422 Unprocessable Entity |
+| `ERR_AWARD_ZERO` | 422 Unprocessable Entity |
+| `ERR_INVALID_DATE_RANGE` | 422 Unprocessable Entity |
+| `ERR_DEPLOYMENT_WINDOW_CONFLICT` | 409 Conflict |
+| `ERR_LODGING_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_SKILL_FIT_BELOW_MINIMUM` | 422 Unprocessable Entity |
+| `ERR_CLOSURE_CRITERIA_NOT_MET` | 409 Conflict |

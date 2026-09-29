@@ -1,0 +1,106 @@
+"""Error catalogue for the Wholesale Auction Arbitration API (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_SALE_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_ROUND_NOT_FOUND": 404,
+    "ERR_SELLER_NOT_FOUND": 404,
+    "ERR_BUYER_NOT_FOUND": 404,
+    "ERR_INSPECTION_NOT_FOUND": 404,
+    "ERR_POLICY_NOT_FOUND": 404,
+    "ERR_NOT_SALE_BUYER": 403,
+    "ERR_NOT_CASE_OWNER": 403,
+    "ERR_NOT_SALE_SELLER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_STALE_CASE_VERSION": 412,
+    "ERR_STALE_BUYER_VERSION": 412,
+    "ERR_INVALID_CASE_STATE": 409,
+    "ERR_INVALID_ROUND_STATE": 409,
+    "ERR_INVALID_INSPECTION_STATE": 409,
+    "ERR_SALE_ALREADY_SETTLED": 409,
+    "ERR_SELLER_NOT_BLOCKED": 409,
+    "ERR_BUYER_PRIVILEGE_SUSPENDED": 409,
+    "ERR_BUYER_FEE_HOLD": 409,
+    "ERR_SELLER_BLOCKED": 409,
+    "ERR_DEFECT_ANNOUNCED": 409,
+    "ERR_PSI_WAIVED_RIGHTS": 409,
+    "ERR_PSI_WINDOW_OVERLAP": 409,
+    "ERR_ARBITRATION_WINDOW_EXPIRED": 409,
+    "ERR_MILEAGE_LIMIT_EXCEEDED": 409,
+    "ERR_ROUND_COOLDOWN_ACTIVE": 409,
+    "ERR_ROUND_EXPIRED": 409,
+    "ERR_CLOCK_NOT_MONOTONIC": 409,
+    "ERR_DUPLICATE_DEALER_LICENSE": 409,
+    "ERR_DUPLICATE_POLICY_DEFECT_CLASS": 409,
+    "ERR_DUPLICATE_OPEN_CLAIM": 409,
+    "ERR_NEGOTIATION_NOT_EXHAUSTED": 409,
+    "ERR_UNWIND_MANDATORY": 409,
+    "ERR_MISSING_INSPECTION_REPORT": 422,
+    "ERR_TITLE_CLAIM_REQUIRES_TITLE_EVIDENCE": 422,
+    "ERR_THIRD_PARTY_VERIFICATION_REQUIRED": 422,
+    "ERR_CLAIM_BELOW_MINIMUM": 422,
+    "ERR_ALLOWANCE_EXCEEDS_CAP": 422,
+    "ERR_PAYMENT_EXCEEDS_BALANCE": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or blank.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this operation.",
+    "ERR_INVALID_REQUEST": "The request payload failed schema validation.",
+    "ERR_SALE_NOT_FOUND": "No such auction sale.",
+    "ERR_CASE_NOT_FOUND": "No such arbitration case.",
+    "ERR_ROUND_NOT_FOUND": "No such negotiation round on this case.",
+    "ERR_SELLER_NOT_FOUND": "No such seller.",
+    "ERR_BUYER_NOT_FOUND": "No such buyer.",
+    "ERR_INSPECTION_NOT_FOUND": "No such post-sale inspection.",
+    "ERR_POLICY_NOT_FOUND": "No arbitration policy governs this defect class.",
+    "ERR_NOT_SALE_BUYER": "The acting buyer is not the buyer of this sale.",
+    "ERR_NOT_CASE_OWNER": "The acting buyer is not the claimant of this case.",
+    "ERR_NOT_SALE_SELLER": "The acting seller is not the consignor of this sale.",
+    "ERR_SEGREGATION_OF_DUTIES": "The intake arbitrator may not decide this case.",
+    "ERR_STALE_CASE_VERSION": "The supplied expected_case_version is stale.",
+    "ERR_STALE_BUYER_VERSION": "The supplied expected_buyer_version is stale.",
+    "ERR_INVALID_CASE_STATE": "The case is not in a status that permits this transition.",
+    "ERR_INVALID_ROUND_STATE": "The negotiation round is not OPEN.",
+    "ERR_INVALID_INSPECTION_STATE": "The post-sale inspection is not REQUESTED.",
+    "ERR_SALE_ALREADY_SETTLED": "The sale is no longer UNSETTLED.",
+    "ERR_SELLER_NOT_BLOCKED": "The seller is not BLOCKED.",
+    "ERR_BUYER_PRIVILEGE_SUSPENDED": "The buyer's claim privileges are suspended.",
+    "ERR_BUYER_FEE_HOLD": "The buyer has an outstanding frivolous-fee balance.",
+    "ERR_SELLER_BLOCKED": "The consignor is blocked or the sale carries a settlement hold.",
+    "ERR_DEFECT_ANNOUNCED": "That defect class was announced at the block.",
+    "ERR_PSI_WAIVED_RIGHTS": "A clean post-sale inspection waived arbitration rights.",
+    "ERR_PSI_WINDOW_OVERLAP": "An outstanding inspection already occupies this window.",
+    "ERR_ARBITRATION_WINDOW_EXPIRED": "The arbitration window has expired.",
+    "ERR_MILEAGE_LIMIT_EXCEEDED": "The mileage allowance has been exceeded.",
+    "ERR_ROUND_COOLDOWN_ACTIVE": "A countered round is still inside its cooldown.",
+    "ERR_ROUND_EXPIRED": "The negotiation round's response deadline has passed.",
+    "ERR_CLOCK_NOT_MONOTONIC": "The logical clock may only advance or stay put.",
+    "ERR_DUPLICATE_DEALER_LICENSE": "That dealer license number is already registered.",
+    "ERR_DUPLICATE_POLICY_DEFECT_CLASS": "A policy already governs that defect class.",
+    "ERR_DUPLICATE_OPEN_CLAIM": "A non-terminal case already exists for this sale and defect class.",
+    "ERR_NEGOTIATION_NOT_EXHAUSTED": "Negotiation is neither exhausted nor timed out.",
+    "ERR_UNWIND_MANDATORY": "Only an unwind may resolve this case.",
+    "ERR_MISSING_INSPECTION_REPORT": "An inspection report is required for this defect class.",
+    "ERR_TITLE_CLAIM_REQUIRES_TITLE_EVIDENCE": "A title document is required for a title claim.",
+    "ERR_THIRD_PARTY_VERIFICATION_REQUIRED": "Verified third-party evidence is required.",
+    "ERR_CLAIM_BELOW_MINIMUM": "The claim amount is below the policy minimum.",
+    "ERR_ALLOWANCE_EXCEEDS_CAP": "The allowance exceeds the policy cap.",
+    "ERR_PAYMENT_EXCEEDS_BALANCE": "The payment exceeds the outstanding balance.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

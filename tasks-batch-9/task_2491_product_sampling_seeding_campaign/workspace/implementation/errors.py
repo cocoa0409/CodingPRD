@@ -1,0 +1,85 @@
+"""Error catalogue (PRD 5) — error_id -> HTTP status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = http_status or STATUS[error_id]
+
+
+STATUS = {
+    # Authentication / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_PANELIST_BANNED": 403,
+    "ERR_PANELIST_INTEGRITY_HOLD": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # Request shape
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_CAMPAIGN_WINDOW_INVALID": 400,
+    "ERR_WAVE_WINDOW_INVALID": 400,
+    # Existence
+    "ERR_CAMPAIGN_NOT_FOUND": 404,
+    "ERR_KIT_LINE_NOT_FOUND": 404,
+    "ERR_FULFILLMENT_CENTER_NOT_FOUND": 404,
+    "ERR_FULFILLMENT_WAVE_NOT_FOUND": 404,
+    "ERR_PANELIST_NOT_FOUND": 404,
+    "ERR_ENROLLMENT_NOT_FOUND": 404,
+    "ERR_SHIPMENT_NOT_FOUND": 404,
+    "ERR_REVIEW_NOT_FOUND": 404,
+    "ERR_RETAILER_NOT_FOUND": 404,
+    "ERR_SYNDICATION_RECORD_NOT_FOUND": 404,
+    "ERR_DIVERSION_CASE_NOT_FOUND": 404,
+    "ERR_PURCHASE_MATCH_NOT_FOUND": 404,
+    "ERR_LIFT_ANALYSIS_NOT_FOUND": 404,
+    # State / conflict
+    "ERR_INVALID_CAMPAIGN_TRANSITION": 409,
+    "ERR_INVALID_KIT_LINE_STATE": 409,
+    "ERR_INVALID_WAVE_STATE": 409,
+    "ERR_ENROLLMENT_NOT_SCREENABLE": 409,
+    "ERR_INVALID_SHIPMENT_STATE": 409,
+    "ERR_INVALID_REVIEW_STATE": 409,
+    "ERR_INVALID_SYNDICATION_STATE": 409,
+    "ERR_INVALID_DIVERSION_CASE_STATE": 409,
+    "ERR_CAMPAIGN_NOT_ACCEPTING_ENROLLMENTS": 409,
+    "ERR_CAMPAIGN_POSTURE_FROZEN": 409,
+    "ERR_CAMPAIGN_POSTURE_RESTRICTED": 409,
+    "ERR_RETAILER_FEED_PAUSED": 409,
+    "ERR_DUPLICATE_ENROLLMENT": 409,
+    "ERR_DUPLICATE_SYNDICATION_TARGET": 409,
+    # Optimistic concurrency
+    "ERR_STALE_CAMPAIGN_VERSION": 412,
+    "ERR_STALE_ENROLLMENT_VERSION": 412,
+    # Business rules
+    "ERR_HOLDOUT_ENROLLMENT_NOT_SAMPLEABLE": 422,
+    "ERR_ENROLLMENT_NOT_ELIGIBLE_FOR_REVIEW": 422,
+    "ERR_CAMPAIGN_KIT_EMPTY": 422,
+    "ERR_KIT_STOCK_INSUFFICIENT": 422,
+    "ERR_WAVE_CAPACITY_EXCEEDED": 422,
+    "ERR_CENTER_CAPACITY_EXCEEDED": 422,
+    "ERR_WRITE_OFF_EXCEEDS_AVAILABLE": 422,
+    "ERR_CAMPAIGN_BUDGET_EXHAUSTED": 422,
+    "ERR_REVIEW_TOO_SHORT": 422,
+    "ERR_DISCLOSURE_STATEMENT_MISSING": 422,
+    "ERR_HONEST_OPINION_NOT_ATTESTED": 422,
+    "ERR_RETAILER_NOT_IN_CAMPAIGN": 422,
+    "ERR_PURCHASE_MATCH_OUT_OF_WINDOW": 422,
+    # Fallback for unrouted paths
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or invalid",
+    "ERR_FORBIDDEN_ROLE": "The acting role may not perform this operation",
+    "ERR_NOT_RESOURCE_OWNER": "The acting panelist does not own this resource",
+    "ERR_INVALID_REQUEST": "The request payload is invalid",
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, message)

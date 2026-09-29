@@ -1,0 +1,62 @@
+"""Error catalogue and the ApiError exception (PRD section 5)."""
+
+
+ERROR_HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_SHARE_PCT_SUM_INVALID": 422,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_FACULTY_NOT_FOUND": 404,
+    "ERR_PACKAGE_NOT_FOUND": 404,
+    "ERR_TRANCHE_NOT_FOUND": 404,
+    "ERR_SPACE_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_UNIT_SCOPE_VIOLATION": 403,
+    "ERR_FACULTY_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_STALE_SPACE_VERSION": 412,
+    "ERR_STALE_PACKAGE_VERSION": 412,
+    "ERR_PACKAGE_STATE_INVALID": 409,
+    "ERR_SPEND_ITEM_STATE_INVALID": 409,
+    "ERR_RENOVATION_STATE_INVALID": 409,
+    "ERR_PACKAGE_SPEND_FROZEN": 409,
+    "ERR_FACULTY_NOT_ACTIVE": 409,
+    "ERR_SPACE_NOT_ASSIGNED_TO_FACULTY": 422,
+    "ERR_SPACE_NOT_READY_FOR_INSTALL": 409,
+    "ERR_SPACE_ALREADY_REGISTERED": 409,
+    "ERR_SPACE_SHARE_EXCEEDED": 422,
+    "ERR_PHASE_WINDOW_OVERLAP": 422,
+    "ERR_PHASE_BUFFER_VIOLATION": 422,
+    "ERR_PHASE_SEQUENCE_GAP": 422,
+    "ERR_NO_PHASES_DEFINED": 422,
+    "ERR_PHASES_INCOMPLETE": 409,
+    "ERR_NO_TRANCHES_DEFINED": 422,
+    "ERR_TRANCHE_SUM_MISMATCH": 422,
+    "ERR_ROLLOVER_FISCAL_YEAR_NOT_ELAPSED": 409,
+    "ERR_ROLLOVER_ALREADY_RUN": 409,
+    "ERR_TRANSFER_TARGET_REQUIRED": 422,
+    "ERR_SEPARATION_NOT_DUE": 409,
+    "ERR_PREDECESSOR_NOT_ELIGIBLE": 422,
+    "ERR_PREDECESSOR_HAS_OPEN_ENCUMBRANCES": 409,
+    "ERR_OPEN_ENCUMBRANCES_BLOCK_CLOSEOUT": 409,
+    "ERR_RECOMMITMENT_BELOW_FLOOR": 422,
+    "ERR_UNIT_POOL_EXCEEDED": 422,
+    "ERR_NO_OPEN_TRANCHE": 422,
+    "ERR_INSUFFICIENT_TRANCHE_BALANCE": 422,
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request pipeline; rendered by the Flask handler."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP_STATUS.get(error_id, 400)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

@@ -1,0 +1,147 @@
+"""Domain thresholds and pinned numeric constants from the PRD.
+
+Every value here is quoted from PRD prose (§2.x, §3.x) so tests never
+recompute a figure the contract already pins.
+"""
+
+# --- Logical clock (PRD §2.4) ---
+CLOCK_DEFAULT_UTC = "2026-08-01T00:00:00Z"
+
+# --- Session fee: base rate by residency discipline (PRD §3.7 step 1) ---
+DISCIPLINE_BASE_RATE_CENTS = {
+    "VISUAL_ARTS": 11000,
+    "DANCE": 12000,
+    "MUSIC": 12500,
+    "THEATER": 11500,
+    "MEDIA_ARTS": 13000,
+    "LITERARY_ARTS": 10500,
+}
+
+# --- Session fee: grade-band factor (PRD §3.7 step 2) ---
+GRADE_BAND_FACTOR = {
+    "K_2": 1.00,
+    "G3_5": 1.05,
+    "G6_8": 1.10,
+    "G9_12": 1.15,
+}
+
+# --- Session fee: effective tier factor (PRD §3.7 step 3) ---
+TIER_FACTOR = {
+    "APPRENTICE": 0.90,
+    "TEACHING_ARTIST": 1.00,
+    "MASTER": 1.20,
+}
+
+# --- Tier rank, ascending (PRD §3.2) ---
+TIER_RANK = {
+    "APPRENTICE": 0,
+    "TEACHING_ARTIST": 1,
+    "MASTER": 2,
+}
+
+THRESHOLDS = {
+    # Session fee (PRD §3.7)
+    "LEAD_PREMIUM_FACTOR": 0.10,
+    "LANGUAGE_PREMIUM_CENTS": 1500,
+    "SUBSTITUTE_FACTOR": 0.85,
+    "FEE_FLOOR_CENTS": 9000,
+    "FEE_CEILING_CENTS": 19000,
+    "BILLED_MINUTE_BLOCK": 5,
+    # Reimbursements (PRD §3.7)
+    "TRAVEL_FREE_MILES": 10.0,
+    "TRAVEL_CENTS_PER_MILE": 67,
+    "MATERIALS_CAP_CENTS": 2500,
+    # Portfolio and demonstration (PRD §3.1)
+    "PORTFOLIO_WEIGHT_ARTISTIC": 0.40,
+    "PORTFOLIO_WEIGHT_PEDAGOGICAL": 0.35,
+    "PORTFOLIO_WEIGHT_CULTURAL": 0.25,
+    "PORTFOLIO_ADVANCE_THRESHOLD": 3.50,
+    "PORTFOLIO_MIN_REVIEWERS": 2,
+    "DEMO_ATTEMPT_LIMIT": 2,
+    "DEMO_PASS_SCORE": 3.5,
+    # Reliability and tier (PRD §3.2)
+    "RELIABILITY_PERFECT_BPS": 10000,
+    "RELIABILITY_ROLLING_WINDOW": 4,
+    "PROBATION_FLOOR_BPS": 8000,
+    "MASTER_LIFETIME_DELIVERED": 25,
+    "MASTER_PROGRAM_YEAR_BPS": 9500,
+    # Curriculum (PRD §3.5)
+    "ADAPTATION_ROUND_LIMIT": 3,
+    "STANDARD_CODE_MIN_LEN": 3,
+    "STANDARD_CODE_MAX_LEN": 24,
+    "SEQUENCE_NO_MIN": 1,
+    "SEQUENCE_NO_MAX": 60,
+    # Scheduling (PRD §3.6)
+    "TRAVEL_BUFFER_MINUTES": 45,
+    # Evaluation index (PRD §3.9)
+    "EVAL_WEIGHT_OBSERVATION": 0.50,
+    "EVAL_WEIGHT_SURVEY": 0.30,
+    "EVAL_WEIGHT_ARTIFACT": 0.20,
+    "EVAL_OBSERVATION_DIVISOR": 4,
+    "EVAL_SURVEY_DIVISOR": 5,
+    # Funder cost brackets (PRD §3.9)
+    "INDIRECT_RATE_LOW": 0.15,
+    "INDIRECT_RATE_MID": 0.12,
+    "INDIRECT_RATE_HIGH": 0.10,
+    "INDIRECT_BRACKET_LOW_CENTS": 500000,
+    "INDIRECT_BRACKET_MID_CENTS": 1500000,
+    # Pagination (PRD §2.3)
+    "PAGE_LIMIT_DEFAULT": 10,
+    "PAGE_LIMIT_MIN": 1,
+    "PAGE_LIMIT_MAX": 100,
+    "PAGE_OFFSET_DEFAULT": 0,
+}
+
+# --- Enum domains (PRD §3.x) ---
+DISCIPLINES = [
+    "VISUAL_ARTS", "DANCE", "MUSIC", "THEATER", "MEDIA_ARTS", "LITERARY_ARTS",
+]
+GRADE_BANDS = ["K_2", "G3_5", "G6_8", "G9_12"]
+STRANDS = ["CREATING", "PERFORMING", "RESPONDING", "CONNECTING"]
+SCREENING_TYPES = ["STATE_CRIMINAL", "FBI_FINGERPRINT", "CHILD_ABUSE_REGISTRY"]
+BLACKOUT_TYPES = [
+    "HOLIDAY", "TESTING_WINDOW", "PROFESSIONAL_DEVELOPMENT", "CLOSURE",
+]
+COLLABORATION_EXPECTATIONS = ["CO_TEACH", "OBSERVE", "PLANNING_ONLY"]
+CANCEL_REASONS = [
+    "SCHOOL_CLOSURE", "TESTING_CONFLICT", "LOW_ENROLLMENT",
+    "ARTIST_ILLNESS", "ARTIST_NO_SHOW", "RESIDENCY_DESCOPED",
+]
+MAKEUP_ELIGIBLE_REASONS = [
+    "SCHOOL_CLOSURE", "TESTING_CONFLICT", "ARTIST_ILLNESS", "ARTIST_NO_SHOW",
+]
+MAKEUP_INELIGIBLE_REASONS = ["LOW_ENROLLMENT", "RESIDENCY_DESCOPED"]
+EVALUATION_TYPES = [
+    "OBSERVATION_RUBRIC", "TEACHER_SURVEY", "STUDENT_WORK_SAMPLE",
+]
+HEADCOUNT_BASES = ["UNDUPLICATED", "ENCOUNTERS"]
+REVIEW_TRACKS = ["FISCAL", "PROGRAM"]
+
+# --- Canonical test scenario defaults (the fixture blueprint) ---
+TEST_DEFAULTS = {
+    "SCHOOL_NAME": "Riverbend Arts Academy",
+    "DISTRICT_NAME": "Riverbend USD",
+    "GRADE_SPAN": "K-8",
+    "CONCURRENT_SESSION_CAPACITY": 2,
+    "TOTAL_ENROLLMENT": 600,
+    "FRL_PCT": 0.62,
+    "ELL_PCT": 0.28,
+    "IEP_PCT": 0.14,
+    "ARTIST_NAME": "Ana Reyes",
+    "ARTIST_EMAIL": "ana.reyes@arts.org",
+    "RESIDENCY_TITLE": "Story in Motion",
+    "CONTRACTED_SESSION_COUNT": 10,
+    "SESSION_LENGTH_MINUTES": 60,
+    "BUDGET_CENTS": 200000,
+    "MATERIALS_STIPEND_CENTS": 5000,
+    "CO_PLANNING_HOURS_REQUIRED": 4,
+    "TERM_START_DATE": "2026-09-08",
+    "TERM_END_DATE": "2026-12-18",
+    "ENROLLED_STUDENT_COUNT": 48,
+    "CLEARANCE_EFFECTIVE_ON": "2026-07-01",
+    "CLEARANCE_EXPIRES_ON": "2027-06-30",
+    "DEMO_RUBRIC_SCORE": 4.2,
+    "CLASSROOM_TEACHER_NAME": "Ms. Delgado",
+    "STANDARD_CODE_CREATING": "DA:Cr1.1.4",
+    "STANDARD_CODE_RESPONDING": "DA:Re7.1.4",
+}

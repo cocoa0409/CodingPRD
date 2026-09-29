@@ -1,0 +1,55 @@
+"""Domain thresholds and numeric constants named by the PRD's calculations."""
+
+# ── Cell slot rationing and the waitlist ──
+WAITLIST_CAP_PER_CELL = 3
+RESERVATION_HOLD_HOURS = 72
+WAIT_DAY_CAP = 365
+PLAN_TIER_RANK = {"PRIORITY_1": 3, "PRIORITY_2": 2, "BEST_EFFORT": 1}
+
+# ── Beam megabit rationing ──
+TIER_WEIGHT = {"PRIORITY_1": 1.0, "PRIORITY_2": 0.7, "BEST_EFFORT": 0.4}
+DEPRIORITIZED_WEIGHT = 0.25
+CONSTRAINED_FRACTION = 0.75
+DEFAULT_OVERSUBSCRIPTION_LIMIT = 4.0
+OVERSUBSCRIPTION_LIMIT_MIN = 1.0
+OVERSUBSCRIPTION_LIMIT_MAX = 20.0
+
+# ── Sky survey verdict bands (obstruction_pct) ──
+SCAN_PASS_MAX_PCT = 2.00
+SCAN_MARGINAL_MAX_PCT = 8.00
+
+# ── Outage credits ──
+MINUTES_PER_BILLING_MONTH = 43200
+SLA_MIN_OUTAGE_MINUTES = 30
+CAUSE_MULTIPLIER = {
+    "WEATHER_RAIN_FADE": 0.5,
+    "EQUIPMENT_FAILURE": 1.0,
+    "SPECTRUM_INTERFERENCE": 1.0,
+    "PLANNED_MAINTENANCE": 0.0,
+}
+SEVERITY_FACTOR = {"FULL_OUTAGE": 1.0, "DEGRADATION": 0.5}
+CREDIT_CAP_FRACTION = 0.5
+
+# ── Cycle charge discount bands (keyed on the gross total, in cents) ──
+DISCOUNT_BAND_1_CENTS = 10000
+DISCOUNT_BAND_2_CENTS = 25000
+DISCOUNT_RATE_BAND_1 = 0.05
+DISCOUNT_RATE_BAND_2 = 0.10
+
+# ── Roaming review ──
+ROAMING_MAX_INFO_ROUNDS = 3
+ROAMING_COOLDOWN_HOURS = 24
+
+# ── Consumer disclosure ──
+DISCLOSURE_ACK_WINDOW_DAYS = 14
+
+# ── Hardware ──
+TERMINAL_DAMAGE_FEE_CENTS = 15000
+
+# ── Logical clock ──
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+# ── Pagination ──
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100

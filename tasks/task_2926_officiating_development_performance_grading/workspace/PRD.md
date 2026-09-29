@@ -1,0 +1,483 @@
+# Officiating Development & Grading API — Product Requirements Document
+
+## 1. Introduction
+
+A professional league's officiating department is judged on two things that pull against each other: the consistency of the calls made on the field, and the fairness of the process used to judge the people making them. Today the department runs that process on spreadsheets and email. Recruitment from the lower levels has no auditable advancement gate; crew scheduling is assembled by hand and routinely produces crews that travel too far on too little rest, or that place an official in a stadium where they have a declared conflict of interest; play-by-play grades are circulated as documents, so an official who wants to challenge a grade has no window, no quota, and no guarantee that the person deciding the challenge is not the person who wrote it.
+
+This document specifies the Officiating Development & Grading service that replaces that process. The service is the single system of record for a season of officiating: it carries the season's governing thresholds, the officials working under them, their training and physical-testing history, their advancement applications, the games and crews they are assigned to, every graded play and the appeals filed against those grades, the replay center's decision windows, the department's public pool reports and rules clarifications, and the discipline and remediation record. From those primitives it derives the numbers the department actually acts on — each official's accuracy index, their postseason assignment eligibility, and an end-of-season retention recommendation.
+
+Two design commitments run through everything below. The first is **segregation of duties**: scheduling, grading, appeal adjudication, field evaluation, training certification, replay adjudication, committee decisions and public communication are held by eight distinct roles, and no single actor can both author a judgment and rule on the challenge to it. The second is **determinism**: every deadline, occupancy window, decision limit and elapsed-time measurement in this system reads a server-held logical clock rather than wall-clock time, and every derived number has exactly one legal evaluation order and one legal rounding point. A grader, an appellant and an auditor replaying the same season must arrive at the same numbers.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Departmental Roles and Caller Identity
+
+Every request to this API must carry two headers: `X-User-ID`, identifying the calling user, and `X-User-Role`, naming the departmental role the caller is acting in. If either header is absent or empty, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If `X-User-Role` is not one of the eight declared role names below, or if it is a declared role that is not authorized for the endpoint being called, the request is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+The eight roles are `OfficiatingDirector`, `CrewScheduler`, `GradingSupervisor`, `Official`, `FieldEvaluator`, `ReplayOfficial`, `TrainingCoordinator`, and `CommunicationsOfficer`.
+
+- An `OfficiatingDirector` runs the department: season configuration and closure, official registration, game scheduling and the game lifecycle, committee decisions on advancement, the replay station registry, and the entire discipline and remediation surface.
+- A `CrewScheduler` builds game crews, balancing experience, conflicts of interest, team rotation and rest windows.
+- A `GradingSupervisor` grades plays against rulebook standards and adjudicates appeals — but never an appeal against a grade this same user authored.
+- An `Official` is a working on-field official who applies for advancement and appeals grades written against their own performance.
+- A `FieldEvaluator` screens advancement applications, files field evaluation reports, and forwards qualifying applications to the committee; a field evaluator cannot make the committee's decision.
+- A `ReplayOfficial` operates the replay center, opening reviews on reviewable play categories and recording decisions inside the decision window.
+- A `TrainingCoordinator` runs rules clinics, physical standards testing and preseason exams, and records the results that gate assignability.
+- A `CommunicationsOfficer` publishes pool reports and rules clarifications about finalized grades.
+
+Caller identity binds to persisted data in exactly one place. When `X-User-Role` is `Official`, `X-User-ID` is the `id` of the acting Official row; ownership checks on any resource that references an Official compare the resource's official reference to `X-User-ID`. Concretely, when an `Official` files or withdraws a grade appeal, the server compares `X-User-ID` to the `official_id` of the appealed play grade, and rejects a mismatch with `ERR_NOT_GRADE_OWNER` (HTTP 403).
+
+For the other seven roles — `OfficiatingDirector`, `CrewScheduler`, `GradingSupervisor`, `FieldEvaluator`, `ReplayOfficial`, `TrainingCoordinator` and `CommunicationsOfficer` — `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity. The server may record it on a resource where a workflow calls for it — a play grade stores the authoring supervisor's identifier in `graded_by_user_id`, a decided appeal stores the adjudicating supervisor's identifier in `decided_by_user_id`, and a field evaluation report stores its author's identifier in `evaluator_user_id` — but it never compares such an identifier to any entity's `id`. Those three recorded identifiers exist so that the segregation-of-duties rule can be enforced: a `GradingSupervisor` whose `X-User-ID` equals the `graded_by_user_id` of the graded play may neither take the appeal under review nor decide it, and both attempts are rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination and List Ordering
+
+Every list endpoint in this API accepts two optional query parameters. `limit` controls the page size: it defaults to 10 when omitted, may not be smaller than 1, and may not be larger than 100. `offset` controls how many matching records are skipped before the page begins: it defaults to 0 and may not be negative. A `limit` outside the permitted range, or a negative `offset`, is a malformed request and is rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+
+List results are ordered by `created_at` ascending unless a specific workflow below states otherwise. This ordering is not cosmetic — several derived quantities in this system are defined over an ordered sequence of rows, and the ordering used there is always `created_at` ascending as well.
+
+For list responses, the `meta` object carries `limit` and `offset` as applied, `total_count` as the number of records matching the filter before pagination, and `has_more` as a boolean that is true when records matching the filter remain beyond the current page.
+
+### 2.4. The Logical Clock
+
+Time in this system is a server-held value, not a reading of the host machine's wall clock. Every deadline, occupancy window, decision limit and elapsed-time measurement described in this document reads that **logical clock**. At server startup the logical clock reads exactly `2026-08-01T00:00:00.000Z`; it must never fall back to real wall-clock time, not even before the clock has been set for the first time.
+
+An administrative test-driving capability, available to all eight roles, sets the logical clock to a supplied UTC instant carried in a `current_utc` field. Setting the clock mutates no entity and runs no sweep of its own: reviews whose decision windows have already elapsed are not retroactively expired by the act of moving the clock, and appeal windows are not swept. Expiry and deadline evaluation happen only when a business operation reads the clock, and the operations that do so are named individually in §3.
+
+All timestamp-bearing fields — the system-managed `created_at` and `updated_at`, and the domain instants `kickoff_utc`, `screened_at`, `posted_at`, `submitted_at`, `published_at`, `released_at`, `occupied_from_utc`, `occupied_until_utc`, `window_open_utc` and `window_close_utc` — are serialized as ISO 8601 UTC instants with exactly three fractional digits (for example `2026-09-13T17:00:00.000Z`). An input timestamp that does not parse as an ISO 8601 UTC instant is rejected with `ERR_INVALID_REQUEST`.
+
+### 2.5. The Season Program as the Departmental Write Gate
+
+Every business object in this system except a replay booth belongs to a season program, and the program's own `status` is the master gate on writes beneath it. A program is created in `CONFIGURING`, is opened into `OPEN`, and ends its life in the terminal `POSTSEASON_LOCKED` state.
+
+Officials, games, crew assignments, play grades, appeals, replay reviews, pool reports, advancement applications, field evaluations, training records and discipline actions may only be created or mutated while the owning program's `status` is `OPEN`. A business write attempted while the owning program is still `CONFIGURING`, or after it has reached `POSTSEASON_LOCKED`, is rejected with `ERR_SEASON_NOT_OPEN` (HTTP 409). The same error is returned when the program's own lifecycle operations are called from the wrong state — opening a program that is not `CONFIGURING`, or locking the postseason on a program that is not `OPEN`.
+
+Four operations are deliberately outside this gate, because they either precede a program's existence or are independent of it: setting the logical clock, creating a season program, opening a season program, locking the postseason, and registering a replay booth. Replay booths are department infrastructure with no season program reference at all, so a booth may be registered at any time.
+
+### 2.6. Common Resource Properties
+
+Most resources in this system are independently addressable rows carrying a standard set of server-managed properties:
+
+- `id` — a server-minted UUID. It carries no type prefix; the resource kind is conveyed by the path the resource was fetched from, never by the shape of the identifier.
+- `created_at` — an ISO 8601 UTC timestamp with three fractional digits recording when the row was first written.
+- `updated_at` — an ISO 8601 UTC timestamp with three fractional digits recording the most recent mutation of the row. Recomputing a derived field counts as a mutation: when a game's `crew_strength_index` is recalculated, or an official's `appeal_credits_remaining` is debited, or a season record's `accuracy_index` is refreshed, that row's `updated_at` is refreshed.
+- `version` — an integer that starts at 1 on creation and increases by exactly 1 on every mutation of the row, including mutations produced indirectly by a cascade originating on another resource.
+
+Season programs, officials, advancement applications, games, crew assignments, play grades, grade appeals, replay stations, replay reviews, official season records, pool reports and discipline actions all carry the full set.
+
+Two resources are append-only evidence logs and are never mutated after they are written: a **field evaluation report** filed against an advancement application, and a **training record** filed against an official. These two carry only `id` and `created_at`. They have no `updated_at` and no `version` field at all, and the absence is deliberate — an evidence log that could be amended would undermine the advancement and clearance gates that read it.
+
+### 2.7. Numeric Precision and Rounding
+
+All non-integer quantities in this system — scores, weights, indices, error points and retention numbers — are decimal values carried to exactly 2 decimal places, and every rounding step uses the round-half-up method (a value exactly halfway between two representable results rounds away from zero). Decimal quantities are returned in response bodies as JSON numbers, never as strings.
+
+Where a quantity is rounded matters as much as how. Three rules are absolute:
+
+- **Per-play error points are rounded before any summation.** The weighted error points of a single graded play are rounded to 2 decimal places at the moment the play is written, and the season aggregate is the sum of those already-rounded per-play values. Summing raw products and rounding the total afterwards is a different — and incorrect — number.
+- **A field evaluation's composite is rounded before it is averaged.** The average that gates committee submission is the mean of the already-rounded per-report composites, so per-report rounding propagates into the gate.
+- **Crew strength is rounded twice.** Each assignment's contribution is rounded to 2 decimal places, and the quotient computed from the sum of those contributions is rounded again.
+
+Interval and elapsed-time arithmetic is done in whole seconds of UTC. Integer-typed inputs must be non-negative; a score submitted outside the inclusive range 0.00 through 100.00 is rejected with `ERR_INVALID_REQUEST`.
+
+### 2.8. Optimistic Concurrency Control on Parent Versions
+
+Two create operations in this system can legitimately displace an existing row that the caller may never have seen. Both therefore require the caller to pin the parent resource's `version`, and both reject a stale pin rather than silently overwriting.
+
+**Proposing a crew assignment** (`POST /crew-assignments`) requires a non-optional `expected_game_version` field in the request body, carrying the `version` of the target game as the client last observed it — the same value returned when reading that game. If `expected_game_version` does not equal the game's current `version`, the request is rejected with `ERR_STALE_GAME_VERSION` (HTTP 412). This check is what makes the crew slot safe: because a create for a position that already holds a proposed assignment supersedes that assignment instead of being refused, no state precondition would have caught a scheduler displacing a crew slot it never read.
+
+**Opening a discipline action** (`POST /discipline-actions`) requires a non-optional `expected_official_version` field in the request body, carrying the `version` of the target official as the client last observed it — the same value returned when reading that official. If `expected_official_version` does not equal the official's current `version`, the request is rejected with `ERR_STALE_OFFICIAL_VERSION` (HTTP 412). Again the check exists because the write would otherwise succeed on its own merits: a newly opened action legitimately supersedes that official's prior non-terminal action, so nothing but the stale-version test stops a director from superseding discipline they never saw.
+
+No other endpoint in this API accepts a version field. Every other write is guarded by state preconditions alone, and supplying a version-like field where none is declared has no effect.
+
+### 2.9. Rejection Precedence
+
+When a single request violates more than one rule, the response is determined by the violated rule that stands highest in the following precedence order, and no lower rule is evaluated. This ordering is part of the contract: a request that is both unauthenticated and malformed reports the authentication failure, and a request that is both out of its appeal window and short of appeal credits reports the closed window.
+
+1. Both `X-User-ID` and `X-User-Role` are present and non-empty, else `ERR_UNAUTHENTICATED` (401).
+2. `X-User-Role` names one of the eight declared roles and that role is authorized for the target endpoint, else `ERR_UNAUTHORIZED` (403).
+3. The request body is well-formed: every required input field is present, no unknown field is honored, every enum-valued field carries a declared value, every score lies within the inclusive range 0.00 through 100.00, every timestamp parses as an ISO 8601 UTC instant, integers are non-negative, and a `MODIFIED` appeal decision carries a `revised_grade_code` that differs from the grade's current `grade_code`. Otherwise `ERR_INVALID_REQUEST` (400).
+4. Every identifier resolves to a live row — path identifiers first, in left-to-right path order, then body identifiers in the order the endpoint declares its inputs. The first unresolved identifier determines which of the not-found errors is returned (`ERR_SEASON_PROGRAM_NOT_FOUND`, `ERR_OFFICIAL_NOT_FOUND`, `ERR_APPLICATION_NOT_FOUND`, `ERR_GAME_NOT_FOUND`, `ERR_ASSIGNMENT_NOT_FOUND`, `ERR_PLAY_GRADE_NOT_FOUND`, `ERR_APPEAL_NOT_FOUND`, `ERR_REPLAY_STATION_NOT_FOUND`, `ERR_REPLAY_REVIEW_NOT_FOUND`, `ERR_POOL_REPORT_NOT_FOUND`, `ERR_DISCIPLINE_ACTION_NOT_FOUND`), all at HTTP 404.
+5. Grade ownership: an `Official` filing an appeal, or withdrawing one, is the official the appealed grade was written against, else `ERR_NOT_GRADE_OWNER` (403).
+6. Segregation of duties: the `GradingSupervisor` taking an appeal under review or deciding it is not the supervisor who authored the graded play, else `ERR_SEGREGATION_OF_DUTIES` (403).
+7. The owning season program is `OPEN` for every business write beneath it, else `ERR_SEASON_NOT_OPEN` (409). The exceptions are listed in §2.5.
+8. The target resource is in a state from which the requested transition is declared, else the matching state error at HTTP 409 — `ERR_GAME_STATE_INVALID`, `ERR_ASSIGNMENT_STATE_INVALID`, `ERR_APPLICATION_STATE_INVALID`, `ERR_GRADE_STATE_INVALID`, `ERR_APPEAL_STATE_INVALID`, `ERR_REVIEW_STATE_INVALID`, `ERR_DISCIPLINE_STATE_INVALID`, `ERR_REPORT_STATE_INVALID`, or `ERR_SEASON_NOT_OPEN` for the program's own two lifecycle operations. A replay booth's availability is *not* part of this rule; it is checked further down at step 19.
+9. The pinned parent version matches, else `ERR_STALE_GAME_VERSION` or `ERR_STALE_OFFICIAL_VERSION` (412), per §2.8.
+10. Fatigue safety: the official's occupancy window for the target game overlaps none of that official's own proposed, confirmed or completed assignment windows, else `ERR_OFFICIAL_WINDOW_CONFLICT` (409). Fatigue safety deliberately outranks every rotation, conflict-of-interest and quota rule below it.
+11. The official being proposed or confirmed has `status` equal to `ACTIVE`, else `ERR_OFFICIAL_NOT_ACTIVE` (409).
+12. The official being proposed or confirmed has `preseason_cleared` true, else `ERR_PRESEASON_NOT_CLEARED` (409).
+13. The official's declared conflict of interest is not with either team of the target game, else `ERR_TEAM_CONFLICT_OF_INTEREST` (409).
+14. Prior exposures to either team of the target game are below the season's per-team exposure cap, else `ERR_TEAM_ROTATION_LIMIT` (409).
+15. No confirmed assignment already occupies the requested position on the target game, else `ERR_POSITION_ALREADY_CONFIRMED` (409). A merely proposed assignment on that position is superseded rather than refused.
+16. No play grade already exists for the same game, official and play identifier, else `ERR_DUPLICATE_PLAY_GRADE` (409).
+17. The official being graded held an assignment on that game in either the confirmed or the completed state, else `ERR_ASSIGNMENT_STATE_INVALID` (409).
+18. The requested review category is one the season program declares reviewable, else `ERR_CATEGORY_NOT_REVIEWABLE` (422).
+19. The target replay booth is online, else `ERR_REPLAY_STATION_OFFLINE` (409).
+20. The booth has spare concurrent capacity for the new decision window, else `ERR_REPLAY_STATION_AT_CAPACITY` (409).
+21. The game's crew posture is `STAFFED` at kickoff, else `ERR_CREW_NOT_STAFFED` (409).
+22. The advancement applicant satisfies every screening criterion, else `ERR_ADVANCEMENT_CRITERIA_NOT_MET` (422).
+23. The application carries enough field evaluation reports and a high enough evaluation average, else `ERR_EVALUATION_REQUIREMENTS_NOT_MET` (422).
+24. The play grade cited by a pool report is final and free of a pending appeal, else `ERR_CITED_GRADE_NOT_FINAL` (409).
+25. The discipline action has remediation cycles left, else `ERR_REMEDIATION_CYCLE_LIMIT` (409).
+26. The appeal is filed inside its window, else `ERR_APPEAL_WINDOW_CLOSED` (422). This sits below step 8 on purpose: an appeal against a grade that was never posted reports `ERR_GRADE_STATE_INVALID`, not a closed window.
+27. The appealing official has at least one appeal credit remaining, else `ERR_APPEAL_CREDITS_EXHAUSTED` (409). This sits below step 26 on purpose: an out-of-window appeal by a credit-less official reports the window error.
+28. No game of the season program is in progress when the postseason is locked, else `ERR_GAMES_IN_PROGRESS` (409).
+
+### 2.10. Derived Fields, Cascades and Version Discipline
+
+A large share of this system's value sits in fields no client ever writes. Counters such as `confirmed_crew_count`, `open_assignment_count`, `active_review_count`, `return_count`, `remediation_cycle_count`, `graded_play_count` and `eligible_official_count`; postures such as `crew_posture`; indices such as `crew_strength_index`, `error_points`, `weighted_error_points`, `accuracy_index`, `availability_component` and `retention_score`; flags such as `preseason_cleared`, `passed`, `accuracy_eligible` and `postseason_eligible`; and variant markers such as `crew_strength_variant` and `accuracy_variant` are all server-derived. A request that attempts to set one of them directly does not have that value honored.
+
+Four of those counters have definitions worth stating once here, because several workflows adjust them incrementally and the invariant must hold either way. A game's `confirmed_crew_count` is the number of that game's crew assignments whose status is `CONFIRMED`. An official's `open_assignment_count` is the number of that official's crew assignments whose status is `PROPOSED` or `CONFIRMED`. A replay booth's `active_review_count` is the number of that booth's reviews whose status is `INITIATED`. A season program's `eligible_official_count` is the number of its season records whose `postseason_eligible` is true.
+
+Three consistency rules apply to every cascade in this document. First, **every row a cascade touches is a mutation of that row**: its `updated_at` is refreshed and its `version` increases by 1, exactly as if it had been written directly. Second, **cascades are deterministic in order**: whenever a cascade acts on a set of sibling rows — the assignments voided by a suspension, the grades finalized by a game, the season records recomputed by the postseason lock, the discipline actions cleared by an overturned appeal — those rows are processed in `created_at` ascending order. Third, **cascades run to completion within the triggering request**: there is no deferred settlement, no background sweep and no eventual consistency. When the request returns, every derived value reachable from the write is already correct.
+
+### 2.11. Identifier Resolution and Sub-Resource Paths
+
+Most relationships in this system are discovered by filtering a flat collection: an official's assignments, a game's grades, an appeal's parent grade, an official's discipline history and an official's season record are all reached by listing the relevant collection with the appropriate identifier supplied as a query filter. No business resource is addressed more than one level deep.
+
+Only the two append-only evidence logs are exposed as sub-resources beneath their owner, because each is owned by exactly one parent: field evaluation reports live beneath their advancement application, and training records live beneath their official. For those paths the server validates identifiers strictly left to right. A request for the evaluation reports of a non-existent application reports `ERR_APPLICATION_NOT_FOUND` before any child lookup is attempted; a request to record a training result for a non-existent official reports `ERR_OFFICIAL_NOT_FOUND` first. The same left-to-right discipline governs body identifiers once the path has resolved, in the order the endpoint declares them.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Configuring a Season and the Governing Thresholds
+
+Everything begins with an `OfficiatingDirector` standing up a **season program** for one officiating year. The director supplies a `season_year`, which must be an integer between 1900 and 2999 inclusive and must be unique across all season programs — two programs cannot govern the same year. The program is born with `status` equal to `CONFIGURING` and `eligible_official_count` at 0, and it stays private to the department until the director opens it. Opening a program is legal only while it is `CONFIGURING`, and it moves `CONFIGURING → OPEN`, bumping the program's `version`. From that moment the whole department may write beneath it, under the gate described in §2.5.
+
+Creation is the department's single opportunity to tune the season, because every threshold below is an optional input on the create call and each has a league-standard default that applies when the field is omitted. Together they are the constants the rest of this document refers to by name.
+
+Two thresholds govern **accuracy eligibility**. `accuracy_eligibility_threshold` is the minimum accuracy percentage an official must reach, compared inclusively, and defaults to 95.00; it must lie between 0.00 and 100.00 with two decimals. `min_graded_plays_for_eligibility` is the minimum number of graded plays an official must have accumulated, again compared inclusively, and defaults to 3; it may not be negative. The two are conjunctive, which is what stops an official with a single flawless play from being ranked above a colleague with a full season of work.
+
+Two thresholds govern **appeals**. `appeal_credits_per_official` is the season quota of grade appeals granted to each official, defaulting to 3 and never negative. `appeal_window_hours` is the number of hours after a grade is posted during which an appeal may still be filed; it defaults to 72 — three full days — and must be strictly greater than zero.
+
+Two thresholds govern the **replay center**. `replay_decision_limit_seconds` is the number of seconds a replay official has between the opening of a decision window and the recording of a decision; it defaults to 120 — two minutes — and must be strictly positive. `reviewable_categories` is the set of play categories the replay center is permitted to open a review for. It defaults to `SCORING_PLAY`, `TURNOVER` and `PLAYER_SAFETY`, and any supplied value must be a non-empty subset of `SCORING_PLAY`, `TURNOVER`, `PLAYER_SAFETY` and `GAME_ADMIN`. A league that has not yet authorized administrative reviews simply leaves `GAME_ADMIN` out, and the replay center cannot open one.
+
+Four thresholds govern **crewing**. `max_team_exposures_per_season` caps how many non-released assignments a single official may hold against any one team code; it defaults to 2 and must be strictly positive. `min_rest_hours_between_games` is the rest period appended to an official's occupancy window after a game ends, defaulting to 96 hours — four days — and never negative. `travel_lead_hours` is the travel allowance prepended to that window before kickoff, defaulting to 24 hours — one day — and never negative. `crew_size_required` is the number of confirmed assignments a game needs before its crew counts as fully staffed; it defaults to 2 and must be strictly positive.
+
+The remaining four thresholds govern **development**. `max_application_returns` is how many committee returns an advancement application may absorb before the next return terminates it in denial; it defaults to 2 and may not be negative. `physical_test_min_score` is the minimum physical-test score that counts as a pass, compared inclusively, defaulting to 70.00. `exam_min_score` is the minimum rules-exam score that counts as a pass, again compared inclusively, defaulting to 80.00; both score minimums lie between 0.00 and 100.00 with two decimals. `clinic_attendance_required` is the number of rules-clinic attendances an official needs in order to avoid carrying a training deficiency; it defaults to 1 and may not be negative.
+
+A season program's `eligible_official_count` is never supplied by a client. It stays at 0 until the postseason lock recomputes it, at which point it becomes the number of that program's season records whose postseason eligibility flag is true.
+
+### 3.2. Recruiting Officials, Clinics and Preseason Clearance
+
+An `OfficiatingDirector` registers each official into an open season program. The registration payload names the `season_program_id` the official is carried under, a `full_name` between 1 and 120 characters that may not be blank, the on-field `position` the official works — one of `REFEREE`, `UMPIRE` or `DOWN_JUDGE` — a `seasons_experience` count of completed seasons at any level which may not be negative, and a `home_market_code` of exactly three uppercase letters identifying the market the official travels from. Two further inputs are optional. `tier` is the official's pipeline level, one of `TIER_3`, `TIER_2` or `TIER_1`, defaulting to `TIER_3` for a new recruit from the lower levels. `affiliated_team_code` declares the team the official has a conflict of interest with, either null — the default — or exactly three uppercase letters.
+
+A newly registered official enters at `status` `CANDIDATE`, with `preseason_cleared` false and `open_assignment_count` at 0, and with `appeal_credits_remaining` seeded from the program's `appeal_credits_per_official`. Registration also opens that official's **season record** in the same breath: a row carrying the official's `official_id` and the `season_program_id`, with `graded_play_count` 0, `weighted_error_points` 0.00, `accuracy_index` 100.00, `accuracy_variant` `PROVISIONAL`, `accuracy_eligible` false, `postseason_eligible` false, `availability_component` 0.00, `retention_score` 0.00 and `retention_recommendation` `DEVELOP`. That record is not returned by the registration response; it is discovered by listing season records filtered by official or by season program.
+
+A `TrainingCoordinator` owns everything that happens next. Each result the coordinator files against an official becomes an immutable **training record** naming the `official_id` it belongs to, a `record_type` of `RULES_CLINIC`, `PHYSICAL_TEST` or `RULES_EXAM`, a `session_code` between 1 and 40 non-blank characters identifying the clinic or testing session, and — for the two scored programs — a `score` between 0.00 and 100.00 with two decimals. A clinic attendance carries no score at all: `score` must be omitted or null on a `RULES_CLINIC` record.
+
+The server derives the record's `passed` flag as it is written. A `RULES_CLINIC` record ignores `score` entirely and always stores `passed` true — attendance is the whole point. A `PHYSICAL_TEST` record passes when its `score` is greater than or equal to the program's `physical_test_min_score`, and a `RULES_EXAM` record passes when its `score` is greater than or equal to the program's `exam_min_score`; in both cases a score sitting exactly on the minimum passes.
+
+**Departmental membership and field readiness are deliberately decoupled**, and this is one of the most consequential rules in the system. Storing a passed rules exam for an official whose `status` is `CANDIDATE` transitions that official `CANDIDATE → ACTIVE` and bumps the official's `version` — passing the rulebook exam is what makes someone a member of the officiating department. Field readiness is a separate derivation: `preseason_cleared` becomes true only when the official holds both a passed `PHYSICAL_TEST` record and a passed `RULES_EXAM` record. An official who has passed the exam but not yet the physical test is therefore `ACTIVE` and still un-cleared, and any attempt to crew them is rejected with `ERR_PRESEASON_NOT_CLEARED`. Every filed training record re-derives `preseason_cleared`; filing a further record for an official who is already `ACTIVE` leaves `status` untouched and only refreshes the clearance derivation.
+
+Clinic attendance sits outside clearance on purpose. An official's **training deficiency count** is the sum of two shortfalls. The clinic shortfall is the program's `clinic_attendance_required` minus the number of that official's `RULES_CLINIC` records, with any negative result treated as zero — clinic attendances are counted regardless of score, since they carry none. The physical shortfall is zero when the official has at least one `PHYSICAL_TEST` record whose `passed` is true, and one otherwise. The count is a non-negative integer, and it is refreshed whenever a training record is filed and again whenever a retention score is computed. Because clearance ignores clinics, an official can be fully cleared and assignable all season while still carrying a clinic deficiency that costs them retention points at the very end.
+
+An official's training history is readable only by listing that official's training records, optionally filtered by `record_type` or by `passed`. Officials themselves are listable with filters on `season_program_id`, `status`, `position`, `tier` and `affiliated_team_code`.
+
+### 3.3. The Advancement Pipeline and the Committee Return Loop
+
+An `Official` who believes they are ready for the next level files an **advancement application** naming their own `official_id` and the `target_tier` they are asking to be promoted into, which must be `TIER_2` or `TIER_1`. The application is created with `status` `SUBMITTED`, `return_count` at 0 and `evaluation_average` null, and it collects a `decision_note` only later, when a return or a decision records one.
+
+Screening is a `FieldEvaluator`'s job and moves the application `SUBMITTED → SCREENED`, stamping `screened_at` with the logical clock. Screening is where the department's advancement criteria bite, and all five must hold simultaneously. The applicant's `status` must be `ACTIVE`; their `preseason_cleared` must be true; their current `tier` must be exactly one step below the requested `target_tier`, meaning `TIER_3` may apply for `TIER_2` and `TIER_2` may apply for `TIER_1` while a `TIER_3` official may not reach directly for `TIER_1`; their `seasons_experience` must be at least 5 for a `TIER_2` application and at least 8 for a `TIER_1` application; and their season record's `accuracy_index` must be at least 90.00. Every comparison is inclusive, so an official sitting exactly on a floor qualifies, and because an official with no graded plays reads an `accuracy_index` of exactly 100.00, a newly cleared official passes the accuracy gate on an empty grading history. Any failure among the five is reported as `ERR_ADVANCEMENT_CRITERIA_NOT_MET`.
+
+Once an application is screened, the same `FieldEvaluator` role files **field evaluation reports** against it. Each report is an immutable observation carrying the `application_id` it belongs to, the `evaluator_user_id` taken from the filer's `X-User-ID`, and three sub-scores between 0.00 and 100.00 with two decimals: `mechanics_score` for positioning and mechanics, `rules_score` for rules application, and `presence_score` for game management and presence. The report's `composite_score` is derived as the weighted sum of the three — 40 percent of the mechanics score plus 35 percent of the rules score plus 25 percent of the presence score — rounded half up to two decimal places. A report scoring 80.00 on mechanics, 76.00 on rules and 70.00 on presence therefore composites to 32.00 plus 26.60 plus 17.50, which is 76.10.
+
+Filing a report also refreshes the parent application's `evaluation_average`, which is the mean of the already-rounded `composite_score` values of every report on that application, taken in `created_at` ascending order and rounded half up to two decimal places. No report is ever excluded from that average — including reports filed before a committee return. Two reports composited at 76.10 and 81.60 average to 78.85.
+
+Forwarding the application to the committee is again a `FieldEvaluator` action, and it is legal from either `SCREENED` or `RETURNED_FOR_TAPE`, moving the application to `COMMITTEE_REVIEW`. Two conditions gate it. The application must carry at least two field evaluation reports plus one additional report for each return it has absorbed — that is, the report count must be at least 2 plus the current `return_count`, which forces at least one fresh observation per return. And `evaluation_average` must be at least 75.00. Failing either condition is reported as `ERR_EVALUATION_REQUIREMENTS_NOT_MET`. An application whose two reports composite to 76.10 and 71.10 averages 73.60 and is refused on that ground.
+
+The committee belongs to the `OfficiatingDirector`, who has two instruments. The first returns the application for more tape, and it carries a required `note`. Its behaviour depends on how many returns the application has already absorbed. While `return_count` is strictly less than the program's `max_application_returns`, the return increments `return_count` by 1, sets `decision_note` to the supplied `note`, and moves the application `COMMITTEE_REVIEW → RETURNED_FOR_TAPE`; the evaluator may then file the extra report the raised bar now demands and forward it again, which is the loop `COMMITTEE_REVIEW → RETURNED_FOR_TAPE → COMMITTEE_REVIEW`. When `return_count` has already reached `max_application_returns`, the very same call does *not* fail. It terminates the loop instead: `return_count` is left unchanged, `decision_note` is set from the supplied `note`, and the application moves `COMMITTEE_REVIEW → DENIED`. An application at the cap is auto-denied by the next return attempt rather than being refused one.
+
+The second instrument is the committee's decision, which carries a required `outcome` of either `APPROVED` or `DENIED` — any other value is `ERR_INVALID_REQUEST` — and an optional `note`. Both outcomes are legal only from `COMMITTEE_REVIEW`, both set `decision_note` from `note` when one is supplied, and both bump the application's `version`. On `APPROVED` the application moves `COMMITTEE_REVIEW → APPROVED` and the applicant's `tier` is raised to the application's `target_tier`, bumping the official's `version` by 1 — this is the only way an official's tier ever moves. On `DENIED` the application moves `COMMITTEE_REVIEW → DENIED` and the official's `tier` is left exactly as it was. `APPROVED` and `DENIED` are both terminal; nothing further can be done with the application.
+
+Applications are readable individually — including their `return_count` and `evaluation_average` — and listable with filters on `official_id`, `status` and `target_tier`. The evaluation reports beneath an application are listable in their own right.
+
+### 3.4. Scheduling Games and Building Crews
+
+An `OfficiatingDirector` schedules each **game** under an open season program, supplying the `season_program_id`, a `home_team_code` and an `away_team_code` — each exactly three uppercase letters, and the two must differ, since a request naming the same code twice is rejected with `ERR_INVALID_REQUEST` — a `venue_market_code` of exactly three uppercase letters naming the market the game is played in, and a `kickoff_utc` instant. A scheduled game starts at `status` `SCHEDULED`, `crew_posture` `UNDERSTAFFED`, `confirmed_crew_count` 0, `crew_strength_index` 0.00 and `crew_strength_variant` `PROJECTED`. Its lifecycle is a strict linear pipeline: `SCHEDULED → IN_PROGRESS → PLAYED → FINALIZED`, with `FINALIZED` terminal. Games are readable individually and listable with filters on `season_program_id`, `status`, `crew_posture`, `home_team_code` and `away_team_code`.
+
+Crew building belongs entirely to the `CrewScheduler`. Proposing an official for a game requires the target `game_id`, the `official_id` being proposed, the crew `position` being filled — one of `REFEREE`, `UMPIRE` or `DOWN_JUDGE` — and the pinned `expected_game_version` described in §2.8. A proposal is only legal while the game is `SCHEDULED`; on a game that has already kicked off it is rejected with `ERR_GAME_STATE_INVALID`.
+
+Before the row is written, the server computes the official's **occupancy window** for this game, and stores it on the assignment. `occupied_from_utc` is the game's `kickoff_utc` moved earlier by the program's `travel_lead_hours` — with the default of 24 hours, a 17:00 kickoff on 13 September 2026 opens its window at 17:00 on 12 September. `occupied_until_utc` is the game's `kickoff_utc` moved later by four hours of game duration and then further by the program's `min_rest_hours_between_games` — with the defaults, the same kickoff yields 21:00 on 13 September plus 96 hours, which is 21:00 on 17 September.
+
+The window is **half-open**: it includes its start instant and excludes its end instant. Two windows conflict when the new window's start is strictly earlier than the existing window's end *and* the existing window's start is strictly earlier than the new window's end. Exact adjacency does not conflict — a second game whose `occupied_from_utc` lands precisely on the first window's `occupied_until_utc` is accepted, while a second game whose window opens even one minute before that instant is rejected with `ERR_OFFICIAL_WINDOW_CONFLICT`. The windows tested against are those of the same official's assignments in `PROPOSED`, `CONFIRMED` or `COMPLETED` status; assignments that have been `WITHDRAWN`, `SUPERSEDED` or `VOIDED` release their window immediately and are never tested.
+
+Once fatigue safety clears, the proposal runs the department's rotation and integrity checks in the order given in §2.9. The official must be `ACTIVE` (`ERR_OFFICIAL_NOT_ACTIVE`) and `preseason_cleared` (`ERR_PRESEASON_NOT_CLEARED`). The official's `affiliated_team_code` must be neither the game's `home_team_code` nor its `away_team_code`, else `ERR_TEAM_CONFLICT_OF_INTEREST`. Then **team rotation exposure** is tested against both of the target game's teams independently. For each of the two team codes, the server counts the official's assignments in `PROPOSED`, `CONFIRMED` or `COMPLETED` status whose game belongs to the same season program and whose game names that team as either home or away side. If that count is greater than or equal to the program's `max_team_exposures_per_season`, the proposal is rejected with `ERR_TEAM_ROTATION_LIMIT`; either of the two teams may trip the cap. The assignment under test is not itself counted, so the cap is on prior exposures: with the default of 2, an official may work exactly two games against a given team and is refused the third.
+
+The last check on the create path concerns the crew slot itself. If a `CONFIRMED` assignment already occupies the requested `position` on that game, the proposal is refused with `ERR_POSITION_ALREADY_CONFIRMED`. If a merely `PROPOSED` assignment occupies it, the incoming proposal wins: the existing assignment moves `PROPOSED → SUPERSEDED`, has its `released_at` stamped with the logical clock, and decrements its official's `open_assignment_count` by 1. Only a proposed assignment may be superseded this way, and `position` is therefore unique per game across the `PROPOSED` and `CONFIRMED` statuses taken together.
+
+The surviving new assignment is written with `status` `PROPOSED` and a null `released_at`, increments the proposed official's `open_assignment_count` by 1, triggers a recomputation of the game's projected crew strength, and bumps the game's `version` by 1. That version bump is exactly why the next proposal needs a fresh `expected_game_version`.
+
+Confirming a proposal is the act that makes a crew member count. It is legal only from `PROPOSED`, only while the game is `SCHEDULED` and the program is `OPEN`, and only when the official is still `ACTIVE` and still `preseason_cleared` — an official who was suspended or who somehow lost clearance between proposal and confirmation is refused with `ERR_OFFICIAL_NOT_ACTIVE` or `ERR_PRESEASON_NOT_CLEARED` respectively. Confirmation moves the assignment `PROPOSED → CONFIRMED`, increments the game's `confirmed_crew_count` by 1, re-derives the game's `crew_posture`, recomputes projected crew strength, and bumps the game's `version` by 1.
+
+**Crew posture** is a pure derivation and never an input. While the game's `status` is `SCHEDULED`, posture is `STAFFED` when `confirmed_crew_count` is greater than or equal to the program's `crew_size_required` and `UNDERSTAFFED` otherwise; because the comparison is inclusive, an over-confirmed crew stays `STAFFED` rather than erroring. Once the game's `status` is anything other than `SCHEDULED`, posture is frozen at `LOCKED`. Only `CONFIRMED` assignments feed `confirmed_crew_count`: a merely proposed official contributes to projected crew strength but never to posture.
+
+**Crew strength** is the department's experience-weighted measure of a crew, and it is computed in two steps. Each included assignment contributes points equal to the lesser of 12 and its official's `seasons_experience`, multiplied by a tier weight of 1.00 for `TIER_1`, 0.80 for `TIER_2` or 0.60 for `TIER_3`, multiplied again by a position weight of 1.30 for `REFEREE`, 1.00 for `UMPIRE` or 0.85 for `DOWN_JUDGE` — where the position weight is read from the *assignment's* `position`, not from the official's registered position — and the product is rounded half up to two decimal places. A referee at `TIER_2` with 14 seasons behind them contributes 12 times 0.80 times 1.30, which is 12.48; an umpire at `TIER_2` with 6 seasons contributes 6 times 0.80 times 1.00, which is 4.80. The game's `crew_strength_index` is then the sum of those already-rounded contributions, taken in `created_at` ascending order, divided by the program's `crew_size_required`, and rounded half up to two decimal places. **The divisor is the required crew size, never the number of included assignments** — an understaffed crew scores proportionally lower rather than averaging its survivors upward. With a required crew of 2, the two contributions above sum to 17.28 and yield an index of 8.64. An empty included set yields exactly 0.00.
+
+The index exists in two variants, and `crew_strength_variant` records which one produced the stored number. The `PROJECTED` variant includes assignments in `PROPOSED` or `CONFIRMED` status, counting a merely proposed official at full weight on the assumption that the slot will hold; it is what every pre-kickoff write recomputes. The `REALIZED` variant includes assignments in `COMPLETED` status only, so anything `WITHDRAWN`, `SUPERSEDED` or `VOIDED` before kickoff contributes nothing; it is computed once, at finalization. In the crew above, if the umpire is voided by a suspension and only the referee reaches `COMPLETED`, the realized index is 12.48 divided by 2, which is 6.24 — not 12.48, because the required crew size stays the divisor.
+
+Withdrawing an assignment is the scheduler's escape hatch, and it accepts an optional `reason`. It is legal from either `PROPOSED` or `CONFIRMED`, and only while the game is still `SCHEDULED`. In both cases the assignment moves to `WITHDRAWN`, its `released_at` is stamped with the logical clock, the official's `open_assignment_count` decrements by 1, the game's projected crew strength is recomputed, and the game's `version` bumps by 1. Withdrawing a **confirmed** assignment additionally walks the posture cascade backwards: the game's `confirmed_crew_count` decrements by 1, which re-derives `crew_posture` from `STAFFED` to `UNDERSTAFFED` as soon as the count falls below `crew_size_required`, and because the crew left `STAFFED` the projected index is recomputed over the assignments that remain in `PROPOSED` or `CONFIRMED`. Withdrawing a merely proposed assignment leaves `confirmed_crew_count` and posture untouched, since a proposal never contributed to either.
+
+An assignment's terminal states are `COMPLETED`, `WITHDRAWN`, `SUPERSEDED` and `VOIDED`. Assignments are readable individually — including their computed `occupied_from_utc` and `occupied_until_utc` — and listable with filters on `game_id`, `official_id`, `status` and `position`, which is the only way to discover an assignment that a cascade voided or superseded behind the scheduler's back.
+
+### 3.5. Game Day: Kickoff, the Replay Center, and the End of Play
+
+Kickoff is an `OfficiatingDirector` action and is legal only from `SCHEDULED`, only while the program is `OPEN`, and only when the game's `crew_posture` is `STAFFED`; a short crew is refused with `ERR_CREW_NOT_STAFFED`. Kickoff advances the game `SCHEDULED → IN_PROGRESS`, freezes `crew_posture` at `LOCKED`, recomputes `crew_strength_index` one last time with the `PROJECTED` variant and writes `crew_strength_variant` as `PROJECTED`, and bumps the game's `version` by 1.
+
+The replay center is department infrastructure that lives outside the season program entirely. An `OfficiatingDirector` registers each booth as a **replay station** with a `station_code` between 1 and 20 characters that must be unique across all booths, an optional `concurrent_capacity` naming how many decision windows the booth may hold open simultaneously — at least 1, defaulting to 1 — and an optional `status` of `ONLINE` or `OFFLINE`, defaulting to `ONLINE`. A booth's `active_review_count` starts at 0 and is thereafter server-derived as the number of that booth's reviews still in `INITIATED` status. Booths are readable individually, including that count.
+
+A `ReplayOfficial` opens a **replay review** against an in-progress game, naming the `game_id`, the `station_id` of the booth that will hold the window, a `play_ref` of between 1 and 40 characters identifying the play under review, and the `category` the play falls under — one of `SCORING_PLAY`, `TURNOVER`, `PLAYER_SAFETY` or `GAME_ADMIN`. Three checks run in the order given in §2.9. The requested `category` must appear in the program's `reviewable_categories`, else `ERR_CATEGORY_NOT_REVIEWABLE`. The booth's `status` must be `ONLINE`, else `ERR_REPLAY_STATION_OFFLINE`. And the booth must have spare concurrent capacity, else `ERR_REPLAY_STATION_AT_CAPACITY`.
+
+Booth capacity is measured over decision windows, and the interval arithmetic here is **deliberately different from the assignment occupancy rule**. A review's `window_open_utc` is the logical clock at the moment the review is opened, and its `window_close_utc` is that instant moved later by the program's `replay_decision_limit_seconds`. Both endpoints are *inclusive*: two review windows conflict when the new window's open instant is at or before the existing window's close instant and the existing window's open instant is at or before the new window's close instant. Touching endpoints therefore *do* conflict here. The server counts the booth's reviews that are still `INITIATED` and whose windows conflict with the new one by that inclusive test, and refuses the new review when that count is greater than or equal to the booth's `concurrent_capacity`. This is an aggregate capacity test, not pairwise exclusion: on a booth with a capacity of 2, a second overlapping review is accepted because the overlapping count of 1 is below 2, and only a third is refused. Concretely, a review opened at 18:00:00 on a two-minute limit closes at 18:02:00; on a capacity-1 booth a second review opened at exactly 18:02:00 touches that close instant and is refused, while the same review opened at 18:02:01 succeeds. Reviews that reach `DECIDED` or `EXPIRED` release their capacity immediately.
+
+An accepted review is written with `status` `INITIATED`, a null `decision`, a null `elapsed_seconds`, and its computed `window_open_utc` and `window_close_utc`. Opening it increments the booth's `active_review_count` by 1 and bumps the booth's `version` by 1.
+
+Recording the outcome is also a `ReplayOfficial` action and carries a required `decision` of `STANDS`, `CONFIRMED` or `REVERSED`. The server measures `elapsed_seconds` as the whole seconds from the review's `window_open_utc` to the current logical clock, and the boundary is **inclusive**: when `elapsed_seconds` is less than or equal to the program's `replay_decision_limit_seconds` the review moves `INITIATED → DECIDED` and stores the supplied `decision`; when it exceeds that limit the review moves `INITIATED → EXPIRED`, the supplied `decision` is discarded and `decision` is stored as null. With the default limit, exactly 120 elapsed seconds still decides — storing `elapsed_seconds` 120 — while 121 elapsed seconds expires with `elapsed_seconds` 121. **A late submission is not an error.** It returns 200 OK with the review recorded as `EXPIRED`, because the department wants the timing failure on the record rather than a lost request. Either outcome stores `elapsed_seconds`, decrements the booth's `active_review_count` by 1 while bumping the booth's `version` by 1, and bumps the review's own `version` by 1. Both `DECIDED` and `EXPIRED` are terminal; a second attempt on an already-settled review is refused with `ERR_REVIEW_STATE_INVALID`. Reviews are readable individually and listable with filters on `game_id`, `station_id`, `status` and `category`.
+
+Ending play is an `OfficiatingDirector` action legal only from `IN_PROGRESS`, and it moves the game `IN_PROGRESS → PLAYED` while sweeping two collections. Every `CONFIRMED` assignment on the game moves `CONFIRMED → COMPLETED` in `created_at` ascending order, and each affected official's `open_assignment_count` decrements by 1. Every review of that game still in `INITIATED` status moves `INITIATED → EXPIRED` with `decision` set to null and `elapsed_seconds` set to the whole seconds from that review's `window_open_utc` to the current logical clock, and each such booth's `active_review_count` decrements by 1 while its `version` bumps. The game's `version` then bumps by 1. Note that the game's `crew_posture` stays `LOCKED` throughout — posture is frozen from kickoff onward and is never re-derived again.
+
+### 3.6. Grading Plays and the Season Accuracy Record
+
+Grading is a `GradingSupervisor`'s work, and it happens after the whistle. A **play grade** names the `game_id` the play occurred in, the `official_id` whose call is being graded, a `play_ref` of between 1 and 40 characters carrying the league's identifier for that play, the `call_category` the call falls under — one of `HOLDING`, `PASS_INTERFERENCE`, `ROUGHING_PASSER` or `FALSE_START` — the `grade_code` recording the verdict against the rulebook standard — one of `CORRECT`, `INCORRECT_CALL`, `MISSED_CALL` or `INADVERTENT_WHISTLE` — and the `impact` band describing the call's competitive weight, one of `LOW`, `MEDIUM`, `HIGH` or `GAME_CRITICAL`.
+
+Two integrity rules guard the create. The triple of `game_id`, `official_id` and `play_ref` must be unique: a repeat is refused with `ERR_DUPLICATE_PLAY_GRADE`, whatever state the earlier grade has since reached. And the graded official must actually have worked the game — they must hold an assignment on that game whose status is `CONFIRMED` or `COMPLETED`, else the grade is refused with `ERR_ASSIGNMENT_STATE_INVALID`.
+
+A new grade records `graded_by_user_id` from the authoring supervisor's `X-User-ID`, and is written with `grade_status` `DRAFT`, `appeal_state` `NOT_APPEALED` and a null `posted_at`. It also computes its `error_points` immediately, even though a draft grade contributes to nothing yet.
+
+**Per-play error points** are the product of three factors, rounded half up to two decimal places. The first factor is a grade base: 0.00 for `CORRECT`, 1.00 for `INCORRECT_CALL`, 1.50 for `MISSED_CALL` and 2.00 for `INADVERTENT_WHISTLE`. The second is an impact multiplier: 0.50 for `LOW`, 1.00 for `MEDIUM`, 1.75 for `HIGH` and 2.50 for `GAME_CRITICAL`. The third is a position factor read from the graded **official's registered `position`**: 1.20 for a `REFEREE`, 1.00 for an `UMPIRE` and 0.90 for a `DOWN_JUDGE`. The rounding happens once, on the product, at the moment the play is written — this is the only legal rounding point for the quantity. A missed call of `HIGH` impact by an umpire therefore scores 1.50 times 1.75 times 1.00, which is 2.625 and rounds to 2.63; the same call by a referee scores 1.50 times 1.75 times 1.20, which is exactly 3.15; an incorrect call of `MEDIUM` impact by a referee scores 1.00 times 1.00 times 1.20, which is 1.20; a missed call of `LOW` impact scores 0.75 for an umpire and 0.90 for a referee. Because the grade base for `CORRECT` is 0.00, a correct call accrues no error points at all regardless of impact or position — even a `GAME_CRITICAL` correct call by a referee scores 0.00. Error points are recomputed whenever a grade's `grade_code` is rewritten by an appeal.
+
+Posting the grade is the act that makes it real. Posting is legal only from `grade_status` `DRAFT`, only while the program is `OPEN`, and only once the game has reached `PLAYED` or `FINALIZED` — a grade cannot be posted on a game still in progress. Posting moves the grade `DRAFT → POSTED` and stamps `posted_at` with the logical clock, which is the instant the appeal window starts running. It then recomputes the graded official's season record with the provisional accuracy variant, refreshing `graded_play_count`, `weighted_error_points`, `accuracy_index`, `accuracy_eligible` and `postseason_eligible`, and bumps the grade's `version` by 1. A grade may sit in `DRAFT` indefinitely without burning any of the official's appeal time, because it is `posted_at` and never `created_at` that starts the window.
+
+An official's **season aggregate** is built from the grades in the currently active included set, always taken in `created_at` ascending order and never in identifier order. `graded_play_count` is the number of grades in that set. `weighted_error_points` is the running sum of their per-play `error_points` — values that were already rounded when each play was written — and **no further rounding is applied to the total**. Round-then-sum is the contract: two missed calls of `HIGH` impact by an umpire give 2.63 plus 2.63, which is 5.26, where summing the raw products first and rounding afterwards would wrongly give 5.25. Three plays graded correct, correct and a low-impact missed call by an umpire give 0.00 plus 0.00 plus 0.75, which is 0.75, with `graded_play_count` 3.
+
+`accuracy_index` follows directly. An official with no plays in the included set reads exactly 100.00. Otherwise the index is 100.00 minus the quantity obtained by dividing `weighted_error_points` by `graded_play_count` and multiplying the quotient by an error scale of 20.00, with the final result rounded half up to two decimal places. `accuracy_eligible` is then true when `accuracy_index` is greater than or equal to the program's `accuracy_eligibility_threshold` **and** `graded_play_count` is greater than or equal to the program's `min_graded_plays_for_eligibility`. Both comparisons are inclusive, which is why an index landing exactly on 95.00 under the default threshold qualifies while 94.00 does not — an umpire with three final plays scoring 0.00, 0.00 and 0.75 reads 100.00 minus 5.00, exactly 95.00, and is eligible, whereas a referee with one low-impact missed call worth 0.90 across three plays reads 100.00 minus 6.00, which is 94.00, and is not. Note also that a zero-play official reading exactly 100.00 is *not* accuracy eligible under the defaults, because the play-count floor of 3 fails.
+
+The included set is where the two **accuracy variants** differ, and `accuracy_variant` records which variant produced the stored numbers. The `PROVISIONAL` variant is used by every in-season recompute — posting a grade, deciding an appeal, finalizing a game — and includes every grade whose `grade_status` is `POSTED` or `FINAL`, using each grade's current `grade_code` whatever an appeal did to it. Under this variant a grade whose appeal was overturned stays in both the numerator and the denominator, contributing 0.00 error points, which pulls the average toward 100.00 while still counting the play. The `FINAL` variant is used only by the postseason lock and includes grades whose `grade_status` is `FINAL` and nothing else — grades left `POSTED` on a game that never finalized, and grades frozen at `POSTED` by a pending appeal, drop out entirely. Under the `FINAL` variant a grade whose appeal ended in `OVERTURNED` is **excluded from both numerator and denominator**, on the principle that for retention purposes the play never happened; a grade whose appeal ended in `MODIFIED` is included, using the replacement grade code the adjudicator supplied.
+
+The difference is material. Consider an umpire with three final plays graded correct, correct and a low-impact missed call worth 0.75, plus one posted play on a game that never finalized, a high-impact missed call worth 2.63. The provisional view has four plays and 3.38 weighted error points: 3.38 divided by 4 is 0.845, multiplied by 20.00 is 16.90, giving an index of 83.10. The final view has three plays and 0.75 weighted error points: 0.75 divided by 3 is 0.25, multiplied by 20.00 is 5.00, giving an index of 95.00.
+
+**Postseason eligibility** is a four-part conjunction re-derived on every write that can move any of its parts. It is true when the official is `accuracy_eligible`, *and* the official's `status` is `ACTIVE`, *and* the official's `preseason_cleared` is true, *and* the official has no discipline action whose status is `OPENED`, `REMEDIATION_ASSIGNED`, `REASSESSED` or `ESCALATED`. A single open discipline action is enough to make an otherwise perfect official ineligible.
+
+Play grades are readable individually — including `error_points`, `grade_status` and `appeal_state` — and listable with filters on `game_id`, `official_id`, `grade_status`, `appeal_state` and `grade_code`. Season records are readable individually and listable with filters on `official_id`, `season_program_id`, `accuracy_variant`, `accuracy_eligible`, `postseason_eligible` and `retention_recommendation`.
+
+A play grade carries **two independent state dimensions on the same row**. `grade_status` tracks authoring and publication through `DRAFT → POSTED → FINAL`, with `FINAL` terminal. `appeal_state` tracks appeal posture through `NOT_APPEALED`, `APPEAL_PENDING` and `APPEAL_RESOLVED`, with `APPEAL_RESOLVED` terminal, and it advances entirely independently of `grade_status`. There is exactly one coupling between the two, and it runs in one direction only: a grade may move `POSTED → FINAL` only while its `appeal_state` is not `APPEAL_PENDING`. A posted grade sitting under a pending appeal simply stays `POSTED` while everything else about its game finalizes around it.
+
+### 3.7. Appeals: Filing, Adjudication, and the Accuracy-Recovery Cascade
+
+An `Official` who disputes a grade written against them files a **grade appeal** naming the `play_grade_id` under appeal and a `basis_note` of between 1 and 500 non-blank characters stating their case. Four gates stand in front of that create, and they are evaluated in the precedence order of §2.9. The filer must own the grade — `X-User-ID` must equal the grade's `official_id`, else `ERR_NOT_GRADE_OWNER`. The grade must be in `grade_status` `POSTED` with `appeal_state` `NOT_APPEALED`, else `ERR_GRADE_STATE_INVALID`; in particular a grade still in `DRAFT` reports the state error and never a window error. The appeal must be inside its window. And the official must have an appeal credit left.
+
+The **appeal window** runs from the grade's `posted_at` forward by the program's `appeal_window_hours`, and its boundary is inclusive: an appeal filed at exactly the deadline instant is accepted, and only an appeal filed strictly after it is refused with `ERR_APPEAL_WINDOW_CLOSED`. With the default of 72 hours, a grade posted at noon on Monday may be appealed up to and including noon on Thursday.
+
+The **appeal credit ledger** is a conserved quantity. Each official's `appeal_credits_remaining` is seeded at registration from the program's `appeal_credits_per_official`, and at every instant thereafter the sum of `appeal_credits_remaining` and the number of that official's appeals whose status is `SUBMITTED`, `UNDER_REVIEW`, `UPHELD`, `OVERTURNED` or `MODIFIED` equals `appeal_credits_per_official` exactly. Filing an appeal debits one credit; an official whose `appeal_credits_remaining` is already 0 is refused with `ERR_APPEAL_CREDITS_EXHAUSTED`. Withdrawing an appeal credits one back, because a withdrawn appeal leaves the consuming set. A **decided** appeal — upheld, overturned or modified alike — consumes its credit permanently; only a withdrawal ever refunds.
+
+A successful filing writes the appeal with `status` `SUBMITTED` and `submitted_at` stamped from the logical clock, sets the parent grade's `appeal_state` from `NOT_APPEALED` to `APPEAL_PENDING` while bumping the grade's `version` by 1 and leaving `grade_status` untouched, and decrements the official's `appeal_credits_remaining` by 1 while bumping the official's `version` by 1.
+
+Adjudication is a `GradingSupervisor`'s job, and the segregation-of-duties rule is absolute on both of its steps: a supervisor whose `X-User-ID` equals the grade's `graded_by_user_id` may neither take the appeal under review nor decide it, and either attempt is refused with `ERR_SEGREGATION_OF_DUTIES`. Taking the appeal under review is legal only from `SUBMITTED`, only while the program is `OPEN`, and moves the appeal `SUBMITTED → UNDER_REVIEW`.
+
+The decision is legal only from `UNDER_REVIEW` and carries a required `outcome` of `UPHELD`, `OVERTURNED` or `MODIFIED`, an optional `decision_note`, and — for a `MODIFIED` outcome — a `revised_grade_code`. The `revised_grade_code` must be present and must differ from the grade's current `grade_code`, else the request is malformed and is rejected with `ERR_INVALID_REQUEST`; it must itself be one of `CORRECT`, `INCORRECT_CALL`, `MISSED_CALL` or `INADVERTENT_WHISTLE`, and it stays null on the other two outcomes. All three outcomes record `decided_by_user_id` from the adjudicating supervisor's `X-User-ID`, record `decision_note` from the supplied note, set the appeal's `status` to the outcome, set the parent grade's `appeal_state` to `APPEAL_RESOLVED`, bump the grade's `version` and the appeal's `version`, and recompute the graded official's season record with the provisional variant. All three are terminal, alongside `WITHDRAWN`.
+
+Where they differ is in what happens to the grade itself. **`UPHELD`** leaves `grade_code` and `error_points` exactly as they were; the season-record recompute still runs, and simply produces the same numbers. **`MODIFIED`** rewrites `grade_code` to the supplied `revised_grade_code` and recomputes `error_points` from the new code, which moves the official's `weighted_error_points` and `accuracy_index`. **`OVERTURNED`** rewrites `grade_code` to `CORRECT`, which recomputes `error_points` to 0.00 — since the grade base for a correct call is 0.00 — and then walks the department's accuracy-recovery cascade in full.
+
+That cascade has five hops, and every one of them must land. First, the grade's `grade_code` becomes `CORRECT`, its `appeal_state` becomes `APPEAL_RESOLVED`, and its `error_points` becomes 0.00. Second, because those error points changed, the graded official's season record has its `weighted_error_points` and `accuracy_index` recomputed with the provisional variant — the play stays in the denominator, so a referee whose three plays previously read 100.00 minus 6.00, or 92.00, on the strength of one incorrect medium-impact call worth 1.20 now reads 100.00 with `graded_play_count` still 3. Third, because the index moved, `accuracy_eligible` is re-derived. Fourth, if and only if `accuracy_eligible` flips from false to true, every discipline action against that official whose `reason_category` is `PERFORMANCE` and whose status is `OPENED`, `REMEDIATION_ASSIGNED` or `REASSESSED` is transitioned to `CLEARED`, in `created_at` ascending order. Fifth, because those actions have left the non-terminal set, the official's `status` moves `PROBATION → ACTIVE` provided no discipline action of theirs remains in `OPENED`, `REMEDIATION_ASSIGNED`, `REASSESSED` or `ESCALATED`, and the season record's `postseason_eligible` is re-derived — typically to true, since all four of its conjuncts have now been restored. An overturned appeal is thus the one route by which an official recovers from performance discipline without a director lifting a finger.
+
+Withdrawal belongs to the appellant. An `Official` may withdraw their own appeal from either `SUBMITTED` or `UNDER_REVIEW` — ownership is checked against the grade's `official_id` and a mismatch is `ERR_NOT_GRADE_OWNER` — and withdrawal moves the appeal to `WITHDRAWN`, returns the parent grade's `appeal_state` from `APPEAL_PENDING` to `NOT_APPEALED` while bumping the grade's `version`, and increments the official's `appeal_credits_remaining` by 1 while bumping the official's `version`. This is a genuine cycle inside the appeal dimension — `NOT_APPEALED → APPEAL_PENDING → NOT_APPEALED` — and it may repeat as long as the official still has credits and the appeal window is still open. It is also the only way to unfreeze a grade that a pending appeal is holding at `POSTED`. Appeals are readable individually, including their decision fields, and listable with filters on `play_grade_id` and `status`.
+
+### 3.8. Discipline, Suspension Cascades and Remediation
+
+Discipline is the `OfficiatingDirector`'s exclusive instrument. Opening a **discipline action** names the `official_id` it is opened against, a `reason_category` of `PERFORMANCE`, `CONDUCT` or `ATTENDANCE`, a `severity` of `WARNING`, `REMEDIATION` or `SUSPENSION`, the pinned `expected_official_version` described in §2.8, and — for a suspension only — a `suspension_games` count of games withheld, which must be an integer of at least 1. A `SUSPENSION` submitted without `suspension_games`, or with a value below 1, is rejected with `ERR_INVALID_REQUEST`; conversely `suspension_games` must be null for a `WARNING` and for a `REMEDIATION`.
+
+Opening an action first supersedes any prior discipline the official is already carrying: an existing action of theirs whose status is `OPENED`, `REMEDIATION_ASSIGNED` or `REASSESSED` is moved to `SUPERSEDED` and has its `version` bumped by 1. That displacement is legitimate and is precisely why the write is version-pinned — nothing else would stop a director from wiping out discipline they never read. The new action is written with `status` `OPENED`, `remediation_cycle_count` 0, and null `remediation_plan` and `resolution_note`.
+
+What the action does to the official depends on its severity, and the severity bands overlap with the reason category in one specific place. A `SUSPENSION` moves the official's `status` to `SUSPENDED`, and it is legal from either `ACTIVE` or `PROBATION`. A `REMEDIATION` of any reason category moves an `ACTIVE` official to `PROBATION`. A `WARNING` moves an `ACTIVE` official to `PROBATION` **only when its `reason_category` is `PERFORMANCE`**; a warning for `CONDUCT` or `ATTENDANCE` leaves the official's `status` alone. In every case the official's `version` bumps by 1 and their season record's `postseason_eligible` is re-derived — which, because an `OPENED` action is in the non-terminal set, turns it false immediately.
+
+A suspension additionally walks the **void cascade**. Every assignment of the suspended official whose status is `PROPOSED` or `CONFIRMED`, and whose game is still `SCHEDULED` or `IN_PROGRESS`, is transitioned to `VOIDED` in `created_at` ascending order with `released_at` stamped from the logical clock. Each void decrements that official's `open_assignment_count` by 1. Each void of a previously `CONFIRMED` assignment additionally decrements its game's `confirmed_crew_count` by 1 and recomputes that game's `crew_strength_index` with the `PROJECTED` variant — and `crew_posture` is re-derived only while the game is still `SCHEDULED`, falling from `STAFFED` to `UNDERSTAFFED` when the count drops below `crew_size_required`. On a game already `IN_PROGRESS`, posture stays `LOCKED` even though the crew has just lost a member, because posture froze at kickoff.
+
+Remediation is assigned — and re-assigned — by the director, and each assignment carries a required `remediation_plan`. It is legal from `OPENED` or from `REASSESSED`, and it is capped: an action whose `remediation_cycle_count` has already reached 2 is refused a further cycle with `ERR_REMEDIATION_CYCLE_LIMIT`. A permitted assignment moves the action to `REMEDIATION_ASSIGNED`, sets `remediation_plan` from the supplied text, increments `remediation_cycle_count` by 1, and bumps the action's `version` by 1. Together with the reassessment outcome below, this forms the loop `REMEDIATION_ASSIGNED → REASSESSED → REMEDIATION_ASSIGNED`, which may run until the second assignment has been made and no further.
+
+Resolving an action carries a required `outcome` of `CLEARED`, `REASSESSED` or `ESCALATED` and an optional `note`, and any supplied note is recorded as the action's `resolution_note`. Each outcome has its own legal origins.
+
+`REASSESSED` is legal **only** from `REMEDIATION_ASSIGNED`, and it moves the action `REMEDIATION_ASSIGNED → REASSESSED` — the director has looked at the remediation work and wants another cycle. It changes nothing about the official.
+
+`CLEARED` is legal from `OPENED`, `REMEDIATION_ASSIGNED` or `REASSESSED`, and it moves the action to the terminal `CLEARED` state. It then attempts to restore the official: an official on `PROBATION` moves `PROBATION → ACTIVE`, and an official who is `SUSPENDED` moves `SUSPENDED → ACTIVE`, in both cases only when no other discipline action of that official remains in `OPENED`, `REMEDIATION_ASSIGNED`, `REASSESSED` or `ESCALATED`. Where the restoration lands, the official's `version` bumps by 1 and their season record's `postseason_eligible` is re-derived. Note what restoration does *not* do: **assignments voided by the suspension are never brought back**. The official may be crewed onto future games, and nothing more.
+
+`ESCALATED` is legal from `OPENED`, `REMEDIATION_ASSIGNED` or `REASSESSED`, and it is the end of the road: the action moves to the terminal `ESCALATED` state, the official's `status` is set to `RELEASED` — reachable from `ACTIVE`, `PROBATION` or `SUSPENDED` — every one of that official's assignments in `PROPOSED` or `CONFIRMED` status on a `SCHEDULED` or `IN_PROGRESS` game is `VOIDED` in `created_at` ascending order with the same per-void bookkeeping as the suspension cascade, and the official's `version` bumps by 1. `RELEASED` is terminal for an official; there is no route back.
+
+`CLEARED`, `ESCALATED` and `SUPERSEDED` are all terminal for a discipline action. Calling assignment or resolution from a state that does not declare the requested transition is refused with `ERR_DISCIPLINE_STATE_INVALID`. Actions are readable individually, including `remediation_cycle_count`, and listable with filters on `official_id`, `status`, `reason_category` and `severity` — which is how a director discovers an action that a superseding create, or an overturned appeal's accuracy-recovery cascade, resolved on their behalf.
+
+### 3.9. Closing Out: Finalization, Public Accountability and Retention
+
+Finalizing a game is the `OfficiatingDirector`'s last act on it, legal only from `PLAYED`, and it moves the game `PLAYED → FINALIZED`. Three things happen alongside. Every play grade on that game whose `grade_status` is `POSTED` and whose `appeal_state` is not `APPEAL_PENDING` moves `POSTED → FINAL`, processed in `created_at` ascending order; a grade under a pending appeal stays `POSTED` and simply waits. The game's `crew_strength_index` is recomputed with the `REALIZED` variant over its `COMPLETED` assignments only, and `crew_strength_variant` is written as `REALIZED` — which is where a crew that lost a member to a suspension realizes a strictly lower index than it projected. And the season record of every official graded on that game is recomputed with the `PROVISIONAL` accuracy variant. The game's `version` then bumps by 1.
+
+Public accountability is the `CommunicationsOfficer`'s domain and is deliberately gated on finalization. Drafting a **pool report** names the `game_id` the statement concerns, the `play_grade_id` of the graded play it cites, a `report_type` of either `POOL_REPORT` or `RULES_CLARIFICATION`, a `body` of between 1 and 2000 non-blank characters carrying the published text, and optionally a `supersedes_id` naming an earlier statement this one will replace when it goes out. A `supersedes_id` that names the drafting report itself, or a report belonging to a different game, is rejected with `ERR_INVALID_REQUEST`; one that names no existing report at all is `ERR_POOL_REPORT_NOT_FOUND`. A drafted report is written with `status` `DRAFT` and a null `published_at`.
+
+Publication is legal only from `DRAFT` — a second attempt is refused with `ERR_REPORT_STATE_INVALID` — and only when the cited play grade has `grade_status` `FINAL` and an `appeal_state` that is not `APPEAL_PENDING`; otherwise the department would be commenting publicly on a call still under challenge, and the request is refused with `ERR_CITED_GRADE_NOT_FINAL`. Publication moves the report `DRAFT → PUBLISHED` and stamps `published_at` from the logical clock. When `supersedes_id` is set, the report it names is retired: a target in `DRAFT` moves `DRAFT → SUPERSEDED` and a target in `PUBLISHED` moves `PUBLISHED → SUPERSEDED`, and either way that target's `version` bumps by 1. `SUPERSEDED` is terminal for a report. Reports are readable individually and listable with filters on `game_id`, `play_grade_id`, `supersedes_id`, `report_type` and `status`.
+
+The season ends when the `OfficiatingDirector` locks the postseason, which is legal only from program `status` `OPEN` and is refused with `ERR_GAMES_IN_PROGRESS` while any game of the program is still `IN_PROGRESS`. The lock walks that program's season records in `created_at` ascending order and, for each one, performs the following steps in this order.
+
+First, `accuracy_index` is recomputed using the `FINAL` variant of the accuracy calculation, `accuracy_variant` is set to `FINAL`, and `graded_play_count` and `weighted_error_points` are recomputed over the `FINAL` included set described in §3.6. Second, `accuracy_eligible` and `postseason_eligible` are re-derived from those new numbers. Third, `availability_component`, `retention_score` and `retention_recommendation` are computed. Fourth, every record whose `retention_recommendation` came out as `RELEASE` has its linked official's `status` set to `RELEASED` — a system-driven transition out of `ACTIVE`, `PROBATION` or `SUSPENDED` — with that official's `version` bumped by 1 and that official's `PROPOSED` and `CONFIRMED` assignments voided. Once every record is settled, the program's `eligible_official_count` is set to the number of its season records whose `postseason_eligible` is true, the program's `status` moves `OPEN → POSTSEASON_LOCKED`, and the program's `version` bumps by 1. `POSTSEASON_LOCKED` is terminal, and from that moment every business write beneath the program reports `ERR_SEASON_NOT_OPEN`.
+
+The **availability component** measures the share of settled obligations the official actually worked. The server counts that official's assignments in `COMPLETED` status as the numerator, and counts their assignments in `COMPLETED`, `VOIDED` or `WITHDRAWN` status as the obligation total. `availability_component` is 100.00 multiplied by the completed count, divided by the greater of 1 and the obligation total, rounded half up to two decimal places. The floor of 1 on the divisor makes the division safe: an official with no assignments at all has a completed count of 0 and an obligation total of 0, and reads exactly 0.00 rather than failing.
+
+The **retention score** is then built in three stages, and the middle stage is the one implementations get wrong. Stage one is the raw composite: 70 percent of the record's `accuracy_index` plus 30 percent of its `availability_component`, rounded half up to two decimal places. Stage two selects a penalty rate **from that raw composite, before any penalty is applied** — 2.00 when the raw composite is greater than or equal to 90.00, otherwise 5.00 when it is greater than or equal to 80.00, otherwise 9.00. Stage three subtracts the selected rate multiplied by the official's training deficiency count from the raw composite, rounds the result half up to two decimal places, and clamps it at a floor of exactly 0.00 so that a heavily deficient official never records a negative score. `retention_recommendation` is then `RETAIN` when `retention_score` is greater than or equal to 90.00, `DEVELOP` when it is greater than or equal to 75.00, and `RELEASE` otherwise.
+
+Worked through: an official with a final `accuracy_index` of 95.00, one `COMPLETED` assignment and one `VOIDED` assignment has an availability component of 100.00 times 1 divided by 2, which is 50.00. The raw composite is 95.00 times 0.70 plus 50.00 times 0.30, which is 66.50 plus 15.00, or 81.50. That raw composite falls in the band from 80.00 up to but not including 90.00, so the penalty rate is 5.00. With a training deficiency count of 1, the retention score is 81.50 minus 5.00, or 76.50, and the recommendation is `DEVELOP`. Selecting the band from the post-penalty number instead would re-band 76.50 below 80.00, apply a rate of 9.00, produce 72.50, and recommend `RELEASE` — the circular reading changes both the score and the official's employment, which is why the band is fixed to the pre-penalty composite.
+
+## 4. Endpoint Definitions
+
+All paths in this API are top-level; no business resource is addressed more than one level deep, and the only two nested paths are the append-only evidence logs described in §2.11. Operations that create a new resource — a season program, an official, a training record, an advancement application, a field evaluation report, a game, a crew assignment, a play grade, a grade appeal, a replay station, a replay review, a pool report or a discipline action — return `201 Created`. Operations that modify an existing resource, including every state transition and every cascade-bearing action, return `200 OK`. Read operations return `200 OK`. In the Authorized Role(s) column, "Any" means all eight declared roles.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock to a supplied UTC instant | Any |
+| POST | `/season-programs` | Create a season program in its configuring state with all governing thresholds supplied or defaulted | OfficiatingDirector |
+| POST | `/season-programs/{id}/open` | Open the program for officiating operations | OfficiatingDirector |
+| POST | `/season-programs/{id}/lock-postseason` | Close the season: final accuracy recompute, retention scoring, releases, and the eligible count | OfficiatingDirector |
+| GET | `/season-programs/{id}` | Read one season program including its eligible official count | Any |
+| POST | `/officials` | Register an official under an open program and open that official's season record | OfficiatingDirector |
+| GET | `/officials/{id}` | Read one official, including the `version` that a discipline create must pin | Any |
+| GET | `/officials` | List officials with filters | Any |
+| POST | `/officials/{id}/training-records` | Record a clinic, physical test or rules exam result and re-derive preseason clearance | TrainingCoordinator |
+| GET | `/officials/{id}/training-records` | List an official's training records | Any |
+| POST | `/advancement-applications` | Apply for advancement to the next tier | Official |
+| POST | `/advancement-applications/{id}/screen` | Screen an application against the advancement criteria | FieldEvaluator |
+| POST | `/advancement-applications/{id}/field-evaluations` | File an immutable field evaluation report against an application | FieldEvaluator |
+| GET | `/advancement-applications/{id}/field-evaluations` | List the field evaluation reports filed against an application | Any |
+| POST | `/advancement-applications/{id}/submit-to-committee` | Forward a screened or returned application to committee review | FieldEvaluator |
+| POST | `/advancement-applications/{id}/return-for-tape` | Return an application for more tape, or auto-deny it once the return cap is reached | OfficiatingDirector |
+| POST | `/advancement-applications/{id}/decide` | Record the committee's decision on an application under review | OfficiatingDirector |
+| GET | `/advancement-applications/{id}` | Read one application including its return count and evaluation average | Any |
+| GET | `/advancement-applications` | List advancement applications with filters | Any |
+| POST | `/games` | Schedule a game under an open season program | OfficiatingDirector |
+| POST | `/games/{id}/kickoff` | Start the game; the crew must be staffed and the roster locks | OfficiatingDirector |
+| POST | `/games/{id}/mark-played` | End play: complete the confirmed crew and expire any open replay review | OfficiatingDirector |
+| POST | `/games/{id}/finalize` | Finalize the game: posted grades become final and crew strength switches to its realized variant | OfficiatingDirector |
+| GET | `/games/{id}` | Read one game, including the `version` that a crew-assignment create must pin | Any |
+| GET | `/games` | List games with filters | Any |
+| POST | `/crew-assignments` | Propose an official for a position on a scheduled game | CrewScheduler |
+| POST | `/crew-assignments/{id}/confirm` | Confirm a proposed assignment so it counts toward crew posture | CrewScheduler |
+| POST | `/crew-assignments/{id}/withdraw` | Withdraw a proposed or confirmed assignment before kickoff | CrewScheduler |
+| GET | `/crew-assignments/{id}` | Read one crew assignment including its computed occupancy window | Any |
+| GET | `/crew-assignments` | List crew assignments with filters | Any |
+| POST | `/play-grades` | Grade one play by one official against the rulebook standard | GradingSupervisor |
+| POST | `/play-grades/{id}/post` | Post a draft grade, opening the appeal window and folding error points into the season record | GradingSupervisor |
+| GET | `/play-grades/{id}` | Read one play grade including its error points and both state dimensions | Any |
+| GET | `/play-grades` | List play grades with filters | Any |
+| POST | `/grade-appeals` | Appeal a posted grade, spending one appeal credit | Official |
+| POST | `/grade-appeals/{id}/start-review` | Take an appeal under review as a supervisor other than the grader | GradingSupervisor |
+| POST | `/grade-appeals/{id}/decide` | Resolve an appeal under review | GradingSupervisor |
+| POST | `/grade-appeals/{id}/withdraw` | Withdraw a submitted or under-review appeal, refunding the credit | Official |
+| GET | `/grade-appeals/{id}` | Read one appeal including its decision fields | Any |
+| GET | `/grade-appeals` | List appeals with filters | Any |
+| POST | `/replay-stations` | Register a replay booth with its concurrent review capacity | OfficiatingDirector |
+| GET | `/replay-stations/{id}` | Read one replay booth including its active review count | Any |
+| POST | `/replay-reviews` | Open a replay review on an in-progress game, seizing booth capacity | ReplayOfficial |
+| POST | `/replay-reviews/{id}/decide` | Record the replay decision; a late submission is recorded as expired | ReplayOfficial |
+| GET | `/replay-reviews/{id}` | Read one replay review including its window and elapsed seconds | Any |
+| GET | `/replay-reviews` | List replay reviews with filters | Any |
+| POST | `/pool-reports` | Draft a pool report or rules clarification citing a graded play | CommunicationsOfficer |
+| POST | `/pool-reports/{id}/publish` | Publish a drafted report and retire the one it supersedes | CommunicationsOfficer |
+| GET | `/pool-reports/{id}` | Read one pool report | Any |
+| GET | `/pool-reports` | List pool reports with filters | Any |
+| POST | `/discipline-actions` | Open a discipline action against an official | OfficiatingDirector |
+| POST | `/discipline-actions/{id}/assign-remediation` | Assign or re-assign a remediation plan, capped at two cycles | OfficiatingDirector |
+| POST | `/discipline-actions/{id}/resolve` | Resolve an action as cleared, reassessed for another cycle, or escalated to release | OfficiatingDirector |
+| GET | `/discipline-actions/{id}` | Read one discipline action including its remediation cycle count | Any |
+| GET | `/discipline-actions` | List discipline actions with filters | Any |
+| GET | `/season-records/{id}` | Read one official season record: accuracy, eligibility, availability and retention | Any |
+| GET | `/season-records` | List official season records with filters | Any |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_SEASON_PROGRAM_NOT_FOUND` | 404 Not Found |
+| `ERR_OFFICIAL_NOT_FOUND` | 404 Not Found |
+| `ERR_APPLICATION_NOT_FOUND` | 404 Not Found |
+| `ERR_GAME_NOT_FOUND` | 404 Not Found |
+| `ERR_ASSIGNMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_PLAY_GRADE_NOT_FOUND` | 404 Not Found |
+| `ERR_APPEAL_NOT_FOUND` | 404 Not Found |
+| `ERR_REPLAY_STATION_NOT_FOUND` | 404 Not Found |
+| `ERR_REPLAY_REVIEW_NOT_FOUND` | 404 Not Found |
+| `ERR_POOL_REPORT_NOT_FOUND` | 404 Not Found |
+| `ERR_DISCIPLINE_ACTION_NOT_FOUND` | 404 Not Found |
+| `ERR_NOT_GRADE_OWNER` | 403 Forbidden |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_SEASON_NOT_OPEN` | 409 Conflict |
+| `ERR_GAME_STATE_INVALID` | 409 Conflict |
+| `ERR_ASSIGNMENT_STATE_INVALID` | 409 Conflict |
+| `ERR_APPLICATION_STATE_INVALID` | 409 Conflict |
+| `ERR_GRADE_STATE_INVALID` | 409 Conflict |
+| `ERR_APPEAL_STATE_INVALID` | 409 Conflict |
+| `ERR_REVIEW_STATE_INVALID` | 409 Conflict |
+| `ERR_DISCIPLINE_STATE_INVALID` | 409 Conflict |
+| `ERR_REPORT_STATE_INVALID` | 409 Conflict |
+| `ERR_STALE_GAME_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_OFFICIAL_VERSION` | 412 Precondition Failed |
+| `ERR_OFFICIAL_WINDOW_CONFLICT` | 409 Conflict |
+| `ERR_OFFICIAL_NOT_ACTIVE` | 409 Conflict |
+| `ERR_PRESEASON_NOT_CLEARED` | 409 Conflict |
+| `ERR_TEAM_CONFLICT_OF_INTEREST` | 409 Conflict |
+| `ERR_TEAM_ROTATION_LIMIT` | 409 Conflict |
+| `ERR_POSITION_ALREADY_CONFIRMED` | 409 Conflict |
+| `ERR_DUPLICATE_PLAY_GRADE` | 409 Conflict |
+| `ERR_CREW_NOT_STAFFED` | 409 Conflict |
+| `ERR_CATEGORY_NOT_REVIEWABLE` | 422 Unprocessable Entity |
+| `ERR_REPLAY_STATION_OFFLINE` | 409 Conflict |
+| `ERR_REPLAY_STATION_AT_CAPACITY` | 409 Conflict |
+| `ERR_APPEAL_WINDOW_CLOSED` | 422 Unprocessable Entity |
+| `ERR_APPEAL_CREDITS_EXHAUSTED` | 409 Conflict |
+| `ERR_ADVANCEMENT_CRITERIA_NOT_MET` | 422 Unprocessable Entity |
+| `ERR_EVALUATION_REQUIREMENTS_NOT_MET` | 422 Unprocessable Entity |
+| `ERR_REMEDIATION_CYCLE_LIMIT` | 409 Conflict |
+| `ERR_CITED_GRADE_NOT_FINAL` | 409 Conflict |
+| `ERR_GAMES_IN_PROGRESS` | 409 Conflict |

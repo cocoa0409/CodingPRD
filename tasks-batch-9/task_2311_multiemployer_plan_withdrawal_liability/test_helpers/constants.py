@@ -1,0 +1,101 @@
+"""Numeric and temporal constants stated by the PRD, plus shared scenario literals."""
+
+# ─── Logical clock ────────────────────────────────────────────────────────────
+
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+# ─── Pagination ───────────────────────────────────────────────────────────────
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ─── Certified data ───────────────────────────────────────────────────────────
+
+VALUATION_QUIET_BUFFER_DAYS = 30
+
+# ─── Withdrawal determination ─────────────────────────────────────────────────
+
+DECLINE_RATIO_THRESHOLD = 0.30
+DECLINE_LOOKBACK_YEARS = 5
+BASE_YEAR_POOL_YEARS = 5
+TESTING_PERIOD_YEARS = 3
+
+# ─── Allocation ───────────────────────────────────────────────────────────────
+
+ROLLING_WINDOW_YEARS = 5
+PRESUMPTIVE_POOL_YEARS = 3
+PRESUMPTIVE_DECAY_STEP = 0.05
+LOOKBACK_YEARS = 5
+
+# ─── De minimis ───────────────────────────────────────────────────────────────
+
+DE_MINIMIS_STATUTORY_CAP_CENTS = 5_000_000
+DE_MINIMIS_STATUTORY_PHASEOUT_START_CENTS = 10_000_000
+DE_MINIMIS_HIGH_CAP_CENTS = 15_000_000
+DE_MINIMIS_HIGH_PHASEOUT_START_CENTS = 15_000_000
+DE_MINIMIS_UVB_FRACTION_BPS = 75
+
+# ─── Level annual payment and amortisation ────────────────────────────────────
+
+ANNUAL_PAYMENT_LOOKBACK_YEARS = 10
+HIGH_AVERAGE_WINDOW_YEARS = 3
+MAX_AMORTIZATION_YEARS = 20
+INSTALLMENTS_PER_YEAR = 4
+FIRST_DUE_DATE_OFFSET_DAYS = 60
+INSTALLMENT_INTERVAL_MONTHS = 3
+DELINQUENCY_GRACE_DAYS = 60
+DELINQUENT_INSTALLMENT_THRESHOLD = 2
+CURE_WINDOW_DAYS = 60
+
+# ─── Review and arbitration windows ───────────────────────────────────────────
+
+REVIEW_WINDOW_DAYS = 90
+PLAN_RESPONSE_WINDOW_DAYS = 120
+ARBITRATION_INNER_WINDOW_DAYS = 60
+ARBITRATION_OUTER_WINDOW_DAYS = 180
+MAX_ARBITRATION_ROUNDS = 3
+
+# ─── Asset sales ──────────────────────────────────────────────────────────────
+
+BOND_AVERAGE_YEARS = 3
+BOND_PERIOD_YEARS = 5
+WORKFORCE_CONTINUITY_WEIGHT = 0.5
+ASSET_CONTINUITY_WEIGHT = 0.3
+CUSTOMER_CONTINUITY_WEIGHT = 0.2
+SUBSTANTIAL_CONTINUITY_THRESHOLD = 0.70
+CONTINGENT_EXPOSURE_SELLER_CONTINUING_SHARE = 0.25
+EXPOSURE_SCORE_DIVISOR_CENTS = 100_000
+
+# ─── Precision ────────────────────────────────────────────────────────────────
+
+FRACTION_DECIMAL_PLACES = 4
+DECLINE_RATIO_DECIMAL_PLACES = 6
+POOL_RATIO_DECIMAL_PLACES = 10
+FLOAT_TOLERANCE = 0.00005
+
+# ─── Shared baseline scenario literals ────────────────────────────────────────
+# A single plan with a flat five-year contribution history, sized so that the
+# modified-presumptive dollar ratio allocates a round 250,000,000 cents.
+
+BASELINE_INTEREST_RATE_BPS = 700
+BASELINE_UVB_TOTAL_CENTS = 10_000_000_000
+BASELINE_UVB_POOL_CENTS = 1_000_000_000
+BASELINE_ALL_EMPLOYER_CONTRIBUTIONS_CENTS = 2_000_000_000
+BASELINE_ALL_EMPLOYER_CBU = 2_000_000
+BASELINE_VALUATION_YEARS = (2021, 2022, 2023, 2024, 2025)
+
+BASELINE_CONTRIBUTION_CBU = 250_000
+BASELINE_CONTRIBUTION_CENTS = 250_000_000
+BASELINE_CONTRIBUTION_RATE_CENTS_PER_CBU = 1_000
+
+BASELINE_WITHDRAWAL_PLAN_YEAR = 2026
+BASELINE_CESSATION_DATE = "2026-06-30T00:00:00Z"
+
+BASELINE_NET_ASSESSED_CENTS = 250_000_000
+BASELINE_ANNUAL_PAYMENT_CENTS = 50_000_000
+BASELINE_INSTALLMENT_COUNT = 28
+BASELINE_QUARTERLY_INSTALLMENT_CENTS = 8_928_571
+BASELINE_FINAL_INSTALLMENT_CENTS = 8_928_583
+BASELINE_FIRST_DUE_DATE = "2026-09-30T00:00:00Z"

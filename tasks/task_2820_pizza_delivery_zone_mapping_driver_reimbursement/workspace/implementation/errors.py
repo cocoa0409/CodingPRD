@@ -1,0 +1,89 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    "ERR_MISSING_USER_ID": 401,
+    "ERR_INVALID_ROLE": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_STORE_SCOPE": 403,
+    "ERR_FORBIDDEN_DRIVER_SCOPE": 403,
+    "ERR_STORE_NOT_FOUND": 404,
+    "ERR_ZONE_VERSION_NOT_FOUND": 404,
+    "ERR_SERVICE_ADDRESS_NOT_FOUND": 404,
+    "ERR_ADDRESS_DISPUTE_NOT_FOUND": 404,
+    "ERR_DRIVER_NOT_FOUND": 404,
+    "ERR_VEHICLE_COST_MODEL_NOT_FOUND": 404,
+    "ERR_MVR_CHECK_NOT_FOUND": 404,
+    "ERR_INSURANCE_VERIFICATION_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_DISPATCH_NOT_FOUND": 404,
+    "ERR_DISPATCH_STOP_NOT_FOUND": 404,
+    "ERR_REIMBURSEMENT_LINE_NOT_FOUND": 404,
+    "ERR_SAFE_DROP_NOT_FOUND": 404,
+    "ERR_COMPLAINT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_POLYGON": 422,
+    "ERR_INVALID_ZONE_WINDOW": 422,
+    "ERR_INVALID_COVERAGE_WINDOW": 422,
+    "ERR_STORE_NUMBER_TAKEN": 409,
+    "ERR_LICENSE_NUMBER_TAKEN": 409,
+    "ERR_STALE_STORE_VERSION": 412,
+    "ERR_STALE_DRIVER_VERSION": 412,
+    "ERR_INVALID_ZONE_VERSION_STATE": 409,
+    "ERR_INVALID_DISPUTE_STATE": 409,
+    "ERR_INVALID_DRIVER_STATE": 409,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_DISPATCH_STATE": 409,
+    "ERR_INVALID_STOP_STATE": 409,
+    "ERR_INVALID_COMPLAINT_STATE": 409,
+    "ERR_INVALID_SAFE_DROP_STATE": 409,
+    "ERR_DRIVER_NOT_QUALIFIED": 422,
+    "ERR_INSURANCE_NOT_ACTIVE": 422,
+    "ERR_MVR_POINTS_EXCEEDED": 422,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_NO_ACTIVE_ZONE_VERSION": 409,
+    "ERR_ADDRESS_OUT_OF_AREA": 422,
+    "ERR_ORDER_STORE_MISMATCH": 409,
+    "ERR_NO_COST_MODEL": 422,
+    "ERR_ZONE_WINDOW_OVERLAP": 409,
+    "ERR_DRIVER_WINDOW_CONFLICT": 409,
+    "ERR_HOT_BAG_CAPACITY_EXCEEDED": 409,
+    "ERR_STACK_LIMIT_EXCEEDED": 409,
+    "ERR_DISPATCH_HAS_NO_STOPS": 422,
+    "ERR_ORDER_NOT_READY": 409,
+    "ERR_ORDER_ALREADY_STACKED": 409,
+    "ERR_DISPUTE_ROUND_LIMIT": 409,
+    "ERR_FEE_NOT_DISCLOSED": 422,
+    "ERR_REMAKE_LIMIT_REACHED": 409,
+    "ERR_REMAKE_NOT_ELIGIBLE": 422,
+    "ERR_STOPS_OUTSTANDING": 409,
+    "ERR_ODOMETER_MISSING": 422,
+    "ERR_STORE_NOT_ACCEPTING_DELIVERY": 409,
+    "ERR_ZONE_HOLD_NOT_APPLICABLE": 422,
+    "ERR_DECLINE_NOT_APPLICABLE": 422,
+    "ERR_CLAWBACK_NOT_SETTLED": 409,
+    "ERR_CASH_LIMIT_REACHED": 402,
+    "ERR_SAFE_DROP_EXCEEDS_CASH": 422,
+    "ERR_SAFE_DROP_NOT_VOIDABLE": 409,
+    "ERR_REMEDY_EXCEEDS_TOTAL": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    body = error_id[4:] if error_id.startswith("ERR_") else error_id
+    return body.replace("_", " ").capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)
+
+
+def invalid(message):
+    raise ApiError("ERR_INVALID_REQUEST", message)

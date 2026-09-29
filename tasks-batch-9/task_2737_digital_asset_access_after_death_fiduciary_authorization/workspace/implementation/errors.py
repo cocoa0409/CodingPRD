@@ -1,0 +1,98 @@
+"""Error catalog and ApiError exception (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_ACTION_ROLE_MISMATCH": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_ESTATE_NOT_FOUND": 404,
+    "ERR_FIDUCIARY_NOT_FOUND": 404,
+    "ERR_DOCUMENT_NOT_FOUND": 404,
+    "ERR_PLATFORM_NOT_FOUND": 404,
+    "ERR_DIRECTIVE_NOT_FOUND": 404,
+    "ERR_ASSET_NOT_FOUND": 404,
+    "ERR_SUBSCRIPTION_TERM_NOT_FOUND": 404,
+    "ERR_REQUEST_NOT_FOUND": 404,
+    "ERR_GRANT_NOT_FOUND": 404,
+    "ERR_DESIGNATION_NOT_FOUND": 404,
+    "ERR_ELECTION_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_VALUATION_RUN_NOT_FOUND": 404,
+    "ERR_FIDUCIARY_ESTATE_MISMATCH": 403,
+    "ERR_PLATFORM_SCOPE_MISMATCH": 403,
+    "ERR_STALE_ESTATE_VERSION": 412,
+    "ERR_STALE_ASSET_VERSION": 412,
+    "ERR_ESTATE_CLOSED": 409,
+    "ERR_INVALID_DOCUMENT_STATE": 409,
+    "ERR_INVALID_REQUEST_STATE": 409,
+    "ERR_INVALID_GRANT_STATE": 409,
+    "ERR_INVALID_ELECTION_STATE": 409,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_INVALID_RUN_STATE": 409,
+    "ERR_VALUATION_ALREADY_FINALIZED": 409,
+    "ERR_DOCUMENT_ESTATE_MISMATCH": 409,
+    "ERR_DOCUMENT_TYPE_MISMATCH": 400,
+    "ERR_PLATFORM_FORM_MISMATCH": 409,
+    "ERR_DEATH_CERTIFICATE_NOT_VERIFIED": 409,
+    "ERR_LETTERS_NOT_ISSUED": 409,
+    "ERR_PLATFORM_SUSPENDED": 409,
+    "ERR_NO_ACTIVE_AUTHORITY": 409,
+    "ERR_CONTENT_DISCLOSURE_NOT_AUTHORIZED": 409,
+    "ERR_COURT_ORDER_REQUIRED": 409,
+    "ERR_ONLINE_TOOL_UNSUPPORTED": 409,
+    "ERR_COUNTERSIGN_REQUIRED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ASSET_NOT_TRANSFERABLE": 409,
+    "ERR_DISPOSITION_UNSUPPORTED": 409,
+    "ERR_BENEFICIARY_REQUIRED": 400,
+    "ERR_SUBSCRIPTION_TERM_MISSING": 409,
+    "ERR_SUBSCRIPTION_TERM_EXISTS": 409,
+    "ERR_REFUND_NOT_OFFERED": 409,
+    "ERR_DATE_OF_DEATH_IN_FUTURE": 400,
+    "ERR_EFFECTIVE_DATE_BEFORE_DEATH": 400,
+    "ERR_ALTERNATE_DATE_NOT_REACHED": 409,
+    "ERR_REQUEST_WINDOW_OVERLAP": 409,
+    "ERR_CLAIM_PERIOD_OUT_OF_TERM": 400,
+    "ERR_CLAIM_PERIOD_OVERLAP": 409,
+    "ERR_REFUND_WINDOW_TOO_SHORT": 400,
+    "ERR_CREDIT_EXCEEDS_CLAIM": 400,
+    "ERR_SHARE_TOTAL_INVALID": 400,
+    "ERR_VALUATION_REQUIRED": 409,
+    "ERR_DISTRIBUTION_POOL_EXHAUSTED": 409,
+    "ERR_BENEFICIARY_ALLOCATION_EXCEEDED": 409,
+    "ERR_VALUATION_NOT_FINALIZED": 409,
+    "ERR_ASSETS_PENDING_DISPOSITION": 409,
+    "ERR_DUPLICATE_ASSET_HANDLE": 409,
+    "ERR_INFO_CYCLE_LIMIT": 409,
+    "ERR_OPEN_CANCELLATIONS": 409,
+    "ERR_OPEN_REFUND_CLAIMS": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_MISSING_AUTH_HEADERS": "X-User-ID and X-User-Role are both required.",
+    "ERR_UNKNOWN_ROLE": "X-User-Role is not a recognised role.",
+    "ERR_ROLE_NOT_PERMITTED": "This role may not call this endpoint.",
+    "ERR_ACTION_ROLE_MISMATCH": "This role does not own the requested action.",
+    "ERR_INVALID_REQUEST": "The request body or query string is invalid.",
+    "ERR_FIDUCIARY_ESTATE_MISMATCH": "The fiduciary does not belong to this estate.",
+    "ERR_PLATFORM_SCOPE_MISMATCH": "The platform identity does not match the target resource.",
+    "ERR_STALE_ESTATE_VERSION": "expected_estate_version does not match the stored estate version.",
+    "ERR_STALE_ASSET_VERSION": "expected_asset_version does not match the stored asset version.",
+    "ERR_ESTATE_CLOSED": "The estate is closed.",
+}
+
+
+def api_error(error_id, message=None):
+    return ApiError(error_id, message)

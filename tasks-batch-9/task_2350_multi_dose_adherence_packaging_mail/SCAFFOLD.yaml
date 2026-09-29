@@ -1,0 +1,3223 @@
+scenario: "2350. Multi-Dose Adherence Packaging & Mail Pharmacy (PillPack by Amazon Pharmacy): medication synchronization to a common fill cycle, dose-time pouch roll generation & pack verification imaging, refill-too-soon and day-supply insurance edits, prescriber refill authorization chase & escalation, cold-chain and non-packable item split shipment, mid-cycle regimen change with partial roll reissue and credit, travel/vacation early-supply exception approval, adherence gap detection & auto-ship pause on non-pickup"
+domain_name: "multi-dose-adherence-mail-pharmacy"
+api_prefix: "/pharmacy"
+
+complexity_profile:
+  primary_archetype: compliance_audit
+  secondary_archetype: workflow_orchestration
+  complexity_layers:
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+    - optimistic_concurrency
+
+  entity_topology: graph
+  # graph: FillCycle x Prescription join through CycleLine (many-to-many per cycle);
+  # Prescription.supersedes_rx_id and FillCycle.reissue_of_cycle_id are self-referential
+  # edges; CreditMemo points at two different FillCycle nodes (issued-on, applied-to).
+  # No single ownership tree exists — a Pouch's contents span many Prescriptions.
+
+  state_machine_shape: parallel
+  # FillCycle carries TWO independent dimensions (packaging_status x insurance_status)
+  # that advance on different triggers. RefillAuthorizationRequest is cyclic
+  # (SENT <-> NO_RESPONSE), Prescription is cyclic (ACTIVE <-> PENDING_AUTHORIZATION),
+  # PouchRoll is branching with a rework loop (PACKED -> {PASSED, FAILED_QUARANTINED},
+  # FAILED_QUARANTINED -> BUILT), Patient.autoship_status is cyclic
+  # (ACTIVE <-> PAUSED_ADHERENCE).
+
+  relationship_patterns:
+    - one_to_many          # Patient -> Prescription, FillCycle -> CycleLine, PouchRoll -> Pouch
+    - many_to_many         # FillCycle <-> Prescription via CycleLine; Pouch.contents spans Rx
+    - self_referential     # Prescription.supersedes_rx_id, FillCycle.reissue_of_cycle_id
+    - cross_aggregate      # CreditMemo.applied_to_cycle_id crosses cycle aggregates
+
+  role_model: segregation_of_duties
+  # The technician who packed a roll may not image its pouches, and the pharmacist who
+  # verifies a roll may not be the technician who packed it. Prescriber answers refill
+  # authorizations; VerifyingPharmacist adjudicates and decides vacation exceptions;
+  # PharmacyOperations owns cycles/shipments/chase. No role is a superset of another.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: InsurancePlan
+    parent: null
+    common_fields: true
+    fields:
+      - name: payer_name
+        type: string
+        source: input
+        description: payer / PBM trade name
+      - name: bin_number
+        type: string
+        source: input
+        description: six-digit routing BIN used on the claim
+      - name: refill_too_soon_threshold_pct
+        type: integer
+        source: input
+        description: minimum percent of the previous day-supply that must be consumed before a refill claim clears
+        default: 75
+        constraints: 0..100; the edit clears when refill_pct_used >= this value (inclusive)
+      - name: max_day_supply_days
+        type: integer
+        source: input
+        description: hard payer ceiling on days dispensed on one claim line
+        default: 90
+        constraints: 1..365
+      - name: vacation_overrides_per_year
+        type: integer
+        source: input
+        description: number of travel/vacation early-supply approvals the payer funds per patient per calendar year
+        default: 1
+        constraints: 0..12
+      - name: generic_copay_cents_per_day
+        type: integer
+        source: input
+        description: per-day copay rate applied to lines whose Prescription.copay_tier == GENERIC
+        constraints: ">= 0"
+      - name: brand_copay_cents_per_day
+        type: integer
+        source: input
+        description: per-day copay rate applied to lines whose Prescription.copay_tier == PREFERRED_BRAND
+        constraints: ">= 0"
+      - name: specialty_copay_cents_per_day
+        type: integer
+        source: input
+        description: per-day copay rate applied to lines whose Prescription.copay_tier == SPECIALTY
+        constraints: ">= 0"
+      - name: coinsurance_pct
+        type: integer
+        source: input
+        description: percent of the per-day rate the plan withholds; the patient share factor is (100 - coinsurance_pct)/100
+        default: 20
+        constraints: 0..100
+      - name: allows_payer_vacation_override
+        type: boolean
+        source: input
+        description: when false the payer refuses PAYER_OVERRIDE_APPROVED decisions and only a pharmacist-level approval is possible
+        default: false
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: patient legal name
+      - name: date_of_birth
+        type: string
+        source: input
+        description: ISO 8601 date (YYYY-MM-DD)
+      - name: email
+        type: string
+        source: input
+        description: contact address for pouch-roll and pickup notifications
+      - name: state_code
+        type: string
+        source: input
+        description: two-letter shipping state code
+      - name: insurance_plan_id
+        type: string
+        source: input
+        description: FK -> InsurancePlan.id; the payer whose edits govern every fill for this patient
+      - name: anchor_fill_day
+        type: integer
+        source: input
+        description: day-of-month all medications are synchronized onto; written by POST /pharmacy/patients/{id}/synchronize
+        default: null
+        constraints: "1..31 (calendar day-of-month); the business ceiling of ANCHOR_DAY_MAX (28) is enforced by validations priority 42, not by the schema check at priority 3"
+      - name: sync_mode
+        type: enum
+        source: system
+        description: pinned synchronization variant used when building CycleLines for this patient
+        default: null
+        constraints: BRIDGE_TO_START | TRIM_TO_START
+      - name: sync_status
+        type: enum
+        source: system
+        description: whether the patient's regimen has been aligned to a common fill cycle
+        default: UNSYNCED
+        constraints: UNSYNCED | SYNCED
+      - name: next_cycle_start_date
+        type: string
+        source: computed
+        description: earliest date >= the logical clock date whose day-of-month equals anchor_fill_day; recomputed on synchronize
+        default: null
+      - name: autoship_status
+        type: enum
+        source: system
+        description: auto-ship posture; gates cycle creation and adjudication
+        default: ACTIVE
+        constraints: ACTIVE | PAUSED_ADHERENCE | PAUSED_PATIENT | CANCELLED
+      - name: pause_reason
+        type: enum
+        source: system
+        description: why auto-ship is not ACTIVE
+        default: null
+        constraints: ADHERENCE_GAP | MISSED_PICKUPS | PATIENT_REQUEST | null
+      - name: adherence_score_pct
+        type: integer
+        source: computed
+        description: pinned ROLLING_28_DAY adherence score (see calculations.adherence_score_pct)
+        default: 100
+        constraints: 0..100
+      - name: consecutive_missed_pickups
+        type: integer
+        source: computed
+        description: count of consecutive Shipments that reached PICKUP_MISSED without an intervening PICKED_UP
+        default: 0
+      - name: credit_balance_cents
+        type: integer
+        source: computed
+        description: sum of CreditMemo.amount_cents for this patient with status == ISSUED
+        default: 0
+      - name: vacation_exceptions_used_this_year
+        type: integer
+        source: system
+        description: number of VacationExceptionRequest rows for this patient approved in the calendar year of the logical clock
+        default: 0
+
+  - name: Prescription
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: FK -> Patient.id; the patient this prescription belongs to
+      - name: prescriber_npi
+        type: string
+        source: input
+        description: ten-digit prescriber NPI used as the refill-authorization destination
+      - name: drug_name
+        type: string
+        source: input
+        description: dispensed drug label name
+      - name: ndc
+        type: string
+        source: input
+        description: national drug code of the dispensed package
+      - name: strength
+        type: string
+        source: input
+        description: free-text strength, e.g. "500mg"
+      - name: form
+        type: enum
+        source: input
+        description: dosage form; drives packability
+        constraints: TABLET | CAPSULE | VIAL | INHALER | INJECTION_PEN | LIQUID
+      - name: copay_tier
+        type: enum
+        source: input
+        description: which InsurancePlan per-day rate applies to this drug
+        constraints: GENERIC | PREFERRED_BRAND | SPECIALTY
+      - name: refrigerated
+        type: boolean
+        source: input
+        description: true when the item must move through a cold chain and can never enter a pouch
+        default: false
+      - name: is_controlled
+        type: boolean
+        source: input
+        description: true for a scheduled controlled substance; caps day supply and forbids travel early-supply overrides
+        default: false
+      - name: packable
+        type: boolean
+        source: computed
+        description: "computed: form IN {TABLET, CAPSULE} AND refrigerated == false"
+      - name: dose_times
+        type: array
+        source: input
+        description: dose slots this drug is taken at; each element is one of MORNING | NOON | EVENING | BEDTIME
+        constraints: non-empty, no duplicates
+      - name: quantity_per_dose
+        type: integer
+        source: input
+        description: units placed in each pouch for this drug at each of its dose slots
+        constraints: ">= 1"
+      - name: days_supply_written
+        type: integer
+        source: input
+        description: days supply the prescriber wrote per fill
+        constraints: 1..90
+      - name: refills_authorized
+        type: integer
+        source: input
+        description: refills the prescriber authorized; increased when a RefillAuthorizationRequest is APPROVED
+        constraints: ">= 0"
+      - name: refills_remaining
+        type: integer
+        source: system
+        description: refills still available; initialized to refills_authorized
+      - name: refills_consumed
+        type: integer
+        source: computed
+        description: refills consumed so far; the invariant refills_remaining + refills_consumed == refills_authorized holds after every mutation
+        default: 0
+      - name: written_date
+        type: string
+        source: input
+        description: ISO 8601 date the prescription was written
+      - name: expiration_date
+        type: string
+        source: input
+        description: ISO 8601 date after which the prescription may no longer be filled
+      - name: status
+        type: enum
+        source: system
+        description: prescription lifecycle state
+        default: ACTIVE
+        constraints: ACTIVE | PENDING_AUTHORIZATION | SUPERSEDED | DISCONTINUED | EXPIRED
+      - name: supersedes_rx_id
+        type: string
+        source: system
+        description: FK -> Prescription.id; set on a successor prescription created by a mid-cycle regimen change, pointing at the prescription it replaces
+        default: null
+      - name: last_dispensed_date
+        type: string
+        source: input
+        description: ISO 8601 date of the most recent dispense; null for a never-filled prescription
+        default: null
+      - name: last_dispensed_days_supply
+        type: integer
+        source: input
+        description: day supply of the most recent dispense; the denominator of the refill-too-soon edit
+        default: 0
+      - name: prior_last_dispensed_date
+        type: string
+        source: system
+        description: value of last_dispensed_date before the current dispense; restored verbatim when a dispense is reversed
+        default: null
+      - name: prior_last_dispensed_days_supply
+        type: integer
+        source: system
+        description: value of last_dispensed_days_supply before the current dispense; restored verbatim when a dispense is reversed
+        default: 0
+      - name: days_dispensed_total
+        type: integer
+        source: computed
+        description: sum of CycleLine.days_supply_filled over this prescription's lines whose line_status IN {ADJUDICATED, PACKED_OUT, REISSUED}
+        default: 0
+      - name: sync_bridge_days
+        type: integer
+        source: computed
+        description: bridge days needed to carry this drug from on-hand exhaustion to Patient.next_cycle_start_date; written by synchronize
+        default: 0
+      - name: sync_trim_days
+        type: integer
+        source: computed
+        description: overlap days by which a full cycle would be trimmed for this drug; written by synchronize
+        default: 0
+
+  - name: FillCycle
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: FK -> Patient.id; the patient whose regimen this cycle fills
+      - name: cycle_start_date
+        type: string
+        source: input
+        description: ISO 8601 first dose date of the cycle (inclusive)
+      - name: cycle_end_date
+        type: string
+        source: computed
+        description: "computed: cycle_start_date + day_supply_days; EXCLUSIVE upper bound of the cycle window"
+      - name: day_supply_days
+        type: integer
+        source: input
+        description: nominal days the cycle covers
+        default: 28
+        constraints: 1..90
+      - name: sync_mode
+        type: enum
+        source: system
+        description: synchronization variant used to size this cycle's lines; copied from Patient.sync_mode unless overridden at creation
+        constraints: BRIDGE_TO_START | TRIM_TO_START
+      - name: is_partial_reissue
+        type: boolean
+        source: system
+        description: true when this cycle was created by a mid-cycle partial roll reissue
+        default: false
+      - name: reissue_of_cycle_id
+        type: string
+        source: system
+        description: FK -> FillCycle.id; the original cycle this partial reissue replaces the tail of
+        default: null
+      - name: vacation_exception_id
+        type: string
+        source: input
+        description: FK -> VacationExceptionRequest.id; the approved travel exception consumed by this cycle's adjudication
+        default: null
+      - name: approved_vacation_extra_days
+        type: integer
+        source: computed
+        description: extra days granted by vacation_exception_id; 0 when none is attached
+        default: 0
+      - name: packaging_status
+        type: enum
+        source: system
+        description: packaging dimension of the cycle; advances on packaging triggers only
+        default: DRAFT
+        constraints: DRAFT | LINES_ADJUDICATED | ROLL_GENERATED | PACKED | VERIFIED | SHIPPED | CLOSED | CANCELLED
+      - name: insurance_status
+        type: enum
+        source: system
+        description: adjudication dimension of the cycle; advances on payer/authorization triggers only and is independent of packaging_status
+        default: NOT_ADJUDICATED
+        constraints: NOT_ADJUDICATED | EDITS_PENDING | CLEARED | REJECTED_TOO_SOON
+      - name: reissue_required
+        type: boolean
+        source: system
+        description: true once a regimen change has left at least one line SUPERSEDED_PENDING_REISSUE on this cycle
+        default: false
+      - name: roll_pouch_count
+        type: integer
+        source: computed
+        description: number of non-VOID Pouch rows across this cycle's PouchRolls
+        default: 0
+      - name: total_copay_cents
+        type: integer
+        source: computed
+        description: PROVISIONAL cycle copay; round-per-line-then-sum (see calculations.cycle_copay_cents)
+        default: 0
+      - name: final_copay_cents
+        type: integer
+        source: computed
+        description: FINAL cycle copay; sum-raw-then-round-once, stamped when packaging_status becomes SHIPPED
+        default: null
+      - name: reissue_fee_cents
+        type: integer
+        source: computed
+        description: fee withheld from the partial-reissue credit issued against this cycle
+        default: 0
+      - name: credit_applied_cents
+        type: integer
+        source: computed
+        description: CreditMemo value consumed by this cycle's adjudication
+        default: 0
+      - name: rounding_delta_cents
+        type: integer
+        source: computed
+        description: "total_copay_cents - final_copay_cents; stamped with final_copay_cents"
+        default: null
+
+  - name: CycleLine
+    parent: FillCycle
+    common_fields: true
+    fields:
+      - name: cycle_id
+        type: string
+        source: input
+        description: FK -> FillCycle.id; the cycle this claim line belongs to
+      - name: prescription_id
+        type: string
+        source: input
+        description: FK -> Prescription.id; the prescription being dispensed on this line
+      - name: line_status
+        type: enum
+        source: system
+        description: per-line adjudication and fulfilment state
+        default: PLANNED
+        constraints: PLANNED | ADJUDICATED | HELD_TOO_SOON | HELD_AUTH | EXCLUDED_HELD | SUPERSEDED_PENDING_REISSUE | REISSUED | CREDITED | PACKED_OUT
+      - name: packable_route
+        type: enum
+        source: computed
+        description: fulfilment route; POUCH for pouch-roll drugs, COLD_CHAIN for refrigerated items, LOOSE_SPLIT for other non-packable forms
+        constraints: POUCH | COLD_CHAIN | LOOSE_SPLIT
+      - name: days_supply_filled
+        type: integer
+        source: computed
+        description: days dispensed on this line after the synchronization variant and any vacation extension are applied
+        default: 0
+      - name: bridge_days_applied
+        type: integer
+        source: computed
+        description: bridge days added ahead of cycle_start_date under BRIDGE_TO_START; always 0 under TRIM_TO_START
+        default: 0
+      - name: trim_days_applied
+        type: integer
+        source: computed
+        description: days removed from the nominal cycle under TRIM_TO_START; always 0 under BRIDGE_TO_START
+        default: 0
+      - name: line_start_date
+        type: string
+        source: computed
+        description: "computed: cycle.cycle_start_date - bridge_days_applied (inclusive)"
+      - name: line_end_date
+        type: string
+        source: computed
+        description: "computed: line_start_date + days_supply_filled (EXCLUSIVE)"
+      - name: quantity_dispensed
+        type: integer
+        source: computed
+        description: "computed: prescription.quantity_per_dose * len(prescription.dose_times) * days_supply_filled"
+        default: 0
+      - name: refill_pct_used
+        type: integer
+        source: computed
+        description: percent of the previous day supply consumed at cycle_start_date; the refill-too-soon numerator
+        default: 0
+      - name: allowance_days
+        type: integer
+        source: computed
+        description: day-supply ceiling for this line under the payer, prescriber and cold-chain/controlled caps
+        default: 0
+      - name: copay_cents
+        type: integer
+        source: computed
+        description: patient copay for this line, rounded to whole cents with round_half_up
+        default: 0
+      - name: hold_reason
+        type: enum
+        source: system
+        description: why the line is held or excluded
+        default: null
+        constraints: REFILL_TOO_SOON | NO_REFILLS_REMAINING | REGIMEN_CHANGE | AUTH_DENIED | AUTH_ESCALATED | null
+
+  - name: PouchRoll
+    parent: FillCycle
+    common_fields: true
+    fields:
+      - name: cycle_id
+        type: string
+        source: input
+        description: FK -> FillCycle.id; the cycle this roll packages
+      - name: roll_serial
+        type: string
+        source: system
+        description: human-readable roll serial stamped at generation
+      - name: verification_status
+        type: enum
+        source: system
+        description: roll lifecycle state
+        default: BUILT
+        constraints: BUILT | PACKED | PASSED | FAILED_QUARANTINED
+      - name: pouch_count
+        type: integer
+        source: computed
+        description: number of this roll's Pouch rows whose verification_result != VOID
+        default: 0
+      - name: segment_start_date
+        type: string
+        source: computed
+        description: first dose date the roll covers (inclusive)
+      - name: segment_end_date
+        type: string
+        source: computed
+        description: last dose date the roll covers (INCLUSIVE); truncated to effective_date - 1 day when a partial reissue supersedes the tail
+      - name: packed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the PackagingTechnician who packed the roll; may not image its pouches or verify it
+        default: null
+      - name: packed_at
+        type: datetime
+        source: system
+        description: logical-clock instant the roll was packed
+        default: null
+      - name: verified_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the VerifyingPharmacist who signed the verification
+        default: null
+      - name: verified_at
+        type: datetime
+        source: system
+        description: logical-clock instant verification was signed
+        default: null
+      - name: rework_count
+        type: integer
+        source: system
+        description: number of times this roll returned to BUILT after a failed verification
+        default: 0
+      - name: mismatch_pouch_count
+        type: integer
+        source: computed
+        description: number of this roll's Pouch rows whose verification_result IN {MISMATCH_COUNT, UNREADABLE}
+        default: 0
+
+  - name: Pouch
+    parent: PouchRoll
+    common_fields: true
+    fields:
+      - name: roll_id
+        type: string
+        source: input
+        description: FK -> PouchRoll.id; the roll this pouch is sequenced into
+      - name: pouch_index
+        type: integer
+        source: computed
+        description: 1-based position in the roll, ordered by (dose_date ASC, dose_slot ASC in MORNING < NOON < EVENING < BEDTIME order)
+      - name: dose_date
+        type: string
+        source: computed
+        description: ISO 8601 date this pouch is to be taken
+      - name: dose_slot
+        type: enum
+        source: computed
+        description: time-of-day slot printed on the pouch
+        constraints: MORNING | NOON | EVENING | BEDTIME
+      - name: contents
+        type: array
+        source: computed
+        description: one object per contributing line, {prescription_id, quantity}; ordered by prescription created_at ASC
+      - name: expected_pill_count
+        type: integer
+        source: computed
+        description: sum of contents[].quantity; the count the verification image must match
+        default: 0
+      - name: verification_result
+        type: enum
+        source: system
+        description: outcome of pack verification imaging for this pouch
+        default: PENDING
+        constraints: PENDING | MATCH | MISMATCH_COUNT | UNREADABLE | VOID
+      - name: detected_pill_count
+        type: integer
+        source: input
+        description: pill count the imaging station read off the pouch
+        default: null
+      - name: image_confidence_pct
+        type: integer
+        source: input
+        description: imaging confidence; below IMAGE_MIN_CONFIDENCE_PCT the read is UNREADABLE regardless of count
+        default: null
+        constraints: 0..100
+      - name: imaged_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the technician who captured the verification image
+        default: null
+      - name: imaged_at
+        type: datetime
+        source: system
+        description: logical-clock instant the image was captured
+        default: null
+
+  - name: RefillAuthorizationRequest
+    parent: Prescription
+    common_fields: true
+    fields:
+      - name: prescription_id
+        type: string
+        source: input
+        description: FK -> Prescription.id; the exhausted prescription this request chases
+      - name: prescriber_npi
+        type: string
+        source: computed
+        description: copied from prescription.prescriber_npi at creation
+      - name: requested_refills
+        type: integer
+        source: input
+        description: refills asked of the prescriber
+        constraints: 1..12
+      - name: status
+        type: enum
+        source: system
+        description: chase lifecycle state
+        default: SENT
+        constraints: SENT | NO_RESPONSE | ESCALATED | APPROVED | DENIED
+      - name: chase_round
+        type: integer
+        source: system
+        description: number of no-response rounds recorded; capped at MAX_CHASE_ROUNDS
+        default: 0
+      - name: first_sent_at
+        type: datetime
+        source: system
+        description: logical-clock instant of the first outbound request
+      - name: last_sent_at
+        type: datetime
+        source: system
+        description: logical-clock instant of the most recent outbound request
+      - name: next_chase_due_at
+        type: datetime
+        source: computed
+        description: "computed: last_sent_at + CHASE_INTERVAL_HOURS; a no-response may not be recorded before this instant"
+      - name: no_response_recorded_at
+        type: datetime
+        source: system
+        description: logical-clock instant the most recent no-response was recorded
+        default: null
+      - name: escalation_level
+        type: integer
+        source: system
+        description: 0 until escalated, then 1
+        default: 0
+      - name: approved_refills
+        type: integer
+        source: input
+        description: refills the prescriber granted; null unless status == APPROVED
+        default: null
+      - name: denial_reason
+        type: string
+        source: input
+        description: prescriber's free-text denial reason; null unless status == DENIED
+        default: null
+
+  - name: Shipment
+    parent: FillCycle
+    common_fields: true
+    fields:
+      - name: cycle_id
+        type: string
+        source: input
+        description: FK -> FillCycle.id; the cycle this parcel fulfils part of
+      - name: shipment_kind
+        type: enum
+        source: input
+        description: which fulfilment route this parcel carries
+        constraints: POUCH_ROLL | COLD_CHAIN | NON_PACKABLE_LOOSE
+      - name: carrier_service
+        type: enum
+        source: input
+        description: transit service level
+        constraints: GROUND | TWO_DAY | OVERNIGHT
+      - name: packaging
+        type: enum
+        source: input
+        description: physical packaging selected
+        constraints: STANDARD | INSULATED_GEL | INSULATED_DRY_ICE
+      - name: status
+        type: enum
+        source: system
+        description: parcel lifecycle state
+        default: STAGED
+        constraints: STAGED | IN_TRANSIT | DELIVERED | PICKED_UP | PICKUP_MISSED | EXCEPTION_RETURNED | CANCELLED
+      - name: covers_line_ids
+        type: array
+        source: computed
+        description: CycleLine ids of the cycle whose packable_route matches shipment_kind and whose line_status IN {ADJUDICATED, PACKED_OUT}; ordered by CycleLine created_at ASC
+      - name: ship_cost_cents
+        type: integer
+        source: computed
+        description: freight cost stamped at creation (see calculations.shipment_cost_cents)
+        default: 0
+      - name: tracking_number
+        type: string
+        source: system
+        description: carrier tracking number stamped at dispatch
+        default: null
+      - name: staged_at
+        type: datetime
+        source: system
+        description: logical-clock instant the parcel was staged; the reference point of the cold-chain separation rule
+      - name: dispatched_at
+        type: datetime
+        source: system
+        description: logical-clock instant the parcel entered transit
+        default: null
+      - name: delivered_at
+        type: datetime
+        source: system
+        description: logical-clock instant the parcel was delivered
+        default: null
+      - name: pickup_confirmed_at
+        type: datetime
+        source: system
+        description: logical-clock instant the patient confirmed pickup
+        default: null
+      - name: cold_chain_excursion_minutes
+        type: integer
+        source: input
+        description: minutes the parcel spent outside the validated temperature range, reported at delivery
+        default: 0
+        constraints: ">= 0"
+
+  - name: VacationExceptionRequest
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: FK -> Patient.id; the traveling patient
+      - name: travel_start_date
+        type: string
+        source: input
+        description: ISO 8601 first day away; must be strictly after the logical-clock date
+      - name: travel_end_date
+        type: string
+        source: input
+        description: ISO 8601 last day away; must be strictly after travel_start_date
+      - name: requested_extra_days
+        type: integer
+        source: input
+        description: extra days of supply asked for
+        constraints: 1..30
+      - name: status
+        type: enum
+        source: system
+        description: decision state
+        default: SUBMITTED
+        constraints: SUBMITTED | PHARMACIST_APPROVED | PAYER_OVERRIDE_APPROVED | DENIED
+      - name: approved_extra_days
+        type: integer
+        source: input
+        description: extra days actually granted; never more than requested_extra_days
+        default: null
+      - name: waives_refill_too_soon
+        type: boolean
+        source: computed
+        description: "computed: status == PAYER_OVERRIDE_APPROVED; a PHARMACIST_APPROVED exception extends day supply but does NOT waive the payer refill-too-soon edit"
+        default: false
+      - name: denial_reason
+        type: string
+        source: input
+        description: free-text reason; null unless status == DENIED
+        default: null
+      - name: decided_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the VerifyingPharmacist who decided the request
+        default: null
+      - name: decided_at
+        type: datetime
+        source: system
+        description: logical-clock instant of the decision
+        default: null
+
+  - name: AdherenceEvent
+    parent: FillCycle
+    common_fields: false
+    fields:
+      - name: cycle_id
+        type: string
+        source: input
+        description: FK -> FillCycle.id; the cycle the event is attributed to (the patient is cycle.patient_id)
+      - name: event_type
+        type: enum
+        source: input
+        description: what happened
+        constraints: POUCH_TAKEN | POUCH_MISSED | PICKUP_CONFIRMED | PICKUP_MISSED | DELIVERY_EXCEPTION
+      - name: occurred_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant the event happened; must not be after the logical clock
+      - name: dose_slot
+        type: enum
+        source: input
+        description: slot the dose belonged to; null for pickup and delivery events
+        default: null
+        constraints: MORNING | NOON | EVENING | BEDTIME | null
+      - name: pouch_index
+        type: integer
+        source: input
+        description: pouch position reported by the patient; null for pickup and delivery events
+        default: null
+      - name: source
+        type: enum
+        source: system
+        description: PATIENT_REPORTED for app-reported dose events, SYSTEM_SCAN for events minted by the ops adherence review
+        constraints: PATIENT_REPORTED | SYSTEM_SCAN
+
+  - name: CreditMemo
+    parent: Patient
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: FK -> Patient.id; the credited patient
+      - name: cycle_id
+        type: string
+        source: input
+        description: FK -> FillCycle.id; the cycle the credit was issued against
+      - name: applied_to_cycle_id
+        type: string
+        source: system
+        description: FK -> FillCycle.id; the later cycle whose adjudication consumed this credit
+        default: null
+      - name: reason
+        type: enum
+        source: system
+        description: why the credit exists
+        constraints: PARTIAL_REISSUE | COLD_CHAIN_EXCURSION | ROUNDING_TRUEUP | FAILED_VERIFICATION
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: credit value in whole cents
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: credit lifecycle state
+        default: ISSUED
+        constraints: ISSUED | APPLIED | VOIDED
+      - name: issued_at
+        type: datetime
+        source: system
+        description: logical-clock instant the credit was issued
+      - name: applied_at
+        type: datetime
+        source: system
+        description: logical-clock instant the credit was consumed
+        default: null
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---------------------------------------------------------------------------
+  # FillCycle carries TWO independent state dimensions on the same row.
+  # `packaging_status` advances only on packaging triggers; `insurance_status`
+  # advances only on payer/authorization triggers. Re-adjudicating a cycle whose
+  # insurance_status is REJECTED_TOO_SOON flips ONLY the insurance dimension and
+  # leaves packaging_status at LINES_ADJUDICATED.
+  # ---------------------------------------------------------------------------
+  - entity: FillCycle
+    initial_state: DRAFT
+    terminal_states: [CLOSED, CANCELLED]
+    note: |
+      Two dimensions on one entity. packaging_status: DRAFT, LINES_ADJUDICATED,
+      ROLL_GENERATED, PACKED, VERIFIED, SHIPPED, CLOSED, CANCELLED (initial DRAFT,
+      terminal CLOSED / CANCELLED). insurance_status: NOT_ADJUDICATED,
+      EDITS_PENDING, CLEARED, REJECTED_TOO_SOON (initial NOT_ADJUDICATED, terminal
+      CLEARED). The state sets are disjoint so every transition below names its
+      dimension unambiguously.
+    transitions:
+      - from: DRAFT
+        to: LINES_ADJUDICATED
+        dimension: packaging_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "packaging_status IN {DRAFT, LINES_ADJUDICATED}"
+          - "insurance_status IN {NOT_ADJUDICATED, REJECTED_TOO_SOON}"
+          - "patient.autoship_status == ACTIVE"
+          - "every CycleLine of the cycle whose prescription.days_supply_written and allowance_days conflict is rejected first (see validations priority 34)"
+        side_effects:
+          - "for every CycleLine with line_status == PLANNED: compute refill_pct_used (calculations.refill_pct_used), allowance_days (calculations.day_supply_allowance_days), packable_route, days_supply_filled, quantity_dispensed and copay_cents (calculations.cycle_copay_cents)"
+          - "line_status := HELD_TOO_SOON with hold_reason REFILL_TOO_SOON when the refill-too-soon edit fails; HELD_AUTH with hold_reason NO_REFILLS_REMAINING when prescription.refills_remaining == 0; otherwise ADJUDICATED"
+          - "for every line set to HELD_AUTH: prescription.status ACTIVE -> PENDING_AUTHORIZATION"
+          - "for every line set to ADJUDICATED: prescription.prior_last_dispensed_date := prescription.last_dispensed_date, prescription.prior_last_dispensed_days_supply := prescription.last_dispensed_days_supply, prescription.last_dispensed_date := cycle.cycle_start_date, prescription.last_dispensed_days_supply := line.days_supply_filled, prescription.days_dispensed_total += line.days_supply_filled, prescription.refills_remaining -= 1, prescription.refills_consumed += 1"
+          - "FillCycle.total_copay_cents := sum of copay_cents over lines with line_status == ADJUDICATED (round-per-line-then-sum)"
+          - "apply outstanding credit: for each CreditMemo of the patient with status == ISSUED ordered by created_at ASC, while remaining copay > 0 set status := APPLIED, applied_to_cycle_id := this cycle, applied_at := clock; FillCycle.credit_applied_cents := sum applied; patient.credit_balance_cents := sum of remaining ISSUED memos"
+          - "increments FillCycle.version by 1"
+        note: "On a re-run from insurance_status REJECTED_TOO_SOON the packaging dimension stays at LINES_ADJUDICATED — only the insurance dimension moves."
+
+      - from: NOT_ADJUDICATED
+        to: CLEARED
+        dimension: insurance_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate — no line ended HELD_TOO_SOON or HELD_AUTH"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "every CycleLine of the cycle has line_status == ADJUDICATED after the edit pass"
+        side_effects:
+          - "cycle becomes eligible for POST /pharmacy/fill-cycles/{id}/generate-roll"
+
+      - from: NOT_ADJUDICATED
+        to: EDITS_PENDING
+        dimension: insurance_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate — at least one line HELD_AUTH and none HELD_TOO_SOON"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "count(CycleLine with line_status == HELD_AUTH) >= 1"
+          - "count(CycleLine with line_status == HELD_TOO_SOON) == 0"
+        side_effects:
+          - "held lines are excluded from total_copay_cents until their authorization resolves"
+
+      - from: NOT_ADJUDICATED
+        to: REJECTED_TOO_SOON
+        dimension: insurance_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate — at least one line HELD_TOO_SOON"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "count(CycleLine with line_status == HELD_TOO_SOON) >= 1"
+        side_effects:
+          - "generate-roll is blocked with ERR_REFILL_TOO_SOON until the cycle re-adjudicates to CLEARED"
+
+      - from: REJECTED_TOO_SOON
+        to: CLEARED
+        dimension: insurance_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate with vacation_exception_id of a PAYER_OVERRIDE_APPROVED request"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "packaging_status == LINES_ADJUDICATED"
+          - "the referenced VacationExceptionRequest.patient_id == cycle.patient_id and its status == PAYER_OVERRIDE_APPROVED"
+        side_effects:
+          - "FillCycle.vacation_exception_id and approved_vacation_extra_days are stamped"
+          - "the refill-too-soon edit is waived for every line; every HELD_TOO_SOON line is recomputed (allowance_days widens by approved_vacation_extra_days), becomes ADJUDICATED and stamps its dispense"
+          - "lines already ADJUDICATED on the first pass are NOT recomputed and their dispense is NOT stamped a second time"
+          - "FillCycle.total_copay_cents recomputed; packaging_status is NOT touched"
+          - "increments FillCycle.version by 1"
+
+      - from: EDITS_PENDING
+        to: CLEARED
+        dimension: insurance_status
+        trigger: "system — the last HELD_AUTH line resolves (authorization APPROVED, DENIED or ESCALATED-dropped)"
+        actor: system
+        preconditions:
+          - "count(CycleLine with line_status IN {HELD_AUTH, HELD_TOO_SOON}) == 0"
+          - "count(CycleLine with line_status == ADJUDICATED) >= 1"
+        side_effects:
+          - "FillCycle.total_copay_cents recomputed over the ADJUDICATED lines"
+          - "increments FillCycle.version by 1"
+
+      - from: LINES_ADJUDICATED
+        to: ROLL_GENERATED
+        dimension: packaging_status
+        trigger: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+        actor: PackagingTechnician
+        preconditions:
+          - "insurance_status == CLEARED"
+          - "count(CycleLine with line_status == ADJUDICATED and packable_route == POUCH) >= 1"
+          - "every CycleLine with line_status == ADJUDICATED has prescription.status == ACTIVE"
+          - "the roll segment does not collide with an existing roll segment in the cycle family (validations priority 29)"
+        side_effects:
+          - "creates one PouchRoll (verification_status BUILT) with segment_start_date = min(line_start_date over POUCH lines) and segment_end_date = max(line_end_date over POUCH lines) - 1 day"
+          - "creates one Pouch per (dose_date, dose_slot) pair per calculations.roll_pouch_count, each with contents, expected_pill_count and verification_result PENDING"
+          - "FillCycle.roll_pouch_count := PouchRoll.pouch_count"
+          - "increments FillCycle.version by 1"
+
+      - from: ROLL_GENERATED
+        to: PACKED
+        dimension: packaging_status
+        trigger: "POST /pharmacy/pouch-rolls/{id}/pack"
+        actor: PackagingTechnician
+        preconditions:
+          - "the roll's verification_status == BUILT"
+        side_effects:
+          - "PouchRoll.verification_status := PACKED, packed_by_user_id := X-User-ID, packed_at := clock"
+          - "increments FillCycle.version by 1"
+
+      - from: PACKED
+        to: VERIFIED
+        dimension: packaging_status
+        trigger: "POST /pharmacy/pouch-rolls/{id}/verify — every pouch MATCH"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "the roll's verification_status == PACKED"
+          - "no Pouch of the roll has verification_result == PENDING"
+          - "PouchRoll.mismatch_pouch_count == 0"
+          - "X-User-ID != PouchRoll.packed_by_user_id"
+        side_effects:
+          - "PouchRoll.verification_status := PASSED, verified_by_user_id := X-User-ID, verified_at := clock"
+          - "increments FillCycle.version by 1"
+
+      - from: PACKED
+        to: ROLL_GENERATED
+        dimension: packaging_status
+        trigger: "POST /pharmacy/pouch-rolls/{id}/verify — at least one pouch MISMATCH_COUNT or UNREADABLE"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "the roll's verification_status == PACKED"
+          - "no Pouch of the roll has verification_result == PENDING"
+          - "PouchRoll.mismatch_pouch_count >= 1"
+          - "X-User-ID != PouchRoll.packed_by_user_id"
+        side_effects:
+          - "PouchRoll.verification_status := FAILED_QUARANTINED, verified_by_user_id := X-User-ID, verified_at := clock"
+          - "issues a CreditMemo (reason FAILED_VERIFICATION, amount_cents = FAILED_VERIFICATION_GOODWILL_CENTS, status ISSUED, cycle_id = this cycle) and raises patient.credit_balance_cents by that amount"
+          - "increments FillCycle.version by 1"
+
+      - from: VERIFIED
+        to: SHIPPED
+        dimension: packaging_status
+        trigger: "system — the dispatch that leaves every required shipment kind of the cycle in transit or beyond"
+        actor: system
+        preconditions:
+          - "required_kinds = {POUCH_ROLL if any ADJUDICATED line has packable_route == POUCH} u {COLD_CHAIN if any has COLD_CHAIN} u {NON_PACKABLE_LOOSE if any has LOOSE_SPLIT}"
+          - "for every kind in required_kinds there is a Shipment of that kind with status IN {IN_TRANSIT, DELIVERED, PICKED_UP}"
+        side_effects:
+          - "FillCycle.final_copay_cents := round_half_up(sum of raw line amounts) per calculations.cycle_copay_cents variant FINAL_SUM_THEN_ROUND"
+          - "FillCycle.rounding_delta_cents := total_copay_cents - final_copay_cents"
+          - "when rounding_delta_cents >= ROUNDING_CREDIT_MIN_CENTS: issues a CreditMemo (reason ROUNDING_TRUEUP, amount_cents = rounding_delta_cents, status ISSUED) and raises patient.credit_balance_cents"
+          - "every CycleLine with line_status == ADJUDICATED becomes PACKED_OUT"
+          - "increments FillCycle.version by 1"
+
+      - from: VERIFIED
+        to: ROLL_GENERATED
+        dimension: packaging_status
+        trigger: "system — cascade from POST /pharmacy/prescriptions/{id}/regimen-change"
+        actor: system
+        preconditions:
+          - "at least one CycleLine of the cycle just became SUPERSEDED_PENDING_REISSUE"
+        side_effects:
+          - "FillCycle.reissue_required := true"
+          - "every Shipment of the cycle with status == STAGED and shipment_kind == POUCH_ROLL becomes CANCELLED"
+          - "increments FillCycle.version by 1"
+
+      - from: PACKED
+        to: ROLL_GENERATED
+        dimension: packaging_status
+        trigger: "system — cascade from POST /pharmacy/prescriptions/{id}/regimen-change on a cycle whose roll is only PACKED"
+        actor: system
+        preconditions:
+          - "at least one CycleLine of the cycle just became SUPERSEDED_PENDING_REISSUE"
+        side_effects:
+          - "FillCycle.reissue_required := true"
+          - "increments FillCycle.version by 1"
+        note: "Same to-state as the VERIFIED branch but a different from-state; the roll is not re-verified, only re-generated."
+
+      - from: SHIPPED
+        to: CLOSED
+        dimension: packaging_status
+        trigger: "system — the pickup confirmation that leaves no Shipment of the cycle awaiting the patient"
+        actor: system
+        preconditions:
+          - "every Shipment of the cycle has status IN {PICKED_UP, PICKUP_MISSED, EXCEPTION_RETURNED, CANCELLED}"
+        side_effects:
+          - "increments FillCycle.version by 1"
+
+      - from: DRAFT
+        to: CANCELLED
+        dimension: packaging_status
+        trigger: "system — cascade from an auto-ship pause (adherence gap or missed pickups)"
+        actor: system
+        preconditions:
+          - "packaging_status == DRAFT"
+          - "patient.autoship_status just became PAUSED_ADHERENCE"
+        side_effects:
+          - "every CycleLine of the cycle becomes EXCLUDED_HELD (hold_reason stays null)"
+          - "increments FillCycle.version by 1"
+
+  - entity: Prescription
+    initial_state: ACTIVE
+    terminal_states: [SUPERSEDED, DISCONTINUED, EXPIRED]
+    note: "Cyclic: ACTIVE -> PENDING_AUTHORIZATION -> ACTIVE whenever refills run out and the prescriber re-authorizes."
+    transitions:
+      - from: ACTIVE
+        to: PENDING_AUTHORIZATION
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate — line held because refills_remaining == 0"
+        actor: system
+        preconditions:
+          - "prescription.refills_remaining == 0"
+          - "a CycleLine referencing this prescription is being adjudicated"
+        side_effects:
+          - "the line becomes HELD_AUTH with hold_reason NO_REFILLS_REMAINING"
+          - "increments Prescription.version by 1"
+      - from: PENDING_AUTHORIZATION
+        to: ACTIVE
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision APPROVE"
+        actor: system
+        preconditions:
+          - "the request's status IN {SENT, ESCALATED}"
+        side_effects:
+          - "refills_authorized += approved_refills; refills_remaining += approved_refills"
+          - "each CycleLine referencing this prescription with line_status == HELD_AUTH is re-adjudicated to ADJUDICATED, its copay_cents recomputed and its dispense stamped onto this prescription exactly as a first-pass adjudication would (refills_remaining -= 1, refills_consumed += 1, days_dispensed_total += days_supply_filled, prior_last_dispensed_* saved and last_dispensed_* advanced); that in turn recomputes cycle.total_copay_cents and can move the cycle's insurance dimension EDITS_PENDING -> CLEARED"
+          - "increments Prescription.version by 1"
+      - from: PENDING_AUTHORIZATION
+        to: DISCONTINUED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision DENY"
+        actor: system
+        preconditions:
+          - "the request's status IN {SENT, ESCALATED}"
+        side_effects:
+          - "each CycleLine referencing this prescription with line_status == HELD_AUTH becomes EXCLUDED_HELD with hold_reason AUTH_DENIED"
+          - "that line change can move the cycle's insurance dimension EDITS_PENDING -> CLEARED"
+          - "increments Prescription.version by 1"
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /pharmacy/prescriptions/{id}/regimen-change"
+        actor: Prescriber
+        preconditions:
+          - "status == ACTIVE"
+          - "expected_prescription_version matches Prescription.version"
+        side_effects:
+          - "creates a successor Prescription (status ACTIVE, supersedes_rx_id = this prescription's id) carrying refills_remaining and refills_consumed forward"
+          - "every CycleLine referencing this prescription on a cycle whose packaging_status IN {DRAFT, LINES_ADJUDICATED, ROLL_GENERATED, PACKED, VERIFIED} becomes SUPERSEDED_PENDING_REISSUE with hold_reason REGIMEN_CHANGE"
+          - "increments Prescription.version by 1"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /pharmacy/patients/{id}/synchronize — expiration_date is before the logical-clock date"
+        actor: system
+        preconditions:
+          - "expiration_date < clock date"
+        side_effects:
+          - "the prescription is excluded from the synchronization set and from any future cycle's lines"
+          - "increments Prescription.version by 1"
+
+  - entity: RefillAuthorizationRequest
+    initial_state: SENT
+    terminal_states: [APPROVED, DENIED]
+    note: "Cyclic chase loop: SENT -> NO_RESPONSE -> SENT, driven by one endpoint whose effect depends on the current state."
+    transitions:
+      - from: SENT
+        to: NO_RESPONSE
+        trigger: "POST /pharmacy/refill-authorizations/{id}/chase"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == SENT"
+          - "clock >= next_chase_due_at"
+          - "chase_round < MAX_CHASE_ROUNDS"
+        side_effects:
+          - "chase_round += 1; no_response_recorded_at := clock"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: NO_RESPONSE
+        to: SENT
+        trigger: "POST /pharmacy/refill-authorizations/{id}/chase"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == NO_RESPONSE"
+        side_effects:
+          - "last_sent_at := clock; next_chase_due_at := clock + CHASE_INTERVAL_HOURS"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: NO_RESPONSE
+        to: ESCALATED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/escalate"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == NO_RESPONSE"
+          - "chase_round >= MAX_CHASE_ROUNDS"
+        side_effects:
+          - "escalation_level := 1"
+          - "when clock date >= the held line's cycle.cycle_start_date: the HELD_AUTH CycleLine becomes EXCLUDED_HELD with hold_reason AUTH_ESCALATED, which can move that cycle's insurance dimension EDITS_PENDING -> CLEARED"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: SENT
+        to: APPROVED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision APPROVE"
+        actor: Prescriber
+        preconditions:
+          - "status IN {SENT, ESCALATED}"
+          - "approved_refills is present and 1..12"
+        side_effects:
+          - "prescription PENDING_AUTHORIZATION -> ACTIVE with refills restored (see Prescription machine)"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: SENT
+        to: DENIED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision DENY"
+        actor: Prescriber
+        preconditions:
+          - "status IN {SENT, ESCALATED}"
+          - "denial_reason is present"
+        side_effects:
+          - "prescription PENDING_AUTHORIZATION -> DISCONTINUED (see Prescription machine)"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: ESCALATED
+        to: APPROVED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision APPROVE"
+        actor: Prescriber
+        preconditions:
+          - "status == ESCALATED"
+          - "approved_refills is present and 1..12"
+        side_effects:
+          - "prescription PENDING_AUTHORIZATION -> ACTIVE; a line already EXCLUDED_HELD by escalation is NOT revived"
+          - "increments RefillAuthorizationRequest.version by 1"
+      - from: ESCALATED
+        to: DENIED
+        trigger: "POST /pharmacy/refill-authorizations/{id}/respond with decision DENY"
+        actor: Prescriber
+        preconditions:
+          - "status == ESCALATED"
+          - "denial_reason is present"
+        side_effects:
+          - "prescription PENDING_AUTHORIZATION -> DISCONTINUED"
+          - "increments RefillAuthorizationRequest.version by 1"
+
+  - entity: PouchRoll
+    initial_state: BUILT
+    terminal_states: [PASSED]
+    note: "Branching verification with a rework loop: PACKED -> {PASSED, FAILED_QUARANTINED}, FAILED_QUARANTINED -> BUILT."
+    transitions:
+      - from: BUILT
+        to: PACKED
+        trigger: "POST /pharmacy/pouch-rolls/{id}/pack"
+        actor: PackagingTechnician
+        preconditions:
+          - "verification_status == BUILT"
+          - "pouch_count >= 1"
+        side_effects:
+          - "packed_by_user_id := X-User-ID; packed_at := clock; cycle.packaging_status ROLL_GENERATED -> PACKED"
+          - "increments PouchRoll.version by 1"
+      - from: PACKED
+        to: PASSED
+        trigger: "POST /pharmacy/pouch-rolls/{id}/verify"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "verification_status == PACKED"
+          - "count(Pouch of this roll with verification_result == PENDING) == 0"
+          - "mismatch_pouch_count == 0"
+          - "X-User-ID != packed_by_user_id"
+        side_effects:
+          - "verified_by_user_id := X-User-ID; verified_at := clock; cycle.packaging_status PACKED -> VERIFIED"
+          - "increments PouchRoll.version by 1"
+      - from: PACKED
+        to: FAILED_QUARANTINED
+        trigger: "POST /pharmacy/pouch-rolls/{id}/verify"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "verification_status == PACKED"
+          - "count(Pouch of this roll with verification_result == PENDING) == 0"
+          - "mismatch_pouch_count >= 1"
+          - "X-User-ID != packed_by_user_id"
+        side_effects:
+          - "verified_by_user_id := X-User-ID; verified_at := clock; cycle.packaging_status PACKED -> ROLL_GENERATED"
+          - "issues a CreditMemo reason FAILED_VERIFICATION for FAILED_VERIFICATION_GOODWILL_CENTS and raises patient.credit_balance_cents"
+          - "increments PouchRoll.version by 1"
+      - from: FAILED_QUARANTINED
+        to: BUILT
+        trigger: "POST /pharmacy/pouch-rolls/{id}/rework"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "verification_status == FAILED_QUARANTINED"
+          - "rework_count < MAX_REWORK_COUNT"
+        side_effects:
+          - "rework_count += 1; packed_by_user_id := null; packed_at := null; verified_by_user_id := null; verified_at := null"
+          - "every Pouch of the roll with verification_result != VOID resets to PENDING with detected_pill_count := null, image_confidence_pct := null, imaged_by_user_id := null, imaged_at := null"
+          - "increments PouchRoll.version by 1"
+
+  - entity: Shipment
+    initial_state: STAGED
+    terminal_states: [PICKED_UP, PICKUP_MISSED, EXCEPTION_RETURNED, CANCELLED]
+    note: "Branching at delivery: a cold-chain excursion above the limit diverts the parcel to EXCEPTION_RETURNED with a full dispense reversal instead of DELIVERED."
+    transitions:
+      - from: STAGED
+        to: IN_TRANSIT
+        trigger: "POST /pharmacy/shipments/{id}/dispatch"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == STAGED"
+          - "for shipment_kind == POUCH_ROLL: the cycle's PouchRoll.verification_status == PASSED"
+        side_effects:
+          - "tracking_number stamped; dispatched_at := clock"
+          - "when every required shipment kind of the cycle is now in transit or beyond: cycle.packaging_status VERIFIED -> SHIPPED with final_copay_cents / rounding_delta_cents stamped"
+          - "increments Shipment.version by 1"
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: "POST /pharmacy/shipments/{id}/deliver with cold_chain_excursion_minutes <= COLD_CHAIN_EXCURSION_LIMIT_MINUTES"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == IN_TRANSIT"
+        side_effects:
+          - "delivered_at := clock; cold_chain_excursion_minutes stored"
+          - "increments Shipment.version by 1"
+      - from: IN_TRANSIT
+        to: EXCEPTION_RETURNED
+        trigger: "POST /pharmacy/shipments/{id}/deliver with shipment_kind == COLD_CHAIN and cold_chain_excursion_minutes > COLD_CHAIN_EXCURSION_LIMIT_MINUTES"
+        actor: PharmacyOperations
+        preconditions:
+          - "status == IN_TRANSIT"
+          - "shipment_kind == COLD_CHAIN"
+        side_effects:
+          - "delivered_at := clock; creates an AdherenceEvent (event_type DELIVERY_EXCEPTION, source SYSTEM_SCAN)"
+          - "every CycleLine in covers_line_ids becomes CREDITED; because those lines are credited, each one's Prescription reverses its dispense: days_dispensed_total -= line.days_supply_filled, refills_remaining += 1, refills_consumed -= 1, last_dispensed_date := prior_last_dispensed_date, last_dispensed_days_supply := prior_last_dispensed_days_supply"
+          - "because the lines were credited, a CreditMemo (reason COLD_CHAIN_EXCURSION, amount_cents = sum of the credited lines' copay_cents, status ISSUED) is issued and patient.credit_balance_cents rises by that amount"
+          - "FillCycle.total_copay_cents recomputed over the remaining ADJUDICATED / PACKED_OUT lines"
+          - "increments Shipment.version by 1"
+      - from: DELIVERED
+        to: PICKED_UP
+        trigger: "POST /pharmacy/shipments/{id}/confirm-pickup"
+        actor: Patient
+        preconditions:
+          - "status == DELIVERED"
+          - "X-User-ID == cycle.patient_id"
+        side_effects:
+          - "pickup_confirmed_at := clock; creates an AdherenceEvent (PICKUP_CONFIRMED, source PATIENT_REPORTED)"
+          - "patient.consecutive_missed_pickups := 0"
+          - "when every Shipment of the cycle is terminal: cycle.packaging_status SHIPPED -> CLOSED"
+          - "increments Shipment.version by 1"
+      - from: DELIVERED
+        to: PICKUP_MISSED
+        trigger: "POST /pharmacy/patients/{id}/adherence-review — clock >= delivered_at + PICKUP_GRACE_DAYS"
+        actor: system
+        preconditions:
+          - "status == DELIVERED"
+          - "clock >= delivered_at + PICKUP_GRACE_DAYS days"
+        side_effects:
+          - "creates an AdherenceEvent (PICKUP_MISSED, source SYSTEM_SCAN)"
+          - "patient.consecutive_missed_pickups += 1; because that counter reached MISSED_PICKUP_PAUSE_COUNT the patient's autoship_status ACTIVE -> PAUSED_ADHERENCE with pause_reason MISSED_PICKUPS; because auto-ship paused, every DRAFT FillCycle of the patient becomes CANCELLED"
+          - "increments Shipment.version by 1"
+      - from: STAGED
+        to: CANCELLED
+        trigger: "system — cascade from POST /pharmacy/prescriptions/{id}/regimen-change reverting the cycle's packaging dimension"
+        actor: system
+        preconditions:
+          - "status == STAGED"
+          - "shipment_kind == POUCH_ROLL"
+        side_effects:
+          - "increments Shipment.version by 1"
+
+  - entity: VacationExceptionRequest
+    initial_state: SUBMITTED
+    terminal_states: [PHARMACIST_APPROVED, PAYER_OVERRIDE_APPROVED, DENIED]
+    note: "Branching decision with divergent side-effect sets: only the payer-override branch waives the refill-too-soon edit."
+    transitions:
+      - from: SUBMITTED
+        to: PHARMACIST_APPROVED
+        trigger: "POST /pharmacy/vacation-exceptions/{id}/decide with decision APPROVE_PHARMACIST"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "status == SUBMITTED"
+          - "no ACTIVE Prescription of the patient has is_controlled == true"
+          - "approved_extra_days <= requested_extra_days"
+        side_effects:
+          - "approved_extra_days stored; waives_refill_too_soon := false; decided_by_user_id / decided_at stamped"
+          - "patient.vacation_exceptions_used_this_year += 1"
+          - "increments VacationExceptionRequest.version by 1"
+      - from: SUBMITTED
+        to: PAYER_OVERRIDE_APPROVED
+        trigger: "POST /pharmacy/vacation-exceptions/{id}/decide with decision APPROVE_PAYER_OVERRIDE"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "status == SUBMITTED"
+          - "patient's InsurancePlan.allows_payer_vacation_override == true"
+          - "no ACTIVE Prescription of the patient has is_controlled == true"
+          - "approved_extra_days <= requested_extra_days"
+        side_effects:
+          - "approved_extra_days stored; waives_refill_too_soon := true; decided_by_user_id / decided_at stamped"
+          - "patient.vacation_exceptions_used_this_year += 1"
+          - "increments VacationExceptionRequest.version by 1"
+      - from: SUBMITTED
+        to: DENIED
+        trigger: "POST /pharmacy/vacation-exceptions/{id}/decide with decision DENY"
+        actor: VerifyingPharmacist
+        preconditions:
+          - "status == SUBMITTED"
+          - "denial_reason is present"
+        side_effects:
+          - "denial_reason stored; approved_extra_days stays null; patient.vacation_exceptions_used_this_year unchanged"
+          - "increments VacationExceptionRequest.version by 1"
+
+  - entity: Patient
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED]
+    note: |
+      Two dimensions. autoship_status: ACTIVE, PAUSED_ADHERENCE, PAUSED_PATIENT,
+      CANCELLED (cyclic — ACTIVE -> PAUSED_ADHERENCE -> ACTIVE). sync_status:
+      UNSYNCED -> SYNCED, advanced only by synchronize and independent of
+      autoship_status.
+    transitions:
+      - from: UNSYNCED
+        to: SYNCED
+        dimension: sync_status
+        trigger: "POST /pharmacy/patients/{id}/synchronize"
+        actor: PharmacyOperations
+        preconditions:
+          - "autoship_status IN {ACTIVE, PAUSED_PATIENT}"
+          - "count(Prescription of the patient with status == ACTIVE and expiration_date >= clock date) >= 1"
+        side_effects:
+          - "anchor_fill_day / sync_mode stored; next_cycle_start_date computed"
+          - "every ACTIVE Prescription with expiration_date < clock date becomes EXPIRED"
+          - "each remaining ACTIVE Prescription gets sync_bridge_days and sync_trim_days per calculations.sync_alignment_days"
+          - "increments Patient.version by 1"
+      - from: ACTIVE
+        to: PAUSED_ADHERENCE
+        dimension: autoship_status
+        trigger: "system — POST /pharmacy/patients/{id}/dose-events or POST /pharmacy/patients/{id}/adherence-review breaches an adherence gate"
+        actor: system
+        preconditions:
+          - "autoship_status == ACTIVE"
+          - "adherence_score_pct < ADHERENCE_PAUSE_THRESHOLD_PCT OR consecutive_missed_pickups >= MISSED_PICKUP_PAUSE_COUNT"
+        side_effects:
+          - "pause_reason := ADHERENCE_GAP when the score gate fired, MISSED_PICKUPS when the pickup gate fired (score gate is evaluated first)"
+          - "because auto-ship paused, every FillCycle of the patient with packaging_status == DRAFT becomes CANCELLED and every CycleLine of those cycles becomes EXCLUDED_HELD"
+          - "increments Patient.version by 1"
+      - from: PAUSED_ADHERENCE
+        to: ACTIVE
+        dimension: autoship_status
+        trigger: "POST /pharmacy/patients/{id}/autoship with action RESUME"
+        actor: PharmacyOperations
+        preconditions:
+          - "autoship_status IN {PAUSED_ADHERENCE, PAUSED_PATIENT}"
+        side_effects:
+          - "pause_reason := null; consecutive_missed_pickups := 0"
+          - "increments Patient.version by 1"
+      - from: ACTIVE
+        to: PAUSED_PATIENT
+        dimension: autoship_status
+        trigger: "POST /pharmacy/patients/{id}/autoship with action PAUSE"
+        actor: Patient
+        preconditions:
+          - "autoship_status == ACTIVE"
+          - "X-User-ID == patient id when acting as Patient"
+        side_effects:
+          - "pause_reason := PATIENT_REQUEST"
+          - "every FillCycle of the patient with packaging_status == DRAFT becomes CANCELLED"
+          - "increments Patient.version by 1"
+      - from: ACTIVE
+        to: CANCELLED
+        dimension: autoship_status
+        trigger: "POST /pharmacy/patients/{id}/autoship with action CANCEL"
+        actor: PharmacyOperations
+        preconditions:
+          - "autoship_status IN {ACTIVE, PAUSED_ADHERENCE, PAUSED_PATIENT}"
+        side_effects:
+          - "pause_reason := PATIENT_REQUEST; every FillCycle with packaging_status == DRAFT becomes CANCELLED"
+          - "because auto-ship is cancelled outright, every CreditMemo of the patient with status == ISSUED becomes VOIDED and credit_balance_cents := 0 — an unredeemed credit has no future fill to land on"
+          - "increments Patient.version by 1"
+
+  - entity: CreditMemo
+    initial_state: ISSUED
+    terminal_states: [APPLIED, VOIDED]
+    transitions:
+      - from: ISSUED
+        to: APPLIED
+        trigger: "POST /pharmacy/fill-cycles/{id}/adjudicate on a later cycle of the same patient"
+        actor: system
+        preconditions:
+          - "status == ISSUED"
+          - "the adjudicating cycle's id != this memo's cycle_id"
+        side_effects:
+          - "applied_to_cycle_id / applied_at stamped; patient.credit_balance_cents drops by amount_cents; cycle.credit_applied_cents rises by amount_cents"
+      - from: ISSUED
+        to: VOIDED
+        trigger: "POST /pharmacy/patients/{id}/autoship with action CANCEL"
+        actor: system
+        preconditions:
+          - "status == ISSUED"
+          - "patient_id == the cancelled patient's id"
+        side_effects:
+          - "patient.credit_balance_cents drops by amount_cents"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules — OCC on the parent's `version` only
+# =============================================================================
+concurrency_rules:
+  - rule_id: reissue-create-stale-cycle
+    parent_entity: FillCycle
+    write_endpoint: "POST /pharmacy/fill-cycles/{id}/reissue"
+    occ_field: "expected_cycle_version"
+    description: |
+      Creating a partial reissue against a FillCycle whose version has advanced
+      since the client last observed it is rejected with a stale-version error.
+      A reissue legitimately supersedes the tail of the cycle — trimming lines,
+      truncating the roll segment and issuing a credit — so a second reissue
+      derived from a pre-trim view of the cycle would credit days that the first
+      reissue already credited. The stale `expected_cycle_version` is what makes
+      that observable and deterministic.
+    error_id: ERR_STALE_CYCLE_VERSION
+    http_status: 412
+
+  - rule_id: regimen-change-stale-prescription
+    parent_entity: Prescription
+    write_endpoint: "POST /pharmacy/prescriptions/{id}/regimen-change"
+    occ_field: "expected_prescription_version"
+    description: |
+      A mid-cycle regimen change against a Prescription whose version has advanced
+      since the client last observed it is rejected with a stale-version error. A
+      regimen change legitimately supersedes the prescription and mints a successor,
+      so a change written from a stale view would branch a second successor off an
+      already-superseded prescription.
+    error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules
+# =============================================================================
+# Global constants (all integers; every monetary field is an integer cent count):
+#   DEFAULT_DAY_SUPPLY_DAYS            = 28
+#   ANCHOR_DAY_MAX                     = 28
+#   CONTROLLED_MAX_DAY_SUPPLY_DAYS     = 30
+#   COLD_CHAIN_MAX_DAY_SUPPLY_DAYS     = 30
+#   PICKUP_GRACE_DAYS                  = 5
+#   MISSED_PICKUP_PAUSE_COUNT          = 2
+#   CHASE_INTERVAL_HOURS               = 72
+#   MAX_CHASE_ROUNDS                   = 3
+#   MAX_REWORK_COUNT                   = 2
+#   COLD_CHAIN_EXCURSION_LIMIT_MINUTES = 120
+#   COLD_CHAIN_MIN_GAP_HOURS           = 48
+#   ADHERENCE_WINDOW_DAYS              = 28
+#   ADHERENCE_PAUSE_THRESHOLD_PCT      = 80
+#   IMAGE_MIN_CONFIDENCE_PCT           = 90
+#   FAILED_VERIFICATION_GOODWILL_CENTS = 500
+#   ROUNDING_CREDIT_MIN_CENTS          = 1
+#   REISSUE_FEE_WAIVE_BASIS_CENTS      = 5000
+#   REISSUE_FEE_REDUCED_BASIS_CENTS    = 2000
+#   REISSUE_FEE_REDUCED_CENTS          = 250
+#   REISSUE_FEE_FULL_CENTS             = 500
+# Rounding: round_half_up to whole cents / whole percent, applied ONLY at the step
+# named in each formula. Percentages use floor() where stated. Dates are compared
+# as calendar dates against the logical clock; day counts are inclusive of the
+# start date and exclusive of the end date unless a field says INCLUSIVE.
+calculations:
+
+  - name: sync_alignment_days
+    entity_field: CycleLine.days_supply_filled
+    algorithm_type: threshold
+    variants: [BRIDGE_TO_START, TRIM_TO_START]
+    description: |
+      Medication synchronization pulls every prescription onto one common fill
+      cycle. The line's dispensed day supply depends on how much of the previous
+      fill the patient still holds on the cycle's start date, and the plan pins
+      ONE of two irreconcilable alignment policies per patient (Patient.sync_mode).
+    formula: |
+      on_hand_through_date = last_dispensed_date + last_dispensed_days_supply days
+        (when last_dispensed_date is null the patient holds nothing:
+         on_hand_through_date = cycle.cycle_start_date)
+      gap_days     = max(0, cycle_start_date - on_hand_through_date)   # in days
+      overlap_days = max(0, on_hand_through_date - cycle_start_date)   # in days
+
+      variant BRIDGE_TO_START:
+        bridge_days_applied = gap_days
+        trim_days_applied   = 0
+        days_supply_filled  = cycle.day_supply_days + gap_days
+        # the fill is LENGTHENED so the patient is covered from the day their
+        # current supply runs out through the end of the common cycle
+
+      variant TRIM_TO_START:
+        bridge_days_applied = 0
+        trim_days_applied   = overlap_days
+        days_supply_filled  = max(0, cycle.day_supply_days - overlap_days)
+        # the fill is SHORTENED so the on-hand supply is burned down first and the
+        # NEXT cycle lands exactly on the anchor day
+
+      line_start_date = cycle.cycle_start_date - bridge_days_applied days  # inclusive
+      line_end_date   = line_start_date + days_supply_filled days          # exclusive
+      # the bridge days sit BEFORE the common cycle start (they cover the gap between
+      # on-hand exhaustion and the anchor day), so a bridged line still ends exactly at
+      # cycle_start_date + cycle.day_supply_days
+    input_set: "every Prescription of the patient with status == ACTIVE at the moment POST /pharmacy/fill-cycles is called"
+    variant_selection: "Patient.sync_mode, pinned by POST /pharmacy/patients/{id}/synchronize and never re-pinned by cycle creation"
+    worked_example: |
+      cycle_start_date 2026-08-15, day_supply_days 28.
+      Rx1 last_dispensed_date 2026-07-25, last_dispensed_days_supply 28
+        -> on_hand_through_date 2026-08-22, gap_days 0, overlap_days 7
+        BRIDGE_TO_START: days_supply_filled = 28 + 0  = 28, trim 0
+        TRIM_TO_START:   days_supply_filled = 28 - 7  = 21, trim 7
+      Rx5 last_dispensed_date 2026-08-01, last_dispensed_days_supply 10
+        -> on_hand_through_date 2026-08-11, gap_days 4, overlap_days 0
+        BRIDGE_TO_START: days_supply_filled = 28 + 4  = 32, bridge 4
+        TRIM_TO_START:   days_supply_filled = 28 - 0  = 28, trim 0
+
+  - name: refill_pct_used
+    entity_field: CycleLine.refill_pct_used
+    algorithm_type: threshold
+    description: |
+      The payer's refill-too-soon edit. A refill claim clears only when the patient
+      has consumed at least InsurancePlan.refill_too_soon_threshold_pct of the day
+      supply on the previous fill. The comparison is INCLUSIVE at the threshold.
+    formula: |
+      when prescription.last_dispensed_date is null:
+        refill_pct_used = 100                       # first fill always clears
+      else:
+        elapsed_days   = cycle.cycle_start_date - prescription.last_dispensed_date
+        refill_pct_used = floor(100 * elapsed_days / prescription.last_dispensed_days_supply)
+
+      clears when refill_pct_used >= plan.refill_too_soon_threshold_pct
+                  OR the cycle carries a VacationExceptionRequest whose status is
+                     PAYER_OVERRIDE_APPROVED (waives_refill_too_soon == true)
+      otherwise the line becomes HELD_TOO_SOON (hold_reason REFILL_TOO_SOON) and the
+      cycle's insurance dimension becomes REJECTED_TOO_SOON
+    constants: "threshold read from InsurancePlan.refill_too_soon_threshold_pct (default 75)"
+    worked_example: |
+      threshold 75, cycle_start_date 2026-08-15.
+      Rx1 last 2026-07-25 / 28d -> floor(100 * 21 / 28) = 75  -> clears (boundary, inclusive)
+      Rx2 last 2026-07-20 / 30d -> floor(100 * 26 / 30) = 86  -> clears
+      Rx3 last 2026-07-18 / 30d -> floor(100 * 28 / 30) = 93  -> clears
+      Rx4 last 2026-07-18 / 28d -> floor(100 * 28 / 28) = 100 -> clears
+      Rx6 last 2026-08-04 / 30d -> floor(100 * 11 / 30) = 36  -> HELD_TOO_SOON
+      Rx7 last 2026-07-24 / 28d -> floor(100 * 22 / 28) = 78  -> clears
+      Rx8 last 2026-07-26 / 28d -> floor(100 * 20 / 28) = 71  -> HELD_TOO_SOON (threshold-1 region)
+
+  - name: day_supply_allowance_days
+    entity_field: CycleLine.allowance_days
+    algorithm_type: aggregation
+    description: |
+      The payer day-supply edit: the maximum number of days the plan will fund on
+      one line. Four independent ceilings are folded together by successive min(),
+      and two of them apply only when a prescription-level flag is set. A line whose
+      days_supply_filled exceeds the allowance is rejected with
+      ERR_DAY_SUPPLY_EXCEEDS_ALLOWANCE (validations priority 37).
+    formula: |
+      base = min(
+        plan.max_day_supply_days,
+        prescription.days_supply_written * (prescription.refills_remaining + 1),
+        cycle.day_supply_days + line.bridge_days_applied + cycle.approved_vacation_extra_days
+      )
+      when prescription.is_controlled  is true: base = min(base, CONTROLLED_MAX_DAY_SUPPLY_DAYS)
+      when prescription.refrigerated   is true: base = min(base, COLD_CHAIN_MAX_DAY_SUPPLY_DAYS)
+      allowance_days = base
+    constants:
+      CONTROLLED_MAX_DAY_SUPPLY_DAYS: 30
+      COLD_CHAIN_MAX_DAY_SUPPLY_DAYS: 30
+    worked_example: |
+      plan.max_day_supply_days 90, cycle.day_supply_days 28, approved_vacation_extra_days 0.
+      Rx1 written 30, refills_remaining 3, bridge 0, not controlled, not refrigerated
+        -> min(90, 120, 28) = 28
+      Rx4 written 28, refills_remaining 3, bridge 0, refrigerated
+        -> min(90, 112, 28) = 28, then min(28, 30) = 28
+      Rx9 written 10, refills_remaining 1, bridge 0
+        -> min(90, 20, 28) = 20  -> a 28-day fill exceeds the allowance
+      Rx5 written 30, refills_remaining 3, bridge 4
+        -> min(90, 120, 32) = 32 -> the bridge widens the ceiling in step with the fill
+      With a PHARMACIST_APPROVED vacation exception of 7 extra days:
+        Rx1 -> min(90, 120, 28 + 0 + 7 = 35) = 35
+
+  - name: cycle_copay_cents
+    entity_field: FillCycle.total_copay_cents
+    algorithm_type: tiered_pricing
+    variants: [PINNED_ROUND_THEN_SUM, FINAL_SUM_THEN_ROUND]
+    description: |
+      Patient copay. The per-day rate is chosen by the prescription's copay tier and
+      scaled by the plan's coinsurance withhold. The two variants differ ONLY in
+      where rounding happens: the provisional amount stamped at adjudication rounds
+      each line and sums the rounded cents; the final amount stamped when the cycle
+      ships sums the unrounded line amounts and rounds once. The difference is
+      retained as FillCycle.rounding_delta_cents and refunded as a credit.
+    formula: |
+      rate_cents_per_day =
+        prescription.copay_tier == GENERIC         -> plan.generic_copay_cents_per_day
+        prescription.copay_tier == PREFERRED_BRAND -> plan.brand_copay_cents_per_day
+        prescription.copay_tier == SPECIALTY       -> plan.specialty_copay_cents_per_day
+
+      raw_line_cents = rate_cents_per_day * line.days_supply_filled
+                       * (100 - plan.coinsurance_pct) / 100        # exact rational, NOT rounded
+
+      variant PINNED_ROUND_THEN_SUM   (stamped by adjudicate)
+        CycleLine.copay_cents        = round_half_up(raw_line_cents)
+        FillCycle.total_copay_cents  = sum of CycleLine.copay_cents over lines with
+                                       line_status IN {ADJUDICATED, PACKED_OUT}
+
+      variant FINAL_SUM_THEN_ROUND    (stamped when packaging_status becomes SHIPPED)
+        FillCycle.final_copay_cents    = round_half_up( sum of raw_line_cents over the
+                                          same line set )
+        FillCycle.rounding_delta_cents = total_copay_cents - final_copay_cents
+
+      when rounding_delta_cents >= ROUNDING_CREDIT_MIN_CENTS a CreditMemo
+      (reason ROUNDING_TRUEUP, amount_cents = rounding_delta_cents) is issued.
+      When rounding_delta_cents <= 0 no memo is issued and no charge is added.
+    input_set: "CycleLine rows of the cycle with line_status IN {ADJUDICATED, PACKED_OUT}; HELD_*, EXCLUDED_HELD, SUPERSEDED_PENDING_REISSUE and CREDITED lines are excluded"
+    constants:
+      ROUNDING_CREDIT_MIN_CENTS: 1
+    worked_example: |
+      plan rates 34 / 74 / 44 cents-per-day, coinsurance_pct 20 (factor 0.8),
+      four ADJUDICATED lines each days_supply_filled 28:
+        Rx1 GENERIC         34 * 28 * 0.8 =  761.6 -> 762
+        Rx2 PREFERRED_BRAND 74 * 28 * 0.8 = 1657.6 -> 1658
+        Rx3 SPECIALTY       44 * 28 * 0.8 =  985.6 ->  986
+        Rx4 SPECIALTY       44 * 28 * 0.8 =  985.6 ->  986
+      PINNED_ROUND_THEN_SUM: total_copay_cents = 762 + 1658 + 986 + 986 = 4392
+      FINAL_SUM_THEN_ROUND:  761.6 + 1657.6 + 985.6 + 985.6 = 4390.4 -> 4390
+      rounding_delta_cents = 4392 - 4390 = 2 -> ROUNDING_TRUEUP CreditMemo of 2 cents
+      Under Patient.sync_mode TRIM_TO_START Rx1 fills 21 days instead:
+        34 * 21 * 0.8 = 571.2 -> 571
+
+  - name: roll_pouch_count
+    entity_field: PouchRoll.pouch_count
+    algorithm_type: aggregation
+    description: |
+      Dose-time pouch roll generation. One pouch is produced per distinct
+      (dose_date, dose_slot) pair that any pouch-routed line covers. Cold-chain and
+      non-packable lines never contribute a pouch — they ship loose — so the roll
+      geometry is a function of the POUCH-routed subset only.
+    formula: |
+      contributing_lines = CycleLine rows of the cycle with line_status == ADJUDICATED
+                           and packable_route == POUCH
+      slot_universe = union of prescription.dose_times over contributing_lines
+      date_universe = the calendar dates d with
+                      min(line.line_start_date over contributing_lines) <= d
+                      < max(line.line_end_date over contributing_lines)
+                      restricted per line to line.line_start_date <= d < line.line_end_date
+      pouch_count = count of (d, slot) pairs where at least one contributing line
+                    has slot in its prescription.dose_times and d < its line_end_date
+
+      pouch_index is 1-based and assigned by (dose_date ASC, slot_rank ASC) with
+      slot_rank MORNING=1, NOON=2, EVENING=3, BEDTIME=4
+      Pouch.contents          = the contributing prescriptions' drug_name values,
+                                ordered by prescription created_at ASC
+      Pouch.expected_pill_count = sum of prescription.quantity_per_dose over the
+                                contributing lines covering that (dose_date, slot)
+
+      PouchRoll.segment_start_date = min(line_start_date over contributing_lines)
+      PouchRoll.segment_end_date   = max(line_end_date over contributing_lines) - 1 day
+                                     (INCLUSIVE — the last day a pouch exists for)
+    input_set: "ADJUDICATED CycleLine rows with packable_route == POUCH"
+    worked_example: |
+      cycle 2026-08-15 .. 2026-09-12 (28 days), three POUCH lines each 28 days:
+        Rx1 dose_times [MORNING, BEDTIME] quantity_per_dose 1
+        Rx2 dose_times [MORNING]          quantity_per_dose 1
+        Rx3 dose_times [EVENING]          quantity_per_dose 1
+        Rx4 dose_times [BEDTIME] but packable_route COLD_CHAIN -> contributes nothing
+      slot_universe = {MORNING, EVENING, BEDTIME} (3 slots) over 28 dates
+      pouch_count = 3 * 28 = 84
+      pouch_index 1 = 2026-08-15 MORNING (expected_pill_count 2: Rx1 + Rx2)
+      pouch_index 2 = 2026-08-15 EVENING (expected_pill_count 1: Rx3)
+      pouch_index 3 = 2026-08-15 BEDTIME (expected_pill_count 1: Rx1 only)
+      pouch_index 4 = 2026-08-16 MORNING
+      segment_start_date 2026-08-15, segment_end_date 2026-09-11 (INCLUSIVE)
+
+  - name: partial_reissue_credit_cents
+    entity_field: CreditMemo.amount_cents
+    algorithm_type: waterfall_allocation
+    description: |
+      A mid-cycle regimen change voids the untaken tail of the roll. The patient is
+      credited the unused portion of every reissued line, less a reissue fee whose
+      tier is read off the RETAINED value of the cycle — that is, the fee tier is
+      selected AFTER the gross credit is removed from the cycle total, so the fee
+      depends on the credit that the fee itself reduces. The four steps below are
+      evaluated in exactly this order.
+    formula: |
+      step 1 — gross credit, per line, rounded per line:
+        used_days   = effective_date - cycle.cycle_start_date        # in days
+        unused_days = line.days_supply_filled - used_days
+        line_credit = round_half_up(line.copay_cents * unused_days / line.days_supply_filled)
+        gross_credit_cents = sum of line_credit over the lines being reissued
+                             (line_status == SUPERSEDED_PENDING_REISSUE, or ADJUDICATED
+                              lines whose prescription is in replacement_prescription_ids)
+
+      step 2 — retained basis (the fee tier is read off THIS number, not the total):
+        tier_basis_cents = cycle.total_copay_cents - gross_credit_cents
+
+      step 3 — fee tier:
+        tier_basis_cents >= REISSUE_FEE_WAIVE_BASIS_CENTS   -> reissue_fee_cents = 0
+        tier_basis_cents >= REISSUE_FEE_REDUCED_BASIS_CENTS -> reissue_fee_cents = REISSUE_FEE_REDUCED_CENTS
+        otherwise                                           -> reissue_fee_cents = REISSUE_FEE_FULL_CENTS
+
+      step 4 — net credit:
+        amount_cents = max(0, gross_credit_cents - reissue_fee_cents)
+
+      and each reissued line retains only the consumed portion:
+        line.copay_cents := line.copay_cents - line_credit
+        line.days_supply_filled := used_days
+        line.line_end_date := effective_date
+        line.line_status := REISSUED
+    constants:
+      REISSUE_FEE_WAIVE_BASIS_CENTS: 5000
+      REISSUE_FEE_REDUCED_BASIS_CENTS: 2000
+      REISSUE_FEE_REDUCED_CENTS: 250
+      REISSUE_FEE_FULL_CENTS: 500
+    worked_example: |
+      cycle_start_date 2026-08-15, total_copay_cents 4392, effective_date 2026-08-25
+      -> used_days 10, each reissued line days_supply_filled 28 -> unused_days 18
+        Rx1  762 * 18 / 28 =  489.86 ->  490   retained  762 -  490 =  272
+        Rx2 1658 * 18 / 28 = 1066.07 -> 1066   retained 1658 - 1066 =  592
+        Rx3  986 * 18 / 28 =  633.86 ->  634   retained  986 -  634 =  352
+        Rx4 is COLD_CHAIN, not reissued          retained          =  986
+      gross_credit_cents = 490 + 1066 + 634 = 2190
+      tier_basis_cents   = 4392 - 2190 = 2202          (>= 2000, < 5000)
+      reissue_fee_cents  = 250
+      amount_cents       = max(0, 2190 - 250) = 1940
+      retained line sum  = 272 + 592 + 352 + 986 = 2202 == tier_basis_cents
+      conservation: 4392 == 2202 (retained) + 1940 (credit) + 250 (fee)
+
+  - name: shipment_cost_cents
+    entity_field: Shipment.ship_cost_cents
+    algorithm_type: tiered_pricing
+    description: |
+      Split shipment pricing. A cycle can require up to three parcels — the pouch
+      roll, a cold-chain parcel for refrigerated items and a loose parcel for
+      non-packable items. Cost is the sum of three independent additive tiers.
+    formula: |
+      kind_base =
+        POUCH_ROLL          -> 0
+        NON_PACKABLE_LOOSE  -> 495
+        COLD_CHAIN          -> 1295
+      packaging_add =
+        STANDARD            -> 0
+        INSULATED_GEL       -> 350
+        INSULATED_DRY_ICE   -> 900
+      service_add =
+        GROUND              -> 0
+        TWO_DAY             -> 600
+        OVERNIGHT           -> 1800
+      ship_cost_cents = kind_base + packaging_add + service_add
+    worked_example: |
+      COLD_CHAIN + INSULATED_GEL + OVERNIGHT       = 1295 + 350 + 1800 = 3445
+      POUCH_ROLL + STANDARD + GROUND               =    0 +   0 +    0 =    0
+      NON_PACKABLE_LOOSE + STANDARD + TWO_DAY      =  495 +   0 +  600 = 1095
+      COLD_CHAIN + INSULATED_DRY_ICE + TWO_DAY     = 1295 + 900 +  600 = 2795
+
+  - name: adherence_score_pct
+    entity_field: Patient.adherence_score_pct
+    algorithm_type: projection
+    variants: [ROLLING_28_DAY, CYCLE_SCOPED]
+    description: |
+      Adherence gap detection. Two scores are derivable from the same AdherenceEvent
+      stream and they disagree: the rolling window ignores pouches whose dose date
+      has passed but which produced no event at all, while the cycle-scoped score
+      counts every elapsed pouch in the denominator. Only ROLLING_28_DAY is written
+      to Patient.adherence_score_pct and only it can pause auto-ship; CYCLE_SCOPED
+      is exposed as a read-only figure on the adherence summary.
+    formula: |
+      variant ROLLING_28_DAY   (pinned; written to Patient.adherence_score_pct)
+        window   = [clock - ADHERENCE_WINDOW_DAYS days, clock)      # half-open
+        events   = AdherenceEvent rows whose cycle_id belongs to a FillCycle of this
+                   patient, event_type IN {POUCH_TAKEN, POUCH_MISSED}, occurred_at in window
+        taken    = count(event_type == POUCH_TAKEN)
+        missed   = count(event_type == POUCH_MISSED)
+        when taken + missed == 0: adherence_score_pct = 100
+        else adherence_score_pct = floor(100 * taken / (taken + missed))
+
+      variant CYCLE_SCOPED     (read-only)
+        expected = count(Pouch of the patient's rolls whose dose_date < clock date
+                         and verification_result != VOID)
+        when expected == 0: cycle_scoped_score_pct = 100
+        else cycle_scoped_score_pct = floor(100 * taken / expected)
+
+      auto-ship pause gate (evaluated after every dose-event batch and every
+      adherence review, score gate first):
+        adherence_score_pct < ADHERENCE_PAUSE_THRESHOLD_PCT
+          -> autoship_status ACTIVE -> PAUSED_ADHERENCE, pause_reason ADHERENCE_GAP
+        else consecutive_missed_pickups >= MISSED_PICKUP_PAUSE_COUNT
+          -> autoship_status ACTIVE -> PAUSED_ADHERENCE, pause_reason MISSED_PICKUPS
+    constants:
+      ADHERENCE_WINDOW_DAYS: 28
+      ADHERENCE_PAUSE_THRESHOLD_PCT: 80
+      MISSED_PICKUP_PAUSE_COUNT: 2
+    worked_example: |
+      clock 2026-08-22T00:00:00Z, window [2026-07-25, 2026-08-22).
+      16 POUCH_TAKEN and 4 POUCH_MISSED in window; the patient's rolls hold 21 pouches
+      whose dose_date is before 2026-08-22 (7 elapsed cycle days x 3 dose slots).
+        ROLLING_28_DAY: floor(100 * 16 / 20) = 80  -> 80 is NOT < 80, auto-ship stays ACTIVE
+        CYCLE_SCOPED:   floor(100 * 16 / 21) = 76
+      One more miss (16 taken / 5 missed):
+        ROLLING_28_DAY: floor(100 * 16 / 21) = 76  -> < 80, auto-ship PAUSED_ADHERENCE
+
+# =============================================================================
+# 1.4 Validation Rules — evaluated in strict ascending `priority` order.
+# The FIRST rule whose condition holds returns; no later rule is evaluated.
+# =============================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "every endpoint except POST /pharmacy/_clock/set_current_utc"
+    condition: "the X-User-ID header is absent or empty, or the X-Role header is absent or empty"
+
+  - priority: 2
+    category: authz
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "every endpoint"
+    condition: "X-Role is not one of the roles listed for the endpoint in §1.5"
+
+  - priority: 3
+    category: schema
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "every endpoint"
+    condition: |
+      a required input field is missing or null; a field has the wrong JSON type; an
+      enum field carries a value outside its declared set; an integer is outside its
+      declared range; a date/timestamp is not ISO 8601; limit is outside 1..100 or
+      offset is negative; a date-range field pair has start > end; dose_times is empty
+      or contains a duplicate slot; an array field that must be non-empty is empty
+
+  - priority: 4
+    category: existence
+    error_id: "ERR_INSURANCE_PLAN_NOT_FOUND | ERR_PATIENT_NOT_FOUND | ERR_PRESCRIPTION_NOT_FOUND | ERR_FILL_CYCLE_NOT_FOUND | ERR_CYCLE_LINE_NOT_FOUND | ERR_POUCH_ROLL_NOT_FOUND | ERR_POUCH_NOT_FOUND | ERR_SHIPMENT_NOT_FOUND | ERR_REFILL_AUTHORIZATION_NOT_FOUND | ERR_VACATION_EXCEPTION_NOT_FOUND | ERR_CREDIT_MEMO_NOT_FOUND | ERR_ADHERENCE_EVENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "every endpoint carrying an {id} path parameter"
+    condition: "no row of the addressed entity has that id"
+
+  - priority: 5
+    category: existence
+    error_id: "ERR_INSURANCE_PLAN_NOT_FOUND | ERR_PATIENT_NOT_FOUND | ERR_PRESCRIPTION_NOT_FOUND | ERR_FILL_CYCLE_NOT_FOUND | ERR_VACATION_EXCEPTION_NOT_FOUND"
+    http_status: 404
+    applies_to: "every endpoint accepting a foreign key in its body"
+    condition: "a body foreign key (insurance_plan_id, patient_id, prescription_id, cycle_id, vacation_exception_id, replacement_prescription_ids[], force_pouch_prescription_ids[]) names no existing row"
+
+  - priority: 6
+    category: ownership
+    error_id: ERR_PATIENT_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "every endpoint when X-Role == Patient"
+    condition: |
+      the addressed resource does not resolve to the caller: for a Patient-scoped
+      path the {id} (or the resource's owning patient_id, walked up through
+      Shipment -> FillCycle -> Patient or Prescription -> Patient) is not equal to
+      X-User-ID
+
+  - priority: 7
+    category: concurrency
+    error_id: "ERR_STALE_CYCLE_VERSION | ERR_STALE_PRESCRIPTION_VERSION"
+    http_status: 412
+    applies_to: "POST /pharmacy/fill-cycles/{id}/reissue, POST /pharmacy/prescriptions/{id}/regimen-change"
+    condition: "the submitted expected_cycle_version / expected_prescription_version does not equal the parent row's current version"
+
+  - priority: 8
+    category: state
+    error_id: ERR_PATIENT_NOT_SYNCHRONIZED
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles"
+    condition: "patient.sync_status != SYNCED (no anchor_fill_day / sync_mode has been pinned)"
+
+  - priority: 9
+    category: state
+    error_id: ERR_AUTOSHIP_PAUSED
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles, POST /pharmacy/fill-cycles/{id}/adjudicate, POST /pharmacy/fill-cycles/{id}/reissue"
+    condition: "patient.autoship_status != ACTIVE"
+
+  - priority: 10
+    category: state
+    error_id: ERR_INVALID_CYCLE_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/adjudicate, /generate-roll, /shipments, /reissue"
+    condition: |
+      adjudicate: packaging_status NOT IN {DRAFT, LINES_ADJUDICATED}, or insurance_status
+        NOT IN {NOT_ADJUDICATED, REJECTED_TOO_SOON} (a CLEARED cycle cannot re-adjudicate)
+      generate-roll: packaging_status != LINES_ADJUDICATED
+      shipments with shipment_kind == POUCH_ROLL: packaging_status NOT IN {VERIFIED, SHIPPED}
+      shipments with shipment_kind IN {COLD_CHAIN, NON_PACKABLE_LOOSE}: packaging_status
+        NOT IN {LINES_ADJUDICATED, ROLL_GENERATED, PACKED, VERIFIED, SHIPPED} — a loose or
+        cold-chain parcel leaves the building independently of the pouch bench
+      reissue: packaging_status NOT IN {ROLL_GENERATED, PACKED, VERIFIED}
+
+  - priority: 11
+    category: state
+    error_id: ERR_CYCLE_NOT_CLEARED
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+    condition: "insurance_status == EDITS_PENDING (authorization edits are still open)"
+
+  - priority: 12
+    category: state
+    error_id: ERR_INVALID_ROLL_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/pouch-rolls/{id}/pack, /verify, /rework, /verification-images, POST /pharmacy/pouches/{id}/verification-image"
+    condition: |
+      pack: verification_status != BUILT
+      verify: verification_status != PACKED, or at least one Pouch of the roll still
+        has verification_result == PENDING
+      rework: verification_status != FAILED_QUARANTINED
+      verification-image and verification-images: the roll's verification_status != PACKED
+
+  - priority: 13
+    category: state
+    error_id: ERR_IMAGE_ALREADY_CAPTURED
+    http_status: 409
+    applies_to: "POST /pharmacy/pouches/{id}/verification-image"
+    condition: "the pouch's verification_result != PENDING (an image was already captured for this pack attempt)"
+
+  - priority: 14
+    category: state
+    error_id: ERR_INVALID_SHIPMENT_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/shipments/{id}/dispatch, /deliver, /confirm-pickup"
+    condition: "dispatch: status != STAGED; deliver: status != IN_TRANSIT; confirm-pickup: status != DELIVERED"
+
+  - priority: 15
+    category: state
+    error_id: ERR_INVALID_AUTH_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/refill-authorizations/{id}/chase, /escalate, /respond"
+    condition: |
+      chase: status NOT IN {SENT, NO_RESPONSE}
+      escalate: status != NO_RESPONSE
+      respond: status NOT IN {SENT, ESCALATED}
+
+  - priority: 16
+    category: state
+    error_id: ERR_INVALID_VACATION_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/vacation-exceptions/{id}/decide"
+    condition: "status != SUBMITTED"
+
+  - priority: 17
+    category: state
+    error_id: ERR_INVALID_PRESCRIPTION_STATE
+    http_status: 409
+    applies_to: "POST /pharmacy/prescriptions/{id}/regimen-change, POST /pharmacy/refill-authorizations"
+    condition: |
+      regimen-change: prescription.status != ACTIVE
+      create authorization: prescription.status NOT IN {ACTIVE, PENDING_AUTHORIZATION}
+
+  - priority: 18
+    category: business_safety
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    applies_to: "POST /pharmacy/pouch-rolls/{id}/verify, POST /pharmacy/pouch-rolls/{id}/verification-images, POST /pharmacy/pouches/{id}/verification-image"
+    condition: |
+      verify: X-User-ID == PouchRoll.packed_by_user_id (the packer cannot self-verify)
+      verification-image / verification-images: X-User-ID == PouchRoll.packed_by_user_id
+        (the packer cannot image their own roll)
+
+  - priority: 19
+    category: business_safety
+    error_id: ERR_CONTROLLED_SUBSTANCE_NO_OVERRIDE
+    http_status: 422
+    applies_to: "POST /pharmacy/vacation-exceptions/{id}/decide with decision APPROVE_PHARMACIST or APPROVE_PAYER_OVERRIDE"
+    condition: "at least one Prescription of the patient with status == ACTIVE has is_controlled == true"
+
+  - priority: 20
+    category: business_safety
+    error_id: ERR_COLD_CHAIN_NOT_PACKABLE
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/adjudicate"
+    condition: "a prescription id in force_pouch_prescription_ids has refrigerated == true (a refrigerated drug can never be routed into a pouch roll)"
+
+  - priority: 21
+    category: business_safety
+    error_id: ERR_COLD_CHAIN_PACKAGING_INVALID
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/shipments"
+    condition: "shipment_kind == COLD_CHAIN and packaging == STANDARD, or shipment_kind != COLD_CHAIN and packaging IN {INSULATED_GEL, INSULATED_DRY_ICE}"
+
+  - priority: 22
+    category: business_referential
+    error_id: ERR_NON_PACKABLE_IN_POUCH_ROUTE
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/adjudicate"
+    condition: "a prescription id in force_pouch_prescription_ids has packable == false, i.e. its form is not TABLET or CAPSULE"
+
+  - priority: 23
+    category: business_referential
+    error_id: ERR_NO_PACKABLE_LINES
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+    condition: "count(CycleLine with line_status == ADJUDICATED and packable_route == POUCH) == 0"
+
+  - priority: 24
+    category: business_referential
+    error_id: ERR_NO_LINES_FOR_SHIPMENT_KIND
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/shipments"
+    condition: |
+      no CycleLine of the cycle with line_status IN {ADJUDICATED, PACKED_OUT} maps to
+      the requested shipment_kind (POUCH_ROLL needs a POUCH line, COLD_CHAIN needs a
+      COLD_CHAIN line, NON_PACKABLE_LOOSE needs a LOOSE_SPLIT line), or a Shipment of
+      that kind already exists for the cycle with status NOT IN {CANCELLED, EXCEPTION_RETURNED}
+
+  - priority: 25
+    category: business_referential
+    error_id: ERR_RX_PENDING_AUTHORIZATION
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+    condition: "a CycleLine with line_status == ADJUDICATED references a Prescription whose status != ACTIVE"
+
+  - priority: 26
+    category: business_referential
+    error_id: ERR_ROLL_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /pharmacy/shipments/{id}/dispatch"
+    condition: "shipment_kind == POUCH_ROLL and the cycle's PouchRoll.verification_status != PASSED"
+
+  - priority: 27
+    category: business_referential
+    error_id: ERR_NO_APPROVED_VACATION_EXCEPTION
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/adjudicate with vacation_exception_id"
+    condition: "the referenced VacationExceptionRequest has patient_id != cycle.patient_id, or its status NOT IN {PHARMACIST_APPROVED, PAYER_OVERRIDE_APPROVED}"
+
+  - priority: 28
+    category: business_temporal
+    error_id: ERR_CYCLE_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles"
+    condition: |
+      HALF-OPEN interval semantics on [cycle_start_date, cycle_end_date): another
+      FillCycle of the same patient with packaging_status NOT IN {CANCELLED, CLOSED}
+      and is_partial_reissue == false satisfies
+      new.cycle_start_date < existing.cycle_end_date AND
+      existing.cycle_start_date < new.cycle_end_date.
+      Touching windows (new.cycle_start_date == existing.cycle_end_date) are LEGAL.
+
+  - priority: 29
+    category: business_temporal
+    error_id: ERR_REISSUE_SEGMENT_OVERLAP
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+    condition: |
+      CLOSED-INCLUSIVE interval semantics on [segment_start_date, segment_end_date]:
+      the segment the new roll would occupy collides with an existing PouchRoll of
+      the same patient whose verification_status NOT IN {FAILED_QUARANTINED} when
+      new.segment_start_date <= existing.segment_end_date AND
+      existing.segment_start_date <= new.segment_end_date.
+      Because the bounds are inclusive, segments that merely ABUT
+      (new.segment_start_date == existing.segment_end_date) DO collide — unlike the
+      half-open cycle windows at priority 28.
+
+  - priority: 30
+    category: business_temporal
+    error_id: ERR_COLD_CHAIN_GAP_VIOLATION
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/shipments with shipment_kind == COLD_CHAIN"
+    condition: |
+      BUFFERED interval semantics: another COLD_CHAIN Shipment of the same patient
+      with status NOT IN {CANCELLED, EXCEPTION_RETURNED} has a staged_at within
+      COLD_CHAIN_MIN_GAP_HOURS (48) of the logical clock, i.e.
+      abs(clock - other.staged_at) < 48 hours. Exactly 48 hours apart is LEGAL.
+
+  - priority: 31
+    category: business_temporal
+    error_id: ERR_VACATION_WINDOW_INVALID
+    http_status: 422
+    applies_to: "POST /pharmacy/vacation-exceptions"
+    condition: "travel_start_date is before the logical-clock date, or travel_end_date - travel_start_date + 1 < requested_extra_days"
+
+  - priority: 32
+    category: business_temporal
+    error_id: ERR_CHASE_TOO_EARLY
+    http_status: 409
+    applies_to: "POST /pharmacy/refill-authorizations/{id}/chase"
+    condition: "status == SENT and the logical clock is before next_chase_due_at (the 72-hour prescriber response window has not elapsed)"
+
+  - priority: 33
+    category: business_temporal
+    error_id: ERR_REISSUE_DATE_OUT_OF_WINDOW
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/reissue"
+    condition: "effective_date <= cycle.cycle_start_date or effective_date >= cycle.cycle_end_date"
+
+  - priority: 34
+    category: business_constraint
+    error_id: ERR_CHASE_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /pharmacy/refill-authorizations/{id}/chase"
+    condition: "status == SENT and chase_round >= MAX_CHASE_ROUNDS (3) — the request must be escalated instead"
+
+  - priority: 35
+    category: business_constraint
+    error_id: ERR_ESCALATION_PREMATURE
+    http_status: 409
+    applies_to: "POST /pharmacy/refill-authorizations/{id}/escalate"
+    condition: "chase_round < MAX_CHASE_ROUNDS (3)"
+
+  - priority: 36
+    category: business_constraint
+    error_id: ERR_REWORK_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /pharmacy/pouch-rolls/{id}/rework"
+    condition: "rework_count >= MAX_REWORK_COUNT (2)"
+
+  - priority: 37
+    category: business_constraint
+    error_id: ERR_DAY_SUPPLY_EXCEEDS_ALLOWANCE
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/adjudicate"
+    condition: "for at least one CycleLine, days_supply_filled > allowance_days as computed by calculations.day_supply_allowance_days"
+
+  - priority: 38
+    category: business_constraint
+    error_id: ERR_VACATION_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /pharmacy/vacation-exceptions"
+    condition: "patient.vacation_exceptions_used_this_year >= plan.vacation_overrides_per_year"
+
+  - priority: 39
+    category: business_constraint
+    error_id: ERR_PAYER_OVERRIDE_NOT_ALLOWED
+    http_status: 422
+    applies_to: "POST /pharmacy/vacation-exceptions/{id}/decide with decision APPROVE_PAYER_OVERRIDE"
+    condition: "the patient's InsurancePlan.allows_payer_vacation_override == false"
+
+  - priority: 40
+    category: business_constraint
+    error_id: ERR_INVALID_APPROVED_DAYS
+    http_status: 422
+    applies_to: "POST /pharmacy/vacation-exceptions/{id}/decide, POST /pharmacy/refill-authorizations/{id}/respond"
+    condition: |
+      decide with an APPROVE_* decision: approved_extra_days is absent, < 1, or
+        > requested_extra_days
+      decide with DENY: denial_reason is absent
+      respond with APPROVE: approved_refills is absent or > requested_refills
+      respond with DENY: denial_reason is absent
+
+  - priority: 41
+    category: business_constraint
+    error_id: ERR_DUPLICATE_AUTH_REQUEST
+    http_status: 409
+    applies_to: "POST /pharmacy/refill-authorizations"
+    condition: "another RefillAuthorizationRequest for the same prescription_id has status IN {SENT, NO_RESPONSE, ESCALATED}"
+
+  - priority: 42
+    category: business_constraint
+    error_id: ERR_INVALID_ANCHOR_DAY
+    http_status: 422
+    applies_to: "POST /pharmacy/patients/{id}/synchronize"
+    condition: "anchor_fill_day > ANCHOR_DAY_MAX (28) — a day-of-month that not every month has; values outside 1..31 are a schema range violation caught at priority 3 instead"
+
+  - priority: 43
+    category: business_referential
+    error_id: ERR_NO_ACTIVE_PRESCRIPTIONS
+    http_status: 422
+    applies_to: "POST /pharmacy/patients/{id}/synchronize, POST /pharmacy/fill-cycles"
+    condition: "after the EXPIRED sweep the patient has no Prescription with status == ACTIVE"
+
+  - priority: 44
+    category: business_fiscal
+    error_id: ERR_REFILL_TOO_SOON
+    http_status: 409
+    applies_to: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+    condition: |
+      the cycle's insurance_status == REJECTED_TOO_SOON — the payer's refill-too-soon
+      edit is unresolved, so no roll may be produced. Cleared either by waiting until
+      refill_pct_used reaches the plan threshold and re-adjudicating, or by attaching a
+      PAYER_OVERRIDE_APPROVED vacation exception and re-adjudicating.
+
+  - priority: 45
+    category: business_constraint
+    error_id: ERR_NOTHING_TO_REISSUE
+    http_status: 422
+    applies_to: "POST /pharmacy/fill-cycles/{id}/reissue"
+    condition: "no CycleLine of the cycle has line_status == SUPERSEDED_PENDING_REISSUE and no ADJUDICATED line references a prescription in replacement_prescription_ids"
+
+# =============================================================================
+# 1.5 Endpoint Table — 52 endpoints (25 GET, 27 POST), all under /pharmacy
+# =============================================================================
+endpoints:
+
+  # --------------------------------- reads -----------------------------------
+  - method: GET
+    path: /pharmacy/insurance-plans/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist]
+    description: "Retrieve one payer plan with its edit thresholds and per-day copay rates."
+    input: {}
+    output: InsurancePlan
+
+  - method: GET
+    path: /pharmacy/patients
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist]
+    description: "List patients, filterable by payer plan, auto-ship posture and synchronization state."
+    input:
+      insurance_plan_id?: string
+      autoship_status?: string
+      sync_status?: string
+      limit?: integer
+      offset?: integer
+    output: Patient[]
+
+  - method: GET
+    path: /pharmacy/patients/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Patient]
+    input: {}
+    output: Patient
+
+  - method: GET
+    path: /pharmacy/patients/{id}/adherence-summary
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    description: "Computed read exposing BOTH adherence variants side by side (see calculations.adherence_score_pct); only rolling_28_day_score_pct can pause auto-ship."
+    input: {}
+    output: "{ patient_id: string, rolling_28_day_score_pct: integer, cycle_scoped_score_pct: integer, taken_count: integer, missed_count: integer, expected_pouch_count: integer, consecutive_missed_pickups: integer, autoship_status: string }"
+
+  - method: GET
+    path: /pharmacy/prescriptions
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Prescriber, Patient]
+    description: "List prescriptions; supersedes_rx_id resolves the successor chain minted by regimen changes."
+    input:
+      patient_id?: string
+      supersedes_rx_id?: string
+      status?: string
+      limit?: integer
+      offset?: integer
+    output: Prescription[]
+
+  - method: GET
+    path: /pharmacy/prescriptions/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Prescriber, Patient]
+    input: {}
+    output: Prescription
+
+  - method: GET
+    path: /pharmacy/fill-cycles
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Patient]
+    description: "List fill cycles; reissue_of_cycle_id resolves partial-reissue children, vacation_exception_id resolves travel-extended cycles."
+    input:
+      patient_id?: string
+      reissue_of_cycle_id?: string
+      vacation_exception_id?: string
+      packaging_status?: string
+      insurance_status?: string
+      limit?: integer
+      offset?: integer
+    output: FillCycle[]
+
+  - method: GET
+    path: /pharmacy/fill-cycles/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Patient]
+    input: {}
+    output: FillCycle
+
+  - method: GET
+    path: /pharmacy/cycle-lines
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    description: "List claim lines, filterable by cycle, prescription and line state."
+    input:
+      cycle_id?: string
+      prescription_id?: string
+      line_status?: string
+      limit?: integer
+      offset?: integer
+    output: CycleLine[]
+
+  - method: GET
+    path: /pharmacy/cycle-lines/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    input: {}
+    output: CycleLine
+
+  - method: GET
+    path: /pharmacy/pouch-rolls
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    input:
+      cycle_id?: string
+      verification_status?: string
+      limit?: integer
+      offset?: integer
+    output: PouchRoll[]
+
+  - method: GET
+    path: /pharmacy/pouch-rolls/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    input: {}
+    output: PouchRoll
+
+  - method: GET
+    path: /pharmacy/pouches
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    description: "List pouches of a roll in pouch_index order; the roll_id filter is the reverse edge from PouchRoll."
+    input:
+      roll_id?: string
+      verification_result?: string
+      dose_slot?: string
+      limit?: integer
+      offset?: integer
+    output: Pouch[]
+
+  - method: GET
+    path: /pharmacy/pouches/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician]
+    input: {}
+    output: Pouch
+
+  - method: GET
+    path: /pharmacy/shipments
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Patient]
+    input:
+      cycle_id?: string
+      shipment_kind?: string
+      status?: string
+      limit?: integer
+      offset?: integer
+    output: Shipment[]
+
+  - method: GET
+    path: /pharmacy/shipments/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Patient]
+    input: {}
+    output: Shipment
+
+  - method: GET
+    path: /pharmacy/refill-authorizations
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Prescriber]
+    input:
+      prescription_id?: string
+      status?: string
+      limit?: integer
+      offset?: integer
+    output: RefillAuthorizationRequest[]
+
+  - method: GET
+    path: /pharmacy/refill-authorizations/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Prescriber]
+    input: {}
+    output: RefillAuthorizationRequest
+
+  - method: GET
+    path: /pharmacy/vacation-exceptions
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    input:
+      patient_id?: string
+      status?: string
+      limit?: integer
+      offset?: integer
+    output: VacationExceptionRequest[]
+
+  - method: GET
+    path: /pharmacy/vacation-exceptions/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    input: {}
+    output: VacationExceptionRequest
+
+  - method: GET
+    path: /pharmacy/credit-memos
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    description: "List credit memos; cycle_id is the cycle the credit was issued against, applied_to_cycle_id the later cycle that consumed it."
+    input:
+      patient_id?: string
+      cycle_id?: string
+      applied_to_cycle_id?: string
+      reason?: string
+      status?: string
+      limit?: integer
+      offset?: integer
+    output: CreditMemo[]
+
+  - method: GET
+    path: /pharmacy/credit-memos/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    input: {}
+    output: CreditMemo
+
+  - method: GET
+    path: /pharmacy/adherence-events
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    description: "List immutable adherence events, filterable by the cycle they are attributed to."
+    input:
+      cycle_id?: string
+      event_type?: string
+      source?: string
+      limit?: integer
+      offset?: integer
+    output: AdherenceEvent[]
+
+  - method: GET
+    path: /pharmacy/adherence-events/{id}
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    input: {}
+    output: AdherenceEvent
+
+  - method: GET
+    path: /pharmacy/fill-cycles/{id}/adherence-events
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, Patient]
+    description: "Sub-resource read of one cycle's adherence event stream in occurred_at ASC, created_at ASC order."
+    input:
+      limit?: integer
+      offset?: integer
+    output: AdherenceEvent[]
+
+  # -------------------------------- writes -----------------------------------
+  - method: POST
+    path: /pharmacy/insurance-plans
+    roles: [PlatformAdmin]
+    description: "Register a payer plan."
+    input:
+      payer_name: string
+      bin_number: string
+      generic_copay_cents_per_day: integer
+      brand_copay_cents_per_day: integer
+      specialty_copay_cents_per_day: integer
+      refill_too_soon_threshold_pct?: integer
+      max_day_supply_days?: integer
+      vacation_overrides_per_year?: integer
+      coinsurance_pct?: integer
+      allows_payer_vacation_override?: boolean
+    output: InsurancePlan
+    side_effects:
+      - "creates an InsurancePlan with version 1"
+
+  - method: POST
+    path: /pharmacy/patients
+    roles: [PlatformAdmin, PharmacyOperations]
+    description: "Enroll a patient against a payer plan. sync_status starts UNSYNCED so no cycle can be built yet."
+    input:
+      full_name: string
+      date_of_birth: string
+      email: string
+      state_code: string
+      insurance_plan_id: string
+    output: Patient
+    side_effects:
+      - "creates a Patient with sync_status UNSYNCED, autoship_status ACTIVE, adherence_score_pct 100, credit_balance_cents 0, consecutive_missed_pickups 0, vacation_exceptions_used_this_year 0, version 1"
+
+  - method: POST
+    path: /pharmacy/prescriptions
+    roles: [Prescriber, PharmacyOperations]
+    description: "Record a prescription. packable is computed from form and refrigerated and cannot be supplied."
+    input:
+      patient_id: string
+      prescriber_npi: string
+      drug_name: string
+      ndc: string
+      strength: string
+      form: string
+      copay_tier: string
+      dose_times: array
+      quantity_per_dose: integer
+      days_supply_written: integer
+      refills_authorized: integer
+      written_date: string
+      expiration_date: string
+      refrigerated?: boolean
+      is_controlled?: boolean
+      last_dispensed_date?: string
+      last_dispensed_days_supply?: integer
+    output: Prescription
+    side_effects:
+      - "creates a Prescription with status ACTIVE, refills_remaining = refills_authorized, refills_consumed 0, days_dispensed_total 0, version 1"
+      - "computes packable = form IN {TABLET, CAPSULE} AND refrigerated == false"
+
+  - method: POST
+    path: /pharmacy/patients/{id}/synchronize
+    roles: [PharmacyOperations]
+    description: "Pin the patient's common fill cycle: anchor day-of-month plus the irreconcilable alignment variant."
+    input:
+      anchor_fill_day: integer
+      sync_mode: string
+    output: Patient
+    side_effects:
+      - "sets anchor_fill_day, sync_mode, sync_status SYNCED and next_cycle_start_date (earliest date >= the clock date whose day-of-month equals anchor_fill_day)"
+      - "sweeps every ACTIVE Prescription whose expiration_date is before the clock date to EXPIRED"
+      - "writes sync_bridge_days and sync_trim_days on every remaining ACTIVE Prescription per calculations.sync_alignment_days"
+      - "increments Patient.version by 1"
+
+  - method: POST
+    path: /pharmacy/patients/{id}/autoship
+    roles: [PharmacyOperations, Patient]
+    description: "Pause, resume or cancel auto-ship. RESUME clears pause_reason and the missed-pickup counter."
+    input:
+      action: string
+    output: Patient
+    side_effects:
+      - "action PAUSE: autoship_status ACTIVE -> PAUSED_PATIENT with pause_reason PATIENT_REQUEST; every DRAFT FillCycle of the patient becomes CANCELLED"
+      - "action RESUME: autoship_status PAUSED_ADHERENCE or PAUSED_PATIENT -> ACTIVE, pause_reason null, consecutive_missed_pickups 0"
+      - "action CANCEL: autoship_status -> CANCELLED; every DRAFT FillCycle of the patient becomes CANCELLED; every ISSUED CreditMemo of the patient becomes VOIDED and credit_balance_cents := 0"
+      - "increments Patient.version by 1"
+
+  - method: POST
+    path: /pharmacy/patients/{id}/dose-events
+    roles: [Patient, PharmacyOperations]
+    description: "Append an immutable batch of pouch-level adherence events, then re-derive the rolling adherence score and the auto-ship pause gate."
+    input:
+      cycle_id: string
+      events: array
+    output: AdherenceEvent[]
+    side_effects:
+      - "creates one immutable AdherenceEvent per element of events (each element carries event_type POUCH_TAKEN or POUCH_MISSED, occurred_at, dose_slot and pouch_index); source is PATIENT_REPORTED when X-Role == Patient, otherwise SYSTEM_SCAN"
+      - "recomputes Patient.adherence_score_pct per calculations.adherence_score_pct variant ROLLING_28_DAY"
+      - "when the score falls below ADHERENCE_PAUSE_THRESHOLD_PCT: autoship_status ACTIVE -> PAUSED_ADHERENCE with pause_reason ADHERENCE_GAP; every DRAFT FillCycle of the patient becomes CANCELLED and every CycleLine of those cycles becomes EXCLUDED_HELD"
+      - "increments Patient.version by 1"
+
+  - method: POST
+    path: /pharmacy/patients/{id}/adherence-review
+    roles: [PharmacyOperations]
+    description: "Sweep the patient's delivered parcels for expired pickup grace, then re-evaluate the auto-ship gate."
+    input: {}
+    output: Patient
+    side_effects:
+      - "every Shipment of the patient with status DELIVERED and clock >= delivered_at + PICKUP_GRACE_DAYS days becomes PICKUP_MISSED and appends an AdherenceEvent (PICKUP_MISSED, source SYSTEM_SCAN)"
+      - "Patient.consecutive_missed_pickups rises by the number of parcels swept"
+      - "recomputes Patient.adherence_score_pct; when the score gate or the consecutive_missed_pickups >= MISSED_PICKUP_PAUSE_COUNT gate fires, autoship_status ACTIVE -> PAUSED_ADHERENCE (pause_reason ADHERENCE_GAP when the score gate fired, otherwise MISSED_PICKUPS), every DRAFT FillCycle becomes CANCELLED and every CycleLine of those cycles becomes EXCLUDED_HELD"
+      - "increments Patient.version by 1"
+
+  - method: POST
+    path: /pharmacy/fill-cycles
+    roles: [PharmacyOperations]
+    description: "Open a fill cycle for a synchronized patient and stage one PLANNED CycleLine per ACTIVE prescription."
+    input:
+      patient_id: string
+      cycle_start_date: string
+      day_supply_days?: integer
+      sync_mode?: string
+    output: FillCycle
+    side_effects:
+      - "creates a FillCycle with packaging_status DRAFT, insurance_status NOT_ADJUDICATED, cycle_end_date = cycle_start_date + day_supply_days (EXCLUSIVE), sync_mode from the body or Patient.sync_mode, version 1"
+      - "creates one CycleLine with line_status PLANNED per Prescription of the patient with status == ACTIVE, in prescription created_at ASC order"
+
+  - method: POST
+    path: /pharmacy/fill-cycles/{id}/adjudicate
+    roles: [VerifyingPharmacist]
+    description: "Run the payer edits over every PLANNED line: refill-too-soon, day supply, refill authorization, packability routing and copay. Re-runnable while the insurance dimension is REJECTED_TOO_SOON."
+    input:
+      force_pouch_prescription_ids?: array
+      vacation_exception_id?: string
+    output: FillCycle
+    side_effects:
+      - "computes days_supply_filled, bridge_days_applied, trim_days_applied, line_start_date, line_end_date, refill_pct_used, allowance_days, packable_route, quantity_dispensed and copay_cents on every PLANNED line"
+      - "packable_route := COLD_CHAIN when prescription.refrigerated, POUCH when prescription.packable, otherwise LOOSE_SPLIT"
+      - "line_status := HELD_TOO_SOON, HELD_AUTH or ADJUDICATED per §1.2 FillCycle; HELD_AUTH also moves the prescription ACTIVE -> PENDING_AUTHORIZATION"
+      - "each ADJUDICATED line stamps the dispense onto its prescription: prior_last_dispensed_date := last_dispensed_date and prior_last_dispensed_days_supply := last_dispensed_days_supply are saved first, then last_dispensed_date := line.line_start_date, last_dispensed_days_supply := line.days_supply_filled, days_dispensed_total += line.days_supply_filled, refills_remaining -= 1, refills_consumed += 1"
+      - "packaging_status DRAFT -> LINES_ADJUDICATED; insurance_status -> CLEARED, EDITS_PENDING or REJECTED_TOO_SOON"
+      - "stamps total_copay_cents (calculations.cycle_copay_cents variant PINNED_ROUND_THEN_SUM) and consumes outstanding ISSUED CreditMemos into credit_applied_cents"
+      - "increments FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/fill-cycles/{id}/generate-roll
+    roles: [PackagingTechnician]
+    description: "Build the dose-time pouch roll for the cycle's pouch-routed lines."
+    input: {}
+    output: PouchRoll
+    side_effects:
+      - "creates one PouchRoll (verification_status BUILT, roll_serial stamped, segment_start_date / segment_end_date per calculations.roll_pouch_count) and one Pouch per (dose_date, dose_slot) pair"
+      - "packaging_status LINES_ADJUDICATED -> ROLL_GENERATED and FillCycle.roll_pouch_count := PouchRoll.pouch_count"
+      - "increments FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/pouch-rolls/{id}/pack
+    roles: [PackagingTechnician]
+    description: "Claim the roll as packed by the calling technician; this pins the identity that may not verify or image it."
+    input: {}
+    output: PouchRoll
+    side_effects:
+      - "verification_status BUILT -> PACKED, packed_by_user_id := X-User-ID, packed_at := clock"
+      - "cycle.packaging_status ROLL_GENERATED -> PACKED"
+      - "increments PouchRoll.version and FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/pouches/{id}/verification-image
+    roles: [PackagingTechnician, VerifyingPharmacist]
+    description: "Record the pack-verification image for one pouch. A low-confidence image is UNREADABLE regardless of the pill count."
+    input:
+      detected_pill_count: integer
+      image_confidence_pct: integer
+    output: Pouch
+    side_effects:
+      - "verification_result := UNREADABLE when image_confidence_pct < IMAGE_MIN_CONFIDENCE_PCT, else MATCH when detected_pill_count == expected_pill_count, else MISMATCH_COUNT"
+      - "detected_pill_count, image_confidence_pct, imaged_by_user_id := X-User-ID and imaged_at := clock are stamped"
+      - "PouchRoll.mismatch_pouch_count := count of the roll's pouches with verification_result IN {MISMATCH_COUNT, UNREADABLE}"
+      - "increments Pouch.version and PouchRoll.version by 1"
+
+  - method: POST
+    path: /pharmacy/pouch-rolls/{id}/verification-images
+    roles: [PackagingTechnician, VerifyingPharmacist]
+    description: "One bench-scanner pass over the whole roll: every still-PENDING pouch is imaged in pouch_index ASC order, with per-pouch overrides for the pouches the scanner read differently."
+    input:
+      image_confidence_pct: integer
+      overrides?: array
+    output: PouchRoll
+    side_effects:
+      - "for every Pouch of the roll with verification_result == PENDING, in pouch_index ASC order: detected_pill_count := expected_pill_count and image_confidence_pct := the body value, UNLESS an element of overrides names that pouch_index, in which case that element's detected_pill_count (and its optional image_confidence_pct) is used instead"
+      - "verification_result is then derived exactly as on the single-pouch route: UNREADABLE when the effective image_confidence_pct < IMAGE_MIN_CONFIDENCE_PCT, else MATCH when detected_pill_count == expected_pill_count, else MISMATCH_COUNT"
+      - "imaged_by_user_id := X-User-ID and imaged_at := clock on every pouch imaged by this pass; pouches that were already imaged are left untouched"
+      - "PouchRoll.mismatch_pouch_count := count of the roll's pouches with verification_result IN {MISMATCH_COUNT, UNREADABLE}"
+      - "increments PouchRoll.version by 1 and Pouch.version by 1 for every pouch imaged"
+
+  - method: POST
+    path: /pharmacy/pouch-rolls/{id}/verify
+    roles: [VerifyingPharmacist]
+    description: "Second-person verification of a fully imaged roll. Branches on mismatch_pouch_count."
+    input: {}
+    output: PouchRoll
+    side_effects:
+      - "mismatch_pouch_count == 0: verification_status PACKED -> PASSED and cycle.packaging_status PACKED -> VERIFIED"
+      - "mismatch_pouch_count >= 1: verification_status PACKED -> FAILED_QUARANTINED, cycle.packaging_status PACKED -> ROLL_GENERATED, and a CreditMemo (reason FAILED_VERIFICATION, amount_cents FAILED_VERIFICATION_GOODWILL_CENTS, status ISSUED) is issued while Patient.credit_balance_cents rises by it"
+      - "verified_by_user_id := X-User-ID, verified_at := clock"
+      - "increments PouchRoll.version and FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/pouch-rolls/{id}/rework
+    roles: [VerifyingPharmacist]
+    description: "Return a quarantined roll to the bench for repacking, at most MAX_REWORK_COUNT times."
+    input: {}
+    output: PouchRoll
+    side_effects:
+      - "verification_status FAILED_QUARANTINED -> BUILT, rework_count += 1, packed_by_user_id / packed_at / verified_by_user_id / verified_at cleared"
+      - "every non-VOID Pouch of the roll resets to verification_result PENDING with its image fields cleared; mismatch_pouch_count := 0"
+      - "increments PouchRoll.version by 1"
+
+  - method: POST
+    path: /pharmacy/fill-cycles/{id}/shipments
+    roles: [PharmacyOperations]
+    description: "Stage one parcel of the split shipment. A POUCH_ROLL parcel may only be staged once the cycle is VERIFIED; COLD_CHAIN and NON_PACKABLE_LOOSE parcels may be staged from LINES_ADJUDICATED onward because they never touch the pouch bench."
+    input:
+      shipment_kind: string
+      carrier_service: string
+      packaging?: string
+    output: Shipment
+    side_effects:
+      - "creates a Shipment with status STAGED, staged_at := clock, covers_line_ids = the cycle's ADJUDICATED or PACKED_OUT lines whose packable_route maps to shipment_kind, and ship_cost_cents per calculations.shipment_cost_cents"
+      - "increments FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/shipments/{id}/dispatch
+    roles: [PharmacyOperations]
+    description: "Hand the parcel to the carrier. The dispatch that leaves every required kind in transit closes the cycle's provisional copay into its final copay."
+    input: {}
+    output: Shipment
+    side_effects:
+      - "status STAGED -> IN_TRANSIT, tracking_number stamped, dispatched_at := clock"
+      - "when every required shipment kind of the cycle is IN_TRANSIT or beyond: cycle.packaging_status VERIFIED -> SHIPPED, final_copay_cents and rounding_delta_cents stamped per calculations.cycle_copay_cents variant FINAL_SUM_THEN_ROUND, every ADJUDICATED line becomes PACKED_OUT, and a ROUNDING_TRUEUP CreditMemo is issued when rounding_delta_cents >= ROUNDING_CREDIT_MIN_CENTS"
+      - "increments Shipment.version and FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/shipments/{id}/deliver
+    roles: [PharmacyOperations]
+    description: "Record carrier delivery. A cold-chain parcel whose excursion exceeded the limit is returned and fully reversed instead of delivered."
+    input:
+      cold_chain_excursion_minutes?: integer
+    output: Shipment
+    side_effects:
+      - "excursion within COLD_CHAIN_EXCURSION_LIMIT_MINUTES (or a non cold-chain parcel): status IN_TRANSIT -> DELIVERED, delivered_at := clock"
+      - "cold-chain excursion above the limit: status IN_TRANSIT -> EXCEPTION_RETURNED; every covered CycleLine becomes CREDITED; because those lines were credited each prescription reverses its dispense (refills_remaining += 1, refills_consumed -= 1, days_dispensed_total -= days_supply_filled, last_dispensed_* restored from prior_last_dispensed_*); a CreditMemo (reason COLD_CHAIN_EXCURSION, amount_cents = the credited lines' copay sum) is issued; cycle.total_copay_cents is recomputed; an AdherenceEvent (DELIVERY_EXCEPTION) is appended"
+      - "increments Shipment.version by 1"
+
+  - method: POST
+    path: /pharmacy/shipments/{id}/confirm-pickup
+    roles: [Patient]
+    description: "Patient-only confirmation that the parcel was collected; resets the missed-pickup streak and can close the cycle."
+    input: {}
+    output: Shipment
+    side_effects:
+      - "status DELIVERED -> PICKED_UP, pickup_confirmed_at := clock, appends an AdherenceEvent (PICKUP_CONFIRMED, source PATIENT_REPORTED)"
+      - "Patient.consecutive_missed_pickups := 0"
+      - "when every Shipment of the cycle is terminal: cycle.packaging_status SHIPPED -> CLOSED"
+      - "increments Shipment.version and FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/refill-authorizations
+    roles: [PharmacyOperations]
+    description: "Open a refill authorization chase against the prescriber."
+    input:
+      prescription_id: string
+      requested_refills: integer
+    output: RefillAuthorizationRequest
+    side_effects:
+      - "creates a RefillAuthorizationRequest with status SENT, chase_round 0, escalation_level 0, first_sent_at := clock, last_sent_at := clock, next_chase_due_at := clock + CHASE_INTERVAL_HOURS, version 1"
+
+  - method: POST
+    path: /pharmacy/refill-authorizations/{id}/chase
+    roles: [PharmacyOperations]
+    description: "One endpoint, two effects: from SENT it records the prescriber's silence, from NO_RESPONSE it re-sends and restarts the 72-hour window."
+    input: {}
+    output: RefillAuthorizationRequest
+    side_effects:
+      - "from SENT: status -> NO_RESPONSE, chase_round += 1, no_response_recorded_at := clock"
+      - "from NO_RESPONSE: status -> SENT, last_sent_at := clock, next_chase_due_at := clock + CHASE_INTERVAL_HOURS"
+      - "increments RefillAuthorizationRequest.version by 1"
+
+  - method: POST
+    path: /pharmacy/refill-authorizations/{id}/escalate
+    roles: [PharmacyOperations]
+    description: "Escalate an exhausted chase; the held line is dropped from the cycle once the cycle's start date has arrived."
+    input: {}
+    output: RefillAuthorizationRequest
+    side_effects:
+      - "status NO_RESPONSE -> ESCALATED, escalation_level := 1"
+      - "when the clock date has reached the held line's cycle_start_date: that HELD_AUTH CycleLine becomes EXCLUDED_HELD with hold_reason AUTH_ESCALATED, which can move the cycle's insurance dimension EDITS_PENDING -> CLEARED"
+      - "increments RefillAuthorizationRequest.version by 1"
+
+  - method: POST
+    path: /pharmacy/refill-authorizations/{id}/respond
+    roles: [Prescriber]
+    description: "Prescriber decision. APPROVE restores refills and revives the held line, which can clear the whole cycle."
+    input:
+      decision: string
+      approved_refills?: integer
+      denial_reason?: string
+    output: RefillAuthorizationRequest
+    side_effects:
+      - "APPROVE: status -> APPROVED, approved_refills stored; because the request was approved the prescription moves PENDING_AUTHORIZATION -> ACTIVE with refills_authorized and refills_remaining raised by approved_refills; because refills exist again every HELD_AUTH line of that prescription becomes ADJUDICATED with copay_cents computed and the dispense stamped; because a held line resolved the cycle's total_copay_cents is recomputed and its insurance dimension can move EDITS_PENDING -> CLEARED"
+      - "DENY: status -> DENIED, denial_reason stored; the prescription moves PENDING_AUTHORIZATION -> DISCONTINUED and every HELD_AUTH line becomes EXCLUDED_HELD with hold_reason AUTH_DENIED, which can also clear the cycle"
+      - "increments RefillAuthorizationRequest.version, Prescription.version and FillCycle.version by 1"
+
+  - method: POST
+    path: /pharmacy/vacation-exceptions
+    roles: [Patient, PharmacyOperations]
+    description: "Request a travel early-supply exception for a future trip."
+    input:
+      patient_id: string
+      travel_start_date: string
+      travel_end_date: string
+      requested_extra_days: integer
+    output: VacationExceptionRequest
+    side_effects:
+      - "creates a VacationExceptionRequest with status SUBMITTED, approved_extra_days null, waives_refill_too_soon false, version 1"
+
+  - method: POST
+    path: /pharmacy/vacation-exceptions/{id}/decide
+    roles: [VerifyingPharmacist]
+    description: "Decide the travel exception. Only the payer-override branch waives the refill-too-soon edit; neither approval branch is available while a controlled substance is active."
+    input:
+      decision: string
+      approved_extra_days?: integer
+      denial_reason?: string
+    output: VacationExceptionRequest
+    side_effects:
+      - "APPROVE_PHARMACIST: status -> PHARMACIST_APPROVED, approved_extra_days stored, waives_refill_too_soon stays false, Patient.vacation_exceptions_used_this_year += 1"
+      - "APPROVE_PAYER_OVERRIDE: status -> PAYER_OVERRIDE_APPROVED, approved_extra_days stored, waives_refill_too_soon := true, Patient.vacation_exceptions_used_this_year += 1"
+      - "DENY: status -> DENIED, denial_reason stored, the yearly counter is untouched"
+      - "decided_by_user_id := X-User-ID, decided_at := clock; increments VacationExceptionRequest.version and Patient.version by 1"
+
+  - method: POST
+    path: /pharmacy/prescriptions/{id}/regimen-change
+    roles: [Prescriber]
+    description: "Mid-cycle regimen change. Supersedes the prescription, mints a successor and unwinds every roll built on the old regimen. The response body is the NEW successor Prescription, not the superseded one."
+    input:
+      new_drug_name: string
+      new_form: string
+      new_copay_tier: string
+      new_dose_times: array
+      new_quantity_per_dose: integer
+      expected_prescription_version: integer
+      new_ndc?: string
+      new_strength?: string
+      new_days_supply_written?: integer
+      change_reason?: string
+    output: Prescription
+    side_effects:
+      - "the addressed Prescription moves ACTIVE -> SUPERSEDED and a successor Prescription is created (status ACTIVE, supersedes_rx_id = the addressed id, refills_remaining and refills_consumed carried forward, packable recomputed from new_form)"
+      - "because the prescription was superseded every CycleLine referencing it on a cycle whose packaging_status IN {DRAFT, LINES_ADJUDICATED, ROLL_GENERATED, PACKED, VERIFIED} becomes SUPERSEDED_PENDING_REISSUE with hold_reason REGIMEN_CHANGE"
+      - "because a line was superseded each affected cycle sets reissue_required := true and reverts packaging_status PACKED or VERIFIED -> ROLL_GENERATED"
+      - "because the cycle reverted, every Shipment of that cycle with status STAGED and shipment_kind POUCH_ROLL becomes CANCELLED"
+      - "increments Prescription.version by 1 (OCC parent), and FillCycle.version by 1 for every affected cycle"
+
+  - method: POST
+    path: /pharmacy/fill-cycles/{id}/reissue
+    roles: [PharmacyOperations]
+    description: "Reissue the untaken tail of a cycle as a new partial cycle and credit the unused portion less the reissue fee. The response body is the NEW partial-reissue FillCycle, not the original."
+    input:
+      effective_date: string
+      replacement_prescription_ids: array
+      expected_cycle_version: integer
+    output: FillCycle
+    side_effects:
+      - "computes the credit per calculations.partial_reissue_credit_cents; stamps reissue_fee_cents on the ORIGINAL cycle and issues a CreditMemo (reason PARTIAL_REISSUE, amount_cents = the net credit, cycle_id = the original cycle, status ISSUED) while Patient.credit_balance_cents rises by it"
+      - "each reissued CycleLine becomes REISSUED with days_supply_filled := used_days, line_end_date := effective_date and copay_cents reduced by its line credit; the original cycle's total_copay_cents is recomputed over the retained lines"
+      - "each reissued line's prescription has last_dispensed_days_supply reset to used_days and days_dispensed_total reduced by the unused days, so the successor cycle adjudicates against what was actually consumed"
+      - "creates a new FillCycle with is_partial_reissue true, reissue_of_cycle_id = the original cycle, cycle_start_date = effective_date, day_supply_days = the original cycle_end_date - effective_date, packaging_status DRAFT, insurance_status NOT_ADJUDICATED, and one PLANNED CycleLine per prescription in replacement_prescription_ids"
+      - "increments FillCycle.version by 1 (OCC parent)"
+
+  - method: POST
+    path: /pharmacy/_clock/set_current_utc
+    roles: [PlatformAdmin, PharmacyOperations, VerifyingPharmacist, PackagingTechnician, Prescriber, Patient]
+    description: "Test-only logical clock. Every date and timestamp comparison in this domain reads this clock. The default logical clock is 2026-08-01T00:00:00Z until this endpoint is called."
+    input:
+      current_utc: string
+    output: "{ current_utc: string }"
+    side_effects:
+      - "sets the logical clock; no business entity is mutated"
+
+# =============================================================================
+# 1.6 Error Catalog — 56 error ids, every one reachable
+# =============================================================================
+errors:
+  - error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    message: "Authentication headers are required."
+    raised_by: "any endpoint called without X-User-ID or X-Role"
+  - error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    message: "Role {role} may not perform this operation."
+    raised_by: "any endpoint called with a role outside its §1.5 role list"
+  - error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    message: "Request body is invalid: {detail}."
+    raised_by: "missing required field, wrong type, out-of-range integer, bad enum, bad date, empty dose_times, limit/offset out of range"
+  - error_id: ERR_PATIENT_SCOPE_VIOLATION
+    http_status: 403
+    message: "A patient may only act on their own records."
+    raised_by: "X-Role == Patient addressing a resource whose owning patient_id != X-User-ID"
+  - error_id: ERR_INSURANCE_PLAN_NOT_FOUND
+    http_status: 404
+    message: "Insurance plan {id} was not found."
+    raised_by: "GET /pharmacy/insurance-plans/{id}; POST /pharmacy/patients with an unknown insurance_plan_id"
+  - error_id: ERR_PATIENT_NOT_FOUND
+    http_status: 404
+    message: "Patient {id} was not found."
+    raised_by: "any /pharmacy/patients/{id} route; unknown patient_id in a body"
+  - error_id: ERR_PRESCRIPTION_NOT_FOUND
+    http_status: 404
+    message: "Prescription {id} was not found."
+    raised_by: "any /pharmacy/prescriptions/{id} route; unknown prescription_id, replacement_prescription_ids[] or force_pouch_prescription_ids[] member"
+  - error_id: ERR_FILL_CYCLE_NOT_FOUND
+    http_status: 404
+    message: "Fill cycle {id} was not found."
+    raised_by: "any /pharmacy/fill-cycles/{id} route; unknown cycle_id in a body"
+  - error_id: ERR_CYCLE_LINE_NOT_FOUND
+    http_status: 404
+    message: "Cycle line {id} was not found."
+    raised_by: "GET /pharmacy/cycle-lines/{id}"
+  - error_id: ERR_POUCH_ROLL_NOT_FOUND
+    http_status: 404
+    message: "Pouch roll {id} was not found."
+    raised_by: "any /pharmacy/pouch-rolls/{id} route"
+  - error_id: ERR_POUCH_NOT_FOUND
+    http_status: 404
+    message: "Pouch {id} was not found."
+    raised_by: "any /pharmacy/pouches/{id} route"
+  - error_id: ERR_SHIPMENT_NOT_FOUND
+    http_status: 404
+    message: "Shipment {id} was not found."
+    raised_by: "any /pharmacy/shipments/{id} route"
+  - error_id: ERR_REFILL_AUTHORIZATION_NOT_FOUND
+    http_status: 404
+    message: "Refill authorization request {id} was not found."
+    raised_by: "any /pharmacy/refill-authorizations/{id} route"
+  - error_id: ERR_VACATION_EXCEPTION_NOT_FOUND
+    http_status: 404
+    message: "Vacation exception request {id} was not found."
+    raised_by: "any /pharmacy/vacation-exceptions/{id} route; unknown vacation_exception_id on adjudicate"
+  - error_id: ERR_CREDIT_MEMO_NOT_FOUND
+    http_status: 404
+    message: "Credit memo {id} was not found."
+    raised_by: "GET /pharmacy/credit-memos/{id}"
+  - error_id: ERR_ADHERENCE_EVENT_NOT_FOUND
+    http_status: 404
+    message: "Adherence event {id} was not found."
+    raised_by: "GET /pharmacy/adherence-events/{id}"
+  - error_id: ERR_STALE_CYCLE_VERSION
+    http_status: 412
+    message: "Fill cycle {id} has moved on; expected version {expected}, found {actual}."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/reissue with a stale expected_cycle_version"
+  - error_id: ERR_STALE_PRESCRIPTION_VERSION
+    http_status: 412
+    message: "Prescription {id} has moved on; expected version {expected}, found {actual}."
+    raised_by: "POST /pharmacy/prescriptions/{id}/regimen-change with a stale expected_prescription_version"
+  - error_id: ERR_PATIENT_NOT_SYNCHRONIZED
+    http_status: 409
+    message: "Patient {id} has no synchronized fill cycle anchor."
+    raised_by: "POST /pharmacy/fill-cycles before synchronize"
+  - error_id: ERR_AUTOSHIP_PAUSED
+    http_status: 409
+    message: "Auto-ship is {status} for patient {id}."
+    raised_by: "POST /pharmacy/fill-cycles, /adjudicate or /reissue while autoship_status != ACTIVE"
+  - error_id: ERR_INVALID_CYCLE_STATE
+    http_status: 409
+    message: "Fill cycle {id} is packaging_status {packaging_status} / insurance_status {insurance_status}; this operation is not available."
+    raised_by: "adjudicate, generate-roll, shipments or reissue against the wrong cycle dimension value"
+  - error_id: ERR_CYCLE_NOT_CLEARED
+    http_status: 409
+    message: "Fill cycle {id} still has open authorization edits."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/generate-roll while insurance_status == EDITS_PENDING"
+  - error_id: ERR_INVALID_ROLL_STATE
+    http_status: 409
+    message: "Pouch roll {id} is {verification_status}; this operation is not available."
+    raised_by: "pack, verify, rework or verification-image against the wrong roll state"
+  - error_id: ERR_IMAGE_ALREADY_CAPTURED
+    http_status: 409
+    message: "Pouch {id} already carries a verification image for this pack attempt."
+    raised_by: "POST /pharmacy/pouches/{id}/verification-image when verification_result != PENDING"
+  - error_id: ERR_INVALID_SHIPMENT_STATE
+    http_status: 409
+    message: "Shipment {id} is {status}; this operation is not available."
+    raised_by: "dispatch, deliver or confirm-pickup against the wrong shipment state"
+  - error_id: ERR_INVALID_AUTH_STATE
+    http_status: 409
+    message: "Refill authorization {id} is {status}; this operation is not available."
+    raised_by: "chase, escalate or respond against the wrong request state"
+  - error_id: ERR_INVALID_VACATION_STATE
+    http_status: 409
+    message: "Vacation exception {id} is already {status}."
+    raised_by: "POST /pharmacy/vacation-exceptions/{id}/decide twice"
+  - error_id: ERR_INVALID_PRESCRIPTION_STATE
+    http_status: 409
+    message: "Prescription {id} is {status}; this operation is not available."
+    raised_by: "regimen-change on a non-ACTIVE prescription; authorization creation on a SUPERSEDED, DISCONTINUED or EXPIRED prescription"
+  - error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 409
+    message: "User {user_id} packed pouch roll {roll_id} and may not image or verify it."
+    raised_by: "verify, verification-images or verification-image called by the technician who packed the roll"
+  - error_id: ERR_CONTROLLED_SUBSTANCE_NO_OVERRIDE
+    http_status: 422
+    message: "Patient {id} has an active controlled substance; early supply cannot be approved."
+    raised_by: "POST /pharmacy/vacation-exceptions/{id}/decide with an APPROVE_* decision"
+  - error_id: ERR_COLD_CHAIN_NOT_PACKABLE
+    http_status: 422
+    message: "Prescription {id} is refrigerated and can never be routed into a pouch roll."
+    raised_by: "adjudicate with a refrigerated prescription in force_pouch_prescription_ids"
+  - error_id: ERR_COLD_CHAIN_PACKAGING_INVALID
+    http_status: 422
+    message: "Packaging {packaging} is not valid for shipment kind {shipment_kind}."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/shipments with STANDARD packaging on a COLD_CHAIN parcel, or insulated packaging on a non cold-chain parcel"
+  - error_id: ERR_NON_PACKABLE_IN_POUCH_ROUTE
+    http_status: 422
+    message: "Prescription {id} has form {form} and cannot be pouch-packed."
+    raised_by: "adjudicate with a non-packable prescription in force_pouch_prescription_ids"
+  - error_id: ERR_NO_PACKABLE_LINES
+    http_status: 422
+    message: "Fill cycle {id} has no adjudicated pouch-routed lines."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/generate-roll on a cold-chain-only cycle"
+  - error_id: ERR_NO_LINES_FOR_SHIPMENT_KIND
+    http_status: 422
+    message: "Fill cycle {id} has no lines routed to shipment kind {shipment_kind}, or such a parcel already exists."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/shipments"
+  - error_id: ERR_RX_PENDING_AUTHORIZATION
+    http_status: 409
+    message: "Prescription {id} is not ACTIVE and cannot be rolled."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/generate-roll"
+  - error_id: ERR_ROLL_NOT_VERIFIED
+    http_status: 409
+    message: "The pouch roll for fill cycle {id} has not passed verification."
+    raised_by: "POST /pharmacy/shipments/{id}/dispatch on a POUCH_ROLL parcel"
+  - error_id: ERR_NO_APPROVED_VACATION_EXCEPTION
+    http_status: 422
+    message: "Vacation exception {id} is not an approved exception for this patient."
+    raised_by: "adjudicate with a vacation_exception_id that is DENIED, SUBMITTED or belongs to another patient"
+  - error_id: ERR_CYCLE_WINDOW_OVERLAP
+    http_status: 409
+    message: "Patient {id} already has a fill cycle covering {cycle_start_date}..{cycle_end_date}."
+    raised_by: "POST /pharmacy/fill-cycles with a half-open window that intersects a live cycle"
+  - error_id: ERR_REISSUE_SEGMENT_OVERLAP
+    http_status: 409
+    message: "Pouch roll segment {segment_start_date}..{segment_end_date} collides with an existing roll."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/generate-roll whose closed segment touches or overlaps a live roll"
+  - error_id: ERR_COLD_CHAIN_GAP_VIOLATION
+    http_status: 409
+    message: "A cold-chain parcel for patient {id} was staged less than 48 hours ago."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/shipments with shipment_kind COLD_CHAIN inside the buffer"
+  - error_id: ERR_VACATION_WINDOW_INVALID
+    http_status: 422
+    message: "Travel window {travel_start_date}..{travel_end_date} cannot support {requested_extra_days} extra days."
+    raised_by: "POST /pharmacy/vacation-exceptions with a past start date or a window shorter than the requested days"
+  - error_id: ERR_CHASE_TOO_EARLY
+    http_status: 409
+    message: "Refill authorization {id} may not be chased before {next_chase_due_at}."
+    raised_by: "POST /pharmacy/refill-authorizations/{id}/chase from SENT inside the 72-hour window"
+  - error_id: ERR_REISSUE_DATE_OUT_OF_WINDOW
+    http_status: 422
+    message: "Effective date {effective_date} is outside the cycle window."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/reissue"
+  - error_id: ERR_CHASE_LIMIT_REACHED
+    http_status: 409
+    message: "Refill authorization {id} has exhausted its 3 chase rounds; escalate instead."
+    raised_by: "POST /pharmacy/refill-authorizations/{id}/chase from SENT with chase_round == 3"
+  - error_id: ERR_ESCALATION_PREMATURE
+    http_status: 409
+    message: "Refill authorization {id} has only completed {chase_round} of 3 chase rounds."
+    raised_by: "POST /pharmacy/refill-authorizations/{id}/escalate too early"
+  - error_id: ERR_REWORK_LIMIT_REACHED
+    http_status: 409
+    message: "Pouch roll {id} has already been reworked {rework_count} times."
+    raised_by: "POST /pharmacy/pouch-rolls/{id}/rework a third time"
+  - error_id: ERR_DAY_SUPPLY_EXCEEDS_ALLOWANCE
+    http_status: 422
+    message: "Line for prescription {id} needs {days_supply_filled} days but only {allowance_days} are allowed."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/adjudicate"
+  - error_id: ERR_VACATION_LIMIT_EXCEEDED
+    http_status: 422
+    message: "Patient {id} has used all {vacation_overrides_per_year} travel exceptions this year."
+    raised_by: "POST /pharmacy/vacation-exceptions"
+  - error_id: ERR_PAYER_OVERRIDE_NOT_ALLOWED
+    http_status: 422
+    message: "Plan {id} does not fund payer-level vacation overrides."
+    raised_by: "POST /pharmacy/vacation-exceptions/{id}/decide with APPROVE_PAYER_OVERRIDE"
+  - error_id: ERR_INVALID_APPROVED_DAYS
+    http_status: 422
+    message: "The approval payload is inconsistent with the request: {detail}."
+    raised_by: "decide or respond with a missing, zero or over-large approved amount, or a DENY without a reason"
+  - error_id: ERR_DUPLICATE_AUTH_REQUEST
+    http_status: 409
+    message: "Prescription {id} already has an open refill authorization request."
+    raised_by: "POST /pharmacy/refill-authorizations"
+  - error_id: ERR_INVALID_ANCHOR_DAY
+    http_status: 422
+    message: "anchor_fill_day must be between 1 and 28."
+    raised_by: "POST /pharmacy/patients/{id}/synchronize"
+  - error_id: ERR_NO_ACTIVE_PRESCRIPTIONS
+    http_status: 422
+    message: "Patient {id} has no active prescriptions to synchronize or fill."
+    raised_by: "POST /pharmacy/patients/{id}/synchronize; POST /pharmacy/fill-cycles"
+  - error_id: ERR_REFILL_TOO_SOON
+    http_status: 409
+    message: "Fill cycle {id} was rejected by the payer as a refill too soon."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/generate-roll while insurance_status == REJECTED_TOO_SOON"
+  - error_id: ERR_NOTHING_TO_REISSUE
+    http_status: 422
+    message: "Fill cycle {id} has no lines awaiting reissue."
+    raised_by: "POST /pharmacy/fill-cycles/{id}/reissue"
+
+# =============================================================================
+# 1.7 RBAC Matrix — role_model: segregation_of_duties
+# =============================================================================
+roles:
+
+  - name: PlatformAdmin
+    identity: opaque
+    description: "Configures payer plans and enrolls patients. Reads everything operational but performs no pharmacy step."
+    exclusive_operations:
+      - "POST /pharmacy/insurance-plans"
+    shared_operations:
+      - "POST /pharmacy/patients (with PharmacyOperations)"
+      - "every GET under /pharmacy"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/fill-cycles/{id}/adjudicate — pharmacist judgement"
+      - "POST /pharmacy/fill-cycles/{id}/generate-roll and /pharmacy/pouch-rolls/{id}/pack — bench work"
+      - "POST /pharmacy/pouch-rolls/{id}/verify and /rework — pharmacist judgement"
+      - "POST /pharmacy/refill-authorizations/{id}/respond and /pharmacy/prescriptions/{id}/regimen-change — prescriber acts"
+      - "POST /pharmacy/shipments/{id}/confirm-pickup — patient acts"
+
+  - name: PharmacyOperations
+    identity: opaque
+    description: "Owns synchronization, cycle creation, the authorization chase, split shipments and reissue. Cannot adjudicate, cannot pack and cannot verify."
+    exclusive_operations:
+      - "POST /pharmacy/patients/{id}/synchronize"
+      - "POST /pharmacy/patients/{id}/adherence-review"
+      - "POST /pharmacy/fill-cycles"
+      - "POST /pharmacy/fill-cycles/{id}/shipments"
+      - "POST /pharmacy/shipments/{id}/dispatch"
+      - "POST /pharmacy/shipments/{id}/deliver"
+      - "POST /pharmacy/refill-authorizations"
+      - "POST /pharmacy/refill-authorizations/{id}/chase"
+      - "POST /pharmacy/refill-authorizations/{id}/escalate"
+      - "POST /pharmacy/fill-cycles/{id}/reissue"
+    shared_operations:
+      - "POST /pharmacy/patients (with PlatformAdmin)"
+      - "POST /pharmacy/prescriptions (with Prescriber)"
+      - "POST /pharmacy/patients/{id}/autoship (with Patient)"
+      - "POST /pharmacy/patients/{id}/dose-events (with Patient)"
+      - "POST /pharmacy/vacation-exceptions (with Patient)"
+      - "every GET under /pharmacy"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/insurance-plans — plan configuration"
+      - "POST /pharmacy/fill-cycles/{id}/adjudicate — pharmacist judgement"
+      - "POST /pharmacy/fill-cycles/{id}/generate-roll and /pharmacy/pouch-rolls/{id}/pack — bench work"
+      - "POST /pharmacy/pouch-rolls/{id}/verify, /rework and /pharmacy/vacation-exceptions/{id}/decide — pharmacist judgement"
+      - "POST /pharmacy/refill-authorizations/{id}/respond and /pharmacy/prescriptions/{id}/regimen-change — prescriber acts"
+      - "POST /pharmacy/shipments/{id}/confirm-pickup — patient acts"
+
+  - name: VerifyingPharmacist
+    identity: opaque
+    description: "Professional judgement: payer adjudication, roll verification, rework and travel exception decisions. Never packs a roll, and per §1.4 priority 18 may not verify or image a roll they packed."
+    exclusive_operations:
+      - "POST /pharmacy/fill-cycles/{id}/adjudicate"
+      - "POST /pharmacy/pouch-rolls/{id}/verify"
+      - "POST /pharmacy/pouch-rolls/{id}/rework"
+      - "POST /pharmacy/vacation-exceptions/{id}/decide"
+    shared_operations:
+      - "POST /pharmacy/pouches/{id}/verification-image (with PackagingTechnician)"
+      - "POST /pharmacy/pouch-rolls/{id}/verification-images (with PackagingTechnician)"
+      - "every GET under /pharmacy"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/insurance-plans and POST /pharmacy/patients"
+      - "POST /pharmacy/fill-cycles, /pharmacy/fill-cycles/{id}/shipments, /pharmacy/fill-cycles/{id}/reissue"
+      - "POST /pharmacy/fill-cycles/{id}/generate-roll and /pharmacy/pouch-rolls/{id}/pack — bench work"
+      - "POST /pharmacy/refill-authorizations and its /chase, /escalate, /respond routes"
+      - "POST /pharmacy/shipments/{id}/dispatch, /deliver, /confirm-pickup"
+      - "POST /pharmacy/patients/{id}/synchronize, /autoship, /dose-events, /adherence-review"
+
+  - name: PackagingTechnician
+    identity: opaque
+    description: "Bench role: builds the roll, packs it and captures pack-verification images. Cannot verify their own work and cannot adjudicate."
+    exclusive_operations:
+      - "POST /pharmacy/fill-cycles/{id}/generate-roll"
+      - "POST /pharmacy/pouch-rolls/{id}/pack"
+    shared_operations:
+      - "POST /pharmacy/pouches/{id}/verification-image (with VerifyingPharmacist)"
+      - "POST /pharmacy/pouch-rolls/{id}/verification-images (with VerifyingPharmacist)"
+      - "GET /pharmacy/patients/{id}, /pharmacy/prescriptions, /pharmacy/prescriptions/{id}, /pharmacy/fill-cycles, /pharmacy/fill-cycles/{id}, /pharmacy/cycle-lines, /pharmacy/cycle-lines/{id}, /pharmacy/pouch-rolls, /pharmacy/pouch-rolls/{id}, /pharmacy/pouches, /pharmacy/pouches/{id}, /pharmacy/shipments, /pharmacy/shipments/{id}"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/pouch-rolls/{id}/verify and /rework — second-person verification"
+      - "POST /pharmacy/fill-cycles/{id}/adjudicate"
+      - "POST /pharmacy/insurance-plans, POST /pharmacy/patients, POST /pharmacy/prescriptions"
+      - "POST /pharmacy/fill-cycles and every /pharmacy/shipments write route"
+      - "GET /pharmacy/insurance-plans/{id}, /pharmacy/patients, /pharmacy/credit-memos, /pharmacy/vacation-exceptions, /pharmacy/refill-authorizations, /pharmacy/adherence-events"
+
+  - name: Prescriber
+    identity: opaque
+    description: "Writes prescriptions, answers refill authorization chases and issues mid-cycle regimen changes. Touches no pharmacy operation."
+    exclusive_operations:
+      - "POST /pharmacy/refill-authorizations/{id}/respond"
+      - "POST /pharmacy/prescriptions/{id}/regimen-change"
+    shared_operations:
+      - "POST /pharmacy/prescriptions (with PharmacyOperations)"
+      - "GET /pharmacy/prescriptions, /pharmacy/prescriptions/{id}, /pharmacy/refill-authorizations, /pharmacy/refill-authorizations/{id}"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/refill-authorizations, /chase and /escalate — the pharmacy chases, the prescriber answers"
+      - "POST /pharmacy/fill-cycles and every cycle, roll, pouch and shipment write route"
+      - "POST /pharmacy/vacation-exceptions/{id}/decide"
+      - "GET /pharmacy/patients, /pharmacy/cycle-lines, /pharmacy/pouch-rolls, /pharmacy/pouches, /pharmacy/credit-memos"
+
+  - name: Patient
+    identity: entity_backed:Patient
+    description: "X-User-ID is a Patient.id. Every read and write is scoped to that patient by §1.4 priority 6. Confirming pickup is the patient's exclusive act."
+    exclusive_operations:
+      - "POST /pharmacy/shipments/{id}/confirm-pickup"
+    shared_operations:
+      - "POST /pharmacy/patients/{id}/autoship (with PharmacyOperations)"
+      - "POST /pharmacy/patients/{id}/dose-events (with PharmacyOperations)"
+      - "POST /pharmacy/vacation-exceptions (with PharmacyOperations)"
+      - "GET /pharmacy/patients/{id}, /pharmacy/patients/{id}/adherence-summary, /pharmacy/prescriptions, /pharmacy/prescriptions/{id}, /pharmacy/fill-cycles, /pharmacy/fill-cycles/{id}, /pharmacy/fill-cycles/{id}/adherence-events, /pharmacy/shipments, /pharmacy/shipments/{id}, /pharmacy/vacation-exceptions, /pharmacy/vacation-exceptions/{id}, /pharmacy/credit-memos, /pharmacy/credit-memos/{id}, /pharmacy/adherence-events, /pharmacy/adherence-events/{id}"
+      - "POST /pharmacy/_clock/set_current_utc"
+    forbidden_operations:
+      - "POST /pharmacy/insurance-plans, POST /pharmacy/patients, POST /pharmacy/prescriptions"
+      - "POST /pharmacy/patients/{id}/synchronize and /adherence-review"
+      - "POST /pharmacy/fill-cycles and every adjudicate, generate-roll, pack, verify, rework, shipments, dispatch, deliver, reissue route"
+      - "POST /pharmacy/vacation-exceptions/{id}/decide"
+      - "GET /pharmacy/insurance-plans/{id}, /pharmacy/patients, /pharmacy/cycle-lines, /pharmacy/pouch-rolls, /pharmacy/pouches, /pharmacy/refill-authorizations"

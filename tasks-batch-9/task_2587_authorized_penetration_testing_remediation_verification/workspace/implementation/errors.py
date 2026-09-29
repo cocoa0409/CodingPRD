@@ -1,0 +1,115 @@
+"""Error catalogue (PRD section 5) and the exception used to raise them."""
+
+
+ERROR_STATUS = {
+    # auth
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_INVALID_ROLE": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_ACTOR_NOT_OWNER": 403,
+    # not found
+    "ERR_ASSET_NOT_FOUND": 404,
+    "ERR_TEST_PLAN_NOT_FOUND": 404,
+    "ERR_SCOPE_ITEM_NOT_FOUND": 404,
+    "ERR_ENGAGEMENT_NOT_FOUND": 404,
+    "ERR_ROE_NOT_FOUND": 404,
+    "ERR_TARGET_NOT_FOUND": 404,
+    "ERR_TESTER_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_FINDING_NOT_FOUND": 404,
+    "ERR_ALERT_NOT_FOUND": 404,
+    "ERR_REMEDIATION_NOT_FOUND": 404,
+    "ERR_RETEST_NOT_FOUND": 404,
+    "ERR_TRAINING_RECOMMENDATION_NOT_FOUND": 404,
+    "ERR_NOT_FOUND": 404,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    # optimistic concurrency
+    "ERR_STALE_PLAN_VERSION": 412,
+    "ERR_STALE_ENGAGEMENT_VERSION": 412,
+    # state
+    "ERR_PLAN_NOT_DRAFT": 409,
+    "ERR_PLAN_NOT_ACTIVE": 409,
+    "ERR_SCOPE_ITEM_NOT_PENDING": 409,
+    "ERR_SCOPE_ITEM_NOT_APPROVED": 409,
+    "ERR_ENGAGEMENT_SUSPENDED": 409,
+    "ERR_ENGAGEMENT_NOT_AUTHORIZED": 409,
+    "ERR_ENGAGEMENT_NOT_EXECUTING": 409,
+    "ERR_INVALID_EXECUTION_TRANSITION": 409,
+    "ERR_ENGAGEMENT_NOT_SUSPENDED": 409,
+    "ERR_ENGAGEMENT_ALREADY_TERMINATED": 409,
+    "ERR_ROE_ALREADY_SIGNED": 409,
+    "ERR_ROE_NOT_MODIFIABLE": 409,
+    "ERR_TARGET_NOT_ACTIVE": 409,
+    "ERR_ASSIGNMENT_STATE_INVALID": 409,
+    "ERR_TESTER_STATE_INVALID": 409,
+    "ERR_FINDING_NOT_TRIAGEABLE": 409,
+    "ERR_FINDING_NOT_TRIAGED": 409,
+    "ERR_REMEDIATION_NOT_ASSIGNED": 409,
+    "ERR_REMEDIATION_NOT_SUBMITTED": 409,
+    "ERR_REMEDIATION_NOT_VALIDATED": 409,
+    "ERR_RETEST_ALREADY_SIGNED_OFF": 409,
+    "ERR_ALERT_ALREADY_ACKNOWLEDGED": 409,
+    # uniqueness
+    "ERR_DUPLICATE_SCOPE_ITEM": 409,
+    "ERR_ROE_ALREADY_EXISTS": 409,
+    "ERR_REMEDIATION_ALREADY_EXISTS": 409,
+    # safety / testing authorization
+    "ERR_NO_OPEN_TESTING_WINDOW": 422,
+    "ERR_TARGET_EXCLUDED": 422,
+    "ERR_TARGET_NOT_AUTHORIZED": 422,
+    "ERR_TESTER_NOT_ASSIGNED": 422,
+    "ERR_ASSET_NOT_GRANTED": 422,
+    "ERR_TESTER_NOT_CLEARED": 422,
+    "ERR_CLEARANCE_EXPIRED": 422,
+    "ERR_GRANT_EXCEEDS_AUTHORIZED_SCOPE": 422,
+    "ERR_TECHNIQUE_NOT_ALLOWED": 422,
+    "ERR_NO_AUTHORIZED_TARGETS": 422,
+    "ERR_UNACKNOWLEDGED_CRITICAL_ALERT": 409,
+    # segregation of duties / referential
+    "ERR_SOD_ROE_SIGNER_CONFLICT": 422,
+    "ERR_SOD_VERIFIER_CONFLICT": 422,
+    "ERR_SOD_SIGNOFF_CONFLICT": 422,
+    "ERR_DUPLICATE_SELF_REFERENCE": 422,
+    "ERR_DUPLICATE_CHAIN_NOT_ALLOWED": 422,
+    "ERR_VERIFIER_ROLE_NOT_PERMITTED": 422,
+    # temporal / capacity
+    "ERR_WINDOW_OUTSIDE_ENGAGEMENT": 422,
+    "ERR_TARGET_WINDOW_COLLISION": 409,
+    "ERR_INTERVAL_OUTSIDE_WINDOW": 422,
+    "ERR_TESTER_CAPACITY_EXCEEDED": 409,
+    "ERR_LEAD_QUALIFICATION_NOT_MET": 422,
+    "ERR_OUTSIDE_TESTING_WINDOW": 422,
+    # programme constraints
+    "ERR_BELOW_RISK_THRESHOLD": 422,
+    "ERR_EMPTY_SCOPE_SELECTION": 422,
+    "ERR_COVERAGE_BELOW_MINIMUM": 422,
+    "ERR_EXTENSION_LIMIT_REACHED": 409,
+    "ERR_RESIDUAL_NOTE_REQUIRED": 422,
+    # fiscal
+    "ERR_PLAN_ENGAGEMENT_LIMIT_REACHED": 409,
+    "ERR_ENGAGEMENT_HOURS_EXCEEDED": 422,
+    # fallback
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_MISSING_AUTH_HEADERS": "X-User-ID and X-User-Role headers are required.",
+    "ERR_INVALID_ROLE": "X-User-Role is not a recognised role.",
+    "ERR_UNAUTHORIZED": "The acting role may not call this endpoint.",
+    "ERR_INVALID_REQUEST": "The request body is malformed.",
+    "ERR_INVALID_PAGINATION": "limit must be an integer in 1..100 and offset an integer >= 0.",
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in a request to terminate it with a catalogued error."""
+
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )

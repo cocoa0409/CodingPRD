@@ -1,0 +1,107 @@
+"""Error catalogue for the mDL issuance API (PRD section 5 / scaffold 1.6)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INTEROP_PROFILE_NOT_FOUND": 404,
+    "ERR_HOLDER_NOT_FOUND": 404,
+    "ERR_PROOFING_SESSION_NOT_FOUND": 404,
+    "ERR_DEVICE_NOT_FOUND": 404,
+    "ERR_CREDENTIAL_NOT_FOUND": 404,
+    "ERR_UPDATE_ORDER_NOT_FOUND": 404,
+    "ERR_UPDATE_DELIVERY_NOT_FOUND": 404,
+    "ERR_VERIFIER_NOT_FOUND": 404,
+    "ERR_READER_APP_NOT_FOUND": 404,
+    "ERR_PRESENTATION_SESSION_NOT_FOUND": 404,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_INVALID_STATE": 409,
+    "ERR_DELIVERY_NOT_PENDING": 409,
+    "ERR_SESSION_NOT_CONSENT_PENDING": 409,
+    "ERR_BILLING_ALREADY_VOIDED": 409,
+    "ERR_STALE_DEVICE_VERSION": 412,
+    "ERR_STALE_INTEROP_VERSION": 412,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_HANDSET_SURRENDER_PROHIBITED": 422,
+    "ERR_LAW_ENFORCEMENT_CONTEXT_NOT_PERMITTED": 403,
+    "ERR_READER_NOT_TRUSTED": 403,
+    "ERR_VERIFIER_NOT_TRUSTED": 403,
+    "ERR_DEVICE_BINDING_MISMATCH": 409,
+    "ERR_DEVICE_NOT_BOUND": 409,
+    "ERR_PHYSICAL_CREDENTIAL_INELIGIBLE": 422,
+    "ERR_PROOFING_ASSURANCE_EXPIRED": 409,
+    "ERR_CREDENTIAL_VALIDITY_OVERLAP": 409,
+    "ERR_TRUST_LIST_WINDOW_OVERLAP": 409,
+    "ERR_TRUST_LIST_WINDOW_GAP": 422,
+    "ERR_CERT_WINDOW_CONFLICT": 422,
+    "ERR_DUPLICATE_READER_APP": 409,
+    "ERR_ASSURANCE_LEVEL_INSUFFICIENT": 422,
+    "ERR_DEVICE_LIMIT_EXCEEDED": 409,
+    "ERR_ACTIVE_CREDENTIAL_LIMIT_EXCEEDED": 409,
+    "ERR_DATA_MINIMIZATION_VIOLATION": 422,
+    "ERR_PROTECTION_METHOD_MISMATCH": 422,
+    "ERR_REVOCATION_STATUS_STALE": 409,
+    "ERR_INSUFFICIENT_EVIDENCE": 422,
+    "ERR_RETENTION_CEILING_EXCEEDED": 422,
+    "ERR_VERIFIER_ACCOUNT_DELINQUENT": 402,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_INTEROP_PROFILE_NOT_FOUND": "No interoperability profile exists with that id.",
+    "ERR_HOLDER_NOT_FOUND": "No holder exists with that id.",
+    "ERR_PROOFING_SESSION_NOT_FOUND": "No identity proofing session exists with that id.",
+    "ERR_DEVICE_NOT_FOUND": "No device exists with that id.",
+    "ERR_CREDENTIAL_NOT_FOUND": "No digital credential exists with that id.",
+    "ERR_UPDATE_ORDER_NOT_FOUND": "No update order exists with that id.",
+    "ERR_UPDATE_DELIVERY_NOT_FOUND": "No update delivery exists with that id.",
+    "ERR_VERIFIER_NOT_FOUND": "No verifier exists with that id.",
+    "ERR_READER_APP_NOT_FOUND": "No reader application exists with that id.",
+    "ERR_PRESENTATION_SESSION_NOT_FOUND": "No presentation session exists with that id.",
+    "ERR_NOT_FOUND": "The requested resource does not exist.",
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be one of the six declared roles.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorized for this endpoint.",
+    "ERR_INVALID_REQUEST": "The request payload does not conform to the endpoint schema.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting identity does not own the addressed resource.",
+    "ERR_INVALID_STATE": "The target resource is not in a state from which the requested transition is declared.",
+    "ERR_DELIVERY_NOT_PENDING": "The update delivery is no longer PENDING.",
+    "ERR_SESSION_NOT_CONSENT_PENDING": "The presentation session is not awaiting the holder's consent.",
+    "ERR_BILLING_ALREADY_VOIDED": "The presentation billing is not in a voidable state.",
+    "ERR_STALE_DEVICE_VERSION": "expected_device_version does not match the current device version.",
+    "ERR_STALE_INTEROP_VERSION": "expected_interop_profile_version does not match the current profile version.",
+    "ERR_SEGREGATION_OF_DUTIES": "The adjudicating operator may not be the proofing agent of this session.",
+    "ERR_HANDSET_SURRENDER_PROHIBITED": "No verifier may require the holder to surrender the handset.",
+    "ERR_LAW_ENFORCEMENT_CONTEXT_NOT_PERMITTED": "Only a LAW_ENFORCEMENT verifier may open a LAW_ENFORCEMENT presentation context.",
+    "ERR_READER_NOT_TRUSTED": "The reader application is not listed or the trust list does not cover the current instant.",
+    "ERR_VERIFIER_NOT_TRUSTED": "The verifier trust status does not permit this operation.",
+    "ERR_DEVICE_BINDING_MISMATCH": "The handset is not in a bindable state or does not belong to the credential subject.",
+    "ERR_DEVICE_NOT_BOUND": "The handset behind this credential is not BOUND.",
+    "ERR_PHYSICAL_CREDENTIAL_INELIGIBLE": "The underlying physical credential is not valid and unexpired.",
+    "ERR_PROOFING_ASSURANCE_EXPIRED": "The identity proofing assurance has lapsed.",
+    "ERR_CREDENTIAL_VALIDITY_OVERLAP": "The requested validity window overlaps another credential on this handset.",
+    "ERR_TRUST_LIST_WINDOW_OVERLAP": "The snapshot window overlaps the newest published snapshot.",
+    "ERR_TRUST_LIST_WINDOW_GAP": "The snapshot window leaves a gap after the newest published snapshot.",
+    "ERR_CERT_WINDOW_CONFLICT": "The reader certificate window violates the mandatory 24 hour renewal buffer.",
+    "ERR_DUPLICATE_READER_APP": "This verifier already registered that certificate serial.",
+    "ERR_ASSURANCE_LEVEL_INSUFFICIENT": "The achieved identity assurance level is insufficient.",
+    "ERR_DEVICE_LIMIT_EXCEEDED": "The holder is already at the multi-device policy cap.",
+    "ERR_ACTIVE_CREDENTIAL_LIMIT_EXCEEDED": "The holder is already at the active credential cap.",
+    "ERR_DATA_MINIMIZATION_VIOLATION": "An AGE_ONLY presentation may only request the age-only allow-listed elements.",
+    "ERR_PROTECTION_METHOD_MISMATCH": "The supplied unlock proof does not match the bound protection method.",
+    "ERR_REVOCATION_STATUS_STALE": "The credential revocation status is not valid and fresh.",
+    "ERR_INSUFFICIENT_EVIDENCE": "A proofing session requires at least two evidence items before submission.",
+    "ERR_RETENTION_CEILING_EXCEEDED": "The declared retention exceeds the verifier's contractual ceiling.",
+    "ERR_VERIFIER_ACCOUNT_DELINQUENT": "The verifier's outstanding query balance is above the permitted maximum.",
+}
+
+
+def bad_request(message=None):
+    return ApiError("ERR_INVALID_REQUEST", message)

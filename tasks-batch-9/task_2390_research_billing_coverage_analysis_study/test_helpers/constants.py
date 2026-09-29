@@ -1,0 +1,56 @@
+"""Domain thresholds and rate caps, exactly as the PRD states them."""
+
+# --- Indirect (facilities and administrative) rate settlement --------------
+FEDERAL_INDIRECT_CAP_PCT = 26.0
+INDUSTRY_INDIRECT_CAP_PCT = 32.0
+INDUSTRY_SMALL_STUDY_SURCHARGE_PCT = 3.0
+INDUSTRY_TIER_THRESHOLD_CENTS = 500_000
+INVESTIGATOR_INITIATED_RATE_PCT = 0.0
+
+# --- Sponsor invoice waterfall selector ------------------------------------
+INVOICE_MAX_LINES = 25
+INVOICE_MAX_GROSS_CENTS = 2_000_000
+INVOICE_VOLUME_CREDIT_THRESHOLD_CENTS = 1_000_000
+INVOICE_VOLUME_CREDIT_PCT = 2.0
+
+# --- Aging epoch buckets (inclusive upper bounds) -------------------------
+AGING_CURRENT_MAX_DAYS = 30
+AGING_31_60_MAX_DAYS = 60
+AGING_61_90_MAX_DAYS = 90
+
+# --- Review loop and scheduling capacity ---------------------------------
+ANALYSIS_MAX_RETURNS = 2
+RESEARCH_VISIT_DAILY_CAPACITY = 2
+
+# --- Pagination ----------------------------------------------------------
+DEFAULT_PAGE_LIMIT = 10
+MIN_PAGE_LIMIT = 1
+MAX_PAGE_LIMIT = 100
+DEFAULT_PAGE_OFFSET = 0
+
+# --- The logical clock ---------------------------------------------------
+# Before any client sets it, the logical clock reads exactly this instant.
+INITIAL_LOGICAL_CLOCK = "2026-08-01T00:00:00Z"
+INITIAL_LOGICAL_CLOCK_STAMP = "2026-08-01T00:00:00.000Z"
+
+# --- Registry numbers ----------------------------------------------------
+REGISTRY_NUMBER_PATTERN = r"^NCT\d{8}$"
+
+THRESHOLDS = {
+    "FEDERAL_INDIRECT_CAP_PCT": FEDERAL_INDIRECT_CAP_PCT,
+    "INDUSTRY_INDIRECT_CAP_PCT": INDUSTRY_INDIRECT_CAP_PCT,
+    "INDUSTRY_SMALL_STUDY_SURCHARGE_PCT": INDUSTRY_SMALL_STUDY_SURCHARGE_PCT,
+    "INDUSTRY_TIER_THRESHOLD_CENTS": INDUSTRY_TIER_THRESHOLD_CENTS,
+    "INVOICE_MAX_LINES": INVOICE_MAX_LINES,
+    "INVOICE_MAX_GROSS_CENTS": INVOICE_MAX_GROSS_CENTS,
+    "INVOICE_VOLUME_CREDIT_THRESHOLD_CENTS": INVOICE_VOLUME_CREDIT_THRESHOLD_CENTS,
+    "INVOICE_VOLUME_CREDIT_PCT": INVOICE_VOLUME_CREDIT_PCT,
+    "AGING_CURRENT_MAX_DAYS": AGING_CURRENT_MAX_DAYS,
+    "AGING_31_60_MAX_DAYS": AGING_31_60_MAX_DAYS,
+    "AGING_61_90_MAX_DAYS": AGING_61_90_MAX_DAYS,
+    "ANALYSIS_MAX_RETURNS": ANALYSIS_MAX_RETURNS,
+    "RESEARCH_VISIT_DAILY_CAPACITY": RESEARCH_VISIT_DAILY_CAPACITY,
+}
+
+# A syntactically valid UUID that no resource in a fresh database can carry.
+UNKNOWN_UUID = "00000000-0000-4000-8000-000000000901"

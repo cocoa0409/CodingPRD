@@ -1,0 +1,78 @@
+"""Error catalogue (PRD section 5 / SCAFFOLD 1.6)."""
+
+ERROR_STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_OWNERSHIP_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # not found
+    "ERR_EMPLOYER_NOT_FOUND": 404,
+    "ERR_CAMPAIGN_NOT_FOUND": 404,
+    "ERR_PLEDGE_NOT_FOUND": 404,
+    "ERR_AGENCY_NOT_FOUND": 404,
+    "ERR_AGENCY_REVIEW_NOT_FOUND": 404,
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_REQUEST_NOT_FOUND": 404,
+    "ERR_PANELIST_NOT_FOUND": 404,
+    "ERR_OUTCOME_REPORT_NOT_FOUND": 404,
+    # concurrency
+    "ERR_STALE_VERSION": 412,
+    # state
+    "ERR_EMPLOYER_INVALID_STATE": 409,
+    "ERR_EMPLOYER_NOT_ACTIVE": 409,
+    "ERR_CAMPAIGN_NOT_OPEN": 409,
+    "ERR_CAMPAIGN_INVALID_STATE": 409,
+    "ERR_PLEDGE_NOT_CONFIRMED": 409,
+    "ERR_PLEDGE_COLLECTION_TERMINAL": 409,
+    "ERR_REVIEW_ALREADY_CERTIFIED": 409,
+    "ERR_REVIEW_AGENCY_MISMATCH": 409,
+    "ERR_AGENCY_MEMBERSHIP_TERMINAL": 409,
+    "ERR_CYCLE_FROZEN": 409,
+    "ERR_CYCLE_NOT_OPEN": 409,
+    "ERR_CYCLE_RESTRICTED": 409,
+    "ERR_REQUEST_INVALID_STATE": 409,
+    "ERR_REPORT_INVALID_STATE": 409,
+    "ERR_AWARD_ALREADY_REPORTED": 409,
+    "ERR_REVISION_LIMIT_REACHED": 409,
+    "ERR_CAMPAIGN_WINDOW_OVERLAP": 409,
+    "ERR_SITE_VISIT_BUFFER_CONFLICT": 409,
+    "ERR_DUPLICATE_DONOR_REFERENCE": 409,
+    "ERR_DUPLICATE_PANEL_SCORE": 409,
+    "ERR_DUPLICATE_REQUEST_FOR_CYCLE": 409,
+    # business
+    "ERR_PANELIST_CONFLICT_DECLARED": 422,
+    "ERR_PANELIST_NOT_ASSIGNED": 422,
+    "ERR_AGENCY_NOT_IN_GOOD_STANDING": 422,
+    "ERR_OUTCOME_REPORT_DELINQUENT": 422,
+    "ERR_DESIGNATION_TARGET_INELIGIBLE": 422,
+    "ERR_DESIGNATION_BELOW_MINIMUM": 422,
+    "ERR_DESIGNATION_EXCEEDS_GROSS": 422,
+    "ERR_SITE_VISIT_WINDOW_INVALID": 422,
+    "ERR_REQUEST_WINDOW_CLOSED": 422,
+    "ERR_NO_ELIGIBLE_SCORES": 422,
+    "ERR_PANEL_QUORUM_NOT_MET": 422,
+    "ERR_PANEL_NOT_SEATED": 422,
+    "ERR_PAYROLL_METHOD_UNAVAILABLE": 422,
+    "ERR_COLLECTION_EXCEEDS_OUTSTANDING": 422,
+    "ERR_CAMPAIGN_NOT_FULLY_REMITTED": 422,
+    "ERR_AWARD_EXCEEDS_AGENCY_CAP": 422,
+    "ERR_POOL_INSUFFICIENT": 422,
+}
+
+
+class ApiError(Exception):
+    """Carries error_id, human message and HTTP status straight from the catalogue."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    words = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return "Request rejected: %s." % words

@@ -1,0 +1,2600 @@
+scenario: |
+  2906. Apartment Doorstep Trash Valet Service (Valet Living): property contract with unit count and service-night schedule, per-unit fee pass-through to residents and property revenue share, valet route assignment and scan-based service verification, non-compliance tagging (early set-out, improper container, recycling contamination) and resident fines, missed-service credit and property SLA, valet contractor onboarding and 1099 vs employee classification, compactor jam and overflow escalation to the property, seasonal volume and holiday schedule adjustment
+domain_name: "apartment-doorstep-trash-valet-service"
+api_prefix: "/valet"
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - dual_variant_calculation
+    - cascading_side_effects
+    - rate_threshold_triggers
+    - optimistic_concurrency
+
+  entity_topology: flat
+  # flat: peer entities linked by explicit foreign keys. Creation is nested one
+  # level under the owning parent for context (POST /properties/{id}/residents),
+  # but every entity is addressed by its own top-level collection
+  # (/residents/{id}, /service-nights/{id}, /resident-fines/{id}) and every
+  # cross-entity link is an FK field, never a URL nesting chain. No entity is
+  # reachable only through a 3-deep path.
+
+  state_machine_shape: cyclic
+  # ResidentFine cycles ASSESSED -> DISPUTED -> UPHELD -> DISPUTED (bounded by
+  # MAX_DISPUTE_ROUNDS). ServiceNight additionally carries two independent state
+  # dimensions (verification_status x billing_status) that advance separately,
+  # and ServiceNight.reschedule branches SKIP vs SHIFT with divergent side
+  # effects. Property is compound: its status is driven by escalation_level,
+  # which is itself an aggregate over its CompactorIncident children.
+
+  relationship_patterns:
+    - one_to_many          # Property -> Resident, ServiceContract -> ServiceNight
+    - self_referential     # ServiceNight.rescheduled_from_night_id -> ServiceNight.id
+    - cross_aggregate      # ServiceScan.resident_id crosses the route aggregate into the property aggregate
+    - polymorphic          # CompactorIncident.reported_by_user_id holds either a Property id or a ValetContractor id, disambiguated by reported_by_role
+
+  role_model: segregation_of_duties
+  # Two duty-separation rules keyed on X-User-ID, both between two operators of
+  # the SAME role (so RBAC alone cannot satisfy them):
+  #   (1) the BillingAnalyst who drafted a MonthlyStatement may not issue it;
+  #   (2) the ComplianceOfficer who ran a contractor's background check may not
+  #       perform that contractor's OBSERVED reclassification audit.
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ---------------------------------------------------------------------------
+# §1.1 Entity-Relationship Table
+# ---------------------------------------------------------------------------
+entities:
+
+  - name: Property
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: apartment community name
+        constraints: "1..120 chars, non-blank"
+      - name: unit_count
+        type: integer
+        source: input
+        description: "billable door count; defines the property's unit numbering as the closed integer range [101, 100 + unit_count]"
+        constraints: ">= 1 and <= 500"
+      - name: market_code
+        type: string
+        source: input
+        description: operating market the property belongs to
+        constraints: "3 uppercase letters"
+      - name: compactor_capacity_lbs
+        type: integer
+        source: input
+        description: rated capacity of the on-site compactor
+        default: 6000
+        constraints: ">= 1000"
+      - name: status
+        type: enum
+        source: computed
+        description: "posture that gates all child service operations; ONBOARDING at creation, ACTIVE once a ServiceContract is activated, SUSPENDED when escalation_level >= PROPERTY_SUSPENSION_ESCALATION_LEVEL, TERMINATED when its last non-TERMINATED contract is terminated"
+        default: ONBOARDING
+        constraints: "one of {ONBOARDING, ACTIVE, SUSPENDED, TERMINATED}"
+      - name: active_contract_id
+        type: string
+        source: computed
+        description: "FK -> ServiceContract.id; the single contract of this property whose status == ACTIVE, or null when none is active"
+        default: null
+      - name: escalation_level
+        type: integer
+        source: computed
+        description: "count of this property's CompactorIncident rows whose status == ESCALATED; maintained incrementally by the escalate and resolve transitions"
+        default: 0
+        constraints: ">= 0"
+      - name: pending_fine_revenue_cents
+        type: integer
+        source: computed
+        description: "sum of fines_outstanding_cents over this property's Resident rows (all statuses)"
+        default: 0
+      - name: delinquent_resident_count
+        type: integer
+        source: computed
+        description: "count of this property's Resident rows whose collections_status == DELINQUENT"
+        default: 0
+
+  - name: ServiceContract
+    parent: Property
+    common_fields: true
+    fields:
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> Property.id; taken from the creation path, never from the body"
+      - name: per_unit_monthly_fee_cents
+        type: integer
+        source: input
+        description: monthly doorstep-valet fee passed through per billable unit
+        constraints: ">= 100 and <= 100000"
+      - name: property_revenue_share_bps
+        type: integer
+        source: input
+        description: basis points of the credited pass-through retained by the property owner
+        constraints: ">= 0 and <= 5000"
+      - name: service_night_days
+        type: array
+        source: input
+        description: weekdays on which doorstep collection is scheduled
+        constraints: "non-empty array, 1..7 distinct members of {SUN, MON, TUE, WED, THU, FRI, SAT}"
+      - name: effective_from
+        type: string
+        source: input
+        description: "first date covered by this contract (ISO date, inclusive)"
+        constraints: "YYYY-MM-DD"
+      - name: effective_to
+        type: string
+        source: input
+        description: "last date covered by this contract (ISO date, INCLUSIVE — the contract period is the closed interval [effective_from, effective_to])"
+        constraints: "YYYY-MM-DD, >= effective_from"
+      - name: sla_missed_threshold_bps
+        type: integer
+        source: input
+        description: missed-service basis points at or above which a missed-service credit is owed to the property
+        constraints: ">= 1 and <= 10000"
+      - name: status
+        type: enum
+        source: computed
+        description: "DRAFT at creation, ACTIVE after activate, TERMINATED after terminate"
+        default: DRAFT
+        constraints: "one of {DRAFT, ACTIVE, TERMINATED}"
+      - name: last_invoiced_period
+        type: string
+        source: computed
+        description: "billing_period (YYYY-MM) of the most recently ISSUED MonthlyStatement of this contract, or null"
+        default: null
+
+  - name: Resident
+    parent: Property
+    common_fields: true
+    fields:
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> Property.id; taken from the creation path"
+      - name: unit_number
+        type: integer
+        source: input
+        description: door this resident occupies
+        constraints: "within the property's closed unit range [101, 100 + Property.unit_count]"
+      - name: full_name
+        type: string
+        source: input
+        description: resident of record on the lease
+        constraints: "1..120 chars, non-blank"
+      - name: move_in_date
+        type: string
+        source: input
+        description: "first date the unit is occupied (ISO date, inclusive)"
+        constraints: "YYYY-MM-DD"
+      - name: move_out_date
+        type: string
+        source: computed
+        description: "date the lease ends (ISO date, EXCLUSIVE — the last billed day is move_out_date minus one day); null while the resident is in place"
+        default: null
+      - name: fee_passthrough_enabled
+        type: boolean
+        source: input
+        description: whether the per-unit valet fee and non-compliance fines are billed to this resident
+        default: true
+      - name: status
+        type: enum
+        source: computed
+        description: "ACTIVE at creation, MOVED_OUT after the move-out transition"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, MOVED_OUT}"
+      - name: collections_status
+        type: enum
+        source: computed
+        description: "CURRENT while fines_outstanding_cents < DELINQUENCY_THRESHOLD_CENTS, DELINQUENT once it reaches that threshold"
+        default: CURRENT
+        constraints: "one of {CURRENT, DELINQUENT}"
+      - name: fines_outstanding_cents
+        type: integer
+        source: computed
+        description: "sum of ResidentFine.amount_cents for this resident whose status IN {ASSESSED, UPHELD, DISPUTED}"
+        default: 0
+      - name: fines_assessed_this_period_cents
+        type: integer
+        source: computed
+        description: "sum of ResidentFine.amount_cents for this resident created within the current billing period (YYYY-MM of the logical clock at assessment time), counting every fine ever created in that period regardless of later status; never decreases within a period"
+        default: 0
+
+  - name: ValetContractor
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: contractor legal name on the onboarding packet
+        constraints: "1..120 chars, non-blank"
+      - name: equipment_provided_by_company
+        type: boolean
+        source: input
+        description: declared factor — company supplies tote, gloves, scanner
+      - name: sets_own_schedule
+        type: boolean
+        source: input
+        description: declared factor — contractor picks their own nights
+      - name: works_exclusively
+        type: boolean
+        source: input
+        description: declared factor — contractor serves only this company
+      - name: weekly_committed_hours
+        type: integer
+        source: input
+        description: declared weekly hours committed in the onboarding packet
+        constraints: ">= 0 and <= 80"
+      - name: tax_form_type
+        type: enum
+        source: input
+        description: "tax form collected during document intake; null until documents are submitted"
+        default: null
+        constraints: "one of {W9, W4}"
+      - name: direct_deposit_on_file
+        type: boolean
+        source: input
+        description: whether payment details were captured at document intake
+        default: false
+      - name: onboarding_status
+        type: enum
+        source: computed
+        description: "APPLIED at creation, BACKGROUND_PENDING after document intake, CLEARED or REJECTED after the background check, DEACTIVATED after deactivation"
+        default: APPLIED
+        constraints: "one of {APPLIED, BACKGROUND_PENDING, CLEARED, REJECTED, DEACTIVATED}"
+      - name: classification
+        type: enum
+        source: computed
+        description: "worker classification written by the classification transition; UNCLASSIFIED until first classified"
+        default: UNCLASSIFIED
+        constraints: "one of {UNCLASSIFIED, CONTRACTOR_1099, EMPLOYEE_W2}"
+      - name: classification_basis
+        type: enum
+        source: computed
+        description: "basis of the most recent classification run, null while UNCLASSIFIED"
+        default: null
+        constraints: "one of {DECLARED, OBSERVED}"
+      - name: control_score
+        type: integer
+        source: computed
+        description: "0..100 employer-control score produced by the most recent classification run (see calculations.contractor_classification_score)"
+        default: 0
+      - name: observed_weekly_hours
+        type: number
+        source: computed
+        description: "route hours observed in the OBSERVED_WINDOW_DAYS trailing window during the most recent OBSERVED classification run; 0 until an OBSERVED run happens"
+        default: 0
+      - name: background_checked_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the ComplianceOfficer who recorded the background-check result; null before the check"
+        default: null
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the ValetOpsManager who created the contractor record
+      - name: deactivation_reason
+        type: string
+        source: input
+        description: free-text reason captured on deactivation
+        default: null
+
+  - name: ServiceNight
+    parent: ServiceContract
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> ServiceContract.id; taken from the creation path"
+      - name: rescheduled_from_night_id
+        type: string
+        source: system
+        description: "FK -> ServiceNight.id; set only on a makeup night created by a SHIFT reschedule, pointing at the night it replaces; null on originally scheduled nights"
+        default: null
+      - name: service_date
+        type: string
+        source: input
+        description: "calendar date of the collection round (ISO date)"
+        constraints: "YYYY-MM-DD; weekday must be a member of the contract's service_night_days; must fall inside the contract's closed effective period"
+      - name: service_window_start
+        type: datetime
+        source: input
+        description: "instant the doorstep round opens (ISO 8601 UTC, 3 fractional digits)"
+      - name: service_window_end
+        type: datetime
+        source: input
+        description: "instant the doorstep round closes; the occupied window is the HALF-OPEN interval [service_window_start, service_window_end)"
+        constraints: "> service_window_start"
+      - name: seasonal_volume_index
+        type: integer
+        source: input
+        description: "seasonal volume index for the night; >= SEASONAL_PEAK_INDEX marks a peak night and uplifts fine amounts"
+        default: 100
+        constraints: ">= 50 and <= 300"
+      - name: holiday_flag
+        type: boolean
+        source: input
+        description: whether the night falls on an observed holiday
+        default: false
+      - name: verification_status
+        type: enum
+        source: computed
+        description: "service-delivery dimension; SCHEDULED at creation, IN_PROGRESS on the first scan, VERIFIED / PARTIAL / MISSED on close, CANCELLED by a reschedule or by a property suspension cascade"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, IN_PROGRESS, VERIFIED, PARTIAL, MISSED, CANCELLED}"
+      - name: billing_status
+        type: enum
+        source: computed
+        description: "billing dimension, independent of verification_status; UNBILLED at creation, ACCRUED on close, INVOICED or CREDITED when a MonthlyStatement covering the night is issued"
+        default: UNBILLED
+        constraints: "one of {UNBILLED, ACCRUED, INVOICED, CREDITED}"
+      - name: expected_door_count
+        type: integer
+        source: computed
+        description: "count of the property's Resident rows occupying the unit on service_date (see calculations.service_night_verification input_set)"
+        default: 0
+      - name: scanned_door_count
+        type: integer
+        source: computed
+        description: "count of this night's ServiceScan rows whose scan_result IN {SERVICED, NO_SET_OUT}"
+        default: 0
+      - name: coverage_bps
+        type: integer
+        source: computed
+        description: "10000 * scanned_door_count / expected_door_count, round_half_up; 0 when expected_door_count == 0"
+        default: 0
+      - name: assigned_unit_coverage_count
+        type: integer
+        source: computed
+        description: "sum of unit_coverage_count over this night's RouteAssignment rows whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS, COMPLETED}"
+        default: 0
+      - name: reschedule_action
+        type: enum
+        source: computed
+        description: "the reschedule decision applied to this night, null if never rescheduled"
+        default: null
+        constraints: "one of {SKIP, SHIFT}"
+
+  - name: RouteAssignment
+    parent: ServiceNight
+    common_fields: true
+    fields:
+      - name: service_night_id
+        type: string
+        source: input
+        description: "FK -> ServiceNight.id; taken from the creation path"
+      - name: contractor_id
+        type: string
+        source: input
+        description: "FK -> ValetContractor.id; the valet who walks this range"
+      - name: unit_from
+        type: integer
+        source: input
+        description: first unit of the assigned closed range
+        constraints: "within [101, 100 + Property.unit_count]"
+      - name: unit_to
+        type: integer
+        source: input
+        description: "last unit of the assigned closed range [unit_from, unit_to]"
+        constraints: ">= unit_from and within [101, 100 + Property.unit_count]"
+      - name: unit_coverage_count
+        type: integer
+        source: computed
+        description: "unit_to - unit_from + 1"
+      - name: status
+        type: enum
+        source: computed
+        description: "ASSIGNED at creation, ACCEPTED on accept, IN_PROGRESS on the route's first scan, COMPLETED on complete, ABANDONED on abandon or on the night's close while still unfinished, CANCELLED by the property-suspension cascade"
+        default: ASSIGNED
+        constraints: "one of {ASSIGNED, ACCEPTED, IN_PROGRESS, COMPLETED, ABANDONED, CANCELLED}"
+      - name: accepted_at
+        type: datetime
+        source: system
+        description: logical-clock instant the valet accepted the route
+        default: null
+      - name: completed_at
+        type: datetime
+        source: system
+        description: logical-clock instant the valet completed the route
+        default: null
+      - name: scan_count
+        type: integer
+        source: computed
+        description: count of ServiceScan rows on this route
+        default: 0
+      - name: abandon_reason
+        type: string
+        source: input
+        description: free-text reason captured on abandon
+        default: null
+
+  - name: ServiceScan
+    parent: RouteAssignment
+    common_fields: true
+    fields:
+      - name: route_assignment_id
+        type: string
+        source: input
+        description: "FK -> RouteAssignment.id; taken from the creation path"
+      - name: service_night_id
+        type: string
+        source: system
+        description: "FK -> ServiceNight.id; denormalised from the route at creation so night-level aggregates and queries never traverse the route"
+      - name: resident_id
+        type: string
+        source: input
+        description: "FK -> Resident.id; the door that was scanned"
+      - name: scan_result
+        type: enum
+        source: input
+        description: "SERVICED (tote collected), NO_SET_OUT (nothing at the door), TAGGED_NOT_SERVICED (left in place with a tag); only SERVICED and NO_SET_OUT count toward scanned_door_count"
+        constraints: "one of {SERVICED, NO_SET_OUT, TAGGED_NOT_SERVICED}"
+      - name: container_type
+        type: enum
+        source: input
+        description: container observed at the door
+        constraints: "one of {TRASH_BIN, RECYCLING_BIN, LOOSE_BAG}"
+      - name: non_compliance_type
+        type: enum
+        source: input
+        description: "non-compliance observed at the door; null when the door was compliant"
+        default: null
+        constraints: "one of {EARLY_SET_OUT, IMPROPER_CONTAINER, RECYCLING_CONTAMINATION}"
+      - name: tag_status
+        type: enum
+        source: computed
+        description: "NONE when non_compliance_type is null, OPEN when a tag was left, FINED once a ResidentFine exists for the scan, VOIDED after the property voids the tag"
+        default: NONE
+        constraints: "one of {NONE, OPEN, FINED, VOIDED}"
+      - name: offense_ordinal
+        type: integer
+        source: computed
+        description: "1 + count of this resident's earlier ServiceScan rows with the SAME non_compliance_type, tag_status IN {OPEN, FINED} and created_at within the trailing FINE_LOOKBACK_DAYS window; 0 when non_compliance_type is null"
+        default: 0
+      - name: scanned_at
+        type: datetime
+        source: system
+        description: logical-clock instant the scan was recorded
+      - name: void_reason
+        type: string
+        source: input
+        description: free-text reason captured when the tag is voided
+        default: null
+
+  - name: ResidentFine
+    parent: ServiceScan
+    common_fields: true
+    fields:
+      - name: scan_id
+        type: string
+        source: input
+        description: "FK -> ServiceScan.id; the tagged scan this fine rests on"
+      - name: resident_id
+        type: string
+        source: system
+        description: "FK -> Resident.id; copied from the scan"
+      - name: tag_type
+        type: enum
+        source: system
+        description: "copied from ServiceScan.non_compliance_type at assessment"
+        constraints: "one of {EARLY_SET_OUT, IMPROPER_CONTAINER, RECYCLING_CONTAMINATION}"
+      - name: offense_ordinal
+        type: integer
+        source: system
+        description: copied from ServiceScan.offense_ordinal at assessment
+      - name: base_cents
+        type: integer
+        source: computed
+        description: FINE_BASE_CENTS entry for tag_type
+      - name: escalation_multiplier
+        type: number
+        source: computed
+        description: FINE_ESCALATION_MULTIPLIER entry for offense_ordinal
+      - name: seasonal_uplift_applied
+        type: boolean
+        source: computed
+        description: "true when the scan's night had seasonal_volume_index >= SEASONAL_PEAK_INDEX"
+      - name: amount_cents
+        type: integer
+        source: computed
+        description: "final fine amount after rounding, floor and monthly-cap clamp (see calculations.resident_fine_amount)"
+      - name: uncapped_amount_cents
+        type: integer
+        source: computed
+        description: "the floored amount before the monthly-cap clamp; equals amount_cents when the cap did not bind"
+      - name: origin
+        type: enum
+        source: computed
+        description: "AUTO when created by the scan cascade, MANUAL when created by the property's assess call"
+        constraints: "one of {AUTO, MANUAL}"
+      - name: status
+        type: enum
+        source: computed
+        description: "ASSESSED at creation, DISPUTED while a resident dispute is open, UPHELD or WAIVED after adjudication, VOIDED when the underlying tag is voided"
+        default: ASSESSED
+        constraints: "one of {ASSESSED, DISPUTED, UPHELD, WAIVED, VOIDED}"
+      - name: dispute_round
+        type: integer
+        source: computed
+        description: "number of disputes filed against this fine; capped by MAX_DISPUTE_ROUNDS"
+        default: 0
+      - name: assessed_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the PropertyManager who assessed a MANUAL fine, or the literal string 'system' for AUTO fines"
+      - name: adjudicated_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the PropertyManager who adjudicated the most recent dispute
+        default: null
+      - name: dispute_reason
+        type: string
+        source: input
+        description: reason text from the most recent resident dispute
+        default: null
+
+  - name: CompactorIncident
+    parent: Property
+    common_fields: true
+    fields:
+      - name: property_id
+        type: string
+        source: input
+        description: "FK -> Property.id; taken from the creation path"
+      - name: incident_type
+        type: enum
+        source: input
+        description: "JAM (compactor stuck, doorstep collection blocked) or OVERFLOW (chute full, collection degraded)"
+        constraints: "one of {JAM, OVERFLOW}"
+      - name: description
+        type: string
+        source: input
+        description: free-text observation from the reporter
+        default: null
+      - name: reported_by_role
+        type: enum
+        source: system
+        description: X-User-Role of the reporter
+        constraints: "one of {Valet, PropertyManager}"
+      - name: reported_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the reporter; a ValetContractor.id when reported_by_role == Valet, a Property.id when reported_by_role == PropertyManager"
+      - name: reported_at
+        type: datetime
+        source: system
+        description: logical-clock instant the incident was filed
+      - name: ack_deadline_at
+        type: datetime
+        source: computed
+        description: "reported_at + ACK_WINDOW_HOURS[incident_type]; the property must acknowledge strictly before this instant"
+      - name: status
+        type: enum
+        source: computed
+        description: "REPORTED at creation, ACKNOWLEDGED when the property acknowledges in time, ESCALATED when ops escalates at or after the deadline, RESOLVED when the property closes it out"
+        default: REPORTED
+        constraints: "one of {REPORTED, ACKNOWLEDGED, ESCALATED, RESOLVED}"
+      - name: acknowledged_at
+        type: datetime
+        source: system
+        description: logical-clock instant of acknowledgement
+        default: null
+      - name: escalated_at
+        type: datetime
+        source: system
+        description: logical-clock instant of escalation
+        default: null
+      - name: resolved_at
+        type: datetime
+        source: system
+        description: logical-clock instant of resolution
+        default: null
+      - name: resolution_note
+        type: string
+        source: input
+        description: free-text note captured on resolution
+        default: null
+
+  - name: MonthlyStatement
+    parent: ServiceContract
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> ServiceContract.id; taken from the creation path"
+      - name: superseded_statement_id
+        type: string
+        source: system
+        description: "FK -> MonthlyStatement.id; set on a statement that replaced a prior DRAFT for the same billing_period, pointing at the DRAFT it voided; null otherwise"
+        default: null
+      - name: billing_period
+        type: string
+        source: input
+        description: "billed calendar month, YYYY-MM"
+        constraints: "YYYY-MM; must intersect the contract's closed effective period"
+      - name: variant
+        type: enum
+        source: computed
+        description: "PROVISIONAL while the statement is a DRAFT (forward-looking accrual on the contracted unit count), FINAL once issued (chronological settlement over occupancy and terminal night outcomes)"
+        default: PROVISIONAL
+        constraints: "one of {PROVISIONAL, FINAL}"
+      - name: gross_passthrough_cents
+        type: integer
+        source: computed
+        description: total per-unit valet fee billed for the period under the active variant
+      - name: scheduled_night_count
+        type: integer
+        source: computed
+        description: "count of the contract's ServiceNight rows in the period whose verification_status != CANCELLED"
+      - name: missed_equivalent_nights
+        type: number
+        source: computed
+        description: "MISSED count + PARTIAL_NIGHT_WEIGHT * PARTIAL count over the nights included by the active variant"
+      - name: missed_service_bps
+        type: integer
+        source: computed
+        description: "10000 * missed_equivalent_nights / scheduled_night_count, round_half_up; 0 when scheduled_night_count == 0"
+      - name: sla_credit_rate_bps
+        type: integer
+        source: computed
+        description: credit rate selected by the SLA tier ladder from missed_service_bps
+      - name: missed_service_credit_cents
+        type: integer
+        source: computed
+        description: "credit owed to the property for missed service (step S2 of calculations.statement_settlement)"
+      - name: property_revenue_share_cents
+        type: integer
+        source: computed
+        description: "owner revenue share (step S3 of calculations.statement_settlement)"
+      - name: net_due_from_property_cents
+        type: integer
+        source: computed
+        description: "gross_passthrough_cents - missed_service_credit_cents - property_revenue_share_cents (step S4)"
+      - name: status
+        type: enum
+        source: computed
+        description: "DRAFT at creation, ISSUED after issue, VOID after void or after being superseded by a newer DRAFT for the same period"
+        default: DRAFT
+        constraints: "one of {DRAFT, ISSUED, VOID}"
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the BillingAnalyst who drafted the statement
+      - name: issued_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the BillingAnalyst who issued the statement
+        default: null
+      - name: void_reason
+        type: string
+        source: input
+        description: free-text reason captured on void, or the literal string 'SUPERSEDED' when voided by a newer draft
+        default: null
+
+# ---------------------------------------------------------------------------
+# §1.2 State Machine Table
+# ---------------------------------------------------------------------------
+state_machines:
+
+  - entity: Property
+    initial_state: ONBOARDING
+    terminal_states: [TERMINATED]
+    note: "compound posture: status is a function of escalation_level (an aggregate over CompactorIncident children) and of contract activation. Property.status gates every child service operation."
+    transitions:
+      - from: ONBOARDING
+        to: ACTIVE
+        trigger: "POST /valet/contracts/{contract_id}/activate (bubble-up from the contract)"
+        actor: PlatformAdmin
+        preconditions:
+          - "contract.property_id == this property"
+          - "property.status == ONBOARDING or property.status == ACTIVE"
+        side_effects:
+          - "set Property.active_contract_id = contract.id"
+          - "set Property.status = ACTIVE"
+          - "increment Property.version by 1"
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "system: cascade from POST /valet/compactor-incidents/{incident_id}/escalate when the escalate side effect drives escalation_level to PROPERTY_SUSPENSION_ESCALATION_LEVEL or above"
+        actor: system
+        preconditions:
+          - "Property.escalation_level >= PROPERTY_SUSPENSION_ESCALATION_LEVEL (2) after the increment"
+          - "Property.status == ACTIVE"
+        side_effects:
+          - "set Property.status = SUSPENDED"
+          - "cascade: every ServiceNight of Property.active_contract_id whose verification_status == SCHEDULED transitions SCHEDULED -> CANCELLED with reschedule_action left null"
+          - "each of those night cancellations itself cascades: every RouteAssignment of that night whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} transitions to CANCELLED and the night's assigned_unit_coverage_count is recomputed to 0"
+          - "increment Property.version by 1"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "system: cascade from POST /valet/compactor-incidents/{incident_id}/resolve when the resolve side effect drops escalation_level below PROPERTY_SUSPENSION_ESCALATION_LEVEL"
+        actor: system
+        preconditions:
+          - "Property.escalation_level < PROPERTY_SUSPENSION_ESCALATION_LEVEL (2) after the decrement"
+          - "Property.status == SUSPENDED"
+        side_effects:
+          - "set Property.status = ACTIVE"
+          - "increment Property.version by 1"
+        note: "ServiceNight rows cancelled by the suspension cascade are NOT restored; recovering coverage requires creating a new ServiceNight."
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /valet/contracts/{contract_id}/terminate (bubble-up from the contract) when no other contract of the property has status IN {DRAFT, ACTIVE}"
+        actor: PlatformAdmin
+        preconditions:
+          - "no other ServiceContract of this property has status IN {DRAFT, ACTIVE}"
+        side_effects:
+          - "set Property.active_contract_id = null"
+          - "set Property.status = TERMINATED"
+          - "increment Property.version by 1"
+      - from: SUSPENDED
+        to: TERMINATED
+        trigger: "POST /valet/contracts/{contract_id}/terminate (bubble-up) when no other contract of the property has status IN {DRAFT, ACTIVE}"
+        actor: PlatformAdmin
+        preconditions:
+          - "no other ServiceContract of this property has status IN {DRAFT, ACTIVE}"
+        side_effects:
+          - "set Property.active_contract_id = null"
+          - "set Property.status = TERMINATED"
+          - "increment Property.version by 1"
+
+  - entity: ServiceContract
+    initial_state: DRAFT
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /valet/contracts/{contract_id}/activate"
+        actor: PlatformAdmin
+        preconditions:
+          - "contract.status == DRAFT"
+          - "property.status != TERMINATED"
+          - "no other ServiceContract of the same property with status == ACTIVE"
+        side_effects:
+          - "set ServiceContract.status = ACTIVE"
+          - "increment ServiceContract.version by 1"
+          - "bubble up: Property ONBOARDING -> ACTIVE, Property.active_contract_id = this contract"
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /valet/contracts/{contract_id}/terminate"
+        actor: PlatformAdmin
+        preconditions:
+          - "contract.status == ACTIVE"
+          - "no MonthlyStatement of this contract has status == DRAFT"
+        side_effects:
+          - "set ServiceContract.status = TERMINATED"
+          - "increment ServiceContract.version by 1"
+          - "cascade: every ServiceNight of this contract whose verification_status == SCHEDULED transitions to CANCELLED"
+          - "bubble up: Property -> TERMINATED when no other contract of the property has status IN {DRAFT, ACTIVE}"
+      - from: DRAFT
+        to: TERMINATED
+        trigger: "POST /valet/contracts/{contract_id}/terminate"
+        actor: PlatformAdmin
+        preconditions:
+          - "contract.status == DRAFT"
+        side_effects:
+          - "set ServiceContract.status = TERMINATED"
+          - "increment ServiceContract.version by 1"
+
+  - entity: Resident
+    initial_state: ACTIVE
+    terminal_states: [MOVED_OUT]
+    transitions:
+      - from: ACTIVE
+        to: MOVED_OUT
+        trigger: "POST /valet/residents/{resident_id}/move-out"
+        actor: PropertyManager
+        preconditions:
+          - "resident.status == ACTIVE"
+          - "move_out_date > resident.move_in_date"
+        side_effects:
+          - "set Resident.move_out_date = payload move_out_date (exclusive last-billed boundary)"
+          - "set Resident.status = MOVED_OUT"
+          - "increment Resident.version by 1"
+          - "recompute expected_door_count on every ServiceNight of the property's ACTIVE contract whose verification_status == SCHEDULED (calculations.service_night_verification)"
+
+  - entity: ValetContractor
+    initial_state: APPLIED
+    terminal_states: [REJECTED, DEACTIVATED]
+    note: "branching fork at the background check: CLEAR and FAIL lead to different states with disjoint side-effect sets."
+    transitions:
+      - from: APPLIED
+        to: BACKGROUND_PENDING
+        trigger: "POST /valet/contractors/{contractor_id}/documents"
+        actor: ValetOpsManager
+        preconditions:
+          - "contractor.onboarding_status == APPLIED"
+        side_effects:
+          - "set ValetContractor.tax_form_type and direct_deposit_on_file from the payload"
+          - "set ValetContractor.onboarding_status = BACKGROUND_PENDING"
+          - "increment ValetContractor.version by 1"
+      - from: BACKGROUND_PENDING
+        to: CLEARED
+        trigger: "POST /valet/contractors/{contractor_id}/background-check with result == CLEAR"
+        actor: ComplianceOfficer
+        preconditions:
+          - "contractor.onboarding_status == BACKGROUND_PENDING"
+        side_effects:
+          - "set ValetContractor.onboarding_status = CLEARED"
+          - "set ValetContractor.background_checked_by_user_id = X-User-ID"
+          - "increment ValetContractor.version by 1"
+      - from: BACKGROUND_PENDING
+        to: REJECTED
+        trigger: "POST /valet/contractors/{contractor_id}/background-check with result == FAIL"
+        actor: ComplianceOfficer
+        preconditions:
+          - "contractor.onboarding_status == BACKGROUND_PENDING"
+        side_effects:
+          - "set ValetContractor.onboarding_status = REJECTED"
+          - "set ValetContractor.background_checked_by_user_id = X-User-ID"
+          - "leave ValetContractor.classification = UNCLASSIFIED (a rejected applicant is never classified)"
+          - "increment ValetContractor.version by 1"
+      - from: CLEARED
+        to: CLEARED
+        trigger: "POST /valet/contractors/{contractor_id}/classification"
+        actor: ComplianceOfficer
+        preconditions:
+          - "contractor.onboarding_status == CLEARED"
+          - "when basis == OBSERVED: X-User-ID != contractor.background_checked_by_user_id (segregation of duties)"
+        side_effects:
+          - "recompute calculations.contractor_classification_score under the requested variant and write ValetContractor.control_score"
+          - "set ValetContractor.classification = EMPLOYEE_W2 when control_score >= CLASSIFICATION_W2_SCORE_THRESHOLD, else CONTRACTOR_1099"
+          - "set ValetContractor.classification_basis = payload basis"
+          - "set ValetContractor.observed_weekly_hours (OBSERVED runs only; DECLARED runs leave it at its prior value)"
+          - "increment ValetContractor.version by 1"
+        note: "self-loop: a cleared contractor may be reclassified any number of times; the OBSERVED audit is the reclassification path."
+      - from: CLEARED
+        to: DEACTIVATED
+        trigger: "POST /valet/contractors/{contractor_id}/deactivate"
+        actor: ValetOpsManager
+        preconditions:
+          - "contractor.onboarding_status == CLEARED"
+          - "contractor has no RouteAssignment with status IN {ASSIGNED, ACCEPTED, IN_PROGRESS}"
+        side_effects:
+          - "set ValetContractor.onboarding_status = DEACTIVATED"
+          - "set ValetContractor.deactivation_reason from the payload"
+          - "increment ValetContractor.version by 1"
+
+  - entity: ServiceNight
+    initial_state: SCHEDULED
+    terminal_states: [VERIFIED, PARTIAL, MISSED, CANCELLED]
+    note: "PARALLEL STATE DIMENSIONS. `verification_status` (service delivery) and `billing_status` (revenue recognition) advance on independent triggers: scans and close drive verification_status; close and statement issue drive billing_status. A night can be MISSED/ACCRUED, VERIFIED/ACCRUED, MISSED/CREDITED or VERIFIED/INVOICED — the pair is not a single lifecycle."
+    transitions:
+      - from: SCHEDULED
+        to: IN_PROGRESS
+        trigger: "system: bubble-up from the first POST /valet/route-assignments/{route_id}/scans on any route of the night"
+        actor: system
+        preconditions:
+          - "night.verification_status == SCHEDULED"
+        side_effects:
+          - "set ServiceNight.verification_status = IN_PROGRESS"
+          - "recompute scanned_door_count, expected_door_count and coverage_bps (calculations.service_night_verification)"
+          - "increment ServiceNight.version by 1"
+      - from: IN_PROGRESS
+        to: VERIFIED
+        trigger: "POST /valet/service-nights/{night_id}/close when scanned_door_count > 0 and coverage_bps >= VERIFICATION_COVERAGE_THRESHOLD_BPS"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status IN {SCHEDULED, IN_PROGRESS}"
+          - "calculations.service_night_verification selects VERIFIED"
+        side_effects:
+          - "set ServiceNight.verification_status = VERIFIED"
+          - "advance the billing dimension UNBILLED -> ACCRUED"
+          - "every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} transitions to ABANDONED and assigned_unit_coverage_count is recomputed"
+          - "increment ServiceNight.version by 1"
+      - from: IN_PROGRESS
+        to: PARTIAL
+        trigger: "POST /valet/service-nights/{night_id}/close when scanned_door_count > 0 and coverage_bps < VERIFICATION_COVERAGE_THRESHOLD_BPS"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status IN {SCHEDULED, IN_PROGRESS}"
+          - "calculations.service_night_verification selects PARTIAL"
+        side_effects:
+          - "set ServiceNight.verification_status = PARTIAL"
+          - "advance the billing dimension UNBILLED -> ACCRUED"
+          - "every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} transitions to ABANDONED"
+          - "increment ServiceNight.version by 1"
+      - from: SCHEDULED
+        to: MISSED
+        trigger: "POST /valet/service-nights/{night_id}/close when scanned_door_count == 0"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status IN {SCHEDULED, IN_PROGRESS}"
+          - "calculations.service_night_verification selects MISSED (the empty-scan-set branch, evaluated before any coverage comparison)"
+        side_effects:
+          - "set ServiceNight.verification_status = MISSED"
+          - "advance the billing dimension UNBILLED -> ACCRUED"
+          - "every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} transitions to ABANDONED"
+          - "increment ServiceNight.version by 1"
+      - from: IN_PROGRESS
+        to: MISSED
+        trigger: "POST /valet/service-nights/{night_id}/close when every scan on the night has scan_result == TAGGED_NOT_SERVICED so scanned_door_count == 0"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status == IN_PROGRESS"
+          - "calculations.service_night_verification selects MISSED"
+        side_effects:
+          - "set ServiceNight.verification_status = MISSED"
+          - "advance the billing dimension UNBILLED -> ACCRUED"
+          - "increment ServiceNight.version by 1"
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /valet/service-nights/{night_id}/reschedule with action == SKIP"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status == SCHEDULED"
+          - "night.rescheduled_from_night_id == null (a makeup night cannot itself be rescheduled)"
+        side_effects:
+          - "set ServiceNight.verification_status = CANCELLED and reschedule_action = SKIP"
+          - "every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED} transitions to CANCELLED; assigned_unit_coverage_count recomputed to 0"
+          - "billing dimension stays UNBILLED — a skipped night is never accrued and is excluded from scheduled_night_count"
+          - "increment ServiceNight.version by 1"
+        note: "SKIP branch of the reschedule fork: no makeup night is created."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "POST /valet/service-nights/{night_id}/reschedule with action == SHIFT"
+        actor: ValetOpsManager
+        preconditions:
+          - "night.verification_status == SCHEDULED"
+          - "night.rescheduled_from_night_id == null"
+          - "makeup_service_date is present, strictly after night.service_date, within MAKEUP_WINDOW_DAYS (14) days of it, inside the contract's closed effective period, and no ServiceNight of the contract already occupies that date with verification_status != CANCELLED"
+        side_effects:
+          - "set ServiceNight.verification_status = CANCELLED and reschedule_action = SHIFT"
+          - "every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED} transitions to CANCELLED"
+          - "create a makeup ServiceNight on makeup_service_date with rescheduled_from_night_id = this night, verification_status = SCHEDULED, billing_status = UNBILLED, holiday_flag = false, seasonal_volume_index copied from this night, and service_window_start/end shifted by exactly the whole-day delta between the two service dates"
+          - "increment ServiceNight.version by 1"
+        note: "SHIFT branch of the reschedule fork; the makeup night is NOT in the response body and is discoverable only via GET /valet/service-nights?rescheduled_from_night_id=<night_id>. A SHIFT makeup night bypasses the service_night_days weekday check (a holiday makeup may land off-schedule)."
+      - from: SCHEDULED
+        to: CANCELLED
+        trigger: "system: cascade from the Property ACTIVE -> SUSPENDED transition, or from the ServiceContract ACTIVE -> TERMINATED transition"
+        actor: system
+        preconditions:
+          - "night.verification_status == SCHEDULED"
+        side_effects:
+          - "set ServiceNight.verification_status = CANCELLED, reschedule_action left null"
+          - "cascade onward: every RouteAssignment of the night whose status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} transitions to CANCELLED"
+          - "increment ServiceNight.version by 1"
+      - from: ACCRUED
+        to: INVOICED
+        trigger: "system: cascade from POST /valet/statements/{statement_id}/issue for a night in the billed period whose verification_status IN {VERIFIED}"
+        actor: system
+        preconditions:
+          - "night.billing_status == ACCRUED"
+          - "night.service_date falls inside the statement's billing_period"
+        side_effects:
+          - "set ServiceNight.billing_status = INVOICED (verification_status untouched)"
+          - "increment ServiceNight.version by 1"
+        note: "billing dimension only."
+      - from: ACCRUED
+        to: CREDITED
+        trigger: "system: cascade from POST /valet/statements/{statement_id}/issue for a night in the billed period whose verification_status IN {MISSED, PARTIAL}"
+        actor: system
+        preconditions:
+          - "night.billing_status == ACCRUED"
+          - "night.service_date falls inside the statement's billing_period"
+        side_effects:
+          - "set ServiceNight.billing_status = CREDITED (verification_status untouched)"
+          - "increment ServiceNight.version by 1"
+        note: "billing dimension only; fires even when sla_credit_rate_bps == 0, because the night's shortfall is what the SLA arithmetic consumed."
+
+  - entity: RouteAssignment
+    initial_state: ASSIGNED
+    terminal_states: [COMPLETED, ABANDONED, CANCELLED]
+    transitions:
+      - from: ASSIGNED
+        to: ACCEPTED
+        trigger: "POST /valet/route-assignments/{route_id}/accept"
+        actor: Valet
+        preconditions:
+          - "route.status == ASSIGNED"
+          - "X-User-ID == route.contractor_id"
+          - "contractor.onboarding_status == CLEARED"
+          - "property.status == ACTIVE"
+        side_effects:
+          - "set RouteAssignment.status = ACCEPTED and accepted_at = logical clock"
+          - "increment RouteAssignment.version by 1"
+      - from: ACCEPTED
+        to: IN_PROGRESS
+        trigger: "system: bubble-up from the route's first POST /valet/route-assignments/{route_id}/scans"
+        actor: system
+        preconditions:
+          - "route.status == ACCEPTED"
+        side_effects:
+          - "set RouteAssignment.status = IN_PROGRESS"
+          - "increment RouteAssignment.scan_count by 1"
+          - "increment RouteAssignment.version by 1"
+          - "bubble up: ServiceNight SCHEDULED -> IN_PROGRESS"
+      - from: IN_PROGRESS
+        to: COMPLETED
+        trigger: "POST /valet/route-assignments/{route_id}/complete"
+        actor: Valet
+        preconditions:
+          - "route.status IN {ACCEPTED, IN_PROGRESS}"
+          - "X-User-ID == route.contractor_id"
+        side_effects:
+          - "set RouteAssignment.status = COMPLETED and completed_at = logical clock"
+          - "increment RouteAssignment.version by 1"
+      - from: ACCEPTED
+        to: COMPLETED
+        trigger: "POST /valet/route-assignments/{route_id}/complete with zero scans recorded"
+        actor: Valet
+        preconditions:
+          - "route.status == ACCEPTED"
+          - "X-User-ID == route.contractor_id"
+        side_effects:
+          - "set RouteAssignment.status = COMPLETED and completed_at = logical clock"
+          - "increment RouteAssignment.version by 1"
+        note: "a completed-but-unscanned route still leaves the night at scanned_door_count == 0, which closes the night as MISSED."
+      - from: ACCEPTED
+        to: ABANDONED
+        trigger: "POST /valet/route-assignments/{route_id}/abandon"
+        actor: Valet
+        preconditions:
+          - "route.status IN {ASSIGNED, ACCEPTED, IN_PROGRESS}"
+          - "when the actor is Valet: X-User-ID == route.contractor_id"
+        side_effects:
+          - "set RouteAssignment.status = ABANDONED and abandon_reason from the payload"
+          - "recompute ServiceNight.assigned_unit_coverage_count (calculations.route_unit_coverage) — the abandoned range leaves the conserved sum"
+          - "increment RouteAssignment.version by 1 and ServiceNight.version by 1"
+      - from: ASSIGNED
+        to: CANCELLED
+        trigger: "system: cascade from the ServiceNight SCHEDULED -> CANCELLED transition (reschedule, property suspension, or contract termination)"
+        actor: system
+        preconditions:
+          - "route.status IN {ASSIGNED, ACCEPTED, IN_PROGRESS}"
+        side_effects:
+          - "set RouteAssignment.status = CANCELLED"
+          - "recompute ServiceNight.assigned_unit_coverage_count"
+          - "increment RouteAssignment.version by 1"
+      - from: ASSIGNED
+        to: ABANDONED
+        trigger: "system: cascade from POST /valet/service-nights/{night_id}/close for routes still open at close time"
+        actor: system
+        preconditions:
+          - "route.status IN {ASSIGNED, ACCEPTED, IN_PROGRESS}"
+        side_effects:
+          - "set RouteAssignment.status = ABANDONED with abandon_reason = 'NIGHT_CLOSED'"
+          - "recompute ServiceNight.assigned_unit_coverage_count"
+          - "increment RouteAssignment.version by 1"
+
+  - entity: ServiceScan
+    initial_state: NONE
+    terminal_states: [VOIDED]
+    note: "the scan row itself is append-only; only its tag dimension (tag_status) transitions. A scan created with non_compliance_type == null is born in NONE and never transitions."
+    transitions:
+      - from: NONE
+        to: OPEN
+        trigger: "POST /valet/route-assignments/{route_id}/scans with non_compliance_type != null"
+        actor: Valet
+        preconditions:
+          - "route.status IN {ACCEPTED, IN_PROGRESS}"
+          - "resident.property_id == the night's property"
+          - "resident.unit_number is inside the route's closed [unit_from, unit_to] range"
+          - "no earlier ServiceScan exists for the same (route_assignment_id, resident_id)"
+        side_effects:
+          - "compute ServiceScan.offense_ordinal over the resident's trailing FINE_LOOKBACK_DAYS history for the same non_compliance_type"
+          - "set ServiceScan.tag_status = OPEN"
+          - "cascade (link 1): when offense_ordinal >= AUTO_FINE_ORDINAL or non_compliance_type == RECYCLING_CONTAMINATION, create a ResidentFine with origin = AUTO and assessed_by_user_id = 'system', which moves this scan OPEN -> FINED"
+      - from: OPEN
+        to: FINED
+        trigger: "POST /valet/service-scans/{scan_id}/fine, or the AUTO cascade from scan creation"
+        actor: PropertyManager
+        preconditions:
+          - "scan.tag_status == OPEN"
+          - "resident.fee_passthrough_enabled == true"
+          - "the resident's remaining monthly fine cap is > 0"
+        side_effects:
+          - "create the ResidentFine (calculations.resident_fine_amount)"
+          - "set ServiceScan.tag_status = FINED"
+          - "increment ServiceScan.version by 1"
+      - from: OPEN
+        to: VOIDED
+        trigger: "POST /valet/service-scans/{scan_id}/void-tag"
+        actor: PropertyManager
+        preconditions:
+          - "scan.tag_status IN {OPEN, FINED}"
+          - "X-User-ID == the property that owns the scanned resident"
+        side_effects:
+          - "set ServiceScan.tag_status = VOIDED and void_reason from the payload"
+          - "the voided scan leaves the offense_ordinal history: every later ordinal computation excludes it"
+          - "increment ServiceScan.version by 1"
+      - from: FINED
+        to: VOIDED
+        trigger: "POST /valet/service-scans/{scan_id}/void-tag"
+        actor: PropertyManager
+        preconditions:
+          - "scan.tag_status == FINED"
+          - "X-User-ID == the property that owns the scanned resident"
+        side_effects:
+          - "set ServiceScan.tag_status = VOIDED and void_reason from the payload"
+          - "cascade: every ResidentFine of this scan whose status IN {ASSESSED, DISPUTED, UPHELD} transitions to VOIDED"
+          - "that fine transition itself cascades: Resident.fines_outstanding_cents drops by the fine amount and, when it falls below DELINQUENCY_THRESHOLD_CENTS, Resident.collections_status returns to CURRENT and Property.delinquent_resident_count decrements"
+          - "increment ServiceScan.version by 1"
+
+  - entity: ResidentFine
+    initial_state: ASSESSED
+    terminal_states: [WAIVED, VOIDED]
+    note: "CYCLIC. ASSESSED -> DISPUTED -> UPHELD -> DISPUTED -> UPHELD; the loop is bounded by MAX_DISPUTE_ROUNDS (2), after which a further dispute is rejected. UPHELD is not terminal — it is re-enterable input to the loop until the round budget is spent."
+    transitions:
+      - from: ASSESSED
+        to: DISPUTED
+        trigger: "POST /valet/resident-fines/{fine_id}/dispute"
+        actor: Resident
+        preconditions:
+          - "fine.status IN {ASSESSED, UPHELD}"
+          - "X-User-ID == fine.resident_id"
+          - "fine.dispute_round < MAX_DISPUTE_ROUNDS (2)"
+        side_effects:
+          - "set ResidentFine.status = DISPUTED, dispute_round += 1, dispute_reason from the payload"
+          - "Resident.fines_outstanding_cents is unchanged — a disputed fine stays outstanding"
+          - "increment ResidentFine.version by 1"
+      - from: UPHELD
+        to: DISPUTED
+        trigger: "POST /valet/resident-fines/{fine_id}/dispute (second round of the cycle)"
+        actor: Resident
+        preconditions:
+          - "fine.status == UPHELD"
+          - "X-User-ID == fine.resident_id"
+          - "fine.dispute_round < MAX_DISPUTE_ROUNDS (2)"
+        side_effects:
+          - "set ResidentFine.status = DISPUTED, dispute_round += 1, dispute_reason from the payload"
+          - "increment ResidentFine.version by 1"
+      - from: DISPUTED
+        to: UPHELD
+        trigger: "POST /valet/resident-fines/{fine_id}/adjudicate with outcome == UPHELD"
+        actor: PropertyManager
+        preconditions:
+          - "fine.status == DISPUTED"
+          - "X-User-ID == the property that owns fine.resident_id"
+        side_effects:
+          - "set ResidentFine.status = UPHELD and adjudicated_by_user_id = X-User-ID"
+          - "Resident.fines_outstanding_cents unchanged"
+          - "increment ResidentFine.version by 1"
+      - from: DISPUTED
+        to: WAIVED
+        trigger: "POST /valet/resident-fines/{fine_id}/adjudicate with outcome == WAIVED"
+        actor: PropertyManager
+        preconditions:
+          - "fine.status == DISPUTED"
+          - "X-User-ID == the property that owns fine.resident_id"
+        side_effects:
+          - "set ResidentFine.status = WAIVED and adjudicated_by_user_id = X-User-ID"
+          - "compensating action: Resident.fines_outstanding_cents -= amount_cents and Property.pending_fine_revenue_cents -= amount_cents (calculations.resident_delinquency_rollup)"
+          - "that ledger move itself cascades: when fines_outstanding_cents falls below DELINQUENCY_THRESHOLD_CENTS, Resident.collections_status DELINQUENT -> CURRENT and Property.delinquent_resident_count -= 1"
+          - "Resident.fines_assessed_this_period_cents is NOT reduced — the monthly cap consumed by an assessment is not returned by a waiver"
+          - "increment ResidentFine.version by 1"
+      - from: ASSESSED
+        to: VOIDED
+        trigger: "system: cascade from POST /valet/service-scans/{scan_id}/void-tag"
+        actor: system
+        preconditions:
+          - "fine.status IN {ASSESSED, DISPUTED, UPHELD}"
+        side_effects:
+          - "set ResidentFine.status = VOIDED"
+          - "Resident.fines_outstanding_cents -= amount_cents; Property.pending_fine_revenue_cents -= amount_cents"
+          - "delinquency re-evaluated exactly as in the WAIVED path"
+          - "increment ResidentFine.version by 1"
+
+  - entity: CompactorIncident
+    initial_state: REPORTED
+    terminal_states: [RESOLVED]
+    transitions:
+      - from: REPORTED
+        to: ACKNOWLEDGED
+        trigger: "POST /valet/compactor-incidents/{incident_id}/acknowledge"
+        actor: PropertyManager
+        preconditions:
+          - "incident.status == REPORTED"
+          - "logical clock < incident.ack_deadline_at"
+          - "X-User-ID == incident.property_id"
+        side_effects:
+          - "set CompactorIncident.status = ACKNOWLEDGED and acknowledged_at = logical clock"
+          - "increment CompactorIncident.version by 1"
+        note: "an ACKNOWLEDGED incident can never be escalated — acknowledging inside the window is the property's escape hatch."
+      - from: REPORTED
+        to: ESCALATED
+        trigger: "POST /valet/compactor-incidents/{incident_id}/escalate"
+        actor: ValetOpsManager
+        preconditions:
+          - "incident.status == REPORTED"
+          - "logical clock >= incident.ack_deadline_at (inclusive boundary)"
+        side_effects:
+          - "set CompactorIncident.status = ESCALATED and escalated_at = logical clock"
+          - "increment Property.escalation_level by 1 (calculations.property_escalation_rollup)"
+          - "cascade: when the new escalation_level >= PROPERTY_SUSPENSION_ESCALATION_LEVEL, Property ACTIVE -> SUSPENDED, which itself cancels SCHEDULED nights, which itself cancels their open routes"
+          - "increment CompactorIncident.version by 1"
+      - from: ESCALATED
+        to: RESOLVED
+        trigger: "POST /valet/compactor-incidents/{incident_id}/resolve"
+        actor: PropertyManager
+        preconditions:
+          - "incident.status IN {REPORTED, ACKNOWLEDGED, ESCALATED}"
+          - "X-User-ID == incident.property_id"
+        side_effects:
+          - "set CompactorIncident.status = RESOLVED, resolved_at = logical clock, resolution_note from the payload"
+          - "when the prior status was ESCALATED: decrement Property.escalation_level by 1"
+          - "cascade: when the decremented escalation_level < PROPERTY_SUSPENSION_ESCALATION_LEVEL and Property.status == SUSPENDED, Property SUSPENDED -> ACTIVE"
+          - "increment CompactorIncident.version by 1"
+      - from: ACKNOWLEDGED
+        to: RESOLVED
+        trigger: "POST /valet/compactor-incidents/{incident_id}/resolve"
+        actor: PropertyManager
+        preconditions:
+          - "incident.status == ACKNOWLEDGED"
+          - "X-User-ID == incident.property_id"
+        side_effects:
+          - "set CompactorIncident.status = RESOLVED, resolved_at = logical clock, resolution_note from the payload"
+          - "Property.escalation_level unchanged (this incident never counted toward it)"
+          - "increment CompactorIncident.version by 1"
+      - from: REPORTED
+        to: RESOLVED
+        trigger: "POST /valet/compactor-incidents/{incident_id}/resolve"
+        actor: PropertyManager
+        preconditions:
+          - "incident.status == REPORTED"
+          - "X-User-ID == incident.property_id"
+        side_effects:
+          - "set CompactorIncident.status = RESOLVED, resolved_at = logical clock, resolution_note from the payload"
+          - "Property.escalation_level unchanged"
+          - "increment CompactorIncident.version by 1"
+
+  - entity: MonthlyStatement
+    initial_state: DRAFT
+    terminal_states: [ISSUED, VOID]
+    transitions:
+      - from: DRAFT
+        to: ISSUED
+        trigger: "POST /valet/statements/{statement_id}/issue"
+        actor: BillingAnalyst
+        preconditions:
+          - "statement.status == DRAFT"
+          - "X-User-ID != statement.created_by_user_id (segregation of duties)"
+          - "every ServiceNight of the contract whose service_date falls in billing_period has verification_status IN {VERIFIED, PARTIAL, MISSED, CANCELLED}"
+        side_effects:
+          - "switch MonthlyStatement.variant PROVISIONAL -> FINAL and recompute all money fields under the FINAL variant (calculations.statement_settlement)"
+          - "set MonthlyStatement.status = ISSUED and issued_by_user_id = X-User-ID"
+          - "set ServiceContract.last_invoiced_period = billing_period and increment ServiceContract.version by 1"
+          - "cascade: nights in the period with billing_status == ACCRUED move to INVOICED (verification_status == VERIFIED) or CREDITED (verification_status IN {MISSED, PARTIAL})"
+          - "increment MonthlyStatement.version by 1"
+      - from: DRAFT
+        to: VOID
+        trigger: "POST /valet/statements/{statement_id}/void"
+        actor: BillingAnalyst
+        preconditions:
+          - "statement.status == DRAFT"
+        side_effects:
+          - "set MonthlyStatement.status = VOID and void_reason from the payload"
+          - "increment MonthlyStatement.version by 1"
+      - from: DRAFT
+        to: VOID
+        trigger: "system: supersede cascade from POST /valet/contracts/{contract_id}/statements when a newer DRAFT is created for the same billing_period"
+        actor: system
+        preconditions:
+          - "the prior statement.status == DRAFT and its billing_period equals the new statement's billing_period"
+        side_effects:
+          - "set the prior MonthlyStatement.status = VOID with void_reason = 'SUPERSEDED'"
+          - "set the new MonthlyStatement.superseded_statement_id = the prior statement's id"
+          - "increment the prior MonthlyStatement.version by 1"
+      - from: ISSUED
+        to: VOID
+        trigger: "POST /valet/statements/{statement_id}/void"
+        actor: BillingAnalyst
+        preconditions:
+          - "statement.status == ISSUED"
+          - "ServiceContract.last_invoiced_period == statement.billing_period (only the most recent issued period may be reversed)"
+        side_effects:
+          - "set MonthlyStatement.status = VOID and void_reason from the payload"
+          - "compensating action: every ServiceNight of the period whose billing_status IN {INVOICED, CREDITED} returns to ACCRUED"
+          - "set ServiceContract.last_invoiced_period back to null and increment ServiceContract.version by 1"
+          - "increment MonthlyStatement.version by 1"
+
+# ---------------------------------------------------------------------------
+# §1.2.1 Concurrency Rules  (OCC on the parent's `version`, only)
+# ---------------------------------------------------------------------------
+concurrency_rules:
+  - rule_id: route-create-stale-service-night
+    parent_entity: ServiceNight
+    write_endpoint: "POST /valet/service-nights/{night_id}/route-assignments"
+    occ_field: "expected_service_night_version"
+    description: |
+      Creating a RouteAssignment against a ServiceNight whose version has
+      advanced past the value the client last observed is rejected. Route
+      creation is a legitimate supersede operation — a range previously walked
+      by an ABANDONED route may be re-issued to another valet — so the write
+      cannot be rejected on state grounds alone; the stale-version check is what
+      tells the dispatcher that the night's coverage map (assigned_unit_coverage_count,
+      the set of live ranges) is no longer the one they planned against.
+    error_id: ERR_STALE_SERVICE_NIGHT_VERSION
+    http_status: 412
+
+  - rule_id: statement-create-stale-contract
+    parent_entity: ServiceContract
+    write_endpoint: "POST /valet/contracts/{contract_id}/statements"
+    occ_field: "expected_contract_version"
+    description: |
+      Drafting a MonthlyStatement against a ServiceContract whose version has
+      advanced past the value the client last observed is rejected. A new draft
+      legitimately supersedes an existing DRAFT for the same billing_period
+      (voiding it), so the write is valid on state grounds; the stale-version
+      check is what prevents an analyst from drafting against contract terms —
+      fee, revenue-share bps, SLA threshold, last_invoiced_period — that have
+      moved since they were read.
+    error_id: ERR_STALE_CONTRACT_VERSION
+    http_status: 412
+
+# ---------------------------------------------------------------------------
+# §1.3 Calculation Rules Table
+# ---------------------------------------------------------------------------
+calculations:
+
+  - name: resident_passthrough_line
+    trigger: "runs inside calculations.statement_settlement whenever the FINAL variant computes gross_passthrough_cents — i.e. on POST /valet/statements/{statement_id}/issue"
+    algorithm: aggregation
+    formula: |
+      # ---- per-resident occupancy proration, then a rounded-line sum ----
+      days_in_period      = number of calendar days in billing_period (e.g. 2026-09 -> 30)
+      daily_rate_exact    = contract.per_unit_monthly_fee_cents / days_in_period      # exact rational, NOT rounded here
+      for each Resident r of the contract's property with r.fee_passthrough_enabled == true:
+          billable_days(r) = count of dates d in billing_period such that
+                                 r.move_in_date <= d                                   # inclusive lower bound
+                             AND (r.move_out_date IS NULL OR d < r.move_out_date)       # EXCLUSIVE upper bound
+          line_cents(r)    = round_half_up(daily_rate_exact * billable_days(r))         # ROUND HERE, per line
+      gross_passthrough_cents = sum over residents of line_cents(r)                     # THEN sum
+
+      # ROUNDING ORDER IS PINNED: round each resident line to whole cents first,
+      # then add the lines. The forbidden alternative — summing the exact rational
+      # line values and rounding the total once — differs by up to (n/2) cents.
+      # Worked check: fee 3495, days_in_period 30 -> daily_rate_exact = 116.5 exactly.
+      #   r1 30 days -> 3495 ; r2 17 days -> 1980.5 -> 1981 ; r3 17 days -> 1980.5 -> 1981
+      #   pinned order  = 3495 + 1981 + 1981 = 7457
+      #   forbidden one = round(3495 + 1980.5 + 1980.5) = round(7456.0) = 7456
+    input_set: "Resident rows whose property_id == contract.property_id and fee_passthrough_enabled == true, regardless of status (a MOVED_OUT resident still contributes the days it occupied). Residents with fee_passthrough_enabled == false contribute 0 and are excluded from the line list."
+    constants:
+      ROUNDING: round_half_up
+    precision: "integer cents; round_half_up applied once per resident line, never to the sum"
+
+  - name: statement_settlement
+    trigger: "POST /valet/contracts/{contract_id}/statements (PROVISIONAL variant) and POST /valet/statements/{statement_id}/issue (FINAL variant)"
+    algorithm: waterfall_allocation
+    formula: |
+      # ---- PINNED FOUR-STEP EVALUATION ORDER ----
+      # The three money fields look mutually dependent: the credit rate is keyed
+      # on a ratio, the revenue share is keyed on an amount net of the credit,
+      # and the net due is keyed on both. The order below is the definition;
+      # any other order is wrong even when it "looks" equally reasonable.
+
+      S1  gross_passthrough_cents:
+            PROVISIONAL -> contract.per_unit_monthly_fee_cents * property.unit_count
+                           (contracted door count; no occupancy proration, vacant units included)
+            FINAL       -> calculations.resident_passthrough_line
+                           (occupancy-prorated, rounded per line then summed)
+
+      S1b scheduled_night_count   = count of ServiceNight of the contract whose service_date
+                                    falls in billing_period and verification_status != CANCELLED
+          missed_equivalent_nights = missed_count + PARTIAL_NIGHT_WEIGHT * partial_count where
+            PROVISIONAL -> missed_count/partial_count counted only over nights already in a
+                           terminal verification state (VERIFIED, PARTIAL, MISSED); nights still
+                           SCHEDULED or IN_PROGRESS are assumed to succeed and contribute 0
+            FINAL       -> every night in the period is terminal by precondition, so all
+                           MISSED and PARTIAL nights count
+          missed_service_bps = 0 if scheduled_night_count == 0
+                               else round_half_up(10000 * missed_equivalent_nights / scheduled_night_count)
+
+      S2  sla_credit_rate_bps:
+            0                      if missed_service_bps <  contract.sla_missed_threshold_bps
+            SLA_TIER1_CREDIT_BPS   if missed_service_bps >= contract.sla_missed_threshold_bps
+                                      and missed_service_bps <  SLA_TIER2_ENTRY_BPS
+            SLA_TIER2_CREDIT_BPS   if missed_service_bps >= SLA_TIER2_ENTRY_BPS
+                                      and missed_service_bps >= contract.sla_missed_threshold_bps
+          missed_service_credit_cents = round_half_up(gross_passthrough_cents * sla_credit_rate_bps / 10000)
+          # keyed on GROSS, never on a net figure
+
+      S3  property_revenue_share_cents =
+            round_half_up((gross_passthrough_cents - missed_service_credit_cents)
+                          * contract.property_revenue_share_bps / 10000)
+          # keyed on gross-minus-credit: the owner does not earn a share of service it did not receive
+
+      S4  net_due_from_property_cents =
+            gross_passthrough_cents - missed_service_credit_cents - property_revenue_share_cents
+
+      # Worked FINAL check (fee 3495, unit_count 4, share 1500 bps, threshold 1000 bps,
+      # 2 scheduled nights of which 1 MISSED, residents 30/17/17 billable days):
+      #   S1 7457 ; S1b bps = round(10000*1.0/2) = 5000 -> tier2 (>= 2000) -> 1200
+      #   S2 round(7457*1200/10000) = round(894.84) = 895
+      #   S3 round((7457-895)*1500/10000) = round(984.30) = 984
+      #   S4 7457 - 895 - 984 = 5578
+      # Worked PROVISIONAL check on the same contract with no night yet terminal:
+      #   S1 3495*4 = 13980 ; S1b missed_equivalent 0 -> bps 0 -> rate 0
+      #   S2 0 ; S3 round(13980*1500/10000) = 2097 ; S4 13980 - 0 - 2097 = 11883
+    input_set: "ServiceNight rows of the contract whose service_date is inside billing_period; CANCELLED nights are excluded from scheduled_night_count and from the missed/partial counts entirely. Resident rows as scoped by calculations.resident_passthrough_line."
+    constants:
+      PARTIAL_NIGHT_WEIGHT: 0.5
+      SLA_TIER1_CREDIT_BPS: 500
+      SLA_TIER2_CREDIT_BPS: 1200
+      SLA_TIER2_ENTRY_BPS: 2000
+      ROUNDING: round_half_up
+    precision: "integer cents and integer bps; round_half_up at S1b, S2 and S3; S4 is exact integer subtraction"
+    variants:
+      - name: PROVISIONAL
+        when: "the statement is a DRAFT — written at POST /valet/contracts/{contract_id}/statements and re-read on every GET until issue"
+        difference: "gross is the contracted unit_count * fee (vacant doors billed, no proration) and only already-terminal nights contribute to missed_equivalent_nights, so a draft cut before the nights close shows the optimistic, forward-looking accrual."
+      - name: FINAL
+        when: "the statement is being ISSUED — written at POST /valet/statements/{statement_id}/issue"
+        difference: "gross is the occupancy-prorated per-resident line sum (vacant doors and partial months drop out) and every night in the period is terminal, so both the gross and the SLA ratio move; on the worked fixture net_due_from_property_cents falls from 11883 to 5578."
+
+  - name: resident_fine_amount
+    trigger: "POST /valet/service-scans/{scan_id}/fine, and the AUTO fine cascade fired by POST /valet/route-assignments/{route_id}/scans"
+    algorithm: tiered_pricing
+    formula: |
+      base_cents            = FINE_BASE_CENTS[scan.non_compliance_type]
+      escalation_multiplier = FINE_ESCALATION_MULTIPLIER[min(scan.offense_ordinal, 3)]
+      seasonal_factor       = SEASONAL_PEAK_MULTIPLIER if night.seasonal_volume_index >= SEASONAL_PEAK_INDEX else 1.0
+      raw_exact             = base_cents * escalation_multiplier * seasonal_factor      # exact rational
+      rounded_cents         = round_half_up(raw_exact)                                  # round ONCE, here
+      floored_cents         = max(rounded_cents, FINE_FLOOR_CENTS)                      # floor AFTER rounding
+      remaining_cap_cents   = max(0, MONTHLY_FINE_CAP_CENTS - resident.fines_assessed_this_period_cents)
+      # remaining_cap_cents == 0 is not a zero-amount fine: it is ERR_FINE_CAP_EXHAUSTED
+      amount_cents          = min(floored_cents, remaining_cap_cents)                   # cap clamp LAST
+      uncapped_amount_cents = floored_cents
+
+      # Nesting order is pinned: round -> max(floor) -> min(cap). Applying the floor
+      # before rounding, or the cap before the floor, changes the result whenever a
+      # clamp binds (e.g. floored 10000 with remaining cap 5000 must yield 5000, and
+      # a raw of 750 with a full cap must yield the 1000 floor, not 750).
+      # Worked checks:
+      #   EARLY_SET_OUT, ordinal 1, index 130 -> 2500*0.5*1.25 = 1562.5 -> 1563 -> max 1563 -> 1563
+      #   IMPROPER_CONTAINER, ordinal 1, index 100 -> 1500*0.5 = 750 -> 750 -> max 1000 -> 1000
+      #   RECYCLING_CONTAMINATION ordinal 1 -> 2500 ; ordinal 2 -> 7500 ; ordinal 3 -> 10000
+      #   RECYCLING_CONTAMINATION ordinal 3 with 12500 already assessed -> min(10000, 2500) = 2500
+    input_set: "the single ServiceScan named in the path (or created by the cascade) plus that scan's ServiceNight for seasonal_volume_index; the ordinal history is ServiceScan rows of the same resident with the same non_compliance_type, tag_status IN {OPEN, FINED}, created_at within the trailing FINE_LOOKBACK_DAYS window ending at the logical clock, ordered by created_at ASC"
+    constants:
+      FINE_BASE_CENTS: { EARLY_SET_OUT: 2500, IMPROPER_CONTAINER: 1500, RECYCLING_CONTAMINATION: 5000 }
+      FINE_ESCALATION_MULTIPLIER: { 1: 0.5, 2: 1.5, 3: 2.0 }
+      SEASONAL_PEAK_INDEX: 120
+      SEASONAL_PEAK_MULTIPLIER: 1.25
+      FINE_FLOOR_CENTS: 1000
+      MONTHLY_FINE_CAP_CENTS: 15000
+      FINE_LOOKBACK_DAYS: 90
+      AUTO_FINE_ORDINAL: 3
+      ROUNDING: round_half_up
+    precision: "integer cents; a single round_half_up on raw_exact, then integer max/min"
+
+  - name: contractor_classification_score
+    trigger: "POST /valet/contractors/{contractor_id}/classification"
+    algorithm: weighted_scoring
+    formula: |
+      # Employer-control score, 0..100. Two factors are always read from the
+      # declared onboarding packet; two are read either from the packet
+      # (DECLARED) or from observed route history (OBSERVED).
+      equipment_factor      = CONTROL_WEIGHT_EQUIPMENT        if contractor.equipment_provided_by_company else 0
+      fixed_schedule_factor = CONTROL_WEIGHT_FIXED_SCHEDULE   if contractor.sets_own_schedule == false     else 0
+
+      DECLARED:
+        hours_factor       = CONTROL_WEIGHT_FULLTIME_HOURS if contractor.weekly_committed_hours >= OBSERVED_FULLTIME_WEEKLY_HOURS else 0
+        exclusivity_factor = CONTROL_WEIGHT_EXCLUSIVITY    if contractor.works_exclusively else 0
+        observed_weekly_hours is not written
+
+      OBSERVED:
+        window             = [clock_date - (OBSERVED_WINDOW_DAYS - 1) days, clock_date]      # closed, whole days
+        audited_routes     = RouteAssignment rows of this contractor with status == COMPLETED
+                             whose ServiceNight.service_date is inside window,
+                             ordered by ServiceNight.service_date ASC, then created_at ASC
+        observed_weekly_hours = round_half_up_2dp( sum over audited_routes of
+                                 (night.service_window_end - night.service_window_start) in hours )
+        hours_factor       = CONTROL_WEIGHT_FULLTIME_HOURS if observed_weekly_hours >= OBSERVED_FULLTIME_WEEKLY_HOURS else 0
+        exclusivity_factor = CONTROL_WEIGHT_EXCLUSIVITY    if count(audited_routes) >= OBSERVED_EXCLUSIVITY_MIN_ROUTES
+                             and every audited route's night belongs to the same Property else 0
+
+      control_score   = equipment_factor + fixed_schedule_factor + hours_factor + exclusivity_factor
+      classification  = EMPLOYEE_W2 if control_score >= CLASSIFICATION_W2_SCORE_THRESHOLD else CONTRACTOR_1099
+
+      # Worked divergence on one contractor (equipment true, sets_own_schedule true,
+      # works_exclusively false, weekly_committed_hours 20; three COMPLETED 10-hour
+      # routes at one property inside the window):
+      #   DECLARED -> 30 + 0 + 0 + 0 = 30  -> CONTRACTOR_1099
+      #   OBSERVED -> 30 + 0 + 25 + 20 = 75 -> EMPLOYEE_W2   (30.0 observed hours >= 30)
+    input_set: "the contractor row; for OBSERVED additionally its RouteAssignment rows with status == COMPLETED whose ServiceNight.service_date lies in the closed trailing window. ASSIGNED, ACCEPTED, IN_PROGRESS, ABANDONED and CANCELLED routes are excluded, as are COMPLETED routes whose night falls outside the window."
+    constants:
+      CONTROL_WEIGHT_EQUIPMENT: 30
+      CONTROL_WEIGHT_FIXED_SCHEDULE: 25
+      CONTROL_WEIGHT_FULLTIME_HOURS: 25
+      CONTROL_WEIGHT_EXCLUSIVITY: 20
+      OBSERVED_FULLTIME_WEEKLY_HOURS: 30
+      OBSERVED_EXCLUSIVITY_MIN_ROUTES: 3
+      OBSERVED_WINDOW_DAYS: 7
+      CLASSIFICATION_W2_SCORE_THRESHOLD: 70
+    precision: "integer score 0..100; observed_weekly_hours to 2 decimals, round_half_up"
+    variants:
+      - name: DECLARED
+        when: "basis == DECLARED — the onboarding screen, run before the contractor may hold any route"
+        difference: "hours and exclusivity come from the self-declared packet fields, so a contractor who declares part-time and non-exclusive work screens as CONTRACTOR_1099 (score 30 on the worked fixture)."
+      - name: OBSERVED
+        when: "basis == OBSERVED — the periodic reclassification audit, run against completed route history"
+        difference: "hours and exclusivity are recomputed from COMPLETED routes in the trailing OBSERVED_WINDOW_DAYS window, so the same contractor with the same declared packet crosses CLASSIFICATION_W2_SCORE_THRESHOLD and becomes EMPLOYEE_W2 (score 75 on the worked fixture)."
+
+  - name: service_night_verification
+    trigger: "POST /valet/route-assignments/{route_id}/scans (recompute) and POST /valet/service-nights/{night_id}/close (final selection)"
+    algorithm: threshold
+    formula: |
+      expected_door_count = count of Resident r where r.property_id == night's property
+                            AND r.fee_passthrough_enabled == true
+                            AND r.move_in_date <= night.service_date
+                            AND (r.move_out_date IS NULL OR night.service_date < r.move_out_date)
+      scanned_door_count  = count of ServiceScan s where s.service_night_id == night.id
+                            AND s.scan_result IN {SERVICED, NO_SET_OUT}
+      coverage_bps        = 0 if expected_door_count == 0
+                            else round_half_up(10000 * scanned_door_count / expected_door_count)
+
+      # close-time selection — EVALUATED IN THIS ORDER
+      if scanned_door_count == 0:            verification_status = MISSED
+      elif coverage_bps >= VERIFICATION_COVERAGE_THRESHOLD_BPS: verification_status = VERIFIED
+      else:                                  verification_status = PARTIAL
+
+      # The empty-scan-set branch is checked FIRST and unconditionally: a night with
+      # expected_door_count == 0 and scanned_door_count == 0 closes MISSED, never
+      # VERIFIED, even though "0 of 0 doors" is vacuously complete coverage.
+      # Boundary: coverage_bps == VERIFICATION_COVERAGE_THRESHOLD_BPS is VERIFIED (>=, not >);
+      # expected 4 / scanned 3 -> 7500 -> VERIFIED, expected 4 / scanned 2 -> 5000 -> PARTIAL.
+    input_set: "Resident rows of the night's property with fee_passthrough_enabled == true, filtered by the occupancy window against night.service_date; ServiceScan rows whose service_night_id == the night, TAGGED_NOT_SERVICED excluded from scanned_door_count but still counted in RouteAssignment.scan_count"
+    constants:
+      VERIFICATION_COVERAGE_THRESHOLD_BPS: 7500
+      ROUNDING: round_half_up
+    precision: "integer bps, round_half_up"
+
+  - name: route_unit_coverage
+    trigger: "POST /valet/service-nights/{night_id}/route-assignments, POST /valet/route-assignments/{route_id}/abandon, and every system cascade that moves a RouteAssignment to CANCELLED or ABANDONED"
+    algorithm: aggregation
+    formula: |
+      unit_coverage_count(route)            = route.unit_to - route.unit_from + 1
+      ServiceNight.assigned_unit_coverage_count =
+          sum of unit_coverage_count(r) over RouteAssignment r of the night
+          with r.status IN {ASSIGNED, ACCEPTED, IN_PROGRESS, COMPLETED}
+          # ABANDONED and CANCELLED routes leave the sum
+
+      # CONSERVED QUANTITY (compensating-action invariant):
+      # abandoning a route and re-issuing the identical [unit_from, unit_to] range to
+      # another valet must leave assigned_unit_coverage_count exactly as it was before
+      # the abandon. Recomputed as a full re-aggregation, never as an incremental delta.
+    input_set: "RouteAssignment rows of the single night, status-filtered as above; ordered by created_at ASC when the sum is materialised for audit"
+    constants:
+      LIVE_ROUTE_STATUSES: "{ASSIGNED, ACCEPTED, IN_PROGRESS, COMPLETED}"
+    precision: "exact integer count"
+
+  - name: resident_delinquency_rollup
+    trigger: "every ResidentFine creation (AUTO cascade or POST /valet/service-scans/{scan_id}/fine) and every transition into WAIVED or VOIDED"
+    algorithm: aggregation
+    formula: |
+      Resident.fines_outstanding_cents = sum of amount_cents over ResidentFine of the resident
+                                         with status IN {ASSESSED, DISPUTED, UPHELD}
+      Resident.fines_assessed_this_period_cents += amount_cents on creation only
+                                         # monotone within a billing period; a waiver does not return cap headroom
+      Resident.collections_status       = DELINQUENT if fines_outstanding_cents >= DELINQUENCY_THRESHOLD_CENTS
+                                          else CURRENT
+      Property.pending_fine_revenue_cents = sum of fines_outstanding_cents over the property's Residents
+      Property.delinquent_resident_count  = count of the property's Residents with collections_status == DELINQUENT
+
+      # CONSERVED QUANTITY (compensating-action invariant):
+      # Resident.fines_outstanding_cents == sum(ResidentFine.amount_cents WHERE
+      #   resident_id == R AND status IN {ASSESSED, DISPUTED, UPHELD}) must hold after
+      # every forward action (assess) and every compensating action (waive, void-tag).
+      # Property.pending_fine_revenue_cents must equal the sum of that quantity over
+      # the property's residents at all times.
+    input_set: "ResidentFine rows of the one resident, status-filtered; then the Resident rows of the one property"
+    constants:
+      DELINQUENCY_THRESHOLD_CENTS: 7500
+    precision: "exact integer cents"
+
+  - name: property_escalation_rollup
+    trigger: "POST /valet/compactor-incidents/{incident_id}/escalate and POST /valet/compactor-incidents/{incident_id}/resolve"
+    algorithm: threshold
+    formula: |
+      ack_deadline_at = incident.reported_at + ACK_WINDOW_HOURS[incident.incident_type]
+      escalation is permitted only while status == REPORTED and logical_clock >= ack_deadline_at
+         # inclusive: at exactly ack_deadline_at the escalation is allowed
+
+      Property.escalation_level = count of the property's CompactorIncident rows with status == ESCALATED
+      Property.status           = SUSPENDED if escalation_level >= PROPERTY_SUSPENSION_ESCALATION_LEVEL
+                                             and prior status == ACTIVE
+                                  ACTIVE    if escalation_level <  PROPERTY_SUSPENSION_ESCALATION_LEVEL
+                                             and prior status == SUSPENDED
+
+      # CONSERVED QUANTITY (compensating-action invariant):
+      # Property.escalation_level == count(CompactorIncident WHERE property_id == P
+      # AND status == ESCALATED) must hold after every escalate and every resolve.
+    input_set: "CompactorIncident rows of the one property with status == ESCALATED; JAM and OVERFLOW incidents count identically toward the level, they differ only in ACK_WINDOW_HOURS"
+    constants:
+      ACK_WINDOW_HOURS: { JAM: 4, OVERFLOW: 24 }
+      PROPERTY_SUSPENSION_ESCALATION_LEVEL: 2
+    precision: "exact integer count; deadline arithmetic in whole hours on the logical clock"
+
+# ---------------------------------------------------------------------------
+# §1.4 Validation Rules Table (ordered by priority — lowest number wins)
+# ---------------------------------------------------------------------------
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers are both present and non-blank, and X-User-Role names a role declared in §1.7"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "the acting role appears in the endpoint's roles list in §1.5"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: existence
+    check: "every resource id in the path exists, validated left-to-right"
+    error_id: "ERR_PROPERTY_NOT_FOUND | ERR_CONTRACT_NOT_FOUND | ERR_RESIDENT_NOT_FOUND | ERR_CONTRACTOR_NOT_FOUND | ERR_SERVICE_NIGHT_NOT_FOUND | ERR_ROUTE_NOT_FOUND | ERR_SCAN_NOT_FOUND | ERR_FINE_NOT_FOUND | ERR_INCIDENT_NOT_FOUND | ERR_STATEMENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path id"
+
+  - priority: 4
+    category: auth
+    check: "for an entity_backed role, X-User-ID owns the addressed resource: Valet -> route.contractor_id; Resident -> fine.resident_id; PropertyManager -> the Property that owns the addressed resident, scan, fine or incident"
+    error_id: ERR_NOT_RESOURCE_OWNER
+    http_status: 403
+    applies_to: "all Valet, Resident and PropertyManager write endpoints"
+
+  - priority: 5
+    category: business_constraint
+    check: "request body shape: every required field present and non-null, enum members legal, integers within their declared constraints, dates YYYY-MM-DD, instants ISO 8601 UTC, unit_from <= unit_to, pagination limit in [1,100] and offset >= 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 422
+    applies_to: all
+
+  - priority: 6
+    category: existence
+    check: "every foreign key supplied in the body resolves: contractor_id on route creation, resident_id on scan creation"
+    error_id: "ERR_CONTRACTOR_NOT_FOUND | ERR_RESIDENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments, POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 7
+    category: business_referential
+    check: "a body foreign key belongs to the same aggregate scope as the path resource: the scanned resident's property_id equals the night's contract's property_id"
+    error_id: ERR_CROSS_PROPERTY_REFERENCE
+    http_status: 409
+    applies_to: "POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 8
+    category: state
+    check: "the addressed resource is in a state from which this transition is declared in §1.2 (includes: tag_status must be OPEN to be fined, statement must be DRAFT to be issued, route must be ASSIGNED to be accepted, night must not already be terminal, incident must be REPORTED to be escalated, contract must be DRAFT to be activated)"
+    error_id: "ERR_INVALID_STATE | ERR_TAG_NOT_FINEABLE | ERR_ALREADY_TERMINAL"
+    http_status: 409
+    applies_to: "all transition endpoints"
+
+  - priority: 9
+    category: state
+    check: "the owning Property is not SUSPENDED or TERMINATED — every service-delivery write (route creation, accept, complete, scan) is gated on property.status == ACTIVE"
+    error_id: ERR_PROPERTY_SUSPENDED
+    http_status: 409
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments, POST /valet/route-assignments/{route_id}/accept, POST /valet/route-assignments/{route_id}/complete, POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 10
+    category: business_constraint
+    check: "OCC: the supplied expected_<parent>_version equals the parent's current version"
+    error_id: "ERR_STALE_SERVICE_NIGHT_VERSION | ERR_STALE_CONTRACT_VERSION"
+    http_status: 412
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments, POST /valet/contracts/{contract_id}/statements"
+
+  - priority: 11
+    category: business_safety
+    check: "the assigned contractor is service-eligible: onboarding_status == CLEARED and classification != UNCLASSIFIED"
+    error_id: ERR_CONTRACTOR_NOT_ELIGIBLE
+    http_status: 409
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments"
+
+  - priority: 12
+    category: business_safety
+    check: "the property has no CompactorIncident with incident_type == JAM and status == ESCALATED — an escalated jam blocks doorstep collection outright"
+    error_id: ERR_COMPACTOR_BLOCKED
+    http_status: 409
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments, POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 13
+    category: business_safety
+    check: "segregation of duties on X-User-ID: the BillingAnalyst issuing a statement is not the one who drafted it; the ComplianceOfficer running an OBSERVED reclassification is not the one who recorded the background check"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /valet/statements/{statement_id}/issue, POST /valet/contractors/{contractor_id}/classification"
+
+  - priority: 14
+    category: business_temporal
+    check: "the new contract's closed date interval [effective_from, effective_to] does not intersect the interval of any existing contract of the same property with status IN {DRAFT, ACTIVE}; because both endpoints are inclusive, new.effective_from == existing.effective_to is an intersection"
+    error_id: ERR_CONTRACT_PERIOD_OVERLAP
+    http_status: 409
+    applies_to: "POST /valet/properties/{property_id}/contracts"
+
+  - priority: 15
+    category: business_temporal
+    check: "the contractor holds no other RouteAssignment with status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} whose night's half-open window [service_window_start, service_window_end) intersects this night's window; touching endpoints (previous end == new start) do not intersect"
+    error_id: ERR_CONTRACTOR_WINDOW_CONFLICT
+    http_status: 409
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments"
+
+  - priority: 16
+    category: business_temporal
+    check: "service_date's weekday is a member of the contract's service_night_days and the date lies inside the contract's closed effective period; a SHIFT makeup night is exempt from the weekday check only"
+    error_id: ERR_SERVICE_DATE_NOT_SCHEDULED
+    http_status: 422
+    applies_to: "POST /valet/contracts/{contract_id}/service-nights"
+
+  - priority: 17
+    category: business_temporal
+    check: "on a SHIFT reschedule: makeup_service_date is present, strictly after the original service_date, no more than MAKEUP_WINDOW_DAYS (14) days after it, inside the contract's closed effective period, and unoccupied by a non-CANCELLED night of the same contract"
+    error_id: ERR_INVALID_MAKEUP_DATE
+    http_status: 422
+    applies_to: "POST /valet/service-nights/{night_id}/reschedule"
+
+  - priority: 18
+    category: business_temporal
+    check: "escalation is attempted at or after ack_deadline_at on the logical clock"
+    error_id: ERR_ESCALATION_WINDOW_NOT_ELAPSED
+    http_status: 409
+    applies_to: "POST /valet/compactor-incidents/{incident_id}/escalate"
+
+  - priority: 19
+    category: business_constraint
+    check: "unit numbers lie inside the property's closed range [101, 100 + Property.unit_count] — applies to Resident.unit_number and to both ends of a route range"
+    error_id: ERR_UNIT_RANGE_OUT_OF_BOUNDS
+    http_status: 422
+    applies_to: "POST /valet/properties/{property_id}/residents, POST /valet/service-nights/{night_id}/route-assignments"
+
+  - priority: 20
+    category: business_constraint
+    check: "the requested closed unit range [unit_from, unit_to] does not intersect the range of any RouteAssignment of the same night with status IN {ASSIGNED, ACCEPTED, IN_PROGRESS, COMPLETED}"
+    error_id: ERR_UNIT_RANGE_OVERLAP
+    http_status: 409
+    applies_to: "POST /valet/service-nights/{night_id}/route-assignments"
+
+  - priority: 21
+    category: business_constraint
+    check: "no other Resident of the property with status == ACTIVE already occupies unit_number"
+    error_id: ERR_UNIT_ALREADY_OCCUPIED
+    http_status: 409
+    applies_to: "POST /valet/properties/{property_id}/residents"
+
+  - priority: 22
+    category: business_referential
+    check: "the scanned resident's unit_number is inside the route's closed [unit_from, unit_to] range"
+    error_id: ERR_UNIT_NOT_IN_ROUTE
+    http_status: 409
+    applies_to: "POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 23
+    category: business_constraint
+    check: "no ServiceScan already exists for this (route_assignment_id, resident_id) pair"
+    error_id: ERR_DUPLICATE_SCAN
+    http_status: 409
+    applies_to: "POST /valet/route-assignments/{route_id}/scans"
+
+  - priority: 24
+    category: business_constraint
+    check: "fine.dispute_round < MAX_DISPUTE_ROUNDS (2)"
+    error_id: ERR_DISPUTE_ROUNDS_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /valet/resident-fines/{fine_id}/dispute"
+
+  - priority: 25
+    category: business_constraint
+    check: "no MonthlyStatement of this contract with status == ISSUED already covers billing_period"
+    error_id: ERR_PERIOD_ALREADY_INVOICED
+    http_status: 409
+    applies_to: "POST /valet/contracts/{contract_id}/statements"
+
+  - priority: 26
+    category: business_constraint
+    check: "every ServiceNight of the contract whose service_date falls inside billing_period is terminal (verification_status IN {VERIFIED, PARTIAL, MISSED, CANCELLED})"
+    error_id: ERR_PERIOD_NOT_CLOSED
+    http_status: 409
+    applies_to: "POST /valet/statements/{statement_id}/issue"
+
+  - priority: 27
+    category: business_fiscal
+    check: "the resident has fee_passthrough_enabled == true — a resident excluded from pass-through cannot be fined"
+    error_id: ERR_PASSTHROUGH_DISABLED
+    http_status: 409
+    applies_to: "POST /valet/service-scans/{scan_id}/fine"
+
+  - priority: 28
+    category: business_fiscal
+    check: "max(0, MONTHLY_FINE_CAP_CENTS - resident.fines_assessed_this_period_cents) > 0 — the resident's monthly fine cap has headroom left"
+    error_id: ERR_FINE_CAP_EXHAUSTED
+    http_status: 409
+    applies_to: "POST /valet/service-scans/{scan_id}/fine"
+
+# ---------------------------------------------------------------------------
+# §1.5 API Endpoint Table
+# ---------------------------------------------------------------------------
+endpoints:
+
+  # ---- Property ----
+  - method: POST
+    path: "/valet/properties"
+    description: "Register a managed apartment community. Unit numbering is fixed at creation as the closed range [101, 100 + unit_count]."
+    roles: [PlatformAdmin]
+    code: 201
+    input: ["name", "unit_count", "market_code", "compactor_capacity_lbs?"]
+    output: Property
+    side_effects:
+      - "Property created in status ONBOARDING with escalation_level 0, pending_fine_revenue_cents 0, delinquent_resident_count 0, active_contract_id null"
+
+  - method: GET
+    path: "/valet/properties/{property_id}"
+    description: "Read one property including its derived escalation and collections rollups."
+    roles: [PlatformAdmin, ValetOpsManager, ComplianceOfficer, BillingAnalyst, PropertyManager]
+    code: 200
+    input: []
+    output: Property
+    side_effects: []
+
+  - method: GET
+    path: "/valet/properties"
+    description: "List properties, filterable by lifecycle status, market and active contract."
+    roles: [PlatformAdmin, ValetOpsManager, ComplianceOfficer, BillingAnalyst]
+    code: 200
+    input: ["status?", "market_code?", "active_contract_id?", "limit?", "offset?"]
+    output: Property[]
+    side_effects: []
+
+  # ---- ServiceContract ----
+  - method: POST
+    path: "/valet/properties/{property_id}/contracts"
+    description: "Draft a service contract for a property: per-unit pass-through fee, property revenue share in bps, the weekly service-night schedule, the closed effective date interval and the SLA missed-service threshold."
+    roles: [PlatformAdmin, BillingAnalyst]
+    code: 201
+    input: [per_unit_monthly_fee_cents, property_revenue_share_bps, service_night_days, effective_from, effective_to, sla_missed_threshold_bps]
+    output: ServiceContract
+    side_effects:
+      - "ServiceContract created in status DRAFT with last_invoiced_period null"
+      - "validations priority 14 rejects a closed-interval intersection with any DRAFT or ACTIVE contract of the property (ERR_CONTRACT_PERIOD_OVERLAP)"
+
+  - method: GET
+    path: "/valet/contracts/{contract_id}"
+    description: "Read one service contract."
+    roles: [PlatformAdmin, ValetOpsManager, BillingAnalyst, PropertyManager]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects: []
+
+  - method: GET
+    path: "/valet/contracts"
+    description: "List service contracts, filterable by property and status."
+    roles: [PlatformAdmin, ValetOpsManager, BillingAnalyst]
+    code: 200
+    input: ["property_id?", "status?", "limit?", "offset?"]
+    output: ServiceContract[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/contracts/{contract_id}/activate"
+    description: "Activate a DRAFT contract, which also brings the property live."
+    roles: [PlatformAdmin]
+    code: 200
+    input: []
+    output: ServiceContract
+    side_effects:
+      - "set ServiceContract.status = ACTIVE"
+      - "set Property.active_contract_id = this contract and Property.status ONBOARDING -> ACTIVE"
+      - "increments ServiceContract.version by 1 and Property.version by 1"
+
+  - method: POST
+    path: "/valet/contracts/{contract_id}/terminate"
+    description: "Terminate an ACTIVE contract; cascades to the property and to every still-scheduled night."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["reason?"]
+    output: ServiceContract
+    side_effects:
+      - "set ServiceContract.status = TERMINATED"
+      - "every ServiceNight of the contract with verification_status IN {SCHEDULED, IN_PROGRESS} -> CANCELLED, which cascades every live RouteAssignment -> CANCELLED"
+      - "set Property.active_contract_id = null and Property.status -> TERMINATED"
+      - "increments ServiceContract.version by 1"
+
+  # ---- Resident ----
+  - method: POST
+    path: "/valet/properties/{property_id}/residents"
+    description: "Add a resident to a unit. move_in_date is the inclusive first billable day; fee_passthrough_enabled defaults to true."
+    roles: [PlatformAdmin, PropertyManager]
+    code: 201
+    input: ["unit_number", "full_name", "move_in_date", "fee_passthrough_enabled?"]
+    output: Resident
+    side_effects:
+      - "Resident created in status ACTIVE, collections_status CURRENT, fines_outstanding_cents 0, fines_assessed_this_period_cents 0, move_out_date null"
+      - "validations priority 19 rejects a unit outside [101, 100 + unit_count]; priority 21 rejects a unit already held by an ACTIVE resident"
+
+  - method: GET
+    path: "/valet/residents/{resident_id}"
+    description: "Read one resident including the fines and collections rollups."
+    roles: [PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident]
+    code: 200
+    input: []
+    output: Resident
+    side_effects: []
+
+  - method: GET
+    path: "/valet/residents"
+    description: "List residents, filterable by property, lifecycle status and collections status."
+    roles: [PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer]
+    code: 200
+    input: ["property_id?", "status?", "collections_status?", "limit?", "offset?"]
+    output: Resident[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/residents/{resident_id}/move-out"
+    description: "Record a move-out. move_out_date is EXCLUSIVE: the resident is billed through the preceding day."
+    roles: [PlatformAdmin, PropertyManager]
+    code: 200
+    input: [move_out_date]
+    output: Resident
+    side_effects:
+      - "set Resident.status = MOVED_OUT and move_out_date from the payload"
+      - "increments Resident.version by 1"
+
+  # ---- ValetContractor ----
+  - method: POST
+    path: "/valet/contractors"
+    description: "Apply a valet to the network with the declared engagement terms used by the classification screen."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 201
+    input: [legal_name, equipment_provided_by_company, sets_own_schedule, works_exclusively, weekly_committed_hours]
+    output: ValetContractor
+    side_effects:
+      - "ValetContractor created in onboarding_status APPLIED, classification UNCLASSIFIED, control_score 0, created_by_user_id = X-User-ID"
+
+  - method: GET
+    path: "/valet/contractors/{contractor_id}"
+    description: "Read one valet contractor including control_score and classification."
+    roles: [PlatformAdmin, ValetOpsManager, ComplianceOfficer, Valet]
+    code: 200
+    input: []
+    output: ValetContractor
+    side_effects: []
+
+  - method: GET
+    path: "/valet/contractors"
+    description: "List valet contractors, filterable by onboarding status and worker classification."
+    roles: [PlatformAdmin, ValetOpsManager, ComplianceOfficer]
+    code: 200
+    input: ["onboarding_status?", "classification?", "limit?", "offset?"]
+    output: ValetContractor[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/contractors/{contractor_id}/documents"
+    description: "Record the tax packet (W9 for a 1099 contractor, W4 for a W2 employee) and deposit details, moving the applicant into background screening."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 200
+    input: [tax_form_type, direct_deposit_on_file]
+    output: ValetContractor
+    side_effects:
+      - "set onboarding_status APPLIED -> BACKGROUND_PENDING"
+      - "increments ValetContractor.version by 1"
+
+  - method: POST
+    path: "/valet/contractors/{contractor_id}/background-check"
+    description: "Record the background-check outcome. CLEAR advances to CLEARED, FAIL is terminal REJECTED. The recording user is retained for segregation of duties against the later OBSERVED reclassification."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [result]
+    output: ValetContractor
+    side_effects:
+      - "set onboarding_status = CLEARED when result == CLEAR, or REJECTED when result == FAIL"
+      - "set background_checked_by_user_id = X-User-ID"
+      - "increments ValetContractor.version by 1"
+
+  - method: POST
+    path: "/valet/contractors/{contractor_id}/classification"
+    description: "Run the employer-control classification screen (calculations.contractor_classification_score). basis DECLARED reads the onboarding packet; basis OBSERVED recomputes hours and exclusivity from COMPLETED route history in the trailing window."
+    roles: [ComplianceOfficer]
+    code: 200
+    input: [basis]
+    output: ValetContractor
+    side_effects:
+      - "recompute control_score and set classification = EMPLOYEE_W2 or CONTRACTOR_1099"
+      - "set classification_basis = the supplied basis; basis OBSERVED also writes observed_weekly_hours"
+      - "validations priority 13 rejects an OBSERVED run by the same X-User-ID that recorded the background check (ERR_SEGREGATION_OF_DUTIES)"
+      - "increments ValetContractor.version by 1"
+
+  - method: POST
+    path: "/valet/contractors/{contractor_id}/deactivate"
+    description: "Deactivate a contractor; live route assignments are abandoned."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 200
+    input: [reason]
+    output: ValetContractor
+    side_effects:
+      - "set onboarding_status = DEACTIVATED and deactivation_reason from the payload"
+      - "every RouteAssignment of the contractor with status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} -> ABANDONED with abandon_reason = 'CONTRACTOR_DEACTIVATED', each recomputing its night's assigned_unit_coverage_count"
+      - "increments ValetContractor.version by 1"
+
+  # ---- ServiceNight ----
+  - method: POST
+    path: "/valet/contracts/{contract_id}/service-nights"
+    description: "Schedule one service night on the contract. The window is half-open [service_window_start, service_window_end). seasonal_volume_index defaults to 100 and drives the peak fine uplift at >= 120."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 201
+    input: ["service_date", "service_window_start", "service_window_end", "seasonal_volume_index?", "holiday_flag?"]
+    output: ServiceNight
+    side_effects:
+      - "ServiceNight created in verification_status SCHEDULED, billing_status UNBILLED, scanned_door_count 0, coverage_bps 0, assigned_unit_coverage_count 0, rescheduled_from_night_id null"
+      - "expected_door_count computed from occupancy on service_date (calculations.service_night_verification)"
+      - "validations priority 16 rejects a date whose weekday is not in the contract's service_night_days or that falls outside the contract's closed effective period (ERR_SERVICE_DATE_NOT_SCHEDULED)"
+
+  - method: GET
+    path: "/valet/service-nights/{night_id}"
+    description: "Read one service night, including its current version for optimistic concurrency on route creation."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, BillingAnalyst, Valet]
+    code: 200
+    input: []
+    output: ServiceNight
+    side_effects: []
+
+  - method: GET
+    path: "/valet/service-nights"
+    description: "List service nights, filterable by contract, verification and billing state, service date and the makeup back-reference."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, BillingAnalyst]
+    code: 200
+    input: ["contract_id?", "rescheduled_from_night_id?", "verification_status?", "billing_status?", "service_date?", "limit?", "offset?"]
+    output: ServiceNight[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/service-nights/{night_id}/close"
+    description: "Close the night and select its verification outcome (MISSED on an empty scan set, VERIFIED at or above the coverage threshold, otherwise PARTIAL). Routes still open are abandoned."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 200
+    input: []
+    output: ServiceNight
+    side_effects:
+      - "recompute coverage_bps and set verification_status per calculations.service_night_verification"
+      - "set billing_status = ACCRUED"
+      - "every RouteAssignment of the night with status IN {ASSIGNED, ACCEPTED, IN_PROGRESS} -> ABANDONED with abandon_reason = 'NIGHT_CLOSED'"
+      - "increments ServiceNight.version by 1"
+
+  - method: POST
+    path: "/valet/service-nights/{night_id}/reschedule"
+    description: "Apply a holiday or seasonal schedule adjustment to a SCHEDULED night. action SKIP cancels the night outright; action SHIFT cancels it and creates a makeup night whose rescheduled_from_night_id points back at it."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 200
+    input: ["action", "makeup_service_date?", "reason?"]
+    output: ServiceNight
+    side_effects:
+      - "set the addressed night verification_status SCHEDULED -> CANCELLED, which cascades every live RouteAssignment -> CANCELLED"
+      - "action SHIFT additionally creates a new ServiceNight on makeup_service_date with the same window and seasonal_volume_index, holiday_flag false, and rescheduled_from_night_id = the cancelled night; the makeup night is exempt from the service_night_days weekday check"
+      - "action SKIP creates nothing"
+      - "validations priority 17 rejects a SHIFT whose makeup_service_date is absent, not strictly after the original, more than MAKEUP_WINDOW_DAYS (14) after it, outside the contract's effective period, or already occupied (ERR_INVALID_MAKEUP_DATE)"
+      - "increments ServiceNight.version by 1"
+
+  # ---- RouteAssignment ----
+  - method: POST
+    path: "/valet/service-nights/{night_id}/route-assignments"
+    description: "Assign a cleared, classified valet a closed unit range on this night. Requires expected_service_night_version to match the night's current version."
+    roles: [PlatformAdmin, ValetOpsManager]
+    code: 201
+    input: [contractor_id, unit_from, unit_to, expected_service_night_version]
+    output: RouteAssignment
+    side_effects:
+      - "RouteAssignment created in status ASSIGNED with unit_coverage_count = unit_to - unit_from + 1, scan_count 0, accepted_at null, completed_at null"
+      - "recompute ServiceNight.assigned_unit_coverage_count (calculations.route_unit_coverage)"
+      - "increments ServiceNight.version by 1"
+      - "rejects a stale expected_service_night_version with ERR_STALE_SERVICE_NIGHT_VERSION (412)"
+
+  - method: GET
+    path: "/valet/route-assignments/{route_id}"
+    description: "Read one route assignment."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects: []
+
+  - method: GET
+    path: "/valet/route-assignments"
+    description: "List route assignments, filterable by night, contractor and status — the discovery channel for routes cancelled or abandoned by cascade."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet]
+    code: 200
+    input: ["service_night_id?", "contractor_id?", "status?", "limit?", "offset?"]
+    output: RouteAssignment[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/route-assignments/{route_id}/accept"
+    description: "The assigned valet accepts the route."
+    roles: [Valet]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects:
+      - "set RouteAssignment.status = ACCEPTED and accepted_at = the logical clock"
+      - "increments RouteAssignment.version by 1"
+
+  - method: POST
+    path: "/valet/route-assignments/{route_id}/complete"
+    description: "The valet closes out the route. Completed routes are the audited input set of the OBSERVED classification."
+    roles: [Valet]
+    code: 200
+    input: []
+    output: RouteAssignment
+    side_effects:
+      - "set RouteAssignment.status = COMPLETED and completed_at = the logical clock"
+      - "recompute ServiceNight.assigned_unit_coverage_count"
+      - "increments RouteAssignment.version by 1"
+
+  - method: POST
+    path: "/valet/route-assignments/{route_id}/abandon"
+    description: "Abandon a live route; its unit range leaves the night's assigned coverage and can be re-issued to another valet."
+    roles: [PlatformAdmin, ValetOpsManager, Valet]
+    code: 200
+    input: [reason]
+    output: RouteAssignment
+    side_effects:
+      - "set RouteAssignment.status = ABANDONED and abandon_reason from the payload"
+      - "recompute ServiceNight.assigned_unit_coverage_count (the abandoned range leaves the sum)"
+      - "increments RouteAssignment.version by 1"
+
+  # ---- ServiceScan ----
+  - method: POST
+    path: "/valet/route-assignments/{route_id}/scans"
+    description: "Record the doorstep scan for one unit on this route. A non-null non_compliance_type opens a tag; recycling contamination and any third-or-later repeat offense auto-assess the fine."
+    roles: [Valet]
+    code: 201
+    input: ["resident_id", "scan_result", "container_type", "non_compliance_type?"]
+    output: ServiceScan
+    side_effects:
+      - "ServiceScan created with service_night_id denormalised from the route, scanned_at = the logical clock, offense_ordinal computed over the resident's trailing FINE_LOOKBACK_DAYS history for the same non_compliance_type"
+      - "tag_status = OPEN when non_compliance_type is non-null, otherwise NONE"
+      - "route.status ACCEPTED -> IN_PROGRESS on the first scan; RouteAssignment.scan_count += 1"
+      - "night.verification_status SCHEDULED -> IN_PROGRESS on the night's first scan; recompute scanned_door_count and coverage_bps"
+      - "when offense_ordinal >= AUTO_FINE_ORDINAL or non_compliance_type == RECYCLING_CONTAMINATION: create a ResidentFine with origin AUTO (calculations.resident_fine_amount), moving tag_status OPEN -> FINED and cascading the resident delinquency and property rollups"
+
+  - method: GET
+    path: "/valet/service-scans/{scan_id}"
+    description: "Read one doorstep scan and its tag state."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet, Resident]
+    code: 200
+    input: []
+    output: ServiceScan
+    side_effects: []
+
+  - method: GET
+    path: "/valet/service-scans"
+    description: "List doorstep scans, filterable by route, night, resident, scan result and tag state."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet, Resident]
+    code: 200
+    input: ["route_assignment_id?", "service_night_id?", "resident_id?", "scan_result?", "tag_status?", "non_compliance_type?", "limit?", "offset?"]
+    output: ServiceScan[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/service-scans/{scan_id}/fine"
+    description: "Assess the resident fine for an OPEN tag (calculations.resident_fine_amount), as the manual counterpart of the AUTO cascade."
+    roles: [PropertyManager]
+    code: 201
+    input: ["note?"]
+    output: ResidentFine
+    side_effects:
+      - "create a ResidentFine in status ASSESSED with origin MANUAL, assessed_by_user_id = X-User-ID, amount_cents and uncapped_amount_cents per calculations.resident_fine_amount"
+      - "set ServiceScan.tag_status OPEN -> FINED"
+      - "Resident.fines_outstanding_cents += amount_cents, fines_assessed_this_period_cents += amount_cents, collections_status re-evaluated; Property.pending_fine_revenue_cents and delinquent_resident_count re-derived"
+      - "rejects a resident with fee_passthrough_enabled == false (ERR_PASSTHROUGH_DISABLED) and an exhausted monthly cap (ERR_FINE_CAP_EXHAUSTED)"
+
+  - method: POST
+    path: "/valet/service-scans/{scan_id}/void-tag"
+    description: "Void a non-compliance tag recorded in error; any fine resting on it is voided and the resident ledger is unwound."
+    roles: [PropertyManager]
+    code: 200
+    input: [reason]
+    output: ServiceScan
+    side_effects:
+      - "set ServiceScan.tag_status = VOIDED and void_reason from the payload"
+      - "every ResidentFine of the scan with status IN {ASSESSED, DISPUTED, UPHELD} -> VOIDED, each reversing Resident.fines_outstanding_cents and Property.pending_fine_revenue_cents and re-evaluating delinquency"
+      - "the voided scan is excluded from every later offense_ordinal computation"
+      - "increments ServiceScan.version by 1"
+
+  # ---- ResidentFine ----
+  - method: GET
+    path: "/valet/resident-fines/{fine_id}"
+    description: "Read one resident fine including the capped and uncapped amounts and the dispute round counter."
+    roles: [PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident]
+    code: 200
+    input: []
+    output: ResidentFine
+    side_effects: []
+
+  - method: GET
+    path: "/valet/resident-fines"
+    description: "List resident fines, filterable by resident, originating scan, status and origin — the discovery channel for fines created by the AUTO cascade."
+    roles: [PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident]
+    code: 200
+    input: ["resident_id?", "scan_id?", "status?", "origin?", "limit?", "offset?"]
+    output: ResidentFine[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/resident-fines/{fine_id}/dispute"
+    description: "The fined resident disputes the fine. Bounded by MAX_DISPUTE_ROUNDS."
+    roles: [Resident]
+    code: 200
+    input: [reason]
+    output: ResidentFine
+    side_effects:
+      - "set ResidentFine.status = DISPUTED, dispute_round += 1, dispute_reason from the payload"
+      - "the fine stays outstanding: Resident.fines_outstanding_cents is unchanged"
+      - "rejects a fine whose dispute_round has reached MAX_DISPUTE_ROUNDS (ERR_DISPUTE_ROUNDS_EXHAUSTED)"
+      - "increments ResidentFine.version by 1"
+
+  - method: POST
+    path: "/valet/resident-fines/{fine_id}/adjudicate"
+    description: "The property manager rules on a disputed fine. UPHELD returns it to the dispute loop; WAIVED is terminal and reverses the resident ledger without returning monthly cap headroom."
+    roles: [PropertyManager]
+    code: 200
+    input: ["outcome", "note?"]
+    output: ResidentFine
+    side_effects:
+      - "outcome UPHELD: status = UPHELD, adjudicated_by_user_id = X-User-ID, ledger unchanged"
+      - "outcome WAIVED: status = WAIVED, Resident.fines_outstanding_cents -= amount_cents, Property.pending_fine_revenue_cents -= amount_cents, delinquency and delinquent_resident_count re-evaluated, fines_assessed_this_period_cents NOT reduced"
+      - "increments ResidentFine.version by 1"
+
+  # ---- CompactorIncident ----
+  - method: POST
+    path: "/valet/properties/{property_id}/compactor-incidents"
+    description: "Report a compactor jam or overflow. ack_deadline_at is stamped from the incident type's acknowledgement window (JAM 4h, OVERFLOW 24h)."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, Valet]
+    code: 201
+    input: ["incident_type", "description?"]
+    output: CompactorIncident
+    side_effects:
+      - "CompactorIncident created in status REPORTED with reported_at = the logical clock, reported_by_role = X-User-Role, reported_by_user_id = X-User-ID, ack_deadline_at = reported_at + ACK_WINDOW_HOURS[incident_type]"
+
+  - method: GET
+    path: "/valet/compactor-incidents/{incident_id}"
+    description: "Read one compactor incident with its acknowledgement deadline and escalation timestamps."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet]
+    code: 200
+    input: []
+    output: CompactorIncident
+    side_effects: []
+
+  - method: GET
+    path: "/valet/compactor-incidents"
+    description: "List compactor incidents, filterable by property, type and status."
+    roles: [PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer]
+    code: 200
+    input: ["property_id?", "incident_type?", "status?", "limit?", "offset?"]
+    output: CompactorIncident[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/compactor-incidents/{incident_id}/acknowledge"
+    description: "The property acknowledges the incident inside its window, which forecloses escalation."
+    roles: [PropertyManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: CompactorIncident
+    side_effects:
+      - "set CompactorIncident.status = ACKNOWLEDGED and acknowledged_at = the logical clock"
+      - "increments CompactorIncident.version by 1"
+
+  - method: POST
+    path: "/valet/compactor-incidents/{incident_id}/escalate"
+    description: "Escalate an unacknowledged incident to the property once its acknowledgement window has elapsed. Escalation is inclusive of the deadline instant."
+    roles: [ValetOpsManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: CompactorIncident
+    side_effects:
+      - "set CompactorIncident.status = ESCALATED and escalated_at = the logical clock"
+      - "recompute Property.escalation_level as the count of ESCALATED incidents; at PROPERTY_SUSPENSION_ESCALATION_LEVEL the property goes ACTIVE -> SUSPENDED, cancelling every SCHEDULED night and every live RouteAssignment"
+      - "rejects escalation before ack_deadline_at (ERR_ESCALATION_WINDOW_NOT_ELAPSED)"
+      - "increments CompactorIncident.version by 1"
+
+  - method: POST
+    path: "/valet/compactor-incidents/{incident_id}/resolve"
+    description: "Resolve an incident. Resolving an escalated incident lowers the property's escalation level and can reinstate a suspended property."
+    roles: [PropertyManager, ValetOpsManager, PlatformAdmin]
+    code: 200
+    input: [resolution_note]
+    output: CompactorIncident
+    side_effects:
+      - "set CompactorIncident.status = RESOLVED, resolved_at = the logical clock, resolution_note from the payload"
+      - "recompute Property.escalation_level; below PROPERTY_SUSPENSION_ESCALATION_LEVEL a SUSPENDED property returns to ACTIVE"
+      - "increments CompactorIncident.version by 1"
+
+  # ---- MonthlyStatement ----
+  - method: POST
+    path: "/valet/contracts/{contract_id}/statements"
+    description: "Cut a PROVISIONAL draft statement for a billing period (calculations.statement_settlement, PROVISIONAL variant). Requires expected_contract_version to match the contract's current version."
+    roles: [BillingAnalyst, PlatformAdmin]
+    code: 201
+    input: [billing_period, expected_contract_version]
+    output: MonthlyStatement
+    side_effects:
+      - "MonthlyStatement created in status DRAFT with variant PROVISIONAL, created_by_user_id = X-User-ID, issued_by_user_id null, superseded_statement_id null unless it replaces an earlier DRAFT for the same period"
+      - "an existing DRAFT of the same contract and billing_period is VOIDed and referenced by the new statement's superseded_statement_id"
+      - "increments ServiceContract.version by 1"
+      - "rejects a stale expected_contract_version with ERR_STALE_CONTRACT_VERSION (412) and an already-ISSUED period with ERR_PERIOD_ALREADY_INVOICED"
+
+  - method: GET
+    path: "/valet/statements/{statement_id}"
+    description: "Read one monthly statement with the full settlement waterfall (gross, SLA credit, revenue share, net due)."
+    roles: [PlatformAdmin, BillingAnalyst, PropertyManager]
+    code: 200
+    input: []
+    output: MonthlyStatement
+    side_effects: []
+
+  - method: GET
+    path: "/valet/statements"
+    description: "List monthly statements, filterable by contract, billing period, status and the supersede back-reference."
+    roles: [PlatformAdmin, BillingAnalyst, PropertyManager]
+    code: 200
+    input: ["contract_id?", "billing_period?", "status?", "variant?", "superseded_statement_id?", "limit?", "offset?"]
+    output: MonthlyStatement[]
+    side_effects: []
+
+  - method: POST
+    path: "/valet/statements/{statement_id}/issue"
+    description: "Issue a DRAFT statement, recomputing it under the FINAL variant (occupancy-prorated gross and the full SLA ratio). A different BillingAnalyst than the drafter must issue it."
+    roles: [BillingAnalyst, PlatformAdmin]
+    code: 200
+    input: []
+    output: MonthlyStatement
+    side_effects:
+      - "set variant = FINAL and recompute gross_passthrough_cents, missed_service_bps, sla_credit_rate_bps, missed_service_credit_cents, property_revenue_share_cents, net_due_from_property_cents per calculations.statement_settlement"
+      - "set status = ISSUED and issued_by_user_id = X-User-ID"
+      - "every ServiceNight of the period moves billing_status ACCRUED -> INVOICED, or ACCRUED -> CREDITED when the night is MISSED or PARTIAL"
+      - "set ServiceContract.last_invoiced_period = billing_period; increments ServiceContract.version by 1"
+      - "rejects issue by the drafting X-User-ID (ERR_SEGREGATION_OF_DUTIES) and a period with a non-terminal night (ERR_PERIOD_NOT_CLOSED)"
+
+  - method: POST
+    path: "/valet/statements/{statement_id}/void"
+    description: "Void a statement. Voiding an ISSUED statement is a compensating action that returns its nights to ACCRUED and clears the contract's last_invoiced_period."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [reason]
+    output: MonthlyStatement
+    side_effects:
+      - "set status = VOID and void_reason from the payload"
+      - "for a previously ISSUED statement: every ServiceNight of the period returns billing_status INVOICED or CREDITED -> ACCRUED and ServiceContract.last_invoiced_period is cleared"
+      - "increments MonthlyStatement.version by 1 and ServiceContract.version by 1"
+
+  # ---- test-driving endpoint ----
+  - method: POST
+    path: "/valet/_clock/set_current_utc"
+    description: "Set the server's logical UTC clock, which every deadline, occupancy and trailing-window rule reads. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z and MUST NOT fall back to real wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: datetime }
+    side_effects:
+      - "the logical clock is repositioned; no entity is mutated and no version is bumped"
+
+# ---------------------------------------------------------------------------
+# §1.6 Error Code Catalog
+# ---------------------------------------------------------------------------
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing, blank, or naming a role not declared in §1.7"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "the acting role is not listed in the endpoint's roles"
+  - id: ERR_NOT_RESOURCE_OWNER
+    http: 403
+    condition: "an entity_backed role's X-User-ID does not own the addressed resource (Valet on another valet's route, Resident on another resident's fine, PropertyManager on another property's resident, scan, fine or incident)"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the BillingAnalyst issuing a statement is the one who drafted it, or the ComplianceOfficer running an OBSERVED reclassification is the one who recorded the background check"
+  - id: ERR_PROPERTY_NOT_FOUND
+    http: 404
+    condition: "no Property with the given id"
+  - id: ERR_CONTRACT_NOT_FOUND
+    http: 404
+    condition: "no ServiceContract with the given id"
+  - id: ERR_RESIDENT_NOT_FOUND
+    http: 404
+    condition: "no Resident with the given id, in the path or in a scan body"
+  - id: ERR_CONTRACTOR_NOT_FOUND
+    http: 404
+    condition: "no ValetContractor with the given id, in the path or in a route-assignment body"
+  - id: ERR_SERVICE_NIGHT_NOT_FOUND
+    http: 404
+    condition: "no ServiceNight with the given id"
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "no RouteAssignment with the given id"
+  - id: ERR_SCAN_NOT_FOUND
+    http: 404
+    condition: "no ServiceScan with the given id"
+  - id: ERR_FINE_NOT_FOUND
+    http: 404
+    condition: "no ResidentFine with the given id"
+  - id: ERR_INCIDENT_NOT_FOUND
+    http: 404
+    condition: "no CompactorIncident with the given id"
+  - id: ERR_STATEMENT_NOT_FOUND
+    http: 404
+    condition: "no MonthlyStatement with the given id"
+  - id: ERR_INVALID_REQUEST
+    http: 422
+    condition: "request body fails shape validation: a required field is missing or null, an enum value is not a declared member, an integer is out of its declared range, a date or instant is malformed, unit_from > unit_to, or pagination limit/offset is out of range"
+  - id: ERR_CROSS_PROPERTY_REFERENCE
+    http: 409
+    condition: "the scanned resident belongs to a different property than the night's contract"
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the requested transition is not declared from the resource's current state in §1.2"
+  - id: ERR_ALREADY_TERMINAL
+    http: 409
+    condition: "the addressed resource is already in a terminal state for its state machine (a CANCELLED or closed night, a VOID statement, a WAIVED or VOIDED fine, a REJECTED or DEACTIVATED contractor)"
+  - id: ERR_TAG_NOT_FINEABLE
+    http: 409
+    condition: "the scan's tag_status is not OPEN — it is NONE (no non-compliance recorded), already FINED, or VOIDED"
+  - id: ERR_PROPERTY_SUSPENDED
+    http: 409
+    condition: "a service-delivery write was attempted on a property whose status is SUSPENDED or TERMINATED"
+  - id: ERR_STALE_SERVICE_NIGHT_VERSION
+    http: 412
+    condition: "expected_service_night_version does not equal the ServiceNight's current version on route creation"
+  - id: ERR_STALE_CONTRACT_VERSION
+    http: 412
+    condition: "expected_contract_version does not equal the ServiceContract's current version on statement creation"
+  - id: ERR_CONTRACTOR_NOT_ELIGIBLE
+    http: 409
+    condition: "the assigned contractor's onboarding_status is not CLEARED, or its classification is still UNCLASSIFIED"
+  - id: ERR_COMPACTOR_BLOCKED
+    http: 409
+    condition: "the property has a JAM incident in status ESCALATED, which blocks doorstep collection"
+  - id: ERR_CONTRACT_PERIOD_OVERLAP
+    http: 409
+    condition: "the new contract's closed [effective_from, effective_to] interval intersects that of an existing DRAFT or ACTIVE contract of the same property, inclusive of a shared endpoint date"
+  - id: ERR_CONTRACTOR_WINDOW_CONFLICT
+    http: 409
+    condition: "the contractor already holds a live route on a night whose half-open [service_window_start, service_window_end) window intersects this night's window; back-to-back windows that merely touch do not conflict"
+  - id: ERR_SERVICE_DATE_NOT_SCHEDULED
+    http: 422
+    condition: "service_date's weekday is not in the contract's service_night_days, or the date lies outside the contract's closed effective period"
+  - id: ERR_INVALID_MAKEUP_DATE
+    http: 422
+    condition: "a SHIFT reschedule supplied no makeup_service_date, or one that is not strictly after the original date, is more than MAKEUP_WINDOW_DAYS (14) after it, falls outside the contract's effective period, or is already occupied by a non-CANCELLED night"
+  - id: ERR_ESCALATION_WINDOW_NOT_ELAPSED
+    http: 409
+    condition: "escalation was attempted strictly before the incident's ack_deadline_at on the logical clock"
+  - id: ERR_UNIT_RANGE_OUT_OF_BOUNDS
+    http: 422
+    condition: "a unit number or route range endpoint falls outside the property's closed unit range [101, 100 + unit_count]"
+  - id: ERR_UNIT_RANGE_OVERLAP
+    http: 409
+    condition: "the requested closed unit range intersects the range of another live route on the same night"
+  - id: ERR_UNIT_ALREADY_OCCUPIED
+    http: 409
+    condition: "another ACTIVE resident of the property already holds the requested unit_number"
+  - id: ERR_UNIT_NOT_IN_ROUTE
+    http: 409
+    condition: "the scanned resident's unit_number lies outside the route's closed [unit_from, unit_to] range"
+  - id: ERR_DUPLICATE_SCAN
+    http: 409
+    condition: "a ServiceScan already exists for this (route_assignment_id, resident_id) pair"
+  - id: ERR_DISPUTE_ROUNDS_EXHAUSTED
+    http: 409
+    condition: "the fine's dispute_round has already reached MAX_DISPUTE_ROUNDS (2)"
+  - id: ERR_PERIOD_ALREADY_INVOICED
+    http: 409
+    condition: "an ISSUED statement of this contract already covers the requested billing_period"
+  - id: ERR_PERIOD_NOT_CLOSED
+    http: 409
+    condition: "a ServiceNight of the billing period is still SCHEDULED or IN_PROGRESS at issue time"
+  - id: ERR_PASSTHROUGH_DISABLED
+    http: 409
+    condition: "a fine was assessed against a resident whose fee_passthrough_enabled is false"
+  - id: ERR_FINE_CAP_EXHAUSTED
+    http: 409
+    condition: "the resident's remaining monthly fine headroom (MONTHLY_FINE_CAP_CENTS - fines_assessed_this_period_cents) is zero or below"
+
+# ---------------------------------------------------------------------------
+# §1.7 RBAC Matrix
+# ---------------------------------------------------------------------------
+roles:
+  - name: PlatformAdmin
+    description: "Valet Living platform operator: onboards properties and contracts, and holds every break-glass compensating action."
+    identity: "opaque"
+    exclusive_operations:
+      - "create a Property"
+      - "activate a ServiceContract"
+      - "terminate a ServiceContract"
+      - "void a MonthlyStatement"
+      - "set the logical clock"
+    shared_operations:
+      - "read properties, contracts, residents, contractors, nights, routes, scans, fines, incidents and statements"
+      - "create residents, contractors and service nights"
+      - "create, accept-side administration and abandonment of route assignments"
+      - "acknowledge, escalate and resolve compactor incidents"
+      - "create and issue MonthlyStatements"
+
+  - name: PropertyManager
+    description: "On-site manager of one apartment community; owns resident records, non-compliance adjudication and the property side of compactor escalations."
+    identity: "entity_backed:Property"
+    exclusive_operations:
+      - "assess a resident fine on an OPEN tag"
+      - "void a non-compliance tag"
+      - "adjudicate a disputed fine (UPHELD or WAIVED)"
+    shared_operations:
+      - "create and move out residents of its own property"
+      - "read its own property, contract, residents, nights, routes, scans, fines, incidents and statements"
+      - "report, acknowledge and resolve compactor incidents"
+
+  - name: ValetOpsManager
+    description: "Regional valet operations manager: schedules service nights, assigns routes, closes nights and escalates compactor incidents to the property."
+    identity: "opaque"
+    exclusive_operations:
+      - "close a ServiceNight"
+      - "reschedule a ServiceNight (SKIP or SHIFT)"
+    shared_operations:
+      - "create service nights and route assignments"
+      - "abandon a route assignment"
+      - "create, document and deactivate valet contractors"
+      - "report, escalate and resolve compactor incidents"
+      - "read properties, contracts, residents, contractors, nights, routes, scans and incidents"
+
+  - name: ComplianceOfficer
+    description: "Worker-classification and background-screening compliance function; segregated so that the officer who screens a valet may not be the one who reclassifies it."
+    identity: "opaque"
+    exclusive_operations:
+      - "record a background-check result"
+      - "run the DECLARED or OBSERVED worker-classification screen"
+    shared_operations:
+      - "read contractors, routes, scans, fines, residents and compactor incidents"
+
+  - name: Valet
+    description: "The doorstep valet who walks a unit range: accepts routes, records scans and non-compliance tags, and reports compactor problems from the field."
+    identity: "entity_backed:ValetContractor"
+    exclusive_operations:
+      - "accept a route assignment"
+      - "complete a route assignment"
+      - "record a doorstep scan"
+    shared_operations:
+      - "abandon its own route assignment"
+      - "report a compactor incident"
+      - "read its own contractor record, its route assignments, the nights it serves and its own scans"
+
+  - name: Resident
+    description: "The apartment resident who pays the pass-through fee and may dispute a fine."
+    identity: "entity_backed:Resident"
+    exclusive_operations:
+      - "dispute a resident fine"
+    shared_operations:
+      - "read its own resident record, scans and fines"
+
+  - name: BillingAnalyst
+    description: "Revenue operations analyst who drafts and issues monthly statements; segregated so that the drafter may not issue."
+    identity: "opaque"
+    exclusive_operations: []
+    shared_operations:
+      - "draft a ServiceContract"
+      - "create a PROVISIONAL MonthlyStatement"
+      - "issue a MonthlyStatement drafted by another analyst"
+      - "read properties, contracts, residents, nights, fines and statements"

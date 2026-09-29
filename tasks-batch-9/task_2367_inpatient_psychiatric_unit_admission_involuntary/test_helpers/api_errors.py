@@ -1,0 +1,217 @@
+"""The error catalogue and its HTTP status mapping.
+
+Registering ``ERROR_HTTP_STATUS`` at import time lets ``validate_error`` cross
+check the transport status against the declared status for every error id, so a
+test that names an error id also implicitly pins its HTTP code.
+"""
+
+from enum import Enum
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId(str, Enum):
+    """Every error id the API may return (PRD 5)."""
+
+    # --- Authentication and authorization ---------------------------------
+    UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    UNAUTHORIZED = "ERR_UNAUTHORIZED"
+
+    # --- Request shape ----------------------------------------------------
+    INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+    # --- Existence --------------------------------------------------------
+    PATIENT_NOT_FOUND = "ERR_PATIENT_NOT_FOUND"
+    UNIT_NOT_FOUND = "ERR_UNIT_NOT_FOUND"
+    EVALUATION_NOT_FOUND = "ERR_EVALUATION_NOT_FOUND"
+    ADMISSION_NOT_FOUND = "ERR_ADMISSION_NOT_FOUND"
+    HOLD_NOT_FOUND = "ERR_HOLD_NOT_FOUND"
+    REFERENCED_RESOURCE_NOT_FOUND = "ERR_REFERENCED_RESOURCE_NOT_FOUND"
+
+    # --- Optimistic concurrency control -----------------------------------
+    STALE_UNIT_VERSION = "ERR_STALE_UNIT_VERSION"
+    STALE_ADMISSION_VERSION = "ERR_STALE_ADMISSION_VERSION"
+
+    # --- State machine guards ---------------------------------------------
+    EVALUATION_ALREADY_SIGNED = "ERR_EVALUATION_ALREADY_SIGNED"
+    EVALUATION_NOT_SIGNED = "ERR_EVALUATION_NOT_SIGNED"
+    HOLD_NOT_PENDING_CERTIFICATION = "ERR_HOLD_NOT_PENDING_CERTIFICATION"
+    HOLD_NOT_ACTIVE = "ERR_HOLD_NOT_ACTIVE"
+    ADMISSION_NOT_PLACEABLE = "ERR_ADMISSION_NOT_PLACEABLE"
+    ADMISSION_NOT_DISCHARGEABLE = "ERR_ADMISSION_NOT_DISCHARGEABLE"
+    PETITION_NOT_OPEN = "ERR_PETITION_NOT_OPEN"
+    HEARING_NOT_SCHEDULED = "ERR_HEARING_NOT_SCHEDULED"
+    RESTRAINT_INVALID_STATE = "ERR_RESTRAINT_INVALID_STATE"
+    DISCHARGE_REQUEST_NOT_PENDING = "ERR_DISCHARGE_REQUEST_NOT_PENDING"
+
+    # --- Segregation of duties --------------------------------------------
+    SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+
+    # --- Clinical and safety gates ----------------------------------------
+    CLINICAL_CRITERIA_NOT_MET = "ERR_CLINICAL_CRITERIA_NOT_MET"
+    SAFETY_SEARCH_INCOMPLETE = "ERR_SAFETY_SEARCH_INCOMPLETE"
+    RESTRAINT_DURATION_EXCEEDS_LIMIT = "ERR_RESTRAINT_DURATION_EXCEEDS_LIMIT"
+    SECLUSION_CAPACITY_EXCEEDED = "ERR_SECLUSION_CAPACITY_EXCEEDED"
+    FACE_TO_FACE_WINDOW_CLOSED = "ERR_FACE_TO_FACE_WINDOW_CLOSED"
+    MONITORING_INCOMPLETE = "ERR_MONITORING_INCOMPLETE"
+    OPEN_RESTRAINT_EPISODE = "ERR_OPEN_RESTRAINT_EPISODE"
+
+    # --- Statutory and judicial windows -----------------------------------
+    CERTIFICATION_WINDOW_CLOSED = "ERR_CERTIFICATION_WINDOW_CLOSED"
+    PETITION_WINDOW_CLOSED = "ERR_PETITION_WINDOW_CLOSED"
+    HEARING_SLOT_INVALID = "ERR_HEARING_SLOT_INVALID"
+    HEARING_BEYOND_HOLD_EXPIRY = "ERR_HEARING_BEYOND_HOLD_EXPIRY"
+    ADVOCATE_DOCKET_CONFLICT = "ERR_ADVOCATE_DOCKET_CONFLICT"
+    ADVOCATE_NOT_QUALIFIED = "ERR_ADVOCATE_NOT_QUALIFIED"
+
+    # --- Capacity and consent ---------------------------------------------
+    CAPACITY_LACKING = "ERR_CAPACITY_LACKING"
+    SURROGATE_REQUIRED = "ERR_SURROGATE_REQUIRED"
+    SURROGATE_SCOPE_INSUFFICIENT = "ERR_SURROGATE_SCOPE_INSUFFICIENT"
+
+    # --- Hold / discharge interaction -------------------------------------
+    NO_ACTIVE_HOLD = "ERR_NO_ACTIVE_HOLD"
+    PETITION_PENDING = "ERR_PETITION_PENDING"
+    ACTIVE_HOLD_BLOCKS_DISCHARGE = "ERR_ACTIVE_HOLD_BLOCKS_DISCHARGE"
+    DUPLICATE_DISCHARGE_REQUEST = "ERR_DUPLICATE_DISCHARGE_REQUEST"
+    CONTINUANCE_LIMIT_REACHED = "ERR_CONTINUANCE_LIMIT_REACHED"
+
+    # --- Placement --------------------------------------------------------
+    ROOM_COHORT_VIOLATION = "ERR_ROOM_COHORT_VIOLATION"
+    BED_NOT_ELIGIBLE = "ERR_BED_NOT_ELIGIBLE"
+    UNIT_POSTURE_BLOCKED = "ERR_UNIT_POSTURE_BLOCKED"
+    NO_ELIGIBLE_BED = "ERR_NO_ELIGIBLE_BED"
+
+    # --- Discharge readiness ----------------------------------------------
+    DISCHARGE_PLAN_INCOMPLETE = "ERR_DISCHARGE_PLAN_INCOMPLETE"
+    FOLLOW_UP_WINDOW_EXCEEDED = "ERR_FOLLOW_UP_WINDOW_EXCEEDED"
+
+
+#: Declared HTTP status for every error id (PRD 5).
+ERROR_HTTP_STATUS = {
+    ApiErrorId.UNAUTHENTICATED.value: 401,
+    ApiErrorId.UNAUTHORIZED.value: 403,
+    ApiErrorId.INVALID_REQUEST.value: 400,
+    ApiErrorId.PATIENT_NOT_FOUND.value: 404,
+    ApiErrorId.UNIT_NOT_FOUND.value: 404,
+    ApiErrorId.EVALUATION_NOT_FOUND.value: 404,
+    ApiErrorId.ADMISSION_NOT_FOUND.value: 404,
+    ApiErrorId.HOLD_NOT_FOUND.value: 404,
+    ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND.value: 404,
+    ApiErrorId.STALE_UNIT_VERSION.value: 412,
+    ApiErrorId.STALE_ADMISSION_VERSION.value: 412,
+    ApiErrorId.EVALUATION_ALREADY_SIGNED.value: 409,
+    ApiErrorId.EVALUATION_NOT_SIGNED.value: 409,
+    ApiErrorId.HOLD_NOT_PENDING_CERTIFICATION.value: 409,
+    ApiErrorId.HOLD_NOT_ACTIVE.value: 409,
+    ApiErrorId.ADMISSION_NOT_PLACEABLE.value: 409,
+    ApiErrorId.ADMISSION_NOT_DISCHARGEABLE.value: 409,
+    ApiErrorId.PETITION_NOT_OPEN.value: 409,
+    ApiErrorId.HEARING_NOT_SCHEDULED.value: 409,
+    ApiErrorId.RESTRAINT_INVALID_STATE.value: 409,
+    ApiErrorId.DISCHARGE_REQUEST_NOT_PENDING.value: 409,
+    ApiErrorId.SEGREGATION_OF_DUTIES.value: 409,
+    ApiErrorId.CLINICAL_CRITERIA_NOT_MET.value: 422,
+    ApiErrorId.SAFETY_SEARCH_INCOMPLETE.value: 409,
+    ApiErrorId.RESTRAINT_DURATION_EXCEEDS_LIMIT.value: 422,
+    ApiErrorId.SECLUSION_CAPACITY_EXCEEDED.value: 409,
+    ApiErrorId.FACE_TO_FACE_WINDOW_CLOSED.value: 409,
+    ApiErrorId.MONITORING_INCOMPLETE.value: 409,
+    ApiErrorId.OPEN_RESTRAINT_EPISODE.value: 409,
+    ApiErrorId.CERTIFICATION_WINDOW_CLOSED.value: 409,
+    ApiErrorId.PETITION_WINDOW_CLOSED.value: 422,
+    ApiErrorId.HEARING_SLOT_INVALID.value: 422,
+    ApiErrorId.HEARING_BEYOND_HOLD_EXPIRY.value: 422,
+    ApiErrorId.ADVOCATE_DOCKET_CONFLICT.value: 409,
+    ApiErrorId.ADVOCATE_NOT_QUALIFIED.value: 422,
+    ApiErrorId.CAPACITY_LACKING.value: 409,
+    ApiErrorId.SURROGATE_REQUIRED.value: 422,
+    ApiErrorId.SURROGATE_SCOPE_INSUFFICIENT.value: 409,
+    ApiErrorId.NO_ACTIVE_HOLD.value: 409,
+    ApiErrorId.PETITION_PENDING.value: 409,
+    ApiErrorId.ACTIVE_HOLD_BLOCKS_DISCHARGE.value: 409,
+    ApiErrorId.DUPLICATE_DISCHARGE_REQUEST.value: 409,
+    ApiErrorId.CONTINUANCE_LIMIT_REACHED.value: 409,
+    ApiErrorId.ROOM_COHORT_VIOLATION.value: 409,
+    ApiErrorId.BED_NOT_ELIGIBLE.value: 409,
+    ApiErrorId.UNIT_POSTURE_BLOCKED.value: 409,
+    ApiErrorId.NO_ELIGIBLE_BED.value: 409,
+    ApiErrorId.DISCHARGE_PLAN_INCOMPLETE.value: 409,
+    ApiErrorId.FOLLOW_UP_WINDOW_EXCEEDED.value: 422,
+}
+
+
+#: The entity-specific not-found error each collection raises for an unknown id.
+NOT_FOUND_BY_COLLECTION = {
+    "patients": ApiErrorId.PATIENT_NOT_FOUND,
+    "units": ApiErrorId.UNIT_NOT_FOUND,
+    "evaluations": ApiErrorId.EVALUATION_NOT_FOUND,
+    "admissions": ApiErrorId.ADMISSION_NOT_FOUND,
+    "holds": ApiErrorId.HOLD_NOT_FOUND,
+    "clinicians": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "beds": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "petitions": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "hearings": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "restraints": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "capacity-determinations": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "medication-consents": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+    "discharge-requests": ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND,
+}
+
+
+#: Priority order of the checks, first failing check terminating the request
+#: (PRD 2.9). Lower numbers win.
+CHECK_PRIORITY = {
+    ApiErrorId.UNAUTHENTICATED: 1,
+    ApiErrorId.UNAUTHORIZED: 2,
+    ApiErrorId.INVALID_REQUEST: 3,
+    ApiErrorId.PATIENT_NOT_FOUND: 4,
+    ApiErrorId.UNIT_NOT_FOUND: 5,
+    ApiErrorId.EVALUATION_NOT_FOUND: 6,
+    ApiErrorId.ADMISSION_NOT_FOUND: 7,
+    ApiErrorId.HOLD_NOT_FOUND: 8,
+    ApiErrorId.REFERENCED_RESOURCE_NOT_FOUND: 9,
+    ApiErrorId.STALE_UNIT_VERSION: 10,
+    ApiErrorId.STALE_ADMISSION_VERSION: 11,
+    ApiErrorId.EVALUATION_ALREADY_SIGNED: 12,
+    ApiErrorId.EVALUATION_NOT_SIGNED: 13,
+    ApiErrorId.HOLD_NOT_PENDING_CERTIFICATION: 14,
+    ApiErrorId.HOLD_NOT_ACTIVE: 15,
+    ApiErrorId.ADMISSION_NOT_PLACEABLE: 16,
+    ApiErrorId.ADMISSION_NOT_DISCHARGEABLE: 17,
+    ApiErrorId.PETITION_NOT_OPEN: 18,
+    ApiErrorId.HEARING_NOT_SCHEDULED: 19,
+    ApiErrorId.RESTRAINT_INVALID_STATE: 20,
+    ApiErrorId.DISCHARGE_REQUEST_NOT_PENDING: 21,
+    ApiErrorId.SEGREGATION_OF_DUTIES: 22,
+    ApiErrorId.CLINICAL_CRITERIA_NOT_MET: 23,
+    ApiErrorId.SAFETY_SEARCH_INCOMPLETE: 24,
+    ApiErrorId.RESTRAINT_DURATION_EXCEEDS_LIMIT: 25,
+    ApiErrorId.SECLUSION_CAPACITY_EXCEEDED: 26,
+    ApiErrorId.FACE_TO_FACE_WINDOW_CLOSED: 27,
+    ApiErrorId.MONITORING_INCOMPLETE: 28,
+    ApiErrorId.OPEN_RESTRAINT_EPISODE: 29,
+    ApiErrorId.CERTIFICATION_WINDOW_CLOSED: 30,
+    ApiErrorId.PETITION_WINDOW_CLOSED: 31,
+    ApiErrorId.HEARING_SLOT_INVALID: 32,
+    ApiErrorId.HEARING_BEYOND_HOLD_EXPIRY: 33,
+    ApiErrorId.ADVOCATE_DOCKET_CONFLICT: 34,
+    ApiErrorId.ADVOCATE_NOT_QUALIFIED: 35,
+    ApiErrorId.CAPACITY_LACKING: 36,
+    ApiErrorId.SURROGATE_REQUIRED: 37,
+    ApiErrorId.SURROGATE_SCOPE_INSUFFICIENT: 38,
+    ApiErrorId.NO_ACTIVE_HOLD: 39,
+    ApiErrorId.PETITION_PENDING: 40,
+    ApiErrorId.ACTIVE_HOLD_BLOCKS_DISCHARGE: 41,
+    ApiErrorId.DUPLICATE_DISCHARGE_REQUEST: 42,
+    ApiErrorId.CONTINUANCE_LIMIT_REACHED: 43,
+    ApiErrorId.ROOM_COHORT_VIOLATION: 44,
+    ApiErrorId.BED_NOT_ELIGIBLE: 45,
+    ApiErrorId.DISCHARGE_PLAN_INCOMPLETE: 46,
+    ApiErrorId.FOLLOW_UP_WINDOW_EXCEEDED: 47,
+    ApiErrorId.UNIT_POSTURE_BLOCKED: 48,
+    ApiErrorId.NO_ELIGIBLE_BED: 49,
+}
+
+
+set_error_http_status_map(ERROR_HTTP_STATUS)

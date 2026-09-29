@@ -1,0 +1,96 @@
+"""Domain constants for the supply-chain-finance / dynamic-discounting API."""
+
+# ─── Logical clock ────────────────────────────────────
+# The server's logical clock reads exactly this instant before the first
+# POST /_clock/set_current_utc call and never falls back to wall-clock time.
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# ─── Day-count / settlement ───────────────────────────
+DAY_COUNT_BASIS = 360
+SETTLEMENT_LAG_DAYS = 2
+
+# ─── Negotiation / onboarding budgets ─────────────────
+MAX_COUNTER_ROUNDS = 3
+MAX_MICRO_DEPOSIT_ATTEMPTS = 3
+SESSION_COOLDOWN_MINUTES = 60
+
+# ─── Adoption bands and rate-optimisation factors ─────
+ADOPTION_OPTIMISED_PCT = 25.00
+ADOPTION_THROTTLED_PCT = 60.00
+OPTIMISED_FACTOR_PCT = 90
+THROTTLED_FACTOR_PCT = 75
+MIN_FLOOR_APR_BPS = 200
+
+# ─── Funder selection scoring ─────────────────────────
+FUNDER_APR_SPREAD_CAP_BPS = 400
+FUNDER_CAPACITY_BONUS = 150
+
+# ─── Funder fee tiers, keyed on the pre-fee net ───────
+FEE_TIER_BPS_UNDER_5M = 45
+FEE_TIER_BPS_5M_TO_25M = 30
+FEE_TIER_BPS_25M_AND_OVER = 18
+FEE_TIER_LOWER_BOUND_CENTS = 5_000_000
+FEE_TIER_UPPER_BOUND_CENTS = 25_000_000
+
+# ─── APR bounds on a programme ────────────────────────
+PROGRAM_APR_MIN_BPS = 200
+PROGRAM_APR_MAX_BPS = 5000
+
+# ─── Pagination ───────────────────────────────────────
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ─── Programme defaults ───────────────────────────────
+DEFAULT_MIN_DAYS_EARLY = 5
+DEFAULT_CONCENTRATION_CAP_PCT = 60.00
+DEFAULT_FUNDING_POLICY = "SELF_THEN_FUNDER"
+DEFAULT_RECLASS_DAYS_THRESHOLD = 30
+DEFAULT_RECLASS_APR_THRESHOLD_BPS = 900
+
+# ─── Enumerations ─────────────────────────────────────
+ROLES = ("BuyerAdmin", "BuyerTreasury", "Supplier", "Funder", "PlatformOps")
+
+BUYER_STATUSES = ("ACTIVE", "SUSPENDED")
+PROGRAM_TYPES = ("SUPPLIER_NAMED", "FIXED_RATE")
+FUNDING_POLICIES = ("SELF_ONLY", "FUNDER_ONLY", "SELF_THEN_FUNDER")
+PROGRAM_STATUSES = ("DRAFT", "OPEN", "PAUSED", "CLOSED")
+RATE_POSTURES = ("DISCOVERY", "OPTIMISED", "THROTTLED")
+SESSION_STATUSES = ("SCHEDULED", "LIVE", "CLOSED", "CANCELLED")
+SUPPLIER_ONBOARDING_STATUSES = ("DRAFT", "VERIFYING", "ACTIVE", "REJECTED", "SUSPENDED")
+IDV_STATUSES = ("NOT_STARTED", "PENDING", "MANUAL_REVIEW", "PASSED", "FAILED")
+BANK_AXIS_STATUSES = ("NOT_STARTED", "MICRO_DEPOSIT_SENT", "VERIFIED", "FAILED")
+BANK_ACCOUNT_STATUSES = ("MICRO_DEPOSIT_SENT", "VERIFIED", "FAILED", "REPLACED")
+INGEST_STATUSES = ("ACCEPTED", "PARTIALLY_ACCEPTED", "REJECTED")
+INVOICE_STATUSES = (
+    "ELIGIBLE", "OFFERED", "AWARDED", "EARLY_PAID", "MATURED", "SUPPRESSED",
+)
+DISPUTE_STATUSES = ("OPEN", "WITHDRAWN", "RESOLVED_UPHELD", "RESOLVED_REJECTED")
+DISPUTE_RESOLUTIONS = ("WITHDRAWN", "REJECTED", "UPHELD")
+DISPUTE_REASON_CODES = (
+    "BUYER_FILE_SUPPRESSION", "SHORT_SHIPMENT", "PRICE_VARIANCE", "GOODS_REJECTED",
+)
+OFFER_STATUSES = (
+    "NAMED", "COUNTERED", "ACCEPTED", "EXPIRED", "SUPERSEDED",
+    "VOIDED_BY_SUPPRESSION",
+)
+FUNDER_STATUSES = ("ACTIVE", "PAUSED", "WITHDRAWN")
+COMMITMENT_STATUSES = ("ACTIVE", "EXPIRED")
+FUNDING_SOURCES = ("BUYER_SELF", "FUNDER")
+FUNDING_STATUSES = ("RESERVED", "DEPLOYED", "RELEASED", "VOID")
+SETTLEMENT_STATUSES = ("UNSENT", "REMITTED", "CONFIRMED", "FAILED")
+ACCOUNTING_STATUSES = ("UNCLASSIFIED", "TRADE_PAYABLE", "DEBT_RECLASSIFIED")
+DELIVERY_STATUSES = ("SENT", "BOUNCED")
+
+# Row-level rejection reasons recorded by payable-file ingestion.
+ROW_REJECTION_REASONS = (
+    "SUPPLIER_UNKNOWN",
+    "DUPLICATE_INVOICE_NUMBER",
+    "NON_POSITIVE_AMOUNT",
+    "DUE_DATE_NOT_AFTER_APPROVAL",
+    "EMPTY_LINES",
+)
+
+# Entities whose rows carry only id + created_at (no updated_at, no version).
+APPEND_ONLY_ENTITIES = ("ApprovedPayableFile", "InvoiceLine", "RemittanceAdvice")

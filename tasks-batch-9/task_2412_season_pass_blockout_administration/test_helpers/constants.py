@@ -1,0 +1,88 @@
+"""Literal constants the PRD pins for the season pass domain.
+
+Every value here is stated explicitly by the PRD; nothing is inferred.
+"""
+
+# --- logical clock ---
+# "Until it has been set explicitly, the logical clock reads 2026-08-01T00:00:00Z."
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# --- pagination (PRD listing conventions) ---
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+# --- pass programme threshold defaults ---
+DEFAULT_CAPACITY_PEAK_THRESHOLD_PCT = 0.85
+DEFAULT_CAPACITY_LOCK_THRESHOLD_PCT = 0.97
+DEFAULT_CAPACITY_LOCK_BLOCKOUT_MAX_RANK = 2
+DEFAULT_DELINQUENCY_SUSPENSION_THRESHOLD = 2
+DEFAULT_DEFAULT_THRESHOLD = 3
+DEFAULT_SHARING_CASE_AUTO_OPEN_SCORE = 65
+
+# --- programme lifecycle ---
+PROGRAM_STATUS_PATH = [
+    "DESIGN",
+    "SALES_OPEN",
+    "SEASON_ACTIVE",
+    "RENEWAL_OPEN",
+    "CLOSED",
+]
+
+# --- tier constraints ---
+MIN_TIER_RANK = 1
+MAX_TIER_RANK = 9
+MIN_BASE_PRICE_CENTS = 1000
+MIN_IN_PARK_DISCOUNT_PCT = 0.0
+MAX_IN_PARK_DISCOUNT_PCT = 0.30
+MIN_PEAK_RESERVATION_QUOTA = 1
+MAX_PEAK_RESERVATION_QUOTA = 20
+
+# --- park day capacity posture ---
+RESERVATION_SLOT_SHARE = 0.10  # floor(capacity_total * 0.10)
+WINDOW_SLOT_DIVISOR = 2  # floor(reservation_slot_capacity / 2), never below 1
+MIN_WINDOW_SLOT_CAPACITY = 1
+
+# --- payment plans ---
+PLAN_SETUP_FEE_CENTS = 1500
+MIN_INSTALLMENT_COUNT = 3
+MAX_INSTALLMENT_COUNT = 10
+MIN_DOWN_PAYMENT_RATE = 0.20
+
+# --- gate operating window ---
+GATE_OPEN_HOUR_UTC = 8
+GATE_CLOSE_HOUR_UTC = 22
+
+# --- anti-passback ---
+ANTIPASSBACK_BUFFER_MINUTES = 90
+
+# --- sharing risk scoring ---
+GATE_CLUSTER_DISTINCT_GATE_POINTS = 40
+GATE_CLUSTER_PHOTO_MISMATCH_POINTS = 25
+ROLLING_WINDOW_PER_ENTRY_POINTS = 15
+ROLLING_WINDOW_PHOTO_MISMATCH_POINTS = 35
+ROLLING_WINDOW_FREE_ENTRIES = 3
+ROLLING_WINDOW_DAYS = 7
+
+# --- upgrade orders ---
+UPGRADE_FEE_BAND_LOW_MAX_CENTS = 5000
+UPGRADE_FEE_BAND_MID_MAX_CENTS = 20000
+UPGRADE_FEE_LOW_CENTS = 0
+UPGRADE_FEE_MID_CENTS = 1000
+UPGRADE_FEE_HIGH_CENTS = 2500
+UPGRADE_QUOTE_VALID_DAYS = 14
+
+# --- renewal quote ---
+EARLY_BIRD_DISCOUNT_RATE = 0.15
+RETENTION_CREDIT_HIGH_CENTS = 3000  # visit_count >= 10
+RETENTION_CREDIT_HIGH_MIN_VISITS = 10
+RETENTION_CREDIT_LOW_CENTS = 1500  # visit_count >= 5
+RETENTION_CREDIT_LOW_MIN_VISITS = 5
+RETENTION_CREDIT_CAP_RATE = 0.20
+
+# --- sharing case ---
+MAX_REVIEW_ROUND_FOR_APPEAL = 2
+SYSTEM_OPENED_BY_USER_ID = "SYSTEM"
+
+# --- a syntactically valid UUID that names nothing ---
+UNKNOWN_UUID = "8a3e1c0b-2f4d-4a91-9c8b-12e7b6a0f1d2"

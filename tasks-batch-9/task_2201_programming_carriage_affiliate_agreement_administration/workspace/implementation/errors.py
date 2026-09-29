@@ -1,0 +1,90 @@
+"""Error catalogue (PRD section 5 / scaffold Table 1.6)."""
+
+ERROR_HTTP = {
+    # auth / authz / shape
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_DISTRIBUTOR_SCOPE_VIOLATION": 403,
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_DISTRIBUTOR_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_REPORT_NOT_FOUND": 404,
+    "ERR_ENGAGEMENT_NOT_FOUND": 404,
+    "ERR_FINDING_NOT_FOUND": 404,
+    "ERR_TITLE_NOT_FOUND": 404,
+    "ERR_WINDOW_NOT_FOUND": 404,
+    "ERR_BLACKOUT_NOT_FOUND": 404,
+    "ERR_COMMITMENT_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_MFN_CLAUSE_NOT_FOUND": 404,
+    "ERR_ANALYSIS_NOT_FOUND": 404,
+    "ERR_RATE_CARD_ENTRY_NOT_FOUND": 404,
+    # optimistic concurrency
+    "ERR_STALE_AGREEMENT_VERSION": 412,
+    "ERR_STALE_DISTRIBUTOR_VERSION": 412,
+    # own-entity state
+    "ERR_INVALID_AGREEMENT_STATE": 409,
+    "ERR_INVALID_RENEWAL_STATE": 409,
+    "ERR_INVALID_REPORT_STATE": 409,
+    "ERR_INVALID_ENGAGEMENT_STATE": 409,
+    "ERR_INVALID_WINDOW_STATE": 409,
+    "ERR_INVALID_INVOICE_STATE": 409,
+    "ERR_INVALID_BLACKOUT_STATE": 409,
+    "ERR_INVALID_MFN_STATE": 409,
+    # cross-entity state
+    "ERR_AGREEMENT_NOT_EXECUTED": 409,
+    "ERR_DISTRIBUTOR_CREDIT_HOLD": 409,
+    "ERR_TITLE_RIGHTS_NOT_CLEARED": 409,
+    # territorial / blackout compliance
+    "ERR_BLACKOUT_SEPARATION_VIOLATION": 409,
+    "ERR_BLACKOUT_MONTHLY_CAP_EXCEEDED": 422,
+    "ERR_BLACKOUT_WINDOW_CONFLICT": 409,
+    "ERR_SUBSTITUTION_TITLE_REQUIRED": 422,
+    # rights / packaging / uniqueness
+    "ERR_WINDOW_EXCLUSIVITY_CONFLICT": 409,
+    "ERR_WINDOW_CONCURRENCY_CAP_EXCEEDED": 422,
+    "ERR_HOLDBACK_NOT_SATISFIED": 422,
+    "ERR_DUPLICATE_ACCEPTED_PERIOD": 409,
+    "ERR_MULTIPLE_ACTIVE_MFN_CLAUSES": 409,
+    "ERR_DUPLICATE_CONTRACT_CODE": 409,
+    "ERR_RESTATEMENT_TARGET_INVALID": 422,
+    # temporal
+    "ERR_PERIOD_OUTSIDE_TERM": 422,
+    "ERR_WINDOW_OUTSIDE_TERM": 422,
+    "ERR_RENEWAL_WINDOW_NOT_OPEN": 422,
+    "ERR_WRITE_OFF_TOO_EARLY": 422,
+    "ERR_AUDIT_RIGHTS_EXPIRED": 422,
+    "ERR_COMMITMENT_DEADLINE_PASSED": 422,
+    "ERR_CLOCK_MUST_MOVE_FORWARD": 422,
+    # referential / billing integrity
+    "ERR_AUDIT_PERIOD_NOT_REPORTED": 422,
+    "ERR_REPORT_ALREADY_BILLED": 409,
+    "ERR_NO_BILLABLE_REPORTS": 422,
+    "ERR_RECOVERY_ALREADY_INVOICED": 409,
+    "ERR_NO_AUDIT_FINDINGS": 422,
+    "ERR_FINDINGS_PRESENT_CANNOT_CLOSE": 409,
+    "ERR_RENEWAL_REQUIRES_ANALYSIS": 422,
+    "ERR_OPEN_RECEIVABLE_BLOCKS_TERMINATION": 409,
+    "ERR_BREACH_COUNT_NOT_CLEARED": 409,
+    # fiscal
+    "ERR_MARKETING_OVEREARN": 422,
+    "ERR_PAYMENT_EXCEEDS_BALANCE": 422,
+    "ERR_INVOICE_ZERO_NET_DUE": 422,
+    "ERR_PENETRATION_FLOOR_UNENFORCEABLE": 422,
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request pipeline; rendered by app.py."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

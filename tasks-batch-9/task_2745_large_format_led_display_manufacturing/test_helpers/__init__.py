@@ -1,0 +1,90 @@
+"""Test infrastructure for the LED Display Manufacturing API.
+
+Importing this package registers the error/HTTP-status cross-check used by the
+shared response validators, and re-exports the client, the payload factories,
+the domain assertions, the business constants and the composite fixtures.
+"""
+
+from . import api_errors, assertions, constants, factories, fixtures, types
+from .api_client import LedDisplayApiClient
+from .api_errors import ERROR_HTTP_STATUS
+from .assertions import (
+    assert_2dp,
+    assert_4dp,
+    assert_6dp,
+    assert_case_fields,
+    assert_cabinet_fields,
+    assert_cents,
+    assert_chamber_fields,
+    assert_common_fields,
+    assert_contract_fields,
+    assert_fields_absent_or_null,
+    assert_id_sequence,
+    assert_instant_equals,
+    assert_instant_format,
+    assert_module_fields,
+    assert_no_pagination_meta,
+    assert_ordered_by_created_at,
+    assert_page_meta,
+    assert_project_fields,
+    assert_run_fields,
+    assert_version,
+    assert_visit_fields,
+    ids_of,
+    normalize_instant,
+)
+from .fixtures import PlantWorkspace, Scene
+from .test_users import (
+    make_design_engineer_headers,
+    make_field_engineer_headers,
+    make_headers,
+    make_plant_admin_headers,
+    make_production_operator_headers,
+    make_qa_engineer_headers,
+    make_service_manager_headers,
+    make_structural_reviewer_headers,
+)
+
+__all__ = [
+    "api_errors",
+    "assertions",
+    "constants",
+    "factories",
+    "fixtures",
+    "types",
+    "LedDisplayApiClient",
+    "ERROR_HTTP_STATUS",
+    "PlantWorkspace",
+    "Scene",
+    "assert_2dp",
+    "assert_4dp",
+    "assert_6dp",
+    "assert_cabinet_fields",
+    "assert_case_fields",
+    "assert_cents",
+    "assert_chamber_fields",
+    "assert_common_fields",
+    "assert_contract_fields",
+    "assert_fields_absent_or_null",
+    "assert_id_sequence",
+    "assert_instant_equals",
+    "assert_instant_format",
+    "assert_module_fields",
+    "assert_no_pagination_meta",
+    "assert_ordered_by_created_at",
+    "assert_page_meta",
+    "assert_project_fields",
+    "assert_run_fields",
+    "assert_version",
+    "assert_visit_fields",
+    "ids_of",
+    "normalize_instant",
+    "make_design_engineer_headers",
+    "make_field_engineer_headers",
+    "make_headers",
+    "make_plant_admin_headers",
+    "make_production_operator_headers",
+    "make_qa_engineer_headers",
+    "make_service_manager_headers",
+    "make_structural_reviewer_headers",
+]

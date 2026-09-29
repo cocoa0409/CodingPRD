@@ -1,0 +1,134 @@
+"""Domain thresholds and rate tables taken from the PRD's pricing rules."""
+
+# --- Producers and inspectors (PRD §3.1) ---------------------------------
+DEFAULT_AUTHORITY_LIMIT_CENTS = 5_000_000
+DEFAULT_DAILY_CAPACITY_MINUTES = 480
+MIN_DAILY_CAPACITY_MINUTES = 30
+
+# --- Logical clock (PRD §2.4) --------------------------------------------
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# --- Policy term (PRD §3.2) ---------------------------------------------
+MIN_TERM_DAYS = 90
+
+# --- Scheduled item valuation (PRD §3.3) --------------------------------
+DEPRECIATION_RATE_PER_YEAR = {
+    "DWELLING": 0.015,
+    "FARM_STRUCTURE": 0.025,
+    "EQUIPMENT": 0.070,
+    "STORED_CROP": 0.0,
+    "HAY": 0.0,
+    "INPUTS": 0.0,
+}
+MAX_DEPRECIATION_FRACTION = 0.60
+CONDITION_FACTOR = {"A": 1.00, "B": 0.92, "C": 0.80, "D": 0.45}
+SALVAGE_FLOOR_FRACTION = 0.20
+ITEM_CLASS_CAP_CENTS = {
+    "DWELLING": 120_000_000,
+    "FARM_STRUCTURE": 60_000_000,
+    "EQUIPMENT": 40_000_000,
+    "STORED_CROP": 25_000_000,
+    "HAY": 15_000_000,
+    "INPUTS": 10_000_000,
+}
+SEASONAL_ITEM_CLASSES = ("STORED_CROP", "HAY", "INPUTS")
+NON_SEASONAL_ITEM_CLASSES = ("DWELLING", "FARM_STRUCTURE", "EQUIPMENT")
+
+# --- Livestock and liability (PRD §3.4) ---------------------------------
+PER_HEAD_AGGREGATE_CAP_CENTS = 30_000_000
+BLANKET_COINSURANCE_PCT = 0.80
+
+GENERAL_FARM_BASE_CENTS = 25_000
+GENERAL_FARM_PER_ACRE_CENTS = 90
+GENERAL_FARM_CAP_CENTS = 500_000
+
+CUSTOM_FARMING_BASE_CENTS = 45_000
+CUSTOM_FARMING_RECEIPTS_RATE = 0.0075
+CUSTOM_FARMING_CAP_CENTS = 900_000
+
+AGRITOURISM_BASE_CENTS = 60_000
+AGRITOURISM_FREE_VISITORS = 500
+AGRITOURISM_PER_VISITOR_CENTS = 120
+AGRITOURISM_RECEIPTS_RATE = 0.0040
+AGRITOURISM_CAP_CENTS = 800_000
+
+ROADSIDE_STAND_BASE_CENTS = 30_000
+ROADSIDE_STAND_RECEIPTS_RATE = 0.0050
+ROADSIDE_STAND_CAP_CENTS = 300_000
+
+# --- Labor and workers-compensation coordination (PRD §3.5) -------------
+LABOR_WEIGHT_FULL_TIME = 1.00
+LABOR_WEIGHT_SEASONAL = 0.50
+LABOR_WEIGHT_MIGRANT_H2A = 0.75
+WC_REQUIRED_THRESHOLD_UNITS = 6.00
+
+# --- Rating (PRD §3.6) --------------------------------------------------
+PROPERTY_RATE = {
+    "DWELLING": 0.0040,
+    "FARM_STRUCTURE": 0.0065,
+    "EQUIPMENT": 0.0090,
+    "STORED_CROP": 0.0110,
+    "HAY": 0.0135,
+    "INPUTS": 0.0120,
+}
+SPECIES_RATE = {
+    "CATTLE": 0.0125,
+    "SWINE": 0.0180,
+    "POULTRY": 0.0240,
+    "SHEEP": 0.0150,
+    "EQUINE": 0.0300,
+}
+PERIL_SCOPE_FACTOR = {"FULL_PERIL": 1.00, "NAMED_PERIL": 0.85, "CATASTROPHE_ONLY": 0.60}
+CAT_RATE = {"HAIL": 0.0032, "WIND": 0.0021, "WILDFIRE": 0.0045}
+CAT_PERIL_ORDER = ("HAIL", "WIND", "WILDFIRE")
+QUOTE_VALIDITY_DAYS = 30
+
+# Deductible credit bands: a deductible below 100000 earns 1.00, below 500000
+# earns 0.95, below 1000000 earns 0.90, and 1000000 or more earns 0.85.
+DEDUCTIBLE_CREDIT_BANDS = ((100_000, 1.00), (500_000, 0.95), (1_000_000, 0.90))
+DEDUCTIBLE_CREDIT_TOP = 0.85
+
+# Scarcity bands on the prospective utilization ratio.
+SCARCITY_BANDS = ((0.50, 1.00), (0.75, 1.15), (0.90, 1.35), (1.00, 1.60))
+
+# Referral triggers.
+REFERRAL_TIV_LIMIT_CENTS = 250_000_000
+REFERRAL_AGRITOURISM_VISITORS = 2000
+REFERRAL_CAT_UTILIZATION = 0.90
+REFERRAL_HAZARD_SCORE = 40
+
+# --- Endorsements (PRD §3.8) -------------------------------------------
+POLLUTION_BUYBACK_RATE = 0.0150
+POLLUTION_BUYBACK_MIN_CENTS = 75_000
+CHEMICAL_BUYBACK_RATE = 0.0220
+CHEMICAL_BUYBACK_MIN_CENTS = 90_000
+AGRITOURISM_LIABILITY_RATE = 0.0090
+AGRITOURISM_LIABILITY_FLAT_CENTS = 25_000
+PEAK_SEASON_INCREASE_RATE = 0.0110
+INSPECTION_REQUIRING_FORMS = ("POLLUTION_BUYBACK", "CHEMICAL_APPLICATION_BUYBACK")
+BUYBACK_MAX_HAZARD_SCORE = 35
+
+# --- Loss control (PRD §3.9) -------------------------------------------
+TRAVEL_BUFFER_MINUTES = 90
+MIN_INSPECTION_MINUTES = 30
+MAX_INSPECTION_MINUTES = 480
+HAZARD_BASE_SCORE = {"INITIAL": 10, "RE_INSPECTION": 5, "LOSS_TRIGGERED": 20}
+SEVERITY_WEIGHT = {"CRITICAL": 30, "MAJOR": 12, "MINOR": 4}
+HAZARD_SCORE_CAP = 100
+
+# --- Pagination (PRD §2.3) ---------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+SWEEP_COUNTERS = (
+    "policies_scanned",
+    "recommendations_marked_overdue",
+    "policies_marked_recs_overdue",
+    "policies_suspended",
+    "labor_profiles_lapsed",
+)
+
+
+__all__ = [name for name in dir() if name.isupper()]

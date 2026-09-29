@@ -1,0 +1,49 @@
+"""Barrel export: framework generics + PRD-specific helpers."""
+
+# Framework generics (re-exported so tests have one import source).
+from prd_bench_local_runner.testing import (  # noqa: F401
+    validate_success,
+    validate_error,
+    validate_paginated,
+    validate_error_is_one_of,
+    get_success_data,
+    is_valid_uuid,
+    is_iso8601_timestamp,
+    assert_cost_precision,
+    assert_version_incremented,
+    assert_timestamp_format,
+    assert_race_outcome,
+    assert_exactly_one_succeeds,
+    assert_at_least_one_succeeds,
+    run_race,
+    build_user_headers,
+    NON_EXISTENT_UUID,
+)
+
+# PRD-specific.
+from .types import *  # noqa: F401,F403
+from .api_client import api_client, ApiClient  # noqa: F401
+from .api_errors import ApiErrorId, HTTP_STATUS_CODES  # noqa: F401
+from .assertions import *  # noqa: F401,F403
+from .factories import *  # noqa: F401,F403
+from .constants import *  # noqa: F401,F403
+from .test_users import (  # noqa: F401
+    TEST_USERS,
+    make_interpreter_headers,
+    make_program_admin_headers,
+    make_quality_reviewer_headers,
+    make_scheduling_coordinator_headers,
+    make_credentialing_officer_headers,
+    make_fiscal_officer_headers,
+    make_headers,
+    PROGRAM_ADMIN_USER_ID,
+    PROGRAM_ADMIN_ALT_USER_ID,
+    CREDENTIALING_OFFICER_USER_ID,
+    SCHEDULING_COORDINATOR_USER_ID,
+    FISCAL_OFFICER_USER_ID,
+    FISCAL_OFFICER_ALT_USER_ID,
+    QUALITY_REVIEWER_USER_ID,
+    QUALITY_REVIEWER_ALT_USER_ID,
+    QUALITY_REVIEWER_THIRD_USER_ID,
+)
+from .fixtures import *  # noqa: F401,F403

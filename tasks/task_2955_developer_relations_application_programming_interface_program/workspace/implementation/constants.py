@@ -1,0 +1,247 @@
+"""Domain constants for the developer-relations API programme."""
+from decimal import Decimal
+
+# ---------------------------------------------------------------- auth / roles
+HEADER_USER_ID = "X-User-ID"
+HEADER_USER_ROLE = "X-User-Role"
+
+ROLE_DEVELOPER = "Developer"
+ROLE_DEVREL_MANAGER = "DevRelManager"
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+ROLE_TRUST_SAFETY = "TrustAndSafetyOfficer"
+ROLE_PARTNER_SUPPORT = "PartnerSupportAgent"
+ROLE_ANONYMOUS = "Anonymous"
+
+ALL_ROLES = [
+    ROLE_DEVELOPER,
+    ROLE_DEVREL_MANAGER,
+    ROLE_PLATFORM_ADMIN,
+    ROLE_TRUST_SAFETY,
+    ROLE_PARTNER_SUPPORT,
+    ROLE_ANONYMOUS,
+]
+
+# --------------------------------------------------------------- pagination
+PAGE_LIMIT_DEFAULT = 10
+PAGE_LIMIT_MIN = 1
+PAGE_LIMIT_MAX = 100
+PAGE_OFFSET_DEFAULT = 0
+PAGE_OFFSET_MIN = 0
+
+# --------------------------------------------------------------- logical clock
+DEFAULT_CLOCK = "2026-08-01T00:00:00.000Z"
+
+# --------------------------------------------------------------- enumerations
+REGION_CODES = ["US", "EU", "APAC"]
+ONBOARDING_STATES = [
+    "REGISTERED",
+    "DOCS_ACKNOWLEDGED",
+    "SANDBOX_VALIDATED",
+    "PRODUCTION_ACTIVE",
+]
+STANDINGS = ["GOOD_STANDING", "UNDER_REVIEW", "RESTRICTED", "REVOKED"]
+DIRECTORY_STATES = ["NOT_LISTED", "PENDING_REVIEW", "LISTED", "DELISTED"]
+CERTIFICATION_LEVELS = ["NONE", "ASSOCIATE", "PROFESSIONAL"]
+
+DATA_SENSITIVITIES = ["PUBLIC", "PERSONAL", "FINANCIAL"]
+SCOPE_SENSITIVITIES = ["PUBLIC", "PERSONAL", "FINANCIAL"]
+
+LIFECYCLE_STATES = [
+    "PREVIEW",
+    "GENERAL_AVAILABILITY",
+    "DEPRECATION_ANNOUNCED",
+    "SUNSET",
+]
+
+TIERS = ["SANDBOX", "STANDARD", "PARTNER", "PRIVILEGED"]
+APPLICATION_STATES = [
+    "DRAFT",
+    "SUBMITTED",
+    "UNDER_REVIEW",
+    "CHANGES_REQUESTED",
+    "APPROVED",
+    "REJECTED",
+]
+ENTITLEMENT_STATES = ["PROVISIONED", "ACTIVE", "SUSPENDED", "RETIRED"]
+THROTTLE_STATES = ["NORMAL", "SOFT_THROTTLED", "HARD_THROTTLED"]
+UPGRADE_STATES = [
+    "PENDING",
+    "GRANTED",
+    "PARTIALLY_GRANTED",
+    "DEFERRED",
+    "VOIDED",
+    "SUPERSEDED",
+]
+DENIAL_REASONS = ["POOL_EXHAUSTED", "STANDING_BLOCKED"]
+ATTRIBUTION_VARIANTS = ["BURST_ISOLATED", "BURST_INCLUSIVE"]
+LEASE_STATES = ["ACTIVE", "RELEASED", "EXPIRED", "REVOKED"]
+LEASE_CLOSED_REASONS = [
+    "DEVELOPER_RELEASE",
+    "CHECKPOINT_EXPIRY",
+    "STANDING_CASCADE",
+]
+VIOLATION_CATEGORIES = ["RATE_ABUSE", "SCOPE_OVERREACH", "DATA_RETENTION", "RESALE"]
+SEVERITIES_LMH = ["LOW", "MEDIUM", "HIGH"]
+CASE_STATES = [
+    "OPENED",
+    "INVESTIGATING",
+    "UPHELD",
+    "APPEALED",
+    "UPHELD_FINAL",
+    "DISMISSED",
+]
+CASE_OUTCOMES = ["UPHELD", "DISMISSED"]
+SUPPORT_KINDS = ["PARTNER_TICKET", "PLATFORM_INCIDENT"]
+SUPPORT_SEVERITIES = ["S1", "S2", "S3", "S4"]
+SUPPORT_STATES = ["OPEN", "RESPONDING", "ESCALATED", "RESOLVED"]
+FEEDBACK_CATEGORIES = ["DEFECT", "MISSING_FEATURE", "DX_FRICTION", "DOC_GAP"]
+FEEDBACK_STATES = ["SUBMITTED", "TRIAGED", "ROADMAP_ACCEPTED", "DECLINED"]
+AUTHOR_TOP_TIERS = ["NONE", "SANDBOX", "STANDARD", "PARTNER", "PRIVILEGED"]
+
+# --------------------------------------------------------------- onboarding
+CURRENT_DOCS_VERSION = 2
+
+# --------------------------------------------------------------- trust score
+TRUST_BASE = 50
+CERTIFICATION_POINTS = {"NONE": 0, "ASSOCIATE": 8, "PROFESSIONAL": 15}
+DOCS_ACK_POINTS = 6
+HACKATHON_POINTS_PER_AWARD = 4
+HACKATHON_AWARD_CAP = 3
+CLEAN_WINDOW_POINTS_PER_WINDOW = 1
+CLEAN_WINDOW_CAP = 10
+PENDING_CASE_WEIGHT = Decimal("0.50")
+THROTTLE_HISTORY_PENALTY = 5
+THROTTLE_HISTORY_THRESHOLD = 2
+TRUST_SCORE_MIN = 0
+TRUST_SCORE_MAX = 100
+
+# --------------------------------------------------------------- provisioning
+TIER_BASE_SUSTAINED_RPM = {
+    "SANDBOX": 60,
+    "STANDARD": 600,
+    "PARTNER": 3000,
+    "PRIVILEGED": 12000,
+}
+TIER_BURST_FACTOR = {
+    "SANDBOX": Decimal("1.5"),
+    "STANDARD": Decimal("2.0"),
+    "PARTNER": Decimal("3.0"),
+    "PRIVILEGED": Decimal("4.0"),
+}
+TIER_MONTHLY_CALL_CAP = {
+    "SANDBOX": 50000,
+    "STANDARD": 1000000,
+    "PARTNER": 10000000,
+    "PRIVILEGED": 60000000,
+}
+BURST_CREDIT_MULTIPLIER = 10
+SCOPE_FACTOR_FLOOR = Decimal("0.60")
+SCOPE_FACTOR_PERSONAL_STEP = Decimal("0.05")
+SCOPE_FACTOR_FINANCIAL_STEP = Decimal("0.10")
+TIER_RANK = {"SANDBOX": 1, "STANDARD": 2, "PARTNER": 3, "PRIVILEGED": 4}
+TIER_DATA_ACCESS_LIMIT = {
+    "SANDBOX": "PUBLIC",
+    "STANDARD": "PERSONAL",
+    "PARTNER": "FINANCIAL",
+    "PRIVILEGED": "FINANCIAL",
+}
+TIER_JUSTIFICATION_FLOOR = {
+    "SANDBOX": 0,
+    "STANDARD": 40,
+    "PARTNER": 120,
+    "PRIVILEGED": 240,
+}
+DRAFT_JUSTIFICATION_FLOOR = 40
+MAX_REVISION_ROUNDS = 3
+UPGRADE_JUSTIFICATION_FLOOR = 40
+UPGRADE_CEILING_FACTOR = 2
+
+GRANTABLE_TIERS_BY_LIFECYCLE = {
+    "PREVIEW": ["SANDBOX"],
+    "GENERAL_AVAILABILITY": ["SANDBOX", "STANDARD", "PARTNER", "PRIVILEGED"],
+    "DEPRECATION_ANNOUNCED": [],
+    "SUNSET": [],
+}
+
+
+def trust_multiplier(score):
+    if score >= 80:
+        return Decimal("1.25")
+    if score >= 60:
+        return Decimal("1.00")
+    if score >= 40:
+        return Decimal("0.75")
+    return Decimal("0.50")
+
+
+# --------------------------------------------------------------- usage
+SOFT_THROTTLE_RATIO = Decimal("0.80")
+HARD_THROTTLE_RATIO = Decimal("1.00")
+SUSTAINED_WINDOW_SECONDS = 60
+RESET_PERIOD_DAYS = 30
+
+# --------------------------------------------------------------- deprecation
+BASE_NOTICE_DAYS = {"PUBLIC": 30, "PERSONAL": 60, "FINANCIAL": 90}
+BREAKING_CHANGE_EXTRA_DAYS = 30
+PARTNER_PINNED_EXTRA_DAYS = 30
+MAX_CONCURRENT_DEPRECATIONS = 2
+
+# --------------------------------------------------------------- sandbox
+MAX_LEASE_DAYS = 30
+MIN_LEASE_DAYS = 1
+
+# --------------------------------------------------------------- enforcement
+CATEGORY_BASE_POINTS = {
+    "RATE_ABUSE": 10,
+    "SCOPE_OVERREACH": 15,
+    "DATA_RETENTION": 20,
+    "RESALE": 25,
+}
+SEVERITY_FACTOR = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
+RESTRICTION_THRESHOLD = 50
+REVOCATION_THRESHOLD = 100
+APPEAL_WINDOW_DAYS = 14
+REMEDIATION_DAYS = {"LOW": 30, "MEDIUM": 14, "HIGH": 7}
+LIVE_CASE_STATES = ["OPENED", "INVESTIGATING", "APPEALED"]
+
+# --------------------------------------------------------------- support
+FIRST_RESPONSE_SLA_MINUTES = {
+    "PARTNER_TICKET": {"S1": 30, "S2": 60, "S3": 240, "S4": 480},
+    "PLATFORM_INCIDENT": {"S1": 15, "S2": 30, "S3": 120, "S4": 240},
+}
+COMMS_MAX_GAP_MINUTES = {"S1": 30, "S2": 60, "S3": 240, "S4": 1440}
+SEVERITY_CREDIT_RATE = {
+    "S1": Decimal("0.10"),
+    "S2": Decimal("0.05"),
+    "S3": Decimal("0.02"),
+    "S4": Decimal("0.00"),
+}
+COMMS_BREACH_UPLIFT = Decimal("1.5")
+NO_BREACH_UPLIFT = Decimal("1.0")
+MINUTES_PER_DAY = 1440
+MAX_ESCALATION_TIER = 3
+ESCALATION_ENTITLED_TIERS = ["PARTNER", "PRIVILEGED"]
+INCIDENT_COALESCE_MINUTES = 60
+
+# --------------------------------------------------------------- feedback
+FEEDBACK_SEVERITY_WEIGHT = {
+    "DEFECT": Decimal("40"),
+    "MISSING_FEATURE": Decimal("25"),
+    "DX_FRICTION": Decimal("15"),
+    "DOC_GAP": Decimal("10"),
+}
+FEEDBACK_TIER_WEIGHT = {
+    "NONE": Decimal("0.25"),
+    "SANDBOX": Decimal("0.50"),
+    "STANDARD": Decimal("1.00"),
+    "PARTNER": Decimal("1.50"),
+    "PRIVILEGED": Decimal("2.00"),
+}
+FEEDBACK_CERT_BONUS = {
+    "NONE": Decimal("0"),
+    "ASSOCIATE": Decimal("2.50"),
+    "PROFESSIONAL": Decimal("5.00"),
+}
+DEMAND_INDEX_DIVISOR = Decimal("500")
+DEMAND_INDEX_UPLIFT_CAP = Decimal("0.50")
+COUNTED_FEEDBACK_STATES = ["TRIAGED", "ROADMAP_ACCEPTED"]

@@ -1,0 +1,528 @@
+# Conference Program Committee API — Product Requirements Document
+
+## 1. Introduction
+
+Every scientific meeting lives or dies on the credibility of its program, and that credibility is manufactured in the three months between a call for abstracts and the first plenary. A professional conference organizer running several meetings a year cannot rely on spreadsheets and mailing lists to do it: the call has to open and close on published deadlines, hundreds of submissions have to be routed to reviewers who are genuinely qualified and demonstrably unconflicted, divergent scores have to be arbitrated rather than averaged away, and the accepted content then has to be squeezed into a fixed number of oral, poster and workshop slots inside rooms that can only hold one session at a time.
+
+This document specifies the Conference Program Committee API — the system of record for that entire pipeline. It governs conference setup and submission categories, author submissions and their formatting compliance, committee recruitment with conflict-of-interest declarations, blinded review assignment driven by keyword expertise matching, rubric scoring with reviewer calibration, discrepancy arbitration, capacity-constrained acceptance decisions, themed session construction with chair assignment, presenter confirmation and no-show sanctions, continuing-education accreditation with disclosure collection, embargo handling for newsworthy findings, and the adjudication of late program changes after the program has been frozen.
+
+Two design commitments shape almost every rule that follows. The first is **determinism**: several quantities in this system are conserved — a reviewer's live workload, a conference's format slots, the accrediting body's minute pool — and the specification therefore states exactly which counter moves, in which direction, on every operation, including the compensating operations that give minutes and slots back. The second is **defensible separation**: the committee member who reviewed an abstract may not decide it, the chair who decided it may not accredit it, and the chair arbitrating a dispute may not have opined on it. Where these two commitments collide with client convenience, they win.
+
+## 2. Global Specifications & System-Wide Principles
+
+Every path in this specification is absolute; the API is mounted at the root, and each business entity is a top-level collection addressed by its own identifier rather than nested inside a parent's URL. Sub-resource paths exist only for actions (status transitions, adjudications, submissions) and for the two computed reads.
+
+### 2.1. User and Role-Based Access Control
+
+All requests must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, declaring the capacity in which that principal is acting. Five roles exist, spelled exactly as follows: `ConferenceAdmin`, `ProgramChair`, `Reviewer`, `Author`, and `PressOfficer`. If either header is absent or empty, or if `X-User-Role` is not one of those five strings, the request is rejected with `ERR_MISSING_AUTH_HEADERS` (401) — and this check runs before any routing-level existence check, so an unauthenticated request aimed at a non-existent abstract still returns 401 rather than 404. A syntactically valid role that is not listed among an endpoint's authorized roles is rejected with `ERR_UNAUTHORIZED` (403), a decision made from the endpoint table alone with no database reads.
+
+Three of the five roles are backed by a persisted entity, and for those the value of `X-User-ID` is a real row identifier:
+
+- When `X-User-Role` is `ProgramChair`, `X-User-ID` is the `id` of the acting `CommitteeMember`, and that member's `member_role` must be `CHAIR`; ownership and segregation checks on any resource that references a committee member compare the resource's member-valued field to `X-User-ID`.
+- When `X-User-Role` is `Reviewer`, `X-User-ID` is the `id` of the acting `CommitteeMember`, and that member's `member_role` must be `REVIEWER`; a review may only be submitted or declined by the member recorded in its `reviewer_member_id`.
+- When `X-User-Role` is `Author`, `X-User-ID` is the `id` of the acting `Author`; ownership checks compare an abstract's `submitting_author_id`, a slot's `presenter_author_id` or a disclosure's `author_id` to `X-User-ID`.
+- When `X-User-Role` is `ConferenceAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record or log it, but it never compares it to any entity's `id` and never resolves it to a row.
+- When `X-User-Role` is `PressOfficer`, `X-User-ID` is likewise an opaque operator identifier not tied to any persisted entity; press actions are attributed to the outlet named in the request, not to the caller's identifier.
+
+An `X-User-ID` that is syntactically well formed but does not resolve to the entity backing the claimed role is rejected with `ERR_IDENTITY_NOT_FOUND` (403). The same error covers the contradiction case: a `CommitteeMember` whose `member_role` is `REVIEWER` presenting `X-User-Role: ProgramChair` is rejected here, as is a chair presenting itself as a `Reviewer`. Once identity resolves, a further ownership gate applies to the operations listed in §2.11 band 6; a principal acting on somebody else's abstract, review, discrepancy case or slot is rejected with `ERR_NOT_RESOURCE_OWNER` (403).
+
+`ConferenceAdmin` owns conference and category setup, committee recruitment, author records and event registration, the logical clock, and the committee-member maintenance patch — and is deliberately excluded from review content, decisions and arbitration. `ProgramChair` owns review assignment, arbitration, decisions, session construction, accreditation validation, disclosure adjudication and change-request approval. `Reviewer` may act only on reviews assigned to it, file its own conflict declarations and move its own membership status. `Author` submits and revises abstracts, registers for the event, confirms or withdraws its own accepted work, files disclosures and requests late program changes. `PressOfficer` is the sole holder of the embargo dimension.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and List Filtering
+
+Collection reads are paginated through two query parameters. `limit` caps the number of rows returned; it defaults to 10, may not be lower than 1 and may not exceed 100. `offset` is the number of rows to skip and defaults to 0; negative values are rejected. A `limit` outside the 1–100 band or a negative `offset` is a schema violation and returns `ERR_VALIDATION` (400). Unless a specific endpoint says otherwise, every list endpoint returns its rows sorted by `created_at` in ascending order. The `meta` object of a list response carries `limit`, `offset`, `total_count` and `has_more`.
+
+Every foreign key in the data model is reverse-reachable through an optional filter on the child collection's list endpoint, and filters combine conjunctively:
+
+- Conferences accept `status`.
+- Categories accept `conference_id` and `cme_eligible`.
+- Authors accept `email`, `is_registered` and `sanction_status`.
+- Abstracts accept `conference_id`, `category_id`, `submitting_author_id`, `decided_by_member_id`, `status`, `decision`, `embargo_status` and `is_newsworthy`.
+- Committee members accept `conference_id`, `member_role`, `status` and `coi_declaration_status`.
+- Conflict declarations accept `member_id`, `conflict_subject_type` and `conflict_type`.
+- Reviews accept `abstract_id`, `reviewer_member_id`, `status`, `assigned_round` and `is_third_review`.
+- Discrepancy cases accept `abstract_id`, `arbiter_member_id`, `third_review_id` and `status`.
+- Sessions accept `conference_id`, `chair_member_id`, `status`, `format`, `theme_code` and `room_code`.
+- Session slots accept `session_id`, `abstract_id`, `presenter_author_id`, the self-referential `swapped_with_slot_id`, and `status`.
+- Accreditations accept `abstract_id`, `validated_by_member_id` and `validation_status`.
+- Disclosure statements accept `abstract_id`, `accreditation_id`, `author_id` and `status`.
+- Program change requests accept `conference_id`, `session_slot_id`, `requested_by_author_id`, `target_session_id`, `substitute_presenter_author_id`, `approver_member_id`, `change_type` and `status`.
+
+### 2.4. The Logical Clock
+
+Nothing in this system reads wall-clock time. Submission deadlines, review due dates, the program freeze, session start and end comparisons, no-show recording and embargo release all compare against a server-held **logical clock**, whose value starts at `2026-08-01T00:00:00Z` and changes only when an administrator drives it forward or backward through the clock-setting capability with a `current_utc` instant. That capability mutates no business entity; it simply changes the instant every subsequent temporal comparison reads. It exists because no business operation can otherwise advance time, and a great many rules in §3 branch on the clock.
+
+### 2.5. Common Resource Properties
+
+Every resource in the system carries a server-minted `id`: a UUID string with no type prefix and no embedded semantics. Clients never supply it. Alongside it, resources carry `created_at`, an ISO 8601 UTC timestamp with three fractional digits recording when the row was first written.
+
+All resources except conflict declarations additionally carry:
+
+- `updated_at` — an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of the row, including mutations that only touch derived counters.
+- `version` — an integer that starts at 1 on creation and increases by exactly one on every mutation of that row. Recomputation of a derived field is a mutation for this purpose: when a slot is added to a session, that session's `version` advances even though no client-supplied field of the session changed.
+
+`ConflictDeclaration` is the one exception. It is immutable once filed and has no update endpoint, so it carries only `id` and `created_at`; it has neither `updated_at` nor `version`. Its own `declared_at` field records the logical-clock instant of filing.
+
+### 2.6. Identifier Resolution Order
+
+Requests are resolved outside-in. When a path contains an identifier, that identifier is checked first, and when a path contains more than one, they are checked strictly left to right; the first identifier that does not resolve decides the 404. Only after every path identifier resolves does the system look at foreign keys carried in the request body, and those are checked in the order the fields are listed for that endpoint. The practical consequence is that when a slot-creation request names a session that does not exist and also an abstract that does not exist, the response is `ERR_SESSION_NOT_FOUND`, never `ERR_ABSTRACT_NOT_FOUND`.
+
+The 404 vocabulary is per resource type: `ERR_CONFERENCE_NOT_FOUND`, `ERR_CATEGORY_NOT_FOUND`, `ERR_AUTHOR_NOT_FOUND`, `ERR_ABSTRACT_NOT_FOUND`, `ERR_MEMBER_NOT_FOUND`, `ERR_DECLARATION_NOT_FOUND`, `ERR_REVIEW_NOT_FOUND`, `ERR_DISCREPANCY_CASE_NOT_FOUND`, `ERR_SESSION_NOT_FOUND`, `ERR_SLOT_NOT_FOUND`, `ERR_ACCREDITATION_NOT_FOUND`, `ERR_DISCLOSURE_NOT_FOUND` and `ERR_CHANGE_REQUEST_NOT_FOUND`. A missing `target_session_id` yields `ERR_SESSION_NOT_FOUND`; a missing `session_slot_id` yields `ERR_SLOT_NOT_FOUND`; a missing `accreditation_id` yields `ERR_ACCREDITATION_NOT_FOUND`; a missing `substitute_presenter_author_id`, `presenter_author_id`, `author_id` or `requested_by_author_id` yields `ERR_AUTHOR_NOT_FOUND`; a missing `reviewer_member_id`, `arbiter_member_id` or `chair_member_id` yields `ERR_MEMBER_NOT_FOUND`.
+
+### 2.7. Optimistic Concurrency on the Two Contended Ledgers
+
+Two write operations in this system commit against a ledger that lives on a parent row, and both therefore require the client to prove it has observed the parent's current state.
+
+The first is the acceptance decision. `POST /abstracts/{abstractId}/decision` requires `expected_conference_version` as a non-optional integer input carrying the client's last observed `version` of the owning `Conference`. A decision consumes one format slot out of the conference-level capacity ledger, so a chair whose view of `accepted_oral_count` or `accepted_poster_count` predates another chair's decision would otherwise commit against capacity that is already spent. If `expected_conference_version` does not equal the conference's current `version`, the request is rejected with `ERR_STALE_CONFERENCE_VERSION` (412) and nothing is written.
+
+The second is slot creation. `POST /sessions/{sessionId}/slots` requires `expected_session_version` as a non-optional integer input carrying the client's last observed `version` of the target `Session`. Slot admission is validated against `slot_count` and `committed_minutes`, both of which any earlier slot creation, withdrawal, move or accreditation recompute has already advanced. If `expected_session_version` does not equal the session's current `version`, the request is rejected with `ERR_STALE_SESSION_VERSION` (412) and nothing is written.
+
+No other endpoint accepts a version field, and no other endpoint performs a concurrency check. The stale-version comparison happens after schema validation — the supplied value must be a well-formed integer before it can be compared — and before every business rule, so a stale version masks state, referential, capacity and packing errors that the same request would otherwise have produced.
+
+### 2.8. Numeric Precision
+
+Scores and money follow fixed precision rules and the "round half up" method throughout; no other rounding mode is used anywhere in the system.
+
+- A review's `weighted_score`, an abstract's `provisional_score`, `final_score` and `score_spread`, a case's `spread_at_open` and `resolved_score`, a session's `accredited_credit_total` and an accreditation's `awarded_credits` are all carried at **two decimal places**, rounded half up. Awarded credit values are additionally always exact multiples of 0.25.
+- A review's `expertise_match_score` is carried at **four decimal places**, rounded half up.
+- A member's `calibration_bias` and a category's `discrepancy_threshold` are supplied at two decimal places.
+- Fees are integers: `estimated_fee_cents` and `final_fee_cents` are whole cents, with any intermediate product rounded half up before the surcharge is added. `rush_pct_applied` is a percentage number.
+- Slot counts, minute totals and ledger counters are exact integers and never rounded. Score comparisons — ranking abstracts for waitlist promotion, comparing a spread to a threshold — are performed at two decimal places.
+
+### 2.9. Conserved Quantities and Cascading Recomputation
+
+Three quantities in this system are conserved, meaning that after any sequence of operations the stored counter must equal the count implied by the underlying rows.
+
+**The reviewer load ledger.** A committee member's `current_review_load` always equals the number of that member's review rows whose `status` is `ASSIGNED`, and it must never be negative nor exceed that member's `max_review_load`. Every assignment raises it by exactly one; every submission, every decline and every system-driven void lowers it by exactly one. A full round trip — assign, decline, reassign elsewhere, submit — must leave the counter of each involved member exactly where it started.
+
+**The format slot ledger.** A conference's `accepted_oral_count`, `accepted_poster_count` and `accepted_workshop_count` each equal the number of that conference's abstracts whose `decision` is the matching format and whose `status` is one of `ACCEPTED`, `CONFIRMED`, `SCHEDULED`, `PRESENTED` or `NO_SHOW`. Its `waitlisted_count` equals the number of its abstracts whose `status` is `WAITLISTED`. Every commit raises one counter; every rescission, withdrawal and promotion adjusts them so the identity holds exactly.
+
+**The continuing-education minute pool.** A conference's `cme_minutes_allocated` equals the sum of `content_minutes` over its accreditations whose `validation_status` is `VALIDATED`, and `cme_minutes_available` is always `cme_minutes_pool_total` minus `cme_minutes_allocated`. A revocation returns exactly the same minute count that the matching validation debited.
+
+Because these ledgers live on parent rows while the events that move them happen on children, several operations fan out. Five cascades recur throughout §3 and are named here so the workflow narratives can refer to them:
+
+- **Cascade A** starts when an already-validated disclosure is later rejected. The disclosure becomes `REJECTED`; the accreditation it supported moves from `VALIDATED` to `REVOKED` and its `awarded_credits` returns to 0.00; the conference's `cme_minutes_allocated` drops by that accreditation's `content_minutes`, `cme_minutes_available` is recomputed and the conference's `version` advances; the session holding a counted slot for that abstract recomputes `accredited_credit_total` and `accreditation_posture`; and if that session is `cme_designated`, its recomputed posture is `NON_COMPLIANT` and it is currently `PUBLISHED`, it drops back to `PLANNED` with its `version` advanced.
+- **Cascade B** starts when an abstract is withdrawn. Each of its slots whose `status` is `SCHEDULED` becomes `WITHDRAWN`; each affected session's `slot_count` drops by one, its `committed_minutes`, `accredited_credit_total` and `accreditation_posture` are recomputed and its `version` advances; and any affected session whose `slot_count` has reached zero while `PUBLISHED` drops back to `PLANNED`, because an empty session cannot remain published. In parallel, if the withdrawn abstract carried a non-null `decision`, the conference's matching accepted count drops by one and its `version` advances, and the freed capacity immediately runs waitlist promotion for that format, which re-increments the same counter if a promotable abstract exists.
+- **Cascade C** starts when a committee member is suspended. Every review of that member whose `status` is `ASSIGNED` becomes `VOIDED`; the member's `current_review_load` is recomputed and therefore falls to zero; and for every abstract that lost an assigned review while its own `status` was `UNDER_REVIEW`, a replacement review is created by the expertise selector with the suspended member excluded. When the candidate pool for a given abstract is empty, no replacement is created, that abstract simply stays `UNDER_REVIEW`, and the suspension still succeeds.
+- **Cascade D** starts when a slot is recorded as a no-show. The slot becomes `NO_SHOW_RECORDED`; its abstract moves from `SCHEDULED` to `NO_SHOW` and the presenting author's `no_show_strikes` is recomputed; and that author's `sanction_status` is re-derived from the combined strike count.
+- **Cascade E** starts when press coverage is released before an embargo expires. The abstract's `press_outlet_name` is recorded and its `embargo_status` becomes `BREACHED`; the submitting author's `embargo_breach_count` is recomputed; and that author's `sanction_status` is re-derived.
+
+Each link of a cascade is a real mutation of the row it touches: `updated_at` is refreshed and `version` advances on every entity the cascade writes, and the whole cascade is committed together with the request that triggered it.
+
+### 2.10. Blinding Integrity and Segregation of Duties
+
+Reviews are blinded, and the integrity of that blinding is enforced structurally rather than by convention. A committee member may not review an abstract they authored or co-authored, may not review an abstract whose author set matches one of their own filed conflict declarations, may not arbitrate a dispute over an abstract they have already scored, may not issue the decision on an abstract they have already scored, and may not validate the continuing-education accreditation of an abstract whose decision they themselves issued. These five separations produce, respectively, `ERR_REVIEWER_CONFLICT`, `ERR_ARBITER_CONFLICT` (which also covers the arbiter's own declared conflicts), `ERR_SEGREGATION_VIOLATION` and `ERR_ACCREDITATION_SELF_VALIDATION`, all at 409. They sit above every remaining business rule in the ladder: a conflicted reviewer is rejected even when that same reviewer is simultaneously over their load ceiling.
+
+Author identity is matched by email, always lowercase. An abstract's author set is the email of the author identified by `submitting_author_id` together with every address in `coauthor_emails`. A declaration whose `conflict_subject_type` is `AUTHOR_EMAIL` matches when its `conflict_subject_value` is in that set; a declaration whose `conflict_subject_type` is `AFFILIATION` matches when its `conflict_subject_value` equals the `affiliation` string of any author in that set; a declaration whose `conflict_subject_type` is `NONE` never matches anything and exists purely to record that the member has considered the question.
+
+### 2.11. The Validation Priority Ladder
+
+When a single request violates more than one rule, exactly one error is reported: the one belonging to the highest band in the following ordering. Later violations are never reported, and no partial write ever survives a rejection. The bands are strictly ordered from 1 to 21.
+
+1. **Header presence and role validity** — both `X-User-ID` and `X-User-Role` present and non-empty, and `X-User-Role` one of the five declared roles. Otherwise `ERR_MISSING_AUTH_HEADERS` (401). Applies to all endpoints, ahead of any existence check.
+2. **Role authorization** — the presented role appears among the endpoint's authorized roles. Otherwise `ERR_UNAUTHORIZED` (403). Applies to all endpoints.
+3. **Identity resolution** — `X-User-ID` resolves to the entity backing the claimed role, with a matching `member_role` where the role is a committee role. Otherwise `ERR_IDENTITY_NOT_FOUND` (403). Applies to every endpoint whose authorized roles include `ProgramChair`, `Reviewer` or `Author`.
+4. **Path identifier existence** — left to right, as described in §2.6, yielding the matching 404.
+5. **Body foreign-key existence** — in request-body field order and always after every path identifier, yielding the matching 404.
+6. **Ownership** — the resolved identity owns the resource it acts on. Otherwise `ERR_NOT_RESOURCE_OWNER` (403). Applies to `POST /abstracts/{abstractId}/revisions`, `POST /abstracts/{abstractId}/status-transitions`, `POST /reviews/{reviewId}/submission`, `POST /reviews/{reviewId}/decline`, `POST /discrepancy-cases/{caseId}/resolution` and `POST /program-change-requests`. Ownership needs the row, so it follows existence, but it still precedes body schema validation.
+7. **Schema** — required fields present; correct types; enum members recognized; string lengths, numeric ranges and ISO 8601 datetime syntax valid; unknown fields ignored. Otherwise `ERR_VALIDATION` (400). This band covers rubric scores within 1 to 5, `confidence` being one of `LOW`, `MEDIUM` or `HIGH`, a `duration_minutes` of at least 1, and the pagination bounds of §2.3. Applies to every POST and PATCH endpoint and every list endpoint.
+8. **Optimistic concurrency** — `expected_conference_version` or `expected_session_version` equal to the parent's current `version`. Otherwise `ERR_STALE_CONFERENCE_VERSION` or `ERR_STALE_SESSION_VERSION` (412). Applies to `POST /abstracts/{abstractId}/decision` and `POST /sessions/{sessionId}/slots`.
+9. **Conference status gate** — the owning conference is in a status that permits the operation. Otherwise `ERR_CONFERENCE_STATE_INVALID` (409). This conference-level gate outranks the acted-on resource's own state: submitting a review while the conference is `REVIEW_CLOSED` returns `ERR_CONFERENCE_STATE_INVALID` even though the review itself is still `ASSIGNED`.
+10. **Acted-on resource state** — a transition to the requested target exists from the resource's current state, and dependent operations find their prerequisites in the required state. Otherwise one of `ERR_ABSTRACT_STATE_INVALID`, `ERR_REVIEW_STATE_INVALID`, `ERR_MEMBER_STATE_INVALID`, `ERR_CASE_STATE_INVALID`, `ERR_SESSION_STATE_INVALID`, `ERR_SLOT_STATE_INVALID`, `ERR_ACCREDITATION_STATE_INVALID`, `ERR_DISCLOSURE_STATE_INVALID` or `ERR_CHANGE_REQUEST_STATE_INVALID` (409). This band also covers terminal-state lockdown and the second attempt at an operation that already succeeded.
+11. **Conflict of interest and segregation of duties** — the separations of §2.10, yielding `ERR_REVIEWER_CONFLICT`, `ERR_ARBITER_CONFLICT`, `ERR_SEGREGATION_VIOLATION` or `ERR_ACCREDITATION_SELF_VALIDATION` (409). Applies to `POST /abstracts/{abstractId}/review-assignments`, `POST /abstracts/{abstractId}/decision`, `POST /discrepancy-cases/{caseId}/arbiter` and `POST /accreditations/{accreditationId}/validation`.
+12. **Author sanction** — neither the acting nor the referenced author is `BARRED`. Otherwise `ERR_AUTHOR_BARRED` (403). Applies to `POST /abstracts`, `POST /abstracts/{abstractId}/status-transitions` and `POST /sessions/{sessionId}/slots`.
+13. **Disclosure completeness** — `ERR_DISCLOSURE_INCOMPLETE` (409) on `POST /accreditations/{accreditationId}/validation` and `POST /disclosure-statements/{disclosureId}/adjudication`.
+14. **Referential coherence** — all parties exist and are in legal states but do not belong together, yielding `ERR_CATEGORY_CONFERENCE_MISMATCH`, `ERR_DISCLOSURE_ABSTRACT_MISMATCH`, `ERR_FORMAT_NOT_ALLOWED`, `ERR_SESSION_THEME_MISMATCH`, `ERR_SESSION_FORMAT_MISMATCH`, `ERR_PRESENTER_NOT_ON_ABSTRACT` or `ERR_CATEGORY_NOT_CME_ELIGIBLE` (422). Applies to `POST /abstracts`, `POST /abstracts/{abstractId}/decision`, `POST /sessions/{sessionId}/slots`, `POST /disclosure-statements`, `POST /accreditations` and `POST /program-change-requests`. The theme, format and presenter checks are re-run at change-request adjudication.
+15. **Temporal** — deadline, embargo-window, date-range and program-freeze constraints against the logical clock, yielding `ERR_CFA_DEADLINE_PASSED`, `ERR_REVIEW_PAST_DUE`, `ERR_EMBARGO_WINDOW_INVALID` or `ERR_INVALID_DATE_RANGE` at 422, and `ERR_PROGRAM_FROZEN` at 409. Applies to `POST /abstracts`, `POST /abstracts/{abstractId}/revisions`, `POST /reviews/{reviewId}/submission`, `POST /sessions`, `POST /sessions/{sessionId}/slots`, `POST /abstracts/{abstractId}/status-transitions`, `POST /abstracts/{abstractId}/press-actions`, `POST /conferences` and `POST /conferences/{conferenceId}/status-transitions`. Because this band sits below coherence, a submission that is both late and pointed at a category from another conference reports the mismatch, not the deadline.
+16. **Abstract formatting** — `ERR_ABSTRACT_FORMAT_INVALID` (422) on `POST /abstracts` and `POST /abstracts/{abstractId}/revisions`. This is a category-conditional rule that fires only for categories that declare the requirement.
+17. **Review-workflow completeness and bounds** — enough submitted reviews, no non-terminal discrepancy case, no duplicate assignment, revision and reopen ceilings, override permissibility, an available reviewer candidate, and the various publication and press preconditions. The identifiers in this band are `ERR_INSUFFICIENT_REVIEWS`, `ERR_OPEN_DISCREPANCY`, `ERR_DUPLICATE_REVIEW_ASSIGNMENT`, `ERR_REVISION_LIMIT_REACHED`, `ERR_CFA_EXTENSION_LIMIT`, `ERR_REVIEW_REOPEN_LIMIT`, `ERR_OVERRIDE_NOT_PERMITTED`, `ERR_NO_ELIGIBLE_REVIEWER`, `ERR_UNDECIDED_ABSTRACTS_REMAIN`, `ERR_COI_NOT_DECLARED`, `ERR_MEMBER_STILL_CHAIRING`, `ERR_EMPTY_SESSION`, `ERR_SESSION_NOT_ACCREDITED`, `ERR_NOT_NEWSWORTHY` and `ERR_EMBARGO_NOT_SET`. All are 409 except `ERR_NO_ELIGIBLE_REVIEWER` and `ERR_NOT_NEWSWORTHY`, which are 422. Applies to `POST /abstracts/{abstractId}/decision`, `POST /abstracts/{abstractId}/review-assignments`, `POST /abstracts/{abstractId}/revisions`, `POST /abstracts/{abstractId}/press-actions`, `POST /conferences/{conferenceId}/status-transitions`, `POST /committee-members/{memberId}/status-transitions`, `POST /discrepancy-cases/{caseId}/resolution` and `POST /sessions/{sessionId}/status-transitions`. This band sits above every resource-contention rule: an abstract with an open discrepancy is rejected before its format capacity is even consulted.
+18. **Resource-temporal exclusivity** — room, chair and presenter interval conflicts, yielding `ERR_ROOM_TIME_CONFLICT`, `ERR_CHAIR_TIME_CONFLICT` or `ERR_PRESENTER_TIME_CONFLICT` (409). Room and chair conflicts are evaluated at session creation, room before chair; presenter conflicts are evaluated at slot creation.
+19. **Session packing** — evaluated in exactly this order: the slot-count ceiling first (`ERR_SESSION_SLOT_CAPACITY_REACHED`), then a duplicate running-order position (`ERR_DUPLICATE_SLOT_POSITION`), then the minute budget (`ERR_SESSION_DURATION_EXCEEDED`), all at 422. Applies to `POST /sessions/{sessionId}/slots`; the ceiling and duration tests are re-run at `POST /program-change-requests/{requestId}/adjudication`.
+20. **Presenter registration** — `ERR_AUTHOR_NOT_REGISTERED` (422), enforced only on the `ACCEPTED` to `CONFIRMED` transition of `POST /abstracts/{abstractId}/status-transitions`. Unregistered authors may still submit and be reviewed.
+21. **Quota and pool ceilings** — the lowest band, so a conference that is out of capacity still reports authentication, state, conflict and workflow problems first. Yields `ERR_FORMAT_CAPACITY_EXHAUSTED` on `POST /abstracts/{abstractId}/decision`, `ERR_CME_POOL_EXHAUSTED` on `POST /accreditations/{accreditationId}/validation`, and `ERR_REVIEWER_LOAD_EXCEEDED` on `POST /abstracts/{abstractId}/review-assignments`, all at 422.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Opening the Call: Conference Setup, Categories and the Submission Window
+
+A conference record is the root of everything else. Operations staff create it with a public `name` of between 1 and 200 characters and a short `code` of between 2 and 12 uppercase alphanumeric characters — the `code` later prefixes every blind label the conference mints. Five instants define the calendar: `event_start_utc` and `event_end_utc` bound the live event, `abstract_deadline_utc` is the submission cut-off, `review_deadline_utc` is the default due date stamped onto new review assignments, and `program_freeze_utc` is the instant after which the running order may only change through an approved change request. These instants must satisfy a strict chain: `event_end_utc` must be later than `event_start_utc`; `abstract_deadline_utc` must be earlier than `event_start_utc`; `review_deadline_utc` must be later than `abstract_deadline_utc`; and `program_freeze_utc` must be later than `review_deadline_utc` and earlier than `event_start_utc`. Any violation of that chain is rejected with `ERR_INVALID_DATE_RANGE`.
+
+Capacity is declared up front and is deliberately hard: `oral_slot_capacity`, `poster_slot_capacity` and `workshop_slot_capacity` are each a non-negative integer count of presentation slots the program can physically hold. An optional `cme_minutes_pool_total`, also non-negative and defaulting to 0, records how many accreditable content minutes the accrediting body has granted. A newly created conference starts in `DRAFT`, with `accepted_oral_count`, `accepted_poster_count`, `accepted_workshop_count`, `waitlisted_count`, `cme_minutes_allocated`, `cfa_extension_count`, `review_reopen_count` and `abstract_sequence` all at zero, and `cme_minutes_available` equal to `cme_minutes_pool_total`.
+
+Before the call can open, at least one submission category must exist for the conference. A category is declared with a `conference_id`, a `code` of 2 to 16 characters that is unique within the conference, a human-readable `name`, and its policy bundle: `max_word_count` between 100 and 600 caps the declared body length; `requires_structured_body`, a boolean, demands the Background/Methods/Results/Conclusion layout; `allowed_formats` is a non-empty subset of `ORAL`, `POSTER` and `WORKSHOP` and constrains both what authors may request and what the committee may decide; `min_reviews_required`, defaulting to 3 and constrained to between 2 and 5, is how many submitted reviews an abstract needs before it is considered scored; `discrepancy_threshold`, defaulting to 2.50 and constrained to between 0.50 and 4.00 at two decimals, is the score spread at which a dispute is opened; and `cme_eligible`, defaulting to false, decides whether abstracts in the category may carry a continuing-education accreditation.
+
+The conference lifecycle runs `DRAFT` → `CFA_OPEN` → `CFA_CLOSED` → `REVIEW_OPEN` → `REVIEW_CLOSED` → `DECISIONS_RELEASED` → `PROGRAM_PUBLISHED`, and every move is driven by operations staff naming a `to_status`. Opening the call — `DRAFT` to `CFA_OPEN` — requires that at least one category exist for this conference and that the logical clock still be earlier than `abstract_deadline_utc`. Closing the call — `CFA_OPEN` to `CFA_CLOSED` — has no preconditions at all, and it is worth being explicit about the corollary: passing `abstract_deadline_utc` does **not** close the call by itself. The call stays `CFA_OPEN` until an administrator closes it; what the deadline does is make further submissions fail with `ERR_CFA_DEADLINE_PASSED`.
+
+A closed call may be re-opened exactly once, as a deadline extension. That back-edge from `CFA_CLOSED` to `CFA_OPEN` requires `cfa_extension_count` to be zero and a `new_abstract_deadline_utc` that is present, later than the logical clock, later than the current `abstract_deadline_utc`, and earlier than `review_deadline_utc`. On success the conference's `abstract_deadline_utc` is replaced by that instant, `cfa_extension_count` rises to one, and `version` advances. A second extension attempt is rejected with `ERR_CFA_EXTENSION_LIMIT`. From `CFA_CLOSED` the other exit is into `REVIEW_OPEN`, which requires that at least one abstract of the conference be in `SUBMITTED` status; it advances only the conference's `version`.
+
+### 3.2. Authors, Registration, Abstract Submission and the Revision Loop
+
+An author record carries a `full_name`, a lowercase `email` that is unique across all author rows and serves as the matching key for every conflict and co-author check, and an optional `affiliation` institution string that defaults to the empty string and is matched against affiliation-type conflict declarations. Creating an author record is not the same as registering for the event: a fresh author has `is_registered` false, `registered_at` null, `no_show_strikes` and `embargo_breach_count` at zero, and `sanction_status` at `NONE`. Event registration is recorded separately, by the author or by operations staff, through a boolean `is_registered`; when it becomes true the author's `registered_at` is stamped with the logical-clock instant, and when it is set back to false `registered_at` returns to null. This capability exists precisely because confirmation of an acceptance is gated on paid registration and nothing else can set the flag.
+
+Two kinds of misconduct accumulate against an author. `no_show_strikes` is the number of session slots recorded as `NO_SHOW_RECORDED` whose presenter is this author; `embargo_breach_count` is the number of this author's abstracts whose embargo dimension reached `BREACHED`. The `sanction_status` ladder is derived from their sum: a combined count of zero leaves the author at `NONE`, a combined count of exactly one moves them to `WARNED`, and a combined count of two or more moves them to `BARRED`. The ladder is monotonic in practice and re-derived on every cascade that touches either counter, so a single cascade that lifts the combined count from zero straight to two takes the author directly from `NONE` to `BARRED` without pausing at `WARNED`. A `BARRED` author cannot submit a new abstract and cannot confirm an acceptance — both attempts fail with `ERR_AUTHOR_BARRED` — and cannot be named as the presenter of a slot.
+
+An author submits work into an open call by naming the `conference_id`, the `category_id`, their own `submitting_author_id`, a `title` of between 1 and 300 characters, a declared `body_word_count` of at least one, a `requested_format` of `ORAL`, `POSTER` or `WORKSHOP`, and between one and five unique lowercase `keywords` that later drive both reviewer matching and session theming. Three optional inputs complete the payload: `body_structured` declares whether the body uses the structured layout, `coauthor_emails` carries up to ten lowercase addresses and defaults to an empty list — it may not contain the submitting author's own email — and `is_newsworthy`, defaulting to false, flags the work for press handling.
+
+Submission is admitted only when the conference is `CFA_OPEN` and the logical clock is at or before `abstract_deadline_utc`; a clock past the deadline yields `ERR_CFA_DEADLINE_PASSED`. The named category must belong to the same conference as the `conference_id` in the payload, or the request fails with `ERR_CATEGORY_CONFERENCE_MISMATCH`. The `requested_format` must be one of the category's `allowed_formats`, or the request fails with `ERR_FORMAT_NOT_ALLOWED`. The category's formatting rules are then applied: `body_word_count` must be less than or equal to the category's `max_word_count`, and when the category has `requires_structured_body` set, `body_structured` must be true; either failure yields `ERR_ABSTRACT_FORMAT_INVALID`. Finally, the submitting author must not be `BARRED`.
+
+On acceptance of the submission the conference's `abstract_sequence` counter is incremented and the abstract's `blind_code` is minted deterministically as the conference `code`, a hyphen, the letter `B`, and the post-increment sequence value zero-padded to four digits — the first abstract of a conference whose `code` is `NEURO26` therefore carries the blind code `NEURO26-B0001`. The conference's `version` advances as part of the same write. The new abstract starts with `status` `SUBMITTED`, `embargo_status` `NONE`, `revision_round` zero, `submitted_review_count` zero, and `provisional_score`, `final_score`, `score_spread`, `decision`, `decided_by_member_id`, `embargo_until_utc` and `press_outlet_name` all null, with `decision_downgraded` false.
+
+An abstract carries **two independent state dimensions**. Its `status` tracks the review and decision lifecycle across `SUBMITTED`, `UNDER_REVIEW`, `SCORED`, `REVISION_REQUESTED`, `ACCEPTED`, `WAITLISTED`, `REJECTED`, `CONFIRMED`, `SCHEDULED`, `PRESENTED`, `NO_SHOW` and `WITHDRAWN`, of which `REJECTED`, `PRESENTED`, `NO_SHOW` and `WITHDRAWN` are terminal. Its `embargo_status` tracks press handling across `NONE`, `EMBARGOED`, `RELEASED` and `BREACHED`. The two dimensions evolve independently: an abstract whose embargo has been breached keeps whatever review or decision status it had, and a breach never blocks a scheduling operation on its own.
+
+The revision loop is bounded at two rounds. A chair may send a scored abstract back for rework, moving it from `SCORED` to `REVISION_REQUESTED`, provided the conference is `REVIEW_OPEN`, the abstract's `revision_round` is currently less than 2, and no discrepancy case for that abstract is in a non-terminal state — `OPEN`, `ARBITER_ASSIGNED`, `THIRD_REVIEW_PENDING` or `ESCALATED` — which would otherwise yield `ERR_OPEN_DISCREPANCY`. That request voids every review of the abstract still in `ASSIGNED` status and decrements each affected reviewer's `current_review_load` by one.
+
+The author closes the loop by resubmitting, which returns the abstract from `REVISION_REQUESTED` to `SUBMITTED`. Only the submitting author may do so; the conference must be `REVIEW_OPEN`; the logical clock must be at or before `review_deadline_utc`; and `revision_round` must still be less than 2, with a third round rejected as `ERR_REVISION_LIMIT_REACHED`. The resubmission carries a mandatory `body_word_count` and optional `title`, `body_structured` and `keywords`, and the category's formatting rules are re-applied exactly as at first submission. On success `revision_round` rises by one; `body_word_count`, `body_structured` and `keywords` are replaced, as is `title` when supplied; `provisional_score`, `final_score` and `score_spread` all return to null; and `submitted_review_count` recomputes to zero, because reviews from the previous round keep the old value in their `assigned_round` and thereby leave the consensus input set for good.
+
+Withdrawal is available to the submitting author or to a chair of the conference from any of `SUBMITTED`, `UNDER_REVIEW`, `SCORED`, `WAITLISTED`, `ACCEPTED`, `CONFIRMED` and `SCHEDULED`. When the abstract has a slot in `SCHEDULED` status, withdrawal additionally requires either that the logical clock still be earlier than `program_freeze_utc`, or that an approved withdrawal change request already exist for that slot; otherwise the attempt is rejected with `ERR_PROGRAM_FROZEN`. A successful withdrawal runs Cascade B in full, as described in §2.9.
+
+### 3.3. Building the Committee: Recruitment, Conflicts and the Review-Load Ledger
+
+Committee recruitment is an administrative act. A member is enrolled onto a conference committee with a `conference_id`, a `full_name`, a lowercase `email` unique within that conference, between one and eight unique lowercase `expertise_keywords`, and a `member_role` of either `REVIEWER` or `CHAIR` which gates the `X-User-Role` that member may later present. Two optional inputs tune the member's behaviour: `max_review_load`, defaulting to 4 and constrained to between 1 and 20, is the ceiling on concurrently assigned reviews, and `calibration_bias`, defaulting to 0.00 and constrained to between minus 1.00 and plus 1.00 at two decimals, is the offset carried over from prior conferences that is added to every rubric total this member produces. A new member starts with `status` `INVITED`, `coi_declaration_status` `PENDING`, `current_review_load` zero and `chaired_session_count` zero.
+
+Selector inputs stay maintainable: an administrator may later revise a member's `expertise_keywords`, `max_review_load` and `calibration_bias`. Revising the bias is explicitly **not** retroactive — review scores already computed are never rescored, and the new bias affects only submissions that happen afterwards.
+
+Conflict-of-interest declarations are filed before activation and are immutable once written. A declaration names the `member_id`, a `conflict_subject_type` of `AUTHOR_EMAIL`, `AFFILIATION` or `NONE`, a `conflict_type` of `COAUTHOR`, `INSTITUTIONAL`, `FINANCIAL`, `ADVISORY` or `NONE`, and, unless the subject type is `NONE`, a `conflict_subject_value` holding either a lowercase email or an exact affiliation string; when the subject type is `NONE` that value must be null. The row's `declared_at` is stamped from the logical clock.
+
+Membership status runs `INVITED` → `ACTIVE`, with `SUSPENDED` as a reversible detour and `RESIGNED` as the terminal exit. Activation requires at least one conflict declaration already on file for that member; without one the attempt fails with `ERR_COI_NOT_DECLARED`. Activation sets the member's `coi_declaration_status` to `SUBMITTED`, which is what the reviewer selector and the assignment rules actually test. Suspension from `ACTIVE` has no preconditions and runs Cascade C. Reinstatement from `SUSPENDED` back to `ACTIVE` likewise has no preconditions and no side effects at all — it does not restore the reviews that the suspension voided. Resignation is reachable from `INVITED`, `ACTIVE` or `SUSPENDED`, but only while the member chairs nothing: if any session with this member as its chair is in `PLANNED`, `PUBLISHED` or `LOCKED` status, the attempt fails with `ERR_MEMBER_STILL_CHAIRING`. A successful resignation voids every review of that member still in `ASSIGNED` status and recomputes `current_review_load` to zero, and — unlike suspension — creates no replacement assignments whatsoever.
+
+### 3.4. Blinded Assignment and the Expertise Selector
+
+A chair assigns a reviewer to an abstract either explicitly, by naming a `reviewer_member_id`, or implicitly, by omitting it and letting the selector choose. An optional `due_utc` overrides the review's deadline; when it is omitted, the review inherits the conference's `review_deadline_utc`. Assignment requires the conference to be `REVIEW_OPEN` and the abstract to be in `SUBMITTED` or `UNDER_REVIEW`. The nominated reviewer must belong to the same conference, be `ACTIVE`, and have `coi_declaration_status` of `SUBMITTED`; otherwise the request fails with `ERR_MEMBER_STATE_INVALID`. An explicitly named reviewer may have a `member_role` of either `REVIEWER` or `CHAIR` — chairs are permitted to carry review load, which is exactly what later makes the decision-time segregation check reachable — whereas the automatic selector considers only members whose `member_role` is `REVIEWER`.
+
+Four further gates apply. No conflict declaration of the reviewer may match the abstract's author set, and the reviewer's own `email` must not be the submitting author's email nor appear in `coauthor_emails`; either failure is `ERR_REVIEWER_CONFLICT`. The same reviewer must not already hold a review on this abstract in `ASSIGNED` or `SUBMITTED` status, or the request fails with `ERR_DUPLICATE_REVIEW_ASSIGNMENT`. And the reviewer's `current_review_load` must be strictly less than their `max_review_load`, or the request fails with `ERR_REVIEWER_LOAD_EXCEEDED`.
+
+A successful assignment creates a review row with `status` `ASSIGNED`, an `assigned_round` frozen to the abstract's current `revision_round`, `is_third_review` false, a computed `expertise_match_score`, and null values for every rubric field, `confidence`, `recommended_format`, `comments_to_authors`, `weighted_score`, `submitted_at` and `decline_reason`. The reviewer's `current_review_load` rises by one. When this is the first non-terminal review of the current round, the abstract moves from `SUBMITTED` to `UNDER_REVIEW`.
+
+**How the selector picks.** The expertise fit between a candidate and an abstract is the Dice coefficient over their keyword sets. Both sets are lowercased and de-duplicated first: the candidate's `expertise_keywords` on one side, the abstract's `keywords` on the other. The score is twice the number of keywords the two sets share, divided by the sum of the two set sizes, rounded half up to four decimal places. A candidate with four distinct expertise keywords facing an abstract with three keywords, sharing two of them, scores twice two divided by seven, or 0.5714.
+
+A candidate is eligible only when every one of the following holds: the candidate belongs to the abstract's conference; the candidate's `member_role` is `REVIEWER`; the candidate's `status` is `ACTIVE`; the candidate's `coi_declaration_status` is `SUBMITTED`; the candidate's `current_review_load` is strictly less than their `max_review_load`; no conflict declaration of the candidate matches the abstract's author set; the candidate's `email` is not in that author set; the candidate holds no review on this abstract in `ASSIGNED` or `SUBMITTED` status; the candidate is not in the explicit exclusion set for this selection; and the candidate's match score is at least 0.2500. Surviving candidates are ranked by match score from highest to lowest; ties are broken by spare capacity, meaning `max_review_load` minus `current_review_load`, from largest to smallest; any remaining tie is broken by `created_at` from earliest to latest. The identifier is never used as a tiebreaker. The single highest-ranked candidate is assigned.
+
+The empty-pool behaviour differs by caller, and the difference matters. When the selector was invoked by an explicit selector-driven assignment or by the third-review branch of a discrepancy resolution, an empty pool aborts the whole request with `ERR_NO_ELIGIBLE_REVIEWER` and nothing is written. When it was invoked as the automatic replacement after a decline or as part of Cascade C, an empty pool simply produces no replacement review and the triggering request still succeeds.
+
+Declining is the reviewer's escape hatch. Only the assigned reviewer may decline, only while the conference is `REVIEW_OPEN`, and a `decline_reason` is mandatory. The review moves from `ASSIGNED` to `DECLINED` and the reviewer's `current_review_load` falls by one. An optional `auto_reassign` flag defaults to true, in which case a replacement review is created by the selector with the declining member in the exclusion set; when `auto_reassign` is false, or when the candidate pool is empty, no replacement appears and the decline still returns success. Reviews may also be voided by the system without any reviewer action — on a member's suspension or resignation, when a scored abstract is sent back for revision, and when review closes — and each void likewise lowers the affected reviewer's `current_review_load` by one. `SUBMITTED`, `DECLINED` and `VOIDED` are all terminal for a review.
+
+### 3.5. Scoring the Rubric, the Two Consensus Variants and Discrepancy Arbitration
+
+A reviewer submits by supplying four rubric integers between 1 and 5 — `score_originality`, `score_methodology`, `score_relevance` and `score_clarity` — plus a `confidence` of `LOW`, `MEDIUM` or `HIGH`, a `recommended_format` of `ORAL`, `POSTER` or `WORKSHOP` which is advisory only and drives nothing, and optional blinded `comments_to_authors`. Submission requires that the acting member be the review's own `reviewer_member_id`, that the conference be `REVIEW_OPEN`, that the review's `assigned_round` still equal the abstract's `revision_round` — a mismatch is `ERR_REVIEW_STATE_INVALID` — and that the logical clock be at or before the review's `due_utc`, with a clock strictly after the due instant rejected as `ERR_REVIEW_PAST_DUE`. All four rubric axes, the confidence and the recommended format must be present.
+
+**The rubric roll-up.** The review's `weighted_score` is built by taking forty percent of `score_originality`, thirty percent of `score_methodology`, fifteen percent of `score_clarity` and fifteen percent of `score_relevance`, and adding those four contributions together. The reviewer's `calibration_bias` is then added to that total. The result is rounded half up to two decimal places and finally clamped into the legal band: anything below 1.00 becomes 1.00 and anything above 5.50 becomes 5.50. Rubric scores of 5, 4, 3 and 3 for originality, methodology, clarity and relevance respectively therefore contribute 2.00, 1.20, 0.45 and 0.45, for a total of 4.10, which with a zero bias is a `weighted_score` of 4.10; the same rubric from a reviewer whose `calibration_bias` is minus 0.35 gives 3.75.
+
+The submission then stamps `submitted_at` from the logical clock, lowers the reviewer's `current_review_load` by one, raises the abstract's `submitted_review_count`, and refreshes the abstract's `provisional_score` and `score_spread`. When `submitted_review_count` reaches the category's `min_reviews_required`, the abstract advances from `UNDER_REVIEW` to `SCORED`. Note that `submitted_review_count` counts only reviews whose `assigned_round` equals the abstract's current `revision_round`, so a revision resets the count without deleting anything.
+
+**Two consensus variants, one input set.** Both consensus scores read exactly the same rows: every review of the abstract whose `status` is `SUBMITTED` and whose `assigned_round` equals the abstract's current `revision_round`. When that set is empty, both scores are null.
+
+- The **provisional** variant is the plain arithmetic mean: the sum of the `weighted_score` values divided by the number of reviews in the set, rounded half up to two decimal places. It is written to `provisional_score` on every review submission and is the only consensus figure available while review is still open.
+- The **final** variant is a confidence-weighted mean. Each review is given a weight from its `confidence` — 1 for `LOW`, 2 for `MEDIUM`, 3 for `HIGH` — and the score is the sum of each review's weight multiplied by its `weighted_score`, divided by the sum of those weights, rounded half up to two decimal places. A high-confidence review therefore counts three times as much as a low-confidence one. It is written to `final_score` when review closes and when a discrepancy resolves, and it is the only score that may drive a decision or a waitlist promotion.
+
+The two genuinely diverge. Given three submitted reviews scoring 4.20 at `HIGH` confidence, 3.00 at `LOW` and 2.40 at `MEDIUM`, the provisional figure is 9.60 divided by 3, or 3.20, while the final figure is three times 4.20 plus one times 3.00 plus two times 2.40, all divided by six — 20.40 divided by 6, or 3.40.
+
+**The spread and when a dispute opens.** `score_spread` measures reviewer disagreement over the same round-filtered set. With fewer than two submitted reviews the spread is null and no dispute can open. With exactly two, the spread is the absolute difference between the two `weighted_score` values, rounded half up to two decimal places. With three or more, the spread is the value that survives discarding a single outlier: for each review in turn, remove it, take the difference between the largest and the smallest `weighted_score` among the remaining reviews, and let the spread be the smallest of those differences, rounded half up to two decimal places. This trim-one rule encodes the product intent that a dispute means *at least two* reviewers disagree materially, not that one reviewer is eccentric.
+
+A discrepancy case is opened whenever the recomputed spread is greater than or equal to the category's `discrepancy_threshold` and no non-terminal case already exists for that abstract; the boundary is inclusive, so with a threshold of 1.50 a spread of exactly 1.50 opens a case while 1.49 does not. The case is created with `status` `OPEN`, its `spread_at_open` frozen to the abstract's spread at that instant, and `arbiter_member_id`, `third_review_id`, `resolution_method` and `resolved_score` all null.
+
+**Arbitration and the third-review fork.** A dispute is arbitrated by a chair who has not already taken a position on the work. Assigning the arbiter moves the case from `OPEN` to `ARBITER_ASSIGNED` and requires that the nominated `arbiter_member_id` identify a member whose `member_role` is `CHAIR`, whose `status` is `ACTIVE`, and whose conference matches the abstract's conference. That member must hold no review on the abstract in `SUBMITTED` status and no conflict declaration matching the abstract's author set; either failure is `ERR_ARBITER_CONFLICT`. Once stored, only that member may resolve the case.
+
+From `ARBITER_ASSIGNED` the case forks on the `resolution_method` the arbiter selects, and the two branches have disjoint effects.
+
+**Chair override.** Choosing `CHAIR_OVERRIDE` resolves the case immediately, moving it straight to `RESOLVED`. It requires an `override_score` between 1.00 and 5.50, and it is permitted only while the case's recorded `spread_at_open` is strictly less than twice the category's `discrepancy_threshold`; at or above that ceiling a third review is mandatory and the override is rejected with `ERR_OVERRIDE_NOT_PERMITTED`. On success the case records `resolution_method` `CHAIR_OVERRIDE` and a `resolved_score` equal to the supplied `override_score`, the abstract's `final_score` is set to that same value — the computed final consensus variant is superseded by the override — and if the abstract is still `UNDER_REVIEW` while its `submitted_review_count` has reached the category's `min_reviews_required`, it advances to `SCORED`.
+
+**Third review.** Choosing `THIRD_REVIEW` moves the case to `THIRD_REVIEW_PENDING` and commissions a tie-breaking review. The selector must find at least one eligible candidate with every existing reviewer of the abstract and the arbiter excluded; an empty pool aborts the resolution with `ERR_NO_ELIGIBLE_REVIEWER`. On success the case records `resolution_method` `THIRD_REVIEW`, a review is created in `ASSIGNED` status with `is_third_review` true and chosen by the selector's match-score ranking, the chosen reviewer's `current_review_load` rises by one, and the new review's identifier is stored on the case as `third_review_id`.
+
+The two branches rejoin when that third review is submitted. Its submission recomputes the abstract's spread as usual, and the case then resolves on the comparison: if the recomputed `score_spread` is strictly less than the category's `discrepancy_threshold`, the case moves from `THIRD_REVIEW_PENDING` to `RESOLVED`, its `resolved_score` is set to the final consensus variant computed over the round's submitted reviews, and the abstract's `final_score` is set to that same value. If instead the recomputed spread is still greater than or equal to the threshold, the case moves to `ESCALATED`, its `resolved_score` stays null and the abstract's `final_score` stays null.
+
+Consider the concrete arithmetic. Two submitted reviews at 4.25 and 2.60 give a spread of 1.65, which opens a case against a threshold of 1.50. A third review scoring 3.30 makes the trim-one candidates 0.70, 0.95 and 1.65, so the spread becomes 0.70, which clears the threshold and joins at `RESOLVED`. A third review scoring 1.00 instead makes the candidates 1.60, 3.25 and 1.65, so the spread becomes 1.60, which still exceeds the threshold and lands at `ESCALATED`.
+
+`ESCALATED` has exactly one exit: the arbiter posts a `CHAIR_OVERRIDE` with an `override_score` between 1.00 and 5.50, which moves the case to `RESOLVED`, records the method and the `resolved_score`, and writes that value to the abstract's `final_score`. From `ESCALATED` the spread ceiling that produced `ERR_OVERRIDE_NOT_PERMITTED` no longer applies — the panel override is the only way out. `RESOLVED` is the only terminal state of a case. Posting an arbiter assignment to a case that is not `OPEN`, or a resolution to a case that is neither `ARBITER_ASSIGNED` nor `ESCALATED`, is rejected with `ERR_CASE_STATE_INVALID`.
+
+### 3.6. Closing Review and Committing Decisions Through the Capacity Waterfall
+
+Closing review is the moment the provisional picture becomes the official one. The move from `REVIEW_OPEN` to `REVIEW_CLOSED` is refused while any discrepancy case belonging to an abstract of this conference is `OPEN`, `ARBITER_ASSIGNED`, `THIRD_REVIEW_PENDING` or `ESCALATED`, in which case the response is `ERR_OPEN_DISCREPANCY`. When it succeeds, it fans out across the conference: every abstract that is `UNDER_REVIEW` with a `submitted_review_count` of at least its category's `min_reviews_required` advances to `SCORED`; every abstract that is `UNDER_REVIEW` or `SCORED` with at least one submitted review gets its `final_score` written from the final consensus variant; every review of the conference still in `ASSIGNED` status becomes `VOIDED`, with each affected reviewer's `current_review_load` lowered by one so the load ledger stays exact; and the conference's `version` advances.
+
+Review may be re-opened exactly once. That back-edge from `REVIEW_CLOSED` to `REVIEW_OPEN` requires `review_reopen_count` to be zero and a present, non-empty `reopen_reason`. On success `review_reopen_count` rises to one, the `final_score` of every abstract that is `SCORED` with a null `decision` is cleared back to null — the final variant is invalidated until review closes again — and the conference's `version` advances. A second reopen attempt is rejected with `ERR_REVIEW_REOPEN_LIMIT`.
+
+**Committing a decision.** Decisions are issued one abstract at a time by a chair, from the `SCORED` state, while the conference is `REVIEW_CLOSED`. The payload carries the intended `decision` — `ORAL`, `POSTER`, `WORKSHOP` or `REJECTED` — the mandatory `expected_conference_version` described in §2.7, and an optional `allow_format_downgrade` flag. Five gates precede the capacity arithmetic: the version must match, or the response is `ERR_STALE_CONFERENCE_VERSION`; the abstract's `submitted_review_count` must be at least its category's `min_reviews_required`, or the response is `ERR_INSUFFICIENT_REVIEWS`; no discrepancy case of the abstract may be in a non-terminal state, or the response is `ERR_OPEN_DISCREPANCY`; the acting chair must hold no review on this abstract in `SUBMITTED` status, or the response is `ERR_SEGREGATION_VIOLATION`; and for any non-rejection outcome the requested format must be among the category's `allowed_formats`, or the response is `ERR_FORMAT_NOT_ALLOWED`.
+
+A decision of `REJECTED` consumes no slot and therefore skips both the allowed-format check and the capacity arithmetic entirely. It sets `decision` to `REJECTED`, records the acting chair in `decided_by_member_id`, moves the abstract to `REJECTED`, and advances the conference's `version`.
+
+**The capacity waterfall.** For each format, remaining capacity is that format's declared slot capacity minus the conference's accepted count for that format. Placement then follows a fixed procedure:
+
+- A `WORKSHOP` decision commits to `WORKSHOP` when remaining workshop capacity is at least one, and otherwise fails with `ERR_FORMAT_CAPACITY_EXHAUSTED`. Workshops never spill into another format, and `allow_format_downgrade` is ignored for them entirely.
+- An `ORAL` decision commits to `ORAL` when remaining oral capacity is at least one. When it is zero and `allow_format_downgrade` is false, the request fails with `ERR_FORMAT_CAPACITY_EXHAUSTED`. When it is zero, `allow_format_downgrade` is true, `POSTER` is among the category's `allowed_formats` and remaining poster capacity is at least one, the abstract is committed as a `POSTER` and `decision_downgraded` is set to true. When none of those hold, the abstract is waitlisted.
+- A `POSTER` decision commits to `POSTER` when remaining poster capacity is at least one. When it is zero and `allow_format_downgrade` is false, the request fails with `ERR_FORMAT_CAPACITY_EXHAUSTED`. When it is zero and downgrade is allowed, there is nothing below poster in the waterfall, so the abstract is waitlisted.
+
+A committed decision moves the abstract from `SCORED` to `ACCEPTED`, writes the waterfall-resolved format into `decision`, sets `decision_downgraded` to true exactly when that resolved format differs from the format the chair asked for, records `decided_by_member_id`, raises the matching accepted count on the conference and advances the conference's `version`. A waitlisted outcome moves the abstract from `SCORED` to `WAITLISTED`, leaves `decision` null, still records `decided_by_member_id`, raises the conference's `waitlisted_count` by one and advances the conference's `version`.
+
+**Promotion when a slot comes free.** Whenever one slot of a format is released — by a decision rescission, an abstract withdrawal or a session cancellation that frees committed capacity — exactly one abstract is promoted. The eligible pool is every abstract of the conference whose `status` is `WAITLISTED` and whose category's `allowed_formats` contains the released format. That pool is ranked by score, taking each abstract's `final_score` when it is present and its `provisional_score` otherwise, from highest to lowest, with ties broken by `created_at` from earliest to latest and never by identifier. The top-ranked abstract moves from `WAITLISTED` to `ACCEPTED` with `decision` set to the released format, `decision_downgraded` set to true when that format differs from its `requested_format`, and `decided_by_member_id` copied from the abstract whose slot was released; the conference's matching accepted count rises by one, its `waitlisted_count` falls by one, and its `version` advances. When the eligible pool is empty the slot simply stays free and no error is raised.
+
+**Rescinding an acceptance.** A chair may take an acceptance back, moving the abstract from `ACCEPTED` to `SCORED`, while the conference is `REVIEW_CLOSED` or `DECISIONS_RELEASED` and provided no slot references the abstract in `SCHEDULED` status. The rescission lowers the conference's accepted count for the abstract's former `decision` by one, clears `decision` and `decided_by_member_id` to null and `decision_downgraded` to false, runs waitlist promotion for the released format, and advances the conference's `version`. This is the compensating action for a commit, and the slot-conservation identity of §2.9 must hold exactly once it completes.
+
+**Releasing decisions.** The move from `REVIEW_CLOSED` to `DECISIONS_RELEASED` is the presenter-notification gate, and it requires that no abstract of the conference still be `SCORED` — every scored abstract must carry a decision or be waitlisted — with `ERR_UNDECIDED_ABSTRACTS_REMAIN` otherwise. It advances only the conference's `version`. Its significance is that an author may only confirm an acceptance from `DECISIONS_RELEASED` onward.
+
+### 3.7. Program Construction: Sessions, Slots, Publication and On-Site Outcomes
+
+**Confirming participation.** An author converts an acceptance into a commitment by moving their abstract from `ACCEPTED` to `CONFIRMED`. Only the submitting author may do so; the conference must be `DECISIONS_RELEASED` or `PROGRAM_PUBLISHED`; the author's `is_registered` must be true, or the request fails with `ERR_AUTHOR_NOT_REGISTERED`; and the author's `sanction_status` must not be `BARRED`, or it fails with `ERR_AUTHOR_BARRED`. The abstract's `version` advances.
+
+**Building a session.** A chair constructs a themed session while the conference is `REVIEW_CLOSED` or `DECISIONS_RELEASED`, naming the `conference_id`, the `chair_member_id` who will run it, a `theme_code` of 2 to 16 characters that every slot in the session must share, a `format` of `ORAL`, `POSTER` or `WORKSHOP`, a `room_code` of 1 to 16 characters identifying the physical room, a `start_utc` and `end_utc` window, a `capacity_slots` ceiling between 1 and 20 that defaults to 6, and an optional `cme_designated` boolean defaulting to false. The nominated chair must have `member_role` `CHAIR`, `status` `ACTIVE` and a matching conference. The window must sit inside the event: `start_utc` at or after the conference's `event_start_utc`, `end_utc` at or before `event_end_utc`, and `end_utc` strictly later than `start_utc`, with `ERR_INVALID_DATE_RANGE` otherwise.
+
+Two exclusivity tests then run, room before chair, and they deliberately use different interval semantics. **Rooms use half-open intervals.** Comparing against every other session of the same conference in the same `room_code` whose `status` is not `CANCELLED`, a conflict exists when the new session's `start_utc` is strictly earlier than the peer's `end_utc` and the peer's `start_utc` is strictly earlier than the new session's `end_utc`; a session that begins at the exact instant another ends is therefore legal, because the room empties instantaneously. Any conflict is `ERR_ROOM_TIME_CONFLICT`. **Chairs use inflated intervals.** Comparing against every other session with the same `chair_member_id` whose `status` is not `CANCELLED`, each peer's end and the new session's end are both extended by a mandatory fifteen-minute turnaround before the same comparison is made: a conflict exists when the new session's `start_utc` is earlier than fifteen minutes after the peer's `end_utc` and the peer's `start_utc` is earlier than fifteen minutes after the new session's `end_utc`. A gap of exactly fifteen minutes between two of a chair's sessions is legal; a gap of fourteen minutes conflicts. Any conflict is `ERR_CHAIR_TIME_CONFLICT`.
+
+A new session starts `PLANNED`, with `slot_count` zero, `committed_minutes` zero, `accredited_credit_total` 0.00, and `accreditation_posture` `NOT_APPLICABLE` when `cme_designated` is false or `NON_COMPLIANT` when it is true. Its chair's `chaired_session_count` rises by one; that counter always equals the number of sessions chaired by the member whose `status` is `PLANNED`, `PUBLISHED` or `LOCKED`.
+
+**Placing an abstract into a slot.** A chair adds a slot by naming the `abstract_id`, the `presenter_author_id`, a 1-based running-order `position` between 1 and 20 that must be unique among the session's counted slots, a `duration_minutes` between 5 and 120, and the mandatory `expected_session_version`. The session must be `PLANNED`, or the request fails with `ERR_SESSION_STATE_INVALID`, and the logical clock must still be earlier than the conference's `program_freeze_utc`, or it fails with `ERR_PROGRAM_FROZEN`. The abstract must be `CONFIRMED`, with `ERR_ABSTRACT_STATE_INVALID` otherwise. The abstract's `decision` must equal the session's `format`, with `ERR_SESSION_FORMAT_MISMATCH` otherwise, and the session's `theme_code` must be one of the abstract's `keywords`, with `ERR_SESSION_THEME_MISMATCH` otherwise. The nominated presenter must be either the abstract's submitting author or an author whose `email` appears in the abstract's `coauthor_emails`, with `ERR_PRESENTER_NOT_ON_ABSTRACT` otherwise, and must not be `BARRED`.
+
+**Presenters use fully closed intervals** — the third and strictest of the three interval rules. Comparing against every slot of the same presenter whose `status` is `SCHEDULED`, that belongs to a different session, and whose session is not `CANCELLED`, a conflict exists when the new session's `start_utc` is at or before the peer session's `end_utc` and the peer session's `start_utc` is at or before the new session's `end_utc`. Touching endpoints therefore **do** conflict for a presenter, the opposite verdict from a room on the same instants, because a person cannot be in two rooms at the instant one session ends and the next begins. Any conflict is `ERR_PRESENTER_TIME_CONFLICT`.
+
+Finally the session must have room. Its counted slots are those whose `status` is `SCHEDULED`, `PRESENTED` or `NO_SHOW_RECORDED`, and `slot_count` is their number. The three packing checks run in a fixed order: the count must be strictly less than `capacity_slots`, or the response is `ERR_SESSION_SLOT_CAPACITY_REACHED`; the requested `position` must not already be occupied by a counted slot of the session, or the response is `ERR_DUPLICATE_SLOT_POSITION`; and the minute budget must admit the new duration, or the response is `ERR_SESSION_DURATION_EXCEEDED`.
+
+**The minute budget.** The session window is the whole number of minutes from `start_utc` to `end_utc`. A session's `committed_minutes` is the sum of `duration_minutes` over its counted slots plus a five-minute changeover allowance for each gap between consecutive counted slots — that is, five minutes multiplied by one less than the number of counted slots, and zero when there are no slots at all. A new slot is admissible only when a ten-minute session buffer, plus the durations of all existing counted slots, plus the new slot's `duration_minutes`, plus five minutes for every gap in the resulting arrangement — five multiplied by one less than the post-addition slot count — is less than or equal to the window in minutes. Worked at the boundary: a ninety-minute window already holding two twenty-five-minute slots has `committed_minutes` of fifty-five, being fifty minutes of content plus one five-minute changeover. Adding a twenty-minute slot needs ten plus seventy plus two changeovers of five, which is exactly ninety and therefore admissible at the boundary; adding a twenty-one-minute slot needs ninety-one, which exceeds the window and is rejected. After the twenty-minute slot lands, `committed_minutes` becomes seventy content minutes plus ten minutes of changeover, or eighty.
+
+A successful placement moves the abstract from `CONFIRMED` to `SCHEDULED`, raises the session's `slot_count` by one, recomputes `committed_minutes`, `accredited_credit_total` and `accreditation_posture`, and advances the session's `version`. The slot itself starts in `SCHEDULED` status with `swapped_with_slot_id` null.
+
+**Publishing and locking.** A chair publishes a session, moving it from `PLANNED` to `PUBLISHED`, only while the conference is `DECISIONS_RELEASED`. The session must hold at least one counted slot, or the response is `ERR_EMPTY_SESSION`; every counted slot's abstract must be in `SCHEDULED` status; and the session's `accreditation_posture` must not be `NON_COMPLIANT`, or the response is `ERR_SESSION_NOT_ACCREDITED`. Publication advances the session's `version`. A published session can be un-published back to `PLANNED`, either manually by a chair — which requires the logical clock to still be earlier than `program_freeze_utc`, with `ERR_PROGRAM_FROZEN` otherwise — or automatically by the last link of Cascade A or Cascade B; either way the session's `version` advances. Sessions are frozen for good when the conference moves from `DECISIONS_RELEASED` to `PROGRAM_PUBLISHED`, which requires that every session of the conference be either `PUBLISHED` or `CANCELLED` and that at least one be `PUBLISHED`; that transition turns every `PUBLISHED` session into `LOCKED`, advancing each such session's `version`, and advances the conference's `version`. `PROGRAM_PUBLISHED` is the conference's terminal state, and `LOCKED` and `CANCELLED` are the session's.
+
+Cancelling a session is available from `PLANNED` or `PUBLISHED` and requires the logical clock to still be earlier than `program_freeze_utc`, with `ERR_PROGRAM_FROZEN` otherwise. Cancellation turns every slot of the session in `SCHEDULED` status into `WITHDRAWN`, returns each affected abstract from `SCHEDULED` to `CONFIRMED` — the acceptance and its committed format slot are retained, so no capacity is released by a cancellation — lowers the chair's `chaired_session_count` by one, and resets the session's `slot_count` to zero, `committed_minutes` to zero and `accredited_credit_total` to 0.00.
+
+**Recording what happened on the day.** Once a session is `PUBLISHED` or `LOCKED`, a chair or an administrator records each slot's outcome by naming a `to_status`, with an optional `reason`. Marking a slot `PRESENTED` additionally requires the logical clock to be at or after the session's `start_utc`, and it moves the slot's abstract from `SCHEDULED` to `PRESENTED`. Marking a slot `NO_SHOW_RECORDED` requires the logical clock to be at or after the session's `end_utc`, and it runs Cascade D: the abstract moves from `SCHEDULED` to `NO_SHOW`, the presenting author's `no_show_strikes` is recomputed, and their `sanction_status` is re-derived — `WARNED` at a combined strike count of one, `BARRED` at two or more. Slots also reach `WITHDRAWN` without any explicit request, driven by an abstract withdrawal, a session cancellation or an approved withdrawal change request; each such withdrawal lowers the owning session's `slot_count` by one, recomputes `committed_minutes`, `accredited_credit_total` and `accreditation_posture`, and advances the session's `version`. `PRESENTED`, `NO_SHOW_RECORDED`, `WITHDRAWN` and `MOVED` are all terminal for a slot.
+
+### 3.8. Continuing-Education Accreditation and Disclosure Governance
+
+Accreditation converts presented content into continuing-education credit, and it is deliberately paperwork-heavy. An accreditation is opened by an administrator or a chair against an `abstract_id`, with `content_minutes` between 5 and 240 of instructional time and an optional `commercial_support_disclosed` boolean defaulting to false. The abstract's category must have `cme_eligible` true, or the request fails with `ERR_CATEGORY_NOT_CME_ELIGIBLE`; the abstract's `status` must be `ACCEPTED`, `CONFIRMED` or `SCHEDULED`; and no other accreditation for the same abstract may be in `PENDING` or `VALIDATED` status, with `ERR_ACCREDITATION_STATE_INVALID` otherwise. The new row starts `PENDING` with `awarded_credits` 0.00, `commercial_bias_flag` derived from the still-empty disclosure set, and `validated_by_member_id` and `validated_at` null.
+
+Disclosures are filed by authors, or by an administrator on their behalf, against a pending accreditation. A disclosure names the `abstract_id`, the `accreditation_id` it supports, the `author_id` making the declaration, a `has_financial_relationship` boolean, and, when that boolean is true, a mandatory `relationship_entity` naming the commercial entity. The accreditation must still be `PENDING`; its own abstract must match the `abstract_id` in the payload, or the response is `ERR_DISCLOSURE_ABSTRACT_MISMATCH`; and the disclosing author must be the abstract's submitting author or the holder of one of its `coauthor_emails`. On creation the row's `status` is `SUBMITTED`, its `mitigation_required` is set to exactly the value of `has_financial_relationship`, its `mitigation_completed` defaults to false, its `rejection_reason` is null, and the parent accreditation's `commercial_bias_flag` is recomputed.
+
+That flag is the linchpin of the bias controls: an accreditation's `commercial_bias_flag` is true precisely when its `commercial_support_disclosed` is true and at least one linked disclosure has `mitigation_required` true while its `mitigation_completed` is still false. It is recomputed on every disclosure creation and on every disclosure adjudication.
+
+A chair adjudicates each disclosure by naming an `outcome`, with optional `rejection_reason` and `mitigation_completed` inputs. An outcome of `VALIDATED` moves the row from `SUBMITTED` to `VALIDATED` and requires either that `mitigation_required` be false or that `mitigation_completed` be true; a disclosure that needs mitigation and has not completed it cannot be validated, and the attempt returns `ERR_DISCLOSURE_INCOMPLETE`. An outcome of `REJECTED` requires a `rejection_reason` and is reachable both from `SUBMITTED` and — as a post-hoc disclosure failure — from `VALIDATED`; the latter path is what triggers Cascade A in full. Every adjudication recomputes the parent accreditation's `commercial_bias_flag`. `REJECTED` is terminal for a disclosure, and posting a `VALIDATED` outcome to an already-validated row is rejected with `ERR_DISCLOSURE_STATE_INVALID`.
+
+**Content validation.** A chair validates, rejects or revokes an accreditation by naming an `action`, with an optional `rejection_reason`. Validation moves the row from `PENDING` to `VALIDATED` and has four preconditions: the acting chair must not be the member recorded in the abstract's `decided_by_member_id`, or the response is `ERR_ACCREDITATION_SELF_VALIDATION`; at least one disclosure must exist for the accreditation and every one of them must be `VALIDATED`, or the response is `ERR_DISCLOSURE_INCOMPLETE`; the accreditation's `commercial_bias_flag` must be false, which is the second trigger for that same error; and `content_minutes` must be less than or equal to the conference's `cme_minutes_available`, or the response is `ERR_CME_POOL_EXHAUSTED`. On success the row's `awarded_credits` is computed, `validated_by_member_id` and `validated_at` are set, the conference's `cme_minutes_allocated` rises by `content_minutes` with `cme_minutes_available` recomputed and the conference's `version` advanced, and the session holding a counted slot for that abstract recomputes its `accredited_credit_total` and `accreditation_posture` with its own `version` advanced.
+
+Rejecting an accreditation moves it from `PENDING` to `REJECTED`, requires a `rejection_reason`, and leaves `awarded_credits` at 0.00. Revoking one moves it from `VALIDATED` to `REVOKED`, has no preconditions, returns `awarded_credits` to 0.00, lowers the conference's `cme_minutes_allocated` by exactly the same `content_minutes` the validation debited with `cme_minutes_available` recomputed and the conference's `version` advanced, recomputes the owning session's `accredited_credit_total` and `accreditation_posture` with that session's `version` advanced, and — when that session is `cme_designated`, its recomputed posture is `NON_COMPLIANT` and it is currently `PUBLISHED` — drops the session back to `PLANNED`. Revocation is the compensating action for validation, and the minute-pool identity of §2.9 must hold exactly afterwards. `REJECTED` and `REVOKED` are terminal.
+
+**Credit arithmetic, in two variants that deliberately disagree.** Both start from accreditable minutes and convert them into quarter credits at fifteen minutes per quarter credit.
+
+- The **per-abstract award** is what an accreditation actually earns and what feeds a session's ledger: for each validated accreditation, divide its `content_minutes` by fifteen, discard the remainder by rounding down to a whole number, and multiply by 0.25; the total over a set is the sum of those individually floored awards. Leftover minutes below fifteen are lost per abstract.
+- The **session bundle estimate** is a conference-level planning figure: sum the `content_minutes` of the validated set first, then divide that single total by fifteen, round down to a whole number once, and multiply by 0.25. Leftover minutes pool together and can buy extra quarter credits.
+
+Given three validated accreditations of 20, 25 and 40 minutes, the per-abstract route awards 0.25, 0.25 and 0.50 for a total of 1.00, while the bundle route sums to 85 minutes, floors 85 divided by 15 to 5, and reports 1.25. A session's `accredited_credit_total` uses the per-abstract route, summing the credits of its counted slots whose accreditation is `VALIDATED`, at two decimal places. A session's `accreditation_posture` follows from it: `NOT_APPLICABLE` whenever `cme_designated` is false, otherwise `COMPLIANT` when `accredited_credit_total` is at least 0.50 and `NON_COMPLIANT` when it is below that.
+
+Both figures are visible side by side on the conference capacity read, which reports the conference's identifier, remaining oral, poster and workshop capacity, the `waitlisted_count`, `cme_minutes_available`, the bundle figure as `cme_bundle_credits`, the plain sum of per-abstract `awarded_credits` as `awarded_credits_sum`, and the count of accredited sessions as `accredited_session_count`. The gap between `cme_bundle_credits` and `awarded_credits_sum` is expected, not a defect.
+
+### 3.9. Near-Event Operations: Embargoed Findings and Late Program Changes
+
+**Press embargoes.** The press dimension is driven solely by communications staff, through an `action` of either `SET_EMBARGO` or `RELEASE`. Setting an embargo moves the abstract's `embargo_status` from `NONE` to `EMBARGOED` and requires that the abstract's `is_newsworthy` be true — otherwise the attempt fails with `ERR_NOT_NEWSWORTHY` — that the abstract's `status` be `ACCEPTED`, `CONFIRMED` or `SCHEDULED`, and that the supplied `embargo_until_utc` be present, strictly later than the logical clock, and at or before the conference's `event_end_utc`; a missing or out-of-window instant is `ERR_EMBARGO_WINDOW_INVALID`. The instant is stored on the abstract as `embargo_until_utc`. Attempting a release while `embargo_status` is still `NONE` is rejected with `ERR_EMBARGO_NOT_SET`.
+
+A release from `EMBARGOED` always requires an `outlet_name`, and it branches on nothing but the clock. When the logical clock is at or after the abstract's `embargo_until_utc`, the abstract's `press_outlet_name` is recorded and `embargo_status` becomes `RELEASED`. When the logical clock is strictly earlier than `embargo_until_utc`, the very same request instead records `press_outlet_name` and lands in `BREACHED`, running Cascade E: the submitting author's `embargo_breach_count` is recomputed and their `sanction_status` is re-derived, which can bar an author who has also missed a presentation. The two outcomes have disjoint side-effect sets, and both `RELEASED` and `BREACHED` are terminal for the embargo dimension.
+
+**Late program changes.** Once decisions are out, structural changes to the running order go through a request-and-approval workflow rather than direct edits. An author or a chair opens a request naming the `session_slot_id`, a `change_type` of `MOVE`, `SWAP`, `SUBSTITUTE_PRESENTER` or `WITHDRAW`, an optional `requested_by_author_id` — which defaults to the caller's own identifier when the caller is an author — an optional `target_session_id`, an optional `substitute_presenter_author_id`, and an optional free-text `reason`. The owning conference is recorded as `conference_id`. The conference must be `DECISIONS_RELEASED` or `PROGRAM_PUBLISHED`; the referenced slot must still be `SCHEDULED`; the logical clock must be earlier than `event_end_utc`; the caller must be a chair of the conference or an author who is either the slot's `presenter_author_id` or the abstract's submitting author, with `ERR_NOT_RESOURCE_OWNER` otherwise; a `MOVE` or `SWAP` must supply `target_session_id` and a `SUBSTITUTE_PRESENTER` must supply a `substitute_presenter_author_id` whose email is among the abstract's `coauthor_emails`; and no other request for the same slot may already be `PENDING`, with `ERR_CHANGE_REQUEST_STATE_INVALID` otherwise.
+
+Creation stamps `submitted_at` from the logical clock and freezes `days_to_event` onto the row: the number of whole 86,400-second days from `submitted_at` to the conference's `event_start_utc`, rounded down, which may be negative for a request filed after the event has begun. The requester is then quoted an `estimated_fee_cents`, and the row starts `PENDING` with `final_fee_cents`, `rush_pct_applied` and `approver_member_id` all null.
+
+**Two fee variants over the same inputs.** The base fee depends only on `change_type`: 4,000 cents for a `MOVE`, 6,000 for a `SWAP`, 2,500 for a `SUBSTITUTE_PRESENTER` and nothing at all for a `WITHDRAW`. A rush percentage is then selected from the frozen `days_to_event`, using three bands: fourteen days or more out is the relaxed band, seven to thirteen days out inclusive is the near band, and fewer than seven days out is the imminent band.
+
+- The **estimate quoted at submission** uses the gentler table — zero percent in the relaxed band, ten percent in the near band, twenty-five percent in the imminent band — applies it to the base fee, rounds half up to whole cents, and adds no surcharge of any kind. That figure is stored in `estimated_fee_cents` and is never revised afterwards.
+- The **final fee charged at approval** uses the steeper table — zero percent relaxed, twenty percent near, fifty percent imminent — on the same frozen `days_to_event`, rounds the uplifted base half up to whole cents, and then adds a flat 1,500-cent post-freeze surcharge when the request's `submitted_at` is at or after the conference's `program_freeze_utc`. The result is stored in `final_fee_cents`, and the steeper percentage that was applied is recorded in `rush_pct_applied`.
+
+A `MOVE` filed five days before the event, after the freeze, therefore quotes 4,000 uplifted by twenty-five percent, or 5,000 cents, and later charges 4,000 uplifted by fifty percent plus the 1,500 surcharge, or 7,500 cents.
+
+**Adjudication.** A chair approves or rejects a pending request through an `outcome`, with an optional `note`. Rejection moves the row to `REJECTED`, sets `final_fee_cents` to zero and records the chair in `approver_member_id`. Approval moves it to `APPLIED` and requires that the referenced slot still be `SCHEDULED`; for a `MOVE` or a `SWAP` it additionally requires that the target session's `format` equal the slot abstract's `decision`, that the target session's `theme_code` be one of that abstract's `keywords`, and that the target session's `slot_count` be strictly less than its `capacity_slots`. Approval computes `final_fee_cents` from the final variant, records `rush_pct_applied` and `approver_member_id`, and then applies the structural change:
+
+- A `MOVE` turns the referenced slot from `SCHEDULED` to `MOVED` and creates a replacement slot in `SCHEDULED` status inside the target session, carrying the same `abstract_id`, `presenter_author_id` and `duration_minutes`, with its `position` set to the target session's `slot_count` plus one. Both sessions recompute `slot_count`, `committed_minutes`, `accredited_credit_total` and `accreditation_posture`, and both advance their `version`.
+- A `SWAP` exchanges the referenced slot with the target session's slot holding the lowest `position`: the two rows exchange their `session_id` and their `position`, and each row's `swapped_with_slot_id` is set to point at the other.
+- A `SUBSTITUTE_PRESENTER` replaces the slot's `presenter_author_id` with the `substitute_presenter_author_id`.
+- A `WITHDRAW` turns the slot from `SCHEDULED` to `WITHDRAWN` and takes its abstract to `WITHDRAWN` with the full Cascade B — and this is the one path by which a withdrawal may still restructure the program after `program_freeze_utc` has passed.
+
+`APPLIED` and `REJECTED` are both terminal, and a second adjudication of the same request is rejected with `ERR_CHANGE_REQUEST_STATE_INVALID`.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence return `201 Created`. Operations that modify an existing resource — status transitions, adjudications, submissions, declines, registrations, patches and the clock capability — return `200 OK`. Read operations return `200 OK`. Every rejection carries the error envelope of §2.2 and one of the identifiers in §5.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock | ConferenceAdmin |
+| POST | `/conferences` | Create a conference in `DRAFT` | ConferenceAdmin |
+| GET | `/conferences` | Paginated conference list | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/conferences/{conferenceId}` | Read one conference with every derived capacity and CME counter | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/conferences/{conferenceId}/capacity-summary` | Computed read: remaining capacity, waitlist depth, remaining minutes and both credit figures | ConferenceAdmin, ProgramChair |
+| POST | `/conferences/{conferenceId}/status-transitions` | Drive the conference lifecycle, including the extension and reopen back-edges | ConferenceAdmin |
+| POST | `/categories` | Declare a submission category with its formatting, review and CME policy | ConferenceAdmin |
+| GET | `/categories` | Filtered category list | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/categories/{categoryId}` | Read one submission category | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| POST | `/authors` | Create an author record | ConferenceAdmin, Author |
+| GET | `/authors` | Filtered author list | ConferenceAdmin, ProgramChair, PressOfficer |
+| GET | `/authors/{authorId}` | Read one author with the sanction ladder state | ConferenceAdmin, ProgramChair, Author, PressOfficer |
+| POST | `/authors/{authorId}/registration` | Record or clear event registration | ConferenceAdmin, Author |
+| POST | `/abstracts` | Submit an abstract to an open call and mint its blind code | Author |
+| GET | `/abstracts` | Filtered abstract list | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/abstracts/{abstractId}` | Read one abstract with both score variants, decision and embargo dimension | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| POST | `/abstracts/{abstractId}/revisions` | Author resubmission after a revision request | Author |
+| POST | `/abstracts/{abstractId}/status-transitions` | Every non-decision abstract status move, including confirmation, withdrawal and rescission | ProgramChair, Author |
+| POST | `/abstracts/{abstractId}/decision` | Commit an acceptance decision through the capacity waterfall under conference OCC | ProgramChair |
+| POST | `/abstracts/{abstractId}/review-assignments` | Assign a blinded reviewer, explicitly or through the expertise selector | ProgramChair |
+| POST | `/abstracts/{abstractId}/press-actions` | Set an embargo or record an outlet release | PressOfficer |
+| POST | `/committee-members` | Recruit a reviewer or chair onto a conference committee | ConferenceAdmin |
+| GET | `/committee-members` | Filtered committee list | ConferenceAdmin, ProgramChair, Reviewer |
+| GET | `/committee-members/{memberId}` | Read one committee member including the live load ledger | ConferenceAdmin, ProgramChair, Reviewer |
+| PATCH | `/committee-members/{memberId}` | Maintain expertise keywords, load ceiling and calibration bias | ConferenceAdmin |
+| POST | `/committee-members/{memberId}/status-transitions` | Activation, suspension, reinstatement and resignation | ConferenceAdmin, ProgramChair, Reviewer |
+| POST | `/conflict-declarations` | File an immutable conflict-of-interest declaration | ConferenceAdmin, ProgramChair, Reviewer |
+| GET | `/conflict-declarations` | Filtered declaration list | ConferenceAdmin, ProgramChair, Reviewer |
+| GET | `/conflict-declarations/{declarationId}` | Read one conflict declaration | ConferenceAdmin, ProgramChair, Reviewer |
+| GET | `/reviews` | Filtered review list | ConferenceAdmin, ProgramChair, Reviewer |
+| GET | `/reviews/{reviewId}` | Read one review with its weighted score and expertise match | ConferenceAdmin, ProgramChair, Reviewer |
+| POST | `/reviews/{reviewId}/submission` | Submit the rubric and recompute the abstract's consensus and spread | Reviewer, ProgramChair |
+| POST | `/reviews/{reviewId}/decline` | Decline an assignment, optionally triggering reassignment | Reviewer, ProgramChair |
+| GET | `/discrepancy-cases` | Filtered discrepancy case list | ConferenceAdmin, ProgramChair |
+| GET | `/discrepancy-cases/{caseId}` | Read one case with its recorded spread and resolution | ConferenceAdmin, ProgramChair |
+| POST | `/discrepancy-cases/{caseId}/arbiter` | Assign a conflict-free chair as arbiter | ProgramChair |
+| POST | `/discrepancy-cases/{caseId}/resolution` | Resolve by chair override or commission a third review | ProgramChair |
+| POST | `/sessions` | Build a themed session and assign its chair | ProgramChair |
+| GET | `/sessions` | Filtered session list | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/sessions/{sessionId}` | Read one session with its packing and accreditation ledgers | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| POST | `/sessions/{sessionId}/status-transitions` | Publish, unpublish or cancel a session | ProgramChair, ConferenceAdmin |
+| POST | `/sessions/{sessionId}/slots` | Place a confirmed abstract into a session under session OCC | ProgramChair |
+| GET | `/session-slots` | Filtered slot list | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| GET | `/session-slots/{slotId}` | Read one session slot | ConferenceAdmin, ProgramChair, Reviewer, Author, PressOfficer |
+| POST | `/session-slots/{slotId}/status-transitions` | Record the on-site outcome of a slot | ProgramChair, ConferenceAdmin |
+| POST | `/accreditations` | Open a continuing-education accreditation on eligible content | ConferenceAdmin, ProgramChair |
+| GET | `/accreditations` | Filtered accreditation list | ConferenceAdmin, ProgramChair, Author |
+| GET | `/accreditations/{accreditationId}` | Read one accreditation with its awarded credits | ConferenceAdmin, ProgramChair, Author |
+| POST | `/accreditations/{accreditationId}/validation` | Validate, reject or revoke accredited content | ProgramChair |
+| POST | `/disclosure-statements` | File an author financial-relationship disclosure | Author, ConferenceAdmin |
+| GET | `/disclosure-statements` | Filtered disclosure list | ConferenceAdmin, ProgramChair, Author |
+| GET | `/disclosure-statements/{disclosureId}` | Read one disclosure statement | ConferenceAdmin, ProgramChair, Author |
+| POST | `/disclosure-statements/{disclosureId}/adjudication` | Adjudicate a disclosure, including post-hoc rejection | ProgramChair |
+| POST | `/program-change-requests` | Open a late program change and quote the estimated fee | Author, ProgramChair |
+| GET | `/program-change-requests` | Filtered change-request list | ConferenceAdmin, ProgramChair, Author |
+| GET | `/program-change-requests/{requestId}` | Read one change request with both fee figures | ConferenceAdmin, ProgramChair, Author |
+| POST | `/program-change-requests/{requestId}/adjudication` | Approve or reject a change request and apply the change | ProgramChair |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_AUTH_HEADERS` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_IDENTITY_NOT_FOUND` | 403 Forbidden |
+| `ERR_NOT_RESOURCE_OWNER` | 403 Forbidden |
+| `ERR_CONFERENCE_NOT_FOUND` | 404 Not Found |
+| `ERR_CATEGORY_NOT_FOUND` | 404 Not Found |
+| `ERR_AUTHOR_NOT_FOUND` | 404 Not Found |
+| `ERR_ABSTRACT_NOT_FOUND` | 404 Not Found |
+| `ERR_MEMBER_NOT_FOUND` | 404 Not Found |
+| `ERR_DECLARATION_NOT_FOUND` | 404 Not Found |
+| `ERR_REVIEW_NOT_FOUND` | 404 Not Found |
+| `ERR_DISCREPANCY_CASE_NOT_FOUND` | 404 Not Found |
+| `ERR_SESSION_NOT_FOUND` | 404 Not Found |
+| `ERR_SLOT_NOT_FOUND` | 404 Not Found |
+| `ERR_ACCREDITATION_NOT_FOUND` | 404 Not Found |
+| `ERR_DISCLOSURE_NOT_FOUND` | 404 Not Found |
+| `ERR_CHANGE_REQUEST_NOT_FOUND` | 404 Not Found |
+| `ERR_VALIDATION` | 400 Bad Request |
+| `ERR_STALE_CONFERENCE_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_SESSION_VERSION` | 412 Precondition Failed |
+| `ERR_CONFERENCE_STATE_INVALID` | 409 Conflict |
+| `ERR_ABSTRACT_STATE_INVALID` | 409 Conflict |
+| `ERR_REVIEW_STATE_INVALID` | 409 Conflict |
+| `ERR_MEMBER_STATE_INVALID` | 409 Conflict |
+| `ERR_CASE_STATE_INVALID` | 409 Conflict |
+| `ERR_SESSION_STATE_INVALID` | 409 Conflict |
+| `ERR_SLOT_STATE_INVALID` | 409 Conflict |
+| `ERR_ACCREDITATION_STATE_INVALID` | 409 Conflict |
+| `ERR_DISCLOSURE_STATE_INVALID` | 409 Conflict |
+| `ERR_CHANGE_REQUEST_STATE_INVALID` | 409 Conflict |
+| `ERR_REVIEWER_CONFLICT` | 409 Conflict |
+| `ERR_ARBITER_CONFLICT` | 409 Conflict |
+| `ERR_SEGREGATION_VIOLATION` | 409 Conflict |
+| `ERR_ACCREDITATION_SELF_VALIDATION` | 409 Conflict |
+| `ERR_AUTHOR_BARRED` | 403 Forbidden |
+| `ERR_DISCLOSURE_INCOMPLETE` | 409 Conflict |
+| `ERR_CATEGORY_CONFERENCE_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_DISCLOSURE_ABSTRACT_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_FORMAT_NOT_ALLOWED` | 422 Unprocessable Entity |
+| `ERR_SESSION_THEME_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_SESSION_FORMAT_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_PRESENTER_NOT_ON_ABSTRACT` | 422 Unprocessable Entity |
+| `ERR_CATEGORY_NOT_CME_ELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_CFA_DEADLINE_PASSED` | 422 Unprocessable Entity |
+| `ERR_REVIEW_PAST_DUE` | 422 Unprocessable Entity |
+| `ERR_PROGRAM_FROZEN` | 409 Conflict |
+| `ERR_EMBARGO_WINDOW_INVALID` | 422 Unprocessable Entity |
+| `ERR_INVALID_DATE_RANGE` | 422 Unprocessable Entity |
+| `ERR_ABSTRACT_FORMAT_INVALID` | 422 Unprocessable Entity |
+| `ERR_INSUFFICIENT_REVIEWS` | 409 Conflict |
+| `ERR_OPEN_DISCREPANCY` | 409 Conflict |
+| `ERR_DUPLICATE_REVIEW_ASSIGNMENT` | 409 Conflict |
+| `ERR_REVISION_LIMIT_REACHED` | 409 Conflict |
+| `ERR_CFA_EXTENSION_LIMIT` | 409 Conflict |
+| `ERR_REVIEW_REOPEN_LIMIT` | 409 Conflict |
+| `ERR_OVERRIDE_NOT_PERMITTED` | 409 Conflict |
+| `ERR_NO_ELIGIBLE_REVIEWER` | 422 Unprocessable Entity |
+| `ERR_UNDECIDED_ABSTRACTS_REMAIN` | 409 Conflict |
+| `ERR_COI_NOT_DECLARED` | 409 Conflict |
+| `ERR_MEMBER_STILL_CHAIRING` | 409 Conflict |
+| `ERR_EMPTY_SESSION` | 409 Conflict |
+| `ERR_SESSION_NOT_ACCREDITED` | 409 Conflict |
+| `ERR_NOT_NEWSWORTHY` | 422 Unprocessable Entity |
+| `ERR_EMBARGO_NOT_SET` | 409 Conflict |
+| `ERR_ROOM_TIME_CONFLICT` | 409 Conflict |
+| `ERR_CHAIR_TIME_CONFLICT` | 409 Conflict |
+| `ERR_PRESENTER_TIME_CONFLICT` | 409 Conflict |
+| `ERR_SESSION_SLOT_CAPACITY_REACHED` | 422 Unprocessable Entity |
+| `ERR_DUPLICATE_SLOT_POSITION` | 422 Unprocessable Entity |
+| `ERR_SESSION_DURATION_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_AUTHOR_NOT_REGISTERED` | 422 Unprocessable Entity |
+| `ERR_FORMAT_CAPACITY_EXHAUSTED` | 422 Unprocessable Entity |
+| `ERR_CME_POOL_EXHAUSTED` | 422 Unprocessable Entity |
+| `ERR_REVIEWER_LOAD_EXCEEDED` | 422 Unprocessable Entity |

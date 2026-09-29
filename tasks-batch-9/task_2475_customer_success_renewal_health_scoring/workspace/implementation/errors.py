@@ -1,0 +1,67 @@
+"""Error catalogue.  Error ids and HTTP statuses are taken verbatim from the
+PRD section 5 catalogue."""
+
+ERROR_STATUS = {
+    'ERR_UNAUTHENTICATED': 401,
+    'ERR_UNAUTHORIZED': 403,
+    'ERR_INVALID_REQUEST': 400,
+    'ERR_ACCOUNT_NOT_FOUND': 404,
+    'ERR_CSM_NOT_FOUND': 404,
+    'ERR_COVERAGE_ASSIGNMENT_NOT_FOUND': 404,
+    'ERR_SIGNAL_NOT_FOUND': 404,
+    'ERR_SPONSOR_CONTACT_NOT_FOUND': 404,
+    'ERR_EXECUTIVE_ENGAGEMENT_NOT_FOUND': 404,
+    'ERR_OUTCOME_GOAL_NOT_FOUND': 404,
+    'ERR_ONBOARDING_MILESTONE_NOT_FOUND': 404,
+    'ERR_SAVE_PLAY_NOT_FOUND': 404,
+    'ERR_ESCALATION_CASE_NOT_FOUND': 404,
+    'ERR_REMEDIATION_COMMITMENT_NOT_FOUND': 404,
+    'ERR_RENEWAL_FORECAST_NOT_FOUND': 404,
+    'ERR_EXPANSION_OPPORTUNITY_NOT_FOUND': 404,
+    'ERR_ADVOCACY_ENROLLMENT_NOT_FOUND': 404,
+    'ERR_STALE_ACCOUNT_VERSION': 412,
+    'ERR_STALE_ESCALATION_VERSION': 412,
+    'ERR_INVALID_STATE_TRANSITION': 409,
+    'ERR_ACCOUNT_LIFECYCLE_INVALID': 409,
+    'ERR_COVERAGE_POSTURE_FROZEN': 409,
+    'ERR_COVERAGE_POSTURE_RESTRICTED': 409,
+    'ERR_COVERAGE_TIER_UNASSIGNED': 409,
+    'ERR_CSM_CAPACITY_EXHAUSTED': 409,
+    'ERR_NO_ELIGIBLE_CSM': 409,
+    'ERR_ENGAGEMENT_WINDOW_CONFLICT': 409,
+    'ERR_SAVE_PLAY_WINDOW_CAPACITY': 409,
+    'ERR_MILESTONE_CODE_DUPLICATE': 409,
+    'ERR_FORECAST_PERIOD_DUPLICATE': 409,
+    'ERR_FORECAST_NOT_SUBMITTED': 409,
+    'ERR_REFERENCE_CALL_CAP_REACHED': 409,
+    'ERR_INVALID_ENGAGEMENT_INTERVAL': 400,
+    'ERR_SPONSOR_DEPARTED': 422,
+    'ERR_HEALTH_TIER_INELIGIBLE': 422,
+    'ERR_CONTRACT_END_IN_PAST': 422,
+    'ERR_MILESTONE_SEQUENCE_VIOLATION': 422,
+    'ERR_WEIGHT_TOTAL_INVALID': 422,
+    'ERR_CREDIT_EXCEEDS_CAP': 422,
+    'ERR_CROSS_ACCOUNT_REFERENCE': 422,
+    'ERR_NO_ACCEPTED_COMMITMENT': 422,
+    'ERR_QUALIFICATION_SCORE_TOO_LOW': 422,
+    'ERR_NOT_HANDOFF_OWNER': 403,
+    'ERR_SEGREGATION_OF_DUTIES': 403,
+}
+
+_DEFAULT_MESSAGE = {
+    'ERR_UNAUTHENTICATED': 'Authentication headers are missing or invalid.',
+    'ERR_UNAUTHORIZED': 'The acting role may not perform this operation.',
+    'ERR_INVALID_REQUEST': 'The request payload is invalid.',
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+def api_error(error_id, message=None):
+    return ApiError(error_id, message)

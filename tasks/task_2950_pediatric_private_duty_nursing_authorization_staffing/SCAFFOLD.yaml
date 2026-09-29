@@ -1,0 +1,2921 @@
+scenario: |
+  2950. Pediatric Private-Duty Nursing Authorization & Staffing (Aveanna Healthcare): plan-of-care
+  authorization with hours-per-week approval by payer, nurse skill match to trach/vent/feeding-tube
+  requirements, case staffing to fill authorized shifts with continuity preference, unfilled-shift
+  escalation and parent backup arrangements, nurse competency validation and supervisory visit
+  cadence, authorization renewal, appeal and hour reduction disputes, incident and hospitalization
+  reporting with case hold, timesheet capture with electronic visit verification and payer billing
+  edits
+domain_name: "pediatric-pdn-authorization-staffing"
+api_prefix: "/pdn"
+
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: temporal_windowing
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - selector_policy
+
+  entity_topology: flat
+  # Peer entities linked by explicit foreign keys. Only three read paths are nested
+  # (`/nurses/{id}/competencies`, `/cases/{id}/supervisory-visits`,
+  # `/cases/{id}/incident-reports`, `/shift-assignments/{id}/timesheets`); every mutation
+  # addresses its own top-level collection and carries FKs in the body.
+
+  state_machine_shape: parallel
+  # Shift carries two independent state axes (`staffing_status` x `evv_status`); Timesheet is
+  # cyclic (BILL_REJECTED -> EDITED -> SUBMITTED -> BILL_REJECTED); Case is cyclic
+  # (ACTIVE -> ON_HOLD -> ACTIVE); AuthorizationDispute is branching with divergent
+  # side-effect sets per outcome; PlanOfCare has a revision loop (RETURNED -> SUBMITTED).
+
+  relationship_patterns:
+    - one_to_many          # Case -> Shift -> ShiftAssignment -> Timesheet
+    - many_to_many         # Nurse <-> skill requirements, expressed through NurseCompetency
+    - self_referential     # Authorization.supersedes_authorization_id -> Authorization.id
+    - cross_aggregate      # Case.authorization_id crosses the payer-authorization aggregate
+
+  role_model: segregation_of_duties
+  # The ClinicalSupervisor who filed the IncidentReport that put a Case ON_HOLD may not be the
+  # ClinicalSupervisor who resumes that Case; the Nurse who captured a Timesheet may not submit
+  # it for billing (Scheduler owns submission, PayerReviewer owns the billing decision).
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Payer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: payer / managed-care organization name
+        constraints: "1..120 chars, non-blank"
+      - name: plan_type
+        type: enum
+        source: input
+        description: benefit program the authorization is written against
+        constraints: "one of MEDICAID_WAIVER, MEDICAID_MCO, COMMERCIAL"
+      - name: weekly_hour_cap
+        type: integer
+        source: input
+        description: hard ceiling on approved_hours_per_week this payer will ever authorize
+        constraints: "1..168"
+      - name: evv_required
+        type: boolean
+        source: input
+        description: whether electronic visit verification is mandatory for billing
+        default: true
+      - name: billing_edit_ruleset
+        type: enum
+        source: input
+        description: >-
+          selects the deduction-percentage table used by calculations.timesheet_net_billable_units
+        default: "STANDARD_15MIN"
+        constraints: "one of STANDARD_15MIN, STRICT_15MIN"
+      - name: appeal_window_days
+        type: integer
+        source: input
+        description: informational notice window published to families; not a gate by itself
+        default: 30
+        constraints: "1..90"
+      - name: reduction_notice_days
+        type: integer
+        source: input
+        description: >-
+          days added to the current logical clock to compute
+          Authorization.reduction_effective_at on POST /pdn/authorizations/{id}/reduce
+        default: 10
+        constraints: "1..60"
+
+  - name: Patient
+    parent: null
+    common_fields: true
+    fields:
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; the payer that must also own every Authorization used by this patient's Cases"
+      - name: full_name
+        type: string
+        source: input
+        description: pediatric patient name
+        constraints: "1..120 chars, non-blank"
+      - name: date_of_birth
+        type: string
+        source: input
+        description: date-only ISO 8601 (YYYY-MM-DD) birth date
+      - name: primary_diagnosis
+        type: string
+        source: input
+        description: free-text primary diagnosis
+      - name: requires_trach
+        type: boolean
+        source: input
+        description: tracheostomy care required at every visit
+        default: false
+      - name: requires_vent
+        type: boolean
+        source: input
+        description: ventilator management required at every visit; drives the 14-day supervisory cadence
+        default: false
+      - name: requires_feeding_tube
+        type: boolean
+        source: input
+        description: enteral feeding-tube management required at every visit
+        default: false
+      - name: parent_backup_available
+        type: boolean
+        source: input
+        description: >-
+          family has a trained parent caregiver who can absorb an unfilled shift; gates
+          POST /pdn/shifts/{id}/parent-backup
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          ACTIVE on create; HOSPITALIZED when a HOSPITALIZATION IncidentReport is filed;
+          back to ACTIVE when that report is closed with patient_returned_home true;
+          DISCHARGED when every Case of the patient is CLOSED
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, HOSPITALIZED, DISCHARGED"
+
+  - name: PlanOfCare
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the child the physician order covers"
+      - name: requested_hours_per_week
+        type: integer
+        source: input
+        description: hours per week the ordering physician requested
+        constraints: "1..168"
+      - name: start_date
+        type: string
+        source: input
+        description: date-only ISO 8601 first covered day
+      - name: end_date
+        type: string
+        source: input
+        description: date-only ISO 8601 last covered day; MUST be strictly after start_date
+      - name: ordering_physician_npi
+        type: string
+        source: input
+        description: 10-digit NPI of the ordering physician
+        constraints: "exactly 10 digits"
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          DRAFT on create; SUBMITTED on submit; UNDER_REVIEW when an Authorization is created
+          against it; AUTHORIZED when that Authorization activates; RETURNED when the payer
+          returns it for revision (RETURNED -> SUBMITTED on resubmit)
+        default: "DRAFT"
+        constraints: "one of DRAFT, SUBMITTED, UNDER_REVIEW, AUTHORIZED, RETURNED"
+      - name: revision_round
+        type: integer
+        source: system
+        description: incremented by 1 every time the payer returns the plan for revision
+        default: 0
+
+  - name: Authorization
+    parent: null
+    common_fields: true
+    fields:
+      - name: plan_of_care_id
+        type: string
+        source: input
+        description: "FK -> PlanOfCare.id; the physician order this approval answers"
+      - name: payer_id
+        type: string
+        source: input
+        description: "FK -> Payer.id; MUST equal PlanOfCare -> Patient.payer_id"
+      - name: supersedes_authorization_id
+        type: string
+        source: input
+        description: >-
+          FK -> Authorization.id; self-referential renewal chain pointer. null for the first
+          authorization of a plan of care; set by POST /pdn/authorizations/{id}/renew
+        default: null
+      - name: approved_hours_per_week
+        type: number
+        source: input
+        description: >-
+          currently effective weekly hour grant; the only quantity the staffing cap check reads
+        constraints: "> 0, <= Payer.weekly_hour_cap, <= PlanOfCare.requested_hours_per_week, 2 decimal places"
+      - name: noticed_hours_per_week
+        type: number
+        source: system
+        description: >-
+          proposed reduced grant recorded by POST /pdn/authorizations/{id}/reduce; null unless
+          status is REDUCTION_NOTICED or UNDER_APPEAL
+        default: null
+      - name: reduction_effective_at
+        type: datetime
+        source: system
+        description: >-
+          current_clock + Payer.reduction_notice_days at the moment of reduce; the dispute filing
+          gate and the apply-reduction gate both compare the clock against this instant
+        default: null
+      - name: effective_start
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant the grant begins (inclusive)
+      - name: effective_end
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant the grant ends (exclusive); MUST be strictly after effective_start
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          PENDING on create; ACTIVE on activate; REDUCTION_NOTICED on reduce; UNDER_APPEAL when a
+          dispute is filed; REDUCED when a reduction takes effect; EXPIRED by the daily checkpoint
+          once effective_end <= clock; SUPERSEDED when its renewal successor activates
+        default: "PENDING"
+        constraints: "one of PENDING, ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED, EXPIRED, SUPERSEDED"
+      - name: renewal_chain_depth
+        type: integer
+        source: system
+        description: 0 for the first authorization; predecessor.renewal_chain_depth + 1 for a renewal successor
+        default: 0
+      - name: hours_committed_this_week
+        type: number
+        source: computed
+        description: >-
+          computed cross-entity: PROJECTED-basis committed hours for the ISO week containing the
+          current logical clock (see calculations.authorization_weekly_utilization)
+      - name: hours_remaining_this_week
+        type: number
+        source: computed
+        description: >-
+          approved_hours_per_week - hours_committed_this_week, floored at 0.00,
+          2 decimal places round_half_up
+
+  - name: Nurse
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: nurse name
+        constraints: "1..120 chars, non-blank"
+      - name: license_type
+        type: enum
+        source: input
+        description: licensure level; RN earns the ventilator depth bonus in the match score
+        constraints: "one of RN, LPN"
+      - name: license_number
+        type: string
+        source: input
+        description: state license number, unique across nurses
+        constraints: "unique across all Nurse rows, 1..32 chars"
+      - name: license_expires_on
+        type: string
+        source: input
+        description: date-only ISO 8601 licence expiry; eligibility requires it to be strictly after the shift end date
+      - name: max_weekly_hours
+        type: integer
+        source: input
+        description: contractual weekly ceiling for this nurse
+        default: 40
+        constraints: "1..80"
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          ACTIVE on create; SUSPENDED or INACTIVE via POST /pdn/nurses/{id}/status;
+          only ACTIVE nurses are staffable
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, SUSPENDED, INACTIVE"
+      - name: scheduled_minutes_this_week
+        type: integer
+        source: computed
+        description: >-
+          computed cross-entity: sum of Shift.scheduled_minutes over ShiftAssignments of this nurse
+          whose status IN {ACTIVE, COMPLETED} and whose Shift.start_at falls in the ISO week
+          containing the current logical clock
+      - name: verified_skills
+        type: array
+        source: computed
+        description: >-
+          skills of this nurse whose NurseCompetency.status == VALID and expires_on is strictly
+          after the current logical clock date, sorted ascending by skill enum name
+
+  - name: NurseCompetency
+    parent: null
+    common_fields: true
+    fields:
+      - name: nurse_id
+        type: string
+        source: input
+        description: "FK -> Nurse.id; the nurse whose skill is attested"
+      - name: skill
+        type: enum
+        source: input
+        description: attested clinical skill; matched against Shift.required_skills
+        constraints: "one of TRACH, VENT, FEEDING_TUBE, SEIZURE_RESCUE; unique per (nurse_id, skill) among rows with status != REVOKED"
+      - name: validated_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the ClinicalSupervisor who signed the validation
+      - name: validated_on
+        type: string
+        source: input
+        description: date-only ISO 8601 validation date
+      - name: expires_on
+        type: string
+        source: input
+        description: date-only ISO 8601 expiry; MUST be strictly after validated_on
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          VALID on create; EXPIRED when the daily checkpoint observes expires_on <= clock date;
+          REVOKED via POST /pdn/nurse-competencies/{id}/revoke
+        default: "VALID"
+        constraints: "one of VALID, EXPIRED, REVOKED"
+      - name: revoked_reason
+        type: string
+        source: system
+        description: reason text captured on revoke; null otherwise
+        default: null
+
+  - name: Case
+    parent: null
+    common_fields: true
+    fields:
+      - name: patient_id
+        type: string
+        source: input
+        description: "FK -> Patient.id; the child receiving care"
+      - name: authorization_id
+        type: string
+        source: input
+        description: >-
+          FK -> Authorization.id; repointed to the renewal successor when that successor activates
+      - name: continuity_nurse_id
+        type: string
+        source: input
+        description: >-
+          FK -> Nurse.id; the family's preferred continuity nurse. null when no continuity
+          preference is recorded
+        default: null
+      - name: assigned_supervisor_user_id
+        type: string
+        source: input
+        description: opaque X-User-ID of the ClinicalSupervisor accountable for supervisory visits
+      - name: concurrent_nurse_limit
+        type: integer
+        source: input
+        description: >-
+          maximum number of overlapping staffed shifts allowed for this patient at any instant
+          (aggregate capacity for the patient-as-resource overlap rule)
+        default: 1
+        constraints: "1..3"
+      - name: excluded_nurse_ids
+        type: array
+        source: input
+        description: >-
+          array of Nurse.id values barred from this case; removed from the auto-staff candidate
+          pool and rejected on manual assignment
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          PENDING_STAFFING on create; ACTIVE on activate; ON_HOLD on hold (or cascaded hold);
+          ACTIVE again on resume (cycle); CLOSED on close
+        default: "PENDING_STAFFING"
+        constraints: "one of PENDING_STAFFING, ACTIVE, ON_HOLD, CLOSED"
+      - name: hold_reason
+        type: enum
+        source: system
+        description: >-
+          why the case is ON_HOLD; cleared to null on resume
+        default: null
+        constraints: "one of HOSPITALIZATION, INCIDENT_REVIEW, AUTHORIZATION_EXPIRED, FAMILY_REQUEST, or null"
+      - name: hold_incident_report_id
+        type: string
+        source: system
+        description: >-
+          FK -> IncidentReport.id; set when the hold was cascaded from an incident report,
+          null when the hold was manual. Drives the segregation-of-duties check on resume
+        default: null
+      - name: unfilled_shift_count
+        type: integer
+        source: computed
+        description: >-
+          count of Shifts of this case with staffing_status IN {OPEN, ESCALATED} whose start_at is
+          greater than or equal to the current logical clock
+      - name: fill_rate
+        type: number
+        source: computed
+        description: >-
+          see calculations.case_fill_metrics; 4 decimal places round_half_up; 1.0000 when the
+          denominator is zero
+      - name: billed_units_to_date
+        type: integer
+        source: computed
+        description: >-
+          sum of Timesheet.net_billable_units over Timesheets of this case whose status is
+          BILL_ACCEPTED (VOIDED timesheets excluded)
+      - name: next_supervisory_visit_due_at
+        type: datetime
+        source: computed
+        description: see calculations.supervisory_visit_cadence
+      - name: supervisory_status
+        type: enum
+        source: computed
+        description: >-
+          OVERDUE when current logical clock >= next_supervisory_visit_due_at, CURRENT otherwise
+        constraints: "one of CURRENT, OVERDUE"
+
+  - name: Shift
+    parent: null
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> Case.id; the case whose authorized hours this shift consumes"
+      - name: start_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC shift start (inclusive); interval semantics are half-open [start_at, end_at)
+      - name: end_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC shift end (exclusive); MUST be strictly after start_at
+      - name: required_skills
+        type: array
+        source: input
+        description: >-
+          non-empty array of skill enum values (TRACH, VENT, FEEDING_TUBE, SEIZURE_RESCUE) the
+          staffed nurse must hold as VALID competencies
+        constraints: "1..4 distinct skill enum values"
+      - name: scheduled_minutes
+        type: integer
+        source: computed
+        description: whole minutes between start_at and end_at
+      - name: staffing_status
+        type: enum
+        source: system
+        description: >-
+          first state axis. OPEN on create; ASSIGNED on assignment; OPEN again on assignment
+          cancel; ESCALATED on escalate; PARENT_BACKUP on parent-backup; COMPLETED on clock-out;
+          CANCELLED by case hold, authorization reduction, authorization expiry or competency revocation
+        default: "OPEN"
+        constraints: "one of OPEN, ASSIGNED, ESCALATED, PARENT_BACKUP, COMPLETED, CANCELLED"
+      - name: evv_status
+        type: enum
+        source: system
+        description: >-
+          second, independent state axis. NOT_STARTED on create; CLOCKED_IN on clock-in;
+          VERIFIED or EXCEPTION on clock-out per calculations.evv_verification_outcome
+        default: "NOT_STARTED"
+        constraints: "one of NOT_STARTED, CLOCKED_IN, VERIFIED, EXCEPTION"
+      - name: escalation_tier
+        type: enum
+        source: system
+        description: >-
+          NONE until escalate sets TIER1_AGENCY_POOL; TIER2_PARENT_BACKUP on parent-backup;
+          TIER3_PAYER_NOTIFICATION when escalate is called on an already ESCALATED shift whose
+          patient has parent_backup_available false
+        default: "NONE"
+        constraints: "one of NONE, TIER1_AGENCY_POOL, TIER2_PARENT_BACKUP, TIER3_PAYER_NOTIFICATION"
+      - name: escalated_at
+        type: datetime
+        source: system
+        description: logical clock at the first escalation; null before that
+        default: null
+      - name: cancel_reason
+        type: enum
+        source: system
+        description: why the shift was cancelled
+        default: "NONE"
+        constraints: "one of NONE, CASE_HOLD, AUTH_REDUCTION, AUTH_EXPIRY, SCHEDULER, COMPETENCY_REVOKED"
+
+  - name: ShiftAssignment
+    parent: null
+    common_fields: true
+    fields:
+      - name: shift_id
+        type: string
+        source: input
+        description: "FK -> Shift.id; the shift being filled"
+      - name: nurse_id
+        type: string
+        source: input
+        description: "FK -> Nurse.id; the staffed nurse"
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          ACTIVE on create; COMPLETED on clock-out; CANCELLED on cancel, on replacement by a newer
+          assignment, or by a cascade (case hold, authorization reduction, authorization expiry,
+          competency revocation)
+        default: "ACTIVE"
+        constraints: "one of ACTIVE, CANCELLED, COMPLETED"
+      - name: continuity_match
+        type: boolean
+        source: computed
+        description: true when nurse_id equals the Case.continuity_nurse_id of the shift's case
+      - name: match_score_at_assignment
+        type: integer
+        source: system
+        description: >-
+          calculations.nurse_match_score evaluated for this nurse and shift at creation time and
+          frozen thereafter (manual assignments store it too)
+      - name: cancel_reason
+        type: enum
+        source: system
+        description: why the assignment was cancelled
+        default: "NONE"
+        constraints: "one of NONE, REPLACED, CASE_HOLD, AUTH_REDUCTION, AUTH_EXPIRY, SCHEDULER, COMPETENCY_REVOKED"
+
+  - name: Timesheet
+    parent: null
+    common_fields: true
+    fields:
+      - name: shift_assignment_id
+        type: string
+        source: input
+        description: "FK -> ShiftAssignment.id; the assignment whose visit this timesheet records"
+      - name: clock_in_at
+        type: datetime
+        source: system
+        description: >-
+          logical clock at POST /pdn/shifts/{id}/clock-in; overwritable by
+          PATCH /pdn/timesheets/{id}
+      - name: clock_out_at
+        type: datetime
+        source: system
+        description: >-
+          logical clock at POST /pdn/shifts/{id}/clock-out; overwritable by
+          PATCH /pdn/timesheets/{id}; null until clock-out
+        default: null
+      - name: evv_method
+        type: enum
+        source: input
+        description: how the visit was verified; MANUAL always draws a billing edit deduction
+        constraints: "one of GPS, IVR, MANUAL"
+      - name: geo_verified
+        type: boolean
+        source: input
+        description: whether the device geofence matched the patient address at clock-in
+        default: false
+      - name: gross_billable_units
+        type: integer
+        source: computed
+        description: see calculations.timesheet_net_billable_units step 2
+      - name: edit_deduction_units
+        type: integer
+        source: computed
+        description: see calculations.timesheet_net_billable_units step 3
+      - name: net_billable_units
+        type: integer
+        source: computed
+        description: gross_billable_units - edit_deduction_units, floored at 0
+      - name: edit_codes
+        type: array
+        source: computed
+        description: >-
+          sorted-ascending subset of {EVV_EXCEPTION, LATE_START, MANUAL_ENTRY, POST_EDIT} recorded
+          by the billing-edit calculation
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          CAPTURED on clock-in; EDITED on PATCH; SUBMITTED on submit; BILL_ACCEPTED or
+          BILL_REJECTED on the payer billing decision; BILL_REJECTED -> EDITED -> SUBMITTED is a
+          cycle; VOIDED on void
+        default: "CAPTURED"
+        constraints: "one of CAPTURED, EDITED, SUBMITTED, BILL_ACCEPTED, BILL_REJECTED, VOIDED"
+      - name: rejection_reason
+        type: string
+        source: system
+        description: payer text captured on a REJECT billing decision; null otherwise
+        default: null
+      - name: edit_reason
+        type: string
+        source: input
+        description: reason supplied with the most recent PATCH; null before any edit
+        default: null
+      - name: submitted_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the Scheduler who submitted the timesheet; null before submission
+        default: null
+
+  - name: SupervisoryVisit
+    parent: null
+    common_fields: false
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> Case.id; the case supervised"
+      - name: supervisor_user_id
+        type: string
+        source: system
+        description: X-User-ID of the recording ClinicalSupervisor
+      - name: visit_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant the visit happened; MUST NOT be after the current logical clock
+      - name: outcome
+        type: enum
+        source: input
+        description: PASS keeps the normal cadence; DEFICIENT halves it
+        constraints: "one of PASS, DEFICIENT"
+      - name: notes
+        type: string
+        source: input
+        description: supervisor narrative
+      - name: cadence_days_applied
+        type: integer
+        source: computed
+        description: cadence in days selected by calculations.supervisory_visit_cadence for this visit
+      - name: next_due_at
+        type: datetime
+        source: computed
+        description: visit_at + cadence_days_applied days
+
+  - name: IncidentReport
+    parent: null
+    common_fields: true
+    fields:
+      - name: case_id
+        type: string
+        source: input
+        description: "FK -> Case.id; the case the incident occurred on"
+      - name: reported_by_user_id
+        type: string
+        source: system
+        description: >-
+          X-User-ID of the filing ClinicalSupervisor; compared against the resuming supervisor for
+          the segregation-of-duties check
+      - name: category
+        type: enum
+        source: input
+        description: HOSPITALIZATION also drives Patient.status to HOSPITALIZED
+        constraints: "one of HOSPITALIZATION, MEDICATION_ERROR, EQUIPMENT_FAILURE, FALL, MISSED_VISIT"
+      - name: severity
+        type: enum
+        source: input
+        description: HIGH severity triggers a case hold even for non-hospitalization categories
+        constraints: "one of LOW, MODERATE, HIGH"
+      - name: occurred_at
+        type: datetime
+        source: input
+        description: ISO 8601 UTC instant of the incident; MUST NOT be after the current logical clock
+      - name: narrative
+        type: string
+        source: input
+        description: incident narrative
+      - name: status
+        type: enum
+        source: system
+        description: OPEN on create; CLOSED on close
+        default: "OPEN"
+        constraints: "one of OPEN, CLOSED"
+      - name: triggered_case_hold
+        type: boolean
+        source: computed
+        description: >-
+          true when category == HOSPITALIZATION or severity == HIGH, i.e. when filing cascaded a
+          case hold
+      - name: resolution
+        type: string
+        source: system
+        description: resolution text captured on close; null otherwise
+        default: null
+      - name: patient_returned_home
+        type: boolean
+        source: system
+        description: >-
+          value supplied at close; when true and the patient is HOSPITALIZED, closing returns
+          Patient.status to ACTIVE
+        default: false
+
+  - name: AuthorizationDispute
+    parent: null
+    common_fields: true
+    fields:
+      - name: authorization_id
+        type: string
+        source: input
+        description: "FK -> Authorization.id; the grant being disputed"
+      - name: dispute_type
+        type: enum
+        source: input
+        description: >-
+          REDUCTION_APPEAL contests a noticed hour reduction; DENIAL_APPEAL contests a partial
+          approval (approved_hours_per_week < PlanOfCare.requested_hours_per_week)
+        constraints: "one of REDUCTION_APPEAL, DENIAL_APPEAL"
+      - name: requested_hours_per_week
+        type: number
+        source: input
+        description: hours per week the filer asks the payer to restore or grant
+        constraints: "> 0, 2 decimal places"
+      - name: reason
+        type: string
+        source: input
+        description: filing narrative
+      - name: filed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the filing CaseManager
+      - name: filed_at
+        type: datetime
+        source: system
+        description: logical clock at filing
+      - name: status
+        type: enum
+        source: system
+        description: >-
+          FILED on create; UNDER_REVIEW on review; UPHELD, OVERTURNED or PARTIALLY_GRANTED on decide
+        default: "FILED"
+        constraints: "one of FILED, UNDER_REVIEW, UPHELD, OVERTURNED, PARTIALLY_GRANTED"
+      - name: decided_hours_per_week
+        type: number
+        source: system
+        description: hours the payer settled on; only populated for PARTIALLY_GRANTED
+        default: null
+      - name: decided_at
+        type: datetime
+        source: system
+        description: logical clock at the decision; null before that
+        default: null
+      - name: reviewer_user_id
+        type: string
+        source: system
+        description: X-User-ID of the PayerReviewer who moved the dispute to UNDER_REVIEW
+        default: null
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: PlanOfCare
+    initial_state: DRAFT
+    terminal_states: [AUTHORIZED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /pdn/plans-of-care/{id}/submit"
+        actor: CaseManager
+        preconditions:
+          - "plan_of_care.status == DRAFT"
+          - "Patient.status != DISCHARGED"
+        side_effects:
+          - "increments PlanOfCare.version by 1"
+      - from: SUBMITTED
+        to: UNDER_REVIEW
+        trigger: "POST /pdn/authorizations (creating an Authorization against this plan)"
+        actor: PayerReviewer
+        preconditions:
+          - "plan_of_care.status == SUBMITTED"
+        side_effects:
+          - "creates Authorization in PENDING with renewal_chain_depth 0"
+          - "increments PlanOfCare.version by 1"
+        note: >-
+          This is the write guarded by concurrency_rules.authorization-create-stale-plan; a second
+          create legitimately supersedes the first Authorization, so the loser is caught by OCC.
+      - from: UNDER_REVIEW
+        to: AUTHORIZED
+        trigger: "POST /pdn/authorizations/{id}/activate"
+        actor: PayerReviewer
+        preconditions:
+          - "authorization.status == PENDING"
+          - "plan_of_care.status == UNDER_REVIEW"
+        side_effects:
+          - "Authorization.status := ACTIVE"
+          - "increments PlanOfCare.version by 1"
+      - from: UNDER_REVIEW
+        to: RETURNED
+        trigger: "POST /pdn/plans-of-care/{id}/return"
+        actor: PayerReviewer
+        preconditions:
+          - "plan_of_care.status IN {SUBMITTED, UNDER_REVIEW}"
+          - "no Authorization of this plan has status IN {ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED}"
+        side_effects:
+          - "PlanOfCare.revision_round += 1"
+          - "every PENDING Authorization of this plan is deleted from consideration by moving it to EXPIRED"
+          - "increments PlanOfCare.version by 1"
+      - from: RETURNED
+        to: SUBMITTED
+        trigger: "POST /pdn/plans-of-care/{id}/submit (resubmission after revision)"
+        actor: CaseManager
+        preconditions:
+          - "plan_of_care.status == RETURNED"
+        side_effects:
+          - "increments PlanOfCare.version by 1"
+        note: "Revision loop: RETURNED -> SUBMITTED -> UNDER_REVIEW -> RETURNED may repeat."
+
+  - entity: Authorization
+    initial_state: PENDING
+    terminal_states: [EXPIRED, SUPERSEDED]
+    transitions:
+      - from: PENDING
+        to: ACTIVE
+        trigger: "POST /pdn/authorizations/{id}/activate"
+        actor: PayerReviewer
+        preconditions:
+          - "authorization.status == PENDING"
+          - "current_clock < authorization.effective_end"
+        side_effects:
+          - "PlanOfCare.status := AUTHORIZED"
+          - "if supersedes_authorization_id is not null: predecessor Authorization.status := SUPERSEDED (cascade hop 1)"
+          - "because the predecessor became SUPERSEDED, every Case whose authorization_id equals the predecessor is repointed to this authorization (cascade hop 2)"
+          - "because Case.authorization_id changed, Case.fill_rate and the successor's hours_committed_this_week / hours_remaining_this_week are recomputed against the successor's approved_hours_per_week (cascade hop 3)"
+      - from: ACTIVE
+        to: REDUCTION_NOTICED
+        trigger: "POST /pdn/authorizations/{id}/reduce"
+        actor: PayerReviewer
+        preconditions:
+          - "authorization.status == ACTIVE"
+          - "0 < request.noticed_hours_per_week < authorization.approved_hours_per_week"
+        side_effects:
+          - "Authorization.noticed_hours_per_week := request.noticed_hours_per_week"
+          - "Authorization.reduction_effective_at := current_clock + Payer.reduction_notice_days days"
+          - "no shift is touched yet; approved_hours_per_week is unchanged during the notice period"
+      - from: REDUCTION_NOTICED
+        to: UNDER_APPEAL
+        trigger: "POST /pdn/authorization-disputes (dispute_type REDUCTION_APPEAL)"
+        actor: CaseManager
+        preconditions:
+          - "authorization.status == REDUCTION_NOTICED"
+          - "current_clock < authorization.reduction_effective_at"
+          - "no AuthorizationDispute of this authorization has status IN {FILED, UNDER_REVIEW}"
+        side_effects:
+          - "creates AuthorizationDispute in FILED with filed_at := current_clock"
+      - from: ACTIVE
+        to: UNDER_APPEAL
+        trigger: "POST /pdn/authorization-disputes (dispute_type DENIAL_APPEAL)"
+        actor: CaseManager
+        preconditions:
+          - "authorization.status == ACTIVE"
+          - "authorization.approved_hours_per_week < PlanOfCare.requested_hours_per_week"
+          - "no AuthorizationDispute of this authorization has status IN {FILED, UNDER_REVIEW}"
+        side_effects:
+          - "creates AuthorizationDispute in FILED with filed_at := current_clock"
+      - from: UNDER_APPEAL
+        to: REDUCED
+        trigger: "POST /pdn/authorization-disputes/{id}/decide with outcome UPHELD or PARTIALLY_GRANTED on a REDUCTION_APPEAL"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+          - "dispute.dispute_type == REDUCTION_APPEAL"
+        side_effects:
+          - "approved_hours_per_week := noticed_hours_per_week (UPHELD) or := decided_hours_per_week (PARTIALLY_GRANTED)"
+          - "noticed_hours_per_week := null; reduction_effective_at := null"
+          - "because approved_hours_per_week decreased, calculations.authorization_reduction_trim_order cancels ASSIGNED future shifts until the week is back under cap (cascade hop 2)"
+          - "because each such Shift was cancelled, its ACTIVE ShiftAssignment becomes CANCELLED with cancel_reason AUTH_REDUCTION (cascade hop 3)"
+          - "because those assignments were cancelled, Nurse.scheduled_minutes_this_week and Case.unfilled_shift_count / fill_rate are recomputed (cascade hop 4)"
+      - from: UNDER_APPEAL
+        to: ACTIVE
+        trigger: "POST /pdn/authorization-disputes/{id}/decide with outcome OVERTURNED, or with any outcome on a DENIAL_APPEAL"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+        side_effects:
+          - "REDUCTION_APPEAL + OVERTURNED: approved_hours_per_week unchanged; noticed_hours_per_week := null; reduction_effective_at := null; no shift is cancelled"
+          - "DENIAL_APPEAL + UPHELD: approved_hours_per_week unchanged"
+          - "DENIAL_APPEAL + OVERTURNED: approved_hours_per_week := min(dispute.requested_hours_per_week, Payer.weekly_hour_cap, PlanOfCare.requested_hours_per_week)"
+          - "DENIAL_APPEAL + PARTIALLY_GRANTED: approved_hours_per_week := dispute.decided_hours_per_week"
+          - "hours_remaining_this_week recomputed"
+      - from: REDUCTION_NOTICED
+        to: REDUCED
+        trigger: "POST /pdn/authorizations/{id}/apply-reduction"
+        actor: PayerReviewer
+        preconditions:
+          - "authorization.status == REDUCTION_NOTICED"
+          - "current_clock >= authorization.reduction_effective_at"
+          - "no AuthorizationDispute of this authorization has status IN {FILED, UNDER_REVIEW}"
+        side_effects:
+          - "approved_hours_per_week := noticed_hours_per_week; noticed_hours_per_week := null; reduction_effective_at := null"
+          - "same trim cascade as the UNDER_APPEAL -> REDUCED transition"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "POST /pdn/_ops/run-daily-checkpoint (system sweep)"
+        actor: system
+        preconditions:
+          - "authorization.status IN {ACTIVE, REDUCTION_NOTICED, REDUCED}"
+          - "current_clock >= authorization.effective_end"
+        side_effects:
+          - "because the authorization became EXPIRED, every Case whose authorization_id is this authorization and whose status IN {PENDING_STAFFING, ACTIVE} becomes ON_HOLD with hold_reason AUTHORIZATION_EXPIRED (cascade hop 2)"
+          - "because the case entered ON_HOLD, its Shifts with staffing_status IN {OPEN, ASSIGNED, ESCALATED} and start_at >= current_clock become CANCELLED with cancel_reason AUTH_EXPIRY (cascade hop 3)"
+          - "because those shifts were cancelled, their ACTIVE ShiftAssignments become CANCELLED with cancel_reason AUTH_EXPIRY and Nurse.scheduled_minutes_this_week is recomputed (cascade hop 4)"
+        note: "Also applies from REDUCTION_NOTICED and REDUCED; PENDING authorizations are left untouched."
+      - from: ACTIVE
+        to: SUPERSEDED
+        trigger: "POST /pdn/authorizations/{id}/activate on this authorization's renewal successor"
+        actor: PayerReviewer
+        preconditions:
+          - "successor.supersedes_authorization_id == this.id"
+          - "this.status IN {ACTIVE, REDUCED}"
+        side_effects:
+          - "Cases repointed to the successor (see the successor's PENDING -> ACTIVE transition)"
+
+  - entity: Case
+    initial_state: PENDING_STAFFING
+    terminal_states: [CLOSED]
+    transitions:
+      - from: PENDING_STAFFING
+        to: ACTIVE
+        trigger: "POST /pdn/cases/{id}/activate"
+        actor: CaseManager
+        preconditions:
+          - "case.status == PENDING_STAFFING"
+          - "Authorization.status IN {ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED}"
+          - "Patient.status == ACTIVE"
+        side_effects:
+          - "Case.supervisory_status recomputed"
+      - from: ACTIVE
+        to: ON_HOLD
+        trigger: "POST /pdn/cases/{id}/hold, or cascaded from an IncidentReport filing or from authorization expiry"
+        actor: ClinicalSupervisor
+        preconditions:
+          - "case.status == ACTIVE"
+        side_effects:
+          - "Case.hold_reason := request.hold_reason (manual) or HOSPITALIZATION / INCIDENT_REVIEW / AUTHORIZATION_EXPIRED (cascaded)"
+          - "Case.hold_incident_report_id := the triggering IncidentReport.id when cascaded, null when manual"
+          - "because the case entered ON_HOLD, every Shift of the case with staffing_status IN {OPEN, ASSIGNED, ESCALATED} and start_at >= current_clock becomes CANCELLED with cancel_reason CASE_HOLD (cascade hop 1 from the hold)"
+          - "because each such Shift was cancelled, its ACTIVE ShiftAssignment becomes CANCELLED with cancel_reason CASE_HOLD (cascade hop 2)"
+          - "because those assignments were cancelled, Nurse.scheduled_minutes_this_week, Authorization.hours_committed_this_week and Case.unfilled_shift_count / fill_rate are recomputed (cascade hop 3)"
+        note: >-
+          Shifts already in progress (start_at < current_clock) and shifts already COMPLETED or
+          PARENT_BACKUP are never cancelled, which is what keeps the evv_status axis independent
+          of the staffing_status axis.
+      - from: ON_HOLD
+        to: ACTIVE
+        trigger: "POST /pdn/cases/{id}/resume"
+        actor: ClinicalSupervisor
+        preconditions:
+          - "case.status == ON_HOLD"
+          - "Patient.status != HOSPITALIZED"
+          - "when case.hold_incident_report_id is not null: that IncidentReport.status == CLOSED"
+          - "when case.hold_incident_report_id is not null: X-User-ID != IncidentReport.reported_by_user_id (segregation of duties)"
+          - "Authorization.status IN {ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED}"
+        side_effects:
+          - "Case.hold_reason := null; Case.hold_incident_report_id := null"
+          - "cancelled shifts are NOT restored; the scheduler must create replacement shifts"
+        note: "ACTIVE -> ON_HOLD -> ACTIVE is a genuine cycle and may repeat any number of times."
+      - from: ACTIVE
+        to: CLOSED
+        trigger: "POST /pdn/cases/{id}/close"
+        actor: CaseManager
+        preconditions:
+          - "case.status IN {PENDING_STAFFING, ACTIVE, ON_HOLD}"
+          - "no Timesheet of this case has status IN {CAPTURED, EDITED, SUBMITTED, BILL_REJECTED}"
+        side_effects:
+          - "every Shift of the case with staffing_status IN {OPEN, ASSIGNED, ESCALATED} and start_at >= current_clock becomes CANCELLED with cancel_reason SCHEDULER, and their ACTIVE assignments become CANCELLED"
+          - "when every Case of the patient is CLOSED, Patient.status := DISCHARGED"
+
+  - entity: Shift
+    initial_state: OPEN
+    terminal_states: [COMPLETED, CANCELLED, PARENT_BACKUP]
+    transitions:
+      - from: OPEN
+        to: ASSIGNED
+        trigger: "POST /pdn/shift-assignments or POST /pdn/shifts/{id}/auto-staff"
+        actor: Scheduler
+        preconditions:
+          - "shift.staffing_status IN {OPEN, ESCALATED, ASSIGNED}; ASSIGNED means the new assignment replaces the incumbent"
+          - "shift.start_at >= current_clock"
+          - "Case.status == ACTIVE"
+          - "Authorization.status IN {ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED}"
+          - "Case.supervisory_status == CURRENT"
+          - "request.expected_shift_version == shift.version"
+          - "all validations of priority 14..36 pass: payer scope, case exclusion, nurse status, licence, required skills, competency validity, supervisory cadence, nurse rest buffer, patient capacity, nurse weekly ceiling and the authorized weekly hour cap"
+        side_effects:
+          - "creates ShiftAssignment in ACTIVE with match_score_at_assignment frozen and continuity_match computed"
+          - "when the shift was already ASSIGNED, the incumbent ShiftAssignment becomes CANCELLED with cancel_reason REPLACED and the incumbent nurse's scheduled_minutes_this_week is recomputed"
+          - "Shift.escalation_tier := NONE and Shift.escalated_at := null when the shift was ESCALATED"
+          - "increments Shift.version by 1"
+          - "Nurse.scheduled_minutes_this_week, Authorization.hours_committed_this_week / hours_remaining_this_week, Case.unfilled_shift_count / fill_rate recomputed"
+      - from: ASSIGNED
+        to: OPEN
+        trigger: "POST /pdn/shift-assignments/{id}/cancel"
+        actor: Scheduler
+        preconditions:
+          - "assignment.status == ACTIVE"
+          - "shift.staffing_status == ASSIGNED"
+          - "shift.evv_status == NOT_STARTED"
+        side_effects:
+          - "ShiftAssignment.status := CANCELLED with cancel_reason SCHEDULER"
+          - "increments Shift.version by 1"
+          - "compensating: Nurse.scheduled_minutes_this_week and Authorization.hours_committed_this_week return to their pre-assignment values exactly (see calculations.committed_minutes_invariant)"
+      - from: OPEN
+        to: ESCALATED
+        trigger: "POST /pdn/shifts/{id}/escalate"
+        actor: Scheduler
+        preconditions:
+          - "shift.staffing_status IN {OPEN, ESCALATED}"
+          - "shift.start_at >= current_clock"
+          - "Case.status == ACTIVE"
+        side_effects:
+          - "first escalation: escalation_tier := TIER1_AGENCY_POOL, escalated_at := current_clock"
+          - "second escalate call on an already ESCALATED shift whose Patient.parent_backup_available == false: escalation_tier := TIER3_PAYER_NOTIFICATION, escalated_at unchanged"
+          - "increments Shift.version by 1"
+        note: >-
+          A second escalate call on an already ESCALATED shift whose patient HAS parent backup is
+          rejected with ERR_INVALID_STATE: tier 2 is only reachable through
+          POST /pdn/shifts/{id}/parent-backup.
+      - from: ESCALATED
+        to: PARENT_BACKUP
+        trigger: "POST /pdn/shifts/{id}/parent-backup"
+        actor: Scheduler
+        preconditions:
+          - "shift.staffing_status == ESCALATED"
+          - "Patient.parent_backup_available == true"
+          - "shift.start_at >= current_clock"
+        side_effects:
+          - "escalation_tier := TIER2_PARENT_BACKUP"
+          - "the shift consumes no authorized hours: it is excluded from every committed-minutes sum"
+          - "Case.unfilled_shift_count / fill_rate recomputed"
+          - "increments Shift.version by 1"
+      - from: ASSIGNED
+        to: COMPLETED
+        trigger: "POST /pdn/shifts/{id}/clock-out"
+        actor: Nurse
+        preconditions:
+          - "shift.staffing_status == ASSIGNED"
+          - "shift.evv_status == CLOCKED_IN"
+          - "X-User-ID == the ACTIVE ShiftAssignment.nurse_id"
+        side_effects:
+          - "ShiftAssignment.status := COMPLETED"
+          - "Timesheet.clock_out_at := current_clock; the billing-edit calculation fills gross_billable_units, edit_deduction_units, net_billable_units, edit_codes"
+          - "evv axis moves independently to VERIFIED or EXCEPTION per calculations.evv_verification_outcome"
+          - "increments Shift.version by 1"
+      - from: NOT_STARTED
+        to: CLOCKED_IN
+        trigger: "POST /pdn/shifts/{id}/clock-in (evv_status axis)"
+        actor: Nurse
+        preconditions:
+          - "shift.evv_status == NOT_STARTED"
+          - "shift.staffing_status == ASSIGNED"
+          - "X-User-ID == the ACTIVE ShiftAssignment.nurse_id"
+          - "current_clock >= shift.start_at - 15 minutes"
+        side_effects:
+          - "creates Timesheet in CAPTURED with clock_in_at := current_clock"
+          - "increments Shift.version by 1"
+        note: "Second axis of the same row; staffing_status is unchanged by this transition."
+      - from: CLOCKED_IN
+        to: VERIFIED
+        trigger: "POST /pdn/shifts/{id}/clock-out (evv_status axis, verification passed)"
+        actor: Nurse
+        preconditions:
+          - "shift.evv_status == CLOCKED_IN"
+          - "Timesheet.evv_method IN {GPS, IVR} AND Timesheet.geo_verified == true AND clock_in_at <= shift.start_at + 60 minutes"
+        side_effects:
+          - "evv_status := VERIFIED; no EVV_EXCEPTION edit code is recorded"
+      - from: CLOCKED_IN
+        to: EXCEPTION
+        trigger: "POST /pdn/shifts/{id}/clock-out (evv_status axis, verification failed)"
+        actor: Nurse
+        preconditions:
+          - "shift.evv_status == CLOCKED_IN"
+          - "Timesheet.evv_method == MANUAL OR geo_verified == false OR clock_in_at > shift.start_at + 60 minutes"
+        side_effects:
+          - "evv_status := EXCEPTION; EVV_EXCEPTION is appended to Timesheet.edit_codes"
+          - "the timesheet stays billable-blocked: POST /pdn/timesheets/{id}/submit is rejected with ERR_EVV_NOT_VERIFIED for as long as evv_status == EXCEPTION"
+      - from: OPEN
+        to: CANCELLED
+        trigger: "cascade from case hold, authorization reduction trim, authorization expiry, or competency revocation"
+        actor: system
+        preconditions:
+          - "shift.staffing_status IN {OPEN, ASSIGNED, ESCALATED}"
+          - "shift.start_at >= current_clock"
+        side_effects:
+          - "cancel_reason := CASE_HOLD | AUTH_REDUCTION | AUTH_EXPIRY | COMPETENCY_REVOKED"
+          - "the ACTIVE ShiftAssignment, if any, becomes CANCELLED with the matching reason"
+
+  - entity: ShiftAssignment
+    initial_state: ACTIVE
+    terminal_states: [CANCELLED, COMPLETED]
+    transitions:
+      - from: ACTIVE
+        to: CANCELLED
+        trigger: "POST /pdn/shift-assignments/{id}/cancel, or any cascade listed on Shift"
+        actor: Scheduler
+        preconditions:
+          - "assignment.status == ACTIVE"
+          - "shift.evv_status == NOT_STARTED when cancelled by the scheduler"
+        side_effects:
+          - "Shift.staffing_status := OPEN when cancelled by the scheduler; := CANCELLED when cancelled by a cascade"
+          - "Nurse.scheduled_minutes_this_week recomputed"
+      - from: ACTIVE
+        to: COMPLETED
+        trigger: "POST /pdn/shifts/{id}/clock-out"
+        actor: Nurse
+        preconditions:
+          - "assignment.status == ACTIVE"
+          - "shift.evv_status == CLOCKED_IN"
+        side_effects:
+          - "Shift.staffing_status := COMPLETED"
+
+  - entity: Timesheet
+    initial_state: CAPTURED
+    terminal_states: [BILL_ACCEPTED, VOIDED]
+    transitions:
+      - from: CAPTURED
+        to: EDITED
+        trigger: "PATCH /pdn/timesheets/{id}"
+        actor: Nurse
+        preconditions:
+          - "timesheet.status IN {CAPTURED, BILL_REJECTED}"
+          - "X-User-ID == ShiftAssignment.nurse_id"
+          - "clock_out_at is not null after applying the patch"
+        side_effects:
+          - "clock_in_at / clock_out_at overwritten with the supplied instants"
+          - "POST_EDIT appended to edit_codes; gross_billable_units, edit_deduction_units, net_billable_units recomputed"
+      - from: CAPTURED
+        to: SUBMITTED
+        trigger: "POST /pdn/timesheets/{id}/submit"
+        actor: Scheduler
+        preconditions:
+          - "timesheet.status IN {CAPTURED, EDITED}"
+          - "Shift.staffing_status == COMPLETED"
+          - "Shift.evv_status == VERIFIED (cross-entity: the evv axis must have passed)"
+        side_effects:
+          - "submitted_by_user_id := X-User-ID"
+      - from: EDITED
+        to: SUBMITTED
+        trigger: "POST /pdn/timesheets/{id}/submit"
+        actor: Scheduler
+        preconditions:
+          - "timesheet.status == EDITED"
+          - "Shift.staffing_status == COMPLETED"
+          - "Shift.evv_status == VERIFIED"
+        side_effects:
+          - "submitted_by_user_id := X-User-ID"
+      - from: SUBMITTED
+        to: BILL_ACCEPTED
+        trigger: "POST /pdn/timesheets/{id}/billing-decision with decision ACCEPT"
+        actor: PayerReviewer
+        preconditions:
+          - "timesheet.status == SUBMITTED"
+        side_effects:
+          - "Case.billed_units_to_date increases by net_billable_units"
+          - "the SETTLED variant of calculations.authorization_weekly_utilization now includes this timesheet"
+      - from: SUBMITTED
+        to: BILL_REJECTED
+        trigger: "POST /pdn/timesheets/{id}/billing-decision with decision REJECT"
+        actor: PayerReviewer
+        preconditions:
+          - "timesheet.status == SUBMITTED"
+        side_effects:
+          - "rejection_reason := request.rejection_reason"
+          - "Case.billed_units_to_date unchanged"
+      - from: BILL_REJECTED
+        to: EDITED
+        trigger: "PATCH /pdn/timesheets/{id} (rework after rejection)"
+        actor: Nurse
+        preconditions:
+          - "timesheet.status == BILL_REJECTED"
+        side_effects:
+          - "same as CAPTURED -> EDITED"
+        note: "Cycle: BILL_REJECTED -> EDITED -> SUBMITTED -> BILL_REJECTED may repeat without limit."
+      - from: BILL_ACCEPTED
+        to: VOIDED
+        trigger: "POST /pdn/timesheets/{id}/void"
+        actor: Scheduler
+        preconditions:
+          - "timesheet.status IN {SUBMITTED, BILL_ACCEPTED, BILL_REJECTED}"
+        side_effects:
+          - "compensating: Case.billed_units_to_date returns to its pre-acceptance value exactly (see calculations.billed_units_invariant)"
+          - "the timesheet leaves the SETTLED utilization input set"
+
+  - entity: IncidentReport
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: OPEN
+        trigger: "POST /pdn/incident-reports (creation)"
+        actor: ClinicalSupervisor
+        preconditions:
+          - "Case.status IN {PENDING_STAFFING, ACTIVE, ON_HOLD}"
+          - "request.occurred_at <= current_clock"
+        side_effects:
+          - "triggered_case_hold := (category == HOSPITALIZATION OR severity == HIGH)"
+          - "when category == HOSPITALIZATION: Patient.status := HOSPITALIZED (cascade hop 1)"
+          - "because the patient became HOSPITALIZED, the Case moves ACTIVE -> ON_HOLD with hold_reason HOSPITALIZATION and hold_incident_report_id := this report (cascade hop 2)"
+          - "because the case entered ON_HOLD, its future Shifts (staffing_status IN {OPEN, ASSIGNED, ESCALATED} and start_at >= current_clock) become CANCELLED with cancel_reason CASE_HOLD and their ACTIVE assignments become CANCELLED (cascade hop 3)"
+          - "because those assignments were cancelled, Nurse.scheduled_minutes_this_week, Authorization.hours_committed_this_week and Case.unfilled_shift_count / fill_rate are recomputed (cascade hop 4)"
+          - "when category != HOSPITALIZATION and severity == HIGH: the case hold is cascaded with hold_reason INCIDENT_REVIEW and the Patient.status hop is skipped"
+        note: "Conditional cascade: LOW/MODERATE non-hospitalization incidents leave the case ACTIVE."
+      - from: OPEN
+        to: CLOSED
+        trigger: "POST /pdn/incident-reports/{id}/close"
+        actor: ClinicalSupervisor
+        preconditions:
+          - "incident_report.status == OPEN"
+        side_effects:
+          - "resolution := request.resolution; patient_returned_home := request.patient_returned_home"
+          - "when patient_returned_home == true AND Patient.status == HOSPITALIZED: Patient.status := ACTIVE"
+          - "the Case stays ON_HOLD; only POST /pdn/cases/{id}/resume releases it"
+
+  - entity: AuthorizationDispute
+    initial_state: FILED
+    terminal_states: [UPHELD, OVERTURNED, PARTIALLY_GRANTED]
+    transitions:
+      - from: FILED
+        to: UNDER_REVIEW
+        trigger: "POST /pdn/authorization-disputes/{id}/review"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == FILED"
+        side_effects:
+          - "reviewer_user_id := X-User-ID"
+      - from: UNDER_REVIEW
+        to: UPHELD
+        trigger: "POST /pdn/authorization-disputes/{id}/decide with outcome UPHELD"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+        side_effects:
+          - "decided_at := current_clock; decided_hours_per_week stays null"
+          - "REDUCTION_APPEAL: Authorization -> REDUCED at noticed_hours_per_week plus the trim cascade"
+          - "DENIAL_APPEAL: Authorization -> ACTIVE with approved_hours_per_week unchanged"
+      - from: UNDER_REVIEW
+        to: OVERTURNED
+        trigger: "POST /pdn/authorization-disputes/{id}/decide with outcome OVERTURNED"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+        side_effects:
+          - "decided_at := current_clock"
+          - "REDUCTION_APPEAL: Authorization -> ACTIVE, notice cleared, zero shifts cancelled"
+          - "DENIAL_APPEAL: Authorization -> ACTIVE with approved_hours_per_week := min(requested_hours_per_week, Payer.weekly_hour_cap, PlanOfCare.requested_hours_per_week)"
+      - from: UNDER_REVIEW
+        to: PARTIALLY_GRANTED
+        trigger: "POST /pdn/authorization-disputes/{id}/decide with outcome PARTIALLY_GRANTED"
+        actor: PayerReviewer
+        preconditions:
+          - "dispute.status == UNDER_REVIEW"
+          - "REDUCTION_APPEAL: authorization.noticed_hours_per_week < request.decided_hours_per_week < authorization.approved_hours_per_week"
+          - "DENIAL_APPEAL: authorization.approved_hours_per_week < request.decided_hours_per_week <= min(dispute.requested_hours_per_week, Payer.weekly_hour_cap, PlanOfCare.requested_hours_per_week)"
+        side_effects:
+          - "decided_hours_per_week := request.decided_hours_per_week; decided_at := current_clock"
+          - "REDUCTION_APPEAL: Authorization -> REDUCED at decided_hours_per_week plus the trim cascade"
+          - "DENIAL_APPEAL: Authorization -> ACTIVE at decided_hours_per_week, no trim"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC on the parent's version only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: authorization-create-stale-plan
+    parent_entity: PlanOfCare
+    write_endpoint: "POST /pdn/authorizations"
+    occ_field: "expected_plan_of_care_version"
+    description: |
+      Creating an Authorization against a PlanOfCare whose version has advanced since the client
+      last observed it is rejected. A second authorization written against the same plan is a
+      legitimate product operation - it supersedes the earlier PENDING grant and moves the plan
+      through UNDER_REVIEW again - so the write cannot be rejected on state alone; the stale
+      plan-of-care version is what identifies the writer whose view of the approval history is
+      out of date.
+    error_id: ERR_STALE_PLAN_OF_CARE_VERSION
+    http_status: 412
+  - rule_id: assignment-create-stale-shift
+    parent_entity: Shift
+    write_endpoint: "POST /pdn/shift-assignments"
+    occ_field: "expected_shift_version"
+    description: |
+      Creating a ShiftAssignment against a Shift whose version has advanced since the client last
+      observed it is rejected. Assigning a nurse to an already ASSIGNED shift is a legitimate
+      continuity swap - the incumbent assignment is cancelled with cancel_reason REPLACED - so the
+      write is not blocked by shift state; the stale shift version is what identifies the scheduler
+      who has not seen the incumbent assignment, the escalation, or the clock-in that happened since.
+    error_id: ERR_STALE_SHIFT_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+# Shared definitions used by several rules below:
+#   week_start(t) = the Monday 00:00:00.000Z of the ISO-8601 week containing instant t
+#   week_window(t) = [week_start(t), week_start(t) + 7 days)   -- half-open
+#   current_clock = the logical clock (default 2026-08-01T00:00:00Z, moved only by
+#                   POST /pdn/_clock/set_current_utc)
+# No calculation, selector, ranking, tie-break, cascade order or allocation order in this
+# scaffold ever reads an `id` value; `created_at ASC/DESC` is the only permitted final
+# tie-break over common fields.
+calculations:
+  - name: authorization_weekly_utilization
+    trigger: >-
+      GET /pdn/authorizations/{id}/utilization; also on every read of
+      Authorization.hours_committed_this_week / hours_remaining_this_week (basis PROJECTED,
+      week_of = current_clock) and on every transition that creates, cancels or completes a
+      ShiftAssignment or accepts/voids a Timesheet
+    algorithm: aggregation
+    formula: |
+      window = week_window(week_of or current_clock)
+      in_scope_cases = every Case whose authorization_id == authorization.id
+                       (CLOSED and ON_HOLD cases included; no status filter)
+
+      # ---- PROJECTED basis (scheduled view) ----
+      committed_minutes = sum(Shift.scheduled_minutes)
+        over Shifts S where S.case_id IN in_scope_cases
+             AND S.staffing_status IN {ASSIGNED, COMPLETED}
+             AND S.start_at IN window
+        # OPEN, ESCALATED, PARENT_BACKUP and CANCELLED shifts contribute nothing.
+
+      # ---- SETTLED basis (billed view) ----
+      settled_gross_units = sum(Timesheet.gross_billable_units)
+        over Timesheets T where T -> ShiftAssignment -> Shift S with S.case_id IN in_scope_cases
+             AND S.start_at IN window
+             AND T.status IN {SUBMITTED, BILL_ACCEPTED}
+        # CAPTURED, EDITED, BILL_REJECTED and VOIDED timesheets are excluded.
+      settled_net_units = same input set, sum(Timesheet.net_billable_units)
+      settled_minutes   = settled_net_units * 15
+
+      basis_minutes = committed_minutes   if basis == "PROJECTED"
+                    = settled_minutes     if basis == "SETTLED"
+      cap_minutes = approved_hours_per_week * 60
+      utilization_ratio = round_half_up(basis_minutes / cap_minutes, 4)
+      hours_remaining   = round_half_up(max(0, cap_minutes - basis_minutes) / 60, 2)
+      # Authorization.hours_committed_this_week = round_half_up(committed_minutes / 60, 2)
+      # with week_of = current_clock; hours_remaining_this_week = hours_remaining on that basis.
+    input_set: >-
+      PROJECTED reads Shift rows filtered to staffing_status IN {ASSIGNED, COMPLETED}; SETTLED
+      reads Timesheet rows filtered to status IN {SUBMITTED, BILL_ACCEPTED}. Both are keyed on
+      Shift.start_at falling inside the half-open ISO-week window, never on Timesheet.clock_in_at.
+    constants:
+      UNIT_MINUTES: 15
+      RATIO_DECIMALS: 4
+      HOURS_DECIMALS: 2
+    precision: "ratios 4 decimal places round_half_up; hours 2 decimal places round_half_up"
+    variants:
+      - name: PROJECTED
+        when: >-
+          default for the weekly cap check on POST /pdn/shift-assignments, for
+          Authorization.hours_committed_this_week, and for the reduction trim cascade
+        difference: >-
+          counts SCHEDULED minutes of ASSIGNED/COMPLETED shifts, so a shift the nurse under-worked
+          still consumes its full scheduled duration and unverified visits still count
+      - name: SETTLED
+        when: >-
+          basis=SETTLED on GET /pdn/authorizations/{id}/utilization and the renewal
+          utilization gate
+        difference: >-
+          counts net billable units x 15 of SUBMITTED/BILL_ACCEPTED timesheets only, so grace
+          capping, 15-minute rounding, billing-edit deductions and un-submitted visits all move the
+          number away from the PROJECTED value for identical shift data
+
+  - name: timesheet_net_billable_units
+    trigger: >-
+      POST /pdn/shifts/{id}/clock-out and PATCH /pdn/timesheets/{id}
+    algorithm: tiered_pricing
+    formula: |
+      # ---- EVALUATION ORDER IS PINNED; steps MUST run 1 -> 2 -> 3 -> 4 ----
+      # step 1: clamp the worked interval
+      raw_minutes    = whole_minutes(clock_out_at - clock_in_at)          # must be > 0
+      capped_minutes = min(raw_minutes, Shift.scheduled_minutes + GRACE_MINUTES)
+
+      # step 2: round to units ONCE, PER TIMESHEET (never per week, never on summed minutes)
+      gross_billable_units = round_half_up(capped_minutes / UNIT_MINUTES)
+
+      # step 3: deduction. The percentage tier is selected FROM gross_billable_units.
+      #         It is NEVER re-selected from the net result, even when the net value falls
+      #         into a lower tier band.
+      deduction_applies = (evv_method == "MANUAL") OR (Shift.evv_status == "EXCEPTION")
+      base_pct = 0.00                                   if not deduction_applies
+               = 0.05                                   if deduction_applies and gross_billable_units <= 8
+               = 0.10                                   if deduction_applies and 9 <= gross_billable_units <= 16
+               = 0.15                                   if deduction_applies and gross_billable_units >= 17
+      pct = base_pct + (0.05 if Payer.billing_edit_ruleset == "STRICT_15MIN" and deduction_applies else 0.00)
+      pct_deduction_units = ceil(gross_billable_units * pct)
+      late_start_units    = 1 if clock_in_at > Shift.start_at + LATE_START_TOLERANCE_MINUTES else 0
+      edit_deduction_units = pct_deduction_units + late_start_units
+
+      # step 4: net
+      net_billable_units = max(0, gross_billable_units - edit_deduction_units)
+
+      edit_codes = sorted_ascending(
+          {"MANUAL_ENTRY" if evv_method == "MANUAL"} u
+          {"EVV_EXCEPTION" if Shift.evv_status == "EXCEPTION"} u
+          {"LATE_START" if late_start_units == 1} u
+          {"POST_EDIT" if at least one PATCH has been applied to this timesheet})
+
+      # ---- WEEKLY AGGREGATION ORDER IS PINNED ----
+      # Weekly settled units = sum of per-timesheet net_billable_units. Summing capped_minutes
+      # across timesheets and rounding the total is FORBIDDEN and produces a different number
+      # (two 250-minute visits: 17 + 17 = 34 units per-timesheet vs round_half_up(500/15) = 33).
+    input_set: >-
+      exactly one Timesheet row plus its Shift (scheduled_minutes, start_at, evv_status) and the
+      Payer.billing_edit_ruleset of the case's patient
+    constants:
+      UNIT_MINUTES: 15
+      GRACE_MINUTES: 15
+      LATE_START_TOLERANCE_MINUTES: 7
+      TIER_LOW_MAX_UNITS: 8
+      TIER_MID_MAX_UNITS: 16
+      TIER_LOW_PCT: 0.05
+      TIER_MID_PCT: 0.10
+      TIER_HIGH_PCT: 0.15
+      STRICT_RULESET_SURCHARGE_PCT: 0.05
+    precision: >-
+      units are integers; round_half_up on the minutes/15 division; ceil on the percentage
+      deduction; net floored at 0
+
+  - name: nurse_match_score
+    trigger: >-
+      POST /pdn/shift-assignments and POST /pdn/shifts/{id}/auto-staff (frozen into
+      ShiftAssignment.match_score_at_assignment); also exposed by
+      GET /pdn/shifts/{id}/staffing-candidates
+    algorithm: weighted_scoring
+    formula: |
+      # 3 inputs interacting non-linearly: continuity history, skill depth, current load.
+      continuity_pts = 40                                              if nurse.id == Case.continuity_nurse_id
+                     = min(30, nurse_continuity_score(nurse, case, basis="STRICT"))   otherwise
+      matched_skills = count(distinct skill s IN Shift.required_skills such that the nurse has a
+                             NurseCompetency with skill == s, status == VALID and
+                             expires_on > date(Shift.start_at))
+      skill_pts = 10 * min(matched_skills, 3)
+                + (10 if nurse.license_type == "RN" AND "VENT" IN Shift.required_skills else 0)
+      availability_pts = max(0, 30 - 5 * floor(nurse.scheduled_minutes_this_week / 240))
+      match_score = continuity_pts + skill_pts + availability_pts        # integer 0..110
+    input_set: >-
+      one eligible Nurse plus the Shift, its Case and the nurse's VALID competencies; scheduled
+      minutes are read for the ISO week containing current_clock
+    constants:
+      CONTINUITY_NURSE_PTS: 40
+      CONTINUITY_HISTORY_CAP_PTS: 30
+      SKILL_PTS_PER_MATCH: 10
+      SKILL_MATCH_CAP: 3
+      RN_VENT_BONUS_PTS: 10
+      AVAILABILITY_BASE_PTS: 30
+      AVAILABILITY_STEP_MINUTES: 240
+      AVAILABILITY_STEP_PENALTY_PTS: 5
+    precision: "integer points, no rounding"
+
+  - name: auto_staff_selector
+    trigger: "POST /pdn/shifts/{id}/auto-staff"
+    algorithm: constraint_propagation
+    formula: |
+      # (a) eligibility filter - an explicit predicate, no fuzzy adjectives
+      candidates = every Nurse N with
+        N.status == "ACTIVE"
+        AND date(N.license_expires_on) > date(Shift.end_at)
+        AND N.id NOT IN Case.excluded_nurse_ids
+        AND for every skill s IN Shift.required_skills: N has a NurseCompetency with skill == s,
+            status == "VALID" and expires_on > date(Shift.start_at)
+        AND N has no ShiftAssignment with status == "ACTIVE" whose Shift O satisfies
+            Shift.start_at < O.end_at + 60 minutes AND O.start_at < Shift.end_at + 60 minutes
+        AND (N.scheduled_minutes_in_week(week_window(Shift.start_at)) + Shift.scheduled_minutes)
+            <= N.max_weekly_hours * 60
+      # (b) ranking expression
+      order by nurse_match_score(N, Shift) DESC
+      # (c) tie-break, applied in order, never using id
+      then by N.scheduled_minutes_in_week(week_window(Shift.start_at)) ASC
+      then by N.created_at ASC
+      # (d) empty-pool fallback
+      if candidates is empty: reject with ERR_NO_ELIGIBLE_NURSE (422) and mutate nothing -
+         no assignment row, no version bump, no escalation; the scheduler must call
+         POST /pdn/shifts/{id}/escalate explicitly
+      selected_nurse = first row of the ordered candidate list
+    input_set: >-
+      all Nurse rows (no pagination), their NurseCompetency rows, their ACTIVE ShiftAssignments and
+      the target Shift with its Case
+    constants:
+      REST_BUFFER_MINUTES: 60
+    precision: "exact integer comparisons; no rounding anywhere in the selector"
+
+  - name: nurse_continuity_score
+    trigger: >-
+      GET /pdn/nurses/{id}/continuity-score; the STRICT variant also feeds
+      calculations.nurse_match_score
+    algorithm: weighted_scoring
+    formula: |
+      STRICT: matched = count(ShiftAssignment A where A.nurse_id == nurse.id
+                             AND A.status == "COMPLETED"
+                             AND A -> Shift.case_id == case.id
+                             AND A -> Shift.start_at >= current_clock - 28 days)
+      BROAD:  matched = count(ShiftAssignment A where A.nurse_id == nurse.id
+                             AND A.status IN {"COMPLETED", "CANCELLED"}
+                             AND A -> Shift -> Case.patient_id == case.patient_id
+                             (any case of that patient, including CLOSED cases and cases under a
+                              SUPERSEDED authorization; no time window at all))
+      continuity_score = 15 * min(matched, 5)                      # 0..75
+    input_set: >-
+      STRICT is scoped to one case, COMPLETED assignments only, trailing 28 days from
+      current_clock; BROAD is scoped to the patient, includes CANCELLED assignments, unbounded time
+    constants:
+      PTS_PER_MATCH: 15
+      MATCH_CAP: 5
+      STRICT_WINDOW_DAYS: 28
+    precision: "integer points"
+    variants:
+      - name: STRICT
+        when: "default basis; the value the match score consumes"
+        difference: "same-case, COMPLETED-only, 28-day trailing window"
+      - name: BROAD
+        when: "basis=BROAD on GET /pdn/nurses/{id}/continuity-score"
+        difference: >-
+          same patient across every case and authorization generation, counts CANCELLED assignments
+          as continuity contact, no time window - so identical history yields a strictly larger
+          score than STRICT whenever the nurse has cancelled or cross-case history
+
+  - name: supervisory_visit_cadence
+    trigger: >-
+      POST /pdn/cases/{id}/supervisory-visits, POST /pdn/_ops/run-daily-checkpoint, and every
+      read of Case.next_supervisory_visit_due_at / Case.supervisory_status
+    algorithm: threshold
+    formula: |
+      base_cadence_days = 14 if Patient.requires_vent
+                        = 30 if (not Patient.requires_vent) and Patient.requires_trach
+                        = 60 otherwise
+      latest_visit = the SupervisoryVisit of this case with the greatest visit_at;
+                     tie-break greatest created_at (never id); null when the case has no visit
+      cadence_days_applied = base_cadence_days                       if latest_visit is null
+                                                                     or latest_visit.outcome == "PASS"
+                           = ceil(base_cadence_days / 2)             if latest_visit.outcome == "DEFICIENT"
+      anchor = Case.created_at if latest_visit is null else latest_visit.visit_at
+      next_supervisory_visit_due_at = anchor + cadence_days_applied days
+      supervisory_status = "OVERDUE" if current_clock >= next_supervisory_visit_due_at else "CURRENT"
+      # Boundary: current_clock exactly equal to the due instant is already OVERDUE.
+    input_set: >-
+      the case's SupervisoryVisit rows (all of them; no status filter exists on this entity) plus
+      the Patient clinical flags
+    constants:
+      VENT_CADENCE_DAYS: 14
+      TRACH_CADENCE_DAYS: 30
+      BASE_CADENCE_DAYS: 60
+    precision: "whole days; ceil on the halved cadence"
+
+  - name: case_fill_metrics
+    trigger: >-
+      every read of Case.unfilled_shift_count / Case.fill_rate, and after any transition that
+      creates, cancels or completes a Shift or ShiftAssignment
+    algorithm: aggregation
+    formula: |
+      forward_window = [current_clock, Authorization.effective_end)        # half-open
+      denominator = count(Shift S of this case where S.start_at IN forward_window
+                          AND S.staffing_status != "CANCELLED")
+      numerator   = count(those S with staffing_status IN {"ASSIGNED", "COMPLETED", "PARENT_BACKUP"})
+      fill_rate = 1.0000 if denominator == 0 else round_half_up(numerator / denominator, 4)
+      unfilled_shift_count = count(Shift S of this case where
+                                   S.staffing_status IN {"OPEN", "ESCALATED"}
+                                   AND S.start_at >= current_clock)
+    input_set: >-
+      Shifts of exactly this case, forward-looking from current_clock, CANCELLED shifts excluded
+      from both numerator and denominator
+    constants:
+      RATE_DECIMALS: 4
+    precision: "4 decimal places round_half_up; 1.0000 when there are no forward shifts"
+
+  - name: authorization_reduction_trim_order
+    trigger: >-
+      POST /pdn/authorization-disputes/{id}/decide with outcome UPHELD or
+      PARTIALLY_GRANTED on a REDUCTION_APPEAL, and POST /pdn/authorizations/{id}/apply-reduction
+    algorithm: waterfall_allocation
+    formula: |
+      target_minutes = new_approved_hours_per_week * 60
+      weeks = every ISO week W with week_start(W) IN
+              [week_start(current_clock), authorization.effective_end), ascending by week_start(W)
+      for W in weeks:
+        loop:
+          committed_W = sum(Shift.scheduled_minutes) over Shifts of in-scope cases with
+                        staffing_status IN {"ASSIGNED", "COMPLETED"} AND start_at IN week_window(W)
+          if committed_W <= target_minutes: break
+          candidates = Shifts of in-scope cases with staffing_status == "ASSIGNED"
+                       AND start_at >= current_clock AND start_at IN week_window(W)
+          if candidates is empty: break                 # already-worked hours are never clawed back
+          victim = candidate with the greatest start_at; tie-break greatest created_at (latest
+                   created loses first); id is never consulted
+          victim.staffing_status := "CANCELLED"; victim.cancel_reason := "AUTH_REDUCTION"
+          victim's ShiftAssignment with status ACTIVE := "CANCELLED" with cancel_reason "AUTH_REDUCTION"
+          # loop re-evaluates committed_W after each cancellation
+    input_set: >-
+      only ASSIGNED future shifts are cancellable; COMPLETED shifts still count toward committed_W
+      but are never cancelled; OPEN / ESCALATED / PARENT_BACKUP shifts are neither counted nor cancelled
+    constants:
+      MINUTES_PER_HOUR: 60
+    precision: "exact integer minutes"
+
+  - name: evv_verification_outcome
+    trigger: "POST /pdn/shifts/{id}/clock-out"
+    algorithm: threshold
+    formula: |
+      verified = (Timesheet.evv_method IN {"GPS", "IVR"})
+                 AND (Timesheet.geo_verified == true)
+                 AND (Timesheet.clock_in_at <= Shift.start_at + EVV_LATE_WINDOW_MINUTES)
+      Shift.evv_status := "VERIFIED" if verified else "EXCEPTION"
+      # Boundary: clock_in_at exactly at start_at + 60 minutes still VERIFIES (<=);
+      # 61 minutes late is an EXCEPTION.
+    input_set: "the single Timesheet created at clock-in plus its Shift.start_at"
+    constants:
+      EVV_LATE_WINDOW_MINUTES: 60
+      EVV_EARLY_WINDOW_MINUTES: 15
+    precision: "whole minutes"
+
+  - name: renewal_utilization_gate
+    trigger: "POST /pdn/authorizations/{id}/renew"
+    algorithm: threshold
+    formula: |
+      prior_week = [week_start(current_clock) - 7 days, week_start(current_clock))   # last completed ISO week
+      settled_minutes = authorization_weekly_utilization(authorization, basis="SETTLED",
+                                                         week_of = week_start(current_clock) - 7 days).settled_minutes
+      ratio = round_half_up(settled_minutes / (authorization.approved_hours_per_week * 60), 4)
+      gate: ratio >= RENEWAL_MIN_RATIO   else reject with ERR_RENEWAL_UTILIZATION_TOO_LOW (422)
+      # Boundary: ratio exactly 0.5000 passes.
+    input_set: >-
+      SUBMITTED and BILL_ACCEPTED timesheets whose Shift.start_at falls in the last completed ISO
+      week; the current (incomplete) week is excluded entirely
+    constants:
+      RENEWAL_MIN_RATIO: 0.5000
+    precision: "4 decimal places round_half_up on the ratio"
+
+  - name: committed_minutes_invariant
+    trigger: >-
+      asserted after POST /pdn/shift-assignments and after
+      POST /pdn/shift-assignments/{id}/cancel
+    algorithm: aggregation
+    formula: |
+      # conserved quantity #1: scheduled minutes committed against a weekly grant
+      Authorization.hours_committed_this_week
+        == round_half_up(sum(Shift.scheduled_minutes for Shifts of the authorization's cases with
+                             staffing_status IN {"ASSIGNED","COMPLETED"} and start_at IN
+                             week_window(current_clock)) / 60, 2)
+      Nurse.scheduled_minutes_this_week
+        == sum(Shift.scheduled_minutes for that nurse's ShiftAssignments with status IN
+               {"ACTIVE","COMPLETED"} and Shift.start_at IN week_window(current_clock))
+      # forward action  : POST /pdn/shift-assignments      -> both quantities grow by exactly
+      #                   Shift.scheduled_minutes (hours by scheduled_minutes/60)
+      # compensating    : POST /pdn/shift-assignments/{id}/cancel -> both shrink by exactly the
+      #                   same amount, so forward+compensate is a no-op with zero drift
+    input_set: "ASSIGNED/COMPLETED shifts of the ISO week containing current_clock"
+    constants:
+      MINUTES_PER_HOUR: 60
+    precision: "hours 2 decimal places round_half_up; minutes exact integers"
+
+  - name: billed_units_invariant
+    trigger: >-
+      asserted after POST /pdn/timesheets/{id}/billing-decision (ACCEPT) and after
+      POST /pdn/timesheets/{id}/void
+    algorithm: aggregation
+    formula: |
+      # conserved quantity #2: accepted billable units on a case
+      Case.billed_units_to_date
+        == sum(Timesheet.net_billable_units over Timesheets of this case with status == "BILL_ACCEPTED")
+      # forward action : billing-decision ACCEPT -> +net_billable_units
+      # compensating   : void                   -> -net_billable_units, and the timesheet also
+      #                  leaves the SETTLED utilization input set, so
+      #                  authorization_weekly_utilization(basis="SETTLED").settled_minutes returns
+      #                  to its pre-acceptance value exactly
+    input_set: "BILL_ACCEPTED timesheets of exactly this case; VOIDED rows excluded"
+    constants:
+      UNIT_MINUTES: 15
+    precision: "integer units"
+
+# =============================================================================
+# 1.4 Validation Rules Table (evaluated strictly in ascending priority order;
+#     the FIRST failing rule determines the response)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers are both present and non-empty"
+    error_id: ERR_MISSING_AUTH_HEADER
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "the X-User-Role value is one of the six roles declared in section 1.7 and is listed in the endpoint's roles"
+    error_id: ERR_UNAUTHORIZED_ROLE
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: auth
+    check: >-
+      entity-backed ownership: role Nurse acting on clock-in, clock-out or PATCH timesheet must have
+      X-User-ID equal to the ACTIVE ShiftAssignment.nurse_id of the shift
+    error_id: ERR_UNAUTHORIZED_ROLE
+    http_status: 403
+    applies_to: "POST /pdn/shifts/{id}/clock-in, POST /pdn/shifts/{id}/clock-out, PATCH /pdn/timesheets/{id}"
+  - priority: 4
+    category: auth
+    check: >-
+      payer scope: role PayerReviewer must have X-User-ID equal to the payer_id of the Authorization
+      in scope (directly, or through the dispute / timesheet -> shift -> case -> authorization chain)
+    error_id: ERR_PAYER_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: >-
+      POST /pdn/authorizations, POST /pdn/authorizations/{id}/activate,
+      POST /pdn/authorizations/{id}/reduce,
+      POST /pdn/authorizations/{id}/apply-reduction,
+      POST /pdn/authorizations/{id}/renew,
+      POST /pdn/authorization-disputes/{id}/review,
+      POST /pdn/authorization-disputes/{id}/decide,
+      POST /pdn/timesheets/{id}/billing-decision,
+      POST /pdn/plans-of-care/{id}/return
+  - priority: 5
+    category: existence
+    check: "every id in the URL path exists, validated left-to-right"
+    error_id: ERR_PAYER_NOT_FOUND | ERR_NURSE_NOT_FOUND | ERR_COMPETENCY_NOT_FOUND | ERR_PATIENT_NOT_FOUND | ERR_PLAN_OF_CARE_NOT_FOUND | ERR_AUTHORIZATION_NOT_FOUND | ERR_DISPUTE_NOT_FOUND | ERR_CASE_NOT_FOUND | ERR_INCIDENT_NOT_FOUND | ERR_SHIFT_NOT_FOUND | ERR_ASSIGNMENT_NOT_FOUND | ERR_TIMESHEET_NOT_FOUND
+    http_status: 404
+    applies_to: "all endpoints with path parameters"
+  - priority: 6
+    category: existence
+    check: "every foreign-key id in the request body exists"
+    error_id: ERR_PAYER_NOT_FOUND | ERR_PATIENT_NOT_FOUND | ERR_PLAN_OF_CARE_NOT_FOUND | ERR_AUTHORIZATION_NOT_FOUND | ERR_NURSE_NOT_FOUND | ERR_CASE_NOT_FOUND | ERR_SHIFT_NOT_FOUND
+    http_status: 404
+    applies_to: "all POST endpoints carrying foreign keys in the body"
+  - priority: 7
+    category: business_constraint
+    check: >-
+      request shape: required fields present, enum members legal, numbers strictly positive,
+      end_at > start_at, effective_end > effective_start, end_date > start_date,
+      expires_on > validated_on, required_skills non-empty with distinct members, NPI exactly 10
+      digits, limit within 1..100, offset >= 0
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST / PATCH endpoints and all list endpoints with pagination"
+  - priority: 8
+    category: state
+    check: >-
+      optimistic concurrency: expected_plan_of_care_version equals PlanOfCare.version /
+      expected_shift_version equals Shift.version
+    error_id: ERR_STALE_PLAN_OF_CARE_VERSION | ERR_STALE_SHIFT_VERSION
+    http_status: 412
+    applies_to: "POST /pdn/authorizations, POST /pdn/shift-assignments, POST /pdn/shifts/{id}/auto-staff"
+  - priority: 9
+    category: state
+    check: "the target resource is in a state from which the requested transition is declared in section 1.2"
+    error_id: ERR_INVALID_STATE
+    http_status: 409
+    applies_to: "all transition endpoints"
+    note: >-
+      one carve-out: this rule does not apply to POST /pdn/authorization-disputes. A filing against
+      an Authorization already in UNDER_APPEAL is reported as ERR_DISPUTE_ALREADY_OPEN (priority 28),
+      and a filing against an Authorization in a status outside {ACTIVE, REDUCTION_NOTICED,
+      UNDER_APPEAL} is reported as ERR_AUTHORIZATION_NOT_ACTIVE (priority 11)
+  - priority: 10
+    category: state
+    check: "the Case of the resource is not ON_HOLD and not CLOSED"
+    error_id: ERR_CASE_ON_HOLD
+    http_status: 409
+    applies_to: >-
+      POST /pdn/shifts, POST /pdn/shift-assignments, POST /pdn/shifts/{id}/auto-staff,
+      POST /pdn/shifts/{id}/escalate, POST /pdn/shifts/{id}/parent-backup,
+      POST /pdn/shifts/{id}/clock-in
+  - priority: 11
+    category: state
+    check: "the governing Authorization.status IN {ACTIVE, REDUCTION_NOTICED, UNDER_APPEAL, REDUCED}"
+    error_id: ERR_AUTHORIZATION_NOT_ACTIVE
+    http_status: 409
+    applies_to: >-
+      POST /pdn/cases, POST /pdn/cases/{id}/activate, POST /pdn/shifts,
+      POST /pdn/shift-assignments, POST /pdn/shifts/{id}/auto-staff,
+      POST /pdn/authorization-disputes
+  - priority: 12
+    category: state
+    check: "the Patient.status is not HOSPITALIZED"
+    error_id: ERR_PATIENT_HOSPITALIZED
+    http_status: 409
+    applies_to: "POST /pdn/cases/{id}/activate, POST /pdn/cases/{id}/resume, POST /pdn/shifts"
+  - priority: 13
+    category: business_constraint
+    check: >-
+      segregation of duties: when Case.hold_incident_report_id is not null, the resuming
+      ClinicalSupervisor's X-User-ID differs from that IncidentReport.reported_by_user_id
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /pdn/cases/{id}/resume"
+  - priority: 14
+    category: business_referential
+    check: "Patient.payer_id equals Authorization.payer_id"
+    error_id: ERR_PAYER_MISMATCH
+    http_status: 422
+    applies_to: "POST /pdn/cases"
+  - priority: 15
+    category: business_referential
+    check: "the nurse is not listed in Case.excluded_nurse_ids"
+    error_id: ERR_NURSE_EXCLUDED_FROM_CASE
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 16
+    category: business_safety
+    check: "Nurse.status == ACTIVE"
+    error_id: ERR_NURSE_NOT_ACTIVE
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 17
+    category: business_safety
+    check: "date(Nurse.license_expires_on) > date(Shift.end_at)"
+    error_id: ERR_NURSE_LICENSE_EXPIRED
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 18
+    category: business_safety
+    check: >-
+      the nurse has a NurseCompetency row (any status) for every skill in Shift.required_skills -
+      a missing skill is a mismatch, not an expiry
+    error_id: ERR_NURSE_SKILL_MISMATCH
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 19
+    category: business_safety
+    check: >-
+      every matched NurseCompetency has status == VALID and expires_on > date(Shift.start_at) -
+      a competency expiring exactly on the shift start date fails
+    error_id: ERR_COMPETENCY_EXPIRED
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 20
+    category: business_safety
+    check: "Case.supervisory_status == CURRENT (current_clock < Case.next_supervisory_visit_due_at)"
+    error_id: ERR_SUPERVISORY_VISIT_OVERDUE
+    http_status: 409
+    applies_to: "POST /pdn/shift-assignments, POST /pdn/shifts/{id}/auto-staff"
+  - priority: 21
+    category: business_safety
+    check: "Patient.parent_backup_available == true"
+    error_id: ERR_NO_PARENT_BACKUP
+    http_status: 422
+    applies_to: "POST /pdn/shifts/{id}/parent-backup"
+  - priority: 22
+    category: business_temporal
+    check: >-
+      Shift.start_at >= Authorization.effective_start AND Shift.end_at <= Authorization.effective_end
+    error_id: ERR_SHIFT_OUTSIDE_AUTH_WINDOW
+    http_status: 422
+    applies_to: "POST /pdn/shifts"
+  - priority: 23
+    category: business_temporal
+    check: >-
+      nurse-as-resource overlap with a 60-minute mandatory rest buffer: no ACTIVE ShiftAssignment of
+      this nurse on a Shift O with new.start_at < O.end_at + 60min AND O.start_at < new.end_at + 60min
+    error_id: ERR_NURSE_SHIFT_OVERLAP
+    http_status: 409
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 24
+    category: business_temporal
+    check: >-
+      patient-as-resource aggregate capacity: the count of Shifts of the patient's cases with
+      staffing_status IN {ASSIGNED, COMPLETED} that strictly overlap the target shift
+      (a.start_at < b.end_at AND b.start_at < a.end_at, so adjacency is allowed and no buffer
+      applies) must remain below Case.concurrent_nurse_limit
+    error_id: ERR_PATIENT_CONCURRENCY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 25
+    category: business_temporal
+    check: "current_clock >= Shift.start_at - 15 minutes"
+    error_id: ERR_CLOCK_IN_TOO_EARLY
+    http_status: 422
+    applies_to: "POST /pdn/shifts/{id}/clock-in"
+  - priority: 26
+    category: business_temporal
+    check: "current_clock < Authorization.reduction_effective_at when filing a REDUCTION_APPEAL"
+    error_id: ERR_DISPUTE_WINDOW_CLOSED
+    http_status: 422
+    applies_to: "POST /pdn/authorization-disputes"
+  - priority: 27
+    category: business_temporal
+    check: "current_clock >= Authorization.reduction_effective_at"
+    error_id: ERR_REDUCTION_NOT_EFFECTIVE
+    http_status: 409
+    applies_to: "POST /pdn/authorizations/{id}/apply-reduction"
+  - priority: 28
+    category: business_constraint
+    check: "no AuthorizationDispute of this authorization has status IN {FILED, UNDER_REVIEW}"
+    error_id: ERR_DISPUTE_ALREADY_OPEN
+    http_status: 409
+    applies_to: "POST /pdn/authorization-disputes"
+  - priority: 29
+    category: business_constraint
+    check: >-
+      decided_hours_per_week is required for outcome PARTIALLY_GRANTED and must sit strictly inside
+      the band declared on the AuthorizationDispute UNDER_REVIEW -> PARTIALLY_GRANTED transition
+    error_id: ERR_DECIDED_HOURS_OUT_OF_RANGE
+    http_status: 422
+    applies_to: "POST /pdn/authorization-disputes/{id}/decide"
+  - priority: 30
+    category: business_constraint
+    check: "Nurse.license_number is unique across all Nurse rows"
+    error_id: ERR_LICENSE_NUMBER_TAKEN
+    http_status: 409
+    applies_to: "POST /pdn/nurses"
+  - priority: 31
+    category: business_constraint
+    check: "no NurseCompetency with the same (nurse_id, skill) and status != REVOKED already exists"
+    error_id: ERR_COMPETENCY_DUPLICATE
+    http_status: 409
+    applies_to: "POST /pdn/nurses/{id}/competencies"
+  - priority: 32
+    category: business_constraint
+    check: >-
+      nurse weekly ceiling: scheduled minutes of the nurse in week_window(Shift.start_at), excluding
+      any minutes already contributed by this same shift, plus Shift.scheduled_minutes, must be
+      <= Nurse.max_weekly_hours * 60
+    error_id: ERR_NURSE_WEEKLY_LIMIT_EXCEEDED
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments"
+  - priority: 33
+    category: business_constraint
+    check: "the auto-staff candidate pool is non-empty"
+    error_id: ERR_NO_ELIGIBLE_NURSE
+    http_status: 422
+    applies_to: "POST /pdn/shifts/{id}/auto-staff"
+  - priority: 34
+    category: business_fiscal
+    check: "approved_hours_per_week <= Payer.weekly_hour_cap"
+    error_id: ERR_PAYER_HOUR_CAP_EXCEEDED
+    http_status: 422
+    applies_to: "POST /pdn/authorizations, POST /pdn/authorizations/{id}/renew"
+  - priority: 35
+    category: business_fiscal
+    check: "approved_hours_per_week <= PlanOfCare.requested_hours_per_week"
+    error_id: ERR_APPROVED_EXCEEDS_REQUESTED
+    http_status: 422
+    applies_to: "POST /pdn/authorizations, POST /pdn/authorizations/{id}/renew"
+  - priority: 36
+    category: business_fiscal
+    check: >-
+      weekly authorized-hours cap: committed_minutes for week_window(Shift.start_at), excluding the
+      target shift's own contribution, plus Shift.scheduled_minutes, must be
+      <= Authorization.approved_hours_per_week * 60 (equality is allowed)
+    error_id: ERR_WEEKLY_HOURS_EXCEEDED
+    http_status: 422
+    applies_to: "POST /pdn/shift-assignments, POST /pdn/shifts/{id}/auto-staff"
+  - priority: 37
+    category: business_fiscal
+    check: "renewal_utilization_gate ratio >= 0.5000 over the last completed ISO week"
+    error_id: ERR_RENEWAL_UTILIZATION_TOO_LOW
+    http_status: 422
+    applies_to: "POST /pdn/authorizations/{id}/renew"
+  - priority: 38
+    category: state
+    check: "Shift.evv_status == VERIFIED before a timesheet may be submitted for billing"
+    error_id: ERR_EVV_NOT_VERIFIED
+    http_status: 409
+    applies_to: "POST /pdn/timesheets/{id}/submit"
+  - priority: 39
+    category: state
+    check: "the timesheet has not already reached BILL_ACCEPTED or VOIDED"
+    error_id: ERR_TIMESHEET_ALREADY_BILLED
+    http_status: 409
+    applies_to: "PATCH /pdn/timesheets/{id}, POST /pdn/timesheets/{id}/submit, POST /pdn/timesheets/{id}/billing-decision"
+
+# =============================================================================
+# 1.5 API Endpoints
+# =============================================================================
+endpoints:
+  # --- test harness control -------------------------------------------------
+  - method: POST
+    path: /pdn/_clock/set_current_utc
+    purpose: >-
+      Set the deterministic logical clock used by every temporal rule (authorization windows,
+      competency and license expiry, supervisory cadence, EVV, escalation, week windows). The
+      default value of the logical clock, before any call to this endpoint, is
+      2026-08-01T00:00:00Z.
+    roles: [AgencyAdmin]
+    input: ["to_iso8601"]
+    output: "{ current_utc: datetime }"
+    success_status: 200
+    side_effects: "no business entity is mutated; only the logical clock moves"
+  - method: POST
+    path: /pdn/_ops/run-daily-checkpoint
+    purpose: >-
+      Advance all clock-driven derivations to the current logical clock: expire Authorizations past
+      effective_end, expire NurseCompetency rows past expires_on, mark Case.supervisory_status
+      OVERDUE where next_supervisory_visit_due_at has passed, and cancel unstaffed Shifts whose
+      start_at has passed.
+    roles: [AgencyAdmin]
+    input: []
+    output: "{ expired_authorization_count: integer, expired_competency_count: integer, overdue_case_count: integer, cancelled_shift_count: integer }"
+    success_status: 200
+    side_effects: >-
+      Authorization ACTIVE -> EXPIRED, NurseCompetency VALID -> EXPIRED plus the competency-loss
+      cascade, Case.supervisory_status := OVERDUE, Shift OPEN|ESCALATED -> CANCELLED
+  # --- payers ---------------------------------------------------------------
+  - method: POST
+    path: /pdn/payers
+    purpose: "Register a payer with its weekly hour cap, appeal window and billing edit ruleset."
+    roles: [AgencyAdmin]
+    input: ["name", "plan_type", "weekly_hour_cap", "evv_required?", "billing_edit_ruleset?", "appeal_window_days?", "reduction_notice_days?"]
+    output: Payer
+    success_status: 201
+    side_effects: "none"
+  - method: GET
+    path: /pdn/payers/{id}
+    purpose: "Read one payer."
+    roles: [AgencyAdmin, PayerReviewer, CaseManager]
+    input: []
+    output: Payer
+    success_status: 200
+    side_effects: "none"
+  # --- nurses and competencies ---------------------------------------------
+  - method: POST
+    path: /pdn/nurses
+    purpose: "Register a nurse with licence type, licence number, licence expiry and weekly ceiling."
+    roles: [AgencyAdmin]
+    input: ["full_name", "license_type", "license_number", "license_expires_on", "max_weekly_hours?"]
+    output: Nurse
+    success_status: 201
+    side_effects: "none"
+  - method: GET
+    path: /pdn/nurses/{id}
+    purpose: "Read one nurse including derived verified_skills and scheduled_minutes_this_week."
+    roles: [AgencyAdmin, Scheduler, ClinicalSupervisor, Nurse]
+    input: []
+    output: Nurse
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/nurses
+    purpose: "List nurses, optionally filtered by status or by a single required skill."
+    roles: [AgencyAdmin, Scheduler]
+    input: ["status?", "skill?", "limit?", "offset?"]
+    output: "Nurse[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/nurses/{id}/status
+    purpose: "Move a nurse between ACTIVE, SUSPENDED and INACTIVE."
+    roles: [AgencyAdmin]
+    input: ["status"]
+    output: Nurse
+    success_status: 200
+    side_effects: >-
+      leaving ACTIVE cancels every ACTIVE ShiftAssignment of the nurse on Shifts whose evv_status is
+      NOT_STARTED with cancel_reason SCHEDULER; each such Shift returns to OPEN and
+      Authorization.hours_committed_this_week and Nurse.scheduled_minutes_this_week are recomputed
+  - method: POST
+    path: /pdn/nurses/{id}/competencies
+    purpose: "Record a validated competency for one skill with a validity window."
+    roles: [ClinicalSupervisor]
+    input: ["skill", "validated_on", "expires_on"]
+    output: NurseCompetency
+    success_status: 201
+    side_effects: "Nurse.verified_skills is re-derived"
+  - method: GET
+    path: /pdn/nurses/{id}/competencies
+    purpose: "List the competency rows of one nurse."
+    roles: [AgencyAdmin, Scheduler, ClinicalSupervisor]
+    input: ["status?"]
+    output: "NurseCompetency[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/nurse-competencies/{id}/revoke
+    purpose: "Revoke a competency after a failed supervisory validation."
+    roles: [ClinicalSupervisor]
+    input: ["revoked_reason"]
+    output: NurseCompetency
+    success_status: 200
+    side_effects: >-
+      the competency-loss cascade: every Shift with start_at >= current_clock whose required_skills
+      contain the revoked skill and whose ACTIVE ShiftAssignment belongs to this nurse becomes
+      CANCELLED with cancel_reason COMPETENCY_REVOKED, that assignment becomes CANCELLED with the
+      same reason, Authorization.hours_committed_this_week and Nurse.scheduled_minutes_this_week are
+      recomputed, and Nurse.verified_skills is re-derived
+  - method: GET
+    path: /pdn/nurses/{id}/continuity-score
+    purpose: "Read the continuity score of one nurse against one case under either basis."
+    roles: [Scheduler, ClinicalSupervisor]
+    input: ["case_id", "basis?"]
+    output: "{ nurse_id: string, case_id: string, basis: enum, matched_assignment_count: integer, continuity_score: integer }"
+    success_status: 200
+    side_effects: "none"
+  # --- patients -------------------------------------------------------------
+  - method: POST
+    path: /pdn/patients
+    purpose: "Enrol a pediatric patient under a payer with clinical requirement flags."
+    roles: [CaseManager]
+    input: ["payer_id", "full_name", "date_of_birth", "primary_diagnosis", "requires_trach?", "requires_vent?", "requires_feeding_tube?", "parent_backup_available?"]
+    output: Patient
+    success_status: 201
+    side_effects: "none"
+  - method: GET
+    path: /pdn/patients/{id}
+    purpose: "Read one patient."
+    roles: [CaseManager, Scheduler, ClinicalSupervisor, PayerReviewer]
+    input: []
+    output: Patient
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/patients
+    purpose: "List patients, optionally filtered by payer or status."
+    roles: [CaseManager, PayerReviewer]
+    input: ["payer_id?", "status?", "limit?", "offset?"]
+    output: "Patient[]"
+    success_status: 200
+    side_effects: "none"
+  # --- plans of care --------------------------------------------------------
+  - method: POST
+    path: /pdn/plans-of-care
+    purpose: "Draft a plan of care requesting a weekly nursing-hour volume for a date range."
+    roles: [CaseManager]
+    input: ["patient_id", "requested_hours_per_week", "start_date", "end_date", "ordering_physician_npi"]
+    output: PlanOfCare
+    success_status: 201
+    side_effects: "none"
+  - method: GET
+    path: /pdn/plans-of-care/{id}
+    purpose: "Read one plan of care."
+    roles: [CaseManager, PayerReviewer]
+    input: []
+    output: PlanOfCare
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/plans-of-care
+    purpose: "List plans of care, optionally filtered by patient or status."
+    roles: [CaseManager, PayerReviewer]
+    input: ["patient_id?", "status?", "limit?", "offset?"]
+    output: "PlanOfCare[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/plans-of-care/{id}/submit
+    purpose: "Submit a drafted plan of care to the payer for authorization."
+    roles: [CaseManager]
+    input: []
+    output: PlanOfCare
+    success_status: 200
+    side_effects: "status := SUBMITTED and PlanOfCare.version increments by 1"
+  - method: POST
+    path: /pdn/plans-of-care/{id}/return
+    purpose: "Return a submitted plan of care to the agency for correction."
+    roles: [PayerReviewer]
+    input: ["return_reason"]
+    output: PlanOfCare
+    success_status: 200
+    side_effects: "status := RETURNED, revision_round += 1, every PENDING Authorization of the plan becomes EXPIRED, and PlanOfCare.version increments by 1"
+  # --- authorizations -------------------------------------------------------
+  - method: POST
+    path: /pdn/authorizations
+    purpose: >-
+      Issue an authorization against a submitted plan of care, approving a weekly hour volume for an
+      effective window. Guarded by optimistic concurrency on the plan of care.
+    roles: [PayerReviewer]
+    input: ["plan_of_care_id", "payer_id", "approved_hours_per_week", "effective_start", "effective_end", "expected_plan_of_care_version", "supersedes_authorization_id?"]
+    output: Authorization
+    success_status: 201
+    side_effects: >-
+      the Authorization is created in PENDING with renewal_chain_depth 0, PlanOfCare
+      SUBMITTED -> UNDER_REVIEW and its version increments; a supplied
+      supersedes_authorization_id is recorded but the predecessor is untouched until this
+      authorization is activated
+  - method: GET
+    path: /pdn/authorizations/{id}
+    purpose: "Read one authorization."
+    roles: [PayerReviewer, CaseManager, Scheduler]
+    input: []
+    output: Authorization
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/authorizations
+    purpose: "List authorizations, optionally filtered by plan of care, payer, predecessor or status."
+    roles: [PayerReviewer, CaseManager]
+    input: ["plan_of_care_id?", "payer_id?", "supersedes_authorization_id?", "status?", "limit?", "offset?"]
+    output: "Authorization[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/authorizations/{id}/activate
+    purpose: "Activate an issued authorization so cases and shifts may be created against it."
+    roles: [PayerReviewer]
+    input: []
+    output: Authorization
+    success_status: 200
+    side_effects: >-
+      status := ACTIVE, PlanOfCare.status := AUTHORIZED and, when supersedes_authorization_id is
+      set, the predecessor becomes SUPERSEDED, its Cases are repointed to this authorization and the
+      successor's hours_committed_this_week / hours_remaining_this_week are recomputed
+  - method: GET
+    path: /pdn/authorizations/{id}/utilization
+    purpose: >-
+      Read weekly utilization of the authorization under the PROJECTED variant (committed scheduled
+      minutes) or the SETTLED variant (billing-accepted net units converted to minutes).
+    roles: [PayerReviewer, CaseManager, Scheduler]
+    input: ["basis?", "week_of?"]
+    output: "{ authorization_id: string, basis: enum, week_start: datetime, week_end: datetime, committed_minutes: integer, settled_gross_units: integer, settled_net_units: integer, settled_minutes: integer, approved_hours_per_week: number, hours_remaining: number, utilization_ratio: number }"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/authorizations/{id}/reduce
+    purpose: "Notice a prospective reduction of the approved weekly hours after the notice period."
+    roles: [PayerReviewer]
+    input: ["noticed_hours_per_week", "reduction_reason"]
+    output: Authorization
+    success_status: 200
+    side_effects: >-
+      status := REDUCTION_NOTICED, noticed_hours_per_week stored,
+      reduction_effective_at := current_clock + Payer.reduction_notice_days days
+  - method: POST
+    path: /pdn/authorizations/{id}/apply-reduction
+    purpose: "Apply a noticed reduction once its effective instant has arrived, trimming over-cap shifts."
+    roles: [PayerReviewer]
+    input: []
+    output: Authorization
+    success_status: 200
+    side_effects: >-
+      approved_hours_per_week := noticed_hours_per_week, status := REDUCED, then the trim cascade:
+      surplus future ASSIGNED shifts are trimmed in authorization_reduction_trim_order until
+      committed minutes fit the new cap, and every trimmed shift becomes CANCELLED with
+      cancel_reason AUTH_REDUCTION together with its ACTIVE assignment
+  - method: POST
+    path: /pdn/authorizations/{id}/renew
+    purpose: >-
+      Renew an authorization by issuing a successor covering the following window; gated on the
+      utilization achieved in the last completed ISO week.
+    roles: [PayerReviewer]
+    input: ["effective_end", "approved_hours_per_week?"]
+    output: Authorization
+    success_status: 201
+    side_effects: >-
+      a new Authorization is created in PENDING with supersedes_authorization_id set to the
+      predecessor and renewal_chain_depth := predecessor.renewal_chain_depth + 1; the predecessor is
+      left ACTIVE until the successor is activated
+  # --- disputes -------------------------------------------------------------
+  - method: POST
+    path: /pdn/authorization-disputes
+    purpose: "File an appeal or hour-reduction dispute against an authorization."
+    roles: [CaseManager]
+    input: ["authorization_id", "dispute_type", "requested_hours_per_week", "reason"]
+    output: AuthorizationDispute
+    success_status: 201
+    side_effects: "Authorization ACTIVE|REDUCTION_NOTICED -> UNDER_APPEAL and any pending reduction is suspended"
+  - method: GET
+    path: /pdn/authorization-disputes/{id}
+    purpose: "Read one dispute."
+    roles: [CaseManager, PayerReviewer]
+    input: []
+    output: AuthorizationDispute
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/authorization-disputes
+    purpose: "List disputes, optionally filtered by authorization or status."
+    roles: [CaseManager, PayerReviewer]
+    input: ["authorization_id?", "status?", "limit?", "offset?"]
+    output: "AuthorizationDispute[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/authorization-disputes/{id}/review
+    purpose: "Take a filed dispute under review."
+    roles: [PayerReviewer]
+    input: []
+    output: AuthorizationDispute
+    success_status: 200
+    side_effects: "status := UNDER_REVIEW and reviewer_user_id := X-User-ID"
+  - method: POST
+    path: /pdn/authorization-disputes/{id}/decide
+    purpose: "Decide a dispute as UPHELD, OVERTURNED or PARTIALLY_GRANTED."
+    roles: [PayerReviewer]
+    input: ["outcome", "decided_hours_per_week?", "decision_note?"]
+    output: AuthorizationDispute
+    success_status: 200
+    side_effects: >-
+      on a REDUCTION_APPEAL, UPHELD applies noticed_hours_per_week and PARTIALLY_GRANTED applies
+      decided_hours_per_week - both move the Authorization to REDUCED and run the trim cascade -
+      while OVERTURNED clears the notice and cancels nothing; on a DENIAL_APPEAL every outcome
+      returns the Authorization to ACTIVE, raising approved_hours_per_week for OVERTURNED and
+      PARTIALLY_GRANTED
+  # --- cases ----------------------------------------------------------------
+  - method: POST
+    path: /pdn/cases
+    purpose: "Open a staffing case binding a patient to an active authorization under a supervisor."
+    roles: [CaseManager]
+    input: ["patient_id", "authorization_id", "assigned_supervisor_user_id", "continuity_nurse_id?", "concurrent_nurse_limit?", "excluded_nurse_ids?"]
+    output: Case
+    success_status: 201
+    side_effects: "next_supervisory_visit_due_at is initialised from the patient acuity cadence"
+  - method: GET
+    path: /pdn/cases/{id}
+    purpose: "Read one case including derived fill metrics and supervisory status."
+    roles: [CaseManager, Scheduler, ClinicalSupervisor, PayerReviewer]
+    input: []
+    output: Case
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/cases
+    purpose: "List cases, optionally filtered by patient, authorization, continuity nurse, holding incident or status."
+    roles: [CaseManager, Scheduler, ClinicalSupervisor]
+    input: ["patient_id?", "authorization_id?", "continuity_nurse_id?", "hold_incident_report_id?", "status?", "limit?", "offset?"]
+    output: "Case[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/cases/{id}/activate
+    purpose: "Activate a case so shifts can be published and staffed."
+    roles: [CaseManager]
+    input: []
+    output: Case
+    success_status: 200
+    side_effects: "status := ACTIVE and Case.supervisory_status / next_supervisory_visit_due_at are recomputed"
+  - method: POST
+    path: /pdn/cases/{id}/hold
+    purpose: "Place a case on hold, suspending all staffing activity."
+    roles: [ClinicalSupervisor]
+    input: ["hold_reason"]
+    output: Case
+    success_status: 200
+    side_effects: >-
+      status := ON_HOLD and every Shift of the case with staffing_status IN {OPEN, ASSIGNED,
+      ESCALATED} and start_at >= current_clock becomes CANCELLED with cancel_reason CASE_HOLD, its
+      ACTIVE assignment becomes CANCELLED, and Authorization.hours_committed_this_week,
+      Nurse.scheduled_minutes_this_week and the case fill metrics are recomputed
+  - method: POST
+    path: /pdn/cases/{id}/resume
+    purpose: "Resume a held case once the holding incident is closed and the patient is home."
+    roles: [ClinicalSupervisor]
+    input: []
+    output: Case
+    success_status: 200
+    side_effects: "status := ACTIVE, hold_reason and hold_incident_report_id cleared"
+  - method: POST
+    path: /pdn/cases/{id}/close
+    purpose: "Close a case permanently."
+    roles: [CaseManager]
+    input: ["close_reason"]
+    output: Case
+    success_status: 200
+    side_effects: "status := CLOSED, every Shift with staffing_status IN {OPEN, ASSIGNED, ESCALATED} and start_at >= current_clock becomes CANCELLED with cancel_reason SCHEDULER, and Patient.status := DISCHARGED once every case of the patient is CLOSED"
+  - method: POST
+    path: /pdn/cases/{id}/supervisory-visits
+    purpose: "Record a supervisory visit, resetting the cadence clock for the case."
+    roles: [ClinicalSupervisor]
+    input: ["visit_at", "outcome", "notes"]
+    output: SupervisoryVisit
+    success_status: 201
+    side_effects: >-
+      SupervisoryVisit.cadence_days_applied and next_due_at are computed by
+      supervisory_visit_cadence, Case.next_supervisory_visit_due_at := next_due_at and
+      Case.supervisory_status is re-derived
+  - method: GET
+    path: /pdn/cases/{id}/supervisory-visits
+    purpose: "List the supervisory visits of one case."
+    roles: [ClinicalSupervisor, CaseManager, PayerReviewer]
+    input: []
+    output: "SupervisoryVisit[]"
+    success_status: 200
+    side_effects: "none"
+  # --- incident reports -----------------------------------------------------
+  - method: POST
+    path: /pdn/incident-reports
+    purpose: "File an incident or hospitalization report against a case."
+    roles: [ClinicalSupervisor]
+    input: ["case_id", "category", "severity", "occurred_at", "narrative"]
+    output: IncidentReport
+    success_status: 201
+    side_effects: >-
+      triggered_case_hold := (category == HOSPITALIZATION OR severity == HIGH); a HOSPITALIZATION
+      report also sets Patient.status := HOSPITALIZED, and either condition cascades the case into
+      ON_HOLD with hold_incident_report_id set to this report
+  - method: GET
+    path: /pdn/incident-reports/{id}
+    purpose: "Read one incident report."
+    roles: [ClinicalSupervisor, CaseManager, PayerReviewer]
+    input: []
+    output: IncidentReport
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/cases/{id}/incident-reports
+    purpose: "List the incident reports of one case."
+    roles: [ClinicalSupervisor, CaseManager, PayerReviewer]
+    input: ["status?"]
+    output: "IncidentReport[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/incident-reports/{id}/close
+    purpose: "Close an incident report and, when the patient returned home, clear the patient hold."
+    roles: [ClinicalSupervisor]
+    input: ["resolution", "patient_returned_home"]
+    output: IncidentReport
+    success_status: 200
+    side_effects: >-
+      status := CLOSED, closed_at := current_clock and, when patient_returned_home is true,
+      Patient.status returns to ACTIVE; the Case stays ON_HOLD until it is explicitly resumed
+  # --- shifts ---------------------------------------------------------------
+  - method: POST
+    path: /pdn/shifts
+    purpose: "Publish an authorized shift on an active case with its required skill set."
+    roles: [Scheduler]
+    input: ["case_id", "start_at", "end_at", "required_skills"]
+    output: Shift
+    success_status: 201
+    side_effects: "scheduled_minutes is derived from the window and Case.unfilled_shift_count / fill_rate are re-derived"
+  - method: GET
+    path: /pdn/shifts/{id}
+    purpose: "Read one shift including its staffing, escalation and EVV dimensions."
+    roles: [Scheduler, ClinicalSupervisor, CaseManager, Nurse]
+    input: []
+    output: Shift
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/shifts
+    purpose: "List shifts, optionally filtered by case, staffing status, EVV status or start instant."
+    roles: [Scheduler, ClinicalSupervisor, CaseManager]
+    input: ["case_id?", "staffing_status?", "evv_status?", "start_after?", "limit?", "offset?"]
+    output: "Shift[]"
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/shifts/{id}/staffing-candidates
+    purpose: >-
+      Read the ranked eligible-nurse pool for a shift together with the nurse the auto-staff
+      selector would choose.
+    roles: [Scheduler]
+    input: []
+    output: "{ shift_id: string, candidate_count: integer, ranked_nurse_ids: array, selected_nurse_id: string, top_match_score: integer }"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/shifts/{id}/auto-staff
+    purpose: "Assign the shift to the nurse chosen by the auto-staff selector. Guarded by optimistic concurrency on the shift."
+    roles: [Scheduler]
+    input: ["expected_shift_version"]
+    output: ShiftAssignment
+    success_status: 201
+    side_effects: >-
+      identical to a manual assignment: Shift OPEN -> ASSIGNED, committed minutes increase, and
+      Case fill metrics are re-derived
+  - method: POST
+    path: /pdn/shifts/{id}/escalate
+    purpose: "Escalate an unfilled shift up the escalation tier ladder."
+    roles: [Scheduler]
+    input: ["escalation_reason"]
+    output: Shift
+    success_status: 200
+    side_effects: "staffing_status := ESCALATED and escalation_tier advances"
+  - method: POST
+    path: /pdn/shifts/{id}/parent-backup
+    purpose: "Record a parent backup arrangement covering an unfilled shift."
+    roles: [Scheduler]
+    input: ["arrangement_note"]
+    output: Shift
+    success_status: 200
+    side_effects: "staffing_status := PARENT_BACKUP, escalation_tier := TIER2_PARENT_BACKUP"
+  - method: POST
+    path: /pdn/shifts/{id}/clock-in
+    purpose: "Electronic visit verification clock-in by the assigned nurse; opens the timesheet."
+    roles: [Nurse]
+    input: ["evv_method", "geo_verified?"]
+    output: Timesheet
+    success_status: 201
+    side_effects: >-
+      Shift.evv_status := CLOCKED_IN, a Timesheet is created in CAPTURED with clock_in_at :=
+      current_clock, the EVV method and geo flag are stored for later verification, and
+      Shift.version increments by 1
+  - method: POST
+    path: /pdn/shifts/{id}/clock-out
+    purpose: "Electronic visit verification clock-out; closes the timesheet and evaluates the EVV outcome."
+    roles: [Nurse]
+    input: []
+    output: Timesheet
+    success_status: 200
+    side_effects: >-
+      Timesheet.clock_out_at := current_clock, gross_billable_units, edit_deduction_units,
+      net_billable_units and edit_codes computed, Shift.evv_status := VERIFIED or EXCEPTION per
+      evv_verification_outcome, Shift.staffing_status := COMPLETED and the ShiftAssignment := COMPLETED
+  # --- shift assignments ----------------------------------------------------
+  - method: POST
+    path: /pdn/shift-assignments
+    purpose: >-
+      Manually assign a nurse to an open shift. Guarded by optimistic concurrency on the shift and by
+      the full skill, competency, licence, overlap, capacity and hour-cap gauntlet.
+    roles: [Scheduler]
+    input: ["shift_id", "nurse_id", "expected_shift_version"]
+    output: ShiftAssignment
+    success_status: 201
+    side_effects: >-
+      Shift OPEN|ESCALATED -> ASSIGNED with version incremented, ShiftAssignment created in ACTIVE
+      with match_score_at_assignment frozen and continuity_match computed,
+      Authorization.hours_committed_this_week and Nurse.scheduled_minutes_this_week grow by exactly
+      Shift.scheduled_minutes, and Case fill metrics are re-derived
+  - method: GET
+    path: /pdn/shift-assignments/{id}
+    purpose: "Read one shift assignment."
+    roles: [Scheduler, ClinicalSupervisor, Nurse]
+    input: []
+    output: ShiftAssignment
+    success_status: 200
+    side_effects: "none"
+  - method: GET
+    path: /pdn/shift-assignments
+    purpose: "List shift assignments, optionally filtered by shift, nurse or status."
+    roles: [Scheduler, ClinicalSupervisor, Nurse]
+    input: ["shift_id?", "nurse_id?", "status?", "limit?", "offset?"]
+    output: "ShiftAssignment[]"
+    success_status: 200
+    side_effects: "none"
+  - method: POST
+    path: /pdn/shift-assignments/{id}/cancel
+    purpose: "Cancel an active assignment, returning the shift to the open pool."
+    roles: [Scheduler]
+    input: ["cancel_note"]
+    output: ShiftAssignment
+    success_status: 200
+    side_effects: >-
+      the compensating leg of the committed-minutes invariant: assignment status := CANCELLED with
+      cancel_reason SCHEDULER, Shift ASSIGNED -> OPEN with version incremented, and
+      Authorization.hours_committed_this_week plus Nurse.scheduled_minutes_this_week fall by exactly
+      Shift.scheduled_minutes (as hours and minutes respectively), Case fill metrics re-derived
+  - method: GET
+    path: /pdn/shift-assignments/{id}/timesheets
+    purpose: "List the timesheets produced under one assignment."
+    roles: [Scheduler, PayerReviewer, Nurse]
+    input: []
+    output: "Timesheet[]"
+    success_status: 200
+    side_effects: "none"
+  # --- timesheets and billing ----------------------------------------------
+  - method: GET
+    path: /pdn/timesheets/{id}
+    purpose: "Read one timesheet including worked minutes, gross units, billing edits and net units."
+    roles: [Scheduler, PayerReviewer, Nurse]
+    input: []
+    output: Timesheet
+    success_status: 200
+    side_effects: "none"
+  - method: PATCH
+    path: /pdn/timesheets/{id}
+    purpose: "Correct the clock instants of a timesheet, recomputing every derived unit figure."
+    roles: [Nurse]
+    input: ["clock_in_at?", "clock_out_at?", "edit_reason"]
+    output: Timesheet
+    success_status: 200
+    side_effects: >-
+      clock_in_at / clock_out_at are overwritten, gross_billable_units, edit_deduction_units,
+      net_billable_units and edit_codes are recomputed with POST_EDIT appended, and the timesheet
+      lands in EDITED whether it came from CAPTURED or from BILL_REJECTED
+  - method: POST
+    path: /pdn/timesheets/{id}/submit
+    purpose: "Submit a verified timesheet for payer billing."
+    roles: [Scheduler]
+    input: []
+    output: Timesheet
+    success_status: 200
+    side_effects: "status := SUBMITTED and submitted_by_user_id := X-User-ID"
+  - method: POST
+    path: /pdn/timesheets/{id}/billing-decision
+    purpose: "Accept or reject a submitted timesheet for billing."
+    roles: [PayerReviewer]
+    input: ["decision", "rejection_reason?"]
+    output: Timesheet
+    success_status: 200
+    side_effects: >-
+      ACCEPT sets status := BILL_ACCEPTED, adds net_billable_units to Case.billed_units_to_date and
+      keeps the timesheet in the SETTLED utilization input set; REJECT sets status := BILL_REJECTED,
+      records rejection_reason, leaves Case.billed_units_to_date unchanged and drops the timesheet
+      out of the SETTLED input set
+  - method: POST
+    path: /pdn/timesheets/{id}/void
+    purpose: "Void a timesheet, reversing any billed units it contributed."
+    roles: [Scheduler]
+    input: ["void_reason"]
+    output: Timesheet
+    success_status: 200
+    side_effects: >-
+      the compensating leg of the billed-units invariant: status := VOIDED and, when the timesheet
+      was BILL_ACCEPTED, exactly its net_billable_units are subtracted from Case.billed_units_to_date
+      and its minutes leave the SETTLED utilization total
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth -----------------------------------------------------------------
+  - id: ERR_MISSING_AUTH_HEADER
+    http: 401
+    condition: "X-User-Role or X-User-ID is absent or empty"
+  - id: ERR_UNAUTHORIZED_ROLE
+    http: 403
+    condition: "the acting role is unknown, is not permitted on the endpoint, or a Nurse acts on a shift or timesheet that is not theirs"
+  - id: ERR_PAYER_SCOPE_VIOLATION
+    http: 403
+    condition: "a PayerReviewer acts on an authorization, dispute, plan of care or timesheet belonging to a different payer"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the supervisor resuming a held case is the same user who filed the holding incident report"
+  # --- request shape --------------------------------------------------------
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "a required field is missing, an enum member is illegal, a number is non-positive, an interval end is not after its start, required_skills is empty or repeats a member, the NPI is not exactly ten digits, or a pagination argument is out of range"
+  # --- existence ------------------------------------------------------------
+  - id: ERR_PAYER_NOT_FOUND
+    http: 404
+    condition: "no Payer with the supplied id"
+  - id: ERR_PATIENT_NOT_FOUND
+    http: 404
+    condition: "no Patient with the supplied id"
+  - id: ERR_PLAN_OF_CARE_NOT_FOUND
+    http: 404
+    condition: "no PlanOfCare with the supplied id"
+  - id: ERR_AUTHORIZATION_NOT_FOUND
+    http: 404
+    condition: "no Authorization with the supplied id"
+  - id: ERR_NURSE_NOT_FOUND
+    http: 404
+    condition: "no Nurse with the supplied id"
+  - id: ERR_COMPETENCY_NOT_FOUND
+    http: 404
+    condition: "no NurseCompetency with the supplied id"
+  - id: ERR_CASE_NOT_FOUND
+    http: 404
+    condition: "no Case with the supplied id"
+  - id: ERR_SHIFT_NOT_FOUND
+    http: 404
+    condition: "no Shift with the supplied id"
+  - id: ERR_ASSIGNMENT_NOT_FOUND
+    http: 404
+    condition: "no ShiftAssignment with the supplied id"
+  - id: ERR_TIMESHEET_NOT_FOUND
+    http: 404
+    condition: "no Timesheet with the supplied id"
+  - id: ERR_INCIDENT_NOT_FOUND
+    http: 404
+    condition: "no IncidentReport with the supplied id"
+  - id: ERR_DISPUTE_NOT_FOUND
+    http: 404
+    condition: "no AuthorizationDispute with the supplied id"
+  # --- optimistic concurrency ----------------------------------------------
+  - id: ERR_STALE_PLAN_OF_CARE_VERSION
+    http: 412
+    condition: "expected_plan_of_care_version does not equal the current PlanOfCare.version"
+  - id: ERR_STALE_SHIFT_VERSION
+    http: 412
+    condition: "expected_shift_version does not equal the current Shift.version"
+  # --- state ---------------------------------------------------------------
+  - id: ERR_INVALID_STATE
+    http: 409
+    condition: "the requested transition is not declared from the resource's current state"
+  - id: ERR_CASE_ON_HOLD
+    http: 409
+    condition: "the case governing the resource is ON_HOLD or CLOSED"
+  - id: ERR_AUTHORIZATION_NOT_ACTIVE
+    http: 409
+    condition: "the governing authorization is not in a staffable status"
+  - id: ERR_PATIENT_HOSPITALIZED
+    http: 409
+    condition: "the patient is HOSPITALIZED"
+  - id: ERR_EVV_NOT_VERIFIED
+    http: 409
+    condition: "a timesheet is submitted for billing while its shift's EVV outcome is not VERIFIED"
+  - id: ERR_TIMESHEET_ALREADY_BILLED
+    http: 409
+    condition: "the timesheet has already reached BILL_ACCEPTED or VOIDED"
+  - id: ERR_REDUCTION_NOT_EFFECTIVE
+    http: 409
+    condition: "a noticed reduction is applied before its effective instant"
+  - id: ERR_DISPUTE_ALREADY_OPEN
+    http: 409
+    condition: "the authorization already has a dispute in FILED or UNDER_REVIEW"
+  # --- clinical safety ------------------------------------------------------
+  - id: ERR_NURSE_SKILL_MISMATCH
+    http: 422
+    condition: "the nurse has no competency row at all for a skill the shift requires"
+  - id: ERR_COMPETENCY_EXPIRED
+    http: 422
+    condition: "a matched competency is EXPIRED, REVOKED, or expires on or before the shift start date"
+  - id: ERR_NURSE_LICENSE_EXPIRED
+    http: 422
+    condition: "the nurse's licence expires on or before the shift end date"
+  - id: ERR_NURSE_NOT_ACTIVE
+    http: 422
+    condition: "the nurse is SUSPENDED or INACTIVE"
+  - id: ERR_NURSE_EXCLUDED_FROM_CASE
+    http: 422
+    condition: "the nurse appears in Case.excluded_nurse_ids"
+  - id: ERR_SUPERVISORY_VISIT_OVERDUE
+    http: 409
+    condition: "the case's supervisory visit cadence has lapsed, so further staffing is blocked"
+  - id: ERR_NO_PARENT_BACKUP
+    http: 422
+    condition: "a parent backup arrangement is recorded for a patient whose parent backup is unavailable"
+  # --- temporal and capacity ------------------------------------------------
+  - id: ERR_NURSE_SHIFT_OVERLAP
+    http: 409
+    condition: "the nurse already holds an active assignment whose window, widened by the sixty-minute rest buffer, meets the target shift"
+  - id: ERR_PATIENT_CONCURRENCY_EXCEEDED
+    http: 409
+    condition: "staffing the shift would put more nurses in the patient's home during a strictly overlapping window than the case allows"
+  - id: ERR_SHIFT_OUTSIDE_AUTH_WINDOW
+    http: 422
+    condition: "the shift window falls outside the authorization's effective window"
+  - id: ERR_CLOCK_IN_TOO_EARLY
+    http: 422
+    condition: "clock-in is attempted more than fifteen minutes before the shift start"
+  - id: ERR_DISPUTE_WINDOW_CLOSED
+    http: 422
+    condition: "a reduction appeal is filed on or after the reduction's effective instant"
+  # --- quota, fiscal and selector ------------------------------------------
+  - id: ERR_WEEKLY_HOURS_EXCEEDED
+    http: 422
+    condition: "committing the shift would push the authorization's weekly committed minutes above the approved weekly ceiling"
+  - id: ERR_NURSE_WEEKLY_LIMIT_EXCEEDED
+    http: 422
+    condition: "committing the shift would push the nurse's weekly scheduled minutes above their personal ceiling"
+  - id: ERR_PAYER_HOUR_CAP_EXCEEDED
+    http: 422
+    condition: "the approved weekly hours exceed the payer's plan-level weekly cap"
+  - id: ERR_APPROVED_EXCEEDS_REQUESTED
+    http: 422
+    condition: "the approved weekly hours exceed the hours the plan of care requested"
+  - id: ERR_RENEWAL_UTILIZATION_TOO_LOW
+    http: 422
+    condition: "renewal is attempted while last completed week's settled utilization sits below the renewal gate"
+  - id: ERR_DECIDED_HOURS_OUT_OF_RANGE
+    http: 422
+    condition: "a partially granted dispute decides an hour figure outside the band between the noticed and the requested hours"
+  - id: ERR_NO_ELIGIBLE_NURSE
+    http: 422
+    condition: "auto-staffing finds an empty candidate pool"
+  - id: ERR_PAYER_MISMATCH
+    http: 422
+    condition: "the patient's payer differs from the authorization's payer"
+  # --- uniqueness -----------------------------------------------------------
+  - id: ERR_LICENSE_NUMBER_TAKEN
+    http: 409
+    condition: "another nurse already holds the supplied licence number"
+  - id: ERR_COMPETENCY_DUPLICATE
+    http: 409
+    condition: "the nurse already holds a non-revoked competency row for the supplied skill"
+
+# =============================================================================
+# 1.7 RBAC Matrix
+# =============================================================================
+roles:
+  - name: AgencyAdmin
+    description: "Agency operations administrator: maintains payers, the nurse roster and the clock and checkpoint controls."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pdn/payers"
+      - "POST /pdn/nurses"
+      - "POST /pdn/nurses/{id}/status"
+      - "POST /pdn/_clock/set_current_utc"
+      - "POST /pdn/_ops/run-daily-checkpoint"
+    shared_operations:
+      - "GET /pdn/payers/{id}"
+      - "GET /pdn/nurses/{id}"
+      - "GET /pdn/nurses"
+      - "GET /pdn/nurses/{id}/competencies"
+  - name: PayerReviewer
+    description: >-
+      Payer-side utilization reviewer: authorizes plans of care, activates, reduces, renews and
+      supersedes authorizations, decides disputes, and rules on billing. X-User-ID is the id of the
+      Payer the reviewer works for, so every write is scoped to that payer's authorizations.
+    identity: "entity_backed:Payer"
+    exclusive_operations:
+      - "POST /pdn/plans-of-care/{id}/return"
+      - "POST /pdn/authorizations"
+      - "POST /pdn/authorizations/{id}/activate"
+      - "POST /pdn/authorizations/{id}/reduce"
+      - "POST /pdn/authorizations/{id}/apply-reduction"
+      - "POST /pdn/authorizations/{id}/renew"
+      - "POST /pdn/authorization-disputes/{id}/review"
+      - "POST /pdn/authorization-disputes/{id}/decide"
+      - "POST /pdn/timesheets/{id}/billing-decision"
+    shared_operations:
+      - "GET /pdn/payers/{id}"
+      - "GET /pdn/patients/{id}"
+      - "GET /pdn/patients"
+      - "GET /pdn/plans-of-care/{id}"
+      - "GET /pdn/plans-of-care"
+      - "GET /pdn/authorizations/{id}"
+      - "GET /pdn/authorizations"
+      - "GET /pdn/authorizations/{id}/utilization"
+      - "GET /pdn/authorization-disputes/{id}"
+      - "GET /pdn/authorization-disputes"
+      - "GET /pdn/cases/{id}"
+      - "GET /pdn/cases/{id}/supervisory-visits"
+      - "GET /pdn/cases/{id}/incident-reports"
+      - "GET /pdn/incident-reports/{id}"
+      - "GET /pdn/timesheets/{id}"
+      - "GET /pdn/shift-assignments/{id}/timesheets"
+  - name: CaseManager
+    description: "Agency case manager: enrols patients, drafts and submits plans of care, opens and closes cases, and files disputes."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pdn/patients"
+      - "POST /pdn/plans-of-care"
+      - "POST /pdn/plans-of-care/{id}/submit"
+      - "POST /pdn/authorization-disputes"
+      - "POST /pdn/cases"
+      - "POST /pdn/cases/{id}/activate"
+      - "POST /pdn/cases/{id}/close"
+    shared_operations:
+      - "GET /pdn/payers/{id}"
+      - "GET /pdn/patients/{id}"
+      - "GET /pdn/patients"
+      - "GET /pdn/plans-of-care/{id}"
+      - "GET /pdn/plans-of-care"
+      - "GET /pdn/authorizations/{id}"
+      - "GET /pdn/authorizations"
+      - "GET /pdn/authorizations/{id}/utilization"
+      - "GET /pdn/authorization-disputes/{id}"
+      - "GET /pdn/authorization-disputes"
+      - "GET /pdn/cases/{id}"
+      - "GET /pdn/cases"
+      - "GET /pdn/cases/{id}/supervisory-visits"
+      - "GET /pdn/cases/{id}/incident-reports"
+      - "GET /pdn/incident-reports/{id}"
+      - "GET /pdn/shifts/{id}"
+      - "GET /pdn/shifts"
+  - name: Scheduler
+    description: "Staffing coordinator: publishes shifts, assigns and cancels nurses, escalates unfilled shifts, arranges parent backup, and submits or voids timesheets."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pdn/shifts"
+      - "GET /pdn/shifts/{id}/staffing-candidates"
+      - "POST /pdn/shifts/{id}/auto-staff"
+      - "POST /pdn/shifts/{id}/escalate"
+      - "POST /pdn/shifts/{id}/parent-backup"
+      - "POST /pdn/shift-assignments"
+      - "POST /pdn/shift-assignments/{id}/cancel"
+      - "POST /pdn/timesheets/{id}/submit"
+      - "POST /pdn/timesheets/{id}/void"
+    shared_operations:
+      - "GET /pdn/nurses/{id}"
+      - "GET /pdn/nurses"
+      - "GET /pdn/nurses/{id}/competencies"
+      - "GET /pdn/nurses/{id}/continuity-score"
+      - "GET /pdn/patients/{id}"
+      - "GET /pdn/authorizations/{id}"
+      - "GET /pdn/authorizations/{id}/utilization"
+      - "GET /pdn/cases/{id}"
+      - "GET /pdn/cases"
+      - "GET /pdn/shifts/{id}"
+      - "GET /pdn/shifts"
+      - "GET /pdn/shift-assignments/{id}"
+      - "GET /pdn/shift-assignments"
+      - "GET /pdn/shift-assignments/{id}/timesheets"
+      - "GET /pdn/timesheets/{id}"
+  - name: ClinicalSupervisor
+    description: "Registered-nurse supervisor: validates and revokes competencies, performs supervisory visits, files and closes incident reports, and holds or resumes cases."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /pdn/nurses/{id}/competencies"
+      - "POST /pdn/nurse-competencies/{id}/revoke"
+      - "POST /pdn/cases/{id}/supervisory-visits"
+      - "POST /pdn/cases/{id}/hold"
+      - "POST /pdn/cases/{id}/resume"
+      - "POST /pdn/incident-reports"
+      - "POST /pdn/incident-reports/{id}/close"
+    shared_operations:
+      - "GET /pdn/nurses/{id}"
+      - "GET /pdn/nurses/{id}/competencies"
+      - "GET /pdn/nurses/{id}/continuity-score"
+      - "GET /pdn/patients/{id}"
+      - "GET /pdn/cases/{id}"
+      - "GET /pdn/cases"
+      - "GET /pdn/cases/{id}/supervisory-visits"
+      - "GET /pdn/cases/{id}/incident-reports"
+      - "GET /pdn/incident-reports/{id}"
+      - "GET /pdn/shifts/{id}"
+      - "GET /pdn/shifts"
+      - "GET /pdn/shift-assignments/{id}"
+      - "GET /pdn/shift-assignments"
+  - name: Nurse
+    description: >-
+      Field nurse: performs electronic visit verification clock-in and clock-out and corrects their
+      own timesheet. X-User-ID is the id of the Nurse row, so ownership is compared against the
+      active assignment's nurse_id.
+    identity: "entity_backed:Nurse"
+    exclusive_operations:
+      - "POST /pdn/shifts/{id}/clock-in"
+      - "POST /pdn/shifts/{id}/clock-out"
+      - "PATCH /pdn/timesheets/{id}"
+    shared_operations:
+      - "GET /pdn/nurses/{id}"
+      - "GET /pdn/shifts/{id}"
+      - "GET /pdn/shift-assignments/{id}"
+      - "GET /pdn/shift-assignments"
+      - "GET /pdn/shift-assignments/{id}/timesheets"
+      - "GET /pdn/timesheets/{id}"

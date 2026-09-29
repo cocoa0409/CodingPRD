@@ -1,0 +1,74 @@
+"""Error taxonomy for the Emergency Food Assistance Allocation API (PRD §5)."""
+
+
+class ApiError(Exception):
+    """A business error carrying the PRD error id and its HTTP status."""
+
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# --- HTTP status per PRD §5 -------------------------------------------------
+STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_STALE_VERSION": 412,
+    "ERR_SERVICE_AREA_NOT_FOUND": 404,
+    "ERR_AGENCY_NOT_FOUND": 404,
+    "ERR_COMMODITY_NOT_FOUND": 404,
+    "ERR_WAREHOUSE_NOT_FOUND": 404,
+    "ERR_INVENTORY_LOT_NOT_FOUND": 404,
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_ALLOCATION_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_ORDER_LINE_NOT_FOUND": 404,
+    "ERR_APPOINTMENT_NOT_FOUND": 404,
+    "ERR_TRANSFER_NOT_FOUND": 404,
+    "ERR_RECALL_NOT_FOUND": 404,
+    "ERR_RECALL_ACTION_NOT_FOUND": 404,
+    "ERR_DISTRIBUTION_NOT_FOUND": 404,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_CYCLE_STATE": 409,
+    "ERR_INVALID_LOT_STATE": 409,
+    "ERR_INVALID_APPOINTMENT_STATE": 409,
+    "ERR_INVALID_TRANSFER_STATE": 409,
+    "ERR_INVALID_RECALL_STATE": 409,
+    "ERR_INVALID_RECALL_ACTION_STATE": 409,
+    "ERR_INVALID_DISTRIBUTION_STATE": 409,
+    "ERR_AGREEMENT_NOT_RENEWABLE": 409,
+    "ERR_RECALL_HOLD_ACTIVE": 409,
+    "ERR_RECALL_CASES_UNACCOUNTED": 409,
+    "ERR_STORAGE_CLASS_UNSUPPORTED": 422,
+    "ERR_TRAINING_NOT_CURRENT": 422,
+    "ERR_AGENCY_INELIGIBLE": 422,
+    "ERR_HOUSEHOLD_INELIGIBLE": 422,
+    "ERR_COMMODITY_NOT_OFFERED": 422,
+    "ERR_APPOINTMENT_ALREADY_EXISTS": 409,
+    "ERR_ORDER_WINDOW_NOT_OPEN": 422,
+    "ERR_ORDER_WINDOW_CLOSED": 422,
+    "ERR_APPOINTMENT_WINDOW_INVALID": 422,
+    "ERR_DOCK_WINDOW_CONFLICT": 409,
+    "ERR_DUPLICATE_CODE": 409,
+    "ERR_RECALL_ALREADY_OPEN": 409,
+    "ERR_DUPLICATE_RECALL_ACTION": 409,
+    "ERR_EMPTY_ORDER": 422,
+    "ERR_NO_ELIGIBLE_AGENCIES": 422,
+    "ERR_ALLOCATION_INFEASIBLE": 422,
+    "ERR_WAREHOUSE_COLD_CAPACITY_EXCEEDED": 409,
+    "ERR_AGENCY_COLD_STORAGE_EXCEEDED": 409,
+    "ERR_INSUFFICIENT_INVENTORY": 409,
+    "ERR_ALLOCATION_EXCEEDED": 422,
+    "ERR_LOT_CASES_UNAVAILABLE": 409,
+    "ERR_AGENCY_INVENTORY_INSUFFICIENT": 422,
+}
+
+
+def fail(error_id, message=None):
+    """Raise the catalogued error, deriving its HTTP status from PRD §5."""
+    raise ApiError(error_id, STATUS.get(error_id, 422), message)

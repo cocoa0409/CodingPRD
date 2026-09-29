@@ -1,0 +1,69 @@
+"""Domain thresholds and shared literals taken from the PRD's calculations."""
+
+# A full-time week is 40 hours, so 100 percent effort is 40 hours per week.
+FULL_TIME_WEEKLY_HOURS = 40
+
+# Degree ceilings on remitted credits.
+MAX_REMITTED_CREDITS = {"MASTERS": 9, "DOCTORAL": 12}
+
+# Insurance subsidy tier breakpoints, keyed on the pre-offset gross term stipend.
+SUBSIDY_TIER_BREAK_LOW_CENTS = 1_200_000
+SUBSIDY_TIER_BREAK_HIGH_CENTS = 1_800_000
+SUBSIDY_TIER_PCT_LOW_GROSS = 90
+SUBSIDY_TIER_PCT_MID_GROSS = 75
+SUBSIDY_TIER_PCT_HIGH_GROSS = 50
+
+# Workload caps.
+DEFAULT_EFFORT_CAP_PCT = 75
+INTERNATIONAL_MAX_WEEKLY_HOURS = 20.0
+
+# Taxation.
+IMPUTED_WITHHOLDING_RATE = 0.2200
+DEFAULT_TUITION_TAX_EXEMPT_CAP_CENTS = 525_000
+
+# Renewal arithmetic.
+RENEWAL_WINDOW_DAYS = 120
+DEFAULT_NON_RENEWAL_NOTICE_DAYS = 60
+MIN_RENEWAL_GPA = 3.00
+
+# Remission bands selected from effort_pct.
+REMISSION_BANDS = ((25, 0), (50, 50), (75, 75), (101, 100))
+
+# Stipend policy defaults.
+DEFAULT_INSURANCE_MIN_EFFORT_PCT = 50
+DEFAULT_MIN_INSURANCE_DURATION_DAYS = 90
+
+# Funding source defaults.
+DEFAULT_GRANT_EFFORT_CAP_PCT = 100
+DEFAULT_AUTO_REINSTATE_THRESHOLD_CENTS = 0
+
+# Pagination contract.
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 100
+
+# The logical clock's value at startup.
+CLOCK_STARTUP_INSTANT = "2026-08-01T00:00:00Z"
+CLOCK_STARTUP_DATE = "2026-08-01"
+
+# A syntactically valid identifier that names no row in a fresh database.
+UNKNOWN_UUID = "00000000-0000-0000-0000-0000000000ff"
+
+TEST_DEFAULTS = {
+    "DEPARTMENT_CODE": "CHEM",
+    "DEPARTMENT_NAME": "Chemistry",
+    "TERM_CODE": "FALL2026",
+    "TERM_START": "2026-09-01",
+    "TERM_END": "2026-12-31",
+    "TAX_CALENDAR_YEAR": 2026,
+    "REMISSION_DROP_DEADLINE": "2026-09-15",
+    "MIN_FTE_MONTHLY_STIPEND_CENTS": 400_000,
+    "PER_CREDIT_TUITION_CENTS": 50_000,
+    "MAX_REMISSION_CENTS_PER_TERM": 900_000,
+    "TERM_INSURANCE_PREMIUM_CENTS": 0,
+    "AUTHORIZED_AMOUNT_CENTS": 5_000_000,
+    "BUDGET_PERIOD_START": "2026-07-01",
+    "BUDGET_PERIOD_END": "2027-06-30",
+    "MONTHLY_STIPEND_CENTS": 300_000,
+    "EFFORT_PCT": 75,
+    "SUPERVISOR_USER_ID": "user-fac-7",
+}

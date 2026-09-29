@@ -1,0 +1,143 @@
+"""Domain thresholds and pinned numeric constants taken from the PRD."""
+
+# The logical clock's startup value (PRD §2.6).
+CLOCK_STARTUP_UTC = "2026-08-01T00:00:00Z"
+CLOCK_STARTUP_DATE = "2026-08-01"
+CLOCK_STARTUP_MONTH = "2026-08"
+
+# Pagination (PRD §2.3).
+PAGINATION = {
+    "DEFAULT_LIMIT": 10,
+    "MIN_LIMIT": 1,
+    "MAX_LIMIT": 100,
+    "DEFAULT_OFFSET": 0,
+}
+
+# Study validity windows in days (PRD §3.2).
+VALIDITY_DAYS = {
+    "RESTING_ROOM_AIR": 30,
+    "EXERCISE": 30,
+    "NOCTURNAL_OVERNIGHT_OXIMETRY": 90,
+    "SLEEP_STUDY": 90,
+}
+
+# Documentation score (PRD §3.3).
+DOCUMENTATION = {
+    "GROUP_I_POINTS": 30,
+    "GROUP_II_POINTS": 24,
+    "NON_QUALIFYING_POINTS": 0,
+    "CURRENCY_FRESH_POINTS": 20,
+    "CURRENCY_GRACE_POINTS": 10,
+    "CURRENCY_STALE_POINTS": 0,
+    "GRACE_PERIOD_DAYS": 15,
+    "USAGE_MAX_POINTS": 15,
+    "USAGE_HOURS_DIVISOR": 24,
+    "NARRATIVE_MAX_POINTS": 20,
+    "NARRATIVE_ELEMENT_DIVISOR": 3,
+    "PORTABLE_CONSISTENCY_POINTS": 10,
+    "DURATION_POINTS": 5,
+    "DURATION_MIN_MONTHS": 12,
+    "PASS_THRESHOLD": 85.00,
+    "REVISION_CEILING": 3,
+}
+
+# Recertification intervals in months (PRD §3.3).
+RECERT_INTERVAL_MONTHS = {"GROUP_I": 12, "GROUP_II": 3}
+
+# Monthly allowable (PRD §3.4).
+CLASS_BASE_CENTS = {
+    "STATIONARY_CONCENTRATOR": 7752,
+    "PORTABLE_CONCENTRATOR": 7340,
+    "LIQUID_RESERVOIR": 9315,
+    "LIQUID_PORTABLE": 8420,
+    "COMPRESSED_CYLINDER": 2520,
+}
+ROLE_FACTOR = {"PRIMARY_STATIONARY": 1.00, "PORTABLE": 0.25, "BACKUP": 0.10}
+BASIS_FACTOR = {
+    "COMPETITIVE_BID_SINGLE_PAYMENT": 0.7358,
+    "FEE_SCHEDULE_ADJUSTED": 0.9050,
+    "CASH": 1.0000,
+}
+SEQUESTRATION_FACTOR = 0.98
+
+# Classes each placement role admits (PRD §3.4).
+ROLE_PERMITTED_CLASSES = {
+    "PRIMARY_STATIONARY": ["STATIONARY_CONCENTRATOR", "LIQUID_RESERVOIR"],
+    "PORTABLE": ["PORTABLE_CONCENTRATOR", "LIQUID_PORTABLE", "COMPRESSED_CYLINDER"],
+    "BACKUP": ["COMPRESSED_CYLINDER", "STATIONARY_CONCENTRATOR"],
+}
+
+# Route litres (PRD §3.5).
+LITERS = {
+    "PORTABLE_REFILL_VESSEL": 1085,
+    "PER_E_CYLINDER": 680,
+    "PICKUP": 0,
+}
+
+# Oxygen-safety risk score (PRD §3.6).
+INITIAL_ASSESSMENT_WEIGHTS = {
+    "smoking": 0.30,
+    "electrical": 0.15,
+    "teachback": 0.15,
+    "flow": 0.30,
+    "incident": 0.10,
+}
+ONGOING_SURVEILLANCE_STEP = 5
+RISK_SCORE_CAP = 100.00
+COMPLIANCE_HOLD_THRESHOLD = 70.00
+TEACHBACK_STEP_POINTS = 20
+TEACHBACK_MAX_SCORE = 5
+INCIDENT_POINTS_PER_REPORT = 30
+
+# Malfunction grading (PRD §3.7).
+MALFUNCTION = {
+    "TIER_1_SYMPTOMS": ["NO_FLOW", "LOW_PURITY"],
+    "TIER_1_GAP_MINUTES": 60,
+    "TIER_2_SYMPTOMS": ["ALARM_CONTINUOUS", "POWER_FAILURE"],
+    "TIER_2_GAP_MINUTES": 15,
+}
+
+# Recall remediation deadlines in days (PRD §3.7).
+RECALL_DEADLINE_DAYS = {"CLASS_I": 5, "CLASS_II": 30, "CLASS_III": 90}
+
+# Capped-rental billing (PRD §3.8).
+CAP_MONTH_LIMIT_DEFAULT = 36
+CAP_MONTH_LIMIT_MAX = 36
+SERVICE_MONTH_BASIS = "SERVICE_MONTH_BASIS"
+PAID_MONTH_BASIS = "PAID_MONTH_BASIS"
+
+# Travel supply waterfall (PRD §3.9).
+TRAVEL = {
+    "ALTITUDE_STEP_FEET": 1000,
+    "ALTITUDE_STEP_FACTOR": 0.03,
+    "ALTITUDE_FACTOR_BASE": 1.00,
+    "ALTITUDE_FACTOR_CAP": 1.30,
+    "RESERVE_PCT_SHORT": 0.20,
+    "RESERVE_PCT_MEDIUM": 0.35,
+    "RESERVE_PCT_LONG": 0.50,
+    "RESERVE_SHORT_MAX_HOURS": 24,
+    "RESERVE_MEDIUM_MAX_HOURS": 72,
+    "LITERS_PER_CYLINDER": 680,
+    "SURCHARGE_RAW_THRESHOLD": 6,
+    "AUTHORIZED_CYLINDER_CEILING": 12,
+}
+
+# Branch operating parameter defaults (PRD §3.1).
+BRANCH_DEFAULTS = {
+    "competitive_bid_area": False,
+    "liquid_oxygen_certified": False,
+    "refill_capacity_per_day": 4,
+    "tank_exchange_buffer_minutes": 30,
+}
+
+# Equipment unit registration defaults (PRD §3.1).
+EQUIPMENT_UNIT_DEFAULTS = {"max_pulse_setting": 0, "pm_interval_days": 365}
+
+# Patient admission default (PRD §3.2).
+PATIENT_DEFAULTS = {"altitude_feet": 0}
+
+TEST_DEFAULTS = {
+    "BRANCH_NAME": "Tampa Bay",
+    "STATE_CODE": "FL",
+    "ORDERING_PHYSICIAN_NPI": "1234567893",
+}

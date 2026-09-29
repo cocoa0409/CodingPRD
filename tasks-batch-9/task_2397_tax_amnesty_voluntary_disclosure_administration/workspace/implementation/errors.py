@@ -1,0 +1,90 @@
+"""Error catalog (PRD 5) and the ApiError exception."""
+
+CATALOG = {
+    "ERR_UNAUTHENTICATED": (401, "Missing or unrecognized identity headers"),
+    "ERR_FORBIDDEN_ROLE": (403, "This role may not perform this operation"),
+    "ERR_IDENTITY_NOT_RECOGNIZED": (403, "X-User-ID does not identify a registered taxpayer or representative"),
+    "ERR_NOT_RESOURCE_OWNER": (403, "The caller does not own this resource"),
+    "ERR_SEGREGATION_OF_DUTIES": (403, "The user who prepared this record may not approve it"),
+    "ERR_INVALID_REQUEST": (400, "Request body failed schema validation"),
+    "ERR_INVALID_PAGINATION": (400, "limit must be within 1..100 and offset must be >= 0"),
+    "ERR_PROGRAM_NOT_FOUND": (404, "Amnesty program not found"),
+    "ERR_TAX_TYPE_TERM_NOT_FOUND": (404, "Program tax type term not found"),
+    "ERR_TAXPAYER_NOT_FOUND": (404, "Taxpayer not found"),
+    "ERR_ENFORCEMENT_CASE_NOT_FOUND": (404, "Enforcement case not found"),
+    "ERR_REPRESENTATIVE_NOT_FOUND": (404, "Representative not found"),
+    "ERR_PRE_CLEARANCE_NOT_FOUND": (404, "Pre-clearance request not found"),
+    "ERR_NEGOTIATION_ROUND_NOT_FOUND": (404, "Negotiation round not found"),
+    "ERR_AGREEMENT_NOT_FOUND": (404, "Voluntary disclosure agreement not found"),
+    "ERR_RETURN_NOT_FOUND": (404, "Disclosure return not found"),
+    "ERR_PAYMENT_PLAN_NOT_FOUND": (404, "Payment plan not found"),
+    "ERR_INSTALLMENT_NOT_FOUND": (404, "Installment not found"),
+    "ERR_PAYMENT_NOT_FOUND": (404, "Payment not found"),
+    "ERR_ENFORCEMENT_ACTION_NOT_FOUND": (404, "Enforcement action not found"),
+    "ERR_STALE_AGREEMENT_VERSION": (412, "expected_agreement_version does not match the current agreement version"),
+    "ERR_STALE_PRE_CLEARANCE_VERSION": (412, "expected_pre_clearance_version does not match the current pre-clearance version"),
+    "ERR_PROGRAM_NOT_DRAFT": (409, "The program is no longer a draft"),
+    "ERR_PROGRAM_NOT_OPEN": (409, "The program is not open"),
+    "ERR_PROGRAM_NOT_CLOSED": (409, "The program is not closed"),
+    "ERR_PRE_CLEARANCE_NOT_SUBMITTED": (409, "The pre-clearance request is not awaiting review"),
+    "ERR_PRE_CLEARANCE_NOT_NEGOTIABLE": (409, "The pre-clearance request is not in a state that accepts a state offer"),
+    "ERR_PRE_CLEARANCE_NOT_OFFERED": (409, "No standing state offer to act on"),
+    "ERR_PRE_CLEARANCE_TERMINAL": (409, "The pre-clearance request has reached a terminal state"),
+    "ERR_AGREEMENT_NOT_DRAFTED": (409, "The agreement is not a draft"),
+    "ERR_AGREEMENT_NOT_EXECUTED": (409, "The agreement is not executed"),
+    "ERR_AGREEMENT_NOT_BREACHED": (409, "The agreement is not breached"),
+    "ERR_RETURN_NOT_DRAFT": (409, "The return is not a draft"),
+    "ERR_RETURN_NOT_FILED": (409, "The return is not filed"),
+    "ERR_PLAN_NOT_PROPOSED": (409, "The payment plan is not awaiting approval"),
+    "ERR_PLAN_NOT_ACTIVE": (409, "The payment plan is not active"),
+    "ERR_PAYMENT_NOT_APPLIED": (409, "The payment is not in the applied state"),
+    "ERR_CASE_NOT_OPEN": (409, "The enforcement case is not open"),
+    "ERR_ACTION_NOT_DRAFT": (409, "The enforcement action is not a draft"),
+    "ERR_ACTION_NOT_ISSUED": (409, "The enforcement action is not issued"),
+    "ERR_RETURN_PERIOD_OVERLAP": (409, "The period overlaps an existing return for this tax type"),
+    "ERR_TAX_TYPE_TERM_WINDOW_OVERLAP": (409, "The eligible period window overlaps an existing term for this tax type"),
+    "ERR_IDENTITY_ALREADY_DISCLOSED": (409, "The client identity has already been disclosed"),
+    "ERR_TAXPAYER_UNDER_CRIMINAL_INVESTIGATION": (422, "The taxpayer is under criminal investigation and is excluded from the program"),
+    "ERR_TAXPAYER_UNDER_AUDIT_FOR_TAX_TYPE": (422, "The taxpayer is under audit for a tax type in scope and is excluded from the program"),
+    "ERR_REPRESENTATIVE_SUSPENDED": (422, "The representative is suspended"),
+    "ERR_INVALID_PROGRAM_WINDOW": (422, "window_open_at must precede window_close_at"),
+    "ERR_PROGRAM_WINDOW_CLOSED": (422, "The program window has closed"),
+    "ERR_PROGRAM_WINDOW_NOT_OPEN": (422, "The program window has not opened yet"),
+    "ERR_PROGRAM_WINDOW_NOT_ELAPSED": (422, "The program window has not elapsed yet"),
+    "ERR_LOOKBACK_EXCEEDS_PROGRAM_LIMIT": (422, "The lookback period exceeds the program limitation"),
+    "ERR_PERIOD_OUTSIDE_LOOKBACK": (422, "The period falls outside the agreement lookback window"),
+    "ERR_PERIOD_OUTSIDE_ELIGIBLE_WINDOW": (422, "The period falls outside the eligible window for this tax type"),
+    "ERR_INSTALLMENT_HORIZON_EXCEEDED": (422, "The schedule extends past the permitted horizon after the program window"),
+    "ERR_NEGOTIATION_ROUND_LIMIT": (422, "The representative counter limit for this pre-clearance is exhausted"),
+    "ERR_NO_ELIGIBLE_TAX_TYPE_TERMS": (422, "The program has no eligible tax type terms"),
+    "ERR_INVALID_INSTALLMENT_COUNT": (422, "installment_count is outside the permitted range for this plan type"),
+    "ERR_INSTALLMENT_BELOW_MINIMUM": (422, "The generated installment amount is below the minimum"),
+    "ERR_NO_DISCLOSURE_RETURNS": (422, "The agreement has no disclosure returns to certify"),
+    "ERR_RETURNS_NOT_SETTLED": (422, "Every disclosure return must be settled before certification"),
+    "ERR_COMPLIANCE_PERIOD_NOT_ELAPSED": (422, "The prospective compliance period has not elapsed"),
+    "ERR_PRECLEARANCE_NOT_ACCEPTED": (422, "The referenced pre-clearance has not been accepted"),
+    "ERR_PRECLEARANCE_TAXPAYER_MISMATCH": (422, "The pre-clearance was disclosed for a different taxpayer"),
+    "ERR_IDENTITY_NOT_DISCLOSED": (422, "The client identity must be disclosed before acceptance"),
+    "ERR_TAX_TYPE_NOT_IN_PROGRAM": (422, "The tax type has no eligible term in this program"),
+    "ERR_TAX_TYPE_NOT_IN_AGREEMENT": (422, "The tax type is not in the agreement scope"),
+    "ERR_NONFILER_PERIOD_REQUIRED": (422, "This tax type term only accepts previously unfiled periods"),
+    "ERR_BELOW_MINIMUM_LIABILITY": (422, "The reported tax is below the minimum liability for this tax type"),
+    "ERR_DOWN_PAYMENT_BELOW_MINIMUM": (422, "The down payment is below the required percentage of the balance"),
+    "ERR_DOWN_PAYMENT_NOT_RECEIVED": (422, "The committed down payment has not been received"),
+    "ERR_PAYMENT_EXCEEDS_BALANCE": (422, "The payment exceeds the outstanding balance"),
+    "ERR_REVERSAL_BREAKS_DOWN_PAYMENT": (422, "The reversal would drop the applied down payment below the committed amount"),
+    "ERR_NOTHING_TO_REINSTATE": (422, "The agreement has no waived or filed amounts to reinstate"),
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        entry = CATALOG.get(error_id, (400, error_id))
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else entry[0]
+        self.message = message if message is not None else entry[1]
+        super().__init__(self.message)
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, message)

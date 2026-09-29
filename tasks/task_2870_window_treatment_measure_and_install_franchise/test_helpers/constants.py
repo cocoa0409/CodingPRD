@@ -1,0 +1,193 @@
+"""Literal constants drawn from the Window Treatment Measure-and-Install Franchise PRD.
+
+Every value here is a figure the PRD states explicitly. Nothing is inferred.
+"""
+
+# ─── Roles (spelled exactly as the PRD spells them) ───────────────────────────
+
+ROLE_FRANCHISOR = "Franchisor"
+ROLE_FRANCHISEE = "Franchisee"
+ROLE_DESIGNER = "Designer"
+ROLE_VENDOR_REP = "VendorRep"
+
+ALL_ROLES = (ROLE_FRANCHISOR, ROLE_FRANCHISEE, ROLE_DESIGNER, ROLE_VENDOR_REP)
+
+# ─── The logical clock ────────────────────────────────────────────────────────
+
+# "Its startup default is exactly 2026-08-01T00:00:00Z".
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00.000Z"
+
+# ─── Pagination ───────────────────────────────────────────────────────────────
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ─── Territory charter defaults and domains ───────────────────────────────────
+
+DEFAULT_ROYALTY_RATE_PCT = 0.055
+DEFAULT_LEAD_CAPACITY_PER_WEEK = 5
+DEFAULT_CREDIT_LIMIT_CENTS = 2000000
+DEFAULT_LIABILITY_WINDOW = "ROLLING_180D"
+
+MAX_ROYALTY_RATE_PCT = 0.15
+MIN_ROYALTY_RATE_PCT = 0.0
+
+TERRITORY_STATUSES = ("ACTIVE", "PROBATION", "SUSPENDED", "TERMINATED")
+LIABILITY_WINDOWS = ("ROLLING_180D", "LIFETIME")
+
+# ─── Designer ─────────────────────────────────────────────────────────────────
+
+DESIGNER_STATUSES = ("ACTIVE", "SUSPENDED", "INACTIVE")
+CERTIFICATIONS = ("MOTORIZATION", "CHILD_SAFETY", "COMMERCIAL")
+
+LIABILITY_SCORE_BASE = 100
+LIABILITY_EXCEPTION_PENALTY = 22
+LIABILITY_LATE_RETURN_PENALTY = 9
+LIABILITY_CLEAN_INSTALL_BONUS = 3
+LIABILITY_SUSPEND_THRESHOLD = 80
+ROLLING_WINDOW_DAYS = 180
+
+# ─── Lead ─────────────────────────────────────────────────────────────────────
+
+LEAD_SOURCES = ("NATIONAL_CALL_CENTER", "WEB_FORM", "REFERRAL", "WALK_IN")
+LEAD_STATUSES = ("NEW", "ROUTED", "QUEUED", "UNROUTABLE", "CONSULT_COMPLETE",
+                 "CONVERTED", "LOST")
+LEAD_OPEN_STATUSES = ("ROUTED", "CONSULT_COMPLETE")
+
+# ─── Sample library ───────────────────────────────────────────────────────────
+
+SAMPLE_KIT_STATUSES = ("AVAILABLE", "ON_LOAN", "LOST")
+CHECKOUT_STATUSES = ("OPEN", "RETURNED", "LOST")
+
+MAX_HOLD_DAYS = 14
+LATE_FEE_PER_DAY_CENTS = 750
+LATE_FEE_MAX_DAYS = 14
+
+# ─── Designer calendar ────────────────────────────────────────────────────────
+
+TRAVEL_BUFFER_MINUTES = 45
+CONSULTATION_STATUSES = ("SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED")
+
+# ─── Measurement ──────────────────────────────────────────────────────────────
+
+MOUNT_TYPES = ("INSIDE", "OUTSIDE")
+ROOM_TYPES = ("BEDROOM", "NURSERY", "LIVING_ROOM", "KITCHEN", "BATH", "OFFICE")
+CHILD_SAFETY_ROOM_TYPES = ("NURSERY", "BEDROOM")
+
+MIN_INSIDE_MOUNT_DEPTH_IN = 2.500
+MAX_READING_IN = 300.000
+
+INSIDE_WIDTH_DEDUCTION_IN = 0.500
+INSIDE_HEIGHT_DEDUCTION_IN = 0.250
+OUTSIDE_WIDTH_OVERLAP_TOTAL_IN = 3.000
+OUTSIDE_HEIGHT_ALLOWANCE_TOTAL_IN = 4.500
+EIGHTH_IN = 0.125
+
+MEASURE_STATUSES = ("MEASURED", "CONFIGURED", "QUOTED", "REMEASURE_REQUIRED")
+INSTALL_OUTCOMES = ("PENDING", "INSTALLED", "NOT_INSTALLED")
+
+# ─── Pricing ──────────────────────────────────────────────────────────────────
+
+BILLABLE_FLOOR_IN = 12.000
+SQFT_DIVISOR = 144
+SQFT_ROUNDING_UNIT = 0.25
+
+FABRIC_RATE_CENTS_PER_SQFT = {
+    "LT-SHEER": 620,
+    "CL-LINEN": 940,
+    "BO-THERMAL": 1280,
+    "WD-FAUX": 1550,
+}
+LIFT_UPLIFT_CENTS = {
+    "CORDED": 0,
+    "CORDLESS": 1800,
+    "CONTINUOUS_LOOP": 2600,
+    "MOTORIZED": 0,
+}
+MOTOR_PRICE_CENTS = {
+    "NONE": 0,
+    "BATTERY": 12500,
+    "HARDWIRED": 19500,
+}
+FABRIC_CODES = tuple(FABRIC_RATE_CENTS_PER_SQFT)
+LIFT_SYSTEMS = tuple(LIFT_UPLIFT_CENTS)
+MOTORIZATION_OPTIONS = tuple(MOTOR_PRICE_CENTS)
+CORDLESS_COMPLIANT_LIFTS = ("CORDLESS", "MOTORIZED")
+
+OVERSIZE_WIDTH_THRESHOLD_IN = 72.000
+OVERSIZE_SURCHARGE_RATE = 0.15
+
+# ─── Quote waterfall ──────────────────────────────────────────────────────────
+
+INSTALL_FEE_BASE_CENTS = 7500
+INSTALL_FEE_PER_OPENING_CENTS = 2500
+INSTALL_FEE_PER_MOTORIZED_CENTS = 4500
+
+DISCOUNT_TIERS = ((500000, 0.12), (250000, 0.08), (100000, 0.05))
+
+QUOTE_VALIDITY_DAYS = 14
+MAX_REVISIONS = 2
+QUOTE_STATUSES = ("DRAFT", "PRESENTED", "ACCEPTED", "EXPIRED", "SUPERSEDED")
+
+# ─── Vendor ───────────────────────────────────────────────────────────────────
+
+DEFAULT_MOTORIZATION_EXTRA_DAYS = 0
+MAX_MOTORIZATION_EXTRA_DAYS = 60
+DEFAULT_CUTOFF_HOUR_UTC = 17
+MIN_CUTOFF_HOUR_UTC = 0
+MAX_CUTOFF_HOUR_UTC = 23
+DEFAULT_CONCURRENT_CAPACITY = 2
+MIN_BASE_LEAD_TIME_DAYS = 1
+MAX_BASE_LEAD_TIME_DAYS = 120
+
+REMAKE_POLICIES = ("FULL_VENDOR_90D", "SHARED_50_50", "NO_REMAKE")
+HUB_PLATFORMS = ("ALEXA", "GOOGLE_HOME", "HOMEKIT", "MATTER")
+VENDOR_STATUSES = ("ACTIVE", "SUSPENDED")
+
+WHOLESALE_COST_RATE = 0.42
+REMAKE_EXPEDITE_DAYS = 4
+LEAD_TIME_FLOOR_DAYS = 5
+
+VENDOR_ORDER_STATUSES = ("PLACED", "SHIPPED", "RECEIVED", "REMAKE_REQUESTED",
+                         "CANCELLED")
+VENDOR_ORDER_OCCUPYING_STATUSES = ("PLACED", "SHIPPED", "REMAKE_REQUESTED")
+
+# ─── Remake ───────────────────────────────────────────────────────────────────
+
+CREDIT_SCOPES = ("REPLACEMENT", "FULL_CREDIT")
+MAX_REMAKES_PER_ORDER = 2
+TERRITORY_ABSORPTION_CAP_CENTS = 15000
+FULL_VENDOR_WINDOW_DAYS = 90
+
+# ─── Install job and commissioning ────────────────────────────────────────────
+
+INSTALL_STATUSES = ("SCHEDULED", "COMPLETED", "EXCEPTION_RAISED", "CANCELLED")
+COMMISSIONING_STATUSES = ("NOT_REQUIRED", "PENDING", "PAIRED", "VERIFIED",
+                          "FAILED")
+COMMISSIONING_RESTING_STATUSES = ("NOT_REQUIRED", "VERIFIED")
+COMMISSIONING_MAX_ATTEMPTS = 3
+
+EXCEPTION_REASONS = ("OUT_OF_SQUARE", "OBSTRUCTION", "DAMAGED_GOODS")
+LIABLE_PARTIES = ("VENDOR", "MEASURER", "CUSTOMER", "NONE")
+
+OUT_OF_SQUARE_TOLERANCE_IN = 0.375
+REMEASURE_CHARGE_RATE = 0.35
+REMEASURE_CHARGE_CAP_CENTS = 12000
+
+# ─── Ledger ───────────────────────────────────────────────────────────────────
+
+LEDGER_ENTRY_TYPES = ("NET_SALES_ROYALTY", "ROYALTY_REVERSAL",
+                      "REMAKE_CHARGEBACK", "REMEASURE_CHARGEBACK",
+                      "SAMPLE_LATE_FEE", "SAMPLE_REPLACEMENT")
+LEDGER_MEMOS = ("quote_accepted", "install_trueup", "remake_replacement",
+                "remake_full_credit", "sample_late", "sample_lost",
+                "remeasure_chargeback")
+LEDGER_SOURCE_ENTITY_TYPES = ("QUOTE", "VENDOR_ORDER", "INSTALL_JOB",
+                              "SAMPLE_CHECKOUT")
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+BASE_PATH = "/blinds"
+CLOCK_PATH = "/_clock/set_current_utc"

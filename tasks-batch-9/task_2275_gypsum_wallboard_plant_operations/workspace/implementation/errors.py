@@ -1,0 +1,70 @@
+"""Error catalogue (PRD 5) and the exception type carried through the stack."""
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_PLANT_NOT_FOUND": 404,
+    "ERR_LOT_NOT_FOUND": 404,
+    "ERR_BATCH_NOT_FOUND": 404,
+    "ERR_RUN_NOT_FOUND": 404,
+    "ERR_OUTAGE_NOT_FOUND": 404,
+    "ERR_LOAD_ORDER_NOT_FOUND": 404,
+    "ERR_REFERENCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_PLANT_SCOPE_MISMATCH": 409,
+    "ERR_STALE_PLANT_VERSION": 412,
+    "ERR_STALE_LOT_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_LOT_NOT_APPROVED": 409,
+    "ERR_ASSAY_EXPIRED": 409,
+    "ERR_MAX_ASSAYS_REACHED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_PLANT_POSTURE_FROZEN": 409,
+    "ERR_POSTURE_RESTRICTED_FIRE_RATED": 409,
+    "ERR_FIRE_RATED_STUCCO_NONCONFORMING": 422,
+    "ERR_INVALID_WINDOW": 400,
+    "ERR_RUN_WINDOW_NOT_STARTED": 409,
+    "ERR_OUTAGE_WINDOW_NOT_STARTED": 409,
+    "ERR_OUTAGE_WINDOW_CONFLICT": 409,
+    "ERR_LINE_WINDOW_CONFLICT": 409,
+    "ERR_CHANGEOVER_BUFFER_VIOLATION": 409,
+    "ERR_SEASONALITY_WINDOW_UNFAVORABLE": 409,
+    "ERR_MAX_DEFERRALS_REACHED": 409,
+    "ERR_LINE_NOT_AVAILABLE": 409,
+    "ERR_RUN_ACTIVE_ON_LINE": 409,
+    "ERR_LINE_SPEED_EXCEEDS_SPEC": 422,
+    "ERR_PAPER_TENSION_OUT_OF_RANGE": 422,
+    "ERR_KILN_PROFILE_INFEASIBLE": 422,
+    "ERR_WINDOW_TOO_SHORT_FOR_CHANGEOVER": 422,
+    "ERR_BUNDLE_CONFIG_INVALID": 422,
+    "ERR_TRAILER_WEIGHT_EXCEEDED": 422,
+    "ERR_NO_BOARD_TEST_SPECIMENS": 422,
+    "ERR_INSUFFICIENT_SPECIMENS": 422,
+    "ERR_RETEST_REQUIRED": 409,
+    "ERR_RUN_QUALITY_NOT_RELEASED": 409,
+    "ERR_CALCINER_CAPACITY_EXCEEDED": 409,
+    "ERR_SILO_CAPACITY_EXCEEDED": 409,
+    "ERR_LOT_TONS_INSUFFICIENT": 409,
+    "ERR_STUCCO_INSUFFICIENT": 409,
+    "ERR_RUN_MSF_INSUFFICIENT": 409,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def err(error_id, message=None):
+    """Build (do not raise) an ApiError."""
+    return ApiError(error_id, message)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

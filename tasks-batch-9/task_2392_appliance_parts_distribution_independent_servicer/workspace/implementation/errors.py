@@ -1,0 +1,93 @@
+"""Error class and the complete error catalogue (id -> HTTP status)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_ACCOUNT_SCOPE_VIOLATION": 403,
+    "ERR_BRANCH_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # schema
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_BRANCH_NOT_FOUND": 404,
+    "ERR_PART_NOT_FOUND": 404,
+    "ERR_MODEL_PART_XREF_NOT_FOUND": 404,
+    "ERR_PRICING_TIER_NOT_FOUND": 404,
+    "ERR_SERVICER_ACCOUNT_NOT_FOUND": 404,
+    "ERR_TECHNICIAN_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_INVENTORY_RECORD_NOT_FOUND": 404,
+    "ERR_PRICE_FILE_NOT_FOUND": 404,
+    "ERR_PRICE_FILE_LINE_NOT_FOUND": 404,
+    "ERR_PART_ORDER_NOT_FOUND": 404,
+    "ERR_ORDER_LINE_NOT_FOUND": 404,
+    "ERR_SUBSTITUTE_REQUEST_NOT_FOUND": 404,
+    "ERR_WARRANTY_CLAIM_NOT_FOUND": 404,
+    "ERR_RETURN_AUTHORIZATION_NOT_FOUND": 404,
+    # state
+    "ERR_SERVICER_NOT_ACTIVE": 409,
+    "ERR_BRANCH_NOT_OPEN": 409,
+    "ERR_ORDER_NOT_DRAFT": 409,
+    "ERR_ORDER_STATE_INVALID": 409,
+    "ERR_SETTLEMENT_STATE_INVALID": 409,
+    "ERR_LINE_NOT_SHIPPED": 409,
+    "ERR_LINE_STATE_INVALID": 409,
+    "ERR_CLAIM_STATE_INVALID": 409,
+    "ERR_RA_STATE_INVALID": 409,
+    "ERR_SUBSTITUTE_ALREADY_DECIDED": 409,
+    "ERR_PRICE_FILE_STATE_INVALID": 409,
+    "ERR_CERT_ALREADY_REVOKED": 409,
+    "ERR_PRICE_FILE_NOT_YET_EFFECTIVE": 409,
+    "ERR_PRICE_WINDOW_OVERLAP": 409,
+    "ERR_CERT_WINDOW_OVERLAP": 409,
+    "ERR_RESUBMISSION_LIMIT_REACHED": 409,
+    "ERR_DUPLICATE_KEY": 409,
+    # concurrency
+    "ERR_STALE_ORDER_VERSION": 412,
+    "ERR_STALE_PART_VERSION": 412,
+    # business rules
+    "ERR_PRICE_FILE_HAS_NO_LINES": 422,
+    "ERR_OEM_AUTHORIZATION_MISSING": 422,
+    "ERR_TECHNICIAN_CERT_REQUIRED": 422,
+    "ERR_PART_NO_LONGER_AVAILABLE": 422,
+    "ERR_SUPERSESSION_CHAIN_BROKEN": 422,
+    "ERR_SUPERSESSION_CYCLE_DETECTED": 422,
+    "ERR_SUPERSESSION_CHAIN_TOO_LONG": 422,
+    "ERR_SUPERSESSION_TARGET_INVALID": 422,
+    "ERR_PART_NON_RETURNABLE": 422,
+    "ERR_RETURN_QUANTITY_EXCEEDS_SHIPPED": 422,
+    "ERR_RETURN_WINDOW_EXPIRED": 422,
+    "ERR_WARRANTY_PERIOD_EXPIRED": 422,
+    "ERR_CERT_INTERVAL_INVALID": 422,
+    "ERR_PRICE_INTERVAL_INVALID": 422,
+    "ERR_SUBSTITUTE_PART_INVALID": 422,
+    "ERR_SUBSTITUTE_PRICE_VARIANCE": 422,
+    "ERR_ORDER_HAS_NO_LINES": 422,
+    "ERR_FULFILLMENT_MODE_MISMATCH": 422,
+    "ERR_WILL_CALL_NOT_ENABLED": 422,
+    "ERR_INVENTORY_NEGATIVE": 422,
+    "ERR_PAYMENT_AMOUNT_MISMATCH": 422,
+    # fiscal
+    "ERR_CREDIT_LIMIT_EXCEEDED": 402,
+    "ERR_PREPAY_REQUIRED": 402,
+    "ERR_CORE_LIABILITY_LIMIT_EXCEEDED": 402,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Missing or unrecognized authentication headers",
+    "ERR_UNAUTHORIZED": "Role is not permitted to perform this operation",
+    "ERR_ACCOUNT_SCOPE_VIOLATION": "Servicer may only act on its own account",
+    "ERR_BRANCH_SCOPE_VIOLATION": "Branch counter rep may only act on its own branch",
+    "ERR_SEGREGATION_OF_DUTIES": "Same operator may not both approve credit and waive the restocking fee",
+    "ERR_INVALID_REQUEST": "Request body or query parameters are malformed",
+    "ERR_DUPLICATE_KEY": "A record with the same unique key already exists",
+}

@@ -1,0 +1,228 @@
+"""Domain constants for the Production Music Library API.
+
+Every literal here is stated verbatim in the PRD: the logical clock origin
+(§2.5), the pricing factors and add-on fees (§3.4), the cue weights and credit
+value (§3.7), the blanket overage / pool retention figures (§3.6), the claim
+platform rates and thresholds (§3.8), the statement minimum payout (§3.9) and
+the pagination bounds (§2.3).
+"""
+
+# --- Routing -----------------------------------------------------------------
+
+API_PREFIX = "/music-library"
+CLOCK_PATH = "/_clock/set_current_utc"
+
+# --- Logical clock (§2.5) ----------------------------------------------------
+
+CLOCK_ORIGIN = "2026-08-01T00:00:00Z"
+
+# --- Pagination (§2.3) -------------------------------------------------------
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Roles (§2.1) ------------------------------------------------------------
+
+ROLE_CATALOG_ADMIN = "CatalogAdmin"
+ROLE_RIGHTS_MANAGER = "RightsManager"
+ROLE_LICENSING_AGENT = "LicensingAgent"
+ROLE_ROYALTY_ACCOUNTANT = "RoyaltyAccountant"
+ROLE_COMPOSER = "Composer"
+ROLE_LICENSEE = "Licensee"
+
+ALL_ROLES = [
+    ROLE_CATALOG_ADMIN,
+    ROLE_RIGHTS_MANAGER,
+    ROLE_LICENSING_AGENT,
+    ROLE_ROYALTY_ACCOUNTANT,
+    ROLE_COMPOSER,
+    ROLE_LICENSEE,
+]
+STAFF_ROLES = [
+    ROLE_CATALOG_ADMIN,
+    ROLE_RIGHTS_MANAGER,
+    ROLE_LICENSING_AGENT,
+    ROLE_ROYALTY_ACCOUNTANT,
+]
+
+# --- Composer defaults (§3.1) ------------------------------------------------
+
+PRO_AFFILIATIONS = ["ASCAP", "BMI", "SESAC", "PRS", "NONE"]
+DEFAULT_PRO_AFFILIATION = "NONE"
+DEFAULT_PAYEE_COUNTRY = "US"
+DEFAULT_TAX_WITHHOLDING_PCT = 0.30
+MIN_TAX_WITHHOLDING_PCT = 0.00
+MAX_TAX_WITHHOLDING_PCT = 0.50
+
+# --- Agreement (§3.1) -------------------------------------------------------
+
+AGREEMENT_TYPES = ["WORK_FOR_HIRE", "ROYALTY_SPLIT"]
+EXCLUSIVITY_VALUES = ["EXCLUSIVE", "NON_EXCLUSIVE"]
+MAX_AMENDMENT_ROUND = 3
+MIN_HOLDBACK_DAYS = 0
+MAX_HOLDBACK_DAYS = 365
+SIGNING_ADVANCE_MEMO = "SIGNING_ADVANCE"
+WORK_FOR_HIRE_BUYOUT_MEMO = "WORK_FOR_HIRE_BUYOUT"
+
+AGREEMENT_STATUSES = [
+    "DRAFT",
+    "PENDING_SIGNATURE",
+    "ACTIVE",
+    "AMENDMENT_PENDING",
+    "TERMINATED",
+]
+
+# --- Composition (§3.2, §2.9) -----------------------------------------------
+
+GENRES = ["CINEMATIC", "ROCK", "ELECTRONIC", "JAZZ", "FOLK", "HIPHOP", "CLASSICAL"]
+MOOD_TAGS = ["UPLIFTING", "HOPEFUL", "EPIC", "DARK", "TENSE", "CALM", "QUIRKY"]
+INSTRUMENTATION = ["PIANO", "STRINGS", "BRASS", "GUITAR", "SYNTH", "PERCUSSION", "VOCALS"]
+MAX_MOOD_TAGS = 5
+MAX_INSTRUMENTATION = 6
+MIN_DURATION_SEC = 1
+MAX_DURATION_SEC = 3600
+MIN_TEMPO_BPM = 40
+MAX_TEMPO_BPM = 240
+
+CATALOG_STATUSES = ["INGESTED", "CATALOGED", "RETIRED"]
+AVAILABILITY_STATUSES = ["AVAILABLE", "RESTRICTED", "WITHDRAWN"]
+
+# --- Search profile / relevance (§3.3) --------------------------------------
+
+DEFAULT_TEMPO_TOLERANCE_BPM = 20
+MIN_TEMPO_TOLERANCE_BPM = 1
+MAX_TEMPO_TOLERANCE_BPM = 60
+DEFAULT_RESTRICTED_AVAILABILITY_FACTOR = 0.60
+RECENCY_BOOST = 1.10
+RECENCY_BOOST_DAYS = 90
+SEARCH_WEIGHT_TOTAL = 100
+
+# --- Rate card (§3.4) -------------------------------------------------------
+
+MEDIA_TYPES = ["BROADCAST_TV", "ONLINE_AD", "FILM", "CORPORATE", "GAME"]
+DISTRIBUTION_SCALES = ["LOCAL", "NATIONAL", "WORLDWIDE"]
+LICENSEE_TYPES = ["BROADCASTER", "PRODUCTION_COMPANY", "AGENCY", "GAME_STUDIO"]
+DEFAULT_MIN_TERM_MONTHS = 1
+DEFAULT_MAX_TERM_MONTHS = 120
+DEFAULT_PER_USE_ELIGIBLE = True
+DEFAULT_BLANKET_ELIGIBLE = False
+
+MEDIA_FACTOR = {
+    "BROADCAST_TV": 1.30,
+    "ONLINE_AD": 1.75,
+    "FILM": 2.20,
+    "CORPORATE": 0.85,
+    "GAME": 1.40,
+}
+SCALE_FACTOR = {"LOCAL": 0.60, "NATIONAL": 1.00, "WORLDWIDE": 1.90}
+EXCLUSIVITY_FACTOR = 1.65
+RUSH_FACTOR = 1.20
+CUSTOM_EDIT_FEE_CENTS = 45000
+STEMS_FEE_CENTS = 30000
+ALT_LENGTH_FEE_CENTS = 12000
+
+# term factor step function: 0.70 for <=3, 1.00 for 4-12, 1.45 for 13-36,
+# 1.90 for 37-120 months.
+TERM_FACTOR_BANDS = [(3, 0.70), (12, 1.00), (36, 1.45), (120, 1.90)]
+
+# volume discount bands selected from the spend basis, in cents.
+DISCOUNT_TIERS = [
+    (0, 499999, 0.00),
+    (500000, 1499999, 5.00),
+    (1500000, 2999999, 10.00),
+    (3000000, None, 15.00),
+]
+
+DEFAULT_QUOTE_VALID_DAYS = 14
+MAX_REVISION_ROUND = 3
+
+SYNC_REQUEST_STATUSES = [
+    "SUBMITTED",
+    "UNDER_REVIEW",
+    "QUOTED",
+    "REVISION_REQUESTED",
+    "ACCEPTED",
+    "EDIT_IN_PROGRESS",
+    "DELIVERED",
+    "DECLINED",
+]
+MAX_ALTERNATE_LENGTHS = 4
+MIN_ALTERNATE_LENGTH_SEC = 5
+MAX_ALTERNATE_LENGTH_SEC = 300
+
+# --- Licence (§3.5) ---------------------------------------------------------
+
+LICENSE_MODES = ["PER_USE", "BLANKET"]
+LICENSE_STATUSES = ["ISSUED", "ACTIVE", "EXPIRED", "REVOKED"]
+DECLINE_REASON_CATALOG_WITHDRAWN = "CATALOG_WITHDRAWN"
+
+# --- Blanket coverage / pool (§3.6) -----------------------------------------
+
+REPORTING_CADENCES = ["MONTHLY", "QUARTERLY"]
+CADENCE_MONTHS = {"MONTHLY": 1, "QUARTERLY": 3}
+CADENCE_FRACTION_DENOMINATOR = {"MONTHLY": 12, "QUARTERLY": 4}
+OVERAGE_RATE_CENTS_PER_MINUTE = 450
+REPORT_GRACE_DAYS = 15
+POOL_ADMIN_PCT = 15.00
+
+COVERAGE_STATUSES = ["DRAFT", "ACTIVE", "EXPIRED", "TERMINATED"]
+REPORTING_STATUSES = ["COMPLIANT", "DELINQUENT"]
+USAGE_REPORT_STATUSES = ["DUE", "SUBMITTED", "ACCEPTED", "REJECTED"]
+REJECTION_REASON_BLANKET_TERMINATED = "BLANKET_TERMINATED"
+
+# --- Cue sheets (§3.7) ------------------------------------------------------
+
+MARKET_TIERS = ["NETWORK", "CABLE", "LOCAL", "DIGITAL"]
+USAGE_TYPES = ["THEME", "FEATURE", "BACKGROUND", "LOGO"]
+USAGE_WEIGHT = {"THEME": 1.00, "FEATURE": 0.65, "BACKGROUND": 0.35, "LOGO": 0.10}
+MARKET_WEIGHT = {"NETWORK": 1.00, "CABLE": 0.65, "LOCAL": 0.40, "DIGITAL": 0.25}
+CUE_SECONDS_DIVISOR = 30
+CREDIT_VALUE_CENTS = 1250
+MIN_CUES = 1
+MAX_CUES = 20
+
+CUE_SHEET_STATUSES = ["COLLECTED", "REGISTERED", "ACCEPTED_BY_SOCIETY", "REJECTED_BY_SOCIETY"]
+
+# --- Fingerprint / claims (§3.8) --------------------------------------------
+
+SOURCE_PLATFORMS = ["UGC_VIDEO", "BROADCAST", "THEATRICAL", "PODCAST"]
+PLATFORM_RATE_CENTS_PER_SEC = {
+    "UGC_VIDEO": 1000,
+    "BROADCAST": 4500,
+    "THEATRICAL": 9000,
+    "PODCAST": 1500,
+}
+STATUTORY_CAP_CENTS = 15000000
+NEGOTIATED_FLOOR_PCT = 30.00
+CLAIM_CONFIDENCE_MIN_PCT = 70.0
+NOTICE_CONFIDENCE_MIN_PCT = 85.0
+# confidence factor bands, closed on their lower bound
+CONFIDENCE_FACTOR_BANDS = [(95.0, 1.00), (85.0, 0.75), (70.0, 0.50)]
+MIN_MATCHED_SECONDS = 1
+MAX_MATCHED_SECONDS = 7200
+
+CLAIM_STATUSES = ["DETECTED", "NOTICED", "DISPUTED", "SETTLED", "ESCALATED"]
+SETTLEMENT_BASES = ["STATUTORY", "NEGOTIATED"]
+
+# --- Ledger / statements (§3.9) ---------------------------------------------
+
+LEDGER_SOURCE_TYPES = [
+    "SYNC_FEE",
+    "SYNC_FEE_REVERSAL",
+    "PERFORMANCE",
+    "PERFORMANCE_REVERSAL",
+    "BLANKET_POOL",
+    "SETTLEMENT",
+    "ADVANCE",
+    "ADVANCE_RECOUP",
+    "ADJUSTMENT",
+]
+NEGATIVE_LEDGER_SOURCE_TYPES = ["ADVANCE", "SYNC_FEE_REVERSAL", "PERFORMANCE_REVERSAL"]
+MANUAL_LEDGER_SOURCE_TYPE = "ADJUSTMENT"
+
+STATEMENT_BASES = ["ACCRUAL", "CASH"]
+STATEMENT_STATUSES = ["DRAFT", "FINALIZED", "PAID"]
+PAYOUT_STATUSES = ["NO_ACTIVITY", "HELD_BELOW_MINIMUM", "PAYABLE"]
+MIN_PAYOUT_CENTS = 2500

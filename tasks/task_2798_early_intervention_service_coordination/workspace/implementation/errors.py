@@ -1,0 +1,94 @@
+"""Error catalog and the ApiError exception carrying error_id/message/http_status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else CATALOG.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+# error_id -> http status
+CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_STALE_REFERRAL_VERSION": 412,
+    "ERR_CHILD_NOT_FOUND": 404,
+    "ERR_REFERRAL_NOT_FOUND": 404,
+    "ERR_COORDINATOR_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_IFSP_NOT_FOUND": 404,
+    "ERR_IFSP_SERVICE_NOT_FOUND": 404,
+    "ERR_PROVIDER_NOT_FOUND": 404,
+    "ERR_AUTHORIZATION_NOT_FOUND": 404,
+    "ERR_VISIT_NOT_FOUND": 404,
+    "ERR_COST_SHARE_NOT_FOUND": 404,
+    "ERR_TRANSITION_PLAN_NOT_FOUND": 404,
+    "ERR_CONTACT_LOG_NOT_FOUND": 404,
+    "ERR_REFERRAL_STATE_INVALID": 409,
+    "ERR_IFSP_STATE_INVALID": 409,
+    "ERR_ASSESSMENT_NOT_SCHEDULED": 409,
+    "ERR_PROVIDER_NOT_ACTIVE": 409,
+    "ERR_AUTHORIZATION_NOT_ACTIVE": 409,
+    "ERR_VISIT_NOT_SCHEDULED": 409,
+    "ERR_VISIT_NOT_VOIDABLE": 409,
+    "ERR_SERVICE_NOT_DELIVERABLE": 409,
+    "ERR_COST_SHARE_NOT_PROVISIONAL": 409,
+    "ERR_TRANSITION_PLAN_STATE_INVALID": 409,
+    "ERR_CHILD_AGE_INELIGIBLE": 422,
+    "ERR_DUPLICATE_REFERRAL": 409,
+    "ERR_PROVIDER_CREDENTIAL_EXPIRED": 422,
+    "ERR_NATURAL_ENVIRONMENT_JUSTIFICATION_REQUIRED": 422,
+    "ERR_REQUIRED_ASSESSMENTS_INCOMPLETE": 422,
+    "ERR_EVALUATION_DOMAINS_INCOMPLETE": 422,
+    "ERR_TRANSITION_PLAN_INCOMPLETE": 422,
+    "ERR_EXIT_OUTCOMES_REQUIRED": 422,
+    "ERR_MAKEUP_TARGET_INVALID": 422,
+    "ERR_MAKEUP_ALREADY_SCHEDULED": 409,
+    "ERR_SUPERSEDE_TARGET_INVALID": 422,
+    "ERR_INSURANCE_POLICY_REQUIRED": 422,
+    "ERR_PROVIDER_SERVICE_TYPE_MISMATCH": 422,
+    "ERR_ALL_SERVICES_DECLINED": 422,
+    "ERR_AUTHORIZATION_WINDOW_OVERLAP": 409,
+    "ERR_PROVIDER_SCHEDULE_CONFLICT": 409,
+    "ERR_COST_SHARE_DUPLICATE": 409,
+    "ERR_TRANSITION_PLAN_DUPLICATE": 409,
+    "ERR_COORDINATOR_NOT_ELIGIBLE": 422,
+    "ERR_NO_ELIGIBLE_COORDINATOR": 409,
+    "ERR_CASELOAD_CAP_EXCEEDED": 409,
+    "ERR_DATE_IN_FUTURE": 422,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_INVALID_VISIT_DURATION": 422,
+    "ERR_MAKEUP_WINDOW_EXPIRED": 422,
+    "ERR_TRANSITION_WINDOW_NOT_OPEN": 422,
+    "ERR_NOTIFICATION_AFTER_THIRD_BIRTHDAY": 422,
+    "ERR_VISIT_OUTSIDE_AUTHORIZATION_WINDOW": 422,
+    "ERR_VISIT_NOT_YET_OCCURRED": 422,
+    "ERR_UNITS_EXCEED_SERVICE_POOL": 422,
+    "ERR_UNITS_EXCEED_AUTHORIZATION": 422,
+    "ERR_ACTUAL_UNITS_EXCEED_SCHEDULED": 422,
+    "ERR_WAIVE_EXCEEDS_BALANCE": 422,
+    "ERR_LEDGER_WOULD_UNBALANCE": 409,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or name an unknown role.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not permitted to use this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting identity does not own the targeted resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting identity determined this row and may not waive it.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed or contains invalid values.",
+    "ERR_INVALID_PAGINATION": "The pagination parameters are outside the accepted range.",
+    "ERR_STALE_REFERRAL_VERSION": "The supplied referral version does not match the stored version.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

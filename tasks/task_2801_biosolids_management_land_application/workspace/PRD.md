@@ -1,0 +1,681 @@
+# Biosolids Land Application API — Product Requirements Document
+
+## 1. Introduction
+
+A publicly owned wastewater treatment utility does not get to choose whether its solids leave the plant. Cake accumulates on the pad every single day, and the only questions are where it goes, whether the paperwork proving it was safe to send there exists, and whether anybody can reconstruct that proof three years later when the state inspector asks. This service is the system of record for that entire chain: thickening, digestion and dewatering with volatile-solids-reduction demonstration; pathogen and vector-attraction-reduction demonstration under an operator-chosen regulatory option; laboratory characterisation of regulated metals and emerging contaminants against ceiling, monthly-average and advisory limits; land application site permitting with agronomic rate derivation, setbacks and site restrictions; farmer agreement negotiation; application scheduling around crop cycles, notice periods and weather; hauling logistics and wet-weather storage headroom; alternative outlets when land application is not available; and the annual report and public narrative that close the loop with the community.
+
+The engineering difficulty in this domain is not CRUD. It is that several quantities are **conserved** and several verdicts are **derived**, and both must survive compensating actions exactly. A batch's dry tons are split across reservations, field applications and diversions, and voiding any of those must return the tonnage to the penny — or rather, to the third decimal place. A field's cumulative metal loading is a ledger whose entries are rounded once at write time and never re-rounded when summed, so that a reversal entry is the exact arithmetic negation of the entry it offsets. The plant's operating posture is a derived gate that can freeze the whole solids train, and a single laboratory result filed late can propagate through four hops: batch rejection, event cancellation, facility recount, posture freeze. Two of the calculations are deliberately **dual-variant** — two formulas over identical inputs that disagree, where only one is compliance-binding — and the specification is explicit about which.
+
+This document is the complete contract. Every state name, every threshold with its inclusivity, every rounding step in its normative order, every error identifier and every request field is stated here. Where a rule looks redundant it is reinforcement, not contradiction. All resources are addressed as flat, root-level collections; relationships travel as foreign keys in request bodies and as optional query filters rather than as nested URL segments, with the two exceptions of the laboratory results filed against a batch and the haul tickets recorded against an application event, which are also readable through their parent.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Operating Roles and Request Identity
+
+Every request to this API, without exception, must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, naming the capacity in which they act. If either header is absent or blank, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401) before any other processing occurs — before path resolution, before body parsing, before any state inspection. If both headers are present but the value of `X-User-Role` is not one of the six recognised roles, or is a recognised role that the called endpoint does not authorise, the request is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+The six roles are `FacilityOperator`, `LabAnalyst`, `ComplianceOfficer`, `Agronomist`, `Farmer` and `PublicLiaison`. Their division of labour is a deliberate segregation of duties:
+
+- A `FacilityOperator` runs the solids train and the loadout yard. They register facilities, create batches, advance the process dimension, record haul tickets, draft, commit and settle diversions, place weather holds and start field applications. They deliberately cannot certify a batch, cannot decide a site permit and cannot close out an application event — the plant does not sign off on its own product.
+- A `LabAnalyst` files analytical results. This is the only role that may write laboratory rows and the only role with no write access to any state machine at all; the analytical record is an input to compliance decisions, never a decision itself.
+- A `ComplianceOfficer` holds the regulatory pen: configuring pollutant limits, certifying batches, ordering retests, deciding site permits, restricting and reinstating sites, resolving odor complaints, closing out and voiding application events, voiding diversion orders and submitting and amending annual reports.
+- An `Agronomist` owns the land side: registering sites, submitting them for permitting, negotiating agreements from the utility's side, and creating, rescheduling and cancelling application events. They cannot certify a batch, cannot decide the permit they applied for, and cannot close out the event they scheduled.
+- A `Farmer` is the counterparty on an agreement: countering, signing and terminating agreements that name them, and reading the sites and events touching their own fields.
+- A `PublicLiaison` handles the community side: logging odor complaints, opening investigations, closing complaints, and drafting the public narrative on the annual report. A `PublicLiaison` can never substantiate a complaint; only a `ComplianceOfficer` converts a complaint into a regulatory consequence.
+
+Identity binding differs by role and must be implemented exactly as follows. When `X-User-Role` is `FacilityOperator`, `X-User-ID` is the `id` of the acting `TreatmentFacility`; ownership checks on any resource that references a `TreatmentFacility` would compare the resource's facility foreign key to `X-User-ID`. No endpoint in this specification performs such a comparison, so a `FacilityOperator` may act on any facility's resources, and the server must not filter or reject on facility ownership. When `X-User-Role` is `LabAnalyst`, `ComplianceOfficer`, `Agronomist`, `Farmer` or `PublicLiaison`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it where a transition says so — as `certified_by_user_id` on a batch at certification, as `completed_by_user_id` on an application event at close-out, as `submitted_by_user_id` on an annual report at submission — and compares it in exactly two places, both of which are stated in full later: the `Farmer` party check against the agreement's stored `farmer_user_id`, and the segregation-of-duties check at event close-out. It is never compared to any entity's `id`.
+
+Two identity-derived refusals therefore exist beyond plain role gating. A call to counter, sign or terminate an agreement whose `farmer_user_id` does not equal the caller's `X-User-ID` is rejected with `ERR_ACTOR_NOT_PARTY` (HTTP 403). And closing out an application event whose batch was certified by the same `X-User-ID` now presenting itself is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and List Ordering
+
+Collection reads are paginated through two query parameters. `limit` is the maximum number of rows returned; it defaults to 10 when absent, must be at least 1 and at most 100, and a value outside that range is rejected with `ERR_INVALID_REQUEST`. `offset` is the number of matching rows to skip before the page begins; it defaults to 0 and must not be negative. Both are accepted on every collection read in this service, including the two child collections read through their parent.
+
+Every list response carries `limit`, `offset`, `total_count` and `has_more` inside `meta`. `total_count` is the number of rows matching the filters **before** `limit` and `offset` are applied, and `has_more` is true exactly when the sum of `offset` and the number of rows returned is less than `total_count`.
+
+Unless a specific collection says otherwise, list results are sorted by `created_at` ascending. The exceptions, which are normative, are: pollutant limits sort by `analyte` ascending then `created_at` ascending; laboratory results read under a batch sort by `sampling_event_index` ascending, then `analyte` ascending, then `created_at` ascending; application events sort by `window_start` ascending then `created_at` ascending; haul tickets — whether read under an event or across events — sort by `depart_at` ascending then `created_at` ascending; odor complaints sort by `received_at` ascending then `created_at` ascending; and annual reports sort by `report_year` ascending then `created_at` ascending. Enumerated filters (a `status`, a `posture`, a `crop_type`, an `outlet_type`, an `analyte`, an `entry_type`, a `severity`, a `process_status`, a `quality_status`, a `disposition`) match on exact equality, and an unrecognised member is an `ERR_INVALID_REQUEST`.
+
+### 2.4. Common Resource Properties, Versioning and the Logical Clock
+
+Every resource in the system is minted with an `id` that is a bare UUID string with no type prefix, and a `created_at` that is an ISO 8601 UTC timestamp with exactly three fractional-second digits (for example `2026-08-01T00:00:00.000Z`). Facilities, pollutant limits, solids batches, land application sites, farmer agreements, application events, alternative outlets, diversion orders, odor complaints and annual reports additionally carry `updated_at`, an ISO 8601 UTC timestamp refreshed on every mutation of the row, and `version`, an integer that is 1 at creation and increments by exactly 1 on every mutation — **including** mutations the server performs on its own initiative as part of a cascade, and including mutations that only change a derived field.
+
+Two record types are append-only audit rows and carry **only** `id` and `created_at`: the laboratory result and the haul ticket, and — a third of the same kind — the loading ledger entry. For those three, `updated_at` and `version` are absent from the response body entirely; they are never modified after creation and are never soft-deleted.
+
+All time comparisons in this service are made against a **logical clock**, not against wall-clock time. A fresh server starts its logical clock at `2026-08-01T00:00:00Z`, and the clock advances only when a caller explicitly sets it. Notice periods, reapplication buffers, agreement expiry, application-window containment, the 30-day complaint window, the 365-day odor window, the 30-day storage horizon and every `*_at` stamp the server writes all read from that clock. Any role may set the clock. Setting it carries out the agreement expiry sweep described in §3.6 and re-derives every site's odor risk scores because the 365-day scoring window has moved; it does **not** recompute any facility's 30-day substantiated-complaint counter and therefore does not by itself change any facility posture.
+
+### 2.5. Numeric Precision, Rounding and the Unit Conversions
+
+All rounding in this service is **round half up** — a value exactly at the midpoint rounds away from zero — and every rounded quantity has a fixed number of decimal places, stated here once and repeated at the point of use:
+
+- Wet tonnage and acreage: 2 decimal places. This covers `wet_tons`, `planned_wet_tons`, `applied_wet_tons`, `storage_used_wet_tons`, `storage_capacity_wet_tons`, `ytd_accepted_wet_tons`, `max_annual_wet_tons`, `min_load_wet_tons`, `acres` and `acres_treated`.
+- Dry tonnage: 3 decimal places. This covers `dry_tons_in`, `dry_tons_out`, `dry_tons_produced`, `unallocated_dry_tons`, `reserved_dry_tons`, `planned_dry_tons`, `applied_dry_tons`, `dry_tons`, `total_dry_tons_land_applied` and `total_dry_tons_diverted`.
+- Percentages and rates: 2 decimal places. This covers `storage_utilization_pct`, `volatile_solids_in_pct`, `volatile_solids_out_pct`, `vsr_pct_van_kleeck`, `vsr_pct_mass_balance`, `vsr_compliance_rate_pct`, `percent_solids`, `requested_rate_dry_tons_per_acre`, `agronomic_rate_cap_dry_tons_per_acre`, `odor_risk_score_historical`, `odor_risk_score_precautionary`, `gating_risk_score` and `surcharge_pct`.
+- Money: 2 decimal places, and returned as JSON numbers rather than strings. This covers `processing_cost`, `hauling_cost`, `subtotal_cost`, `surcharge_cost`, `total_cost` and `cost_per_dry_ton`.
+- Plant-available nitrogen: 4 decimal places, on `plant_available_n_lb_per_dry_ton`.
+- Loading ledger deltas: 4 decimal places, on `kg_per_hectare_delta`, and on every per-analyte increment projected before an application is accepted.
+- Concentrations: 3 decimal places, on `concentration_mg_kg`.
+- Haul distance: 1 decimal place, on `haul_miles`. Configuration rates such as `haul_rate_per_mile_per_wet_ton` (4 decimal places) and `gate_fee_per_wet_ton` retain the precision supplied at creation.
+
+Three physical conversions are used throughout and are exact for the purposes of this service: a dry-weight concentration in milligrams per kilogram is converted to pounds per dry ton by multiplying by **0.002**; one dry ton is **907.185** kilograms; and one acre is **0.404686** hectares.
+
+Where a formula prescribes a sequence of rounding steps, that sequence is **normative**. Rounding earlier or later than specified produces a different answer in the last decimal place and is a defect, not a tolerance. Two places in this service depend on it critically: the diversion order cost breakdown, where each component is rounded before the subtotal is formed and the surcharge tier is keyed on that rounded subtotal; and the cumulative loading ledger, where each per-analyte entry is rounded to 4 decimal places at write time and the site's totals are the **exact sums of those already-rounded entries**, never a re-rounding of an unrounded aggregate.
+
+### 2.6. Stale-Read Protection on Agreement and Diversion Creation
+
+Exactly two write operations in this service require the caller to prove it has read the current state of a parent record before writing a child against it. Both are cases where no state precondition can catch the mistake, because a second child on the same parent is a legitimate product operation.
+
+Creating a farmer agreement requires `expected_site_version` in the request body as a non-optional integer field, carrying the client's last observed `version` of the `LandApplicationSite` named by `site_id`. If it does not equal the site's current `version`, the create is rejected with `ERR_STALE_SITE_VERSION` (HTTP 412), and the response message names both the actual and expected version. A second `DRAFT` agreement on the same site is legal — it supersedes the earlier draft's terms once proposed and signed — so nothing about the site's state refuses the write; only the stale-version check tells the caller that its view of the field's acreage, crop nitrogen demand, loading headroom or permit status is out of date. A successful create also increments the site's own `version` by 1, so that any other holder of the previous version is forced to re-read before its own write.
+
+Creating a diversion order requires `expected_batch_version` in the request body as a non-optional integer field, carrying the client's last observed `version` of the `SolidsBatch` named by `batch_id`. If it does not equal the batch's current `version`, the create is rejected with `ERR_STALE_BATCH_VERSION` (HTTP 412). Multiple diversion orders against one batch are legitimate — a batch's unallocated tonnage can be split between a compost outlet and a landfill — so again no state precondition refuses the second create; the stale-version check is what catches a caller sizing its order against an `unallocated_dry_tons` figure that another write has already reduced.
+
+No other endpoint in this service accepts a version field of any kind, and none may be required to.
+
+### 2.7. Validation Order and Error Precedence
+
+When a single request violates several rules at once, the server must return the violation with the **lowest priority number** in the ladder below. This ordering is part of the contract: a request that is both unauthorized and malformed returns `ERR_UNAUTHORIZED`, not `ERR_INVALID_REQUEST`, and a request naming a non-existent site with an out-of-range rate returns `ERR_SITE_NOT_FOUND`, not `ERR_AGRONOMIC_RATE_EXCEEDED`.
+
+1. **Priority 1 — authentication, every endpoint.** `X-User-Role` and `X-User-ID` are both present and non-blank, otherwise `ERR_UNAUTHENTICATED` (401).
+2. **Priority 2 — authorization, every endpoint.** `X-User-Role` is one of the six declared roles and that role appears in the called operation's authorized-role list, otherwise `ERR_UNAUTHORIZED` (403).
+3. **Priority 3 — path identifier existence, every endpoint carrying a path identifier.** Each path identifier resolves, validated left to right in this order: `facilityId`, `batchId`, `siteId`, `agreementId`, `eventId`, `orderId`, `complaintId`, `reportId`, `entryId`. The corresponding 404 is `ERR_FACILITY_NOT_FOUND`, `ERR_BATCH_NOT_FOUND`, `ERR_SITE_NOT_FOUND`, `ERR_AGREEMENT_NOT_FOUND`, `ERR_EVENT_NOT_FOUND`, `ERR_ORDER_NOT_FOUND`, `ERR_COMPLAINT_NOT_FOUND`, `ERR_REPORT_NOT_FOUND` or `ERR_LEDGER_ENTRY_NOT_FOUND`. The two directly addressed audit rows use `ERR_LAB_RESULT_NOT_FOUND` for an unknown `resultId` and `ERR_HAUL_TICKET_NOT_FOUND` for an unknown `ticketId`, both 404 and both at this priority.
+4. **Priority 4 — body foreign-key existence.** Every foreign key in the request body resolves, validated in this field order: `facility_id`, `site_id`, `batch_id`, `agreement_id`, `outlet_id`, `event_id`, each raising its matching 404 above (`ERR_OUTLET_NOT_FOUND` for `outlet_id`). This applies to solids-batch creation, site registration, agreement creation, application-event creation, haul-ticket creation, diversion-order creation, odor-complaint creation, annual-report creation and laboratory-result filing.
+5. **Priority 5 — request schema, every endpoint.** Required fields present, types correct, enum members recognised, numeric ranges honoured, month arrays strictly ascending within 1 through 12 with no duplicates, `window_end` strictly after `window_start`, `term_end` strictly after `term_start`, `return_at` strictly after `depart_at`, `limit` within 1 through 100 and `offset` at least 0, otherwise `ERR_INVALID_REQUEST` (400).
+6. **Priority 6 — party identity.** On the three Farmer-actor operations (agreement counter, agreement signature and agreement termination) the caller's `X-User-ID` equals the target agreement's `farmer_user_id`, otherwise `ERR_ACTOR_NOT_PARTY` (403).
+7. **Priority 10 — agreement stale read.** `expected_site_version` equals the site's current `version`, otherwise `ERR_STALE_SITE_VERSION` (412).
+8. **Priority 11 — diversion stale read.** `expected_batch_version` equals the batch's current `version`, otherwise `ERR_STALE_BATCH_VERSION` (412).
+9. **Priority 20 — batch dimension states.** The target batch is in the `process_status` or `quality_status` the requested transition declares as its from-state, and a laboratory result requires `quality_status` to be `PENDING_RESULTS` or `QUALIFIED`. The failure is `ERR_INVALID_PROCESS_TRANSITION` for the process dimension and `ERR_INVALID_QUALITY_TRANSITION` for the quality dimension, both 409.
+10. **Priority 21 — other entity states.** The target site, agreement, application event, diversion order, odor complaint or annual report is in the from-state its transition declares, otherwise `ERR_SITE_INVALID_STATE`, `ERR_AGREEMENT_INVALID_STATE`, `ERR_EVENT_NOT_SCHEDULED`, `ERR_EVENT_NOT_IN_PROGRESS`, `ERR_EVENT_NOT_COMPLETED`, `ERR_ORDER_INVALID_STATE`, `ERR_COMPLAINT_INVALID_STATE` or `ERR_REPORT_INVALID_STATE`, all 409.
+11. **Priority 22 — negotiation bound.** `round_index` is strictly less than 3 before a counter-offer is accepted, otherwise `ERR_AGREEMENT_ROUND_LIMIT` (409).
+12. **Priority 23 — resampling bound.** `retest_round` is strictly less than 2 before a retest is accepted, otherwise `ERR_RETEST_LIMIT_REACHED` (409).
+13. **Priority 24 — site permitted.** The referenced site's `status` is `PERMITTED`, otherwise `ERR_SITE_NOT_PERMITTED` (409). This applies to application-event creation, event start, event reschedule and agreement proposal.
+14. **Priority 25 — agreement active.** The referenced agreement's `status` is `ACTIVE`, otherwise `ERR_AGREEMENT_NOT_ACTIVE` (409). This applies to application-event creation, event start and event reschedule.
+15. **Priority 26 — batch qualified.** The referenced batch's `quality_status` is `QUALIFIED`, otherwise `ERR_BATCH_NOT_QUALIFIED` (409). This applies to application-event creation and event start, and **not** to reschedule.
+16. **Priority 27 — outlet accepting.** The referenced outlet's `status` is `ACCEPTING`, otherwise `ERR_OUTLET_NOT_ACCEPTING` (409). This applies to diversion-order commit only.
+17. **Priority 28 — reporting lock.** No annual report for the event's facility and the calendar year of `window_start` is in status `SUBMITTED` or `AMENDED`, otherwise `ERR_REPORTING_PERIOD_LOCKED` (409). This applies to the void of a completed application event.
+18. **Priority 29 — segregation of duties.** On application-event close-out the calling `X-User-ID` differs from the batch's `certified_by_user_id`, otherwise `ERR_SEGREGATION_OF_DUTIES` (403).
+19. **Priority 30 — facility not frozen.** The governing facility's `posture` is not `FROZEN`, otherwise `ERR_FACILITY_FROZEN` (409). This applies to batch creation, both process advances, batch certification and application-event creation.
+20. **Priority 31 — restricted facility horizon.** When the governing facility's `posture` is `RESTRICTED`, `window_start` is no more than 7 days after the logical clock, otherwise `ERR_FACILITY_RESTRICTED` (409). This applies to application-event creation only.
+21. **Priority 32 — site not restricted.** The referenced site's `status` is not `RESTRICTED`, otherwise `ERR_SITE_RESTRICTED` (409). This applies to application-event creation, event start and event close-out.
+22. **Priority 33 — pathogen class.** The batch's derived `pathogen_class` is `CLASS_B` or `CLASS_A`, otherwise `ERR_PATHOGEN_CLASS_INSUFFICIENT` (422). Certification only.
+23. **Priority 34 — plant-side vector evidence.** The chosen plant-side vector option's evidence is present and passes, otherwise `ERR_VSR_BELOW_MINIMUM` (for `VAR_OPTION_1_VSR`) or `ERR_VECTOR_OPTION_EVIDENCE_MISSING` (for `VAR_OPTION_3_SOUR` and `VAR_OPTION_5_AEROBIC`), both 422. Certification only.
+24. **Priority 35 — analyte panel.** Every analyte carrying an `ACTIVE` pollutant limit row has a laboratory result in the batch's current sampling round, none with `exceeds_ceiling` true and none with `exceeds_monthly_avg` true, otherwise `ERR_ANALYTE_PANEL_INCOMPLETE`, `ERR_CEILING_EXCEEDED` or `ERR_MONTHLY_AVG_EXCEEDED`, all 422 and evaluated in exactly that order. Certification only.
+25. **Priority 36 — method-conditional setbacks.** `ERR_SETBACK_VIOLATION` (422) on application-event creation and reschedule, per §3.7.
+26. **Priority 37 — odor gate.** The site's `gating_risk_score` is strictly below 60.00, otherwise `ERR_ODOR_RISK_BLOCK` (422). Application-event creation and reschedule.
+27. **Priority 38 — phosphorus block.** The site's `soil_p_index` is strictly below 100, otherwise `ERR_PHOSPHORUS_INDEX_BLOCK` (422). Application-event creation and reschedule.
+28. **Priority 39 — weather clearance.** The site's `weather_clearance_ok` is true, otherwise `ERR_WEATHER_RESTRICTION` (422). Event start only, plus the clearing branch of the weather-hold operation described in §3.8.
+29. **Priority 40 — deferred vector option.** `ERR_VECTOR_OPTION_METHOD_MISMATCH` (422) on close-out, per §3.3.
+30. **Priority 41 — inside the window.** The logical clock lies inside the half-open window from `window_start` inclusive to `window_end` exclusive, otherwise `ERR_OUTSIDE_APPLICATION_WINDOW` (409). Event start only.
+31. **Priority 42 — window overlap.** The requested half-open window does not overlap another application event on the same site whose `status` is `SCHEDULED`, `WEATHER_HOLD`, `DEFERRED` or `IN_PROGRESS`, otherwise `ERR_SITE_WINDOW_CONFLICT` (409). Half-open semantics mean an existing window ending exactly at the new `window_start` is accepted. On reschedule the event being rescheduled is excluded from its own comparison set.
+32. **Priority 43 — reapplication interval.** `window_start` is at or after the latest `window_end` among `COMPLETED` events on this site plus `reapplication_interval_days` days; the boundary instant itself is accepted. Otherwise `ERR_REAPPLICATION_INTERVAL` (409). On reschedule the event being rescheduled is excluded.
+33. **Priority 44 — agreement covers this site.** The agreement's `site_id` equals the request's `site_id`, otherwise `ERR_AGREEMENT_SITE_MISMATCH` (422). Application-event creation only.
+34. **Priority 45 — agreement term coverage.** `window_start` is at or after `term_start` and `window_end` is at or before `term_end`, otherwise `ERR_AGREEMENT_TERM_COVERAGE` (422). Creation and reschedule.
+35. **Priority 46 — crop cycle.** The calendar month of `window_start` is a member of the site's `allowed_application_months`, otherwise `ERR_CROP_CYCLE_CONFLICT` (422). Creation and reschedule.
+36. **Priority 47 — notice period.** `window_start` is at or after the logical clock plus the agreement's `notice_days` days, otherwise `ERR_NOTICE_PERIOD_NOT_MET` (422). Creation and reschedule.
+37. **Priority 48 — loadout bay occupancy.** `ERR_LOADOUT_BAY_CAPACITY` (409) on haul-ticket creation, per §3.8.
+38. **Priority 49 — acreage.** `acres_treated` is greater than 0 and at most the site's `acres`, otherwise `ERR_ACRES_EXCEED_SITE` (422). Creation and reschedule.
+39. **Priority 50 — nitrogen defined.** The derived `plant_available_n_lb_per_dry_ton` is strictly greater than 0, otherwise `ERR_AGRONOMIC_RATE_UNDEFINED` (422). Creation and reschedule.
+40. **Priority 51 — agronomic rate.** `requested_rate_dry_tons_per_acre` is at most `agronomic_rate_cap_dry_tons_per_acre`; equality is accepted. Otherwise `ERR_AGRONOMIC_RATE_EXCEEDED` (422). Creation and reschedule.
+41. **Priority 52 — cumulative loading headroom.** For every analyte with a CPLR, the site's cumulative loading plus this event's rounded increment is at most `cplr_kg_per_hectare`; equality is accepted. Otherwise `ERR_CPLR_HEADROOM_EXCEEDED` (422). Creation and reschedule; the same error also guards site reinstatement.
+42. **Priority 53 — annual loading headroom.** For every analyte with an APLR, the annual loading for the window's year plus this event's rounded increment is at most `aplr_kg_per_hectare_yr`; equality is accepted. Otherwise `ERR_APLR_EXCEEDED` (422). Creation and reschedule.
+43. **Priority 54 — unallocated tonnage.** `planned_dry_tons` for an application event, or `dry_tons` for a diversion order, is at most the batch's `unallocated_dry_tons`; equality is accepted. Otherwise `ERR_INSUFFICIENT_UNALLOCATED_TONS` (422).
+44. **Priority 55 — storage headroom.** The facility's `storage_used_wet_tons` plus the offered `wet_tons` is at most `storage_capacity_wet_tons`; landing exactly on capacity is accepted. Otherwise `ERR_STORAGE_CAPACITY_EXCEEDED` (422). Batch creation only.
+45. **Priority 56 — outlet acceptance criteria.** `wet_tons` is at least the outlet's `min_load_wet_tons` and the batch's `percent_solids` is at least the outlet's `min_percent_solids`, otherwise `ERR_OUTLET_ACCEPTANCE_CRITERIA` (422). Diversion-order commit only.
+46. **Priority 57 — outlet annual cap.** The outlet's `ytd_accepted_wet_tons` plus this order's `wet_tons` is at most `max_annual_wet_tons`; equality is accepted. Otherwise `ERR_OUTLET_ANNUAL_CAP_EXCEEDED` (422). Diversion-order commit only.
+47. **Priority 58 — uniqueness.** `npdes_permit_number` is unique across all facilities; `batch_code` is unique within a `facility_id`; `site_code` is unique within a `facility_id`; `report_year` is unique within a `facility_id` across reports whose `status` is `DRAFT`, `SUBMITTED` or `AMENDED`; and the triple of `batch_id`, `analyte` and `sampling_event_index` is unique across laboratory results. A collision is `ERR_DUPLICATE_RESOURCE` (409).
+48. **Priority 59 — sampling round.** A laboratory result's `sampling_event_index` equals the target batch's `retest_round`, otherwise `ERR_SAMPLING_ROUND_MISMATCH` (422).
+49. **Priority 60 — limit configured.** An `ACTIVE` pollutant limit row exists for the posted `analyte`, otherwise `ERR_LIMIT_NOT_FOUND` (404).
+50. **Priority 61 — haul ticket present.** At least one haul ticket exists for the event being closed out, otherwise `ERR_NO_HAUL_TICKET` (422).
+51. **Priority 62 — applied tonnage.** `applied_dry_tons` is strictly greater than 0 and at most `planned_dry_tons`, otherwise `ERR_APPLIED_TONS_INVALID` (422).
+
+Two further 409 conditions sit outside the numbered ladder and are checked immediately after the from-state check of the operation they guard: `ERR_OPEN_EVENTS_EXIST`, raised when a site is closed while any of its application events is `SCHEDULED`, `WEATHER_HOLD`, `DEFERRED` or `IN_PROGRESS`, and raised again when an annual report is submitted while the report year still contains unfinished work; and `ERR_AGREEMENT_TERM_OVERLAP`, raised when an agreement is activated while another `ACTIVE` agreement on the same site has an overlapping half-open term.
+
+Note that priorities 61 and 62 sit at the end of the ladder even though they guard the same close-out operation as priorities 29, 32 and 40: on a close-out request that both lacks haul tickets and is made by the certifying officer, the answer is `ERR_SEGREGATION_OF_DUTIES`.
+
+### 2.8. Facility Posture as a Derived Gate
+
+Every facility carries a derived `posture` that gates the operations of its children. It is recomputed after every mutation that changes `storage_used_wet_tons`, `open_ceiling_exceedance_count` or `substantiated_complaint_count_30d`, and the clauses are evaluated top down with the **first** match winning:
+
+- `posture` is `FROZEN` when `open_ceiling_exceedance_count` is greater than 0, or when `storage_utilization_pct` is at or above 98.00.
+- Otherwise `posture` is `RESTRICTED` when `storage_utilization_pct` is at or above 90.00, or when `substantiated_complaint_count_30d` is at or above 3.
+- Otherwise `posture` is `OPEN`.
+
+Both thresholds are inclusive and both comparisons use the 2-decimal rounded `storage_utilization_pct`. The three counters are defined as follows. `open_ceiling_exceedance_count` is the number of solids batches of this facility whose `ceiling_exceedance_flag` is true **and** whose `quality_status` is `REJECTED`. `substantiated_complaint_count_30d` is the number of odor complaints of this facility whose `status` is `SUBSTANTIATED` and whose `received_at` is at or after the logical clock minus 30 days; it is refreshed only when a complaint is substantiated, and specifically **not** when the clock moves. `days_of_capacity` is the drawdown projection of §3.1.
+
+A `FROZEN` posture refuses batch creation, both process advances, batch certification and application-event creation with `ERR_FACILITY_FROZEN`. A `RESTRICTED` posture refuses only application-event creation, and only when `window_start` is more than 7 days after the logical clock, with `ERR_FACILITY_RESTRICTED` — the intent is to force near-term removal while storage is tight. Neither posture ever blocks a diversion: an over-full or exceedance-bound plant must still be able to move solids to a landfill or a thermal outlet.
+
+### 2.9. The Two Conserved Quantities
+
+Two quantities in this service must balance exactly after every mutation, including every compensating reversal. They are the backbone of the whole model, and any endpoint that touches them is required to restate them from their definitions rather than adjusting them incrementally by guesswork.
+
+**Dry tons, per solids batch.** Let `reserved` be the sum of `planned_dry_tons` over the application events of this batch whose `status` is `SCHEDULED`, `WEATHER_HOLD`, `DEFERRED` or `IN_PROGRESS`; let `applied` be the sum of `applied_dry_tons` over the events of this batch whose `status` is `COMPLETED`; and let `diverted` be the sum of `dry_tons` over the diversion orders of this batch whose `status` is `DRAFT`, `COMMITTED` or `SETTLED`. Then `unallocated_dry_tons` is `dry_tons_produced` minus `reserved` minus `applied` minus `diverted`, rounded to 3 decimal places. `CANCELLED` and `VOIDED` events contribute nothing, and `VOIDED` diversion orders contribute nothing — a voided event keeps its `applied_dry_tons` for the audit trail but no longer matches the `COMPLETED` filter, which is precisely how the void restores the balance. The invariant that must hold after every one of these mutations is that `dry_tons_produced` equals the rounded sum of `unallocated_dry_tons`, `reserved`, `applied` and `diverted`.
+
+Note the deliberate asymmetry: a diversion order consumes batch tonnage from the moment it is drafted, while an application event consumes tonnage from the moment it is created. Both are reservations of the same pool, and both are released by their respective void or cancel paths.
+
+The batch's `disposition` is a pure function of that balance and is re-derived on every change to it: `FULLY_COMMITTED` when `unallocated_dry_tons` is exactly 0, `HELD` when nothing at all is reserved, applied or diverted, and `PARTIALLY_COMMITTED` in every other case.
+
+**Wet-ton storage, per facility.** `storage_used_wet_tons` is the sum of `wet_tons` over the batches of this facility, minus the sum of `applied_wet_tons` over the application events whose `status` is `COMPLETED` and whose site belongs to this facility, minus the sum of `wet_tons` over the diversion orders whose `status` is `SETTLED` and whose batch belongs to this facility, the whole rounded to 2 decimal places. `storage_utilization_pct` is `storage_used_wet_tons` divided by `storage_capacity_wet_tons`, multiplied by 100 and rounded to 2 decimal places.
+
+Storage is therefore credited when a batch is created, debited when an application event is closed out, credited back when a completed event is voided, and debited when a diversion order **settles**. A `DRAFT` or `COMMITTED` diversion order does **not** debit storage, which is why voiding a committed order leaves storage untouched while still returning the dry tons.
+
+### 2.10. The Cumulative Loading Ledger
+
+Metal loading on a field is tracked in an append-only ledger of per-analyte entries, and the site's two loading maps are always projections of that ledger, never independently maintained accumulators.
+
+At write time, on the close-out of an application event, let `applied_rate` be `applied_dry_tons` divided by `acres_treated`, carried **unrounded**. Then for each analyte that has a laboratory result on the event's batch in the batch's current sampling round, taken in ascending order of the analyte name, one entry is written whose `kg_per_hectare_delta` is `applied_rate` multiplied by that analyte's `concentration_mg_kg`, multiplied by 0.000001, multiplied by 907.185, divided by 0.404686, and rounded to 4 decimal places. The entry's `entry_type` is `APPLICATION`, its `reversal_of_id` is null, and its `applied_year` is the calendar year of the event's `window_start`.
+
+On the void of a completed event, one entry with `entry_type` `REVERSAL` is written for each `APPLICATION` entry of that event, in the same ascending analyte order, with `reversal_of_id` naming the entry it offsets and `kg_per_hectare_delta` the **exact negation** of that entry's already-rounded delta. There is no re-rounding on the reversal path, which is what makes the void restore the loading maps to their pre-close-out values exactly.
+
+At read time, the site's `cumulative_loading_kg_per_hectare` is a map from analyte name to the **sum of the already-rounded deltas** of every ledger entry for that site and analyte, with both entry types included and no status filter, because ledger rows are immutable and are never soft-deleted. The site's `annual_loading_kg_per_hectare` is a map whose keys are the analyte's `applied_year` and name joined by a colon — for example `2026:CADMIUM` — to the same sum restricted to that `applied_year`.
+
+The rounding order here is pinned and normative: **round each ledger entry, then sum**. Summing unrounded per-event values and rounding the total at read time is a different and incorrect result. Analytes with no ledger entry are simply absent from the maps, and an absent key is read as 0 everywhere a comparison needs it.
+
+The comparison that drives the loading cascade uses the fraction 0.90: when any analyte's cumulative loading is at or above 0.90 multiplied by that analyte's `cplr_kg_per_hectare`, the site is restricted. The comparison is made on the exact sum with no further rounding.
+
+### 2.11. Cascades and Compensating Reversals
+
+Five multi-hop cascades exist in this service. Each hop is caused by the previous hop rather than by the originating call, so each hop's own side effects — including every `version` increment — must be applied in full even when the hop was reached indirectly. The cascades are specified in detail in §3 and indexed here so that no implementer treats one of them as optional:
+
+- **The ceiling rejection cascade**, three hops, headed by a laboratory result whose concentration breaches its analyte ceiling: the batch is rejected, then its open application events are cancelled and their reservations released, then the facility's exceedance counter rises and its posture is re-derived, which freezes the plant.
+- **The loading cascade**, four hops, headed by an application-event close-out: ledger entries are written, then the site's loading maps are re-summed, then the site may be restricted for low cumulative headroom, then that site's remaining pre-field events are deferred.
+- **The loading compensation**, three hops, headed by the void of a completed event: reversal entries are written, then the maps are re-summed back to their exact prior values, then a loading-driven restriction may be lifted.
+- **The odor cascade**, headed by the substantiation of a complaint: the site's two odor scores and its gating score are re-derived, the facility's 30-day counter is recounted and its posture re-derived, and — when the resolution action is a site restriction — the site is restricted and its pre-field events are deferred.
+- **The site-closure cascade**, headed by the retirement of a site: its agreements still in negotiation are withdrawn.
+
+Two rules apply to all of them. First, a deferral **retains** the event's `reserved_dry_tons`, whereas a cancellation **releases** it back to the batch; the distinction is what keeps the dry-tons invariant true through both paths. Second, no cascade ever auto-reschedules a deferred event: once the restriction that deferred it is lifted, each event must be rescheduled explicitly with a fresh window.
+
+### 2.12. Regulatory Limit Configuration and the Analyte Panel
+
+Ten regulated parameters exist in this service: `ARSENIC`, `CADMIUM`, `COPPER`, `LEAD`, `MERCURY`, `MOLYBDENUM`, `NICKEL`, `SELENIUM`, `ZINC` and `PFOS`. Each may have at most one `ACTIVE` pollutant limit row at any moment. Creating a new row for an analyte that already has an `ACTIVE` row moves the previous row to `SUPERSEDED` and increments that previous row's `version` by 1; the new row is created with `status` `ACTIVE` and `version` 1.
+
+A limit row carries four thresholds, and each of them may legitimately be null: `ceiling_mg_kg` is the absolute concentration ceiling and is always required; `monthly_avg_mg_kg` is the high-quality concentration limit; `aplr_kg_per_hectare_yr` is the annual loading cap in kilograms per hectare per calendar year; `cplr_kg_per_hectare` is the cumulative loading cap in kilograms per hectare for the life of the site; and `advisory_threshold_mg_kg` is the emerging-contaminant advisory screening level. Analytes with no land-application loading limits — `MOLYBDENUM` and `PFOS` in the customary seeded set — simply omit `aplr_kg_per_hectare_yr` and `cplr_kg_per_hectare`, and are therefore excluded from the APLR candidate rate of §3.7, from the annual loading check, and from the cumulative headroom check and its 0.90 restriction trigger. They are **not** excluded from the analyte panel completeness check, from the ceiling check, or from the ledger: a ledger entry is written for every analyte with a current-round result.
+
+The set of analytes that must be present in a batch's current sampling round is computed **at the moment of certification** from the analytes that then have an `ACTIVE` limit row. A limit row seeded after a batch was certified is not retroactively required of that batch, but a result later filed against that new row can still reject the batch through the ceiling cascade.
+
+---
+
+## 3. Core Workflows & Business Logic
+
+### 3.1. Registering a Treatment Facility and Projecting Storage Drawdown
+
+A facility is registered by a `FacilityOperator` or a `ComplianceOfficer` with `name` (a non-blank string of 1 to 120 characters), `npdes_permit_number` (a string unique across all facilities), `storage_capacity_wet_tons` (a number strictly greater than 0), `daily_production_wet_tons` (a number at or above 0) and `loadout_bay_count` (an integer of at least 1). All five are required. A repeated `npdes_permit_number` is `ERR_DUPLICATE_RESOURCE`.
+
+The new facility is created with `version` 1 and every derived figure at its documented zero value: `storage_used_wet_tons` 0.00, `storage_utilization_pct` 0.00, `open_ceiling_exceedance_count` 0, `substantiated_complaint_count_30d` 0, `days_of_capacity` 9999 and `posture` `OPEN`. Facilities are readable individually and as a list, and the list accepts a `posture` filter. Every one of the six roles may read a facility.
+
+The wet-weather drawdown projection is a read-only view available to the `FacilityOperator`, the `ComplianceOfficer` and the `Agronomist`. It answers the operational question of how many days of cake-pad capacity remain at the current production rate net of committed removals, and it is computed as follows. Let `available` be `storage_capacity_wet_tons` minus `storage_used_wet_tons`, rounded to 2 decimal places. Let the horizon run from the logical clock inclusive to the logical clock plus 30 days exclusive. Then `projected_outflow_wet_tons` is the sum of `planned_wet_tons` over this facility's application events whose `status` is `SCHEDULED` or `IN_PROGRESS` and whose `window_start` falls inside that half-open horizon, plus the sum of `wet_tons` over **every** `COMMITTED` diversion order of this facility regardless of date, the whole rounded to 2 decimal places. Events on `WEATHER_HOLD` and events `DEFERRED` are excluded: a held window is not a removal commitment. `projected_inflow_wet_tons` is `daily_production_wet_tons` multiplied by 30, rounded to 2 decimal places.
+
+From those figures, let `daily_removal` be `projected_outflow_wet_tons` divided by 30 and rounded to 4 decimal places, and let `daily_net` be `daily_production_wet_tons` minus `daily_removal`, also rounded to 4 decimal places. When `daily_net` is at or below 0 — that is, when committed removals match or outpace production — `days_of_capacity` is the sentinel 9999. Otherwise `days_of_capacity` is `available` divided by `daily_net`, taken to the integer floor. An empty removal set yielding `projected_outflow_wet_tons` of 0.00 is a legitimate result and never an error. The projection response carries `facility_id`, `storage_used_wet_tons`, `storage_capacity_wet_tons`, `storage_utilization_pct`, `projected_outflow_wet_tons`, `projected_inflow_wet_tons`, `days_of_capacity` and `posture`.
+
+### 3.2. The Solids Process Train and the Two Volatile Solids Reduction Variants
+
+Only a `FacilityOperator` may create a solids batch. The required fields are `facility_id`, `batch_code` (unique within the facility), `wet_tons` (greater than 0, 2 decimal places), `dry_tons_in` (greater than 0, 3 decimal places), `volatile_solids_in_pct` (greater than 0 and less than 100) and `percent_solids` (greater than 0 and less than 100). The optional fields default as follows: `detention_days` 0.0, `digester_temp_c` 0.0, `stabilization_process` `ANAEROBIC_DIGESTION`, `pathogen_option` `PSRP_ALT1_TIME_TEMP`, `vector_option` `VAR_OPTION_1_VSR`, `fecal_coliform_mpn_per_g` null, `salmonella_mpn_per_4g` null, `sour_mg_o2_per_g_hr` null, `aerobic_process_days` 0.0, and each of the four nutrient-panel fields `nh4_n_mg_kg`, `organic_n_mg_kg`, `nitrate_n_mg_kg` and `total_p_mg_kg` 0.0. A batch is created with `process_status` `THICKENED`, `quality_status` `UNTESTED`, `disposition` `HELD` and `version` 1; `dry_tons_produced`, `unallocated_dry_tons`, `vsr_pct_van_kleeck` and `vsr_pct_mass_balance` all stay at 0.000 until the batch is dewatered.
+
+Creation credits the facility: `wet_tons` is added to `storage_used_wet_tons`, `storage_utilization_pct` and `posture` are re-derived, and the facility's `version` is incremented by 1. Creation is refused with `ERR_FACILITY_FROZEN` when the facility posture is already `FROZEN`, and with `ERR_STORAGE_CAPACITY_EXCEEDED` when the offered `wet_tons` would push stored solids strictly past capacity; landing exactly on capacity is accepted.
+
+The batch carries **two independent state dimensions on one row**, and neither constrains the other's transitions. `process_status` moves `THICKENED` to `DIGESTED` to `DEWATERED` and never backwards. `quality_status` moves through `UNTESTED`, `PENDING_RESULTS`, `QUALIFIED` and `REJECTED`. A single request advances the process dimension by naming the next stage in `to_status`; any other value is `ERR_INVALID_PROCESS_TRANSITION`. Both advances are refused while the facility posture is `FROZEN`.
+
+Advancing to `DIGESTED` requires `dry_tons_out`, `volatile_solids_out_pct`, `detention_days` and `digester_temp_c` in the request. `dry_tons_out` must be greater than 0 and at most `dry_tons_in`; `volatile_solids_out_pct` must be greater than 0 and strictly less than `volatile_solids_in_pct`. All four values are persisted, and then **both** volatile solids reduction variants are computed from those identical inputs and both are persisted:
+
+- Let `vs_in` be `volatile_solids_in_pct` divided by 100 and `vs_out` be `volatile_solids_out_pct` divided by 100, both fractions of total solids. Then `vsr_pct_van_kleeck` is the quantity `vs_in` minus `vs_out`, divided by the quantity `vs_in` minus the product of `vs_in` and `vs_out`, multiplied by 100, rounded to 2 decimal places. This variant corrects for the ash left behind, and it therefore reports a **higher** reduction than the other variant for the same inputs, because its denominator is smaller.
+- Let `vs_mass_in` be `dry_tons_in` multiplied by `vs_in` and `vs_mass_out` be `dry_tons_out` multiplied by `vs_out`. Then `vsr_pct_mass_balance` is the quantity `vs_mass_in` minus `vs_mass_out`, divided by `vs_mass_in`, multiplied by 100, rounded to 2 decimal places. This variant works on absolute volatile-solids masses, so any dry-solids mass loss through the process shows up as apparent reduction, and it reports a **lower** figure than the Van Kleeck variant when total solids are conserved.
+
+The two variants disagree, and that disagreement is intentional. Only `vsr_pct_van_kleeck` is compliance-binding: it alone decides vector attraction reduction under `VAR_OPTION_1_VSR` and it alone can reject a batch. `vsr_pct_mass_balance` is the operations figure published in the annual report and is never a gate. The gate compares the **rounded** `vsr_pct_van_kleeck` against 38.00, and a value of exactly 38.00 passes.
+
+Therefore, on the `DIGESTED` advance, when the batch's `vector_option` is `VAR_OPTION_1_VSR` and the rounded `vsr_pct_van_kleeck` is strictly below 38.00, the quality dimension also moves from `UNTESTED` to `REJECTED` in the same request with `rejection_reason` `VSR_BELOW_MINIMUM`. This rejection is deliberately **not** a ceiling exceedance: it does not set `ceiling_exceedance_flag`, it does not change the facility's `open_ceiling_exceedance_count`, and it therefore does not freeze the plant. The same advance also recomputes `pathogen_class` per §3.3.
+
+Advancing to `DEWATERED` requires `percent_solids` either already on the batch from creation or supplied in this request, greater than 0 and less than 100. It sets `dry_tons_produced` to `dry_tons_out` and `unallocated_dry_tons` to the same value, and — when `quality_status` is still `UNTESTED` — moves the quality dimension to `PENDING_RESULTS`, which opens sampling round 0 for laboratory results. Note the consequence of the two dimensions being independent: a batch rejected for low volatile solids reduction while still `THICKENED`-to-`DIGESTED` may still be dewatered, and it may still be diverted to a landfill or a thermal outlet; only land application is closed to it.
+
+Both advances increment the batch's `version` by 1 and refresh `updated_at` to the logical clock. Batches are readable individually and as a list filtered by `facility_id`, `process_status`, `quality_status` or `disposition`; the `FacilityOperator`, `ComplianceOfficer`, `LabAnalyst` and `Agronomist` may all read them.
+
+### 3.3. Pathogen Class and Vector Attraction Reduction
+
+`pathogen_class` is derived on the `DIGESTED` advance and re-evaluated as a precondition of certification. It is computed only from the batch's own `pathogen_option`, `digester_temp_c`, `detention_days`, `fecal_coliform_mpn_per_g` and `salmonella_mpn_per_4g`. Nulls never coerce to 0: a null required field yields `NONE`. The three branches are:
+
+- `PFRP_ALT1_TIME_TEMP` yields `CLASS_A` when `digester_temp_c` is at or above 53.0, `detention_days` is at or above 5.0, `fecal_coliform_mpn_per_g` is not null and strictly below 1000, and `salmonella_mpn_per_4g` is not null and strictly below 3. Otherwise `NONE`.
+- `PSRP_ALT1_TIME_TEMP` yields `CLASS_B` when `digester_temp_c` is at or above 35.0 and `detention_days` is at or above 15.0. Otherwise `NONE`.
+- `PSRP_ALT3_FECAL_COLIFORM` yields `CLASS_B` when `fecal_coliform_mpn_per_g` is not null and strictly below 2000000. Otherwise `NONE`.
+
+The temperature and duration comparisons are inclusive; the organism-density comparisons are strict. A derived class of `NONE` refuses certification with `ERR_PATHOGEN_CLASS_INSUFFICIENT`.
+
+Vector attraction reduction is demonstrated by one of five options, and the options split into two groups by **where** the demonstration happens. The three plant-side options are checked at certification:
+
+- `VAR_OPTION_1_VSR` is demonstrated when `vsr_pct_van_kleeck` is not null and at or above 38.00. Failure is `ERR_VSR_BELOW_MINIMUM`.
+- `VAR_OPTION_3_SOUR` is demonstrated when `sour_mg_o2_per_g_hr` is not null and at or below 1.5 milligrams of oxygen per gram of total solids per hour, **and** `digester_temp_c` is at or below 20.0 degrees Celsius. Failure is `ERR_VECTOR_OPTION_EVIDENCE_MISSING`.
+- `VAR_OPTION_5_AEROBIC` is demonstrated when `aerobic_process_days` is not null and at or above 14.0 days **and** `digester_temp_c` is at or above 40.0 degrees Celsius. Failure is `ERR_VECTOR_OPTION_EVIDENCE_MISSING`.
+
+The two field-side options defer their demonstration to the application event that consumes the batch. At certification they are simply recorded as deferred, and certification does not test them at all:
+
+- `VAR_OPTION_9_INJECTION` is demonstrated at close-out when the event's `application_method` is `INJECTED`.
+- `VAR_OPTION_10_INCORPORATION` is demonstrated at close-out when the event's `incorporation_within_hours` is not null and at or below 6. The bound is inclusive: 6 passes, 7 fails.
+
+Either field-side failure is `ERR_VECTOR_OPTION_METHOD_MISMATCH` at close-out. Only the specific event being closed out is consulted; sibling events on the same batch are irrelevant to it.
+
+The boolean `vector_demonstrated_at_batch` records which group applies. Certification sets it true when `vector_option` is one of `VAR_OPTION_1_VSR`, `VAR_OPTION_3_SOUR` or `VAR_OPTION_5_AEROBIC`, and false when it is `VAR_OPTION_9_INJECTION` or `VAR_OPTION_10_INCORPORATION`. Its default before certification is false.
+
+### 3.4. Laboratory Results, Certification, Retesting and the Ceiling Rejection Cascade
+
+The `LabAnalyst` is the only role that may file a laboratory result, and filing results is the only write that role performs anywhere in the service: the analytical record is the input to compliance decisions, never a decision itself. A result is filed against a batch with `analyte`, `concentration_mg_kg` (at or above 0, 3 decimal places), `sampling_event_index` and `analyzed_at`; `method_code` is optional and is a string of 1 to 32 characters recorded for the annual report. Results are accepted while the batch's `quality_status` is `PENDING_RESULTS` or `QUALIFIED` and refused from any other quality state with `ERR_INVALID_QUALITY_TRANSITION`. `sampling_event_index` must equal the batch's current `retest_round`, otherwise `ERR_SAMPLING_ROUND_MISMATCH`; the triple of batch, analyte and round must be unique, otherwise `ERR_DUPLICATE_RESOURCE`; and an `ACTIVE` pollutant limit row must exist for the posted analyte, otherwise `ERR_LIMIT_NOT_FOUND`.
+
+Filing derives three booleans against that `ACTIVE` limit row, each strict: `exceeds_ceiling` is true when `concentration_mg_kg` is strictly greater than `ceiling_mg_kg`; `exceeds_monthly_avg` is true when `monthly_avg_mg_kg` is not null and `concentration_mg_kg` is strictly greater than it; and `advisory_exceeded` is true when `advisory_threshold_mg_kg` is not null and `concentration_mg_kg` is strictly greater than it. A laboratory result carries only `id` and `created_at` beyond its own fields — it has no `updated_at` and no `version`, and it is never modified or deleted once filed.
+
+**The ceiling rejection cascade.** When the filed result has `exceeds_ceiling` true, three hops follow, and the second and third are consequences of the first rather than of the filing call:
+
+- *Hop 1.* The batch's `ceiling_exceedance_flag` is set true, `quality_status` moves to `REJECTED` and `rejection_reason` is set to `CEILING_EXCEEDED`. If the batch had already been certified — that is, if its `quality_status` was `QUALIFIED` — then `certified_at` and `certified_by_user_id` are both cleared to null. This is the only way a `QUALIFIED` batch leaves that state, and a confirmatory result filed after certification therefore **withdraws** the certification. The batch's `version` is incremented by 1.
+- *Hop 2.* Caused by hop 1: every application event on this batch whose `status` is `SCHEDULED`, `WEATHER_HOLD` or `DEFERRED` moves to `CANCELLED`, each setting its own `reserved_dry_tons` to 0 and returning its `planned_dry_tons` to the batch's `unallocated_dry_tons`, and each incrementing its own `version` by 1. The batch's `disposition` is re-derived from the resulting balance. Events already `IN_PROGRESS` are left standing — solids are already in the field and the close-out path must remain available to account for them. Every `DRAFT` diversion order on the batch is also voided, with `void_reason` set to `BATCH_REJECTED`, returning its `dry_tons` to the batch and incrementing the order's `version` by 1.
+- *Hop 3.* Caused by hop 1: the facility's `open_ceiling_exceedance_count` is recomputed upward, its `posture` is re-derived, and because the count is now greater than 0 the posture becomes `FROZEN`. The facility's `version` is incremented by 1.
+
+Separately, when the filed result is for `PFOS` with `advisory_exceeded` true, `pfas_advisory_flag` is set true on every `PERMITTED` or `RESTRICTED` site that already has a `COMPLETED` application event for this batch, each such site's odor risk scores are re-derived because the precautionary variant carries a PFAS multiplier, and each site's `version` is incremented by 1.
+
+**Certification.** Only a `ComplianceOfficer` may certify, and certification moves `quality_status` from `PENDING_RESULTS` to `QUALIFIED`. It takes no request body. Its preconditions, checked in the ladder order of §2.7, are that `process_status` is `DEWATERED`, `quality_status` is `PENDING_RESULTS` (any other quality state is `ERR_INVALID_QUALITY_TRANSITION`), the facility posture is not `FROZEN`, the derived `pathogen_class` is `CLASS_B` or `CLASS_A`, the plant-side vector evidence for the chosen option passes, every analyte that has an `ACTIVE` limit row at this moment has a result in the current round, no current-round result has `exceeds_ceiling` true, and no current-round result has `exceeds_monthly_avg` true. Results from earlier sampling rounds are excluded from every one of those checks and from every calculation; only results whose `sampling_event_index` equals the batch's `retest_round` count. Success sets `certified_at` to the logical clock, `certified_by_user_id` to the calling `X-User-ID`, sets `vector_demonstrated_at_batch` per §3.3, and increments the batch's `version` by 1. The recorded `certified_by_user_id` is the key the segregation-of-duties check reads at close-out.
+
+**Retesting.** A `ComplianceOfficer` may reopen a `REJECTED` batch for one more sampling round, moving `quality_status` from `REJECTED` back to `PENDING_RESULTS`. The bound is `retest_round` strictly less than 2, so a batch may be resampled at most twice and `retest_round` tops out at 2; a third attempt is `ERR_RETEST_LIMIT_REACHED`. A retest from any state other than `REJECTED` is `ERR_INVALID_QUALITY_TRANSITION`. Success increments `retest_round` by 1, clears `rejection_reason` to null, sets `ceiling_exceedance_flag` false and increments the batch's `version` by 1. When the cleared rejection was a ceiling exceedance, the facility's `open_ceiling_exceedance_count` is recomputed downward, its posture is re-derived — which can move it from `FROZEN` back to `RESTRICTED` or `OPEN` — and the facility's `version` is incremented by 1. A retest driven by a volatile-solids rejection never touches the facility counters, because that rejection never incremented them. Prior-round results are retained for the audit trail but are excluded from every subsequent check.
+
+Laboratory results are readable as a per-batch collection ordered by `sampling_event_index`, then `analyte`, then `created_at`, filterable by `analyte` and `sampling_event_index`; as a cross-batch collection ordered by `created_at` and filterable by `batch_id`, `analyte`, `sampling_event_index` and `exceeds_ceiling`; and individually by `resultId`.
+
+### 3.5. Registering and Permitting a Land Application Site
+
+Only an `Agronomist` may register a site. The required fields are `facility_id`, `site_code` (unique within the facility), `acres` (greater than 0, 2 decimal places), `crop_type` (one of `CORN`, `SOYBEAN`, `HAY`, `SMALL_GRAIN`, `PASTURE`), `crop_n_demand_lb_per_acre` (greater than 0), `crop_p_removal_lb_per_acre` (greater than 0), `soil_p_index` (at or above 0), `setback_to_well_ft` (at or above 0), `setback_to_surface_water_ft` (at or above 0) and `allowed_application_months` (a non-empty array of integers from 1 to 12, strictly ascending, no duplicates). The optional fields default to `soil_ph` 6.5, `depth_to_groundwater_ft` 10.0, `slope_pct` 3.0, `nearest_residence_ft` 3000 and `reapplication_interval_days` 30.
+
+A new site is created in `DRAFT` with `version` 1, `odor_risk_score_historical` 0.00, `odor_risk_score_precautionary` 0.00, `gating_risk_score` 0.00, `pfas_advisory_flag` false, `permit_number` null, `permitted_at` null, `restriction_reason` null, and both `cumulative_loading_kg_per_hectare` and `annual_loading_kg_per_hectare` as empty maps. Its weather fields start with `latest_weather_observed_at` null and `weather_clearance_ok` false, so a site has no weather clearance until an observation has actually been posted for it.
+
+The site lifecycle is `DRAFT`, `UNDER_REVIEW`, `PERMITTED`, `RESTRICTED` and the terminal `CLOSED`. Any attempt to make a transition the machine does not allow from the site's current state is `ERR_SITE_INVALID_STATE`.
+
+**Submitting for permit review** moves `DRAFT` to `UNDER_REVIEW` and is performed by the `Agronomist`. It runs the baseline siting screen: `soil_ph` at or above 6.0, `depth_to_groundwater_ft` at or above 3.0, `setback_to_well_ft` at or above 100, `setback_to_surface_water_ft` at or above 33, and a non-empty `allowed_application_months`. Any failure is `ERR_SETBACK_VIOLATION`. The stricter method-conditional setbacks are deliberately **not** enforced here — they depend on how a particular load will be placed, and are therefore enforced per application event.
+
+**The permit decision** is made by a `ComplianceOfficer` on a site `UNDER_REVIEW` with a `decision` of `APPROVE` or `REJECT`. `APPROVE` requires a non-blank `permit_number` in the request, sets `status` `PERMITTED`, writes that `permit_number` and sets `permitted_at` to the logical clock. `REJECT` returns the site to `DRAFT` and leaves `permit_number` null, so the `Agronomist` may amend the field data and resubmit; this revision loop is unbounded. Both branches increment the site's `version` by 1.
+
+**Restricting a site** moves `PERMITTED` to `RESTRICTED`. A `ComplianceOfficer` may order it explicitly, in which case `restriction_reason` is `OFFICER_ORDER`. The same transition fires automatically from the loading cascade with reason `CPLR_HEADROOM_LOW` and from a substantiated odor complaint with reason `ODOR_RISK_HIGH`. In all three cases the cascade is identical: every application event on the site whose `status` is `SCHEDULED` or `WEATHER_HOLD` moves to `DEFERRED` with `defer_reason` `SITE_RESTRICTED` (or `ODOR_RISK` when the odor cascade drove it), each incrementing its own `version` by 1, and each **retaining** its `reserved_dry_tons` rather than releasing it.
+
+**Reinstating a site** moves `RESTRICTED` back to `PERMITTED`, and both substantive conditions must hold regardless of what the `restriction_reason` was: for every analyte whose `ACTIVE` limit row carries a non-null `cplr_kg_per_hectare`, the site's cumulative loading for that analyte must be strictly below 0.90 multiplied by that limit, otherwise `ERR_CPLR_HEADROOM_EXCEEDED`; and `gating_risk_score` must be strictly below 60.00, otherwise `ERR_ODOR_RISK_BLOCK`. Success clears `restriction_reason` to null and increments `version` by 1. Deferred events are **not** rescheduled automatically; each must be rescheduled explicitly with a fresh window.
+
+**Closing a site** retires it permanently from either `PERMITTED` or `RESTRICTED`. It is refused with `ERR_OPEN_EVENTS_EXIST` while any application event on the site is `SCHEDULED`, `WEATHER_HOLD`, `DEFERRED` or `IN_PROGRESS`. Success sets `status` `CLOSED`, increments the site's `version` by 1, and cascades every farmer agreement on the site whose `status` is `DRAFT`, `PROPOSED` or `COUNTERED` to `WITHDRAWN`, incrementing each agreement's `version` by 1. `ACTIVE` agreements are deliberately left standing and must be terminated explicitly — closing a field does not silently repudiate a contract in force.
+
+Sites are readable individually and as a list filtered by `facility_id`, `status` and `crop_type`. The site loading summary is a separate read that returns `site_id`, `cumulative_loading_kg_per_hectare`, `annual_loading_kg_per_hectare`, `cplr_headroom_kg_per_hectare`, `aplr_headroom_kg_per_hectare`, `binding_analyte` and `pfas_advisory_flag`, and accepts an `applied_year` filter that scopes the annual figures. The two headroom maps give, per analyte carrying the relevant limit, that limit minus the current loading. `binding_analyte` is the analyte whose remaining cumulative headroom is smallest as a fraction of its own `cplr_kg_per_hectare`, with ties broken by ascending analyte name; when no analyte has any loading it is null. Loading ledger entries themselves are readable individually and as a list ordered by `created_at`, filterable by `site_id`, `source_event_id`, `reversal_of_id`, `analyte`, `applied_year` and `entry_type`; that list is the audit view behind every cumulative and annual loading decision.
+
+### 3.6. Negotiating and Operating a Farmer Agreement
+
+An agreement is the contract between the utility and the farming operator of a field. Only an `Agronomist` may draft one, supplying `site_id`, `expected_site_version`, `farmer_user_id`, `farm_name` (1 to 120 characters), `term_start`, `term_end` (strictly after `term_start`) and `max_dry_tons_per_acre` (greater than 0, 2 decimal places); `notice_days` is optional and defaults to 14. The stale-read rule of §2.6 applies. A new agreement is created in `DRAFT` with `round_index` 0, `last_proposed_by_role` `NONE` and `version` 1, and the anchoring site's own `version` is incremented by 1 as a side effect of the draft.
+
+`farmer_user_id` is an opaque user identifier, not a resource reference; it is never validated against any stored entity. It is the value the party check compares the caller's `X-User-ID` against on the three Farmer-actor operations.
+
+The lifecycle is `DRAFT`, `PROPOSED`, `COUNTERED`, `SIGNED`, `ACTIVE`, and the three terminal states `TERMINATED`, `EXPIRED` and `WITHDRAWN`. Any transition the machine does not allow from the current state is `ERR_AGREEMENT_INVALID_STATE`.
+
+**Proposing** is an `Agronomist` action from either `DRAFT` or `COUNTERED`, and it requires the anchoring site to be `PERMITTED`, otherwise `ERR_SITE_NOT_PERMITTED`. It sets `status` `PROPOSED`, sets `last_proposed_by_role` to `Agronomist`, and applies the optional `max_dry_tons_per_acre` and `notice_days` overrides from the request onto the agreement when they are supplied.
+
+**Countering** is a `Farmer` action from `PROPOSED` only, and the caller's `X-User-ID` must equal `farmer_user_id`, otherwise `ERR_ACTOR_NOT_PARTY`. It is bounded: `round_index` must be strictly less than 3, so the propose-and-counter cycle can turn at most three times and a fourth counter attempt is `ERR_AGREEMENT_ROUND_LIMIT`. Success sets `status` `COUNTERED`, sets `last_proposed_by_role` to `Farmer`, increments `round_index` by 1, and applies the optional `max_dry_tons_per_acre` and `notice_days` overrides when supplied. The cycle closes when the `Agronomist` proposes again from `COUNTERED`, which does **not** increment `round_index` — only the farmer's counter advances the counter.
+
+**Signing** is a `Farmer` action from `PROPOSED` only, restricted to the named party, and it additionally requires `last_proposed_by_role` to be `Agronomist` — a farmer cannot accept their own standing counter-offer. Success sets `status` `SIGNED` and `signed_at` to the logical clock.
+
+**Activating** is an `Agronomist` action from `SIGNED` only. It requires the logical clock to be inside the half-open term, that is at or after `term_start` and strictly before `term_end`; a clock outside that interval is `ERR_AGREEMENT_INVALID_STATE`. It is refused with `ERR_AGREEMENT_TERM_OVERLAP` when another `ACTIVE` agreement on the same site has a half-open term overlapping this one — two agreements may share a boundary instant, since one term ending exactly where another begins does not overlap. Success sets `status` `ACTIVE`.
+
+**Withdrawing** is an `Agronomist` action abandoning a negotiation from `DRAFT`, `PROPOSED` or `COUNTERED`. It is also the transition the site-closure cascade applies. It sets `status` `WITHDRAWN` and has no further side effects.
+
+**Terminating** ends an `ACTIVE` agreement early and requires a `termination_reason` in the request. Either party may do it: the `Agronomist` for the utility, or the `Farmer` named on the agreement, whose `X-User-ID` must match `farmer_user_id`. Success sets `status` `TERMINATED`, `terminated_at` to the logical clock and `termination_reason` from the request, and cascades every application event on the agreement whose `status` is `SCHEDULED` or `WEATHER_HOLD` to `DEFERRED` with `defer_reason` `AGREEMENT_TERMINATED`, each retaining its `reserved_dry_tons` and each incrementing its own `version` by 1.
+
+**Expiry** is the only clock-driven transition in the entire service. When the logical clock is set, every `ACTIVE` agreement whose `term_end` is at or before the new clock value moves to `EXPIRED`, each incrementing its `version` by 1, and the count of agreements so expired is returned as `expired_agreement_count`. Expiry deliberately cascades nothing: events already `IN_PROGRESS` under an expired agreement finish normally, and `SCHEDULED` events are left in place — the agreement-active precondition will refuse their start on its own.
+
+Every one of these transitions increments the agreement's `version` by 1. Agreements are readable individually and as a list filtered by `site_id`, `farmer_user_id` and `status`, by the `Agronomist`, `ComplianceOfficer`, `Farmer` and `FacilityOperator`.
+
+### 3.7. Scheduling an Application Event and the Agronomic Rate Cap
+
+Scheduling an application is the most heavily gated operation in the service. Only an `Agronomist` may do it, supplying `site_id`, `batch_id`, `agreement_id`, `window_start`, `window_end` (strictly after `window_start`), `application_method` (one of `SURFACE`, `INCORPORATED`, `INJECTED`), `acres_treated` (greater than 0, 2 decimal places) and `planned_dry_tons` (greater than 0, 3 decimal places); `incorporation_within_hours` is optional and defaults to null. `planned_wet_tons` is **not** an input: the server derives it as `planned_dry_tons` divided by the quantity `percent_solids` divided by 100, rounded to 2 decimal places.
+
+Before anything is written, the server derives `requested_rate_dry_tons_per_acre`, `plant_available_n_lb_per_dry_ton`, `agronomic_rate_cap_dry_tons_per_acre` and `binding_rate_constraint`, and then screens the request through the ladder of §2.7. The rate cap is a four-input nested minimum, and its evaluation order and rounding discipline are normative.
+
+**Step 1 — plant-available nitrogen.** Let the volatilization factor be 0.50 when `application_method` is `SURFACE`, 0.75 when it is `INCORPORATED` and 1.00 when it is `INJECTED`. Let the first-year mineralization factor be 0.20 when the batch's `stabilization_process` is `ANAEROBIC_DIGESTION`, 0.10 when it is `COMPOSTED` and 0.30 when it is `LIME_STABILIZED`. Then `plant_available_n_lb_per_dry_ton` is the sum of three terms — the batch's `nh4_n_mg_kg` multiplied by the volatilization factor, plus its `organic_n_mg_kg` multiplied by the mineralization factor, plus its `nitrate_n_mg_kg` unmodified — the whole multiplied by 0.002 and rounded to 4 decimal places. These four nutrient inputs are the batch fields supplied at batch creation; they are **not** laboratory results, which carry only the ten regulated analytes. When the rounded value is 0 or negative the request is refused with `ERR_AGRONOMIC_RATE_UNDEFINED`.
+
+**Step 2 — the nitrogen-limited rate.** The first candidate is the site's `crop_n_demand_lb_per_acre` divided by `plant_available_n_lb_per_dry_ton`.
+
+**Step 3 — the phosphorus-limited rate, tiered on the soil index.** When the site's `soil_p_index` is at or above 100 the request is refused outright with `ERR_PHOSPHORUS_INDEX_BLOCK`. When it is at or above 75 but below 100, the second candidate is the site's `crop_p_removal_lb_per_acre` divided by the product of the batch's `total_p_mg_kg` and 0.002. Below 75 the second candidate is the sentinel 9999.0, which in practice is never the minimum.
+
+**Step 4 — the APLR-limited rate.** For each analyte that has both a non-null `aplr_kg_per_hectare_yr` on its `ACTIVE` limit row and a laboratory result on this batch in the batch's current sampling round, taken in ascending analyte-name order for deterministic reporting: let the remaining annual headroom be `aplr_kg_per_hectare_yr` minus the site's `annual_loading_kg_per_hectare` entry for the key formed from the calendar year of `window_start` and that analyte name, treating an absent key as 0; let the per-unit loading be that analyte's `concentration_mg_kg` multiplied by 0.000001, multiplied by 907.185, divided by 0.404686; and let that analyte's candidate rate be the headroom divided by the per-unit loading. The third candidate is the minimum of those per-analyte rates. When the qualifying set is empty — no analyte carries an APLR, or none has a current-round result — the third candidate is 9999.0. The minimum value itself is order-independent; the ascending order matters only for reporting.
+
+**Step 5 — the agreement cap.** The fourth candidate is the agreement's `max_dry_tons_per_acre`.
+
+**Step 6 — one rounding, and a fixed tie order.** The four candidates are considered in the literal order `NITROGEN`, `PHOSPHORUS`, `APLR`, `AGREEMENT`. `binding_rate_constraint` is the **first** of them whose value equals the minimum, so nitrogen wins any tie, then phosphorus, then the APLR rate, then the agreement cap. `agronomic_rate_cap_dry_tons_per_acre` is that minimum rounded to 2 decimal places. There is **no intermediate rounding**: all four candidate rates are carried at full precision into the minimum, and only the winner is rounded, exactly once.
+
+**Step 7 — the acceptance test.** `requested_rate_dry_tons_per_acre` is `planned_dry_tons` divided by `acres_treated`, rounded to 2 decimal places. When it is strictly greater than `agronomic_rate_cap_dry_tons_per_acre` the request is refused with `ERR_AGRONOMIC_RATE_EXCEEDED`; equality is accepted. Both sides of that comparison are the rounded values.
+
+**The loading headroom projection.** Once the rate cap has passed, the request is screened against both loading limits using the increment the ledger will actually write. For each analyte with a non-null `cplr_kg_per_hectare` and a current-round result, in ascending analyte-name order, the projected cumulative figure is the site's current `cumulative_loading_kg_per_hectare` for that analyte — 0 when absent — plus the rounded product of `requested_rate_dry_tons_per_acre`, that analyte's `concentration_mg_kg`, 0.000001 and 907.185, divided by 0.404686, that increment rounded to 4 decimal places. Strictly greater than the limit is `ERR_CPLR_HEADROOM_EXCEEDED`; equality passes. The same increment is then projected against the annual key for the year of `window_start` for each analyte with a non-null `aplr_kg_per_hectare_yr`; strictly greater than that limit is `ERR_APLR_EXCEEDED`, and equality passes. Events in status `CANCELLED`, `VOIDED` or `DEFERRED` contribute nothing to either figure, because none of them ever wrote a ledger row — a deferred event holds a tonnage reservation but no loading.
+
+**The method-conditional setbacks.** Independently of the baseline siting screen, the placement method demands its own clearances: `SURFACE` requires the site's `setback_to_surface_water_ft` to be at or above 100 **and** `slope_pct` to be at or below 15.0; `INCORPORATED` requires `setback_to_surface_water_ft` at or above 66; `INJECTED` requires `setback_to_surface_water_ft` at or above 33; and every method requires `setback_to_well_ft` at or above 100. Any failure is `ERR_SETBACK_VIOLATION`.
+
+**Success.** The event is created in `SCHEDULED` with `version` 1, `applied_dry_tons` 0.000, `applied_wet_tons` 0.00, `reserved_dry_tons` equal to `planned_dry_tons`, and `hold_reason` and `defer_reason` null. Creation moves `planned_dry_tons` out of the batch's `unallocated_dry_tons` into its reserved column, re-derives the batch's `disposition` and increments the batch's `version` by 1. **No ledger entry is written at scheduling time**: a reservation consumes tonnage, not loading headroom. `agronomic_rate_cap_dry_tons_per_acre`, `binding_rate_constraint` and `plant_available_n_lb_per_dry_ton` are pinned onto the event at this moment and are not silently refreshed afterwards.
+
+**Rescheduling.** An `Agronomist` may move an event that is `SCHEDULED`, `WEATHER_HOLD` or `DEFERRED` to a new window, supplying `window_start` and `window_end` and optionally revising `application_method`, `acres_treated`, `planned_dry_tons` and `incorporation_within_hours`. Any other status is `ERR_EVENT_NOT_SCHEDULED`. Rescheduling re-runs the site-permitted and agreement-active preconditions and then the whole scheduling screen from the site-restricted check onward — setbacks, odor gate, phosphorus block, window overlap, reapplication interval, agreement term coverage, crop cycle, notice period, acreage, the rate cap and both loading projections, and the unallocated-tonnage check when the tonnage changed. It deliberately does **not** re-check the batch's qualification, the facility posture, the agreement-site match, or the site's weather clearance. Success sets `status` `SCHEDULED`, writes the new window and any revised values, clears both `hold_reason` and `defer_reason` to null, re-derives every rate field against current site and agreement data, and increments the event's `version` by 1. A change in `planned_dry_tons` adjusts the batch's reserved and unallocated columns by the delta, re-derives `disposition` and increments the batch's `version` by 1. In the window-overlap and reapplication-interval comparisons the event being rescheduled is excluded from its own comparison set.
+
+**Cancelling.** An `Agronomist` or a `ComplianceOfficer` may abandon an event that never reached the field, from `SCHEDULED`, `WEATHER_HOLD` or `DEFERRED`; any other status is `ERR_EVENT_NOT_SCHEDULED`. It sets `status` `CANCELLED`, sets `reserved_dry_tons` to 0, returns `planned_dry_tons` to the batch's `unallocated_dry_tons`, re-derives the batch's `disposition` and increments both the event's and the batch's `version` by 1. No ledger entry is written or reversed, because none was ever posted.
+
+Events are readable individually and as a list ordered by `window_start` then `created_at`, filtered by `site_id`, `batch_id`, `agreement_id` and `status`, by the `Agronomist`, `ComplianceOfficer`, `FacilityOperator` and `Farmer`.
+
+### 3.8. Field Execution: Weather, Haul Tickets, Close-Out and the Loading Cascade
+
+**Weather observations.** A `FacilityOperator`, `Agronomist` or `ComplianceOfficer` may post the current weather observation for a site with `site_id`, `rainfall_in_24h`, `forecast_rainfall_in_48h` and `frozen_ground`; `observed_at` is optional and defaults to the logical clock. The observation writes `latest_rainfall_in_24h`, `latest_forecast_rainfall_in_48h`, `latest_frozen_ground` and `latest_weather_observed_at` onto the site, re-derives `weather_clearance_ok` and increments the site's `version` by 1. `weather_clearance_ok` becomes true only when `latest_rainfall_in_24h` is strictly below 0.50 inches **and** `latest_forecast_rainfall_in_48h` is strictly below 1.00 inches **and** `latest_frozen_ground` is false. Posting an observation never moves an application event by itself: a hold is placed or cleared explicitly. The whole site record is returned as the response.
+
+**Weather holds.** A `FacilityOperator` or `Agronomist` may place or clear a hold, supplying `hold_reason`, one of `RAINFALL_24H`, `FORECAST_48H`, `FROZEN_GROUND`, `OPERATOR_JUDGEMENT` or the sentinel `CLEARED`. When `hold_reason` is `CLEARED` the event must be on `WEATHER_HOLD` and the site's `weather_clearance_ok` must be true, otherwise `ERR_WEATHER_RESTRICTION`; the event returns to `SCHEDULED` and `hold_reason` is cleared to null. When `hold_reason` is any of the other four the event must be `SCHEDULED`, and unless the reason is `OPERATOR_JUDGEMENT` the site's `weather_clearance_ok` must be false — a weather-driven hold on a field that currently has clearance is `ERR_WEATHER_RESTRICTION`. Either direction increments the event's `version` by 1 and leaves `reserved_dry_tons` untouched. An event in any other status is `ERR_EVENT_NOT_SCHEDULED`.
+
+**Starting.** Only a `FacilityOperator` may begin field application, moving `SCHEDULED` to `IN_PROGRESS`; any other status is `ERR_EVENT_NOT_SCHEDULED`. This is the last gate at which live conditions are re-verified, and all of them are checked: the site must be `PERMITTED` and not `RESTRICTED`, the agreement must be `ACTIVE`, the batch's `quality_status` must be `QUALIFIED`, the logical clock must lie inside the half-open window from `window_start` inclusive to `window_end` exclusive (otherwise `ERR_OUTSIDE_APPLICATION_WINDOW`), and the site's `weather_clearance_ok` must be true (otherwise `ERR_WEATHER_RESTRICTION`). Success increments the event's `version` by 1 and changes nothing else.
+
+**Haul tickets.** A `FacilityOperator` records one truck movement against an `IN_PROGRESS` event with `truck_id` (1 to 32 characters), `wet_tons` (greater than 0, 2 decimal places), `depart_at` and `return_at` (strictly after `depart_at`); `odometer_miles` is optional and defaults to 0.0. An event in any other status is `ERR_EVENT_NOT_IN_PROGRESS`. Loadout bay occupancy is a **closed** interval from `depart_at` to `return_at` inclusive, so two tickets that merely touch at an endpoint **do** occupy a bay at the same instant. The count of existing tickets across the whole facility whose closed interval shares any instant with the requested interval must be strictly less than the facility's `loadout_bay_count`, otherwise `ERR_LOADOUT_BAY_CAPACITY`. A haul ticket carries only `id` and `created_at` beyond its own fields, and it is a record of movement only: creating one moves no tonnage, no loading and no storage figure. Tickets are readable as a per-event collection filterable by `truck_id`, as a cross-event collection filterable by `event_id` and `truck_id`, and individually by `ticketId`; both collections are ordered by `depart_at` then `created_at`.
+
+**Close-out and the four-hop loading cascade.** Only a `ComplianceOfficer` may close out an `IN_PROGRESS` event; any other status is `ERR_EVENT_NOT_IN_PROGRESS`. The request optionally carries `applied_dry_tons`, which defaults to the event's `planned_dry_tons`, and optionally `incorporation_within_hours`, which overwrites the value on the event when supplied. `applied_wet_tons` is not an input: it is the sum of this event's haul tickets' `wet_tons` at the moment of close-out, so at least one ticket must exist, otherwise `ERR_NO_HAUL_TICKET`. `applied_dry_tons` must be strictly greater than 0 and at most `planned_dry_tons`, otherwise `ERR_APPLIED_TONS_INVALID`. The closing officer's `X-User-ID` must differ from the batch's `certified_by_user_id`, otherwise `ERR_SEGREGATION_OF_DUTIES`. The site must not be `RESTRICTED`, otherwise `ERR_SITE_RESTRICTED`. The batch's deferred vector option, if any, is demonstrated here per §3.3.
+
+- *Hop 1.* `status` becomes `COMPLETED`, `applied_dry_tons` and `applied_wet_tons` are written, `completed_by_user_id` is set to the calling `X-User-ID`, `reserved_dry_tons` is set to 0, the batch's `disposition` is re-derived from the conserved balance of §2.9, and both the event's and the batch's `version` are incremented by 1.
+- *Hop 2.* Caused by hop 1: one ledger entry with `entry_type` `APPLICATION` is written per analyte having a current-round laboratory result on the batch, each with `kg_per_hectare_delta` rounded to 4 decimal places and `applied_year` taken from the calendar year of `window_start`, exactly as §2.10 prescribes.
+- *Hop 3.* Caused by hop 2: the site's `cumulative_loading_kg_per_hectare` and `annual_loading_kg_per_hectare` are re-summed from the ledger and the site's `version` is incremented by 1.
+- *Hop 4.* Caused by hop 3: when any analyte's cumulative loading has reached 0.90 multiplied by that analyte's `cplr_kg_per_hectare`, the site moves `PERMITTED` to `RESTRICTED` with `restriction_reason` `CPLR_HEADROOM_LOW`, and every **sibling** application event on that site whose `status` is `SCHEDULED` or `WEATHER_HOLD` moves to `DEFERRED` with `defer_reason` `SITE_RESTRICTED`, each incrementing its own `version` by 1 and each retaining its `reserved_dry_tons`.
+
+Close-out also debits storage: `applied_wet_tons` is subtracted from the facility's `storage_used_wet_tons`, `storage_utilization_pct` and `posture` are re-derived, and the facility's `version` is incremented by 1. Finally, the site's `pfas_advisory_flag` is recomputed from the batch's `PFOS` result, becoming true when that result has `advisory_exceeded` true.
+
+Note the accounting subtlety at hop 1: the batch's `unallocated_dry_tons` is **not** reduced again here. The tonnage was already removed from the unallocated pool at scheduling time; close-out only moves it from the reserved column to the applied column. When `applied_dry_tons` is less than `planned_dry_tons`, the difference returns to `unallocated_dry_tons` as a direct consequence of the definitions in §2.9, since the reservation ends and only the smaller applied figure is subtracted.
+
+### 3.9. Voiding a Completed Application
+
+A `ComplianceOfficer` may void a `COMPLETED` event as a compensating reversal; any other status is `ERR_EVENT_NOT_COMPLETED`. It is refused with `ERR_REPORTING_PERIOD_LOCKED` once the reporting year containing `window_start` has an annual report for that facility in status `SUBMITTED` or `AMENDED`. Amending a report does not unlock the year — amendment recomputes the figures but the year stays closed to voids.
+
+The void restores every conserved quantity to its exact pre-close-out value:
+
+- *Hop 1.* One ledger entry with `entry_type` `REVERSAL` is written for each `APPLICATION` entry of this event, in the same ascending analyte order, each with `reversal_of_id` naming the entry it offsets and `kg_per_hectare_delta` the exact negation of that entry's rounded delta.
+- *Hop 2.* Caused by hop 1: the site's two loading maps are re-summed from the ledger, returning them to their exact pre-close-out values, and the site's `version` is incremented by 1.
+- *Hop 3.* Caused by hop 2: when the site is `RESTRICTED` with `restriction_reason` `CPLR_HEADROOM_LOW` and the re-sum drops **every** analyte back strictly below 0.90 of its `cplr_kg_per_hectare`, the site returns `RESTRICTED` to `PERMITTED` and `restriction_reason` is cleared to null. Sibling events that were deferred are **not** auto-rescheduled. A restriction whose reason is `ODOR_RISK_HIGH` or `OFFICER_ORDER` is never lifted by a void.
+
+The void also sets `status` `VOIDED` and `voided_at` to the logical clock, returns `applied_dry_tons` to the batch's `unallocated_dry_tons`, re-derives the batch's `disposition`, and increments both the event's and the batch's `version` by 1. `applied_dry_tons` and `applied_wet_tons` are **retained** on the row for the audit trail; they stop counting only because the `VOIDED` status no longer matches the `COMPLETED` filters in §2.9. Finally `applied_wet_tons` is added back to the facility's `storage_used_wet_tons`, `storage_utilization_pct` and `posture` are re-derived, and the facility's `version` is incremented by 1.
+
+### 3.10. Diverting Solids to an Alternative Outlet
+
+An alternative outlet is a non-land destination for solids: a compost facility, a landfill or a thermal processing plant. A `FacilityOperator` or `ComplianceOfficer` registers one with `name` (1 to 120 characters), `outlet_type` (one of `COMPOST`, `LANDFILL`, `THERMAL`), `gate_fee_per_wet_ton` (at or above 0, 2 decimal places), `haul_rate_per_mile_per_wet_ton` (at or above 0, 4 decimal places), `min_load_wet_tons` (at or above 0, 2 decimal places) and `max_annual_wet_tons` (greater than 0); `min_percent_solids` is optional, defaults to 0.0, and must be at or above 0 and below 100. An outlet is created with `status` `ACCEPTING`, `ytd_accepted_wet_tons` 0.00 and `version` 1. A `ComplianceOfficer` may move an outlet between `ACCEPTING`, `SUSPENDED` and `CLOSED` by supplying the new `status`; suspending or closing an outlet leaves already-committed orders alone and blocks only new commits. `ytd_accepted_wet_tons` is the sum of `wet_tons` over this outlet's diversion orders whose `status` is `COMMITTED` or `SETTLED` in the calendar year of the logical clock, to 2 decimal places.
+
+Only a `FacilityOperator` may draft a diversion order, supplying `batch_id`, `outlet_id`, `expected_batch_version`, `dry_tons` (greater than 0, 3 decimal places), `wet_tons` (greater than 0, 2 decimal places) and `haul_miles` (greater than 0, 1 decimal place). The stale-read rule of §2.6 applies, and `dry_tons` must be at most the batch's `unallocated_dry_tons`, otherwise `ERR_INSUFFICIENT_UNALLOCATED_TONS`; equality is accepted. A batch whose `quality_status` is `REJECTED` may still be diverted — a landfill or a thermal outlet is exactly the destination for it — and no batch qualification, site status or agreement is involved at any point in this workflow.
+
+The order is created in `DRAFT` with `version` 1 and its whole cost breakdown derived and frozen. Drafting immediately consumes batch tonnage: `unallocated_dry_tons` drops by `dry_tons`, the batch's `disposition` is re-derived and the batch's `version` is incremented by 1.
+
+**The cost breakdown, six pinned steps.** The surcharge tier is keyed on the subtotal and the subtotal is a component of the total, so the dependency looks circular and the evaluation order is pinned to exactly these steps:
+
+1. `processing_cost` is `wet_tons` multiplied by the outlet's `gate_fee_per_wet_ton`, rounded to 2 decimal places.
+2. `hauling_cost` is `haul_miles` multiplied by `wet_tons`, multiplied by the outlet's `haul_rate_per_mile_per_wet_ton`, multiplied by the fuel escalator 1.08, rounded to 2 decimal places. The escalator applies to hauling **only** and never to the gate fee.
+3. `subtotal_cost` is the sum of those two **already-rounded** components, rounded to 2 decimal places.
+4. `surcharge_pct` is looked up from `subtotal_cost` with inclusive lower bounds: 0.05 when `subtotal_cost` is at or above 10000.00, otherwise 0.03 when it is at or above 2000.00, otherwise 0.00.
+5. `surcharge_cost` is `subtotal_cost` multiplied by `surcharge_pct`, rounded to 2 decimal places.
+6. `total_cost` is `subtotal_cost` plus `surcharge_cost`, rounded to 2 decimal places, and `cost_per_dry_ton` is `total_cost` divided by `dry_tons`, rounded to 2 decimal places.
+
+Computing the surcharge from an unrounded sum of processing and hauling, or applying the escalator to the gate fee, yields different cents and is wrong.
+
+**Committing** an order moves `DRAFT` to `COMMITTED` and may be done by a `FacilityOperator` or a `ComplianceOfficer`; any other status is `ERR_ORDER_INVALID_STATE`. Tonnage was already consumed at draft time, so commit is where the acceptance criteria bite: the outlet must be `ACCEPTING` (otherwise `ERR_OUTLET_NOT_ACCEPTING`), `wet_tons` must be at least the outlet's `min_load_wet_tons` and the batch's `percent_solids` must be at least the outlet's `min_percent_solids` (otherwise `ERR_OUTLET_ACCEPTANCE_CRITERIA`), and `ytd_accepted_wet_tons` plus this order's `wet_tons` must be at most `max_annual_wet_tons` (otherwise `ERR_OUTLET_ANNUAL_CAP_EXCEEDED`; equality is accepted). Success sets `committed_at` to the logical clock, increments the order's `version` by 1, adds `wet_tons` to the outlet's `ytd_accepted_wet_tons` and increments the outlet's `version` by 1. Batch tonnage is unchanged. Costs are not recomputed at commit — they were frozen at draft.
+
+**Settling** moves `COMMITTED` to `SETTLED` and may be done by a `FacilityOperator` or a `ComplianceOfficer`. It sets `settled_at` to the logical clock, increments the order's `version` by 1, and — this is the only point at which a diversion touches storage — subtracts `wet_tons` from the facility's `storage_used_wet_tons`, re-derives `storage_utilization_pct` and `posture`, which can move the posture from `RESTRICTED` back to `OPEN`, and increments the facility's `version` by 1.
+
+**Voiding** is a `ComplianceOfficer` action from `DRAFT` or `COMMITTED`, requiring a `void_reason`; from `SETTLED` or `VOIDED` it is `ERR_ORDER_INVALID_STATE`. It sets `status` `VOIDED` and `void_reason`, increments the order's `version` by 1, returns `dry_tons` to the batch's `unallocated_dry_tons`, re-derives the batch's `disposition` and increments the batch's `version` by 1. From `COMMITTED` only, it also subtracts `wet_tons` from the outlet's `ytd_accepted_wet_tons` and increments the outlet's `version` by 1. Storage is untouched in both branches, because a committed order never debited it.
+
+**The cost comparison read** re-runs the six cost steps for every outlet whose `status` is `ACCEPTING`, using this order's own `wet_tons`, `dry_tons` and `haul_miles` for each candidate. The response carries `order_id`, `batch_id`, `dry_tons`, `wet_tons`, `recommended_outlet_id` and `options`; each option in `options` carries the candidate outlet's identifier, name and `outlet_type` together with the full breakdown `processing_cost`, `hauling_cost`, `subtotal_cost`, `surcharge_pct`, `surcharge_cost`, `total_cost` and `cost_per_dry_ton`. Options are sorted by `cost_per_dry_ton` ascending with ties broken by the outlet's `created_at` ascending, and `recommended_outlet_id` is the identifier of the first option after that sort. When no outlet is `ACCEPTING`, `options` is empty and `recommended_outlet_id` is null.
+
+Outlets are readable individually and as a list filtered by `outlet_type` and `status`; orders are readable individually and as a list filtered by `batch_id`, `outlet_id` and `status`.
+
+### 3.11. Odor Complaints and the Two Risk Score Variants
+
+A `PublicLiaison` or a `FacilityOperator` logs a complaint with `facility_id`, `received_at` and `severity` (one of `LOW`, `MODERATE`, `SEVERE`); `site_id`, `description` (1 to 500 characters) and `complainant_contact` (1 to 120 characters) are optional. A complaint with no `site_id` names the plant only and never scores any field. Complaints are created in `RECEIVED` with `version` 1, `resolution_action` null and `resolved_at` null.
+
+The lifecycle is `RECEIVED`, `INVESTIGATING`, then one of the two divergent outcomes `SUBSTANTIATED` or `UNSUBSTANTIATED`, then the terminal `CLOSED`. A transition the machine does not allow is `ERR_COMPLAINT_INVALID_STATE`: investigation only from `RECEIVED`, resolution only from `INVESTIGATING`, and closure only from `SUBSTANTIATED` or `UNSUBSTANTIATED`.
+
+**The two scores.** Each site carries two odor risk scores computed from the complaints naming it. Let the severity weight be 1 for `LOW`, 3 for `MODERATE` and 7 for `SEVERE`, and let the window be the 365 days ending at the logical clock, with `received_at` at or after the logical clock minus 365 days as an inclusive lower bound. Treat a complaint as being in the substantiated set when its `status` is `SUBSTANTIATED`, or when its `status` is `CLOSED` and its `resolution_action` is anything other than `NONE` — closing a substantiated complaint is a records action and keeps it inside the window.
+
+- `odor_risk_score_historical` is the sum of severity weights over the substantiated set for this site within the window, multiplied by 4.0, clamped to at most 100.0 by taking the minimum of 100.0 and that product, and then rounded to 2 decimal places. It ignores the PFAS advisory entirely.
+- `odor_risk_score_precautionary` is the sum of severity weights over the substantiated set **plus** every complaint whose `status` is `RECEIVED` or `INVESTIGATING`, again within the window, multiplied by 4.0, multiplied by 1.5 when the site's `pfas_advisory_flag` is true and by 1.0 otherwise, clamped by the same minimum against 100.0, and rounded to 2 decimal places.
+
+Complaints whose `status` is `UNSUBSTANTIATED` are excluded from **both** variants — an investigation that found nothing removes the complaint from the precautionary queue as well. The only structural differences between the variants are that open complaints count at full weight in the precautionary one, and that the PFAS multiplier applies to the precautionary one alone. The precautionary score is therefore never lower than the historical score.
+
+`gating_risk_score` is `odor_risk_score_precautionary` when the site's `nearest_residence_ft` is strictly below 1500 feet, and `odor_risk_score_historical` otherwise. It is the only one of the three that gates anything: at or above 60.00 it refuses application scheduling and rescheduling with `ERR_ODOR_RISK_BLOCK`, and strictly below 60.00 it is a precondition of reinstating a restricted site. The comparison uses the rounded value.
+
+**When the scores are recomputed.** Logging a complaint that names a site, and opening an investigation on one, both re-derive that site's `odor_risk_score_precautionary` and `gating_risk_score` and increment the site's `version` by 1 — a queue of unresolved complaints near a dwelling can therefore block scheduling before any investigation concludes. `odor_risk_score_historical` is unchanged by either, because neither has entered the substantiated set. Setting the logical clock re-derives all three scores for every site, because the 365-day window has moved.
+
+**Resolution** is a `ComplianceOfficer` action on an `INVESTIGATING` complaint, carrying `outcome` (either `SUBSTANTIATED` or `UNSUBSTANTIATED`), an optional `investigation_note` and an optional `resolution_action` which is one of `NONE`, `PUBLIC_NOTICE`, `OPERATIONAL_CHANGE` or `SITE_RESTRICTION` and defaults to `NONE`. Both branches set `status` from the outcome, set `resolved_at` to the logical clock, record the note, and increment the complaint's `version` by 1. The branches then diverge sharply:
+
+- `SUBSTANTIATED` re-derives all three of the named site's scores and increments the site's `version` by 1; recounts the facility's `substantiated_complaint_count_30d` over the 30 days ending at the logical clock, re-derives the facility's `posture` — which becomes `RESTRICTED` at a count of 3 or more, subject to the top-down ordering of §2.8 — and increments the facility's `version` by 1; and, when `resolution_action` is `SITE_RESTRICTION` and the named site is `PERMITTED`, restricts the site with `restriction_reason` `ODOR_RISK_HIGH` and defers that site's `SCHEDULED` and `WEATHER_HOLD` events with `defer_reason` `ODOR_RISK`, incrementing each event's `version` by 1. A high gating score on its own does **not** restrict the site; only the explicit `SITE_RESTRICTION` action does, though the score continues to block new scheduling regardless.
+- `UNSUBSTANTIATED` forces `resolution_action` to `NONE`, leaves the facility's `substantiated_complaint_count_30d` and `posture` untouched, never cascades to the site's `status`, and re-derives only `odor_risk_score_precautionary` and `gating_risk_score` for the named site — which typically **lowers** them, because the complaint has left the open set without entering the substantiated one. `odor_risk_score_historical` is unchanged.
+
+**Closure** is a `PublicLiaison` or `ComplianceOfficer` action that sets `status` `CLOSED` and increments the complaint's `version` by 1. It reverses none of the substantiation side effects, and a closed substantiated complaint keeps contributing to `odor_risk_score_historical` for the remainder of its 365 days.
+
+Complaints are readable individually and as a list ordered by `received_at` then `created_at`, filtered by `facility_id`, `site_id`, `severity` and `status`.
+
+### 3.12. Annual Reporting and the Reporting Lock
+
+A `ComplianceOfficer` or `PublicLiaison` opens the annual report for one facility and calendar year with `facility_id` and `report_year`; `public_summary` is optional at creation and is a plain-language paragraph of 1 to 1000 characters published for odor and emerging-contaminant questions. A second report for the same facility and year is `ERR_DUPLICATE_RESOURCE` while an existing one is `DRAFT`, `SUBMITTED` or `AMENDED`. A new report is created in `DRAFT` with `amendment_index` 0, `version` 1, `total_dry_tons_land_applied` 0.000, `total_dry_tons_diverted` 0.000, `diverted_dry_tons_by_outlet_type` an empty map, `vsr_compliance_rate_pct` 0.00, `ceiling_exceedance_count` 0 and `sites_reported_count` 0.
+
+**Submission** is a `ComplianceOfficer` action accepted from `DRAFT` and from `AMENDED`; from `SUBMITTED` it is `ERR_REPORT_INVALID_STATE`. It optionally carries `public_summary`, which overwrites the stored narrative when supplied, and the stored narrative must be non-blank by the time the report is submitted, otherwise `ERR_INVALID_REQUEST`. `report_year` must be at or before the calendar year of the logical clock, otherwise `ERR_INVALID_REQUEST`. Submission is refused with `ERR_OPEN_EVENTS_EXIST` while the report year still contains unfinished work of either kind: any application event of this facility whose `window_start` falls in the report year and whose `status` is `SCHEDULED`, `WEATHER_HOLD`, `DEFERRED` or `IN_PROGRESS`, or any solids batch of this facility created in the report year whose `quality_status` is still `PENDING_RESULTS`.
+
+Submission then freezes the rollup, computed as follows with `Y` standing for `report_year`:
+
+- `total_dry_tons_land_applied` is the sum of `applied_dry_tons` over application events whose `status` is `COMPLETED`, whose `window_start` falls in year `Y`, and whose site belongs to this facility, rounded to 3 decimal places. `VOIDED` events are excluded, which is exactly why the void is blocked once a report covering that year exists.
+- `diverted_dry_tons_by_outlet_type` maps each of `COMPOST`, `LANDFILL` and `THERMAL` to the sum of `dry_tons` over diversion orders whose `status` is `SETTLED`, whose `settled_at` falls in year `Y`, whose outlet has that type and whose batch belongs to this facility, each rounded to 3 decimal places.
+- `total_dry_tons_diverted` is the sum of those three values, rounded to 3 decimal places.
+- `vsr_compliance_rate_pct` is derived from the batches of this facility whose `process_status` is `DEWATERED` and whose `created_at` falls in year `Y`. The denominator is the count of those batches and the numerator is the count of them whose `vsr_pct_van_kleeck` is at or above 38.00. When the denominator is 0 the result is 0.00 rather than an error; otherwise it is the numerator divided by the denominator, multiplied by 100 and rounded to 2 decimal places.
+- `ceiling_exceedance_count` is the count of laboratory results with `exceeds_ceiling` true whose batch belongs to this facility and whose `analyzed_at` falls in year `Y`.
+- `sites_reported_count` is the count of distinct `site_id` values over application events whose `status` is `COMPLETED`, whose `window_start` falls in year `Y` and whose site belongs to this facility.
+
+Each line is scoped to the calendar year by the exact timestamp field named on that line — `window_start` for events, `settled_at` for diversions, `created_at` for batches, `analyzed_at` for laboratory results — and by exactly the status filters written. Nothing else is included. Submission sets `status` `SUBMITTED`, `submitted_at` to the logical clock, `submitted_by_user_id` to the calling `X-User-ID`, and increments the report's `version` by 1.
+
+**Amendment** is a `ComplianceOfficer` action accepted from `SUBMITTED` and from `AMENDED`; from `DRAFT` it is `ERR_REPORT_INVALID_STATE`. It optionally carries `public_summary` and an `amendment_reason` recorded for the regulatory file; when `amendment_reason` is supplied it must be non-blank, and its absence is not an error. Amendment recomputes every rollup figure from current data, sets `status` `AMENDED`, increments `amendment_index` by 1, refreshes `submitted_at` to the logical clock and increments the report's `version` by 1. Amendment unlocks nothing: voiding an event in a reported year stays refused with `ERR_REPORTING_PERIOD_LOCKED`.
+
+Reports are readable individually and as a list ordered by `report_year` then `created_at`, filtered by `facility_id`, `report_year` and `status`, by the `ComplianceOfficer`, `PublicLiaison`, `FacilityOperator` and `Agronomist`.
+
+### 3.13. Simulation Controls
+
+Two operations exist so that time-dependent and weather-dependent behaviour is exercisable. Both are ordinary authenticated endpoints subject to priorities 1, 2 and 5 of the ladder.
+
+Setting the logical clock takes a single required field `now`, an ISO 8601 UTC timestamp, and any of the six roles may call it. It returns `now` as accepted together with `expired_agreement_count`, the number of `ACTIVE` agreements moved to `EXPIRED` by the sweep described in §3.6. Its full effects are: the clock is set; the agreement expiry sweep runs; and every site's three odor scores are re-derived because the 365-day window has moved. It deliberately does **not** recount any facility's `substantiated_complaint_count_30d` and therefore does not by itself change any facility's `posture`, even when moving the clock forward would have aged complaints out of the 30-day window.
+
+Posting a weather observation is described in §3.8. It is the only way `weather_clearance_ok` ever changes.
+
+---
+
+## 4. API Endpoints
+
+Every endpoint below is rooted at the prefix `/api/v1`. Creation endpoints return HTTP 201 with the created resource in `data`; every other successful operation returns HTTP 200, and state-transition endpoints return the full updated resource rather than an empty body. The two child collections are addressed under their parent, and every other resource is addressed at the root level even when it has a mandatory parent.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/api/v1/treatment-facilities` | Register a wastewater treatment facility with all derived counters at their zero values and `posture` `OPEN`. | FacilityOperator, ComplianceOfficer |
+| GET | `/api/v1/treatment-facilities/{facilityId}` | Read one facility with its live derived posture and storage figures. | FacilityOperator, ComplianceOfficer, Agronomist, LabAnalyst, PublicLiaison |
+| GET | `/api/v1/treatment-facilities` | List facilities ordered by `created_at` ascending, filterable by `posture`. | FacilityOperator, ComplianceOfficer, Agronomist, LabAnalyst, PublicLiaison |
+| GET | `/api/v1/treatment-facilities/{facilityId}/storage-projection` | Wet-weather storage drawdown projection; `days_of_capacity` is 9999 when the projected 30-day drawdown does not exceed inflow. | FacilityOperator, ComplianceOfficer, Agronomist |
+| POST | `/api/v1/pollutant-limits` | Seed or supersede the regulatory limit row for one analyte. | ComplianceOfficer |
+| GET | `/api/v1/pollutant-limits/{limitId}` | Read one pollutant limit row. | ComplianceOfficer, LabAnalyst, Agronomist, FacilityOperator, PublicLiaison |
+| GET | `/api/v1/pollutant-limits` | List pollutant limits ordered by `analyte` then `created_at`, filterable by `analyte` and `status`. | ComplianceOfficer, LabAnalyst, Agronomist, FacilityOperator, PublicLiaison |
+| POST | `/api/v1/solids-batches` | Create a solids batch entering the train at `THICKENED` with `quality_status` `UNTESTED` and `disposition` `HELD`. | FacilityOperator |
+| GET | `/api/v1/solids-batches/{batchId}` | Read one batch with both volatile solids reduction variants and its live allocation figures. | FacilityOperator, ComplianceOfficer, LabAnalyst, Agronomist |
+| GET | `/api/v1/solids-batches` | List batches ordered by `created_at`, filterable by `facility_id`, `process_status`, `quality_status` and `disposition`. | FacilityOperator, ComplianceOfficer, LabAnalyst, Agronomist |
+| POST | `/api/v1/solids-batches/{batchId}/advance-process` | Advance the process dimension one stage, naming the next stage in `to_status`. | FacilityOperator |
+| POST | `/api/v1/solids-batches/{batchId}/lab-results` | File one analyte result for the batch's current sampling round. | LabAnalyst |
+| GET | `/api/v1/solids-batches/{batchId}/lab-results` | All results for the batch ordered by `sampling_event_index`, then `analyte`, then `created_at`. | LabAnalyst, ComplianceOfficer, FacilityOperator, Agronomist |
+| POST | `/api/v1/solids-batches/{batchId}/certify` | Compliance sign-off moving `quality_status` from `PENDING_RESULTS` to `QUALIFIED`. | ComplianceOfficer |
+| POST | `/api/v1/solids-batches/{batchId}/retest-request` | Reopen a `REJECTED` batch for one more sampling round. | ComplianceOfficer |
+| POST | `/api/v1/land-application-sites` | Register a candidate land application site in `DRAFT`. | Agronomist |
+| GET | `/api/v1/land-application-sites/{siteId}` | Read one site with its loading maps, odor scores and weather clearance. | Agronomist, ComplianceOfficer, FacilityOperator, PublicLiaison, Farmer |
+| GET | `/api/v1/land-application-sites` | List sites ordered by `created_at`, filterable by `facility_id`, `status` and `crop_type`. | Agronomist, ComplianceOfficer, FacilityOperator, PublicLiaison, Farmer |
+| POST | `/api/v1/land-application-sites/{siteId}/submit-permit` | Submit a `DRAFT` site for permit review after the baseline siting screen. | Agronomist |
+| POST | `/api/v1/land-application-sites/{siteId}/permit-decision` | Approve or reject a site under review. | ComplianceOfficer |
+| POST | `/api/v1/land-application-sites/{siteId}/restrict` | Officer-ordered restriction of a `PERMITTED` site. | ComplianceOfficer |
+| POST | `/api/v1/land-application-sites/{siteId}/reinstate` | Lift a restriction once loading headroom and odor risk both allow it. | ComplianceOfficer |
+| POST | `/api/v1/land-application-sites/{siteId}/close` | Permanently retire a site with no open events. | Agronomist, ComplianceOfficer |
+| GET | `/api/v1/land-application-sites/{siteId}/loading-summary` | Cumulative and annual loading with per-analyte headroom and the binding analyte. | Agronomist, ComplianceOfficer, FacilityOperator, PublicLiaison |
+| GET | `/api/v1/loading-ledger-entries/{entryId}` | Read one immutable loading ledger entry. | Agronomist, ComplianceOfficer, FacilityOperator |
+| GET | `/api/v1/loading-ledger-entries` | List ledger entries ordered by `created_at`, filterable by `site_id`, `source_event_id`, `reversal_of_id`, `analyte`, `applied_year` and `entry_type`. | Agronomist, ComplianceOfficer, FacilityOperator |
+| POST | `/api/v1/farmer-agreements` | Draft a land application agreement, guarded by `expected_site_version`. | Agronomist |
+| GET | `/api/v1/farmer-agreements/{agreementId}` | Read one agreement with its negotiation round counter. | Agronomist, ComplianceOfficer, Farmer, FacilityOperator |
+| GET | `/api/v1/farmer-agreements` | List agreements ordered by `created_at`, filterable by `site_id`, `farmer_user_id` and `status`. | Agronomist, ComplianceOfficer, Farmer, FacilityOperator |
+| POST | `/api/v1/farmer-agreements/{agreementId}/propose` | Send a `DRAFT` or `COUNTERED` agreement to the farmer. | Agronomist |
+| POST | `/api/v1/farmer-agreements/{agreementId}/counter` | Farmer counter-offer on a `PROPOSED` agreement, bounded at three rounds. | Farmer |
+| POST | `/api/v1/farmer-agreements/{agreementId}/sign` | Farmer acceptance of a `PROPOSED` agreement. | Farmer |
+| POST | `/api/v1/farmer-agreements/{agreementId}/activate` | Bring a `SIGNED` agreement into force with no overlapping active term. | Agronomist |
+| POST | `/api/v1/farmer-agreements/{agreementId}/withdraw` | Abandon a negotiation before signature. | Agronomist |
+| POST | `/api/v1/farmer-agreements/{agreementId}/terminate` | End an `ACTIVE` agreement early; either party may act. | Agronomist, Farmer |
+| POST | `/api/v1/application-events` | Schedule a land application, deriving the agronomic rate cap and screening the full ladder. | Agronomist |
+| GET | `/api/v1/application-events/{eventId}` | Read one event with its derived rate figures and binding constraint. | Agronomist, ComplianceOfficer, FacilityOperator, Farmer |
+| GET | `/api/v1/application-events` | List events ordered by `window_start` then `created_at`, filterable by `site_id`, `batch_id`, `agreement_id` and `status`. | Agronomist, ComplianceOfficer, FacilityOperator, Farmer |
+| POST | `/api/v1/application-events/{eventId}/weather-hold` | Place a weather hold, or clear it back to `SCHEDULED` with `hold_reason` `CLEARED`. | Agronomist, FacilityOperator |
+| POST | `/api/v1/application-events/{eventId}/reschedule` | Move a pre-field event to a new window, re-running the scheduling screen. | Agronomist |
+| POST | `/api/v1/application-events/{eventId}/start` | Begin field application inside the half-open window. | FacilityOperator |
+| POST | `/api/v1/application-events/{eventId}/complete` | Close out an event and post its metal loading to the ledger. | ComplianceOfficer |
+| POST | `/api/v1/application-events/{eventId}/cancel` | Abandon an event that never reached the field. | Agronomist, ComplianceOfficer |
+| POST | `/api/v1/application-events/{eventId}/void` | Compensating reversal of a `COMPLETED` event. | ComplianceOfficer |
+| POST | `/api/v1/application-events/{eventId}/haul-tickets` | Record one truck movement against an `IN_PROGRESS` event. | FacilityOperator |
+| GET | `/api/v1/application-events/{eventId}/haul-tickets` | All tickets for the event ordered by `depart_at` then `created_at`, filterable by `truck_id`. | FacilityOperator, ComplianceOfficer, Agronomist |
+| POST | `/api/v1/alternative-outlets` | Register a non-land outlet in `ACCEPTING`. | FacilityOperator, ComplianceOfficer |
+| GET | `/api/v1/alternative-outlets/{outletId}` | Read one outlet with its year-to-date accepted tonnage. | FacilityOperator, ComplianceOfficer, Agronomist, PublicLiaison |
+| GET | `/api/v1/alternative-outlets` | List outlets ordered by `created_at`, filterable by `outlet_type` and `status`. | FacilityOperator, ComplianceOfficer, Agronomist, PublicLiaison |
+| POST | `/api/v1/alternative-outlets/{outletId}/set-status` | Move an outlet between `ACCEPTING`, `SUSPENDED` and `CLOSED`. | ComplianceOfficer |
+| POST | `/api/v1/diversion-orders` | Draft a diversion of batch tonnage, guarded by `expected_batch_version`. | FacilityOperator |
+| GET | `/api/v1/diversion-orders/{orderId}` | Read one order with its frozen cost breakdown. | FacilityOperator, ComplianceOfficer, PublicLiaison |
+| GET | `/api/v1/diversion-orders` | List orders ordered by `created_at`, filterable by `batch_id`, `outlet_id` and `status`. | FacilityOperator, ComplianceOfficer, PublicLiaison |
+| POST | `/api/v1/diversion-orders/{orderId}/commit` | Commit a `DRAFT` order against the outlet's acceptance criteria and annual cap. | FacilityOperator, ComplianceOfficer |
+| POST | `/api/v1/diversion-orders/{orderId}/settle` | Record final settlement, the only point at which a diversion debits storage. | FacilityOperator, ComplianceOfficer |
+| POST | `/api/v1/diversion-orders/{orderId}/void` | Void a `DRAFT` or `COMMITTED` order, returning every quantity it consumed. | ComplianceOfficer |
+| GET | `/api/v1/diversion-orders/{orderId}/cost-comparison` | Cost comparison across every `ACCEPTING` outlet with a recommendation. | FacilityOperator, ComplianceOfficer |
+| POST | `/api/v1/odor-complaints` | Log a public odor complaint, optionally attributed to a site. | PublicLiaison, FacilityOperator |
+| GET | `/api/v1/odor-complaints/{complaintId}` | Read one odor complaint. | PublicLiaison, ComplianceOfficer, FacilityOperator, Agronomist |
+| GET | `/api/v1/odor-complaints` | List complaints ordered by `received_at` then `created_at`, filterable by `facility_id`, `site_id`, `severity` and `status`. | PublicLiaison, ComplianceOfficer, FacilityOperator, Agronomist |
+| POST | `/api/v1/odor-complaints/{complaintId}/investigate` | Open an investigation on a `RECEIVED` complaint. | ComplianceOfficer, PublicLiaison |
+| POST | `/api/v1/odor-complaints/{complaintId}/resolve` | Record the investigation outcome on an `INVESTIGATING` complaint. | ComplianceOfficer |
+| POST | `/api/v1/odor-complaints/{complaintId}/close` | Close a resolved complaint. | PublicLiaison, ComplianceOfficer |
+| POST | `/api/v1/annual-reports` | Open the annual biosolids report for one facility and year in `DRAFT`. | ComplianceOfficer, PublicLiaison |
+| GET | `/api/v1/annual-reports/{reportId}` | Read one annual report with its rollup figures. | ComplianceOfficer, PublicLiaison, FacilityOperator, Agronomist |
+| GET | `/api/v1/annual-reports` | List reports ordered by `report_year` then `created_at`, filterable by `facility_id`, `report_year` and `status`. | ComplianceOfficer, PublicLiaison, FacilityOperator, Agronomist |
+| POST | `/api/v1/annual-reports/{reportId}/submit` | Freeze the year's rollup and lock the year against event voids. | ComplianceOfficer |
+| POST | `/api/v1/annual-reports/{reportId}/amend` | Recompute the rollup from current data and increment `amendment_index`. | ComplianceOfficer |
+| GET | `/api/v1/lab-results/{resultId}` | Read one laboratory result row directly. | LabAnalyst, ComplianceOfficer, FacilityOperator, Agronomist |
+| GET | `/api/v1/lab-results` | List results across batches ordered by `created_at`, filterable by `batch_id`, `analyte`, `sampling_event_index` and `exceeds_ceiling`. | LabAnalyst, ComplianceOfficer, FacilityOperator, Agronomist |
+| GET | `/api/v1/haul-tickets/{ticketId}` | Read one haul ticket directly. | FacilityOperator, ComplianceOfficer, Agronomist |
+| GET | `/api/v1/haul-tickets` | List tickets across events ordered by `depart_at` then `created_at`, filterable by `event_id` and `truck_id`. | FacilityOperator, ComplianceOfficer, Agronomist |
+| POST | `/api/v1/_clock/set_current_utc` | Set the logical clock and run the agreement expiry sweep. | FacilityOperator, ComplianceOfficer, Agronomist, LabAnalyst, Farmer, PublicLiaison |
+| POST | `/api/v1/_weather/observations` | Post the current weather observation for a site and re-derive its clearance. | FacilityOperator, Agronomist, ComplianceOfficer |
+
+---
+
+## 5. Error Codes
+
+Every failure response carries the envelope of §2.2 with one of the identifiers below in `error.code`. The status code for a given identifier is fixed and never varies by endpoint; where several identifiers could apply to one request, the ladder of §2.7 decides which one is returned.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_ACTOR_NOT_PARTY` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_FACILITY_NOT_FOUND` | 404 |
+| `ERR_BATCH_NOT_FOUND` | 404 |
+| `ERR_SITE_NOT_FOUND` | 404 |
+| `ERR_AGREEMENT_NOT_FOUND` | 404 |
+| `ERR_EVENT_NOT_FOUND` | 404 |
+| `ERR_OUTLET_NOT_FOUND` | 404 |
+| `ERR_ORDER_NOT_FOUND` | 404 |
+| `ERR_COMPLAINT_NOT_FOUND` | 404 |
+| `ERR_REPORT_NOT_FOUND` | 404 |
+| `ERR_LEDGER_ENTRY_NOT_FOUND` | 404 |
+| `ERR_LAB_RESULT_NOT_FOUND` | 404 |
+| `ERR_HAUL_TICKET_NOT_FOUND` | 404 |
+| `ERR_LIMIT_NOT_FOUND` | 404 |
+| `ERR_STALE_SITE_VERSION` | 412 |
+| `ERR_STALE_BATCH_VERSION` | 412 |
+| `ERR_INVALID_PROCESS_TRANSITION` | 409 |
+| `ERR_INVALID_QUALITY_TRANSITION` | 409 |
+| `ERR_RETEST_LIMIT_REACHED` | 409 |
+| `ERR_SITE_INVALID_STATE` | 409 |
+| `ERR_AGREEMENT_INVALID_STATE` | 409 |
+| `ERR_AGREEMENT_ROUND_LIMIT` | 409 |
+| `ERR_AGREEMENT_TERM_OVERLAP` | 409 |
+| `ERR_EVENT_NOT_SCHEDULED` | 409 |
+| `ERR_EVENT_NOT_IN_PROGRESS` | 409 |
+| `ERR_EVENT_NOT_COMPLETED` | 409 |
+| `ERR_ORDER_INVALID_STATE` | 409 |
+| `ERR_COMPLAINT_INVALID_STATE` | 409 |
+| `ERR_REPORT_INVALID_STATE` | 409 |
+| `ERR_SITE_NOT_PERMITTED` | 409 |
+| `ERR_AGREEMENT_NOT_ACTIVE` | 409 |
+| `ERR_BATCH_NOT_QUALIFIED` | 409 |
+| `ERR_OUTLET_NOT_ACCEPTING` | 409 |
+| `ERR_FACILITY_FROZEN` | 409 |
+| `ERR_FACILITY_RESTRICTED` | 409 |
+| `ERR_SITE_RESTRICTED` | 409 |
+| `ERR_OPEN_EVENTS_EXIST` | 409 |
+| `ERR_REPORTING_PERIOD_LOCKED` | 409 |
+| `ERR_SITE_WINDOW_CONFLICT` | 409 |
+| `ERR_REAPPLICATION_INTERVAL` | 409 |
+| `ERR_LOADOUT_BAY_CAPACITY` | 409 |
+| `ERR_OUTSIDE_APPLICATION_WINDOW` | 409 |
+| `ERR_DUPLICATE_RESOURCE` | 409 |
+| `ERR_VSR_BELOW_MINIMUM` | 422 |
+| `ERR_VECTOR_OPTION_EVIDENCE_MISSING` | 422 |
+| `ERR_VECTOR_OPTION_METHOD_MISMATCH` | 422 |
+| `ERR_PATHOGEN_CLASS_INSUFFICIENT` | 422 |
+| `ERR_ANALYTE_PANEL_INCOMPLETE` | 422 |
+| `ERR_CEILING_EXCEEDED` | 422 |
+| `ERR_MONTHLY_AVG_EXCEEDED` | 422 |
+| `ERR_SAMPLING_ROUND_MISMATCH` | 422 |
+| `ERR_SETBACK_VIOLATION` | 422 |
+| `ERR_PHOSPHORUS_INDEX_BLOCK` | 422 |
+| `ERR_ODOR_RISK_BLOCK` | 422 |
+| `ERR_WEATHER_RESTRICTION` | 422 |
+| `ERR_CROP_CYCLE_CONFLICT` | 422 |
+| `ERR_NOTICE_PERIOD_NOT_MET` | 422 |
+| `ERR_AGREEMENT_SITE_MISMATCH` | 422 |
+| `ERR_AGREEMENT_TERM_COVERAGE` | 422 |
+| `ERR_ACRES_EXCEED_SITE` | 422 |
+| `ERR_AGRONOMIC_RATE_UNDEFINED` | 422 |
+| `ERR_AGRONOMIC_RATE_EXCEEDED` | 422 |
+| `ERR_CPLR_HEADROOM_EXCEEDED` | 422 |
+| `ERR_APLR_EXCEEDED` | 422 |
+| `ERR_INSUFFICIENT_UNALLOCATED_TONS` | 422 |
+| `ERR_NO_HAUL_TICKET` | 422 |
+| `ERR_APPLIED_TONS_INVALID` | 422 |
+| `ERR_STORAGE_CAPACITY_EXCEEDED` | 422 |
+| `ERR_OUTLET_ACCEPTANCE_CRITERIA` | 422 |
+| `ERR_OUTLET_ANNUAL_CAP_EXCEEDED` | 422 |

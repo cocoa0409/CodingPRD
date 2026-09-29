@@ -1,0 +1,3193 @@
+scenario: |
+  2808. Master Patient Index Duplicate Resolution & Identity Integrity (health system identity integrity team): duplicate detection scoring across demographic attributes with configurable thresholds, potential duplicate work queue triage and manual review evidence, merge, unmerge and overlay correction with downstream system propagation, registration front-end search behavior and duplicate creation prevention, identity fraud detection when a record shows conflicting biometrics or insurance, historical merge audit and clinical data cross-contamination remediation, external identity matching for exchange participation, duplicate rate metrics by registration site
+
+domain_name: master-patient-index-identity-integrity
+api_prefix: "/mpi"
+
+complexity_profile:
+  primary_archetype: graph_constraint
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - cascading_side_effects
+    - dual_variant_calculation
+    - optimistic_concurrency
+    - derived_field_reconciliation
+    - conditional_feature_flags
+
+  entity_topology: graph
+  # PatientRecord is self-referential (survivor_record_id -> PatientRecord.id) and
+  # DuplicateCandidatePair is a many-to-many junction over PatientRecord. Merge
+  # clusters form a star-compressed graph whose transitive closure (enterprise_id
+  # cluster) gates merge, unmerge, remediation-reassignment and external matching.
+
+  state_machine_shape: cyclic
+  # DuplicateCandidatePair cycles RECOMMENDED_MERGE -> UNDER_REVIEW -> RECOMMENDED_MERGE
+  # and RESOLVED_MERGED -> UNDER_REVIEW (via unmerge). PropagationTask cycles
+  # SENT -> FAILED -> SENT. PatientRecord additionally carries two independent
+  # state dimensions (identity_state x integrity_state) on the same row, and
+  # ExternalMatchRequest branches SUBMITTED -> {MATCHED, NO_MATCH}.
+
+  relationship_patterns:
+    - self_referential      # PatientRecord.survivor_record_id -> PatientRecord.id
+    - many_to_many          # DuplicateCandidatePair junction over PatientRecord
+    - polymorphic           # ContaminationRemediation / PropagationTask reference MergeOperation OR OverlayCorrection
+    - one_to_many           # RegistrationSite -> PatientRecord, DuplicateCandidatePair -> ReviewEvidence
+    - cross_aggregate       # SiteDuplicateMetric aggregates MergeOperation across RegistrationSite boundaries
+
+  role_model: segregation_of_duties
+  # The IdentityAnalyst who records a merge recommendation MUST NOT be the
+  # IdentityStewardApprover user who executes it (compared on X-User-ID).
+
+  consistency_model: immediate
+
+difficulty_level: expert
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+global_constants:
+  DEFAULT_CLOCK_UTC: "2026-08-01T00:00:00Z"
+  SCORE_PRECISION_DP: 2
+  SCORE_ROUNDING: round_half_up
+  NULL_CREDIT_FRACTION: 0.25
+  PARTIAL_AGREEMENT_FRACTION: 0.5
+  PREFIX_COMPARE_CHARS: 3
+  MIN_EVIDENCE_COUNT: 2
+  CONTAMINATION_REVIEW_ELEMENT_THRESHOLD: 25
+  REVERSAL_WINDOW_DAYS: 90
+  PROPAGATION_DEADLINE_HOURS_SYNCHRONOUS: 24
+  PROPAGATION_DEADLINE_HOURS_BATCH: 72
+  SEARCH_ATTEMPT_TTL_MINUTES: 15
+  METRIC_MIN_SAMPLE_SIZE: 30
+  BAND_CUTOFF_P1: 85.00
+  BAND_CUTOFF_P2: 70.00
+  BAND_MULTIPLIER_P1: 1.50
+  BAND_MULTIPLIER_P2: 1.00
+  BAND_MULTIPLIER_P3: 0.50
+  FRAUD_AUTO_OPEN_RAW_SCORE_MIN: 70.00
+  FRAUD_CONFLICT_COMPONENT_POINTS: 30.00
+  FRAUD_SCORE_COMPONENT_CAP: 30.00
+  FRAUD_SITE_COMPONENT_PER_FLAGGED_RECORD: 2.00
+  FRAUD_SITE_COMPONENT_CAP: 20.00
+  FRAUD_INSURANCE_COMPONENT_POINTS: 25.00
+  BPS_SCALE: 10000
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: RegistrationSite
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: site_code
+        type: string
+        source: input
+        description: "Short human-readable site code; used verbatim inside PatientRecord.enterprise_id"
+        constraints: "1-12 chars, uppercase letters/digits/hyphen, globally unique; ERR_INVALID_REQUEST on violation"
+      - name: name
+        type: string
+        source: input
+        description: "Display name of the registration site"
+      - name: region_code
+        type: string
+        source: input
+        description: "Geographic region grouping used for metric filtering"
+      - name: registrar_headcount
+        type: integer
+        source: input
+        description: "Number of front-desk registrars staffed at this site"
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: system
+        description: "Site lifecycle; SUSPENDED sites reject new PatientRecord creation"
+        default: ACTIVE
+        constraints: "ACTIVE | SUSPENDED"
+      - name: active_record_count
+        type: integer
+        source: computed
+        description: "Cross-entity count of PatientRecord with site_id == this.id AND identity_state == ACTIVE"
+      - name: flagged_record_count
+        type: integer
+        source: computed
+        description: "Cross-entity count of PatientRecord with site_id == this.id AND identity_state == ACTIVE AND integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}; feeds fraud_risk_score.site_component"
+
+  - name: MatchRuleSet
+    parent: null
+    common_fields: true
+    kind: configuration
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Rule set name"
+      - name: version_label
+        type: string
+        source: input
+        description: "Author-assigned version label, e.g. 'v3.2'"
+      - name: attribute_weights
+        type: object
+        source: input
+        description: "Per-attribute weight map with exactly the keys last_name, first_name, dob, ssn_last4, sex, postal_code, phone"
+        constraints: "each value number >= 0.00; values MUST sum to exactly 100.00 else ERR_WEIGHTS_SUM_INVALID"
+      - name: auto_link_threshold
+        type: number
+        source: input
+        description: "match_score >= this value classifies the pair AUTO_LINK"
+        constraints: "0.00 <= value <= 100.00, 2 dp"
+      - name: review_threshold
+        type: number
+        source: input
+        description: "match_score >= this value (and < auto_link_threshold) classifies the pair POTENTIAL_DUPLICATE"
+        constraints: "0.00 <= value <= auto_link_threshold else ERR_THRESHOLD_ORDER_INVALID"
+      - name: conflict_penalty_points
+        type: number
+        source: input
+        description: "Points subtracted from raw_score per entry in conflict_flags"
+        constraints: "0.00 <= value <= 100.00, 2 dp"
+      - name: status
+        type: enum
+        source: system
+        description: "DRAFT until activated; activating retires the previously ACTIVE rule set"
+        default: DRAFT
+        constraints: "DRAFT | ACTIVE | RETIRED"
+
+  - name: PatientRecord
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: site_id
+        type: string
+        source: input
+        description: "FK -> RegistrationSite.id; the site that registered this record"
+      - name: origin_search_attempt_id
+        type: string
+        source: input
+        description: "FK -> RegistrationSearchAttempt.id; the duplicate-prevention search that preceded creation. Mandatory when the caller role is SiteRegistrar, optional for MpiAdmin bulk/historical load"
+        default: null
+      - name: mrn
+        type: string
+        source: input
+        description: "Medical record number, unique within (site_id, mrn); also the created_at-independent tie-break key for pair-subject selection"
+        constraints: "1-20 chars; (site_id, mrn) unique else ERR_DUPLICATE_MRN"
+      - name: last_name
+        type: string
+        source: input
+        description: "Family name, compared case-insensitively during scoring"
+      - name: first_name
+        type: string
+        source: input
+        description: "Given name, compared case-insensitively during scoring"
+      - name: dob
+        type: string
+        source: input
+        description: "Date of birth as YYYY-MM-DD"
+        constraints: "ISO date; ERR_INVALID_REQUEST if unparseable"
+      - name: sex
+        type: enum
+        source: input
+        description: "Administrative sex"
+        constraints: "M | F | X | U"
+      - name: ssn_last4
+        type: string
+        source: input
+        description: "Last four digits of the national identifier; null when not collected"
+        default: null
+        constraints: "exactly 4 digits when present"
+      - name: address_line
+        type: string
+        source: input
+        description: "Street address line; not scored"
+        default: null
+      - name: postal_code
+        type: string
+        source: input
+        description: "Postal code; scored with 3-character prefix partial credit"
+        default: null
+      - name: phone
+        type: string
+        source: input
+        description: "Contact phone digits; scored exact-match only"
+        default: null
+      - name: biometric_template_hash
+        type: string
+        source: input
+        description: "Opaque hash of the enrolled biometric template; two non-null differing values raise BIOMETRIC_CONFLICT"
+        default: null
+      - name: insurance_member_id
+        type: string
+        source: input
+        description: "Payer member identifier; two non-null differing values raise INSURANCE_CONFLICT"
+        default: null
+      - name: clinical_element_count
+        type: integer
+        source: input
+        description: "Number of clinical elements (encounters, results, documents) filed under this record; conserved across merge/unmerge"
+        default: 0
+        constraints: ">= 0"
+      - name: identity_state
+        type: enum
+        source: system
+        description: "Merge-lifecycle dimension, independent of integrity_state"
+        default: ACTIVE
+        constraints: "ACTIVE | MERGED_SUBSUMED"
+      - name: integrity_state
+        type: enum
+        source: computed
+        description: "Integrity-lifecycle dimension, independent of identity_state; derived by calculations.record_integrity_state_derivation"
+        default: CLEAR
+        constraints: "CLEAR | FRAUD_SUSPECTED | FRAUD_CONFIRMED | REMEDIATION_PENDING"
+      - name: survivor_record_id
+        type: string
+        source: system
+        description: "FK -> PatientRecord.id; self-referential pointer to the surviving record of the merge cluster. Non-null if and only if identity_state == MERGED_SUBSUMED"
+        default: null
+      - name: enterprise_id
+        type: string
+        source: computed
+        description: "Enterprise identity key. At creation: 'EID-' + RegistrationSite.site_code + '-' + mrn. On merge: overwritten with the survivor's enterprise_id. On unmerge: restored from MergeOperation.subsumed_prior_enterprise_id"
+      - name: subsumed_member_count
+        type: integer
+        source: computed
+        description: "Count of PatientRecord rows whose survivor_record_id == this.id AND identity_state == MERGED_SUBSUMED (cluster size minus one)"
+
+  - name: RegistrationSearchAttempt
+    parent: RegistrationSite
+    common_fields: false
+    kind: event
+    fields:
+      - name: site_id
+        type: string
+        source: system
+        description: "FK -> RegistrationSite.id; taken from the path segment of the search endpoint"
+      - name: searched_last_name
+        type: string
+        source: input
+        description: "Last name typed into the registration front end"
+      - name: searched_first_name
+        type: string
+        source: input
+        description: "First name typed into the registration front end"
+        default: null
+      - name: searched_dob
+        type: string
+        source: input
+        description: "Date of birth typed as YYYY-MM-DD"
+        default: null
+      - name: searched_sex
+        type: enum
+        source: input
+        description: "Administrative sex typed into the front end"
+        default: null
+        constraints: "M | F | X | U"
+      - name: searched_ssn_last4
+        type: string
+        source: input
+        description: "Last four national-identifier digits typed into the front end"
+        default: null
+      - name: searched_postal_code
+        type: string
+        source: input
+        description: "Postal code typed into the front end"
+        default: null
+      - name: searched_phone
+        type: string
+        source: input
+        description: "Phone typed into the front end"
+        default: null
+      - name: result_count
+        type: integer
+        source: computed
+        description: "Count of ACTIVE PatientRecord whose STRICT match_score against the typed terms is >= the ACTIVE MatchRuleSet.review_threshold"
+      - name: top_score
+        type: number
+        source: computed
+        description: "Highest STRICT match_score over all ACTIVE PatientRecord; 0.00 when no ACTIVE record exists"
+      - name: top_match_record_mrn
+        type: string
+        source: computed
+        description: "mrn of the ACTIVE PatientRecord attaining top_score, ranked by match_score DESC then created_at ASC then mrn ASC; null when top_score == 0.00"
+      - name: blocked_creation
+        type: boolean
+        source: computed
+        description: "true when top_score >= the ACTIVE MatchRuleSet.auto_link_threshold; a PatientRecord create citing this attempt is rejected with ERR_DUPLICATE_CREATION_BLOCKED"
+      - name: rule_set_version_label
+        type: string
+        source: computed
+        description: "Copy of MatchRuleSet.version_label for the rule set whose status was ACTIVE when the search ran (audit snapshot, not a foreign key)"
+
+  - name: DuplicateCandidatePair
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: record_a_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; first member of the unordered candidate pair"
+      - name: record_b_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; second member of the unordered candidate pair"
+      - name: rule_set_id
+        type: string
+        source: input
+        description: "FK -> MatchRuleSet.id; rule set used for scoring. Defaults to the rule set whose status == ACTIVE at scoring time"
+      - name: detected_at_site_id
+        type: string
+        source: computed
+        description: "FK -> RegistrationSite.id; site_id of the pair's subject record (see subject_record_mrn) — the site credited with introducing the duplicate under CREATION_SITE_ATTRIBUTION"
+      - name: score_variant
+        type: enum
+        source: input
+        description: "Null-handling variant used for the current match_score"
+        default: STRICT
+        constraints: "STRICT | TOLERANT"
+      - name: match_score
+        type: number
+        source: computed
+        description: "Output of calculations.pair_match_score, 2 dp"
+      - name: raw_score
+        type: number
+        source: computed
+        description: "Pre-penalty weighted agreement sum from calculations.pair_match_score, 2 dp"
+      - name: attribute_score_breakdown
+        type: object
+        source: computed
+        description: "Per-attribute contribution map with keys last_name, first_name, dob, ssn_last4, sex, postal_code, phone, each rounded to 2 dp"
+      - name: conflict_flags
+        type: array
+        source: computed
+        description: "Ordered subset of [SSN4_CONFLICT, BIOMETRIC_CONFLICT, INSURANCE_CONFLICT] emitted in that fixed order"
+      - name: classification
+        type: enum
+        source: computed
+        description: "Threshold classification of match_score against the rule set"
+        constraints: "AUTO_LINK | POTENTIAL_DUPLICATE | NON_DUPLICATE"
+      - name: subject_record_mrn
+        type: string
+        source: computed
+        description: "mrn of the pair's subject record — the member with the later created_at; tie-break on identical created_at is the lexicographically greater mrn"
+      - name: evidence_points
+        type: number
+        source: computed
+        description: "Signed sum over ReviewEvidence of this pair (created_at ASC): +weight_points for SUPPORTS_SAME_PERSON, -weight_points for SUPPORTS_DISTINCT, 0 for INCONCLUSIVE"
+      - name: base_band
+        type: enum
+        source: computed
+        description: "Pre-evidence band derived from match_score alone; pins the multiplier used by evidence_adjustment"
+        constraints: "P1 | P2 | P3"
+      - name: evidence_adjustment
+        type: number
+        source: computed
+        description: "round(evidence_points * BAND_MULTIPLIER[base_band], 2)"
+      - name: effective_score
+        type: number
+        source: computed
+        description: "round(min(100.00, max(0.00, match_score + evidence_adjustment)), 2)"
+      - name: priority_band
+        type: enum
+        source: computed
+        description: "Work-queue band derived from effective_score using the same cutoffs as base_band"
+        constraints: "P1 | P2 | P3"
+      - name: queue_state
+        type: enum
+        source: system
+        description: "Work-queue triage state machine"
+        default: NEW
+        constraints: "NEW | TRIAGED | UNDER_REVIEW | RECOMMENDED_MERGE | RECOMMENDED_DISTINCT | RESOLVED_MERGED | RESOLVED_DISTINCT | ESCALATED_FRAUD"
+      - name: triage_note
+        type: string
+        source: input
+        description: "Free-text note captured at triage"
+        default: null
+      - name: recommended_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the IdentityAnalyst who recorded the recommendation; null for system AUTO_LINK recommendations"
+        default: null
+      - name: recommendation
+        type: enum
+        source: input
+        description: "Analyst recommendation recorded on the pair"
+        default: null
+        constraints: "MERGE | DISTINCT"
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the IdentityStewardApprover who resolved the pair"
+        default: null
+
+  - name: ReviewEvidence
+    parent: DuplicateCandidatePair
+    common_fields: false
+    kind: event
+    fields:
+      - name: pair_id
+        type: string
+        source: system
+        description: "FK -> DuplicateCandidatePair.id; taken from the path segment"
+      - name: evidence_type
+        type: enum
+        source: input
+        description: "Kind of manual-review evidence captured"
+        constraints: "PHOTO_ID | INSURANCE_CARD | PHONE_VERIFICATION | CLINICAL_CHART_COMPARE | BIOMETRIC_COMPARE"
+      - name: outcome
+        type: enum
+        source: input
+        description: "Direction the evidence points"
+        constraints: "SUPPORTS_SAME_PERSON | SUPPORTS_DISTINCT | INCONCLUSIVE"
+      - name: weight_points
+        type: number
+        source: input
+        description: "Magnitude of the evidence in score points"
+        constraints: "0.00 <= value <= 10.00, 2 dp"
+      - name: note
+        type: string
+        source: input
+        description: "Reviewer note"
+        default: null
+      - name: submitted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the submitting IdentityAnalyst (opaque operator id, not an entity id)"
+
+  - name: MergeOperation
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: pair_id
+        type: string
+        source: input
+        description: "FK -> DuplicateCandidatePair.id; the pair whose recommendation authorises this merge"
+      - name: survivor_record_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; the record that survives and absorbs clinical elements"
+      - name: subsumed_record_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; the record that becomes MERGED_SUBSUMED"
+      - name: rationale
+        type: string
+        source: input
+        description: "Approver's written rationale, retained for merge audit"
+      - name: state
+        type: enum
+        source: system
+        description: "Merge lifecycle"
+        default: PENDING_PROPAGATION
+        constraints: "PENDING_PROPAGATION | COMPLETED | UNMERGED"
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the executing IdentityStewardApprover; MUST differ from the pair's recommended_by_user_id"
+      - name: moved_clinical_element_count
+        type: integer
+        source: computed
+        description: "Snapshot of subsumed PatientRecord.clinical_element_count at merge time; the exact quantity unmerge moves back"
+      - name: subsumed_prior_enterprise_id
+        type: string
+        source: computed
+        description: "Snapshot of the subsumed record's enterprise_id before overwrite; restored verbatim on unmerge"
+      - name: recompressed_record_mrns
+        type: array
+        source: computed
+        description: "mrns of the PatientRecord rows whose survivor_record_id this merge re-pointed from the subsumed record to the survivor (path compression); unmerge re-points exactly these back"
+      - name: propagation_task_count
+        type: integer
+        source: computed
+        description: "Number of PropagationTask rows created for this merge (one per DownstreamSystem with status == ACTIVE at merge time)"
+      - name: completed_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant when state became COMPLETED; null while PENDING_PROPAGATION"
+        default: null
+      - name: reversal_deadline_at
+        type: datetime
+        source: computed
+        description: "completed_at + REVERSAL_WINDOW_DAYS days; unmerge after this instant is rejected with ERR_REVERSAL_WINDOW_EXPIRED"
+        default: null
+      - name: unmerge_reason
+        type: string
+        source: input
+        description: "Reason recorded when the merge is reversed"
+        default: null
+      - name: unmerged_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant when state became UNMERGED"
+        default: null
+
+  - name: OverlayCorrection
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: record_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; the record whose demographics were overwritten with another person's data"
+      - name: overlay_type
+        type: enum
+        source: input
+        description: "Nature of the overlay defect"
+        constraints: "DEMOGRAPHIC_OVERWRITE | CLINICAL_MISFILE"
+      - name: corrected_field_snapshot
+        type: object
+        source: input
+        description: "Map of PatientRecord demographic field names to their corrected values; allowed keys are last_name, first_name, dob, sex, ssn_last4, address_line, postal_code, phone, biometric_template_hash, insurance_member_id"
+      - name: prior_field_snapshot
+        type: object
+        source: computed
+        description: "Values of the same keys read off the PatientRecord at POST /mpi/overlay-corrections time (before any correction is applied), retained for audit and as the reversal basis"
+        default: null
+      - name: affected_clinical_element_count
+        type: integer
+        source: input
+        description: "Count of clinical elements filed under the record during the overlay period"
+        constraints: ">= 0"
+      - name: encounter_from_date
+        type: string
+        source: input
+        description: "First clinical date affected by the overlay, YYYY-MM-DD"
+      - name: encounter_to_date
+        type: string
+        source: input
+        description: "Last clinical date affected by the overlay, YYYY-MM-DD; MUST be >= encounter_from_date"
+      - name: state
+        type: enum
+        source: system
+        description: "Correction lifecycle"
+        default: DETECTED
+        constraints: "DETECTED | UNDER_CORRECTION | CORRECTED"
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the caller who filed the correction (opaque operator id)"
+      - name: closure_note
+        type: string
+        source: input
+        description: "Note recorded when the correction is completed"
+        default: null
+
+  - name: ContaminationRemediation
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: source_type
+        type: enum
+        source: system
+        description: "Which upstream defect opened this remediation (polymorphic discriminator)"
+        constraints: "MERGE | OVERLAY"
+      - name: merge_operation_id
+        type: string
+        source: system
+        description: "FK -> MergeOperation.id; set when source_type == MERGE, null otherwise"
+        default: null
+      - name: overlay_correction_id
+        type: string
+        source: system
+        description: "FK -> OverlayCorrection.id; set when source_type == OVERLAY, null otherwise"
+        default: null
+      - name: record_id
+        type: string
+        source: system
+        description: "FK -> PatientRecord.id; the record holding the potentially cross-contaminated clinical elements (the survivor for MERGE, the overlaid record for OVERLAY)"
+      - name: element_count_subject
+        type: integer
+        source: system
+        description: "Number of clinical elements under remediation: MergeOperation.moved_clinical_element_count for MERGE, OverlayCorrection.affected_clinical_element_count for OVERLAY"
+      - name: element_count_quarantined
+        type: integer
+        source: input
+        description: "Elements pulled out of the chart for adjudication; MUST be <= element_count_subject"
+        default: 0
+      - name: element_count_reassigned
+        type: integer
+        source: input
+        description: "Elements refiled onto the correct record; MUST be <= element_count_quarantined"
+        default: 0
+      - name: reassigned_to_record_mrn
+        type: string
+        source: computed
+        description: "mrn of the PatientRecord the quarantined elements were refiled onto (audit copy of the reassign target, not a foreign key)"
+        default: null
+      - name: state
+        type: enum
+        source: system
+        description: "Remediation lifecycle"
+        default: OPEN
+        constraints: "OPEN | QUARANTINED | REASSIGNED | CLOSED"
+      - name: closure_note
+        type: string
+        source: input
+        description: "Note recorded at closure; system writes 'CLOSED_BY_UNMERGE' when an unmerge closes the remediation"
+        default: null
+
+  - name: DownstreamSystem
+    parent: null
+    common_fields: true
+    kind: configuration
+    fields:
+      - name: system_code
+        type: string
+        source: input
+        description: "Short code of the downstream consumer, e.g. 'EHR-CORE'"
+        constraints: "1-16 chars, globally unique"
+      - name: name
+        type: string
+        source: input
+        description: "Display name"
+      - name: propagation_mode
+        type: enum
+        source: input
+        description: "Selects the send deadline: SYNCHRONOUS uses PROPAGATION_DEADLINE_HOURS_SYNCHRONOUS, BATCH uses PROPAGATION_DEADLINE_HOURS_BATCH"
+        constraints: "SYNCHRONOUS | BATCH"
+      - name: ack_required
+        type: boolean
+        source: input
+        description: "When false, PropagationTask rows for this system are created directly in state ACKED and never occupy dispatch capacity"
+        default: true
+      - name: max_concurrent_dispatch
+        type: integer
+        source: input
+        description: "Maximum number of SENT PropagationTask rows whose dispatch windows may cover any single instant"
+        constraints: ">= 1"
+      - name: status
+        type: enum
+        source: system
+        description: "PAUSED systems reject sends and receive no new tasks"
+        default: ACTIVE
+        constraints: "ACTIVE | PAUSED"
+      - name: unacked_task_count
+        type: integer
+        source: computed
+        description: "Cross-entity count of PropagationTask with downstream_system_id == this.id AND state IN {QUEUED, SENT}"
+
+  - name: PropagationTask
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: merge_operation_id
+        type: string
+        source: system
+        description: "FK -> MergeOperation.id; set when operation_kind IN {MERGE, UNMERGE}, null otherwise"
+        default: null
+      - name: overlay_correction_id
+        type: string
+        source: system
+        description: "FK -> OverlayCorrection.id; set when operation_kind == OVERLAY_CORRECTION, null otherwise"
+        default: null
+      - name: downstream_system_id
+        type: string
+        source: system
+        description: "FK -> DownstreamSystem.id; the consumer this task notifies"
+      - name: operation_kind
+        type: enum
+        source: system
+        description: "Identity change being propagated"
+        constraints: "MERGE | UNMERGE | OVERLAY_CORRECTION"
+      - name: state
+        type: enum
+        source: system
+        description: "Dispatch lifecycle; SENT -> FAILED -> SENT is a permitted retry cycle"
+        default: QUEUED
+        constraints: "QUEUED | SENT | ACKED | FAILED | CANCELLED"
+      - name: attempt_count
+        type: integer
+        source: system
+        description: "Incremented by one on every transition into SENT"
+        default: 0
+      - name: dispatch_window_start_at
+        type: datetime
+        source: input
+        description: "Inclusive start of the half-open dispatch window claimed on the DownstreamSystem"
+        default: null
+      - name: dispatch_window_end_at
+        type: datetime
+        source: input
+        description: "Exclusive end of the half-open dispatch window; MUST be strictly after dispatch_window_start_at"
+        default: null
+      - name: propagation_deadline_at
+        type: datetime
+        source: computed
+        description: "created_at + PROPAGATION_DEADLINE_HOURS_SYNCHRONOUS hours when the system's propagation_mode == SYNCHRONOUS, else created_at + PROPAGATION_DEADLINE_HOURS_BATCH hours"
+      - name: last_error_code
+        type: string
+        source: input
+        description: "Consumer-reported failure code recorded on the SENT -> FAILED transition"
+        default: null
+
+  - name: FraudInvestigation
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: record_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; the subject record whose identity is in question"
+      - name: pair_id
+        type: string
+        source: input
+        description: "FK -> DuplicateCandidatePair.id; the pair whose conflict_flags provoked the investigation; null for manually opened investigations"
+        default: null
+      - name: trigger_kind
+        type: enum
+        source: input
+        description: "Which conflicting attribute class opened the investigation"
+        constraints: "BIOMETRIC_CONFLICT | INSURANCE_CONFLICT | BOTH | MANUAL"
+      - name: opened_by
+        type: enum
+        source: system
+        description: "SYSTEM for investigations auto-opened by pair scoring, OFFICER for manually filed ones"
+        constraints: "SYSTEM | OFFICER"
+      - name: opened_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the PrivacyOfficer who filed it; null when opened_by == SYSTEM"
+        default: null
+      - name: risk_score
+        type: number
+        source: computed
+        description: "Output of calculations.fraud_risk_score, 2 dp, computed after the subject's integrity_state has been set to FRAUD_SUSPECTED"
+      - name: state
+        type: enum
+        source: system
+        description: "Investigation lifecycle"
+        default: OPEN
+        constraints: "OPEN | SUBSTANTIATED | UNSUBSTANTIATED | REFERRED_LAW_ENFORCEMENT"
+      - name: note
+        type: string
+        source: input
+        description: "Opening note"
+        default: null
+      - name: finding_note
+        type: string
+        source: input
+        description: "Note recorded on substantiate/unsubstantiate"
+        default: null
+      - name: referral_reference
+        type: string
+        source: input
+        description: "External referral case reference recorded on REFERRED_LAW_ENFORCEMENT"
+        default: null
+
+  - name: ExternalMatchRequest
+    parent: null
+    common_fields: true
+    kind: resource
+    fields:
+      - name: record_id
+        type: string
+        source: input
+        description: "FK -> PatientRecord.id; the local record offered to the exchange partner"
+      - name: exchange_partner_code
+        type: string
+        source: input
+        description: "Code of the health-information-exchange participant"
+      - name: consent_on_file
+        type: boolean
+        source: input
+        description: "Whether a signed exchange authorisation exists; false is rejected with ERR_EXCHANGE_CONSENT_MISSING"
+      - name: external_demographics
+        type: object
+        source: input
+        description: "Partner-supplied demographic map with the same keys the scorer reads: last_name, first_name, dob, sex, ssn_last4, postal_code, phone (missing keys count as null)"
+      - name: external_score
+        type: number
+        source: computed
+        description: "calculations.pair_match_score run in TOLERANT variant between the local PatientRecord and external_demographics, 2 dp"
+      - name: state
+        type: enum
+        source: system
+        description: "Exchange match outcome, resolved inside the create request"
+        default: SUBMITTED
+        constraints: "SUBMITTED | MATCHED | NO_MATCH"
+
+  - name: SiteDuplicateMetric
+    parent: RegistrationSite
+    common_fields: false
+    kind: event
+    fields:
+      - name: site_id
+        type: string
+        source: system
+        description: "FK -> RegistrationSite.id; taken from the path segment"
+      - name: window_start_date
+        type: string
+        source: input
+        description: "Inclusive first date of the measurement window, YYYY-MM-DD"
+      - name: window_end_date
+        type: string
+        source: input
+        description: "Inclusive last date of the measurement window, YYYY-MM-DD; MUST be >= window_start_date"
+      - name: attribution_variant
+        type: enum
+        source: input
+        description: "Which side of a merge the duplicate is charged to"
+        constraints: "CREATION_SITE_ATTRIBUTION | SURVIVOR_SITE_ATTRIBUTION"
+      - name: records_created
+        type: integer
+        source: computed
+        description: "Count of PatientRecord with site_id == this.site_id whose created_at date falls inside the closed window, counting both identity_states"
+      - name: confirmed_duplicates
+        type: integer
+        source: computed
+        description: "Count of MergeOperation attributed to this site under attribution_variant, per calculations.site_duplicate_rate"
+      - name: duplicate_rate_bps
+        type: integer
+        source: computed
+        description: "Output of calculations.site_duplicate_rate in basis points, single round_half_up at the end"
+      - name: sample_size_sufficient
+        type: boolean
+        source: computed
+        description: "records_created >= METRIC_MIN_SAMPLE_SIZE"
+      - name: rule_set_version_label
+        type: string
+        source: computed
+        description: "version_label of the MatchRuleSet whose status was ACTIVE when the run executed (audit snapshot, not a foreign key)"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  - entity: RegistrationSite
+    dimension: status
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "PATCH /mpi/registration-sites/{id} with status=SUSPENDED"
+        actor: MpiAdmin
+        preconditions: ["site.status == ACTIVE"]
+        side_effects:
+          - "refreshes RegistrationSite.updated_at and increments RegistrationSite.version by 1"
+          - "subsequent POST /mpi/patient-records naming this site_id is rejected with ERR_SITE_SUSPENDED"
+      - from: SUSPENDED
+        to: ACTIVE
+        trigger: "PATCH /mpi/registration-sites/{id} with status=ACTIVE"
+        actor: MpiAdmin
+        preconditions: ["site.status == SUSPENDED"]
+        side_effects: ["refreshes RegistrationSite.updated_at and increments RegistrationSite.version by 1"]
+
+  - entity: MatchRuleSet
+    dimension: status
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: ACTIVE
+        trigger: "POST /mpi/match-rule-sets/{id}/activate"
+        actor: MpiAdmin
+        preconditions: ["rule_set.status == DRAFT"]
+        side_effects:
+          - "the MatchRuleSet whose status == ACTIVE (at most one exists) transitions ACTIVE -> RETIRED and its version increments by 1"
+          - "increments this MatchRuleSet.version by 1"
+          - "all later scoring that omits rule_set_id resolves to this rule set"
+      - from: ACTIVE
+        to: RETIRED
+        trigger: "system event: another MatchRuleSet is activated"
+        actor: system
+        preconditions: ["rule_set.status == ACTIVE"]
+        side_effects: ["increments MatchRuleSet.version by 1; existing DuplicateCandidatePair rows keep their stored rule_set_id and are NOT rescored"]
+
+  - entity: PatientRecord
+    dimension: identity_state
+    initial_state: ACTIVE
+    terminal_states: []
+    transitions:
+      - from: ACTIVE
+        to: MERGED_SUBSUMED
+        trigger: "POST /mpi/merge-operations (this record is subsumed_record_id)"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "record.identity_state == ACTIVE"
+          - "record.integrity_state NOT IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"
+        side_effects:
+          - "sets survivor_record_id to the merge's survivor_record_id"
+          - "sets enterprise_id := survivor.enterprise_id after MergeOperation.subsumed_prior_enterprise_id snapshots the old value"
+          - "moves clinical_element_count to the survivor: survivor.clinical_element_count += this.clinical_element_count, then this.clinical_element_count := 0"
+          - "every PatientRecord whose survivor_record_id == this.id is re-pointed to the survivor (path compression) and its mrn is appended to MergeOperation.recompressed_record_mrns"
+          - "increments PatientRecord.version by 1 on this record, on the survivor, and on every re-pointed record"
+      - from: MERGED_SUBSUMED
+        to: ACTIVE
+        trigger: "POST /mpi/merge-operations/{id}/unmerge (this record is subsumed_record_id)"
+        actor: IdentityStewardApprover
+        preconditions: ["record.identity_state == MERGED_SUBSUMED", "merge.state IN {PENDING_PROPAGATION, COMPLETED}"]
+        side_effects:
+          - "sets survivor_record_id := null"
+          - "restores enterprise_id := MergeOperation.subsumed_prior_enterprise_id"
+          - "moves exactly MergeOperation.moved_clinical_element_count elements back: survivor.clinical_element_count -= that count, this.clinical_element_count += that count"
+          - "re-points every PatientRecord whose mrn is in MergeOperation.recompressed_record_mrns back to this record"
+          - "increments PatientRecord.version by 1 on this record, on the survivor, and on every re-pointed record"
+        note: "This is the compensating action for ACTIVE -> MERGED_SUBSUMED; see calculations.clinical_element_conservation and calculations.enterprise_identity_conservation"
+
+  - entity: PatientRecord
+    dimension: integrity_state
+    initial_state: CLEAR
+    terminal_states: []
+    note: "Second, independent state dimension on the same PatientRecord row. It evolves under fraud/remediation events while identity_state evolves under merge events; neither dimension constrains the other's transition set. Every transition below is the re-derivation described by calculations.record_integrity_state_derivation."
+    transitions:
+      - from: CLEAR
+        to: FRAUD_SUSPECTED
+        trigger: "POST /mpi/fraud-investigations, or system auto-open during POST /mpi/candidate-pairs"
+        actor: PrivacyOfficer | system
+        preconditions: ["a FraudInvestigation with state == OPEN now references this record"]
+        side_effects:
+          - "increments PatientRecord.version by 1"
+          - "increments RegistrationSite.flagged_record_count for the record's site"
+          - "every DuplicateCandidatePair referencing this record with queue_state IN {NEW, TRIAGED, UNDER_REVIEW, RECOMMENDED_MERGE, RECOMMENDED_DISTINCT} transitions to ESCALATED_FRAUD"
+      - from: FRAUD_SUSPECTED
+        to: FRAUD_CONFIRMED
+        trigger: "POST /mpi/fraud-investigations/{id}/substantiate"
+        actor: PrivacyOfficer
+        preconditions: ["a FraudInvestigation with state IN {SUBSTANTIATED, REFERRED_LAW_ENFORCEMENT} now references this record"]
+        side_effects:
+          - "increments PatientRecord.version by 1"
+          - "every DuplicateCandidatePair referencing this record with queue_state IN {NEW, TRIAGED, UNDER_REVIEW, RECOMMENDED_MERGE, RECOMMENDED_DISTINCT} transitions to ESCALATED_FRAUD"
+      - from: FRAUD_SUSPECTED
+        to: CLEAR
+        trigger: "POST /mpi/fraud-investigations/{id}/unsubstantiate"
+        actor: PrivacyOfficer
+        preconditions:
+          - "no FraudInvestigation referencing this record has state IN {OPEN, SUBSTANTIATED, REFERRED_LAW_ENFORCEMENT}"
+          - "no ContaminationRemediation referencing this record has state IN {OPEN, QUARANTINED, REASSIGNED}"
+          - "no OverlayCorrection referencing this record has state IN {DETECTED, UNDER_CORRECTION}"
+        side_effects:
+          - "increments PatientRecord.version by 1"
+          - "decrements RegistrationSite.flagged_record_count for the record's site"
+          - "every DuplicateCandidatePair referencing this record with queue_state == ESCALATED_FRAUD transitions to UNDER_REVIEW"
+      - from: CLEAR
+        to: REMEDIATION_PENDING
+        trigger: "POST /mpi/overlay-corrections, or system auto-open of a ContaminationRemediation during POST /mpi/merge-operations"
+        actor: IdentityStewardApprover | MpiAdmin | system
+        preconditions:
+          - "no FraudInvestigation referencing this record has state IN {OPEN, SUBSTANTIATED, REFERRED_LAW_ENFORCEMENT}"
+          - "an OverlayCorrection with state IN {DETECTED, UNDER_CORRECTION} or a ContaminationRemediation with state IN {OPEN, QUARANTINED, REASSIGNED} now references this record"
+        side_effects: ["increments PatientRecord.version by 1", "subsequent POST /mpi/external-match-requests for this record is rejected with ERR_RECORD_REMEDIATION_PENDING"]
+      - from: REMEDIATION_PENDING
+        to: CLEAR
+        trigger: "POST /mpi/contamination-remediations/{id}/close, POST /mpi/overlay-corrections/{id}/complete, or the remediation closure cascade of POST /mpi/merge-operations/{id}/unmerge"
+        actor: IdentityStewardApprover | system
+        preconditions:
+          - "no ContaminationRemediation referencing this record has state IN {OPEN, QUARANTINED, REASSIGNED}"
+          - "no OverlayCorrection referencing this record has state IN {DETECTED, UNDER_CORRECTION}"
+          - "no FraudInvestigation referencing this record has state IN {OPEN, SUBSTANTIATED, REFERRED_LAW_ENFORCEMENT}"
+        side_effects: ["increments PatientRecord.version by 1"]
+      - from: REMEDIATION_PENDING
+        to: FRAUD_SUSPECTED
+        trigger: "POST /mpi/fraud-investigations"
+        actor: PrivacyOfficer
+        preconditions: ["a FraudInvestigation with state == OPEN now references this record"]
+        side_effects:
+          - "increments PatientRecord.version by 1"
+          - "increments RegistrationSite.flagged_record_count for the record's site"
+        note: "Fraud outranks remediation in the derivation precedence FRAUD_CONFIRMED > FRAUD_SUSPECTED > REMEDIATION_PENDING > CLEAR, so the open remediation stays open but stops being the visible integrity_state"
+
+  - entity: DuplicateCandidatePair
+    dimension: queue_state
+    initial_state: NEW
+    terminal_states: [RESOLVED_DISTINCT]
+    note: "Cyclic. RECOMMENDED_MERGE -> UNDER_REVIEW -> RECOMMENDED_MERGE is the approver-rejection loop; RESOLVED_MERGED -> UNDER_REVIEW re-opens the queue item when the merge is reversed; ESCALATED_FRAUD -> UNDER_REVIEW re-opens it when fraud is unsubstantiated. The initial state is NEW unless the create-time classification/conflict branch overrides it (see the two system transitions below)."
+    transitions:
+      - from: NEW
+        to: RECOMMENDED_MERGE
+        trigger: "system event during POST /mpi/candidate-pairs when classification == AUTO_LINK and conflict_flags is empty"
+        actor: system
+        preconditions: ["match_score >= rule_set.auto_link_threshold", "conflict_flags == []"]
+        side_effects:
+          - "sets recommended_by_user_id := null (system recommendation, so the segregation-of-duties check on POST /mpi/merge-operations cannot fail for this pair)"
+          - "sets recommendation := MERGE"
+      - from: NEW
+        to: ESCALATED_FRAUD
+        trigger: "system event during POST /mpi/candidate-pairs when a FraudInvestigation is auto-opened"
+        actor: system
+        preconditions:
+          - "conflict_flags contains BIOMETRIC_CONFLICT or INSURANCE_CONFLICT"
+          - "raw_score >= FRAUD_AUTO_OPEN_RAW_SCORE_MIN"
+        side_effects:
+          - "creates exactly ONE FraudInvestigation with opened_by == SYSTEM and opened_by_user_id == null on the subject record (the pair member with the later created_at; tie-break lexicographically greater mrn); pair_id == this pair; state OPEN; note null"
+          - "that investigation's trigger_kind is BOTH when conflict_flags contains both BIOMETRIC_CONFLICT and INSURANCE_CONFLICT, BIOMETRIC_CONFLICT when it contains BIOMETRIC_CONFLICT but not INSURANCE_CONFLICT, and INSURANCE_CONFLICT when it contains INSURANCE_CONFLICT but not BIOMETRIC_CONFLICT (SSN4_CONFLICT alone never fires this branch)"
+          - "that investigation drives the subject PatientRecord CLEAR -> FRAUD_SUSPECTED integrity transition; the NON-subject member record is left untouched (its own integrity_state stays whatever calculations.record_integrity_state_derivation yields for it)"
+          - "the subject record's RegistrationSite.flagged_record_count is recomputed BEFORE risk_score is evaluated, so the subject itself is counted"
+        note: "This branch outranks the AUTO_LINK branch: a pair with conflict_flags is never auto-recommended"
+      - from: NEW
+        to: TRIAGED
+        trigger: "POST /mpi/candidate-pairs/{id}/triage"
+        actor: IdentityAnalyst
+        preconditions: ["pair.queue_state == NEW", "neither member PatientRecord has integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"]
+        side_effects: ["stores triage_note", "recomputes evidence_points, base_band, evidence_adjustment, effective_score and priority_band", "increments DuplicateCandidatePair.version by 1"]
+      - from: TRIAGED
+        to: UNDER_REVIEW
+        trigger: "POST /mpi/candidate-pairs/{id}/start-review"
+        actor: IdentityAnalyst
+        preconditions: ["pair.queue_state == TRIAGED", "neither member PatientRecord has integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"]
+        side_effects: ["increments DuplicateCandidatePair.version by 1"]
+      - from: UNDER_REVIEW
+        to: RECOMMENDED_MERGE
+        trigger: "POST /mpi/candidate-pairs/{id}/recommend with recommendation=MERGE"
+        actor: IdentityAnalyst
+        preconditions:
+          - "pair.queue_state == UNDER_REVIEW"
+          - "count of ReviewEvidence with pair_id == pair.id is >= MIN_EVIDENCE_COUNT"
+          - "neither member PatientRecord has integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"
+        side_effects: ["sets recommended_by_user_id := X-User-ID", "sets recommendation := MERGE", "increments DuplicateCandidatePair.version by 1"]
+      - from: UNDER_REVIEW
+        to: RECOMMENDED_DISTINCT
+        trigger: "POST /mpi/candidate-pairs/{id}/recommend with recommendation=DISTINCT"
+        actor: IdentityAnalyst
+        preconditions:
+          - "pair.queue_state == UNDER_REVIEW"
+          - "count of ReviewEvidence with pair_id == pair.id is >= MIN_EVIDENCE_COUNT"
+          - "neither member PatientRecord has integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"
+        side_effects: ["sets recommended_by_user_id := X-User-ID", "sets recommendation := DISTINCT", "increments DuplicateCandidatePair.version by 1"]
+      - from: RECOMMENDED_MERGE
+        to: UNDER_REVIEW
+        trigger: "POST /mpi/candidate-pairs/{id}/return-to-review"
+        actor: IdentityStewardApprover
+        preconditions: ["pair.queue_state IN {RECOMMENDED_MERGE, RECOMMENDED_DISTINCT}"]
+        side_effects:
+          - "sets recommended_by_user_id := null and recommendation := null so a fresh analyst recommendation is required"
+          - "increments DuplicateCandidatePair.version by 1"
+        note: "Closes the review cycle; the same or a different analyst may recommend again"
+      - from: RECOMMENDED_DISTINCT
+        to: UNDER_REVIEW
+        trigger: "POST /mpi/candidate-pairs/{id}/return-to-review"
+        actor: IdentityStewardApprover
+        preconditions: ["pair.queue_state IN {RECOMMENDED_MERGE, RECOMMENDED_DISTINCT}"]
+        side_effects: ["sets recommended_by_user_id := null and recommendation := null", "increments DuplicateCandidatePair.version by 1"]
+      - from: RECOMMENDED_DISTINCT
+        to: RESOLVED_DISTINCT
+        trigger: "POST /mpi/candidate-pairs/{id}/resolve-distinct"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "pair.queue_state == RECOMMENDED_DISTINCT"
+          - "X-User-ID != pair.recommended_by_user_id"
+        side_effects: ["sets approved_by_user_id := X-User-ID", "increments DuplicateCandidatePair.version by 1"]
+      - from: RECOMMENDED_MERGE
+        to: RESOLVED_MERGED
+        trigger: "POST /mpi/merge-operations"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "pair.queue_state == RECOMMENDED_MERGE"
+          - "pair.recommended_by_user_id is null OR X-User-ID != pair.recommended_by_user_id"
+          - "the merge's survivor_record_id and subsumed_record_id are exactly {pair.record_a_id, pair.record_b_id}"
+        side_effects:
+          - "sets approved_by_user_id := X-User-ID"
+          - "creates the MergeOperation, whose own state resolves within this same request to PENDING_PROPAGATION or COMPLETED per the POST /mpi/merge-operations completion rule (COMPLETED when propagation_task_count == 0 or no created task belongs to an ack_required system)"
+          - "increments DuplicateCandidatePair.version by 1"
+      - from: RESOLVED_MERGED
+        to: UNDER_REVIEW
+        trigger: "POST /mpi/merge-operations/{id}/unmerge"
+        actor: IdentityStewardApprover
+        preconditions: ["pair.queue_state == RESOLVED_MERGED"]
+        side_effects:
+          - "clears recommended_by_user_id, recommendation and approved_by_user_id"
+          - "increments DuplicateCandidatePair.version by 1"
+        note: "Second cycle back-edge: a reversed merge returns the queue item to manual review"
+      - from: NEW
+        to: ESCALATED_FRAUD
+        trigger: "POST /mpi/fraud-investigations or POST /mpi/fraud-investigations/{id}/substantiate on a member record (fraud-hold cascade)"
+        actor: PrivacyOfficer
+        preconditions: ["a member PatientRecord's integrity_state has been re-derived to FRAUD_SUSPECTED or FRAUD_CONFIRMED"]
+        side_effects: ["increments DuplicateCandidatePair.version by 1"]
+        note: "Cascade edge driven by the PatientRecord integrity dimension, distinct from the create-time auto-open edge above"
+      - from: TRIAGED
+        to: ESCALATED_FRAUD
+        trigger: "POST /mpi/fraud-investigations or POST /mpi/fraud-investigations/{id}/substantiate on a member record (fraud-hold cascade)"
+        actor: PrivacyOfficer
+        preconditions: ["a member PatientRecord's integrity_state has been re-derived to FRAUD_SUSPECTED or FRAUD_CONFIRMED"]
+        side_effects: ["increments DuplicateCandidatePair.version by 1"]
+      - from: UNDER_REVIEW
+        to: ESCALATED_FRAUD
+        trigger: "POST /mpi/fraud-investigations or POST /mpi/fraud-investigations/{id}/substantiate on a member record (fraud-hold cascade)"
+        actor: PrivacyOfficer
+        preconditions: ["a member PatientRecord's integrity_state has been re-derived to FRAUD_SUSPECTED or FRAUD_CONFIRMED"]
+        side_effects: ["increments DuplicateCandidatePair.version by 1"]
+      - from: RECOMMENDED_MERGE
+        to: ESCALATED_FRAUD
+        trigger: "POST /mpi/fraud-investigations or POST /mpi/fraud-investigations/{id}/substantiate on a member record (fraud-hold cascade)"
+        actor: PrivacyOfficer
+        preconditions: ["a member PatientRecord's integrity_state has been re-derived to FRAUD_SUSPECTED or FRAUD_CONFIRMED"]
+        side_effects: ["clears recommended_by_user_id and recommendation", "increments DuplicateCandidatePair.version by 1"]
+      - from: RECOMMENDED_DISTINCT
+        to: ESCALATED_FRAUD
+        trigger: "POST /mpi/fraud-investigations or POST /mpi/fraud-investigations/{id}/substantiate on a member record (fraud-hold cascade)"
+        actor: PrivacyOfficer
+        preconditions: ["a member PatientRecord's integrity_state has been re-derived to FRAUD_SUSPECTED or FRAUD_CONFIRMED"]
+        side_effects: ["clears recommended_by_user_id and recommendation", "increments DuplicateCandidatePair.version by 1"]
+      - from: ESCALATED_FRAUD
+        to: UNDER_REVIEW
+        trigger: "POST /mpi/fraud-investigations/{id}/unsubstantiate on an investigation referencing a member record"
+        actor: PrivacyOfficer
+        preconditions: ["the member record's integrity_state has been re-derived to CLEAR"]
+        side_effects: ["increments DuplicateCandidatePair.version by 1"]
+
+  - entity: MergeOperation
+    dimension: state
+    initial_state: PENDING_PROPAGATION
+    terminal_states: [UNMERGED]
+    transitions:
+      - from: PENDING_PROPAGATION
+        to: COMPLETED
+        trigger: "system event: every PropagationTask with merge_operation_id == merge.id and operation_kind == MERGE has state IN {ACKED, CANCELLED}; evaluated at merge creation and again after each POST /mpi/propagation-tasks/{id}/ack"
+        actor: system
+        preconditions: ["no PropagationTask for this merge has state IN {QUEUED, SENT, FAILED}"]
+        side_effects:
+          - "sets completed_at := current logical clock"
+          - "sets reversal_deadline_at := completed_at + REVERSAL_WINDOW_DAYS days"
+          - "increments MergeOperation.version by 1"
+        note: "Fires inside POST /mpi/merge-operations itself when propagation_task_count == 0 (no ACTIVE DownstreamSystem) or when every created task went straight to ACKED because its system has ack_required == false"
+      - from: PENDING_PROPAGATION
+        to: UNMERGED
+        trigger: "POST /mpi/merge-operations/{id}/unmerge"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "merge.state == PENDING_PROPAGATION"
+          - "no PropagationTask for this merge has state == SENT"
+        side_effects:
+          - "sets unmerge_reason and unmerged_at := current logical clock"
+          - "cancels every PropagationTask for this merge whose state == QUEUED (QUEUED -> CANCELLED)"
+          - "drives the subsumed PatientRecord MERGED_SUBSUMED -> ACTIVE compensation chain"
+          - "drives the pair RESOLVED_MERGED -> UNDER_REVIEW transition"
+          - "closes the merge's ContaminationRemediation when its state IN {OPEN, QUARANTINED, REASSIGNED}"
+          - "creates one PropagationTask with operation_kind == UNMERGE per DownstreamSystem with status == ACTIVE"
+          - "increments MergeOperation.version by 1"
+      - from: COMPLETED
+        to: UNMERGED
+        trigger: "POST /mpi/merge-operations/{id}/unmerge"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "merge.state == COMPLETED"
+          - "no PropagationTask for this merge has state == SENT"
+          - "current logical clock <= merge.reversal_deadline_at"
+        side_effects:
+          - "identical side-effect set to the PENDING_PROPAGATION -> UNMERGED transition"
+        note: "Compensating action; see calculations.clinical_element_conservation and calculations.enterprise_identity_conservation"
+
+  - entity: OverlayCorrection
+    dimension: state
+    initial_state: DETECTED
+    terminal_states: [CORRECTED]
+    transitions:
+      - from: DETECTED
+        to: UNDER_CORRECTION
+        trigger: "POST /mpi/overlay-corrections/{id}/apply"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "overlay.state == DETECTED"
+          - "the target PatientRecord.integrity_state NOT IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}"
+        side_effects:
+          - "writes each corrected_field_snapshot key onto the PatientRecord (prior_field_snapshot was already captured at POST /mpi/overlay-corrections) and increments PatientRecord.version by 1"
+          - "creates a ContaminationRemediation with source_type == OVERLAY when affected_clinical_element_count > CONTAMINATION_REVIEW_ELEMENT_THRESHOLD"
+          - "creates one PropagationTask with operation_kind == OVERLAY_CORRECTION per DownstreamSystem with status == ACTIVE"
+          - "increments OverlayCorrection.version by 1"
+      - from: UNDER_CORRECTION
+        to: CORRECTED
+        trigger: "POST /mpi/overlay-corrections/{id}/complete"
+        actor: IdentityStewardApprover
+        preconditions:
+          - "overlay.state == UNDER_CORRECTION"
+          - "no ContaminationRemediation with overlay_correction_id == overlay.id has state IN {OPEN, QUARANTINED, REASSIGNED}"
+        side_effects:
+          - "stores closure_note"
+          - "re-derives the target PatientRecord.integrity_state (REMEDIATION_PENDING -> CLEAR when nothing else holds it)"
+          - "increments OverlayCorrection.version by 1"
+
+  - entity: ContaminationRemediation
+    dimension: state
+    initial_state: OPEN
+    terminal_states: [CLOSED]
+    transitions:
+      - from: OPEN
+        to: QUARANTINED
+        trigger: "POST /mpi/contamination-remediations/{id}/quarantine"
+        actor: IdentityAnalyst | PrivacyOfficer
+        preconditions:
+          - "remediation.state == OPEN"
+          - "element_count_quarantined <= remediation.element_count_subject"
+        side_effects: ["stores element_count_quarantined", "increments ContaminationRemediation.version by 1"]
+      - from: QUARANTINED
+        to: REASSIGNED
+        trigger: "POST /mpi/contamination-remediations/{id}/reassign"
+        actor: PrivacyOfficer
+        preconditions:
+          - "remediation.state == QUARANTINED"
+          - "element_count_reassigned <= remediation.element_count_quarantined"
+          - "the target PatientRecord has identity_state == ACTIVE AND enterprise_id != the remediation record's enterprise_id"
+        side_effects:
+          - "stores element_count_reassigned and reassigned_to_record_mrn"
+          - "target.clinical_element_count += element_count_reassigned and the remediation record's clinical_element_count -= element_count_reassigned; increments both PatientRecord.version values by 1"
+          - "increments ContaminationRemediation.version by 1"
+      - from: REASSIGNED
+        to: CLOSED
+        trigger: "POST /mpi/contamination-remediations/{id}/close"
+        actor: PrivacyOfficer
+        preconditions: ["remediation.state IN {QUARANTINED, REASSIGNED}"]
+        side_effects:
+          - "stores closure_note"
+          - "re-derives the remediation record's PatientRecord.integrity_state (REMEDIATION_PENDING -> CLEAR when nothing else holds it)"
+          - "increments ContaminationRemediation.version by 1"
+      - from: OPEN
+        to: CLOSED
+        trigger: "system event during POST /mpi/merge-operations/{id}/unmerge"
+        actor: system
+        preconditions: ["remediation.source_type == MERGE", "remediation.state IN {OPEN, QUARANTINED, REASSIGNED}"]
+        side_effects:
+          - "sets closure_note := 'CLOSED_BY_UNMERGE'"
+          - "re-derives the survivor PatientRecord.integrity_state (REMEDIATION_PENDING -> CLEAR)"
+          - "increments ContaminationRemediation.version by 1"
+      - from: QUARANTINED
+        to: CLOSED
+        trigger: "system event during POST /mpi/merge-operations/{id}/unmerge"
+        actor: system
+        preconditions: ["remediation.source_type == MERGE", "remediation.state IN {OPEN, QUARANTINED, REASSIGNED}"]
+        side_effects: ["sets closure_note := 'CLOSED_BY_UNMERGE'", "re-derives the survivor PatientRecord.integrity_state", "increments ContaminationRemediation.version by 1"]
+
+  - entity: PropagationTask
+    dimension: state
+    initial_state: QUEUED
+    terminal_states: [ACKED, CANCELLED]
+    note: "Cyclic on the retry edge SENT -> FAILED -> SENT. Tasks for a DownstreamSystem with ack_required == false are created directly in ACKED and never enter QUEUED."
+    transitions:
+      - from: QUEUED
+        to: SENT
+        trigger: "POST /mpi/propagation-tasks/{id}/send"
+        actor: MpiAdmin
+        preconditions:
+          - "task.state IN {QUEUED, FAILED}"
+          - "the DownstreamSystem.status == ACTIVE"
+          - "current logical clock <= task.propagation_deadline_at"
+          - "dispatch_window_end_at > dispatch_window_start_at"
+          - "count of other PropagationTask rows on the same downstream_system_id with state == SENT whose half-open window [dispatch_window_start_at, dispatch_window_end_at) intersects the requested window is < DownstreamSystem.max_concurrent_dispatch"
+        side_effects: ["stores the dispatch window", "increments attempt_count by 1", "increments PropagationTask.version by 1"]
+      - from: FAILED
+        to: SENT
+        trigger: "POST /mpi/propagation-tasks/{id}/send"
+        actor: MpiAdmin
+        preconditions: ["task.state IN {QUEUED, FAILED}", "the DownstreamSystem.status == ACTIVE", "current logical clock <= task.propagation_deadline_at"]
+        side_effects: ["stores the new dispatch window", "increments attempt_count by 1", "increments PropagationTask.version by 1"]
+        note: "Retry back-edge closing the SENT -> FAILED -> SENT cycle"
+      - from: SENT
+        to: ACKED
+        trigger: "POST /mpi/propagation-tasks/{id}/ack"
+        actor: MpiAdmin
+        preconditions: ["task.state == SENT"]
+        side_effects:
+          - "increments PropagationTask.version by 1"
+          - "re-evaluates the parent MergeOperation PENDING_PROPAGATION -> COMPLETED condition"
+      - from: SENT
+        to: FAILED
+        trigger: "POST /mpi/propagation-tasks/{id}/fail"
+        actor: MpiAdmin
+        preconditions: ["task.state == SENT"]
+        side_effects: ["stores last_error_code", "increments PropagationTask.version by 1"]
+      - from: QUEUED
+        to: CANCELLED
+        trigger: "system event during POST /mpi/merge-operations/{id}/unmerge"
+        actor: system
+        preconditions: ["task.state == QUEUED", "task.operation_kind == MERGE", "task.merge_operation_id == the merge being reversed"]
+        side_effects: ["increments PropagationTask.version by 1", "decrements DownstreamSystem.unacked_task_count"]
+
+  - entity: FraudInvestigation
+    dimension: state
+    initial_state: OPEN
+    terminal_states: [UNSUBSTANTIATED, REFERRED_LAW_ENFORCEMENT]
+    transitions:
+      - from: OPEN
+        to: SUBSTANTIATED
+        trigger: "POST /mpi/fraud-investigations/{id}/substantiate"
+        actor: PrivacyOfficer
+        preconditions: ["investigation.state == OPEN"]
+        side_effects:
+          - "stores finding_note"
+          - "drives the subject PatientRecord FRAUD_SUSPECTED -> FRAUD_CONFIRMED integrity transition"
+          - "which in turn escalates every DuplicateCandidatePair referencing the subject with queue_state IN {NEW, TRIAGED, UNDER_REVIEW, RECOMMENDED_MERGE, RECOMMENDED_DISTINCT} to ESCALATED_FRAUD"
+          - "increments FraudInvestigation.version by 1"
+      - from: OPEN
+        to: UNSUBSTANTIATED
+        trigger: "POST /mpi/fraud-investigations/{id}/unsubstantiate"
+        actor: PrivacyOfficer
+        preconditions: ["investigation.state == OPEN"]
+        side_effects:
+          - "stores finding_note"
+          - "drives the subject PatientRecord FRAUD_SUSPECTED -> CLEAR re-derivation when no other hold applies"
+          - "which in turn returns every ESCALATED_FRAUD DuplicateCandidatePair referencing the subject to UNDER_REVIEW"
+          - "increments FraudInvestigation.version by 1"
+      - from: SUBSTANTIATED
+        to: REFERRED_LAW_ENFORCEMENT
+        trigger: "POST /mpi/fraud-investigations/{id}/refer"
+        actor: PrivacyOfficer
+        preconditions: ["investigation.state == SUBSTANTIATED"]
+        side_effects: ["stores referral_reference", "increments FraudInvestigation.version by 1"]
+
+  - entity: ExternalMatchRequest
+    dimension: state
+    initial_state: SUBMITTED
+    terminal_states: [MATCHED, NO_MATCH]
+    note: "Branching fork resolved inside POST /mpi/external-match-requests: the row is minted SUBMITTED and immediately takes exactly one of the two outgoing edges, with a divergent side-effect set per branch."
+    transitions:
+      - from: SUBMITTED
+        to: MATCHED
+        trigger: "system event during POST /mpi/external-match-requests when external_score >= rule_set.auto_link_threshold"
+        actor: system
+        preconditions: ["record.identity_state == ACTIVE", "record.integrity_state == CLEAR", "consent_on_file == true"]
+        side_effects: ["stores external_score", "increments ExternalMatchRequest.version by 1"]
+      - from: SUBMITTED
+        to: NO_MATCH
+        trigger: "system event during POST /mpi/external-match-requests when external_score < rule_set.auto_link_threshold"
+        actor: system
+        preconditions: ["record.identity_state == ACTIVE", "record.integrity_state == CLEAR", "consent_on_file == true"]
+        side_effects: ["stores external_score", "increments ExternalMatchRequest.version by 1"]
+
+# =============================================================================
+# 1.2.1 Concurrency Rules (OCC on the parent entity's `version`)
+# =============================================================================
+concurrency_rules:
+  - rule_id: rescore-stale-pair-version
+    parent_entity: DuplicateCandidatePair
+    write_endpoint: "POST /mpi/candidate-pairs/{id}/rescore"
+    occ_field: "expected_pair_version"
+    description: |
+      Re-scoring a DuplicateCandidatePair whose version has advanced since the
+      client last observed it is rejected. Re-scoring is a legitimate supersede
+      operation — a new scoring run may replace the previous score any number of
+      times while the pair is not resolved — so the rejection cannot be derived
+      from queue_state alone. It is expressed purely as a stale-version check:
+      the submitted expected_pair_version must equal the pair's current version,
+      which triage, start-review, evidence submission, recommendation and the
+      fraud-escalation cascade all advance.
+    error_id: ERR_STALE_PAIR_VERSION
+    http_status: 412
+
+  - rule_id: overlay-create-stale-record-version
+    parent_entity: PatientRecord
+    write_endpoint: "POST /mpi/overlay-corrections"
+    occ_field: "expected_record_version"
+    description: |
+      Filing an OverlayCorrection against a PatientRecord whose version has
+      advanced since the client last observed it is rejected. Filing a new
+      correction legitimately supersedes any previously filed one — a record can
+      be corrected repeatedly — so a second filing based on a stale view of the
+      record is not excluded by any state precondition. The check is a
+      stale-version comparison against PatientRecord.version, which the previous
+      filing (and every merge, remediation and fraud cascade touching the record)
+      has already advanced.
+    error_id: ERR_STALE_RECORD_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: pair_match_score
+    trigger: "POST /mpi/candidate-pairs (initial scoring), POST /mpi/candidate-pairs/{id}/rescore, POST /mpi/registration-sites/{id}/search-attempts (virtual record vs each ACTIVE PatientRecord), POST /mpi/external-match-requests (local record vs external_demographics)"
+    algorithm: weighted_scoring
+    input_set: |
+      Exactly the seven scored attributes, evaluated in this fixed order:
+      [last_name, first_name, dob, ssn_last4, sex, postal_code, phone].
+      address_line is never scored. Both sides are the raw stored values; string
+      comparison is case-insensitive after trimming leading/trailing whitespace.
+      identity_state and integrity_state do NOT filter the inputs of this
+      calculation (a MERGED_SUBSUMED record can still be scored), but the
+      candidate pool of POST /mpi/registration-sites/{id}/search-attempts is
+      restricted to PatientRecord with identity_state == ACTIVE.
+    formula: |
+      # --- Step 1: per-attribute agreement -----------------------------------
+      # agreement(a) is NULL when either side's value for `a` is null/absent.
+      agreement(last_name), agreement(first_name):
+          1.0 if the two values are equal (case-insensitive)
+          0.5 if the first PREFIX_COMPARE_CHARS characters are equal but the
+              full values differ
+          0.0 otherwise
+      agreement(dob):
+          1.0 if the two YYYY-MM-DD values are equal
+          0.5 if YYYY and MM are equal but DD differs
+          0.5 if the two values are day/month transpositions of one another
+              (same YYYY, a.MM == b.DD and a.DD == b.MM, and a.MM != a.DD)
+          0.0 otherwise
+      agreement(ssn_last4), agreement(sex), agreement(phone):
+          1.0 if equal, else 0.0            # no partial credit
+      agreement(postal_code):
+          1.0 if equal
+          0.5 if the first PREFIX_COMPARE_CHARS characters are equal but the
+              full values differ
+          0.0 otherwise
+
+      # --- Step 2: per-attribute contribution, ROUNDED FIRST ------------------
+      # ROUNDING ORDER IS PINNED: round every attribute contribution to
+      # SCORE_PRECISION_DP (round_half_up) and THEN sum the rounded values.
+      # "sum the exact products then round once" is the WRONG order and is
+      # explicitly rejected by this scaffold.
+      for a in the fixed attribute order:
+          w = rule_set.attribute_weights[a]
+          if agreement(a) is NULL:
+              contribution(a) = 0.00                                   # variant STRICT
+              contribution(a) = round(w * NULL_CREDIT_FRACTION, 2)     # variant TOLERANT
+          else:
+              contribution(a) = round(w * agreement(a), 2)
+      attribute_score_breakdown = { a: contribution(a) }
+      raw_score = round(sum of contribution(a) over the fixed attribute order, 2)
+
+      # --- Step 3: conflict flags, emitted in this fixed order ---------------
+      conflict_flags = []
+      if a.ssn_last4 is not null and b.ssn_last4 is not null
+         and a.ssn_last4 != b.ssn_last4:                conflict_flags += [SSN4_CONFLICT]
+      if a.biometric_template_hash is not null and b.biometric_template_hash is not null
+         and they differ:                               conflict_flags += [BIOMETRIC_CONFLICT]
+      if a.insurance_member_id is not null and b.insurance_member_id is not null
+         and they differ:                               conflict_flags += [INSURANCE_CONFLICT]
+
+      # --- Step 4: penalty and classification --------------------------------
+      match_score = round(max(0.00,
+                    raw_score - rule_set.conflict_penalty_points * len(conflict_flags)), 2)
+      classification =
+          AUTO_LINK           if match_score >= rule_set.auto_link_threshold
+          POTENTIAL_DUPLICATE if match_score >= rule_set.review_threshold
+          NON_DUPLICATE       otherwise
+    constants:
+      NULL_CREDIT_FRACTION: 0.25
+      PARTIAL_AGREEMENT_FRACTION: 0.5
+      PREFIX_COMPARE_CHARS: 3
+    precision: "2 decimal places per attribute contribution and on raw_score/match_score, round_half_up"
+    variants:
+      - name: STRICT
+        when: "score_variant == STRICT (the default for POST /mpi/candidate-pairs and the only variant used by POST /mpi/registration-sites/{id}/search-attempts)"
+        difference: "A null on either side contributes exactly 0.00 and the attribute's weight is NOT redistributed — the denominator stays 100.00, so sparse records score low."
+      - name: TOLERANT
+        when: "score_variant == TOLERANT, and always for POST /mpi/external-match-requests (partner feeds are sparse by construction)"
+        difference: "A null on either side contributes round(weight * NULL_CREDIT_FRACTION, 2) instead of 0.00, so the same two records can cross review_threshold under TOLERANT while landing NON_DUPLICATE under STRICT."
+
+  - name: pair_triage_effective_score
+    trigger: "POST /mpi/candidate-pairs, POST /mpi/candidate-pairs/{id}/rescore, POST /mpi/candidate-pairs/{id}/evidence, POST /mpi/candidate-pairs/{id}/triage — every write that can change match_score or the pair's ReviewEvidence set"
+    algorithm: constraint_propagation
+    input_set: |
+      pair.match_score plus every ReviewEvidence row with pair_id == pair.id,
+      with no status filter (ReviewEvidence is append-only and has no state), read
+      in created_at ASC order; ties on identical created_at are broken by
+      evidence_type ASC then outcome ASC.
+    formula: |
+      # This dependency LOOKS circular: the band selects the multiplier, the
+      # multiplier scales the adjustment, the adjustment shifts the score, and the
+      # score selects the band. THE EVALUATION ORDER IS PINNED to the four steps
+      # below; the multiplier always comes from base_band (pre-evidence), never
+      # from the final priority_band.
+      # Step 1
+      base_band = P1 if match_score >= BAND_CUTOFF_P1
+                  P2 if match_score >= BAND_CUTOFF_P2
+                  P3 otherwise
+      # Step 2
+      multiplier = BAND_MULTIPLIER_P1 if base_band == P1
+                   BAND_MULTIPLIER_P2 if base_band == P2
+                   BAND_MULTIPLIER_P3 if base_band == P3
+      evidence_points = sum over ReviewEvidence (created_at ASC) of
+                          +e.weight_points if e.outcome == SUPPORTS_SAME_PERSON
+                          -e.weight_points if e.outcome == SUPPORTS_DISTINCT
+                           0.00            if e.outcome == INCONCLUSIVE
+      evidence_adjustment = round(evidence_points * multiplier, 2)
+      # Step 3
+      effective_score = round(min(100.00, max(0.00, match_score + evidence_adjustment)), 2)
+      # Step 4
+      priority_band = P1 if effective_score >= BAND_CUTOFF_P1
+                      P2 if effective_score >= BAND_CUTOFF_P2
+                      P3 otherwise
+    constants:
+      BAND_CUTOFF_P1: 85.00
+      BAND_CUTOFF_P2: 70.00
+      BAND_MULTIPLIER_P1: 1.50
+      BAND_MULTIPLIER_P2: 1.00
+      BAND_MULTIPLIER_P3: 0.50
+    precision: "2 decimal places, round_half_up"
+
+  - name: record_integrity_state_derivation
+    trigger: "every write that creates or transitions a FraudInvestigation, ContaminationRemediation or OverlayCorrection referencing the record, and the unmerge cascade"
+    algorithm: projection
+    input_set: |
+      All FraudInvestigation rows with record_id == record.id, all
+      ContaminationRemediation rows with record_id == record.id, and all
+      OverlayCorrection rows with record_id == record.id — no time window,
+      full current state.
+    formula: |
+      # Strict precedence, first match wins:
+      if any FraudInvestigation with record_id == record.id has
+         state IN {SUBSTANTIATED, REFERRED_LAW_ENFORCEMENT}:  integrity_state = FRAUD_CONFIRMED
+      elif any FraudInvestigation with record_id == record.id has
+         state == OPEN:                                        integrity_state = FRAUD_SUSPECTED
+      elif any ContaminationRemediation with record_id == record.id has
+           state IN {OPEN, QUARANTINED, REASSIGNED}
+           OR any OverlayCorrection with record_id == record.id has
+           state IN {DETECTED, UNDER_CORRECTION}:              integrity_state = REMEDIATION_PENDING
+      else:                                                    integrity_state = CLEAR
+    precision: "n/a (enum)"
+
+  - name: fraud_risk_score
+    trigger: "POST /mpi/fraud-investigations, and the system auto-open branch of POST /mpi/candidate-pairs; recomputed on POST /mpi/fraud-investigations/{id}/substantiate"
+    algorithm: weighted_scoring
+    input_set: |
+      The investigation's conflict source (pair.conflict_flags when pair_id is
+      non-null, otherwise the empty list for trigger_kind == MANUAL), the pair's
+      match_score, and the subject record's RegistrationSite.flagged_record_count
+      evaluated AFTER the subject's integrity_state has been re-derived (so the
+      subject itself is counted).
+    formula: |
+      conflict_count = len(pair.conflict_flags) if pair_id is not null else 0
+      conflict_component  = FRAUD_CONFLICT_COMPONENT_POINTS * conflict_count
+      score_component     = min(FRAUD_SCORE_COMPONENT_CAP,
+                                max(0.00, round(pair.match_score
+                                                - rule_set.review_threshold, 2)))
+                            if pair_id is not null else 0.00
+      site_component      = min(FRAUD_SITE_COMPONENT_CAP,
+                                FRAUD_SITE_COMPONENT_PER_FLAGGED_RECORD
+                                * site.flagged_record_count)
+      insurance_component = FRAUD_INSURANCE_COMPONENT_POINTS
+                            if pair_id is not null
+                               and INSURANCE_CONFLICT in pair.conflict_flags
+                            else 0.00
+      risk_score = round(min(100.00, conflict_component + score_component
+                                     + site_component + insurance_component), 2)
+    constants:
+      FRAUD_CONFLICT_COMPONENT_POINTS: 30.00
+      FRAUD_SCORE_COMPONENT_CAP: 30.00
+      FRAUD_SITE_COMPONENT_PER_FLAGGED_RECORD: 2.00
+      FRAUD_SITE_COMPONENT_CAP: 20.00
+      FRAUD_INSURANCE_COMPONENT_POINTS: 25.00
+    precision: "2 decimal places, round_half_up"
+
+  - name: site_duplicate_rate
+    trigger: "POST /mpi/registration-sites/{id}/duplicate-metric-runs"
+    algorithm: aggregation
+    input_set: |
+      (a) records_created: PatientRecord rows with site_id == the path site,
+          counted with NO identity_state filter (ACTIVE and MERGED_SUBSUMED both
+          count), whose date(created_at) satisfies
+          window_start_date <= date(created_at) <= window_end_date (CLOSED at both
+          ends, date-only comparison in UTC).
+      (b) confirmed_duplicates: MergeOperation rows with
+          state IN {PENDING_PROPAGATION, COMPLETED} — UNMERGED merges are
+          EXCLUDED — whose attributed record's site_id == the path site and whose
+          attributed record's date(created_at) lies in the same closed window.
+          Which record is "attributed" is the variant axis below.
+      Ordering is irrelevant (pure counts), so no tie-break is required.
+    formula: |
+      records_created      = count per input_set (a)
+      confirmed_duplicates = count per input_set (b) under the selected variant
+      # SINGLE rounding, applied once at the very end. Do NOT round an
+      # intermediate ratio and do NOT round per-merge.
+      duplicate_rate_bps   = 0 if records_created == 0
+                             else round_half_up(confirmed_duplicates * BPS_SCALE
+                                                / records_created)   # integer bps
+      sample_size_sufficient = (records_created >= METRIC_MIN_SAMPLE_SIZE)
+    constants:
+      BPS_SCALE: 10000
+      METRIC_MIN_SAMPLE_SIZE: 30
+    precision: "integer basis points, round_half_up, exactly one rounding step"
+    variants:
+      - name: CREATION_SITE_ATTRIBUTION
+        when: "attribution_variant == CREATION_SITE_ATTRIBUTION"
+        difference: "The attributed record is the merge's SUBSUMED record — the duplicate is charged to whichever site created the redundant chart."
+      - name: SURVIVOR_SITE_ATTRIBUTION
+        when: "attribution_variant == SURVIVOR_SITE_ATTRIBUTION"
+        difference: "The attributed record is the merge's SURVIVOR record — the duplicate is charged to the site that owns the retained chart. For a cross-site merge the two variants charge two different sites, so the same MergeOperation set yields different duplicate_rate_bps per site."
+
+  - name: registration_search_evaluation
+    trigger: "POST /mpi/registration-sites/{id}/search-attempts"
+    algorithm: threshold
+    input_set: |
+      Candidate pool = every PatientRecord with identity_state == ACTIVE, across
+      ALL sites (the duplicate-prevention search is enterprise-wide, not
+      site-scoped). MERGED_SUBSUMED records are excluded. The typed search terms
+      form a virtual record whose absent terms are null.
+    formula: |
+      rule_set   = the MatchRuleSet with status == ACTIVE
+      for each candidate c in the pool:
+          s(c) = pair_match_score(virtual_record, c, rule_set, variant=STRICT).match_score
+      result_count = count of candidates with s(c) >= rule_set.review_threshold
+      top_score    = 0.00 if the pool is empty
+                     else max over the pool of s(c)
+      top_match_record_mrn =
+          null if top_score == 0.00
+          else the mrn of the candidate ranked first by
+               s(c) DESC, then created_at ASC, then mrn ASC
+      blocked_creation = (top_score >= rule_set.auto_link_threshold)
+    constants: {}
+    precision: "top_score to 2 decimal places, round_half_up; result_count integer"
+
+  - name: merge_element_transfer
+    trigger: "POST /mpi/merge-operations, and reversed by POST /mpi/merge-operations/{id}/unmerge"
+    algorithm: aggregation
+    input_set: "Exactly the two PatientRecord rows named by the MergeOperation, plus every PatientRecord whose survivor_record_id == subsumed_record_id at merge time (the path-compression set)."
+    formula: |
+      # Forward (merge)
+      moved_clinical_element_count      = subsumed.clinical_element_count   # snapshot BEFORE mutation
+      subsumed_prior_enterprise_id      = subsumed.enterprise_id            # snapshot BEFORE overwrite
+      survivor.clinical_element_count  += moved_clinical_element_count
+      subsumed.clinical_element_count   = 0
+      subsumed.enterprise_id            = survivor.enterprise_id
+      recompressed_record_mrns          = [ r.mrn for r in PatientRecord
+                                            where r.survivor_record_id == subsumed.id
+                                              and r.identity_state == MERGED_SUBSUMED,
+                                            ordered by r.created_at ASC then r.mrn ASC ]
+      for r in that set: r.survivor_record_id = survivor.id ;
+                         r.enterprise_id     = survivor.enterprise_id
+      survivor.subsumed_member_count    = count of PatientRecord where
+                                            survivor_record_id == survivor.id
+                                            and identity_state == MERGED_SUBSUMED
+      # Reverse (unmerge) — exact mirror using the stored snapshots
+      survivor.clinical_element_count  -= merge.moved_clinical_element_count
+      subsumed.clinical_element_count  += merge.moved_clinical_element_count
+      subsumed.enterprise_id            = merge.subsumed_prior_enterprise_id
+      for mrn in merge.recompressed_record_mrns (same stored order):
+          the PatientRecord with that mrn under this cluster gets
+          survivor_record_id = subsumed.id and enterprise_id = subsumed.enterprise_id
+    constants: {}
+    precision: "integer element counts, no rounding"
+
+  - name: clinical_element_conservation
+    trigger: "invariant checked across the POST /mpi/merge-operations forward action and its POST /mpi/merge-operations/{id}/unmerge compensating action"
+    algorithm: aggregation
+    input_set: "Every PatientRecord whose id is the merge's survivor_record_id, its subsumed_record_id, or appears in the merge's path-compression set — no status filter."
+    formula: |
+      CLUSTER_ELEMENTS(merge) = survivor.clinical_element_count
+                              + subsumed.clinical_element_count
+                              + sum(r.clinical_element_count for r in the
+                                    path-compression set of the merge)
+      INVARIANT: CLUSTER_ELEMENTS evaluated immediately before
+                 POST /mpi/merge-operations equals CLUSTER_ELEMENTS evaluated
+                 immediately after POST /mpi/merge-operations/{id}/unmerge.
+                 Merge shifts the quantity between rows; unmerge shifts exactly
+                 merge.moved_clinical_element_count back, so the sum never drifts.
+      NOTE: a ContaminationRemediation reassign performed between merge and
+      unmerge intentionally moves elements OUT of the cluster; the invariant is
+      therefore stated over merge+unmerge with no intervening reassign.
+    constants: {}
+    precision: "integer, exact equality"
+
+  - name: enterprise_identity_conservation
+    trigger: "invariant checked across the POST /mpi/merge-operations forward action and its POST /mpi/merge-operations/{id}/unmerge compensating action"
+    algorithm: aggregation
+    input_set: "Every PatientRecord with identity_state == ACTIVE, enterprise-wide."
+    formula: |
+      DISTINCT_ACTIVE_EIDS = count of distinct PatientRecord.enterprise_id over
+                             rows with identity_state == ACTIVE
+      INVARIANT: DISTINCT_ACTIVE_EIDS immediately before
+                 POST /mpi/merge-operations equals DISTINCT_ACTIVE_EIDS
+                 immediately after POST /mpi/merge-operations/{id}/unmerge, and
+                 the unmerged record's enterprise_id equals
+                 merge.subsumed_prior_enterprise_id byte for byte.
+                 Merge decrements the count by exactly 1 (the subsumed record
+                 leaves the ACTIVE set); unmerge increments it by exactly 1 and
+                 restores the original key, so no enterprise identity is lost or
+                 invented.
+    constants: {}
+    precision: "integer count, exact equality; enterprise_id string equality"
+
+  - name: dispatch_window_occupancy
+    trigger: "POST /mpi/propagation-tasks/{id}/send"
+    algorithm: interval_merge
+    input_set: |
+      Every OTHER PropagationTask row with the same downstream_system_id and
+      state == SENT (QUEUED, ACKED, FAILED and CANCELLED tasks hold no capacity),
+      excluding the task being sent.
+    formula: |
+      # HALF-OPEN interval arithmetic: [start, end). Touching endpoints do NOT
+      # intersect, so back-to-back windows are always permitted.
+      intersects(x, y) = (x.start < y.end) and (y.start < x.end)
+      occupancy = count of qualifying tasks t with intersects(t, requested_window)
+      REJECT with ERR_DISPATCH_CAPACITY_EXCEEDED when
+          occupancy >= DownstreamSystem.max_concurrent_dispatch
+      # Aggregate-capacity semantics: a single overlap is legal while occupancy
+      # stays below max_concurrent_dispatch.
+    constants: {}
+    precision: "datetime comparison at millisecond resolution, ISO 8601 UTC with three fractional digits"
+
+  - name: metric_window_exclusivity
+    trigger: "POST /mpi/registration-sites/{id}/duplicate-metric-runs"
+    algorithm: interval_merge
+    input_set: |
+      Every existing SiteDuplicateMetric row with the same site_id AND the same
+      attribution_variant. Runs of the other attribution_variant are ignored, so
+      both variants may be computed over identical windows.
+    formula: |
+      # CLOSED interval arithmetic on date-only values: [start, end]. Because the
+      # boundary date is counted inside BOTH windows, touching endpoints DO
+      # collide — this is the opposite adjacency treatment from
+      # dispatch_window_occupancy.
+      collides(x, y) = (x.window_start_date <= y.window_end_date)
+                       and (y.window_start_date <= x.window_end_date)
+      REJECT with ERR_METRIC_WINDOW_OVERLAP when any qualifying existing row
+          collides with the requested window.
+      # Pairwise-exclusive semantics: there is no capacity dimension — one
+      # collision is fatal.
+    constants: {}
+    precision: "date-only comparison, YYYY-MM-DD lexicographic"
+
+# =============================================================================
+# 1.4 Validation Rules Table (evaluated strictly in ascending priority order;
+#     the FIRST failing row determines the response error_id)
+# =============================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers are both present and X-User-Role is one of the five declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role appears in the endpoint's roles list"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+
+  - priority: 3
+    category: auth
+    check: "When X-User-Role == SiteRegistrar, X-User-ID equals the RegistrationSite id in scope: the {id} path segment for POST /mpi/registration-sites/{id}/search-attempts, and the body site_id for POST /mpi/patient-records"
+    error_id: ERR_SITE_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "POST /mpi/registration-sites/{id}/search-attempts, POST /mpi/patient-records"
+
+  - priority: 4
+    category: business_constraint
+    check: "Request body is well formed: every required input field present, types match, enum values inside the declared constraint set, dates parseable as YYYY-MM-DD, datetimes parseable as ISO 8601 UTC, numeric values inside declared ranges, attribute_weights carries exactly the seven declared keys, corrected_field_snapshot carries only allowed keys, encounter_to_date >= encounter_from_date, window_end_date >= window_start_date, dispatch_window_end_at > dispatch_window_start_at, pagination limit in [1,100] and offset >= 0"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: all
+
+  - priority: 5
+    category: existence
+    check: "The RegistrationSite named by the {id} path segment or by body site_id exists"
+    error_id: ERR_SITE_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /mpi/registration-sites/{id}/search-attempts, POST /mpi/registration-sites/{id}/duplicate-metric-runs, GET /mpi/registration-sites/{id}, GET /mpi/registration-sites/{id}/search-attempts, GET /mpi/registration-sites/{id}/duplicate-metric-runs, PATCH /mpi/registration-sites/{id}, POST /mpi/patient-records"
+
+  - priority: 6
+    category: existence
+    check: "The MatchRuleSet named by the {id} path segment or by body rule_set_id exists"
+    error_id: ERR_RULE_SET_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /mpi/match-rule-sets/{id}/activate, POST /mpi/candidate-pairs, POST /mpi/candidate-pairs/{id}/rescore"
+
+  - priority: 7
+    category: existence
+    check: "The RegistrationSearchAttempt named by body origin_search_attempt_id exists"
+    error_id: ERR_SEARCH_ATTEMPT_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /mpi/patient-records"
+
+  - priority: 8
+    category: existence
+    check: "Every PatientRecord named by a path segment or by body record_id / record_a_id / record_b_id / survivor_record_id / subsumed_record_id / target_record_id exists"
+    error_id: ERR_RECORD_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/patient-records/{id}, POST /mpi/candidate-pairs, POST /mpi/merge-operations, POST /mpi/overlay-corrections, POST /mpi/fraud-investigations, POST /mpi/external-match-requests, POST /mpi/contamination-remediations/{id}/reassign"
+
+  - priority: 9
+    category: existence
+    check: "The DuplicateCandidatePair named by the {id} path segment or by body pair_id exists"
+    error_id: ERR_PAIR_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/candidate-pairs/{id}, GET /mpi/candidate-pairs/{id}/evidence, POST /mpi/candidate-pairs/{id}/rescore, POST /mpi/candidate-pairs/{id}/triage, POST /mpi/candidate-pairs/{id}/start-review, POST /mpi/candidate-pairs/{id}/evidence, POST /mpi/candidate-pairs/{id}/recommend, POST /mpi/candidate-pairs/{id}/return-to-review, POST /mpi/candidate-pairs/{id}/resolve-distinct, POST /mpi/merge-operations, POST /mpi/fraud-investigations"
+
+  - priority: 10
+    category: existence
+    check: "The MergeOperation named by the {id} path segment exists"
+    error_id: ERR_MERGE_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/merge-operations/{id}, POST /mpi/merge-operations/{id}/unmerge"
+
+  - priority: 11
+    category: existence
+    check: "The OverlayCorrection named by the {id} path segment exists"
+    error_id: ERR_OVERLAY_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/overlay-corrections/{id}, POST /mpi/overlay-corrections/{id}/apply, POST /mpi/overlay-corrections/{id}/complete"
+
+  - priority: 12
+    category: existence
+    check: "The ContaminationRemediation named by the {id} path segment exists"
+    error_id: ERR_REMEDIATION_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/contamination-remediations/{id}, POST /mpi/contamination-remediations/{id}/quarantine, POST /mpi/contamination-remediations/{id}/reassign, POST /mpi/contamination-remediations/{id}/close"
+
+  - priority: 13
+    category: existence
+    check: "The PropagationTask named by the {id} path segment exists"
+    error_id: ERR_TASK_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/propagation-tasks/{id}, POST /mpi/propagation-tasks/{id}/send, POST /mpi/propagation-tasks/{id}/ack, POST /mpi/propagation-tasks/{id}/fail"
+
+  - priority: 14
+    category: existence
+    check: "The FraudInvestigation named by the {id} path segment exists"
+    error_id: ERR_INVESTIGATION_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/fraud-investigations/{id}, POST /mpi/fraud-investigations/{id}/substantiate, POST /mpi/fraud-investigations/{id}/unsubstantiate, POST /mpi/fraud-investigations/{id}/refer"
+
+  - priority: 15
+    category: existence
+    check: "The DownstreamSystem named by the {id} path segment exists"
+    error_id: ERR_DOWNSTREAM_SYSTEM_NOT_FOUND
+    http_status: 404
+    applies_to: "GET /mpi/downstream-systems/{id}, PATCH /mpi/downstream-systems/{id}"
+
+  - priority: 16
+    category: business_constraint
+    check: "The seven attribute_weights values sum to exactly 100.00"
+    error_id: ERR_WEIGHTS_SUM_INVALID
+    http_status: 422
+    applies_to: "POST /mpi/match-rule-sets"
+
+  - priority: 17
+    category: business_constraint
+    check: "review_threshold <= auto_link_threshold"
+    error_id: ERR_THRESHOLD_ORDER_INVALID
+    http_status: 422
+    applies_to: "POST /mpi/match-rule-sets"
+
+  - priority: 18
+    category: business_constraint
+    check: "When X-User-Role == SiteRegistrar, origin_search_attempt_id is present in the body"
+    error_id: ERR_SEARCH_ATTEMPT_REQUIRED
+    http_status: 422
+    applies_to: "POST /mpi/patient-records"
+
+  - priority: 19
+    category: business_constraint
+    check: "expected_pair_version equals the DuplicateCandidatePair's current version (OCC per concurrency_rules.rescore-stale-pair-version)"
+    error_id: ERR_STALE_PAIR_VERSION
+    http_status: 412
+    applies_to: "POST /mpi/candidate-pairs/{id}/rescore"
+
+  - priority: 20
+    category: business_constraint
+    check: "expected_record_version equals the target PatientRecord's current version (OCC per concurrency_rules.overlay-create-stale-record-version)"
+    error_id: ERR_STALE_RECORD_VERSION
+    http_status: 412
+    applies_to: "POST /mpi/overlay-corrections"
+
+  - priority: 21
+    category: business_safety
+    check: "No PatientRecord in scope has integrity_state IN {FRAUD_SUSPECTED, FRAUD_CONFIRMED}. Scope = both member records for pair operations, both merge members for POST /mpi/merge-operations, the target record for overlay/external-match/remediation-reassign operations"
+    error_id: ERR_RECORD_UNDER_FRAUD_HOLD
+    http_status: 409
+    applies_to: "POST /mpi/candidate-pairs/{id}/triage, POST /mpi/candidate-pairs/{id}/start-review, POST /mpi/candidate-pairs/{id}/evidence, POST /mpi/candidate-pairs/{id}/recommend, POST /mpi/merge-operations, POST /mpi/overlay-corrections, POST /mpi/overlay-corrections/{id}/apply, POST /mpi/external-match-requests, POST /mpi/contamination-remediations/{id}/reassign"
+
+  - priority: 22
+    category: business_safety
+    check: "The target PatientRecord.integrity_state != REMEDIATION_PENDING"
+    error_id: ERR_RECORD_REMEDIATION_PENDING
+    http_status: 409
+    applies_to: "POST /mpi/external-match-requests, POST /mpi/merge-operations"
+
+  - priority: 23
+    category: business_safety
+    check: "consent_on_file == true"
+    error_id: ERR_EXCHANGE_CONSENT_MISSING
+    http_status: 403
+    applies_to: "POST /mpi/external-match-requests"
+
+  - priority: 24
+    category: state
+    check: "The RegistrationSite in scope has status == ACTIVE"
+    error_id: ERR_SITE_SUSPENDED
+    http_status: 409
+    applies_to: "POST /mpi/patient-records, POST /mpi/registration-sites/{id}/search-attempts"
+
+  - priority: 25
+    category: state
+    check: "Every PatientRecord in scope has identity_state == ACTIVE"
+    error_id: ERR_RECORD_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /mpi/merge-operations, POST /mpi/overlay-corrections, POST /mpi/external-match-requests, POST /mpi/contamination-remediations/{id}/reassign"
+
+  - priority: 26
+    category: state
+    check: "pair.queue_state is a declared `from:` state of the requested DuplicateCandidatePair transition. POST /mpi/candidate-pairs/{id}/rescore declares no transition — it is permitted only from queue_state IN {NEW, TRIAGED, UNDER_REVIEW} and leaves queue_state unchanged"
+    error_id: ERR_PAIR_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/candidate-pairs/{id}/rescore, POST /mpi/candidate-pairs/{id}/triage, POST /mpi/candidate-pairs/{id}/start-review, POST /mpi/candidate-pairs/{id}/evidence, POST /mpi/candidate-pairs/{id}/recommend, POST /mpi/candidate-pairs/{id}/return-to-review, POST /mpi/candidate-pairs/{id}/resolve-distinct, POST /mpi/merge-operations"
+
+  - priority: 27
+    category: state
+    check: "merge.state is a declared `from:` state of the requested MergeOperation transition"
+    error_id: ERR_MERGE_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/merge-operations/{id}/unmerge"
+
+  - priority: 28
+    category: state
+    check: "overlay.state is a declared `from:` state of the requested OverlayCorrection transition"
+    error_id: ERR_OVERLAY_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/overlay-corrections/{id}/apply, POST /mpi/overlay-corrections/{id}/complete"
+
+  - priority: 29
+    category: state
+    check: "remediation.state is a declared `from:` state of the requested ContaminationRemediation transition"
+    error_id: ERR_REMEDIATION_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/contamination-remediations/{id}/quarantine, POST /mpi/contamination-remediations/{id}/reassign, POST /mpi/contamination-remediations/{id}/close"
+
+  - priority: 30
+    category: state
+    check: "task.state IN {QUEUED, FAILED} for send, and task.state == SENT for ack/fail"
+    error_id: ERR_TASK_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/propagation-tasks/{id}/send, POST /mpi/propagation-tasks/{id}/ack, POST /mpi/propagation-tasks/{id}/fail"
+
+  - priority: 31
+    category: state
+    check: "investigation.state == OPEN for substantiate/unsubstantiate and == SUBSTANTIATED for refer"
+    error_id: ERR_INVESTIGATION_INVALID_STATE
+    http_status: 409
+    applies_to: "POST /mpi/fraud-investigations/{id}/substantiate, POST /mpi/fraud-investigations/{id}/unsubstantiate, POST /mpi/fraud-investigations/{id}/refer"
+
+  - priority: 32
+    category: state
+    check: "The task's DownstreamSystem.status == ACTIVE"
+    error_id: ERR_DOWNSTREAM_SYSTEM_PAUSED
+    http_status: 409
+    applies_to: "POST /mpi/propagation-tasks/{id}/send"
+
+  - priority: 33
+    category: state
+    check: "No PropagationTask with merge_operation_id == merge.id has state == SENT"
+    error_id: ERR_PROPAGATION_IN_FLIGHT
+    http_status: 409
+    applies_to: "POST /mpi/merge-operations/{id}/unmerge"
+
+  - priority: 34
+    category: business_constraint
+    check: "X-User-ID differs from pair.recommended_by_user_id (segregation of duties); vacuously satisfied when recommended_by_user_id is null"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /mpi/merge-operations, POST /mpi/candidate-pairs/{id}/resolve-distinct"
+
+  - priority: 35
+    category: business_constraint
+    check: "count of ReviewEvidence with pair_id == pair.id is >= MIN_EVIDENCE_COUNT"
+    error_id: ERR_INSUFFICIENT_REVIEW_EVIDENCE
+    http_status: 422
+    applies_to: "POST /mpi/candidate-pairs/{id}/recommend"
+
+  - priority: 36
+    category: business_referential
+    check: "survivor_record_id != subsumed_record_id, and record_a_id != record_b_id"
+    error_id: ERR_MERGE_SELF_REFERENCE
+    http_status: 422
+    applies_to: "POST /mpi/merge-operations, POST /mpi/candidate-pairs"
+
+  - priority: 37
+    category: business_referential
+    check: "{survivor_record_id, subsumed_record_id} equals {pair.record_a_id, pair.record_b_id} as an unordered set"
+    error_id: ERR_PAIR_RECORD_MISMATCH
+    http_status: 422
+    applies_to: "POST /mpi/merge-operations"
+
+  - priority: 38
+    category: business_referential
+    check: "target_record_id names a PatientRecord whose enterprise_id differs from the remediation record's enterprise_id (elements must leave the contaminated cluster)"
+    error_id: ERR_REASSIGN_TARGET_INVALID
+    http_status: 422
+    applies_to: "POST /mpi/contamination-remediations/{id}/reassign"
+
+  - priority: 39
+    category: business_referential
+    check: "No existing PatientRecord shares the requested (site_id, mrn) combination"
+    error_id: ERR_DUPLICATE_MRN
+    http_status: 409
+    applies_to: "POST /mpi/patient-records"
+
+  - priority: 40
+    category: business_referential
+    check: "No existing DuplicateCandidatePair with the same unordered {record_a_id, record_b_id} set has queue_state NOT IN {RESOLVED_DISTINCT, RESOLVED_MERGED}"
+    error_id: ERR_PAIR_ALREADY_EXISTS
+    http_status: 409
+    applies_to: "POST /mpi/candidate-pairs"
+
+  - priority: 41
+    category: business_temporal
+    check: "current logical clock <= origin_search_attempt.created_at + SEARCH_ATTEMPT_TTL_MINUTES minutes"
+    error_id: ERR_SEARCH_ATTEMPT_EXPIRED
+    http_status: 409
+    applies_to: "POST /mpi/patient-records"
+
+  - priority: 42
+    category: business_temporal
+    check: "When merge.state == COMPLETED, current logical clock <= merge.reversal_deadline_at"
+    error_id: ERR_REVERSAL_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /mpi/merge-operations/{id}/unmerge"
+
+  - priority: 43
+    category: business_temporal
+    check: "current logical clock <= task.propagation_deadline_at"
+    error_id: ERR_PROPAGATION_WINDOW_EXPIRED
+    http_status: 409
+    applies_to: "POST /mpi/propagation-tasks/{id}/send"
+
+  - priority: 44
+    category: business_temporal
+    check: "The requested closed date window does not collide with any existing SiteDuplicateMetric on the same site_id AND same attribution_variant, per calculations.metric_window_exclusivity"
+    error_id: ERR_METRIC_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /mpi/registration-sites/{id}/duplicate-metric-runs"
+
+  - priority: 45
+    category: business_fiscal
+    check: "Half-open dispatch-window occupancy on the DownstreamSystem is below max_concurrent_dispatch, per calculations.dispatch_window_occupancy"
+    error_id: ERR_DISPATCH_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /mpi/propagation-tasks/{id}/send"
+
+  - priority: 46
+    category: business_fiscal
+    check: "The cited origin_search_attempt.blocked_creation is false"
+    error_id: ERR_DUPLICATE_CREATION_BLOCKED
+    http_status: 409
+    applies_to: "POST /mpi/patient-records"
+
+  - priority: 47
+    category: business_fiscal
+    check: "element_count_quarantined <= remediation.element_count_subject on quarantine, and element_count_reassigned <= remediation.element_count_quarantined on reassign"
+    error_id: ERR_REMEDIATION_COUNT_INVALID
+    http_status: 422
+    applies_to: "POST /mpi/contamination-remediations/{id}/quarantine, POST /mpi/contamination-remediations/{id}/reassign"
+
+# =============================================================================
+# 1.5 Endpoint Table
+#     `input:` lists body/query field NAMES only ("?" suffix = optional).
+#     `output:` names the §1.1 entity (or `Entity[]` for lists).
+# =============================================================================
+endpoints:
+
+  # --- logical clock -------------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    purpose: |
+      Test-driving endpoint (§1.5 ladder step 3): sets the service-wide logical
+      clock used by every temporal rule. The clock defaults to
+      global_constants.DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z" before any
+      call is made, and every created_at / updated_at / deadline value is derived
+      from it, never from wall-clock time.
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - current_utc
+    output: { current_utc: string }
+    side_effects:
+      - "All subsequent created_at / updated_at stamps and all temporal comparisons use current_utc."
+
+  # --- registration sites --------------------------------------------------
+  - method: POST
+    path: "/mpi/registration-sites"
+    purpose: "Register a front-end registration site (a registrar desk cluster whose duplicate rate is measured)."
+    roles: [MpiAdmin]
+    input:
+      - site_code
+      - name
+      - region_code
+      - registrar_headcount
+    output: RegistrationSite
+    side_effects:
+      - "status initialised to ACTIVE; active_record_count and flagged_record_count initialised to 0."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: PATCH
+    path: "/mpi/registration-sites/{id}"
+    purpose: "Rename a site, adjust its registrar headcount, or suspend/reactivate it."
+    roles: [MpiAdmin]
+    input:
+      - name?
+      - registrar_headcount?
+      - status?
+    output: RegistrationSite
+    side_effects:
+      - "version += 1; updated_at set to the logical clock."
+      - "Suspending a site does not retire its PatientRecords; it only blocks new registration and new search attempts."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/registration-sites/{id}"
+    purpose: "Read one site including its computed active_record_count and flagged_record_count."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: RegistrationSite
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_SITE_NOT_FOUND]
+
+  # --- match rule sets -----------------------------------------------------
+  - method: POST
+    path: "/mpi/match-rule-sets"
+    purpose: "Define a configurable duplicate-detection rule set: per-attribute weights and the two thresholds."
+    roles: [MpiAdmin]
+    input:
+      - name
+      - version_label
+      - attribute_weights
+      - auto_link_threshold
+      - review_threshold
+      - conflict_penalty_points
+    output: MatchRuleSet
+    side_effects:
+      - "status initialised to DRAFT."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_WEIGHTS_SUM_INVALID, ERR_THRESHOLD_ORDER_INVALID]
+
+  - method: POST
+    path: "/mpi/match-rule-sets/{id}/activate"
+    purpose: "Promote a DRAFT rule set to ACTIVE; any previously ACTIVE rule set is RETIRED in the same request."
+    roles: [MpiAdmin]
+    input: []
+    output: MatchRuleSet
+    side_effects:
+      - "Every other MatchRuleSet whose status == ACTIVE transitions to RETIRED (cascading side effect, immediate consistency)."
+      - "Existing DuplicateCandidatePair rows are NOT re-scored; they keep the rule_set_id they were scored under until an explicit rescore."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_RULE_SET_NOT_FOUND, ERR_INVALID_REQUEST]
+
+  - method: GET
+    path: "/mpi/match-rule-sets/{id}"
+    purpose: "Read one rule set's weights, thresholds and status."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: MatchRuleSet
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_RULE_SET_NOT_FOUND]
+
+  # --- registration front-end search --------------------------------------
+  - method: POST
+    path: "/mpi/registration-sites/{id}/search-attempts"
+    purpose: |
+      Record a registration front-end identity search. The response tells the
+      registrar whether creating a new record is permitted (blocked_creation),
+      implementing duplicate-creation prevention at the point of registration.
+    roles: [SiteRegistrar, IdentityAnalyst]
+    input:
+      - searched_last_name
+      - searched_first_name?
+      - searched_dob?
+      - searched_sex?
+      - searched_ssn_last4?
+      - searched_postal_code?
+      - searched_phone?
+    output: RegistrationSearchAttempt
+    side_effects:
+      - "Evaluates calculations.registration_search_evaluation against every ACTIVE PatientRecord."
+      - "Sets result_count, top_score, top_match_record_mrn, blocked_creation and rule_set_version_label."
+      - "Immutable once written (common_fields: false — no version, no update endpoint)."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_SITE_SCOPE_VIOLATION, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND, ERR_SITE_SUSPENDED]
+
+  - method: GET
+    path: "/mpi/registration-sites/{id}/search-attempts"
+    purpose: "List the search attempts recorded at one site (reverse reachability for RegistrationSearchAttempt.site_id)."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - limit?
+      - offset?
+    output: RegistrationSearchAttempt[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND]
+
+  # --- patient records -----------------------------------------------------
+  - method: POST
+    path: "/mpi/patient-records"
+    purpose: "Create a patient record at a site. SiteRegistrar callers must cite a fresh, non-blocking search attempt."
+    roles: [SiteRegistrar, IdentityAnalyst]
+    input:
+      - site_id
+      - mrn
+      - last_name
+      - first_name
+      - dob
+      - sex
+      - ssn_last4?
+      - address_line?
+      - postal_code?
+      - phone?
+      - biometric_template_hash?
+      - insurance_member_id?
+      - clinical_element_count?
+      - origin_search_attempt_id?
+    output: PatientRecord
+    side_effects:
+      - "identity_state initialised to ACTIVE; integrity_state derived as CLEAR; survivor_record_id null; subsumed_member_count 0."
+      - "enterprise_id computed as 'EID-' + site.site_code + '-' + mrn."
+      - "clinical_element_count defaults to 0 when omitted."
+      - "site.active_record_count += 1 (derived_field_reconciliation)."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_SITE_SCOPE_VIOLATION, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND, ERR_SEARCH_ATTEMPT_NOT_FOUND, ERR_SEARCH_ATTEMPT_REQUIRED, ERR_SITE_SUSPENDED, ERR_DUPLICATE_MRN, ERR_SEARCH_ATTEMPT_EXPIRED, ERR_DUPLICATE_CREATION_BLOCKED]
+
+  - method: GET
+    path: "/mpi/patient-records/{id}"
+    purpose: "Read one patient record including enterprise_id, identity_state, integrity_state and subsumed_member_count."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: PatientRecord
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_RECORD_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/patient-records"
+    purpose: "List/filter patient records. Reverse reachability for site_id, origin_search_attempt_id and the self-referential survivor_record_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - site_id?
+      - survivor_record_id?
+      - origin_search_attempt_id?
+      - identity_state?
+      - integrity_state?
+      - enterprise_id?
+      - mrn?
+      - limit?
+      - offset?
+    output: PatientRecord[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  # --- duplicate candidate pairs & work queue ------------------------------
+  - method: POST
+    path: "/mpi/candidate-pairs"
+    purpose: |
+      Score two records against a rule set under one score_variant and place the
+      pair on the triage work queue. rule_set_id may name a rule set in ANY status
+      (DRAFT, ACTIVE or RETIRED) — pinning the exact rule set is what makes a
+      score reproducible and auditable years later.
+    roles: [IdentityAnalyst, MpiAdmin]
+    input:
+      - record_a_id
+      - record_b_id
+      - rule_set_id
+      - score_variant
+    output: DuplicateCandidatePair
+    side_effects:
+      - "Computes attribute_score_breakdown, raw_score, conflict_flags and match_score per calculations.pair_match_score."
+      - "Sets classification from the rule set's thresholds, and subject_record_mrn to the mrn of the subject record (the member with the later created_at; on identical created_at the lexicographically greater mrn)."
+      - "Computes evidence_points (0), base_band, evidence_adjustment, effective_score and priority_band per calculations.pair_triage_effective_score."
+      - "queue_state initialised to NEW; detected_at_site_id set to the subject record's site_id."
+      - "When conflict_flags contains BIOMETRIC_CONFLICT or INSURANCE_CONFLICT AND raw_score >= FRAUD_AUTO_OPEN_RAW_SCORE_MIN, exactly one FraudInvestigation is auto-opened (opened_by SYSTEM, opened_by_user_id null, pair_id this pair, state OPEN) on the SUBJECT record only, the subject record's integrity_state becomes FRAUD_SUSPECTED, the subject's site flagged_record_count is recomputed, risk_score is then computed per calculations.fraud_risk_score, and the pair's queue_state jumps to ESCALATED_FRAUD instead of NEW. The non-subject member record is not modified. SSN4_CONFLICT alone never triggers this branch."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RULE_SET_NOT_FOUND, ERR_RECORD_NOT_FOUND, ERR_MERGE_SELF_REFERENCE, ERR_PAIR_ALREADY_EXISTS]
+
+  - method: GET
+    path: "/mpi/candidate-pairs/{id}"
+    purpose: "Read one candidate pair including its full score breakdown and triage band."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: DuplicateCandidatePair
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_PAIR_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/candidate-pairs"
+    purpose: "The work queue list. Reverse reachability for record_a_id, record_b_id, rule_set_id and detected_at_site_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - record_a_id?
+      - record_b_id?
+      - rule_set_id?
+      - detected_at_site_id?
+      - queue_state?
+      - classification?
+      - priority_band?
+      - limit?
+      - offset?
+    output: DuplicateCandidatePair[]
+    side_effects:
+      - "Default ordering: priority_band ASC (P1 first), then effective_score DESC, then created_at ASC, then subject_record_mrn ASC."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/rescore"
+    purpose: "Re-run scoring for a pair under a (possibly different) rule set and/or score_variant. Guarded by OCC on the pair's version."
+    roles: [IdentityAnalyst, MpiAdmin]
+    input:
+      - rule_set_id
+      - score_variant
+      - expected_pair_version
+    output: DuplicateCandidatePair
+    side_effects:
+      - "Recomputes the full score chain (raw_score, conflict_flags, match_score, classification, attribute_score_breakdown) and the triage chain (base_band, evidence_adjustment, effective_score, priority_band); rule_set_id and score_variant are overwritten with the submitted values."
+      - "queue_state is left UNCHANGED — rescore is not a queue transition. It is permitted only from NEW, TRIAGED or UNDER_REVIEW."
+      - "version += 1. Existing ReviewEvidence rows are preserved, so evidence_points and evidence_adjustment are recomputed from them."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RULE_SET_NOT_FOUND, ERR_PAIR_NOT_FOUND, ERR_STALE_PAIR_VERSION, ERR_PAIR_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/triage"
+    purpose: "Analyst triages a NEW pair, attaching a triage note."
+    roles: [IdentityAnalyst]
+    input:
+      - triage_note
+    output: DuplicateCandidatePair
+    side_effects:
+      - "queue_state NEW -> TRIAGED; version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_PAIR_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/start-review"
+    purpose: "Open manual review on a triaged pair so evidence can be attached."
+    roles: [IdentityAnalyst]
+    input: []
+    output: DuplicateCandidatePair
+    side_effects:
+      - "queue_state TRIAGED -> UNDER_REVIEW; version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_PAIR_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_PAIR_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/evidence"
+    purpose: "Attach one immutable piece of manual-review evidence to a pair under review."
+    roles: [IdentityAnalyst]
+    input:
+      - evidence_type
+      - outcome
+      - weight_points
+      - note?
+    output: ReviewEvidence
+    side_effects:
+      - "weight_points is stored verbatim as supplied (0.00-10.00); its SIGN is not stored — the sign comes from outcome inside calculations.pair_triage_effective_score."
+      - "submitted_by_user_id set from the X-User-ID header."
+      - "The parent pair's evidence_points, evidence_adjustment, effective_score and priority_band are recomputed; pair.version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_PAIR_INVALID_STATE]
+
+  - method: GET
+    path: "/mpi/candidate-pairs/{id}/evidence"
+    purpose: "List a pair's review evidence (reverse reachability for ReviewEvidence.pair_id)."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - limit?
+      - offset?
+    output: ReviewEvidence[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/recommend"
+    purpose: "Analyst records a MERGE or DISTINCT recommendation, which requires at least MIN_EVIDENCE_COUNT evidence rows."
+    roles: [IdentityAnalyst]
+    input:
+      - recommendation
+    output: DuplicateCandidatePair
+    side_effects:
+      - "queue_state UNDER_REVIEW -> RECOMMENDED_MERGE or RECOMMENDED_DISTINCT according to recommendation."
+      - "recommended_by_user_id set from X-User-ID (the anchor for the segregation-of-duties check on approval)."
+      - "version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_PAIR_INVALID_STATE, ERR_INSUFFICIENT_REVIEW_EVIDENCE]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/return-to-review"
+    purpose: "Approver rejects a recommendation and sends the pair back for more evidence (the queue cycle)."
+    roles: [IdentityStewardApprover]
+    input:
+      - triage_note?
+    output: DuplicateCandidatePair
+    side_effects:
+      - "queue_state RECOMMENDED_MERGE or RECOMMENDED_DISTINCT -> UNDER_REVIEW."
+      - "recommendation and recommended_by_user_id are cleared to null, which releases the segregation-of-duties lock."
+      - "version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND, ERR_PAIR_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/candidate-pairs/{id}/resolve-distinct"
+    purpose: "Approver confirms the two records are genuinely different people, closing the pair without a merge."
+    roles: [IdentityStewardApprover]
+    input:
+      - resolution_note?
+    output: DuplicateCandidatePair
+    side_effects:
+      - "queue_state RECOMMENDED_DISTINCT -> RESOLVED_DISTINCT (terminal); approved_by_user_id set from X-User-ID; version += 1."
+      - "Neither record's identity_state changes; the pair stops suppressing a future pair on the same record set only because RESOLVED_* states are excluded from the ERR_PAIR_ALREADY_EXISTS check."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_PAIR_NOT_FOUND, ERR_PAIR_INVALID_STATE, ERR_SEGREGATION_OF_DUTIES]
+
+  # --- merge / unmerge -----------------------------------------------------
+  - method: POST
+    path: "/mpi/merge-operations"
+    purpose: "Approve a merge: subsume one record into the survivor, move clinical elements, and fan out propagation tasks."
+    roles: [IdentityStewardApprover]
+    input:
+      - pair_id
+      - survivor_record_id
+      - subsumed_record_id
+      - rationale
+    output: MergeOperation
+    side_effects:
+      - "pair.queue_state RECOMMENDED_MERGE -> RESOLVED_MERGED; pair.approved_by_user_id set; pair.version += 1."
+      - "subsumed.identity_state ACTIVE -> MERGED_SUBSUMED; subsumed.survivor_record_id = survivor.id; subsumed.clinical_element_count = 0."
+      - "survivor.clinical_element_count += moved_clinical_element_count per calculations.merge_element_transfer; survivor.subsumed_member_count recomputed."
+      - "subsumed_prior_enterprise_id records the subsumed record's enterprise_id before the merge (the only way unmerge can restore it)."
+      - "Transitive cascade: every record whose survivor_record_id pointed at the subsumed record is re-pointed to the survivor; recompressed_record_mrns lists their mrns in created_at ASC order."
+      - "Each member site's active_record_count is recomputed (the subsumed record leaves the ACTIVE population)."
+      - "One PropagationTask (operation_kind MERGE) is created per ACTIVE DownstreamSystem, in system_code ASC order; propagation_task_count records how many. A task for a system with ack_required == true is minted QUEUED; a task for a system with ack_required == false is minted directly in ACKED and never enters QUEUED."
+      - "state is COMPLETED when propagation_task_count == 0 or when no created task belongs to an ack_required system, otherwise PENDING_PROPAGATION."
+      - "When state becomes COMPLETED in this request, completed_at is set and reversal_deadline_at = completed_at + REVERSAL_WINDOW_DAYS days."
+      - "When moved_clinical_element_count > CONTAMINATION_REVIEW_ELEMENT_THRESHOLD, a ContaminationRemediation (source_type MERGE, state OPEN) is opened on the survivor and the survivor's integrity_state becomes REMEDIATION_PENDING."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RECORD_NOT_FOUND, ERR_PAIR_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_RECORD_REMEDIATION_PENDING, ERR_RECORD_NOT_ACTIVE, ERR_PAIR_INVALID_STATE, ERR_SEGREGATION_OF_DUTIES, ERR_MERGE_SELF_REFERENCE, ERR_PAIR_RECORD_MISMATCH]
+
+  - method: GET
+    path: "/mpi/merge-operations/{id}"
+    purpose: "Historical merge audit: read one merge with its element counts, recompression list and reversal deadline."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: MergeOperation
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_MERGE_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/merge-operations"
+    purpose: "Merge audit list. Reverse reachability for pair_id, survivor_record_id and subsumed_record_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - pair_id?
+      - survivor_record_id?
+      - subsumed_record_id?
+      - state?
+      - limit?
+      - offset?
+    output: MergeOperation[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/merge-operations/{id}/unmerge"
+    purpose: "Reverse a completed merge inside the reversal window, restoring both identities exactly."
+    roles: [IdentityStewardApprover, MpiAdmin]
+    input:
+      - unmerge_reason
+    output: MergeOperation
+    side_effects:
+      - "state COMPLETED -> UNMERGED (terminal); unmerged_at set to the logical clock; version += 1."
+      - "subsumed.identity_state MERGED_SUBSUMED -> ACTIVE; survivor_record_id cleared; enterprise_id restored to subsumed_prior_enterprise_id."
+      - "Exact mirror of calculations.merge_element_transfer: survivor.clinical_element_count -= moved_clinical_element_count and subsumed.clinical_element_count = moved_clinical_element_count, so the conservation invariant holds bit-for-bit."
+      - "Every record listed in recompressed_record_mrns has its survivor_record_id re-pointed back to the subsumed record."
+      - "Both sites' active_record_count and subsumed_member_count are recomputed."
+      - "Every PropagationTask for this merge in state QUEUED or FAILED transitions to CANCELLED; one new PropagationTask (operation_kind UNMERGE) is created per ACTIVE DownstreamSystem under the same QUEUED / directly-ACKED rule as merge creation."
+      - "Any ContaminationRemediation opened by this merge that is still OPEN is closed as CLOSED with a system closure_note, and the survivor's integrity_state is re-derived."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_MERGE_NOT_FOUND, ERR_MERGE_INVALID_STATE, ERR_PROPAGATION_IN_FLIGHT, ERR_REVERSAL_WINDOW_EXPIRED]
+
+  # --- overlay correction --------------------------------------------------
+  - method: POST
+    path: "/mpi/overlay-corrections"
+    purpose: |
+      Open an overlay correction: an overlay is one patient's data written onto
+      another patient's record, so correcting it is not a merge but a field-level
+      restoration plus clinical-element extraction. Guarded by OCC on the record.
+    roles: [IdentityAnalyst, IdentityStewardApprover]
+    input:
+      - record_id
+      - overlay_type
+      - corrected_field_snapshot
+      - affected_clinical_element_count
+      - encounter_from_date
+      - encounter_to_date
+      - expected_record_version
+    output: OverlayCorrection
+    side_effects:
+      - "state initialised to DETECTED; created_by_user_id set from X-User-ID."
+      - "prior_field_snapshot captures the record's current values for exactly the keys present in corrected_field_snapshot (the audit basis for reversal)."
+      - "No demographic field on the PatientRecord is written yet — those change only on apply. The single record-level effect of this call is the CLEAR -> REMEDIATION_PENDING integrity re-derivation (the new OverlayCorrection is in DETECTED), which increments record.version by 1. The OCC check on expected_record_version is evaluated against the record version BEFORE that increment."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RECORD_NOT_FOUND, ERR_STALE_RECORD_VERSION, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_RECORD_NOT_ACTIVE]
+
+  - method: GET
+    path: "/mpi/overlay-corrections/{id}"
+    purpose: "Read one overlay correction with both field snapshots."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: OverlayCorrection
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_OVERLAY_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/overlay-corrections"
+    purpose: "List overlay corrections (reverse reachability for OverlayCorrection.record_id)."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - record_id?
+      - state?
+      - overlay_type?
+      - limit?
+      - offset?
+    output: OverlayCorrection[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/overlay-corrections/{id}/apply"
+    purpose: "Write the corrected field values onto the record and fan out correction propagation."
+    roles: [IdentityStewardApprover]
+    input: []
+    output: OverlayCorrection
+    side_effects:
+      - "state DETECTED -> UNDER_CORRECTION; version += 1."
+      - "Every key in corrected_field_snapshot is written onto the PatientRecord; record.version += 1. enterprise_id is NOT recomputed: mrn and site_id are outside the allowed corrected_field_snapshot key set, so the enterprise identity is stable across an overlay correction."
+      - "One PropagationTask (operation_kind OVERLAY_CORRECTION) is created per ACTIVE DownstreamSystem, in system_code ASC order, under the same QUEUED / directly-ACKED rule as merge creation."
+      - "When affected_clinical_element_count > CONTAMINATION_REVIEW_ELEMENT_THRESHOLD a ContaminationRemediation (source_type OVERLAY, state OPEN) is opened with element_count_subject = affected_clinical_element_count; the record's integrity_state is REMEDIATION_PENDING for the whole DETECTED/UNDER_CORRECTION span regardless."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_OVERLAY_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_OVERLAY_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/overlay-corrections/{id}/complete"
+    purpose: "Close an overlay correction once its remediation has been resolved."
+    roles: [IdentityStewardApprover]
+    input:
+      - closure_note
+    output: OverlayCorrection
+    side_effects:
+      - "state UNDER_CORRECTION -> CORRECTED (terminal); version += 1."
+      - "The record's integrity_state is re-derived, which returns it to CLEAR once no OPEN/QUARANTINED/REASSIGNED remediation remains."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_OVERLAY_NOT_FOUND, ERR_OVERLAY_INVALID_STATE]
+
+  # --- clinical cross-contamination remediation ----------------------------
+  - method: GET
+    path: "/mpi/contamination-remediations/{id}"
+    purpose: "Read one remediation with its three element counts."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: ContaminationRemediation
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_REMEDIATION_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/contamination-remediations"
+    purpose: "List remediations. Reverse reachability for merge_operation_id, overlay_correction_id and record_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - merge_operation_id?
+      - overlay_correction_id?
+      - record_id?
+      - state?
+      - limit?
+      - offset?
+    output: ContaminationRemediation[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/contamination-remediations/{id}/quarantine"
+    purpose: "Quarantine the clinical elements suspected of belonging to the wrong patient."
+    roles: [IdentityAnalyst, PrivacyOfficer]
+    input:
+      - element_count_quarantined
+    output: ContaminationRemediation
+    side_effects:
+      - "state OPEN -> QUARANTINED; version += 1."
+      - "No PatientRecord field changes: quarantine only records the count. Elements physically leave the subject record on reassign, so the subject record's clinical_element_count and version are untouched here."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_REMEDIATION_NOT_FOUND, ERR_REMEDIATION_INVALID_STATE, ERR_REMEDIATION_COUNT_INVALID]
+
+  - method: POST
+    path: "/mpi/contamination-remediations/{id}/reassign"
+    purpose: "Move quarantined elements to the patient they actually belong to."
+    roles: [PrivacyOfficer]
+    input:
+      - target_record_id
+      - element_count_reassigned
+    output: ContaminationRemediation
+    side_effects:
+      - "state QUARANTINED -> REASSIGNED; version += 1; reassigned_to_record_mrn stores the target record's mrn as an audit copy."
+      - "The target record's clinical_element_count += element_count_reassigned and the remediation record's clinical_element_count -= element_count_reassigned; both PatientRecord.version values += 1."
+      - "Elements not reassigned (element_count_quarantined - element_count_reassigned) remain quarantined and are conserved by calculations.clinical_element_conservation."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RECORD_NOT_FOUND, ERR_REMEDIATION_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_RECORD_NOT_ACTIVE, ERR_REMEDIATION_INVALID_STATE, ERR_REASSIGN_TARGET_INVALID, ERR_REMEDIATION_COUNT_INVALID]
+
+  - method: POST
+    path: "/mpi/contamination-remediations/{id}/close"
+    purpose: "Close a remediation, releasing the subject record's REMEDIATION_PENDING hold."
+    roles: [PrivacyOfficer]
+    input:
+      - closure_note
+    output: ContaminationRemediation
+    side_effects:
+      - "state QUARANTINED or REASSIGNED -> CLOSED (terminal); version += 1."
+      - "The subject record's integrity_state is re-derived per calculations.record_integrity_state_derivation."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_REMEDIATION_NOT_FOUND, ERR_REMEDIATION_INVALID_STATE]
+
+  # --- downstream systems & propagation ------------------------------------
+  - method: POST
+    path: "/mpi/downstream-systems"
+    purpose: "Register a downstream consumer of identity changes (EHR, lab, billing, HIE gateway)."
+    roles: [MpiAdmin]
+    input:
+      - system_code
+      - name
+      - propagation_mode
+      - ack_required
+      - max_concurrent_dispatch
+    output: DownstreamSystem
+    side_effects:
+      - "status initialised to ACTIVE; unacked_task_count initialised to 0."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: PATCH
+    path: "/mpi/downstream-systems/{id}"
+    purpose: "Pause/resume a downstream system or change its dispatch concurrency ceiling."
+    roles: [MpiAdmin]
+    input:
+      - name?
+      - status?
+      - max_concurrent_dispatch?
+    output: DownstreamSystem
+    side_effects:
+      - "version += 1. Lowering max_concurrent_dispatch does not retroactively invalidate already-SENT tasks; it only tightens the next dispatch_window_occupancy check."
+      - "A PAUSED system receives no new tasks from later merges/overlays and cannot be sent to."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_DOWNSTREAM_SYSTEM_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/downstream-systems/{id}"
+    purpose: "Read one downstream system including its computed unacked_task_count."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: DownstreamSystem
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_DOWNSTREAM_SYSTEM_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/propagation-tasks/{id}"
+    purpose: "Read one propagation task with its dispatch window and deadline."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: PropagationTask
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_TASK_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/propagation-tasks"
+    purpose: "List propagation tasks. Reverse reachability for merge_operation_id, overlay_correction_id and downstream_system_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - merge_operation_id?
+      - overlay_correction_id?
+      - downstream_system_id?
+      - state?
+      - operation_kind?
+      - limit?
+      - offset?
+    output: PropagationTask[]
+    side_effects:
+      - "Default ordering: created_at ASC, then id ASC only as a total-order stabiliser for identical timestamps (never as a business decision input)."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/propagation-tasks/{id}/send"
+    purpose: "Dispatch a queued or previously failed task inside an explicit half-open dispatch window."
+    roles: [MpiAdmin, IdentityAnalyst]
+    input:
+      - dispatch_window_start_at
+      - dispatch_window_end_at
+    output: PropagationTask
+    side_effects:
+      - "state QUEUED or FAILED -> SENT; attempt_count += 1; version += 1; the window fields are stored."
+      - "The downstream system's unacked_task_count is recomputed."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_TASK_NOT_FOUND, ERR_TASK_INVALID_STATE, ERR_DOWNSTREAM_SYSTEM_PAUSED, ERR_PROPAGATION_WINDOW_EXPIRED, ERR_DISPATCH_CAPACITY_EXCEEDED]
+
+  - method: POST
+    path: "/mpi/propagation-tasks/{id}/ack"
+    purpose: "Record the downstream acknowledgement, which can complete the parent merge."
+    roles: [MpiAdmin]
+    input: []
+    output: PropagationTask
+    side_effects:
+      - "state SENT -> ACKED (terminal); version += 1; the system's unacked_task_count is recomputed."
+      - "Bubble up: when the parent MergeOperation is PENDING_PROPAGATION and every one of its tasks belonging to an ack_required system is now ACKED (CANCELLED tasks ignored), the merge transitions to COMPLETED, completed_at is set to the logical clock, and reversal_deadline_at = completed_at + REVERSAL_WINDOW_DAYS days."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_TASK_NOT_FOUND, ERR_TASK_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/propagation-tasks/{id}/fail"
+    purpose: "Record a downstream rejection so the task can be re-sent (the retry cycle)."
+    roles: [MpiAdmin]
+    input:
+      - last_error_code
+    output: PropagationTask
+    side_effects:
+      - "state SENT -> FAILED; version += 1; the dispatch window fields are cleared so the slot is released for other tasks."
+      - "The parent merge stays PENDING_PROPAGATION; the system's unacked_task_count is recomputed."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_TASK_NOT_FOUND, ERR_TASK_INVALID_STATE]
+
+  # --- identity fraud detection --------------------------------------------
+  - method: POST
+    path: "/mpi/fraud-investigations"
+    purpose: "Open a manual identity-fraud investigation on a record showing conflicting biometrics or insurance."
+    roles: [PrivacyOfficer]
+    input:
+      - record_id
+      - pair_id?
+      - trigger_kind
+      - note?
+    output: FraudInvestigation
+    side_effects:
+      - "state initialised to OPEN; opened_by set to OFFICER; opened_by_user_id set from X-User-ID."
+      - "risk_score computed per calculations.fraud_risk_score."
+      - "The record's integrity_state becomes FRAUD_SUSPECTED and its site's flagged_record_count is recomputed BEFORE risk_score is evaluated."
+      - "Every DuplicateCandidatePair having this record as a member with queue_state IN {NEW, TRIAGED, UNDER_REVIEW, RECOMMENDED_MERGE, RECOMMENDED_DISTINCT} moves to ESCALATED_FRAUD (version += 1 each); on the two RECOMMENDED_* edges recommended_by_user_id and recommendation are cleared."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RECORD_NOT_FOUND, ERR_PAIR_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/fraud-investigations/{id}"
+    purpose: "Read one investigation with its computed risk_score."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: FraudInvestigation
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVESTIGATION_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/fraud-investigations"
+    purpose: "List investigations. Reverse reachability for record_id and pair_id."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - record_id?
+      - pair_id?
+      - state?
+      - trigger_kind?
+      - limit?
+      - offset?
+    output: FraudInvestigation[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  - method: POST
+    path: "/mpi/fraud-investigations/{id}/substantiate"
+    purpose: "Confirm the fraud finding, hardening the record's hold to FRAUD_CONFIRMED."
+    roles: [PrivacyOfficer]
+    input:
+      - finding_note
+    output: FraudInvestigation
+    side_effects:
+      - "state OPEN -> SUBSTANTIATED; version += 1."
+      - "The record's integrity_state becomes FRAUD_CONFIRMED; the site's flagged_record_count is recomputed."
+      - "Every DuplicateCandidatePair having this record as a member with queue_state IN {NEW, TRIAGED, UNDER_REVIEW, RECOMMENDED_MERGE, RECOMMENDED_DISTINCT} moves to ESCALATED_FRAUD (version += 1 each); on the two RECOMMENDED_* edges recommended_by_user_id and recommendation are cleared. RESOLVED_MERGED, RESOLVED_DISTINCT and already-ESCALATED_FRAUD pairs are untouched."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_INVESTIGATION_NOT_FOUND, ERR_INVESTIGATION_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/fraud-investigations/{id}/unsubstantiate"
+    purpose: "Clear the record: the conflict was a data-entry artefact, not fraud."
+    roles: [PrivacyOfficer]
+    input:
+      - finding_note
+    output: FraudInvestigation
+    side_effects:
+      - "state OPEN -> UNSUBSTANTIATED (terminal); version += 1."
+      - "The record's integrity_state is re-derived; it returns to CLEAR only when no other open investigation and no open remediation remain."
+      - "Every pair with queue_state == ESCALATED_FRAUD having this investigation's record as a member returns to UNDER_REVIEW once that record's integrity_state re-derives to CLEAR (the cyclic queue re-entry path); version += 1."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_INVESTIGATION_NOT_FOUND, ERR_INVESTIGATION_INVALID_STATE]
+
+  - method: POST
+    path: "/mpi/fraud-investigations/{id}/refer"
+    purpose: "Refer a substantiated case to law enforcement (terminal escalation)."
+    roles: [PrivacyOfficer]
+    input:
+      - referral_reference
+    output: FraudInvestigation
+    side_effects:
+      - "state SUBSTANTIATED -> REFERRED_LAW_ENFORCEMENT (terminal); version += 1."
+      - "The record's integrity_state remains FRAUD_CONFIRMED — referral never releases the hold."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_INVESTIGATION_NOT_FOUND, ERR_INVESTIGATION_INVALID_STATE]
+
+  # --- external identity matching for exchange participation ---------------
+  - method: POST
+    path: "/mpi/external-match-requests"
+    purpose: "Submit a record's demographics to a health-information-exchange partner for external identity matching."
+    roles: [IdentityAnalyst]
+    input:
+      - record_id
+      - exchange_partner_code
+      - consent_on_file
+      - external_demographics
+    output: ExternalMatchRequest
+    side_effects:
+      - "external_score computed with the TOLERANT variant of calculations.pair_match_score against external_demographics using the ACTIVE MatchRuleSet."
+      - "state is MATCHED when external_score >= the active rule set's auto_link_threshold, otherwise NO_MATCH (branching fork resolved in the same request)."
+      - "Terminal on creation: both MATCHED and NO_MATCH are terminal states, so no further transition endpoint exists for this entity."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_RECORD_NOT_FOUND, ERR_RECORD_UNDER_FRAUD_HOLD, ERR_RECORD_REMEDIATION_PENDING, ERR_EXCHANGE_CONSENT_MISSING, ERR_RECORD_NOT_ACTIVE]
+
+  - method: GET
+    path: "/mpi/external-match-requests/{id}"
+    purpose: "Read one external match request and its score."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input: []
+    output: ExternalMatchRequest
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_RECORD_NOT_FOUND]
+
+  - method: GET
+    path: "/mpi/external-match-requests"
+    purpose: "List external match requests (reverse reachability for ExternalMatchRequest.record_id)."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - record_id?
+      - state?
+      - exchange_partner_code?
+      - limit?
+      - offset?
+    output: ExternalMatchRequest[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST]
+
+  # --- duplicate rate metrics by registration site -------------------------
+  - method: POST
+    path: "/mpi/registration-sites/{id}/duplicate-metric-runs"
+    purpose: "Compute a site's duplicate rate over a closed date window under one of the two attribution variants."
+    roles: [MpiAdmin, IdentityAnalyst]
+    input:
+      - window_start_date
+      - window_end_date
+      - attribution_variant
+    output: SiteDuplicateMetric
+    side_effects:
+      - "records_created, confirmed_duplicates and duplicate_rate_bps computed per calculations.site_duplicate_rate."
+      - "sample_size_sufficient set to (records_created >= METRIC_MIN_SAMPLE_SIZE)."
+      - "rule_set_version_label snapshots the currently ACTIVE rule set's version_label."
+      - "Immutable once written (common_fields: false)."
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND, ERR_METRIC_WINDOW_OVERLAP]
+
+  - method: GET
+    path: "/mpi/registration-sites/{id}/duplicate-metric-runs"
+    purpose: "List a site's metric runs (reverse reachability for SiteDuplicateMetric.site_id)."
+    roles: [SiteRegistrar, IdentityAnalyst, IdentityStewardApprover, PrivacyOfficer, MpiAdmin]
+    input:
+      - attribution_variant?
+      - limit?
+      - offset?
+    output: SiteDuplicateMetric[]
+    side_effects: []
+    errors: [ERR_UNAUTHENTICATED, ERR_UNAUTHORIZED, ERR_INVALID_REQUEST, ERR_SITE_NOT_FOUND]
+
+# =============================================================================
+# 1.6 Error Catalog (every code is reachable from at least one §1.4 row)
+# =============================================================================
+errors:
+
+  - error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    message: "Missing or unrecognised authentication headers"
+    triggered_by: "§1.4 priority 1 — X-User-ID or X-User-Role absent, or X-User-Role not one of the five declared roles"
+
+  - error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    message: "Role {role} may not perform this operation"
+    triggered_by: "§1.4 priority 2 — role not in the endpoint's roles list"
+
+  - error_id: ERR_SITE_SCOPE_VIOLATION
+    http_status: 403
+    message: "SiteRegistrar {user_id} may only act on its own registration site"
+    triggered_by: "§1.4 priority 3 — SiteRegistrar X-User-ID does not equal the site in scope"
+
+  - error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    message: "Request payload is invalid: {detail}"
+    triggered_by: "§1.4 priority 4 — missing required field, wrong type, out-of-set enum, malformed date, inverted range, bad pagination"
+
+  - error_id: ERR_SITE_NOT_FOUND
+    http_status: 404
+    message: "Registration site {site_id} not found"
+    triggered_by: "§1.4 priority 5"
+
+  - error_id: ERR_RULE_SET_NOT_FOUND
+    http_status: 404
+    message: "Match rule set {rule_set_id} not found"
+    triggered_by: "§1.4 priority 6"
+
+  - error_id: ERR_SEARCH_ATTEMPT_NOT_FOUND
+    http_status: 404
+    message: "Registration search attempt {origin_search_attempt_id} not found"
+    triggered_by: "§1.4 priority 7"
+
+  - error_id: ERR_RECORD_NOT_FOUND
+    http_status: 404
+    message: "Patient record {record_id} not found"
+    triggered_by: "§1.4 priority 8"
+
+  - error_id: ERR_PAIR_NOT_FOUND
+    http_status: 404
+    message: "Duplicate candidate pair {pair_id} not found"
+    triggered_by: "§1.4 priority 9"
+
+  - error_id: ERR_MERGE_NOT_FOUND
+    http_status: 404
+    message: "Merge operation {merge_id} not found"
+    triggered_by: "§1.4 priority 10"
+
+  - error_id: ERR_OVERLAY_NOT_FOUND
+    http_status: 404
+    message: "Overlay correction {overlay_id} not found"
+    triggered_by: "§1.4 priority 11"
+
+  - error_id: ERR_REMEDIATION_NOT_FOUND
+    http_status: 404
+    message: "Contamination remediation {remediation_id} not found"
+    triggered_by: "§1.4 priority 12"
+
+  - error_id: ERR_TASK_NOT_FOUND
+    http_status: 404
+    message: "Propagation task {task_id} not found"
+    triggered_by: "§1.4 priority 13"
+
+  - error_id: ERR_INVESTIGATION_NOT_FOUND
+    http_status: 404
+    message: "Fraud investigation {investigation_id} not found"
+    triggered_by: "§1.4 priority 14"
+
+  - error_id: ERR_DOWNSTREAM_SYSTEM_NOT_FOUND
+    http_status: 404
+    message: "Downstream system {system_id} not found"
+    triggered_by: "§1.4 priority 15"
+
+  - error_id: ERR_WEIGHTS_SUM_INVALID
+    http_status: 422
+    message: "Attribute weights must sum to 100.00, got {sum}"
+    triggered_by: "§1.4 priority 16"
+
+  - error_id: ERR_THRESHOLD_ORDER_INVALID
+    http_status: 422
+    message: "review_threshold {review_threshold} must not exceed auto_link_threshold {auto_link_threshold}"
+    triggered_by: "§1.4 priority 17"
+
+  - error_id: ERR_SEARCH_ATTEMPT_REQUIRED
+    http_status: 422
+    message: "SiteRegistrar registrations must cite an origin_search_attempt_id"
+    triggered_by: "§1.4 priority 18 — conditional_feature_flags layer: the requirement exists only for the SiteRegistrar role"
+
+  - error_id: ERR_STALE_PAIR_VERSION
+    http_status: 412
+    message: "expected_pair_version {expected} does not match current version {actual}"
+    triggered_by: "§1.4 priority 19 / §1.2.1 rescore-stale-pair-version"
+
+  - error_id: ERR_STALE_RECORD_VERSION
+    http_status: 412
+    message: "expected_record_version {expected} does not match current version {actual}"
+    triggered_by: "§1.4 priority 20 / §1.2.1 overlay-create-stale-record-version"
+
+  - error_id: ERR_RECORD_UNDER_FRAUD_HOLD
+    http_status: 409
+    message: "Patient record {record_id} is under an identity-fraud hold ({integrity_state})"
+    triggered_by: "§1.4 priority 21"
+
+  - error_id: ERR_RECORD_REMEDIATION_PENDING
+    http_status: 409
+    message: "Patient record {record_id} has clinical remediation pending"
+    triggered_by: "§1.4 priority 22"
+
+  - error_id: ERR_EXCHANGE_CONSENT_MISSING
+    http_status: 403
+    message: "External identity matching requires consent on file for record {record_id}"
+    triggered_by: "§1.4 priority 23"
+
+  - error_id: ERR_SITE_SUSPENDED
+    http_status: 409
+    message: "Registration site {site_id} is SUSPENDED"
+    triggered_by: "§1.4 priority 24"
+
+  - error_id: ERR_RECORD_NOT_ACTIVE
+    http_status: 409
+    message: "Patient record {record_id} is not ACTIVE (identity_state {identity_state})"
+    triggered_by: "§1.4 priority 25"
+
+  - error_id: ERR_PAIR_INVALID_STATE
+    http_status: 409
+    message: "Candidate pair {pair_id} is in queue_state {queue_state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 26"
+
+  - error_id: ERR_MERGE_INVALID_STATE
+    http_status: 409
+    message: "Merge operation {merge_id} is in state {state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 27"
+
+  - error_id: ERR_OVERLAY_INVALID_STATE
+    http_status: 409
+    message: "Overlay correction {overlay_id} is in state {state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 28"
+
+  - error_id: ERR_REMEDIATION_INVALID_STATE
+    http_status: 409
+    message: "Remediation {remediation_id} is in state {state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 29"
+
+  - error_id: ERR_TASK_INVALID_STATE
+    http_status: 409
+    message: "Propagation task {task_id} is in state {state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 30"
+
+  - error_id: ERR_INVESTIGATION_INVALID_STATE
+    http_status: 409
+    message: "Fraud investigation {investigation_id} is in state {state}; this operation requires one of {allowed}"
+    triggered_by: "§1.4 priority 31"
+
+  - error_id: ERR_DOWNSTREAM_SYSTEM_PAUSED
+    http_status: 409
+    message: "Downstream system {system_code} is PAUSED"
+    triggered_by: "§1.4 priority 32"
+
+  - error_id: ERR_PROPAGATION_IN_FLIGHT
+    http_status: 409
+    message: "Merge {merge_id} still has propagation tasks in flight (SENT)"
+    triggered_by: "§1.4 priority 33"
+
+  - error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    message: "User {user_id} recommended this pair and may not also approve its resolution"
+    triggered_by: "§1.4 priority 34"
+
+  - error_id: ERR_INSUFFICIENT_REVIEW_EVIDENCE
+    http_status: 422
+    message: "Pair {pair_id} has {count} evidence rows; at least {minimum} are required to recommend"
+    triggered_by: "§1.4 priority 35"
+
+  - error_id: ERR_MERGE_SELF_REFERENCE
+    http_status: 422
+    message: "A record cannot be paired with or merged into itself"
+    triggered_by: "§1.4 priority 36"
+
+  - error_id: ERR_PAIR_RECORD_MISMATCH
+    http_status: 422
+    message: "survivor_record_id and subsumed_record_id must be the two member records of pair {pair_id}"
+    triggered_by: "§1.4 priority 37"
+
+  - error_id: ERR_REASSIGN_TARGET_INVALID
+    http_status: 422
+    message: "Reassignment target {target_record_id} shares enterprise_id {enterprise_id} with the contaminated record"
+    triggered_by: "§1.4 priority 38"
+
+  - error_id: ERR_DUPLICATE_MRN
+    http_status: 409
+    message: "MRN {mrn} already exists at registration site {site_id}"
+    triggered_by: "§1.4 priority 39 — site-scoped uniqueness"
+
+  - error_id: ERR_PAIR_ALREADY_EXISTS
+    http_status: 409
+    message: "An unresolved candidate pair already exists for this record set"
+    triggered_by: "§1.4 priority 40"
+
+  - error_id: ERR_SEARCH_ATTEMPT_EXPIRED
+    http_status: 409
+    message: "Search attempt {origin_search_attempt_id} is older than {ttl_minutes} minutes"
+    triggered_by: "§1.4 priority 41"
+
+  - error_id: ERR_REVERSAL_WINDOW_EXPIRED
+    http_status: 409
+    message: "Merge {merge_id} may no longer be reversed; the window closed at {reversal_deadline_at}"
+    triggered_by: "§1.4 priority 42"
+
+  - error_id: ERR_PROPAGATION_WINDOW_EXPIRED
+    http_status: 409
+    message: "Propagation task {task_id} passed its deadline at {propagation_deadline_at}"
+    triggered_by: "§1.4 priority 43"
+
+  - error_id: ERR_METRIC_WINDOW_OVERLAP
+    http_status: 409
+    message: "Requested metric window collides with an existing {attribution_variant} run for this site"
+    triggered_by: "§1.4 priority 44 / calculations.metric_window_exclusivity (CLOSED intervals — touching endpoints collide)"
+
+  - error_id: ERR_DISPATCH_CAPACITY_EXCEEDED
+    http_status: 409
+    message: "Downstream system {system_code} already has {occupancy} overlapping dispatches; ceiling is {max_concurrent_dispatch}"
+    triggered_by: "§1.4 priority 45 / calculations.dispatch_window_occupancy (HALF-OPEN intervals — touching endpoints do not collide)"
+
+  - error_id: ERR_DUPLICATE_CREATION_BLOCKED
+    http_status: 409
+    message: "Search attempt {origin_search_attempt_id} matched an existing record at or above the auto-link threshold; creation is blocked"
+    triggered_by: "§1.4 priority 46 — duplicate-creation prevention at the registration front end"
+
+  - error_id: ERR_REMEDIATION_COUNT_INVALID
+    http_status: 422
+    message: "Requested element count {requested} exceeds the available count {available}"
+    triggered_by: "§1.4 priority 47 — clinical element conservation guard"
+
+# =============================================================================
+# 1.7 RBAC Table
+#     role_model: segregation_of_duties — the same X-User-ID may not both
+#     recommend and approve the resolution of a candidate pair.
+# =============================================================================
+roles:
+
+  - role: SiteRegistrar
+    identity: "entity_backed:RegistrationSite — X-User-ID is the id of the RegistrationSite the registrar desk belongs to. Every write is scoped to that site (§1.4 priority 3)."
+    description: "Front-desk registration clerk. Can search the index and create records at its own site only, and must cite a fresh non-blocking search attempt to do so."
+    exclusive_operations: []
+    shared_operations:
+      - "POST /mpi/registration-sites/{id}/search-attempts (shared with IdentityAnalyst; site-scoped)"
+      - "POST /mpi/patient-records (shared with IdentityAnalyst; site-scoped and search-attempt-gated)"
+      - "All GET endpoints"
+    cannot:
+      - "Create or rescore candidate pairs, attach evidence, recommend, approve, merge, unmerge, correct overlays, remediate contamination, open investigations, submit external matches, or run metrics."
+
+  - role: IdentityAnalyst
+    identity: "opaque — X-User-ID is an arbitrary analyst identifier, tracked so segregation of duties can be enforced against approvals."
+    description: "Identity integrity analyst. Owns the detection and manual-review half of the workflow."
+    exclusive_operations:
+      - "POST /mpi/candidate-pairs/{id}/triage"
+      - "POST /mpi/candidate-pairs/{id}/start-review"
+      - "POST /mpi/candidate-pairs/{id}/evidence"
+      - "POST /mpi/candidate-pairs/{id}/recommend"
+      - "POST /mpi/external-match-requests"
+    shared_operations:
+      - "POST /mpi/candidate-pairs and POST /mpi/candidate-pairs/{id}/rescore (shared with MpiAdmin)"
+      - "POST /mpi/overlay-corrections (shared with IdentityStewardApprover)"
+      - "POST /mpi/contamination-remediations/{id}/quarantine (shared with PrivacyOfficer)"
+      - "POST /mpi/propagation-tasks/{id}/send and POST /mpi/registration-sites/{id}/duplicate-metric-runs (shared with MpiAdmin)"
+      - "POST /mpi/registration-sites/{id}/search-attempts and POST /mpi/patient-records (shared with SiteRegistrar; not site-scoped for this role)"
+      - "All GET endpoints"
+    cannot:
+      - "Approve a merge, unmerge, resolve a pair as distinct, return a recommendation to review, apply or complete an overlay, reassign or close a remediation, open or adjudicate a fraud investigation, or configure sites, rule sets and downstream systems."
+
+  - role: IdentityStewardApprover
+    identity: "opaque — X-User-ID is the approver identifier compared against pair.recommended_by_user_id for the segregation-of-duties check."
+    description: "Data steward with approval authority over identity-changing operations."
+    exclusive_operations:
+      - "POST /mpi/candidate-pairs/{id}/return-to-review"
+      - "POST /mpi/candidate-pairs/{id}/resolve-distinct"
+      - "POST /mpi/merge-operations"
+      - "POST /mpi/overlay-corrections/{id}/apply"
+      - "POST /mpi/overlay-corrections/{id}/complete"
+    shared_operations:
+      - "POST /mpi/merge-operations/{id}/unmerge (shared with MpiAdmin)"
+      - "POST /mpi/overlay-corrections (shared with IdentityAnalyst)"
+      - "All GET endpoints"
+    cannot:
+      - "Triage, start review, attach evidence or recommend (that is the analyst half of the duty split); create or rescore pairs; adjudicate fraud; quarantine, reassign or close remediations; configure sites, rule sets or downstream systems."
+
+  - role: PrivacyOfficer
+    identity: "opaque — X-User-ID is the privacy officer identifier recorded on investigations they open."
+    description: "Privacy and identity-fraud officer. Owns fraud adjudication and clinical cross-contamination remediation."
+    exclusive_operations:
+      - "POST /mpi/fraud-investigations"
+      - "POST /mpi/fraud-investigations/{id}/substantiate"
+      - "POST /mpi/fraud-investigations/{id}/unsubstantiate"
+      - "POST /mpi/fraud-investigations/{id}/refer"
+      - "POST /mpi/contamination-remediations/{id}/reassign"
+      - "POST /mpi/contamination-remediations/{id}/close"
+    shared_operations:
+      - "POST /mpi/contamination-remediations/{id}/quarantine (shared with IdentityAnalyst)"
+      - "All GET endpoints"
+    cannot:
+      - "Create records or search attempts, create/rescore/triage/review/recommend pairs, approve or reverse merges, create/apply/complete overlay corrections, submit external matches, or configure sites, rule sets and downstream systems."
+
+  - role: MpiAdmin
+    identity: "opaque — X-User-ID is the administrator identifier; admins are peers of the other roles, not a superset of them."
+    description: "MPI platform administrator. Owns configuration (sites, rule sets, downstream systems) and propagation operations."
+    exclusive_operations:
+      - "POST /mpi/registration-sites"
+      - "PATCH /mpi/registration-sites/{id}"
+      - "POST /mpi/match-rule-sets"
+      - "POST /mpi/match-rule-sets/{id}/activate"
+      - "POST /mpi/downstream-systems"
+      - "PATCH /mpi/downstream-systems/{id}"
+      - "POST /mpi/propagation-tasks/{id}/ack"
+      - "POST /mpi/propagation-tasks/{id}/fail"
+    shared_operations:
+      - "POST /mpi/candidate-pairs and POST /mpi/candidate-pairs/{id}/rescore (shared with IdentityAnalyst)"
+      - "POST /mpi/merge-operations/{id}/unmerge (shared with IdentityStewardApprover)"
+      - "POST /mpi/propagation-tasks/{id}/send and POST /mpi/registration-sites/{id}/duplicate-metric-runs (shared with IdentityAnalyst)"
+      - "All GET endpoints"
+    cannot:
+      - "Create patient records or search attempts, triage/review/recommend pairs, approve a merge, resolve a pair as distinct, create/apply/complete overlay corrections, remediate contamination, adjudicate fraud, or submit external matches."

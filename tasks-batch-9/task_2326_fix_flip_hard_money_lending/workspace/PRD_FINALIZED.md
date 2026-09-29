@@ -1,0 +1,486 @@
+# Fix-Flip Hard Money Lending API — Product Requirements Document
+
+## 1. Introduction
+
+Private construction lenders live and die on two numbers that nobody can observe directly: how much of a rehab budget has actually been built, and how much of the commitment the lender has already put at risk. A fix-and-flip note is written in weeks, funded in slices, repriced when the sponsor misses maturity, and occasionally taken over and finished by the lender itself. Every one of those events moves cash between buckets, and a single bucket that drifts out of alignment turns an eight-month bridge loan into an unrecoverable write-off. This document specifies the API for a hard money lending platform that originates, sizes, funds, services, monitors and — when necessary — forecloses on short-term fix-and-flip construction loans, mounted under the `/lending` prefix.
+
+The platform serves an origination desk that must size a loan against three competing collateral limits simultaneously; a credit committee that decides but never sizes; a servicing desk that reviews and funds draws under strict separation of duties; field inspectors who verify percent-complete but never approve a dollar; and trade contractors whose payment is gated on live trade licences, W-9s and lien waiver coverage. Because the same sponsor may run several projects, and because a single default poisons every application that sponsor has in flight, the specification places heavy emphasis on cascading side effects — a suspension at the sponsor level must reach down through applications to individual scope lines, and a lender takeover must sweep uncommitted holdback out of the commitment without breaking the ledger identity.
+
+Two design constraints shape almost every rule below. First, all money is held as integer cents and every derived money figure is produced by an explicitly pinned rounding order — the platform is a ledger, and "close enough" is a defect. Second, every date-dependent rule reads a server-side **logical clock** rather than the wall clock, so licence expiry, delinquency aging, redemption periods, days-on-market and payoff per-diem interest are all reproducible and test-drivable.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, naming the role that user is acting in. If `X-User-Role` is absent, empty, or not one of the seven declared role names, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). This applies to every endpoint in the system except the logical-clock endpoint, which is exempt from the authentication check. When the header names a valid role that is not permitted on the requested operation, the rejection is `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+The seven roles are `Borrower`, `Contractor`, `LoanOfficer`, `CreditCommittee`, `LoanServicer`, `DrawInspector` and `PlatformAdmin`.
+
+Two of these roles are backed by persisted entities, which is what ties `X-User-ID` to resource ownership:
+
+- When `X-User-Role` is `Borrower`, `X-User-ID` is the `id` of the acting `Borrower` entity. Ownership checks on any resource that references a `Borrower` compare the resource's foreign-key field to `X-User-ID`: the sponsor record being read, and the `borrower_id` of any application, loan, draw request, scope line (through its owning application) or exit milestone being touched. A mismatch is rejected with `ERR_NOT_OWNER` (HTTP 403).
+- When `X-User-Role` is `Contractor`, `X-User-ID` is the `id` of the acting `Contractor` entity. Ownership checks compare the `contractor_id` of the contractor record being read or the lien waiver being filed to `X-User-ID`, and a mismatch is likewise rejected with `ERR_NOT_OWNER`.
+
+The remaining five roles carry opaque identities:
+
+- When `X-User-Role` is `LoanOfficer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server retains it internally as the user who sized an application so that the credit decision can be checked against it — that identifier is held for the duty check only and is not published as a field of the application resource — but it never compares it to any entity's `id`.
+- When `X-User-Role` is `CreditCommittee`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. It must differ from the user id that sized the application; it is used for that comparison alone and is not published as a field of the application resource.
+- When `X-User-Role` is `LoanServicer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it as `reviewed_by_user_id` on a draw request it reviews and as `funded_by_user_id` on a draw request it funds, but does not compare it to any entity's `id`.
+- When `X-User-Role` is `DrawInspector`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. It is compared to the `inspector_id` that an inspection visit was assigned to — `inspector_id` is a free-form operator identifier and is deliberately **not** a foreign key to any stored entity — and a caller reporting on a visit assigned to somebody else is rejected with `ERR_NOT_ASSIGNED_INSPECTOR` (HTTP 403).
+- When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. Ownership scoping is bypassed for this role, but a platform administrator cannot evade any separation-of-duties rule, any state-machine rule, or any fiscal rule described in this document.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. `limit` caps the number of records returned; it defaults to 10, has a minimum of 1 and a maximum of 100. `offset` skips records from the front of the result set; it defaults to 0 and may not be negative. A `limit` outside the range of 1 through 100, or a negative `offset`, is a schema violation and is rejected with `ERR_INVALID_REQUEST` (HTTP 400).
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending. Every list response carries `limit`, `offset`, `total_count` and `has_more` in the `meta` object of the envelope.
+
+Beyond pagination, list endpoints accept optional filters that narrow the collection. Applications may be filtered by `borrower_id`, `property_id` and `status`. Loans may be filtered by `application_id`, `borrower_id`, `payment_status`, `construction_status` and `exit_status`. Draw requests may be filtered by `loan_id`, `status` and `superseded_by_draw_request_id`, which makes the supersede chain queryable. Draw allocations may be filtered by `draw_request_id` and `rehab_line_item_id`. Scope-line, lien-waiver, inspection-visit and foreclosure-case listings accept a `status` filter; the ledger listing accepts an `entry_type` filter; and the exit-milestone listing accepts a `milestone_type` filter.
+
+### 2.4. The Logical Clock
+
+Every date- and time-dependent rule in this system reads a server-side logical clock, never the host's wall clock. Absent any explicit clock write, the clock reads `2026-08-01T00:00:00Z`. A `PlatformAdmin` may move the clock by supplying a `to_iso8601` instant; the operation returns the new `current_utc` value.
+
+Moving the clock re-derives every clock-dependent value in the system rather than freezing historical snapshots: a contractor's `license_status` and therefore its `payable` flag, a loan's `days_on_market` and `exit_watch_flag`, a loan's live `payoff_quote_cents`, and the boundary tests for accrual periods, redemption expiry and delinquency aging. Where a rule below refers to "the current date", it means the date component of the logical clock in UTC.
+
+### 2.5. Commitment Conservation and the Loan Money Buckets
+
+A `Loan` holds the lender's commitment split across six mutually exclusive buckets, and the platform treats their sum as a hard invariant. `funded_principal_cents` is cash advanced and still outstanding. `repaid_principal_cents` is cumulative principal the borrower has returned. `reserved_release_cents` is holdback that an approved draw has earmarked but not yet disbursed. `undisbursed_holdback_cents` is rehab holdback not yet committed to any approved draw. `interest_reserve_balance_cents` is unswept interest reserve. `decommitted_holdback_cents` is commitment that was cancelled without ever being advanced.
+
+The field `commitment_balance_check_cents` reports `committed_amount_cents` less the sum of those six buckets, and it must read exactly zero after every single write that touches any loan money bucket. Two balances are deliberately **outside** this identity: `fee_balance_cents` (unpaid extension fees) and `accrued_interest_unpaid_cents` are revenue owed to the lender rather than commitment extended to the borrower, and folding either into the identity would break it. Interest swept out of the reserve moves between two terms of the identity — out of `interest_reserve_balance_cents` and into `funded_principal_cents` — so a sweep leaves the total untouched. The convenience field `available_rehab_pool_cents` reports `undisbursed_holdback_cents` plus `reserved_release_cents`; it is a read-only view, not a seventh bucket. `interest_reserve_funded_cents` records what the reserve was funded with at closing and is never mutated afterwards.
+
+Every cash movement also writes an immutable `LedgerEntry` against the loan. An entry carries the owning `loan_id`, an `entry_type` drawn from `INITIAL_FUNDING`, `DRAW_DISBURSEMENT`, `RESERVE_SWEEP`, `BORROWER_PAYMENT`, `EXTENSION_FEE`, `HOLDBACK_DECOMMIT`, `COMPLETION_ADVANCE`, `REO_SALE_PROCEEDS`, `PAYOFF` and `CHARGE_OFF`; a positive `amount_cents` magnitude; the `effective_date` the entry applies to (the logical clock date, or the business date the caller supplied with the triggering action); a human-readable `memo`; and a `source_ref` holding an opaque identifier of the triggering resource, such as the draw request, accrual period or foreclosure case. `source_ref` is an opaque string, not a foreign key.
+
+### 2.6. Money, Percentages, Precision and Rounding
+
+All monetary amounts are integer cents. All intermediate arithmetic is performed in decimal, never binary floating point. Unless a rule explicitly calls for truncation, every division or multiplication that produces a money figure is rounded **half up** to a whole cent. Where a rule says a value is *floored*, the fractional part is discarded toward zero and no rounding occurs — the caps in loan sizing, the selling-cost deduction on an REO sale, the completion-budget ceiling and the single-line concentration cap are all floored, and a rule that floors each of several intermediate figures before combining them produces a different answer than one that combines first and floors once. Where a rule pins the order of rounding — for example, rounding each draw line to whole cents and then summing the rounded lines, rather than summing unrounded lines and rounding the total once — the pinned order is normative.
+
+Percentages carried on request bodies and stored on resources are decimals with two fractional digits, with two exceptions noted in place: a scope line's `released_percent` is carried to four decimal places, and a borrower's experience score is carried to two decimal places on a 0-to-100 scale. Interest rates are always expressed in basis points as integers; one basis point is one hundredth of one percent, so a rate of 1150 basis points is 11.50 percent per annum.
+
+### 2.7. Common Resource Properties
+
+Most resources in the system carry a standard set of server-managed properties:
+
+- `id` (string): a server-minted UUID with no type prefix, unique across the resource collection.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits recording when the record was first stored.
+- `updated_at` (string): an ISO 8601 UTC timestamp, in the same format, refreshed on every mutation of the record.
+- `version` (integer): a server-managed counter that increments by one on every mutation of the record.
+
+Borrowers, properties, loan applications, scope lines, contractors, loans, draw requests, draw allocations, inspection visits, lien waivers and foreclosure cases all carry the full set. Three record types are append-only journals and therefore carry only `id` and `created_at` — both `updated_at` and `version` are absent from ledger entries, interest accrual periods and exit milestones.
+
+A recomputation of a derived field counts as a mutation. When a funded draw rolls cash up into a scope line, when a suspension cascade withdraws an application, or when a completion budget re-bases a loan's commitment, the affected record's `updated_at` is refreshed and its `version` increments — including records the caller never named in the request.
+
+### 2.8. Resolving Identifiers in Paths and Bodies
+
+Path identifiers are validated left to right. When a path names a parent and then a child, the parent's existence is checked first and the request fails on the first identifier that does not resolve, before the system attempts to locate anything further right. Each entity type reports its own not-found code: `ERR_BORROWER_NOT_FOUND`, `ERR_PROPERTY_NOT_FOUND`, `ERR_APPLICATION_NOT_FOUND`, `ERR_REHAB_LINE_ITEM_NOT_FOUND`, `ERR_CONTRACTOR_NOT_FOUND`, `ERR_LOAN_NOT_FOUND`, `ERR_DRAW_REQUEST_NOT_FOUND`, `ERR_INSPECTION_VISIT_NOT_FOUND`, `ERR_LIEN_WAIVER_NOT_FOUND` and `ERR_FORECLOSURE_CASE_NOT_FOUND`, each at HTTP 404. The same codes are used for identifiers supplied in a request body, such as a `borrower_id` or `property_id` on an application, a `contractor_id` on a scope line, or a `loan_id` and `contractor_id` on a lien waiver.
+
+### 2.9. Optimistic Concurrency on Supersede Writes
+
+Two write operations rebase state that a client must have observed before acting, and both therefore require the client to echo back the version it based its request on.
+
+Submitting a draw request against a loan — `POST /lending/loans/{id}/draw-requests` — requires a non-optional `expected_loan_version` field carrying the `version` of the target `Loan` as the client last read it. The create is a supersede-create: it drives every still-open request on the same loan to `SUPERSEDED`, and where a superseded request had already been approved it also moves money back out of `reserved_release_cents` into `undisbursed_holdback_cents`. A caller working from an older read would therefore cancel work it never saw and size its allocations against a holdback figure that no longer exists. If `expected_loan_version` does not equal the loan's current `version`, the request is rejected with `ERR_STALE_LOAN_VERSION` (HTTP 412) and no draw request is created. A successful create increments the loan's `version` by one.
+
+Setting or revising a lender completion budget — `POST /lending/foreclosure-cases/{id}/completion-budget` — requires a non-optional `expected_foreclosure_case_version` field carrying the `version` of the target `ForeclosureCase` as the client last read it. A budget write supersedes the previous budget and re-bases the loan's commitment by the difference between the new and old figures, so a caller computing a delta from an older read would move a commitment total somebody else has already moved. If `expected_foreclosure_case_version` does not equal the case's current `version`, the request is rejected with `ERR_STALE_FORECLOSURE_CASE_VERSION` (HTTP 412) and neither the case nor the loan changes. A successful budget write increments the case's `version` by one.
+
+No other endpoint in this system accepts a version field, and no other endpoint performs a version check.
+
+### 2.10. Cascades and Compensating Reversals
+
+State changes in this domain propagate downward, sometimes three levels deep, and the platform performs those propagations itself without requiring the caller to name the affected children. A sponsor suspension withdraws that sponsor's in-flight applications, and withdrawing an application voids its live scope lines. A default declaration suspends the sponsor, which withdraws the sponsor's other in-flight applications, which voids their scope lines — and independently suspends every open draw request on the defaulted loan. A lender takeover moves the property into lender ownership, flips the loan onto the foreclosure exit track, puts construction under lender control and sweeps uncommitted holdback out of the commitment.
+
+Whenever a cascade or a supersede undoes an approval that had already reserved cash, the platform performs an explicit compensating reversal so that `commitment_balance_check_cents` still reads zero afterwards: the reserved amount returns from `reserved_release_cents` to `undisbursed_holdback_cents`, and the approved per-line and per-request release figures are cleared back to null rather than left as stale numbers. Money that leaves the commitment without ever being advanced is never simply dropped; it lands in `decommitted_holdback_cents`.
+
+### 2.11. Segregation of Duties
+
+The lending workflow deliberately splits authority so that no single operator can both authorise and execute a money movement. Sizing an application and deciding it are separate roles, and the `X-User-ID` that ran the sizing may not be the `X-User-ID` that records the credit decision. Reviewing a draw and funding it are both servicing operations, and the `X-User-ID` recorded as `reviewed_by_user_id` may not be the `X-User-ID` that funds the request. Verification and approval are also split: an inspector reports verified percentages but has no authority to approve or disburse anything. Any attempt to perform both halves of a split-duty pair under the same user id is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403), and that rejection applies to `PlatformAdmin` exactly as it applies to everyone else.
+
+### 2.12. Rejection Precedence
+
+When more than one rule would reject a request, the platform evaluates rules in a strict, fixed order and reports only the **first** rule whose condition holds; later rules are never reported. The ladder, from highest precedence to lowest, is:
+
+1. Authentication — `ERR_UNAUTHENTICATED`.
+2. Role authorization — `ERR_FORBIDDEN_ROLE`.
+3. Request schema, types, enum membership, numeric ranges, date formats, pagination bounds and structural well-formedness — `ERR_INVALID_REQUEST`.
+4. Existence of every path and body identifier — the ten not-found codes of §2.8.
+5. Entity-backed ownership for the `Borrower` and `Contractor` roles — `ERR_NOT_OWNER`.
+6. Assigned-inspector ownership on an inspection report — `ERR_NOT_ASSIGNED_INSPECTOR`.
+7. Business-referential integrity of allocation and verification arrays — `ERR_LINE_ITEM_MISMATCH` and `ERR_LINE_VERIFICATION_INCOMPLETE`.
+8. Optimistic concurrency — `ERR_STALE_LOAN_VERSION` and `ERR_STALE_FORECLOSURE_CASE_VERSION`.
+9. The target entity's own state permitting the requested transition — `ERR_BORROWER_STATE_INVALID`, `ERR_APPLICATION_STATE_INVALID`, `ERR_REHAB_LINE_STATE_INVALID`, `ERR_DRAW_REQUEST_STATE_INVALID`, `ERR_INSPECTION_VISIT_STATE_INVALID`, `ERR_PROPERTY_STATE_INVALID`, `ERR_FORECLOSURE_CASE_STATE_INVALID` and `ERR_LOAN_STATE_INVALID`.
+10. The governing loan being serviceable — `ERR_LOAN_NOT_SERVICEABLE`.
+11. Separation of duties — `ERR_SEGREGATION_OF_DUTIES`.
+12. Sponsor eligibility — `ERR_BORROWER_NOT_ELIGIBLE`, `ERR_GUARANTEE_NOT_EXECUTED` and `ERR_ENTITY_TYPE_NOT_ELIGIBLE`.
+13. Scope-validation completeness — `ERR_SCOPE_NOT_VALIDATED` and `ERR_SCOPE_LINE_NOT_APPROVED`.
+14. Contractor payability — `ERR_CONTRACTOR_NOT_PAYABLE`.
+15. Waiver disputes — `ERR_LIEN_WAIVER_DISPUTED`.
+16. Waiver coverage — `ERR_WAIVER_HEADROOM_EXCEEDED` and `ERR_FINAL_WAIVER_REQUIRED`.
+17. Joint-check acknowledgement — `ERR_JOINT_CHECK_ACK_REQUIRED`.
+18. Inspector calendar conflicts — `ERR_INSPECTOR_WINDOW_CONFLICT`.
+19. Accrual period overlap — `ERR_ACCRUAL_PERIOD_OVERLAP`.
+20. Accrual period contiguity — `ERR_ACCRUAL_PERIOD_GAP`.
+21. Other temporal bounds — `ERR_ACCRUAL_BEYOND_CLOCK`, `ERR_MILESTONE_BACKDATED` and `ERR_REDEMPTION_PERIOD_ACTIVE`.
+22. Verification-leg constraints — `ERR_VISIT_ALREADY_SCHEDULED`, `ERR_VERIFICATION_METHOD_MISMATCH`, `ERR_INSUFFICIENT_PHOTO_EVIDENCE` and `ERR_PHOTO_REQUEST_TOO_LARGE`.
+23. Uniqueness constraints — `ERR_DUPLICATE_SCOPE_CODE` and `ERR_LINE_ALLOCATION_DUPLICATE`.
+24. Repetition limits — `ERR_EXTENSION_LIMIT_REACHED` and `ERR_REVISION_LIMIT_REACHED`.
+25. Exit-watch extension block — `ERR_EXTENSION_BLOCKED_BY_EXIT_WATCH`.
+26. Percent-complete regression — `ERR_PERCENT_COMPLETE_REGRESSION`.
+27. Scope-line cost caps — `ERR_SCOPE_LINE_CAP_EXCEEDED`.
+28. Sizing preconditions on a credit decision — `ERR_SIZING_REQUIRED`, `ERR_SIZING_STALE` and `ERR_LOAN_AMOUNT_EXCEEDS_LIMIT`.
+29. Remaining fiscal limits — `ERR_PAYMENT_EXCEEDS_BALANCE`, `ERR_PAYOFF_SHORT`, `ERR_COMPLETION_BUDGET_EXCEEDS_CAP`, `ERR_COMPLETION_SPEND_EXCEEDS_BUDGET` and `ERR_DEFAULT_PRECONDITION_NOT_MET`.
+
+The practical consequence worth internalising: a request that is both unauthorised and malformed reports the authorisation failure, and a draw funding attempt by the same operator who reviewed it reports the separation-of-duties failure even when the joint-check acknowledgement is also missing.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Sponsor Onboarding, Experience Scoring, Recertification and Suspension
+
+A `LoanOfficer` registers a sponsor by supplying the borrowing entity's `legal_entity_name`, its `entity_type` (one of `LLC`, `CORP`, `LP` or `SOLE_PROP`), the `guarantor_name` of the natural person offered as personal guarantor, the sponsor's track record as `flips_last_24mo` and `flips_lifetime`, the guarantor's FICO `credit_score`, verified post-closing `liquidity_cents`, a `prior_default_count`, and the `declared_target_loan_cents` the sponsor says it is looking for. Counts of flips must be zero or greater, `flips_last_24mo` may never exceed `flips_lifetime`, `credit_score` must fall between 300 and 850 inclusive, `liquidity_cents` and `prior_default_count` must be zero or greater, and `declared_target_loan_cents` must be strictly greater than zero. A newly registered sponsor begins with `status` of `PROSPECT` and `guarantee_status` of `PENDING`; `guarantee_effective_date` and `suspension_reason` are null.
+
+Registration immediately produces a score. **Borrower experience scoring** builds a raw total out of four positive terms and one penalty, all computed unrounded:
+
+- An experience term worth up to 40 points: divide the sponsor's experience units by a target of 5 completed flips, cap the ratio at 1, and multiply by 40.
+- A credit term worth up to 25 points: subtract 600 from `credit_score`, divide by 200, clamp the result to the range 0 through 1, and multiply by 25. A guarantor at or below 600 earns nothing here; a guarantor at or above 800 earns the full 25.
+- A liquidity term worth up to 20 points: divide `liquidity_cents` by ten percent of a basis amount, cap the ratio at 1, and multiply by 20.
+- A career term worth up to 15 points: divide `flips_lifetime` by a target of 10, cap the ratio at 1, and multiply by 15.
+- A default penalty: subtract 15 points for each prior lender default counted in `prior_default_count`.
+
+The raw total is then clamped to the range 0 through 100 and rounded half up to two decimal places. Only the clamped total is rounded; the four terms are carried at full precision until then. The resulting score is banded into `experience_tier`: `TIER_A` at 80.00 or above, `TIER_B` at 65.00 or above, `TIER_C` at 45.00 or above, and `TIER_D` below 45.00. The bands are inclusive at their lower edge, so a score of exactly 65.00 is `TIER_B` and not `TIER_C`.
+
+Two variants of that score exist, and they differ only in what feeds "experience units" and "the basis amount". At registration the **intake** variant applies: experience units are `flips_last_24mo` alone — lifetime flips are worth nothing in that term — and the basis amount is `declared_target_loan_cents`. The result is stored as `intake_experience_score`.
+
+On recertification the **lifetime-decay** variant applies: experience units are `flips_last_24mo` plus half of the difference between `flips_lifetime` and `flips_last_24mo`, so older flips are credited at a decay weight of one half and the same sponsor scores differently on recertification than at intake. The basis amount becomes the largest `committed_amount_cents` among that sponsor's loans whose `payment_status` is `CURRENT`, `DELINQUENT` or `DEFAULT`; when the sponsor has no loan in any of those three statuses, the basis falls back to `declared_target_loan_cents`. The result is stored as `recertified_experience_score`, which is null until a recertification has been run. Whenever a recertification runs, `recertified_at` is set to the logical-clock instant. The field `effective_experience_score` reports `recertified_experience_score` when `recertified_at` is non-null and `intake_experience_score` otherwise, and `experience_tier` is always banded from `effective_experience_score`.
+
+Before a sponsor can borrow, the personal guarantee must be executed. Recording execution takes a `guarantor_name`, a `signature_ref` identifying the signed instrument, and an `effective_date`; it sets `guarantee_status` to `EXECUTED` and stores `guarantee_effective_date` from the supplied `effective_date`. Sponsor lifecycle actions are then driven by a `CreditCommittee` operator submitting an `action` of `APPROVE_SPONSOR`, `RECERTIFY`, `SUSPEND` or `REINSTATE`, optionally with a `note`.
+
+Approving a sponsor advances `PROSPECT → APPROVED_SPONSOR` and requires three things: `entity_type` is not `SOLE_PROP` (a sole proprietorship cannot borrow on an entity-based loan, and the attempt is rejected with `ERR_ENTITY_TYPE_NOT_ELIGIBLE`), `guarantee_status` is `EXECUTED` (otherwise `ERR_GUARANTEE_NOT_EXECUTED`), and `experience_tier` is anything other than `TIER_D` (otherwise `ERR_BORROWER_NOT_ELIGIBLE`).
+
+Recertification is a self-transition when it goes well and a demotion when it does not. Recertifying requires `guarantee_status` to be `EXECUTED`. The action recomputes `recertified_experience_score` with the lifetime-decay variant, sets `recertified_at`, and re-derives `effective_experience_score` and `experience_tier`. If the recertified score stays at 45.00 or above, the sponsor remains `APPROVED_SPONSOR → APPROVED_SPONSOR` and nothing else changes; critically, applications that already exist keep the pricing tier they snapshotted and are **not** re-tiered. If the recertified score falls below 45.00, the sponsor drops to `TIER_D` and moves `APPROVED_SPONSOR → SUSPENDED` with `suspension_reason` set to `RECERT_BELOW_FLOOR`. The suspension then cascades: every application of that sponsor whose `status` is `DRAFT` or `SIZED` moves to `WITHDRAWN`, and one level deeper, every scope line of each withdrawn application whose `status` is `PROPOSED`, `REVISION_REQUESTED` or `APPROVED` moves to `VOID`. An application withdrawn from `SIZED` additionally has every sizing field cleared back to null.
+
+An administrative suspension takes the same `APPROVED_SPONSOR → SUSPENDED` path with the identical two-level cascade — in-flight `DRAFT` and `SIZED` applications to `WITHDRAWN`, their live scope lines to `VOID` — but records `suspension_reason` as `ADMIN_SUSPENSION` and does not re-score anything. Reinstatement moves `SUSPENDED → APPROVED_SPONSOR`, clears `suspension_reason`, and requires both that no loan of this sponsor sits in `DEFAULT` or `CHARGED_OFF` and that `experience_tier` is not `TIER_D`; either failure is reported as `ERR_BORROWER_NOT_ELIGIBLE`. Reinstatement is forward-looking only: applications withdrawn by the suspension are **not** revived. Attempting to reinstate a sponsor that is not `SUSPENDED` is a state violation reported as `ERR_BORROWER_STATE_INVALID`.
+
+### 3.2. The Subject Property, Its Revaluations, the Trades, and Rehab Scope Validation
+
+A property is registered with an `address_line`, an uppercase recording `county_code`, the contract `purchase_price_cents`, the `as_is_value_cents` on the current appraisal, the `arv_cents` after-repair value, and the `appraisal_date` of the valuation on file. All three money figures must be strictly greater than zero. A new property's `status` begins at `UNDER_CONTRACT` with `valuation_revision_count` at 0, and the status track runs `UNDER_CONTRACT → BORROWER_OWNED` at closing, then either `BORROWER_OWNED → SOLD` on a borrower payoff, or `BORROWER_OWNED → LENDER_REO` on a lender takeover and `LENDER_REO → SOLD` on the REO disposition. `SOLD` is terminal.
+
+A revised appraisal may be posted at any time by a `LoanOfficer`, supplying a new `appraisal_date` and optionally a new `arv_cents` and/or `as_is_value_cents`. Each accepted revision increments `valuation_revision_count` by one and cascades outward: every application on that property whose `status` is `SIZED` has `sizing_stale` set to true, because the after-repair value that the sizing was computed against has moved.
+
+Trade contractors are registered separately with a `business_name`, a `license_number`, the `license_expires_on` date the trade licence lapses, a `w9_on_file` boolean, and a `joint_check_required` boolean marking contractors whose disbursements must be issued as joint-payee checks. A contractor's `license_status` is derived from the logical clock rather than stored: it reads `ACTIVE` when the current date is on or before `license_expires_on` and `EXPIRED` once the current date passes it. The derived `payable` flag is true only when `license_status` is `ACTIVE` **and** `w9_on_file` is true.
+
+An application's rehab budget is expressed as scope lines. A scope line is added under an application with a `scope_code`, a `description` narrative, a proposed `cost_cents` strictly greater than zero, and the `contractor_id` of the trade assigned to it; the owning application is taken from the path and recorded as `application_id`. Valid scope codes are `ROOF`, `KITCHEN`, `BATH`, `ELECTRICAL`, `PLUMBING`, `HVAC`, `FOUNDATION`, `EXTERIOR`, `FLOORING`, `PERMITS` and `CONTINGENCY`. A scope code must be unique among the application's *live* lines — those whose `status` is `PROPOSED`, `REVISION_REQUESTED`, `APPROVED` or `FULLY_RELEASED` — so a second `ROOF` line alongside a live one is rejected with `ERR_DUPLICATE_SCOPE_CODE`, while re-using a code whose earlier line was rejected or voided is permitted. A new line starts at `PROPOSED` with `revision_round` at 0, `released_cents` at 0, `released_percent` at 0, and `approved_cost_cents` and `reviewer_note` both null. Adding a line to an application that is already `SIZED` sets that application's `sizing_stale` to true.
+
+Scope validation is performed line by line by a `LoanOfficer` submitting a `decision` of `APPROVE`, `REQUEST_REVISION` or `REJECT`, optionally with `approved_cost_cents` and a `reviewer_note`. Every one of these decisions requires the owning application to be in `DRAFT` or `SIZED`; a decision on a line under an application in any other status is rejected with `ERR_APPLICATION_STATE_INVALID`.
+
+Approving a line moves `PROPOSED → APPROVED` and sets `approved_cost_cents`, defaulting to the line's proposed `cost_cents` when the reviewer omits the figure. Two ceilings apply. The approved cost may not exceed the borrower's proposed `cost_cents`, and it may not exceed **half** of the application's proposed-plus-approved scope total measured at review time — that is, floor of one half of the sum of `cost_cents` across sibling lines still in `PROPOSED` or `REVISION_REQUESTED` plus the sum of `approved_cost_cents` across sibling lines already in `APPROVED`, with this line's own new approved cost included in that total. Either breach is rejected with `ERR_SCOPE_LINE_CAP_EXCEEDED`. This concentration cap is what stops a single line from swallowing the rehab budget. An approval recomputes the application's `approved_rehab_total_cents`, which is the sum of `approved_cost_cents` over lines whose `status` is `APPROVED` or `FULLY_RELEASED` and which starts at 0, and when the application is already `SIZED` it also sets `sizing_stale` to true.
+
+Requesting a revision on a `PROPOSED` line moves it `PROPOSED → REVISION_REQUESTED`, increments `revision_round` by one, and stores the `reviewer_note`. The same decision on a line already in `APPROVED` is a compensating de-approval, moving `APPROVED → REVISION_REQUESTED`; it is permitted only while that line's `released_cents` is still 0, clears `approved_cost_cents` back to null, recomputes the application's `approved_rehab_total_cents` downward by the cleared amount, increments `revision_round`, and sets `sizing_stale` to true when the application is `SIZED`. Rejecting a line moves `PROPOSED → REJECTED` and stores the `reviewer_note`; `REJECTED` is terminal.
+
+The borrower answers a revision request by resubmitting the line, supplying any of `cost_cents`, `description`, `scope_code` or `contractor_id`. This moves `REVISION_REQUESTED → PROPOSED`, applies the supplied changes and clears `approved_cost_cents` back to null. Resubmission is only available while the line is in `REVISION_REQUESTED` — attempting it on a line in any other status is rejected with `ERR_REHAB_LINE_STATE_INVALID` — and only while the owning application is `DRAFT` or `SIZED`. A line may go around the revision loop at most three times: a resubmission attempted when `revision_round` has already reached 3 is rejected with `ERR_REVISION_LIMIT_REACHED`. A resubmission that would collide with a live sibling's `scope_code` is rejected with `ERR_DUPLICATE_SCOPE_CODE`.
+
+A scope line also has two terminal ends it reaches without a reviewer's involvement. It becomes `FULLY_RELEASED` when funded draws take its `released_cents` up to exactly its `approved_cost_cents`, and it becomes `VOID` when its application is withdrawn or declined. Voiding a line that was in `APPROVED` recomputes the application's `approved_rehab_total_cents` to 0; voiding a `PROPOSED` or `REVISION_REQUESTED` line has no further effect since those lines never contributed to the total.
+
+### 3.3. Sizing the Commitment Against Purchase Price, Cost and After-Repair Value
+
+Opening an application requires a `borrower_id`, a `property_id`, a `term_months` between 6 and 18 inclusive, a `quoted_rate_bps` between 800 and 1800 inclusive, an `interest_reserve_months` between 0 and 12 inclusive, and an optional `day_count_convention` of `PER_DIEM_360` or `PER_DIEM_365` that defaults to `PER_DIEM_360`. Creation is refused when the sponsor's `entity_type` is `SOLE_PROP`, reported as `ERR_ENTITY_TYPE_NOT_ELIGIBLE`. On creation, the application snapshots the sponsor's `effective_experience_score` into its own `intake_experience_score` and the sponsor's `experience_tier` into `pricing_tier`. That snapshot is decisive: all sizing uses the application's `pricing_tier`, never the sponsor's live tier, so a later recertification cannot silently reprice an application already in flight. A new application's `status` is `DRAFT`, its `approved_rehab_total_cents` is 0, and every cap, sized, allocation and decision field is null, with `sizing_stale` false and `decline_reason` null.
+
+Sizing advances `DRAFT → SIZED`, and re-sizing is permitted as a `SIZED → SIZED` self-transition after a valuation or scope change. A first sizing requires the sponsor to be `APPROVED_SPONSOR` (otherwise `ERR_BORROWER_NOT_ELIGIBLE`), at least one scope line in `APPROVED`, and no scope line still sitting in `PROPOSED` or `REVISION_REQUESTED` — an unfinished scope is rejected with `ERR_SCOPE_NOT_VALIDATED`. A re-sizing requires the sponsor to be `APPROVED_SPONSOR` and at least one `APPROVED` scope line.
+
+**Loan sizing** produces three independent ceilings, each floored to a whole cent, and then combines them. The percentages depend entirely on the application's `pricing_tier`. The loan-to-purchase percentage is 90 percent for `TIER_A`, 85 percent for `TIER_B`, 80 percent for `TIER_C` and 70 percent for `TIER_D`; the loan-to-cost percentage uses the same four figures — 90, 85, 80 and 70 percent respectively; and the loan-to-after-repair-value percentage is 75 percent for `TIER_A`, 70 percent for `TIER_B`, 65 percent for `TIER_C` and 60 percent for `TIER_D`. From those:
+
+- `cap_purchase_advance_cents` is the floor of the loan-to-purchase percentage applied to the property's `purchase_price_cents`.
+- `cap_ltc_cents` is the floor of the loan-to-cost percentage applied to `purchase_price_cents` plus `approved_rehab_total_cents`.
+- `cap_ltarv_cents` is the floor of the loan-to-after-repair-value percentage applied to the property's `arv_cents`.
+- `max_total_loan_cents` is the smallest of three quantities: `cap_purchase_advance_cents` plus `approved_rehab_total_cents`, `cap_ltc_cents`, and `cap_ltarv_cents`.
+
+Each of the three caps is floored to a whole cent **before** the smallest is selected. Flooring the smallest of the unfloored caps instead is a different number and is wrong.
+
+Sizing then splits the commitment across buckets in the **sizing pass** of the commitment allocation. The three buckets are circularly coupled — the interest reserve is priced off the funded principal, and the funded principal is what remains of the commitment after the reserve — and the platform resolves that coupling with a single bounded pass and never iterates to a fixed point. Reserve pricing is a single formula used throughout: for a given principal figure, the reserve is that principal multiplied by `quoted_rate_bps` divided by 10000, multiplied by `interest_reserve_months` divided by 12 months, rounded half up to whole cents. Note that the reserve is priced off the quoted note rate in both passes.
+
+The sizing pass runs as follows. A provisional purchase-advance figure is taken as the smaller of `cap_purchase_advance_cents` and `max_total_loan_cents` less `approved_rehab_total_cents`. A first reserve is priced on that provisional figure, and a first committed total is formed as the provisional figure plus that reserve plus `approved_rehab_total_cents`. If the first committed total is less than or equal to `max_total_loan_cents`, then `sized_initial_funding_cents` is the provisional figure and `sized_interest_reserve_cents` is the first reserve. Otherwise the excess — the first committed total less `max_total_loan_cents` — is subtracted from the provisional figure to give `sized_initial_funding_cents`, and `sized_interest_reserve_cents` is re-priced on that reduced figure **exactly once**. `sized_committed_amount_cents` is then `sized_initial_funding_cents` plus `sized_interest_reserve_cents` plus `approved_rehab_total_cents`. Because the second reserve is cheaper than the first, the sized commitment normally lands strictly below `max_total_loan_cents`; that residual slack is deliberately left unused and a second correction round is forbidden.
+
+Sizing also drops two staleness sentinels: `sizing_arv_cents` records the property's `arv_cents` as observed at sizing time, `sizing_rate_bps` records `quoted_rate_bps` as observed at sizing time, and `sizing_stale` is set to false. The field `sizing_stale` reads true while the application is `SIZED` and either the property's `arv_cents` no longer equals `sizing_arv_cents` or `approved_rehab_total_cents` has changed since the sizing ran. A re-sizing recomputes every sizing field against current property and scope-line values, re-snapshots both sentinels, and clears `sizing_stale`.
+
+### 3.4. The Credit Decision and Closing the Note
+
+A `CreditCommittee` operator decides a `SIZED` application by submitting a `decision` of `APPROVE` or `DECLINE`, optionally with `approved_loan_amount_cents`, a `rate_bps` and a `decline_reason`. The decision is the second half of a split-duty pair: the `X-User-ID` recording the decision may not be the `X-User-ID` that ran the sizing, and a collision is rejected with `ERR_SEGREGATION_OF_DUTIES`. Deciding an application that was never sized is rejected with `ERR_SIZING_REQUIRED`, and deciding one whose `sizing_stale` reads true is rejected with `ERR_SIZING_STALE` — the committee is never allowed to approve a number computed against a stale appraisal or a since-changed scope.
+
+Approval moves `SIZED → APPROVED`. It requires `sizing_stale` to be false, the sponsor to be `APPROVED_SPONSOR` with `guarantee_status` of `EXECUTED`, and the amount being approved — `approved_loan_amount_cents` when supplied, otherwise `sized_committed_amount_cents` — to be less than or equal to `max_total_loan_cents`; an amount above the ceiling is rejected with `ERR_LOAN_AMOUNT_EXCEEDS_LIMIT`. Approval stores `approved_loan_amount_cents` and `approved_rate_bps`, the latter defaulting to `quoted_rate_bps` when the committee omits `rate_bps`.
+
+Approval then runs the **decision pass** of the commitment allocation, which splits the same commitment differently from the sizing pass. Let the approved total be `approved_loan_amount_cents`, defaulting to `sized_committed_amount_cents`. A provisional non-rehab remainder is that total less `approved_rehab_total_cents`. `alloc_interest_reserve_cents` is the reserve priced on that provisional remainder using the same reserve formula of §3.3. `alloc_initial_funding_cents` is the provisional remainder less `alloc_interest_reserve_cents`. `alloc_rehab_holdback_cents` equals `approved_rehab_total_cents`. Because the reserve here is carved **out of** the non-rehab remainder rather than added **on top of** a capped purchase advance, the committed total lands on the approved amount exactly, with no slack — and the same application will therefore report a `sized_initial_funding_cents` that differs from its `alloc_initial_funding_cents`. That divergence is intended, not a defect.
+
+Declining moves `SIZED → DECLINED`, stores the `decline_reason`, and cascades every scope line of the application in `PROPOSED`, `REVISION_REQUESTED` or `APPROVED` to `VOID`. `DECLINED`, `CLOSED` and `WITHDRAWN` are all terminal application statuses.
+
+Closing is performed by a `LoanServicer` supplying the `closing_date` on which the note funded, and it moves the application `APPROVED → CLOSED`. Four preconditions apply: the sponsor must be `APPROVED_SPONSOR` with `guarantee_status` of `EXECUTED`; the property must still be `UNDER_CONTRACT`, with any other property status reported as `ERR_PROPERTY_STATE_INVALID`; every scope line of the application must be settled into `APPROVED`, `REJECTED` or `VOID`, with any line still `PROPOSED` or `REVISION_REQUESTED` rejected as `ERR_SCOPE_NOT_VALIDATED`; and every contractor referenced by an `APPROVED` scope line must have `payable` reading true, with a lapsed licence or missing W-9 rejected as `ERR_CONTRACTOR_NOT_PAYABLE`. Closing an application that is not `APPROVED` is rejected with `ERR_APPLICATION_STATE_INVALID`.
+
+Closing mints the `Loan`. The loan records the originating `application_id` and denormalises `borrower_id` from the application; it copies `term_months`, `day_count_convention` and the approved rate into `note_rate_bps`; and it derives `default_rate_bps` as `note_rate_bps` plus a default spread of 600 basis points, so a note at 11.50 percent carries a default rate of 17.50 percent. `maturity_date` is the `closing_date` advanced by `term_months` plus `extension_months_total` calendar months, clamped to the last day of the target month when that month is shorter than the closing day-of-month. `committed_amount_cents` is set to the application's `approved_loan_amount_cents` and is thereafter increased only by an accepted foreclosure completion budget.
+
+The loan's buckets are seeded straight from the decision-pass allocation: `funded_principal_cents` starts at `alloc_initial_funding_cents`, both `interest_reserve_balance_cents` and `interest_reserve_funded_cents` start at `alloc_interest_reserve_cents`, and `undisbursed_holdback_cents` starts at `alloc_rehab_holdback_cents`. `repaid_principal_cents`, `reserved_release_cents`, `decommitted_holdback_cents`, `accrued_interest_unpaid_cents`, `fee_balance_cents`, `extension_count` and `extension_months_total` all start at 0, and `last_accrual_through`, `delinquent_since` and `default_effective_date` are all null. A ledger entry of type `INITIAL_FUNDING` is written for the initial funding amount, and the property cascades `UNDER_CONTRACT → BORROWER_OWNED`. The loan opens on three independent state axes: `payment_status` at `CURRENT`, `construction_status` at `NOT_STARTED`, and `exit_status` at `NOT_LISTED`. Any write attempted against a loan whose `payment_status` has reached `PAID_OFF` or `CHARGED_OFF` is rejected with `ERR_LOAN_STATE_INVALID` — those two are terminal and accept nothing further.
+
+### 3.5. Draw Intake and Verification
+
+Only the sponsor submits a draw. A `Borrower` requests cash by supplying `line_allocations`, a `verification_method` of `INSPECTION` or `PHOTO`, and the `expected_loan_version` described in §2.9. Each entry in `line_allocations` names a `rehab_line_item_id` and a `claimed_percent_complete` between 0.01 and 1.00 inclusive, carried to two decimals, expressing the sponsor's claimed *cumulative* completion of that scope line. An empty `line_allocations` array is a schema violation. The same `rehab_line_item_id` appearing twice inside one array is rejected with `ERR_LINE_ALLOCATION_DUPLICATE`. An allocation naming a scope line that does not belong to the loan's originating application is rejected with `ERR_LINE_ITEM_MISMATCH`, and one naming a line whose `status` is anything other than `APPROVED` is rejected with `ERR_SCOPE_LINE_NOT_APPROVED`.
+
+Submission creates a `DrawRequest` recording the owning `loan_id` from the path, a `sequence_number` that is the one-based creation ordinal within that loan when its requests are ordered by `created_at` ascending, and one `DrawLineItem` per allocation entry. Each allocation records its owning `draw_request_id`, its `rehab_line_item_id`, the submitted `claimed_percent_complete`, and a `requested_amount_cents` computed at creation time as the scope line's `approved_cost_cents` multiplied by `claimed_percent_complete`, rounded half up to whole cents, less that scope line's `released_cents` at that moment. `verified_percent_complete`, `effective_percent_complete` and `approved_amount_cents` are all null at this point, and the allocation's own `released_cents` is 0. The request's `requested_total_cents` is the sum of its allocations' `requested_amount_cents`; `approved_release_cents`, `reviewed_by_user_id`, `funded_by_user_id`, `funded_at`, `photo_count` and `superseded_by_draw_request_id` are all null, and `status` opens at `SUBMITTED`.
+
+Creating a new request is also a supersede: every other draw request on the same loan whose `status` is `SUBMITTED`, `INSPECTION_ORDERED`, `INSPECTED`, `REVISION_REQUESTED` or `APPROVED` moves to `SUPERSEDED` with its `superseded_by_draw_request_id` set to the new request's `id`. Superseding a request that was `INSPECTION_ORDERED` also cascades every `SCHEDULED` inspection visit of that request to `CANCELLED`, which frees the inspector's calendar slot for future conflict checks. Superseding a request that was already `APPROVED` performs the compensating reversal of §2.10: the request's `approved_release_cents` returns from the loan's `reserved_release_cents` to its `undisbursed_holdback_cents`, and `approved_release_cents` together with every allocation's `approved_amount_cents` is cleared back to null, so `commitment_balance_check_cents` still reads zero. `FUNDED`, `REJECTED`, `SUPERSEDED` and `SUSPENDED` are terminal draw statuses and are never superseded.
+
+Verification splits into two legs, chosen by the request's `verification_method`, and a request may only travel the leg its method names — using the wrong leg is rejected with `ERR_VERIFICATION_METHOD_MISMATCH`.
+
+On the **inspection** leg, a `LoanServicer` orders a site visit by supplying an `inspector_id`, a `window_start` and a `window_end`, where the window is treated as half-open — inclusive of `window_start`, exclusive of `window_end` — and `window_end` must be strictly later than `window_start`. Ordering a visit moves the request `SUBMITTED → INSPECTION_ORDERED` and creates an `InspectionVisit` in `SCHEDULED` with `reported_at` and `site_notes` null. Two constraints guard the order. A request that already has a `SCHEDULED` visit cannot have another ordered, and the attempt is rejected with `ERR_VISIT_ALREADY_SCHEDULED`. And the named inspector must be free: if that inspector already holds a `SCHEDULED` visit whose window, widened by a travel buffer of one and a half hours at both ends, overlaps the requested half-open window, the order is rejected with `ERR_INSPECTOR_WINDOW_CONFLICT`. Visits that have been cancelled by a supersede or a suspension no longer occupy the calendar for this test.
+
+The assigned `DrawInspector` files the report by supplying `line_verifications` and optionally `site_notes`. Each entry in `line_verifications` names a `rehab_line_item_id` and the `verified_percent_complete` the inspector observed, carried to two decimals as a cumulative figure. The array must cover every allocation of the request exactly once — no gaps and no repeats — and any other shape is rejected with `ERR_LINE_VERIFICATION_INCOMPLETE`; an empty array is a schema violation. Reporting requires the caller's `X-User-ID` to equal the visit's `inspector_id`, the visit to be `SCHEDULED` (otherwise `ERR_INSPECTION_VISIT_STATE_INVALID`), and the owning request to be `INSPECTION_ORDERED`. The report moves the visit `SCHEDULED → COMPLETED`, sets its `reported_at` to the logical-clock instant and stores `site_notes`; drives the request `INSPECTION_ORDERED → INSPECTED`; sets `verified_percent_complete` on every allocation; and computes each allocation's `effective_percent_complete` as the smaller of its claimed and verified figures.
+
+On the **photo** leg, the `LoanServicer` verifies from photographic evidence instead, supplying `line_verifications` in the same shape plus a `photo_count`. Three constraints apply. The request's `requested_total_cents` may not exceed thirty thousand dollars — three million cents — and a larger photo draw is rejected with `ERR_PHOTO_REQUEST_TOO_LARGE`. The supplied `photo_count` must be at least three photos for every allocation on the request, so a five-line request needs at least fifteen photos; a shortfall is rejected with `ERR_INSUFFICIENT_PHOTO_EVIDENCE`. And `line_verifications` must again cover every allocation exactly once, on pain of `ERR_LINE_VERIFICATION_INCOMPLETE`. Photo verification moves the request `SUBMITTED → INSPECTED` directly, with no visit involved: it stores `photo_count`, sets `verified_percent_complete` on every allocation, and computes each `effective_percent_complete` as the smallest of the claimed figure, the verified figure and a photo ceiling of 0.50. A photo-verified allocation can therefore never be credited with more than half a scope line's completion regardless of what the sponsor claims or the servicer sees.
+
+### 3.6. Draw Underwriting, Lien Waivers, Contractor Controls and Disbursement
+
+A `LoanServicer` underwrites an `INSPECTED` request by submitting a `decision` of `APPROVE`, `REQUEST_REVISION` or `REJECT`, optionally with a `reviewer_note`. All three record the deciding `X-User-ID` as `reviewed_by_user_id`. `REQUEST_REVISION` moves `INSPECTED → REVISION_REQUESTED` and `REJECT` moves `INSPECTED → REJECTED`, neither with any money effect. Re-reviewing a request that has already been funded, or reviewing one that is not `INSPECTED`, is rejected with `ERR_DRAW_REQUEST_STATE_INVALID`. A draw may only be reviewed while the loan's `payment_status` is `CURRENT` or `DELINQUENT`.
+
+Approval moves `INSPECTED → APPROVED` and computes the release. The **draw release** calculation walks the request's allocations in ascending order of their scope line's `scope_code` and, for each one:
+
+- takes the effective completion as the smaller of `claimed_percent_complete` and `verified_percent_complete`, then, on a `PHOTO` request only, takes the smaller of that result and the photo ceiling of 0.50;
+- sets retainage to zero when the effective completion is exactly 1.00, and otherwise to 10 percent on an `INSPECTION` request or 20 percent on a `PHOTO` request;
+- computes an earned figure as the scope line's `approved_cost_cents` multiplied by the effective completion, rounded half up to whole cents;
+- computes a releasable figure as that earned figure multiplied by one minus the retainage, again rounded half up to whole cents;
+- sets the allocation's `approved_amount_cents` to that releasable figure less the scope line's `released_cents` to date.
+
+The request's `approved_release_cents` is the sum of the per-line `approved_amount_cents`. Each line is rounded to whole cents first and the rounded line amounts are then summed; summing unrounded line values and rounding the total once is a different number and is wrong. Because retainage falls away entirely at 1.00, the last dollar of completion on a line releases both the final increment of work and all previously withheld retainage. Since a photo draw caps effective completion at 0.50 and withholds 20 percent, it can never release more than 40 percent of a scope line's approved cost, whereas an inspection draw at full completion releases the whole approved cost. If any allocation's computed release comes out negative — because the verified completion implies less earned work than has already been released against that line — the whole approval is rejected with `ERR_PERCENT_COMPLETE_REGRESSION`.
+
+An approval never over-commits the holdback, and this is structural rather than a separate check: each per-line release is bounded by that line's remaining approved cost, and the sum of remaining approved costs across the application equals the loan's `undisbursed_holdback_cents` plus the `reserved_release_cents` held by the loan's other open draws. On success, `approved_release_cents` moves out of the loan's `undisbursed_holdback_cents` and into its `reserved_release_cents`.
+
+Approval is also where contractor payment controls bite. Every contractor referenced by an allocation must have `payable` reading true, or the approval is rejected with `ERR_CONTRACTOR_NOT_PAYABLE`. No contractor on the request may have any lien waiver in `DISPUTED`, or the approval is rejected with `ERR_LIEN_WAIVER_DISPUTED`. And each contractor's share of the computed release — the sum of that contractor's per-line `approved_amount_cents` on this request — must be covered by that contractor's waiver headroom, or the approval is rejected with `ERR_WAIVER_HEADROOM_EXCEEDED`.
+
+A lien waiver is filed against a loan for a contractor with a `loan_id`, a `contractor_id`, a `waiver_type` of `PARTIAL_CONDITIONAL`, `PARTIAL_UNCONDITIONAL` or `FINAL_UNCONDITIONAL`, an `amount_covered_cents` strictly greater than zero naming the dollar value of work it releases, and a `through_date` through which claims are released. A filed waiver opens in `COLLECTED`. Its derived `counts_toward_coverage` flag is true only when `status` is `COLLECTED` **and** `waiver_type` is one of the two unconditional types — a conditional partial waiver never counts toward coverage, however large it is.
+
+From those waivers the platform derives three contractor figures. `collected_waiver_coverage_cents` is the sum of `amount_covered_cents` over that contractor's waivers whose `status` is `COLLECTED` and whose `waiver_type` is `PARTIAL_UNCONDITIONAL` or `FINAL_UNCONDITIONAL`. `released_to_contractor_cents` is the sum of `released_cents` over every scope line whose `contractor_id` is that contractor, across every loan. `open_waiver_headroom_cents` is `collected_waiver_coverage_cents` less `released_to_contractor_cents`, and it is allowed to go **negative** — which is exactly what happens when already-consumed coverage is disputed, and what then blocks the next draw until the dispute is resolved or fresh coverage is filed. All three default to 0 for a contractor with no waivers and no released work.
+
+A `LoanServicer` toggles a dispute by submitting an `action` of `DISPUTE` or `RESOLVE`, optionally with a `note`. Disputing moves the waiver `COLLECTED → DISPUTED`, sets `counts_toward_coverage` to false, and recomputes the contractor's `collected_waiver_coverage_cents` and `open_waiver_headroom_cents`, which may now be negative. Resolving moves `DISPUTED → COLLECTED`, re-derives `counts_toward_coverage` from the waiver's `waiver_type`, and recomputes the same two contractor figures.
+
+Funding an `APPROVED` request moves it `APPROVED → FUNDED` and takes a `funding_date` plus an optional `joint_check_ack` boolean. Four preconditions guard the disbursement. The funding `X-User-ID` must differ from `reviewed_by_user_id`, or the request is rejected with `ERR_SEGREGATION_OF_DUTIES`. The loan's `payment_status` must be `CURRENT` or `DELINQUENT`. When any allocation's contractor has `joint_check_required` set to true, `joint_check_ack` must be present and true, or the funding is rejected with `ERR_JOINT_CHECK_ACK_REQUIRED`. And every contractor whose scope line reaches full completion with this funding must already have a `FINAL_UNCONDITIONAL` waiver on file, or the funding is rejected with `ERR_FINAL_WAIVER_REQUIRED` — a check that exists only at funding time, since a review does not yet disburse. Waiver headroom is re-checked at funding as well as at review.
+
+Funding then cascades. Each allocation's `released_cents` is set to its `approved_amount_cents`. The request's `approved_release_cents` moves out of the loan's `reserved_release_cents` and into `funded_principal_cents`. One level deeper, each allocation's released amount is added to its scope line's `released_cents` and that line's `released_percent` is re-derived as `released_cents` divided by `approved_cost_cents` carried to four decimal places, reading 0 while `approved_cost_cents` is null. One level deeper again, any scope line whose `released_cents` now equals its `approved_cost_cents` moves `APPROVED → FULLY_RELEASED`, and when no `APPROVED` line remains on the loan's application — every one of them having become `FULLY_RELEASED` — the loan's `construction_status` advances `IN_PROGRESS → COMPLETE`. On a loan's very first funded draw, `construction_status` advances `NOT_STARTED → IN_PROGRESS`. Reaching `COMPLETE` does **not** sweep any residual `undisbursed_holdback_cents`; that money stays available in case a further scope re-approval reopens work. Finally, funding writes a `DRAW_DISBURSEMENT` ledger entry for `approved_release_cents` and records `funded_by_user_id` and `funded_at`, the latter as the logical-clock instant.
+
+### 3.7. Interest Accrual, the Reserve Sweep, Payments and Payoff
+
+A `LoanServicer` accrues interest one period at a time, supplying a `period_start` and a `period_end` as ISO dates. Both endpoints are inclusive, so `day_count` is the number of days from `period_start` to `period_end` plus one. Periods must be contiguous and must not overlap: a period that overlaps an existing accrual period of the loan on the inclusive interval is rejected with `ERR_ACCRUAL_PERIOD_OVERLAP`, and a `period_start` that is not exactly one day after the loan's `last_accrual_through` — or, for the very first period, not exactly the `closing_date` — leaves an un-accrued gap and is rejected with `ERR_ACCRUAL_PERIOD_GAP`. A `period_end` later than the logical-clock date is rejected with `ERR_ACCRUAL_BEYOND_CLOCK`, and a `period_end` earlier than `period_start` is a schema violation.
+
+Accrual splits the period across two rates. `note_rate_days` counts the days in the inclusive period for which either `default_effective_date` is null or the day falls strictly before `default_effective_date`; `default_rate_days` is `day_count` less `note_rate_days`. `principal_snapshot_cents` records the loan's `funded_principal_cents` read **before** this period's sweep is capitalised. Then `note_rate_interest_cents` is `principal_snapshot_cents` multiplied by `note_rate_bps` divided by 10000, multiplied by `note_rate_days` divided by a 360-day basis, rounded half up to whole cents; `default_rate_interest_cents` is the same computation using `default_rate_bps` and `default_rate_days`; and `interest_accrued_cents` is the sum of those two independently rounded components. Blending the two rates into a single computation and rounding once produces a different, incorrect number.
+
+The reserve then absorbs what it can. `swept_from_reserve_cents` is the smaller of `interest_accrued_cents` and the loan's `interest_reserve_balance_cents` as it stood before the sweep, and `unpaid_added_cents` is `interest_accrued_cents` less `swept_from_reserve_cents`. The loan is updated in this order: `interest_reserve_balance_cents` is reduced by the swept amount; `funded_principal_cents` is increased by the swept amount, because swept interest capitalises into principal; `accrued_interest_unpaid_cents` is increased by `unpaid_added_cents`; and `last_accrual_through` is set to `period_end`. Because the capitalisation lands after `principal_snapshot_cents` was taken, it affects only the *next* period's accrual — capitalising before the snapshot over-accrues. A `RESERVE_SWEEP` ledger entry records the sweep. Note that the sweep moves money between two terms of the conservation identity, so `commitment_balance_check_cents` still reads zero. Whenever `unpaid_added_cents` comes out greater than zero on a loan that is `CURRENT`, the loan moves `CURRENT → DELINQUENT` and `delinquent_since` is set to that period's `period_end`.
+
+Payments are applied by a `LoanServicer` or by the `Borrower`, supplying an `amount_cents`, a `payment_date`, and an `intent` of `REGULAR` or `PAYOFF`.
+
+A `REGULAR` payment runs a strict three-tier **waterfall**. Starting with the full payment amount as the remaining balance: first pay the smaller of the remaining balance and `fee_balance_cents`, reducing the remaining balance accordingly; then pay the smaller of what remains and `accrued_interest_unpaid_cents`, again reducing the remainder; then pay the smaller of what remains and `funded_principal_cents`. If anything is still left over after all three tiers, the payment exceeds the borrower's total obligation and the whole request is rejected with `ERR_PAYMENT_EXCEEDS_BALANCE` with nothing applied. Otherwise `fee_balance_cents`, `accrued_interest_unpaid_cents` and `funded_principal_cents` are each reduced by their tier's amount, and `repaid_principal_cents` is increased by the principal portion — principal only moves between the funded and repaid buckets, which is why the conservation identity survives a payment. A `BORROWER_PAYMENT` ledger entry is written. If the loan was `DELINQUENT` and both `fee_balance_cents` and `accrued_interest_unpaid_cents` have now reached zero, the loan moves `DELINQUENT → CURRENT` and `delinquent_since` is cleared to null; a shortfall of even one cent on either balance leaves the loan `DELINQUENT`.
+
+A `PAYOFF` payment must cover the full quote. The **payoff quote** is computed as of a quote date, which is the logical-clock date when a loan is merely being read and the supplied `payment_date` when a payoff is being applied. An anchor date is taken as `last_accrual_through` when it is non-null, and otherwise as the day before `closing_date`. The per-diem day count is the number of days from that anchor to the quote date, exclusive of the anchor. The applicable rate is `default_rate_bps` when the loan's `payment_status` is `DEFAULT` and `note_rate_bps` otherwise. The divisor is 360 when `day_count_convention` is `PER_DIEM_360` and 365 when it is `PER_DIEM_365`. The per-diem interest component is `funded_principal_cents` multiplied by the applicable rate divided by 10000, multiplied by the per-diem day count divided by that divisor, rounded half up to whole cents. `payoff_quote_cents` is then `funded_principal_cents` plus `accrued_interest_unpaid_cents` plus `fee_balance_cents` plus that per-diem component. The 360-day convention produces the larger quote and the 365-day convention the smaller; a payoff sized off the wrong convention is short, and a payment below `payoff_quote_cents` as of `payment_date` is rejected with `ERR_PAYOFF_SHORT`.
+
+A successful payoff settles the loan. It moves the whole of `funded_principal_cents` into `repaid_principal_cents`, zeroes `accrued_interest_unpaid_cents` and `fee_balance_cents`, and moves whatever remains in `interest_reserve_balance_cents` and `undisbursed_holdback_cents` into `decommitted_holdback_cents`. `payment_status` reaches `PAID_OFF` — from `CURRENT`, from `DELINQUENT` (in which case `delinquent_since` is also cleared), or from `DEFAULT` as a reinstatement payoff, which is available only while no foreclosure case of the loan has reached `RESOLVED` and prices the per-diem at `default_rate_bps`. In every case `exit_status` becomes `EXITED`, the property cascades `BORROWER_OWNED → SOLD`, and a `PAYOFF` ledger entry is written.
+
+### 3.8. Extensions and Exit Monitoring
+
+Short-term paper gets extended, and the platform charges for it. A `LoanServicer` grants an extension by supplying `months`. **Extension repricing** computes a fee as `funded_principal_cents` multiplied by 100 basis points — one percent — divided by 10000, multiplied by the granted `months`, rounded half up to whole cents; so a one-month extension costs one percent of outstanding principal and a three-month extension costs three percent. That fee is added to `fee_balance_cents`, which sits outside the commitment identity because it is revenue rather than commitment. The grant then steps `note_rate_bps` up by 50 basis points — per grant, not per month — re-derives `default_rate_bps` as the stepped `note_rate_bps` plus the 600 basis point default spread, increments `extension_count` by one, adds the granted `months` to `extension_months_total`, and recomputes `maturity_date` as `closing_date` advanced by `term_months` plus `extension_months_total` calendar months. An `EXTENSION_FEE` ledger entry records the charge. A loan may be extended at most twice: a third grant is rejected with `ERR_EXTENSION_LIMIT_REACHED`.
+
+Exit progress is recorded as a stream of milestones. The `Borrower` or a `LoanServicer` files one with a `milestone_type`, an `effective_date`, and — depending on the type — a `listing_price_cents`, a `lender_name` and a free-text `note`. Valid types are `LISTED`, `PRICE_REDUCED`, `DELISTED`, `UNDER_CONTRACT`, `CONTRACT_FALLOUT`, `REFI_APPLICATION`, `REFI_APPRAISAL_COMPLETE` and `REFI_COMMITMENT_ISSUED`. `listing_price_cents` is required for `LISTED` and `PRICE_REDUCED` and null otherwise; `lender_name` is required for all three `REFI_*` types and null otherwise; omitting a required one is a schema violation. A milestone whose `effective_date` precedes the loan's `closing_date`, or precedes the `effective_date` of the latest milestone already on file, is rejected with `ERR_MILESTONE_BACKDATED`. Each milestone carries a derived `derived_exit_status` naming the exit status it maps to, one of `NOT_LISTED`, `LISTED`, `UNDER_CONTRACT` or `REFI_IN_PROCESS`.
+
+The loan's `exit_status` is driven by the latest milestone overall, ordered by `effective_date` descending and then by `created_at` descending — never by `id`. `LISTED`, `CONTRACT_FALLOUT` and `PRICE_REDUCED` all map to `LISTED`; `UNDER_CONTRACT` maps to `UNDER_CONTRACT`; all three `REFI_*` types map to `REFI_IN_PROCESS`; and `DELISTED` maps back to `NOT_LISTED`. So the axis runs `NOT_LISTED → LISTED` on a first listing (whose `effective_date` must be on or after `closing_date`), `LISTED → UNDER_CONTRACT` when a buyer is found, `UNDER_CONTRACT → LISTED` on a contract fallout, `LISTED → NOT_LISTED` on a delisting, and `NOT_LISTED → REFI_IN_PROCESS` or `LISTED → REFI_IN_PROCESS` when a refinance application is filed. From `REFI_IN_PROCESS`, `UNDER_CONTRACT`, `LISTED` or `NOT_LISTED` the axis reaches `EXITED` on a payoff — an off-market payoff straight from a live listing is permitted, and a payoff that never went to market at all exits directly from `NOT_LISTED` — and it reaches `FORECLOSED` from `NOT_LISTED`, `LISTED` or `REFI_IN_PROCESS` on a lender takeover. `EXITED` and `FORECLOSED` are terminal.
+
+**Exit monitoring** derives two further figures. The *governing* listing is the loan's `LISTED` milestone with the greatest `effective_date`, tie-broken by the greatest `created_at`, whose `effective_date` is later than the `effective_date` of the most recent `DELISTED` milestone if any exists; when no such milestone exists the governing listing is null. `days_on_market` is 0 when the governing listing is null, and otherwise the whole number of days from the governing listing's `effective_date` to the logical-clock date, with no partial-day arithmetic. A contract fallout does **not** reset the count — days keep accumulating from the governing listing — whereas a delisting resets `days_on_market` to 0 and `exit_watch_flag` to false. Once `exit_status` leaves `LISTED` for a refinance track, `days_on_market` stops being derived from the listing but the governing listing is retained for the watch flag, and a payoff freezes `days_on_market` at its value on the payoff date.
+
+`exit_watch_flag` reads true when `days_on_market` is strictly greater than 90 days **and** no `PRICE_REDUCED` milestone exists whose `effective_date` is on or after the governing listing's `effective_date`. A stale listing that has never been repriced is the exit-watch signal; a single price reduction dated on or after the governing listing clears the flag permanently, while a price reduction dated *before* the governing listing does not clear it. At exactly 90 days the flag is still false, because the comparison is strict. An exit-watched loan may not be extended: a grant attempted while `exit_watch_flag` is true is rejected with `ERR_EXTENSION_BLOCKED_BY_EXIT_WATCH`, which forces the sponsor to reprice the listing before buying more time.
+
+### 3.9. Default, Foreclosure, Lender Completion and REO Disposition
+
+A `LoanServicer` declares default by supplying a `reason`. Two independent grounds exist. A `DELINQUENT` loan may be declared in default once the logical-clock date is at least 10 days after `delinquent_since`, moving `DELINQUENT → DEFAULT`. A `CURRENT` loan may be declared in default on a maturity breach, when the logical-clock date is strictly later than `maturity_date`, moving `CURRENT → DEFAULT`. When neither the 10-day delinquency aging test nor the maturity-breach test is satisfied, the declaration is rejected with `ERR_DEFAULT_PRECONDITION_NOT_MET`.
+
+Both grounds fire the identical cascade set. `default_effective_date` is set to the logical-clock date, and from that day forward accrual days on or after it price at `default_rate_bps`. One level down, the sponsor's `prior_default_count` increments by one and the sponsor moves `APPROVED_SPONSOR → SUSPENDED` with `suspension_reason` set to `LOAN_DEFAULT`. A level below that, every *other* application of that sponsor whose `status` is `DRAFT` or `SIZED` moves to `WITHDRAWN`; and a level below that, every scope line of those applications in `PROPOSED`, `REVISION_REQUESTED` or `APPROVED` moves to `VOID`. Independently, every draw request on the defaulting loan whose `status` is `SUBMITTED`, `INSPECTION_ORDERED`, `INSPECTED` or `APPROVED` moves to `SUSPENDED`. Suspending a request that was `INSPECTION_ORDERED` also cancels its `SCHEDULED` inspection visits; suspending one that was `APPROVED` returns its `approved_release_cents` from `reserved_release_cents` to `undisbursed_holdback_cents` and clears `approved_release_cents` and every allocation's `approved_amount_cents` back to null.
+
+A loan in `DEFAULT` is no longer serviceable in the ordinary sense. New draw requests, draw reviews, draw funding, extensions and new exit milestones are all refused with `ERR_LOAN_NOT_SERVICEABLE`; foreclosure actions and a reinstatement payoff remain available.
+
+Foreclosure begins with a notice. A `LoanServicer` opens a case by supplying a `notice_date` and a recording `county_code`; the case records the owning `loan_id`, opens in `NOTICE_FILED`, and derives `redemption_expires_on` as `notice_date` plus 90 days. `takeover_date`, `completion_budget_cents`, `sale_price_cents`, `selling_costs_cents` and `net_proceeds_cents` are all null at this point, and `completion_advanced_cents` is 0.
+
+Takeover moves the case `NOTICE_FILED → TAKEOVER_COMPLETE` and takes a `takeover_date`. It requires the logical-clock date to be on or after `redemption_expires_on` — an attempt during the redemption window is rejected with `ERR_REDEMPTION_PERIOD_ACTIVE` — and the loan's `payment_status` to be `DEFAULT`. Taking over sets the case's `takeover_date`, cascades the property `BORROWER_OWNED → LENDER_REO`, drives the loan's `exit_status` to `FORECLOSED`, and moves `construction_status` to `LENDER_COMPLETING` from `NOT_STARTED`, from `IN_PROGRESS`, or from `COMPLETE`. It also performs a compensating sweep: all remaining `undisbursed_holdback_cents` moves into `decommitted_holdback_cents` and a `HOLDBACK_DECOMMIT` ledger entry is written, so the commitment identity holds even though the lender will never advance that money to the borrower. Attempting a takeover on a case that is not `NOTICE_FILED` is rejected with `ERR_FORECLOSURE_CASE_STATE_INVALID`.
+
+The lender may then fund completion of construction itself. Supplying `budget_cents` alongside the `expected_foreclosure_case_version` of §2.9 moves the case `TAKEOVER_COMPLETE → COMPLETION_FUNDED` on a first budget, or `COMPLETION_FUNDED → COMPLETION_FUNDED` on a revision. In both cases `budget_cents` may not exceed the floor of 20 percent of the property's `arv_cents`, and a larger figure is rejected with `ERR_COMPLETION_BUDGET_EXCEEDS_CAP`. A first budget sets `completion_budget_cents` and increases both the loan's `committed_amount_cents` and its `undisbursed_holdback_cents` by `budget_cents`. A revision adjusts both of those loan figures by the difference between the new `budget_cents` and the old `completion_budget_cents`, which may be negative. Either way the case's `version` increments by one.
+
+Disposition sells the asset and settles the loan, taking a `sale_price_cents`, a `sale_date` and a `completion_spend_cents`. A case in `TAKEOVER_COMPLETE` may be disposed only when `completion_spend_cents` is zero, since no completion budget was ever funded; a case in `COMPLETION_FUNDED` may be disposed only when `completion_spend_cents` is less than or equal to `completion_budget_cents`, with an overspend rejected as `ERR_COMPLETION_SPEND_EXCEEDS_BUDGET`. Both paths move the case to `RESOLVED`, which is terminal.
+
+The **REO settlement** runs in a fixed order. `completion_advanced_cents` is set to `completion_spend_cents` and added to the loan's `funded_principal_cents`, with a `COMPLETION_ADVANCE` ledger entry — the advance lands *before* the payoff arithmetic, so it is itself part of what must be recovered. The unspent remainder — `completion_budget_cents`, treated as zero when no budget was funded, less `completion_advanced_cents` — plus any residual `undisbursed_holdback_cents` moves into `decommitted_holdback_cents`, leaving `undisbursed_holdback_cents` at exactly 0 and `commitment_balance_check_cents` at 0. `selling_costs_cents` is the floor of 6 percent of `sale_price_cents`, and `net_proceeds_cents` is `sale_price_cents` less `selling_costs_cents`. The payoff at disposition is the payoff quote of §3.7 computed as of `sale_date`, pricing the per-diem at `default_rate_bps`, anchored on `last_accrual_through`, and using the post-advance `funded_principal_cents`. From those two figures the disposition computes three settlement amounts, recording each of them on the foreclosure case and mirroring the same value onto the loan: `recovery_cents` is the smaller of the payoff at disposition and `net_proceeds_cents`; `charge_off_cents` is the payoff at disposition less `net_proceeds_cents` when that difference is positive and 0 otherwise; and `surplus_returned_cents` is `net_proceeds_cents` less the payoff at disposition when that difference is positive and 0 otherwise. All three read null — on the case and on the loan alike — until a disposition sets them, so a loan that never reaches an REO disposition reports all three as null.
+
+Settlement also closes the books. `sale_price_cents`, `selling_costs_cents` and `net_proceeds_cents` are recorded on the case; the property cascades `LENDER_REO → SOLD`; and `construction_status` reaches `LENDER_COMPLETE` from `LENDER_COMPLETING`. When `charge_off_cents` is greater than zero the loan moves `DEFAULT → CHARGED_OFF`, writing a `REO_SALE_PROCEEDS` ledger entry followed by a `CHARGE_OFF` entry; otherwise the proceeds covered the debt and the loan moves `DEFAULT → PAID_OFF`. In either case the whole of `funded_principal_cents` moves into `repaid_principal_cents` and both `accrued_interest_unpaid_cents` and `fee_balance_cents` are zeroed, so that after settlement `repaid_principal_cents` plus `decommitted_holdback_cents` equals `committed_amount_cents` exactly.
+
+## 4. Endpoint Definitions
+
+Operations that mint a new stand-alone resource or append a new distinct record to a collection — registering a sponsor, a property, a contractor or an application, adding a scope line, submitting a draw request, ordering an inspection visit, filing a lien waiver, accruing an interest period, filing an exit milestone, opening a foreclosure case, or closing an application into a new `Loan` — return `201 Created`. Operations that modify an existing resource, including every lifecycle action, review, decision, funding, payment and disposition, return `200 OK`.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/lending/borrowers` | Register a sponsor entity and score it with the intake variant | LoanOfficer, PlatformAdmin |
+| GET | `/lending/borrowers/{id}` | Read a sponsor with its live score and tier | LoanOfficer, CreditCommittee, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/borrowers/{id}/status` | Sponsor lifecycle action: APPROVE_SPONSOR, RECERTIFY, SUSPEND or REINSTATE | CreditCommittee, PlatformAdmin |
+| POST | `/lending/borrowers/{id}/guarantee` | Record execution of the personal guarantee | LoanOfficer, Borrower, PlatformAdmin |
+| POST | `/lending/properties` | Register the subject property with purchase price, as-is value and ARV | LoanOfficer, PlatformAdmin |
+| GET | `/lending/properties/{id}` | Read a property | LoanOfficer, CreditCommittee, LoanServicer, DrawInspector, PlatformAdmin |
+| PATCH | `/lending/properties/{id}/valuation` | Post a revised appraisal; invalidates dependent sizings | LoanOfficer, PlatformAdmin |
+| POST | `/lending/applications` | Open a loan application, snapshotting the sponsor's score and tier | LoanOfficer, PlatformAdmin |
+| GET | `/lending/applications/{id}` | Read an application with its sizing and allocation fields | LoanOfficer, CreditCommittee, LoanServicer, Borrower, PlatformAdmin |
+| GET | `/lending/applications` | List applications, filterable by sponsor, property and status | LoanOfficer, CreditCommittee, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/applications/{id}/rehab-line-items` | Add a rehab budget scope line | LoanOfficer, Borrower, PlatformAdmin |
+| GET | `/lending/applications/{id}/rehab-line-items` | List an application's scope lines | LoanOfficer, CreditCommittee, LoanServicer, Borrower, Contractor, PlatformAdmin |
+| GET | `/lending/rehab-line-items/{id}` | Read one scope line with its release progress | LoanOfficer, CreditCommittee, LoanServicer, Borrower, Contractor, PlatformAdmin |
+| POST | `/lending/rehab-line-items/{id}/review` | Scope validation decision: APPROVE, REQUEST_REVISION or REJECT | LoanOfficer, PlatformAdmin |
+| PATCH | `/lending/rehab-line-items/{id}` | Borrower re-submits a revised scope line | Borrower, LoanOfficer, PlatformAdmin |
+| POST | `/lending/applications/{id}/size` | Run the sizing limits and the sizing-pass commitment allocation | LoanOfficer, PlatformAdmin |
+| POST | `/lending/applications/{id}/decision` | Credit committee decision: APPROVE or DECLINE | CreditCommittee, PlatformAdmin |
+| POST | `/lending/applications/{id}/close` | Close the loan and create the Loan with its money buckets | LoanServicer, PlatformAdmin |
+| POST | `/lending/contractors` | Register a trade contractor with licence and W-9 status | LoanOfficer, PlatformAdmin |
+| GET | `/lending/contractors/{id}` | Read a contractor with waiver coverage and headroom | LoanOfficer, LoanServicer, Contractor, PlatformAdmin |
+| GET | `/lending/contractors/{id}/rehab-line-items` | List every scope line assigned to a contractor | LoanOfficer, LoanServicer, Contractor, PlatformAdmin |
+| GET | `/lending/contractors/{id}/lien-waivers` | List a contractor's lien waivers | LoanOfficer, LoanServicer, Contractor, PlatformAdmin |
+| GET | `/lending/loans/{id}` | Read a loan with all three state axes, every money bucket, the conservation check and the live payoff quote | LoanOfficer, CreditCommittee, LoanServicer, Borrower, PlatformAdmin |
+| GET | `/lending/loans` | List loans, filterable by application, sponsor and status axes | LoanOfficer, CreditCommittee, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/loans/{id}/draw-requests` | Submit a draw request; supersedes every still-open request on the loan | Borrower, PlatformAdmin |
+| GET | `/lending/draw-requests` | List draw requests, filterable by loan, status and supersede chain | LoanOfficer, LoanServicer, Borrower, DrawInspector, PlatformAdmin |
+| GET | `/lending/draw-requests/{id}` | Read one draw request | LoanOfficer, LoanServicer, Borrower, DrawInspector, PlatformAdmin |
+| POST | `/lending/draw-requests/{id}/inspection-visits` | Order a site inspection into an inspector's calendar window | LoanServicer, PlatformAdmin |
+| GET | `/lending/draw-requests/{id}/inspection-visits` | List the visits ordered for a draw request | LoanServicer, DrawInspector, Borrower, PlatformAdmin |
+| POST | `/lending/inspection-visits/{id}/report` | File the inspector's verified percent-complete per scope line | DrawInspector, PlatformAdmin |
+| POST | `/lending/draw-requests/{id}/photo-verification` | Verify a small draw from photo evidence instead of a site visit | LoanServicer, PlatformAdmin |
+| POST | `/lending/draw-requests/{id}/review` | Underwrite the verified draw: APPROVE, REQUEST_REVISION or REJECT | LoanServicer, PlatformAdmin |
+| POST | `/lending/draw-requests/{id}/fund` | Disburse an approved draw | LoanServicer, PlatformAdmin |
+| GET | `/lending/draw-line-items` | List draw allocations, filterable by request or scope line | LoanOfficer, LoanServicer, Borrower, DrawInspector, PlatformAdmin |
+| GET | `/lending/draw-line-items/{id}` | Read one draw allocation | LoanOfficer, LoanServicer, Borrower, DrawInspector, PlatformAdmin |
+| POST | `/lending/lien-waivers` | File a lien waiver against a loan for a contractor | Contractor, LoanServicer, PlatformAdmin |
+| GET | `/lending/loans/{id}/lien-waivers` | List the waivers filed against a loan | LoanOfficer, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/lien-waivers/{id}/dispute` | Flag or clear a waiver dispute: DISPUTE or RESOLVE | LoanServicer, PlatformAdmin |
+| POST | `/lending/loans/{id}/interest-accruals` | Accrue one interest period and sweep the reserve | LoanServicer, PlatformAdmin |
+| GET | `/lending/loans/{id}/interest-periods` | List a loan's accrual periods | LoanOfficer, LoanServicer, Borrower, PlatformAdmin |
+| GET | `/lending/loans/{id}/ledger-entries` | List a loan's cash ledger | LoanOfficer, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/loans/{id}/payments` | Apply a borrower payment: REGULAR waterfall or full PAYOFF | LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/loans/{id}/extensions` | Grant a short-term extension, charging a fee and stepping the rate | LoanServicer, PlatformAdmin |
+| POST | `/lending/loans/{id}/exit-milestones` | Record listing, repricing, contract or refinance progress | Borrower, LoanServicer, PlatformAdmin |
+| GET | `/lending/loans/{id}/exit-milestones` | List a loan's exit milestones | LoanOfficer, LoanServicer, Borrower, PlatformAdmin |
+| POST | `/lending/loans/{id}/default-declaration` | Declare the loan in default and start default-rate accrual | LoanServicer, PlatformAdmin |
+| POST | `/lending/loans/{id}/foreclosure-cases` | File a notice of default and open a foreclosure case | LoanServicer, PlatformAdmin |
+| GET | `/lending/loans/{id}/foreclosure-cases` | List the foreclosure cases filed against a loan | LoanOfficer, LoanServicer, PlatformAdmin |
+| GET | `/lending/foreclosure-cases/{id}` | Read one foreclosure case | LoanOfficer, LoanServicer, PlatformAdmin |
+| POST | `/lending/foreclosure-cases/{id}/takeover` | Complete the property takeover after redemption expires | LoanServicer, PlatformAdmin |
+| POST | `/lending/foreclosure-cases/{id}/completion-budget` | Set or revise the lender's completion-of-construction budget | LoanServicer, PlatformAdmin |
+| POST | `/lending/foreclosure-cases/{id}/disposition` | Sell the REO asset and settle the loan | LoanServicer, PlatformAdmin |
+| POST | `/_clock/set_current_utc` | Test-driving capability: set the logical clock that every date-dependent rule reads | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN_ROLE` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_BORROWER_NOT_FOUND` | 404 |
+| `ERR_PROPERTY_NOT_FOUND` | 404 |
+| `ERR_APPLICATION_NOT_FOUND` | 404 |
+| `ERR_REHAB_LINE_ITEM_NOT_FOUND` | 404 |
+| `ERR_CONTRACTOR_NOT_FOUND` | 404 |
+| `ERR_LOAN_NOT_FOUND` | 404 |
+| `ERR_DRAW_REQUEST_NOT_FOUND` | 404 |
+| `ERR_INSPECTION_VISIT_NOT_FOUND` | 404 |
+| `ERR_LIEN_WAIVER_NOT_FOUND` | 404 |
+| `ERR_FORECLOSURE_CASE_NOT_FOUND` | 404 |
+| `ERR_NOT_OWNER` | 403 |
+| `ERR_NOT_ASSIGNED_INSPECTOR` | 403 |
+| `ERR_LINE_ITEM_MISMATCH` | 409 |
+| `ERR_LINE_VERIFICATION_INCOMPLETE` | 409 |
+| `ERR_STALE_LOAN_VERSION` | 412 |
+| `ERR_STALE_FORECLOSURE_CASE_VERSION` | 412 |
+| `ERR_BORROWER_STATE_INVALID` | 409 |
+| `ERR_APPLICATION_STATE_INVALID` | 409 |
+| `ERR_REHAB_LINE_STATE_INVALID` | 409 |
+| `ERR_DRAW_REQUEST_STATE_INVALID` | 409 |
+| `ERR_INSPECTION_VISIT_STATE_INVALID` | 409 |
+| `ERR_PROPERTY_STATE_INVALID` | 409 |
+| `ERR_FORECLOSURE_CASE_STATE_INVALID` | 409 |
+| `ERR_LOAN_STATE_INVALID` | 409 |
+| `ERR_LOAN_NOT_SERVICEABLE` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_BORROWER_NOT_ELIGIBLE` | 409 |
+| `ERR_GUARANTEE_NOT_EXECUTED` | 409 |
+| `ERR_ENTITY_TYPE_NOT_ELIGIBLE` | 409 |
+| `ERR_SCOPE_NOT_VALIDATED` | 409 |
+| `ERR_SCOPE_LINE_NOT_APPROVED` | 409 |
+| `ERR_CONTRACTOR_NOT_PAYABLE` | 409 |
+| `ERR_LIEN_WAIVER_DISPUTED` | 409 |
+| `ERR_WAIVER_HEADROOM_EXCEEDED` | 409 |
+| `ERR_FINAL_WAIVER_REQUIRED` | 409 |
+| `ERR_JOINT_CHECK_ACK_REQUIRED` | 409 |
+| `ERR_INSPECTOR_WINDOW_CONFLICT` | 409 |
+| `ERR_ACCRUAL_PERIOD_OVERLAP` | 409 |
+| `ERR_ACCRUAL_PERIOD_GAP` | 409 |
+| `ERR_ACCRUAL_BEYOND_CLOCK` | 409 |
+| `ERR_MILESTONE_BACKDATED` | 409 |
+| `ERR_REDEMPTION_PERIOD_ACTIVE` | 409 |
+| `ERR_VISIT_ALREADY_SCHEDULED` | 409 |
+| `ERR_VERIFICATION_METHOD_MISMATCH` | 409 |
+| `ERR_INSUFFICIENT_PHOTO_EVIDENCE` | 409 |
+| `ERR_PHOTO_REQUEST_TOO_LARGE` | 409 |
+| `ERR_DUPLICATE_SCOPE_CODE` | 409 |
+| `ERR_LINE_ALLOCATION_DUPLICATE` | 409 |
+| `ERR_EXTENSION_LIMIT_REACHED` | 409 |
+| `ERR_REVISION_LIMIT_REACHED` | 409 |
+| `ERR_EXTENSION_BLOCKED_BY_EXIT_WATCH` | 409 |
+| `ERR_PERCENT_COMPLETE_REGRESSION` | 409 |
+| `ERR_SCOPE_LINE_CAP_EXCEEDED` | 409 |
+| `ERR_SIZING_REQUIRED` | 409 |
+| `ERR_SIZING_STALE` | 409 |
+| `ERR_LOAN_AMOUNT_EXCEEDS_LIMIT` | 409 |
+| `ERR_PAYMENT_EXCEEDS_BALANCE` | 409 |
+| `ERR_PAYOFF_SHORT` | 409 |
+| `ERR_COMPLETION_BUDGET_EXCEEDS_CAP` | 409 |
+| `ERR_COMPLETION_SPEND_EXCEEDS_BUDGET` | 409 |
+| `ERR_DEFAULT_PRECONDITION_NOT_MET` | 409 |

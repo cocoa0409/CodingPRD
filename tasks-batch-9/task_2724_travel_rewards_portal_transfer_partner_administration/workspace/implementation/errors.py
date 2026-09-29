@@ -1,0 +1,65 @@
+"""Error catalogue (SCAFFOLD 1.6 / PRD section 5)."""
+
+ERROR_STATUS = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_ACCOUNT_OWNERSHIP_REQUIRED": 403,
+    "ERR_AGENCY_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_STALE_OFFER_VERSION": 412,
+    "ERR_STALE_ACCOUNT_VERSION": 412,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_ACCOUNT_CLOSED": 409,
+    "ERR_ACCOUNT_POSTURE_LOCKED": 409,
+    "ERR_OFFER_NOT_BOOKABLE": 409,
+    "ERR_AGREEMENT_NOT_ACTIVE": 409,
+    "ERR_AGENCY_SUSPENDED": 409,
+    "ERR_BENEFIT_NOT_CONSUMABLE": 409,
+    "ERR_OFFER_HAS_COMMITTED_SEATS": 409,
+    "ERR_ACCOUNT_HAS_IN_FLIGHT_POINTS": 409,
+    "ERR_AGREEMENT_HAS_IN_FLIGHT_TRANSFERS": 409,
+    "ERR_OFFER_OUT_OF_PARITY": 409,
+    "ERR_AVAILABILITY_PARITY_BREACH": 422,
+    "ERR_ROTATION_WINDOW_OVERLAP": 409,
+    "ERR_BONUS_EVENT_WINDOW_CONFLICT": 409,
+    "ERR_TRANSFER_REVERSAL_WINDOW_EXPIRED": 409,
+    "ERR_NOTICE_PERIOD_TOO_SHORT": 422,
+    "ERR_SNAPSHOT_AS_OF_IN_FUTURE": 422,
+    "ERR_CHANNEL_REQUIRES_OFFER": 422,
+    "ERR_BENEFIT_REQUIRES_TICKETED_BOOKING": 409,
+    "ERR_ORDER_ACCOUNT_MISMATCH": 422,
+    "ERR_DUPLICATE_CATEGORY_MAPPING": 409,
+    "ERR_DUPLICATE_PROGRAM_CODE": 409,
+    "ERR_NOTICE_TARGET_REQUIRED": 422,
+    "ERR_BELOW_MIN_TRANSFER": 422,
+    "ERR_TRANSFER_INCREMENT_INVALID": 422,
+    "ERR_SEAT_UNAVAILABLE": 409,
+    "ERR_STATEMENT_CREDIT_BELOW_MINIMUM": 422,
+    "ERR_INSUFFICIENT_POINTS": 402,
+    "ERR_BENEFIT_ALLOWANCE_EXHAUSTED": 409,
+    "ERR_SETTLEMENT_AMOUNT_INVALID": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, message)
+
+
+def not_found(resource_type, ident):
+    return ApiError("ERR_RESOURCE_NOT_FOUND", "%s '%s' not found." % (resource_type, ident))
+
+
+def invalid(detail):
+    return ApiError("ERR_INVALID_REQUEST", "Invalid request: %s." % detail)

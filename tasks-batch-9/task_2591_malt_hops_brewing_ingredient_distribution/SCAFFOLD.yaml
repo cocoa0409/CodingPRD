@@ -1,0 +1,3590 @@
+scenario: "2591. Malt, Hops & Brewing Ingredient Distribution (BSG CraftBrewing): contract versus spot hop allocation with crop-year commitments, malt lot analysis sheets and specification matching to brewer recipes, cold storage of hops and yeast with temperature-controlled shipping, minimum order quantity, pallet break fees and freight program tiers, hop contract carry-forward, resale and default handling, yeast propagation lead time and pitch-rate advising, brewer credit terms and seasonal demand surges, substitution recommendations on crop shortfall"
+domain_name: brewing-ingredient-distribution
+api_prefix: ""          # flat topology — every collection is a top-level path (e.g. /hop-contracts, /malt-lots)
+
+complexity_profile:
+  primary_archetype: quota_allocation
+  secondary_archetype: pricing_engine
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer entities joined by explicit foreign keys; no nesting in collection URLs.
+  # Sub-paths exist only for action endpoints (/sales-orders/{id}/confirm) and for
+  # the append-only TemperatureReading event log.
+
+  state_machine_shape: parallel
+  # SalesOrder carries two independent state dimensions (fulfillment_status x
+  # credit_status). HopContract is cyclic (ACTIVE -> CARRY_FORWARD_PENDING ->
+  # ACTIVE) with divergent branch targets (CARRIED_FORWARD | DEFAULTED).
+  # MaltLot is cyclic (RECEIVED -> QUARANTINED -> RECEIVED) with a PASSED/
+  # QUARANTINED fork. YeastPropagationJob forks PROPAGATING -> {READY, FAILED}
+  # and cycles FAILED -> REQUESTED. ColdChainShipment cycles STAGED -> HELD ->
+  # STAGED.
+
+  relationship_patterns:
+    - one_to_many          # Brewer -> HopContract, SalesOrder -> OrderLine
+    - self_referential     # HopContract.carried_forward_from_contract_id -> HopContract.id
+                           # YeastPropagationJob.replaces_job_id -> YeastPropagationJob.id
+    - cross_aggregate      # OrderLine -> HopContract / MaltLot / YeastPropagationJob
+    - polymorphic          # OrderLine.item_type selects which of three nullable FKs is populated
+
+  role_model: segregation_of_duties
+  # Layered over a peer-role split (Brewer / AllocationManager / CreditManager /
+  # WarehouseOperator / PlatformAdmin). Two SoD gates are enforced on X-User-ID:
+  # (1) the AllocationManager who declared a contract default may not authorize
+  #     the resale of that defaulted volume;
+  # (2) the WarehouseOperator who signed a malt lot analysis may not release the
+  #     lot they analysed.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# 1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: Brewer
+    parent: null
+    common_fields: true
+    fields:
+      - name: name
+        type: string
+        source: input
+        description: "Brewery trade name"
+        constraints: "1..120 chars"
+      - name: brewery_license_no
+        type: string
+        source: input
+        description: "State alcohol licence identifier; globally unique"
+        constraints: "unique across Brewer; 1..40 chars"
+      - name: credit_terms_days
+        type: integer
+        source: input
+        description: "Net payment terms granted to this brewer"
+        default: 30
+        constraints: "one of {0, 15, 30, 45}"
+      - name: credit_limit_cents
+        type: integer
+        source: input
+        description: "Maximum permitted credit_exposure_cents before HOLD"
+        default: 500000
+        constraints: ">= 1"
+      - name: cold_chain_certified
+        type: boolean
+        source: input
+        description: "True when the brewer's dock is certified to receive reefer freight"
+        default: false
+      - name: legacy_trailing_lbs
+        type: integer
+        source: input
+        description: "Migrated pre-platform shipped poundage; optional at creation and thereafter rewritten only by POST /brewers/{id}/volume-adjustments"
+        default: 0
+        constraints: ">= 0"
+      - name: ar_balance_cents
+        type: integer
+        source: computed
+        description: "Open accounts-receivable balance; see calculations.brewer_ar_ledger"
+        default: 0
+      - name: open_order_exposure_cents
+        type: integer
+        source: computed
+        description: "Sum of SalesOrder.total_cents over own orders with fulfillment_status IN {CONFIRMED, PICKED}"
+        default: 0
+      - name: credit_exposure_cents
+        type: integer
+        source: computed
+        description: "ar_balance_cents + open_order_exposure_cents"
+        default: 0
+      - name: credit_utilization_pct
+        type: number
+        source: computed
+        description: "credit_exposure_cents / credit_limit_cents * 100, 2 dp round_half_up"
+        default: 0
+      - name: credit_status
+        type: enum
+        source: computed
+        description: "Credit posture derived by calculations.brewer_credit_posture"
+        default: GOOD_STANDING
+        constraints: "one of {GOOD_STANDING, WATCH, HOLD}"
+      - name: trailing_12mo_volume_lbs
+        type: integer
+        source: computed
+        description: "legacy_trailing_lbs plus chargeable_lbs of own DELIVERED orders in the trailing 365-day window"
+        default: 0
+      - name: freight_program_tier
+        type: enum
+        source: computed
+        description: "Freight program band derived by calculations.freight_program_tier"
+        default: TIER_1
+        constraints: "one of {TIER_1, TIER_2, TIER_3}"
+
+  - name: CropYearProgram
+    parent: null
+    common_fields: true
+    fields:
+      - name: crop_year
+        type: integer
+        source: input
+        description: "Hop harvest year this program books commitments against; globally unique"
+        constraints: "unique across CropYearProgram; 2020..2100"
+      - name: contract_open_date
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant contracting opened for this crop year"
+      - name: harvest_report_due_date
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant by which the harvest report is expected"
+      - name: status
+        type: enum
+        source: system
+        description: "Program lifecycle state"
+        default: OPEN
+        constraints: "one of {OPEN, HARVEST_REPORTED, SETTLED}"
+      - name: harvest_yield_pct
+        type: number
+        source: system
+        description: "Realised harvest as a percentage of total_contracted_lbs; null until report-harvest"
+        default: null
+        constraints: "null, or 0.00..200.00 with 2 dp"
+      - name: total_contracted_lbs
+        type: integer
+        source: computed
+        description: "Sum of HopContract.contracted_lbs over contracts in this program with status IN {ACTIVE, SHORTFALL_ADJUSTED, CARRY_FORWARD_PENDING}"
+        default: 0
+      - name: allocatable_pool_lbs
+        type: integer
+        source: computed
+        description: "floor(total_contracted_lbs * harvest_yield_pct / 100) frozen at report-harvest; null before"
+        default: null
+      - name: unallocated_pool_lbs
+        type: integer
+        source: computed
+        description: "Poundage left in allocatable_pool_lbs after the waterfall in calculations.shortfall_prorata_reallocation; null before report-harvest"
+        default: null
+      - name: harvest_reported_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant of the report-harvest call; null before"
+        default: null
+
+  - name: HopVariety
+    parent: null
+    common_fields: true
+    fields:
+      - name: variety_code
+        type: string
+        source: input
+        description: "Short trade code, e.g. CITRA; globally unique"
+        constraints: "unique across HopVariety; 1..20 chars"
+      - name: name
+        type: string
+        source: input
+        description: "Variety trade name, e.g. Citra"
+        constraints: "1..60 chars"
+      - name: substitution_group
+        type: string
+        source: input
+        description: "Aroma/alpha family used as the substitution candidate pool key"
+        constraints: "1..40 chars"
+      - name: alpha_acid_target_pct
+        type: number
+        source: input
+        description: "Nominal alpha acid content used for substitution ranking"
+        constraints: "0.01..30.00, 2 dp"
+      - name: cold_storage_required
+        type: boolean
+        source: input
+        description: "True when lots of this variety must travel under reefer"
+        default: true
+      - name: pallet_quantity_lbs
+        type: integer
+        source: input
+        description: "Full-pallet poundage; order lines that are not an exact multiple incur a pallet break fee"
+        default: 880
+        constraints: ">= 1"
+      - name: min_order_lbs
+        type: integer
+        source: input
+        description: "Hard per-line minimum order quantity for this variety"
+        default: 44
+        constraints: ">= 1"
+      - name: spot_price_cents_per_lb
+        type: number
+        source: input
+        description: "Posted spot market price; supplied at creation and repriced by PUT /hop-varieties/{id}/spot-price"
+        constraints: "> 0 with 2 dp"
+      - name: available_spot_lbs
+        type: integer
+        source: input
+        description: "Uncommitted spot poundage on the floor; optional at creation, reset by PUT /hop-varieties/{id}/spot-price, drawn down by SPOT order lines and accepted substitution offers"
+        default: 0
+        constraints: ">= 0"
+
+  - name: HopContract
+    parent: null
+    common_fields: true
+    fields:
+      - name: brewer_id
+        type: string
+        source: input
+        description: "FK -> Brewer.id; the brewer holding this crop-year commitment"
+      - name: variety_id
+        type: string
+        source: input
+        description: "FK -> HopVariety.id; the contracted variety"
+      - name: crop_year_program_id
+        type: string
+        source: input
+        description: "FK -> CropYearProgram.id; the crop-year program this commitment books against"
+      - name: carried_forward_from_contract_id
+        type: string
+        source: system
+        description: "FK -> HopContract.id; set on the successor contract minted by an approved carry-forward, null otherwise"
+        default: null
+      - name: carry_forward_target_program_id
+        type: string
+        source: system
+        description: "FK -> CropYearProgram.id; program named in the pending carry-forward request, null otherwise"
+        default: null
+      - name: contract_type
+        type: enum
+        source: input
+        description: "Allocation rank class: FIXED_CROP_YEAR is honoured before SPOT_HOLD in a shortfall waterfall"
+        constraints: "one of {FIXED_CROP_YEAR, SPOT_HOLD}"
+      - name: contracted_lbs
+        type: integer
+        source: input
+        description: "Poundage committed at signing"
+        constraints: ">= HopVariety.min_order_lbs of variety_id"
+      - name: price_per_lb_cents
+        type: number
+        source: input
+        description: "Contract price in cents per pound"
+        constraints: "> 0, 2 dp"
+      - name: delivery_window_start
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC first instant of the permitted delivery window (inclusive)"
+      - name: delivery_window_end
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC last instant of the permitted delivery window (inclusive); must be > delivery_window_start"
+      - name: allocated_lbs
+        type: integer
+        source: computed
+        description: "Poundage the crop actually supports; equals contracted_lbs until calculations.shortfall_prorata_reallocation rewrites it"
+      - name: committed_lbs
+        type: integer
+        source: computed
+        description: "Poundage locked by order lines; see calculations.contract_allocation_ledger"
+        default: 0
+      - name: carried_forward_out_lbs
+        type: integer
+        source: system
+        description: "Poundage transferred to a successor contract by an approved carry-forward"
+        default: 0
+      - name: defaulted_lbs
+        type: integer
+        source: system
+        description: "Poundage written off at default declaration and not yet resold"
+        default: 0
+      - name: resold_lbs
+        type: integer
+        source: system
+        description: "Poundage moved out of defaulted_lbs by an authorized resale"
+        default: 0
+      - name: remaining_lbs
+        type: integer
+        source: computed
+        description: "allocated_lbs - committed_lbs - carried_forward_out_lbs - defaulted_lbs - resold_lbs"
+      - name: shortfall_lbs
+        type: integer
+        source: computed
+        description: "contracted_lbs - allocated_lbs; 0 when the crop covered the commitment"
+        default: 0
+      - name: substitution_covered_lbs
+        type: integer
+        source: system
+        description: "Shortfall poundage covered by an accepted SubstitutionOffer"
+        default: 0
+      - name: settlement_variant
+        type: enum
+        source: system
+        description: "Which default-settlement algorithm was applied; null until default is declared"
+        default: null
+        constraints: "null, or one of {MARKET_SETTLED, LIQUIDATED}"
+      - name: settlement_damages_cents
+        type: integer
+        source: computed
+        description: "Pre-fee damages from calculations.contract_default_settlement; null until default"
+        default: null
+      - name: settlement_admin_fee_cents
+        type: integer
+        source: computed
+        description: "Administration fee keyed on the pre-fee damages tier; null until default"
+        default: null
+      - name: settlement_total_cents
+        type: integer
+        source: computed
+        description: "settlement_damages_cents + settlement_admin_fee_cents; null until default"
+        default: null
+      - name: resale_credit_cents
+        type: integer
+        source: system
+        description: "Credit posted back to the defaulting brewer by an authorized resale"
+        default: 0
+      - name: defaulted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the AllocationManager who declared the default; drives the resale segregation-of-duties gate"
+        default: null
+      - name: carry_forward_requested_lbs
+        type: integer
+        source: computed
+        description: "Poundage the pending carry-forward request would move; null when no request is pending"
+        default: null
+      - name: carry_forward_fee_cents
+        type: integer
+        source: computed
+        description: "Carry fee on the pending carry-forward request; null when no request is pending"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Contract lifecycle state"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SHORTFALL_ADJUSTED, CARRY_FORWARD_PENDING, CARRIED_FORWARD, DEFAULTED, RESOLD}"
+
+  - name: SubstitutionOffer
+    parent: null
+    common_fields: true
+    fields:
+      - name: hop_contract_id
+        type: string
+        source: input
+        description: "FK -> HopContract.id; the shortfall-adjusted contract this offer covers"
+      - name: substitute_variety_id
+        type: string
+        source: input
+        description: "FK -> HopVariety.id; explicit substitute, or the AUTO_RANKED winner when the request omitted it"
+      - name: created_contract_id
+        type: string
+        source: system
+        description: "FK -> HopContract.id; SPOT_HOLD contract minted when the brewer accepted, null otherwise"
+        default: null
+      - name: offered_lbs
+        type: integer
+        source: computed
+        description: "Poundage offered; defaults to the contract's uncovered shortfall_lbs when the request omitted it"
+        constraints: ">= 1"
+      - name: offered_price_cents_per_lb
+        type: number
+        source: computed
+        description: "Snapshot of substitute variety spot_price_cents_per_lb at offer time"
+      - name: alpha_acid_delta_pct
+        type: number
+        source: computed
+        description: "abs(substitute.alpha_acid_target_pct - contracted variety alpha_acid_target_pct), 2 dp"
+      - name: selection_mode
+        type: enum
+        source: system
+        description: "EXPLICIT when the caller named substitute_variety_id, AUTO_RANKED when the server selected it"
+        constraints: "one of {EXPLICIT, AUTO_RANKED}"
+      - name: responded_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant of the brewer's response; null while OPEN"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Offer lifecycle state"
+        default: OPEN
+        constraints: "one of {OPEN, ACCEPTED, DECLINED, SUPERSEDED}"
+
+  - name: MaltProduct
+    parent: null
+    common_fields: true
+    fields:
+      - name: sku
+        type: string
+        source: input
+        description: "Distributor stock-keeping unit, e.g. PALE-ALE; globally unique"
+        constraints: "unique across MaltProduct; 1..30 chars"
+      - name: name
+        type: string
+        source: input
+        description: "Malt product trade name"
+        constraints: "1..80 chars"
+      - name: malt_class
+        type: enum
+        source: input
+        description: "BASE malts must clear the diastatic power floor; SPECIALTY malts are exempt"
+        constraints: "one of {BASE, SPECIALTY}"
+      - name: pallet_quantity_lbs
+        type: integer
+        source: input
+        description: "Full-pallet poundage for pallet break fee assessment"
+        default: 2200
+        constraints: ">= 1"
+      - name: min_order_lbs
+        type: integer
+        source: input
+        description: "Hard per-line minimum order quantity"
+        default: 55
+        constraints: ">= 1"
+      - name: list_price_cents_per_lb
+        type: number
+        source: input
+        description: "Spot list price in cents per pound"
+        constraints: "> 0, 2 dp"
+      - name: max_moisture_pct
+        type: number
+        source: input
+        description: "Analysis moisture ceiling; a lot above this is quarantined"
+        default: 5.0
+        constraints: "> 0, 2 dp"
+      - name: min_diastatic_power
+        type: number
+        source: input
+        description: "Analysis diastatic power floor in degrees Lintner (enforced for BASE only)"
+        default: 60.0
+        constraints: ">= 0, 2 dp"
+      - name: cold_storage_required
+        type: boolean
+        source: input
+        description: "True when lots of this product must travel under reefer"
+        default: false
+
+  - name: MaltLot
+    parent: null
+    common_fields: true
+    fields:
+      - name: malt_product_id
+        type: string
+        source: input
+        description: "FK -> MaltProduct.id; the product this physical lot belongs to"
+      - name: lot_code
+        type: string
+        source: input
+        description: "Maltster lot identifier; globally unique"
+        constraints: "unique across MaltLot; 1..40 chars"
+      - name: quantity_lbs
+        type: integer
+        source: input
+        description: "Poundage received into the warehouse"
+        constraints: ">= 1"
+      - name: received_at
+        type: datetime
+        source: input
+        description: "Warehouse receipt timestamp; defaults to the current logical clock when omitted"
+        default: "current logical clock at creation"
+      - name: committed_lbs
+        type: integer
+        source: computed
+        description: "Poundage locked by order lines; see calculations.malt_lot_availability"
+        default: 0
+      - name: available_lbs
+        type: integer
+        source: computed
+        description: "quantity_lbs - committed_lbs"
+      - name: color_lovibond
+        type: number
+        source: system
+        description: "Analysis sheet colour in degrees Lovibond; null before the first analysis"
+        default: null
+      - name: extract_pct
+        type: number
+        source: system
+        description: "Analysis sheet fine grind extract percentage; null before the first analysis"
+        default: null
+      - name: moisture_pct
+        type: number
+        source: system
+        description: "Analysis sheet moisture percentage; null before the first analysis"
+        default: null
+      - name: protein_pct
+        type: number
+        source: system
+        description: "Analysis sheet total protein percentage; null before the first analysis"
+        default: null
+      - name: diastatic_power
+        type: number
+        source: system
+        description: "Analysis sheet diastatic power in degrees Lintner; null before the first analysis"
+        default: null
+      - name: analysis_count
+        type: integer
+        source: system
+        description: "Number of analysis sheets filed against this lot"
+        default: 0
+      - name: analyzed_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID that filed the most recent analysis sheet; drives the release segregation-of-duties gate"
+        default: null
+      - name: released_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID that released the lot to saleable stock"
+        default: null
+      - name: quarantine_reason
+        type: string
+        source: system
+        description: "Which product-level hard spec the analysis failed; null unless quarantined"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Lot lifecycle state"
+        default: RECEIVED
+        constraints: "one of {RECEIVED, PASSED, QUARANTINED, RELEASED, REJECTED}"
+
+  - name: YeastStrain
+    parent: null
+    common_fields: true
+    fields:
+      - name: strain_code
+        type: string
+        source: input
+        description: "Laboratory strain code, e.g. WLP001; globally unique"
+        constraints: "unique across YeastStrain; 1..20 chars"
+      - name: name
+        type: string
+        source: input
+        description: "Strain trade name"
+        constraints: "1..60 chars"
+      - name: fermentation_type
+        type: enum
+        source: input
+        description: "Selects the recommended pitch rate constant in calculations.yeast_pitch_advisory"
+        constraints: "one of {ALE, LAGER}"
+      - name: propagation_lead_time_days
+        type: integer
+        source: input
+        description: "Whole days of bench time required; also the minimum gap between two propagation slots on this strain"
+        constraints: ">= 1"
+      - name: viability_pct_at_ship
+        type: number
+        source: input
+        description: "Nominal cell viability percentage at hand-off"
+        default: 92.0
+        constraints: "50.00..100.00, 2 dp"
+      - name: cells_per_ml_slurry_billion
+        type: number
+        source: input
+        description: "Billion cells per millilitre of harvested slurry"
+        default: 1.2
+        constraints: "> 0, 2 dp"
+      - name: min_batch_l
+        type: number
+        source: input
+        description: "Smallest propagation batch the bench will run, in litres"
+        default: 20.0
+        constraints: "> 0, 3 dp"
+      - name: vessel_max_l
+        type: number
+        source: input
+        description: "Largest propagation vessel available, in litres"
+        default: 2000.0
+        constraints: ">= min_batch_l, 3 dp"
+      - name: cold_storage_required
+        type: boolean
+        source: input
+        description: "True when slurry of this strain must travel under reefer"
+        default: true
+      - name: list_price_cents_per_l
+        type: number
+        source: input
+        description: "Spot list price in cents per litre of slurry"
+        constraints: "> 0, 2 dp"
+
+  - name: BrewerRecipe
+    parent: null
+    common_fields: true
+    fields:
+      - name: brewer_id
+        type: string
+        source: input
+        description: "FK -> Brewer.id; owning brewer"
+      - name: malt_product_id
+        type: string
+        source: input
+        description: "FK -> MaltProduct.id; base malt this recipe specifies"
+      - name: yeast_strain_id
+        type: string
+        source: input
+        description: "FK -> YeastStrain.id; strain this recipe pitches"
+      - name: name
+        type: string
+        source: input
+        description: "Recipe name"
+        constraints: "1..80 chars"
+      - name: batch_volume_bbl
+        type: number
+        source: input
+        description: "Brew length in US barrels"
+        constraints: "> 0, 2 dp"
+      - name: original_gravity_plato
+        type: number
+        source: input
+        description: "Target original gravity in degrees Plato"
+        constraints: "> 0, 2 dp"
+      - name: adjunct_pct
+        type: number
+        source: input
+        description: "Unmalted adjunct share of the grist; raises the diastatic power requirement in spec matching"
+        default: 0
+        constraints: "0.00..60.00, 2 dp"
+      - name: target_color_lovibond
+        type: number
+        source: input
+        description: "Desired malt colour in degrees Lovibond"
+        constraints: "> 0, 2 dp"
+      - name: target_extract_pct
+        type: number
+        source: input
+        description: "Desired fine grind extract percentage"
+        constraints: "> 0, 2 dp"
+      - name: target_protein_pct
+        type: number
+        source: input
+        description: "Desired total protein percentage"
+        constraints: "> 0, 2 dp"
+      - name: requested_pitch_rate_million_cells_per_ml_per_plato
+        type: number
+        source: input
+        description: "Pitch rate the brewer intends to use; compared against the recommended rate for advisory purposes"
+        constraints: "> 0, 3 dp"
+
+  - name: YeastPropagationJob
+    parent: null
+    common_fields: true
+    fields:
+      - name: brewer_id
+        type: string
+        source: input
+        description: "FK -> Brewer.id; brewer the slurry is propagated for"
+      - name: recipe_id
+        type: string
+        source: input
+        description: "FK -> BrewerRecipe.id; supplies batch_volume_bbl, original_gravity_plato and the requested pitch rate"
+      - name: yeast_strain_id
+        type: string
+        source: input
+        description: "FK -> YeastStrain.id; must equal BrewerRecipe.yeast_strain_id of recipe_id"
+      - name: replaces_job_id
+        type: string
+        source: system
+        description: "FK -> YeastPropagationJob.id; set on a replacement job auto-created after a cold-chain excursion failed the original, null otherwise"
+        default: null
+      - name: pitch_date
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant the brewer intends to pitch; occupies a propagation slot on yeast_strain_id"
+      - name: recommended_pitch_rate_million_cells_per_ml_per_plato
+        type: number
+        source: computed
+        description: "Constant for the strain's fermentation_type; see calculations.yeast_pitch_advisory"
+      - name: required_cells_billion
+        type: number
+        source: computed
+        description: "Billion cells the recommended rate demands for this recipe, 2 dp"
+      - name: recommended_slurry_l
+        type: number
+        source: computed
+        description: "Viability-adjusted slurry litres to hand off, 3 dp"
+      - name: propagation_volume_l
+        type: number
+        source: computed
+        description: "Bench batch size after the safety factor and the min/max vessel clamp, 3 dp"
+      - name: pitch_rate_advice
+        type: enum
+        source: computed
+        description: "Verdict on the recipe's requested pitch rate against the recommended rate"
+        constraints: "one of {UNDERPITCH, OPTIMAL, OVERPITCH}"
+      - name: ready_at
+        type: datetime
+        source: computed
+        description: "Logical-clock instant of the start call plus propagation_lead_time_days; null before start"
+        default: null
+      - name: failure_reason
+        type: string
+        source: system
+        description: "Why the propagation failed; null unless FAILED"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Propagation job lifecycle state"
+        default: REQUESTED
+        constraints: "one of {REQUESTED, PROPAGATING, READY, FAILED, SHIPPED}"
+
+  - name: SalesOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: brewer_id
+        type: string
+        source: input
+        description: "FK -> Brewer.id; ordering brewer"
+      - name: requested_ship_date
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant the brewer wants the order to leave the dock"
+      - name: purchase_order_ref
+        type: string
+        source: input
+        description: "Brewer's own purchase-order reference; optional, echoed back verbatim and never interpreted"
+        default: null
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: "Physical dimension of the order state; evolves independently of credit_status"
+        default: DRAFT
+        constraints: "one of {DRAFT, CONFIRMED, PICKED, SHIPPED, DELIVERED, CANCELLED}"
+      - name: credit_status
+        type: enum
+        source: system
+        description: "Financial dimension of the order state; evolves independently of fulfillment_status"
+        default: PENDING_REVIEW
+        constraints: "one of {PENDING_REVIEW, APPROVED, ON_HOLD}"
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of OrderLine.extended_cents over lines with status IN {OPEN, TRIMMED}; see calculations.order_subtotal_rollup"
+        default: 0
+      - name: volume_discount_cents
+        type: integer
+        source: computed
+        description: "Discount keyed on the subtotal_cents tier"
+        default: 0
+      - name: chargeable_lbs
+        type: integer
+        source: computed
+        description: "Sum of OrderLine.quantity over lines with uom == LB and status IN {OPEN, TRIMMED}"
+        default: 0
+      - name: freight_cents
+        type: integer
+        source: computed
+        description: "Freight program charge plus reefer surcharge; see calculations.order_fee_assessment"
+        default: 0
+      - name: pallet_break_fee_cents
+        type: integer
+        source: computed
+        description: "Pallet break fee across lines whose quantity is not a whole-pallet multiple"
+        default: 0
+      - name: small_order_surcharge_cents
+        type: integer
+        source: computed
+        description: "Minimum-order-quantity surcharge when chargeable_lbs is below the order MOQ"
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "subtotal_cents - volume_discount_cents + freight_cents + pallet_break_fee_cents + small_order_surcharge_cents. Stays 0 for the whole DRAFT phase because no fee variant has been assessed yet: calculations.order_fee_assessment first runs at confirm. A DRAFT order therefore contributes 0 to Brewer.open_order_exposure_cents even though its subtotal_cents is already live, which is what keeps the priority 45 limit test from double-counting the order it is judging."
+        default: 0
+      - name: fee_variant
+        type: enum
+        source: system
+        description: "Which variant of calculations.order_fee_assessment produced the current fee fields; null before confirm"
+        default: null
+        constraints: "null, or one of {PROVISIONAL, FINAL}"
+      - name: freight_tier_applied
+        type: enum
+        source: system
+        description: "Freight band used by the current fee_variant; null before confirm"
+        default: null
+        constraints: "null, or one of {TIER_1, TIER_2, TIER_3}"
+      - name: final_freight_adjustment_cents
+        type: integer
+        source: system
+        description: "total_cents delta booked when the FINAL variant replaced the PROVISIONAL one at delivery; may be negative"
+        default: 0
+      - name: requires_cold_chain
+        type: boolean
+        source: computed
+        description: "True when any line with status IN {OPEN, TRIMMED} has cold_chain_required true"
+        default: false
+      - name: line_count
+        type: integer
+        source: computed
+        description: "Count of lines with status IN {OPEN, TRIMMED}"
+        default: 0
+      - name: invoiced_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant the order was invoiced to accounts receivable; null before ship"
+        default: null
+      - name: delivered_at
+        type: datetime
+        source: system
+        description: "Logical-clock instant of delivery; null before deliver"
+        default: null
+      - name: cancel_reason
+        type: string
+        source: system
+        description: "Reason recorded at cancellation; null unless CANCELLED"
+        default: null
+
+  - name: OrderLine
+    parent: null
+    common_fields: true
+    fields:
+      - name: sales_order_id
+        type: string
+        source: input
+        description: "FK -> SalesOrder.id; owning order"
+      - name: hop_contract_id
+        type: string
+        source: input
+        description: "FK -> HopContract.id; populated only when item_type == HOP and allocation_source == CONTRACT, null otherwise"
+        default: null
+      - name: malt_lot_id
+        type: string
+        source: input
+        description: "FK -> MaltLot.id; populated only when item_type == MALT, null otherwise"
+        default: null
+      - name: yeast_propagation_job_id
+        type: string
+        source: input
+        description: "FK -> YeastPropagationJob.id; populated only when item_type == YEAST, null otherwise"
+        default: null
+      - name: hop_variety_id
+        type: string
+        source: input
+        description: "FK -> HopVariety.id; populated on every HOP line whatever its allocation_source, null otherwise. A CONTRACT-sourced HOP line carries BOTH this and hop_contract_id, and validation priority 9 refuses the line when the two disagree about the variety."
+        default: null
+      - name: item_type
+        type: enum
+        source: input
+        description: "Which of the three product families this line sells"
+        constraints: "one of {HOP, MALT, YEAST}"
+      - name: allocation_source
+        type: enum
+        source: input
+        description: "CONTRACT draws against a crop-year commitment; SPOT draws against floor inventory. MALT and YEAST lines are always SPOT."
+        default: SPOT
+        constraints: "one of {CONTRACT, SPOT}"
+      - name: quantity
+        type: number
+        source: input
+        description: "Billable quantity in the line's uom"
+        constraints: "> 0, 3 dp"
+      - name: uom
+        type: enum
+        source: input
+        description: "Supplied by the caller and cross-checked against item_type by validation priority 9: LB for HOP and MALT lines, L for YEAST lines. A disagreeing uom is refused rather than silently corrected."
+        constraints: "one of {LB, L}"
+      - name: unit_price_cents
+        type: number
+        source: computed
+        description: "Contract price, variety spot price, malt list price or strain list price depending on item_type and allocation_source"
+      - name: extended_cents
+        type: integer
+        source: computed
+        description: "round_half_up(quantity * unit_price_cents) to whole cents, computed per line before any summation"
+      - name: pallet_break
+        type: boolean
+        source: computed
+        description: "True when the line's pallet_quantity_lbs is > 0 and quantity is not an exact multiple of it"
+        default: false
+      - name: cold_chain_required
+        type: boolean
+        source: computed
+        description: "cold_storage_required of the referenced variety, product or strain"
+        default: false
+      - name: trimmed_lbs
+        type: number
+        source: system
+        description: "Poundage removed from quantity by a crop-shortfall trim, 3 dp"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Line lifecycle state"
+        default: OPEN
+        constraints: "one of {OPEN, TRIMMED, CANCELLED_SHORTFALL, REMOVED, QUARANTINED}"
+
+  - name: ColdStorageZone
+    parent: null
+    common_fields: true
+    fields:
+      - name: zone_code
+        type: string
+        source: input
+        description: "Warehouse zone identifier; globally unique"
+        constraints: "unique across ColdStorageZone; 1..20 chars"
+      - name: temp_setpoint_c
+        type: number
+        source: input
+        description: "Zone temperature setpoint in degrees Celsius"
+        constraints: "-40.00..25.00, 2 dp"
+      - name: tolerance_c
+        type: number
+        source: input
+        description: "Permitted excursion band around temp_setpoint_c"
+        default: 2.0
+        constraints: "> 0, 2 dp"
+      - name: capacity_pallets
+        type: integer
+        source: input
+        description: "Maximum pallets the zone can hold at any instant"
+        constraints: ">= 1"
+      - name: occupied_pallets
+        type: integer
+        source: computed
+        description: "Sum of ColdChainShipment.pallet_count over shipments in this zone with status == STAGED whose staging window contains the current logical clock"
+        default: 0
+
+  - name: ColdChainShipment
+    parent: null
+    common_fields: true
+    fields:
+      - name: sales_order_id
+        type: string
+        source: input
+        description: "FK -> SalesOrder.id; order this reefer load carries"
+      - name: cold_storage_zone_id
+        type: string
+        source: input
+        description: "FK -> ColdStorageZone.id; zone the load is staged in before departure"
+      - name: pallet_count
+        type: integer
+        source: input
+        description: "Pallets this load occupies in the staging zone"
+        constraints: ">= 1"
+      - name: stage_from
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC start of the zone occupation, inclusive"
+      - name: stage_until
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC end of the zone occupation, exclusive; must be > stage_from"
+      - name: reefer_setpoint_c
+        type: number
+        source: input
+        description: "Trailer setpoint in degrees Celsius"
+        constraints: "-40.00..25.00, 2 dp"
+      - name: reefer_tolerance_c
+        type: number
+        source: input
+        description: "Permitted excursion band around reefer_setpoint_c"
+        default: 2.0
+        constraints: "> 0, 2 dp"
+      - name: excursion_minutes
+        type: integer
+        source: computed
+        description: "Cumulative minutes spent outside the reefer band; see calculations.cold_chain_excursion_assessment"
+        default: 0
+      - name: reading_count
+        type: integer
+        source: computed
+        description: "Number of TemperatureReading rows filed against this shipment"
+        default: 0
+      - name: last_reading_at
+        type: datetime
+        source: system
+        description: "recorded_at of the newest reading; null before the first reading"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Reefer load lifecycle state"
+        default: STAGED
+        constraints: "one of {STAGED, HELD, IN_TRANSIT, DELIVERED, EXCURSION_FLAGGED, SUPERSEDED}"
+
+  - name: TemperatureReading
+    parent: null
+    common_fields: false
+    fields:
+      - name: cold_chain_shipment_id
+        type: string
+        source: input
+        description: "FK -> ColdChainShipment.id; load this telemetry sample belongs to"
+      - name: temp_c
+        type: number
+        source: input
+        description: "Sampled trailer temperature in degrees Celsius"
+        constraints: "-60.00..60.00, 2 dp"
+      - name: recorded_at
+        type: datetime
+        source: input
+        description: "ISO 8601 UTC instant the probe sampled; must be strictly after the shipment's last_reading_at"
+      - name: interval_minutes
+        type: integer
+        source: computed
+        description: "floor((recorded_at - previous reading recorded_at) / 60s); 0 for the first reading on the shipment"
+      - name: in_violation
+        type: boolean
+        source: computed
+        description: "True when temp_c is strictly outside [reefer_setpoint_c - reefer_tolerance_c, reefer_setpoint_c + reefer_tolerance_c]"
+      - name: cumulative_excursion_minutes
+        type: integer
+        source: computed
+        description: "Snapshot of the shipment's excursion_minutes immediately after this reading was applied"
+
+# =============================================================================
+# 1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  - entity: CropYearProgram
+    initial_state: OPEN
+    terminal_states: [SETTLED]
+    transitions:
+      - from: OPEN
+        to: HARVEST_REPORTED
+        trigger: "POST /crop-year-programs/{id}/report-harvest"
+        actor: AllocationManager
+        preconditions:
+          - "program.status == OPEN"
+          - "harvest_yield_pct present, 0.00..200.00"
+        side_effects:
+          - "sets harvest_yield_pct and harvest_reported_at = current logical clock"
+          - "recomputes total_contracted_lbs over contracts in this program with status IN {ACTIVE, SHORTFALL_ADJUSTED, CARRY_FORWARD_PENDING}"
+          - "freezes allocatable_pool_lbs = floor(total_contracted_lbs * harvest_yield_pct / 100) via calculations.shortfall_prorata_reallocation"
+          - "CASCADE A LINK 1: runs calculations.shortfall_prorata_reallocation, writing HopContract.allocated_lbs and HopContract.shortfall_lbs for every contract in the program, and sets unallocated_pool_lbs to the waterfall remainder"
+          - "CASCADE A LINK 2 (caused by link 1): every contract whose allocated_lbs < contracted_lbs transitions ACTIVE -> SHORTFALL_ADJUSTED"
+          - "increments CropYearProgram.version by 1"
+        note: "Entry point of cascade A; links 3-5 are documented on HopContract.ACTIVE_to_SHORTFALL_ADJUSTED."
+      - from: HARVEST_REPORTED
+        to: SETTLED
+        trigger: "POST /crop-year-programs/{id}/settle"
+        actor: AllocationManager
+        preconditions:
+          - "program.status == HARVEST_REPORTED"
+          - "no contract in this program has status == CARRY_FORWARD_PENDING"
+        side_effects:
+          - "increments CropYearProgram.version by 1"
+        note: "SETTLED is terminal; contract creation is already barred outside status == OPEN."
+
+  - entity: HopContract
+    initial_state: ACTIVE
+    terminal_states: [CARRIED_FORWARD, RESOLD]
+    transitions:
+      - from: ACTIVE
+        to: SHORTFALL_ADJUSTED
+        trigger: "system event: cascade from POST /crop-year-programs/{id}/report-harvest"
+        actor: system
+        preconditions:
+          - "contract.status == ACTIVE"
+          - "allocated_lbs written by calculations.shortfall_prorata_reallocation is < contracted_lbs"
+        side_effects:
+          - "sets shortfall_lbs = contracted_lbs - allocated_lbs and recomputes remaining_lbs"
+          - "CASCADE A LINK 3 (caused by the allocated_lbs reduction on this row): while committed_lbs > allocated_lbs, OrderLine rows with hop_contract_id == this contract, status == OPEN and whose SalesOrder.fulfillment_status == CONFIRMED are trimmed in created_at DESC order — quantity is reduced by the smallest amount that closes the gap, trimmed_lbs accumulates the reduction, and status becomes TRIMMED (or CANCELLED_SHORTFALL when quantity would reach 0). Lines whose order is PICKED, SHIPPED or DELIVERED are immune."
+          - "CASCADE A LINK 4 (caused by the line trim in link 3): every affected SalesOrder re-runs calculations.order_subtotal_rollup and calculations.order_fee_assessment variant PROVISIONAL, rewriting subtotal_cents, volume_discount_cents, chargeable_lbs, freight_cents, pallet_break_fee_cents, small_order_surcharge_cents and total_cents"
+          - "CASCADE A LINK 5 (caused by the total_cents rewrite in link 4): the owning Brewer re-runs calculations.brewer_credit_posture, rewriting open_order_exposure_cents, credit_exposure_cents, credit_utilization_pct and credit_status"
+          - "increments HopContract.version by 1"
+        note: "Depth-5 transitive cascade; each link is caused by the preceding link, not by the report-harvest call itself."
+      - from: ACTIVE
+        to: CARRY_FORWARD_PENDING
+        trigger: "POST /hop-contracts/{id}/carry-forward-requests"
+        actor: Brewer
+        preconditions:
+          - "contract.status IN {ACTIVE, SHORTFALL_ADJUSTED}"
+          - "X-User-ID == contract.brewer_id"
+          - "crop_year_program_id program.status == HARVEST_REPORTED"
+          - "target program exists, has crop_year == this program's crop_year + 1 and status == OPEN"
+          - "remaining_lbs > 0"
+        side_effects:
+          - "sets carry_forward_target_program_id and writes carry_forward_requested_lbs / carry_forward_fee_cents from calculations.carry_forward_eligibility"
+          - "increments HopContract.version by 1"
+        note: "SHORTFALL_ADJUSTED uses the same transition; the from-state set is {ACTIVE, SHORTFALL_ADJUSTED}."
+      - from: CARRY_FORWARD_PENDING
+        to: ACTIVE
+        trigger: "POST /hop-contracts/{id}/carry-forward-decision with decision == DECLINE"
+        actor: AllocationManager
+        preconditions:
+          - "contract.status == CARRY_FORWARD_PENDING"
+        side_effects:
+          - "clears carry_forward_target_program_id, carry_forward_requested_lbs and carry_forward_fee_cents to null"
+          - "increments HopContract.version by 1"
+        note: "The revision loop that makes this machine cyclic: ACTIVE -> CARRY_FORWARD_PENDING -> ACTIVE."
+      - from: CARRY_FORWARD_PENDING
+        to: CARRIED_FORWARD
+        trigger: "POST /hop-contracts/{id}/carry-forward-decision with decision == APPROVE"
+        actor: AllocationManager
+        preconditions:
+          - "contract.status == CARRY_FORWARD_PENDING"
+          - "carry_forward_target_program_id program.status == OPEN"
+        side_effects:
+          - "sets carried_forward_out_lbs = carry_forward_requested_lbs and recomputes remaining_lbs"
+          - "mints a successor HopContract in the target program with the same brewer_id, variety_id, contract_type and price_per_lb_cents, contracted_lbs = carry_forward_requested_lbs, carried_forward_from_contract_id = this contract, delivery window shifted forward by 365 days, status ACTIVE"
+          - "posts carry_forward_fee_cents onto Brewer.ar_balance_cents, then re-runs calculations.brewer_credit_posture"
+          - "increments HopContract.version by 1"
+      - from: ACTIVE
+        to: DEFAULTED
+        trigger: "POST /hop-contracts/{id}/declare-default"
+        actor: AllocationManager
+        preconditions:
+          - "contract.status IN {ACTIVE, SHORTFALL_ADJUSTED}"
+          - "remaining_lbs > 0"
+        side_effects:
+          - "sets defaulted_lbs = remaining_lbs, recomputes remaining_lbs to 0, records defaulted_by_user_id = X-User-ID"
+          - "runs calculations.contract_default_settlement, writing settlement_variant, settlement_damages_cents, settlement_admin_fee_cents and settlement_total_cents"
+          - "CASCADE B LINK 1: adds settlement_total_cents to Brewer.ar_balance_cents"
+          - "CASCADE B LINK 2 (caused by the ar_balance_cents increase): the Brewer re-runs calculations.brewer_credit_posture, rewriting credit_exposure_cents, credit_utilization_pct and credit_status"
+          - "CASCADE B LINK 3 (caused by credit_status becoming HOLD): every SalesOrder of that brewer with fulfillment_status IN {DRAFT, CONFIRMED} and credit_status == APPROVED transitions credit_status APPROVED -> ON_HOLD"
+          - "CASCADE B LINK 4 (caused by the order going ON_HOLD): every ColdChainShipment of those orders with status == STAGED transitions STAGED -> HELD, which releases its pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments HopContract.version by 1"
+        note: "Depth-5 transitive cascade whose trigger differs from cascade A's. SHORTFALL_ADJUSTED uses the same transition."
+      - from: DEFAULTED
+        to: RESOLD
+        trigger: "POST /hop-contracts/{id}/resale"
+        actor: AllocationManager
+        preconditions:
+          - "contract.status == DEFAULTED"
+          - "X-User-ID != contract.defaulted_by_user_id (segregation of duties)"
+          - "resale_lbs <= defaulted_lbs"
+          - "buyer brewer exists and buyer_brewer_id != contract.brewer_id"
+        side_effects:
+          - "moves resale_lbs out of defaulted_lbs into resold_lbs, leaving allocated_lbs unchanged"
+          - "sets resale_credit_cents = min(settlement_total_cents, round_half_up(resale_lbs * resale_price_cents_per_lb)) and subtracts it from Brewer.ar_balance_cents"
+          - "the Brewer re-runs calculations.brewer_credit_posture, which can flip credit_status HOLD -> WATCH or HOLD -> GOOD_STANDING"
+          - "increments HopContract.version by 1"
+      - from: SHORTFALL_ADJUSTED
+        to: DEFAULTED
+        trigger: "POST /hop-contracts/{id}/declare-default"
+        actor: AllocationManager
+        preconditions:
+          - "contract.status == SHORTFALL_ADJUSTED"
+          - "remaining_lbs > 0"
+        side_effects:
+          - "identical to the ACTIVE -> DEFAULTED transition, including cascade B links 1-4"
+      - from: SHORTFALL_ADJUSTED
+        to: CARRY_FORWARD_PENDING
+        trigger: "POST /hop-contracts/{id}/carry-forward-requests"
+        actor: Brewer
+        preconditions:
+          - "contract.status == SHORTFALL_ADJUSTED"
+          - "identical to the ACTIVE -> CARRY_FORWARD_PENDING preconditions"
+        side_effects:
+          - "identical to the ACTIVE -> CARRY_FORWARD_PENDING side effects"
+
+  - entity: SubstitutionOffer
+    initial_state: OPEN
+    terminal_states: [ACCEPTED, DECLINED, SUPERSEDED]
+    transitions:
+      - from: OPEN
+        to: ACCEPTED
+        trigger: "POST /substitution-offers/{id}/respond with decision == ACCEPT"
+        actor: Brewer
+        preconditions:
+          - "offer.status == OPEN"
+          - "X-User-ID == the offer's contract brewer_id"
+          - "substitute variety available_spot_lbs >= offer.offered_lbs"
+        side_effects:
+          - "sets responded_at = current logical clock"
+          - "mints a SPOT_HOLD HopContract for the substitute variety in the original contract's crop_year_program_id with contracted_lbs = offered_lbs and price_per_lb_cents = offered_price_cents_per_lb, status ACTIVE, and records it in created_contract_id"
+          - "reduces HopVariety.available_spot_lbs of the substitute by offered_lbs"
+          - "adds offered_lbs to the original contract's substitution_covered_lbs"
+          - "increments SubstitutionOffer.version by 1"
+      - from: OPEN
+        to: DECLINED
+        trigger: "POST /substitution-offers/{id}/respond with decision == DECLINE"
+        actor: Brewer
+        preconditions:
+          - "offer.status == OPEN"
+          - "X-User-ID == the offer's contract brewer_id"
+        side_effects:
+          - "sets responded_at = current logical clock"
+          - "increments SubstitutionOffer.version by 1"
+      - from: OPEN
+        to: SUPERSEDED
+        trigger: "system event: cascade from POST /hop-contracts/{id}/substitution-offers creating a newer offer on the same contract"
+        actor: system
+        preconditions:
+          - "offer.status == OPEN"
+          - "a newer offer is being created against the same hop_contract_id"
+        side_effects:
+          - "increments SubstitutionOffer.version by 1"
+        note: "The legitimate supersede that makes offer creation a true race; resolved by OCC on HopContract.version (see concurrency_rules)."
+
+  - entity: MaltLot
+    initial_state: RECEIVED
+    terminal_states: [RELEASED, REJECTED]
+    transitions:
+      - from: RECEIVED
+        to: PASSED
+        trigger: "POST /malt-lots/{id}/analysis"
+        actor: WarehouseOperator
+        preconditions:
+          - "lot.status == RECEIVED"
+          - "moisture_pct <= product.max_moisture_pct"
+          - "product.malt_class == SPECIALTY, or diastatic_power >= product.min_diastatic_power"
+        side_effects:
+          - "writes color_lovibond, extract_pct, moisture_pct, protein_pct and diastatic_power onto the lot"
+          - "increments analysis_count by 1 and records analyzed_by_user_id = X-User-ID"
+          - "clears quarantine_reason to null"
+          - "increments MaltLot.version by 1"
+      - from: RECEIVED
+        to: QUARANTINED
+        trigger: "POST /malt-lots/{id}/analysis"
+        actor: WarehouseOperator
+        preconditions:
+          - "lot.status == RECEIVED"
+          - "moisture_pct > product.max_moisture_pct, or (product.malt_class == BASE and diastatic_power < product.min_diastatic_power)"
+        side_effects:
+          - "writes the analysis fields, increments analysis_count, records analyzed_by_user_id = X-User-ID"
+          - "sets quarantine_reason to MOISTURE_ABOVE_MAX or DIASTATIC_POWER_BELOW_MIN (moisture is evaluated first)"
+          - "increments MaltLot.version by 1"
+        note: "The PASSED/QUARANTINED fork; branch choice depends on the parent MaltProduct's configuration."
+      - from: QUARANTINED
+        to: RECEIVED
+        trigger: "POST /malt-lots/{id}/retest"
+        actor: WarehouseOperator
+        preconditions:
+          - "lot.status == QUARANTINED"
+        side_effects:
+          - "clears quarantine_reason to null and leaves analysis_count and the recorded analysis values intact"
+          - "increments MaltLot.version by 1"
+        note: "The revision loop that makes this machine cyclic: RECEIVED -> QUARANTINED -> RECEIVED."
+      - from: QUARANTINED
+        to: REJECTED
+        trigger: "POST /malt-lots/{id}/reject"
+        actor: WarehouseOperator
+        preconditions:
+          - "lot.status == QUARANTINED"
+        side_effects:
+          - "increments MaltLot.version by 1"
+      - from: PASSED
+        to: RELEASED
+        trigger: "POST /malt-lots/{id}/release"
+        actor: WarehouseOperator
+        preconditions:
+          - "lot.status == PASSED"
+          - "X-User-ID != lot.analyzed_by_user_id (segregation of duties)"
+        side_effects:
+          - "records released_by_user_id = X-User-ID"
+          - "increments MaltLot.version by 1"
+
+  - entity: YeastPropagationJob
+    initial_state: REQUESTED
+    terminal_states: [SHIPPED]
+    transitions:
+      - from: REQUESTED
+        to: PROPAGATING
+        trigger: "POST /yeast-propagation-jobs/{id}/start"
+        actor: WarehouseOperator
+        preconditions:
+          - "job.status == REQUESTED"
+        side_effects:
+          - "sets ready_at = current logical clock + strain.propagation_lead_time_days days"
+          - "increments YeastPropagationJob.version by 1"
+      - from: PROPAGATING
+        to: READY
+        trigger: "POST /yeast-propagation-jobs/{id}/complete with outcome == READY"
+        actor: WarehouseOperator
+        preconditions:
+          - "job.status == PROPAGATING"
+        side_effects:
+          - "clears failure_reason to null"
+          - "increments YeastPropagationJob.version by 1"
+      - from: PROPAGATING
+        to: FAILED
+        trigger: "POST /yeast-propagation-jobs/{id}/complete with outcome == FAILED"
+        actor: WarehouseOperator
+        preconditions:
+          - "job.status == PROPAGATING"
+        side_effects:
+          - "sets failure_reason from the request"
+          - "increments YeastPropagationJob.version by 1"
+        note: "The PROPAGATING fork; READY and FAILED carry different side-effect sets."
+      - from: READY
+        to: FAILED
+        trigger: "system event: cascade from POST /cold-chain-shipments/{id}/readings flagging an excursion"
+        actor: system
+        preconditions:
+          - "job.status == READY"
+          - "the job is referenced by a YEAST OrderLine of the flagged shipment's order"
+        side_effects:
+          - "sets failure_reason = COLD_CHAIN_EXCURSION"
+          - "CASCADE C LINK 3 (caused by this job failing): a replacement YeastPropagationJob is created with status REQUESTED, replaces_job_id = this job, the same brewer_id / recipe_id / yeast_strain_id, and pitch_date = this job's pitch_date + strain.propagation_lead_time_days days; its advisory fields are computed by calculations.yeast_pitch_advisory"
+          - "increments YeastPropagationJob.version by 1"
+      - from: FAILED
+        to: REQUESTED
+        trigger: "POST /yeast-propagation-jobs/{id}/requeue"
+        actor: WarehouseOperator
+        preconditions:
+          - "job.status == FAILED"
+          - "new_pitch_date >= current logical clock + strain.propagation_lead_time_days days"
+          - "no other job on the same yeast_strain_id with status IN {REQUESTED, PROPAGATING, READY} sits within strain.propagation_lead_time_days of new_pitch_date"
+        side_effects:
+          - "sets pitch_date = new_pitch_date, clears failure_reason and ready_at to null"
+          - "increments YeastPropagationJob.version by 1"
+        note: "The revision loop that makes this machine cyclic: PROPAGATING -> FAILED -> REQUESTED."
+      - from: READY
+        to: SHIPPED
+        trigger: "system event: cascade from POST /sales-orders/{id}/ship"
+        actor: system
+        preconditions:
+          - "job.status == READY"
+          - "the job is referenced by a YEAST OrderLine with status IN {OPEN, TRIMMED} of the shipping order"
+        side_effects:
+          - "increments YeastPropagationJob.version by 1"
+
+  - entity: SalesOrder
+    dimension: fulfillment_status
+    initial_state: DRAFT
+    terminal_states: [DELIVERED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: CONFIRMED
+        trigger: "POST /sales-orders/{id}/confirm"
+        actor: Brewer
+        preconditions:
+          - "order.fulfillment_status == DRAFT"
+          - "X-User-ID == order.brewer_id"
+          - "line_count >= 1"
+          - "brewer.credit_status != HOLD"
+          - "brewer.credit_exposure_cents + this order's freshly computed total_cents <= brewer.credit_limit_cents"
+          - "for every CONTRACT hop line: order.requested_ship_date is within [contract.delivery_window_start, contract.delivery_window_end]"
+          - "for every CONTRACT hop line: contract.remaining_lbs >= line.quantity"
+          - "for every MALT line: lot.available_lbs >= line.quantity and lot.status == RELEASED is NOT required until pick"
+          - "when order.requires_cold_chain: brewer.cold_chain_certified == true"
+        side_effects:
+          - "commits poundage: every CONTRACT hop line adds its quantity to HopContract.committed_lbs, reducing remaining_lbs by the same amount so allocated_lbs is conserved"
+          - "commits malt: every MALT line adds its quantity to MaltLot.committed_lbs, reducing available_lbs"
+          - "commits spot hops: every SPOT hop line subtracts its quantity from HopVariety.available_spot_lbs"
+          - "runs calculations.order_subtotal_rollup then calculations.order_fee_assessment variant PROVISIONAL, sets fee_variant = PROVISIONAL and freight_tier_applied"
+          - "the Brewer re-runs calculations.brewer_credit_posture (open_order_exposure_cents now includes this order)"
+          - "increments SalesOrder.version by 1"
+      - from: CONFIRMED
+        to: PICKED
+        trigger: "POST /sales-orders/{id}/pick"
+        actor: WarehouseOperator
+        preconditions:
+          - "order.fulfillment_status == CONFIRMED"
+          - "order.credit_status == APPROVED"
+          - "every MALT line's MaltLot.status == RELEASED"
+          - "every YEAST line's YeastPropagationJob.status == READY"
+        side_effects:
+          - "increments SalesOrder.version by 1"
+        note: "Guarded transition across three entity pairs: SalesOrder->MaltLot, SalesOrder->YeastPropagationJob, and the order's own credit dimension."
+      - from: PICKED
+        to: SHIPPED
+        trigger: "POST /sales-orders/{id}/ship"
+        actor: WarehouseOperator
+        preconditions:
+          - "order.fulfillment_status == PICKED"
+          - "when order.requires_cold_chain: a ColdChainShipment for this order exists with status == IN_TRANSIT"
+        side_effects:
+          - "sets invoiced_at = current logical clock and adds total_cents to Brewer.ar_balance_cents"
+          - "every READY YeastPropagationJob referenced by a YEAST line transitions READY -> SHIPPED"
+          - "the Brewer re-runs calculations.brewer_credit_posture; the order leaves open_order_exposure_cents as it enters ar_balance_cents, so credit_exposure_cents is unchanged"
+          - "increments SalesOrder.version by 1"
+      - from: SHIPPED
+        to: DELIVERED
+        trigger: "POST /sales-orders/{id}/deliver"
+        actor: WarehouseOperator
+        preconditions:
+          - "order.fulfillment_status == SHIPPED"
+          - "when order.requires_cold_chain: the order's ColdChainShipment status == IN_TRANSIT (a shipment in EXCURSION_FLAGGED blocks delivery)"
+        side_effects:
+          - "sets delivered_at = current logical clock"
+          - "the order's ColdChainShipment, when present, transitions IN_TRANSIT -> DELIVERED"
+          - "re-runs calculations.order_fee_assessment variant FINAL, sets fee_variant = FINAL, rewrites freight_cents / total_cents / freight_tier_applied and stores final_freight_adjustment_cents = new total_cents - previous total_cents"
+          - "adds final_freight_adjustment_cents to Brewer.ar_balance_cents"
+          - "the Brewer re-runs calculations.freight_program_tier (chargeable_lbs now inside the trailing window) and calculations.brewer_credit_posture"
+          - "increments SalesOrder.version by 1"
+      - from: CONFIRMED
+        to: CANCELLED
+        trigger: "POST /sales-orders/{id}/cancel"
+        actor: Brewer
+        preconditions:
+          - "order.fulfillment_status IN {DRAFT, CONFIRMED, PICKED, SHIPPED}"
+          - "actor is the owning Brewer (X-User-ID == order.brewer_id) or an AllocationManager"
+        side_effects:
+          - "sets cancel_reason and moves every line with status IN {OPEN, TRIMMED} to REMOVED"
+          - "releases poundage: every CONTRACT hop line subtracts its quantity from HopContract.committed_lbs and adds it back to remaining_lbs, leaving allocated_lbs unchanged"
+          - "releases malt: subtracts the line quantity from MaltLot.committed_lbs; releases spot hops: adds the line quantity back to HopVariety.available_spot_lbs"
+          - "when invoiced_at is not null: subtracts (total_cents + final_freight_adjustment_cents already booked) from Brewer.ar_balance_cents as a credit memo, restoring the pre-invoice balance"
+          - "every ColdChainShipment of this order with status IN {STAGED, HELD} transitions to SUPERSEDED, releasing its pallet_count from ColdStorageZone.occupied_pallets"
+          - "the Brewer re-runs calculations.brewer_credit_posture"
+          - "increments SalesOrder.version by 1"
+        note: "Compensating action for both conserved quantities: HopContract.allocated_lbs and Brewer.ar_balance_cents."
+
+  - entity: SalesOrder
+    dimension: credit_status
+    initial_state: PENDING_REVIEW
+    terminal_states: []
+    transitions:
+      - from: PENDING_REVIEW
+        to: APPROVED
+        trigger: "POST /sales-orders/{id}/credit-decision with decision == APPROVE"
+        actor: CreditManager
+        preconditions:
+          - "order.credit_status IN {PENDING_REVIEW, ON_HOLD}"
+          - "order.fulfillment_status NOT IN {CANCELLED, DELIVERED}"
+          - "brewer.credit_status != HOLD"
+        side_effects:
+          - "increments SalesOrder.version by 1"
+        note: "Independent of fulfillment_status: an order can be APPROVED while still DRAFT, or PENDING_REVIEW while already CONFIRMED."
+      - from: PENDING_REVIEW
+        to: ON_HOLD
+        trigger: "POST /sales-orders/{id}/credit-decision with decision == HOLD"
+        actor: CreditManager
+        preconditions:
+          - "order.credit_status IN {PENDING_REVIEW, APPROVED}"
+          - "order.fulfillment_status NOT IN {CANCELLED, DELIVERED}"
+        side_effects:
+          - "every ColdChainShipment of this order with status == STAGED transitions STAGED -> HELD, releasing its pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments SalesOrder.version by 1"
+      - from: APPROVED
+        to: ON_HOLD
+        trigger: "system event: cascade from a Brewer credit_status transition to HOLD (see HopContract ACTIVE -> DEFAULTED, cascade B link 3)"
+        actor: system
+        preconditions:
+          - "order.credit_status == APPROVED"
+          - "order.fulfillment_status IN {DRAFT, CONFIRMED}"
+          - "owning brewer.credit_status just became HOLD"
+        side_effects:
+          - "CASCADE B LINK 4 (caused by this order going ON_HOLD): every ColdChainShipment of this order with status == STAGED transitions STAGED -> HELD, releasing its pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments SalesOrder.version by 1"
+      - from: ON_HOLD
+        to: APPROVED
+        trigger: "POST /sales-orders/{id}/credit-decision with decision == APPROVE"
+        actor: CreditManager
+        preconditions:
+          - "order.credit_status == ON_HOLD"
+          - "brewer.credit_status != HOLD"
+        side_effects:
+          - "increments SalesOrder.version by 1"
+        note: "Makes the credit dimension cyclic: APPROVED -> ON_HOLD -> APPROVED."
+
+  - entity: OrderLine
+    initial_state: OPEN
+    terminal_states: [CANCELLED_SHORTFALL, REMOVED]
+    transitions:
+      - from: OPEN
+        to: TRIMMED
+        trigger: "system event: cascade A link 3 from POST /crop-year-programs/{id}/report-harvest"
+        actor: system
+        preconditions:
+          - "line.status == OPEN"
+          - "owning SalesOrder.fulfillment_status == CONFIRMED"
+          - "the line's contract has committed_lbs > allocated_lbs after reallocation"
+          - "the trim leaves quantity > 0"
+        side_effects:
+          - "reduces quantity, accumulates trimmed_lbs, recomputes extended_cents and pallet_break"
+          - "reduces HopContract.committed_lbs by the trimmed amount and raises remaining_lbs by the same amount"
+          - "increments OrderLine.version by 1"
+      - from: OPEN
+        to: CANCELLED_SHORTFALL
+        trigger: "system event: cascade A link 3 from POST /crop-year-programs/{id}/report-harvest"
+        actor: system
+        preconditions:
+          - "line.status == OPEN"
+          - "owning SalesOrder.fulfillment_status == CONFIRMED"
+          - "the trim would reduce quantity to 0 or below"
+        side_effects:
+          - "sets trimmed_lbs = the original quantity, sets extended_cents to 0 and removes the line from subtotal_cents, chargeable_lbs and line_count"
+          - "reduces HopContract.committed_lbs by the original quantity and raises remaining_lbs by the same amount"
+          - "increments OrderLine.version by 1"
+      - from: TRIMMED
+        to: CANCELLED_SHORTFALL
+        trigger: "system event: a second cascade A trim that exhausts the remaining quantity"
+        actor: system
+        preconditions:
+          - "line.status == TRIMMED"
+          - "the new trim would reduce quantity to 0 or below"
+        side_effects:
+          - "identical to the OPEN -> CANCELLED_SHORTFALL side effects"
+      - from: OPEN
+        to: REMOVED
+        trigger: "DELETE /sales-orders/{id}/lines/{line_id}, or cascade from POST /sales-orders/{id}/cancel"
+        actor: Brewer
+        preconditions:
+          - "line.status IN {OPEN, TRIMMED}"
+          - "for the DELETE trigger: owning SalesOrder.fulfillment_status == DRAFT"
+        side_effects:
+          - "recomputes the owning order's subtotal_cents, chargeable_lbs, line_count and requires_cold_chain"
+          - "when the order was already CONFIRMED (cancel cascade), releases the line's committed poundage back to its contract, lot or variety"
+          - "increments OrderLine.version by 1"
+      - from: OPEN
+        to: QUARANTINED
+        trigger: "system event: cascade C link 2 from POST /cold-chain-shipments/{id}/readings flagging an excursion"
+        actor: system
+        preconditions:
+          - "line.status IN {OPEN, TRIMMED}"
+          - "line.cold_chain_required == true and line.item_type == HOP"
+          - "the owning order's ColdChainShipment just entered EXCURSION_FLAGGED"
+        side_effects:
+          - "increments OrderLine.version by 1"
+
+  - entity: ColdChainShipment
+    initial_state: STAGED
+    terminal_states: [DELIVERED, EXCURSION_FLAGGED, SUPERSEDED]
+    transitions:
+      - from: STAGED
+        to: IN_TRANSIT
+        trigger: "POST /cold-chain-shipments/{id}/depart"
+        actor: WarehouseOperator
+        preconditions:
+          - "shipment.status == STAGED"
+          - "owning SalesOrder.fulfillment_status == PICKED"
+          - "owning SalesOrder.credit_status == APPROVED"
+        side_effects:
+          - "releases pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments ColdChainShipment.version by 1"
+      - from: STAGED
+        to: HELD
+        trigger: "system event: cascade B link 4, or POST /sales-orders/{id}/credit-decision with decision == HOLD"
+        actor: system
+        preconditions:
+          - "shipment.status == STAGED"
+          - "owning SalesOrder.credit_status just became ON_HOLD"
+        side_effects:
+          - "releases pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments ColdChainShipment.version by 1"
+      - from: HELD
+        to: STAGED
+        trigger: "POST /cold-chain-shipments/{id}/release-hold"
+        actor: CreditManager
+        preconditions:
+          - "shipment.status == HELD"
+          - "owning SalesOrder.credit_status == APPROVED"
+          - "re-occupying the zone over [stage_from, stage_until) keeps every instant at or below ColdStorageZone.capacity_pallets"
+        side_effects:
+          - "re-occupies pallet_count in ColdStorageZone.occupied_pallets when the current logical clock is inside [stage_from, stage_until)"
+          - "increments ColdChainShipment.version by 1"
+        note: "The revision loop that makes this machine cyclic: STAGED -> HELD -> STAGED."
+      - from: STAGED
+        to: SUPERSEDED
+        trigger: "system event: a newer ColdChainShipment is created for the same sales_order_id, or POST /sales-orders/{id}/cancel"
+        actor: system
+        preconditions:
+          - "shipment.status IN {STAGED, HELD}"
+        side_effects:
+          - "releases pallet_count from ColdStorageZone.occupied_pallets"
+          - "increments ColdChainShipment.version by 1"
+        note: "The legitimate supersede that makes shipment creation a true race; resolved by OCC on SalesOrder.version (see concurrency_rules)."
+      - from: IN_TRANSIT
+        to: EXCURSION_FLAGGED
+        trigger: "system event: cascade C link 1 from POST /cold-chain-shipments/{id}/readings"
+        actor: system
+        preconditions:
+          - "shipment.status == IN_TRANSIT"
+          - "excursion_minutes after applying the reading is strictly greater than MAX_EXCURSION_MINUTES"
+        side_effects:
+          - "CASCADE C LINK 2 (caused by this shipment being flagged): every YEAST OrderLine's YeastPropagationJob with status == READY transitions READY -> FAILED with failure_reason COLD_CHAIN_EXCURSION, and every HOP line with cold_chain_required true transitions OPEN -> QUARANTINED"
+          - "CASCADE C LINK 3 (caused by the job failing in link 2): a replacement YeastPropagationJob is created in REQUESTED with replaces_job_id pointing at the failed job"
+          - "increments ColdChainShipment.version by 1"
+        note: "Depth-3 transitive cascade: reading -> shipment -> propagation job -> replacement job."
+      - from: IN_TRANSIT
+        to: DELIVERED
+        trigger: "system event: cascade from POST /sales-orders/{id}/deliver"
+        actor: system
+        preconditions:
+          - "shipment.status == IN_TRANSIT"
+          - "owning SalesOrder.fulfillment_status == SHIPPED"
+        side_effects:
+          - "increments ColdChainShipment.version by 1"
+
+# =============================================================================
+# 1.2.1 Concurrency Rules  (OCC on the parent's `version` only)
+# =============================================================================
+concurrency_rules:
+  - rule_id: substitution-offer-create-stale-contract
+    parent_entity: HopContract
+    write_endpoint: "POST /hop-contracts/{id}/substitution-offers"
+    occ_field: "expected_hop_contract_version"
+    description: |
+      Creating a SubstitutionOffer against a HopContract whose version has
+      advanced since the client last observed it is rejected. A newly created
+      offer legitimately supersedes the prior OPEN offer on the same contract
+      (SubstitutionOffer OPEN -> SUPERSEDED), so a second create against an
+      unchanged contract would itself succeed under the product semantics; the
+      stale-version check is what tells an allocation desk that the shortfall
+      picture it based its offer on has already moved.
+    error_id: ERR_STALE_HOP_CONTRACT_VERSION
+    http_status: 412
+
+  - rule_id: shipment-create-stale-order
+    parent_entity: SalesOrder
+    write_endpoint: "POST /cold-chain-shipments"
+    occ_field: "expected_sales_order_version"
+    description: |
+      Creating a ColdChainShipment for a SalesOrder whose version has advanced
+      since the client last observed it is rejected. A new reefer load
+      legitimately supersedes the order's prior STAGED load (ColdChainShipment
+      STAGED -> SUPERSEDED, releasing its pallets), so re-staging is a valid
+      repeat operation; the stale-version check catches a dock planner working
+      from an order snapshot that predates a trim, a credit hold or an earlier
+      re-stage.
+    error_id: ERR_STALE_SALES_ORDER_VERSION
+    http_status: 412
+
+  - rule_id: credit-profile-update-stale-brewer
+    parent_entity: Brewer
+    write_endpoint: "PUT /brewers/{id}/credit-profile"
+    occ_field: "expected_brewer_version"
+    description: |
+      Updating a Brewer's credit limit or payment terms against a version that
+      has advanced since the client last observed it is rejected. Repeated
+      credit-profile updates are legitimate on their own, so nothing in the
+      state machine would stop the second write; the stale-version check is
+      what prevents a credit desk from overwriting a limit that a default
+      settlement or a payment has already repriced.
+    error_id: ERR_STALE_BREWER_VERSION
+    http_status: 412
+
+# =============================================================================
+# 1.3 Calculation Rules
+# =============================================================================
+calculations:
+
+  - name: order_subtotal_rollup
+    entity: SalesOrder
+    algorithm_type: aggregation
+    trigger: "on POST /sales-orders/{id}/lines, DELETE /sales-orders/{id}/lines/{line_id}, POST /sales-orders/{id}/confirm, and on every cascade A line trim"
+    input_set: "OrderLine rows with sales_order_id == this order and status IN {OPEN, TRIMMED}"
+    formula: |
+      Per line, in OrderLine.created_at ASC order:
+        extended_cents = round_half_up(quantity * unit_price_cents)   # to 0 dp, cents
+      Then:
+        subtotal_cents = sum of the per-line extended_cents values
+        chargeable_lbs = sum of quantity over lines whose uom == LB
+        line_count     = count of lines in the input set
+        requires_cold_chain = true when any line in the input set has cold_chain_required == true
+      ROUNDING ORDER IS NORMATIVE: each line's extended_cents is rounded to whole
+      cents FIRST, and the already-rounded per-line values are then summed.
+      Summing the unrounded products and rounding once at the end is WRONG and
+      produces a different subtotal whenever two or more lines each carry a
+      half-cent residue (see difficulty rule boundary_precision_check).
+      pallet_break per line = true when the line's pallet_quantity (HopVariety.pallet_quantity_lbs
+      for HOP lines, MaltProduct.pallet_quantity_lbs for MALT lines, absent for YEAST lines)
+      is greater than 0 AND quantity MOD pallet_quantity != 0.
+    constants: {}
+    precision: "extended_cents and subtotal_cents are integer cents; quantity is decimal(12,2); round_half_up"
+    output_field: "SalesOrder.subtotal_cents (also writes chargeable_lbs, line_count, requires_cold_chain, and OrderLine.extended_cents / OrderLine.pallet_break)"
+
+  - name: order_fee_assessment
+    entity: SalesOrder
+    algorithm_type: tiered_pricing
+    trigger: "variant PROVISIONAL on POST /sales-orders/{id}/confirm and on every cascade A recompute; variant FINAL on POST /sales-orders/{id}/deliver"
+    input_set: "the order's own subtotal_cents and chargeable_lbs from order_subtotal_rollup, plus the owning Brewer's freight_program_tier"
+    variants:
+      - name: PROVISIONAL
+        description: |
+          Applied at confirm time. The freight program tier is read from the
+          brewer's trailing-12-month volume EXCLUDING this order's own
+          chargeable_lbs, because the order has not shipped and therefore has
+          not yet earned volume credit. final_freight_adjustment_cents stays null.
+      - name: FINAL
+        description: |
+          Applied at delivery. The freight program tier is recomputed with this
+          order's own chargeable_lbs INCLUDED in the trailing window, because a
+          delivered order counts toward the program. A large order can therefore
+          promote itself into a cheaper tier between confirm and delivery, and
+          the difference is booked as final_freight_adjustment_cents.
+    formula: |
+      EVALUATION ORDER IS NORMATIVE. Execute exactly these eleven steps in order:
+        1. subtotal_cents comes from order_subtotal_rollup (per-line rounding already applied).
+        2. discount_pct = 3.0 when subtotal_cents >= DISCOUNT_TIER_2_CENTS
+                          else 1.5 when subtotal_cents >= DISCOUNT_TIER_1_CENTS
+                          else 0.0
+        3. volume_discount_cents = round_half_up(subtotal_cents * discount_pct / 100)
+        4. discounted_subtotal_cents = subtotal_cents - volume_discount_cents
+        5. tier_volume_lbs = brewer trailing volume from freight_program_tier,
+           PLUS this order's chargeable_lbs when and only when the variant is FINAL.
+        6. freight_tier_applied = TIER_3 when tier_volume_lbs >= TIER_3_MIN_LBS
+                                  else TIER_2 when tier_volume_lbs >= TIER_2_MIN_LBS
+                                  else TIER_1
+        7. rate_freight_cents = round_half_up(chargeable_lbs * FREIGHT_RATE_CENTS_PER_LB[freight_tier_applied])
+        8. freight_cents = max(FREIGHT_MINIMUM_CENTS[freight_tier_applied], rate_freight_cents)
+        9. when requires_cold_chain is true: freight_cents = freight_cents + REEFER_SURCHARGE_CENTS
+       10. pallet_break_fee_cents = PALLET_BREAK_FEE_CENTS * (count of lines in the
+           order_subtotal_rollup input set whose pallet_break is true)
+       11. small_order_surcharge_cents = SMALL_ORDER_SURCHARGE_CENTS when
+           chargeable_lbs < MOQ_ORDER_LBS, else 0
+      total_cents = discounted_subtotal_cents + freight_cents
+                    + pallet_break_fee_cents + small_order_surcharge_cents
+      The freight minimum in step 8 is applied BEFORE the reefer surcharge in
+      step 9, so the surcharge is never absorbed by the minimum. Applying the
+      minimum after the surcharge is WRONG.
+      The volume discount in steps 2-3 is derived from subtotal_cents only;
+      freight, pallet break and surcharge are never discounted.
+      On the FINAL variant: final_freight_adjustment_cents = new total_cents - the
+      total_cents stored by the PROVISIONAL pass (negative when the order promoted
+      itself into a cheaper tier).
+    constants:
+      DISCOUNT_TIER_1_CENTS: 1000000
+      DISCOUNT_TIER_2_CENTS: 5000000
+      DISCOUNT_TIER_1_PCT: 1.5
+      DISCOUNT_TIER_2_PCT: 3.0
+      TIER_2_MIN_LBS: 40000
+      TIER_3_MIN_LBS: 120000
+      FREIGHT_RATE_CENTS_PER_LB_TIER_1: 12
+      FREIGHT_RATE_CENTS_PER_LB_TIER_2: 8
+      FREIGHT_RATE_CENTS_PER_LB_TIER_3: 5
+      FREIGHT_MINIMUM_CENTS_TIER_1: 25000
+      FREIGHT_MINIMUM_CENTS_TIER_2: 15000
+      FREIGHT_MINIMUM_CENTS_TIER_3: 0
+      REEFER_SURCHARGE_CENTS: 18000
+      PALLET_BREAK_FEE_CENTS: 4500
+      MOQ_ORDER_LBS: 2000
+      SMALL_ORDER_SURCHARGE_CENTS: 7500
+    precision: "all money is integer cents; discount_pct is decimal(3,1); round_half_up at each rounding step named above"
+    output_field: "SalesOrder.total_cents (also writes volume_discount_cents, freight_cents, freight_tier_applied, pallet_break_fee_cents, small_order_surcharge_cents, fee_variant, final_freight_adjustment_cents)"
+
+  - name: freight_program_tier
+    entity: Brewer
+    algorithm_type: threshold
+    trigger: "on POST /sales-orders/{id}/deliver, on POST /brewers/{id}/volume-adjustments, and whenever order_fee_assessment needs a tier"
+    input_set: "SalesOrder rows with brewer_id == this brewer, fulfillment_status == DELIVERED, and delivered_at inside the half-open trailing window (current_logical_clock - TRAILING_WINDOW_DAYS days, current_logical_clock]"
+    formula: |
+      trailing_12mo_volume_lbs = legacy_trailing_lbs
+                                 + sum of chargeable_lbs over the input set
+      freight_program_tier = TIER_3 when trailing_12mo_volume_lbs >= TIER_3_MIN_LBS
+                             else TIER_2 when trailing_12mo_volume_lbs >= TIER_2_MIN_LBS
+                             else TIER_1
+      The window is half-open: an order delivered exactly TRAILING_WINDOW_DAYS
+      before the current logical clock has aged OUT and is excluded, while an
+      order delivered exactly at the current logical clock is included.
+      legacy_trailing_lbs is a seeded opening balance that is never aged out;
+      POST /brewers/{id}/volume-adjustments is the only way to change it.
+    constants:
+      TRAILING_WINDOW_DAYS: 365
+      TIER_2_MIN_LBS: 40000
+      TIER_3_MIN_LBS: 120000
+    precision: "poundage is decimal(12,2); tier comparison is a plain >= on the summed value with no rounding"
+    output_field: "Brewer.freight_program_tier (also writes trailing_12mo_volume_lbs)"
+
+  - name: contract_default_settlement
+    entity: HopContract
+    algorithm_type: threshold
+    trigger: "on POST /hop-contracts/{id}/declare-default"
+    input_set: "the contract's own remaining_lbs and price_per_lb_cents, plus the current HopVariety.spot_price_cents_per_lb of its variety"
+    variants:
+      - name: MARKET_SETTLED
+        description: |
+          Damages are the brewer's shortfall against the market: the defaulted
+          poundage times the amount by which the contract price exceeds today's
+          spot price, floored at zero. When spot has risen above the contract
+          price the distributor can resell at a profit and damages are 0.
+      - name: LIQUIDATED
+        description: |
+          Damages are a flat LIQUIDATED_DAMAGES_PCT of the full contract value of
+          the defaulted poundage, with no reference to spot. This is the variant
+          selected when the contract's crop-year program has not reported a
+          harvest, because no market reference price is considered established.
+    formula: |
+      defaulted_lbs = the contract's remaining_lbs at the moment of default.
+      settlement_variant = MARKET_SETTLED when the contract's CropYearProgram.status
+        IN {HARVEST_REPORTED, SETTLED}, else LIQUIDATED.
+      MARKET_SETTLED:
+        settlement_damages_cents = round_half_up(defaulted_lbs *
+            max(0, price_per_lb_cents - variety.spot_price_cents_per_lb))
+      LIQUIDATED:
+        settlement_damages_cents = round_half_up(defaulted_lbs *
+            price_per_lb_cents * LIQUIDATED_DAMAGES_PCT / 100)
+      Then, for BOTH variants:
+        admin_fee_pct = ADMIN_FEE_LOW_PCT when settlement_damages_cents >= ADMIN_FEE_TIER_CENTS
+                        else ADMIN_FEE_HIGH_PCT
+        settlement_admin_fee_cents = round_half_up(settlement_damages_cents * admin_fee_pct / 100)
+        settlement_total_cents = settlement_damages_cents + settlement_admin_fee_cents
+      TIER SELECTION ORDER IS NORMATIVE: the admin-fee tier is chosen from the
+      PRE-FEE damages figure. Choosing the tier from the fee-inclusive total is
+      WRONG and flips the rate whenever damages sit just below
+      ADMIN_FEE_TIER_CENTS while damages-plus-fee sit at or above it.
+      Note the inverted tier direction: LARGER settlements attract the LOWER
+      administration percentage.
+    constants:
+      LIQUIDATED_DAMAGES_PCT: 35
+      ADMIN_FEE_TIER_CENTS: 1000000
+      ADMIN_FEE_LOW_PCT: 1.0
+      ADMIN_FEE_HIGH_PCT: 2.0
+    precision: "all money is integer cents; admin_fee_pct is decimal(2,1); round_half_up"
+    output_field: "HopContract.settlement_total_cents (also writes settlement_variant, settlement_damages_cents, settlement_admin_fee_cents, defaulted_lbs)"
+
+  - name: shortfall_prorata_reallocation
+    entity: CropYearProgram
+    algorithm_type: waterfall_allocation
+    trigger: "on POST /crop-year-programs/{id}/report-harvest"
+    input_set: "HopContract rows with crop_year_program_id == this program and status IN {ACTIVE, SHORTFALL_ADJUSTED, CARRY_FORWARD_PENDING}"
+    formula: |
+      total_contracted_lbs = sum of contracted_lbs over the input set
+      allocatable_pool_lbs = floor(total_contracted_lbs * harvest_yield_pct / 100)
+      FLOOR, not round: a partial pound is never allocated.
+      The pool is then drained as a strict waterfall, NOT pro rata. Order the
+      input set by:
+        1. contract_type rank ASC, where FIXED_CROP_YEAR = 1 and SPOT_HOLD = 2
+        2. created_at ASC
+      and for each contract in that order:
+        allocated_lbs = min(remaining pool, contracted_lbs)
+        remaining pool = remaining pool - allocated_lbs
+        shortfall_lbs = contracted_lbs - allocated_lbs
+      unallocated_pool_lbs = whatever is left after the last contract (0 unless
+      harvest_yield_pct exceeds 100).
+      EVERY FIXED_CROP_YEAR contract is filled to its full contracted_lbs before
+      ANY SPOT_HOLD contract receives a single pound. A shortfall therefore lands
+      entirely on the spot holders until they are exhausted, and only then bites
+      into fixed commitments. Distributing the shortfall proportionally across
+      all contracts is WRONG.
+      remaining_lbs is then recomputed by contract_allocation_ledger.
+    constants:
+      FIXED_CROP_YEAR_RANK: 1
+      SPOT_HOLD_RANK: 2
+    precision: "poundage is decimal(12,2); the pool uses floor to whole pounds; per-contract allocation is exact with no rounding"
+    output_field: "CropYearProgram.allocatable_pool_lbs (also writes total_contracted_lbs, unallocated_pool_lbs, and HopContract.allocated_lbs / HopContract.shortfall_lbs)"
+
+  - name: contract_allocation_ledger
+    entity: HopContract
+    algorithm_type: aggregation
+    trigger: "on POST /hop-contracts, on POST /sales-orders/{id}/confirm, on POST /sales-orders/{id}/cancel, on cascade A line trims, and on the carry-forward, default and resale transitions"
+    input_set: "the contract's own allocated_lbs, committed_lbs, carried_forward_out_lbs, defaulted_lbs and resold_lbs"
+    formula: |
+      At creation: allocated_lbs = contracted_lbs (a program that has not reported
+      a harvest is assumed to deliver in full).
+      remaining_lbs = allocated_lbs - committed_lbs - carried_forward_out_lbs
+                      - defaulted_lbs - resold_lbs
+      CONSERVATION INVARIANT (must hold after every write to this contract):
+        allocated_lbs == remaining_lbs + committed_lbs + carried_forward_out_lbs
+                         + defaulted_lbs + resold_lbs
+      Confirming an order moves poundage from remaining_lbs into committed_lbs;
+      cancelling the order moves exactly the same poundage back. allocated_lbs is
+      never touched by order activity, so the sum of the five buckets is invariant
+      across a confirm/cancel round trip. A resale moves poundage from
+      defaulted_lbs into resold_lbs, again leaving the sum unchanged.
+      substitution_covered_lbs is a reporting field that tracks how much of
+      shortfall_lbs an accepted SubstitutionOffer has replaced with a different
+      variety. It sits OUTSIDE the conservation identity because the substitute
+      poundage lives on a different contract.
+    constants: {}
+    precision: "poundage is decimal(12,2); no rounding — all five buckets are exact"
+    output_field: "HopContract.remaining_lbs"
+
+  - name: carry_forward_eligibility
+    entity: HopContract
+    algorithm_type: threshold
+    trigger: "on POST /hop-contracts/{id}/carry-forward-requests"
+    input_set: "the contract's own contracted_lbs and remaining_lbs, plus the requested poundage"
+    formula: |
+      cap_lbs = floor(contracted_lbs * CARRY_FORWARD_CAP_PCT / 100)
+      eligible_lbs = min(cap_lbs, remaining_lbs)
+      The request is rejected with ERR_CARRY_FORWARD_EXCEEDS_CAP when
+      requested_lbs > eligible_lbs. Requesting exactly eligible_lbs is accepted.
+      carry_forward_requested_lbs = requested_lbs
+      carry_forward_fee_cents = round_half_up(requested_lbs * price_per_lb_cents
+                                              * CARRY_FORWARD_FEE_PCT / 100)
+      The cap is a percentage of the ORIGINAL contracted_lbs, not of the
+      currently-remaining poundage, so a brewer who has already drawn most of a
+      contract can still roll the full capped amount as long as that much
+      remains. Basing the cap on remaining_lbs is WRONG.
+    constants:
+      CARRY_FORWARD_CAP_PCT: 25
+      CARRY_FORWARD_FEE_PCT: 8
+    precision: "cap_lbs uses floor to whole pounds; the fee is integer cents with round_half_up"
+    output_field: "HopContract.carry_forward_fee_cents (also writes carry_forward_requested_lbs)"
+
+  - name: substitution_ranking
+    entity: SubstitutionOffer
+    algorithm_type: weighted_scoring
+    trigger: "on POST /hop-contracts/{id}/substitution-offers when selection_mode == AUTO_RANKED"
+    input_set: "HopVariety rows with substitution_group == the shorted variety's substitution_group, id != the shorted variety's id, and available_spot_lbs >= the offered poundage"
+    formula: |
+      For each candidate variety:
+        alpha_acid_delta_pct = absolute value of
+          (candidate.alpha_acid_target_pct - shorted_variety.alpha_acid_target_pct)
+      Order the candidate set by:
+        1. alpha_acid_delta_pct ASC   (closest brewing character wins)
+        2. spot_price_cents_per_lb ASC (cheaper wins a character tie)
+        3. created_at ASC             (final deterministic tie-break)
+      and select the first candidate. Its spot_price_cents_per_lb becomes the
+      offer's offered_price_cents_per_lb.
+      When the candidate set is empty the request is rejected with
+      ERR_NO_SUBSTITUTE_AVAILABLE; no offer row is created.
+      id is NEVER consulted as a tie-break: created_at ASC is the only sanctioned
+      final ordering.
+      When selection_mode == EXPLICIT the caller supplies substitute_variety_id
+      and offered_price_cents_per_lb directly and no ranking runs, but the
+      candidate-set membership test (same substitution_group, sufficient
+      available_spot_lbs) still applies.
+    constants: {}
+    precision: "alpha_acid_delta_pct is decimal(5,2); comparisons are exact with no rounding"
+    output_field: "SubstitutionOffer.substitute_variety_id (also writes offered_price_cents_per_lb and alpha_acid_delta_pct)"
+
+  - name: malt_lot_availability
+    entity: MaltLot
+    algorithm_type: aggregation
+    trigger: "on POST /malt-lots, on POST /sales-orders/{id}/confirm, on POST /sales-orders/{id}/cancel, and on DELETE /sales-orders/{id}/lines/{line_id}"
+    input_set: "OrderLine rows with malt_lot_id == this lot, item_type == MALT, status IN {OPEN, TRIMMED}, whose SalesOrder.fulfillment_status IN {CONFIRMED, PICKED, SHIPPED, DELIVERED}"
+    formula: |
+      committed_lbs = sum of quantity over the input set
+      available_lbs = quantity_lbs - committed_lbs
+      Lines on a DRAFT order are deliberately EXCLUDED: malt is not reserved until
+      the order is confirmed, so two brewers can hold draft lines against the same
+      lot and the second one to confirm is the one that fails with
+      ERR_MALT_LOT_INSUFFICIENT_QUANTITY.
+      Lines in status CANCELLED_SHORTFALL, REMOVED or QUARANTINED are excluded, so
+      cancelling or trimming a line returns its poundage to available_lbs.
+    constants: {}
+    precision: "poundage is decimal(12,2); no rounding"
+    output_field: "MaltLot.available_lbs (also writes committed_lbs)"
+
+  - name: malt_spec_match_score
+    entity: MaltLot
+    algorithm_type: weighted_scoring
+    trigger: "on GET /malt-lots/{id}/spec-match"
+    input_set: "the lot's own analysis values and the referenced BrewerRecipe's target values, plus the lot's MaltProduct configuration"
+    formula: |
+      HARD FAILS ARE EVALUATED FIRST, in exactly this order. When either fires the
+      score is not computed at all and match_grade is REJECTED:
+        1. lot.moisture_pct > product.max_moisture_pct
+        2. lot.diastatic_power < the applicable floor, where the floor is
+           product.min_diastatic_power normally, but is raised to
+           product.min_diastatic_power + ADJUNCT_DP_BONUS when
+           recipe.adjunct_pct > 0 (adjunct brewing needs surplus enzyme).
+      Otherwise, for each of the three graded attributes:
+        deviation = min(1, absolute_value(lot_value - recipe_target) / TOLERANCE_attr)
+      where the pairs are
+        color   : lot.color_lovibond   vs recipe.target_color_lovibond,   TOLERANCE_COLOR
+        extract : lot.extract_pct      vs recipe.target_extract_pct,      TOLERANCE_EXTRACT
+        protein : lot.protein_pct      vs recipe.target_protein_pct,      TOLERANCE_PROTEIN
+      Then:
+        match_score = round_half_up(100 * (1 - (deviation_color   * WEIGHT_COLOR
+                                              + deviation_extract * WEIGHT_EXTRACT
+                                              + deviation_protein * WEIGHT_PROTEIN)), 2)
+      Each deviation is capped at 1 INDIVIDUALLY, before weighting. A wildly
+      off-spec colour therefore costs at most WEIGHT_COLOR of the score and cannot
+      drag the total negative. Capping the weighted sum instead of the individual
+      deviations is WRONG.
+      match_grade = EXACT               when match_score >= GRADE_EXACT_MIN
+                    ACCEPTABLE          when match_score >= GRADE_ACCEPTABLE_MIN
+                    SUBSTITUTE_REQUIRED when match_score >= GRADE_SUBSTITUTE_MIN
+                    REJECTED            otherwise
+      The three weights sum to exactly 1.00, so a perfect lot scores 100.00.
+    constants:
+      WEIGHT_COLOR: 0.40
+      WEIGHT_EXTRACT: 0.35
+      WEIGHT_PROTEIN: 0.25
+      TOLERANCE_COLOR: 1.5
+      TOLERANCE_EXTRACT: 1.0
+      TOLERANCE_PROTEIN: 0.8
+      ADJUNCT_DP_BONUS: 10.0
+      GRADE_EXACT_MIN: 95.00
+      GRADE_ACCEPTABLE_MIN: 80.00
+      GRADE_SUBSTITUTE_MIN: 60.00
+    precision: "each deviation is carried at decimal(8,4); match_score is decimal(5,2) with round_half_up applied once at the end"
+    output_field: "inline response field match_score on GET /malt-lots/{id}/spec-match (also returns match_grade, per-attribute deviations and hard_fail_reason)"
+
+  - name: yeast_pitch_advisory
+    entity: YeastPropagationJob
+    algorithm_type: decay_function
+    trigger: "on POST /yeast-propagation-jobs and on the cascade C creation of a replacement job"
+    input_set: "the referenced BrewerRecipe's batch_volume_bbl, original_gravity_plato and requested_pitch_rate_million_cells_per_ml_per_plato, plus the YeastStrain's configuration"
+    formula: |
+      1. recommended_pitch_rate_million_cells_per_ml_per_plato =
+           ALE_TARGET_RATE  when strain.fermentation_type == ALE
+           LAGER_TARGET_RATE when strain.fermentation_type == LAGER
+         Lagers are pitched at double the ale rate.
+      2. propagation_volume_l is built from the batch:
+           batch_litres = recipe.batch_volume_bbl * LITRES_PER_BBL
+           required_cells_billion = round_half_up(
+             recommended_pitch_rate * recipe.original_gravity_plato * batch_litres, 2)
+      3. Viability decays from the shipping figure over the days the slurry waits:
+           wait_days = whole days from the current logical clock to pitch_date, floored at 0
+           viability_fraction = max(VIABILITY_FLOOR,
+             strain.viability_pct_at_ship / 100 - VIABILITY_DECAY_PER_DAY * wait_days)
+         The floor is a hard clamp: a slurry sitting long enough to decay past
+         VIABILITY_FLOOR is still costed at VIABILITY_FLOOR, never lower.
+      4. recommended_slurry_l = round_half_up(
+           required_cells_billion / (strain.cells_per_ml_slurry_billion * viability_fraction) / 1000, 3)
+      5. propagation_volume_l = min(strain.vessel_max_l,
+                                   max(strain.min_batch_l,
+                                       round_half_up(recommended_slurry_l * SAFETY_FACTOR, 3)))
+         NESTING ORDER IS NORMATIVE: the min_batch_l floor is applied FIRST and the
+         vessel_max_l ceiling SECOND, so when min_batch_l exceeds vessel_max_l the
+         ceiling wins. Swapping the two produces a different answer for a tiny
+         batch on a small vessel.
+      6. pitch_rate_advice compares what the brewer ASKED FOR against the
+         recommendation, using a symmetric tolerance band:
+           UNDERPITCH when requested_rate < recommended_rate * (1 - ADVICE_BAND_PCT/100)
+           OVERPITCH  when requested_rate > recommended_rate * (1 + ADVICE_BAND_PCT/100)
+           OPTIMAL    otherwise (both band edges are inclusive of OPTIMAL)
+         The advice never changes the computed volumes; it is guidance only.
+      7. ready_at is written by the PROPAGATING transition, not here.
+    constants:
+      LITRES_PER_BBL: 117.348
+      ALE_TARGET_RATE: 0.75
+      LAGER_TARGET_RATE: 1.50
+      VIABILITY_DECAY_PER_DAY: 0.02
+      VIABILITY_FLOOR: 0.50
+      SAFETY_FACTOR: 1.15
+      ADVICE_BAND_PCT: 10
+    precision: "required_cells_billion is decimal(14,2); recommended_slurry_l and propagation_volume_l are decimal(10,3); viability_fraction is carried at decimal(6,4); round_half_up"
+    output_field: "YeastPropagationJob.propagation_volume_l (also writes recommended_pitch_rate_million_cells_per_ml_per_plato, required_cells_billion, recommended_slurry_l, pitch_rate_advice)"
+
+  - name: brewer_ar_ledger
+    entity: Brewer
+    algorithm_type: projection
+    trigger: "on POST /sales-orders/{id}/ship, POST /sales-orders/{id}/deliver, POST /sales-orders/{id}/cancel, POST /brewers/{id}/payments, POST /hop-contracts/{id}/declare-default, POST /hop-contracts/{id}/resale, and the carry-forward approval"
+    input_set: "the ordered sequence of money events posted against this brewer, replayed in event created_at ASC order"
+    formula: |
+      ar_balance_cents starts at 0 and is moved by exactly these events:
+        + SalesOrder.total_cents               on POST /sales-orders/{id}/ship (invoicing)
+        + final_freight_adjustment_cents       on POST /sales-orders/{id}/deliver (may be negative)
+        - (total_cents + final_freight_adjustment_cents already booked)
+                                               on POST /sales-orders/{id}/cancel of an
+                                               order whose invoiced_at is not null (credit memo)
+        + HopContract.settlement_total_cents   on POST /hop-contracts/{id}/declare-default
+        - HopContract.resale_credit_cents      on POST /hop-contracts/{id}/resale
+        + HopContract.carry_forward_fee_cents  on carry-forward approval
+        - amount_cents                         on POST /brewers/{id}/payments
+      CONSERVATION INVARIANT: cancelling an invoiced order posts a credit memo for
+      exactly the amount that was booked, including any delivery-time freight
+      adjustment, so a ship -> deliver -> cancel sequence returns
+      ar_balance_cents to its pre-invoice value with no residue.
+      A payment is rejected with ERR_PAYMENT_EXCEEDS_BALANCE when
+      amount_cents > ar_balance_cents, so the balance can never go negative
+      through payments. It CAN transiently go negative through a credit memo on
+      an order that was already paid; that is accepted and reported as is.
+      Replay order matters: the events are applied in created_at ASC order of the
+      triggering operation, never re-sorted by amount or by entity.
+    constants: {}
+    precision: "integer cents throughout; no rounding — every event amount is already an integer"
+    output_field: "Brewer.ar_balance_cents"
+
+  - name: brewer_credit_posture
+    entity: Brewer
+    algorithm_type: threshold
+    trigger: "on every write that changes ar_balance_cents or any order total, on PUT /brewers/{id}/credit-profile, and on cascade A link 5 / cascade B link 2"
+    input_set: "SalesOrder rows with brewer_id == this brewer and fulfillment_status IN {DRAFT, CONFIRMED, PICKED} (open exposure), plus the brewer's own ar_balance_cents"
+    formula: |
+      open_order_exposure_cents = sum of total_cents over the input set
+      credit_exposure_cents     = ar_balance_cents + open_order_exposure_cents
+      credit_utilization_pct    = round_half_up(
+        credit_exposure_cents / credit_limit_cents * 100, 2)
+      credit_status = HOLD           when credit_exposure_cents > credit_limit_cents
+                      WATCH          when credit_utilization_pct >= WATCH_THRESHOLD_PCT
+                      GOOD_STANDING  otherwise
+      A SHIPPED order is deliberately EXCLUDED from open_order_exposure_cents
+      because its total_cents has already moved into ar_balance_cents at invoicing.
+      Counting it in both places would double-count the exposure. DELIVERED and
+      CANCELLED orders are likewise excluded.
+      DRAFT orders are inside the input set but each carries total_cents 0 until
+      its first fee assessment at confirm, so they add nothing to the sum. That is
+      deliberate: it lets validations priority 45 add the order's freshly computed
+      total_cents to credit_exposure_cents without counting the same order twice,
+      and it keeps ERR_CREDIT_LIMIT_EXCEEDED reachable instead of being pre-empted
+      by the priority 44 HOLD test.
+      Exposure exactly EQUAL to credit_limit_cents is NOT a hold: the comparison
+      is strictly greater-than, so a brewer at exactly 100.00% utilization lands
+      in WATCH, not HOLD.
+      credit_terms_days does not enter this calculation; it is settlement metadata
+      carried on the brewer.
+    constants:
+      WATCH_THRESHOLD_PCT: 85.00
+    precision: "money is integer cents; credit_utilization_pct is decimal(6,2) with round_half_up; the HOLD test compares raw cents, NOT the rounded percentage"
+    output_field: "Brewer.credit_status (also writes open_order_exposure_cents, credit_exposure_cents, credit_utilization_pct)"
+
+  - name: cold_chain_excursion_assessment
+    entity: ColdChainShipment
+    algorithm_type: chronological
+    trigger: "on POST /cold-chain-shipments/{id}/readings"
+    input_set: "TemperatureReading rows with cold_chain_shipment_id == this shipment, ordered by recorded_at ASC"
+    formula: |
+      Readings must arrive in non-decreasing recorded_at order; a reading whose
+      recorded_at is strictly earlier than the shipment's last_reading_at is
+      rejected with ERR_READING_OUT_OF_ORDER, so the series is append-only.
+      For each reading, in recorded_at ASC order:
+        in_violation = temp_c > (shipment.reefer_setpoint_c + shipment.reefer_tolerance_c)
+                       OR temp_c < (shipment.reefer_setpoint_c - shipment.reefer_tolerance_c)
+        interval_minutes = whole minutes between the PREVIOUS reading's recorded_at
+                           and this reading's recorded_at; 0 for the first reading
+                           of the shipment.
+        cumulative_excursion_minutes = the previous reading's
+                           cumulative_excursion_minutes, PLUS interval_minutes when
+                           and only when THIS reading is in_violation.
+      ATTRIBUTION IS NORMATIVE: the interval is charged to the reading that CLOSES
+      it, so the elapsed time before the first out-of-tolerance sample is not
+      penalised, but the whole gap leading up to a violating sample is. Charging
+      the interval to the reading that OPENS it is WRONG and shifts every
+      accumulation by one sample.
+      shipment.excursion_minutes = the latest reading's cumulative_excursion_minutes.
+      shipment.reading_count and shipment.last_reading_at track the series.
+      The shipment is flagged (IN_TRANSIT -> EXCURSION_FLAGGED, cascade C) when
+      excursion_minutes > MAX_EXCURSION_MINUTES. Exactly MAX_EXCURSION_MINUTES does
+      NOT flag: the comparison is strictly greater-than.
+      Once flagged, the shipment stops accumulating; further readings are rejected
+      with ERR_INVALID_SHIPMENT_STATE.
+    constants:
+      MAX_EXCURSION_MINUTES: 30
+    precision: "temperatures are decimal(5,2); interval_minutes and cumulative_excursion_minutes are whole integer minutes truncated toward zero"
+    output_field: "ColdChainShipment.excursion_minutes (also writes reading_count, last_reading_at, and TemperatureReading.interval_minutes / in_violation / cumulative_excursion_minutes)"
+
+  - name: zone_occupancy_projection
+    entity: ColdStorageZone
+    algorithm_type: interval_merge
+    trigger: "on POST /cold-chain-shipments, on POST /cold-chain-shipments/{id}/release-hold, and on GET /cold-storage-zones/{id}"
+    input_set: "ColdChainShipment rows with cold_storage_zone_id == this zone and status == STAGED"
+    formula: |
+      Each STAGED shipment occupies pallet_count pallets over the HALF-OPEN
+      interval [stage_from, stage_until). A shipment that vacates at exactly the
+      instant another arrives does NOT overlap it, so back-to-back staging with a
+      zero gap is always permitted regardless of capacity.
+      ADMISSION TEST on create and on release-hold — the candidate interval is
+      merged into the existing set and the aggregate is swept:
+        collect the boundary instants of the candidate plus every STAGED shipment
+        in the zone; for each resulting sub-interval, sum pallet_count over every
+        shipment whose half-open interval covers it; reject with
+        ERR_ZONE_CAPACITY_EXCEEDED when any sub-interval's sum exceeds
+        capacity_pallets.
+      A sum exactly EQUAL to capacity_pallets is accepted; only a strict excess is
+      rejected. It is NOT enough to test the candidate against each existing
+      shipment pairwise: three shipments can each be individually admissible while
+      their common overlap breaches capacity, so the check must be an aggregate
+      sweep over merged boundaries.
+      REPORTED FIELD, distinct from the admission test:
+        occupied_pallets = sum of pallet_count over STAGED shipments in this zone
+        whose interval covers the CURRENT logical clock, i.e.
+        stage_from <= current_logical_clock < stage_until.
+      A shipment staged entirely in the future therefore passes the admission test
+      but contributes 0 to occupied_pallets until its window opens. A shipment
+      moving STAGED -> HELD, STAGED -> IN_TRANSIT or STAGED -> SUPERSEDED leaves
+      the input set and releases its pallets immediately.
+    constants: {}
+    precision: "pallet counts are integers; interval endpoints are UTC timestamps compared to whole-second resolution"
+    output_field: "ColdStorageZone.occupied_pallets"
+
+# =============================================================================
+# 1.4 Validation Rules Table (Ordered by Priority)
+#
+# Priority is a total order. When a single request violates several rules, the
+# response carries the error of the LOWEST priority number. The groups are:
+#   1-3    authentication and authorization
+#   4      request shape
+#   5-7    existence and ownership scope
+#   8-11   referential coherence between the named resources
+#   12-18  state preconditions on the target resource
+#   19     optimistic concurrency (checked AFTER state preconditions, so an
+#          operation attempted from the wrong state reports the state error even
+#          when the supplied version is also stale)
+#   20-24  safety and cold-chain compliance
+#   25-30  temporal conflicts
+#   31-43  capacity, uniqueness and volume constraints
+#   44-47  credit and money (fiscal checks last)
+# =============================================================================
+validations:
+
+  - priority: 1
+    category: auth
+    check: "X-User-ID and X-User-Role headers are both present and non-empty"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all endpoints"
+
+  - priority: 2
+    category: auth
+    check: "X-User-Role is one of Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin"
+    error_id: ERR_INVALID_ROLE
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 3
+    category: auth
+    check: "the supplied role appears in the endpoint's allowed_roles"
+    error_id: ERR_ROLE_NOT_PERMITTED
+    http_status: 403
+    applies_to: "all endpoints"
+
+  - priority: 4
+    category: request_shape
+    check: "every required body field is present; every field has the declared type; every enum field carries a declared member; quantities, poundages, pallet counts and money amounts are non-negative; decimal fields do not exceed their declared scale; expected_*_version fields are integers"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST, PUT and DELETE endpoints"
+
+  - priority: 5
+    category: existence
+    check: "every id embedded in the request path resolves to an existing row, validated left to right so an outer id is reported before an inner one"
+    error_id: "ERR_BREWER_NOT_FOUND, ERR_CROP_YEAR_PROGRAM_NOT_FOUND, ERR_HOP_VARIETY_NOT_FOUND, ERR_HOP_CONTRACT_NOT_FOUND, ERR_SUBSTITUTION_OFFER_NOT_FOUND, ERR_MALT_PRODUCT_NOT_FOUND, ERR_MALT_LOT_NOT_FOUND, ERR_BREWER_RECIPE_NOT_FOUND, ERR_YEAST_STRAIN_NOT_FOUND, ERR_YEAST_JOB_NOT_FOUND, ERR_SALES_ORDER_NOT_FOUND, ERR_ORDER_LINE_NOT_FOUND, ERR_COLD_STORAGE_ZONE_NOT_FOUND or ERR_COLD_CHAIN_SHIPMENT_NOT_FOUND, per the segment that failed"
+    http_status: 404
+    applies_to: "all endpoints carrying a path id"
+
+  - priority: 6
+    category: existence
+    check: "an actor holding the Brewer role may only address resources belonging to the brewer whose id equals X-User-ID; addressing another brewer's contract, order, recipe, propagation job, offer or payment is refused"
+    error_id: ERR_BREWER_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "all endpoints reachable by the Brewer role"
+
+  - priority: 7
+    category: existence
+    check: "every id supplied in the request BODY or query string resolves to an existing row (brewer_id, variety_id, crop_year_program_id, carried_forward_from_contract_id, carry_forward_target_program_id, hop_contract_id, substitute_variety_id, malt_product_id, malt_lot_id, yeast_strain_id, recipe_id, yeast_propagation_job_id, sales_order_id, cold_storage_zone_id, buyer_brewer_id)"
+    error_id: "the matching ERR_*_NOT_FOUND code from priority 5"
+    http_status: 404
+    applies_to: "all POST and PUT endpoints carrying a foreign key, and every filtered list endpoint"
+
+  - priority: 8
+    category: business_referential
+    check: "an OrderLine's referenced HopContract belongs to the same brewer as the owning SalesOrder"
+    error_id: ERR_CONTRACT_BREWER_MISMATCH
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/lines"
+
+  - priority: 9
+    category: business_referential
+    check: "exactly the FK matching item_type is populated and the uom agrees: HOP requires hop_variety_id plus, when allocation_source == CONTRACT, hop_contract_id, and uom LB; MALT requires malt_lot_id and uom LB; YEAST requires yeast_propagation_job_id and uom L. A HOP line naming a malt_lot_id, or a YEAST line in uom LB, is refused."
+    error_id: ERR_ITEM_REFERENCE_MISMATCH
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/lines"
+
+  - priority: 10
+    category: business_referential
+    check: "a YeastPropagationJob's yeast_strain_id equals its recipe's yeast_strain_id, and the recipe's brewer_id equals the job's brewer_id"
+    error_id: ERR_STRAIN_RECIPE_MISMATCH
+    http_status: 422
+    applies_to: "POST /yeast-propagation-jobs"
+
+  - priority: 11
+    category: business_referential
+    check: "a HopContract may only be created against a CropYearProgram whose status == OPEN; a SubstitutionOffer's substitute variety shares the shorted variety's substitution_group; a ColdChainShipment's zone accepts the order's item mix"
+    error_id: ERR_PROGRAM_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /hop-contracts, POST /hop-contracts/{id}/substitution-offers"
+
+  - priority: 12
+    category: state
+    check: "the target HopContract is in a status from which the requested transition is declared (carry-forward request from ACTIVE or SHORTFALL_ADJUSTED; carry-forward decision from CARRY_FORWARD_PENDING; declare-default from ACTIVE or SHORTFALL_ADJUSTED; resale from DEFAULTED; substitution offer from SHORTFALL_ADJUSTED)"
+    error_id: ERR_INVALID_CONTRACT_STATE
+    http_status: 409
+    applies_to: "POST /hop-contracts/{id}/carry-forward-requests, POST /hop-contracts/{id}/carry-forward-decision, POST /hop-contracts/{id}/declare-default, POST /hop-contracts/{id}/resale, POST /hop-contracts/{id}/substitution-offers"
+
+  - priority: 13
+    category: state
+    check: "the target CropYearProgram is in a status from which the requested transition is declared (report-harvest from OPEN; settle from HARVEST_REPORTED), and for settle no HopContract belonging to the program is left in status CARRY_FORWARD_PENDING — an undecided carry-forward request blocks settlement of the crop year"
+    error_id: ERR_INVALID_PROGRAM_STATE
+    http_status: 409
+    applies_to: "POST /crop-year-programs/{id}/report-harvest, POST /crop-year-programs/{id}/settle"
+
+  - priority: 14
+    category: state
+    check: "the target MaltLot is in a status from which the requested transition is declared (analysis from RECEIVED; release from PASSED; retest and reject from QUARANTINED)"
+    error_id: ERR_INVALID_LOT_STATE
+    http_status: 409
+    applies_to: "POST /malt-lots/{id}/analysis, POST /malt-lots/{id}/release, POST /malt-lots/{id}/retest, POST /malt-lots/{id}/reject"
+
+  - priority: 15
+    category: state
+    check: "the target YeastPropagationJob is in a status from which the requested transition is declared (start from REQUESTED; complete from PROPAGATING; requeue from FAILED)"
+    error_id: ERR_INVALID_JOB_STATE
+    http_status: 409
+    applies_to: "POST /yeast-propagation-jobs/{id}/start, POST /yeast-propagation-jobs/{id}/complete, POST /yeast-propagation-jobs/{id}/requeue"
+
+  - priority: 16
+    category: state
+    check: "the target SalesOrder's fulfillment_status admits the requested transition (line add and line delete require DRAFT; confirm requires DRAFT; pick requires CONFIRMED; ship requires PICKED; deliver requires SHIPPED; cancel requires DRAFT, CONFIRMED, PICKED or SHIPPED; credit-decision requires a fulfillment_status other than CANCELLED and DELIVERED)"
+    error_id: ERR_INVALID_ORDER_STATE
+    http_status: 409
+    applies_to: "POST /sales-orders/{id}/lines, DELETE /sales-orders/{id}/lines/{line_id}, POST /sales-orders/{id}/confirm, POST /sales-orders/{id}/pick, POST /sales-orders/{id}/ship, POST /sales-orders/{id}/deliver, POST /sales-orders/{id}/cancel, POST /sales-orders/{id}/credit-decision"
+
+  - priority: 17
+    category: state
+    check: "the target ColdChainShipment is in a status from which the requested transition is declared (depart from STAGED; readings from IN_TRANSIT; release-hold from HELD)"
+    error_id: ERR_INVALID_SHIPMENT_STATE
+    http_status: 409
+    applies_to: "POST /cold-chain-shipments/{id}/depart, POST /cold-chain-shipments/{id}/readings, POST /cold-chain-shipments/{id}/release-hold"
+
+  - priority: 18
+    category: state
+    check: "the target SubstitutionOffer has status == OPEN; an offer already ACCEPTED, DECLINED or SUPERSEDED cannot be responded to again"
+    error_id: ERR_INVALID_OFFER_STATE
+    http_status: 409
+    applies_to: "POST /substitution-offers/{id}/respond"
+
+  - priority: 19
+    category: concurrency
+    check: "the supplied expected_<parent>_version equals the parent's current version, per the matching concurrency_rules entry"
+    error_id: "ERR_STALE_HOP_CONTRACT_VERSION, ERR_STALE_SALES_ORDER_VERSION or ERR_STALE_BREWER_VERSION"
+    http_status: 412
+    applies_to: "POST /hop-contracts/{id}/substitution-offers, POST /cold-chain-shipments, PUT /brewers/{id}/credit-profile"
+
+  - priority: 20
+    category: business_safety
+    check: "the acting X-User-ID differs from the user who performed the paired earlier step: a MaltLot may not be released by its analyzed_by_user_id, and a defaulted HopContract may not be resold by its defaulted_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /malt-lots/{id}/release, POST /hop-contracts/{id}/resale"
+
+  - priority: 21
+    category: business_safety
+    check: "when the SalesOrder's requires_cold_chain is true, the owning Brewer's cold_chain_certified is true; and a ColdChainShipment may only be created for an order whose requires_cold_chain is true"
+    error_id: ERR_COLD_CHAIN_NOT_CERTIFIED
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm, POST /cold-chain-shipments"
+
+  - priority: 22
+    category: business_safety
+    check: "every MALT line on the order references a MaltLot whose status == RELEASED"
+    error_id: ERR_MALT_LOT_NOT_RELEASED
+    http_status: 409
+    applies_to: "POST /sales-orders/{id}/pick"
+
+  - priority: 23
+    category: business_safety
+    check: "every YEAST line on the order references a YeastPropagationJob whose status == READY"
+    error_id: ERR_YEAST_NOT_READY
+    http_status: 409
+    applies_to: "POST /sales-orders/{id}/pick"
+
+  - priority: 24
+    category: business_safety
+    check: "the order's ColdChainShipment, when present, is not in status EXCURSION_FLAGGED; a flagged load cannot be shipped or delivered"
+    error_id: ERR_COLD_CHAIN_EXCURSION
+    http_status: 409
+    applies_to: "POST /sales-orders/{id}/ship, POST /sales-orders/{id}/deliver"
+
+  - priority: 25
+    category: business_temporal
+    check: "the reading's recorded_at is greater than or equal to the shipment's last_reading_at; equal timestamps are accepted and contribute interval_minutes 0"
+    error_id: ERR_READING_OUT_OF_ORDER
+    http_status: 422
+    applies_to: "POST /cold-chain-shipments/{id}/readings"
+
+  - priority: 26
+    category: business_temporal
+    check: "stage_until is strictly after stage_from; a zero-length or inverted staging window is refused"
+    error_id: ERR_INVALID_STAGING_WINDOW
+    http_status: 422
+    applies_to: "POST /cold-chain-shipments"
+
+  - priority: 27
+    category: business_temporal
+    check: "for every CONTRACT-sourced hop line, the order's requested_ship_date falls inside the closed inclusive interval [contract.delivery_window_start, contract.delivery_window_end]"
+    error_id: ERR_SHIP_DATE_OUTSIDE_DELIVERY_WINDOW
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm"
+
+  - priority: 28
+    category: business_temporal
+    check: "pitch_date is at least strain.propagation_lead_time_days whole days after the current logical clock; exactly the lead time is accepted"
+    error_id: ERR_INSUFFICIENT_PROPAGATION_LEAD_TIME
+    http_status: 422
+    applies_to: "POST /yeast-propagation-jobs, POST /yeast-propagation-jobs/{id}/requeue"
+
+  - priority: 29
+    category: business_temporal
+    check: "no other YeastPropagationJob on the same yeast_strain_id with status IN {REQUESTED, PROPAGATING, READY} has a pitch_date strictly closer than strain.propagation_lead_time_days whole days to the requested pitch_date; a gap exactly equal to the lead time is permitted because the propagation vessel has been turned over"
+    error_id: ERR_PROPAGATION_SLOT_CONFLICT
+    http_status: 409
+    applies_to: "POST /yeast-propagation-jobs, POST /yeast-propagation-jobs/{id}/requeue"
+
+  - priority: 30
+    category: business_temporal
+    check: "the new HopContract's [delivery_window_start, delivery_window_end] closed inclusive interval does not intersect that of any existing contract for the same (brewer_id, variety_id) pair whose status IS NOT IN {CARRIED_FORWARD, RESOLD}; sharing a single endpoint date IS an intersection and is refused"
+    error_id: ERR_CONTRACT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /hop-contracts"
+
+  - priority: 31
+    category: business_constraint
+    check: "merging the candidate staging interval into the zone's STAGED set leaves every swept sub-interval at or below capacity_pallets; equality is accepted"
+    error_id: ERR_ZONE_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /cold-chain-shipments, POST /cold-chain-shipments/{id}/release-hold"
+
+  - priority: 32
+    category: business_constraint
+    check: "unique keys are free: CropYearProgram.crop_year, MaltLot.lot_code, Brewer.brewery_license_no, ColdStorageZone.zone_code, HopVariety.variety_code, MaltProduct.sku, YeastStrain.strain_code"
+    error_id: "ERR_DUPLICATE_CROP_YEAR, ERR_DUPLICATE_LOT_CODE, ERR_DUPLICATE_BREWERY_LICENSE or ERR_DUPLICATE_RESOURCE_CODE, per the key that collided"
+    http_status: 409
+    applies_to: "POST /crop-year-programs, POST /malt-lots, POST /brewers, POST /cold-storage-zones, POST /hop-varieties, POST /malt-products, POST /yeast-strains"
+
+  - priority: 33
+    category: business_constraint
+    check: "the order has at least one line in status OPEN or TRIMMED"
+    error_id: ERR_ORDER_HAS_NO_LINES
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm"
+
+  - priority: 34
+    category: business_constraint
+    check: "each line's quantity is at least the item's minimum: HopVariety.min_order_lbs for HOP lines, MaltProduct.min_order_lbs for MALT lines, YeastStrain.min_batch_l for YEAST lines. A quantity exactly at the minimum is accepted."
+    error_id: ERR_BELOW_MINIMUM_ORDER_QUANTITY
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/lines"
+
+  - priority: 35
+    category: business_constraint
+    check: "the carry-forward target program's crop_year equals the source program's crop_year + 1, its status == OPEN, and it is not the source program itself"
+    error_id: ERR_INVALID_CARRY_FORWARD_TARGET
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/carry-forward-requests"
+
+  - priority: 36
+    category: business_constraint
+    check: "requested_lbs does not exceed min(floor(contracted_lbs * CARRY_FORWARD_CAP_PCT / 100), remaining_lbs); exactly the cap is accepted"
+    error_id: ERR_CARRY_FORWARD_EXCEEDS_CAP
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/carry-forward-requests"
+
+  - priority: 37
+    category: business_constraint
+    check: "the contract's remaining_lbs is greater than 0; a fully drawn contract can be neither carried forward nor defaulted"
+    error_id: ERR_NO_UNCOMMITTED_VOLUME
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/carry-forward-requests, POST /hop-contracts/{id}/declare-default"
+
+  - priority: 38
+    category: business_constraint
+    check: "for selection_mode == AUTO_RANKED the candidate set from calculations.substitution_ranking is non-empty; for selection_mode == EXPLICIT the named substitute variety is itself a member of that candidate set"
+    error_id: ERR_NO_SUBSTITUTE_AVAILABLE
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/substitution-offers"
+
+  - priority: 39
+    category: business_constraint
+    check: "resale_lbs does not exceed the contract's current defaulted_lbs; exactly defaulted_lbs is accepted and empties the bucket"
+    error_id: ERR_RESALE_EXCEEDS_DEFAULTED_VOLUME
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/resale"
+
+  - priority: 40
+    category: business_constraint
+    check: "buyer_brewer_id differs from the defaulting contract's brewer_id; a brewer cannot buy back its own defaulted poundage"
+    error_id: ERR_RESALE_BUYER_INVALID
+    http_status: 422
+    applies_to: "POST /hop-contracts/{id}/resale"
+
+  - priority: 41
+    category: business_constraint
+    check: "for every CONTRACT-sourced hop line, contract.remaining_lbs is at least the line quantity; the check is aggregate across all lines drawing on the same contract, so two individually affordable lines that jointly overdraw are refused"
+    error_id: ERR_CONTRACT_VOLUME_EXHAUSTED
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm"
+
+  - priority: 42
+    category: business_constraint
+    check: "for every MALT line, lot.available_lbs is at least the line quantity, aggregated across all lines drawing on the same lot"
+    error_id: ERR_MALT_LOT_INSUFFICIENT_QUANTITY
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm"
+
+  - priority: 43
+    category: business_constraint
+    check: "for every SPOT-sourced hop line, variety.available_spot_lbs is at least the line quantity, aggregated across all lines drawing on the same variety; and an accepted SubstitutionOffer's substitute variety still holds offered_lbs"
+    error_id: ERR_SPOT_INVENTORY_INSUFFICIENT
+    http_status: 422
+    applies_to: "POST /sales-orders/{id}/confirm, POST /substitution-offers/{id}/respond"
+
+  - priority: 44
+    category: business_fiscal
+    check: "the owning Brewer's credit_status is not HOLD"
+    error_id: ERR_BREWER_CREDIT_HOLD
+    http_status: 402
+    applies_to: "POST /sales-orders/{id}/confirm, POST /sales-orders/{id}/credit-decision with decision == APPROVE, POST /yeast-propagation-jobs"
+
+  - priority: 45
+    category: business_fiscal
+    check: "brewer.credit_exposure_cents plus this order's freshly computed total_cents does not exceed brewer.credit_limit_cents; exposure exactly equal to the limit is accepted"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 402
+    applies_to: "POST /sales-orders/{id}/confirm"
+
+  - priority: 46
+    category: business_fiscal
+    check: "the order's own credit_status == APPROVED"
+    error_id: ERR_ORDER_CREDIT_NOT_APPROVED
+    http_status: 402
+    applies_to: "POST /sales-orders/{id}/pick, POST /cold-chain-shipments/{id}/depart"
+
+  - priority: 47
+    category: business_fiscal
+    check: "amount_cents does not exceed the brewer's current ar_balance_cents; a payment exactly clearing the balance is accepted"
+    error_id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http_status: 422
+    applies_to: "POST /brewers/{id}/payments"
+
+# =============================================================================
+# 1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+
+  # ---- Brewer -------------------------------------------------------------
+  - method: POST
+    path: "/brewers"
+    description: "Register a brewery account with its credit terms, freight-program opening volume and cold-chain certification."
+    roles: [CreditManager, PlatformAdmin]
+    code: 201
+    input: [name, brewery_license_no, "credit_terms_days?", "credit_limit_cents?", "cold_chain_certified?", "legacy_trailing_lbs?"]
+    output: Brewer
+    side_effects:
+      - "runs calculations.freight_program_tier over an empty delivered set plus legacy_trailing_lbs, writing trailing_12mo_volume_lbs and freight_program_tier"
+      - "runs calculations.brewer_credit_posture, writing ar_balance_cents 0, open_order_exposure_cents 0, credit_exposure_cents 0, credit_utilization_pct 0.00 and credit_status GOOD_STANDING"
+
+  - method: GET
+    path: "/brewers/{id}"
+    description: "Fetch a brewery with its live credit posture and freight program tier."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: Brewer
+    side_effects: []
+
+  - method: PUT
+    path: "/brewers/{id}/credit-profile"
+    description: "Reprice a brewery's credit limit, payment terms or cold-chain certification. Guarded by optimistic concurrency on the brewer's version."
+    roles: [CreditManager]
+    code: 200
+    input: [expected_brewer_version, "credit_limit_cents?", "credit_terms_days?", "cold_chain_certified?"]
+    output: Brewer
+    side_effects:
+      - "re-runs calculations.brewer_credit_posture against the new limit, which can move credit_status in either direction"
+      - "increments Brewer.version by 1"
+
+  - method: POST
+    path: "/brewers/{id}/payments"
+    description: "Post a cash receipt against the brewery's accounts-receivable balance."
+    roles: [CreditManager]
+    code: 201
+    input: [amount_cents, "received_at?", "reference?"]
+    output: Brewer
+    side_effects:
+      - "subtracts amount_cents from Brewer.ar_balance_cents via calculations.brewer_ar_ledger"
+      - "re-runs calculations.brewer_credit_posture, which can lift credit_status from HOLD to WATCH or GOOD_STANDING"
+      - "increments Brewer.version by 1"
+
+  - method: POST
+    path: "/brewers/{id}/volume-adjustments"
+    description: "Adjust the brewery's non-ageing opening freight volume (legacy_trailing_lbs), used to seed or correct freight-program standing."
+    roles: [AllocationManager, PlatformAdmin]
+    code: 200
+    input: [legacy_trailing_lbs, "reason?"]
+    output: Brewer
+    side_effects:
+      - "re-runs calculations.freight_program_tier, rewriting trailing_12mo_volume_lbs and freight_program_tier"
+      - "increments Brewer.version by 1"
+
+  # ---- CropYearProgram ----------------------------------------------------
+  - method: POST
+    path: "/crop-year-programs"
+    description: "Open a crop-year contracting program. crop_year is unique across programs."
+    roles: [AllocationManager, PlatformAdmin]
+    code: 201
+    input: [crop_year, contract_open_date, harvest_report_due_date]
+    output: CropYearProgram
+    side_effects:
+      - "sets status OPEN, total_contracted_lbs 0, allocatable_pool_lbs 0, unallocated_pool_lbs 0 and harvest_yield_pct null"
+
+  - method: GET
+    path: "/crop-year-programs/{id}"
+    description: "Fetch a crop-year program with its contracted total and post-harvest allocatable pool."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: CropYearProgram
+    side_effects: []
+
+  - method: GET
+    path: "/crop-year-programs"
+    description: "List crop-year programs, newest crop_year first, with optional status filtering."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["status?", "crop_year?", "limit?", "offset?"]
+    output: CropYearProgram[]
+    side_effects: []
+
+  - method: POST
+    path: "/crop-year-programs/{id}/report-harvest"
+    description: "Report the crop-year harvest yield. Entry point of cascade A: reallocates the shortfall across every contract in the program and trims the committed order lines that no longer have poundage behind them."
+    roles: [AllocationManager]
+    code: 200
+    input: [harvest_yield_pct, "reported_note?"]
+    output: CropYearProgram
+    side_effects:
+      - "transitions CropYearProgram OPEN -> HARVEST_REPORTED and sets harvest_reported_at to the current logical clock"
+      - "runs calculations.shortfall_prorata_reallocation, writing total_contracted_lbs, allocatable_pool_lbs, unallocated_pool_lbs and every contract's allocated_lbs / shortfall_lbs"
+      - "CASCADE A LINK 2: short contracts transition ACTIVE -> SHORTFALL_ADJUSTED"
+      - "CASCADE A LINK 3: OrderLine rows on CONFIRMED orders are trimmed to TRIMMED or CANCELLED_SHORTFALL, releasing committed_lbs"
+      - "CASCADE A LINK 4: affected SalesOrders re-run calculations.order_subtotal_rollup and calculations.order_fee_assessment variant PROVISIONAL"
+      - "CASCADE A LINK 5: affected Brewers re-run calculations.brewer_credit_posture"
+      - "increments CropYearProgram.version by 1"
+
+  - method: POST
+    path: "/crop-year-programs/{id}/settle"
+    description: "Close a crop-year program once every carry-forward request has been decided."
+    roles: [AllocationManager]
+    code: 200
+    input: ["settlement_note?"]
+    output: CropYearProgram
+    side_effects:
+      - "transitions CropYearProgram HARVEST_REPORTED -> SETTLED"
+      - "increments CropYearProgram.version by 1"
+
+  # ---- HopVariety ---------------------------------------------------------
+  - method: POST
+    path: "/hop-varieties"
+    description: "Register a hop variety with its substitution group, alpha-acid target, pallet size, minimum order and spot inventory."
+    roles: [AllocationManager, PlatformAdmin]
+    code: 201
+    input: [variety_code, name, substitution_group, alpha_acid_target_pct, spot_price_cents_per_lb, "available_spot_lbs?", "cold_storage_required?", "pallet_quantity_lbs?", "min_order_lbs?"]
+    output: HopVariety
+    side_effects: []
+
+  - method: GET
+    path: "/hop-varieties/{id}"
+    description: "Fetch a hop variety with its current spot price and uncommitted spot inventory."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: HopVariety
+    side_effects: []
+
+  - method: PUT
+    path: "/hop-varieties/{id}/spot-price"
+    description: "Reprice a variety on the spot market. Changes the market reference used by the MARKET_SETTLED default settlement variant and by AUTO_RANKED substitution ranking."
+    roles: [AllocationManager]
+    code: 200
+    input: [spot_price_cents_per_lb, "available_spot_lbs?"]
+    output: HopVariety
+    side_effects:
+      - "increments HopVariety.version by 1"
+
+  # ---- HopContract --------------------------------------------------------
+  - method: POST
+    path: "/hop-contracts"
+    description: "Commit a brewer to crop-year poundage of a hop variety, either as a FIXED_CROP_YEAR contract or a SPOT_HOLD. Delivery windows for the same (brewer, variety) pair may not intersect."
+    roles: [AllocationManager]
+    code: 201
+    input: [brewer_id, variety_id, crop_year_program_id, contract_type, contracted_lbs, price_per_lb_cents, delivery_window_start, delivery_window_end]
+    output: HopContract
+    side_effects:
+      - "sets status ACTIVE and allocated_lbs = contracted_lbs (a program with no reported harvest is assumed to deliver in full)"
+      - "runs calculations.contract_allocation_ledger, writing remaining_lbs = contracted_lbs with committed_lbs, carried_forward_out_lbs, defaulted_lbs and resold_lbs all 0"
+      - "recomputes the program's total_contracted_lbs"
+
+  - method: GET
+    path: "/hop-contracts/{id}"
+    description: "Fetch a hop contract with its full allocation ledger, shortfall, carry-forward and settlement figures."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: HopContract
+    side_effects: []
+
+  - method: GET
+    path: "/hop-contracts"
+    description: "List hop contracts filtered by brewer, variety, crop-year program, carry-forward lineage or status, ordered by created_at ASC."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["brewer_id?", "variety_id?", "crop_year_program_id?", "carried_forward_from_contract_id?", "carry_forward_target_program_id?", "contract_type?", "status?", "limit?", "offset?"]
+    output: HopContract[]
+    side_effects: []
+
+  - method: POST
+    path: "/hop-contracts/{id}/carry-forward-requests"
+    description: "Ask to roll undrawn poundage into the next crop year, capped at CARRY_FORWARD_CAP_PCT of the original commitment and charged a carry fee."
+    roles: [Brewer]
+    code: 200
+    input: [carry_forward_target_program_id, requested_lbs, "justification?"]
+    output: HopContract
+    side_effects:
+      - "transitions HopContract ACTIVE or SHORTFALL_ADJUSTED -> CARRY_FORWARD_PENDING"
+      - "runs calculations.carry_forward_eligibility, writing carry_forward_requested_lbs and carry_forward_fee_cents"
+      - "increments HopContract.version by 1"
+
+  - method: POST
+    path: "/hop-contracts/{id}/carry-forward-decision"
+    description: "Approve or decline a pending carry-forward. Approval mints the successor contract in the target crop year and books the carry fee; declining returns the contract to its prior working status."
+    roles: [AllocationManager]
+    code: 200
+    input: [decision, "decision_note?"]
+    output: HopContract
+    side_effects:
+      - "on APPROVE: transitions CARRY_FORWARD_PENDING -> CARRIED_FORWARD, sets carried_forward_out_lbs, re-runs calculations.contract_allocation_ledger, mints the successor HopContract with carried_forward_from_contract_id set, posts carry_forward_fee_cents through calculations.brewer_ar_ledger and re-runs calculations.brewer_credit_posture"
+      - "on DECLINE: transitions CARRY_FORWARD_PENDING -> ACTIVE and clears carry_forward_target_program_id, carry_forward_requested_lbs and carry_forward_fee_cents"
+      - "increments HopContract.version by 1"
+
+  - method: POST
+    path: "/hop-contracts/{id}/declare-default"
+    description: "Declare the brewer in default on its undrawn poundage. Entry point of cascade B: prices the settlement, books it to accounts receivable, and can drive the brewer onto credit hold, freezing orders and releasing staged reefer loads."
+    roles: [AllocationManager]
+    code: 200
+    input: [default_reason, "declared_at?"]
+    output: HopContract
+    side_effects:
+      - "transitions HopContract ACTIVE or SHORTFALL_ADJUSTED -> DEFAULTED, sets defaulted_lbs = remaining_lbs and records defaulted_by_user_id = X-User-ID"
+      - "runs calculations.contract_default_settlement, selecting MARKET_SETTLED or LIQUIDATED from the program status and writing settlement_variant, settlement_damages_cents, settlement_admin_fee_cents and settlement_total_cents"
+      - "runs calculations.contract_allocation_ledger, moving the poundage from remaining_lbs into defaulted_lbs"
+      - "CASCADE B LINK 1: adds settlement_total_cents to Brewer.ar_balance_cents through calculations.brewer_ar_ledger"
+      - "CASCADE B LINK 2: the Brewer re-runs calculations.brewer_credit_posture"
+      - "CASCADE B LINK 3: DRAFT and CONFIRMED orders of that brewer move credit_status APPROVED -> ON_HOLD"
+      - "CASCADE B LINK 4: STAGED ColdChainShipments of those orders move STAGED -> HELD, releasing zone pallets"
+      - "increments HopContract.version by 1"
+
+  - method: POST
+    path: "/hop-contracts/{id}/resale"
+    description: "Resell defaulted poundage to a different brewer and credit the recovery against the defaulting brewer's settlement. May not be actioned by the user who declared the default."
+    roles: [AllocationManager]
+    code: 200
+    input: [buyer_brewer_id, resale_lbs, resale_price_cents_per_lb]
+    output: HopContract
+    side_effects:
+      - "transitions HopContract DEFAULTED -> RESOLD, moving resale_lbs from defaulted_lbs into resold_lbs so allocated_lbs is conserved"
+      - "sets resale_credit_cents = min(settlement_total_cents, round_half_up(resale_lbs * resale_price_cents_per_lb)) and subtracts it from Brewer.ar_balance_cents through calculations.brewer_ar_ledger"
+      - "the Brewer re-runs calculations.brewer_credit_posture, which can lift credit_status off HOLD"
+      - "increments HopContract.version by 1"
+
+  - method: POST
+    path: "/hop-contracts/{id}/substitution-offers"
+    description: "Offer the brewer a different variety from the same substitution group to cover a crop shortfall, either explicitly named or auto-ranked by brewing character. Guarded by optimistic concurrency on the contract's version; a new offer supersedes the contract's prior OPEN offer."
+    roles: [AllocationManager]
+    code: 201
+    input: [expected_hop_contract_version, selection_mode, offered_lbs, "substitute_variety_id?", "offered_price_cents_per_lb?"]
+    output: SubstitutionOffer
+    side_effects:
+      - "on AUTO_RANKED: runs calculations.substitution_ranking to pick substitute_variety_id and offered_price_cents_per_lb"
+      - "writes alpha_acid_delta_pct against the shorted variety and sets status OPEN"
+      - "transitions any prior OPEN offer on this contract to SUPERSEDED"
+      - "increments HopContract.version by 1"
+
+  # ---- SubstitutionOffer --------------------------------------------------
+  - method: GET
+    path: "/substitution-offers/{id}"
+    description: "Fetch a substitution offer with its alpha-acid delta and the contract it minted on acceptance."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: SubstitutionOffer
+    side_effects: []
+
+  - method: GET
+    path: "/substitution-offers"
+    description: "List substitution offers filtered by the shorted contract, the substitute variety, the contract they created, or status."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["hop_contract_id?", "substitute_variety_id?", "created_contract_id?", "status?", "limit?", "offset?"]
+    output: SubstitutionOffer[]
+    side_effects: []
+
+  - method: POST
+    path: "/substitution-offers/{id}/respond"
+    description: "Accept or decline a substitution offer. Acceptance mints a SPOT_HOLD contract on the substitute variety and draws down its spot inventory."
+    roles: [Brewer]
+    code: 200
+    input: [decision, "response_note?"]
+    output: SubstitutionOffer
+    side_effects:
+      - "on ACCEPT: transitions OPEN -> ACCEPTED, mints the substitute HopContract and records it in created_contract_id, reduces the substitute HopVariety.available_spot_lbs by offered_lbs, and adds offered_lbs to the shorted contract's substitution_covered_lbs"
+      - "on DECLINE: transitions OPEN -> DECLINED"
+      - "sets responded_at to the current logical clock"
+      - "increments SubstitutionOffer.version by 1"
+
+  # ---- MaltProduct / MaltLot ---------------------------------------------
+  - method: POST
+    path: "/malt-products"
+    description: "Register a malt SKU with its class, pallet size, minimum order and the specification ceilings and floors that gate lot release."
+    roles: [WarehouseOperator, PlatformAdmin]
+    code: 201
+    input: [sku, name, malt_class, list_price_cents_per_lb, "max_moisture_pct?", "min_diastatic_power?", "pallet_quantity_lbs?", "min_order_lbs?"]
+    output: MaltProduct
+    side_effects: []
+
+  - method: GET
+    path: "/malt-products/{id}"
+    description: "Fetch a malt product with its specification limits."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: MaltProduct
+    side_effects: []
+
+  - method: POST
+    path: "/malt-lots"
+    description: "Receive a malt lot into inventory. lot_code is unique. The lot lands in RECEIVED with no analysis recorded."
+    roles: [WarehouseOperator]
+    code: 201
+    input: [malt_product_id, lot_code, quantity_lbs, "received_at?"]
+    output: MaltLot
+    side_effects:
+      - "sets status RECEIVED, analysis_count 0 and all analysis fields null"
+      - "runs calculations.malt_lot_availability, writing committed_lbs 0 and available_lbs = quantity_lbs"
+
+  - method: GET
+    path: "/malt-lots/{id}"
+    description: "Fetch a malt lot with its analysis sheet, availability and quarantine reason."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: MaltLot
+    side_effects: []
+
+  - method: GET
+    path: "/malt-lots"
+    description: "List malt lots filtered by product or status, ordered by created_at ASC."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["malt_product_id?", "status?", "limit?", "offset?"]
+    output: MaltLot[]
+    side_effects: []
+
+  - method: POST
+    path: "/malt-lots/{id}/analysis"
+    description: "Record a lot analysis sheet. Passing the product's moisture ceiling and, for BASE malt, its diastatic-power floor moves the lot to PASSED; failing either quarantines it."
+    roles: [WarehouseOperator]
+    code: 200
+    input: [color_lovibond, extract_pct, moisture_pct, protein_pct, diastatic_power]
+    output: MaltLot
+    side_effects:
+      - "writes the five analysis values, increments analysis_count by 1 and records analyzed_by_user_id = X-User-ID"
+      - "transitions RECEIVED -> PASSED, or RECEIVED -> QUARANTINED with quarantine_reason MOISTURE_ABOVE_MAX or DIASTATIC_POWER_BELOW_MIN"
+      - "increments MaltLot.version by 1"
+
+  - method: POST
+    path: "/malt-lots/{id}/release"
+    description: "Release a passed lot for picking. The releasing user may not be the user who recorded the analysis."
+    roles: [WarehouseOperator]
+    code: 200
+    input: ["release_note?"]
+    output: MaltLot
+    side_effects:
+      - "transitions PASSED -> RELEASED and records released_by_user_id = X-User-ID"
+      - "increments MaltLot.version by 1"
+
+  - method: POST
+    path: "/malt-lots/{id}/retest"
+    description: "Return a quarantined lot to RECEIVED so a fresh analysis sheet can be recorded, keeping the prior analysis_count."
+    roles: [WarehouseOperator]
+    code: 200
+    input: ["retest_reason?"]
+    output: MaltLot
+    side_effects:
+      - "transitions QUARANTINED -> RECEIVED and clears quarantine_reason"
+      - "increments MaltLot.version by 1"
+
+  - method: POST
+    path: "/malt-lots/{id}/reject"
+    description: "Condemn a quarantined lot. Terminal."
+    roles: [WarehouseOperator]
+    code: 200
+    input: [reject_reason]
+    output: MaltLot
+    side_effects:
+      - "transitions QUARANTINED -> REJECTED"
+      - "increments MaltLot.version by 1"
+
+  - method: GET
+    path: "/malt-lots/{id}/spec-match"
+    description: "Score this lot's analysis sheet against a brewer recipe's targets, returning the weighted match score, its grade, the per-attribute deviations and any hard-fail reason."
+    roles: [Brewer, AllocationManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: [recipe_id]
+    output:
+      malt_lot_id: string
+      recipe_id: string
+      match_score: decimal
+      match_grade: string
+      deviation_color: decimal
+      deviation_extract: decimal
+      deviation_protein: decimal
+      hard_fail_reason: string
+      applicable_diastatic_power_floor: decimal
+    side_effects: []
+
+  # ---- BrewerRecipe -------------------------------------------------------
+  - method: POST
+    path: "/brewer-recipes"
+    description: "Register a brewer recipe with its batch size, gravity, adjunct fraction, malt specification targets and requested pitch rate."
+    roles: [Brewer, AllocationManager]
+    code: 201
+    input: [brewer_id, malt_product_id, yeast_strain_id, name, batch_volume_bbl, original_gravity_plato, target_color_lovibond, target_extract_pct, target_protein_pct, requested_pitch_rate_million_cells_per_ml_per_plato, "adjunct_pct?"]
+    output: BrewerRecipe
+    side_effects: []
+
+  - method: GET
+    path: "/brewer-recipes/{id}"
+    description: "Fetch a brewer recipe with its specification targets."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: BrewerRecipe
+    side_effects: []
+
+  - method: GET
+    path: "/brewer-recipes"
+    description: "List brewer recipes filtered by brewer, malt product or yeast strain."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["brewer_id?", "malt_product_id?", "yeast_strain_id?", "limit?", "offset?"]
+    output: BrewerRecipe[]
+    side_effects: []
+
+  # ---- YeastStrain / YeastPropagationJob ----------------------------------
+  - method: POST
+    path: "/yeast-strains"
+    description: "Register a yeast strain with its fermentation type, propagation lead time, shipping viability, slurry density and vessel limits."
+    roles: [WarehouseOperator, PlatformAdmin]
+    code: 201
+    input: [strain_code, name, fermentation_type, propagation_lead_time_days, list_price_cents_per_l, "viability_pct_at_ship?", "cells_per_ml_slurry_billion?", "min_batch_l?", "vessel_max_l?"]
+    output: YeastStrain
+    side_effects: []
+
+  - method: GET
+    path: "/yeast-strains/{id}"
+    description: "Fetch a yeast strain with its propagation and viability parameters."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: YeastStrain
+    side_effects: []
+
+  - method: POST
+    path: "/yeast-propagation-jobs"
+    description: "Request a yeast propagation for a recipe's batch on a given pitch date. Computes the pitch-rate advisory and the propagation volume, and enforces both the lead time and the strain's vessel turnover gap."
+    roles: [Brewer, WarehouseOperator]
+    code: 201
+    input: [brewer_id, recipe_id, yeast_strain_id, pitch_date]
+    output: YeastPropagationJob
+    side_effects:
+      - "sets status REQUESTED with ready_at and failure_reason null"
+      - "runs calculations.yeast_pitch_advisory, writing recommended_pitch_rate_million_cells_per_ml_per_plato, required_cells_billion, recommended_slurry_l, propagation_volume_l and pitch_rate_advice"
+
+  - method: GET
+    path: "/yeast-propagation-jobs/{id}"
+    description: "Fetch a propagation job with its pitch-rate advisory, propagation volume and readiness."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: YeastPropagationJob
+    side_effects: []
+
+  - method: GET
+    path: "/yeast-propagation-jobs"
+    description: "List propagation jobs filtered by brewer, recipe, strain, the job they replace, or status. The replaces_job_id filter is the only way to discover a replacement job minted by a cold-chain excursion."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["brewer_id?", "recipe_id?", "yeast_strain_id?", "replaces_job_id?", "status?", "limit?", "offset?"]
+    output: YeastPropagationJob[]
+    side_effects: []
+
+  - method: POST
+    path: "/yeast-propagation-jobs/{id}/start"
+    description: "Begin propagation, stamping the readiness date from the strain's lead time."
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: YeastPropagationJob
+    side_effects:
+      - "transitions REQUESTED -> PROPAGATING and sets ready_at = current logical clock + strain.propagation_lead_time_days days"
+      - "increments YeastPropagationJob.version by 1"
+
+  - method: POST
+    path: "/yeast-propagation-jobs/{id}/complete"
+    description: "Close a propagation as READY or FAILED."
+    roles: [WarehouseOperator]
+    code: 200
+    input: [outcome, "failure_reason?"]
+    output: YeastPropagationJob
+    side_effects:
+      - "on READY: transitions PROPAGATING -> READY and clears failure_reason"
+      - "on FAILED: transitions PROPAGATING -> FAILED and records failure_reason"
+      - "increments YeastPropagationJob.version by 1"
+
+  - method: POST
+    path: "/yeast-propagation-jobs/{id}/requeue"
+    description: "Re-book a failed propagation onto a new pitch date, re-checking the lead time and the strain's vessel turnover gap."
+    roles: [WarehouseOperator]
+    code: 200
+    input: [new_pitch_date]
+    output: YeastPropagationJob
+    side_effects:
+      - "transitions FAILED -> REQUESTED, sets pitch_date = new_pitch_date and clears failure_reason and ready_at"
+      - "re-runs calculations.yeast_pitch_advisory against the new pitch date, which can change propagation_volume_l through viability decay"
+      - "increments YeastPropagationJob.version by 1"
+
+  # ---- SalesOrder ---------------------------------------------------------
+  - method: POST
+    path: "/sales-orders"
+    description: "Open a draft sales order for a brewer with the requested ship date. Fees are not assessed until confirmation."
+    roles: [Brewer, AllocationManager]
+    code: 201
+    input: [brewer_id, requested_ship_date, "purchase_order_ref?"]
+    output: SalesOrder
+    side_effects:
+      - "sets fulfillment_status DRAFT, credit_status PENDING_REVIEW, fee_variant null, line_count 0, requires_cold_chain false and every money field 0"
+
+  - method: GET
+    path: "/sales-orders/{id}"
+    description: "Fetch a sales order with its priced fee breakdown, both status dimensions and the freight tier that was applied."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects: []
+
+  - method: GET
+    path: "/sales-orders"
+    description: "List sales orders filtered by brewer or by either status dimension independently, ordered by created_at ASC."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["brewer_id?", "fulfillment_status?", "credit_status?", "limit?", "offset?"]
+    output: SalesOrder[]
+    side_effects: []
+
+  - method: POST
+    path: "/sales-orders/{id}/lines"
+    description: "Add a hop, malt or yeast line to a draft order. Hop lines draw either on a crop-year contract or on spot inventory. Enforces the item minimum and flags a pallet break."
+    roles: [Brewer, AllocationManager]
+    code: 201
+    input: [item_type, quantity, uom, "allocation_source?", "hop_variety_id?", "hop_contract_id?", "malt_lot_id?", "yeast_propagation_job_id?", "unit_price_cents?"]
+    output: OrderLine
+    side_effects:
+      - "defaults unit_price_cents from the contract price, the variety spot price, the malt product list price or the yeast strain list price when omitted"
+      - "sets cold_chain_required from HopVariety.cold_storage_required for HOP lines, MaltProduct.cold_storage_required for MALT lines and YeastStrain.cold_storage_required for YEAST lines"
+      - "runs calculations.order_subtotal_rollup, writing OrderLine.extended_cents and pallet_break plus the order's subtotal_cents, chargeable_lbs, line_count and requires_cold_chain"
+      - "increments SalesOrder.version by 1"
+
+  - method: DELETE
+    path: "/sales-orders/{id}/lines/{line_id}"
+    description: "Remove a line from a draft order and reprice the order."
+    roles: [Brewer, AllocationManager]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects:
+      - "moves the OrderLine to REMOVED"
+      - "re-runs calculations.order_subtotal_rollup, rewriting subtotal_cents, chargeable_lbs, line_count and requires_cold_chain"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/confirm"
+    description: "Confirm the order: commit contract, malt and spot volume, price the PROVISIONAL fee assessment against the brewer's pre-order freight tier, and re-test the credit limit."
+    roles: [Brewer]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects:
+      - "transitions fulfillment_status DRAFT -> CONFIRMED"
+      - "commits contract poundage into HopContract.committed_lbs and re-runs calculations.contract_allocation_ledger, leaving allocated_lbs unchanged"
+      - "commits malt into MaltLot.committed_lbs via calculations.malt_lot_availability and draws SPOT hop lines from HopVariety.available_spot_lbs"
+      - "runs calculations.order_subtotal_rollup then calculations.order_fee_assessment variant PROVISIONAL, writing volume_discount_cents, freight_cents, freight_tier_applied, pallet_break_fee_cents, small_order_surcharge_cents, total_cents and fee_variant PROVISIONAL"
+      - "the Brewer re-runs calculations.brewer_credit_posture, raising open_order_exposure_cents by this order's total_cents"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/credit-decision"
+    description: "Approve or hold the order on the credit dimension, independently of fulfillment. A hold freezes any staged reefer load."
+    roles: [CreditManager]
+    code: 200
+    input: [decision, "decision_note?"]
+    output: SalesOrder
+    side_effects:
+      - "on APPROVE: transitions credit_status PENDING_REVIEW or ON_HOLD -> APPROVED"
+      - "on HOLD: transitions credit_status PENDING_REVIEW or APPROVED -> ON_HOLD and moves the order's STAGED ColdChainShipments to HELD, releasing zone pallets"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/pick"
+    description: "Pick the order from the warehouse. Requires released malt, ready yeast and an approved credit decision."
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects:
+      - "transitions fulfillment_status CONFIRMED -> PICKED"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/ship"
+    description: "Ship and invoice the order, moving its total into accounts receivable and marking its yeast as shipped."
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects:
+      - "transitions fulfillment_status PICKED -> SHIPPED and sets invoiced_at to the current logical clock"
+      - "adds total_cents to Brewer.ar_balance_cents through calculations.brewer_ar_ledger"
+      - "transitions every READY YeastPropagationJob on a YEAST line to SHIPPED"
+      - "the Brewer re-runs calculations.brewer_credit_posture; the order leaves open_order_exposure_cents as it enters ar_balance_cents, so credit_exposure_cents does not move"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/deliver"
+    description: "Record delivery. Re-prices freight under the FINAL variant with this order's own volume now counted in the trailing-12-month window, books the difference, and re-rates the brewer's freight program."
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: SalesOrder
+    side_effects:
+      - "transitions fulfillment_status SHIPPED -> DELIVERED and sets delivered_at to the current logical clock"
+      - "transitions the order's ColdChainShipment IN_TRANSIT -> DELIVERED when one exists"
+      - "re-runs calculations.order_fee_assessment variant FINAL, rewriting freight_cents, freight_tier_applied and total_cents, setting fee_variant FINAL and storing final_freight_adjustment_cents"
+      - "adds final_freight_adjustment_cents to Brewer.ar_balance_cents through calculations.brewer_ar_ledger"
+      - "the Brewer re-runs calculations.freight_program_tier and calculations.brewer_credit_posture"
+      - "increments SalesOrder.version by 1"
+
+  - method: POST
+    path: "/sales-orders/{id}/cancel"
+    description: "Cancel the order. Releases every committed pound back to its contract, lot or variety, credits any invoice already booked, and supersedes any staged or held reefer load."
+    roles: [Brewer, AllocationManager]
+    code: 200
+    input: [cancel_reason]
+    output: SalesOrder
+    side_effects:
+      - "transitions fulfillment_status DRAFT, CONFIRMED, PICKED or SHIPPED -> CANCELLED and moves every OPEN or TRIMMED line to REMOVED"
+      - "releases contract poundage from HopContract.committed_lbs back into remaining_lbs, malt from MaltLot.committed_lbs and spot hops back into HopVariety.available_spot_lbs, so calculations.contract_allocation_ledger conservation holds"
+      - "when invoiced_at is not null: posts a credit memo for total_cents plus any final_freight_adjustment_cents already booked through calculations.brewer_ar_ledger"
+      - "moves the order's STAGED or HELD ColdChainShipments to SUPERSEDED, releasing zone pallets"
+      - "the Brewer re-runs calculations.brewer_credit_posture"
+      - "increments SalesOrder.version by 1"
+
+  # ---- OrderLine ----------------------------------------------------------
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "Fetch an order line with its extended value, pallet-break flag and any shortfall trim."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+
+  - method: GET
+    path: "/order-lines"
+    description: "List order lines filtered by order, contract, malt lot, propagation job, hop variety, item type or status. The only discovery channel for lines trimmed or quarantined by a cascade."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["sales_order_id?", "hop_contract_id?", "malt_lot_id?", "yeast_propagation_job_id?", "hop_variety_id?", "item_type?", "allocation_source?", "status?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+
+  # ---- ColdStorageZone / ColdChainShipment --------------------------------
+  - method: POST
+    path: "/cold-storage-zones"
+    description: "Commission a temperature-controlled zone with its setpoint, tolerance and pallet capacity. zone_code is unique."
+    roles: [WarehouseOperator, PlatformAdmin]
+    code: 201
+    input: [zone_code, temp_setpoint_c, capacity_pallets, "tolerance_c?"]
+    output: ColdStorageZone
+    side_effects:
+      - "sets occupied_pallets 0"
+
+  - method: GET
+    path: "/cold-storage-zones/{id}"
+    description: "Fetch a cold storage zone with the pallet occupancy in force at the current logical clock."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: ColdStorageZone
+    side_effects:
+      - "runs calculations.zone_occupancy_projection to report occupied_pallets as of the current logical clock"
+
+  - method: POST
+    path: "/cold-chain-shipments"
+    description: "Stage a reefer load for a cold-chain order in a zone over a half-open staging window, subject to the zone's aggregate pallet capacity. Guarded by optimistic concurrency on the order's version; a new load supersedes the order's prior staged load."
+    roles: [WarehouseOperator]
+    code: 201
+    input: [sales_order_id, cold_storage_zone_id, expected_sales_order_version, pallet_count, stage_from, stage_until, reefer_setpoint_c, "reefer_tolerance_c?"]
+    output: ColdChainShipment
+    side_effects:
+      - "sets status STAGED, excursion_minutes 0, reading_count 0 and last_reading_at null"
+      - "runs calculations.zone_occupancy_projection as an admission test over the merged staging intervals and then to update ColdStorageZone.occupied_pallets"
+      - "moves any prior STAGED or HELD shipment on this order to SUPERSEDED, releasing its pallets"
+      - "increments SalesOrder.version by 1"
+
+  - method: GET
+    path: "/cold-chain-shipments/{id}"
+    description: "Fetch a reefer load with its accumulated excursion minutes and reading count."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: []
+    output: ColdChainShipment
+    side_effects: []
+
+  - method: GET
+    path: "/cold-chain-shipments"
+    description: "List reefer loads filtered by order, zone or status. The only discovery channel for a load superseded or held by a cascade."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["sales_order_id?", "cold_storage_zone_id?", "status?", "limit?", "offset?"]
+    output: ColdChainShipment[]
+    side_effects: []
+
+  - method: POST
+    path: "/cold-chain-shipments/{id}/depart"
+    description: "Release the load from the zone onto the road. Requires a picked order with an approved credit decision."
+    roles: [WarehouseOperator]
+    code: 200
+    input: []
+    output: ColdChainShipment
+    side_effects:
+      - "transitions STAGED -> IN_TRANSIT and releases pallet_count from ColdStorageZone.occupied_pallets"
+      - "increments ColdChainShipment.version by 1"
+
+  - method: POST
+    path: "/cold-chain-shipments/{id}/readings"
+    description: "Append a reefer temperature reading. Accumulates out-of-tolerance minutes and, past the excursion ceiling, flags the load, fails its yeast and quarantines its cold-chain hops."
+    roles: [WarehouseOperator]
+    code: 201
+    input: [temp_c, recorded_at]
+    output: TemperatureReading
+    side_effects:
+      - "runs calculations.cold_chain_excursion_assessment, writing the reading's interval_minutes, in_violation and cumulative_excursion_minutes and the shipment's excursion_minutes, reading_count and last_reading_at"
+      - "CASCADE C LINK 1: when excursion_minutes exceeds MAX_EXCURSION_MINUTES the shipment transitions IN_TRANSIT -> EXCURSION_FLAGGED"
+      - "CASCADE C LINK 2: READY YeastPropagationJobs on the order's YEAST lines transition to FAILED with failure_reason COLD_CHAIN_EXCURSION, and cold-chain HOP lines transition OPEN -> QUARANTINED"
+      - "CASCADE C LINK 3: a replacement YeastPropagationJob is created in REQUESTED with replaces_job_id set and pitch_date pushed out by the strain's propagation_lead_time_days"
+      - "increments ColdChainShipment.version by 1"
+
+  - method: GET
+    path: "/cold-chain-shipments/{id}/readings"
+    description: "List the reefer temperature series for a load in recorded_at ASC order with its per-reading violation flags and running excursion total."
+    roles: [Brewer, AllocationManager, CreditManager, WarehouseOperator, PlatformAdmin]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: TemperatureReading[]
+    side_effects: []
+
+  - method: POST
+    path: "/cold-chain-shipments/{id}/release-hold"
+    description: "Return a credit-held load to staged status once the order's credit decision is approved again, re-testing the zone's aggregate capacity over the original window."
+    roles: [CreditManager]
+    code: 200
+    input: []
+    output: ColdChainShipment
+    side_effects:
+      - "transitions HELD -> STAGED"
+      - "re-runs calculations.zone_occupancy_projection as an admission test and then to update ColdStorageZone.occupied_pallets"
+      - "increments ColdChainShipment.version by 1"
+
+  # ---- Logical clock ------------------------------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical UTC clock, which every window, lead-time, decay and trailing-volume rule reads. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z; it MUST NOT fall back to real wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [current_utc]
+    output:
+      current_utc: string
+    side_effects:
+      - "changes the instant that calculations.freight_program_tier, calculations.yeast_pitch_advisory, calculations.zone_occupancy_projection and every temporal validation evaluate against"
+
+# =============================================================================
+# 1.6 Error Code Catalog
+# =============================================================================
+errors:
+
+  # ---- authentication and authorization -----------------------------------
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-ID or X-User-Role header is absent or empty"
+  - id: ERR_INVALID_ROLE
+    http: 403
+    condition: "X-User-Role is not one of the five declared roles"
+  - id: ERR_ROLE_NOT_PERMITTED
+    http: 403
+    condition: "the supplied role is not in the target endpoint's roles list"
+  - id: ERR_BREWER_SCOPE_VIOLATION
+    http: 403
+    condition: "an actor holding the Brewer role addresses a contract, order, recipe, propagation job, offer or payment belonging to a brewer other than X-User-ID"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "a MaltLot release is attempted by its analyzed_by_user_id, or a defaulted HopContract resale is attempted by its defaulted_by_user_id"
+
+  # ---- request shape ------------------------------------------------------
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "a required body field is missing, a field has the wrong type, an enum field carries an undeclared member, a quantity or money amount is negative, or a decimal exceeds its declared scale"
+
+  # ---- not found ----------------------------------------------------------
+  - id: ERR_BREWER_NOT_FOUND
+    http: 404
+    condition: "a brewer_id or buyer_brewer_id in the path, body or query does not resolve"
+  - id: ERR_CROP_YEAR_PROGRAM_NOT_FOUND
+    http: 404
+    condition: "a crop_year_program_id or carry_forward_target_program_id does not resolve"
+  - id: ERR_HOP_VARIETY_NOT_FOUND
+    http: 404
+    condition: "a variety_id, hop_variety_id or substitute_variety_id does not resolve"
+  - id: ERR_HOP_CONTRACT_NOT_FOUND
+    http: 404
+    condition: "a hop contract path id, hop_contract_id, carried_forward_from_contract_id or created_contract_id does not resolve"
+  - id: ERR_SUBSTITUTION_OFFER_NOT_FOUND
+    http: 404
+    condition: "a substitution offer path id does not resolve"
+  - id: ERR_MALT_PRODUCT_NOT_FOUND
+    http: 404
+    condition: "a malt_product_id does not resolve"
+  - id: ERR_MALT_LOT_NOT_FOUND
+    http: 404
+    condition: "a malt lot path id or malt_lot_id does not resolve"
+  - id: ERR_BREWER_RECIPE_NOT_FOUND
+    http: 404
+    condition: "a recipe path id or recipe_id does not resolve"
+  - id: ERR_YEAST_STRAIN_NOT_FOUND
+    http: 404
+    condition: "a yeast_strain_id does not resolve"
+  - id: ERR_YEAST_JOB_NOT_FOUND
+    http: 404
+    condition: "a propagation job path id, yeast_propagation_job_id or replaces_job_id does not resolve"
+  - id: ERR_SALES_ORDER_NOT_FOUND
+    http: 404
+    condition: "a sales order path id or sales_order_id does not resolve"
+  - id: ERR_ORDER_LINE_NOT_FOUND
+    http: 404
+    condition: "a line_id path segment does not resolve, or resolves to a line on a different order"
+  - id: ERR_COLD_STORAGE_ZONE_NOT_FOUND
+    http: 404
+    condition: "a zone path id or cold_storage_zone_id does not resolve"
+  - id: ERR_COLD_CHAIN_SHIPMENT_NOT_FOUND
+    http: 404
+    condition: "a shipment path id does not resolve"
+
+  # ---- referential coherence ---------------------------------------------
+  - id: ERR_CONTRACT_BREWER_MISMATCH
+    http: 422
+    condition: "an OrderLine's HopContract belongs to a brewer other than the owning SalesOrder's brewer"
+  - id: ERR_ITEM_REFERENCE_MISMATCH
+    http: 422
+    condition: "the populated item foreign key or the uom does not match the line's item_type"
+  - id: ERR_STRAIN_RECIPE_MISMATCH
+    http: 422
+    condition: "a propagation job's yeast_strain_id differs from its recipe's yeast_strain_id, or the recipe's brewer differs from the job's brewer"
+  - id: ERR_PROGRAM_NOT_OPEN
+    http: 409
+    condition: "a HopContract is created against a CropYearProgram whose status is not OPEN"
+
+  # ---- state preconditions ------------------------------------------------
+  - id: ERR_INVALID_CONTRACT_STATE
+    http: 409
+    condition: "the requested HopContract transition is not declared from the contract's current status"
+  - id: ERR_INVALID_PROGRAM_STATE
+    http: 409
+    condition: "the requested CropYearProgram transition is not declared from the program's current status, including settling a program that still has a CARRY_FORWARD_PENDING contract"
+  - id: ERR_INVALID_LOT_STATE
+    http: 409
+    condition: "the requested MaltLot transition is not declared from the lot's current status"
+  - id: ERR_INVALID_JOB_STATE
+    http: 409
+    condition: "the requested YeastPropagationJob transition is not declared from the job's current status"
+  - id: ERR_INVALID_ORDER_STATE
+    http: 409
+    condition: "the requested SalesOrder fulfillment transition is not declared from the order's current fulfillment_status"
+  - id: ERR_INVALID_SHIPMENT_STATE
+    http: 409
+    condition: "the requested ColdChainShipment transition is not declared from the shipment's current status, including appending a reading to a load that is not IN_TRANSIT"
+  - id: ERR_INVALID_OFFER_STATE
+    http: 409
+    condition: "a SubstitutionOffer response is attempted on an offer that is not OPEN"
+
+  # ---- optimistic concurrency --------------------------------------------
+  - id: ERR_STALE_HOP_CONTRACT_VERSION
+    http: 412
+    condition: "expected_hop_contract_version does not equal the HopContract's current version on POST /hop-contracts/{id}/substitution-offers"
+  - id: ERR_STALE_SALES_ORDER_VERSION
+    http: 412
+    condition: "expected_sales_order_version does not equal the SalesOrder's current version on POST /cold-chain-shipments"
+  - id: ERR_STALE_BREWER_VERSION
+    http: 412
+    condition: "expected_brewer_version does not equal the Brewer's current version on PUT /brewers/{id}/credit-profile"
+
+  # ---- safety and cold chain ---------------------------------------------
+  - id: ERR_COLD_CHAIN_NOT_CERTIFIED
+    http: 422
+    condition: "a cold-chain order is confirmed for a brewer whose cold_chain_certified is false, or a reefer load is staged for an order whose requires_cold_chain is false"
+  - id: ERR_MALT_LOT_NOT_RELEASED
+    http: 409
+    condition: "an order is picked while one of its MALT lines references a lot that is not RELEASED"
+  - id: ERR_YEAST_NOT_READY
+    http: 409
+    condition: "an order is picked while one of its YEAST lines references a propagation job that is not READY"
+  - id: ERR_COLD_CHAIN_EXCURSION
+    http: 409
+    condition: "an order is shipped or delivered while its reefer load is EXCURSION_FLAGGED"
+
+  # ---- temporal -----------------------------------------------------------
+  - id: ERR_READING_OUT_OF_ORDER
+    http: 422
+    condition: "a reading's recorded_at is strictly earlier than the shipment's last_reading_at"
+  - id: ERR_INVALID_STAGING_WINDOW
+    http: 422
+    condition: "stage_until is not strictly after stage_from"
+  - id: ERR_SHIP_DATE_OUTSIDE_DELIVERY_WINDOW
+    http: 422
+    condition: "the order's requested_ship_date falls outside a CONTRACT-sourced line's closed inclusive contract delivery window"
+  - id: ERR_INSUFFICIENT_PROPAGATION_LEAD_TIME
+    http: 422
+    condition: "pitch_date is fewer than propagation_lead_time_days whole days after the current logical clock"
+  - id: ERR_PROPAGATION_SLOT_CONFLICT
+    http: 409
+    condition: "another live job on the same strain sits strictly closer than propagation_lead_time_days whole days to the requested pitch_date"
+  - id: ERR_CONTRACT_WINDOW_OVERLAP
+    http: 409
+    condition: "a new contract's closed inclusive delivery window intersects a live contract's window for the same brewer and variety, sharing an endpoint date included"
+
+  # ---- capacity, uniqueness and volume -----------------------------------
+  - id: ERR_ZONE_CAPACITY_EXCEEDED
+    http: 409
+    condition: "merging the candidate staging interval into the zone's STAGED set pushes some swept sub-interval strictly above capacity_pallets"
+  - id: ERR_DUPLICATE_CROP_YEAR
+    http: 409
+    condition: "a CropYearProgram already exists for the supplied crop_year"
+  - id: ERR_DUPLICATE_LOT_CODE
+    http: 409
+    condition: "a MaltLot already exists with the supplied lot_code"
+  - id: ERR_DUPLICATE_BREWERY_LICENSE
+    http: 409
+    condition: "a Brewer already exists with the supplied brewery_license_no"
+  - id: ERR_DUPLICATE_RESOURCE_CODE
+    http: 409
+    condition: "a ColdStorageZone.zone_code, HopVariety.variety_code, MaltProduct.sku or YeastStrain.strain_code collides with an existing row"
+  - id: ERR_ORDER_HAS_NO_LINES
+    http: 422
+    condition: "an order is confirmed with no line in status OPEN or TRIMMED"
+  - id: ERR_BELOW_MINIMUM_ORDER_QUANTITY
+    http: 422
+    condition: "a line's quantity is below the item's minimum order quantity"
+  - id: ERR_INVALID_CARRY_FORWARD_TARGET
+    http: 422
+    condition: "the carry-forward target program is not the immediately following crop year, is not OPEN, or is the source program itself"
+  - id: ERR_CARRY_FORWARD_EXCEEDS_CAP
+    http: 422
+    condition: "requested_lbs exceeds min(floor(contracted_lbs * CARRY_FORWARD_CAP_PCT / 100), remaining_lbs)"
+  - id: ERR_NO_UNCOMMITTED_VOLUME
+    http: 422
+    condition: "a carry-forward or default is attempted on a contract whose remaining_lbs is 0"
+  - id: ERR_NO_SUBSTITUTE_AVAILABLE
+    http: 422
+    condition: "no variety in the shorted variety's substitution group has enough spot inventory, or an EXPLICIT substitute names a variety outside that candidate set"
+  - id: ERR_RESALE_EXCEEDS_DEFAULTED_VOLUME
+    http: 422
+    condition: "resale_lbs exceeds the contract's current defaulted_lbs"
+  - id: ERR_RESALE_BUYER_INVALID
+    http: 422
+    condition: "buyer_brewer_id equals the defaulting contract's brewer_id"
+  - id: ERR_CONTRACT_VOLUME_EXHAUSTED
+    http: 422
+    condition: "the order's aggregate draw on a contract exceeds that contract's remaining_lbs"
+  - id: ERR_MALT_LOT_INSUFFICIENT_QUANTITY
+    http: 422
+    condition: "the order's aggregate draw on a malt lot exceeds that lot's available_lbs"
+  - id: ERR_SPOT_INVENTORY_INSUFFICIENT
+    http: 422
+    condition: "the order's aggregate spot draw on a variety, or an accepted substitution offer, exceeds that variety's available_spot_lbs"
+
+  # ---- credit and money ---------------------------------------------------
+  - id: ERR_BREWER_CREDIT_HOLD
+    http: 402
+    condition: "the owning brewer's credit_status is HOLD when confirming an order, approving an order's credit, or requesting a propagation"
+  - id: ERR_CREDIT_LIMIT_EXCEEDED
+    http: 402
+    condition: "credit_exposure_cents plus this order's total_cents would exceed credit_limit_cents"
+  - id: ERR_ORDER_CREDIT_NOT_APPROVED
+    http: 402
+    condition: "an order is picked, or its reefer load departs, while the order's own credit_status is not APPROVED"
+  - id: ERR_PAYMENT_EXCEEDS_BALANCE
+    http: 422
+    condition: "a payment's amount_cents exceeds the brewer's current ar_balance_cents"
+
+# =============================================================================
+# 1.7 RBAC Matrix   (role_model: segregation_of_duties)
+# =============================================================================
+roles:
+
+  - name: Brewer
+    description: "A brewery customer. Draws on its own crop-year contracts, builds and confirms its own orders, responds to substitution offers, requests carry-forward, and requests yeast propagation. Sees only its own resources."
+    identity: "entity_backed:Brewer"
+    exclusive_operations:
+      - "POST /hop-contracts/{id}/carry-forward-requests"
+      - "POST /substitution-offers/{id}/respond"
+      - "POST /sales-orders/{id}/confirm"
+    shared_operations:
+      - "POST /brewer-recipes"
+      - "POST /yeast-propagation-jobs"
+      - "POST /sales-orders"
+      - "POST /sales-orders/{id}/lines"
+      - "DELETE /sales-orders/{id}/lines/{line_id}"
+      - "POST /sales-orders/{id}/cancel"
+      - "every GET endpoint except GET /malt-lots/{id}/spec-match, which excludes CreditManager"
+
+  - name: AllocationManager
+    description: "The hop desk. Opens crop-year programs, writes contracts, reports harvest, prices spot, runs shortfall substitution, and handles carry-forward decisions, defaults and resales. Cannot approve credit and cannot pick or ship."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /crop-year-programs"
+      - "POST /crop-year-programs/{id}/report-harvest"
+      - "POST /crop-year-programs/{id}/settle"
+      - "POST /hop-contracts"
+      - "PUT /hop-varieties/{id}/spot-price"
+      - "POST /hop-contracts/{id}/carry-forward-decision"
+      - "POST /hop-contracts/{id}/declare-default"
+      - "POST /hop-contracts/{id}/resale"
+      - "POST /hop-contracts/{id}/substitution-offers"
+    shared_operations:
+      - "POST /hop-varieties"
+      - "POST /brewers/{id}/volume-adjustments"
+      - "POST /brewer-recipes"
+      - "POST /sales-orders"
+      - "POST /sales-orders/{id}/lines"
+      - "DELETE /sales-orders/{id}/lines/{line_id}"
+      - "POST /sales-orders/{id}/cancel"
+      - "every GET endpoint"
+
+  - name: CreditManager
+    description: "The credit desk. Onboards brewers, sets limits and terms, posts cash receipts, decides each order's credit status and releases credit-held reefer loads. Cannot write contracts, declare defaults, or move fulfillment."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /brewers/{id}/payments"
+      - "PUT /brewers/{id}/credit-profile"
+      - "POST /sales-orders/{id}/credit-decision"
+      - "POST /cold-chain-shipments/{id}/release-hold"
+    shared_operations:
+      - "POST /brewers"
+      - "every GET endpoint except GET /malt-lots/{id}/spec-match"
+
+  - name: WarehouseOperator
+    description: "The warehouse and cold-chain floor. Receives and analyses malt lots, releases them under segregation of duties, propagates yeast, picks, ships and delivers orders, stages reefer loads and logs temperature readings. Cannot approve credit and cannot write contracts."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /malt-lots"
+      - "POST /malt-lots/{id}/analysis"
+      - "POST /malt-lots/{id}/release"
+      - "POST /malt-lots/{id}/retest"
+      - "POST /malt-lots/{id}/reject"
+      - "POST /yeast-propagation-jobs/{id}/start"
+      - "POST /yeast-propagation-jobs/{id}/complete"
+      - "POST /yeast-propagation-jobs/{id}/requeue"
+      - "POST /sales-orders/{id}/pick"
+      - "POST /sales-orders/{id}/ship"
+      - "POST /sales-orders/{id}/deliver"
+      - "POST /cold-chain-shipments"
+      - "POST /cold-chain-shipments/{id}/depart"
+      - "POST /cold-chain-shipments/{id}/readings"
+    shared_operations:
+      - "POST /malt-products"
+      - "POST /yeast-strains"
+      - "POST /cold-storage-zones"
+      - "POST /yeast-propagation-jobs"
+      - "every GET endpoint"
+
+  - name: PlatformAdmin
+    description: "Platform operations. Seeds reference data and drives the logical clock. Deliberately holds NO business decision rights: cannot confirm, approve credit, report harvest, declare default, analyse or release a lot, or move fulfillment."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "POST /brewers"
+      - "POST /crop-year-programs"
+      - "POST /hop-varieties"
+      - "POST /malt-products"
+      - "POST /yeast-strains"
+      - "POST /cold-storage-zones"
+      - "POST /brewers/{id}/volume-adjustments"
+      - "every GET endpoint"

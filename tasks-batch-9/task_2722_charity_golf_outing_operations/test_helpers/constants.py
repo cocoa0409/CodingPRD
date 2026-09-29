@@ -1,0 +1,111 @@
+"""Domain constants for the Charity Golf Outing Operations API.
+
+Every value here is stated verbatim in the PRD; nothing is inferred.
+"""
+
+# --- Logical clock (PRD 2.4) ---------------------------------------------
+CLOCK_START_UTC = "2026-08-01T00:00:00Z"
+
+# --- Roles (PRD 2.1) ----------------------------------------------------
+ROLE_TOURNAMENT_DIRECTOR = "TournamentDirector"
+ROLE_SPONSORSHIP_MANAGER = "SponsorshipManager"
+ROLE_CHARITY_TREASURER = "CharityTreasurer"
+ROLE_COURSE_OPERATIONS = "CourseOperations"
+ROLE_PARTICIPANT = "Participant"
+ROLE_BENEFICIARY = "Beneficiary"
+
+ALL_ROLES = [
+    ROLE_TOURNAMENT_DIRECTOR,
+    ROLE_SPONSORSHIP_MANAGER,
+    ROLE_CHARITY_TREASURER,
+    ROLE_COURSE_OPERATIONS,
+    ROLE_PARTICIPANT,
+    ROLE_BENEFICIARY,
+]
+
+STAFF_ROLES = [
+    ROLE_TOURNAMENT_DIRECTOR,
+    ROLE_SPONSORSHIP_MANAGER,
+    ROLE_CHARITY_TREASURER,
+    ROLE_COURSE_OPERATIONS,
+]
+
+# --- Pagination (PRD 2.3) -----------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Course contract defaults (PRD 3.1) ---------------------------------
+DEFAULT_GUARANTEED_PLAYER_COUNT = 72
+DEFAULT_FNB_MINIMUM_CENTS = 0
+DEFAULT_FNB_PER_PLAYER_CENTS = 4500
+DEFAULT_COURSE_RATING = 71.4
+DEFAULT_SLOPE_RATING = 128
+DEFAULT_PAR = 72
+DEFAULT_TEE_INTERVAL_MINUTES = 10
+DEFAULT_CART_ALLOWANCE_COUNT = 40
+DEFAULT_RAIN_DATE_TERMS = "NONE"
+DEFAULT_RAIN_DATE_CREDIT_PCT = 0.5
+DEFAULT_CANCELLATION_NOTICE_DAYS = 30
+
+# --- Package tier defaults (PRD 3.2) ------------------------------------
+DEFAULT_GSV_CENTS = 0
+DEFAULT_INVENTORY_CAP = 999
+DEFAULT_ENTITLED_ASSET_TYPE = "NONE"
+DEFAULT_ENTITLED_ASSET_COUNT = 0
+MIN_PLAYER_SLOTS = 0
+MAX_PLAYER_SLOTS = 4
+
+# --- Field capacity / waitlist (PRD 3.2) --------------------------------
+PLAYERS_PER_TEAM = 4
+LATE_CANCEL_FEE_PCT = 0.25
+MAX_FIELD_REOPENS = 2
+
+# --- Handicaps (PRD 3.3) ------------------------------------------------
+MIN_HANDICAP_INDEX = 0
+MAX_HANDICAP_INDEX = 54.0
+SLOPE_DIVISOR = 113
+MIN_COURSE_HANDICAP = 0
+MAX_COURSE_HANDICAP = 36
+MAX_INDEX_IMPROVEMENT = 3.0
+SCRAMBLE_WEIGHTS = [0.20, 0.15, 0.10, 0.05]
+BEST_BALL_ALLOWANCE_PCT = 0.90
+STROKE_PLAY_ALLOWANCE_PCT = 1.00
+TEAM_ALLOWANCE_AGGREGATE_MULTIPLIER = 0.25
+
+# --- Sponsorship inventory (PRD 3.4) ------------------------------------
+DEFAULT_ASSET_CAPACITY = 1
+DEFAULT_ASSET_EXCLUSIVE = True
+WAIVER_CREDIT_PCT = 0.60
+CHANGEOVER_BUFFER_MINUTES = 30
+
+# --- Tee sheet and carts (PRD 3.5) --------------------------------------
+CART_TURNAROUND_MINUTES = 30
+CART_PREP_MINUTES = 15
+
+# --- Contests and insurance (PRD 3.6) -----------------------------------
+INSURANCE_REQUIRED_THRESHOLD_CENTS = 500000
+AMATEUR_CASH_CAP_CENTS = 75000
+DEFAULT_INSURANCE_MIN_YARDAGE = 165
+DEFAULT_INSURANCE_REQUIRED_WITNESS_COUNT = 2
+
+# --- Receipts (PRD 3.7) -------------------------------------------------
+TOKEN_GSV_CAP_CENTS = 1300
+TOKEN_GSV_PCT = 0.02
+RECEIPT_NUMBER_PREFIX = "GR-"
+
+# --- Scoring (PRD 3.8) --------------------------------------------------
+NET_SCORE_HANDICAP_FRACTION = 1.0
+NET_BACK_9_HANDICAP_FRACTION = 1.0 / 2.0
+NET_BACK_6_HANDICAP_FRACTION = 1.0 / 3.0
+NET_BACK_3_HANDICAP_FRACTION = 1.0 / 6.0
+NET_HOLE_18_HANDICAP_FRACTION = 1.0 / 18.0
+PRIZE_SHARES = [0.50, 0.30, 0.20]
+
+# --- Administrative fee (PRD 3.9) ---------------------------------------
+ADMIN_FEE_TIER_1_LIMIT_CENTS = 2000000
+ADMIN_FEE_TIER_2_LIMIT_CENTS = 5000000
+ADMIN_FEE_PCT_TIER_1 = 0.05
+ADMIN_FEE_PCT_TIER_2 = 0.035
+ADMIN_FEE_PCT_TIER_3 = 0.02

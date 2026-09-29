@@ -1,0 +1,173 @@
+"""Domain constants: enumerations, thresholds and rate tables from the PRD."""
+
+# --- Logical clock (PRD §2.4) ---
+# "Before the clock has ever been set it reads exactly 2026-08-01T00:00:00Z"
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00.000Z"
+
+# --- Roles (PRD §2.1) ---
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+ROLE_NUMBERING_ADMIN = "NumberingAdmin"
+ROLE_PORTING_SPECIALIST = "PortingSpecialist"
+ROLE_CARRIER_LIAISON = "CarrierLiaison"
+ROLE_ACCOUNT_ADMIN = "AccountAdmin"
+ROLE_E911_VALIDATOR = "E911Validator"
+ROLE_SECURITY_ANALYST = "SecurityAnalyst"
+ROLE_BILLING_ADMIN = "BillingAdmin"
+
+ALL_ROLES = (
+    ROLE_PLATFORM_ADMIN,
+    ROLE_NUMBERING_ADMIN,
+    ROLE_PORTING_SPECIALIST,
+    ROLE_CARRIER_LIAISON,
+    ROLE_ACCOUNT_ADMIN,
+    ROLE_E911_VALIDATOR,
+    ROLE_SECURITY_ANALYST,
+    ROLE_BILLING_ADMIN,
+)
+
+# --- Enumerations (PRD §3) ---
+ACCOUNT_STATUSES = ("ACTIVE", "SUSPENDED", "CLOSED")
+E911_POSTURES = ("COMPLIANT", "AT_RISK", "BLOCKED")
+CSR_MATCH_POLICIES = ("STRICT", "RELAXED")
+FEE_TYPES = ("PER_LINE", "PER_LOCATION")
+PHONE_NUMBER_STATUSES = ("AVAILABLE", "RESERVED", "ASSIGNED", "PARKED")
+RESERVATION_PURPOSES = ("PORT_BRIDGE", "NEW_LINE")
+RESERVATION_STATUSES = ("HELD", "CONSUMED", "RELEASED", "EXPIRED")
+RELEASED_REASONS = ("MANUAL", "BRIDGE_ORPHANED", "CUTOVER_COMPLETED")
+PORT_REQUEST_STATUSES = (
+    "SUBMITTED",
+    "CSR_MISMATCH",
+    "VALIDATED",
+    "SCHEDULED",
+    "BRIDGED",
+    "REJECTED",
+    "COMPLETED",
+    "CANCELLED",
+)
+PORT_REQUEST_TERMINAL_STATUSES = ("COMPLETED", "CANCELLED")
+MATCH_STATUSES = ("MATCHED", "MISMATCHED")
+REJECTION_CODES = (
+    "CSR_MISMATCH",
+    "PIN_INVALID",
+    "ACCOUNT_NOT_FOUND",
+    "PENDING_BALANCE",
+    "NUMBER_NOT_PORTABLE",
+    "DUPLICATE_REQUEST",
+)
+# PRD §3.4: "Four of those six describe a fixable data problem and are resubmittable"
+RESUBMITTABLE_REJECTION_CODES = (
+    "CSR_MISMATCH",
+    "PIN_INVALID",
+    "ACCOUNT_NOT_FOUND",
+    "PENDING_BALANCE",
+)
+TERMINAL_REJECTION_CODES = ("NUMBER_NOT_PORTABLE", "DUPLICATE_REQUEST")
+CUTOVER_SLOT_STATUSES = ("OPEN", "BOOKED", "CONSUMED", "RELEASED")
+BRIDGE_STATUSES = ("PROVISIONED", "ACTIVE", "RELEASED", "ORPHANED")
+DEVICE_TYPES = ("BASE_STATION", "HANDSET", "SOFTPHONE")
+REGISTRATION_STATUSES = (
+    "PENDING_REGISTRATION",
+    "ADDRESS_UNVERIFIED",
+    "REGISTERED",
+    "RELOCATION_DETECTED",
+    "SUSPENDED_911",
+)
+CALLING_STATUSES = ("UNRESTRICTED", "INTL_BLOCKED", "FULL_BLOCKED")
+VERIFICATION_STATUSES = (
+    "UNVERIFIED",
+    "VERIFIED",
+    "STALE",
+    "REJECTED",
+    "SUPERSEDED",
+)
+CALL_DECISIONS = (
+    "ALLOWED",
+    "BLOCKED_DEVICE",
+    "BLOCKED_E911",
+    "BLOCKED_INTL",
+    "BLOCKED_FRAUD",
+    "BLOCKED_SPEND_CAP",
+)
+RESTRICTION_ACTIONS = ("BLOCK_INTL", "BLOCK_ALL", "REVIEW_UNBLOCK")
+ASSESSMENT_VARIANTS = ("PROVISIONAL", "FINAL")
+ASSESSMENT_STATUSES = ("ASSESSED", "VOIDED", "REMITTED")
+
+# --- CSR comparison points (PRD §3.4) ---
+MATCH_POINT_WEIGHTS = {
+    "account_number": 40,
+    "pin": 30,
+    "billing_name": 15,
+    "service_address_line1": 10,
+    "service_zip": 5,
+}
+# Sorted ascending as plain strings, per PRD §3.4.
+COMPARISON_POINT_NAMES = (
+    "account_number",
+    "billing_name",
+    "pin",
+    "service_address_line1",
+    "service_zip",
+)
+THRESHOLD_STRICT = 100
+THRESHOLD_RELAXED = 85
+PERFECT_MATCH_POINTS = 100
+
+# --- Port request budget (PRD §3.4) ---
+PORT_RESUBMISSION_LIMIT = 2
+MIN_REQUESTED_NUMBERS = 1
+MAX_REQUESTED_NUMBERS = 5
+
+# --- Cutover windows (PRD §3.5) ---
+CUTOVER_MIN_WINDOW_MINUTES = 60
+CUTOVER_MAX_WINDOW_MINUTES = 480
+
+# --- Reservations (PRD §3.3) ---
+RESERVATION_MAX_DAYS = 45
+
+# --- Numbers (PRD §3.2) ---
+PARK_HOURS = 168
+E164_COUNTRY_PREFIX = "+1"
+
+# --- Devices and E911 (PRD §3.7) ---
+REGISTRATION_PROMPT_HOURS = 72
+DEFAULT_INTL_DAILY_CAP_CENTS = 2000
+
+# --- Toll-fraud scoring (PRD §3.8) ---
+FRAUD_BLOCK_THRESHOLD = 60
+FRAUD_SCORE_CAP = 100
+FRAUD_WINDOW_MINUTES = 60
+NEW_DEVICE_AGE_HOURS = 72
+NEW_DEVICE_MULTIPLIER = 1.5
+VELOCITY_POINTS_REALTIME = 4
+VELOCITY_POINTS_DAILY_REVIEW = 2
+VELOCITY_CAP = 40
+SPREAD_POINTS_REALTIME = 6
+SPREAD_POINTS_DAILY_REVIEW = 4
+NOMADISM_POINTS = 10
+FULL_BLOCK_FRAUD_COUNT = 3
+
+# PRD §3.8: "the risk of a country code is 0 for 1, 5 for 44, 25 for 53,
+# 30 for 234, 35 for 252, and 20 for any country code not in that table"
+COUNTRY_RISK_POINTS = {"1": 0, "44": 5, "53": 25, "234": 30, "252": 35}
+DEFAULT_COUNTRY_RISK_POINTS = 20
+
+# PRD §3.8: "12 cents for 44, 60 for 53, 95 for 234, 140 for 252, and 75 cents
+# for every other country code including the domestic 1"
+COUNTRY_RATE_CENTS = {"44": 12, "53": 60, "234": 95, "252": 140}
+DEFAULT_RATE_CENTS = 75
+
+# --- International spend control (PRD §3.8) ---
+# "0 percent from 0 cents, 5 percent from 2000 cents, 12 percent from 5000 cents"
+SURCHARGE_TIERS = ((0, 0), (2000, 5), (5000, 12))
+
+# --- Fee assessment (PRD §3.9) ---
+REMITTANCE_SENTINEL = "system:remittance-run"
+
+# --- Convenience test defaults ---
+TEST_DEFAULTS = {
+    "CLOCK_BASE": CLOCK_DEFAULT_ISO,
+    "JURISDICTION_STATE": "CA",
+    "JURISDICTION_FIPS": "06001",
+    "MONTHLY_FEE_CENTS": 175,
+    "REMIT_DAY_OF_MONTH": 5,
+}

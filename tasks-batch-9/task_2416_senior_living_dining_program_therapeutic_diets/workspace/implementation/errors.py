@@ -1,0 +1,63 @@
+"""Error catalogue (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# HTTP status per error id -- PRD section 5.
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_COMMUNITY_NOT_FOUND": 404,
+    "ERR_VENUE_NOT_FOUND": 404,
+    "ERR_RESIDENT_NOT_FOUND": 404,
+    "ERR_DIET_ORDER_NOT_FOUND": 404,
+    "ERR_RESERVATION_NOT_FOUND": 404,
+    "ERR_MENU_CYCLE_NOT_FOUND": 404,
+    "ERR_MENU_ITEM_NOT_FOUND": 404,
+    "ERR_EXTENSION_NOT_FOUND": 404,
+    "ERR_TICKET_NOT_FOUND": 404,
+    "ERR_RECONCILIATION_NOT_FOUND": 404,
+    "ERR_REVIEW_NOT_FOUND": 404,
+    "ERR_OBSERVATION_NOT_FOUND": 404,
+    "ERR_CROSS_COMMUNITY_REFERENCE": 422,
+    "ERR_LINKED_RESOURCE_MISMATCH": 422,
+    "ERR_MENU_ITEM_NOT_IN_CYCLE": 422,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_VERSION": 412,
+    "ERR_VENUE_SERVICE_SUSPENDED": 409,
+    "ERR_VENUE_POSTURE_RESTRICTED": 409,
+    "ERR_UNSAFE_TRAY_NO_SUBSTITUTION": 422,
+    "ERR_TEXTURE_REQUIRES_DIETITIAN": 422,
+    "ERR_DIET_ORDER_NOT_VERIFIED": 409,
+    "ERR_RESIDENT_NOT_ACTIVE": 409,
+    "ERR_CARE_LEVEL_NOT_SERVED": 422,
+    "ERR_NO_PUBLISHED_MENU_CYCLE": 409,
+    "ERR_OBSERVATION_FUTURE_DATE": 422,
+    "ERR_RESIDENT_MEAL_SPACING": 409,
+    "ERR_MENU_CYCLE_DATE_OVERLAP": 409,
+    "ERR_DUPLICATE_ITEM_CODE": 409,
+    "ERR_DUPLICATE_BALLOT": 409,
+    "ERR_THERAPEUTIC_COVERAGE_INCOMPLETE": 409,
+    "ERR_REVIEW_ROUND_LIMIT": 409,
+    "ERR_VENUE_CAPACITY_EXCEEDED": 409,
+    "ERR_PERIOD_CLOSED": 409,
+    "ERR_SPONSOR_LIMIT_EXCEEDED": 402,
+    "ERR_RECONCILIATION_STALE": 409,
+    "ERR_VARIANCE_UNRESOLVED": 409,
+}
+
+
+def api_error(error_id, message=None):
+    return ApiError(error_id, ERROR_STATUS[error_id], message)
+
+
+def invalid(message):
+    return ApiError("ERR_INVALID_REQUEST", 400, message)

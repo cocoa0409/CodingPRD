@@ -1,0 +1,67 @@
+"""Numeric and temporal constants fixed by the PRD.
+
+Only values the PRD states literally appear here; anything derived is computed
+inside the test that needs it so the arithmetic stays visible at the assertion.
+"""
+
+# --- Logical clock (PRD 2.7) ------------------------------------------
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# --- Designation fee allocation (PRD 3.3) -----------------------------
+PROCESSING_FEE_RATE = "0.0725"
+PROCESSING_FEE_RATE_PCT = "7.25"
+MINIMUM_PROCESSING_FEE = "1.50"
+MINIMUM_DESIGNATION_AMOUNT = "25.00"
+
+# --- Campaign pledge loss estimate (PRD 3.5) --------------------------
+ESCROW_HOLD_SHRINKAGE_THRESHOLD_BPS = 1500
+BASIS_POINT_DIVISOR = 10000
+
+# --- Agency financial standing score (PRD 3.6) ------------------------
+PROGRAM_RATIO_FLOOR = "0.65"
+PROGRAM_POINTS_MULTIPLIER = 400
+PROGRAM_POINTS_CAP = "40"
+RESERVE_POINTS_PER_MONTH = "5"
+RESERVE_POINTS_CAP = "25"
+GOVERNANCE_POINTS_PER_PRACTICE = "2.5"
+AUDIT_POINTS_UNQUALIFIED = "10"
+AUDIT_POINTS_QUALIFIED = "5"
+ADMIN_RATIO_THRESHOLD = "0.25"
+ADMIN_PENALTY_MULTIPLIER = 200
+RESTATEMENT_PENALTY = "7.5"
+RESTATEMENT_TOLERANCE = "0.02"
+STANDING_SCORE_MIN = "0"
+STANDING_SCORE_MAX = "100"
+GOOD_STANDING_THRESHOLD = "70"
+PROBATION_THRESHOLD = "55"
+
+# --- Cycle restriction posture (PRD 3.6) ------------------------------
+CYCLE_RESTRICTION_RATIO_THRESHOLD = "0.34"
+
+# --- Panel composite score (PRD 3.7) ----------------------------------
+WEIGHT_PROGRAM_DESIGN = "0.40"
+WEIGHT_ORGANIZATIONAL_CAPACITY = "0.35"
+WEIGHT_COMMUNITY_NEED = "0.25"
+PANEL_QUORUM = 3
+PANEL_TRIM_THRESHOLD = 5
+FOCUS_AREA_MULTIPLIER = "1.15"
+COMPOSITE_SCORE_CAP = "100.00"
+PANEL_APPROVAL_THRESHOLD = "72.00"
+
+# --- Community impact fund allocation (PRD 3.8) -----------------------
+DESIGNATION_OFFSET_TIER_1_CEILING = "50000"
+DESIGNATION_OFFSET_TIER_2_CEILING = "150000"
+DESIGNATION_OFFSET_RATE_TIER_1 = "0.00"
+DESIGNATION_OFFSET_RATE_TIER_2 = "0.15"
+DESIGNATION_OFFSET_RATE_TIER_3 = "0.35"
+SUPPLEMENT_TIER_1_CEILING = "50000"
+SUPPLEMENT_TIER_2_CEILING = "120000"
+SUPPLEMENT_RATE_TIER_1 = "0.06"
+SUPPLEMENT_RATE_TIER_2 = "0.03"
+SUPPLEMENT_RATE_TIER_3 = "0.01"
+OUTCOME_REPORT_DUE_DAYS = 180
+
+# --- Outcome reports and monitoring site visits (PRD 3.9) -------------
+MAX_REVISION_ROUNDS = 2
+SITE_VISIT_BUFFER_DAYS = 3
+SITE_VISIT_MAX_LEAD_DAYS = 90

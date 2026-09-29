@@ -1,0 +1,185 @@
+"""Domain constants -- every value is taken verbatim from SCAFFOLD.yaml /
+PRD.md.  Money is integer cents; every fractional quantity is a Decimal so
+that arithmetic never touches IEEE-754 floats.
+"""
+from decimal import Decimal
+
+D = Decimal
+
+# ---------------------------------------------------------------- roles
+ROLE_HOMEOWNER = "Homeowner"
+ROLE_INSTALLER = "InstallerTech"
+ROLE_GATEWAY = "DeviceGateway"
+ROLE_ANALYST = "InsurerAnalyst"
+ROLE_ADJUSTER = "ClaimsAdjuster"
+ROLE_ADMIN = "ProgramAdmin"
+
+ALL_ROLES = (
+    ROLE_HOMEOWNER,
+    ROLE_INSTALLER,
+    ROLE_GATEWAY,
+    ROLE_ANALYST,
+    ROLE_ADJUSTER,
+    ROLE_ADMIN,
+)
+
+HEADER_USER_ID = "X-User-ID"
+HEADER_USER_ROLE = "X-User-Role"
+
+# ---------------------------------------------------------------- clock
+CLOCK_DEFAULT_ISO = "2026-08-01T00:00:00Z"
+
+# ---------------------------------------------------------------- pagination
+PAGE_LIMIT_DEFAULT = 10
+PAGE_LIMIT_MIN = 1
+PAGE_LIMIT_MAX = 100
+PAGE_OFFSET_DEFAULT = 0
+
+# ---------------------------------------------------------------- baseline_learning_profile
+MIN_LEARNING_SAMPLES = 3
+DRIP_FRACTION = D("0.02")
+MIN_DRIP_GPM = D("0.05")
+
+# ---------------------------------------------------------------- anomaly_classification
+BURST_FLOW_FACTOR = D("1.50")
+BURST_MIN_DURATION_MINUTES = D("3")
+BURST_MIN_GALLONS = D("30")
+RUNNING_FLOW_FACTOR = D("0.40")
+RUNNING_MIN_DURATION_MINUTES = D("20")
+DRIP_MIN_DURATION_MINUTES = D("60")
+VACATION_SENSITIVITY_MULTIPLIER = D("0.50")
+VACATION_RUNNING_GALLON_CAP = D("15")
+
+# ---------------------------------------------------------------- severity_score
+SEVERITY_FLOW_WEIGHT = D("0.50")
+SEVERITY_DURATION_WEIGHT = D("0.30")
+SEVERITY_GALLON_WEIGHT = D("0.20")
+SEVERITY_REFERENCE_FACTOR = D("2.00")
+
+# ---------------------------------------------------------------- auto_shutoff_decision
+OVERRIDE_GRACE_MINUTES = 120
+
+# ---------------------------------------------------------------- uptime_coverage_pct
+COVERAGE_MINUTES_PER_READING = 120
+MIN_OFFLINE_GAP_MINUTES = 60
+
+# ---------------------------------------------------------------- premium_credit_award
+UPTIME_CREDIT_FLOOR_PCT = D("95.00")
+TIER_ELITE_CUT = D("99.00")
+TIER_ELITE_PCT = D("0.12")
+TIER_STRONG_CUT = D("97.00")
+TIER_STRONG_PCT = D("0.08")
+TIER_BASE_CUT = D("95.00")
+TIER_BASE_PCT = D("0.05")
+PERIODS_PER_POLICY_YEAR = 2
+
+# ---------------------------------------------------------------- claim_payout_award
+MITIGATION_WINDOW_MINUTES = D("5")
+WATER_DAMAGE_CAP_CENTS = 500000
+WARRANTY_CAP_CENTS = 150000
+UNMITIGATED_FACTOR = D("0.50")
+POLICY_ANNUAL_PAYOUT_CAP_CENTS = 600000
+
+# ---------------------------------------------------------------- false_positive_tuning
+TUNING_STEP = D("0.20")
+DRIP_CEILING_GPM = D("0.50")
+MAX_FALSE_POSITIVES_BEFORE_RELEARN = 3
+FALSE_POSITIVE_WINDOW_DAYS = 30
+
+# ---------------------------------------------------------------- escalation_sla_evaluation
+HOMEOWNER_SLA_MINUTES = 15
+CONTACT_SLA_MINUTES = 30
+
+# ---------------------------------------------------------------- operational_window_bounds
+INSTALL_MIN_STATIC_PSI = D("40.0")
+INSTALL_MAX_STATIC_PSI = D("80.0")
+INSTALL_MAX_DROP_PSI = D("2.0")
+MAX_READING_BACKDATE_HOURS = 24
+DUPLICATE_COOLDOWN_MINUTES = 60
+MIN_SNOOZE_MINUTES = 30
+MAX_SNOOZE_MINUTES = 240
+SNOOZE_COOLDOWN_MINUTES = 60
+MAX_VACATION_DAYS = 90
+TRANSFER_ACCEPT_WINDOW_HOURS = 168
+CLAIM_SUBMISSION_WINDOW_DAYS = 30
+
+# ---------------------------------------------------------------- enums
+NOTIFICATION_CHANNELS = ("SMS", "EMAIL", "PUSH")
+ACCOUNT_STATES = ("ACTIVE", "DEACTIVATED")
+CONTACT_VERIFICATION_STATES = ("PENDING", "VERIFIED")
+CONTACT_STATUSES = ("ACTIVE", "REMOVED")
+PROPERTY_STATES = ("ACTIVE", "TRANSFER_PENDING", "ARCHIVED")
+MODEL_CODES = ("FLO_SMART_3_4", "FLO_SMART_1_0")
+LIFECYCLE_STATES = (
+    "REGISTERED",
+    "INSTALL_VERIFIED",
+    "LEARNING",
+    "ARMED",
+    "TRANSFER_PENDING",
+    "DECOMMISSIONED",
+)
+VALVE_STATES = ("OPEN", "CLOSED")
+MONITOR_MODES = ("NORMAL", "VACATION", "SNOOZE")
+LEARNING_STATES = ("COLLECTING", "COMPLETE", "INVALIDATED")
+INVALIDATED_REASONS = ("FIRMWARE_UPDATE", "OWNERSHIP_TRANSFER", "FALSE_POSITIVE_THRESHOLD")
+READING_SOURCES = ("DEVICE", "MANUAL_TEST")
+CLASSIFICATIONS = ("NONE", "DRIP", "RUNNING_FIXTURE", "CATASTROPHIC_BURST")
+EVENT_STATES = (
+    "DETECTED",
+    "SUPPRESSED",
+    "ALERTED",
+    "ESCALATED",
+    "RESOLVED",
+    "FALSE_POSITIVE",
+)
+SUPPRESSION_REASONS = ("DEVICE_NOT_ARMED", "SNOOZE_ACTIVE", "DUPLICATE_WITHIN_COOLDOWN")
+FEEDBACK_LABELS = ("TRUE_POSITIVE", "FALSE_POSITIVE")
+TICKET_STAGES = (
+    "PENDING_HOMEOWNER",
+    "PENDING_EMERGENCY_CONTACT",
+    "ACKNOWLEDGED",
+    "EXPIRED",
+)
+TICKET_EXPIRY_REASONS = (
+    "CONTACT_SLA_BREACH",
+    "NO_ELIGIBLE_CONTACT",
+    "ACCOUNT_DEACTIVATED",
+    "EVENT_CLOSED",
+)
+IRRIGATION_STATUSES = ("ACTIVE", "SUSPENDED_BY_SHUTOFF", "CANCELLED")
+CREDIT_STATES = (
+    "PENDING_ENROLLMENT",
+    "CREDIT_ACTIVE",
+    "CREDIT_SUSPENDED",
+    "TERMINATED",
+)
+POLICY_SUSPENDED_REASONS = ("DEVICE_NOT_ARMED", "UPTIME_BELOW_FLOOR", "OWNERSHIP_TRANSFER")
+ATTESTATION_STATUSES = ("OPEN", "FINALIZED_AWARDED", "FINALIZED_DENIED")
+ATTESTATION_DENIAL_REASONS = ("UPTIME_BELOW_FLOOR", "DEVICE_NOT_ARMED", "NO_ENROLLED_DEVICE")
+CLAIM_TYPES = ("WARRANTY_DEVICE", "WATER_DAMAGE")
+CLAIM_STATUSES = (
+    "SUBMITTED",
+    "UNDER_REVIEW",
+    "INFO_REQUESTED",
+    "APPROVED",
+    "DENIED",
+    "PAID",
+)
+PAYOUT_VARIANTS = ("MITIGATED", "UNMITIGATED", "WARRANTY_FLAT")
+CLAIM_DENIAL_REASONS = (
+    "NO_QUALIFYING_EVENT",
+    "OVERRIDE_DEFEATED_MITIGATION",
+    "INSUFFICIENT_DOCUMENTATION",
+    "ACCOUNT_CLOSED",
+)
+CLAIM_DECISIONS = (
+    "BEGIN_REVIEW",
+    "REQUEST_INFO",
+    "SUPPLY_INFO",
+    "APPROVE",
+    "DENY",
+    "PAY",
+)
+TRANSFER_STATUSES = ("INITIATED", "ACCEPTED", "CANCELLED", "EXPIRED")
+TRANSFER_CANCEL_REASONS = ("SUPERSEDED", "ACCOUNT_DEACTIVATED")
+VALVE_COMMANDS = ("OPEN", "CLOSE")

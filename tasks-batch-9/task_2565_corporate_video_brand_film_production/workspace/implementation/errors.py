@@ -1,0 +1,67 @@
+"""Error catalog (PRD section 5 / scaffold 1.6) and the ApiError exception."""
+
+ERROR_CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_CREW_SCOPE_FORBIDDEN": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_DELIVERABLE_NOT_FOUND": 404,
+    "ERR_DELIVERABLE_VERSION_NOT_FOUND": 404,
+    "ERR_CHANGE_ORDER_NOT_FOUND": 404,
+    "ERR_SHOOT_DAY_NOT_FOUND": 404,
+    "ERR_LOCATION_NOT_FOUND": 404,
+    "ERR_CREW_MEMBER_NOT_FOUND": 404,
+    "ERR_CREW_BOOKING_NOT_FOUND": 404,
+    "ERR_COMPLIANCE_CERT_NOT_FOUND": 404,
+    "ERR_TALENT_ENGAGEMENT_NOT_FOUND": 404,
+    "ERR_STALE_DELIVERABLE_VERSION": 412,
+    "ERR_PROJECT_STATE_INVALID": 409,
+    "ERR_DELIVERABLE_STATE_INVALID": 409,
+    "ERR_VERSION_REVIEW_STATE_INVALID": 409,
+    "ERR_QC_ALREADY_RECORDED": 409,
+    "ERR_VERSION_QC_NOT_PASSED": 409,
+    "ERR_SHOOT_DAY_STATE_INVALID": 409,
+    "ERR_CREW_BOOKING_STATE_INVALID": 409,
+    "ERR_COMPLIANCE_CERT_STATE_INVALID": 409,
+    "ERR_CHANGE_ORDER_STATE_INVALID": 409,
+    "ERR_TALENT_ENGAGEMENT_STATE_INVALID": 409,
+    "ERR_ARCHIVE_ALREADY_HANDED_OVER": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_PERMIT_WINDOW_MISMATCH": 422,
+    "ERR_INSUFFICIENT_COI_COVERAGE": 422,
+    "ERR_COMPLIANCE_POSTURE_BLOCKED": 422,
+    "ERR_MIN_CREW_NOT_MET": 422,
+    "ERR_CALL_SHEET_WINDOW_CLOSED": 422,
+    "ERR_CREW_DOUBLE_BOOKED": 409,
+    "ERR_CREW_TURNAROUND_VIOLATION": 409,
+    "ERR_EQUIPMENT_WINDOW_OUT_OF_RANGE": 422,
+    "ERR_LOCATION_CAPACITY_EXCEEDED": 409,
+    "ERR_REVISION_ROUNDS_EXHAUSTED": 409,
+    "ERR_CHANGE_ORDER_PENDING": 409,
+    "ERR_SCOPE_INCOMPLETE": 422,
+    "ERR_CHANNEL_OUT_OF_SCOPE": 422,
+    "ERR_USAGE_RIGHTS_EXCEED_TERM": 422,
+    "ERR_TALENT_COMP_MODEL_INVALID": 422,
+    "ERR_VERSION_DELIVERABLE_MISMATCH": 422,
+    "ERR_CERT_SCOPE_MISMATCH": 422,
+    "ERR_BUDGET_CEILING_EXCEEDED": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_CATALOG.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    words = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return "Request rejected: %s." % words
+
+
+def bad_request(message):
+    return ApiError("ERR_INVALID_REQUEST", message)

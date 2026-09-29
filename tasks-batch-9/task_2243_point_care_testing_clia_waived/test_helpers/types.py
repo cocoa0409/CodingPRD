@@ -1,0 +1,205 @@
+"""Domain enums and response shapes for the Point-Of-Care Testing Oversight API."""
+
+from enum import Enum
+
+
+class UserRole(str, Enum):
+    PROGRAM_ADMIN = "ProgramAdmin"
+    LAB_DIRECTOR = "LabDirector"
+    QUALITY_COORDINATOR = "QualityCoordinator"
+    OPERATOR = "Operator"
+    SURVEYOR = "Surveyor"
+
+
+class CertificateType(str, Enum):
+    CERTIFICATE_OF_WAIVER = "CERTIFICATE_OF_WAIVER"
+    CERTIFICATE_OF_COMPLIANCE = "CERTIFICATE_OF_COMPLIANCE"
+    CERTIFICATE_OF_ACCREDITATION = "CERTIFICATE_OF_ACCREDITATION"
+
+
+class Complexity(str, Enum):
+    WAIVED = "WAIVED"
+    MODERATE = "MODERATE"
+
+
+class CertificateStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    SUSPENDED = "SUSPENDED"
+    EXPIRED = "EXPIRED"
+
+
+class OversightPosture(str, Enum):
+    OPEN = "OPEN"
+    RESTRICTED = "RESTRICTED"
+    SUSPENDED = "SUSPENDED"
+
+
+class RoleTitle(str, Enum):
+    PHYSICIAN = "PHYSICIAN"
+    DOCTORAL_SCIENTIST = "DOCTORAL_SCIENTIST"
+    MIDLEVEL_PRACTITIONER = "MIDLEVEL_PRACTITIONER"
+    MEDICAL_TECHNOLOGIST = "MEDICAL_TECHNOLOGIST"
+    MEDICAL_ASSISTANT = "MEDICAL_ASSISTANT"
+    NURSE = "NURSE"
+
+
+class CompetencyStatus(str, Enum):
+    PENDING = "PENDING"
+    PROVISIONAL = "PROVISIONAL"
+    COMPETENT = "COMPETENT"
+    LAPSED = "LAPSED"
+    REVOKED = "REVOKED"
+
+
+class AccessStatus(str, Enum):
+    LOCKED_OUT = "LOCKED_OUT"
+    ACTIVE = "ACTIVE"
+    DEACTIVATED = "DEACTIVATED"
+
+
+class LockoutReason(str, Enum):
+    NEVER_TRAINED = "NEVER_TRAINED"
+    COMPETENCY_LAPSED = "COMPETENCY_LAPSED"
+    SITE_SUSPENDED = "SITE_SUSPENDED"
+    COMPETENCY_REVOKED = "COMPETENCY_REVOKED"
+
+
+class AssessmentType(str, Enum):
+    INITIAL = "INITIAL"
+    SEMIANNUAL_1 = "SEMIANNUAL_1"
+    SEMIANNUAL_2 = "SEMIANNUAL_2"
+    ANNUAL = "ANNUAL"
+
+
+class AssessmentStatus(str, Enum):
+    SUBMITTED = "SUBMITTED"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    VOIDED = "VOIDED"
+
+
+class DeviceStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    QC_LOCKED = "QC_LOCKED"
+    RETIRED = "RETIRED"
+
+
+class QcLockReason(str, Enum):
+    QC_FAILURE = "QC_FAILURE"
+    QC_OVERDUE = "QC_OVERDUE"
+    LOT_QUARANTINE = "LOT_QUARANTINE"
+    PT_UNSUCCESSFUL = "PT_UNSUCCESSFUL"
+    CERTIFICATE_SCOPE = "CERTIFICATE_SCOPE"
+
+
+class ConnectivityMode(str, Enum):
+    INTERFACED = "INTERFACED"
+    MANUAL_ENTRY = "MANUAL_ENTRY"
+    OFFLINE = "OFFLINE"
+
+
+class ExcursionState(str, Enum):
+    IN_RANGE = "IN_RANGE"
+    EXCURSION_OPEN = "EXCURSION_OPEN"
+
+
+class ReadingDisposition(str, Enum):
+    IN_RANGE = "IN_RANGE"
+    OUT_OF_RANGE = "OUT_OF_RANGE"
+
+
+class VerificationStatus(str, Enum):
+    UNVERIFIED = "UNVERIFIED"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+    QUARANTINED = "QUARANTINED"
+    DISCARDED = "DISCARDED"
+    EXPIRED = "EXPIRED"
+
+
+class QuarantineReason(str, Enum):
+    TEMPERATURE_EXCURSION = "TEMPERATURE_EXCURSION"
+
+
+class ControlLevel(str, Enum):
+    LEVEL_1 = "LEVEL_1"
+    LEVEL_2 = "LEVEL_2"
+
+
+class QcResult(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+
+
+class EntryMode(str, Enum):
+    INTERFACED = "INTERFACED"
+    MANUAL = "MANUAL"
+
+
+class PostingStatus(str, Enum):
+    PENDING_REVIEW = "PENDING_REVIEW"
+    POSTED = "POSTED"
+    HELD = "HELD"
+    REJECTED = "REJECTED"
+    CORRECTION_PENDING = "CORRECTION_PENDING"
+
+
+class EnrollmentStatus(str, Enum):
+    ENROLLED = "ENROLLED"
+    UNSUCCESSFUL_PARTICIPATION = "UNSUCCESSFUL_PARTICIPATION"
+
+
+class PtEventStatus(str, Enum):
+    PENDING = "PENDING"
+    PASSED = "PASSED"
+    INVESTIGATION_OPEN = "INVESTIGATION_OPEN"
+    UNSUCCESSFUL_LOCKED = "UNSUCCESSFUL_LOCKED"
+    INVESTIGATION_SUBMITTED = "INVESTIGATION_SUBMITTED"
+    INVESTIGATION_ACCEPTED = "INVESTIGATION_ACCEPTED"
+
+
+class PtOutcome(str, Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+
+
+class InspectionType(str, Enum):
+    BIENNIAL_SURVEY = "BIENNIAL_SURVEY"
+    COMPLAINT_SURVEY = "COMPLAINT_SURVEY"
+    INTERNAL_READINESS = "INTERNAL_READINESS"
+
+
+class InspectionStatus(str, Enum):
+    IN_PROGRESS = "IN_PROGRESS"
+    DEFICIENCIES_ISSUED = "DEFICIENCIES_ISSUED"
+    CLOSED = "CLOSED"
+    RESCINDED = "RESCINDED"
+
+
+class DeficiencyCategory(str, Enum):
+    PERSONNEL_COMPETENCY = "PERSONNEL_COMPETENCY"
+    QUALITY_CONTROL = "QUALITY_CONTROL"
+    PROFICIENCY_TESTING = "PROFICIENCY_TESTING"
+    REAGENT_STORAGE = "REAGENT_STORAGE"
+    RESULT_REPORTING = "RESULT_REPORTING"
+    CERTIFICATE_SCOPE = "CERTIFICATE_SCOPE"
+
+
+class Severity(str, Enum):
+    CONDITION_LEVEL = "CONDITION_LEVEL"
+    STANDARD_LEVEL = "STANDARD_LEVEL"
+    ADVISORY = "ADVISORY"
+
+
+class DeficiencyStatus(str, Enum):
+    DRAFT = "DRAFT"
+    OPEN = "OPEN"
+    CORRECTION_SUBMITTED = "CORRECTION_SUBMITTED"
+    CORRECTION_REJECTED = "CORRECTION_REJECTED"
+    CLOSED = "CLOSED"
+    VOIDED = "VOIDED"
+
+
+class ReadinessBasis(str, Enum):
+    AS_OF_ACTUAL = "AS_OF_ACTUAL"
+    PRE_SURVEY_PROJECTED = "PRE_SURVEY_PROJECTED"

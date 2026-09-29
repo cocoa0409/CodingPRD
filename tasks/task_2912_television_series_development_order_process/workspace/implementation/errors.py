@@ -1,0 +1,143 @@
+"""Error catalogue for the Television Series Development API.
+
+Every identifier and HTTP status below is taken verbatim from PRD section 5
+(Error Code Catalogue) / SCAFFOLD section 1.6.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_AGENCY_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_AGENCY_NOT_FOUND": 404,
+    "ERR_SLATE_NOT_FOUND": 404,
+    "ERR_WRITER_NOT_FOUND": 404,
+    "ERR_HOLDING_DEAL_NOT_FOUND": 404,
+    "ERR_PITCH_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_SCRIPT_DEAL_NOT_FOUND": 404,
+    "ERR_DEAL_STEP_NOT_FOUND": 404,
+    "ERR_PILOT_ORDER_NOT_FOUND": 404,
+    "ERR_SCREENING_NOT_FOUND": 404,
+    "ERR_NEGOTIATION_NOT_FOUND": 404,
+    "ERR_GREENLIGHT_NOT_FOUND": 404,
+    # state
+    "ERR_INVALID_PITCH_STATE": 409,
+    "ERR_INVALID_PROJECT_STATE": 409,
+    "ERR_INVALID_DEAL_STATE": 409,
+    "ERR_INVALID_DEAL_STEP_STATE": 409,
+    "ERR_INVALID_PILOT_ORDER_STATE": 409,
+    "ERR_CONTINGENCY_ALREADY_RESOLVED": 409,
+    "ERR_INVALID_SCREENING_STATE": 409,
+    "ERR_INVALID_NEGOTIATION_STATE": 409,
+    "ERR_INVALID_GREENLIGHT_STATE": 409,
+    "ERR_COMMITTEE_ALREADY_DECIDED": 409,
+    "ERR_ACCEPT_BY_OFFERING_SIDE": 409,
+    "ERR_SLATE_POSTURE_LOCKED": 409,
+    # optimistic concurrency
+    "ERR_STALE_PROJECT_VERSION": 412,
+    "ERR_STALE_PILOT_ORDER_VERSION": 412,
+    # business
+    "ERR_PACKAGING_NOT_PERMITTED": 422,
+    "ERR_RIGHTS_NOT_CLEAR": 422,
+    "ERR_RIGHTS_HOLDBACK_CONFLICT": 422,
+    "ERR_HOLDING_DEAL_OVERLAP": 422,
+    "ERR_WRITER_EXCLUSIVITY_CONFLICT": 422,
+    "ERR_WRITER_STEP_LOAD_EXCEEDED": 422,
+    "ERR_GUARANTEED_STEP_NOT_CUTTABLE": 422,
+    "ERR_TEST_SAMPLE_TOO_SMALL": 422,
+    "ERR_OPTION_PERIOD_EXPIRED": 422,
+    "ERR_SHOOT_WINDOW_NOT_ELAPSED": 422,
+    "ERR_TURNAROUND_WINDOW_CLOSED": 422,
+    "ERR_NOTES_ROUNDS_EXHAUSTED": 422,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 422,
+    "ERR_TERM_SHEET_INVALID": 422,
+    "ERR_LICENSE_FEE_ABOVE_CAP": 422,
+    "ERR_PILOT_BUDGET_ABOVE_PATTERN": 422,
+    "ERR_STAGE_CAPACITY_EXCEEDED": 422,
+    "ERR_AGENCY_SUBMISSION_CAP_REACHED": 422,
+    "ERR_NEGOTIATION_PROJECT_MISMATCH": 422,
+    "ERR_NO_CERTIFIED_TEST": 422,
+    "ERR_TEST_SCORE_BELOW_FLOOR": 422,
+    "ERR_SLATE_DEV_BUDGET_EXCEEDED": 422,
+    "ERR_EPISODE_CAPACITY_EXCEEDED": 422,
+    "ERR_FEASIBILITY_FAILED": 422,
+    # framework-level fallbacks
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are both required.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this operation.",
+    "ERR_AGENCY_SCOPE_VIOLATION": "An AgencyRep may only act within their own agency.",
+    "ERR_SEGREGATION_OF_DUTIES": "This user has already recorded a committee decision on this request.",
+    "ERR_INVALID_REQUEST": "The request body or query string is malformed.",
+    "ERR_AGENCY_NOT_FOUND": "No agency with the given id.",
+    "ERR_SLATE_NOT_FOUND": "No slate with the given id.",
+    "ERR_WRITER_NOT_FOUND": "No writer with the given id.",
+    "ERR_HOLDING_DEAL_NOT_FOUND": "No holding deal with the given id.",
+    "ERR_PITCH_NOT_FOUND": "No pitch with the given id.",
+    "ERR_PROJECT_NOT_FOUND": "No development project with the given id.",
+    "ERR_SCRIPT_DEAL_NOT_FOUND": "No script deal with the given id.",
+    "ERR_DEAL_STEP_NOT_FOUND": "No deal step with the given id on that script deal.",
+    "ERR_PILOT_ORDER_NOT_FOUND": "No pilot order with the given id.",
+    "ERR_SCREENING_NOT_FOUND": "No test screening with the given id.",
+    "ERR_NEGOTIATION_NOT_FOUND": "No series-order negotiation with the given id.",
+    "ERR_GREENLIGHT_NOT_FOUND": "No greenlight request with the given id.",
+    "ERR_INVALID_PITCH_STATE": "The pitch's status does not permit this operation.",
+    "ERR_INVALID_PROJECT_STATE": "The project's dev_status does not permit this operation.",
+    "ERR_INVALID_DEAL_STATE": "The deal is not EXECUTED, so its steps are frozen.",
+    "ERR_INVALID_DEAL_STEP_STATE": "The deal step is not in the status this operation requires.",
+    "ERR_INVALID_PILOT_ORDER_STATE": "The pilot order's production_status does not permit this operation.",
+    "ERR_CONTINGENCY_ALREADY_RESOLVED": "That contingency dimension is no longer PENDING.",
+    "ERR_INVALID_SCREENING_STATE": "The test screening is not FIELDED.",
+    "ERR_INVALID_NEGOTIATION_STATE": "The negotiation is not in a status that permits this operation.",
+    "ERR_INVALID_GREENLIGHT_STATE": "The greenlight request is not OPEN.",
+    "ERR_COMMITTEE_ALREADY_DECIDED": "That committee has already recorded a decision.",
+    "ERR_ACCEPT_BY_OFFERING_SIDE": "The side that tabled the standing offer may not accept it.",
+    "ERR_SLATE_POSTURE_LOCKED": "The slate posture is LOCKED and takes no new commitment.",
+    "ERR_STALE_PROJECT_VERSION": "expected_project_version does not match the project's current version.",
+    "ERR_STALE_PILOT_ORDER_VERSION": "expected_pilot_order_version does not match the pilot order's current version.",
+    "ERR_PACKAGING_NOT_PERMITTED": "This agency may not submit packaged pitches.",
+    "ERR_RIGHTS_NOT_CLEAR": "The pitch's most recent rights check is not CLEAR.",
+    "ERR_RIGHTS_HOLDBACK_CONFLICT": "The underlying IP is inside its holdback or quiet period.",
+    "ERR_HOLDING_DEAL_OVERLAP": "The writer already has an ACTIVE holding deal overlapping this term.",
+    "ERR_WRITER_EXCLUSIVITY_CONFLICT": "The writer is held exclusive by another slate.",
+    "ERR_WRITER_STEP_LOAD_EXCEEDED": "The writer already carries the maximum number of open steps.",
+    "ERR_GUARANTEED_STEP_NOT_CUTTABLE": "A guaranteed step is still PENDING and cannot be cut off.",
+    "ERR_TEST_SAMPLE_TOO_SMALL": "The screening panel is too small to certify.",
+    "ERR_OPTION_PERIOD_EXPIRED": "The step's option period has expired.",
+    "ERR_SHOOT_WINDOW_NOT_ELAPSED": "The pilot's shoot window has not elapsed.",
+    "ERR_TURNAROUND_WINDOW_CLOSED": "The turnaround window has closed.",
+    "ERR_NOTES_ROUNDS_EXHAUSTED": "The step has no notes rounds left.",
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": "The negotiation has no rounds left.",
+    "ERR_TERM_SHEET_INVALID": "The term sheet is not internally coherent.",
+    "ERR_LICENSE_FEE_ABOVE_CAP": "The license fee exceeds the slate's per-episode cap.",
+    "ERR_PILOT_BUDGET_ABOVE_PATTERN": "The pilot budget exceeds the slate's pattern-budget tolerance.",
+    "ERR_STAGE_CAPACITY_EXCEEDED": "The slate has no free pilot shoot window.",
+    "ERR_AGENCY_SUBMISSION_CAP_REACHED": "The agency has used its whole submission allotment.",
+    "ERR_NEGOTIATION_PROJECT_MISMATCH": "The negotiation belongs to a different project.",
+    "ERR_NO_CERTIFIED_TEST": "The project has no CERTIFIED test screening.",
+    "ERR_TEST_SCORE_BELOW_FLOOR": "The certified screening's normalised score is below the floor.",
+    "ERR_SLATE_DEV_BUDGET_EXCEEDED": "The slate's available development dollars do not cover this commitment.",
+    "ERR_EPISODE_CAPACITY_EXCEEDED": "The slate's available episode inventory does not cover this reservation.",
+    "ERR_FEASIBILITY_FAILED": "The project's PATTERN-basis feasibility verdict is INFEASIBLE.",
+    "ERR_NOT_FOUND": "The requested resource does not exist.",
+    "ERR_METHOD_NOT_ALLOWED": "That method is not allowed on this path.",
+    "ERR_INTERNAL": "An unexpected server error occurred.",
+}

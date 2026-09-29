@@ -1,0 +1,84 @@
+"""Error catalogue (PRD §5) and the exception type carrying it."""
+
+# error_id -> HTTP status code, transcribed verbatim from PRD §5.
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_COMPANY_NOT_FOUND": 404,
+    "ERR_PEER_GROUP_NOT_FOUND": 404,
+    "ERR_PEER_GROUP_MEMBER_NOT_FOUND": 404,
+    "ERR_EXECUTIVE_NOT_FOUND": 404,
+    "ERR_PAY_PROGRAM_NOT_FOUND": 404,
+    "ERR_INCENTIVE_METRIC_NOT_FOUND": 404,
+    "ERR_PAYOUT_AWARD_NOT_FOUND": 404,
+    "ERR_CDA_DRAFT_NOT_FOUND": 404,
+    "ERR_SCREEN_NOT_FOUND": 404,
+    "ERR_ENGAGEMENT_NOT_FOUND": 404,
+    "ERR_RESTATEMENT_EVENT_NOT_FOUND": 404,
+    "ERR_DETERMINATION_NOT_FOUND": 404,
+    "ERR_STALE_PEER_GROUP_VERSION": 412,
+    "ERR_STALE_PAY_PROGRAM_VERSION": 412,
+    "ERR_STALE_INCENTIVE_METRIC_VERSION": 412,
+    "ERR_PEER_GROUP_NOT_MUTABLE": 409,
+    "ERR_PEER_GROUP_NOT_SCREENED": 409,
+    "ERR_PROGRAM_NOT_MUTABLE": 409,
+    "ERR_METRIC_STATE_INVALID": 409,
+    "ERR_AWARD_NOT_GRANTED": 409,
+    "ERR_CDA_STATE_INVALID": 409,
+    "ERR_ENGAGEMENT_STATE_INVALID": 409,
+    "ERR_PROGRAM_NOT_DISCLOSED": 409,
+    "ERR_VOTE_ALREADY_CERTIFIED": 409,
+    "ERR_VOTE_NOT_FAILED": 409,
+    "ERR_EVENT_STATE_INVALID": 409,
+    "ERR_DETERMINATION_STATE_INVALID": 409,
+    "ERR_QUIET_PERIOD_ENGAGEMENT": 409,
+    "ERR_DETERMINATION_NOT_ACKNOWLEDGED": 422,
+    "ERR_PEER_COMPANY_DELISTED": 422,
+    "ERR_PEER_IS_ISSUER": 422,
+    "ERR_PEER_GROUP_NOT_APPROVED": 409,
+    "ERR_ISS_SCREEN_NOT_CURRENT": 409,
+    "ERR_METRIC_NOT_CERTIFIED": 409,
+    "ERR_CDA_NOT_FILED": 409,
+    "ERR_ISSUER_ALREADY_EXISTS": 409,
+    "ERR_PEER_ALREADY_IN_GROUP": 409,
+    "ERR_METRIC_ALREADY_DEFINED": 409,
+    "ERR_CDA_SECTION_ALREADY_EXISTS": 409,
+    "ERR_SCREEN_ALREADY_EXISTS": 409,
+    "ERR_ENGAGEMENT_WINDOW_IN_PAST": 422,
+    "ERR_OUTREACH_WINDOW_OVERLAP": 409,
+    "ERR_LOOKBACK_PERIOD_COLLISION": 409,
+    "ERR_MEETING_DATE_NOT_FUTURE": 422,
+    "ERR_PAY_MIX_MUST_TOTAL_100": 422,
+    "ERR_MIX_COMPONENT_OUT_OF_BOUNDS": 422,
+    "ERR_GOAL_CURVE_NOT_MONOTONIC": 422,
+    "ERR_METRIC_WEIGHTS_NOT_100": 422,
+    "ERR_PEER_OUTSIDE_SIZE_BAND": 422,
+    "ERR_PEER_GROUP_EMPTY": 422,
+    "ERR_CDA_TABLES_INCOMPLETE": 422,
+    "ERR_ADJUSTMENT_EXCEEDS_POLICY_LIMIT": 422,
+    "ERR_TDC_EXCEEDS_BENCHMARK_CAP": 422,
+    "ERR_OUTREACH_COVERAGE_INSUFFICIENT": 422,
+    # Not part of the PRD catalogue; only ever produced for an unrouted path.
+    "ERR_NOT_FOUND": 404,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or carry an unrecognised role.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not authorised for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting officer does not own this resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this user performing this step.",
+    "ERR_INVALID_REQUEST": "The request is malformed.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )
+        self.http_status = ERROR_STATUS.get(error_id, 400)

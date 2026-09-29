@@ -1,0 +1,223 @@
+"""
+Enumeration members and per-collection field shapes.
+
+Every literal here is spelled exactly as the PRD spells it — "Spelling is exact
+and case-sensitive" (§2.1) — so a typo in a test payload fails at import review
+rather than as a mysterious 400.
+"""
+
+# ─── Roles (§2.1) ─────────────────────────────────────────────────────
+
+ROLE_CARDHOLDER = "Cardholder"
+ROLE_AGENCY_SUPPLIER = "AgencySupplier"
+ROLE_PROGRAM_ADMIN = "ProgramAdmin"
+ROLE_PROGRAM_APPROVER = "ProgramApprover"
+ROLE_FRAUD_ANALYST = "FraudAnalyst"
+
+ALL_ROLES = (
+    ROLE_CARDHOLDER,
+    ROLE_AGENCY_SUPPLIER,
+    ROLE_PROGRAM_ADMIN,
+    ROLE_PROGRAM_APPROVER,
+    ROLE_FRAUD_ANALYST,
+)
+
+
+# ─── Account (§3.1) ───────────────────────────────────────────────────
+
+ACCOUNT_ACTIVE = "ACTIVE"
+ACCOUNT_CLOSED = "CLOSED"
+
+POSTURE_CLEAR = "CLEAR"
+POSTURE_WATCH = "WATCH"
+POSTURE_LOCKED = "LOCKED"
+
+PRODUCT_PREMIER = "PREMIER"
+PRODUCT_CORE = "CORE"
+PRODUCT_LEGACY_GOLD = "LEGACY_GOLD"
+
+
+# ─── Merchant categories and rotations (§3.2) ─────────────────────────
+
+CATEGORY_DINING = "DINING"
+CATEGORY_TRAVEL_AIR = "TRAVEL_AIR"
+CATEGORY_TRAVEL_HOTEL = "TRAVEL_HOTEL"
+CATEGORY_GROCERY = "GROCERY"
+CATEGORY_GAS = "GAS"
+CATEGORY_OTHER = "OTHER"
+
+ROTATION_DRAFT = "DRAFT"
+ROTATION_SCHEDULED = "SCHEDULED"
+ROTATION_ACTIVE = "ACTIVE"
+ROTATION_EXPIRED = "EXPIRED"
+
+
+# ─── Transactions (§3.3, §3.4) ────────────────────────────────────────
+
+TRANSACTION_POSTED = "POSTED"
+TRANSACTION_REVERSED = "REVERSED"
+
+CLASSIFICATION_MAPPED = "MAPPED"
+CLASSIFICATION_FALLBACK = "FALLBACK"
+
+
+# ─── Points ledger (§2.7) ─────────────────────────────────────────────
+
+ENTRY_EARN_BASE = "EARN_BASE"
+ENTRY_EARN_BONUS = "EARN_BONUS"
+ENTRY_CLAWBACK = "CLAWBACK"
+ENTRY_REDEEM_DEBIT = "REDEEM_DEBIT"
+ENTRY_REDEEM_REFUND = "REDEEM_REFUND"
+ENTRY_TRANSFER_DEBIT = "TRANSFER_DEBIT"
+ENTRY_TRANSFER_REVERSAL = "TRANSFER_REVERSAL"
+
+SOURCE_TRANSACTION = "TRANSACTION"
+SOURCE_REDEMPTION_ORDER = "REDEMPTION_ORDER"
+SOURCE_TRANSFER_REQUEST = "TRANSFER_REQUEST"
+
+
+# ─── Agencies and offers (§3.5) ───────────────────────────────────────
+
+AGENCY_ACTIVE = "ACTIVE"
+AGENCY_SUSPENDED = "SUSPENDED"
+
+OFFER_OPEN = "OPEN"
+OFFER_SUSPENDED = "SUSPENDED"
+OFFER_SOLD_OUT = "SOLD_OUT"
+OFFER_WITHDRAWN = "WITHDRAWN"
+
+PARITY_IN = "IN_PARITY"
+PARITY_OUT = "OUT_OF_PARITY"
+
+#: The cascade reason stamped on offers pulled down with their agency (§3.5).
+SUSPENSION_AGENCY_SUSPENDED = "AGENCY_SUSPENDED"
+
+
+# ─── Redemption orders (§3.6) ─────────────────────────────────────────
+
+CHANNEL_PORTAL_BOOKING = "PORTAL_BOOKING"
+CHANNEL_STATEMENT_CREDIT = "STATEMENT_CREDIT"
+
+FULFILLMENT_QUOTED = "QUOTED"
+FULFILLMENT_CONFIRMED = "CONFIRMED"
+FULFILLMENT_TICKETED = "TICKETED"
+FULFILLMENT_REFUNDED = "REFUNDED"
+FULFILLMENT_CANCELLED = "CANCELLED"
+
+SETTLEMENT_UNSETTLED = "UNSETTLED"
+SETTLEMENT_AGENCY_INVOICED = "AGENCY_INVOICED"
+SETTLEMENT_SETTLED = "SETTLED"
+SETTLEMENT_CLAWED_BACK = "CLAWED_BACK"
+
+
+# ─── Partner agreements and bonus events (§3.7) ───────────────────────
+
+AGREEMENT_DRAFT = "DRAFT"
+AGREEMENT_PENDING_APPROVAL = "PENDING_APPROVAL"
+AGREEMENT_ACTIVE = "ACTIVE"
+AGREEMENT_SUSPENDED = "SUSPENDED"
+AGREEMENT_TERMINATED = "TERMINATED"
+
+EVENT_SCHEDULED = "SCHEDULED"
+EVENT_RUNNING = "RUNNING"
+EVENT_CLOSED = "CLOSED"
+EVENT_CANCELLED = "CANCELLED"
+
+#: The cascade reason stamped on promotions cancelled with their agreement.
+CANCELLED_AGREEMENT_SUSPENDED = "AGREEMENT_SUSPENDED"
+
+
+# ─── Transfer requests (§3.8) ─────────────────────────────────────────
+
+TRANSFER_SUBMITTED = "SUBMITTED"
+TRANSFER_QUEUED = "QUEUED"
+TRANSFER_HELD = "HELD"
+TRANSFER_REJECTED = "REJECTED"
+TRANSFER_COMPLETED = "COMPLETED"
+TRANSFER_REVERSED = "REVERSED"
+
+HOLD_ATO_SUSPECTED = "ATO_SUSPECTED"
+HOLD_INSUFFICIENT_BALANCE_AFTER_CLAWBACK = "INSUFFICIENT_BALANCE_AFTER_CLAWBACK"
+HOLD_MANUAL_REVIEW = "MANUAL_REVIEW"
+
+#: "`held_by_user_id` is the literal string `SYSTEM`" for cascade holds (§3.4).
+SYSTEM_USER_ID = "SYSTEM"
+
+#: "there the `resolution_reason` is `POSTURE_LOCKED`" (§3.8).
+RESOLUTION_POSTURE_LOCKED = "POSTURE_LOCKED"
+
+
+# ─── Fraud cases (§3.9) ───────────────────────────────────────────────
+
+CASE_ACCOUNT_TAKEOVER = "ACCOUNT_TAKEOVER"
+CASE_POINTS_DRAIN = "POINTS_DRAIN"
+CASE_REDEMPTION_ABUSE = "REDEMPTION_ABUSE"
+
+CASE_OPEN = "OPEN"
+CASE_UNDER_REVIEW = "UNDER_REVIEW"
+CASE_CONFIRMED = "CONFIRMED"
+CASE_CLEARED = "CLEARED"
+
+SIGNAL_DEVICE_CHANGE = "DEVICE_CHANGE"
+SIGNAL_EMAIL_CHANGE = "EMAIL_CHANGE"
+SIGNAL_PASSWORD_RESET = "PASSWORD_RESET"
+SIGNAL_NEW_PAYEE = "NEW_PAYEE"
+SIGNAL_GEO_ANOMALY = "GEO_ANOMALY"
+
+ALL_SIGNALS = (
+    SIGNAL_DEVICE_CHANGE,
+    SIGNAL_EMAIL_CHANGE,
+    SIGNAL_PASSWORD_RESET,
+    SIGNAL_NEW_PAYEE,
+    SIGNAL_GEO_ANOMALY,
+)
+
+
+# ─── Benefit entitlements (§3.9) ──────────────────────────────────────
+
+BENEFIT_TRAVEL_INSURANCE = "TRAVEL_INSURANCE"
+BENEFIT_LOUNGE_ACCESS = "LOUNGE_ACCESS"
+BENEFIT_BAGGAGE_FEE_CREDIT = "BAGGAGE_FEE_CREDIT"
+
+ENTITLEMENT_ACTIVE = "ACTIVE"
+ENTITLEMENT_SUSPENDED = "SUSPENDED"
+ENTITLEMENT_EXPIRED = "EXPIRED"
+
+SUSPENSION_POSTURE_WATCH = "POSTURE_WATCH"
+SUSPENSION_POSTURE_LOCKED = "POSTURE_LOCKED"
+
+
+# ─── Programme change notices (§3.10) ─────────────────────────────────
+
+NOTICE_DRAFT = "DRAFT"
+NOTICE_PENDING_APPROVAL = "PENDING_APPROVAL"
+NOTICE_ANNOUNCED = "ANNOUNCED"
+NOTICE_EFFECTIVE = "EFFECTIVE"
+NOTICE_WITHDRAWN = "WITHDRAWN"
+
+CHANGE_TRANSFER_RATIO_CHANGE = "TRANSFER_RATIO_CHANGE"
+CHANGE_EARN_MULTIPLIER_CUT = "EARN_MULTIPLIER_CUT"
+CHANGE_BENEFIT_REMOVAL = "BENEFIT_REMOVAL"
+
+#: "that earlier notice moves to `WITHDRAWN` with `withdrawn_reason`
+#: `SUPERSEDED`" (§3.10).
+WITHDRAWN_SUPERSEDED = "SUPERSEDED"
+
+
+# ─── Liability snapshots (§3.11) ──────────────────────────────────────
+
+METHOD_COST_BASIS = "COST_BASIS"
+METHOD_FAIR_VALUE = "FAIR_VALUE"
+
+
+# ─── Audit-field shapes (§2.4) ────────────────────────────────────────
+
+#: The four audit fields carried by the thirteen mutable collections.
+MUTABLE_AUDIT_FIELDS = ("id", "created_at", "updated_at", "version")
+
+#: "`PointsLedgerEntry` and `LiabilitySnapshot` are the two exceptions: both are
+#: immutable once written, so both carry only `id` and `created_at`."
+IMMUTABLE_AUDIT_FIELDS = ("id", "created_at")
+
+#: Fields that must be absent from the two immutable collections entirely.
+FORBIDDEN_ON_IMMUTABLE = ("updated_at", "version")

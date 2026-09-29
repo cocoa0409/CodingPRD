@@ -1,0 +1,143 @@
+"""Test helper package for the Neonatal Network API.
+
+Re-exports the shared framework generics alongside this suite's domain types,
+client, error catalogue, assertions, factories, constants, identities and
+composite fixtures, so a test file can import everything from one place.
+"""
+
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    GenericApiClient,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+from . import assertions, constants, factories, fixtures, test_users, types
+from .api_client import ApiClient, api_client
+from .api_errors import HTTP_STATUS_CODES, ApiErrorId
+from .assertions import (
+    assert_admission,
+    assert_bed_ledger_balanced,
+    assert_bed_reservation,
+    assert_census_posture_consistent,
+    assert_close,
+    assert_common_fields,
+    assert_decimal_places,
+    assert_designation_review,
+    assert_designation_standard,
+    assert_effective_level_consistent,
+    assert_enum_value,
+    assert_equipment_asset,
+    assert_follow_up_enrollment,
+    assert_immutable_resource_fields,
+    assert_milk_batch,
+    assert_milk_ledger_balanced,
+    assert_nicu_unit,
+    assert_referral,
+    assert_staff_credential,
+    assert_surge_escalation,
+    assert_surveillance_report,
+    assert_sweep_result,
+    assert_transport_run,
+    assert_unit_counts,
+    expected_census_posture,
+)
+from .constants import CLOCK_START
+from .test_users import (
+    TEST_USERS,
+    make_bedside_nurse_headers,
+    make_followup_coordinator_headers,
+    make_intake_neonatologist_headers,
+    make_network_admin_headers,
+    make_referring_clinician_headers,
+    make_transport_coordinator_headers,
+    make_unit_director_headers,
+    make_unit_scoped_user_id,
+)
+from .types import LEVEL_RANKS, UserRole
+
+__all__ = [
+    # framework generics
+    "GenericApiClient",
+    "NON_EXISTENT_UUID",
+    "assert_at_least_one_succeeds",
+    "assert_cost_precision",
+    "assert_exactly_one_succeeds",
+    "assert_race_outcome",
+    "assert_timestamp_format",
+    "assert_version_incremented",
+    "build_user_headers",
+    "get_success_data",
+    "is_iso8601_timestamp",
+    "is_valid_uuid",
+    "run_race",
+    "validate_error",
+    "validate_error_is_one_of",
+    "validate_paginated",
+    "validate_success",
+    # submodules
+    "assertions",
+    "constants",
+    "factories",
+    "fixtures",
+    "test_users",
+    "types",
+    # client and errors
+    "ApiClient",
+    "api_client",
+    "ApiErrorId",
+    "HTTP_STATUS_CODES",
+    # domain assertions
+    "assert_admission",
+    "assert_bed_ledger_balanced",
+    "assert_bed_reservation",
+    "assert_census_posture_consistent",
+    "assert_close",
+    "assert_common_fields",
+    "assert_decimal_places",
+    "assert_designation_review",
+    "assert_designation_standard",
+    "assert_effective_level_consistent",
+    "assert_enum_value",
+    "assert_equipment_asset",
+    "assert_follow_up_enrollment",
+    "assert_immutable_resource_fields",
+    "assert_milk_batch",
+    "assert_milk_ledger_balanced",
+    "assert_nicu_unit",
+    "assert_referral",
+    "assert_staff_credential",
+    "assert_surge_escalation",
+    "assert_surveillance_report",
+    "assert_sweep_result",
+    "assert_transport_run",
+    "assert_unit_counts",
+    "expected_census_posture",
+    # identities
+    "TEST_USERS",
+    "make_bedside_nurse_headers",
+    "make_followup_coordinator_headers",
+    "make_intake_neonatologist_headers",
+    "make_network_admin_headers",
+    "make_referring_clinician_headers",
+    "make_transport_coordinator_headers",
+    "make_unit_director_headers",
+    "make_unit_scoped_user_id",
+    # misc
+    "CLOCK_START",
+    "LEVEL_RANKS",
+    "UserRole",
+]

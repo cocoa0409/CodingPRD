@@ -1,0 +1,95 @@
+"""Error catalogue and the ApiError exception carried through the request."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+# Complete error catalogue: error_id -> http status (PRD section 5).
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_DOMAIN_OWNER": 403,
+    "ERR_NOT_DOMAIN_STEWARD": 403,
+    "ERR_NOT_SUBSCRIPTION_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_CLEARANCE_INSUFFICIENT": 403,
+    "ERR_DOMAIN_NOT_FOUND": 404,
+    "ERR_SOURCE_SYSTEM_NOT_FOUND": 404,
+    "ERR_STEWARD_NOT_FOUND": 404,
+    "ERR_REGISTRATION_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_QUALITY_RULE_NOT_FOUND": 404,
+    "ERR_SCORECARD_RUN_NOT_FOUND": 404,
+    "ERR_FINDING_NOT_FOUND": 404,
+    "ERR_MASTER_RECORD_NOT_FOUND": 404,
+    "ERR_MERGE_PROPOSAL_NOT_FOUND": 404,
+    "ERR_CHANGE_REQUEST_NOT_FOUND": 404,
+    "ERR_SUBSCRIPTION_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_DOMAIN_VERSION": 412,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_DOMAIN_NOT_DRAFT": 409,
+    "ERR_DOMAIN_NOT_ACTIVE": 409,
+    "ERR_SOURCE_NOT_CERTIFIED": 409,
+    "ERR_FINDING_ALREADY_CLOSED": 409,
+    "ERR_RECORD_NOT_CURATED": 409,
+    "ERR_RECORD_ALREADY_PUBLISHED": 409,
+    "ERR_PROPOSAL_NOT_UNDER_REVIEW": 409,
+    "ERR_CHANGE_REQUEST_NOT_SCHEDULED": 409,
+    "ERR_RULE_HAS_OPEN_FINDINGS": 409,
+    "ERR_CROSS_DOMAIN_MERGE": 422,
+    "ERR_SELF_MERGE": 422,
+    "ERR_UNKNOWN_RULE_CODE": 422,
+    "ERR_HIERARCHY_CYCLE": 422,
+    "ERR_LINEAGE_SOURCE_MISMATCH": 422,
+    "ERR_LINEAGE_TARGET_MISMATCH": 422,
+    "ERR_LINEAGE_CYCLE": 422,
+    "ERR_AUTHORITATIVE_SOURCE_UNDEFINED": 422,
+    "ERR_DOMAIN_POSTURE_BLOCKED": 409,
+    "ERR_ASSIGNMENT_OVERLAP": 409,
+    "ERR_INVALID_INTERVAL": 422,
+    "ERR_FREEZE_WINDOW_CONFLICT": 409,
+    "ERR_CHANGE_CALENDAR_CAPACITY": 409,
+    "ERR_LEAD_TIME_NOT_SATISFIED": 409,
+    "ERR_APPLY_WINDOW_NOT_REACHED": 409,
+    "ERR_TIER1_ACK_MISSING": 409,
+    "ERR_LINEAGE_INCOMPLETE": 409,
+    "ERR_NO_PENDING_NOTIFICATION": 409,
+    "ERR_MATCH_SCORE_BELOW_FLOOR": 422,
+    "ERR_MATCH_CONFIDENCE_TOO_LOW": 422,
+    "ERR_RECORD_INCOMPLETE": 422,
+    "ERR_OWNER_NOT_PRINCIPAL": 422,
+    "ERR_DUE_DATE_IN_PAST": 422,
+    "ERR_ASSIGNMENT_STEWARD_NOT_ELIGIBLE": 422,
+    "ERR_RESOLUTION_BELOW_THRESHOLD": 422,
+    "ERR_NO_QUALITY_RULES": 422,
+    "ERR_STEWARDSHIP_INCOMPLETE": 422,
+    "ERR_NO_CERTIFIED_AUTHORITATIVE_SOURCE": 422,
+    "ERR_DUPLICATE_DOMAIN_CODE": 409,
+    "ERR_DUPLICATE_SOURCE_CODE": 409,
+    "ERR_DUPLICATE_STEWARD_EMAIL": 409,
+    "ERR_DUPLICATE_RULE_CODE": 409,
+    "ERR_DUPLICATE_CONSUMER_CODE": 409,
+    "ERR_DUPLICATE_NATURAL_KEY": 409,
+    "ERR_RULE_WEIGHT_BUDGET_EXCEEDED": 422,
+}
+
+_DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or invalid.",
+    "ERR_UNAUTHORIZED": "The acting role may not call this endpoint.",
+    "ERR_INVALID_REQUEST": "The request body or query string is invalid.",
+}
+
+
+def fail(error_id, message=None):
+    """Raise the catalogued error with its declared HTTP status."""
+    raise ApiError(error_id, ERROR_STATUS[error_id], message)
+
+
+def invalid(message="The request body or query string is invalid."):
+    raise ApiError("ERR_INVALID_REQUEST", 400, message)

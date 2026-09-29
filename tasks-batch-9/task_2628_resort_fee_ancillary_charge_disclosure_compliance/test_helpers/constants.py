@@ -1,0 +1,103 @@
+"""Domain thresholds and reference figures declared by the PRD's calculations."""
+
+# --- Disclosure score ------------------------------------------------------
+WEIGHT_TOTAL_AT_FIRST_QUOTE = 40
+WEIGHT_ITEMIZED_AT_FIRST_QUOTE = 25
+PLACEMENT_POINTS = {
+    "FIRST_QUOTE": 25,
+    "RATE_DETAILS": 15,
+    "CHECKOUT": 8,
+    "CONFIRMATION_ONLY": 3,
+    "ABSENT": 0,
+}
+COVERAGE_BONUS_CAP = 10
+PENALTY_NO_TOTAL_SUPPORT = 30
+PENALTY_NO_ITEMIZATION = 20
+PENALTY_PER_CONFIRMED_UNDISCLOSED = 5
+DISCLOSURE_SCORE_MIN = 0
+DISCLOSURE_SCORE_MAX = 100
+
+# --- Posture / remediation thresholds -------------------------------------
+DISCLOSURE_FLAG_THRESHOLD = 60
+DISCLOSURE_CONFIRM_THRESHOLD = 80
+
+# --- Quote / folio reconciliation ----------------------------------------
+QUOTE_VARIANCE_TOLERANCE_CENTS = 100
+
+# --- Publication rollup reference stay -----------------------------------
+MODEL_REFERENCE_GUESTS = 2
+MODEL_REFERENCE_NIGHTS = 4
+
+# --- Roll-in commission tiers (basis points on the modelled ADR) ---------
+COMMISSION_TIER_1_MAX = 19999
+COMMISSION_TIER_1_BPS = 1500
+COMMISSION_TIER_2_MAX = 34999
+COMMISSION_TIER_2_BPS = 1800
+COMMISSION_TIER_3_BPS = 2100
+
+# --- Disclosure profile cutover buffer -----------------------------------
+CUTOVER_BUFFER_HOURS = 24
+
+# --- Pagination ----------------------------------------------------------
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 100
+
+# --- Logical clock -------------------------------------------------------
+CLOCK_START = "2026-08-01T00:00:00Z"
+CLOCK_START_TIMESTAMP = "2026-08-01T00:00:00.000Z"
+
+# --- Canonical scenario reference data -----------------------------------
+# The nightly reference room rate used by nearly every scenario.
+BASE_ROOM_RATE_CENTS = 29900
+# Property whose reference rate puts the roll-in model on the tier boundary.
+TIER_BOUNDARY_ROOM_RATE_CENTS = 32854
+OCCUPANCY_TAX_RATE_BPS = 1338
+
+STAY_NIGHTS = 4
+STAY_GUESTS = 2
+ARRIVAL_DATE = "2026-09-10T00:00:00Z"
+DEPARTURE_DATE = "2026-09-14T00:00:00Z"
+
+FEE_PROGRAM_EFFECTIVE_FROM = "2026-09-01T00:00:00Z"
+FEE_PROGRAM_EFFECTIVE_TO = "2026-12-01T00:00:00Z"
+PROFILE_DEPLOYED_FROM = "2026-09-01T00:00:00Z"
+PROFILE_DEPLOYED_TO = "2026-11-30T00:00:00Z"
+
+# Fee codes used by the canonical three-fee program.
+FEE_CODE_RESORT = "RESORT"
+FEE_CODE_DESTINATION = "DESTINATION"
+FEE_CODE_WIFI_PREMIUM = "WIFI_PREMIUM"
+
+RESORT_PERCENT_BPS = 750
+DESTINATION_AMOUNT_CENTS = 1495
+WIFI_PREMIUM_AMOUNT_CENTS = 325
+DESTINATION_OPT_OUT_WINDOW_HOURS = 48
+
+# --- Canonical quoted figures (4 nights, 2 guests, 29900 per night) ------
+QUOTED_ROOM_TOTAL_CENTS = 119600
+QUOTED_MANDATORY_FEE_CENTS = 17552
+QUOTED_TAX_BASE_CENTS = 134552
+QUOTED_TAX_CENTS = 18003
+QUOTED_TOTAL_CENTS = 155155
+
+# --- Canonical folio figures (stay aggregation, per-line tax) ------------
+FOLIO_ROOM_AMOUNT_CENTS = 119600
+FOLIO_ROOM_TAX_CENTS = 16002
+FOLIO_RESORT_AMOUNT_CENTS = 8970
+FOLIO_RESORT_TAX_CENTS = 1200
+FOLIO_DESTINATION_AMOUNT_CENTS = 5980
+FOLIO_DESTINATION_TAX_CENTS = 800
+FOLIO_WIFI_AMOUNT_CENTS = 2600
+FOLIO_WIFI_TAX_CENTS = 0
+FOLIO_FEE_TOTAL_CENTS = 17550
+FOLIO_CHARGES_SUBTOTAL_CENTS = 137150
+FOLIO_TAX_TOTAL_CENTS = 18002
+FOLIO_TOTAL_CENTS = 155152
+QUOTE_FOLIO_VARIANCE_CENTS = -3
+
+# --- Publication rollups at the reference stay --------------------------
+PUBLISHED_TOTAL_MANDATORY_FEE_CENTS_PER_NIGHT = 4388
+PUBLISHED_RESORT_PER_NIGHT_CENTS = 2243
+PUBLISHED_DESTINATION_PER_NIGHT_CENTS = 1495
+PUBLISHED_WIFI_PER_NIGHT_CENTS = 650
+FULL_INCLUSION_COVERAGE_RATIO = 1.0000

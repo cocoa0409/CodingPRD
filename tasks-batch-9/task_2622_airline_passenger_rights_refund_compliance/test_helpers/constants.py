@@ -1,0 +1,204 @@
+"""Domain constants for the airline passenger-rights refund compliance API.
+
+Every value here is taken from the PRD: the regulatory policy-profile defaults
+(§2.9), the statutory constants the carrier may not tune (§3.4, §3.6, §3.9),
+the boundary conventions of §2.7 and the logical-clock startup default (§2.8).
+"""
+
+# ─── Logical clock (PRD §2.8) ─────────────────────────
+
+# "Before any client sets it, the logical clock reads exactly 2026-08-01T00:00:00Z"
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00Z"
+CLOCK_SET_PATH = "/_clock/set_current_utc"
+
+# ─── Policy profile regulatory defaults (PRD §2.9) ────
+
+DEFAULT_DOMESTIC_SIGNIFICANT_DELAY_MINUTES = 180
+DEFAULT_INTERNATIONAL_SIGNIFICANT_DELAY_MINUTES = 360
+DEFAULT_CREDIT_CARD_REFUND_DEADLINE_DAYS = 7
+DEFAULT_OTHER_METHOD_REFUND_DEADLINE_DAYS = 20
+DEFAULT_BAG_DELAY_THRESHOLD_HOURS_DOMESTIC = 12
+DEFAULT_BAG_DELAY_THRESHOLD_HOURS_INTERNATIONAL = 30
+DEFAULT_TARMAC_DEPLANE_DEADLINE_MINUTES_DOMESTIC = 180
+DEFAULT_TARMAC_DEPLANE_DEADLINE_MINUTES_INTERNATIONAL = 240
+DEFAULT_COMPLAINT_ACK_DEADLINE_DAYS = 30
+DEFAULT_COMPLAINT_ANSWER_DEADLINE_DAYS_GENERAL = 60
+DEFAULT_COMPLAINT_ANSWER_DEADLINE_DAYS_DISABILITY = 30
+DEFAULT_TRAVEL_CREDIT_DEFAULT_PERMITTED = False
+DEFAULT_TRAVEL_CREDIT_ELECTION_BONUS_PCT = 0.10
+
+POLICY_PROFILE_DEFAULTS = {
+    "domestic_significant_delay_minutes": DEFAULT_DOMESTIC_SIGNIFICANT_DELAY_MINUTES,
+    "international_significant_delay_minutes": DEFAULT_INTERNATIONAL_SIGNIFICANT_DELAY_MINUTES,
+    "credit_card_refund_deadline_days": DEFAULT_CREDIT_CARD_REFUND_DEADLINE_DAYS,
+    "other_method_refund_deadline_days": DEFAULT_OTHER_METHOD_REFUND_DEADLINE_DAYS,
+    "bag_delay_threshold_hours_domestic": DEFAULT_BAG_DELAY_THRESHOLD_HOURS_DOMESTIC,
+    "bag_delay_threshold_hours_international": DEFAULT_BAG_DELAY_THRESHOLD_HOURS_INTERNATIONAL,
+    "tarmac_deplane_deadline_minutes_domestic": DEFAULT_TARMAC_DEPLANE_DEADLINE_MINUTES_DOMESTIC,
+    "tarmac_deplane_deadline_minutes_international": DEFAULT_TARMAC_DEPLANE_DEADLINE_MINUTES_INTERNATIONAL,
+    "complaint_ack_deadline_days": DEFAULT_COMPLAINT_ACK_DEADLINE_DAYS,
+    "complaint_answer_deadline_days_general": DEFAULT_COMPLAINT_ANSWER_DEADLINE_DAYS_GENERAL,
+    "complaint_answer_deadline_days_disability": DEFAULT_COMPLAINT_ANSWER_DEADLINE_DAYS_DISABILITY,
+    "travel_credit_default_permitted": DEFAULT_TRAVEL_CREDIT_DEFAULT_PERMITTED,
+    "travel_credit_election_bonus_pct": DEFAULT_TRAVEL_CREDIT_ELECTION_BONUS_PCT,
+}
+
+# ─── Statutory constants (PRD §3.4, §3.6, §3.9) ───────
+
+# Denied-boarding ladder (§3.4)
+INVOLUNTARY_NO_COMP_MAX_MINUTES = 60
+TIER1_MAX_MINUTES_DOMESTIC = 120
+TIER1_MAX_MINUTES_INTERNATIONAL = 240
+INVOLUNTARY_TIER1_MULTIPLE = 2.0
+INVOLUNTARY_TIER1_CAP_CENTS = 77500
+INVOLUNTARY_TIER2_MULTIPLE = 4.0
+INVOLUNTARY_TIER2_CAP_CENTS = 155000
+VOLUNTARY_DISCLOSURE_FLOOR_PCT = 0.50
+
+# Election window (§3.6) — a statutory constant the carrier cannot tune
+ELECTION_WINDOW_DAYS = 5
+
+# Complaint auto-close window and reopen cap (§3.9, §3.8)
+AUTO_CLOSE_DAYS = 30
+REOPEN_LIMIT = 2
+
+# ─── Enumerations (PRD §3) ────────────────────────────
+
+PAYMENT_METHODS = ["CREDIT_CARD", "CASH_OR_CHECK", "TRAVEL_CREDIT", "MILES"]
+ITINERARY_SCOPES = ["DOMESTIC", "INTERNATIONAL"]
+DISRUPTION_POSTURES = ["NORMAL", "DISRUPTED", "REFUND_OBLIGATED", "CLOSED_OUT"]
+SEGMENT_STATUSES = [
+    "SCHEDULED",
+    "DELAYED",
+    "CANCELLED",
+    "DISRUPTED_UNUSED",
+    "DEPARTED",
+    "ARRIVED",
+]
+DISRUPTION_TYPES = ["NONE", "DELAY", "CANCELLATION"]
+SEGMENT_OPERATIONS = ["DEPARTED", "ARRIVED", "RESTORED"]
+SERVICE_TYPES = [
+    "SEAT_SELECTION",
+    "WIFI",
+    "ENTERTAINMENT",
+    "PRIORITY_BOARDING",
+    "LOUNGE_ACCESS",
+]
+DELIVERY_STATUSES = ["PENDING_DELIVERY", "DELIVERED", "NOT_PROVIDED"]
+NON_PROVISION_REASONS = [
+    "EQUIPMENT_SWAP",
+    "SYSTEM_OUTAGE",
+    "SEAT_REASSIGNED",
+    "SERVICE_CANCELLED",
+]
+BAG_STATUSES = ["IN_TRANSIT", "DELIVERED_ON_TIME", "DELIVERED_LATE", "DECLARED_LOST"]
+BAG_RESOLUTIONS = ["DELIVERED", "DECLARED_LOST"]
+DENIED_BOARDING_CATEGORIES = ["VOLUNTARY", "INVOLUNTARY"]
+DENIED_BOARDING_STATUSES = ["RECORDED", "FINALIZED", "RECATEGORIZED"]
+TARMAC_PHASES = ["DEPARTURE", "ARRIVAL"]
+TARMAC_STATUSES = ["DELAY_ACTIVE", "DEPLANED", "EXEMPTION_INVOKED", "REPORT_FILED"]
+EXEMPTION_REASONS = ["SAFETY", "SECURITY", "ATC_DIRECTIVE"]
+OBLIGATION_BASES = [
+    "FARE",
+    "ANCILLARY",
+    "BAGGAGE_FEE",
+    "DENIED_BOARDING",
+    "GOODWILL_GRANT",
+]
+ISSUANCE_MODES = ["PROACTIVE", "REQUEST_BASED"]
+VARIANTS_APPLIED = [
+    "PROACTIVE_FULL_ITINERARY",
+    "REQUEST_BASED_UNUSED_PRORATION",
+    "FEE_FACE_VALUE",
+    "INVOLUNTARY_STATUTORY",
+    "VOLUNTARY_NEGOTIATED",
+    "GOODWILL_GRANT_AMOUNT",
+]
+ELECTION_STATUSES = ["PENDING_ELECTION", "ELECTED_CASH", "ELECTED_CREDIT"]
+ELECTION_SOURCES = ["PASSENGER", "OFFICER_ON_BEHALF", "AUTO_DEFAULT"]
+ELECTION_CHOICES = ["CASH", "TRAVEL_CREDIT"]
+SETTLEMENT_STATUSES = ["UNSETTLED", "INITIATED", "SETTLED", "FAILED", "VOIDED"]
+SETTLEMENT_METHODS = ["ORIGINAL_PAYMENT", "CASH_OR_CHECK", "TRAVEL_CREDIT", "MILES"]
+SETTLEMENT_OUTCOMES = ["SUCCEEDED", "FAILED"]
+FAILURE_REASONS = ["CARD_DECLINED", "ACCOUNT_CLOSED", "PROCESSOR_TIMEOUT"]
+VOID_REASONS = [
+    "CREATED_IN_ERROR",
+    "DUPLICATE",
+    "PASSENGER_WITHDREW",
+    "SETTLEMENT_REVERSED",
+]
+COMPLAINT_CATEGORIES = [
+    "REFUND",
+    "BAGGAGE",
+    "ANCILLARY_SERVICE",
+    "DENIED_BOARDING",
+    "DISABILITY",
+    "OTHER",
+]
+COMPLAINT_CHANNELS = ["WEB", "EMAIL", "PHONE", "MAIL"]
+COMPLAINT_STATUSES = [
+    "RECEIVED",
+    "ACKNOWLEDGED",
+    "INFO_REQUESTED",
+    "ANSWERED",
+    "CLOSED",
+]
+COMPLAINT_DISPOSITIONS = [
+    "REFUND_GRANTED",
+    "REFUND_DENIED",
+    "POLICY_EXPLAINED",
+    "ACCOMMODATION_PROVIDED",
+]
+ACCESSIBILITY_RESOLUTION_CODES = [
+    "ASSISTANCE_PROVIDED",
+    "EQUIPMENT_REPAIRED",
+    "TRAINING_ISSUED",
+    "ESCALATED_TO_CRO",
+]
+ACTIVITY_TYPES = [
+    "RECEIVED",
+    "ACKNOWLEDGED",
+    "INFO_REQUESTED",
+    "ANSWERED",
+    "REOPENED",
+    "AUTO_CLOSED",
+    "DEADLINE_BREACH_FLAGGED",
+]
+REPORT_STATUSES = ["DRAFT", "SUBMITTED", "AMENDING"]
+
+# ─── Pagination bounds (PRD §2.3) ─────────────────────
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ─── Refund-exposure read field set (PRD §3.6) ────────
+
+REFUND_EXPOSURE_FIELDS = [
+    "proactive_full_itinerary_cents",
+    "request_based_proration_cents",
+    "variant_delta_cents",
+    "obligated_total_cents",
+    "remaining_headroom_cents",
+    "collected_total_cents",
+    "segment_count",
+    "unused_segment_count",
+    "travel_commenced",
+]
+
+# ─── Compliance sweep response field set (PRD §3.9) ───
+
+SWEEP_RESPONSE_FIELDS = [
+    "policy_profile_id",
+    "deadline_breach_flagged_count",
+    "election_auto_defaulted_count",
+    "complaint_ack_breach_flagged_count",
+    "complaint_answer_breach_flagged_count",
+    "complaint_auto_closed_count",
+    "open_violation_count",
+    "policy_profile_version",
+]
+
+# A sentinel id that no row ever carries, for 404 probes.
+SENTINEL_ID = "00000000-0000-0000-0000-0000000000ff"

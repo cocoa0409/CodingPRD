@@ -1,0 +1,443 @@
+# Police Evidence Room API — Product Requirements Document
+
+## 1. Introduction
+
+A police property and evidence unit is judged, ultimately, by whether it can prove where a thing has been every minute since it was taken. That proof is a paper problem long before it is a software problem: an unbroken chain of custody documentation, a packaging standard appropriate to what was seized, a bin that is cold enough or locked enough for the contents, a statutory retention clock that nobody may shorten, and a disposition — return, auction, destruction or conversion to agency use — that a court has either authorized or expressly excused from authorization. Units that run this on paper lose items, and when an item is lost the loss is usually discovered months later during an inventory count, by which time the chain is unreconstructable.
+
+This document specifies the service that replaces those binders. It models the property room itself as a governed resource whose **operating posture** tightens automatically as discrepancies accumulate, so that a firearm reported missing does not merely produce a memo but immediately freezes the movement of every other item in the room. It models each piece of evidence along two independent axes — where the item physically is, and what the law currently permits us to do with it — because those two stories genuinely diverge: an item can be out at a crime laboratory while its retention period has already matured. And it models money, because auctioned property produces proceeds that must sit in room escrow, be reduced by an auctioneer's commission and a capped recovery of storage cost, and then be disbursed to the treasury without a cent appearing or vanishing along the way.
+
+The audience for this specification is the engineering team building the service. Every deadline, retention period, overlap window and sweep in this system reads a single server-side logical clock rather than wall-clock time, so that retention arithmetic spanning years can be exercised deterministically in test. Where a rule has a threshold, the threshold is stated exactly, including whether it is inclusive; where a calculation has an evaluation order, that order is pinned and must not be reorganized for convenience, because reorganizing it changes the answer.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, naming the role that principal is acting in. If either header is absent or empty, the request is rejected with `ERR_MISSING_USER_CONTEXT` (HTTP 400). If `X-User-Role` is present but is not one of the six roles below, the request is rejected with `ERR_INVALID_ROLE` (HTTP 401). If the role is recognized but is not among the roles authorized for the requested endpoint (see the table in §4), the request is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+The six roles are:
+
+- **`PropertyRoomManager`** — the property room commander. Configures the room, the offense statutes, the storage locations and the custodian roster; runs the nightly sweep; executes, settles and disburses dispositions; verifies owner claims; and adjudicates discrepancies.
+- **`EvidenceTechnician`** — logs intake, applies packaging and barcodes, assigns storage, releases and receives custody transfers with signature capture, and issues owner notices.
+- **`Investigator`** — the case investigator. Files charges and requests investigative-review transfers.
+- **`LabAnalyst`** — the laboratory analyst. Requests laboratory-analysis transfers and receives items for examination.
+- **`CourtClerk`** — records adjudication, appeals and appeal resolution, and authorizes or refuses dispositions. A court clerk can never execute a disposition, which keeps authorization and execution in different hands.
+- **`InternalAuditor`** — schedules and conducts inventory audits, scans barcodes and reconciles a location. An internal auditor can never resolve the discrepancies it raises, which keeps detection and adjudication in different hands.
+
+Four of these roles are **entity-backed**. When `X-User-Role` is `EvidenceTechnician`, `Investigator`, `LabAnalyst` or `InternalAuditor`, `X-User-ID` is the `id` of the acting `Custodian` row, and that row's `role_type` must correspond to the acting role: `EvidenceTechnician` requires `role_type` of `EVIDENCE_TECH`, `Investigator` requires `INVESTIGATOR`, `LabAnalyst` requires `LAB_ANALYST`, and `InternalAuditor` requires `AUDITOR`. If `X-User-ID` does not resolve to a `Custodian`, or resolves to one whose `role_type` does not correspond, the request is rejected with `ERR_CUSTODIAN_ROLE_MISMATCH` (HTTP 403). The same error covers two body-level ownership checks: when the caller is an entity-backed role, the `auditor_id` supplied when scheduling an audit session must equal `X-User-ID`, and the `requested_by_custodian_id` supplied when opening a disposition order must equal `X-User-ID`.
+
+The remaining two roles are **opaque**. When `X-User-Role` is `PropertyRoomManager` or `CourtClerk`, `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity; the server never compares it to any row's `id`. Chain of custody entries record the acting role in `actor_role` in all cases, and populate `actor_custodian_id` only when the acting principal is an entity-backed custodian; entries produced by the nightly sweep or by a cascade record `SYSTEM` in `actor_role` and leave `actor_custodian_id` null.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints are paginated with two query parameters. `limit` sets the maximum number of rows returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` sets the number of rows to skip and defaults to 0.
+
+Unless a specific endpoint states otherwise, list endpoints return rows sorted by creation timestamp in ascending order.
+
+Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope.
+
+### 2.4. Resource Identity, Retrieval and Filtering
+
+Every persisted resource is addressed at the API root and carries a server-minted `id` formatted as a UUID with no type prefix, plus a `created_at` timestamp rendered as an ISO 8601 UTC instant with three fractional digits (for example `2026-08-01T00:00:00.000Z`). Property rooms, offense statutes, storage locations, custodians, cases, evidence items, retention determinations, custody transfers, disposition orders, owner claims, audit sessions and discrepancies additionally carry `updated_at`, refreshed on every mutation, and `version`, an integer that increments by one on every mutation — including mutations that only touch derived counters. Chain of custody entries are the single exception: a `ChainEvent` is an immutable ledger line and carries only `id` and `created_at`; it has neither `updated_at` nor `version`.
+
+Relationships between resources are expressed by identifier fields in request bodies rather than by nested URLs, so path templates carry at most one identifier each. That identifier is resolved before anything in the body is examined, and it produces the 404 belonging to its own resource type: `roomId` yields `ERR_PROPERTY_ROOM_NOT_FOUND`, `statuteId` yields `ERR_OFFENSE_STATUTE_NOT_FOUND`, `locationId` yields `ERR_STORAGE_LOCATION_NOT_FOUND`, `custodianId` yields `ERR_CUSTODIAN_NOT_FOUND`, `caseId` yields `ERR_CASE_NOT_FOUND`, `itemId` yields `ERR_EVIDENCE_ITEM_NOT_FOUND`, `determinationId` yields `ERR_RETENTION_DETERMINATION_NOT_FOUND`, `transferId` yields `ERR_CUSTODY_TRANSFER_NOT_FOUND`, `orderId` yields `ERR_DISPOSITION_ORDER_NOT_FOUND`, `claimId` yields `ERR_OWNER_CLAIM_NOT_FOUND`, `sessionId` yields `ERR_AUDIT_SESSION_NOT_FOUND`, `discrepancyId` yields `ERR_DISCREPANCY_NOT_FOUND`, and `eventId` yields `ERR_CHAIN_EVENT_NOT_FOUND`. Identifier fields carried in a request body are resolved afterwards, in the order in which the endpoint declares its inputs, and raise the same family of 404 codes.
+
+Collections may be narrowed by query parameters, all of which are optional and combine conjunctively. Storage locations may be filtered by `property_room_id`, `category`, `status` and `sealed_by_audit_session_id`. Custodians may be filtered by `property_room_id`, `role_type` and `status`. Cases may be filtered by `property_room_id`, `offense_statute_id` and `status`. Evidence items may be filtered by `case_id`, `storage_location_id`, `current_holder_id`, `custody_state` and `disposition_state`. Retention determinations may be filtered by `evidence_item_id`, `basis` and `superseded`. Custody transfers may be filtered by `evidence_item_id`, `from_custodian_id`, `to_custodian_id` and `status`. Disposition orders may be filtered by `evidence_item_id`, `owner_claim_id`, `requested_by_custodian_id`, `executed_by_custodian_id`, `witness_custodian_id`, `status` and `type`. Owner claims may be filtered by `evidence_item_id` and `status`. Audit sessions may be filtered by `storage_location_id`, `auditor_id` and `status`. Discrepancies may be filtered by `audit_session_id`, `evidence_item_id`, `kind` and `status`, and this list is the only channel through which discrepancy rows created by a cascade can be discovered. Chain of custody entries may be filtered by `evidence_item_id`, `actor_custodian_id` and `event_type`.
+
+### 2.5. The Logical Clock
+
+All temporal reasoning in this service — retention arithmetic, claim deadlines, custody window overlap, certification expiry, settlement windows and the nightly sweep — reads a single server-side logical clock, never the host's wall clock. Before the clock has ever been set, it reads exactly `2026-08-01T00:00:00Z`, and it never falls back to real time. A `PropertyRoomManager` may advance or rewind it through an administrative test-driving capability that accepts a `current_utc` instant and responds with the newly effective `current_utc` together with the `previous_utc` value it replaced. Setting the clock mutates no entity; it only changes what "now" means for subsequent requests.
+
+### 2.6. Room Posture: The Derived Operating Gate
+
+A `PropertyRoom` carries a `posture` of `OPEN`, `RESTRICTED` or `LOCKED_DOWN`. Posture is never set by a client; it is recomputed at the end of every request that changes a discrepancy's status, an evidence item's `custody_state` or `disposition_state`, a storage location's `status`, or an audit session's `risk_index`, and again at the end of the nightly sweep. The recomputation reads four quantities scoped to the room:
+
+- `open_discrepancy_count` — the number of discrepancy rows whose evidence item belongs to a case of this room and whose `status` is either `OPEN` or `UNDER_INVESTIGATION`.
+- `missing_high_risk_count` — the subset of those rows whose `kind` is `MISSING` and whose evidence item has a `category` of `FIREARM`, `CURRENCY` or `NARCOTICS`.
+- the unresolved reconciled risk sum — the total of `risk_index` across every audit session whose storage location belongs to this room, whose `status` is `RECONCILED`, and which still has at least one discrepancy in `OPEN` or `UNDER_INVESTIGATION`.
+- `sealed_location_count` — the number of storage locations of this room whose `status` is `SEALED_FOR_AUDIT`.
+
+The posture is then decided in a fixed order. If `missing_high_risk_count` is at least 1, **or** `open_discrepancy_count` is at least 5, **or** the unresolved reconciled risk sum is at least 25.00, the posture is `LOCKED_DOWN`. Otherwise, if `open_discrepancy_count` is at least 1 or `sealed_location_count` is at least 1, the posture is `RESTRICTED`. Otherwise it is `OPEN`. The risk-sum comparison is made with two-decimal exactness and its threshold is inclusive, so a sum of exactly 25.00 locks the room down; a single missing firearm, banknote bundle or narcotics package is likewise enough on its own.
+
+A `LOCKED_DOWN` room refuses every mutating operation scoped to it with `ERR_ROOM_LOCKED_DOWN` (HTTP 409). Five families of operation are deliberately exempt, because they are the only tools available for digging the room back out: the nightly sweep, scheduling an audit session and every audit-session operation, every discrepancy operation, custodian suspension, and setting the logical clock. This gate sits **above** the target resource's own state check in the validation order, so a locked-down room rejects a request even when the target resource is in the wrong state to begin with — the lockdown supersedes the state error.
+
+A `RESTRICTED` room is narrower: it refuses only the three movement-sensitive operations — requesting a custody transfer, releasing an item into a custodian's custody, and executing a disposition — with `ERR_ROOM_RESTRICTED` (HTTP 409). Storage assignment, case progression, retention determinations, owner-claim handling and disposition authorization all remain available while the room is merely restricted.
+
+Two posture side effects matter beyond the gate itself. First, whenever a recomputation moves the room into `LOCKED_DOWN` — whether from `OPEN` or from `RESTRICTED` — every custody transfer in that room whose `status` is `REQUESTED` is moved to `DENIED`, has its `denial_reason` set to the literal string `ROOM_LOCKED_DOWN`, and releases the escort capacity it was holding, decrementing `open_escort_count` on its receiving custodian. Second, when the counters later fall back so that no lockdown branch holds and the room returns to `RESTRICTED`, those denied transfers are **not** revived; a new transfer must be requested. When the last open discrepancy is resolved and every seal is released, the room returns to `OPEN` and all gated operations become available again.
+
+### 2.7. Conservation Invariants: Bin Occupancy and Room Escrow
+
+Two derived quantities in this system are conserved, meaning that at every observable point they must equal a re-derivation from first principles rather than merely reflecting a history of increments.
+
+`StorageLocation.occupied_slots` equals the number of evidence items whose `storage_location_id` is that location and whose `custody_state` is either `STORED` or `CHECKED_OUT`. Items in `LOGGED`, `MISSING` or `PURGED` are excluded. The consequence is that an item signed out to a laboratory keeps its bin reserved — releasing it does not free a slot — whereas an item that goes `MISSING` releases its slot immediately, and recovering it consumes a slot again. At every observable point, `occupied_slots` must be at least 0 and at most `capacity_slots` for every location.
+
+`PropertyRoom.escrow_balance_cents` equals the sum of `settled_net_proceeds_cents` across every disposition order whose `settlement_status` is `HELD` and whose evidence item belongs to a case of that room. Orders whose `settlement_status` is `NONE` or `DISBURSED` contribute nothing. Because of this, settling an auction and then disbursing it returns the room's escrow balance to exactly its prior value. Aggregation performs no rounding of its own.
+
+### 2.8. Precision, Rounding and Whole-Day Arithmetic
+
+All money in this system is carried as integer cents in fields whose names end in `_cents`, and all monetary arithmetic must be performed with exact decimal arithmetic, never binary floating point. Where a rate is applied to an amount, the product is rounded **half up** to whole cents. Where a cap is computed as a percentage of an amount, the cap is **floored** to whole cents. Tiered rate boundaries are inclusive upper bounds.
+
+Risk scoring is carried to exactly two decimal places using round-half-up, and the rounding order is pinned: each discrepancy's contribution is rounded to two decimals first, and the rounded contributions are then summed and the sum rounded again. Summing raw products and rounding once at the end is explicitly not the specified order and produces different answers.
+
+Retention periods and notice periods are expressed in whole days and are added to a UTC instant as exact increments of 86,400 seconds. Where a period is halved and the result is not a whole number of days, it is rounded **up** to the next whole day. Elapsed-day counts derived by subtracting two instants are rounded **down** to a whole number of days.
+
+### 2.9. Optimistic Concurrency Control
+
+Two create operations are guarded by optimistic concurrency control against a parent resource's `version`, because in both cases a second sequential attempt observing identical state would legitimately succeed, and the stale version is therefore the only available signal that the client's view of the parent has gone out of date.
+
+Recording a retention determination requires `expected_evidence_item_version` in the request body as a non-optional field, carrying the `version` of the target evidence item as the client last observed it. If that value does not equal the item's current `version`, the request is rejected with `ERR_STALE_EVIDENCE_ITEM_VERSION` (HTTP 412). A new determination legitimately supersedes the previous one, so without this guard a client whose view predates, say, an adjudication cascade that already rewrote `retention_release_at` would silently overwrite a posture it never saw.
+
+Scheduling an audit session requires `expected_storage_location_version` in the request body as a non-optional field, carrying the `version` of the target storage location as the client last observed it. If that value does not equal the location's current `version`, the request is rejected with `ERR_STALE_STORAGE_LOCATION_VERSION` (HTTP 412). Multiple non-overlapping sessions may legitimately be scheduled against one location, so the stale version is what tells the scheduler that the location's occupancy or seal state has moved since it was read.
+
+No other endpoint accepts a version field, and no other endpoint performs a version check.
+
+### 2.10. Order of Validation
+
+When a request could fail several checks at once, exactly one error is reported, and which one is determined by a fixed global priority. Implementations must evaluate in this sequence:
+
+1. Presence and non-emptiness of `X-User-Role` and `X-User-ID` — `ERR_MISSING_USER_CONTEXT` (400), on every endpoint.
+2. `X-User-Role` is one of the six declared roles — `ERR_INVALID_ROLE` (401), on every endpoint.
+3. The acting role is authorized for the endpoint — `ERR_ROLE_NOT_PERMITTED` (403), on every endpoint.
+4. For entity-backed roles, `X-User-ID` resolves to a `Custodian` with the corresponding `role_type`, and `auditor_id` / `requested_by_custodian_id` equal `X-User-ID` where those fields are supplied — `ERR_CUSTODIAN_ROLE_MISMATCH` (403). This applies to every endpoint whose authorized roles include `EvidenceTechnician`, `Investigator`, `LabAnalyst` or `InternalAuditor`.
+5. The path-templated identifier resolves — the resource-specific 404 named in §2.4, on every endpoint with a templated path segment.
+6. Request shape: required fields present, types and enum values valid, and conditionally required fields honoured — `ERR_INVALID_REQUEST` (400), on every endpoint with a request body. The conditional requirements policed here are `temperature_c` when a location's `category` is `REFRIGERATED`, `reserve_price_cents` when an order's `type` is `AUCTION`, and `owner_claim_id` when an order's `type` is `RETURN_TO_OWNER`. The dual-signature requirement is deliberately not policed here; it is handled at stage 18.
+7. Every identifier field in the request body resolves, in the endpoint's declared input order — the resource-specific 404 codes; a scanned `barcode` that matches no evidence item yields `ERR_BARCODE_NOT_FOUND` (404).
+8. The room's `posture` is not `LOCKED_DOWN` — `ERR_ROOM_LOCKED_DOWN` (409), on every mutating room-scoped endpoint except the nightly sweep, audit-session scheduling and audit-session operations, discrepancy operations, custodian suspension and the clock capability.
+9. The room's `posture` is not `RESTRICTED`, for the three movement-sensitive operations — `ERR_ROOM_RESTRICTED` (409).
+10. `expected_evidence_item_version` matches the item's `version`, and `expected_storage_location_version` matches the location's `version` — `ERR_STALE_EVIDENCE_ITEM_VERSION` or `ERR_STALE_STORAGE_LOCATION_VERSION` (412), on retention-determination creation and audit-session scheduling respectively.
+11. The target resource is in a state that permits the requested transition, and neither the source nor the destination storage location is sealed — `ERR_ITEM_CUSTODY_STATE_INVALID`, `ERR_ITEM_DISPOSITION_STATE_INVALID`, `ERR_CASE_STATE_INVALID`, `ERR_TRANSFER_STATE_INVALID`, `ERR_ORDER_STATE_INVALID`, `ERR_CLAIM_STATE_INVALID`, `ERR_AUDIT_STATE_INVALID`, `ERR_DISCREPANCY_STATE_INVALID` or `ERR_LOCATION_SEALED` (all 409). One carve-out applies: when a disposition order is opened, an item whose `disposition_state` is `RETAINED` or `COURT_HOLD` is **not** reported at this stage — those cases are reported by the domain checks at stages 23, 24 and 25 — so this stage reports only the remaining illegal disposition states `ORDER_PENDING` and `DISPOSED`, using `ERR_ITEM_DISPOSITION_STATE_INVALID`.
+12. Every custodian referenced as actor, holder, auditor, executor or witness has `status` of `ACTIVE` — `ERR_CUSTODIAN_SUSPENDED` (409). This applies to requesting a transfer, releasing a transfer, returning a transfer, opening a disposition order, executing a disposition order, and scheduling an audit session.
+13. Every custodian referenced as actor, holder, executor or witness has `certification_expires_at` strictly after the logical clock — `ERR_CUSTODIAN_NOT_CERTIFIED` (409). This applies to requesting a transfer, releasing a transfer, and executing a disposition order.
+14. Segregation of duties at execution — `ERR_SEGREGATION_OF_DUTIES` (409), on disposition execution.
+15. Scoped uniqueness — `ERR_DUPLICATE_AGENCY_CODE`, `ERR_DUPLICATE_OFFENSE_CODE`, `ERR_DUPLICATE_LOCATION_CODE`, `ERR_DUPLICATE_BADGE_NUMBER` or `ERR_DUPLICATE_CASE_NUMBER` (all 409), on property-room, offense-statute, storage-location, custodian and case creation respectively.
+16. Packaging standard — `ERR_PACKAGING_NOT_PERMITTED` (422), on evidence-item intake.
+17. Storage suitability — `ERR_STORAGE_CATEGORY_MISMATCH` or `ERR_REFRIGERATION_OUT_OF_RANGE` (409), on storage assignment and on discrepancy resolution.
+18. Signature capture — `ERR_WITNESS_SIGNATURE_REQUIRED` (422), on transfer release.
+19. Escort capacity for the receiving custodian — `ERR_ESCORT_CAPACITY_EXCEEDED` (409), on transfer request.
+20. Transfer window sanity and duration — `ERR_INVALID_TRANSFER_WINDOW` or `ERR_TRANSFER_WINDOW_TOO_LONG` (both 422), on transfer request.
+21. Per-item custody window overlap — `ERR_CUSTODY_WINDOW_CONFLICT` (409), on transfer request. This is deliberately ordered **below** the certification check at stage 13, so an uncertified custodian is reported even when the requested window also collides.
+22. Audit window buffer — `ERR_AUDIT_WINDOW_BUFFER` (409), on audit-session scheduling. A session whose `scheduled_end_at` is not strictly after its `scheduled_start_at` is rejected first, with `ERR_INVALID_TRANSFER_WINDOW` (422).
+23. Preservation class permits the pathway — `ERR_PRESERVATION_CLASS_FORBIDS_DESTRUCTION` (409), on disposition-order creation.
+24. Case disposability — `ERR_CASE_NOT_DISPOSABLE` (409), on disposition-order creation.
+25. Retention maturity — `ERR_RETENTION_NOT_MATURED` (409), on disposition-order creation.
+26. Owner claim verification — `ERR_CLAIM_NOT_VERIFIED` (409), on disposition execution.
+27. Barcode ownership — `ERR_BARCODE_FOREIGN_ROOM` (409), on audit scan.
+28. Case closure completeness — `ERR_CASE_HAS_UNDISPOSED_ITEMS` (409), on case closure.
+29. Resolution-kind compatibility — `ERR_DISCREPANCY_RESOLUTION_NOT_PERMITTED` (422), on discrepancy resolution.
+30. Auction reserve floor — `ERR_SALE_BELOW_RESERVE` (409), on settlement. This is deliberately ordered **above** the settlement-window check at stage 32, so a below-reserve sale is reported even when the settlement window has also closed.
+31. Disbursement requires held proceeds — `ERR_NO_PROCEEDS_HELD` (409), on disbursement.
+32. Settlement window still open — `ERR_SETTLEMENT_WINDOW_CLOSED` (409), on settlement.
+33. Storage capacity — `ERR_STORAGE_LOCATION_FULL` or `ERR_NO_ELIGIBLE_STORAGE` (409), on storage assignment and on discrepancy resolution.
+
+### 2.11. Segregation of Duties and Custodian Eligibility
+
+The unit's internal controls rest on keeping requesting, authorizing, executing and witnessing in different hands. At disposition execution the service enforces two inequalities: the `executed_by_custodian_id` supplied at execution must differ from the `requested_by_custodian_id` recorded when the order was opened, and the `witness_custodian_id` must differ from the `executed_by_custodian_id`. Either violation is rejected with `ERR_SEGREGATION_OF_DUTIES`. Note that nothing forbids the witness from being the original requester — the constraint is only on the two pairs named.
+
+Eligibility is a separate axis. A custodian whose `status` is `SUSPENDED` may not act, hold, audit, execute or witness, and any operation referencing such a custodian is rejected with `ERR_CUSTODIAN_SUSPENDED`. Independently, a custodian's `certification_expires_at` must fall strictly after the logical clock for the custody and disposition actions listed at stage 13 of §2.10; a certification that expires at exactly the current instant is expired, and the request is rejected with `ERR_CUSTODIAN_NOT_CERTIFIED`. Suspension itself, however, is always available even in a locked-down room, and suspending a custodian deliberately leaves their open transfers untouched.
+
+### 2.12. Chain of Custody Documentation
+
+Every consequential act against an evidence item appends an immutable chain of custody entry. An entry records the `evidence_item_id` it documents, the `actor_custodian_id` where one exists, an `event_type` drawn from `INTAKE`, `STORAGE_ASSIGN`, `RELEASE`, `RECEIPT`, `AUDIT_SCAN`, `DISCREPANCY_RAISED`, `RETENTION_SET`, `NOTICE_SENT` and `DISPOSITION_EXECUTED`, the `occurred_at` instant read from the logical clock, the `actor_role` of the acting principal (one of the six roles, or `SYSTEM` for sweep and cascade entries), a `signature_ref` holding the signature string captured with the event or null when the event carries no signature, and a human-readable `detail` line for the printed document.
+
+Entries also carry `sequence_no`, a 1-based and gapless sequence **per evidence item**, assigned in ascending `occurred_at` order and, where two entries share an instant, in ascending `created_at` order. The chain of custody document for an item is simply that item's entries read in `sequence_no` order.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a Property Room
+
+A `PropertyRoomManager` registers the unit by supplying a `name` of between 1 and 120 characters and an `agency_code` of between 3 and 5 characters drawn from uppercase A–Z and the digits 0–9. The agency code doubles as the prefix of every barcode the room ever prints, so it must be unique across all property rooms; a collision is refused with `ERR_DUPLICATE_AGENCY_CODE`. A newly registered room opens with `posture` of `OPEN`, with `open_discrepancy_count`, `missing_high_risk_count`, `sealed_location_count`, `disposal_eligible_count` and `escrow_balance_cents` all at 0, and with `last_sweep_at` null until the nightly sweep first runs.
+
+Retention law reaches the system through offense statutes. Each statute carries an `offense_code` of 1 to 16 characters, unique across all statutes (a collision yields `ERR_DUPLICATE_OFFENSE_CODE`), a free-text `description`, and a `preservation_class` of `STANDARD`, `DRUG_SCHEDULE`, `BIOLOGICAL_INDEFINITE` or `HOMICIDE_PERMANENT`. The numeric parameters are `statutory_retention_days`, a whole number of days from 0 up to and including 36500, and `appeal_window_days`, a whole number from 0 up to and including 3650, which only the final retention variant consumes. A boolean `destruction_requires_court_order` records whether the legislature insists on a judge's signature before anything seized under this statute may be destroyed; when it is true, a destruction order can never be automatically authorized.
+
+Storage is modelled as a set of bins, shelves, vaults, refrigerators and yard slots. Each `StorageLocation` names its owning room through `property_room_id` and carries a `code` of 1 to 16 characters that must be unique within that room — a duplicate is refused with `ERR_DUPLICATE_LOCATION_CODE` — together with a `category` of `GENERAL`, `REFRIGERATED`, `HIGH_VALUE_VAULT` or `OVERSIZED_YARD` and a `capacity_slots` count of at least 1 and at most 1000. A refrigerated location must supply `temperature_c`, its last recorded Celsius reading, which must be at least -30.0 and at most 30.0; every other category must leave `temperature_c` null. Note that the reading is accepted as recorded even when a chiller is running warm: a value above 4.0 is stored without complaint, but it makes the bin ineligible to receive items and excludes it from automatic bin selection. The optional `requires_dual_signature` flag defaults to false; when true, releasing any item out of that location demands a witness signature alongside the releasing signature. A new location starts with `occupied_slots` at 0, `status` of `OPEN` and `sealed_by_audit_session_id` null.
+
+Custodians are the people. A `Custodian` belongs to a room through `property_room_id`, is identified by a `badge_number` of 1 to 16 characters that must be unique within that room (`ERR_DUPLICATE_BADGE_NUMBER` otherwise), prints `full_name` on chain of custody documents, holds a functional `role_type` of `EVIDENCE_TECH`, `INVESTIGATOR`, `LAB_ANALYST` or `AUDITOR`, and carries `certification_expires_at`. New custodians begin `ACTIVE` with `suspension_reason` null and `open_escort_count` at 0; that counter is the number of custody transfers naming this custodian as receiver whose `status` is `REQUESTED`, `RELEASED` or `OVERDUE`. A `PropertyRoomManager` may suspend a custodian by supplying a `reason`, which moves `status` from `ACTIVE` to `SUSPENDED` and stores the text in `suspension_reason`.
+
+Cases sit between statutes and items. Opening a case requires the `property_room_id`, the `offense_statute_id` whose retention and destruction rules will govern its evidence, and a `case_number` matching exactly two digits, a hyphen, and five digits — for example `26-00001` — that must be unique within the room, failing which the request is refused with `ERR_DUPLICATE_CASE_NUMBER`. A case opens in `OPEN` with `charged_at`, `adjudicated_at`, `appeal_opened_at` and `closed_at` all null and both `item_count` and `undisposed_item_count` at 0.
+
+### 3.2. Intake: Packaging, Barcoding and the First Chain Entry
+
+Logging an item is the work of an `EvidenceTechnician`, who submits the `case_id` the item was seized under, an `item_description` as written in the field, the `category` — one of `GENERAL`, `BIOLOGICAL`, `CURRENCY`, `FIREARM`, `NARCOTICS` or `OVERSIZED` — the `packaging_type` actually applied, drawn from `SEALED_ENVELOPE`, `PAPER_BAG`, `RIGID_BOX`, `SHARPS_TUBE`, `PALLET_WRAP` and `CHAIN_TAG_ONLY`, an `appraised_value_cents` of at least 0 and at most 100000000, and the `seized_at` instant at which the item was seized or found. The optional `is_found_property` flag defaults to false; setting it true marks the item as found or unclaimed property, which both widens the owner-notice window and later exempts the item from the case-status gate on disposition.
+
+Packaging standards are enforced per category, and a mismatch is refused with `ERR_PACKAGING_NOT_PERMITTED` (HTTP 422). A `BIOLOGICAL` item may only be packaged as `SHARPS_TUBE` or `RIGID_BOX`. A `CURRENCY` item may only be packaged as `SEALED_ENVELOPE`. A `FIREARM` may only be packaged as `RIGID_BOX` or `CHAIN_TAG_ONLY`. `NARCOTICS` may only be packaged as `SEALED_ENVELOPE` or `RIGID_BOX`. An `OVERSIZED` item may only be packaged as `PALLET_WRAP` or `CHAIN_TAG_ONLY`. A `GENERAL` item may use any packaging type except `SHARPS_TUBE`.
+
+Where the item must live is derived at intake and stored on the item as `required_storage_category`, and it is re-read on every storage assignment and on every relocation of a misplaced item. The derivation looks only at the item's own `category` and `appraised_value_cents`. A `BIOLOGICAL` item requires `REFRIGERATED`. A `CURRENCY`, `FIREARM` or `NARCOTICS` item requires `HIGH_VALUE_VAULT`. An `OVERSIZED` item requires `OVERSIZED_YARD`. A `GENERAL` item requires `HIGH_VALUE_VAULT` when its appraised value is at least 500000 cents — that is, five thousand dollars or more, with exactly 500000 already qualifying — and `GENERAL` otherwise.
+
+Barcode assignment happens before the item row is returned. First the service computes `item_sequence` as one more than the number of evidence items already recorded against the same `case_id`; disposed items are counted, so a sequence number is never reused within a case. It then forms a working string by concatenating the room's `agency_code`, the case's `case_number`, and `item_sequence` zero-padded to four characters. Taking the decimal digits of that working string in left-to-right order and ignoring any non-digit character, it weights the rightmost digit by 3, the next digit leftward by 1, and continues alternating those two weights leftward across all digits; the weighted digits are summed. The check digit is ten minus the remainder of that sum divided by ten, itself reduced modulo ten (so a sum ending in zero produces a check digit of zero). The stored `barcode` is then the `agency_code`, a hyphen, the `case_number`, a hyphen, the four-character zero-padded `item_sequence`, a hyphen, and the check digit. For agency `CPD`, case `26-00001` and sequence 1, the barcode is `CPD-26-00001-0001-2`. Barcodes are unique across all evidence items.
+
+Intake also fixes the item's starting posture on both axes and writes the surrounding records. `intake_at` is set from the logical clock and becomes the anchor both of the preliminary retention variant and of storage-cost recovery at auction settlement. `custody_state` starts at `LOGGED` and `disposition_state` at `RETAINED`, with `storage_location_id`, `current_holder_id` null and `open_transfer_count` at 0. A preliminary retention determination is created immediately, writing `retention_release_at` and `retention_basis` onto the item. The first chain of custody entry is appended with `event_type` of `INTAKE` and `sequence_no` of 1. Finally the owning case has `item_count` and `undisposed_item_count` each incremented by 1 and its `version` incremented by 1.
+
+### 3.3. Getting the Item Into a Bin
+
+Storage assignment advances an item's custody dimension from `LOGGED` to `STORED` and is performed by an `EvidenceTechnician`. The request may name a `storage_location_id` explicitly, or omit it and let the service choose.
+
+When a bin is named, four conditions are checked against it. The location's `status` must be `OPEN`; a location currently sealed for audit refuses the assignment with `ERR_LOCATION_SEALED`. The location's `category` must equal the item's `required_storage_category`, otherwise `ERR_STORAGE_CATEGORY_MISMATCH`. If that category is `REFRIGERATED`, the location's `temperature_c` must be at most 4.0; a warmer reading yields `ERR_REFRIGERATION_OUT_OF_RANGE`. And the location's `occupied_slots` must be strictly less than its `capacity_slots`, otherwise `ERR_STORAGE_LOCATION_FULL`. The room's `posture` must also not be `LOCKED_DOWN`.
+
+When `storage_location_id` is omitted, the service selects the tightest fitting bin. The eligible pool is every storage location whose `property_room_id` matches the room of the item's case, whose `status` is `OPEN`, whose `category` equals the item's `required_storage_category`, whose `occupied_slots` is strictly less than its `capacity_slots`, and — for refrigerated locations only — whose `temperature_c` is at most 4.0. Candidates are ranked by the number of free slots, computed as `capacity_slots` minus `occupied_slots`, in ascending order so that the fullest usable bin wins; ties are broken by `capacity_slots` ascending, and any remaining tie by `created_at` ascending. The resource's `id` is never a decision input. If the eligible pool is empty, the assignment is refused with `ERR_NO_ELIGIBLE_STORAGE`.
+
+A successful assignment writes `storage_location_id` onto the item, increments the chosen location's `occupied_slots` by 1 and that location's `version` by 1, appends a chain entry with `event_type` of `STORAGE_ASSIGN`, and recomputes the room's `posture`. The item retains `storage_location_id` even after it reaches `PURGED`, so that audit history remains reconstructable long after the item has left the building.
+
+### 3.4. Retention Determination and the Case Timeline
+
+Retention is the legal clock on an item, and it is recomputed from the case's statute rather than stored by hand. Every determination resolves to one of four bases, recorded on the determination as `resolved_basis` and mirrored onto the item as `retention_basis`: `PRELIMINARY`, `FINAL`, `INDEFINITE` or `COURT_HOLD`. Two override branches are evaluated first, in this order. If the item's `disposition_state` is `COURT_HOLD`, or its case's `status` is `APPEAL_PENDING`, the resolved basis is `COURT_HOLD`, the release instant is null and `statute_days_applied` is 0. Otherwise, if the statute's `preservation_class` is `BIOLOGICAL_INDEFINITE` or `HOMICIDE_PERMANENT`, the resolved basis is `INDEFINITE`, the release instant is null and `statute_days_applied` is 0. A null release instant means the item may never leave the room on retention grounds alone.
+
+If neither override applies, the requested `basis` selects between two variants. Under the `PRELIMINARY` variant the `anchor_at` is the item's `intake_at`, the `statute_days_applied` is the statute's full `statutory_retention_days`, and the release instant is the anchor plus those whole days; the appeal window and the ninety-day floor are both ignored. Under the `FINAL` variant — which requires the case to have reached `ADJUDICATED`, and which is otherwise refused with `ERR_CASE_STATE_INVALID` — the `anchor_at` is the case's `adjudicated_at`, and the `statute_days_applied` is the statute's `appeal_window_days` plus half of `statutory_retention_days` rounded up to the next whole day. The candidate release instant is the anchor plus those days; a floor instant is computed as the item's `intake_at` plus 90 days; and the release instant actually applied is the later of the candidate and the floor. Whichever variant runs, the resulting instant is stored as `computed_release_at` on the determination and copied onto the item as `retention_release_at`.
+
+Recording a determination is available to an `EvidenceTechnician` or a `PropertyRoomManager`, who supply the `evidence_item_id`, the requested `basis` of `PRELIMINARY` or `FINAL`, and the `expected_evidence_item_version` described in §2.9. The determination stores its `resolved_basis`, `anchor_at`, `statute_days_applied` and `computed_release_at`; the previously current determination for that item has its `superseded` flag set to true; the item's `retention_release_at` and `retention_basis` are rewritten; a chain entry with `event_type` of `RETENTION_SET` is appended; and the item's `version` is incremented by 1.
+
+The case's own lifecycle drives most retention changes automatically. An `Investigator` (or a `PropertyRoomManager`) records that charges were filed, moving the case from `OPEN` to `CHARGED` and stamping `charged_at` from the logical clock. Adjudication, performed by a `CourtClerk` or a `PropertyRoomManager`, moves the case `CHARGED → ADJUDICATED`, stamps `adjudicated_at`, and then walks every evidence item of the case in ascending `created_at` order: for each item it creates a determination with a requested `basis` of `FINAL`, marks the prior determination superseded, rewrites the item's `retention_release_at` and `retention_basis`, appends a `RETENTION_SET` chain entry, and increments that item's `version` by 1. Any item whose newly computed `retention_release_at` is at or before the current instant and whose `custody_state` is `STORED` continues in the same request from `RETAINED` to `DISPOSAL_ELIGIBLE`, and the room's `disposal_eligible_count` and `posture` are recomputed as a consequence.
+
+Appeals put everything back under judicial control. A `CourtClerk` opening an appeal moves the case `ADJUDICATED → APPEAL_PENDING` and stamps `appeal_opened_at`. Every non-`DISPOSED` item of the case moves on its disposition axis to `COURT_HOLD` — from `RETAINED` or from `DISPOSAL_ELIGIBLE` alike — with `retention_release_at` set to null and `retention_basis` set to `COURT_HOLD`, and a fresh determination recording a `resolved_basis` of `COURT_HOLD` and a null `computed_release_at` is written per item while the prior determination is superseded, accompanied by a `RETENTION_SET` chain entry. Items arriving from `DISPOSAL_ELIGIBLE` additionally decrement the room's `disposal_eligible_count`; the room's counter is recomputed either way.
+
+Resolving the appeal, again a `CourtClerk` action, closes the cycle: the case moves `APPEAL_PENDING → ADJUDICATED`, `adjudicated_at` is re-stamped to the current instant and `appeal_opened_at` is cleared. Every non-`DISPOSED` item leaves `COURT_HOLD` and returns to `RETAINED` with a new `FINAL` determination computed against the new anchor; because the anchor has moved forward, the second pass necessarily produces a strictly later release instant than the first. Any item whose newly computed release instant is already at or before the current instant, and whose `custody_state` is `STORED`, continues to `DISPOSAL_ELIGIBLE` within the same request. The `ADJUDICATED → APPEAL_PENDING → ADJUDICATED` cycle may repeat without limit, re-anchoring retention on every pass.
+
+Case closure belongs to the `PropertyRoomManager` and moves the case `ADJUDICATED → CLOSED`, stamping `closed_at`. It is permitted only when the case's `undisposed_item_count` — the number of its items whose `disposition_state` is anything other than `DISPOSED` — has reached 0; otherwise the request is refused with `ERR_CASE_HAS_UNDISPOSED_ITEMS`. Charge, adjudication, appeal and appeal resolution all additionally require the room not to be `LOCKED_DOWN`.
+
+### 3.5. Chain of Custody Transfers
+
+An item leaves the room only under a transfer, and a transfer is requested by an `Investigator`, a `LabAnalyst` or an `EvidenceTechnician` supplying the `evidence_item_id`, the `to_custodian_id` of the custodian who will hold it, a `purpose` of `LAB_ANALYSIS`, `COURT_PRESENTATION` or `INVESTIGATIVE_REVIEW`, and the planned window as `released_at` and `due_back_at`. The new row starts with `status` of `REQUESTED`, with `from_custodian_id`, all three signature fields, `returned_at` and `denial_reason` null, and it increments both the receiving custodian's `open_escort_count` and the item's `open_transfer_count`.
+
+Windows are bounded by purpose. `due_back_at` must be strictly after `released_at`, and a window that is not is refused with `ERR_INVALID_TRANSFER_WINDOW`. The elapsed span between the two instants must not exceed the maximum for the purpose: 30 days for `LAB_ANALYSIS`, 3 days for `COURT_PRESENTATION`, and 7 days for `INVESTIGATIVE_REVIEW`. A window of exactly the maximum is permitted; one millisecond longer is refused with `ERR_TRANSFER_WINDOW_TOO_LONG`.
+
+Two distinct overlap rules then apply, and they deliberately use different boundary semantics. The per-item rule treats each open custody window as half-open, so adjacency is allowed. For this purpose an existing transfer's effective end is its `returned_at` when one has been recorded, and otherwise its `due_back_at`; only transfers on the same item whose `status` is `REQUESTED`, `RELEASED` or `OVERDUE` participate, while `RETURNED`, `DENIED` and `LOST` rows are ignored. A conflict exists when the candidate's `released_at` falls strictly before that effective end **and** the existing transfer's `released_at` falls strictly before the candidate's `due_back_at`; a candidate starting at exactly the instant an existing window ends is therefore not a conflict. A conflict is refused with `ERR_CUSTODY_WINDOW_CONFLICT`.
+
+The escort rule is a capacity limit on the receiving custodian, spanning all items and all cases, and it treats windows as closed intervals so that touching endpoints do count. The service counts the open transfers — again `REQUESTED`, `RELEASED` or `OVERDUE` — assigned to the same `to_custodian_id` whose `released_at` is at or before the candidate's `due_back_at` and whose effective end (its `returned_at` if recorded, otherwise its `due_back_at`) is at or after the candidate's `released_at`. If that count reaches 2, the request is refused with `ERR_ESCORT_CAPACITY_EXCEEDED`: no custodian may be responsible for more than two overlapping escorts at once.
+
+Release is an `EvidenceTechnician` action and drives two state machines at once, moving the transfer `REQUESTED → RELEASED` and the item's custody dimension `STORED → CHECKED_OUT`. It requires a `released_signature` in the request, and a `witness_signature` when the item's current storage location has `requires_dual_signature` set to true — omitting the second signature in that case is refused with `ERR_WITNESS_SIGNATURE_REQUIRED`. Release further requires the room's `posture` to be neither `RESTRICTED` nor `LOCKED_DOWN`, the transfer to be in `REQUESTED`, the item to be in `STORED`, the item's storage location to be `OPEN` rather than sealed, and the receiving custodian to be `ACTIVE` with a `certification_expires_at` strictly after the current instant. On success the acting technician's identity is written to `from_custodian_id`, both captured signatures are stored, the item's `current_holder_id` is set to the transfer's `to_custodian_id`, and a chain entry with `event_type` of `RELEASE` is appended carrying the `released_signature` in its `signature_ref`. The bin is not freed: `occupied_slots` stays exactly as it was, because the slot remains reserved for the absent item.
+
+Return, also an `EvidenceTechnician` action, requires a `receipt_signature` and accepts a transfer whose `status` is either `RELEASED` or `OVERDUE`, provided the item is currently `CHECKED_OUT` and its storage location is `OPEN` rather than sealed. It moves the transfer to `RETURNED`, stamps `returned_at` from the logical clock — which closes the custody interval for overlap purposes — moves the item's custody dimension `CHECKED_OUT → STORED`, clears `current_holder_id`, appends a `RECEIPT` chain entry carrying the `receipt_signature` in `signature_ref`, and decrements both the receiving custodian's `open_escort_count` and the item's `open_transfer_count`.
+
+Two unhappy endings exist. When the nightly sweep finds an open transfer whose `due_back_at` has arrived — that is, is at or before the current instant — it moves the transfer `RELEASED → OVERDUE`; the custody interval stays open for overlap purposes, and the transfer remains returnable. When an item cannot be produced at all, a `PropertyRoomManager` reports it lost, supplying a `reason` that is stored in `denial_reason`. That moves the transfer from `RELEASED` or `OVERDUE` to `LOST`, moves the item `CHECKED_OUT → MISSING`, clears `current_holder_id`, creates a discrepancy with `kind` of `MISSING`, a null `audit_session_id` and `status` of `OPEN`, decrements the item's storage location `occupied_slots` by 1 because the item has left the occupancy set, increments the room's `open_discrepancy_count` and — when the item's `category` is `FIREARM`, `CURRENCY` or `NARCOTICS` — its `missing_high_risk_count`, appends a `DISCREPANCY_RAISED` chain entry, and recomputes the room's `posture`. Reporting a high-risk item lost therefore takes an otherwise clean room straight from `OPEN` to `LOCKED_DOWN`. Separately, a transfer sitting in `REQUESTED` when the room enters `LOCKED_DOWN` is moved to `DENIED` as described in §2.6.
+
+### 3.6. Found Property, Owner Notice and Claims
+
+Both seized property with a known owner and found property awaiting a claimant are noticed through the same mechanism. An `EvidenceTechnician` issues a notice by supplying the `evidence_item_id`, the `claimant_name`, the `claimant_contact` mailing address or contact string used for the notice, and a `notice_method` of `CERTIFIED_MAIL`, `PUBLICATION` or `IN_PERSON`. The claim opens with `status` of `NOTICE_SENT`, `notified_at` stamped from the logical clock, and `proof_document_ref` and `verified_at` null, and a chain entry with `event_type` of `NOTICE_SENT` is appended to the item.
+
+The `claim_deadline_at` is derived at that moment from two facts. The base period is 90 days when the item's `is_found_property` flag is true, and 30 days otherwise. Publication earns a further 15 days on top, because a notice in a newspaper reaches a claimant more slowly than a certified letter or a conversation; `CERTIFIED_MAIL` and `IN_PERSON` add nothing. The deadline is `notified_at` plus the sum of the base period and the extension, added as whole days.
+
+A claimant who responds in time causes the technician to record the filing, supplying a `proof_document_ref` for the proof-of-ownership document; that moves the claim `NOTICE_SENT → CLAIM_FILED` and is permitted only while the current instant is at or before `claim_deadline_at`. A `PropertyRoomManager` then verifies the filed claim, moving it `CLAIM_FILED → VERIFIED` and stamping `verified_at`; verification requires the room not to be `LOCKED_DOWN`. Verification is what unlocks a return-to-owner disposition, and when that disposition is executed the claim moves `VERIFIED → RELEASED` as the item passes to the claimant.
+
+A claimant who does not respond loses the item to the unclaimed pathway. During the nightly sweep, a claim still in `NOTICE_SENT` whose `claim_deadline_at` is at or before the current instant moves to `EXPIRED`, and its item's disposition dimension moves `RETAINED → UNCLAIMED_ELIGIBLE`, incrementing the room's `disposal_eligible_count`.
+
+### 3.7. Disposition: Authorization, Execution, Settlement and Disbursement
+
+An `EvidenceTechnician` or `PropertyRoomManager` opens a disposition order by supplying the `evidence_item_id`, a `type` of `RETURN_TO_OWNER`, `AUCTION`, `DESTRUCTION` or `CONVERSION`, and the `requested_by_custodian_id` of the custodian asking for it — who, by §2.11, may not later execute it. An `owner_claim_id` is required when the type is `RETURN_TO_OWNER` and must be null for every other type; a `reserve_price_cents` of at least 0 is required when the type is `AUCTION` and must be null otherwise.
+
+Four gates guard the creation, and their relative order matters because an item can fail several at once. The room must not be `LOCKED_DOWN`. The item's disposition dimension must be `DISPOSAL_ELIGIBLE` or `UNCLAIMED_ELIGIBLE`: an item in `ORDER_PENDING` or `DISPOSED` is refused with `ERR_ITEM_DISPOSITION_STATE_INVALID`, while an item in `RETAINED` or `COURT_HOLD` falls through to the domain gates instead of being reported there. Then the preservation class is examined: a `DESTRUCTION` order for an item whose statute has a `preservation_class` of `BIOLOGICAL_INDEFINITE` or `HOMICIDE_PERMANENT` is refused with `ERR_PRESERVATION_CLASS_FORBIDS_DESTRUCTION`. Then case disposability: the case's `status` must be `ADJUDICATED` or `CLOSED`, unless the item has `is_found_property` set to true **and** a `disposition_state` of `UNCLAIMED_ELIGIBLE`, in which case found property may be disposed of regardless of where the case stands; otherwise the request is refused with `ERR_CASE_NOT_DISPOSABLE`. Finally retention maturity: an item still in `RETAINED` is refused with `ERR_RETENTION_NOT_MATURED`, because its `retention_release_at` is either null or still in the future.
+
+A successful creation moves the item's disposition dimension from `DISPOSAL_ELIGIBLE` or `UNCLAIMED_ELIGIBLE` to `ORDER_PENDING` and starts the order in `PENDING_COURT_AUTH` with `auto_authorized` false, `court_order_number`, `gross_sale_cents`, `commission_cents`, `storage_recovery_cents`, `settled_net_proceeds_cents`, `executed_by_custodian_id`, `witness_custodian_id`, `authorized_at`, `executed_at`, `settlement_deadline_at`, `settled_at` and `payee_reference` all null, and `settlement_status` at `NONE`.
+
+Immediately after the row is created, the service evaluates whether the order may skip the courthouse entirely. Automatic authorization applies only when all four of the following hold: the order's `type` is `DESTRUCTION`; the case's statute has `destruction_requires_court_order` set to false; the item's `category` is none of `FIREARM`, `CURRENCY`, `NARCOTICS` or `BIOLOGICAL`; and the item's `appraised_value_cents` is strictly below 500000 cents, so that an item appraised at exactly five thousand dollars still requires a judge. When the predicate holds, the order transitions `PENDING_COURT_AUTH → AUTHORIZED` in the same request, `auto_authorized` is set to true, `authorized_at` is stamped from the logical clock, and `court_order_number` stays null. When it does not hold, the order waits: a `CourtClerk` supplies a `court_order_number`, which moves the order `PENDING_COURT_AUTH → AUTHORIZED`, stamps `authorized_at`, and leaves `auto_authorized` false. The same clerk may instead refuse the disposition, supplying a `reason`; refusal moves the order `PENDING_COURT_AUTH → REJECTED` without recording any `court_order_number`, returns the item's disposition dimension `ORDER_PENDING → RETAINED`, decrements the room's `disposal_eligible_count` and recomputes `posture` — the next nightly sweep will re-derive eligibility from scratch. Both authorization and refusal require the room not to be `LOCKED_DOWN`.
+
+At creation time the service also records an estimate of what the disposition will yield, in `estimated_net_proceeds_cents`. For every type other than `AUCTION` the estimate is 0. For an auction, the estimate is the item's `appraised_value_cents` less a flat ten percent commission on that appraisal, the commission being the appraised value multiplied by 0.10 and rounded half up to whole cents.
+
+Execution belongs solely to the `PropertyRoomManager`, who supplies the `executed_by_custodian_id` and the `witness_custodian_id`. It requires the order to be `AUTHORIZED`, the room's `posture` to be neither `RESTRICTED` nor `LOCKED_DOWN`, the item's `custody_state` to be `STORED`, the segregation-of-duties inequalities of §2.11 to hold, both named custodians to be `ACTIVE` and certified, and — for a `RETURN_TO_OWNER` order — the referenced owner claim to be in `VERIFIED`, failing which the request is refused with `ERR_CLAIM_NOT_VERIFIED`. On success the order moves `AUTHORIZED → EXECUTED` with `executed_at` stamped from the logical clock; for an `AUCTION` order the `settlement_deadline_at` is set to 30 days after `executed_at`. The item is retired on both axes at once — `custody_state` to `PURGED` and `disposition_state` to `DISPOSED` — its storage location's `occupied_slots` is decremented by 1, the room's `disposal_eligible_count` is decremented, the case's `undisposed_item_count` is decremented, a chain entry with `event_type` of `DISPOSITION_EXECUTED` is appended, and for a `RETURN_TO_OWNER` order the owner claim moves `VERIFIED → RELEASED`.
+
+Non-auction dispositions have nothing to sell, so execution settles them immediately: an order whose `type` is `RETURN_TO_OWNER`, `DESTRUCTION` or `CONVERSION` continues `EXECUTED → SETTLED` inside the same request with `settled_net_proceeds_cents` of 0, `settlement_status` of `NONE`, and `settled_at` stamped from the logical clock. That `SETTLED` position is a resting place rather than an ending: because `settlement_status` is `NONE` rather than `HELD`, any attempt to disburse such an order is refused with `ERR_NO_PROCEEDS_HELD`.
+
+An auction, by contrast, is settled explicitly by the `PropertyRoomManager` against the hammer price, supplied as `gross_sale_cents`. Settlement requires the order's `type` to be `AUCTION` and the order to be in `EXECUTED`. The hammer price must be greater than or equal to the order's `reserve_price_cents`, and a shortfall is refused with `ERR_SALE_BELOW_RESERVE` — reported in preference to a closed window, so a below-reserve sale surfaces as a reserve failure even when the deadline has also passed. The current instant must be at or before `settlement_deadline_at`, and a late settlement is refused with `ERR_SETTLEMENT_WINDOW_CLOSED`.
+
+The settled proceeds are computed in five pinned steps, and the order of those steps is not interchangeable. **Step one** determines the auctioneer's commission from the hammer price using an inclusive-upper-bound tier ladder: a gross of 50000 cents or less attracts fifteen percent (a rate of 0.15), a gross above that but not exceeding 500000 cents attracts ten percent (0.10), and anything above 500000 cents attracts seven percent (0.07). The `commission_cents` is the gross multiplied by the applicable rate, rounded half up to whole cents. **Step two** takes the subtotal as the gross less `commission_cents`. **Step three** computes the cap on storage-cost recovery as thirty percent (a rate of 0.30) of that post-commission subtotal, floored to whole cents — the cap is a share of the subtotal, not of the gross and not of the final net. **Step four** computes the raw recovery and applies the cap: the number of storage days is the whole number of days, rounded down, between the item's `intake_at` and the order's `executed_at`, and the raw recovery is that day count multiplied by the daily rate for the item's `required_storage_category`, which is 25 cents per day for `GENERAL`, 120 cents per day for `REFRIGERATED`, 60 cents per day for `HIGH_VALUE_VAULT` and 200 cents per day for `OVERSIZED_YARD`; the `storage_recovery_cents` actually charged is the lesser of the raw recovery and the cap. **Step five** sets `settled_net_proceeds_cents` to the subtotal less `storage_recovery_cents`. Because the settled figure works from the hammer price with a tiered commission and a storage deduction while the estimate worked from the appraisal with a flat commission and no storage deduction, the two figures routinely diverge for the same item, and both are retained on the order.
+
+Settlement then moves the order `EXECUTED → SETTLED`, stamps `settled_at`, sets `settlement_status` to `HELD`, and increases the room's `escrow_balance_cents` by `settled_net_proceeds_cents`. Disbursement closes the loop: the `PropertyRoomManager` supplies a `payee_reference` for the treasury, the order moves `SETTLED → DISBURSED`, `settlement_status` becomes `DISBURSED`, and the room's `escrow_balance_cents` is reduced by the same `settled_net_proceeds_cents`, returning the balance to the value it held before settlement. Disbursement is permitted only while `settlement_status` is `HELD`; otherwise it is refused with `ERR_NO_PROCEEDS_HELD`.
+
+### 3.8. Periodic Audits, Discrepancy Investigation and the Nightly Sweep
+
+Inventory reconciliation is scheduled one storage location at a time by an `InternalAuditor`, who supplies the `storage_location_id`, the `auditor_id` (which must equal their own `X-User-ID`), the planned window as `scheduled_start_at` and `scheduled_end_at`, and the `expected_storage_location_version` described in §2.9. A session whose `scheduled_end_at` is not strictly after its `scheduled_start_at` is refused with `ERR_INVALID_TRANSFER_WINDOW`. Beyond that, sessions on the same location must be well separated: every existing session on that location whose `status` is `SCHEDULED`, `IN_PROGRESS` or `RECONCILED` is treated as occupying its window inflated by 48 hours — two full days — on both sides, and a candidate conflicts when its `scheduled_start_at` is at or before that inflated end **and** the existing session's `scheduled_start_at` is at or before the candidate's inflated end. The boundary is inclusive, so scheduling a session to begin exactly 48 hours after an existing session's end still conflicts; the refusal is `ERR_AUDIT_WINDOW_BUFFER`. A session begins with `status` of `SCHEDULED`, a `risk_index` of 0.00, empty `expected_evidence_item_ids` and `scanned_evidence_item_ids`, zero `expected_item_count`, `scanned_item_count`, `missing_count` and `misplaced_count`, and null `started_at`, `reconciled_at` and `closed_at`. Creating it also increments the target location's `version` by 1. Scheduling an audit is one of the operations that remains available in a locked-down room.
+
+Starting the session moves it `SCHEDULED → IN_PROGRESS`, stamps `started_at`, and snapshots the inventory the auditor is expected to find: `expected_evidence_item_ids` is the list of identifiers of the evidence items whose `storage_location_id` is that location and whose `custody_state` is `STORED`, ordered by `created_at` ascending, and `expected_item_count` is the length of that list. The location itself moves `OPEN → SEALED_FOR_AUDIT`, records the session in `sealed_by_audit_session_id`, and has its `version` incremented by 1; the room's `sealed_location_count` is incremented and its `posture` recomputed, which takes a clean room from `OPEN` to `RESTRICTED` for the duration. A sealed location blocks storage assignment into it, release out of it and return into it, all with `ERR_LOCATION_SEALED`. Starting requires the location to be `OPEN`.
+
+Scanning records progress. The auditor submits a `barcode`; if it matches no evidence item the scan is refused with `ERR_BARCODE_NOT_FOUND`, and if the matched item belongs to a case of a different property room than the audited location the scan is refused with `ERR_BARCODE_FOREIGN_ROOM`. A valid scan appends the item's identifier to `scanned_evidence_item_ids`, increments `scanned_item_count`, and appends a chain entry with `event_type` of `AUDIT_SCAN`. If the scanned item's `storage_location_id` is not the audited location, the item is physically present in the wrong place, and a discrepancy is raised on the spot with `kind` of `MISPLACED` and `status` of `OPEN`, incrementing the room's `open_discrepancy_count` and triggering a `posture` recomputation.
+
+Reconciliation is the counterpart: it moves the session `IN_PROGRESS → RECONCILED`, stamps `reconciled_at`, and accounts for everything expected but never scanned. For each identifier in `expected_evidence_item_ids` that is absent from `scanned_evidence_item_ids` and whose item is still `STORED`, processed in ascending `created_at` order of the items, a discrepancy is created with `kind` of `MISSING`. Each such discrepancy drives its item `STORED → MISSING`, which decrements the location's `occupied_slots` by 1 and increments the room's `open_discrepancy_count` and, for a `FIREARM`, `CURRENCY` or `NARCOTICS` item, its `missing_high_risk_count`; a `DISCREPANCY_RAISED` chain entry is appended. The session's `missing_count` and `misplaced_count` are the counts of its own discrepancies with `kind` of `MISSING` and `MISPLACED` respectively.
+
+Reconciliation then scores the exposure. For each discrepancy of the session whose `status` is `OPEN` or `UNDER_INVESTIGATION`, three factors are multiplied together. The kind weight is 5.0 for a `MISSING` discrepancy and 2.0 for a `MISPLACED` one. The value multiplier is one plus the lesser of two quantities: the item's `appraised_value_cents` divided by 1000000 — that is, its value expressed in units of ten thousand dollars — and a ceiling of 2.0, so that no single item can contribute a value multiplier above 3.0. The category multiplier is 1.5 when the audited location's `category` is `HIGH_VALUE_VAULT` or `REFRIGERATED`, and 1.0 for `GENERAL` and `OVERSIZED_YARD`. The product of the three is rounded half up to two decimal places and stored on the discrepancy as `weight_contribution`. The session's `risk_index` is then the sum of those already-rounded contributions, itself rounded half up to two decimal places. Resolved discrepancies drop out of the calculation entirely, and the index is re-derived whenever one of the session's discrepancies is resolved. Finally the room's `posture` is recomputed from the new counters; if the result is `LOCKED_DOWN`, every custody transfer in the room still sitting in `REQUESTED` is denied as described in §2.6.
+
+Discrepancies are adjudicated by the `PropertyRoomManager`, never by the auditor who raised them. Opening an investigation moves a discrepancy `OPEN → UNDER_INVESTIGATION` and changes no counter, because `UNDER_INVESTIGATION` remains inside the open set for both posture and risk purposes; a discrepancy that is not `OPEN` is refused with `ERR_DISCREPANCY_STATE_INVALID`. Resolution takes a `resolution` of `FOUND` or `WRITTEN_OFF` together with a `resolution_note`, is available from either `OPEN` or `UNDER_INVESTIGATION`, and stamps `resolved_at`. A `FOUND` resolution moves the discrepancy's `status` to the terminal value `RESOLVED_FOUND` and a `WRITTEN_OFF` resolution moves it to the terminal value `RESOLVED_WRITTEN_OFF`; both terminal values sit outside the open set, so neither contributes to the room's counters or to any session's `risk_index` thereafter.
+
+Resolving a `MISSING` discrepancy as `FOUND` returns the item to its bin: it requires the item's storage location to have `occupied_slots` strictly below `capacity_slots`, otherwise `ERR_STORAGE_LOCATION_FULL`, and it moves the item `MISSING → STORED` while incrementing that location's `occupied_slots` by 1 — the compensating half of the occupancy invariant, since the slot was released when the item went missing. Resolving a `MISPLACED` discrepancy as `FOUND` instead relocates the item into the audited location: it requires that location to have `occupied_slots` strictly below `capacity_slots` (`ERR_STORAGE_LOCATION_FULL`) and its `category` to equal the item's `required_storage_category` (`ERR_STORAGE_CATEGORY_MISMATCH`), and on success the item's `storage_location_id` becomes the audited location while the old location's `occupied_slots` is decremented by 1 and the new location's incremented by 1. Resolving as `WRITTEN_OFF` accepts the loss: it is permitted only for a `MISSING` discrepancy, and requesting it for a `MISPLACED` one is refused with `ERR_DISCREPANCY_RESOLUTION_NOT_PERMITTED`. A write-off drives the item `MISSING → PURGED` and sets its `disposition_state` to `DISPOSED`, leaves `occupied_slots` untouched because the slot was already released when the item went missing, and decrements the case's `undisposed_item_count`. Every resolution decrements the room's `open_discrepancy_count`, decrements `missing_high_risk_count` where the resolved row was a high-risk missing item, re-derives the owning session's `risk_index`, and recomputes the room's `posture`.
+
+A session is closed by an `InternalAuditor` or a `PropertyRoomManager` from either `IN_PROGRESS` or `RECONCILED`, and is refused with `ERR_AUDIT_STATE_INVALID` while any discrepancy of that session still has `status` of `OPEN` or `UNDER_INVESTIGATION`. Closing stamps `closed_at`, returns the location `SEALED_FOR_AUDIT → OPEN`, clears `sealed_by_audit_session_id`, increments the location's `version` by 1, decrements the room's `sealed_location_count` and recomputes its `posture`.
+
+The nightly sweep is the room-level reconciliation, run by a `PropertyRoomManager`, and it executes four steps strictly in order, each processing candidate rows in ascending `created_at` order. **Step one** flags overdue escorts: every custody transfer in `RELEASED` whose `due_back_at` is at or before the current instant becomes `OVERDUE`. **Step two** expires owner notices: every claim in `NOTICE_SENT` whose `claim_deadline_at` is at or before the current instant becomes `EXPIRED` and moves its item `RETAINED → UNCLAIMED_ELIGIBLE`. **Step three** matures retention: every item whose `custody_state` is `STORED` and whose `retention_release_at` is non-null and at or before the current instant moves `RETAINED → DISPOSAL_ELIGIBLE`. Because step two runs before step three, an item whose notice expired on this very sweep becomes `UNCLAIMED_ELIGIBLE` rather than `DISPOSAL_ELIGIBLE` — the unclaimed pathway wins the tie. **Step four** re-derives every dependent figure on the room: `open_discrepancy_count`, `missing_high_risk_count`, `sealed_location_count`, `disposal_eligible_count`, `escrow_balance_cents` and `posture`, and finally stamps `last_sweep_at` with the current instant.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence — registering a room, statute, location or custodian, opening a case, logging an evidence item, recording a retention determination, requesting a custody transfer, opening a disposition order, issuing an owner notice, or scheduling an audit session — return `201 Created`. Every other operation, including all reads, all state transitions on an existing resource, the nightly sweep and the clock capability, returns `200 OK`. Error responses carry the status code listed in §5.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock | PropertyRoomManager |
+| POST | `/property-rooms` | Register a property and evidence unit | PropertyRoomManager |
+| GET | `/property-rooms/{roomId}` | Read a property room with its derived posture, counters and escrow balance | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| POST | `/property-rooms/{roomId}/daily-sweep` | Run the nightly reconciliation for one room | PropertyRoomManager |
+| POST | `/offense-statutes` | Register an offense statute with its retention and preservation parameters | PropertyRoomManager |
+| GET | `/offense-statutes/{statuteId}` | Read an offense statute | PropertyRoomManager, EvidenceTechnician, Investigator, CourtClerk, InternalAuditor |
+| POST | `/storage-locations` | Create a storage location in a room | PropertyRoomManager |
+| GET | `/storage-locations/{locationId}` | Read a storage location with its derived occupancy and seal state | PropertyRoomManager, EvidenceTechnician, InternalAuditor |
+| GET | `/storage-locations` | List storage locations | PropertyRoomManager, EvidenceTechnician, InternalAuditor |
+| POST | `/custodians` | Register a custodian | PropertyRoomManager |
+| GET | `/custodians/{custodianId}` | Read a custodian with the derived open escort count | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, InternalAuditor |
+| GET | `/custodians` | List custodians | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, InternalAuditor |
+| POST | `/custodians/{custodianId}/suspend` | Suspend a custodian | PropertyRoomManager |
+| POST | `/cases` | Open a case that evidence will be logged against | PropertyRoomManager, EvidenceTechnician |
+| GET | `/cases/{caseId}` | Read a case with its derived item counters | PropertyRoomManager, EvidenceTechnician, Investigator, CourtClerk, InternalAuditor |
+| GET | `/cases` | List cases | PropertyRoomManager, EvidenceTechnician, Investigator, CourtClerk, InternalAuditor |
+| POST | `/cases/{caseId}/charge` | Record that charges were filed | Investigator, PropertyRoomManager |
+| POST | `/cases/{caseId}/adjudicate` | Record adjudication and re-determine retention for every item of the case | CourtClerk, PropertyRoomManager |
+| POST | `/cases/{caseId}/appeal` | Open an appeal, placing every non-disposed item under court hold | CourtClerk |
+| POST | `/cases/{caseId}/resolve-appeal` | Close the appeal and re-adjudicate against a new retention anchor | CourtClerk |
+| POST | `/cases/{caseId}/close` | Close a fully disposed case | PropertyRoomManager |
+| POST | `/evidence-items` | Log an item into the property room with barcode and preliminary retention | EvidenceTechnician |
+| GET | `/evidence-items/{itemId}` | Read an evidence item with both state dimensions and its retention posture | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| GET | `/evidence-items` | List evidence items | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| POST | `/evidence-items/{itemId}/storage-assignment` | Assign an item to a storage bin, auto-selecting when none is named | EvidenceTechnician |
+| POST | `/retention-determinations` | Record a retention determination, superseding the prior one | EvidenceTechnician, PropertyRoomManager |
+| GET | `/retention-determinations/{determinationId}` | Read a retention determination including its anchor and days applied | PropertyRoomManager, EvidenceTechnician, CourtClerk, InternalAuditor |
+| GET | `/retention-determinations` | List retention determinations | PropertyRoomManager, EvidenceTechnician, CourtClerk, InternalAuditor |
+| POST | `/custody-transfers` | Request a chain of custody transfer | Investigator, LabAnalyst, EvidenceTechnician |
+| GET | `/custody-transfers/{transferId}` | Read a custody transfer with its captured signatures and window | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| GET | `/custody-transfers` | List custody transfers | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| POST | `/custody-transfers/{transferId}/release` | Release the item into the receiving custodian's custody with signature capture | EvidenceTechnician |
+| POST | `/custody-transfers/{transferId}/return` | Receive the item back into the property room with receipt signature capture | EvidenceTechnician |
+| POST | `/custody-transfers/{transferId}/report-lost` | Report an item lost while out of the room, raising a missing-item discrepancy | PropertyRoomManager |
+| POST | `/disposition-orders` | Open a disposition order, auto-authorizing low-value destructions | EvidenceTechnician, PropertyRoomManager |
+| GET | `/disposition-orders/{orderId}` | Read a disposition order with both proceeds variants and the escrow posture | PropertyRoomManager, EvidenceTechnician, CourtClerk, InternalAuditor |
+| GET | `/disposition-orders` | List disposition orders | PropertyRoomManager, EvidenceTechnician, CourtClerk, InternalAuditor |
+| POST | `/disposition-orders/{orderId}/authorize` | Record court authorization for a pending disposition order | CourtClerk |
+| POST | `/disposition-orders/{orderId}/reject` | Record that the court refused the disposition, returning the item to retention | CourtClerk |
+| POST | `/disposition-orders/{orderId}/execute` | Execute the authorized disposition under segregation of duties | PropertyRoomManager |
+| POST | `/disposition-orders/{orderId}/settle` | Settle an executed auction from the hammer price and hold the net in room escrow | PropertyRoomManager |
+| POST | `/disposition-orders/{orderId}/disburse` | Disburse held auction proceeds to the treasury | PropertyRoomManager |
+| POST | `/owner-claims` | Issue an owner notification and open the claim window | EvidenceTechnician |
+| GET | `/owner-claims/{claimId}` | Read an owner claim with its computed deadline | PropertyRoomManager, EvidenceTechnician, InternalAuditor |
+| GET | `/owner-claims` | List owner claims | PropertyRoomManager, EvidenceTechnician, InternalAuditor |
+| POST | `/owner-claims/{claimId}/file` | Record that the noticed owner filed a claim with proof of ownership | EvidenceTechnician |
+| POST | `/owner-claims/{claimId}/verify` | Verify the filed claim, unlocking a return-to-owner disposition | PropertyRoomManager |
+| POST | `/audit-sessions` | Schedule a periodic inventory audit of one storage location | InternalAuditor |
+| GET | `/audit-sessions/{sessionId}` | Read an audit session with its expected and scanned snapshots and risk index | PropertyRoomManager, InternalAuditor, EvidenceTechnician |
+| GET | `/audit-sessions` | List audit sessions | PropertyRoomManager, InternalAuditor, EvidenceTechnician |
+| POST | `/audit-sessions/{sessionId}/start` | Start the audit, sealing the location and snapshotting the expected inventory | InternalAuditor |
+| POST | `/audit-sessions/{sessionId}/scan` | Record a barcode scan during the audit | InternalAuditor |
+| POST | `/audit-sessions/{sessionId}/reconcile` | Reconcile the audit and compute the weighted risk index | InternalAuditor |
+| POST | `/audit-sessions/{sessionId}/close` | Close the audit and release the seal | InternalAuditor, PropertyRoomManager |
+| GET | `/discrepancies/{discrepancyId}` | Read a discrepancy with its rounded risk contribution | PropertyRoomManager, InternalAuditor, EvidenceTechnician |
+| GET | `/discrepancies` | List discrepancies | PropertyRoomManager, InternalAuditor, EvidenceTechnician |
+| POST | `/discrepancies/{discrepancyId}/investigate` | Open an investigation into a discrepancy | PropertyRoomManager |
+| POST | `/discrepancies/{discrepancyId}/resolve` | Resolve a discrepancy as found or written off | PropertyRoomManager |
+| GET | `/chain-events/{eventId}` | Read one chain of custody entry | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+| GET | `/chain-events` | List chain of custody entries | PropertyRoomManager, EvidenceTechnician, Investigator, LabAnalyst, CourtClerk, InternalAuditor |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_USER_CONTEXT` | 400 |
+| `ERR_INVALID_ROLE` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_CUSTODIAN_ROLE_MISMATCH` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_PROPERTY_ROOM_NOT_FOUND` | 404 |
+| `ERR_OFFENSE_STATUTE_NOT_FOUND` | 404 |
+| `ERR_STORAGE_LOCATION_NOT_FOUND` | 404 |
+| `ERR_CUSTODIAN_NOT_FOUND` | 404 |
+| `ERR_CASE_NOT_FOUND` | 404 |
+| `ERR_EVIDENCE_ITEM_NOT_FOUND` | 404 |
+| `ERR_RETENTION_DETERMINATION_NOT_FOUND` | 404 |
+| `ERR_CUSTODY_TRANSFER_NOT_FOUND` | 404 |
+| `ERR_DISPOSITION_ORDER_NOT_FOUND` | 404 |
+| `ERR_OWNER_CLAIM_NOT_FOUND` | 404 |
+| `ERR_AUDIT_SESSION_NOT_FOUND` | 404 |
+| `ERR_DISCREPANCY_NOT_FOUND` | 404 |
+| `ERR_CHAIN_EVENT_NOT_FOUND` | 404 |
+| `ERR_BARCODE_NOT_FOUND` | 404 |
+| `ERR_ROOM_LOCKED_DOWN` | 409 |
+| `ERR_ROOM_RESTRICTED` | 409 |
+| `ERR_STALE_EVIDENCE_ITEM_VERSION` | 412 |
+| `ERR_STALE_STORAGE_LOCATION_VERSION` | 412 |
+| `ERR_ITEM_CUSTODY_STATE_INVALID` | 409 |
+| `ERR_ITEM_DISPOSITION_STATE_INVALID` | 409 |
+| `ERR_CASE_STATE_INVALID` | 409 |
+| `ERR_TRANSFER_STATE_INVALID` | 409 |
+| `ERR_ORDER_STATE_INVALID` | 409 |
+| `ERR_CLAIM_STATE_INVALID` | 409 |
+| `ERR_AUDIT_STATE_INVALID` | 409 |
+| `ERR_DISCREPANCY_STATE_INVALID` | 409 |
+| `ERR_LOCATION_SEALED` | 409 |
+| `ERR_CUSTODIAN_SUSPENDED` | 409 |
+| `ERR_CUSTODIAN_NOT_CERTIFIED` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 409 |
+| `ERR_DUPLICATE_AGENCY_CODE` | 409 |
+| `ERR_DUPLICATE_OFFENSE_CODE` | 409 |
+| `ERR_DUPLICATE_LOCATION_CODE` | 409 |
+| `ERR_DUPLICATE_BADGE_NUMBER` | 409 |
+| `ERR_DUPLICATE_CASE_NUMBER` | 409 |
+| `ERR_PACKAGING_NOT_PERMITTED` | 422 |
+| `ERR_STORAGE_CATEGORY_MISMATCH` | 409 |
+| `ERR_REFRIGERATION_OUT_OF_RANGE` | 409 |
+| `ERR_WITNESS_SIGNATURE_REQUIRED` | 422 |
+| `ERR_ESCORT_CAPACITY_EXCEEDED` | 409 |
+| `ERR_INVALID_TRANSFER_WINDOW` | 422 |
+| `ERR_TRANSFER_WINDOW_TOO_LONG` | 422 |
+| `ERR_CUSTODY_WINDOW_CONFLICT` | 409 |
+| `ERR_AUDIT_WINDOW_BUFFER` | 409 |
+| `ERR_PRESERVATION_CLASS_FORBIDS_DESTRUCTION` | 409 |
+| `ERR_CASE_NOT_DISPOSABLE` | 409 |
+| `ERR_RETENTION_NOT_MATURED` | 409 |
+| `ERR_CLAIM_NOT_VERIFIED` | 409 |
+| `ERR_BARCODE_FOREIGN_ROOM` | 409 |
+| `ERR_CASE_HAS_UNDISPOSED_ITEMS` | 409 |
+| `ERR_DISCREPANCY_RESOLUTION_NOT_PERMITTED` | 422 |
+| `ERR_SALE_BELOW_RESERVE` | 409 |
+| `ERR_NO_PROCEEDS_HELD` | 409 |
+| `ERR_SETTLEMENT_WINDOW_CLOSED` | 409 |
+| `ERR_STORAGE_LOCATION_FULL` | 409 |
+| `ERR_NO_ELIGIBLE_STORAGE` | 409 |

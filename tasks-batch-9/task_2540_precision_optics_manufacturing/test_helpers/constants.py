@@ -1,0 +1,268 @@
+"""Domain constants for the precision optics manufacturing API.
+
+Every value here is taken directly from the PRD: the enum vocabularies of
+section 2.11, the declared field defaults of sections 3.1 through 3.9, the
+rounding scales of section 2.5 and the fixed physical sensitivities and
+threshold limits named in the workflow narratives.
+"""
+
+# --- Logical clock (PRD 2.4) -------------------------------------------------
+# "The logical clock begins at exactly 2026-08-01T00:00:00Z"
+CLOCK_EPOCH_UTC = "2026-08-01T00:00:00Z"
+
+# --- Roles (PRD 2.1) --------------------------------------------------------
+ROLE_OPTICS_ENGINEER = "OpticsEngineer"
+ROLE_PROCUREMENT_OFFICER = "ProcurementOfficer"
+ROLE_PROCESS_TECHNICIAN = "ProcessTechnician"
+ROLE_METROLOGY_TECHNICIAN = "MetrologyTechnician"
+ROLE_QUALITY_MANAGER = "QualityManager"
+ROLE_EXPORT_COMPLIANCE_OFFICER = "ExportComplianceOfficer"
+ROLE_PLANT_ADMIN = "PlantAdmin"
+
+ALL_ROLES = (
+    ROLE_OPTICS_ENGINEER,
+    ROLE_PROCUREMENT_OFFICER,
+    ROLE_PROCESS_TECHNICIAN,
+    ROLE_METROLOGY_TECHNICIAN,
+    ROLE_QUALITY_MANAGER,
+    ROLE_EXPORT_COMPLIANCE_OFFICER,
+    ROLE_PLANT_ADMIN,
+)
+
+# A role literal that is deliberately NOT one of the seven defined roles.
+UNKNOWN_ROLE = "ShippingClerk"
+
+# --- Pagination (PRD 2.3) ---------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+# --- Enum vocabularies (PRD 2.11) -------------------------------------------
+DESIGN_STATUSES = ("DRAFT", "TOLERANCED", "RELEASED", "SUPERSEDED", "RETIRED")
+TOLERANCE_METHODS = ("STATISTICAL", "WORST_CASE")
+TOLERANCE_VERDICTS = ("PENDING", "PASS", "FAIL")
+CONTRIBUTOR_TYPES = (
+    "SURFACE_IRREGULARITY",
+    "INDEX_HOMOGENEITY",
+    "STRIAE",
+    "WEDGE_ANGLE",
+    "CENTER_THICKNESS",
+    "COATING_STRESS",
+    "MOUNT_STRAIN",
+)
+ALLOCATION_STATUSES = ("ACTIVE", "RETIRED")
+
+# Homogeneity and striae grades order "better" as "lower" (PRD 2.11).
+HOMOGENEITY_GRADES = ("H1", "H2", "H3", "H4", "H5")
+STRIAE_GRADES = ("A", "B", "C", "D")
+
+GLASS_LOT_STATUSES = ("QUARANTINED", "RELEASED", "BLOCKED", "DEPLETED")
+
+WORK_ORDER_PROCESS_STATUSES = (
+    "BLANKS_RESERVED",
+    "GRINDING",
+    "POLISHING",
+    "FIGURING",
+    "FIGURE_ACCEPTED",
+    "COATING",
+    "COATED",
+    "RELEASED_TO_ASSEMBLY",
+    "HELD",
+    "SCRAPPED",
+    "CANCELLED",
+)
+WORK_ORDER_COMPLIANCE_STATUSES = ("UNCLASSIFIED", "SCREENED", "CLEARED", "BLOCKED")
+
+# The seven fabrication states a glass-lot block converts to HELD (PRD 3.2).
+BLOCK_HELDABLE_PROCESS_STATUSES = (
+    "BLANKS_RESERVED",
+    "GRINDING",
+    "POLISHING",
+    "FIGURING",
+    "FIGURE_ACCEPTED",
+    "COATING",
+    "COATED",
+)
+
+RUN_STAGES = ("GRINDING", "POLISHING", "FIGURING")
+PROCESS_RUN_STATUSES = (
+    "SCHEDULED",
+    "IN_PROCESS",
+    "AWAITING_METROLOGY",
+    "ACCEPTED",
+    "REWORK_REQUIRED",
+    "CANCELLED",
+)
+INSTRUMENT_TYPES = (
+    "PHASE_SHIFTING_INTERFEROMETER",
+    "WHITE_LIGHT_INTERFEROMETER",
+    "AFM_PROFILOMETER",
+)
+INSTRUMENT_STATUSES = ("CALIBRATED", "OVERDUE")
+
+REPORT_STATUSES = ("DRAFT", "SIGNED")
+REPORT_VERDICTS = ("PENDING", "ACCEPTED", "REWORK_REQUIRED")
+
+COATING_TYPES = ("AR_BROADBAND", "DIELECTRIC_MIRROR", "BEAMSPLITTER")
+COATING_STATUSES = ("LOADED", "DEPOSITED", "VERIFIED_PASS", "VERIFIED_FAIL", "SCRAPPED")
+SPECTRAL_VERDICTS = ("PENDING", "PASS", "FAIL")
+
+ASSEMBLY_STATUSES = (
+    "KITTED",
+    "CEMENTED",
+    "MOUNTED",
+    "ALIGNED",
+    "SEALED",
+    "RELEASED",
+    "REJECTED",
+    "EXPORT_BLOCKED",
+)
+COMPONENT_STATUSES = ("ACTIVE", "VOIDED")
+
+INSPECTION_STATUSES = ("PASSED", "FAILED", "WAIVED")
+
+CLASSIFICATION_STATUSES = (
+    "LICENSE_REQUIRED",
+    "EXEMPT_CLEARED",
+    "LICENSE_APPROVED",
+    "LICENSE_DENIED",
+)
+LICENSE_DECISIONS = ("APPROVED", "DENIED")
+
+PACKAGE_STATUSES = ("ASSEMBLING", "SUBMITTED", "APPROVED")
+REVIEW_DECISIONS = ("APPROVED", "REJECTED")
+DOCUMENT_TYPES = (
+    "CERTIFICATE_OF_CONFORMANCE",
+    "MELT_CERTIFICATE",
+    "INTERFEROGRAM_REPORT",
+    "COATING_SPECTRAL_DATA",
+    "EXPORT_LICENSE",
+    "INSPECTION_WAIVER",
+)
+BASE_REQUIRED_DOCUMENT_TYPES = (
+    "CERTIFICATE_OF_CONFORMANCE",
+    "INTERFEROGRAM_REPORT",
+    "MELT_CERTIFICATE",
+)
+
+# System-written scrap / hold / cancel reason literals (PRD 3.2, 3.5, 3.6).
+HOLD_REASON_GLASS_LOT_BLOCKED = "GLASS_LOT_BLOCKED"
+CANCEL_REASON_BY_OPERATOR = "CANCELLED_BY_OPERATOR"
+CANCEL_REASON_WORK_ORDER_HELD = "WORK_ORDER_HELD"
+CANCEL_REASON_WORK_ORDER_CANCELLED = "WORK_ORDER_CANCELLED"
+SCRAP_REASON_MIN_THICKNESS_BREACH = "MIN_THICKNESS_BREACH"
+SCRAP_REASON_FIGURE_CONVERGENCE_FAILURE = "FIGURE_CONVERGENCE_FAILURE"
+SCRAP_REASON_COATING_STRIP_LIMIT = "COATING_STRIP_LIMIT"
+SCRAP_REASON_LATENT_SUBSURFACE_DEFECT = "LATENT_SUBSURFACE_DEFECT"
+SCRAP_REASON_ASSEMBLY_DAMAGE = "ASSEMBLY_DAMAGE"
+
+# --- Declared field defaults (PRD 3.1) --------------------------------------
+DEFAULT_SURFACE_FIGURE_BUDGET_WAVES = 0.0250
+DEFAULT_SURFACE_ROUGHNESS_BUDGET_NM = 1.2000
+DEFAULT_MIN_CENTER_THICKNESS_UM = 5800.0
+DEFAULT_MIN_INDEX_HOMOGENEITY_GRADE = "H3"
+DEFAULT_MAX_STRIAE_GRADE = "B"
+DEFAULT_TOLERANCE_METHOD = "STATISTICAL"
+DEFAULT_SCRATCH_DIG_SCRATCH_LIMIT = 40
+DEFAULT_SCRATCH_DIG_DIG_LIMIT = 20
+DEFAULT_CLEANLINESS_LIMIT_PER_CM2 = 50
+
+# --- Declared field defaults (PRD 3.2) --------------------------------------
+DEFAULT_MELT_INDEX_ND = 1.516800
+MELT_INDEX_ND_MIN = 1.300000
+MELT_INDEX_ND_MAX = 2.200000
+DEFAULT_DECLARED_INDEX_HOMOGENEITY_GRADE = "H2"
+DEFAULT_DECLARED_STRIAE_GRADE = "A"
+DEFAULT_BLANK_CENTER_THICKNESS_UM = 6200.0
+
+# --- Declared field defaults (PRD 3.4) --------------------------------------
+DEFAULT_INSTRUMENT_TYPE = "PHASE_SHIFTING_INTERFEROMETER"
+DEFAULT_LATERAL_RESOLUTION_UM = 250.0
+DEFAULT_CALIBRATION_INTERVAL_DAYS = 90
+
+# --- Declared field defaults (PRD 3.6, 3.9) ---------------------------------
+DEFAULT_COATING_TYPE = "AR_BROADBAND"
+DEFAULT_SCRATCH_COUNT_AT_LIMIT = 1
+
+# --- Fixed computation constants -------------------------------------------
+# PRD 3.3: element_count bounds.
+MIN_ELEMENT_COUNT = 1
+MAX_ELEMENT_COUNT = 12
+
+# PRD 3.4: uncertainty drift and the capability gate.
+UNCERTAINTY_DRIFT_PER_DAY_PCT = 2.0
+UNCERTAINTY_DRIFT_CAP_MULTIPLE = 2.0
+CAPABILITY_RATIO_NUMERATOR_FACTOR = 4.0
+CAPABILITY_RATIO_LIMIT = 0.2500
+
+# PRD 3.4: metrology window shape and the purge buffer.
+MIN_WINDOW_MINUTES = 30
+MAX_WINDOW_MINUTES = 480
+INSTRUMENT_PURGE_BUFFER_MINUTES = 15
+
+# PRD 3.5: the per-stage figure budget multipliers.
+STAGE_FIGURE_BUDGET_MULTIPLIERS = {"GRINDING": 10.0, "POLISHING": 3.0, "FIGURING": 1.0}
+ROUGHNESS_LIMIT_WAVES = 1.2000
+MAX_FIGURING_ITERATIONS = 2
+
+# PRD 3.6: the spectral gates.
+MIN_IN_BAND_SAMPLES = 5
+BAND_AVERAGE_REFLECTANCE_LIMIT_PCT = 0.5000
+WORST_POINT_REFLECTANCE_LIMIT_PCT = 1.2000
+MAX_STRIP_COUNT = 1
+
+# PRD 3.7: export control thresholds.
+CONTROLLED_APERTURE_MM = 100.0
+CONTROLLED_RMS_WAVEFRONT_WAVES = 0.0500
+CONTROLLED_FIGURE_OF_MERIT = 4000.00
+ECCN_CONTROLLED = "6A004.A.1"
+ECCN_UNCONTROLLED = "EAR99"
+LICENSE_EXEMPT_DESTINATIONS = ("CA", "AU", "GB")
+
+# PRD 3.8: the transmitted-wavefront roll-up.
+DECENTER_SENSITIVITY_WAVES_PER_UM = 0.0012
+TILT_SENSITIVITY_WAVES_PER_ARCMIN = 0.0080
+CEMENT_DERATE_LOW_WAVES = 0.0020
+CEMENT_DERATE_MID_WAVES = 0.0060
+CEMENT_DERATE_HIGH_WAVES = 0.0150
+CEMENT_DERATE_MID_THRESHOLD = 0.0500
+CEMENT_DERATE_HIGH_THRESHOLD = 0.1000
+MAX_ALIGNMENT_ATTEMPTS = 3
+
+# PRD 3.9: the cosmetic and waiver limits.
+MAX_SCRATCHES_AT_LIMIT = 2
+WAIVER_LIMIT_MULTIPLE = 2
+MIN_WAIVER_JUSTIFICATION_CHARS = 20
+
+# --- Rounding scales (PRD 2.5) ----------------------------------------------
+WAVEFRONT_DECIMALS = 4
+UNCERTAINTY_DECIMALS = 6
+CAPABILITY_DECIMALS = 4
+FOM_DECIMALS = 2
+COMPLETENESS_DECIMALS = 2
+
+# Absolute tolerances used when comparing rounded numeric outputs.
+TOL_WAVEFRONT = 1e-4
+TOL_UNCERTAINTY = 1e-6
+TOL_TWO_DP = 1e-2
+
+# --- Reusable literal payload fragments ------------------------------------
+ALL_ZERO_UUID = "00000000-0000-0000-0000-000000000000"
+
+# A five-point spectrophotometer trace whose aggregates both pass (PRD 3.6).
+PASSING_SPECTRAL_TRACE = [
+    {"wavelength_nm": 450, "reflectance_pct": 0.1000},
+    {"wavelength_nm": 500, "reflectance_pct": 0.1200},
+    {"wavelength_nm": 600, "reflectance_pct": 0.1400},
+    {"wavelength_nm": 680, "reflectance_pct": 0.1600},
+    {"wavelength_nm": 700, "reflectance_pct": 0.1800},
+]
+
+# The trace of PRD 3.6 whose band average passes but whose worst point fails.
+WORST_POINT_FAILING_TRACE = [
+    {"wavelength_nm": 480, "reflectance_pct": 0.2000},
+    {"wavelength_nm": 550, "reflectance_pct": 0.1800},
+    {"wavelength_nm": 600, "reflectance_pct": 0.2200},
+    {"wavelength_nm": 650, "reflectance_pct": 0.2500},
+    {"wavelength_nm": 700, "reflectance_pct": 1.3500},
+]

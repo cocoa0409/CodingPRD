@@ -1,0 +1,588 @@
+# Adult Education HSE Testing API — Product Requirements Document
+
+## 1. Introduction
+
+Adult education programmes live or die by their records. A learner walks in without a high school diploma, is oriented, is pre-tested to establish an educational functioning level, is placed into a literacy, high-school-equivalency preparation or English-language class, accumulates instructional hours, is post-tested to demonstrate measurable skill gain, sits four proctored subtests at an authorised testing centre, receives a credential, orders sealed transcripts for an employer or a college, and finally appears as one line in the state performance report that determines next year's funding. Every one of those steps is auditable, and almost every one of them can be undone retroactively — a proctor's certification is revoked and the results they witnessed stop counting; an instructor voids a mis-keyed attendance sheet and a post-test loses its hour basis; a centre is suspended and every seat sold in its rooms must be refunded.
+
+This document specifies the API that carries that chain of custody. It is written for the engineer who has to make the retroactive cases correct, because those are the cases the state auditor will look at. The system tracks fifteen record types at the top level of a single flat collection space, joined by explicit foreign-key fields rather than deep URL nesting, so that a record can be reached both from its owner and from the audit trail that touches it. Two families of behaviour dominate the design: **compliance cascades**, where withdrawing one piece of evidence propagates through tests, credentials, transcripts, outcome claims and committed funding in a fixed order; and **temporal windowing**, where a rule's answer depends on where a logical clock instant falls relative to a certification expiry, a seating window, a post-testing interval or a funding period.
+
+Two further properties shape the contract. First, several figures — voucher cents, seat counts, committed funding — are conserved quantities, and every operation that moves them must move all of their counterparts in the same request, so a reader who sums the ledger always finds it balanced. Second, the same underlying data legitimately yields two different answers depending on who is asking: a programme coordinator forecasting mid-year sees the most favourable reading of a learner's skill gain and of the funding pool, while a state auditor settling the period sees the strictest one. Both readings are specified here as named variants; implementing only one of them is a defect.
+
+## 2. Global Specifications & System-Wide Principles
+
+Every rule in this section applies across the whole API unless a later section narrows it explicitly. All resource collections are mounted directly at the API root — there is no version or product prefix in front of `/students`, `/exam-sessions` and their siblings.
+
+### 2.1. User and Role-Based Access Control
+
+Every request, without exception, must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, naming the capacity that user is acting in. When either header is absent, or when `X-User-Role` holds a value that is not one of the seven declared roles, the request is rejected with `ERR_UNAUTHENTICATED` (401). When the headers are well-formed but the named role is not among the roles the addressed operation admits, the request is rejected with `ERR_UNAUTHORIZED` (403).
+
+The seven roles are `StateAuthority`, `ProgramCoordinator`, `Registrar`, `Instructor`, `CenterAdministrator`, `Proctor` and `Student`.
+
+- A `StateAuthority` is a state adult-education agency officer. They alone register testing centres, decide centre authorisation, suspend centres, decide proctor certification, issue credentials, create funding periods, run funding allocation and close funding periods; they also share read access to every record, outcome recording and certification, room and proctor registration, session cancellation, student intake and voucher adjustment.
+- A `ProgramCoordinator` owns the instructional side: they alone create class sections, transition section status, create enrollments and void attendance entries, and they share intake, orientation, voucher adjustment, attendance posting, enrollment withdrawal, test-event scheduling, outcome recording and certification, and transcript fulfilment.
+- A `Registrar` has no exclusive operation; they run orientation completion, test-event scheduling, exam registration and cancellation, accommodation submission and resubmission, transcript ordering on a learner's behalf, and transcript fulfilment.
+- An `Instructor` alone scores test events, and additionally posts attendance entries and withdraws enrollments for the classes they teach.
+- A `CenterAdministrator` alone creates exam sessions, assigns proctors to sessions, issues accommodation information requests and decides accommodation requests; they also add rooms and register proctors at their own centre and cancel their own centre's sessions.
+- A `Proctor` alone records identity verification, checks candidates in and records exam results.
+- A `Student` acts on their own record: submitting and resubmitting accommodation requests, creating and cancelling their own exam registrations, ordering their own transcripts, and reading their own records.
+
+Four of the roles carry an **opaque** identity. When `X-User-Role` is `StateAuthority`, `ProgramCoordinator`, `Registrar` or `Instructor`, the `X-User-ID` value is an operator identifier that is not tied to any persisted entity; the server never compares it to any record's `id`. It is, however, recorded where an audit trail demands it: as `posted_by_user_id` on an attendance entry, and as `recorded_by_user_id` and later `certified_by_user_id` on an outcome record. The `instructor_user_id` carried on a class section is the same kind of opaque staff identifier supplied as input, not a reference to a stored user record.
+
+The remaining three roles are **entity-backed**, and for them `X-User-ID` is a record identifier that constrains what they may address.
+
+- When `X-User-Role` is `CenterAdministrator`, `X-User-ID` is the `id` of the acting `TestingCenter`; ownership checks compare it to the testing centre in the path, or to the `testing_center_id` of the addressed room, or to the `testing_center_id` of the room that hosts the addressed session or registration.
+- When `X-User-Role` is `Proctor`, `X-User-ID` is the `id` of the acting `Proctor`; ownership checks compare it to the `proctor_id` of the exam session that hosts the addressed registration.
+- When `X-User-Role` is `Student`, `X-User-ID` is the `id` of the acting `Student`; ownership checks compare it to the addressed student's `id`, or to the `student_id` of the addressed enrollment, test event, registration, accommodation request, credential or transcript order.
+
+An entity-backed role that reaches outside its own scope — the wrong centre, a session it is not assigned to, another learner's record — is rejected with `ERR_FORBIDDEN_SCOPE` (403). This is distinct from `ERR_UNAUTHORIZED`: the role is permitted to perform the operation in general, but not on that particular record.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every collection read accepts two query parameters. `limit` caps the number of records returned; it defaults to 10 when omitted, may be no smaller than 1 and no larger than 100. `offset` is the number of records to skip before the returned window begins; it defaults to 0 and may not be negative. A `limit` outside the permitted range, or a negative `offset`, is rejected with `ERR_INVALID_PAGINATION` (400).
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending — oldest record first.
+
+List responses carry `limit`, `offset`, `total_count` and `has_more` inside the envelope's `meta` object. `total_count` is the number of records matching the filters before the pagination window is applied, and `has_more` states whether any matching record remains beyond the returned window.
+
+### 2.4. The Logical Program Clock
+
+Every temporal rule in this specification — certification expiry, seating windows, post-testing intervals, accommodation validity, funding-period windows, attendance dating — reads a single server-side **logical clock** rather than wall-clock time. Before any client sets it, the clock reads exactly `2026-08-01T00:00:00Z`; the server never falls back to real time, at startup or afterwards.
+
+The clock may only move forward. Setting it takes a `current_utc` instant, and a value earlier than the clock's current reading is rejected with `ERR_CLOCK_BACKWARD` (422); setting it to exactly the current reading is accepted. Both the write and the read of the clock return the resulting `current_utc` value. `StateAuthority`, `ProgramCoordinator`, `Registrar`, `CenterAdministrator` and `Instructor` may advance the clock; every role including `Proctor` and `Student` may read it.
+
+Because the clock is explicit, several state changes that would otherwise need a scheduler are evaluated **lazily**: the server recognises them at the moment a request first depends on them, writes the state change, and only then continues evaluating the request that triggered it. Two such lazy transitions exist — proctor certification lapse and accommodation approval expiry — and both are described where they belong, in §3.5 and §3.7. In both cases the lazily written state change is durable: it persists even though the triggering request itself is refused.
+
+### 2.5. Record Identity, Timestamps and Versioning
+
+Every record type in the system — students, testing centres, testing rooms, proctors, class sections, enrollments, attendance entries, test events, exam sessions, exam registrations, accommodation requests, outcome records, credential issuances, transcript orders and funding periods — carries the same four system-managed properties.
+
+- `id` is a server-minted UUID string. It carries no type prefix and clients never supply it.
+- `created_at` is an ISO 8601 UTC timestamp with three fractional digits, recording when the record was first stored.
+- `updated_at` is an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the record.
+- `version` is an integer that starts at 1 when the record is created and increases by exactly one on every mutation of that record.
+
+A "mutation" here includes writes the client did not ask for directly. When a computed field changes because of activity elsewhere — an enrollment's `posted_hours` because an attendance entry was posted, a student's `voucher_balance_cents` because a registration was refunded, a funding period's `available_cents` because an allocation ran — that is a mutation of the record holding the field: its `updated_at` is refreshed and its `version` increases by one. A single request therefore commonly bumps the `version` of several records, and every one of those bumps is specified in the cascade descriptions in §3.
+
+### 2.6. Request Evaluation Order
+
+When a single request could fail more than one check, the check listed earliest below is the one that reports. This ordering is part of the contract: an implementation that surfaces a later error instead of an earlier one is wrong even though it also refused the request. Where a band names the operations it guards, that list is exhaustive.
+
+1. **Authentication.** Both context headers present and `X-User-Role` a declared role — otherwise `ERR_UNAUTHENTICATED` (401). Applies to every endpoint.
+2. **Role authorisation.** The acting role appears in the addressed endpoint's role list — otherwise `ERR_UNAUTHORIZED` (403). Applies to every endpoint.
+3. **Path identifier resolution.** Every identifier embedded in the path is resolved left to right, and the first one that does not resolve determines the 404 reported: `ERR_STUDENT_NOT_FOUND`, `ERR_TESTING_CENTER_NOT_FOUND`, `ERR_TESTING_ROOM_NOT_FOUND`, `ERR_PROCTOR_NOT_FOUND`, `ERR_CLASS_SECTION_NOT_FOUND`, `ERR_ENROLLMENT_NOT_FOUND`, `ERR_ATTENDANCE_ENTRY_NOT_FOUND`, `ERR_TEST_EVENT_NOT_FOUND`, `ERR_EXAM_SESSION_NOT_FOUND`, `ERR_EXAM_REGISTRATION_NOT_FOUND`, `ERR_ACCOMMODATION_REQUEST_NOT_FOUND`, `ERR_OUTCOME_RECORD_NOT_FOUND`, `ERR_CREDENTIAL_NOT_FOUND`, `ERR_TRANSCRIPT_ORDER_NOT_FOUND` or `ERR_FUNDING_PERIOD_NOT_FOUND`.
+4. **Scope.** Entity-backed roles act only inside their own scope, as defined in §2.1 — otherwise `ERR_FORBIDDEN_SCOPE` (403). Applies to every `CenterAdministrator`, `Proctor` and `Student` operation.
+5. **Request shape.** Required body fields present, types correct, enum values drawn from the declared set, and numeric constraints satisfied — otherwise `ERR_INVALID_REQUEST` (400). Applies to every write endpoint.
+6. **Pagination arguments**, as described in §2.3 — otherwise `ERR_INVALID_PAGINATION` (400). Applies to every list endpoint.
+7. **Clock monotonicity** — otherwise `ERR_CLOCK_BACKWARD` (422). Applies to the clock-setting endpoint only.
+8. **Body foreign keys.** Every identifier supplied in a request body — `student_id`, `class_section_id`, `exam_session_id`, `accommodation_request_id`, `credential_issuance_id`, `funding_period_id`, `proctor_id`, `testing_room_id`, `enrollment_id` — must resolve, and an unresolved one reports the matching 404 from the list in band 3. Applies to enrollment creation, test-event creation, exam-session creation, proctor assignment, exam-registration creation, accommodation-request creation, outcome-record creation, credential issuance and transcript-order creation.
+9. **Stale-view guard.** The optimistic-concurrency field matches the parent record's current `version` (§2.7) — otherwise the corresponding 412. Applies to exam-registration creation, attendance-entry voiding and allocation runs. Note the position of this band: on those three operations the stale-view guard reports ahead of every state and business check that follows, so a client working from a stale read learns that first.
+10. **Transition legality.** The addressed record is in a state from which the requested transition is declared, per the state machines narrated in §3 — otherwise the 409 that belongs to that record type: `ERR_INVALID_INTAKE_STATE`, `ERR_CENTER_DECISION_NOT_ALLOWED`, `ERR_ROOM_OUT_OF_SERVICE`, `ERR_PROCTOR_DECISION_NOT_ALLOWED`, `ERR_SECTION_TRANSITION_NOT_ALLOWED`, `ERR_ENROLLMENT_NOT_ACTIVE`, `ERR_ATTENDANCE_ALREADY_VOIDED`, `ERR_TEST_EVENT_NOT_SCHEDULED`, `ERR_SESSION_NOT_ASSIGNABLE`, `ERR_SESSION_NOT_CANCELLABLE`, `ERR_REGISTRATION_NOT_OPEN`, `ERR_REGISTRATION_NOT_CHECKED_IN`, `ERR_IDENTITY_ALREADY_VERIFIED`, `ERR_ACCOMMODATION_NOT_PENDING`, `ERR_ACCOMMODATION_NOT_INFO_REQUESTED`, `ERR_OUTCOME_NOT_CERTIFIABLE`, `ERR_TRANSCRIPT_ORDER_NOT_QUEUED` or `ERR_FUNDING_PERIOD_CLOSED`.
+11. **Learner intake gates** (409). Test-event scheduling requires the learner's `intake_status` to be `ORIENTED`, `PLACED` or `ENROLLED` — otherwise `ERR_STUDENT_NOT_ORIENTED`. Enrollment requires a non-null `placement_efl_level` — otherwise `ERR_PLACEMENT_TEST_MISSING`. Exam registration requires `intake_status` to be `PLACED` or `ENROLLED` — otherwise `ERR_STUDENT_NOT_PLACED`.
+12. **Centre authorisation** (409). The testing centre owning the addressed room or session must be `PROVISIONAL` or `FULL_AUTHORIZED`. A centre still `APPLIED` or already `WITHDRAWN` reports `ERR_CENTER_NOT_AUTHORIZED`; a `SUSPENDED` centre reports `ERR_CENTER_SUSPENDED` — the two are deliberately distinguishable. This band guards four operations: room creation under a centre, exam-session creation, proctor assignment and exam-registration creation.
+13. **Section acceptance** (409). Enrollment requires the section's `status` to be `OPEN` or `IN_SESSION` — otherwise `ERR_SECTION_NOT_ACCEPTING_ENROLLMENT`. Guards enrollment creation only.
+14. **Credential validity** (409). A referenced credential issuance must be `ISSUED` rather than `VOIDED` — otherwise `ERR_CREDENTIAL_NOT_ISSUED`. Guards transcript-order creation, transcript fulfilment, and outcome-record creation when the claimed `measure_type` is `CREDENTIAL_ATTAINMENT`.
+15. **Funding period open** (409). The addressed or referenced funding period must be `OPEN` — otherwise `ERR_FUNDING_PERIOD_CLOSED`. Guards outcome-record creation, outcome certification, allocation runs and period closing.
+16. **Room availability** (409). The room named for a new sitting must be `ACTIVE`; a room turned `OUT_OF_SERVICE` by maintenance retirement or by centre suspension reports `ERR_ROOM_OUT_OF_SERVICE`. Guards exam-session creation.
+17. **Session open for registration** (409). Only a `SCHEDULED` session sells seats; a session that is `DRAFT`, `IN_PROGRESS`, `COMPLETED` or `CANCELLED` reports `ERR_SESSION_NOT_OPEN_FOR_REGISTRATION`. Guards exam-registration creation.
+18. **Proctor certification** (409). The proctor involved must be `CERTIFIED` after lazy lapse evaluation. A proctor who is `PENDING` or `REVOKED` reports `ERR_PROCTOR_NOT_CERTIFIED`; one whose `certification_expires_at` has been reached reports `ERR_PROCTOR_CERTIFICATION_LAPSED`. This band guards four operations: proctor assignment, candidate check-in, identity verification and result entry.
+19. **Identity before seating** (409). Check-in requires `identity_status` to be `VERIFIED`; both `UNVERIFIED` and `ID_REJECTED` report `ERR_IDENTITY_NOT_VERIFIED`. Guards check-in only.
+20. **Segregation of duties** (403). The `X-User-ID` certifying an outcome record must differ from its `recorded_by_user_id` — otherwise `ERR_SEGREGATION_OF_DUTIES`. Guards outcome certification only.
+21. **Subtest authorisation** (409). The session's `subtest` must be a member of the owning centre's `allowed_subtests` — otherwise `ERR_SUBTEST_NOT_AUTHORIZED`. Guards exam-session creation and exam-registration creation.
+22. **Accommodation ownership** (409). A referenced accommodation request must belong to the registering learner — otherwise `ERR_ACCOMMODATION_OWNER_MISMATCH`. Guards exam-registration creation.
+23. **Accommodation standing** (409). A referenced accommodation request must be `APPROVED`, and must not have lapsed under lazy expiry evaluation. One that is `SUBMITTED`, `INFO_REQUESTED` or `DENIED` reports `ERR_ACCOMMODATION_NOT_APPROVED`; one whose `valid_until` the clock has reached reports `ERR_ACCOMMODATION_EXPIRED`. Guards exam-registration creation.
+24. **Format deliverability** (409). The session's `supported_formats` must contain the accommodation's `granted_format` — otherwise `ERR_ACCOMMODATION_FORMAT_UNAVAILABLE`. Guards exam-registration creation.
+25. **Outcome evidence** (409). A `CREDENTIAL_ATTAINMENT` claim requires a `credential_issuance_id` whose credential belongs to the same learner as the outcome — otherwise `ERR_OUTCOME_EVIDENCE_MISMATCH`. Guards outcome-record creation.
+26. **Measurable-gain support** (409). Certifying an `EFL_GAIN` outcome requires the audited reading of the skill-gain determination to report a gain — otherwise `ERR_MSG_NOT_SUPPORTED`. Guards outcome certification.
+27. **Sitting not in the past** (422). A session's `starts_at` must be strictly later than the clock — otherwise `ERR_SESSION_IN_PAST`. Guards exam-session creation and exam-registration creation.
+28. **Post-testing interval** (409). At least thirty whole UTC days must have elapsed since the learner's earliest scored pre-test — otherwise `ERR_POST_TEST_INTERVAL_NOT_MET`. Guards test-event creation when `purpose` is `POST_TEST`.
+29. **Window shape** (422). A session's `ends_at` must be strictly after its `starts_at` and the window may not exceed six hours; a test event's `scheduled_for` may not precede the clock. Violations report `ERR_INVALID_SESSION_WINDOW`. Guards exam-session creation and test-event creation.
+30. **Seating window** (409). Check-in must fall inside the window that opens sixty minutes before `starts_at` and closes at `ends_at`, the closing instant itself excluded — otherwise `ERR_CHECK_IN_WINDOW_CLOSED`. Guards check-in.
+31. **Effective window** (422). An accommodation approval's `valid_until` must be strictly later than the clock, and an `attendance_date` may not be in the future. Violations report `ERR_INVALID_EFFECTIVE_WINDOW`. Guards accommodation decisions and attendance posting.
+32. **Post-testing hours** (409). The enrollment's `posted_hours` must be at least forty hours — otherwise `ERR_POST_TEST_HOURS_NOT_MET`. Guards test-event creation when `purpose` is `POST_TEST`. Note that this hour gate is evaluated *after* the interval gate in band 28, so a learner who fails both is told about the interval.
+33. **Room turnaround conflict** (409) — `ERR_ROOM_BUFFER_CONFLICT`, guarding exam-session creation.
+34. **Proctor interval conflict** (409) — `ERR_PROCTOR_TIME_CONFLICT`, guarding proctor assignment.
+35. **Proctor daily load** (409) — `ERR_PROCTOR_DAILY_CAP_EXCEEDED`, guarding proctor assignment. Bands 34 and 35 are two separate gates on the same operation and the interval conflict reports first.
+36. **Duplicate active enrollment** (409) — `ERR_DUPLICATE_ACTIVE_ENROLLMENT`, guarding enrollment creation.
+37. **Functioning-level band** (409) — `ERR_EFL_LEVEL_OUT_OF_RANGE`, guarding enrollment creation.
+38. **Concurrent test event** (409) — `ERR_TEST_EVENT_CONFLICT`, guarding test-event creation.
+39. **Duplicate credential** (409) — `ERR_DUPLICATE_CREDENTIAL`, guarding credential issuance.
+40. **Credential requirements** (409) — `ERR_CREDENTIAL_REQUIREMENTS_NOT_MET`, guarding credential issuance. Bands 39 and 40 are ordered: a learner who already holds a credential is told so before their subtest results are re-examined.
+41. **Information-request ceiling** (409) — `ERR_INFO_REQUEST_LIMIT_REACHED`, guarding accommodation information requests.
+42. **Section capacity** (409) — `ERR_SECTION_CAPACITY_EXCEEDED`, guarding enrollment creation. Within enrollment creation the order across bands is therefore section acceptance, then duplicate-track, then functioning-level band, then capacity.
+43. **Seat availability and duplicate sitting** (409) — `ERR_SESSION_SEATS_EXHAUSTED` when the session's seats are gone, `ERR_DUPLICATE_REGISTRATION` when the learner already holds a live registration on that session. Guards exam-registration creation.
+44. **Fiscal coverage.** A learner who is not authorised to self-pay must have voucher funds covering the whole post-discount fee — otherwise `ERR_VOUCHER_INSUFFICIENT` (402), guarding exam-registration creation. A voucher adjustment may not drive the balance negative — otherwise `ERR_VOUCHER_ADJUSTMENT_INVALID` (422), guarding voucher adjustment. This band is last: the fee is only assessed once every eligibility, capacity and scheduling question has been answered.
+
+### 2.7. Stale-View Protection on Shared Aggregates
+
+Three write operations reason about an aggregate that other writers can move underneath them, and each is therefore guarded by an explicit optimistic-concurrency field. In all three cases the field is a **required** input, not an optional one, and it must carry the `version` value the client last observed on the named parent record. If it does not equal that parent's current `version`, the write is refused and nothing is changed.
+
+- Creating an exam registration requires `expected_exam_session_version` matching the target `ExamSession`'s current `version`. A mismatch is rejected with `ERR_STALE_EXAM_SESSION_VERSION` (412). The client's view may have gone stale because another registrar consumed a seat, because the session was re-assigned to a different proctor, or because the session moved to `IN_PROGRESS` — in every one of those cases the seat arithmetic the client reasoned about no longer holds.
+- Voiding an attendance entry requires `expected_enrollment_version` matching the parent `Enrollment`'s current `version`. A mismatch is rejected with `ERR_STALE_ENROLLMENT_VERSION` (412). The void cascade decides whether post-tests lose their hour basis by comparing `posted_hours` against the forty-hour threshold, so deciding that crossing from a stale hour figure would invalidate the wrong records.
+- Running a funding allocation requires `expected_funding_period_version` matching the `FundingPeriod`'s current `version`. A mismatch is rejected with `ERR_STALE_FUNDING_PERIOD_VERSION` (412). Because a later run legitimately supersedes the earlier committed view of the pool, an operator working from a stale `available_cents` figure must re-read the period before committing.
+
+No other endpoint accepts a version field, and no other endpoint performs a stale-view check.
+
+### 2.8. Cents, Hours and Rounding
+
+Money in this system is always an integer number of cents. There are no fractional-cent fields, no currency strings, and no rounding of money at the API boundary — every monetary field named in this document (`gross_fee_cents`, `accommodation_surcharge_cents`, `discount_cents`, `voucher_applied_cents`, `fee_due_cents`, `refunded_cents`, `voucher_granted_cents`, `voucher_balance_cents`, `voucher_spent_cents`, `exam_fee_owed_cents`, `base_charge_cents`, `waiver_cents`, `state_records_fee_cents`, `total_charge_cents`, `rate_cents_per_weight`, `total_cents`, `committed_cents`, `available_cents`, `allocated_cents`) is a whole number of cents.
+
+Rounding is not uniform, and each calculation names its own rule. Three rules are used, and using the wrong one is a defect even when the result differs by a single cent:
+
+- **Round half up** is applied where a rate is multiplied out: the retake-multiplied base exam fee, and each individual funding-allocation line.
+- **Floor** — truncation toward zero — is applied where a percentage reduction is computed: the attendance-tier exam discount and the transcript copy-fee waiver.
+- **No rounding at all** applies to subtraction and addition of already-integral cents.
+
+Where a funding total is assembled from several lines, the order is pinned: each line is rounded first and the rounded lines are then summed exactly. Summing unrounded weights and rounding once at the end produces a different figure and is not acceptable.
+
+Instructional hours are decimal numbers carried to two decimal places, rounded half up. Attendance is posted in quarter-hour increments, so the hour aggregates are always exact multiples of 0.25 and no rounding residue accumulates. A session's `duration_hours` is likewise expressed in hours to two decimal places, rounded half up. Educational functioning levels and scale scores are integers and are never rounded.
+
+### 2.9. Cascade Discipline
+
+Withdrawing evidence in this system is never a single-record edit. A suspension, a proctor revocation, a section closure or an attendance void each propagates through a fixed chain of dependent records, and those chains are described in §3 as numbered links so that an implementer can reproduce them exactly. Three rules hold for every chain.
+
+First, **ordering is deterministic**: wherever a link touches a set of records, that set is processed in `created_at` ascending order. Second, **every touched record is a mutation**: each record a cascade writes has its `updated_at` refreshed and its `version` increased by one, including the aggregate holders — students, sections, sessions and funding periods — that were not themselves the target of the request. Third, **cascades run to completion within the request**: consistency is immediate, not eventual, and a reader who fetches any record in the chain immediately after the request observes the settled state.
+
+Reverse propagation follows the same discipline. When a child record's change causes a parent's criteria to be met or unmet — an enrollment count reaching zero, a checked-in count reaching zero, a posted-hour total dropping below a threshold — the server transitions the parent itself, without a separate client request on that parent.
+
+### 2.10. Conserved Ledgers
+
+Three quantities in the system are conserved, and every operation that moves one must move all of its counterparts inside the same request so that the invariant holds at every observable instant.
+
+The **voucher ledger** on a learner satisfies a single identity: the lifetime `voucher_granted_cents` always equals `voucher_balance_cents` plus `voucher_spent_cents`. Neither `voucher_balance_cents` nor `voucher_spent_cents` may ever be negative. Applying a voucher to a registration moves cents from balance to spent; refunding a registration moves exactly the same cents back.
+
+**Seat counts** are conserved in two places. A section's `seats_available` is always its `seats_total` less its `seats_taken`, where `seats_taken` is the number of that section's enrollments in `ACTIVE` status. A session's `seats_taken` is the number of its registrations whose `registration_status` is `REGISTERED`, `CHECKED_IN` or `SCORED`; every transition out of those statuses releases the seat.
+
+The **funding pool** on a period satisfies `available_cents` equalling `total_cents` less `committed_cents`, where `committed_cents` is the sum of `allocated_cents` over that period's outcome lines whose `allocation_status` is `COMMITTED`. Revoking a committed line returns its cents to the pool in the same request that revokes it.
+
+### 2.11. Separation of Recording and Certification Duties
+
+Performance outcomes drive money, so the system refuses to let one operator both claim an outcome and bless it. The `X-User-ID` that creates an outcome record is stored as `recorded_by_user_id`; the `X-User-ID` that later decides it is stored as `certified_by_user_id`. When those two values would be equal the decision is refused with `ERR_SEGREGATION_OF_DUTIES` (403), regardless of whether the decision was a certification or a rejection, and regardless of which of the two roles permitted to decide is acting. Because both roles' identities are opaque operator identifiers, the comparison is a plain string comparison of header values, not a lookup.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Intake, Orientation and Functioning-Level Placement
+
+A learner enters the system when a `ProgramCoordinator` or `StateAuthority` performs intake, supplying the learner's `full_name` — legal name as captured on the intake form, non-empty and no longer than 120 characters — an `email` that must contain an at-sign and must be unique across all learners, and the `primary_track` the learner enters on, which is `LITERACY`, `HSE_PREP` or `ESL`. Intake may optionally set `self_pay_authorized`, the flag stating whether the learner is permitted to owe an out-of-pocket exam balance; when omitted it is `false`. Everything else on a new learner record is server-assigned: `intake_status` begins at `INTAKE_STARTED`, `orientation_completed_at` and `placement_efl_level` are null, `total_instructional_hours` is 0, `voucher_granted_cents`, `voucher_balance_cents`, `voucher_spent_cents`, `exam_fee_owed_cents` and `active_enrollment_count` are all 0, and `credential_status` is `NONE`.
+
+The intake axis walks `INTAKE_STARTED`, `ORIENTED`, `PLACED` and `ENROLLED`, with `EXITED` as its terminal state. Recording orientation completion — an action available to a `Registrar` or a `ProgramCoordinator` — moves `intake_status` from `INTAKE_STARTED` to `ORIENTED`, stamps `orientation_completed_at` with the logical clock's current instant, and increases the learner's `version` by one. The request carries no payload. Attempting it on a learner who is not in `INTAKE_STARTED` — including one already `ORIENTED` — is refused with `ERR_INVALID_INTAKE_STATE`.
+
+Standardized testing is modelled as a **test event**, scheduled by a `Registrar` or `ProgramCoordinator` with a `student_id`, a `purpose` of either `PRE_TEST` or `POST_TEST`, a `test_form` naming the instrument (`CASAS_R_900`, `CASAS_M_900` or `BEST_PLUS`), and a `scheduled_for` instant that may not precede the logical clock. A `POST_TEST` additionally requires the `enrollment_id` whose hours support it; an intake `PRE_TEST` leaves `enrollment_id` null, and a `POST_TEST` submitted without one is refused as a malformed request. Scheduling is blocked for a learner still in `INTAKE_STARTED` or already `EXITED`, which is what `ERR_STUDENT_NOT_ORIENTED` reports, and a learner may hold only one `SCHEDULED` test event per `purpose` at a time — a second concurrent one of the same purpose is refused with `ERR_TEST_EVENT_CONFLICT`. A new event is stored with `status` `SCHEDULED`, `test_date` null, `scale_score` null, `efl_level` null and `invalidation_reason` null.
+
+An `Instructor` — and only an `Instructor` — scores a test event, supplying the raw `scale_score`, which for a standardized instrument must be an integer between 0 and 999 inclusive. Scoring moves the event from `SCHEDULED` to `SCORED`; an event already `SCORED` or `INVALIDATED` refuses the attempt with `ERR_TEST_EVENT_NOT_SCHEDULED`. Scoring stamps `test_date` with the logical clock's current instant and derives `efl_level`, the educational functioning level, from the score.
+
+The **functioning-level bands** are per-instrument, ascending, and their lower bounds are inclusive: a score landing exactly on a band floor takes the higher of the two levels. The derived level is the highest level whose floor the score reaches or exceeds. For `CASAS_R_900` the floors are level 1 from a score of 0, level 2 from 201, level 3 from 211, level 4 from 221, level 5 from 236 and level 6 from 246. For `CASAS_M_900` they are level 1 from 0, level 2 from 194, level 3 from 203, level 4 from 214, level 5 from 227 and level 6 from 236. For `BEST_PLUS` they are level 1 from 0, level 2 from 401, level 3 from 418, level 4 from 439, level 5 from 473 and level 6 from 507. Because every instrument's level 1 starts at 0, a scored event always yields a level between 1 and 6, and no additional rounding is involved.
+
+Placement is a by-product of pre-testing rather than a separate operation. When the scored event's `purpose` is `PRE_TEST` and it is the learner's **earliest** scored pre-test — earliest by `test_date` ascending, ties broken by `created_at` ascending — the derived level is copied onto the learner as `placement_efl_level` and the learner's `intake_status` advances from `ORIENTED` to `PLACED`. That copy is a mutation of the learner record, so the learner's `version` increases by one in addition to the test event's own increment. A later pre-test never overwrites `placement_efl_level`; the earliest scored one is definitive.
+
+Exam-fee vouchers are administered independently of the intake ladder. A `ProgramCoordinator` or `StateAuthority` adjusts a learner's voucher funds by submitting a `delta_cents` amount, which is added both to the lifetime `voucher_granted_cents` and to the spendable `voucher_balance_cents`. A negative `delta_cents` claws funds back. An adjustment that would leave `voucher_balance_cents` below zero is refused with `ERR_VOUCHER_ADJUSTMENT_INVALID`, leaving the ledger untouched; an accepted adjustment increases the learner's `version` by one.
+
+Reads of learner data come in two shapes. A single-learner read returns the whole record including its computed hour, voucher and credential fields, and is available to a `ProgramCoordinator`, `StateAuthority`, `Registrar`, `Instructor` or the `Student` themselves. The collection read is restricted to staff roles and accepts `intake_status`, `primary_track` and `credential_status` as filters alongside `limit` and `offset`.
+
+The final rung of the intake ladder is described with credential issuance in §3.9: a learner with no active enrollment who receives a credential moves to `EXITED`, from either `ENROLLED` or `PLACED`, and their `credential_status` becomes `ISSUED`.
+
+### 3.2. Instructional Sections, Enrollment and Seat Conservation
+
+Instruction is delivered through **class sections**, which only a `ProgramCoordinator` may create. A section declares the `program_track` it teaches (`LITERACY`, `HSE_PREP` or `ESL`), a non-empty `title`, the `instructor_user_id` of the staff member assigned to it, the inclusive functioning-level band it accepts as `min_efl_level` and `max_efl_level` — each between 1 and 6, with the maximum no lower than the minimum — a `seats_total` of at least 1 and no more than 60, and `weekly_hours`, the scheduled instructional hours per week, which must be greater than zero, no greater than 40, and carried to two decimal places. A new section opens its life with `status` `PLANNED`, `seats_taken` at 0 and `seats_available` equal to `seats_total`.
+
+Section status moves through a transition request naming a `target_status`. A `PLANNED` section may become `OPEN`; an `OPEN` section may become `IN_SESSION`; and a section that is either `OPEN` or `IN_SESSION` may become `CLOSED`, which is terminal. Any other combination — reopening a closed section, jumping from `PLANNED` straight to `IN_SESSION` or to `CLOSED` — is refused with `ERR_SECTION_TRANSITION_NOT_ALLOWED`. Each accepted transition increases the section's `version` by one.
+
+Closing a section is the point where the instructional ledger settles, and it cascades in two links. **Link 1** walks that section's enrollments whose `status` is `ACTIVE`, in `created_at` ascending order, and decides each one's fate from its own hour total: an enrollment whose `posted_hours` has reached at least forty hours becomes `COMPLETED`, while one below that threshold becomes `WITHDRAWN`. Both outcomes record `exit_reason` as `SECTION_CLOSED`, but only the `WITHDRAWN` branch stamps `withdrawn_at` with the logical clock's current instant — a completed enrollment has no withdrawal instant. Each closed enrollment decrements the section's `seats_taken`, and `seats_available` is recomputed from the new count. **Link 2**, caused by link 1, decrements each affected learner's `active_enrollment_count`; when that count reaches zero and the learner's `intake_status` is `ENROLLED`, the learner moves back from `ENROLLED` to `PLACED`. Every enrollment, learner and the section itself has its `version` increased by one.
+
+Assigning a learner to a section is an **enrollment**, created by a `ProgramCoordinator` with a `student_id` and a `class_section_id`. Before it is accepted the request passes four business gates in a fixed order after the learner's placement has been confirmed to exist. First the section must be accepting: only `OPEN` and `IN_SESSION` sections take enrollments, and a `PLANNED` or `CLOSED` one reports `ERR_SECTION_NOT_ACCEPTING_ENROLLMENT`. Second, the learner must not already hold an `ACTIVE` enrollment on any section teaching the same `program_track`, which `ERR_DUPLICATE_ACTIVE_ENROLLMENT` reports — a learner may study two different tracks concurrently, but not the same track twice. Third, the learner's `placement_efl_level` must fall inside the section's band, at or above `min_efl_level` and at or below `max_efl_level`; a learner outside that band is refused with `ERR_EFL_LEVEL_OUT_OF_RANGE`. Fourth, the section must have a free seat: when `seats_taken` already equals `seats_total`, the request is refused with `ERR_SECTION_CAPACITY_EXCEEDED`. A learner with no scored pre-test at all — a null `placement_efl_level` — never reaches these four gates and is turned away earlier with `ERR_PLACEMENT_TEST_MISSING`.
+
+An accepted enrollment is stored with `status` `ACTIVE`, `posted_hours` at 0, `post_test_eligible` false, `withdrawn_at` and `exit_reason` null, and `entry_efl_level` frozen as a copy of the learner's `placement_efl_level` at the moment of creation. Freezing matters: a later pre-test or a corrected placement never rewrites an existing enrollment's `entry_efl_level`. Creation also increments the section's `seats_taken` and recomputes `seats_available`, increments the learner's `active_enrollment_count`, and — when the learner was `PLACED` — advances `intake_status` to `ENROLLED`. The section and the learner both have their `version` increased by one alongside the new enrollment.
+
+Withdrawal is available to a `ProgramCoordinator` or an `Instructor` and carries an `exit_reason`. It applies only to an `ACTIVE` enrollment; one already `COMPLETED` or `WITHDRAWN` reports `ERR_ENROLLMENT_NOT_ACTIVE`. Withdrawal moves the enrollment from `ACTIVE` to `WITHDRAWN`, stamps `withdrawn_at` with the clock's current instant, records the supplied reason, releases the seat by decrementing the section's `seats_taken` and recomputing `seats_available`, and decrements the learner's `active_enrollment_count`. When that count reaches zero and the learner's `intake_status` is `ENROLLED`, the learner returns to `PLACED` — and from `PLACED` the learner may enrol again, so the `ENROLLED` and `PLACED` states form a cycle a learner can traverse repeatedly across a programme year. The enrollment, the section and the learner each have their `version` increased by one.
+
+Enrollment reads expose `posted_hours` and `post_test_eligible` for a single record, and the collection read filters on `student_id`, `class_section_id` and `status`. A learner may read their own enrollments; staff roles may read any.
+
+### 3.3. The Attendance Hour Ledger, Post-Testing and Measurable Skill Gain
+
+Instructional hours are posted against an enrollment by an `Instructor` or a `ProgramCoordinator`, one **attendance entry** per delivery day. An entry carries the `attendance_date` on which the hours were delivered, as a UTC calendar date in year-month-day form, and the `hours` delivered on that date. Hours must be greater than zero, no more than 8, and an exact multiple of 0.25 — the quarter-hour is the ledger's smallest unit, and a value like 1.3 is refused as a malformed request. An `attendance_date` later than the logical clock's own UTC date is refused with `ERR_INVALID_EFFECTIVE_WINDOW`, because hours cannot be posted for a day that has not happened yet. Hours may only be posted against an `ACTIVE` enrollment; a completed or withdrawn one reports `ERR_ENROLLMENT_NOT_ACTIVE`. Each new entry is stored with `status` `POSTED`, `void_reason` null, and `posted_by_user_id` set from the acting `X-User-ID`, which is how the ledger records who keyed the hours.
+
+Two aggregates are maintained from those entries. An enrollment's `posted_hours` is the sum of the `hours` of that enrollment's entries whose `status` is `POSTED` — voided entries contribute nothing. A learner's `total_instructional_hours` is the sum of `posted_hours` across every one of that learner's enrollments regardless of enrollment status, so hours banked in an enrollment that later became `COMPLETED` or `WITHDRAWN` still count toward the learner's lifetime total. Both aggregates are carried to two decimal places, rounded half up, and because postings are always quarter-hour multiples the sums are themselves exact quarter-hour multiples. Order of posting is irrelevant to either sum. Posting also re-evaluates the enrollment's `post_test_eligible` flag and increases the enrollment's `version` by one; the learner's own `version` rises with its changed total.
+
+Voiding an entry is the correction path, available to an `Instructor` or `ProgramCoordinator`, and it is the most consequential single operation in the system. The request carries a `void_reason` and the `expected_enrollment_version` described in §2.7. Once the stale-view guard has passed, the entry itself must still be `POSTED` — a second void reports `ERR_ATTENDANCE_ALREADY_VOIDED` — and the parent enrollment must still be `ACTIVE`, otherwise `ERR_ENROLLMENT_NOT_ACTIVE`. The entry then moves from `POSTED` to `VOIDED`, records the reason, and four cascade links run.
+
+**Link 1** subtracts the voided entry's `hours` from the enrollment's `posted_hours` and from the learner's `total_instructional_hours`, and recomputes the enrollment's `post_test_eligible` flag from the new total. **Link 2** fires only when that subtraction drops `posted_hours` below forty hours: every test event carrying this `enrollment_id` whose `purpose` is `POST_TEST` and whose `status` is `SCHEDULED` or `SCORED` is walked in `created_at` ascending order and moved to `INVALIDATED`, with `invalidation_reason` set to `HOURS_WITHDRAWN`. An invalidated event keeps its `scale_score` and `efl_level` for audit; the values are not erased, they simply stop counting. **Link 3**, caused by link 2, revisits the learner's outcome claims: every outcome record for this learner whose `measure_type` is `EFL_GAIN` and whose `status` is `RECORDED` or `CERTIFIED` is re-evaluated under the audited reading of the skill-gain determination, and any claim whose gain is no longer supported moves to `RESCINDED` with `rescission_reason` set to `POST_TEST_INVALIDATED`. **Link 4**, caused by link 3, unwinds the money: for each rescinded outcome whose `allocation_status` was `COMMITTED`, the funding period's `committed_cents` is reduced by that line's `allocated_cents`, the same amount is returned to the period's `available_cents`, the line's `allocation_status` becomes `REVOKED` and its `allocated_cents` becomes 0. Every entity touched by links 1 through 4 — the entry, the enrollment, the learner, each test event, each outcome record and each funding period — has its `version` increased by one.
+
+**Post-test eligibility** has two gates that are deliberately not symmetric. The stored `post_test_eligible` flag on an enrollment tracks the hour gate alone: it is true exactly when `posted_hours` has reached at least forty hours, and false otherwise. Accepting a `POST_TEST` test event, however, requires both that hour gate and an interval gate: at least thirty whole UTC days must separate the learner's earliest scored pre-test's `test_date` from the logical clock's current instant, counting whole days and discarding any partial day, with the thirtieth day itself sufficient. A learner with no scored pre-test at all satisfies neither gate. Of the two, the interval gate is evaluated first, so a learner who is short on both hours and days is told `ERR_POST_TEST_INTERVAL_NOT_MET`; a learner who has waited long enough but has banked too few hours is told `ERR_POST_TEST_HOURS_NOT_MET`.
+
+**Measurable skill gain** compares a learner's entry level against a post-test level inside a funding period's window, and this is where the system's two readings of the same data diverge. The window runs from the funding period's `start_date` inclusive to its `end_date` exclusive. The entry side is the learner's pre-test: their test event whose `purpose` is `PRE_TEST` and `status` is `SCORED` whose `test_date` falls inside the window, taking the first by `test_date` ascending with ties broken by `created_at` ascending. The post side is drawn from that learner's test events whose `purpose` is `POST_TEST` and `status` is `SCORED` whose `test_date` falls inside the window; events that are `SCHEDULED` or `INVALIDATED` are excluded from consideration entirely. When there is no qualifying pre-test, or no qualifying post-test at all, no gain is claimed: the determination reports a null post side and no achievement.
+
+Where more than one post-test qualifies, the selection rule depends on who is asking, and the two rules can disagree on identical data:
+
+- The **`BEST_POST`** reading selects the post-test with the highest `efl_level`, breaking ties by `test_date` ascending and then `created_at` ascending. Because it takes the learner's best showing, a later regression is ignored and a gain can be reported.
+- The **`LATEST_POST`** reading selects the chronologically last post-test, ordering by `test_date` descending and breaking ties by `created_at` descending. Because the most recent result governs, the same learner and the same events can yield no gain when a later post-test came in lower.
+
+In both readings a gain exists only when the selected post-test's `efl_level` is **strictly greater** than the pre-test's; an equal level is not a gain. `BEST_POST` is the provisional, programmatic view and is what the skill-gain read returns by default. `LATEST_POST` is the audited view, and it is the one used when an `EFL_GAIN` outcome is certified and when the attendance-void cascade re-tests a standing claim.
+
+The skill-gain read itself is a computed, side-effect-free view available to a `ProgramCoordinator`, `StateAuthority` or `Registrar`. It accepts an optional `variant` naming `BEST_POST` or `LATEST_POST` — defaulting to `BEST_POST` — and an optional `funding_period_id` selecting the window to evaluate. Its payload reports the `student_id`, the `variant` actually applied, the `entry_efl_level` taken from the selected pre-test, the `post_efl_level` of the selected post-test, the `best_post_scale_score` and `latest_post_scale_score` of the window's post-tests so that a reviewer can see both readings side by side, the `levels_gained` as the post level less the entry level — reported as null whenever either of those two levels is itself null, since the subtraction then has no operands — and the boolean `msg_achieved`.
+
+### 3.4. Testing Centre Authorisation, Rooms and Suspension
+
+Only a `StateAuthority` registers a **testing centre**, supplying a non-empty display `name` and the `state_code` of the state that owns the authorisation, which must be exactly two uppercase letters. A newly registered centre begins with `authorization_status` `APPLIED`, an empty `allowed_subtests` array, `max_sessions_per_week` at 0, and `authorized_at` and `suspended_reason` null.
+
+Authorisation is decided by a `StateAuthority` submitting a `decision` of `GRANT_PROVISIONAL`, `GRANT_FULL` or `WITHDRAW`. The decision payload also admits `allowed_subtests` and `max_sessions_per_week`, but these are advisory only: the server always writes the values implied by the branch taken, never the values a client suggests. The branch matters, because the two grant branches leave the centre with materially different capabilities:
+
+- `GRANT_PROVISIONAL` on an `APPLIED` centre moves it to `PROVISIONAL`. Its `allowed_subtests` becomes exactly `MATH` and `RLA` — a deliberately narrower scope — its `max_sessions_per_week` becomes 2, and `authorized_at` is stamped with the logical clock's current instant as the first authorisation grant.
+- `GRANT_FULL` on an `APPLIED` centre moves it to `FULL_AUTHORIZED`. Its `allowed_subtests` becomes all four of `MATH`, `RLA`, `SCIENCE` and `SOCIAL_STUDIES`, its `max_sessions_per_week` becomes 20, and `authorized_at` is likewise stamped from the clock.
+- `GRANT_FULL` on a centre already `PROVISIONAL` promotes it to `FULL_AUTHORIZED`, again widening `allowed_subtests` to all four subtests and raising `max_sessions_per_week` to 20. Here `authorized_at` is left exactly as it was: the field records the *first* grant, and a promotion does not restate it.
+- `WITHDRAW` on an `APPLIED` centre moves it to `WITHDRAWN`, which is terminal, and empties `allowed_subtests`. No other field is written by this branch.
+
+Every accepted decision increases the centre's `version` by one. Any decision that does not match the centre's current posture — a provisional grant against an already fully authorised centre, a promotion of a centre still `APPLIED` through the wrong decision value, or any decision at all against a `WITHDRAWN` or `SUSPENDED` centre — is refused with `ERR_CENTER_DECISION_NOT_ALLOWED`.
+
+Suspension is the enforcement lever and it is the widest cascade a centre-level action can trigger. A `StateAuthority` suspends a centre that is `PROVISIONAL` or `FULL_AUTHORIZED`, supplying `suspended_reason`; the centre moves to `SUSPENDED`, which is terminal, its supplied reason is recorded, its `allowed_subtests` is emptied and its `max_sessions_per_week` is set to 0. Four cascade links then run, each in `created_at` ascending order over the records it touches. **Link 1** takes every testing room of that centre whose `status` is `ACTIVE` to `OUT_OF_SERVICE`. **Link 2**, caused by link 1, cancels every exam session in those rooms whose `status` is `DRAFT` or `SCHEDULED`, setting each one's `cancel_reason` to `CENTER_SUSPENDED`; where a cancelled session had a proctor assigned, that proctor's `assigned_session_count` is decremented. **Link 3**, caused by link 2, takes every registration on each cancelled session whose `registration_status` is `REGISTERED` to `CANCELLED_BY_CENTER`, sets its `refunded_cents` to whatever it had consumed as `voucher_applied_cents`, and decrements the session's `seats_taken`. **Link 4**, caused by link 3, settles the learner ledgers: for each refunded registration the learner's `voucher_balance_cents` rises by the refunded amount, their `voucher_spent_cents` falls by the same amount, and their `exam_fee_owed_cents` falls by that registration's `fee_due_cents`. Every entity touched anywhere in links 1 through 4 has its `version` increased by one.
+
+**Testing rooms** are added to a centre by that centre's own `CenterAdministrator` or by a `StateAuthority`, and the room's `testing_center_id` is taken from the path rather than the body. A room declares a `room_code`, unique within its centre, a `seat_capacity` between 1 and 200 inclusive, and optionally a `turnaround_buffer_minutes` — the mandatory clean-down gap the room needs between two sittings — which defaults to 45 and must fall between 0 and 120 inclusive. Rooms may only be added to a centre that is `PROVISIONAL` or `FULL_AUTHORIZED`; a centre still `APPLIED` or `WITHDRAWN` reports `ERR_CENTER_NOT_AUTHORIZED`, and a suspended one reports `ERR_CENTER_SUSPENDED`. A new room is stored with `status` `ACTIVE` and `service_note` null, and its creation increases the owning centre's `version` by one.
+
+A room can also be retired for maintenance while its centre stays fully authorised. Taking a room out of service — an action for a `CenterAdministrator` or `StateAuthority` — carries a `service_note` recording the maintenance reason and moves `status` from `ACTIVE` to `OUT_OF_SERVICE`, which is terminal. The important asymmetry is what it does *not* do: sittings already created in that room are left exactly as they are, keeping their own status and their sold seats, and only *new* sittings are blocked. A second attempt on a room already `OUT_OF_SERVICE` — whether it got there by maintenance retirement or by its centre's suspension cascade — is refused with `ERR_ROOM_OUT_OF_SERVICE`, and the same code is what a new sitting in such a room receives. Room reads accept `testing_center_id` and `status` as collection filters, which is how a centre's rooms are discovered.
+
+### 3.5. Proctor Certification, Lapse and Revocation
+
+A **proctor** is registered at a centre by that centre's `CenterAdministrator` or by a `StateAuthority`, with the proctor's `full_name` and an optional `daily_hour_cap` — the maximum proctored session hours the individual may cover in one UTC calendar day — which defaults to 8.00 and must be greater than zero, no greater than 12, and carried to two decimal places. As with rooms, the `testing_center_id` comes from the path. A new proctor begins with `certification_status` `PENDING`, `certification_expires_at` null and `assigned_session_count` at 0. That count is maintained as the number of exam sessions currently pointing at the proctor whose `status` is `SCHEDULED`, `IN_PROGRESS` or `COMPLETED`.
+
+Certification is a state matter: only a `StateAuthority` decides it, submitting a `decision` of `CERTIFY`, `RENEW` or `REVOKE`, and for the first two a `certification_expires_at` instant that must be strictly later than the logical clock — an expiry at or before the clock is not a usable certification window and is refused as a malformed request.
+
+- `CERTIFY` applies to a `PENDING` proctor and moves them to `CERTIFIED`, writing the supplied `certification_expires_at`.
+- `RENEW` applies to a `LAPSED` proctor and returns them to `CERTIFIED`, writing the new `certification_expires_at`. Certification therefore cycles: a proctor may travel `CERTIFIED` to `LAPSED` and back to `CERTIFIED` as many times as the state renews them.
+- `REVOKE` applies to a proctor who is `PENDING`, `CERTIFIED` or `LAPSED`, and moves them to `REVOKED`, which is terminal. `certification_expires_at` is left exactly as it was — the record of what the expiry had been is preserved — while `assigned_session_count` is set to 0.
+
+Any decision that does not match the proctor's current posture — a renewal of a proctor still `PENDING`, a certification of one already `CERTIFIED`, or any decision at all against a `REVOKED` proctor — is refused with `ERR_PROCTOR_DECISION_NOT_ALLOWED`. Each accepted decision increases the proctor's `version` by one.
+
+Lapse is evaluated lazily rather than swept. At the two moments where a proctor's live certification actually matters — assigning them to a session, and checking a candidate in — the server first compares the logical clock against the proctor's `certification_expires_at`. When the clock has reached or passed that instant, the proctor is moved from `CERTIFIED` to `LAPSED` and their `version` is increased by one, and *then* the triggering request is refused with `ERR_PROCTOR_CERTIFICATION_LAPSED`. The lapse is durable: the proctor stays `LAPSED` after the refused request, and only a renewal returns them to service. A read of a proctor record reflects the same evaluation, reporting the proctor as `LAPSED` once the clock has reached the expiry instant. A proctor who is `PENDING` or `REVOKED` is refused with the distinct code `ERR_PROCTOR_NOT_CERTIFIED` instead. Both codes guard the same four operations: proctor assignment, candidate check-in, identity verification and result entry.
+
+Revocation is the compliance chain in its longest form, because a proctor's signature underwrites everything they witnessed. Five cascade links run, each ordered by `created_at` ascending. **Link 1** takes every exam session whose `proctor_id` is the revoked proctor and whose `status` is `SCHEDULED` back to `DRAFT`, clearing `proctor_id` to null — the sitting is not cancelled, it merely loses its supervisor and becomes re-assignable to another certified proctor, which is why the session's `DRAFT` and `SCHEDULED` states form a cycle. **Link 2a**, caused by link 1, resets identity on those reverted sessions: every registration on them whose `identity_status` is `VERIFIED` returns to `UNVERIFIED` and has `identity_verified_by_proctor_id` cleared to null, while `identity_document_type` is retained for audit. **Link 2b** reaches further back in time: every registration anywhere whose `identity_verified_by_proctor_id` is the revoked proctor and whose `registration_status` is `SCORED` moves to `RESULT_INVALIDATED`, retaining its `result_outcome` and `scale_score` for audit. **Link 3**, caused by link 2b, voids credentials that rested on those results: every credential issuance whose `status` is `ISSUED` and whose `qualifying_registration_ids` include an invalidated registration moves to `VOIDED` with `void_reason` set to `PROCTOR_REVOKED`, and the holder's `credential_status` becomes `REVOKED`. **Link 4**, caused by link 3, has two branches that both run: every transcript order whose `status` is `QUEUED` and whose `credential_issuance_id` is a voided credential moves to `HELD` with `hold_reason` set to `CREDENTIAL_VOIDED`; and every outcome record whose `credential_issuance_id` is a voided credential and whose `status` is `RECORDED` or `CERTIFIED` moves to `RESCINDED` with `rescission_reason` set to `CREDENTIAL_VOIDED`. **Link 5**, caused by link 4, returns the money exactly as the attendance-void cascade does: for each rescinded outcome whose `allocation_status` was `COMMITTED`, the funding period's `committed_cents` falls by that line's `allocated_cents`, its `available_cents` rises by the same amount, and the line becomes `REVOKED` with `allocated_cents` reset to 0. Every entity touched anywhere in links 1 through 5 has its `version` increased by one. Revoking a proctor who never held an assignment is legal and simply produces no work beyond the status change itself.
+
+Proctor reads accept `testing_center_id` and `certification_status` as collection filters; a proctor may read their own record, and centre and programme staff may read any.
+
+### 3.6. Scheduling Exam Sittings
+
+An **exam session** is one sitting of one high-school-equivalency subtest in one room, and only a `CenterAdministrator` creates it. The request names the `testing_room_id` to occupy, the `subtest` to administer (`MATH`, `RLA`, `SCIENCE` or `SOCIAL_STUDIES`), the `starts_at` instant at which the sitting opens and the `ends_at` instant at which it closes, and `requested_seats`, the number of seats the centre wishes to open, which must be at least 1. It may also declare `supported_formats`, the alternate testing formats the sitting is equipped to deliver, drawn from `STANDARD`, `EXTRA_TIME`, `LARGE_PRINT`, `BRAILLE` and `AUDIO`; when omitted it defaults to `STANDARD` and `EXTRA_TIME` only, which is why a braille or audio candidate cannot simply be dropped into an ordinary sitting.
+
+The gates a new sitting must clear run in the order set out in §2.6, and they are worth restating in business terms. The acting administrator must own the centre that owns the room, or the request is out of scope. That centre must be authorised, and a suspended one is reported differently from a never-authorised one. The room must be `ACTIVE`. The `subtest` must be inside the owning centre's `allowed_subtests`, which is the practical consequence of the provisional branch in §3.4: a `PROVISIONAL` centre attempting a `SCIENCE` or `SOCIAL_STUDIES` sitting is refused with `ERR_SUBTEST_NOT_AUTHORIZED`. The sitting must be in the future — a `starts_at` at or before the logical clock reports `ERR_SESSION_IN_PAST`. The window must be well-formed: `ends_at` strictly after `starts_at`, and the span between them no more than six hours, or `ERR_INVALID_SESSION_WINDOW`. Finally the room must actually be free.
+
+**Room turnaround** is what "free" means here, and it is deliberately generous on both sides. The room's `turnaround_buffer_minutes` is added to the trailing edge of *both* the candidate sitting and each existing one, and a conflict exists when the candidate begins before an existing sitting's buffered end and that existing sitting begins before the candidate's buffered end. The comparisons are strict, so two sittings separated by a gap of exactly the buffer are accepted while a gap one minute shorter is refused with `ERR_ROOM_BUFFER_CONFLICT`. The sittings compared are every non-cancelled one in the same room — those whose `status` is `DRAFT`, `SCHEDULED`, `IN_PROGRESS` or `COMPLETED`. A `CANCELLED` sitting occupies nothing and frees its slot for immediate rebooking.
+
+A newly created sitting is stored with `status` `DRAFT`, `proctor_id` null, `seats_taken` at 0 and `cancel_reason` null. Two fields are derived at creation. Its `seat_capacity` is the smaller of the `requested_seats` asked for and the room's own `seat_capacity`, so a centre cannot oversell a room by asking for more seats than it has. Its `duration_hours` is the span from `starts_at` to `ends_at` expressed in hours to two decimal places, rounded half up.
+
+A `DRAFT` sitting sells no seats; it becomes sellable only when a proctor is attached. Assigning a proctor is a `CenterAdministrator` action carrying the `proctor_id`, and it moves the session from `DRAFT` to `SCHEDULED`. A session that is not `DRAFT` — one already `SCHEDULED`, or `IN_PROGRESS`, `COMPLETED` or `CANCELLED` — refuses the attempt with `ERR_SESSION_NOT_ASSIGNABLE`. The named proctor must be employed by the same centre that owns the session's room: a proctor whose `testing_center_id` differs from the room's `testing_center_id` lies outside the acting administrator's scope and is refused with `ERR_FORBIDDEN_SCOPE`. The proctor must be currently certified after the lazy lapse evaluation described in §3.5. Two load gates then apply, in this order.
+
+**Interval conflict** treats a proctor's committed sittings as half-open intervals with **zero** buffer: a conflict exists when the candidate sitting begins before an existing one ends and that existing one begins before the candidate ends, comparing strictly on both sides. Back-to-back supervision is therefore legal — a sitting starting at exactly the instant another ends is accepted — while any genuine overlap is refused with `ERR_PROCTOR_TIME_CONFLICT`. The sittings considered are that proctor's sessions whose `status` is `SCHEDULED`, `IN_PROGRESS` or `COMPLETED`, across every room and every centre, because a person cannot be in two buildings at once.
+
+**Daily load** is a separate, aggregate gate. The server takes the UTC calendar date of the candidate sitting's `starts_at`, sums the `duration_hours` of that proctor's sessions whose `status` is `SCHEDULED`, `IN_PROGRESS` or `COMPLETED` and whose own `starts_at` falls on that same UTC date, and adds the candidate's `duration_hours` to that sum. `DRAFT` and `CANCELLED` sittings are excluded from the sum. When the projected total is strictly greater than the proctor's `daily_hour_cap` the assignment is refused with `ERR_PROCTOR_DAILY_CAP_EXCEEDED`; a projection landing exactly on the cap is allowed. Because back-to-back sittings pass the interval gate, this cap is what actually limits a long proctoring day: a proctor with the default cap can cover eight hours of sittings on one date and not a minute more.
+
+An accepted assignment writes the supplied `proctor_id` onto the session, increments the proctor's `assigned_session_count` by one, and increases both the session's and the proctor's `version` by one.
+
+Cancelling a sitting is available to a `CenterAdministrator` or a `StateAuthority` and carries a `cancel_reason`. It applies to a session that is `DRAFT` or `SCHEDULED`; one already `IN_PROGRESS`, `COMPLETED` or `CANCELLED` reports `ERR_SESSION_NOT_CANCELLABLE`. Cancellation records the reason, decrements the assigned proctor's `assigned_session_count` when a `proctor_id` was set, and then unwinds the seats exactly as the suspension cascade does: every registration on the sitting whose `registration_status` is `REGISTERED` becomes `CANCELLED_BY_CENTER` with `refunded_cents` set to its `voucher_applied_cents`, the session's `seats_taken` is decremented for each, and for each refunded registration the learner's `voucher_balance_cents` rises by the refunded amount, `voucher_spent_cents` falls by the same amount, and `exam_fee_owed_cents` falls by that registration's `fee_due_cents`. Every touched record's `version` increases by one. `COMPLETED` and `CANCELLED` are the two terminal session states.
+
+The centre's `max_sessions_per_week` is recorded as the weekly sitting ceiling implied by whichever authorisation branch the centre took — 2 for a `PROVISIONAL` centre and 20 for a `FULL_AUTHORIZED` one — and is carried on the centre record for reporting. Session reads accept `testing_room_id`, `proctor_id`, `subtest` and `status` as collection filters, which is how a room's schedule or a proctor's day is discovered.
+
+### 3.7. Accommodation Requests and Alternate-Format Testing
+
+A learner who needs an alternate testing format submits an **accommodation request**, either directly as a `Student` or through a `Registrar` acting on their behalf. The request names the `student_id`, the `requested_format` — one of `EXTRA_TIME`, `LARGE_PRINT`, `BRAILLE` or `AUDIO` — and a non-empty `documentation_ref` pointing at the supporting documentation held on file. Note that `STANDARD` is not a requestable format: a candidate needing nothing special simply registers without an accommodation. A new request is stored with `status` `SUBMITTED`, `info_request_rounds` at 0, and `granted_format`, `valid_until` and `decision_note` all null.
+
+Review is the `CenterAdministrator`'s job, because the centre must be able to deliver whatever it grants. A reviewer who needs more paperwork issues an **information request**, supplying a `decision_note` explaining what is missing. This moves the request from `SUBMITTED` to `INFO_REQUESTED` and increments `info_request_rounds` by one. The learner or their registrar then resubmits, supplying a fresh `documentation_ref` that replaces the one on file, which returns the request from `INFO_REQUESTED` to `SUBMITTED`. That loop is bounded: an information request may only be issued while `info_request_rounds` is still below 2, so a request can travel `SUBMITTED` to `INFO_REQUESTED` and back at most twice before the reviewer must decide on the evidence in hand. A third attempt is refused with `ERR_INFO_REQUEST_LIMIT_REACHED`. An information request or a decision attempted on a request that is not `SUBMITTED` is refused with `ERR_ACCOMMODATION_NOT_PENDING`, and a resubmission attempted on a request that is not `INFO_REQUESTED` is refused with `ERR_ACCOMMODATION_NOT_INFO_REQUESTED`.
+
+The decision itself carries a `decision` of `APPROVE` or `DENY`, and both branches are recorded with equal care. An `APPROVE` decision must name the `granted_format` actually authorised — which may legitimately differ from the `requested_format`, for instance granting `EXTRA_TIME` where `BRAILLE` was asked for — and a `valid_until` instant at which the approval lapses, exclusive of that instant itself. A `valid_until` at or before the logical clock is refused with `ERR_INVALID_EFFECTIVE_WINDOW`, and an approval submitted without a `granted_format` is refused as a malformed request. An accepted approval moves the request from `SUBMITTED` to `APPROVED`, writing `granted_format`, `valid_until` and the `decision_note`. A `DENY` decision moves the request from `SUBMITTED` to `DENIED`, which is terminal, records the `decision_note`, and leaves `granted_format` null — a denial grants nothing, not even the requested format at a reduced scope.
+
+Approvals expire, and the expiry is evaluated lazily at the one moment it matters: when a learner tries to register for a sitting using the approval. If the logical clock has reached or passed `valid_until`, the request is first moved from `APPROVED` to `EXPIRED` — a terminal state, with the request's `version` increased by one — and only then is the registration refused with `ERR_ACCOMMODATION_EXPIRED`. As with a proctor lapse, the state change survives the refused request. A registration citing a request that never reached approval at all, one still `SUBMITTED` or `INFO_REQUESTED` or already `DENIED`, is refused with the different code `ERR_ACCOMMODATION_NOT_APPROVED`.
+
+Reads of accommodation requests reflect the same lazy expiry evaluation. The collection read accepts `student_id`, `status` and `requested_format` as filters; a learner may read their own requests, and `Registrar`, `ProgramCoordinator` and `StateAuthority` may read any.
+
+### 3.8. Candidate Registration, Fee Assessment and Exam Day
+
+A seat on a sitting is claimed by an **exam registration**, created by a `Registrar` or by the `Student` themselves. The request names the `student_id`, the `exam_session_id` whose seat is being consumed, the `expected_exam_session_version` stale-view guard from §2.7, and optionally the `accommodation_request_id` of an approved accommodation to apply to this sitting; a candidate sitting under standard conditions leaves it null.
+
+Registration is the most heavily gated write in the system, and the gates run in the §2.6 order. After the stale-view guard, the learner must be `PLACED` or `ENROLLED` — a learner still `INTAKE_STARTED` or `ORIENTED`, or already `EXITED`, is refused with `ERR_STUDENT_NOT_PLACED`. The centre owning the sitting must be authorised and not suspended. The sitting itself must be `SCHEDULED`: a `DRAFT` sitting has no proctor and sells nothing, and an `IN_PROGRESS`, `COMPLETED` or `CANCELLED` one is past selling, so all four report `ERR_SESSION_NOT_OPEN_FOR_REGISTRATION`. The sitting's `subtest` must still be inside the centre's `allowed_subtests`, which matters because a centre can be narrowed by suspension after a sitting was created. Where an accommodation is cited, three checks follow in sequence: it must belong to the registering learner, or `ERR_ACCOMMODATION_OWNER_MISMATCH`; it must be `APPROVED` and unexpired, per §3.7; and the sitting's `supported_formats` must contain the accommodation's `granted_format`, or `ERR_ACCOMMODATION_FORMAT_UNAVAILABLE`. The sitting must not have started — a `starts_at` at or before the clock reports `ERR_SESSION_IN_PAST`. Then capacity: the sitting's `seats_taken` must still be below its `seat_capacity`, or `ERR_SESSION_SEATS_EXHAUSTED`, and the learner must not already hold a registration on that same sitting whose `registration_status` is `REGISTERED`, `CHECKED_IN` or `SCORED`, or `ERR_DUPLICATE_REGISTRATION`. Only when all of that passes is the fee assessed.
+
+**Fee assessment** runs in nine pinned steps, and no other evaluation order produces the same cents.
+
+1. The base fee is the published price of the sitting's `subtest`: 34 dollars for `RLA`, and 30 dollars for each of `MATH`, `SCIENCE` and `SOCIAL_STUDIES` — that is, 3400 cents for reading-language-arts and 3000 cents for the other three.
+2. A retake multiplier is derived from `prior_scored_attempts`, the count of the learner's *earlier* registrations on the **same** subtest whose `registration_status` is `SCORED` or `RESULT_INVALIDATED`, frozen onto the new registration at creation. The multiplier is 1.25 raised to the power of that count, with the exponent capped at 2 — so a first sitting is charged at the base, a second at one and a quarter times the base, and a third or any later sitting at one and a quarter squared, which is 1.5625 times the base. The cap means a fourth retake costs no more than a third.
+3. `gross_fee_cents` is the base fee multiplied by that multiplier, rounded half up to whole cents.
+4. `accommodation_surcharge_cents` is 1200 cents when this registration cites an accommodation whose `granted_format` is `LARGE_PRINT`, `BRAILLE` or `AUDIO`, and 0 otherwise. An `EXTRA_TIME` grant carries no surcharge, and neither does a standard sitting with no accommodation at all — only genuinely alternate materials cost extra to produce.
+5. The billable amount is `gross_fee_cents` plus `accommodation_surcharge_cents`.
+6. An attendance-based discount tier is chosen from the learner's `total_instructional_hours` at request time. A learner with fewer than twelve hours receives nothing. From twelve hours up to but not including forty, the tier is 25 percent. From forty hours up to but not including one hundred, it is 50 percent. At one hundred hours or beyond, it is 75 percent — a learner who has put in the equivalent of two and a half full-time weeks of class pays a quarter of the sticker price. `discount_cents` is the billable amount multiplied by that percentage and divided by one hundred, then **floored** to whole cents; it is never rounded up, so the discount never exceeds the exact percentage.
+7. The net amount is the billable amount less `discount_cents`.
+8. `voucher_applied_cents` is the smaller of that net amount and the learner's `voucher_balance_cents` — vouchers are applied as far as they go and no further.
+9. `fee_due_cents` is the net amount less `voucher_applied_cents`, and is the out-of-pocket remainder.
+
+The assessment then writes the learner's ledger in the same request: `voucher_balance_cents` falls by `voucher_applied_cents`, `voucher_spent_cents` rises by the same amount, and `exam_fee_owed_cents` rises by `fee_due_cents`, keeping the conservation identity of §2.10 intact. A learner's `exam_fee_owed_cents` is at all times the sum of `fee_due_cents` over their non-refunded registrations.
+
+The fiscal gate is the last one and it depends on `self_pay_authorized`. When that flag is `false`, the learner may not be left owing anything: their `voucher_balance_cents` must cover the whole post-discount net, so that the computed `fee_due_cents` would be zero. If it would not, the registration is refused with `ERR_VOUCHER_INSUFFICIENT` (402) and no ledger movement is persisted. A learner whose `self_pay_authorized` is `true` may register with a positive `fee_due_cents`.
+
+An accepted registration is stored with `registration_status` `REGISTERED` and `identity_status` `UNVERIFIED`, with `identity_document_type` and `identity_verified_by_proctor_id` null, `scale_score` and `result_outcome` null, `checked_in_at` null and `refunded_cents` at 0. It increments the sitting's `seats_taken` and raises the sitting's `version` by one.
+
+The two status fields on a registration are **independent axes on the same row**, and confusing them is the classic implementation error. `registration_status` tracks the seat and the attempt, moving among `REGISTERED`, `CHECKED_IN`, `SCORED` and the three terminal states `CANCELLED`, `CANCELLED_BY_CENTER` and `RESULT_INVALIDATED`. `identity_status` tracks the document check alone, moving among `UNVERIFIED`, `VERIFIED` and `ID_REJECTED`, and it has no terminal state — a rejected document can be replaced. The axes are coupled at exactly one point, described below: check-in reads the identity axis as a precondition.
+
+**Identity verification** is a `Proctor` action, and only the proctor actually assigned to the sitting may perform it; another proctor is out of scope. The request carries a `decision` of `VERIFIED` or `REJECTED` and, optionally, the `identity_document_type` describing the document class presented. The registration's `registration_status` must still be `REGISTERED` — a checked-in, scored or cancelled registration reports `ERR_REGISTRATION_NOT_OPEN` — and the acting proctor must be currently certified. A `VERIFIED` decision moves `identity_status` from `UNVERIFIED` or from `ID_REJECTED` to `VERIFIED`, writes the supplied `identity_document_type`, and stamps `identity_verified_by_proctor_id` with the acting proctor's own identifier, which is the audit link the revocation cascade of §3.5 later follows. A `REJECTED` decision moves `identity_status` from `UNVERIFIED` to `ID_REJECTED`, writes the supplied `identity_document_type`, and leaves `identity_verified_by_proctor_id` null. The `ID_REJECTED` state is not a dead end: a candidate who produces a second, acceptable document is verified from `ID_REJECTED` in the same way. What is refused is walking a completed verification backwards: a `REJECTED` decision submitted against a registration whose `identity_status` is already `VERIFIED` reports `ERR_IDENTITY_ALREADY_VERIFIED`, since a proctor may not retract another proctor's accepted document check through this route — the only path out of `VERIFIED` is the revocation cascade of §3.5, which returns the registration to `UNVERIFIED`. A redundant `VERIFIED` decision on an already `VERIFIED` registration is likewise not a declared transition and reports the same code. Every accepted decision raises the registration's `version` by one.
+
+**Check-in** seats the candidate and takes no payload. It requires the registration to be `REGISTERED`, the acting `Proctor` to be the one assigned to the sitting, that proctor to be currently certified after lazy lapse evaluation, and the identity axis to read `VERIFIED` — both `UNVERIFIED` and `ID_REJECTED` are refused with `ERR_IDENTITY_NOT_VERIFIED`, which is the cross-axis gate. Check-in is only meaningful while the hosting sitting is `SCHEDULED` or `IN_PROGRESS`; every earlier or later sitting state leaves the registration in a status that already fails the `REGISTERED` gate. Timing is enforced as a **seating window** that opens sixty minutes before the sitting's `starts_at` and closes at its `ends_at`, with the opening instant included and the closing instant excluded. A check-in outside that window — an hour and one minute early, or at the exact instant the sitting ends — is refused with `ERR_CHECK_IN_WINDOW_CLOSED`. An accepted check-in moves `registration_status` from `REGISTERED` to `CHECKED_IN`, stamps `checked_in_at` from the logical clock, and — on the *first* check-in for that sitting only — moves the sitting itself from `SCHEDULED` to `IN_PROGRESS`. Both records' `version` values rise by one.
+
+**Result entry** is likewise the assigned `Proctor`'s action, carrying the subtest `scale_score`, which for a high-school-equivalency subtest must be an integer between 100 and 200 inclusive — a value outside that band is a malformed request. The registration must be `CHECKED_IN`; anything else reports `ERR_REGISTRATION_NOT_CHECKED_IN`. Recording the result moves `registration_status` from `CHECKED_IN` to `SCORED`, stores the score, and derives `result_outcome` as `PASSED` when the score is at least 145 and `FAILED` when it is below — 145 is the passing line for every subtest. Session completion is derived rather than requested: once no registration on the sitting remains `CHECKED_IN`, the sitting moves itself from `IN_PROGRESS` to `COMPLETED` and its `version` rises. The registration's own `version` rises by one in every case.
+
+A candidate may also withdraw before sitting. Cancellation by a `Registrar` or by the `Student` applies only to a registration still `REGISTERED`; anything else reports `ERR_REGISTRATION_NOT_OPEN`. It moves `registration_status` to `CANCELLED`, sets `refunded_cents` to whatever the registration had consumed as `voucher_applied_cents`, releases the seat by decrementing the sitting's `seats_taken`, and settles the learner ledger by raising `voucher_balance_cents` by the refunded amount, lowering `voucher_spent_cents` by the same amount, and lowering `exam_fee_owed_cents` by the registration's `fee_due_cents`. The registration, the sitting and the learner each have their `version` increased by one. The centre-initiated equivalent — `CANCELLED_BY_CENTER`, reached through a sitting cancellation or a centre suspension — performs the identical refund arithmetic; the two states differ only in who caused the cancellation, and the distinction is preserved because the state report treats a centre-caused cancellation differently from a candidate's own change of mind.
+
+Registration reads expose the whole fee breakdown and both status axes. The collection read filters on `student_id`, `exam_session_id`, `accommodation_request_id`, `identity_verified_by_proctor_id`, `registration_status` and `identity_status`, which is also how the registrations supporting a credential are discovered after the fact.
+
+### 3.9. Credentials, Transcripts, Outcome Measures and Funding
+
+**Credential issuance** is reserved to a `StateAuthority` and takes the `student_id` and optionally a `credential_type`, whose only accepted value is `HSE_DIPLOMA`. Two gates apply in order: a learner who already holds a credential whose `status` is `ISSUED` is refused with `ERR_DUPLICATE_CREDENTIAL` before their results are re-examined at all, and a learner whose results fall short is refused with `ERR_CREDENTIAL_REQUIREMENTS_NOT_MET`.
+
+Eligibility is assembled from scored sittings, one per required subtest. For each of `MATH`, `RLA`, `SCIENCE` and `SOCIAL_STUDIES` in that order, the server gathers the learner's registrations whose sitting administered that subtest and whose `registration_status` is `SCORED` — registrations that ended in `RESULT_INVALIDATED` are excluded, which is precisely how a proctor revocation removes support from a credential — and picks the best of them by highest `scale_score`, breaking ties by earliest `created_at`. Those picks populate `subtest_scores`, a map from subtest to the best passing score used, with a null entry for any subtest the learner has no scored sitting in. The learner qualifies only when all four subtests have a score and every one of those scores is at least 145. When they do, `composite_score` is the exact sum of the four scores; otherwise it is null. Issuance additionally requires that `composite_score` reach at least 580 — a learner can pass all four subtests at exactly 145 each, totalling 580, and that is sufficient, while 579 is not. The four selected registration identifiers are recorded as `qualifying_registration_ids`, ordered by subtest in the `MATH`, `RLA`, `SCIENCE`, `SOCIAL_STUDIES` sequence. That array is an audit list rather than a navigable reference, and the registrations behind it are reachable through the registration collection read filtered by learner.
+
+An issued credential is stored with `status` `ISSUED`, `issued_at` stamped from the logical clock, and `void_reason` null. Issuance also sets the holder's `credential_status` to `ISSUED`, and — when the learner has no active enrollment left, meaning `active_enrollment_count` is 0 — moves their `intake_status` to `EXITED`, whether they were `ENROLLED` or `PLACED` immediately before. A learner still carrying an active enrollment keeps their current intake state and simply gains the credential. `VOIDED` is the credential's only other state, it is terminal, and it is reachable only through the proctor-revocation cascade of §3.5, never by direct request.
+
+**Transcript orders** are placed against an issued credential, by the `Student` themselves or by a `Registrar`, with the learner taken from the path. The order names the `credential_issuance_id` whose transcript is wanted, the number of sealed `copies` between 1 and 10 inclusive, the `delivery` speed (`STANDARD` or `RUSH`), and the `destination_type` routing the result (`SELF`, `EMPLOYER`, `POSTSECONDARY` or `STATE_RECORDS`). A credential that has been voided rather than issued is refused with `ERR_CREDENTIAL_NOT_ISSUED`.
+
+The charge is computed in five pinned steps, and the pinning exists because the fee structure is genuinely circular: the waiver tier is keyed on the order total, the total includes a records-maintenance fee, and that fee is itself keyed on the post-waiver figure. The loop is broken by evaluating strictly in this sequence and never revisiting an earlier step.
+
+1. `base_charge_cents` is 1500 cents per copy, plus a flat 2500 cents when `delivery` is `RUSH` and nothing extra when it is `STANDARD`.
+2. A waiver percentage is chosen from `base_charge_cents` alone: nothing below 3000 cents, 10 percent from 3000 cents up to but not including 6000, and 20 percent at 6000 cents or above. `waiver_cents` is `base_charge_cents` multiplied by that percentage and divided by one hundred, floored to whole cents.
+3. The net figure is `base_charge_cents` less `waiver_cents`.
+4. `state_records_fee_cents` is keyed on that net figure: 0 when the net is exactly zero, 200 cents when the net is above zero but below 3000, and 500 cents when the net is 3000 cents or more. This fee never re-enters the waiver decision in step 2 — a records fee that pushed an order over a waiver breakpoint would change the waiver that produced it, which is exactly the circularity the pinned order forbids.
+5. `total_charge_cents` is the net figure plus `state_records_fee_cents`.
+
+The `destination_type` has no effect on the charge; it exists to route the sealed copies and to distinguish a state-records filing from a copy sent to an employer. A new order is stored with `status` `QUEUED`, `fulfilled_at` and `hold_reason` null. Fulfilment, performed by a `Registrar` or `ProgramCoordinator`, requires the order to still be `QUEUED` — otherwise `ERR_TRANSCRIPT_ORDER_NOT_QUEUED` — and the linked credential to still be `ISSUED` — otherwise `ERR_CREDENTIAL_NOT_ISSUED`. It moves the order from `QUEUED` to `FULFILLED`, which is terminal, stamps `fulfilled_at` from the logical clock and raises the order's `version` by one. The third state, `HELD`, is also terminal and is reached only by cascade: when the linked credential is voided, a still-queued order moves to `HELD` with `hold_reason` set to `CREDENTIAL_VOIDED`, and it is never fulfilled afterwards. Order reads filter on `student_id`, `credential_issuance_id` and `status`.
+
+**Funding periods** frame the performance-reporting year. A `StateAuthority` opens one with a non-empty `label`, a `start_date` as the first UTC date inside the outcome window and an `end_date` as the first UTC date after it — so the window is inclusive of its start and exclusive of its end, and `end_date` must be later than `start_date` — a `rate_cents_per_weight` of at least 1 cent paid per unit of outcome weight, and a `total_cents` pool of at least 0. A new period begins with `status` `OPEN`, `committed_cents` at 0, `available_cents` equal to `total_cents`, `allocation_run_count` at 0, and `last_allocation_run_at` and `last_allocation_variant` null.
+
+**Outcome records** are the claims that draw on that pool, created by a `ProgramCoordinator` or `StateAuthority`. Each names the `student_id` the outcome is claimed for, the `funding_period_id` it is claimed against, the `measure_type` claimed — `EFL_GAIN`, `CREDENTIAL_ATTAINMENT`, `EMPLOYMENT_Q2` or `POSTSECONDARY_ENROLLMENT` — a non-empty `evidence_ref` pointing at the supporting artefact, and, for a credential claim, the `credential_issuance_id` that evidences it. The period must be `OPEN`, or `ERR_FUNDING_PERIOD_CLOSED`. A `CREDENTIAL_ATTAINMENT` claim must carry a `credential_issuance_id` whose credential is `ISSUED` rather than voided, and whose own learner is the same learner the outcome is claimed for; a missing identifier or a credential belonging to somebody else is refused with `ERR_OUTCOME_EVIDENCE_MISMATCH`, while a voided credential is refused with `ERR_CREDENTIAL_NOT_ISSUED`. The other three measure types leave `credential_issuance_id` null.
+
+A new claim is stored with `status` `RECORDED`, `allocation_status` `UNALLOCATED`, `allocated_cents` at 0, `certified_by_user_id` and `rescission_reason` null, and `recorded_by_user_id` taken from the acting `X-User-ID`. Its `weight` is fixed from the `measure_type` at creation: an `EFL_GAIN` weighs 1.00, a `CREDENTIAL_ATTAINMENT` weighs 1.50, an `EMPLOYMENT_Q2` weighs 1.25 and a `POSTSECONDARY_ENROLLMENT` weighs 1.40. Credential attainment is therefore worth half again as much to the programme as a functioning-level gain.
+
+Certification is decided by a `StateAuthority` or `ProgramCoordinator` submitting a `decision` of `CERTIFY` or `REJECT`, and the two branches share most of their gates. Both require the claim to be `RECORDED` — one already `CERTIFIED`, `REJECTED` or `RESCINDED` reports `ERR_OUTCOME_NOT_CERTIFIABLE` — both require the funding period to still be `OPEN`, and both require the acting `X-User-ID` to differ from the claim's `recorded_by_user_id` per §2.11, failing with `ERR_SEGREGATION_OF_DUTIES`. Both write `certified_by_user_id` from the acting `X-User-ID` and raise the claim's `version` by one; a rejection is as much a recorded decision as an approval, and its decider is recorded identically. The branches diverge on evidence: a `CERTIFY` decision on an `EFL_GAIN` claim additionally requires the audited `LATEST_POST` reading of the skill-gain determination described in §3.3 to report a gain, and is refused with `ERR_MSG_NOT_SUPPORTED` when it does not — which is why a learner whose `BEST_POST` preview looked positive can still fail certification if their most recent post-test regressed. A `CERTIFY` decision on a `CREDENTIAL_ATTAINMENT` claim additionally requires its linked credential to still be `ISSUED`, and is refused with `ERR_CREDENTIAL_NOT_ISSUED` otherwise. A `REJECT` decision carries neither of those evidence checks: rejecting an unsupported claim is always permitted. Accepted decisions move the claim from `RECORDED` to `CERTIFIED` or to `REJECTED` respectively, and `REJECTED` is terminal.
+
+`RESCINDED` is the fourth outcome state and, like the credential's `VOIDED`, it is only ever reached by cascade — from the attendance-void chain of §3.3 or the proctor-revocation chain of §3.5. A rescission may strike a claim that was still `RECORDED` as well as one already `CERTIFIED`. Its `rescission_reason` records which chain caused it, `POST_TEST_INVALIDATED` for a withdrawn hour basis and `CREDENTIAL_VOIDED` for a voided credential. The money consequence depends on the line's `allocation_status`: a line that was `COMMITTED` has its cents returned to the period as described in §2.10 and becomes `REVOKED` with `allocated_cents` reset to 0, while a line that was `UNALLOCATED` or `DEFERRED` keeps its allocation posture unchanged because it was never holding any of the pool.
+
+**Allocation** converts certified claims into committed cents. A `StateAuthority` runs it against an open period, supplying the `variant` to apply and the `expected_funding_period_version` stale-view guard. The run is a self-transition — the period stays `OPEN` — and it is legitimate to run it repeatedly as evidence accumulates, which is exactly why the stale-view guard exists: a run supersedes the previous view of the pool, so a stale `expected_funding_period_version` is refused with `ERR_STALE_FUNDING_PERIOD_VERSION` before the period's own `OPEN` status is even examined. A closed period refuses the run with `ERR_FUNDING_PERIOD_CLOSED`.
+
+The candidate set is drawn from that period's outcome records whose `allocation_status` is `UNALLOCATED` and whose review `status` passes the variant's filter, taken in `created_at` ascending order — never in identifier order, since the order decides who gets paid when the pool runs dry. Two variants exist and they select different review states from identical data:
+
+- The **`PROVISIONAL`** variant admits claims whose `status` is `RECORDED` or `CERTIFIED`. It is the mid-year forecast, and because it counts claims nobody has yet blessed, its `committed_cents` figure can exceed the final one on the same records.
+- The **`FINAL`** variant admits only claims whose `status` is `CERTIFIED`. It is the period-close settlement, and a merely `RECORDED` claim contributes nothing to it.
+
+Claims that are `RESCINDED` or `REJECTED` never qualify under either variant, and claims already `COMMITTED`, `DEFERRED` or `REVOKED` never re-enter a run at all — in particular a line deferred for lack of funds is not reconsidered by a later run even if the pool has since recovered.
+
+The run walks the candidates in order against a running pool that starts at the period's current `available_cents`. Each candidate's line amount is the period's `rate_cents_per_weight` multiplied by the `weight` of that claim's `measure_type`, rounded half up to whole cents. When that line amount is no greater than what remains in the running pool, the claim is committed: its `allocated_cents` becomes the line amount, its `allocation_status` becomes `COMMITTED`, and the running pool falls by the line amount. When the line amount exceeds what remains, the claim is deferred: its `allocated_cents` stays 0 and its `allocation_status` becomes `DEFERRED`. There is no partial allocation — a claim is paid in full or not at all — and a deferral does not stop the walk, so a cheaper claim later in the order can still be committed after an expensive one was deferred. When the walk finishes, the period's `committed_cents` rises by the exact integer sum of the committed line amounts, each already rounded, and `available_cents` is recomputed as `total_cents` less `committed_cents`. Summing the weights first and rounding once at the end is a defect, as §2.8 states. The run also increments `allocation_run_count` by one, stamps `last_allocation_run_at` from the logical clock, and records the applied variant as `last_allocation_variant`. The period's `version` and each touched claim's `version` each rise by one.
+
+A side-effect-free preview of the same computation is available to a `StateAuthority` or `ProgramCoordinator`, taking an optional `variant` that defaults to `FINAL`. It writes nothing at all — no claim's `allocation_status` moves and no counter advances — and reports the `funding_period_id`, the `variant` applied, the `total_weight` as the sum of the `weight` values of the candidate claims, the `line_count` as the number of candidates considered, the `projected_committed_cents` the period would hold after the run, the `projected_available_cents` that would remain, and the `deferred_line_count` the pool could not cover.
+
+Closing a period is the last act. A `StateAuthority` moves an `OPEN` period to `CLOSED`, which is terminal and raises the period's `version` by one; a second attempt reports `ERR_FUNDING_PERIOD_CLOSED`. Closing freezes the period in every direction: no further claim may be recorded against it, no standing claim may be certified or rejected, and no further allocation may run. Lines left `DEFERRED` at close stay `DEFERRED` permanently and can never be allocated. Period reads filter on `status`; claim reads filter on `student_id`, `funding_period_id`, `credential_issuance_id`, `measure_type`, `status` and `allocation_status`; and credential reads filter on `student_id`, `status` and `credential_type`.
+
+## 4. API Endpoint Definitions
+
+Every collection in this service is mounted directly at the root of the API — there is no version or product prefix — and every path below is therefore complete as written. Endpoints that bring a new resource into existence answer with HTTP 201 and the created resource in the `data` field; every other successful call, including all state transitions, all ledger movements and all reads, answers with HTTP 200 and the affected or requested resource in `data`. Transition endpoints are modelled as named sub-resources under the record they act on rather than as partial updates, so the request body carries only the decision data described in §3 and never the target state of a record the caller is not entitled to set. Collection reads accept the pagination parameters of §2.3 in addition to the filters listed in their description, and every filter is optional and combinable with the others. All endpoints require the `X-User-Role` and `X-User-ID` headers of §2.1.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/students` | Intake a new adult-education learner, who begins at intake status INTAKE_STARTED with an empty voucher ledger and no placement. | ProgramCoordinator, StateAuthority |
+| POST | `/students/{studentId}/orientation-completion` | Record that the learner has completed programme orientation, advancing them from INTAKE_STARTED to ORIENTED. | Registrar, ProgramCoordinator |
+| POST | `/students/{studentId}/voucher-adjustments` | Grant additional exam-fee voucher funds to a learner, or claw funds back, as a signed cents movement on the voucher ledger. | ProgramCoordinator, StateAuthority |
+| GET | `/students/{studentId}` | Read one learner with their instructional-hour total, voucher ledger and credential standing. | ProgramCoordinator, StateAuthority, Registrar, Instructor, Student |
+| GET | `/students` | List learners, filterable by intake status, primary programme track and credential standing. | ProgramCoordinator, StateAuthority, Registrar, Instructor |
+| GET | `/students/{studentId}/skill-gain` | Computed, side-effect-free read of the learner's measurable-skill-gain determination under either the preview or the audited variant. | ProgramCoordinator, StateAuthority, Registrar |
+| POST | `/testing-centers` | Register a testing-centre authorisation application, which begins at APPLIED with no authorised subtests. | StateAuthority |
+| POST | `/testing-centers/{centerId}/authorization-decision` | Decide a centre's authorisation: grant provisional standing, grant full standing, or withdraw authorisation. | StateAuthority |
+| POST | `/testing-centers/{centerId}/suspend` | Suspend an authorised centre, cascading to its rooms, its unstarted sittings, their live registrations and the affected voucher ledgers. | StateAuthority |
+| GET | `/testing-centers/{centerId}` | Read one testing centre with its authorisation standing and authorised subtests. | StateAuthority, ProgramCoordinator, CenterAdministrator, Registrar |
+| GET | `/testing-centers` | List testing centres, filterable by authorisation status and state code. | StateAuthority, ProgramCoordinator, Registrar |
+| POST | `/testing-centers/{centerId}/rooms` | Add a testing room to an authorised centre, taking the owning centre from the path. | CenterAdministrator, StateAuthority |
+| POST | `/testing-rooms/{roomId}/out-of-service` | Take a room out of service for maintenance, blocking new sittings while leaving already-scheduled ones in place. | CenterAdministrator, StateAuthority |
+| GET | `/testing-rooms/{roomId}` | Read one testing room with its seat capacity and turnaround buffer. | CenterAdministrator, StateAuthority, ProgramCoordinator |
+| GET | `/testing-rooms` | List testing rooms, filterable by owning centre and room status. | CenterAdministrator, StateAuthority, ProgramCoordinator |
+| POST | `/testing-centers/{centerId}/proctors` | Register a proctor candidate at a centre, taking the employing centre from the path; the candidate begins PENDING. | CenterAdministrator, StateAuthority |
+| POST | `/proctors/{proctorId}/certification-decision` | Decide proctor certification: certify a pending proctor, renew a lapsed one, or revoke, which cascades through sittings, registrations, credentials, transcript orders and funding. | StateAuthority |
+| GET | `/proctors/{proctorId}` | Read one proctor, with certification lapse evaluated at read time. | CenterAdministrator, StateAuthority, ProgramCoordinator, Proctor |
+| GET | `/proctors` | List proctors, filterable by employing centre and certification status. | CenterAdministrator, StateAuthority, ProgramCoordinator |
+| POST | `/class-sections` | Create an instructional section for a programme track, which begins PLANNED with all seats free. | ProgramCoordinator |
+| POST | `/class-sections/{sectionId}/status-transition` | Move a section between PLANNED, OPEN, IN_SESSION and CLOSED; closing settles every active enrollment by posted hours. | ProgramCoordinator |
+| GET | `/class-sections/{sectionId}` | Read one instructional section with its seat counts and functioning-level band. | ProgramCoordinator, StateAuthority, Instructor, Registrar |
+| GET | `/class-sections` | List instructional sections, filterable by programme track and status. | ProgramCoordinator, StateAuthority, Instructor, Registrar |
+| POST | `/enrollments` | Enrol a placed learner in an accepting section, snapshotting their entry functioning level and consuming a seat. | ProgramCoordinator |
+| POST | `/enrollments/{enrollmentId}/withdraw` | Withdraw an active enrollment with an exit reason, releasing its seat. | ProgramCoordinator, Instructor |
+| GET | `/enrollments/{enrollmentId}` | Read one enrollment with its posted hours and post-test eligibility. | ProgramCoordinator, StateAuthority, Instructor, Registrar, Student |
+| GET | `/enrollments` | List enrollments, filterable by learner, section and status. | ProgramCoordinator, StateAuthority, Instructor, Registrar |
+| POST | `/enrollments/{enrollmentId}/attendance-entries` | Post instructional hours against an active enrollment, taking the enrollment from the path and re-evaluating post-test eligibility. | Instructor, ProgramCoordinator |
+| POST | `/attendance-entries/{entryId}/void` | Void a posted attendance entry under a stale-view guard on its parent enrollment, cascading to hour ledgers, post-tests, outcome records and committed funding. | Instructor, ProgramCoordinator |
+| GET | `/attendance-entries/{entryId}` | Read one attendance entry with its hours and posting user. | Instructor, ProgramCoordinator, StateAuthority |
+| GET | `/attendance-entries` | List attendance entries, filterable by enrollment and status. | Instructor, ProgramCoordinator, StateAuthority |
+| POST | `/test-events` | Schedule a standardised pre-test or post-test for a learner; a post-test is gated on the interval since placement and on posted hours. | Registrar, ProgramCoordinator |
+| POST | `/test-events/{testEventId}/score` | Record a scale score for a scheduled test event, deriving its functioning level and, for the earliest pre-test, the learner's placement. | Instructor |
+| GET | `/test-events/{testEventId}` | Read one test event with its scale score and derived functioning level. | Registrar, ProgramCoordinator, StateAuthority, Student |
+| GET | `/test-events` | List test events, filterable by learner, enrollment, purpose and status. | Registrar, ProgramCoordinator, StateAuthority |
+| POST | `/exam-sessions` | Schedule an exam sitting in a room of an authorised centre, enforcing buffered room occupation and deriving the seat capacity and duration. | CenterAdministrator |
+| POST | `/exam-sessions/{sessionId}/proctor-assignment` | Assign a currently certified proctor to a draft sitting, enforcing the proctor's interval conflicts and daily hour cap. | CenterAdministrator |
+| POST | `/exam-sessions/{sessionId}/cancel` | Cancel a sitting that has not started or completed, cancelling its live registrations, refunding vouchers and releasing the proctor. | CenterAdministrator, StateAuthority |
+| GET | `/exam-sessions/{sessionId}` | Read one exam sitting with its seat counts, duration and supported formats. | CenterAdministrator, StateAuthority, ProgramCoordinator, Registrar, Proctor |
+| GET | `/exam-sessions` | List exam sittings, filterable by room, assigned proctor, subtest and status. | CenterAdministrator, StateAuthority, ProgramCoordinator, Registrar, Proctor |
+| POST | `/exam-registrations` | Register a placed learner for a seat on a scheduled sitting under a stale-view guard on that sitting, assessing the full exam fee and settling the voucher ledger. | Registrar, Student |
+| POST | `/exam-registrations/{registrationId}/identity-verification` | Record the proctor's identity-check outcome for a registration, either accepting or rejecting the document presented. | Proctor |
+| POST | `/exam-registrations/{registrationId}/check-in` | Seat an identity-verified candidate inside the seating window, starting the sitting on the first check-in. | Proctor |
+| POST | `/exam-registrations/{registrationId}/result` | Record the subtest scale score for a seated candidate, deriving pass or fail and completing the sitting when the last candidate is scored. | Proctor |
+| POST | `/exam-registrations/{registrationId}/cancel` | Cancel a registration before the candidate is seated, releasing the seat and refunding the voucher funds it consumed. | Registrar, Student |
+| GET | `/exam-registrations/{registrationId}` | Read one exam registration with its full fee breakdown and both status axes. | ProgramCoordinator, StateAuthority, CenterAdministrator, Proctor, Student |
+| GET | `/exam-registrations` | List exam registrations, filterable by learner, sitting, cited accommodation, verifying proctor, registration status and identity status. | ProgramCoordinator, StateAuthority, CenterAdministrator, Proctor, Registrar |
+| POST | `/accommodation-requests` | Submit an accommodation and alternate-format testing request for a learner, with a documentation reference. | Student, Registrar |
+| POST | `/accommodation-requests/{requestId}/info-request` | Ask the learner for further documentation, with a decision note; at most two rounds are permitted per request. | CenterAdministrator |
+| POST | `/accommodation-requests/{requestId}/resubmission` | Supply the requested documentation, replacing the reference on file and returning the request to review. | Student, Registrar |
+| POST | `/accommodation-requests/{requestId}/decision` | Approve a request with a granted format and an effective-until instant, or deny it. | CenterAdministrator |
+| GET | `/accommodation-requests/{requestId}` | Read one accommodation request, with approval expiry evaluated at read time. | Registrar, ProgramCoordinator, StateAuthority, Student |
+| GET | `/accommodation-requests` | List accommodation requests, filterable by learner, status and requested format. | Registrar, ProgramCoordinator, StateAuthority |
+| POST | `/credentials` | Issue a high-school-equivalency credential from the learner's best scored subtest results, exiting them when no enrollment remains active. | StateAuthority |
+| GET | `/credentials/{credentialId}` | Read one credential with its subtest score map, composite score and qualifying registrations. | StateAuthority, ProgramCoordinator, Student |
+| GET | `/credentials` | List credentials, filterable by learner, status and credential type. | StateAuthority, ProgramCoordinator |
+| POST | `/students/{studentId}/transcript-orders` | Order sealed transcript copies against an issued credential, taking the learner from the path and computing the full charge. | Student, Registrar |
+| POST | `/transcript-orders/{orderId}/fulfillment` | Mark a queued transcript order as fulfilled and released. | Registrar, ProgramCoordinator |
+| GET | `/transcript-orders/{orderId}` | Read one transcript order with its charge breakdown. | ProgramCoordinator, StateAuthority, Student |
+| GET | `/transcript-orders` | List transcript orders, filterable by learner, credential and status. | ProgramCoordinator, StateAuthority |
+| POST | `/outcome-records` | Record a performance-reporting outcome claim inside an open funding period, fixing its measure weight. | ProgramCoordinator, StateAuthority |
+| POST | `/outcome-records/{outcomeId}/certification` | Certify or reject a recorded outcome claim; the deciding user may not be the recording user. | StateAuthority, ProgramCoordinator |
+| GET | `/outcome-records/{outcomeId}` | Read one outcome claim with its weight, review status and allocation figures. | StateAuthority, ProgramCoordinator, Registrar |
+| GET | `/outcome-records` | List outcome claims, filterable by learner, funding period, credential, measure type, review status and allocation status. | StateAuthority, ProgramCoordinator, Registrar |
+| POST | `/funding-periods` | Open a performance-funding period with a total pool and a rate paid per unit of outcome weight. | StateAuthority |
+| POST | `/funding-periods/{periodId}/allocation-run` | Run outcome-based funding allocation over the period under a stale-view guard, committing or deferring each eligible claim under the requested variant. | StateAuthority |
+| POST | `/funding-periods/{periodId}/close` | Close a funding period, freezing further recording, certification and allocation. | StateAuthority |
+| GET | `/funding-periods/{periodId}` | Read one funding period with its committed and available cents and its allocation-run history. | StateAuthority, ProgramCoordinator |
+| GET | `/funding-periods` | List funding periods, filterable by status. | StateAuthority, ProgramCoordinator |
+| GET | `/funding-periods/{periodId}/allocation-preview` | Computed, side-effect-free read of what an allocation run under the given variant would commit, leave available and defer. | StateAuthority, ProgramCoordinator |
+| POST | `/_clock/set_current_utc` | Advance the server's logical UTC clock, which every window, interval and expiry rule reads; the clock may only move forward. | StateAuthority, ProgramCoordinator, Registrar, CenterAdministrator, Instructor |
+| GET | `/_clock/current_utc` | Read the current logical UTC clock value. | StateAuthority, ProgramCoordinator, Registrar, CenterAdministrator, Instructor, Proctor, Student |
+
+## 5. Error Codes
+
+The table below is the complete catalogue of machine-readable error identifiers this service may return, with the HTTP status code each is served with. The identifier travels in the `error_id` field of the error envelope described in §2.2, and the order in which competing conditions are reported is fixed by §2.6.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_FORBIDDEN_SCOPE` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_INVALID_PAGINATION` | 400 |
+| `ERR_STUDENT_NOT_FOUND` | 404 |
+| `ERR_TESTING_CENTER_NOT_FOUND` | 404 |
+| `ERR_TESTING_ROOM_NOT_FOUND` | 404 |
+| `ERR_PROCTOR_NOT_FOUND` | 404 |
+| `ERR_CLASS_SECTION_NOT_FOUND` | 404 |
+| `ERR_ENROLLMENT_NOT_FOUND` | 404 |
+| `ERR_ATTENDANCE_ENTRY_NOT_FOUND` | 404 |
+| `ERR_TEST_EVENT_NOT_FOUND` | 404 |
+| `ERR_EXAM_SESSION_NOT_FOUND` | 404 |
+| `ERR_EXAM_REGISTRATION_NOT_FOUND` | 404 |
+| `ERR_ACCOMMODATION_REQUEST_NOT_FOUND` | 404 |
+| `ERR_OUTCOME_RECORD_NOT_FOUND` | 404 |
+| `ERR_CREDENTIAL_NOT_FOUND` | 404 |
+| `ERR_TRANSCRIPT_ORDER_NOT_FOUND` | 404 |
+| `ERR_FUNDING_PERIOD_NOT_FOUND` | 404 |
+| `ERR_STALE_EXAM_SESSION_VERSION` | 412 |
+| `ERR_STALE_ENROLLMENT_VERSION` | 412 |
+| `ERR_STALE_FUNDING_PERIOD_VERSION` | 412 |
+| `ERR_INVALID_INTAKE_STATE` | 409 |
+| `ERR_STUDENT_NOT_ORIENTED` | 409 |
+| `ERR_PLACEMENT_TEST_MISSING` | 409 |
+| `ERR_STUDENT_NOT_PLACED` | 409 |
+| `ERR_CENTER_DECISION_NOT_ALLOWED` | 409 |
+| `ERR_CENTER_NOT_AUTHORIZED` | 409 |
+| `ERR_CENTER_SUSPENDED` | 409 |
+| `ERR_ROOM_OUT_OF_SERVICE` | 409 |
+| `ERR_PROCTOR_DECISION_NOT_ALLOWED` | 409 |
+| `ERR_SECTION_TRANSITION_NOT_ALLOWED` | 409 |
+| `ERR_SECTION_NOT_ACCEPTING_ENROLLMENT` | 409 |
+| `ERR_ENROLLMENT_NOT_ACTIVE` | 409 |
+| `ERR_ATTENDANCE_ALREADY_VOIDED` | 409 |
+| `ERR_TEST_EVENT_NOT_SCHEDULED` | 409 |
+| `ERR_SESSION_NOT_ASSIGNABLE` | 409 |
+| `ERR_SESSION_NOT_CANCELLABLE` | 409 |
+| `ERR_SESSION_NOT_OPEN_FOR_REGISTRATION` | 409 |
+| `ERR_REGISTRATION_NOT_OPEN` | 409 |
+| `ERR_REGISTRATION_NOT_CHECKED_IN` | 409 |
+| `ERR_IDENTITY_ALREADY_VERIFIED` | 409 |
+| `ERR_ACCOMMODATION_NOT_PENDING` | 409 |
+| `ERR_ACCOMMODATION_NOT_INFO_REQUESTED` | 409 |
+| `ERR_OUTCOME_NOT_CERTIFIABLE` | 409 |
+| `ERR_CREDENTIAL_NOT_ISSUED` | 409 |
+| `ERR_TRANSCRIPT_ORDER_NOT_QUEUED` | 409 |
+| `ERR_FUNDING_PERIOD_CLOSED` | 409 |
+| `ERR_PROCTOR_NOT_CERTIFIED` | 409 |
+| `ERR_PROCTOR_CERTIFICATION_LAPSED` | 409 |
+| `ERR_IDENTITY_NOT_VERIFIED` | 409 |
+| `ERR_SUBTEST_NOT_AUTHORIZED` | 409 |
+| `ERR_ACCOMMODATION_OWNER_MISMATCH` | 409 |
+| `ERR_ACCOMMODATION_NOT_APPROVED` | 409 |
+| `ERR_ACCOMMODATION_EXPIRED` | 409 |
+| `ERR_ACCOMMODATION_FORMAT_UNAVAILABLE` | 409 |
+| `ERR_OUTCOME_EVIDENCE_MISMATCH` | 409 |
+| `ERR_MSG_NOT_SUPPORTED` | 409 |
+| `ERR_SESSION_IN_PAST` | 422 |
+| `ERR_POST_TEST_INTERVAL_NOT_MET` | 409 |
+| `ERR_INVALID_SESSION_WINDOW` | 422 |
+| `ERR_CHECK_IN_WINDOW_CLOSED` | 409 |
+| `ERR_INVALID_EFFECTIVE_WINDOW` | 422 |
+| `ERR_CLOCK_BACKWARD` | 422 |
+| `ERR_POST_TEST_HOURS_NOT_MET` | 409 |
+| `ERR_ROOM_BUFFER_CONFLICT` | 409 |
+| `ERR_PROCTOR_TIME_CONFLICT` | 409 |
+| `ERR_PROCTOR_DAILY_CAP_EXCEEDED` | 409 |
+| `ERR_DUPLICATE_ACTIVE_ENROLLMENT` | 409 |
+| `ERR_EFL_LEVEL_OUT_OF_RANGE` | 409 |
+| `ERR_TEST_EVENT_CONFLICT` | 409 |
+| `ERR_DUPLICATE_CREDENTIAL` | 409 |
+| `ERR_CREDENTIAL_REQUIREMENTS_NOT_MET` | 409 |
+| `ERR_INFO_REQUEST_LIMIT_REACHED` | 409 |
+| `ERR_SECTION_CAPACITY_EXCEEDED` | 409 |
+| `ERR_SESSION_SEATS_EXHAUSTED` | 409 |
+| `ERR_DUPLICATE_REGISTRATION` | 409 |
+| `ERR_VOUCHER_INSUFFICIENT` | 402 |
+| `ERR_VOUCHER_ADJUSTMENT_INVALID` | 422 |

@@ -1,0 +1,73 @@
+"""Domain thresholds and numeric constants named by the requirements."""
+
+# The statutory evaluation window and its derived postures.
+STATUTORY_EVAL_DAYS = 60
+AT_RISK_WINDOW_DAYS = 10
+EXCLUSION_CAP_PCT = 0.30
+AGGREGATE_EXCLUSION_CAP_DAYS = 18  # whole-number part of 60 * 30 percent
+
+# Per-claim exclusion ceilings by statutory basis.
+PER_TYPE_CAP_DAYS = {
+    "BREAK_CLOSURE": 14,
+    "PARENT_UNAVAILABLE": 10,
+    "STUDENT_ABSENT_STREAK": 7,
+    "TRANSFER_IN_TRANSIT": 5,
+}
+
+# Workload weight of an evaluation.
+BASE_POINTS = 3
+EXTRA_DOMAIN_POINTS = 1
+INTERPRETER_POINTS = 2
+INITIAL_TYPE_POINTS = 2
+REEVAL_TYPE_POINTS = 1
+
+# Urgency weights feeding the clock-weighted pressure index.
+URGENCY_WEIGHT_BREACHED = 2.0
+URGENCY_WEIGHT_AT_RISK = 1.5
+URGENCY_WEIGHT_DEFAULT = 1.0
+
+# Assignment selector adjustments.
+BREACH_PENALTY = 0.25
+CONTINUITY_BONUS = 0.10
+CONTINUITY_CAP = 2
+
+# Breach severity bands and compensatory-minute arithmetic.
+MINOR_MAX_DAYS = 5
+MODERATE_MAX_DAYS = 15
+SEVERITY_MULTIPLIER = {"MINOR": 1.0, "MODERATE": 1.25, "SEVERE": 1.5}
+DAILY_SERVICE_MINUTES = 30
+WEEKLY_SERVICE_MINUTES = 150
+REMEDY_MINUTES_CAP = 1800
+
+# Protocol-order pricing.
+TIER1_MIN_QTY = 25
+TIER2_MIN_QTY = 100
+TIER_MULTIPLIER_SMALL = 1.00
+TIER_MULTIPLIER_MID = 0.95
+TIER_MULTIPLIER_LARGE = 0.90
+DISTRICT_CONTRACT_DISCOUNT_PCT = 0.07
+RUSH_SURCHARGE_PCT = 0.085
+SMALL_ORDER_HANDLING_FEE_CENTS = 1250
+AUTO_APPROVE_THRESHOLD_CENTS = 40000
+
+# Calendars and meetings.
+TRAVEL_BUFFER_MINUTES = 15
+PARENT_NOTICE_LEAD_DAYS = 10
+MAX_RESCHEDULES = 2
+
+# Registration defaults the requirements declare.
+DEFAULT_WEEKLY_CAPACITY_POINTS = 20
+DEFAULT_CONCURRENT_MEETING_CAPACITY = 1
+DEFAULT_ENROLLMENT_COUNT = 0
+DEFAULT_LANGUAGES_CERTIFIED = ["en"]
+DEFAULT_PRIMARY_LANGUAGE = "en"
+DEFAULT_SUPPORTED_LANGUAGE_EDITIONS = ["en"]
+DEFAULT_PROTOCOL_UNITS_PER_ADMINISTRATION = 1
+
+# The logical clock's value before any client has moved it.
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# Pagination contract.
+DEFAULT_PAGE_LIMIT = 10
+MIN_PAGE_LIMIT = 1
+MAX_PAGE_LIMIT = 100

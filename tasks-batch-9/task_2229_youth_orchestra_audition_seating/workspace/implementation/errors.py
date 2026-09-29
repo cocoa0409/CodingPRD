@@ -1,0 +1,96 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    # protocol / auth
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    # existence
+    "ERR_SEASON_NOT_FOUND": 404,
+    "ERR_ENSEMBLE_NOT_FOUND": 404,
+    "ERR_SECTION_QUOTA_NOT_FOUND": 404,
+    "ERR_MEMBER_NOT_FOUND": 404,
+    "ERR_PANELIST_NOT_FOUND": 404,
+    "ERR_AUDITION_SLOT_NOT_FOUND": 404,
+    "ERR_AUDITION_NOT_FOUND": 404,
+    "ERR_PANEL_SCORE_NOT_FOUND": 404,
+    "ERR_PLACEMENT_NOT_FOUND": 404,
+    "ERR_SEAT_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_TUITION_ACCOUNT_NOT_FOUND": 404,
+    "ERR_ENSEMBLE_EVENT_NOT_FOUND": 404,
+    "ERR_PARTICIPATION_NOT_FOUND": 404,
+    # state
+    "ERR_INVALID_SEASON_TRANSITION": 409,
+    "ERR_INVALID_STATE_FOR_OPERATION": 409,
+    "ERR_AID_REQUEST_NOT_ALLOWED_IN_STATE": 409,
+    "ERR_INVALID_MEMBER_TRANSITION": 409,
+    "ERR_MAX_REVISION_ROUNDS_REACHED": 409,
+    "ERR_EVENT_NOT_PROGRAMMABLE": 409,
+    "ERR_ASSESSMENT_ALREADY_FINAL": 409,
+    # concurrency
+    "ERR_STALE_ENSEMBLE_VERSION": 412,
+    "ERR_STALE_SEASON_VERSION": 412,
+    # cross-entity state
+    "ERR_SEASON_NOT_ACCEPTING_AUDITIONS": 409,
+    "ERR_ENSEMBLE_NOT_ACCEPTING_PLACEMENTS": 409,
+    "ERR_AUDITION_NOT_ADJUDICATED": 409,
+    "ERR_ENSEMBLE_NOT_SEATED": 409,
+    "ERR_EVENT_KIND_NOT_ELIGIBLE": 409,
+    "ERR_DELINQUENT_ACCOUNT_BLOCKS_CLOSE": 409,
+    "ERR_SEASON_PRECONDITION_UNMET": 409,
+    # safety / SoD / blind panel
+    "ERR_PANEL_CONFLICT_OF_INTEREST": 403,
+    "ERR_PANELIST_NOT_ON_PANEL": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_SOLOIST_NOT_ELIGIBLE": 422,
+    "ERR_NO_ELIGIBLE_SOLOIST": 422,
+    # temporal
+    "ERR_SLOT_OUTSIDE_AUDITION_WINDOW": 422,
+    "ERR_EVENT_NOT_STARTED": 422,
+    "ERR_EXCUSE_WINDOW_CLOSED": 422,
+    # referential / uniqueness
+    "ERR_SLOT_INSTRUMENT_MISMATCH": 422,
+    "ERR_REPERTOIRE_REQUIREMENTS_UNMET": 422,
+    "ERR_DUPLICATE_PANEL_SCORE": 409,
+    "ERR_DUPLICATE_SECTION_QUOTA": 409,
+    "ERR_DUPLICATE_TUITION_ACCOUNT": 409,
+    "ERR_DUPLICATE_PARTICIPATION": 409,
+    "ERR_DUPLICATE_AUDITION": 409,
+    "ERR_DUPLICATE_PLACEMENT": 409,
+    "ERR_TIER_ABOVE_RECOMMENDATION": 422,
+    "ERR_NO_SECTION_FOR_INSTRUMENT": 422,
+    # constraint / overlap
+    "ERR_ROTATION_NOT_PERMITTED": 422,
+    "ERR_AUDITION_SLOT_FULL": 409,
+    "ERR_ROOM_DOUBLE_BOOKED": 409,
+    "ERR_MEMBER_EVENT_CONFLICT": 409,
+    "ERR_PANELIST_UNAVAILABLE": 409,
+    # fiscal
+    "ERR_AID_REQUEST_EXCEEDS_ASSESSMENT": 422,
+    "ERR_NO_AID_BUDGET": 422,
+    "ERR_PAYMENT_EXCEEDS_BALANCE": 422,
+    "ERR_GUEST_ARTIST_FEE_CAP_EXCEEDED": 422,
+    "ERR_TOUR_REQUIREMENTS_UNMET": 422,
+    # capacity / quota
+    "ERR_SECTION_CAPACITY_EXCEEDED": 409,
+    "ERR_SECTION_FULL_AT_ACCEPTANCE": 409,
+    "ERR_MEMBER_NOT_IN_ENSEMBLE": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

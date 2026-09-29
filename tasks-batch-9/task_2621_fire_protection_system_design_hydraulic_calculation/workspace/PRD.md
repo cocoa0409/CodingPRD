@@ -1,0 +1,497 @@
+# Fire Protection Hydraulic Design API — Product Requirements Document
+
+## 1. Introduction
+
+A fire protection engineering firm lives or dies by the defensibility of its numbers. Every sprinkler package the firm stamps must show, on paper, that the most demanding area of the building can be supplied by the water that is actually available at the street — and it must show it with a classification the authority having jurisdiction accepts, a flow test the authority believes, a friction chain the authority can re-add by hand, and a seal applied by an engineer whose licence is current in the state where the building stands. Today that evidence lives in spreadsheets, marked-up plan sets and email threads, so a single tenant change late in design silently invalidates a demand figure that has already been packaged, drawn and coordinated with three other trades.
+
+This document specifies the backend service that replaces those spreadsheets. The service owns the whole chain of custody: occupancy hazard classification and commodity escalation, the density and design area that fall out of it, hydrant flow test records and the safety-margin evaluation projected from them, the iterative pipe-sizing chain that demonstrates the demand, fire pump selection when the city supply falls short, standpipe and special hazard demand additions, shop drawing coordination with the structural, mechanical and lighting trades, the authority's review comments and resubmittal cycles, and finally witnessed acceptance testing with as-built documentation. Each of those artefacts is a first-class resource with its own lifecycle, and the service's central obligation is that when any upstream artefact moves, everything derived from it either moves with it or is visibly marked stale — never left quietly wrong.
+
+Two design consequences run through everything below. First, the service is **derivation-heavy**: densities, design areas, demands, friction losses, margins, pump ratings, fees and acceptance thresholds are computed by the server from declared inputs, and clients never supply them. Second, the service is **posture-gated**: a project carries a derived design posture that decides, at every write, whether design work may continue, may only be revised, or is frozen outright. A client that ignores the posture will find its writes refused rather than partially applied.
+
+## 2. Global Specifications & System-Wide Principles
+
+The service is mounted at the server root; every path in section 4 is absolute. All request and response bodies are JSON.
+
+### 2.1. User and Role-Based Access Control
+
+Every request carries two headers: `X-User-ID`, identifying the acting person, and `X-User-Role`, naming the capacity in which that person acts. If either header is missing or blank, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401); the sole exception is the logical-clock endpoint, which still requires `X-User-Role` but does not require `X-User-ID`. If the header is present but names a role that is not authorised for the endpoint being called, the rejection is `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+Five roles exist, spelled exactly as follows: `FirmAdmin`, `DesignEngineer`, `QcReviewer`, `Contractor`, and `AhjReviewer`.
+
+A `FirmAdmin` is the firm's operations administrator. They register design professionals and authority reviewers, open projects, record fee payments against a project's outstanding review fee balance, and drive the logical clock in test scenarios. When `X-User-Role` is `FirmAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it for audit but never compares it to any entity's `id`.
+
+A `DesignEngineer` is the engineer of record. When `X-User-Role` is `DesignEngineer`, `X-User-ID` is the `id` of the acting `Engineer` row; ownership checks on any resource that references an `Engineer` compare the resource's foreign-key field to `X-User-ID`. Concretely, every design write is refused with `ERR_NOT_PROJECT_ENGINEER` (HTTP 403) unless `X-User-ID` equals the `lead_engineer_id` of the project the target row belongs to. That guard covers the whole design surface: declaring a hazard area, reclassifying one, recording a flow test, creating a water supply evaluation, opening a hydraulic calculation, appending an iteration to it, sealing it, sizing a fire pump, adding an auxiliary system, withdrawing an auxiliary system, recording a trade clearance outcome, lodging a permit submittal, resubmitting one, and responding to a review comment.
+
+A `QcReviewer` is a second engineer performing the independent quality check. This role is backed by the same `Engineer` table, so when `X-User-Role` is `QcReviewer`, `X-User-ID` is likewise the `id` of an `Engineer` row. The segregation-of-duties rule applies to this role alone: the acting QC reviewer may never be the author of the calculation under review, and an attempt to review one's own work is refused with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+A `Contractor` is the installing sprinkler contractor: they record hydrant flow tests, prepare shop drawing sheets and trade coordination items, commission auxiliary systems together with their water-supply outage windows, open acceptance tests, lodge as-built documentation and pay authority review fees. When `X-User-Role` is `Contractor`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it but does not compare it to any entity's `id`.
+
+An `AhjReviewer` is the authority's plan examiner and witness. When `X-User-Role` is `AhjReviewer`, `X-User-ID` is the `id` of the acting `AhjReviewer` row; ownership checks compare a resource's reviewer foreign key to `X-User-ID`. Every authority write is refused with `ERR_NOT_ASSIGNED_REVIEWER` (HTTP 403) unless `X-User-ID` equals the project's `ahj_reviewer_id`, and the same error is raised when a request body supplies a `witness_reviewer_id` that is not that project's assigned reviewer. The guarded operations are: opening review of a package, raising a comment on it, completing the review pass, disposing of a comment, booking a witness window, recording a witnessed measurement, and disposing of an as-built package.
+
+For the three identity-backed roles — `DesignEngineer`, `QcReviewer` and `AhjReviewer` — the supplied `X-User-ID` must resolve to an existing row of the backing table: an `Engineer` for the first two, an `AhjReviewer` for the third. A well-formed but unknown identifier is rejected with `ERR_IDENTITY_NOT_RECOGNIZED` (HTTP 403). Read endpoints are open to all five roles.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every list endpoint is paginated with two query parameters. `limit` controls page size: it defaults to 10, must be at least 1, and must not exceed 100. `offset` controls the starting position: it defaults to 0 and must not be negative. A supplied value outside those bounds is a request-shape violation and is rejected with `ERR_INVALID_REQUEST` (HTTP 422).
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending. The one documented exception is the iteration log of a hydraulic calculation, which is returned in ascending `iteration_index` order so the friction chain reads in the order it was accumulated. List responses carry `limit`, `offset`, `total_count` and `has_more` in the `meta` object, where `total_count` counts every row matching the filters before pagination is applied and `has_more` is true when rows remain beyond the current page. Every filter documented for a list endpoint is optional, and filters combine conjunctively.
+
+### 2.4. Record Identity, Timestamps and Revision Counters
+
+Every resource is addressed by an `id` that is a server-minted UUID with no type prefix; clients never choose identifiers. Every resource also carries `created_at`, an ISO 8601 UTC timestamp with three fractional digits, stamped from the logical clock when the row is inserted.
+
+Most resources additionally carry `updated_at`, in the same format, and `version`, an integer that starts at 1 on creation and increases by exactly 1 on every mutation of that row. Whenever a write changes a row — whether the client addressed that row directly or the row moved as a downstream consequence of some other write — both `updated_at` and `version` advance on it. This is what makes the cascades described in section 3 observable: a client that holds a stale `version` for a project or an evaluation will be told so rather than allowed to overwrite work it never saw.
+
+Four record types are deliberately append-only or reference-only and therefore carry **only** `id` and `created_at`, with both `updated_at` and `version` absent from their representations: the `Engineer` directory row, the `AhjReviewer` directory row, the `FlowTest` field record, and the `PipeSizingIteration` chain entry. A flow test, once witnessed and recorded, is never edited; an iteration, once appended, is never edited — a revised chain is expressed by appending a further iteration that restarts the chain, never by rewriting history.
+
+### 2.5. The Project Design Posture Gate
+
+Alongside its workflow `status`, every project carries a derived `design_posture` with three values: `OPEN`, `GATED` and `FROZEN`. The posture is recomputed on every write that changes the project's `status` or its `open_major_comment_count`, and it is derived, never supplied: when `status` is either `CORRECTIVE_ACTION` or `CLOSED_OUT` the posture is `FROZEN`; otherwise, when `open_major_comment_count` is greater than zero the posture is `GATED`; otherwise the posture is `OPEN`.
+
+A `FROZEN` posture refuses every design mutation on the project with `ERR_PROJECT_POSTURE_FROZEN` (HTTP 409). The refused set is exactly: declaring a hazard area, reclassifying a hazard area, opening a hydraulic calculation, appending an iteration to one, QC-reviewing one, sealing one, creating a water supply evaluation, sizing a fire pump, adding an auxiliary system, commissioning one, withdrawing one, creating a shop drawing, opening a trade clearance on a sheet, recording a trade clearance outcome, lodging a submittal, and resubmitting a submittal.
+
+A `GATED` posture is narrower and refuses only the three package-advancing writes with `ERR_PROJECT_POSTURE_GATED` (HTTP 409): sealing a hydraulic calculation, lodging a permit submittal, and opening an acceptance test. Everything else stays available on purpose — while a `MAJOR` comment is outstanding the designer must still be able to revise geometry, re-run the chain and write the response that clears the gate.
+
+### 2.6. Units, Precision and Rounding
+
+Every rounding operation in this specification is **round half up** on the decimal value: a digit sequence exactly at the midpoint rounds away from zero. There is no banker's rounding anywhere in the service.
+
+Precision is fixed per quantity rather than globally, because the trade rounds its worksheets differently by column. Design discharge densities, in gallons per minute per square foot, carry 3 decimal places. Design areas, in square feet, carry 0 decimal places. Flows, in gallons per minute, carry 1 decimal place. Pressures, in pounds per square inch, carry 2 decimal places, with one deliberate exception noted where it applies: the pump's churn discharge pressure is carried to 1 decimal place. Percentages carry 1 decimal place. Monetary amounts, in US dollars, carry 2 decimal places. Hose stream allowances carry 1 decimal place. Velocities, in feet per second, carry 2 decimal places.
+
+Where a computation accumulates over a sequence, the rounding order is itself part of the contract and is stated with that computation in section 3. In particular, the pipe-sizing chain rounds each per-segment loss to its own precision, adds the already-rounded terms into the running pressure, and rounds the running pressure again after each segment; summing raw losses and rounding once at the end is a different specification and yields different numbers.
+
+### 2.7. Version Pinning on Package and Pump Writes
+
+Two write operations require the client to prove it has observed the current state of a parent record before it may act on it. Both use the same mechanism: a non-optional integer field in the request body carrying the client's last observed `version` of that parent, compared for exact equality against the parent's current `version`, with the write refused when they differ.
+
+Lodging a permit submittal requires `expected_project_version` matching the target project's current `version`. A package binds the project's sealed calculation set, its demand ledger and its fee balance as they stood when the client assembled it; any intervening write — a newly sealed calculation, a withdrawn auxiliary system, a fee payment — advances the project's `version` and makes the client's picture of the package contents stale. When `expected_project_version` does not equal the project's current `version`, the request is rejected with `ERR_STALE_PROJECT_VERSION` (HTTP 412). The identical guard, with the identical field and the identical error, applies to resubmitting a submittal, which legitimately supersedes the prior cycle and so must not be allowed to run on an unobserved project state.
+
+Sizing a fire pump requires `expected_water_supply_evaluation_version` matching the referenced water supply evaluation's current `version`. A pump selection legitimately supersedes any prior selection made against the same evaluation, so without this pin a second writer's request would succeed on state it never read, including that evaluation's `pump_sized` flag. When `expected_water_supply_evaluation_version` does not equal the evaluation's current `version`, the request is rejected with `ERR_STALE_SUPPLY_EVALUATION_VERSION` (HTTP 412).
+
+No other endpoint takes a version field. Everywhere else, staleness is caught by the domain reconciliation rules described in section 3 rather than by a version pin.
+
+### 2.8. Request Admission Order
+
+When a single request violates more than one rule, the response must report the violation the service reaches first. The admission order below is therefore normative and is evaluated top to bottom, stopping at the first failure. The business meaning of each domain check is developed in section 3; what this list fixes is only the precedence and the error each check raises.
+
+1. Authentication headers present and non-blank — `ERR_UNAUTHENTICATED` (401).
+2. The acting role is authorised for the endpoint — `ERR_ROLE_NOT_PERMITTED` (403).
+3. For `DesignEngineer`, `QcReviewer` and `AhjReviewer`, `X-User-ID` resolves to an existing backing row — `ERR_IDENTITY_NOT_RECOGNIZED` (403).
+4. Every `{id}` path parameter resolves to an existing row, validated left to right along the path — the matching one of `ERR_PROJECT_NOT_FOUND`, `ERR_HAZARD_AREA_NOT_FOUND`, `ERR_CALCULATION_NOT_FOUND`, `ERR_EVALUATION_NOT_FOUND`, `ERR_FIRE_PUMP_NOT_FOUND`, `ERR_AUXILIARY_SYSTEM_NOT_FOUND`, `ERR_SHOP_DRAWING_NOT_FOUND`, `ERR_TRADE_CLEARANCE_NOT_FOUND`, `ERR_SUBMITTAL_NOT_FOUND`, `ERR_REVIEW_COMMENT_NOT_FOUND`, `ERR_ACCEPTANCE_TEST_NOT_FOUND` (404).
+5. Every foreign key supplied in the request body resolves to an existing row of its declared parent type, validated in the order the fields are listed for that endpoint — the matching one of `ERR_ENGINEER_NOT_FOUND`, `ERR_REVIEWER_NOT_FOUND`, `ERR_PROJECT_NOT_FOUND`, `ERR_HAZARD_AREA_NOT_FOUND`, `ERR_FLOW_TEST_NOT_FOUND`, `ERR_CALCULATION_NOT_FOUND`, `ERR_EVALUATION_NOT_FOUND`, `ERR_SUBMITTAL_NOT_FOUND` (404). This applies to project creation, hazard area creation, flow test creation, water supply evaluation creation, hydraulic calculation creation, fire pump creation, auxiliary system creation, shop drawing creation, submittal creation, resubmittal, and comment creation.
+6. The acting `DesignEngineer` is the project's `lead_engineer_id` — `ERR_NOT_PROJECT_ENGINEER` (403).
+7. The acting `AhjReviewer` is the project's `ahj_reviewer_id`, and any `witness_reviewer_id` in the body is that same reviewer — `ERR_NOT_ASSIGNED_REVIEWER` (403).
+8. The acting `QcReviewer` is not the calculation's `authored_by_engineer_id` — `ERR_SEGREGATION_OF_DUTIES` (403).
+9. The body conforms to the endpoint's input schema: required fields present, types correct, enum members recognised, numeric ranges satisfied, `elevation_high_in` greater than `elevation_low_in`, `included_calculation_ids` non-empty and free of duplicates, and `residual_psi` strictly below `static_psi` — `ERR_INVALID_REQUEST` (422).
+10. The conditional fields demanded by an auxiliary system's `system_type` are present — `ERR_SYSTEM_TYPE_FIELD_REQUIRED` (422).
+11. `expected_project_version` equals the project's current `version` — `ERR_STALE_PROJECT_VERSION` (412).
+12. `expected_water_supply_evaluation_version` equals the evaluation's current `version` — `ERR_STALE_SUPPLY_EVALUATION_VERSION` (412).
+13. The project's `design_posture` is not `FROZEN`, for every design mutation in the frozen set — `ERR_PROJECT_POSTURE_FROZEN` (409).
+14. The project's `design_posture` is not `GATED`, for the three package-advancing writes — `ERR_PROJECT_POSTURE_GATED` (409).
+15. The target row is not already in a terminal state of the dimension the request advances — `ERR_TERMINAL_STATE_LOCKED` (409).
+16. The requested transition is declared for the row's current state — `ERR_INVALID_STATE_TRANSITION` (409).
+17. The sealing engineer's `license_status` is `ACTIVE` — `ERR_SEAL_LICENSE_INACTIVE` (409).
+18. The sealing engineer's `license_state` equals the project's `jurisdiction_state` — `ERR_SEAL_LICENSE_JURISDICTION_MISMATCH` (409).
+19. `interlock_verified` is true when the auxiliary system's `interlock_required` is true — `ERR_INTERLOCK_NOT_VERIFIED` (409).
+20. The iteration's computed `velocity_fps` does not exceed the velocity limit — `ERR_VELOCITY_LIMIT_EXCEEDED` (422).
+21. At seal time the safety margin is resolved, either by an adequate or marginal verdict or by an acceptable sized pump — `ERR_SAFETY_MARGIN_UNRESOLVED` (409).
+22. The referenced flow test's `tested_at` is within the validity window of the logical clock — `ERR_FLOW_TEST_STALE` (422).
+23. At seal time the newest evaluated supply evaluation reconciles with the calculation on all three pinned figures — `ERR_EVALUATION_REFERENCE_STALE` (409).
+24. A supply-connection iteration carries `flow_gpm` exactly equal to the calculation's `design_flow_gpm` — `ERR_SUPPLY_FLOW_MISMATCH` (422).
+25. Every member of `included_calculation_ids` names a calculation of this project whose state is `SEALED` — `ERR_CALCULATION_NOT_SEALED` (409). This check guards submittal creation, resubmittal, and shop drawing creation.
+26. Every shop drawing over a packaged calculation is `COORDINATED` or `ISSUED` — `ERR_DRAWING_NOT_COORDINATED` (409), on submittal creation and resubmittal.
+27. Every shop drawing of the project is `ISSUED` before an acceptance test may be opened — `ERR_DRAWING_NOT_ISSUED` (409).
+28. The project has a governing hydraulic calculation, so acceptance thresholds are defined — `ERR_NO_GOVERNING_CALCULATION` (409).
+29. An in-rack auxiliary system's referenced hazard area stores a qualifying commodity — `ERR_IN_RACK_HAZARD_MISMATCH` (422).
+30. The referenced evaluation is still evaluated and its margin verdict is not adequate — `ERR_PUMP_NOT_REQUIRED` (409).
+31. The referenced evaluation's `pump_sized` is false — `ERR_PUMP_ALREADY_SIZED` (409).
+32. A room-design calculation's hazard area satisfies the room-design admissibility conditions — `ERR_ROOM_DESIGN_NOT_PERMITTED` (422).
+33. `iteration_index` equals the calculation's current iteration row count plus one — `ERR_ITERATION_OUT_OF_SEQUENCE` (409).
+34. `restart_chain` agrees with the calculation's state — `ERR_CHAIN_RESTART_REQUIRED` (409).
+35. The calculation referenced by an evaluation has at least one iteration — `ERR_NO_ITERATIONS_IN_CHAIN` (409).
+36. No clearance for the same `trade` already exists on the sheet — `ERR_DUPLICATE_TRADE_CLEARANCE` (409).
+37. The pump catalogue contains a rating reaching the evaluated design demand — `ERR_PUMP_CAPACITY_UNAVAILABLE` (422).
+38. The supplied window start is strictly before the window end — `ERR_WINDOW_START_NOT_BEFORE_END` (422). This check guards both witness scheduling and auxiliary system commissioning.
+39. A witness window starts at or after the logical clock — `ERR_WITNESS_WINDOW_IN_PAST` (422).
+40. The buffered witness window does not collide with the reviewer's calendar — `ERR_WITNESS_WINDOW_CONFLICT` (409).
+41. The outage window does not exceed the project's concurrent-outage capacity — `ERR_OUTAGE_CONCURRENCY_EXCEEDED` (409).
+42. The superseded submittal's `cycle_number` is below the cycle limit — `ERR_RESUBMITTAL_CYCLE_LIMIT` (409).
+43. The project's `review_fee_balance_usd` is exactly zero before the authority opens review — `ERR_REVIEW_FEE_OUTSTANDING` (402).
+44. A fee payment's `amount_usd` does not exceed the project's `review_fee_balance_usd` — `ERR_FEE_PAYMENT_EXCEEDS_BALANCE` (422).
+
+### 2.9. Path Resolution and Reference Existence
+
+The model is a flat collection space: each resource type is addressed as its own top-level collection, and parentage is carried in foreign-key fields rather than in the URL. Two exceptions exist because they are event logs rather than sub-resources — the iteration chain hanging under a hydraulic calculation, and the trade clearance list hanging under a shop drawing. For any path carrying more than one segment identifier, identifiers are resolved strictly left to right, and the first identifier that fails to resolve determines the error: a request naming a missing calculation and a missing iteration reports the calculation, not the iteration.
+
+Reverse reachability is guaranteed for every foreign key in the model. Each list endpoint accepts filters for the foreign keys of the resource it lists, so no relationship in the model is write-only: flow tests are reachable by project, hydraulic calculations by project, hazard area, author, QC reviewer, sealing engineer, reopening submittal, state and `method`, submittals by the calculation they include, and so on through the catalogue in section 4.
+
+### 2.10. The Logical Clock
+
+All time in the service comes from a logical clock, never from wall-clock time. At startup the clock reads exactly `2026-08-01T00:00:00Z`, and it must not fall back to the host's real time under any circumstance. A `FirmAdmin` may move the clock to any instant by supplying `current_utc`, and the response echoes the new value.
+
+Every time-sensitive rule reads that clock: the flow-test staleness check, the check that a witness window does not start in the past, the `submitted_at` stamp on a submittal, the `sealed_at` stamp on a sealed calculation, and the `created_at` and `updated_at` stamps on every row. A flow test is accepted as evidence while its `tested_at` is no earlier than 365 days before the current clock reading; a test older than that is refused when an evaluation tries to use it, with `ERR_FLOW_TEST_STALE`.
+
+### 2.11. The Project Demand Ledger
+
+Each project maintains a derived demand ledger that is recomputed after any write that changes a hydraulic calculation's state or demand snapshot, or an auxiliary system's status. The ledger has three steps and no client input.
+
+First, the eligible set is pinned by state: only calculations of this project in `CONVERGED`, `QC_PASSED` or `SEALED` are eligible. Calculations in `DRAFT`, `ITERATING`, `PRESSURE_DEFICIENT`, `REOPENED` or `ARCHIVED` are excluded. Second, the governing calculation is selected from the eligible set by ranking on `hazard_total_demand_gpm` from highest to lowest and breaking ties by the earlier `created_at`; the winner's `id` becomes the project's `governing_hydraulic_calculation_id` and its `hazard_total_demand_gpm` becomes the project's `governing_demand_gpm`. When the eligible set is empty, `governing_hydraulic_calculation_id` is null and `governing_demand_gpm` is 0.0. Third, `auxiliary_demand_gpm` is the sum of `demand_gpm` over every auxiliary system of the project whose `status` is anything other than `WITHDRAWN` — which deliberately includes systems in `DECOMMISSIONED_PENDING_RETEST`, because a system awaiting retest is still part of the design demand — rounded to 1 decimal place. Finally `total_system_demand_gpm` is `governing_demand_gpm` plus `auxiliary_demand_gpm`, rounded to 1 decimal place.
+
+The apparent circularity between the ledger, the supply evaluation and convergence is resolved by a pinned evaluation order. A supply evaluation reads the referenced calculation's `hazard_total_demand_gpm` and the project's `auxiliary_demand_gpm` **directly**, and never reads `governing_demand_gpm` or `total_system_demand_gpm` — at that moment the referenced calculation is still iterating and therefore not eligible. Convergence then reads the evaluation's available pressure, and only once a calculation reaches `CONVERGED` is the ledger recomputed to include it. The order ledger, then evaluation, then convergence, then ledger is acyclic and every derived figure is well defined.
+
+### 2.12. Terminal States and Undeclared Transitions
+
+Each lifecycle in section 3 has terminal states, and a request that tries to advance a row already sitting in a terminal state of the dimension it addresses is refused with `ERR_TERMINAL_STATE_LOCKED`. The terminal states are: `ARCHIVED` for a hydraulic calculation; `APPROVED` or `SUPERSEDED` for a submittal; `RESOLVED` or `WITHDRAWN` for a review comment; `WITHDRAWN` for an auxiliary system; `LOCKED` for a trade clearance; `ISSUED` for a shop drawing; `ACCEPTED` or `SUPERSEDED` for a fire pump; `SUPERSEDED` for a water supply evaluation; `WITNESSED_PASS` on an acceptance test's witness dimension and `AS_BUILT_ACCEPTED` on its documentation dimension; and `CLOSED_OUT` for a project.
+
+A request whose target is not terminal but whose current state has no declared transition for the requested action is refused with `ERR_INVALID_STATE_TRANSITION`. The distinction matters for tests: a locked row and an out-of-sequence row are different failures with different error identifiers, and the terminal check is evaluated before the transition check.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up the Directory and the Project Record
+
+Before any design work exists, the firm's administrator populates two directories. A design professional is registered with a `full_name`, the `license_state` in which the professional engineer registration is held — exactly two uppercase letters of the USPS state code — and the `license_number` carried on the seal. Two further attributes may be supplied and otherwise take defaults: `license_status`, one of `ACTIVE`, `EXPIRED` or `SUSPENDED`, defaulting to `ACTIVE`; and `discipline`, one of `FIRE_PROTECTION`, `MECHANICAL` or `ELECTRICAL`, defaulting to `FIRE_PROTECTION`. Those two licence attributes are not decoration — they are re-read at seal time, and a lapsed or out-of-state licence is what stops a seal being granted.
+
+An authority plan examiner is registered with a `full_name` and the `jurisdiction_code` of the office they review for, such as a code of the form `TX-AUS`, plus an optional `discipline` drawn from `FIRE`, `BUILDING` or `ELECTRICAL` and defaulting to `FIRE`. An examiner's witness calendar is not a separate record: it is exactly the set of acceptance tests naming that examiner, which is what makes the calendar collision rule in section 3.9 computable.
+
+Opening a project fixes the whole cast and the whole code context in one write. The administrator supplies a `project_number` for the firm's job, the `building_name` of the protected building, the `jurisdiction_code` whose fire code governs, the `jurisdiction_state` — again exactly two uppercase letters — whose engineering registration will be required to seal the package, the `occupancy_type` classification drawn from `STORAGE`, `MERCANTILE`, `INDUSTRIAL`, `ASSEMBLY` and `HEALTHCARE`, and the `building_height_ft` of the highest occupied floor above grade, which must be greater than zero and which later decides the standpipe demand cap. An optional `underground_lead_in_loss_psi`, which must not be negative and defaults to 0.0, records the fixed friction allowance for the underground lead-in between the city main and the base of riser; it is added to every required-pressure figure the supply must satisfy. Two identifiers complete the record: `lead_engineer_id`, naming the only engineer permitted to author, seal and revise design objects on this project, and `ahj_reviewer_id`, naming the only examiner permitted to review, comment on and witness it.
+
+A newly opened project starts at `status` `DESIGN` with `design_posture` `OPEN`. Its ledger starts empty: `governing_hydraulic_calculation_id` is null and `governing_demand_gpm`, `auxiliary_demand_gpm` and `total_system_demand_gpm` are all 0.0. Its counters start at zero — `sealed_calculation_count`, `open_major_comment_count` and `submittal_cycle_count` — its `review_fee_balance_usd` starts at 0.00, and `pump_required_flag`, the derived marker that this design cannot be supplied without a fire pump, starts false. Each of those figures is maintained by the server; the writes that move them are named with the workflows that cause them.
+
+Review fees accrue against the project and are paid down separately. A payment supplies `amount_usd`, and the project's `review_fee_balance_usd` becomes the current balance less that amount, rounded to 2 decimal places. Overpayment is refused rather than clamped: when `amount_usd` exceeds the current `review_fee_balance_usd` the payment is rejected with `ERR_FEE_PAYMENT_EXCEEDS_BALANCE` and the balance is untouched. A successful payment returns the updated project and advances the project's `version`, which is exactly why a client holding an old project version cannot then lodge a package — see section 2.7.
+
+### 3.2. Hazard Areas: Classification and Commodity Escalation
+
+A hazard area is the unit of protection the design reasons about. The engineer declares one against a project by supplying the `project_id`, a designer `label` such as "Rack Zone A", the occupancy `hazard_class` the designer believes applies — one of `LIGHT`, `ORDINARY_1`, `ORDINARY_2`, `EXTRA_1` or `EXTRA_2` — the stored `commodity_class`, one of `CLASS_I`, `CLASS_II`, `CLASS_III`, `CLASS_IV` or `GROUP_A_PLASTIC`, the `storage_height_ft` of the top of storage above the floor, which must not be negative, the `ceiling_height_ft` of the sprinkler deflector plane, which must be greater than zero, the gross `area_sqft` of the area, which must be greater than zero, and the `sprinkler_system_type`, one of `WET`, `DRY` or `PREACTION`. Four further inputs are optional: `ceiling_slope_pct`, the ceiling slope as a percentage, which must not be negative and defaults to 0.0; `room_area_sqft`, the floor area of the enclosing room, which must be greater than zero when supplied and is otherwise null; `enclosure_rating_hours`, the fire resistance rating of the room enclosure in hours, which must not be negative when supplied and is otherwise null; and `room_has_unprotected_opening`, a flag defaulting to false. The last three matter only to the room-design method described in section 3.3.
+
+Declaring the area immediately derives its classification, in three ordered steps, and the outputs are `effective_hazard_class`, `design_density`, `design_area_sqft` and `hose_allowance_gpm`. The classification also initialises `reclassification_count` to 0.
+
+**Step one, commodity escalation.** The declared hazard classes form an ascending severity order: `LIGHT`, then `ORDINARY_1`, then `ORDINARY_2`, then `EXTRA_1`, then `EXTRA_2`. Stored plastics are tested first: when `commodity_class` is `GROUP_A_PLASTIC` and `storage_height_ft` is strictly greater than 12 feet, the effective class is one position higher in that order than the declared `hazard_class`. Otherwise, when `commodity_class` is `CLASS_IV` and `storage_height_ft` is strictly greater than 15 feet, the effective class is likewise one position higher. In every other case the effective class equals the declared class. Escalation never advances by more than a single position, and it can never move past the top of the order — a declared `EXTRA_2` stays `EXTRA_2`. Each effective class carries a base pair of figures: `LIGHT` starts at a density of 0.100 gallons per minute per square foot over 1500 square feet; `ORDINARY_1` at 0.150 over 1500; `ORDINARY_2` at 0.200 over 1500; `EXTRA_1` at 0.300 over 2500; and `EXTRA_2` at 0.400 over 2500.
+
+**Step two, design area adjustments.** The base area is then adjusted multiplicatively, in exactly this order. When `sprinkler_system_type` is `DRY` or `PREACTION` the area is multiplied by 1.30, because a dry or preaction system's water delivery delay widens the expected area of operation. Then, when `ceiling_slope_pct` is strictly greater than 16.7 percent — a slope steeper than two units of rise in twelve of run — the area is multiplied by 1.30 again. A dry system under a steeply sloped ceiling therefore carries both multipliers, applied one after the other.
+
+**Step three, the high-ceiling density bump.** When `ceiling_height_ft` is strictly greater than 30 feet, the density is increased in whole steps: the number of steps is the excess height above 30 feet divided by 5 feet and rounded down to a whole number, each step adds 0.02 gallons per minute per square foot, and the total addition is capped at 0.06 — so a ceiling at 45 feet earns three steps and the full 0.06, and a ceiling at 60 feet earns the same 0.06 and no more.
+
+The final figures are then fixed: `design_density` is the adjusted density rounded to 3 decimal places; `design_area_sqft` is the adjusted area rounded to a whole number of square feet, but never larger than the declared gross `area_sqft`, which caps it; and `hose_allowance_gpm` is the inside and outside hose stream allowance implied by the effective class — 100.0 gallons per minute for `LIGHT`, 250.0 for both `ORDINARY_1` and `ORDINARY_2`, and 500.0 for both `EXTRA_1` and `EXTRA_2`, carried to 1 decimal place.
+
+**Reclassification and its cascade.** A tenant change forces the engineer to restate the area. Reclassifying re-supplies `hazard_class`, `commodity_class`, `storage_height_ft`, `ceiling_height_ft` and `area_sqft`, optionally with `ceiling_slope_pct`, `room_area_sqft`, `enclosure_rating_hours` and `room_has_unprotected_opening`; the `label` is not restated. The three classification steps run again on the new inputs, `reclassification_count` increases by 1, and the area's `version` advances.
+
+Reclassification is the head of the design's deepest invalidation chain, because every calculation that was settled against the old density is now wrong. Every hydraulic calculation whose `hazard_area_id` names this area and whose state is `CONVERGED`, `QC_PASSED` or `SEALED` moves to `REOPENED` with `stale_reason` set to `HAZARD_RECLASSIFIED`, and its `design_flow_gpm`, `hose_allowance_gpm`, `room_design_penalty_gpm` and `hazard_total_demand_gpm` are re-derived from the new density and area. The three source states differ in what else they clear, and each is specified: a `CONVERGED → REOPENED` calculation clears nothing further; a `QC_PASSED → REOPENED` calculation also has `qc_reviewed_by_engineer_id` set back to null, because the QC pass no longer applies to the numbers that were reviewed; and a `SEALED → REOPENED` calculation has both `sealed_by_engineer_id` and `sealed_at` set back to null and decrements the project's `sealed_calculation_count` by 1.
+
+The chain continues past the calculation. Every water supply evaluation whose `governing_hydraulic_calculation_id` names one of the reopened calculations and whose state is `EVALUATED` moves to `SUPERSEDED`, and every fire pump whose `water_supply_evaluation_id` names one of those superseded evaluations and whose state is `SIZED` moves to `SUPERSEDED` in turn. The project demand ledger is then recomputed without the reopened calculations, which — since a `REOPENED` calculation is not eligible — will change or clear `governing_hydraulic_calculation_id`, `governing_demand_gpm` and `total_system_demand_gpm`. Every row touched along the chain has its own `version` advanced.
+
+### 3.3. Demonstrating the Demand: Calculations and the Pipe-Sizing Chain
+
+A hydraulic calculation is the document that proves one hazard area can be supplied. The engineer opens one by naming the `project_id`, the `hazard_area_id` of the most demanding area it demonstrates, the `method` by which the demand is computed — either `AREA_DENSITY` or `ROOM_DESIGN` — and the `k_factor`, the discharge coefficient of the end sprinkler head, which must be greater than zero. The server records `authored_by_engineer_id` from the acting engineer's identifier; the client never supplies it. A new calculation opens in state `DRAFT` with `chain_start_index` 1, `iteration_count` 0, `end_head_psi` 0.0 and `required_psi_at_base_of_riser` 0.0, and with `deficiency_psi`, `stale_reason`, `qc_reviewed_by_engineer_id`, `sealed_by_engineer_id`, `sealed_at` and `reopened_by_submittal_id` all null.
+
+Creation immediately snapshots the demand from the hazard area's derived classification, and the snapshot is what the rest of the system ranks and evaluates. Under either method, `design_flow_gpm` is the hazard area's `design_density` multiplied by a basis area, multiplied by an overdischarge factor of 1.10 to allow for the hose and end-head overdischarge the trade assumes, plus the room-design opening penalty, with the result rounded to 1 decimal place. `hose_allowance_gpm` is copied verbatim from the hazard area's own `hose_allowance_gpm`. `hazard_total_demand_gpm` is `design_flow_gpm` plus `hose_allowance_gpm`, rounded to 1 decimal place; this is the single figure the project ledger ranks calculations by.
+
+The two methods differ only in the basis area and the penalty, and both branches are fully specified. Under `AREA_DENSITY`, the basis area is the hazard area's `design_area_sqft` and `room_design_penalty_gpm` is 0.0; neither the enclosure requirement nor the opening penalty applies. Under `ROOM_DESIGN`, the basis area is the hazard area's `room_area_sqft`, and the method is admissible only while three conditions all hold: `room_area_sqft` is present, `room_area_sqft` is less than or equal to `design_area_sqft`, and `enclosure_rating_hours` is at least 1.0 hour. A request that asks for `ROOM_DESIGN` where any of the three fails is rejected with `ERR_ROOM_DESIGN_NOT_PERMITTED`. When the method is admissible and `room_has_unprotected_opening` is true, `room_design_penalty_gpm` is the hazard area's `design_density` multiplied by an opening penalty factor of 0.25 and by `room_area_sqft`, rounded to 1 decimal place; when the room has no unprotected opening the penalty is 0.0.
+
+**Appending an iteration.** The pressure demonstration is built one pipe segment at a time, and the log is append-only. Each iteration carries an `iteration_index` giving its position in the chain, a `pipe_size_in` nominal size drawn from `'1'`, `'1.25'`, `'1.5'`, `'2'`, `'2.5'`, `'3'`, `'4'`, `'6'` and `'8'`, the centre-line `length_ft` of the segment, which must be greater than zero, the `fitting_equivalent_ft` equivalent length of its fittings and valves, which must not be negative, the `flow_gpm` the segment carries, which must be greater than zero, and the `elevation_change_ft` rise from the previous node to this node, where a negative value is a drop. Two optional flags shape the chain rather than the arithmetic: `is_supply_connection`, defaulting to false, marks the segment that terminates at the base of riser and closes the chain against the water supply; `restart_chain`, also defaulting to false, marks an iteration that opens a revised chain. `iteration_index` must equal the number of iteration rows the calculation already has, plus one — including rows that have been superseded out of the active chain — and any other value is rejected with `ERR_ITERATION_OUT_OF_SEQUENCE`.
+
+Each nominal size maps to a Schedule 40 internal diameter in inches that enters the friction formula: `'1'` is 1.049, `'1.25'` is 1.380, `'1.5'` is 1.610, `'2'` is 2.067, `'2.5'` is 2.469, `'3'` is 3.068, `'4'` is 4.026, `'6'` is 6.065, and `'8'` is 7.981.
+
+Three per-segment figures are derived. `friction_loss_psi` is the Hazen-Williams loss over the segment's total equivalent length: take 4.52, multiply it by the segment's `flow_gpm` raised to the power 1.85, divide that by the product of the Hazen-Williams roughness coefficient of 120 raised to the power 1.85 and the internal diameter raised to the power 4.87, then multiply by the sum of `length_ft` and `fitting_equivalent_ft`, and round the result to 2 decimal places. `elevation_loss_psi` is `elevation_change_ft` multiplied by the elevation head constant of 0.433 pounds per square inch per foot, rounded to 2 decimal places — so a drop contributes a negative loss and recovers pressure. `velocity_fps` is 0.4085 multiplied by the segment's `flow_gpm`, divided by the square of the internal diameter, rounded to 2 decimal places. A segment whose derived `velocity_fps` exceeds the velocity limit of 32.00 feet per second is rejected with `ERR_VELOCITY_LIMIT_EXCEEDED`, and the boundary is inclusive at the limit: exactly 32.00 is accepted, and 32.01 is refused.
+
+**Accumulating the chain.** The active chain of a calculation is the set of its iteration rows whose `iteration_index` is greater than or equal to the calculation's `chain_start_index`, taken in ascending `iteration_index` order; every such row carries `in_active_chain` true, and rows below `chain_start_index` carry `in_active_chain` false, stay on the record forever and never enter the sum. `end_head_psi` is the pressure required at the end sprinkler head of the active chain: divide the `flow_gpm` of the first active iteration by the calculation's `k_factor`, square the quotient, and round to 2 decimal places. The running pressure starts at `end_head_psi`; then, walking the active chain in ascending index order, each segment's already-rounded `friction_loss_psi` and `elevation_loss_psi` are added to the running pressure and the running total is rounded again to 2 decimal places, and that value is stored on the segment as `cumulative_psi_after`. The calculation's `iteration_count` is the number of active rows, and its `required_psi_at_base_of_riser` is the `cumulative_psi_after` of the newest active iteration.
+
+**What appending does to the state.** The first iteration of a fresh calculation moves it `DRAFT → ITERATING` and sets `iteration_count` to 1; it must carry `iteration_index` 1 and must not carry `restart_chain` true. Each further iteration with `is_supply_connection` false is an `ITERATING → ITERATING` step that raises `iteration_count` by one and re-derives `required_psi_at_base_of_riser` from the newest segment. The `restart_chain` flag must agree with the state the calculation is in: it is **required** to be true when the calculation is in `PRESSURE_DEFICIENT` or `REOPENED`, and it is **forbidden** — false or absent — when the calculation is in `DRAFT` or `ITERATING`. A mismatch either way is rejected with `ERR_CHAIN_RESTART_REQUIRED`.
+
+An iteration with `restart_chain` true raises the calculation's `chain_start_index` to that iteration's own `iteration_index`, resets `iteration_count` to 1, marks every earlier iteration `in_active_chain` false without deleting it, and re-derives `end_head_psi` from this iteration's `flow_gpm`. From `PRESSURE_DEFICIENT` that restart returns the calculation to `ITERATING`; from `REOPENED` it likewise returns the calculation to `ITERATING` and additionally clears `stale_reason` back to null, which is how a reopened calculation re-enters design.
+
+**Closing the chain against the supply.** An iteration with `is_supply_connection` true is the moment of truth, and it splits into two divergent branches that write different fields on different entities. Both branches first require that the closing segment's `flow_gpm` is exactly equal to the calculation's `design_flow_gpm`; a mismatch is rejected with `ERR_SUPPLY_FLOW_MISMATCH`. Both branches also require a water supply evaluation of the same project in state `EVALUATED`; when the project has no such evaluation, no convergence branch is declared for the calculation's state and the append is refused with `ERR_INVALID_STATE_TRANSITION`. The comparison is then made against that evaluation: take the closing segment's `cumulative_psi_after`, add the project's `underground_lead_in_loss_psi`, and round to 2 decimal places.
+
+When that figure is less than or equal to the evaluation's `available_psi_at_demand`, the calculation moves `ITERATING → CONVERGED`, `deficiency_psi` is set to null, and the project demand ledger is recomputed — the calculation is now eligible, so it may become the project's governing calculation and move `governing_hydraulic_calculation_id`, `governing_demand_gpm` and `total_system_demand_gpm`. When that figure is strictly greater than the evaluation's `available_psi_at_demand`, the calculation moves `ITERATING → PRESSURE_DEFICIENT` instead, `deficiency_psi` records the shortfall as that same required figure minus the evaluation's `available_psi_at_demand` rounded to 2 decimal places, the project's `pump_required_flag` is set true, and the ledger is recomputed *without* this calculation, because a `PRESSURE_DEFICIENT` calculation is not eligible. Every append advances the calculation's `version`.
+
+The iteration log of a calculation can be read back in full, including superseded rows, and filtered by `in_active_chain` so the reader can see either the chain that counts or the whole history of chains. A calculation itself can be found by `project_id`, `hazard_area_id`, `authored_by_engineer_id`, `qc_reviewed_by_engineer_id`, `sealed_by_engineer_id`, `reopened_by_submittal_id`, `state` or `method`, and every submittal package that included it can be listed from it.
+
+### 3.4. Water Supply Evidence, Safety Margin and Pump Selection
+
+Field evidence enters the system as a hydrant flow test, recorded by either the engineer of record or the installing contractor. A test names the `project_id` whose supply was tested and the `hydrant_tag` of the flowed hydrant, and carries three readings: `static_psi`, the pressure observed with no flow, which must be greater than zero; `residual_psi`, the pressure observed while flowing, which must be greater than zero and strictly below `static_psi`; and `flow_gpm`, the measured test flow, which must be greater than zero. `tested_at` records the instant the test was witnessed in the field and may be backdated deliberately, which is how the staleness rule of section 2.10 is exercised. A flow test is immutable once recorded, and every test taken for a project can be listed from the project.
+
+An evaluation projects one test's curve onto the current design demand. The engineer supplies the `project_id`, the `flow_test_id` whose curve is to be projected, the `governing_hydraulic_calculation_id` of the calculation whose demand and required pressure the evaluation is measured against, and the `evaluation_basis`, either `RAW_TEST` or `SEASONAL_ADJUSTED`. The referenced calculation may be in any state but must have at least one iteration in its active chain, since otherwise its required pressure is undefined; a calculation with `iteration_count` 0 is refused with `ERR_NO_ITERATIONS_IN_CHAIN`. The referenced flow test must not be stale, as described in section 2.10.
+
+The basis figures are written first, and this is where the two variants differ. Under `RAW_TEST`, `basis_static_psi`, `basis_residual_psi` and `basis_test_flow_gpm` are the flow test's `static_psi`, `residual_psi` and `flow_gpm` exactly as witnessed. Under `SEASONAL_ADJUSTED`, a seasonal allowance of 10.0 pounds per square inch is subtracted from both pressures — `basis_static_psi` is `static_psi` less 10.0 rounded to 2 decimal places and `basis_residual_psi` is `residual_psi` less 10.0 rounded to 2 decimal places — and the test flow is derated to 90 percent of the witnessed value, so `basis_test_flow_gpm` is `flow_gpm` multiplied by 0.90 and rounded to 1 decimal place. The same field test therefore yields a lower available pressure under the seasonal basis, and can flip the verdict.
+
+The remaining figures follow from the basis. `design_demand_gpm` is the referenced calculation's `hazard_total_demand_gpm` plus the project's `auxiliary_demand_gpm`, rounded to 1 decimal place. `required_psi_at_demand` is the referenced calculation's `required_psi_at_base_of_riser` plus the project's `underground_lead_in_loss_psi`, rounded to 2 decimal places. `available_psi_at_demand` is the pressure the supply can still deliver once the design demand is flowing: start from `basis_static_psi`, and subtract from it the difference between `basis_static_psi` and `basis_residual_psi` multiplied by the ratio of `design_demand_gpm` to `basis_test_flow_gpm` raised to the power 1.85, rounding the result to 2 decimal places. `safety_margin_psi` is `available_psi_at_demand` less `required_psi_at_demand`, rounded to 2 decimal places, and `safety_margin_pct` expresses that margin as a percentage of `available_psi_at_demand`, rounded to 1 decimal place.
+
+`margin_verdict` is then a three-way threshold over the margin, evaluated in order: a `safety_margin_psi` of at least 10.00 pounds per square inch is `ADEQUATE`; otherwise a margin of at least 0.00 is `MARGINAL`; otherwise, with the required pressure above what the supply can deliver, the verdict is `INADEQUATE_PUMP_REQUIRED`. The evaluation also pins `pinned_calculation_iteration_count` to the referenced calculation's `iteration_count` at that instant — one third of the reconciliation triple re-checked at seal time — starts `pump_sized` false, and opens in `state` `EVALUATED`. The project's `pump_required_flag` is set to true exactly when the new verdict is anything other than `ADEQUATE`, and the project's `version` advances.
+
+Only one evaluation of a project is current at a time. Creating a new evaluation moves any existing evaluation of the same project in state `EVALUATED` to `SUPERSEDED` before the new row is inserted, and every fire pump whose `water_supply_evaluation_id` names a just-superseded evaluation and whose `state` is `SIZED` moves to `SUPERSEDED` with it — a pump selected against a curve nobody relies on any more is not a pump anyone may accept. Evaluations can be listed by `project_id`, `flow_test_id`, `governing_hydraulic_calculation_id`, `state` or `margin_verdict`.
+
+**Sizing the pump.** When the supply cannot carry the demand on its own, the engineer sizes a pump against the deficient evaluation, naming the `project_id`, the `water_supply_evaluation_id` whose deficiency the pump makes up, an optional `model_tag` for the pump schedule that defaults to `TBD`, and the version pin described in section 2.7. The referenced evaluation must still be in `EVALUATED` and must carry a `margin_verdict` other than `ADEQUATE` — an adequate supply needs no pump, and asking for one is refused with `ERR_PUMP_NOT_REQUIRED` — and its `pump_sized` must still be false, since a second selection against the same evaluation is refused with `ERR_PUMP_ALREADY_SIZED`.
+
+Selection walks a fixed catalogue of ratings: 500, 750, 1000, 1250, 1500, 2000 and 2500 gallons per minute. `rated_flow_gpm` is the smallest catalogue rating that is greater than or equal to the evaluation's `design_demand_gpm`; when no rating reaches the demand the request is refused with `ERR_PUMP_CAPACITY_UNAVAILABLE`. Every pressure figure below is computed from the *evaluation's* basis figures, so a seasonally adjusted evaluation propagates its derate through the whole pump worksheet.
+
+`suction_psi_at_rated` is the supply pressure available at the catalogue rated flow — not at the design demand — obtained by subtracting from `basis_static_psi` the difference between `basis_static_psi` and `basis_residual_psi` multiplied by the ratio of `rated_flow_gpm` to `basis_test_flow_gpm` raised to the power 1.85, rounded to 2 decimal places. `required_discharge_psi` is the evaluation's `required_psi_at_demand` plus a pump safety allowance of 10.0 pounds per square inch, rounded to 2 decimal places. `rated_pressure_psi` is the pressure the pump must add: take `required_discharge_psi` less `suction_psi_at_rated`, divide by the catalogue step of 5 pounds per square inch, round that quotient **up** to a whole number of steps, multiply back by 5, and then floor the result at a minimum rated pressure of 40 pounds per square inch — so the stored value is always an exact multiple of 5 and never below 40.
+
+Three further figures describe the pump's curve. `churn_discharge_psi` is `rated_pressure_psi` multiplied by a churn factor of 1.40, plus `basis_static_psi`, rounded to 1 decimal place. `flow_150_pct_gpm` is `rated_flow_gpm` multiplied by 1.5, rounded to 1 decimal place, and is the overload test point. `suction_psi_at_150_pct` is the supply pressure available at that overload flow, computed by the same projection: `basis_static_psi` less the difference between `basis_static_psi` and `basis_residual_psi` multiplied by the ratio of `flow_150_pct_gpm` to `basis_test_flow_gpm` raised to the power 1.85, rounded to 2 decimal places. `available_psi_at_150_pct` is `rated_pressure_psi` multiplied by an overload factor of 0.65, plus `suction_psi_at_150_pct`, rounded to 2 decimal places.
+
+`sizing_verdict` is then decided by three tests applied in exactly this order, stopping at the first that matches. If `suction_psi_at_150_pct` is below the minimum suction pressure of 20.0 pounds per square inch, the verdict is `INSUFFICIENT_SUCTION_AT_150_PCT`. Otherwise, if `churn_discharge_psi` is greater than the maximum churn pressure of 175.0 pounds per square inch, the verdict is `REQUIRES_PRESSURE_RELIEF_VALVE`. Otherwise, if `available_psi_at_150_pct` is below the evaluation's `required_psi_at_demand`, the verdict is `INSUFFICIENT_AT_150_PCT`. Otherwise the verdict is `ACCEPTABLE`. Note that the order is not severity order: a pump that both starves at the overload point and would need a relief valve reports the suction failure, because that test runs first.
+
+A newly sized pump opens in `state` `SIZED`. The write also sets the evaluation's `pump_sized` to true and advances the evaluation's `version`, sets the project's `pump_required_flag` to true and advances the project's `version`. A pump leaves `SIZED` in only two ways: it becomes `SUPERSEDED` when its evaluation is superseded, by either of the routes described above, or it becomes `ACCEPTED` when a witnessed pump flow test passes, as described in section 3.9. Pumps can be listed by `project_id`, `water_supply_evaluation_id`, `state` or `sizing_verdict`.
+
+### 3.5. Standpipes, Cooking Hoods and Special Hazard Systems
+
+Sprinklers over the hazard area are only part of the water the supply must carry. Standpipe risers, kitchen hood systems, in-rack sprinklers and deluge systems for foam and hazardous materials each add their own demand, and each is recorded as an auxiliary system against the project. The engineer names the `project_id`, a designer `label`, and the `system_type`, one of `STANDPIPE_CLASS_I`, `STANDPIPE_CLASS_II`, `COOKING`, `IN_RACK`, `FOAM_DELUGE` or `HAZMAT_DELUGE`. An optional `agent_type` records the suppression agent — `WET_CHEMICAL`, `AFFF`, `HIGH_EXPANSION_FOAM` or `NONE`, defaulting to `NONE`.
+
+Which further fields are required depends entirely on the type, and a missing one is refused with `ERR_SYSTEM_TYPE_FIELD_REQUIRED`. Both standpipe classes require `riser_count`, the number of risers, which must be at least 1 when present. `COOKING` requires `appliance_count`, the number of protected cooking appliances, at least 1 when present, and accepts `water_wash_enabled`, a flag defaulting to false that records whether the hood has a water-wash cycle. `IN_RACK` requires both `in_rack_head_count`, the number of in-rack sprinklers assumed operating, at least 1 when present, and a `hazard_area_id` naming the area the racks stand in; that referenced area must store a qualifying commodity, meaning its `commodity_class` is either `CLASS_IV` or `GROUP_A_PLASTIC`, and anything else is refused with `ERR_IN_RACK_HAZARD_MISMATCH`. Both deluge types require `protected_area_sqft`, the area covered by the deluge, which must be greater than zero when present. For system types that do not reference an area, `hazard_area_id` stays null.
+
+The demand each type contributes to the ledger is derived on creation as `demand_gpm`, rounded to 1 decimal place, and the branches are as follows. A Class I standpipe starts at 500.0 gallons per minute for the first riser and adds 250.0 for each additional riser, but is then capped: the cap is 1000.0 gallons per minute for a building whose `building_height_ft` is at most 150 feet, and 1250.0 for a taller, high-rise building. A Class II standpipe starts at 100.0 for the first riser, adds 75.0 for each additional riser, and is capped at 400.0. A cooking system takes a fixed 40.0 for the hood, adds 15.0 per protected appliance, and adds a further 60.0 when `water_wash_enabled` is true. An in-rack system takes 30.0 per assumed operating head, then is raised to a floor of 150.0 if it falls below that, and capped at 480.0. A foam deluge system takes a density of 0.16 gallons per minute per square foot over `protected_area_sqft`, rounded to 1 decimal place, and is raised to a floor of 250.0 if it falls below it. A hazardous-materials deluge system works the same way at a density of 0.30 gallons per minute per square foot with a floor of 300.0.
+
+Creation also derives `interlock_required`, which is true for exactly two types — `COOKING` and `HAZMAT_DELUGE` — and false for the rest. A new system opens with `status` `PROPOSED`, `interlock_verified` false, and both `outage_start_at` and `outage_end_at` null; the project ledger is recomputed so `auxiliary_demand_gpm` and `total_system_demand_gpm` rise by the new `demand_gpm`, and the project's `version` advances. Systems can be listed by `project_id`, `hazard_area_id`, `system_type` or `status`.
+
+**Commissioning and the outage window.** The installing contractor commissions a system by booking the water-supply outage the work requires: `outage_start_at` and `outage_end_at` bound the window and may be accompanied by `interlock_verified`. The window start must be strictly before the window end, and a window that is empty or inverted is refused with `ERR_WINDOW_START_NOT_BEFORE_END`. A system whose `interlock_required` is true may not be commissioned unless the request presents `interlock_verified` true; otherwise the commissioning is refused with `ERR_INTERLOCK_NOT_VERIFIED`.
+
+The outage window is a **half-open** interval: it includes its start instant and excludes its end instant, so a window that ends exactly when another begins does not overlap it, and no travel buffer is applied. The project tolerates at most one other outage in flight at any instant: the request is refused with `ERR_OUTAGE_CONCURRENCY_EXCEEDED` when some instant inside the candidate half-open window falls inside the half-open outage windows of two or more *other* auxiliary systems of the same project whose `status` is `COMMISSIONED`. A successful commissioning records `outage_start_at`, `outage_end_at` and `interlock_verified`, and moves the system either `PROPOSED → COMMISSIONED` or `DECOMMISSIONED_PENDING_RETEST → COMMISSIONED`, advancing the system's `version`.
+
+**Withdrawal.** The engineer may withdraw a system that is still `PROPOSED` or that sits in `DECOMMISSIONED_PENDING_RETEST`, optionally recording a `withdraw_note`. Withdrawal moves `status` to `WITHDRAWN`, clears `outage_start_at` and `outage_end_at` back to null, and recomputes the project ledger without the withdrawn system, so `auxiliary_demand_gpm` and `total_system_demand_gpm` fall by exactly that system's `demand_gpm`. Both the system's `version` and the project's `version` advance. Withdrawal is the compensating half of the demand round trip: adding a system and then withdrawing it must leave the project's ledger figures exactly where they started. Note the contrast with `DECOMMISSIONED_PENDING_RETEST`, which is a suspension rather than a removal — a system awaiting retest keeps its `demand_gpm` and stays in the ledger, because the design still contains it.
+
+### 3.6. Independent Quality Control and the Engineer's Seal
+
+A converged calculation is not yet a sealed calculation. A second engineer, acting as `QcReviewer`, dispositions it by supplying a `disposition` of either `PASS` or `REJECT` and an optional `review_note`. The reviewer's identifier must differ from the calculation's `authored_by_engineer_id`; an author reviewing their own work is refused with `ERR_SEGREGATION_OF_DUTIES`. Either disposition records `qc_reviewed_by_engineer_id` from the acting reviewer.
+
+A `PASS` moves the calculation `CONVERGED → QC_PASSED` and changes nothing else about the numbers. A `REJECT` moves it `CONVERGED → ITERATING`, sets `stale_reason` to `QC_REJECTED`, and retains `qc_reviewed_by_engineer_id` for the audit trail rather than clearing it. Because an `ITERATING` calculation is not eligible for the demand ledger, a rejection also causes the ledger to be recomputed without it, which can hand the governing role to a different calculation or empty the ledger entirely. Both dispositions advance the calculation's `version`.
+
+Sealing is the act that makes the calculation a legal document, and it takes no request body at all — everything the seal asserts is re-checked server-side at the moment it is applied. The calculation must be in `QC_PASSED`, and the acting engineer must be both the calculation's `authored_by_engineer_id` and the project's `lead_engineer_id`; since only the lead engineer may author on a project, an actor who is not that engineer is refused with `ERR_NOT_PROJECT_ENGINEER`. Four substantive checks then run, in this order:
+
+First, the sealing engineer's `license_status` must be `ACTIVE`; an `EXPIRED` or `SUSPENDED` licence is refused with `ERR_SEAL_LICENSE_INACTIVE`. Second, the sealing engineer's `license_state` must equal the project's `jurisdiction_state`; a licence registered elsewhere is refused with `ERR_SEAL_LICENSE_JURISDICTION_MISMATCH`. Third, the safety margin must be resolved: either the project's newest `EVALUATED` water supply evaluation carries a `margin_verdict` other than `INADEQUATE_PUMP_REQUIRED`, or a fire pump in state `SIZED` with `sizing_verdict` `ACCEPTABLE` references that evaluation. Neither condition holding is refused with `ERR_SAFETY_MARGIN_UNRESOLVED` — a pump whose verdict is `REQUIRES_PRESSURE_RELIEF_VALVE`, `INSUFFICIENT_SUCTION_AT_150_PCT` or `INSUFFICIENT_AT_150_PCT` does not resolve anything.
+
+Fourth, the newest `EVALUATED` evaluation must still reconcile with the calculation on all three of its pinned figures, and all three must agree: the evaluation's `pinned_calculation_iteration_count` must equal the calculation's current `iteration_count`; the evaluation's `required_psi_at_demand` must equal the calculation's current `required_psi_at_base_of_riser` plus the project's `underground_lead_in_loss_psi`, rounded to 2 decimal places; and the evaluation's `design_demand_gpm` must equal the project's current `total_system_demand_gpm`. Any one of the three disagreeing is refused with `ERR_EVALUATION_REFERENCE_STALE`. This is the check that catches the case the version pins cannot: an auxiliary system added after the evaluation was taken raises the project's demand without touching the calculation, and the seal must not be granted against evidence that no longer describes the design.
+
+When all four pass, the calculation moves `QC_PASSED → SEALED`, `sealed_by_engineer_id` records the acting engineer, `sealed_at` records the current logical clock reading, the project's `sealed_calculation_count` rises by 1, the demand ledger is recomputed, and both the calculation's and the project's `version` advance.
+
+### 3.7. Coordinating the Sheet with the Structural, Mechanical and Lighting Trades
+
+Once a calculation is sealed, the installing contractor draws it. A shop drawing sheet names the `project_id`, the `hydraulic_calculation_id` of the sealed calculation it details, and its own `sheet_number` such as "FP-101". The referenced calculation must be in state `SEALED`; drawing an unsealed calculation is refused with `ERR_CALCULATION_NOT_SEALED`. Every new sheet opens in state `DRAFT` with `required_trade_count` fixed at 3 — structural, mechanical and lighting must all clear before the sheet can be packaged — and `cleared_trade_count` 0. Sheets can be listed by `project_id`, `hydraulic_calculation_id` or `state`.
+
+A coordination item is opened per trade, and each item carries the `shop_drawing_id` of the sheet it belongs to. The contractor supplies the `trade`, one of `STRUCTURAL`, `MECHANICAL` or `LIGHTING`, and the elevation band the sprinkler main reserves: `elevation_low_in`, the lowest elevation above finished floor claimed, and `elevation_high_in`, the highest, which must be strictly greater than `elevation_low_in`. Only one item per trade per sheet is permitted, and a second attempt for the same `trade` is refused with `ERR_DUPLICATE_TRADE_CLEARANCE`. A new item opens in state `PENDING` with `conflict_severity` and `note` both null, and opening the first item on a sheet moves the sheet `DRAFT → IN_COORDINATION` and advances the sheet's `version`.
+
+Dispositioning an item is the engineer of record's job, and it requires the acting engineer to be the project's `lead_engineer_id`. The disposition supplies an `outcome` of either `CLEARED` or `CONFLICT_OPEN`, optionally with a `conflict_severity` and a free-text `note` recorded against the newest disposition. An outcome of `CLEARED` is admissible while the sheet is in `IN_COORDINATION`, `CONFLICTED` or `STALE`, and moves the item to `CLEARED` from `PENDING`, from `CONFLICT_OPEN` or from `STALE`, clearing `conflict_severity` back to null and recounting the sheet's `cleared_trade_count` over its cleared items. An outcome of `CONFLICT_OPEN` requires a `conflict_severity` to be supplied — either `BLOCKING` or `ADVISORY` — and moves the item `PENDING → CONFLICT_OPEN`, storing both the severity and the note.
+
+The sheet's own state follows from the counters and the severities, and every branch is specified. A clearance that raises `cleared_trade_count` to `required_trade_count` moves the sheet to `COORDINATED`, whether it was in `IN_COORDINATION`, in `CONFLICTED` — provided no item of the sheet remains in `CONFLICT_OPEN` — or in `STALE`. A clearance that leaves `cleared_trade_count` short of `required_trade_count` moves the sheet to `IN_COORDINATION`: from `CONFLICTED` this is permitted only once no remaining item of the sheet is in `CONFLICT_OPEN` with `conflict_severity` `BLOCKING`, and from `STALE` only once the referenced calculation is no longer in `REOPENED`. A conflict recorded with `conflict_severity` `BLOCKING` drives the sheet `IN_COORDINATION → CONFLICTED`; a conflict recorded as `ADVISORY` leaves the sheet in `IN_COORDINATION`, which is the whole point of the distinction. Each disposition advances both the item's and the sheet's `version`.
+
+Two further sheet movements are driven by events elsewhere and never by a direct request. When the calculation behind a sheet is reopened by an authority comment, a `COORDINATED` sheet becomes `STALE`, every item of that sheet in `CLEARED` becomes `STALE`, and `cleared_trade_count` resets to 0 — the coordination has to be re-walked because the geometry it was agreed against has changed. When the package containing that calculation is approved, a `COORDINATED` sheet becomes `ISSUED` and every `CLEARED` item of the sheet becomes `LOCKED`, which is terminal: an issued sheet's coordination record is frozen as the permitted document.
+
+### 3.8. Permit Review, Comments and the Resubmittal Cycle
+
+Lodging a package is the moment the design leaves the firm. The engineer of record supplies the `project_id`, the `included_calculation_ids` — a non-empty, duplicate-free list of the sealed calculations bound into the package — and the version pin of section 2.7. Every named calculation must belong to this project and be in state `SEALED`, or the lodgement is refused with `ERR_CALCULATION_NOT_SEALED`; every shop drawing whose `hydraulic_calculation_id` is one of those calculations must be in `COORDINATED` or `ISSUED`, or the lodgement is refused with `ERR_DRAWING_NOT_COORDINATED`. The project must also carry no outstanding `MAJOR` comment, which the posture gate of section 2.5 already enforces.
+
+The package is stamped on creation. `cycle_number` is the project's `submittal_cycle_count` plus one, `submitted_at` is the current logical clock reading, `state` opens at `SUBMITTED`, `open_comment_count` and `major_comment_count` open at 0, `reviewed_by_ahj_reviewer_id` opens null, and `supersedes_submittal_id` is null on a first cycle. The project's `submittal_cycle_count` is set to the new `cycle_number`, the project moves `DESIGN → PERMIT_REVIEW`, its posture is recomputed and its `version` advances.
+
+Review fees are tiered by cycle and accrue to the project. `review_fee_usd` is 0.00 for the first two cycles, 250.00 for the third cycle, and 500.00 for the fourth; the fourth is the last cycle the authority accepts, and a fifth is refused with `ERR_RESUBMITTAL_CYCLE_LIMIT`. Whatever fee the cycle carries is added to the project's `review_fee_balance_usd`, rounded to 2 decimal places, and the balance is paid down as described in section 3.1.
+
+The authority opens review only against a paid-up project: while `review_fee_balance_usd` is above 0.00 the attempt is refused with `ERR_REVIEW_FEE_OUTSTANDING`. Opening review moves the package `SUBMITTED → UNDER_REVIEW` on a first pass, or `RESPONSE_COMPLETE → UNDER_REVIEW` on any later pass, and records `reviewed_by_ahj_reviewer_id` from the acting examiner.
+
+**Raising comments.** While the package is `UNDER_REVIEW` the examiner raises comments against it. Each comment carries the `code_section` it is written against, such as "NFPA 13 23.4.4.7", a `severity` of `MAJOR`, `MINOR` or `INFORMATIONAL`, the `description` body of the comment, and optionally an `assigned_engineer_id` directing it at a particular engineer, which is null when unassigned. The server records `raised_by_ahj_reviewer_id` from the acting examiner and opens the comment in state `OPEN` with `response_note`, `close_note` and `disposition` all null. Counters then move: the package's `open_comment_count` is the number of its comments in `OPEN` or `RESPONDED`, and its `major_comment_count` is the number of those whose `severity` is `MAJOR`; the project's `open_major_comment_count` is recounted as the number of `MAJOR` comments in `OPEN` or `RESPONDED` across every package of the project. Raising a `MAJOR` comment therefore drives the project's posture straight to `GATED` — the designer may keep revising, but may not seal, lodge or open acceptance testing until the comment is disposed of. Both the package's and the project's `version` advance. Comments can be listed by `submittal_id`, `raised_by_ahj_reviewer_id`, `assigned_engineer_id`, `severity` or `state`.
+
+**Completing the pass.** Closing out a review pass has two outcomes. With `open_comment_count` equal to 0, the package moves `UNDER_REVIEW → APPROVED`, the project moves `PERMIT_REVIEW → PERMITTED`, every `COORDINATED` shop drawing over the included calculations becomes `ISSUED` and every `CLEARED` item of those sheets becomes `LOCKED`. With `open_comment_count` of 1 or more, the package moves `UNDER_REVIEW → COMMENTS_ISSUED` and returns to the designer for correction.
+
+When at least one of those outstanding comments has `severity` `MAJOR`, the same write drives a four-link invalidation. Every calculation named in `included_calculation_ids` whose state is `SEALED` moves `SEALED → REOPENED`, with `stale_reason` set to `MAJOR_COMMENT` and `reopened_by_submittal_id` set to this package. The project's `sealed_calculation_count` is decremented once per reopened calculation. Every `COORDINATED` shop drawing over those calculations becomes `STALE`, and every `CLEARED` trade item of those sheets becomes `STALE` with the sheet's `cleared_trade_count` reset to 0. The project's `open_major_comment_count` is recounted, driving the posture to `GATED`, the demand ledger is recomputed — a `REOPENED` calculation is not eligible, so the governing selection may change or empty — and both the package's and the project's `version` advance.
+
+**Answering and disposing.** The engineer of record answers a comment by supplying a `response_note`, which moves it `OPEN → RESPONDED` while the package is in `COMMENTS_ISSUED`. When no comment of the package remains in `OPEN`, the package bubbles up `COMMENTS_ISSUED → RESPONSE_COMPLETE` and is ready for the authority to reopen review. Note that answering does not reduce `open_comment_count`: a `RESPONDED` comment is still counted there, and still counted in the project's `open_major_comment_count` if it is `MAJOR`, so the posture stays `GATED` until the examiner actually disposes of it.
+
+The examiner disposes of a comment with a `disposition` and an optional `close_note`. `RESOLVED` accepts the answer and moves the comment `RESPONDED → RESOLVED`. `REJECT_RESPONSE` sends it back, moving the comment `RESPONDED → OPEN`, clearing `response_note` to null, and returning the package to `COMMENTS_ISSUED` if it had already bubbled to `RESPONSE_COMPLETE`. `WITHDRAWN` retracts the comment entirely from `OPEN`, moving it to `WITHDRAWN`. Every disposition recounts the package's `open_comment_count` and `major_comment_count`, recounts the project's `open_major_comment_count`, and recomputes the posture, which may return the project to `OPEN`.
+
+A withdrawal that clears the last outstanding comment of a package compensates the four-link invalidation in full, with no drift left behind. The package returns `COMMENTS_ISSUED → UNDER_REVIEW`. Every calculation whose `reopened_by_submittal_id` is this package moves `REOPENED → SEALED`, with its previous `sealed_by_engineer_id` and `sealed_at` restored, `stale_reason` cleared to null and `reopened_by_submittal_id` cleared to null. The project's `sealed_calculation_count` is incremented once per resealed calculation, returning it to exactly the value it held before the cascade. Every `STALE` shop drawing over those calculations returns to `COORDINATED`, every `STALE` item of those sheets returns to `CLEARED`, and each sheet's `cleared_trade_count` is restored to its `required_trade_count`. The demand ledger is recomputed, and the comment's, the package's and the project's `version` all advance.
+
+**Resubmitting.** Rather than wait for withdrawal, the designer normally answers the comments and lodges the next cycle. Resubmitting supplies a fresh `included_calculation_ids` and the project version pin, and is admissible from `COMMENTS_ISSUED` or from `RESPONSE_COMPLETE`, provided the target package's `cycle_number` is below the limit of 4 and the acting engineer is the project's `lead_engineer_id`. The target package moves to `SUPERSEDED`, and a successor package is created in `SUBMITTED` with `supersedes_submittal_id` naming the target, `cycle_number` one higher, its own `review_fee_usd` from the tiered schedule, and `submitted_at` at the current clock reading. The project's `submittal_cycle_count` becomes the new cycle number, the new fee is added to `review_fee_balance_usd`, and both the project's and the superseded package's `version` advance. Packages can be listed by `project_id`, `supersedes_submittal_id`, `reviewed_by_ahj_reviewer_id`, `included_calculation_ids` or `state`.
+
+### 3.9. Witnessed Acceptance Testing and As-Built Close-Out
+
+With the permit issued, the contractor opens acceptance tests against the installed system. A test names the `project_id` and its `test_type`, one of `SYSTEM_FLOW_TEST`, `PUMP_FLOW_TEST`, `HYDROSTATIC_TEST` or `STANDPIPE_FLOW_TEST`. Three preconditions guard the first one: the project must be `PERMITTED` — or already in `ACCEPTANCE`, in which case an additional test is simply accepted and the status stays put — the project must have a governing hydraulic calculation, since otherwise the pass thresholds are undefined and the request is refused with `ERR_NO_GOVERNING_CALCULATION`, and every shop drawing of the project must be in `ISSUED`, or the request is refused with `ERR_DRAWING_NOT_ISSUED`. Opening the first test moves the project `PERMITTED → ACCEPTANCE` and advances its `version`.
+
+The pass thresholds are frozen on the row at creation and are **never** re-derived, so a later design change cannot move the bar a witnessed test was measured against. `required_flow_gpm` is the project's `total_system_demand_gpm` at that instant multiplied by an acceptance flow factor of 0.95 — the trade's allowance for gauge and pitot error — rounded to 1 decimal place. `required_residual_psi` is the `required_psi_at_base_of_riser` of the project's governing calculation at that same instant. A new test opens with `witness_status` `NOT_SCHEDULED`, `documentation_status` `PENDING`, `retest_count` 0, and `witness_reviewer_id`, `measured_flow_gpm`, `measured_residual_psi`, `witness_window_start`, `witness_window_end` and `as_built_document_ref` all null.
+
+Each test advances along **two independent dimensions**. `witness_status` tracks the authority's attendance and measurement; `documentation_status` tracks the as-built record. Scheduling or witnessing never touches `documentation_status`, and lodging or disposing of an as-built package never touches `witness_status`. The two dimensions join at exactly one point, described at the end of this section. Tests can be listed by `project_id`, `witness_reviewer_id`, `test_type`, `witness_status` or `documentation_status`.
+
+**Booking the witness.** The assigned examiner books attendance by supplying `witness_window_start` and `witness_window_end`; the acting examiner is recorded as `witness_reviewer_id`, and a `witness_reviewer_id` naming anyone other than the project's assigned reviewer is refused with `ERR_NOT_ASSIGNED_REVIEWER`. The window start must be strictly before the window end, or the booking is refused with `ERR_WINDOW_START_NOT_BEFORE_END`, and it must be at or after the current logical clock reading, or refused with `ERR_WITNESS_WINDOW_IN_PAST`.
+
+The examiner's calendar is protected by a **closed interval with a symmetric travel buffer of 60 minutes**. The candidate window is inflated by one hour on each side, and the booking is refused with `ERR_WITNESS_WINDOW_CONFLICT` when the inflated candidate intersects the window of any other acceptance test naming the same `witness_reviewer_id` whose `witness_status` is `SCHEDULED`. Concretely, a collision exists when the candidate start less one hour is at or before the existing window's end **and** the candidate end plus one hour is at or after the existing window's start. Because both comparisons are inclusive, a gap of exactly 60 minutes between two windows collides, and a gap of 61 minutes does not.
+
+A successful booking moves the witness dimension `NOT_SCHEDULED → SCHEDULED` on a first attempt. It is also the route back from a failed test: from `WITNESSED_FAIL` it moves the dimension to `SCHEDULED` again, raises `retest_count` by 1, returns the project `CORRECTIVE_ACTION → ACCEPTANCE`, and recomputes the project's posture — which, with the project no longer in corrective action, lifts the freeze. Both the test's and the project's `version` advance.
+
+**Recording the measurement.** The witnessing examiner — who must be the same reviewer recorded as `witness_reviewer_id` — records `measured_flow_gpm` and `measured_residual_psi` against the frozen thresholds. The test passes only when both readings meet or exceed their threshold: `measured_flow_gpm` at least `required_flow_gpm` **and** `measured_residual_psi` at least `required_residual_psi`. A pass moves the witness dimension `SCHEDULED → WITNESSED_PASS`, and when `test_type` is `PUMP_FLOW_TEST` every fire pump of the project in state `SIZED` moves to `ACCEPTED`.
+
+A shortfall on either reading is a failure, and it is the most consequential single write in the service. The witness dimension moves `SCHEDULED → WITNESSED_FAIL`; the project moves `ACCEPTANCE → CORRECTIVE_ACTION` and its `design_posture` becomes `FROZEN`, which suspends the entire design surface listed in section 2.5; and every auxiliary system of the project whose `status` is `COMMISSIONED` moves to `DECOMMISSIONED_PENDING_RETEST` with both `outage_start_at` and `outage_end_at` cleared to null. Systems sitting in `PROPOSED` or `WITHDRAWN` are deliberately skipped. A decommissioned system keeps its `demand_gpm` and stays in the project ledger, because the design still contains it — only the commissioning and its booked outage are undone. Every row touched advances its own `version`.
+
+**As-built documentation.** Independently of all of that, the contractor lodges the as-built record set for a test by supplying an `as_built_document_ref`, which moves the documentation dimension `PENDING → AS_BUILT_SUBMITTED`. This is legal from any `witness_status` — the drawings can be lodged before, during or after the witness visit — and is refused only once the project is `CLOSED_OUT`. A rejected package may be re-lodged: from `AS_BUILT_REJECTED` a fresh submission replaces `as_built_document_ref` and returns the dimension to `AS_BUILT_SUBMITTED`.
+
+The examiner disposes of the lodged package with a `disposition` of `ACCEPTED` or `REJECTED`. `REJECTED` moves the documentation dimension `AS_BUILT_SUBMITTED → AS_BUILT_REJECTED` and nothing else. `ACCEPTED` moves it `AS_BUILT_SUBMITTED → AS_BUILT_ACCEPTED`, and this is the sole join point between the two dimensions: acceptance is permitted only while that test's `witness_status` is already `WITNESSED_PASS`, because the authority will not accept the record of a test that has not passed.
+
+Acceptance of the last outstanding package closes the job out. When, after the write, every acceptance test of the project is `WITNESSED_PASS` on the witness dimension **and** `AS_BUILT_ACCEPTED` on the documentation dimension, the project moves `ACCEPTANCE → CLOSED_OUT`, every hydraulic calculation of the project still in `SEALED` moves to `ARCHIVED`, and the project's `design_posture` becomes `FROZEN` permanently. Both the test's and the project's `version` advance. A closed-out project is terminal: nothing further may be written against it or any of its design objects.
+
+## 4. Endpoint Definitions
+
+Status codes follow one rule throughout: an operation that brings a new resource into existence answers 201 Created, and an operation that modifies an existing resource — including every state-advancing action, every disposition and the clock endpoint — answers 200 OK. Read endpoints answer 200 OK. Rows marked *All roles* are readable by all five roles: `FirmAdmin`, `DesignEngineer`, `QcReviewer`, `Contractor` and `AhjReviewer`. The request and response shapes are not repeated here; they are established by the narratives in section 3.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/engineers` | Register a design professional with the seal credentials checked at seal time. | `FirmAdmin` |
+| POST | `/ahj-reviewers` | Register an authority plan examiner and witness. | `FirmAdmin` |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock; the startup default is 2026-08-01T00:00:00Z. | `FirmAdmin` |
+| POST | `/projects` | Open a fire protection design project and its empty demand ledger. | `FirmAdmin` |
+| GET | `/projects/{id}` | Read one project with its demand ledger, posture and version. | All roles |
+| GET | `/projects` | List projects, filterable by lead engineer, assigned reviewer, governing calculation, status and posture. | All roles |
+| POST | `/projects/{id}/fee-payments` | Pay down the accrued authority review fee balance; overpayment is refused. | `FirmAdmin`, `Contractor` |
+| POST | `/hazard-areas` | Declare a hazard area and derive its classification, density, design area and hose allowance. | `DesignEngineer` |
+| GET | `/hazard-areas/{id}` | Read one hazard area with its derived figures. | All roles |
+| GET | `/hazard-areas` | List hazard areas, filterable by project, effective class and system type. | All roles |
+| POST | `/hazard-areas/{id}/reclassify` | Restate an area's commodity and geometry and invalidate everything derived from it. | `DesignEngineer` |
+| POST | `/flow-tests` | Record an immutable hydrant flow test. | `DesignEngineer`, `Contractor` |
+| GET | `/projects/{id}/flow-tests` | List every flow test recorded for a project. | All roles |
+| POST | `/water-supply-evaluations` | Evaluate the supply against the current demand and pin the reconciliation triple. | `DesignEngineer` |
+| GET | `/water-supply-evaluations/{id}` | Read one supply evaluation with its margin verdict. | All roles |
+| GET | `/water-supply-evaluations` | List supply evaluations, filterable by project, flow test, evaluated calculation, state and verdict. | All roles |
+| POST | `/hydraulic-calculations` | Open a hydraulic calculation over one hazard area and snapshot its demand. | `DesignEngineer` |
+| GET | `/hydraulic-calculations/{id}` | Read one calculation with its demand snapshot, chain summary and seal metadata. | All roles |
+| GET | `/hydraulic-calculations` | List calculations, filterable by project, area, author, QC reviewer, sealing engineer, reopening submittal, state and method. | All roles |
+| POST | `/hydraulic-calculations/{id}/iterations` | Append one pipe-sizing iteration; may restart the chain or close it against the supply. | `DesignEngineer` |
+| GET | `/hydraulic-calculations/{id}/iterations` | List the iterations of a calculation in index order, filterable by active-chain membership. | All roles |
+| GET | `/hydraulic-calculations/{id}/submittals` | List every package whose included calculations contain this calculation. | All roles |
+| POST | `/hydraulic-calculations/{id}/qc-review` | Independent QC disposition of a converged calculation. | `QcReviewer` |
+| POST | `/hydraulic-calculations/{id}/seal` | Apply the engineer's seal after the licence, margin and reconciliation checks. | `DesignEngineer` |
+| POST | `/fire-pumps` | Size a fire pump against a deficient supply evaluation. | `DesignEngineer` |
+| GET | `/fire-pumps/{id}` | Read one fire pump with its full sizing worksheet and verdict. | All roles |
+| GET | `/fire-pumps` | List fire pumps, filterable by project, source evaluation, state and sizing verdict. | All roles |
+| POST | `/auxiliary-systems` | Add a standpipe or special hazard system and derive its demand and interlock requirement. | `DesignEngineer` |
+| GET | `/auxiliary-systems/{id}` | Read one auxiliary system with its demand, interlock and outage window. | All roles |
+| GET | `/auxiliary-systems` | List auxiliary systems, filterable by project, hazard area, system type and status. | All roles |
+| POST | `/auxiliary-systems/{id}/commission` | Commission the system and book its half-open water-supply outage window. | `Contractor` |
+| POST | `/auxiliary-systems/{id}/withdraw` | Withdraw a proposed or decommissioned system and remove its demand from the ledger. | `DesignEngineer` |
+| POST | `/shop-drawings` | Issue a shop drawing sheet for a sealed calculation. | `Contractor` |
+| GET | `/shop-drawings/{id}` | Read one sheet with its coordination counters and state. | All roles |
+| GET | `/shop-drawings` | List sheets, filterable by project, source calculation and state. | All roles |
+| POST | `/shop-drawings/{id}/trade-clearances` | Open a trade coordination item on a sheet, one per trade. | `Contractor` |
+| GET | `/shop-drawings/{id}/trade-clearances` | List the trade coordination items of a sheet, filterable by state. | All roles |
+| POST | `/trade-clearances/{id}/record` | Record a trade coordination outcome and move the sheet accordingly. | `DesignEngineer` |
+| POST | `/submittals` | Lodge the permit package with the authority. | `DesignEngineer` |
+| GET | `/submittals/{id}` | Read one package with its cycle, fee, comment counters and state. | All roles |
+| GET | `/submittals` | List packages, filterable by project, predecessor, reviewing official, included calculation and state. | All roles |
+| POST | `/submittals/{id}/begin-review` | The authority opens or reopens review of the package. | `AhjReviewer` |
+| POST | `/submittals/{id}/comments` | Raise one plan review comment against a package under review. | `AhjReviewer` |
+| POST | `/submittals/{id}/complete-review` | Close out the review pass: approve, or issue comments and invalidate downstream. | `AhjReviewer` |
+| POST | `/submittals/{id}/resubmit` | Supersede a commented package with the next cycle and charge the tiered fee. | `DesignEngineer` |
+| GET | `/review-comments/{id}` | Read one comment with its response, disposition and state. | All roles |
+| GET | `/review-comments` | List comments, filterable by package, raising official, assigned engineer, severity and state. | All roles |
+| POST | `/review-comments/{id}/respond` | The engineer of record answers a comment. | `DesignEngineer` |
+| POST | `/review-comments/{id}/close` | The authority resolves, rejects or withdraws a comment. | `AhjReviewer` |
+| POST | `/acceptance-tests` | Open an acceptance test and freeze its pass thresholds. | `Contractor` |
+| GET | `/acceptance-tests/{id}` | Read one test with its frozen thresholds, window and both status dimensions. | All roles |
+| GET | `/acceptance-tests` | List tests, filterable by project, witnessing official, type and either status dimension. | All roles |
+| POST | `/acceptance-tests/{id}/schedule-witness` | Book the authority's witness attendance within a buffered window. | `AhjReviewer` |
+| POST | `/acceptance-tests/{id}/record-witness` | Record the witnessed measurement against the frozen thresholds. | `AhjReviewer` |
+| POST | `/acceptance-tests/{id}/submit-as-built` | Lodge the as-built record set for a test. | `Contractor` |
+| POST | `/acceptance-tests/{id}/accept-as-built` | Dispose of the as-built package and, on the last one, close the project out. | `AhjReviewer` |
+
+## 5. Error Code Catalogue
+
+Trigger conditions are not repeated here; each error's condition is stated with the rule that raises it in sections 2 and 3.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_IDENTITY_NOT_RECOGNIZED` | 403 |
+| `ERR_NOT_PROJECT_ENGINEER` | 403 |
+| `ERR_NOT_ASSIGNED_REVIEWER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_ENGINEER_NOT_FOUND` | 404 |
+| `ERR_REVIEWER_NOT_FOUND` | 404 |
+| `ERR_PROJECT_NOT_FOUND` | 404 |
+| `ERR_HAZARD_AREA_NOT_FOUND` | 404 |
+| `ERR_FLOW_TEST_NOT_FOUND` | 404 |
+| `ERR_CALCULATION_NOT_FOUND` | 404 |
+| `ERR_EVALUATION_NOT_FOUND` | 404 |
+| `ERR_FIRE_PUMP_NOT_FOUND` | 404 |
+| `ERR_AUXILIARY_SYSTEM_NOT_FOUND` | 404 |
+| `ERR_SHOP_DRAWING_NOT_FOUND` | 404 |
+| `ERR_TRADE_CLEARANCE_NOT_FOUND` | 404 |
+| `ERR_SUBMITTAL_NOT_FOUND` | 404 |
+| `ERR_REVIEW_COMMENT_NOT_FOUND` | 404 |
+| `ERR_ACCEPTANCE_TEST_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 422 |
+| `ERR_SYSTEM_TYPE_FIELD_REQUIRED` | 422 |
+| `ERR_STALE_PROJECT_VERSION` | 412 |
+| `ERR_STALE_SUPPLY_EVALUATION_VERSION` | 412 |
+| `ERR_PROJECT_POSTURE_FROZEN` | 409 |
+| `ERR_PROJECT_POSTURE_GATED` | 409 |
+| `ERR_TERMINAL_STATE_LOCKED` | 409 |
+| `ERR_INVALID_STATE_TRANSITION` | 409 |
+| `ERR_SEAL_LICENSE_INACTIVE` | 409 |
+| `ERR_SEAL_LICENSE_JURISDICTION_MISMATCH` | 409 |
+| `ERR_INTERLOCK_NOT_VERIFIED` | 409 |
+| `ERR_VELOCITY_LIMIT_EXCEEDED` | 422 |
+| `ERR_SAFETY_MARGIN_UNRESOLVED` | 409 |
+| `ERR_FLOW_TEST_STALE` | 422 |
+| `ERR_EVALUATION_REFERENCE_STALE` | 409 |
+| `ERR_SUPPLY_FLOW_MISMATCH` | 422 |
+| `ERR_CALCULATION_NOT_SEALED` | 409 |
+| `ERR_DRAWING_NOT_COORDINATED` | 409 |
+| `ERR_DRAWING_NOT_ISSUED` | 409 |
+| `ERR_NO_GOVERNING_CALCULATION` | 409 |
+| `ERR_IN_RACK_HAZARD_MISMATCH` | 422 |
+| `ERR_PUMP_NOT_REQUIRED` | 409 |
+| `ERR_PUMP_ALREADY_SIZED` | 409 |
+| `ERR_ROOM_DESIGN_NOT_PERMITTED` | 422 |
+| `ERR_ITERATION_OUT_OF_SEQUENCE` | 409 |
+| `ERR_CHAIN_RESTART_REQUIRED` | 409 |
+| `ERR_NO_ITERATIONS_IN_CHAIN` | 409 |
+| `ERR_DUPLICATE_TRADE_CLEARANCE` | 409 |
+| `ERR_PUMP_CAPACITY_UNAVAILABLE` | 422 |
+| `ERR_RESUBMITTAL_CYCLE_LIMIT` | 409 |
+| `ERR_WINDOW_START_NOT_BEFORE_END` | 422 |
+| `ERR_WITNESS_WINDOW_IN_PAST` | 422 |
+| `ERR_WITNESS_WINDOW_CONFLICT` | 409 |
+| `ERR_OUTAGE_CONCURRENCY_EXCEEDED` | 409 |
+| `ERR_REVIEW_FEE_OUTSTANDING` | 402 |
+| `ERR_FEE_PAYMENT_EXCEEDS_BALANCE` | 422 |

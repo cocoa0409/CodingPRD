@@ -1,0 +1,96 @@
+"""Error catalogue (PRD Section 5) and the ApiError exception."""
+
+HTTP_BY_ERROR = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_CARRIER_SCOPE_FORBIDDEN": 403,
+    "ERR_PRODUCER_SCOPE_FORBIDDEN": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 422,
+    # existence
+    "ERR_CARRIER_NOT_FOUND": 404,
+    "ERR_PRODUCER_NOT_FOUND": 404,
+    "ERR_APPLICANT_NOT_FOUND": 404,
+    "ERR_VEHICLE_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_PLAN_PERIOD_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_CYCLE_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_POLICY_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_COMPLAINT_NOT_FOUND": 404,
+    "ERR_QUOTA_RECONCILIATION_NOT_FOUND": 404,
+    # state
+    "ERR_INVALID_APPLICATION_STATE": 409,
+    "ERR_INVALID_ASSIGNMENT_STATE": 409,
+    "ERR_INVALID_POLICY_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_INVALID_COMPLAINT_STATE": 409,
+    "ERR_INVALID_CYCLE_STATE": 409,
+    "ERR_INVALID_PERIOD_STATE": 409,
+    "ERR_CARRIER_NOT_ACTIVE": 409,
+    # optimistic concurrency
+    "ERR_STALE_CARRIER_VERSION": 412,
+    "ERR_STALE_POLICY_VERSION": 412,
+    # business safety
+    "ERR_MVR_NOT_VERIFIED": 422,
+    "ERR_INSUFFICIENT_MARKET_REJECTIONS": 422,
+    "ERR_CARRIER_SUSPENDED": 409,
+    "ERR_ACCEPTANCE_WINDOW_EXPIRED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    # business referential
+    "ERR_COMPLAINT_FREEZE_ACTIVE": 409,
+    "ERR_OPEN_CLAIM_BLOCKS_EXIT": 409,
+    "ERR_VEHICLE_APPLICANT_MISMATCH": 422,
+    "ERR_REJECTING_CARRIER_UNKNOWN": 422,
+    "ERR_DUPLICATE_REJECTING_CARRIER": 409,
+    "ERR_COMPLAINT_CARRIER_MISMATCH": 422,
+    "ERR_PRODUCER_SUSPENDED": 409,
+    "ERR_PRODUCER_TERRITORY_NOT_APPOINTED": 422,
+    # business temporal
+    "ERR_CANCEL_REASON_NOT_PERMITTED": 422,
+    "ERR_CANCEL_DATE_OUT_OF_TERM": 422,
+    "ERR_POLICY_TERM_OVERLAP": 409,
+    "ERR_CYCLE_WINDOW_CONFLICT": 409,
+    "ERR_CYCLE_WINDOW_OUTSIDE_PERIOD": 422,
+    "ERR_PERIOD_WINDOW_CONFLICT": 409,
+    "ERR_POLICY_TERM_INVALID": 422,
+    "ERR_NON_RENEWAL_NOTICE_TOO_LATE": 422,
+    "ERR_EXIT_NOTICE_TOO_SHORT": 422,
+    "ERR_LOSS_DATE_OUTSIDE_TERM": 422,
+    "ERR_WINDOW_NOT_REACHED": 409,
+    # business constraint
+    "ERR_CURE_LIMIT_EXCEEDED": 409,
+    "ERR_REVIEW_ROUND_LIMIT": 409,
+    "ERR_DUPLICATE_IDENTIFIER": 409,
+    "ERR_NON_RENEWAL_QUOTA_EXCEEDED": 409,
+    "ERR_CARRIER_NOT_LICENSED_IN_TERRITORY": 422,
+    "ERR_CLEAN_YEARS_INSUFFICIENT": 422,
+    "ERR_PAYMENT_EXCEEDS_RESERVE": 422,
+    "ERR_PERIOD_NOT_RECONCILING": 409,
+    "ERR_CYCLE_STILL_SCHEDULED": 409,
+    # business fiscal
+    "ERR_DEPOSIT_BELOW_REQUIRED": 422,
+    "ERR_DEPOSIT_AMOUNT_INVALID": 422,
+    # fallback for unrouted requests
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or HTTP_BY_ERROR.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower().capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

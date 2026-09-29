@@ -1,0 +1,128 @@
+"""Error catalogue for the host-agency advisor commissions API (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_OWNERSHIP_VIOLATION": 403,
+    "ERR_TRUST_DIRECTION_FORBIDDEN": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # not found
+    "ERR_ADVISOR_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_SPLIT_SCHEDULE_NOT_FOUND": 404,
+    "ERR_CREDENTIAL_NOT_FOUND": 404,
+    "ERR_CONSORTIUM_NOT_FOUND": 404,
+    "ERR_SUPPLIER_NOT_FOUND": 404,
+    "ERR_CLIENT_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_SETTLEMENT_RUN_NOT_FOUND": 404,
+    "ERR_STATEMENT_NOT_FOUND": 404,
+    # optimistic concurrency
+    "ERR_ADVISOR_VERSION_STALE": 412,
+    "ERR_CLIENT_VERSION_STALE": 412,
+    # state
+    "ERR_ADVISOR_NOT_ACTIVE": 409,
+    "ERR_INVALID_ADVISOR_STATE": 409,
+    "ERR_INVALID_CREDENTIAL_STATE": 409,
+    "ERR_INVALID_BOOKING_STATE": 409,
+    "ERR_TRAVELED_TOO_EARLY": 409,
+    "ERR_INVALID_COMMISSION_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_INVALID_RUN_STATE": 409,
+    "ERR_INVALID_STATEMENT_STATE": 409,
+    "ERR_RUN_NOT_POSTED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_ACTIVE_AGREEMENT_MISSING": 422,
+    # compliance
+    "ERR_SELLER_OF_TRAVEL_INVALID": 422,
+    "ERR_EO_COVERAGE_INSUFFICIENT": 422,
+    "ERR_TRAINING_CERT_MISSING": 422,
+    "ERR_SUPPLIER_ACCREDITATION_MISSING": 422,
+    "ERR_CREDENTIAL_FIELDS_INCOHERENT": 422,
+    "ERR_CREDENTIAL_COVERAGE_OVERLAP": 409,
+    # payment processing / trust
+    "ERR_TRUST_ACCOUNT_REQUIRED": 422,
+    "ERR_TRUST_ACCOUNT_NOT_PERMITTED": 422,
+    "ERR_TRUST_FUNDS_INSUFFICIENT": 402,
+    "ERR_TRUST_DEPOSIT_SHORTFALL": 402,
+    # business constraints
+    "ERR_ADVISOR_EMAIL_DUPLICATE": 409,
+    "ERR_SETTLEMENT_PERIOD_DUPLICATE": 409,
+    "ERR_TRANSITION_ADVISOR_INVALID": 409,
+    "ERR_TRAVEL_WINDOW_CONFLICT": 409,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_CLAIM_AMOUNT_MISMATCH": 422,
+    "ERR_CLAIM_ROUND_LIMIT": 409,
+    "ERR_CLAIM_RESOLUTION_INVALID": 422,
+    "ERR_RECEIPT_EXCEEDS_EXPECTED": 422,
+    "ERR_SPLIT_TIER_UNRESOLVED": 422,
+    "ERR_DEPARTURE_BLOCKED": 409,
+    "ERR_CLOCK_REWIND_FORBIDDEN": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be recognized.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorized for this endpoint.",
+    "ERR_OWNERSHIP_VIOLATION": "The acting principal does not own the addressed resource.",
+    "ERR_TRUST_DIRECTION_FORBIDDEN": "Role Advisor may only append DEPOSIT trust ledger lines.",
+    "ERR_INVALID_REQUEST": "The request body is malformed, incomplete or carries an unknown field.",
+    "ERR_ADVISOR_NOT_FOUND": "No such advisor.",
+    "ERR_AGREEMENT_NOT_FOUND": "No such advisor agreement.",
+    "ERR_SPLIT_SCHEDULE_NOT_FOUND": "No such split schedule.",
+    "ERR_CREDENTIAL_NOT_FOUND": "No such compliance credential.",
+    "ERR_CONSORTIUM_NOT_FOUND": "No such consortium.",
+    "ERR_SUPPLIER_NOT_FOUND": "No such supplier.",
+    "ERR_CLIENT_NOT_FOUND": "No such client.",
+    "ERR_BOOKING_NOT_FOUND": "No such booking.",
+    "ERR_CLAIM_NOT_FOUND": "No such commission claim.",
+    "ERR_SETTLEMENT_RUN_NOT_FOUND": "No such settlement run.",
+    "ERR_STATEMENT_NOT_FOUND": "No such advisor statement.",
+    "ERR_ADVISOR_VERSION_STALE": "expected_advisor_version does not match the advisor's current version.",
+    "ERR_CLIENT_VERSION_STALE": "expected_client_version does not match the client's current version.",
+    "ERR_ADVISOR_NOT_ACTIVE": "The advisor is not in the required status.",
+    "ERR_INVALID_ADVISOR_STATE": "The advisor is not in a state that declares this transition.",
+    "ERR_INVALID_CREDENTIAL_STATE": "The credential is not in a state that declares this decision.",
+    "ERR_INVALID_BOOKING_STATE": "The booking's fulfilment status does not declare this transition.",
+    "ERR_TRAVELED_TOO_EARLY": "The logical clock has not reached the booking's travel_end_date.",
+    "ERR_INVALID_COMMISSION_STATE": "The booking's commission status does not declare this transition.",
+    "ERR_INVALID_CLAIM_STATE": "The claim is not in a state that declares this transition.",
+    "ERR_INVALID_RUN_STATE": "The settlement run is not in a state that declares this transition.",
+    "ERR_INVALID_STATEMENT_STATE": "The advisor statement is not in a state that declares this transition.",
+    "ERR_RUN_NOT_POSTED": "The statement's parent settlement run has not been posted.",
+    "ERR_SEGREGATION_OF_DUTIES": "The posting operator may not be the operator that calculated the run.",
+    "ERR_ACTIVE_AGREEMENT_MISSING": "The advisor does not hold exactly one ACTIVE agreement.",
+    "ERR_SELLER_OF_TRAVEL_INVALID": "No in-force VERIFIED seller-of-travel registration for the advisor's home state.",
+    "ERR_EO_COVERAGE_INSUFFICIENT": "No in-force VERIFIED errors-and-omissions policy with sufficient coverage.",
+    "ERR_TRAINING_CERT_MISSING": "No in-force VERIFIED training certification.",
+    "ERR_SUPPLIER_ACCREDITATION_MISSING": "The advisor holds no in-force VERIFIED accreditation for this supplier.",
+    "ERR_CREDENTIAL_FIELDS_INCOHERENT": "The optional credential columns do not match the credential_type's required shape.",
+    "ERR_CREDENTIAL_COVERAGE_OVERLAP": "The credential's coverage period touches or overlaps an existing period.",
+    "ERR_TRUST_ACCOUNT_REQUIRED": "This advisor must use CLIENT_TRUST payment handling.",
+    "ERR_TRUST_ACCOUNT_NOT_PERMITTED": "This advisor may not use CLIENT_TRUST payment handling.",
+    "ERR_TRUST_FUNDS_INSUFFICIENT": "The trust ledger line would drive the client's balance below zero.",
+    "ERR_TRUST_DEPOSIT_SHORTFALL": "The client's trust balance does not cover the booking's deposit.",
+    "ERR_ADVISOR_EMAIL_DUPLICATE": "That email is already held by another advisor.",
+    "ERR_SETTLEMENT_PERIOD_DUPLICATE": "A settlement run already exists for that period_month.",
+    "ERR_TRANSITION_ADVISOR_INVALID": "The named successor advisor is not eligible.",
+    "ERR_TRAVEL_WINDOW_CONFLICT": "The client's concurrent travel capacity would be exceeded.",
+    "ERR_INVALID_DATE_RANGE": "The supplied date range is not valid.",
+    "ERR_CLAIM_AMOUNT_MISMATCH": "claimed_amount_cents does not equal the booking's outstanding commission.",
+    "ERR_CLAIM_ROUND_LIMIT": "The claim has exhausted its resubmission rounds.",
+    "ERR_CLAIM_RESOLUTION_INVALID": "The resolution shape is invalid.",
+    "ERR_RECEIPT_EXCEEDS_EXPECTED": "The remitted amount exceeds the booking's expected commission.",
+    "ERR_SPLIT_TIER_UNRESOLVED": "No production tier resolves for the basis production amount.",
+    "ERR_DEPARTURE_BLOCKED": "The departing advisor has not wound down.",
+    "ERR_CLOCK_REWIND_FORBIDDEN": "The logical clock may not move backwards.",
+}

@@ -1,0 +1,440 @@
+# Film Extrusion Bag Converting API — Product Requirements Document
+
+## 1. Introduction
+
+A blown-film and bag converting plant carries a single physical stream of polyethylene from a resin silo through an extruder, a printing press, a bag machine and finally onto a pallet — yet the paperwork that must accompany that stream is anything but single-threaded. Every finished case has to be traceable back to a blend whose regrind fraction was inside a customer-specific cap, to a line whose gauge process was statistically capable, to a press whose registration and color were signed off, to a seal panel that met a newton-per-15-millimetre specification, and to a recycled-content figure that can be defended against what was actually extruded rather than what the design book assumed. Today those five facts live in five different notebooks, and when a customer challenges a recycled-content claim there is no mechanical way to prove or disprove it.
+
+This API is the plant's system of record for that chain of custody. It models the product specification, the resin library, the blend recipe and its approval workflow, the extrusion line and its runs, the wound rolls, the segregated regrind pools and every gram that moves through them, the presses and plate sets, the print jobs, the converting lots with their seal panels and case packouts, and the compliance dossier that finally makes a food-contact and recycled-content declaration to the customer. Numbers are not merely stored: gauge capability, blend property indices, pool mass balances, bag counts and case allocations are all derived by the server from primitive observations, so that two operators reading the same lot cannot disagree about whether it is shippable.
+
+Two design commitments run through everything that follows. The first is **segregation of duties** — the engineer who submits a blend may not approve it, and the technician who pulled a seal specimen may not issue the dossier that certifies the lot. The second is **non-reversal of compliance cascades**: when a dossier is revoked, the damage propagates outward through the lot, its plate set, and the producing line, and clearing a line's capability counters afterwards does *not* resurrect the runs and rolls that the cascade already condemned. Both commitments are enforced by the server, not by convention.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to this API — read or write — must carry two headers. `X-User-ID` identifies the acting operator and `X-User-Role` declares the capacity in which they are acting. If either header is absent, or if `X-User-Role` is not one of the six recognized roles, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If the headers are well-formed but the declared role is not among the roles authorized for the endpoint being called, the request is rejected with `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+The six roles are `PlantAdmin`, `BlendEngineer`, `QualityManager`, `ExtrusionOperator`, `PrintOperator` and `ConvertingOperator`. `PlantAdmin` owns plant master data — products, resin grades, lines, presses and regrind pools — plus the logical clock and the final ship step. `BlendEngineer` designs blends: appends component lines, submits a recipe for review, and reopens a rejected one. `QualityManager` is the quality and compliance authority: approves or rejects recipes, releases or scraps rolls, reverses regrind transactions, finalizes seal testing, releases lots, and drafts, issues and revokes dossiers. `ExtrusionOperator` runs the film lines: schedules, starts, holds, resumes and completes runs, logs gauge samples, draws regrind, and records wound rolls. `PrintOperator` runs the presses: mounts plate sets, creates print jobs, records registration and color measurements, and completes printing. `ConvertingOperator` runs the bag machines: opens lots, records seal specimens and commits packouts. Every role may call every read endpoint.
+
+All six roles are **opaque identities**. When `X-User-Role` is `PlantAdmin`, `BlendEngineer`, `QualityManager`, `ExtrusionOperator`, `PrintOperator` or `ConvertingOperator`, the accompanying `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity in this system. The server may record it where a transition writes it — as `submitted_by_user_id` or `approved_by_user_id` on a blend recipe, as `entered_by_user_id` inside a seal specimen, or as `issued_by_user_id` on a dossier — but it never compares `X-User-ID` to any entity's `id`, and no resource is "owned" by a user. The only places `X-User-ID` carries semantic weight are the two segregation-of-duties invariants in §2.11.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and Collection Filters
+
+Collection reads are paginated by two query parameters. `limit` is the maximum number of records returned; it defaults to 10, may not be smaller than 1, and may not be larger than 100. `offset` is the number of records skipped before the page begins; it defaults to 0 and may not be negative. A `limit` outside the inclusive range 1 through 100, a non-integer `limit`, a negative `offset` or a non-integer `offset` is rejected with `ERR_INVALID_PAGINATION` (HTTP 400).
+
+Unless a specific endpoint says otherwise, every collection is sorted by `created_at` in ascending order. The `meta` object of a list response carries `limit`, `offset`, `total_count` and `has_more`.
+
+Collections also accept optional equality filters drawn from the resource's own attributes, and any combination of them may be supplied together with the pagination parameters. Products may be filtered by `customer_code`, `food_contact_required` and `bag_style`. Resin grades accept `polymer_family`, `material_class`, `food_contact_approved` and `is_barrier`. Blend recipes accept `product_id`, `supersedes_recipe_id` and `status`. Extrusion lines accept `process_type`, `posture` and `food_contact_certified`. Extrusion runs accept `line_id`, `blend_recipe_id`, `status` and `gauge_capability_state`. Film rolls accept `extrusion_run_id` and `status`. Regrind pools accept `food_contact_status` and `polymer_family`. Regrind transactions accept `pool_id`, `extrusion_run_id`, `reverses_transaction_id`, `direction` and `origin_kind`. Presses accept pagination only. Plate sets accept `product_id`, `mounted_press_id` and `status`. Print jobs accept `film_roll_id`, `plate_set_id`, `press_id`, `status`, `registration_state` and `color_state`. Bag lots accept `print_job_id`, `product_id` and `status`. Compliance dossiers accept `bag_lot_id`, `status` and `claim_conformance`.
+
+### 2.4. Common Resource Properties, the Logical Clock and Immutable Ledger Rows
+
+Every resource carries an `id`, which is a server-minted UUID with no type prefix of any kind, and a `created_at`, which is an ISO 8601 UTC timestamp rendered with exactly three fractional digits. Most resources additionally carry `updated_at`, an ISO 8601 UTC timestamp with three fractional digits refreshed on every mutation, and `version`, an integer that starts at 1 on creation and increments by one on each mutation of that resource. Recomputing a derived field counts as a mutation: when a run's completion refreshes a film roll's `actual_recycled_content_pct`, or when a dossier revocation resets a lot's packout counters, the affected resource's `updated_at` moves and its `version` increments.
+
+Regrind transactions are the one exception. A regrind transaction is an immutable ledger row: it carries only `id` and `created_at`, and both `updated_at` and `version` are absent from it entirely. A transaction is never edited or deleted — it is neutralized by booking a compensating reversal row against it, as described in §3.6.
+
+The server runs on a **logical clock** rather than wall-clock time. Before any client sets it, the clock reads exactly `2026-08-01T00:00:00Z`; it must never fall back to real time. A `PlantAdmin` moves the clock by supplying a `current_utc` instant, and every clock-relative check thereafter — scheduling window gates, run start gates, print window gates, and the `issued_at`, `revoked_at` and `recorded_at` stamps — reads the new value.
+
+### 2.5. Numeric Precision and Rounding Discipline
+
+All rounding in this system is **round half up**, and the number of decimal places is fixed per quantity rather than global. Blend composition percentages (`total_weight_pct`, `regrind_pct`, `additive_pct`, `hdpe_pct`, `virgin_pcr_pct`, `regrind_cap_pct`, `nominal_recycled_content_pct`) and all regrind and mass-balance masses and percentages (`available_kg`, `cumulative_in_kg`, `cumulative_out_kg`, `cumulative_in_pcr_kg`, `embedded_pcr_pct`, `pcr_kg`, `pool_available_kg_after`, `net_good_kg`, `regrind_consumed_kg`, `regrind_actual_pct`, `pcr_mass_kg`, `actual_recycled_content_pct`, `claim_variance_pct`) carry three decimal places. Blend cost and density (`blend_cost_per_kg`, `blended_density_kg_m3`), the three property indices (`strength_index`, `clarity_index`, `slip_index`), the seal figures (`seal_provisional_mean_n`, `seal_final_min_n`, `seal_final_mean_n`), the layflat deviation (`layflat_deviation_max_mm`) and `count_accuracy_pct` carry two. `gauge_mean_micron`, `gauge_cv_pct` and `gauge_capability_index` carry three; `gauge_sd_micron` carries four; `bag_unit_weight_kg` carries six. Case, pallet, bag, cylinder, impression, hold and specimen counts are integers.
+
+Two rounding orders are deliberately pinned and are not interchangeable with the obvious alternative. First, blend cost and blended density are accumulated by rounding **each component's contribution** to two decimal places before summing, and then rounding the sum again to two decimal places; summing unrounded contributions and rounding once at the end produces a different and incorrect figure. Second, gauge capability is **rounded before it is banded** — the capability band reads the three-decimal rounded value of the index, not the unrounded quotient. Where a formula below carries an intermediate factor, that factor is carried at full precision and only the published result is rounded.
+
+### 2.6. Optimistic Concurrency on Pools and Lots
+
+Two write operations in this system commit an allocation computed from a shared, monotonically consumed balance, and both are protected by optimistic concurrency control against the parent resource's `version`.
+
+Drawing regrind mass into a run requires the request to carry `expected_regrind_pool_version`, a non-optional field holding the `version` of the target regrind pool as the client last observed it. If that value does not equal the pool's current `version`, the draw is rejected with `ERR_STALE_POOL_VERSION` (HTTP 412). This gate is necessary precisely because reincorporation is legitimately repeatable: the same run may draw from the same pool many times, and two draws that each individually fit inside `available_kg` would each succeed on their own merits. The pool's `version` is therefore the only observable that distinguishes a client working from a current view of `available_kg` from one working from a superseded view. Every accepted draw, and every reversal booked against the pool, increments the pool's `version` by one.
+
+Committing a packout allocation requires the request to carry `expected_bag_lot_version`, a non-optional field holding the `version` of the target bag lot as the client last observed it. A mismatch with the lot's current `version` is rejected with `ERR_STALE_BAG_LOT_VERSION` (HTTP 412). Packout is likewise incremental and repeatable — each call re-reads `bag_count_unpacked` — so without this gate a stale caller could commit an allocation computed against an unpacked count that no longer exists. Each accepted packout increments the lot's `version` by one.
+
+No other endpoint accepts a version field. Endpoints outside these two do not take, and must not require, any expected-version input.
+
+### 2.7. Order in Which a Request Is Screened
+
+Requests are screened by a strictly ordered sequence of checks. **The first violated check decides the response, and no later check is evaluated.** This ordering is observable and is part of the contract: a request that violates two rules must surface the earlier one.
+
+1. Authentication — headers present and the role recognized (`ERR_UNAUTHENTICATED`, 401).
+2. Authorization — the acting role is listed for the endpoint (`ERR_FORBIDDEN_ROLE`, 403).
+3. Request shape — the body parses, every required field is present, types and enum members are valid, and each per-field numeric constraint from the domain model holds, including that a run's `scheduled_end` is strictly later than its `scheduled_start` and a print job's `window_end` is strictly later than its `window_start` (`ERR_INVALID_REQUEST`, 400). This applies to all write endpoints.
+4. Pagination shape on collection reads (`ERR_INVALID_PAGINATION`, 400).
+5. Path identifier resolution, evaluated left to right (a 404 naming the entity that failed).
+6. Foreign-key resolution for identifiers carried in the body — `product_id`, `resin_grade_id`, `blend_recipe_id`, `line_id`, `pool_id`, `film_roll_id`, `plate_set_id`, `press_id`, `print_job_id`, `bag_lot_id` and `supersedes_recipe_id` (a 404 naming the entity that failed).
+7. Business-code uniqueness (`ERR_DUPLICATE_CODE`, 409).
+8. Optimistic concurrency on the pool or the lot (`ERR_STALE_POOL_VERSION` or `ERR_STALE_BAG_LOT_VERSION`, 412).
+9. The state of the entity named in the path permits the requested transition (a 409 state error naming that entity).
+10. Cross-entity state gates — the referenced non-path entity is in the state the operation requires (409).
+11. Food-contact, recycled-content and segregation-of-duties compliance (422, except the segregation violation which is 403).
+12. Structural coherence of the blend against its product, and product identity between a lot and its print job's plate set (422, except the product mismatch which is 409).
+13. Resource capability, exclusive line occupancy and aggregate press cylinder capacity (409, except the two capability mismatches which are 422).
+14. Clock-relative window and hold-limit gates (409).
+15. Quantity, data-sufficiency and budget sufficiency (422, except pool availability, missing pool and already-reversed transaction which are 409).
+16. Converting feature verification before seal testing (`ERR_CONVERTING_FEATURE_NOT_VERIFIED`, 422).
+
+Rule 5 deserves emphasis. When a path names an identifier, that identifier is resolved before anything to its right and before any body field is examined. Rule 6 resolves body foreign keys in the order listed above, so a request naming both a missing product and a missing print job surfaces the product first if the product identifier is listed first.
+
+### 2.8. Derived Aggregates, Cascades and the Line Posture Gate
+
+Large parts of this model are **derived**, meaning the server recomputes them from primitive rows rather than accepting them from a client. A blend recipe's composition totals, cost, density and three property indices are recomputed from its component list on every append and again at submit. A run's capability statistics are recomputed on every gauge sample and again at completion. A pool's balances are recomputed from its non-reversed transaction rows after every transaction and every reversal. A lot's theoretical bag count and count accuracy are recomputed at lot creation and at every packout. A line's `posture` is recomputed after every run start, hold, resume or completion, after every dossier revocation, and whenever its capability flags are cleared.
+
+`posture` is the plant's master gate and it takes one of three values: `OPEN`, `RESTRICTED` or `FROZEN`. It is not a field an operator sets; it is read off three counters the server maintains on the line — `incapable_run_count`, `active_hold_count` and `revoked_dossier_count`. `incapable_run_count` is the number of `COMPLETED` runs on the line whose `gauge_capability_state` came out `INCAPABLE`. `active_hold_count` is the number of runs currently sitting in `HELD`. `revoked_dossier_count` is the number of `REVOKED` compliance dossiers traceable to the line through the chain lot → print job → film roll → run. The line is `FROZEN` when `incapable_run_count` has reached two or more, or when `revoked_dossier_count` has reached one or more. Otherwise it is `RESTRICTED` when `incapable_run_count` is exactly one, or when `active_hold_count` has reached two or more. Otherwise it is `OPEN`. Note that a single revoked dossier is sufficient to freeze a line outright.
+
+Cascades in this system reach several entities from a single call, and each affected resource is independently mutated — its `updated_at` refreshed and its `version` incremented. Two cascade roots matter most. Completing a run touches the run, its film rolls, the regrind pool, the blend recipe's pin counter, and possibly the line's posture and every scheduled run and wound roll on it. Revoking a dossier touches the dossier, the lot, the lot's plate set, the plate set's setup-stage print jobs, and the producing line together with its scheduled runs and wound rolls. Both chains are spelled out in §3.5, §3.6 and §3.9.
+
+One asymmetry is deliberate and must not be "fixed" by an implementer. A frozen line can be returned to `OPEN` by clearing its capability flags, but the runs the freeze already blocked and the rolls it already quarantined are **not** restored. The cascade is forward-only.
+
+### 2.9. Food-Contact and Recycled-Content Doctrine
+
+Food-contact status is a property of the customer's product, and it propagates as an obligation across four independent checkpoints. A recipe for a food-contact product may only be submitted if every one of its virgin and additive components draws on a resin grade whose `food_contact_approved` flag is true; otherwise the submit is refused with `ERR_FOOD_CONTACT_RESIN_INELIGIBLE`. A run for a food-contact product may only be scheduled and started on a line whose `food_contact_certified` flag is true; otherwise `ERR_LINE_NOT_FOOD_CERTIFIED`. A run for a food-contact product may only draw regrind from a pool whose `food_contact_status` is `FOOD_CONTACT_ELIGIBLE`; drawing from a `NON_FOOD_ONLY` pool is refused with `ERR_FOOD_CONTACT_POOL_INELIGIBLE`, and the same error covers any draw — food-contact or not — from a pool whose `polymer_family` differs from the recipe's `dominant_polymer_family`. Finally, a dossier that declares food contact may only be issued when the lot's recipe carries `food_contact_eligible` as true and the producing line is `food_contact_certified`; otherwise `ERR_FOOD_CONTACT_DECLARATION_INVALID`.
+
+Recycled content is tracked in **two distinct variants** that are never interchangeable. The **nominal** variant is a design-book figure computed on the recipe at design time, before any material is extruded; it multiplies the recipe's declared regrind fraction by the product's assumed post-consumer-recycled fraction for regrind and adds the virgin contribution. The **as-built** variant is computed at run completion from the mass actually drawn out of the pool and that pool's measured embedded recycled fraction, against the real gross output; it is then propagated to the rolls and the lots. The two diverge whenever a run consumes less regrind than the recipe declares, or whenever the pool's real embedded recycled fraction differs from the product's assumption. **A dossier's claim is checked against the as-built variant only.** A claim that exceeds the as-built figure by more than 0.500 percentage points is refused at issue with `ERR_CLAIM_OVERSTATED`.
+
+### 2.10. Segregation of Duties
+
+Two pairings are forbidden, and both are checked against the acting `X-User-ID`.
+
+First, the operator who most recently submitted a blend recipe may neither approve nor reject it. On both of those transitions, the acting `X-User-ID` must differ from the recipe's stored `submitted_by_user_id`. Second, the operator who entered any seal specimen for a bag lot may not issue that lot's compliance dossier: on issue, the acting `X-User-ID` must not appear as `entered_by_user_id` on any row of the lot's specimen log — regardless of the specimen's `test_kind`, its `attempt`, or whether it was later superseded. Either violation is rejected with `ERR_SEGREGATION_OF_DUTIES`, which carries HTTP 403 even though it sits in the compliance band of the screening order.
+
+### 2.11. Business-Code Uniqueness
+
+Each registry resource is addressed operationally by a human-readable code, and each such code is globally unique within its own collection: `product_code`, `grade_code`, `recipe_code`, `line_code`, `run_code`, `pool_code`, `press_code`, `plate_code`, `job_code`, `lot_code` and `dossier_code`. A film roll has no code of its own; instead its `roll_number` must be unique within the run that wound it. A collision on any of these is rejected with `ERR_DUPLICATE_CODE` (HTTP 409).
+
+## 3. Business Logic & Workflows
+
+### 3.1. Product Specifications and the Resin Library
+
+Everything in the plant is ultimately driven by a customer **product specification**, registered by a `PlantAdmin`. Beyond its `product_code` and the `customer_code` of the customer that owns it, a product declares the converting geometry of the finished bag: `bag_style` is one of `FLAT`, `GUSSETED` or `BOTTOM_SEAL_LINER`; `layflat_width_mm` is the target flat width of the tube; `bag_length_mm` is the cut length; and `gusset_depth_mm` is the side gusset depth, which defaults to 0.0, may not be negative, and must be strictly greater than zero whenever `bag_style` is `GUSSETED`. `perforation_required` defaults to false and marks products whose converted bag must carry a perforation line. `target_gauge_micron` is the nominal film thickness and must be positive; `gauge_tolerance_pct` is a symmetric tolerance band expressed as a percent of that target, defaults to 8.0 and must be greater than zero and less than 100 — the upper specification limit is the target multiplied by one plus the tolerance percent divided by 100, and the lower limit is the target multiplied by one minus the tolerance percent divided by 100.
+
+The product also fixes the quality bar and the compliance envelope. `min_bottom_seal_n_per_15mm` is the customer's bottom-seal strength specification in newtons per 15 millimetres and must be positive. `min_strength_index` is the minimum blend strength score the product will accept and may not be negative. `required_layer_count` is the coextrusion layer count the blend must declare; it defaults to 1 and must be at least 1 and at most 9. `max_regrind_pct_food` and `max_regrind_pct_nonfood` are the base regrind caps as a percent of blend weight, defaulting to 10.0 and 35.0 respectively; the former applies when `food_contact_required` is true and the latter when it is false, and `food_contact_required` itself defaults to false. `declared_recycled_content_pct` is the recycled-content percentage printed on the customer's documentation and defaults to 0.0. `assumed_regrind_pcr_pct` is the nominal post-consumer-recycled fraction the design book attributes to regrind, defaults to 0.0, and is read only by the nominal recycled-content variant.
+
+Packaging arithmetic is likewise a product property. `bags_per_case` is the bag count of a full case and must be positive. `min_partial_case_bags` is the smallest bag count at which a short case still counts as a billable case; it defaults to 0 and must be at least zero and no greater than `bags_per_case`. `cases_per_pallet` is the case count of a full pallet and must be positive. `count_accuracy_tolerance_pct` defaults to 2.0 and bounds how far a lot's measured count accuracy may sit from one hundred percent before release is refused.
+
+The **resin library** is a flat registry, also maintained by a `PlantAdmin`. A grade is identified by `grade_code` and classified by `material_class`, which is either `VIRGIN_RESIN` or `ADDITIVE_MASTERBATCH`, and by `polymer_family`, one of `LDPE`, `LLDPE`, `HDPE`, `MDPE`, `EVOH` or `TIE`. Physical and commercial data comprise `melt_index` (melt flow index in grams per ten minutes), `density_kg_m3` (solid density in kilograms per cubic metre, which must be positive), `cost_per_kg` (purchase cost, which may not be negative), `seal_initiation_temp_c` (seal initiation temperature in Celsius) and `pcr_content_pct` (the grade's post-consumer-recycled content, defaulting to 0.0 and constrained to the inclusive range zero through one hundred). Three relative contribution indices feed the blend property model: `dart_impact_index` for toughness, `haze_index` for clarity where a lower value is clearer, and `cof_index` for slip where a lower value is slipperier. Two booleans complete the record: `food_contact_approved`, defaulting to false, and `is_barrier`, defaulting to false, which marks grades that function as a barrier layer.
+
+### 3.2. Designing a Blend: Components, Indices and the Regrind Cap
+
+A `BlendEngineer` (or a `PlantAdmin`) opens a **blend recipe** in `DRAFT` by naming its `recipe_code`, the `product_id` it is designed for, a `process_type` of either `BLOWN` or `CAST`, and a `layer_count` between 1 and 9 inclusive. An optional `supersedes_recipe_id` names the approved predecessor this recipe is intended to replace. At creation the recipe's `components` list is empty and every derived index sits at its default.
+
+Components are then **appended one at a time** by a `BlendEngineer`; the list is append-only and there is no edit or delete. Each append supplies a `layer_index`, a `component_kind` of `VIRGIN`, `ADDITIVE` or `REGRIND`, a `weight_pct`, and — for virgin and additive lines — a `resin_grade_id`; a regrind line carries no grade reference. The server stores each line with a `position` equal to its one-based append index, so the list preserves call order permanently. A `layer_index` outside the inclusive range from 1 through the recipe's `layer_count` is refused with `ERR_LAYER_COUNT_MISMATCH`. Appending to a recipe that is not in `DRAFT` is refused with `ERR_RECIPE_STATE_INVALID`. A non-positive `weight_pct` is a request-shape violation.
+
+Every append recomputes the whole derived block. `total_weight_pct` is the sum of `weight_pct` across all components, rounded to three decimals. `regrind_pct` is the same sum restricted to components whose `component_kind` is `REGRIND`; `additive_pct` restricts it to `ADDITIVE`; and `hdpe_pct` restricts it to `VIRGIN` components whose resin's `polymer_family` is `HDPE`. `barrier_layer_present` is true when at least one virgin or additive component's resin carries `is_barrier` as true. `dominant_polymer_family` is determined over **virgin components only**: the server totals `weight_pct` per polymer family across the virgin lines and selects the family with the greatest total, breaking ties by taking the alphabetically earliest `polymer_family` name in ascending order (so `LDPE` precedes `LLDPE`, which precedes `MDPE`) and never by identifier; when the recipe has no virgin component at all, `dominant_polymer_family` is null.
+
+Cost and density are accumulated line by line. For each component in append order, the unit cost is the referenced resin's `cost_per_kg`, except that a regrind line uses a flat regrind cost of 0.42 per kilogram; the unit density is the resin's `density_kg_m3`, except that a regrind line uses a flat regrind density of 922.0 kilograms per cubic metre. Each line's contribution is its `weight_pct` divided by one hundred, multiplied by the relevant unit value, and **rounded to two decimals at the line**. `blend_cost_per_kg` is then the sum of the rounded cost lines, rounded again to two decimals, and `blended_density_kg_m3` is the sum of the rounded density lines, rounded again to two decimals.
+
+The three **property indices** are where the blend's engineering judgement lives. A dart base is accumulated as the sum, over every component, of its `weight_pct` divided by one hundred multiplied by that component's dart contribution — the resin's `dart_impact_index` for virgin and additive lines, and a flat 34.0 for regrind lines. Two penalty factors are then computed. The family factor is exactly 1.000 while `hdpe_pct` is at or below 30.0; above that, it is the larger of 0.700 and the quantity one minus 0.004 multiplied by the excess of `hdpe_pct` over 30.0. The regrind factor is the larger of 0.800 and the quantity one minus 0.006 multiplied by `regrind_pct`. Crucially, **the two penalties do not multiply together — only the smaller, more binding of the two is applied.** An additive boost is the smaller of 1.150 and the quantity one plus 0.020 multiplied by the number of additive components in the list. `strength_index` is then the dart base multiplied by the binding penalty factor multiplied by the additive boost, rounded to two decimals, with the intermediate factors carried at full precision.
+
+Clarity and slip follow the same weighted pattern. A haze sum is accumulated as the sum over all components of `weight_pct` divided by one hundred multiplied by the resin's `haze_index`, with regrind lines contributing a flat 18.0; `clarity_index` is then one hundred minus 2.500 multiplied by the haze sum, floored at 0.00 and rounded to two decimals. A coefficient-of-friction sum is accumulated the same way from each resin's `cof_index`, with regrind lines contributing a flat 0.55; `slip_index` is then the reference coefficient 0.600 minus that sum, divided by 0.600, multiplied by one hundred, then clamped to the inclusive range 0.00 through 100.00 and rounded to two decimals.
+
+The **regrind cap evaluation** runs in five pinned steps, in exactly this order, and step three reads only the output of step two. Step one recomputes `regrind_pct` to three decimals. Step two computes `virgin_pcr_pct` as the sum, over **virgin components only**, of `weight_pct` divided by one hundred multiplied by that resin's `pcr_content_pct`, rounded to three decimals; the recycled content embedded in regrind is deliberately excluded here. Step three selects the base cap — `max_regrind_pct_food` when the product requires food contact, otherwise `max_regrind_pct_nonfood` — and derives `pcr_band` from `virgin_pcr_pct` alone: `HIGH` when `virgin_pcr_pct` is at least 20.0, otherwise `MID` when it is at least 5.0, otherwise `LOW`. The band then shifts the cap: `HIGH` subtracts 5.0 percentage points, `MID` subtracts 2.0, and `LOW` leaves it unchanged. `regrind_cap_pct` is the base cap plus that shift, floored at 0.0 and rounded to three decimals. Deriving the band from the step-five nominal figure instead of from `virgin_pcr_pct` yields a different and incorrect result. Step four compares: the cap is satisfied when `regrind_pct` is less than or equal to `regrind_cap_pct`, with equality at the cap accepted. Step five computes `nominal_recycled_content_pct` as `virgin_pcr_pct` plus `regrind_pct` divided by one hundred multiplied by the product's `assumed_regrind_pcr_pct`, rounded to three decimals, and sets `food_contact_eligible` to true when either the product does not require food contact at all, or every virgin and additive component's resin is `food_contact_approved` **and** the cap is satisfied.
+
+### 3.3. Recipe Review, Approval and the Supersession Chain
+
+A `BlendEngineer` submits a `DRAFT` recipe for quality review, moving `status` along `DRAFT → SUBMITTED`. Submit re-runs every calculation in §3.2 against the current component list and then enforces seven gates. `total_weight_pct` must be exactly 100.000 — anything else, including an empty component list, is refused with `ERR_BLEND_WEIGHT_NOT_100`. The recipe's `layer_count` must equal the product's `required_layer_count`, and every component's `layer_index` must fall within that layer count, or the submit is refused with `ERR_LAYER_COUNT_MISMATCH`. When the product requires food contact, every virgin and additive component's resin must be `food_contact_approved`, or `ERR_FOOD_CONTACT_RESIN_INELIGIBLE`. `regrind_pct` must be no greater than `regrind_cap_pct`, or `ERR_REGRIND_CAP_EXCEEDED` — equality at the cap passes. When the product's `required_layer_count` is three or more, `barrier_layer_present` must be true, or `ERR_BARRIER_STRUCTURE_REQUIRED`. And `strength_index` must be at least the product's `min_strength_index`, or `ERR_STRENGTH_INDEX_BELOW_MIN`. A successful submit stamps `submitted_by_user_id` with the acting `X-User-ID` and clears any previous `rejection_reason`.
+
+Review is a `QualityManager` privilege and it forks. Approval moves `SUBMITTED → APPROVED`, requires that the acting `X-User-ID` differ from `submitted_by_user_id`, and — when `supersedes_recipe_id` is present — requires that the named predecessor be in `APPROVED` status and target the same `product_id` as this recipe; a predecessor targeting a different product is refused with `ERR_PRODUCT_MISMATCH`. Approval stamps `approved_by_user_id` and freezes `food_contact_eligible`. Rejection moves `SUBMITTED → REJECTED`, likewise requires that the acting `X-User-ID` differ from `submitted_by_user_id`, and requires a `rejection_reason` in the payload, which is stored on the recipe. Either action attempted on a recipe that is not in `SUBMITTED` is refused with `ERR_RECIPE_STATE_INVALID`.
+
+Rejection is not a dead end: a `BlendEngineer` reopens a `REJECTED` recipe, moving `REJECTED → DRAFT`, provided no extrusion run currently references it with a `status` of `SCHEDULED`, `RUNNING` or `HELD`. Reopening clears both `submitted_by_user_id` and `rejection_reason`; the existing `components` survive and may be extended by further appends. The full cycle `DRAFT → SUBMITTED → REJECTED → DRAFT → SUBMITTED` is therefore legitimate and each pass re-runs every blend calculation against the extended component list.
+
+Supersession is the recipe lifecycle's terminal move, and it is **deferred when the predecessor is still pinned**. The server maintains `pinned_run_count` on each recipe: the number of extrusion runs referencing it whose `status` is `SCHEDULED`, `RUNNING` or `HELD`. When a successor is approved and the predecessor's `pinned_run_count` is zero, the predecessor moves `APPROVED → SUPERSEDED` immediately. When the predecessor is still pinned, the server instead sets the predecessor's `supersede_pending` flag to true and leaves it `APPROVED`; the predecessor then transitions to `SUPERSEDED` automatically at the moment its `pinned_run_count` reaches zero — which happens when its last pinning run either completes or is blocked. On that transition `supersede_pending` is cleared. `SUPERSEDED` is terminal, and any later attempt to schedule a run against a superseded recipe is refused with `ERR_RECIPE_NOT_APPROVED`.
+
+### 3.4. Scheduling a Line: Capability, Occupancy and the Conditional Purge
+
+A `PlantAdmin` registers each **extrusion line** with a `line_code`, a `process_type` of `BLOWN` or `CAST`, the number of extruders it can coextrude as `max_layers` (at least one), the gauge range it can hold as `min_gauge_micron` and `max_gauge_micron`, the widest tube it can produce as `max_layflat_mm`, a changeover purge time in `purge_buffer_minutes` (defaulting to 45 minutes and never negative), and a `food_contact_certified` flag defaulting to false. A newly registered line starts with `posture` at `OPEN` and all three of `incapable_run_count`, `active_hold_count` and `revoked_dossier_count` at zero.
+
+An `ExtrusionOperator` or `PlantAdmin` schedules a **run** by supplying a `run_code`, the `line_id` to occupy, the `blend_recipe_id` to pin, a `scheduled_start` and `scheduled_end` bounding the occupation window (start inclusive, end exclusive, end strictly after start), and a `target_output_kg` of planned good output, which must be positive and from which the run's regrind budget is later derived. The run enters `SCHEDULED` and the pinned recipe's `pinned_run_count` increments.
+
+Scheduling is gated on four families of check. The recipe must be in `APPROVED` status, or `ERR_RECIPE_NOT_APPROVED`. The line must not be `FROZEN`, or `ERR_LINE_POSTURE_FROZEN`; and when the recipe's product requires food contact, the line must not be `RESTRICTED` either, or `ERR_LINE_POSTURE_RESTRICTED` — a `RESTRICTED` line still accepts non-food work. Food-contact products additionally demand a `food_contact_certified` line, or `ERR_LINE_NOT_FOOD_CERTIFIED`. And the line must be physically capable: the recipe's `layer_count` may not exceed the line's `max_layers`, the recipe's `process_type` must match the line's `process_type`, and the product's `target_gauge_micron` and `layflat_width_mm` must sit inside the line's gauge range and at or below its `max_layflat_mm`; a violation of any of these is `ERR_LINE_CAPABILITY_MISMATCH`.
+
+**Line occupancy is exclusive, and the required gap between two runs depends on what they have in common.** Only runs whose `status` is `SCHEDULED`, `RUNNING` or `HELD` occupy the line; `COMPLETED` and `BLOCKED` runs never do. For each occupying run on the same line, the required gap is zero minutes when that run pins the same `blend_recipe_id` **and** its product's `food_contact_required` value matches the new run's — nothing needs purging when neither the blend nor the food-contact status changes. In every other case the required gap is the line's `purge_buffer_minutes`. A conflict exists when the new run's `scheduled_start` falls earlier than the occupying run's `scheduled_end` extended forward by the gap, **and** the occupying run's `scheduled_start` falls earlier than the new run's `scheduled_end` extended forward by the gap. Because the windows are half-open, a run beginning exactly at an existing run's `scheduled_end` with a zero gap does not conflict. A conflict is refused with `ERR_LINE_WINDOW_CONFLICT`. A `scheduled_start` earlier than the current logical clock is refused with `ERR_WINDOW_IN_PAST`.
+
+Rescheduling a run moves its `scheduled_start` and `scheduled_end` and re-runs exactly the same occupancy and past-window evaluation; it is permitted only while the run is still `SCHEDULED`, and an attempt on any other status yields `ERR_RUN_STATE_INVALID`.
+
+### 3.5. Running the Line: Gauge Capability, Holds and Closure
+
+Starting a run advances it `SCHEDULED → RUNNING`. Four preconditions apply: the line's `posture` must not be `FROZEN` (`ERR_LINE_POSTURE_FROZEN`); the pinned recipe must still be `APPROVED` (`ERR_RECIPE_NOT_APPROVED`); a food-contact product demands a `food_contact_certified` line (`ERR_LINE_NOT_FOOD_CERTIFIED`); and the current logical clock must have reached `scheduled_start`, an earlier clock yielding `ERR_RUN_NOT_YET_STARTABLE`. Starting re-derives the line's `active_hold_count` and `posture`.
+
+While a run is `RUNNING` or `HELD`, an `ExtrusionOperator` appends **gauge samples** to it. Each sample carries a `thickness_micron`, and optionally a `layflat_mm` — which defaults to the product's `layflat_width_mm` — and a `bubble_deviation_mm`, which defaults to 0.0. The server stores each sample in the run's append-only reading log, `gauge_readings`, with a `seq` equal to its one-based append index and a `recorded_at` taken from the logical clock, and then re-derives the capability block over the **entire** log in append order, with no filtering by recency. `gauge_sample_count` is simply the number of samples logged.
+
+The capability block behaves in two regimes. While fewer than five samples exist, `gauge_mean_micron`, `gauge_sd_micron`, `gauge_cv_pct` and `gauge_capability_index` are all null and `gauge_capability_state` reads `INSUFFICIENT_DATA`. Once at least five samples exist, the mean thickness is the sum of `thickness_micron` divided by the sample count, published as `gauge_mean_micron` rounded to three decimals. The standard deviation is a **population** standard deviation: the sum of squared deviations from the mean divided by the sample count itself — not by the count less one — and then square-rooted; it is published as `gauge_sd_micron` rounded to four decimals. `gauge_cv_pct` is that standard deviation divided by the mean, multiplied by one hundred, rounded to three decimals. The capability index is a two-sided Cpk against the product's tolerance band: the upper limit is `target_gauge_micron` multiplied by one plus `gauge_tolerance_pct` divided by one hundred, the lower limit is `target_gauge_micron` multiplied by one minus `gauge_tolerance_pct` divided by one hundred, and the raw index is the smaller of two quotients — the upper limit minus the mean divided by three times the standard deviation, and the mean minus the lower limit divided by three times the standard deviation. When the standard deviation is exactly zero the raw index is taken as the ceiling value 4.000. `gauge_capability_index` is the smaller of 4.000 and the raw index, rounded to three decimals. `gauge_capability_state` is then read **from that rounded value**: `CAPABLE` when the index is at least 1.330, `MARGINAL` when it is at least 1.000, and `INCAPABLE` otherwise.
+
+Two further readings-derived figures do not wait for five samples. `layflat_deviation_max_mm` is the largest absolute difference between any sample's `layflat_mm` and the product's `layflat_width_mm`, rounded to two decimals, and is null while the log is empty. `bubble_instability_events` counts the samples whose `bubble_deviation_mm` has an absolute value strictly greater than 3.0 millimetres.
+
+Bubble instability and gauge drift are handled by holding the run. A hold moves `RUNNING → HELD`, requires a `hold_reason` in the payload, increments the run's `hold_count`, increments the line's `active_hold_count` and re-derives `posture` — which is why a second concurrent hold on the same line tips that line from `OPEN` to `RESTRICTED`. Resuming moves `HELD → RUNNING`, requires that the line's `posture` not be `FROZEN`, clears `hold_reason`, decrements the line's `active_hold_count` and re-derives `posture`. A run may be held and resumed repeatedly, but resume is refused with `ERR_RUN_HOLD_LIMIT_EXCEEDED` once `hold_count` has passed three; beyond that point the run can only be completed or blocked.
+
+**Completing a run is the first of the two great cascade roots.** Closure moves `RUNNING → COMPLETED` and takes two figures: a `gross_output_kg` of total extruded mass and a `scrap_kg` of scrap mass. It requires at least five gauge samples, or `ERR_INSUFFICIENT_GAUGE_DATA`; it requires `scrap_kg` to be no greater than `gross_output_kg`, or `ERR_SCRAP_EXCEEDS_OUTPUT`; and it requires that an eligible regrind pool exist for the scrap — matching the recipe's `dominant_polymer_family` and the product's food-contact status — or `ERR_NO_ELIGIBLE_REGRIND_POOL`.
+
+The mass balance is then struck. `regrind_consumed_kg` is the sum of `kg` over the run's non-reversed reincorporation transactions, rounded to three decimals. `net_good_kg` is `gross_output_kg` minus `scrap_kg`, rounded to three decimals. An intermediate virgin feed mass is `gross_output_kg` minus `regrind_consumed_kg`, floored at zero and rounded to three decimals. The recycled mass carried in by the pool is the sum of `pcr_kg` over those same transactions. `pcr_mass_kg` is then the virgin feed mass multiplied by the recipe's `virgin_pcr_pct` divided by one hundred, plus that pool-borne recycled mass, rounded to three decimals. `regrind_actual_pct` is `regrind_consumed_kg` divided by `gross_output_kg`, multiplied by one hundred, rounded to three decimals. And `actual_recycled_content_pct` — the as-built variant — is `pcr_mass_kg` divided by `gross_output_kg`, multiplied by one hundred, rounded to three decimals. Both `regrind_actual_pct` and `actual_recycled_content_pct` are null before completion.
+
+Closure then fires five side effects. The run's `actual_recycled_content_pct` is copied onto every film roll wound by the run. A regrind transaction is booked into the eligible pool with `direction` `IN` and `origin_kind` `EXTRUSION_SCRAP`, carrying `kg` equal to `scrap_kg` and a `pcr_kg` equal to `scrap_kg` multiplied by the run's freshly computed `actual_recycled_content_pct` divided by one hundred, rounded to three decimals — the scrap enters the pool carrying the run's own as-built recycled fraction — and the pool's aggregates are re-derived. The run's `recipe_pin_released` flag is set to true and the recipe's `pinned_run_count` decrements, which may fire a deferred supersession as described in §3.3. When `gauge_capability_state` came out `INCAPABLE`, the line's `incapable_run_count` increments. Finally the line's `posture` is re-derived; if it now reads `FROZEN`, every `SCHEDULED` run on that line moves to `BLOCKED` and every `WOUND` roll produced on that line moves to `QUARANTINED`.
+
+A run driven to `BLOCKED` by a freeze likewise sets `recipe_pin_released` to true and decrements the recipe's `pinned_run_count` — and when the recipe now carries `supersede_pending` as true with `pinned_run_count` at zero, that recipe moves to `SUPERSEDED`. Blocking also releases the run's line occupancy window, so a later run may legitimately be scheduled over the same interval. Both `COMPLETED` and `BLOCKED` are terminal for a run. Attempting a transition from a status where it is not declared — starting a run that is not `SCHEDULED`, holding one that is not `RUNNING`, resuming one that is not `HELD`, completing one that is not `RUNNING`, or logging a gauge sample or a regrind draw on a run that is neither `RUNNING` nor `HELD` — is refused with `ERR_RUN_STATE_INVALID`.
+
+An `ExtrusionOperator` records each **wound roll** against its run by supplying the `extrusion_run_id`, a `roll_number` that must be positive and unique within that run, a positive `net_kg` of film mass, and optionally a measured `layflat_mm` (defaulting to the product's `layflat_width_mm`) and `gauge_micron_avg` (defaulting to the product's `target_gauge_micron`). A roll starts in `WOUND` with a null `actual_recycled_content_pct`, which stays null until the producing run completes and is then refreshed whenever the run's own figure changes.
+
+### 3.6. The Regrind Ledger: Pools, Draws, Scrap and Reversals
+
+Regrind is not a number on a shelf; it is a **double-entry ledger** whose balances are always re-derived from rows. A `PlantAdmin` creates each pool with a `pool_code`, a `food_contact_status` of `FOOD_CONTACT_ELIGIBLE` or `NON_FOOD_ONLY`, and a `polymer_family` of `LDPE`, `LLDPE`, `HDPE` or `MDPE`, which segregates the pool by material.
+
+Each transaction row is immutable and records the `pool_id` it moves mass through, a positive `kg`, a `direction` of `IN` or `OUT`, an `origin_kind` of `EXTRUSION_SCRAP`, `ROLL_SCRAP`, `LOT_SCRAP`, `REINCORPORATION` or `REVERSAL`, a computed `pcr_kg` of recycled mass carried, a `pool_available_kg_after` snapshot of the pool's available mass immediately after the row was applied, and a `recorded_at` taken from the logical clock. The `extrusion_run_id` field names the run that generated the mass for an extrusion-scrap row or consumed it for a reincorporation row, and is null for roll-scrap, lot-scrap and reversal rows. `origin_ref_id` is a **polymorphic** reference resolved by `origin_kind`: it holds the film roll's identifier when `origin_kind` is `ROLL_SCRAP`, the bag lot's identifier when `origin_kind` is `LOT_SCRAP`, and null for every other origin kind. `reverses_transaction_id` names the row a reversal undoes and is null otherwise, and `reversal_reason` records why.
+
+Pool aggregates are computed over a carefully defined input set: all of the pool's transaction rows whose `origin_kind` is not `REVERSAL` and whose identifier does not appear as the `reverses_transaction_id` of any reversal row. A reversal row is itself never summed — its only effect is to remove its target from the input set. Over that set, `cumulative_in_kg` is the sum of `kg` for rows with `direction` `IN`, `cumulative_out_kg` the sum of `kg` for rows with `direction` `OUT`, and `cumulative_in_pcr_kg` the sum of `pcr_kg` for rows with `direction` `IN`, each rounded to three decimals. `available_kg` is `cumulative_in_kg` minus `cumulative_out_kg`, rounded to three decimals — this is the pool's first invariant, and it must hold at every observable moment. `embedded_pcr_pct` is 0.000 when `cumulative_in_kg` is zero, and otherwise `cumulative_in_pcr_kg` divided by `cumulative_in_kg`, multiplied by one hundred, rounded to three decimals. `generation_count` counts the non-reversed inbound rows and `reincorporation_count` the non-reversed outbound rows. A second invariant holds system-wide and is checkable at any point: `available_kg` plus the total non-reversed outbound mass always equals the total non-reversed inbound mass. A dedicated computed read re-derives all of these from the rows and returns the reconciled pool, so a caller can verify the balance without trusting the stored copy.
+
+An `ExtrusionOperator` **draws regrind** into a `RUNNING` or `HELD` run by naming the `pool_id`, the `kg` to draw, and the `expected_regrind_pool_version` described in §2.6. The draw books a row with `direction` `OUT` and `origin_kind` `REINCORPORATION`, whose `pcr_kg` is the drawn `kg` multiplied by the pool's `embedded_pcr_pct` **as measured immediately before this draw**, divided by one hundred, rounded to three decimals — so successive draws from a pool whose embedded fraction is shifting each carry the fraction current at their own draw time. Four gates apply beyond concurrency. A food-contact product may not draw from a `NON_FOOD_ONLY` pool, and no product may draw from a pool whose `polymer_family` differs from the recipe's `dominant_polymer_family`; either is `ERR_FOOD_CONTACT_POOL_INELIGIBLE`. A request for more `kg` than the pool's `available_kg` is refused with `ERR_REGRIND_INSUFFICIENT`. And the run carries a **regrind budget**: a draw that would push the run's cumulative regrind consumption above the run's `target_output_kg` multiplied by the recipe's `regrind_cap_pct` divided by one hundred is refused with `ERR_REGRIND_BUDGET_EXCEEDED`. Each accepted draw re-derives the pool's balances and increments the pool's `version`.
+
+Mass also enters pools from scrapped material. A `QualityManager` scraps a roll that is in `WOUND` or `QUARANTINED` status, moving it to the terminal `SCRAPPED` state; the request may name a `pool_id` explicitly, and when it is omitted the server selects the single eligible pool matching the product's polymer family and food-contact status. Scrapping books a row with `direction` `IN` and `origin_kind` `ROLL_SCRAP`, an `origin_ref_id` naming the roll, and a `kg` equal to the roll's `net_kg`, then re-derives the pool. Scrapping a roll that is `CONSUMED`, `RELEASED` or already `SCRAPPED` is refused with `ERR_ROLL_STATE_INVALID`, and the absence of an eligible pool is `ERR_NO_ELIGIBLE_REGRIND_POOL`.
+
+Because rows are immutable, the compensating action is a **reversal**, available to a `QualityManager`. Reversing a target row books a new row whose `origin_kind` is `REVERSAL`, whose `reverses_transaction_id` names the target, whose `kg` equals the target's `kg`, and whose `direction` is opposite to the target's, together with the supplied `reversal_reason`. The pool's aggregates are then re-derived so both invariants hold again, and the pool's `version` increments. When the reversed target was a reincorporation, the consuming run's `regrind_consumed_kg` is decremented and its `regrind_actual_pct` re-derived. Two refusals guard the action: a target already referenced by an existing reversal yields `ERR_TRANSACTION_ALREADY_REVERSED`, and a target that is itself a reversal — or whose reversal would drive the pool's `available_kg` below zero — yields `ERR_TRANSACTION_NOT_REVERSIBLE`.
+
+### 3.7. Releasing Rolls onto the Printing Floor
+
+A wound roll is not printable until quality releases it. A `QualityManager` moves a roll `WOUND → RELEASED` subject to four conditions: the producing run must be `COMPLETED`, or `ERR_RUN_STATE_INVALID`; that run's `gauge_capability_state` must be either `CAPABLE` or `MARGINAL`, an `INCAPABLE` or `INSUFFICIENT_DATA` run yielding `ERR_GAUGE_CAPABILITY_INSUFFICIENT`; the roll's `layflat_mm` must deviate from the product's `layflat_width_mm` by no more than 5.0 millimetres in absolute value, a wider deviation yielding `ERR_LAYFLAT_OUT_OF_TOLERANCE`; and the producing line's `posture` must not be `FROZEN`, or `ERR_LINE_POSTURE_FROZEN`. Release clears any `release_blocked_reason` previously stamped on the roll. Release attempted on a roll that is not `WOUND` is refused with `ERR_ROLL_STATE_INVALID`.
+
+Rolls can also be taken out of play by the system rather than by an operator. A `WOUND` roll moves to `QUARANTINED` whenever its producing line's `posture` becomes `FROZEN`, or whenever a compliance dossier traceable to that roll is revoked; the transition stamps a `release_blocked_reason` explaining which of the two happened. A quarantined roll is not printable, but it remains scrappable into a regrind pool as described in §3.6.
+
+A `PlantAdmin` registers each **press** with a `press_code`, a `cylinder_capacity` of print stations available concurrently (at least one), a `max_colors` limit on a single plate set (at least one), a positive `registration_tolerance_micron` of accepted registration drift, and a `max_delta_e` of accepted color deviation, defaulting to 2.0.
+
+A `PrintOperator` or `PlantAdmin` registers a **plate set** with a `plate_code`, the `product_id` it prints, a `color_count` of at least one — which is also the number of cylinders it will occupy — and a `wear_limit_impressions` defaulting to 500000. A plate set begins in `NEW` with `impressions_count` and `nonconformance_count` at zero and `mounted_press_id` null. A `PrintOperator` mounts a `NEW` plate set onto a press by naming the `press_id`, moving it `NEW → MOUNTED` and setting `mounted_press_id`; the plate's `color_count` may not exceed that press's `max_colors`, or the mount is refused with `ERR_PLATE_COLOR_EXCEEDS_PRESS`. Mounting anything that is not `NEW` — including the terminal `WORN` state — is refused with `ERR_PLATE_STATE_INVALID`; no separate wear guard is needed at mount time, because `impressions_count` and `nonconformance_count` only advance while a plate is `MOUNTED` and either counter reaching its limit already drives the plate to `WORN`.
+
+A plate set moves `MOUNTED → WORN` under either of two conditions: `impressions_count` reaching or exceeding `wear_limit_impressions` after a print job completes, or `nonconformance_count` reaching one after a dossier revocation is traced back to a lot printed with that plate. Wearing out clears `mounted_press_id` and moves every print job on that plate set whose `status` is `SETUP` to `BLOCKED`, releasing each of those jobs' press cylinder windows.
+
+### 3.8. Printing: Three Independent Dimensions
+
+A `PrintOperator` creates a **print job** by naming a `job_code`, the `film_roll_id` to feed, the `plate_set_id` to print with, the `press_id` whose cylinders it will occupy, and a `window_start` and `window_end` bounding that occupation (start inclusive, end exclusive, end strictly after start). The named roll must be in `RELEASED` status, or `ERR_ROLL_STATE_INVALID`; the named plate set must be `MOUNTED`, or `ERR_PLATE_STATE_INVALID`. Creation freezes `cylinders_required` as a copy of the plate set's `color_count` at that moment, and it claims the roll: the roll moves `RELEASED → CONSUMED`, so a second job naming the same roll is refused with `ERR_ROLL_STATE_INVALID`.
+
+**Press cylinders are an aggregate resource with no buffer.** The server gathers every job on the same press whose `status` is `SETUP` or `PRINTING` and whose window overlaps the requested one — overlap meaning that job's `window_start` falls earlier than the new `window_end` and the new `window_start` falls earlier than that job's `window_end`, so the intervals are half-open. It sums those jobs' `cylinders_required`, adds the new job's own requirement, and refuses with `ERR_PRESS_CYLINDER_CAPACITY` when the total exceeds the press's `cylinder_capacity`. Each individual job may fit comfortably; it is only the collective sum inside an overlapping window that can breach capacity. Jobs in `COMPLETED` or `BLOCKED` status release their cylinders and are excluded from the sum.
+
+A print job carries **three state dimensions that evolve independently**: a primary `status`, a `registration_state`, and a `color_state`. `status` starts at `SETUP` and may reach `PRINTING`, `COMPLETED` or `BLOCKED`. `registration_state` starts at `REG_PENDING` and moves between `REG_PASS` and `REG_FAIL`. `color_state` starts at `COLOR_PENDING` and moves between `COLOR_PASS` and `COLOR_FAIL`. A job may sit at `REG_PASS` while still `COLOR_PENDING`, or vice versa; neither dimension constrains the other.
+
+Registration is measured by recording a `registration_drift_micron` against the job. The job must be in `SETUP`, or the measurement is refused with `ERR_PRINT_JOB_STATE_INVALID`. The measurement is stored, `setup_attempt_count` increments, and `registration_state` becomes `REG_PASS` when the recorded drift is no greater than the press's `registration_tolerance_micron` and `REG_FAIL` when it is greater. This applies uniformly from every starting point: `REG_PENDING → REG_PASS`, `REG_PENDING → REG_FAIL`, `REG_FAIL → REG_PASS` on a corrected measurement, and `REG_PASS → REG_FAIL` on a measurement that has drifted back out.
+
+Color matching is measured symmetrically by recording a `delta_e_measured` against the job. The job must again be in `SETUP`, or `ERR_PRINT_JOB_STATE_INVALID`. The measurement is stored, `setup_attempt_count` increments, and `color_state` becomes `COLOR_PASS` when the recorded deviation is no greater than the press's `max_delta_e` and `COLOR_FAIL` when it is greater — again from every starting point: `COLOR_PENDING → COLOR_PASS`, `COLOR_PENDING → COLOR_FAIL`, `COLOR_FAIL → COLOR_PASS`, and `COLOR_PASS → COLOR_FAIL`.
+
+Because `setup_attempt_count` counts registration measurements and color proofs together, a job that cannot be dialled in eventually gives up: once `setup_attempt_count` passes four, the job's `status` moves `SETUP → BLOCKED`, a `blocked_reason` is stamped, and its press cylinder window is released so a later job may occupy the same interval. The same `SETUP → BLOCKED` move, with the same reason stamping and window release, is triggered when the job's plate set wears out.
+
+Starting to print advances `SETUP → PRINTING` and requires all of: `registration_state` equal to `REG_PASS` and `color_state` equal to `COLOR_PASS`, either being otherwise refused with `ERR_PRINT_JOB_STATE_INVALID`; the plate set still `MOUNTED` and its `mounted_press_id` equal to the job's `press_id`, or `ERR_PLATE_STATE_INVALID`; the fed roll in `CONSUMED` status, confirming it was claimed by this job, or `ERR_ROLL_STATE_INVALID`; and the current logical clock at or after `window_start`, an earlier clock yielding `ERR_PRINT_WINDOW_NOT_OPEN`.
+
+Completing the job advances `PRINTING → COMPLETED` and takes a `printed_kg` of printed mass, which must be strictly positive and no greater than the fed roll's `net_kg`; a violation is `ERR_PRINTED_KG_EXCEEDS_ROLL`. Completion charges the plate set: `impressions_count` increases by `printed_kg` rounded **down** to a whole number, and when `impressions_count` then stands at or above `wear_limit_impressions` the plate set moves to `WORN` with the consequences described in §3.7. Completion also releases the job's press cylinder window. Completing a job that is not `PRINTING` is refused with `ERR_PRINT_JOB_STATE_INVALID`.
+
+### 3.9. Converting: Seal Qualification, Case Packout and Release
+
+A `ConvertingOperator` opens a **bag lot** from a `COMPLETED` print job by naming a `lot_code`, the `print_job_id`, the `product_id`, a positive `bag_count_produced` counted off the converting line, and optionally a `bag_count_scrapped` seeded at creation (defaulting to zero) plus the two converting confirmations `perforation_verified` and `gusset_verified`, each defaulting to false. A lot opened from a job that is not `COMPLETED` is refused with `ERR_PRINT_JOB_STATE_INVALID`, and a lot whose `product_id` differs from the product of its print job's plate set is refused with `ERR_PRODUCT_MISMATCH`. `bag_count_produced` is immutable after creation. Creation sets `bag_count_unpacked` to `bag_count_produced` minus `bag_count_scrapped`, copies `actual_recycled_content_pct` from the producing film roll, and computes the count-accuracy block.
+
+The **theoretical bag count** treats a bag as two plies of film across the layflat width. `bag_unit_weight_kg` is the product's `layflat_width_mm` divided by one thousand, multiplied by two, multiplied by the sum of `bag_length_mm` and `gusset_depth_mm` divided by one thousand, multiplied by `target_gauge_micron` divided by one million, multiplied by the producing recipe's `blended_density_kg_m3`, rounded to six decimals. `bag_count_theoretical` is the print job's `printed_kg` divided by `bag_unit_weight_kg`, rounded **down** to a whole number. `count_accuracy_pct` is `bag_count_produced` divided by `bag_count_theoretical`, multiplied by one hundred, rounded to two decimals, and is null when `bag_count_theoretical` is zero. `count_accuracy_conforming` is true when the absolute difference between `count_accuracy_pct` and one hundred is no greater than the product's `count_accuracy_tolerance_pct`. A conservation invariant holds after every packout and every unwind: `bag_count_produced` always equals `bag_count_unpacked` plus `packed_bag_count` plus `bag_count_scrapped`.
+
+**Seal testing** begins when the first specimen is appended, which advances the lot `CONVERTING → TESTING`. Before any specimen may be appended, the converting features must be confirmed: a product whose `perforation_required` is true demands `perforation_verified` as true, and a product whose `bag_style` is `GUSSETED` demands `gusset_verified` as true; either shortfall is refused with `ERR_CONVERTING_FEATURE_NOT_VERIFIED`. Both a `ConvertingOperator` and a `QualityManager` may append specimens. Each append supplies a `specimen_index`, a `measured_n_per_15mm` in newtons per 15 millimetres, and optionally a `test_kind` of `BOTTOM_SEAL`, `SIDE_SEAL` or `PERFORATION`, which defaults to `BOTTOM_SEAL`. The server derives the row's `attempt` as one plus the number of earlier specimens sharing the same `specimen_index`, derives `is_retest` as true exactly when that `attempt` is greater than one, records `entered_by_user_id` from the acting `X-User-ID` — which is what later feeds the dossier segregation-of-duties rule — and stamps `recorded_at` from the logical clock. The specimen log, `seal_specimens`, is append-only. Appending to a lot that is neither `CONVERTING` nor `TESTING` is refused with `ERR_BAG_LOT_STATE_INVALID`.
+
+Seal strength is judged by **two variants that can disagree**. The *provisional* variant is recomputed on every append and looks only at bottom-seal specimens whose `is_retest` is false — first passes only, retests entirely ignored. While fewer than three such first-pass specimens exist, `seal_provisional_mean_n` is null and `seal_provisional_verdict` reads `PENDING`. Once three or more exist, `seal_provisional_mean_n` is the mean of their `measured_n_per_15mm` rounded to two decimals, and `seal_provisional_verdict` is `PASS` when that mean is at least the product's `min_bottom_seal_n_per_15mm` and `FAIL` otherwise. A weak specimen that was later retested still drags the provisional mean down, and a retest that came out worse than its first pass is invisible to it.
+
+The *final* variant is written once, by a `QualityManager` finalizing the tests, and it is the only variant the lot's fork reads. It is computed over the **superseding panel**: for each distinct `specimen_index` among the bottom-seal specimens, only the row with the highest `attempt` is kept, so a retest supersedes its first pass entirely. If that panel holds fewer than three distinct specimen indices, finalization is refused with `ERR_INSUFFICIENT_SEAL_PANEL`. Otherwise `seal_final_min_n` is the minimum `measured_n_per_15mm` over the panel and `seal_final_mean_n` its mean, both rounded to two decimals. Three thresholds are then derived from the product's `min_bottom_seal_n_per_15mm`: a pass floor equal to that specification multiplied by 0.900 and rounded to two decimals, a conditional floor equal to it multiplied by 0.800 and rounded to two decimals, and a conditional mean equal to it multiplied by 0.950 and rounded to two decimals. `seal_final_verdict` is `PASS` when `seal_final_min_n` is at least the pass floor **and** `seal_final_mean_n` is at least the raw specification; otherwise `CONDITIONAL` when `seal_final_min_n` is at least the conditional floor **and** `seal_final_mean_n` is at least the conditional mean; otherwise `FAIL`. Because the final variant reads the superseding panel while the provisional reads first passes, the final verdict may be `PASS` where the provisional said `FAIL` — a good retest replaced a weak specimen — or `FAIL` where the provisional said `PASS`, when the retest came out worse. Until finalization writes them, the three final fields carry their unwritten values: a lot is created with `seal_final_min_n` and `seal_final_mean_n` null and `seal_final_verdict` reading the sentinel `PENDING`, and nothing other than finalization ever changes any of the three.
+
+Finalization is a **three-way fork with divergent consequences**, and each branch requires the panel to hold at least three specimens. On a final verdict of `PASS`, the lot moves `TESTING → QUALIFIED` and `seal_final_verdict`, `seal_final_min_n` and `seal_final_mean_n` are written. On a final verdict of `CONDITIONAL`, the lot moves `TESTING → CONDITIONAL` with the same three fields written; the lot remains packable and shippable, but its release gate is tightened — release will additionally require that the lot's issued dossier carry a `claim_conformance` of `CONFORMING`. On a final verdict of `FAIL`, the lot moves `TESTING → FAILED`, which is terminal: `bag_count_scrapped` is set equal to `bag_count_produced` and `bag_count_unpacked` is set to zero, and the entire lot is converted into pool mass by booking a regrind transaction with `direction` `IN`, `origin_kind` `LOT_SCRAP`, an `origin_ref_id` naming the lot, and a `kg` equal to `bag_count_produced` multiplied by `bag_unit_weight_kg` rounded to three decimals, after which the pool's aggregates are re-derived. The `FAILED` branch therefore requires that an eligible pool exist for the lot's polymer family and food-contact status, or it is refused with `ERR_NO_ELIGIBLE_REGRIND_POOL`. Finalizing a lot that is not in `TESTING` is refused with `ERR_BAG_LOT_STATE_INVALID`.
+
+**Packout** is incremental. A `ConvertingOperator` commits an allocation by supplying a `requested_bags` count and the `expected_bag_lot_version` of §2.6; the lot must be `QUALIFIED`, `CONDITIONAL` or already `PACKED`, and any other status is refused with `ERR_BAG_LOT_STATE_INVALID`. `requested_bags` may not exceed the lot's current `bag_count_unpacked`, or the call is refused with `ERR_PACKOUT_EXCEEDS_UNPACKED`. The allocation is a waterfall: the number of full cases is `requested_bags` divided by the product's `bags_per_case`, rounded down; the remainder is `requested_bags` minus that full-case count multiplied by `bags_per_case`. A short case counts as one billable case only when the remainder is greater than zero **and** at least the product's `min_partial_case_bags`; in that case the remainder's bags are packed into it, and otherwise the short case is not created and its bags are **not** packed — they remain in `bag_count_unpacked` awaiting a later call. The bags packed by this call are the full-case count multiplied by `bags_per_case`, plus the partial-case bags if any. `packed_bag_count` increases by that figure, `packed_case_count` increases by the full-case count plus the partial case if any, `partial_case_bag_count` increases by the partial-case bags, and `bag_count_unpacked` decreases by the bags actually packed. `pallet_count` is then recomputed as the **cumulative** `packed_case_count` divided by the product's `cases_per_pallet`, rounded up — a ceiling taken over the cumulative case count, never the sum of per-packout ceilings. The first accepted packout moves the lot `QUALIFIED → PACKED` or `CONDITIONAL → PACKED`, applying identical allocation and counter updates on both branches, and each accepted packout increments the lot's `version`.
+
+Releasing a `PACKED` lot is a `QualityManager` action and it enforces four gates. `count_accuracy_conforming` must be true, or `ERR_COUNT_ACCURACY_OUT_OF_SPEC`. Some compliance dossier for the lot must be in `ISSUED` status, or `ERR_DOSSIER_NOT_ISSUED`. When the lot's `seal_final_verdict` is `CONDITIONAL`, that dossier's `claim_conformance` must additionally be `CONFORMING`, and a shortfall here is likewise `ERR_DOSSIER_NOT_ISSUED`. And when the product requires food contact, that dossier's `food_contact_declared` must be true, or `ERR_FOOD_CONTACT_DECLARATION_INVALID`. Release moves the lot `PACKED → RELEASED`. A `PlantAdmin` then ships a `RELEASED` lot, moving it `RELEASED → SHIPPED`, provided `packed_case_count` is greater than zero. Releasing a lot that is not `PACKED`, or shipping one that is not `RELEASED`, is refused with `ERR_BAG_LOT_STATE_INVALID`.
+
+### 3.10. Compliance Dossiers and the Revocation Cascade
+
+A `QualityManager` drafts a **compliance dossier** against a lot by supplying a `dossier_code`, the `bag_lot_id`, a `food_contact_declared` assertion, and a `recycled_content_claim_pct` constrained to the inclusive range zero through one hundred. The dossier begins in `DRAFT` with `as_built_recycled_content_pct` and `claim_variance_pct` null and `claim_conformance` reading `PENDING`. A dossier drafted for a lot whose status is not `QUALIFIED`, `CONDITIONAL` or `PACKED` is refused with `ERR_DOSSIER_STATE_INVALID`.
+
+Issuing the dossier moves `DRAFT → ISSUED` and is the moment the claim is tested against reality. Four preconditions apply: the lot's status must be `QUALIFIED`, `CONDITIONAL` or `PACKED`; the lot's `actual_recycled_content_pct` must not be null, since a lot whose producing run never completed has no as-built figure to certify against; the acting `X-User-ID` must not appear as `entered_by_user_id` on any of the lot's seal specimens, or `ERR_SEGREGATION_OF_DUTIES`; and when `food_contact_declared` is true, the lot's blend recipe must carry `food_contact_eligible` as true and the producing line must be `food_contact_certified`, or `ERR_FOOD_CONTACT_DECLARATION_INVALID`. Issue then freezes `as_built_recycled_content_pct` from the lot's `actual_recycled_content_pct`, computes `claim_variance_pct` as `recycled_content_claim_pct` minus `as_built_recycled_content_pct` rounded to three decimals, and sets `claim_conformance` to `CONFORMING` when the absolute value of that variance is no greater than 0.500 percentage points, to `OVERSTATED` when the variance is greater than 0.500, and to `UNDERSTATED` otherwise — that is, when the claim falls short of the as-built figure by more than 0.500 points. A claim that would land `OVERSTATED` is refused outright with `ERR_CLAIM_OVERSTATED`; understating is permitted, since a conservative claim harms nobody. Issue also stamps `issued_by_user_id` with the acting `X-User-ID` and `issued_at` from the logical clock. Issuing a dossier that is not in `DRAFT` is refused with `ERR_DOSSIER_STATE_INVALID`.
+
+**Revocation is the second great cascade root, and it reaches five levels deep.** A `QualityManager` revokes an `ISSUED` dossier with a mandatory `revocation_reason` in the payload; revoking anything that is not `ISSUED` is refused with `ERR_DOSSIER_STATE_INVALID`. At the first level, the dossier moves `ISSUED → REVOKED` and `revoked_at` is stamped from the logical clock. At the second level, the documented lot is quarantined: a lot whose status is `QUALIFIED`, `CONDITIONAL`, `PACKED` or `RELEASED` moves to the terminal `QUARANTINED` state — so both `PACKED → QUARANTINED` and `RELEASED → QUARANTINED` are legitimate — a `quarantine_reason` is stamped, and the packout is **unwound**: `packed_bag_count`, `packed_case_count`, `partial_case_bag_count` and `pallet_count` all reset to zero and `bag_count_unpacked` is restored to `bag_count_produced` minus `bag_count_scrapped`, which re-establishes the conservation invariant of §3.9. At the third level, the lot's print job's plate set has its `nonconformance_count` incremented. At the fourth level, if that increment brings `nonconformance_count` to one, the plate set moves to `WORN`, its `mounted_press_id` is cleared, and every print job on it whose `status` is `SETUP` moves to `BLOCKED` with a `blocked_reason` stamped and its press cylinder window released. At the fifth level, the producing line — reached through the chain lot → print job → film roll → run — has its `revoked_dossier_count` incremented and its `posture` re-derived; since a single revoked dossier is enough to freeze a line, the line typically moves to `FROZEN`, which in turn moves every `SCHEDULED` run on that line to `BLOCKED` and every `WOUND` roll produced on it to `QUARANTINED`.
+
+Corrective action is possible but partial. A `QualityManager` or `PlantAdmin` may clear a line's capability flags, which zeroes both `incapable_run_count` and `revoked_dossier_count` and re-derives `posture`. A line can therefore return `RESTRICTED → OPEN` — which requires `incapable_run_count` at zero, `active_hold_count` below two, and `revoked_dossier_count` at zero — or `FROZEN → OPEN` under those same three conditions. Note that clearing the flags does not clear held runs: a line with two or more runs still sitting in `HELD` stays `RESTRICTED`. And note above all that **runs already driven to `BLOCKED` and rolls already driven to `QUARANTINED` are not restored** by clearing the flags. The freeze cascade is forward-only; reversing it would silently re-admit material whose compliance basis has been withdrawn.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence — a product, a resin grade, a recipe, a component line on a recipe, a line, a run, a gauge sample, a regrind draw, a roll, a pool, a reversal, a press, a plate set, a print job, a bag lot, a seal specimen, or a dossier — return `201 Created`. Operations that modify an existing resource, including every state transition and every read, return `200 OK`. Read endpoints are open to all six roles; write endpoints are restricted as listed below.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock | PlantAdmin |
+| POST | `/products` | Register a customer product specification | PlantAdmin |
+| GET | `/products/{id}` | Read one product specification | Any |
+| GET | `/products` | List product specifications | Any |
+| POST | `/resin-grades` | Register a resin or additive masterbatch grade | PlantAdmin |
+| GET | `/resin-grades/{id}` | Read one resin grade | Any |
+| GET | `/resin-grades` | List resin grades | Any |
+| POST | `/blend-recipes` | Open a DRAFT blend recipe for a product | BlendEngineer, PlantAdmin |
+| GET | `/blend-recipes/{id}` | Read one blend recipe with its components and derived indices | Any |
+| GET | `/blend-recipes` | List blend recipes | Any |
+| POST | `/blend-recipes/{id}/components` | Append one component line and recompute every blend calculation | BlendEngineer |
+| POST | `/blend-recipes/{id}/submit` | Submit a DRAFT recipe for quality review | BlendEngineer |
+| POST | `/blend-recipes/{id}/approve` | Approve a SUBMITTED recipe | QualityManager |
+| POST | `/blend-recipes/{id}/reject` | Reject a SUBMITTED recipe | QualityManager |
+| POST | `/blend-recipes/{id}/reopen` | Return a REJECTED recipe to DRAFT | BlendEngineer |
+| POST | `/extrusion-lines` | Register a blown or cast film line | PlantAdmin |
+| GET | `/extrusion-lines/{id}` | Read one line with its derived posture and counters | Any |
+| GET | `/extrusion-lines` | List lines | Any |
+| POST | `/extrusion-lines/{id}/clear-capability-flags` | Clear a line's capability and revocation counters and re-derive posture | QualityManager, PlantAdmin |
+| POST | `/extrusion-runs` | Schedule a run, pinning an APPROVED recipe onto a line | ExtrusionOperator, PlantAdmin |
+| GET | `/extrusion-runs/{id}` | Read one run with its gauge readings and derived fields | Any |
+| GET | `/extrusion-runs` | List runs | Any |
+| PATCH | `/extrusion-runs/{id}/reschedule` | Move a SCHEDULED run's window | ExtrusionOperator, PlantAdmin |
+| POST | `/extrusion-runs/{id}/start` | Start extrusion on the line | ExtrusionOperator |
+| POST | `/extrusion-runs/{id}/gauge-readings` | Append one gauge/layflat/bubble sample and re-run capability | ExtrusionOperator |
+| POST | `/extrusion-runs/{id}/hold` | Place a RUNNING run on hold | ExtrusionOperator |
+| POST | `/extrusion-runs/{id}/resume` | Resume a HELD run | ExtrusionOperator |
+| POST | `/extrusion-runs/{id}/regrind-reincorporations` | Draw regrind mass from a pool into the run | ExtrusionOperator |
+| POST | `/extrusion-runs/{id}/complete` | Close a RUNNING run, freezing capability and as-built content | ExtrusionOperator |
+| POST | `/film-rolls` | Record a wound roll against a run | ExtrusionOperator |
+| GET | `/film-rolls/{id}` | Read one roll | Any |
+| GET | `/film-rolls` | List rolls | Any |
+| POST | `/film-rolls/{id}/release` | Release a WOUND roll for printing | QualityManager |
+| POST | `/film-rolls/{id}/scrap` | Scrap a WOUND or QUARANTINED roll into a regrind pool | QualityManager |
+| POST | `/regrind-pools` | Create a segregated regrind pool | PlantAdmin |
+| GET | `/regrind-pools/{id}` | Read one pool with its derived balances | Any |
+| GET | `/regrind-pools` | List pools | Any |
+| GET | `/regrind-pools/{id}/balance` | Re-derive and return the pool's reconciled aggregates | Any |
+| GET | `/regrind-transactions/{id}` | Read one immutable regrind transaction | Any |
+| GET | `/regrind-transactions` | List regrind transactions | Any |
+| POST | `/regrind-transactions/{id}/reverse` | Book a REVERSAL removing an earlier transaction from every aggregate | QualityManager |
+| POST | `/print-presses` | Register a printing press | PlantAdmin |
+| GET | `/print-presses/{id}` | Read one press | Any |
+| GET | `/print-presses` | List presses | Any |
+| POST | `/plate-sets` | Register a plate set for a product | PrintOperator, PlantAdmin |
+| GET | `/plate-sets/{id}` | Read one plate set | Any |
+| GET | `/plate-sets` | List plate sets | Any |
+| POST | `/plate-sets/{id}/mount` | Mount a NEW plate set onto a press | PrintOperator |
+| POST | `/print-jobs` | Create a print job, consuming a RELEASED roll and reserving cylinders | PrintOperator |
+| GET | `/print-jobs/{id}` | Read one print job with all three state dimensions | Any |
+| GET | `/print-jobs` | List print jobs | Any |
+| POST | `/print-jobs/{id}/registration-check` | Record a registration measurement | PrintOperator |
+| POST | `/print-jobs/{id}/color-proof` | Record a color proof measurement | PrintOperator |
+| POST | `/print-jobs/{id}/start-print` | Start printing once registration and color have passed | PrintOperator |
+| POST | `/print-jobs/{id}/complete` | Close a PRINTING job, charging impressions to the plate set | PrintOperator |
+| POST | `/bag-lots` | Open a converting lot from a COMPLETED print job | ConvertingOperator |
+| GET | `/bag-lots/{id}` | Read one lot with its seal specimens and packout counters | Any |
+| GET | `/bag-lots` | List bag lots | Any |
+| POST | `/bag-lots/{id}/seal-tests` | Append one seal specimen | ConvertingOperator, QualityManager |
+| POST | `/bag-lots/{id}/finalize-tests` | Compute the final seal variant and fork the lot | QualityManager |
+| POST | `/bag-lots/{id}/packout` | Allocate unpacked bags into cases and pallets | ConvertingOperator |
+| POST | `/bag-lots/{id}/release` | Release a PACKED lot to the customer | QualityManager |
+| POST | `/bag-lots/{id}/ship` | Ship a RELEASED lot | PlantAdmin |
+| POST | `/compliance-dossiers` | Draft a food-contact and recycled-content dossier for a lot | QualityManager |
+| GET | `/compliance-dossiers/{id}` | Read one dossier with its frozen as-built figure and conformance | Any |
+| GET | `/compliance-dossiers` | List dossiers | Any |
+| POST | `/compliance-dossiers/{id}/issue` | Issue a DRAFT dossier, freezing and checking the claim | QualityManager |
+| POST | `/compliance-dossiers/{id}/revoke` | Revoke an ISSUED dossier, firing the compliance cascade | QualityManager |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_FORBIDDEN_ROLE` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_INVALID_PAGINATION` | 400 Bad Request |
+| `ERR_PRODUCT_NOT_FOUND` | 404 Not Found |
+| `ERR_RESIN_GRADE_NOT_FOUND` | 404 Not Found |
+| `ERR_BLEND_RECIPE_NOT_FOUND` | 404 Not Found |
+| `ERR_EXTRUSION_LINE_NOT_FOUND` | 404 Not Found |
+| `ERR_EXTRUSION_RUN_NOT_FOUND` | 404 Not Found |
+| `ERR_FILM_ROLL_NOT_FOUND` | 404 Not Found |
+| `ERR_REGRIND_POOL_NOT_FOUND` | 404 Not Found |
+| `ERR_REGRIND_TRANSACTION_NOT_FOUND` | 404 Not Found |
+| `ERR_PRINT_PRESS_NOT_FOUND` | 404 Not Found |
+| `ERR_PLATE_SET_NOT_FOUND` | 404 Not Found |
+| `ERR_PRINT_JOB_NOT_FOUND` | 404 Not Found |
+| `ERR_BAG_LOT_NOT_FOUND` | 404 Not Found |
+| `ERR_DOSSIER_NOT_FOUND` | 404 Not Found |
+| `ERR_DUPLICATE_CODE` | 409 Conflict |
+| `ERR_STALE_POOL_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_BAG_LOT_VERSION` | 412 Precondition Failed |
+| `ERR_RECIPE_STATE_INVALID` | 409 Conflict |
+| `ERR_RUN_STATE_INVALID` | 409 Conflict |
+| `ERR_ROLL_STATE_INVALID` | 409 Conflict |
+| `ERR_PLATE_STATE_INVALID` | 409 Conflict |
+| `ERR_PRINT_JOB_STATE_INVALID` | 409 Conflict |
+| `ERR_BAG_LOT_STATE_INVALID` | 409 Conflict |
+| `ERR_DOSSIER_STATE_INVALID` | 409 Conflict |
+| `ERR_RECIPE_NOT_APPROVED` | 409 Conflict |
+| `ERR_DOSSIER_NOT_ISSUED` | 409 Conflict |
+| `ERR_LINE_POSTURE_FROZEN` | 409 Conflict |
+| `ERR_LINE_POSTURE_RESTRICTED` | 409 Conflict |
+| `ERR_FOOD_CONTACT_RESIN_INELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_LINE_NOT_FOOD_CERTIFIED` | 422 Unprocessable Entity |
+| `ERR_FOOD_CONTACT_POOL_INELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_FOOD_CONTACT_DECLARATION_INVALID` | 422 Unprocessable Entity |
+| `ERR_CLAIM_OVERSTATED` | 422 Unprocessable Entity |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_CONVERTING_FEATURE_NOT_VERIFIED` | 422 Unprocessable Entity |
+| `ERR_BLEND_WEIGHT_NOT_100` | 422 Unprocessable Entity |
+| `ERR_LAYER_COUNT_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_BARRIER_STRUCTURE_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_REGRIND_CAP_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_STRENGTH_INDEX_BELOW_MIN` | 422 Unprocessable Entity |
+| `ERR_PRODUCT_MISMATCH` | 409 Conflict |
+| `ERR_LINE_CAPABILITY_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_LINE_WINDOW_CONFLICT` | 409 Conflict |
+| `ERR_PRESS_CYLINDER_CAPACITY` | 409 Conflict |
+| `ERR_PLATE_COLOR_EXCEEDS_PRESS` | 422 Unprocessable Entity |
+| `ERR_WINDOW_IN_PAST` | 409 Conflict |
+| `ERR_RUN_NOT_YET_STARTABLE` | 409 Conflict |
+| `ERR_PRINT_WINDOW_NOT_OPEN` | 409 Conflict |
+| `ERR_RUN_HOLD_LIMIT_EXCEEDED` | 409 Conflict |
+| `ERR_INSUFFICIENT_GAUGE_DATA` | 422 Unprocessable Entity |
+| `ERR_INSUFFICIENT_SEAL_PANEL` | 422 Unprocessable Entity |
+| `ERR_SCRAP_EXCEEDS_OUTPUT` | 422 Unprocessable Entity |
+| `ERR_NO_ELIGIBLE_REGRIND_POOL` | 409 Conflict |
+| `ERR_REGRIND_INSUFFICIENT` | 409 Conflict |
+| `ERR_REGRIND_BUDGET_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_PACKOUT_EXCEEDS_UNPACKED` | 422 Unprocessable Entity |
+| `ERR_PRINTED_KG_EXCEEDS_ROLL` | 422 Unprocessable Entity |
+| `ERR_COUNT_ACCURACY_OUT_OF_SPEC` | 422 Unprocessable Entity |
+| `ERR_LAYFLAT_OUT_OF_TOLERANCE` | 422 Unprocessable Entity |
+| `ERR_GAUGE_CAPABILITY_INSUFFICIENT` | 422 Unprocessable Entity |
+| `ERR_TRANSACTION_ALREADY_REVERSED` | 409 Conflict |
+| `ERR_TRANSACTION_NOT_REVERSIBLE` | 422 Unprocessable Entity |

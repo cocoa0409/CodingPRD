@@ -1,0 +1,65 @@
+"""Error catalogue and the ApiError exception carrying error_id + HTTP status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Complete catalogue from PRD section 5 -> HTTP status.
+ERROR_STATUS = {
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_CASHIER_BARRED": 403,
+    "ERR_DUAL_CONTROL_VIOLATION": 403,
+    "ERR_STORE_NOT_FOUND": 404,
+    "ERR_CASHIER_NOT_FOUND": 404,
+    "ERR_SAFE_NOT_FOUND": 404,
+    "ERR_SALES_JOURNAL_NOT_FOUND": 404,
+    "ERR_TILL_SESSION_NOT_FOUND": 404,
+    "ERR_SAFE_TRANSACTION_NOT_FOUND": 404,
+    "ERR_DEPOSIT_NOT_FOUND": 404,
+    "ERR_BANK_CREDIT_RECORD_NOT_FOUND": 404,
+    "ERR_CARD_SETTLEMENT_NOT_FOUND": 404,
+    "ERR_VARIANCE_CASE_NOT_FOUND": 404,
+    "ERR_CHANGE_ORDER_NOT_FOUND": 404,
+    "ERR_DUPLICATE_BUSINESS_DATE": 409,
+    "ERR_TENDERS_ALREADY_POSTED": 409,
+    "ERR_SETTLEMENT_ALREADY_POSTED": 409,
+    "ERR_TILL_SESSION_INVALID_STATE": 409,
+    "ERR_REGISTER_OCCUPIED": 409,
+    "ERR_CASHIER_SHIFT_OVERLAP": 409,
+    "ERR_CASHIER_RESTRICTED": 409,
+    "ERR_COACHING_NOT_ACKNOWLEDGED": 409,
+    "ERR_SAFE_NOT_UNLOCKED": 409,
+    "ERR_SAFE_OPEN_REQUEST_ACTIVE": 409,
+    "ERR_TIME_DELAY_NOT_ELAPSED": 409,
+    "ERR_SAFE_OPEN_REQUEST_EXPIRED": 409,
+    "ERR_SAFE_FROZEN": 409,
+    "ERR_SMART_SAFE_REQUIRED": 409,
+    "ERR_DEPOSIT_INVALID_STATE": 409,
+    "ERR_PICKUP_WINDOW_CONFLICT": 409,
+    "ERR_BANK_CREDIT_ALREADY_MATCHED": 409,
+    "ERR_VARIANCE_CASE_INVALID_STATE": 409,
+    "ERR_CHANGE_ORDER_INVALID_STATE": 409,
+    "ERR_SAFE_VERSION_STALE": 412,
+    "ERR_CASE_VERSION_STALE": 412,
+    "ERR_INSUFFICIENT_SAFE_BALANCE": 422,
+    "ERR_PICKUP_CAPACITY_EXCEEDED": 422,
+    "ERR_CREDIT_TYPE_INVALID": 422,
+    "ERR_ATTRIBUTION_EXCEEDS_VARIANCE": 422,
+    "ERR_ESCALATION_THRESHOLD_NOT_MET": 422,
+    "ERR_CLOCK_MONOTONIC": 422,
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, ERROR_STATUS[error_id], message)
+
+
+def bad_request(message):
+    return err("ERR_INVALID_REQUEST", message)

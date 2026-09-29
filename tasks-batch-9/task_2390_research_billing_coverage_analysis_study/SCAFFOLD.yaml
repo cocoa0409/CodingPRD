@@ -1,0 +1,2567 @@
+scenario: "2390. Research Billing Coverage Analysis & Study Charge Segregation (academic medical center research billing office): protocol-level coverage analysis classifying each item as routine care, research-paid or promotional, budget build from the coverage analysis with per-patient and invoiceable items, study calendar build in the electronic health record with visit-linked charge routing, charge review to prevent billing the payer for sponsor-paid items, Medicare qualifying clinical trial determination and registry number requirements, protocol amendment triggering re-analysis and calendar rebuild, unbilled/held charge aging and sponsor invoicing, audit response and refund of improperly billed claims"
+
+domain_name: research-billing-coverage-analysis
+api_prefix: /research-billing
+
+complexity_profile:
+  primary_archetype: ledger_reconciliation
+  secondary_archetype: compliance_audit
+  complexity_layers:
+    - optimistic_concurrency
+    - cascading_side_effects
+    - dual_variant_calculation
+    - rate_threshold_triggers
+
+  entity_topology: flat
+  # Peer collections joined by FK fields carried in request bodies. Only five
+  # read paths are nested (`/studies/{id}/sponsor-invoices`,
+  # `/studies/{id}/amendments`, `/studies/{id}/charge-review-summary`,
+  # `/coverage-analyses/{id}/items`, `/study-calendars/{id}/visits`); every
+  # write endpoint is a flat collection or a flat action on one.
+
+  state_machine_shape: cyclic
+  # CoverageAnalysis loops DRAFT -> UNDER_REVIEW -> RETURNED -> DRAFT (bounded
+  # by ANALYSIS_MAX_RETURNS); Study loops OPEN_TO_ACCRUAL -> COVERAGE_PENDING
+  # -> COVERAGE_APPROVED -> OPEN_TO_ACCRUAL on amendment; SponsorInvoice loops
+  # SUBMITTED -> DISPUTED -> SUBMITTED. Study additionally carries two
+  # independent dimensions (lifecycle_status x budget_status) and Charge
+  # carries two (routing_state x billing_state).
+
+  relationship_patterns:
+    - one_to_many
+    - many_to_many          # VisitChargeRoute joins CalendarVisit x CoverageItem
+    - self_referential      # CoverageAnalysis.supersedes_analysis_id, Charge.replaces_charge_id
+    - cross_aggregate       # Charge -> CoverageItem across the analysis aggregate
+
+  role_model: segregation_of_duties
+  # Three user-id-level SoD gates: analysis approver != preparer, budget
+  # executor != builder, finding responder != finding opener.
+
+  consistency_model: immediate
+  # Every cascade completes inside the triggering request, EXCEPT the aging
+  # epoch: Charge.aging_days / Charge.aging_bucket are refreshed only by
+  # POST /research-billing/_ops/aging-run and are deliberately stale between
+  # runs (ops-run checkpoint).
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# ===========================================================================
+# 1.1 Entity-Relationship Table
+# ===========================================================================
+entities:
+  - name: Study
+    parent: null
+    common_fields: true
+    fields:
+      - name: protocol_number
+        type: string
+        source: input
+        description: Institutional protocol identifier
+        constraints: "unique across all Study rows; 1-40 chars"
+      - name: title
+        type: string
+        source: input
+        description: Protocol title
+      - name: sponsor_name
+        type: string
+        source: input
+        description: Paying sponsor of record for research-paid items
+      - name: funding_source
+        type: enum
+        source: input
+        description: Funding channel; drives the indirect-rate branch
+        constraints: "INDUSTRY_SPONSORED | FEDERALLY_FUNDED | INVESTIGATOR_INITIATED"
+      - name: ind_ide_status
+        type: enum
+        source: input
+        description: FDA regulatory footing used by the QCT deeming rules
+        constraints: "IND_HELD | IDE_CATEGORY_A | IDE_CATEGORY_B | NONE"
+      - name: therapeutic_intent
+        type: boolean
+        source: input
+        description: Whether the protocol has therapeutic intent (QCT self-certification input)
+      - name: registry_number
+        type: string
+        source: input
+        description: "ClinicalTrials.gov registry number; null until registered"
+        default: null
+        constraints: "when non-null MUST match ^NCT[0-9]{8}$"
+      - name: qct_determination
+        type: enum
+        source: computed
+        description: Medicare qualifying-clinical-trial outcome, written by POST /studies/{id}/qct-determination
+        default: UNDETERMINED
+        constraints: "UNDETERMINED | DEEMED_QUALIFYING | SELF_CERTIFIED_QUALIFYING | NON_QUALIFYING"
+      - name: qct_basis
+        type: enum
+        source: computed
+        description: Basis recorded by the most recent determination
+        default: null
+        constraints: "null | DEEMED_IND_IDE | DEEMED_FEDERALLY_FUNDED | SELF_CERTIFIED | NOT_QUALIFYING_DECLARED"
+      - name: qct_determined_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the ComplianceReviewer who recorded the determination
+        default: null
+      - name: qct_determined_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the determination
+        default: null
+      - name: lifecycle_status
+        type: enum
+        source: computed
+        description: Protocol lifecycle dimension (independent of budget_status)
+        default: DRAFT
+        constraints: "DRAFT | COVERAGE_PENDING | COVERAGE_APPROVED | OPEN_TO_ACCRUAL | CLOSED_TO_ACCRUAL"
+      - name: budget_status
+        type: enum
+        source: computed
+        description: Budget dimension, evolves independently of lifecycle_status
+        default: NOT_BUILT
+        constraints: "NOT_BUILT | BUILT | EXECUTED | SUPERSEDED"
+      - name: budget_source_analysis_id
+        type: string
+        source: computed
+        description: "FK -> CoverageAnalysis.id; analysis the current budget was built from; null while budget_status == NOT_BUILT"
+        default: null
+      - name: budget_basis
+        type: enum
+        source: computed
+        description: Variant selected at budget build
+        default: null
+        constraints: "null | COVERAGE_DRIVEN | CALENDAR_DRIVEN"
+      - name: indirect_rate_pct
+        type: number
+        source: input
+        description: Requested indirect (F&A) rate supplied at budget build, percent
+        default: null
+        constraints: ">= 0 and <= 100, at most 2 decimals"
+      - name: effective_indirect_rate_pct
+        type: number
+        source: computed
+        description: Output of calculations.study_effective_indirect_rate
+        default: null
+      - name: per_patient_subtotal_cents
+        type: integer
+        source: computed
+        description: Sponsor-borne per-patient subtotal before indirect
+        default: 0
+      - name: per_patient_budget_cents
+        type: integer
+        source: computed
+        description: Per-patient total including indirect (sum-then-round order)
+        default: 0
+      - name: invoiceable_subtotal_cents
+        type: integer
+        source: computed
+        description: Sponsor-borne invoiceable (milestone/one-time) subtotal before indirect
+        default: 0
+      - name: invoiceable_budget_cents
+        type: integer
+        source: computed
+        description: Invoiceable total including indirect
+        default: 0
+      - name: budget_built_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that built the current budget (SoD counterparty)
+        default: null
+      - name: budget_executed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that executed the current budget; MUST differ from budget_built_by_user_id
+        default: null
+      - name: billing_hold_posture
+        type: enum
+        source: computed
+        description: Derived gate over charge review; output of calculations.study_billing_hold_posture
+        default: PAYER_BLOCKED
+        constraints: "OPEN | PAYER_BLOCKED | ALL_BLOCKED"
+      - name: open_finding_count
+        type: integer
+        source: computed
+        description: Count of AuditFinding rows for this study with status IN {OPEN, RESPONDED}
+        default: 0
+      - name: rebuild_required_calendar_count
+        type: integer
+        source: computed
+        description: Count of StudyCalendar rows for this study with status == REBUILD_REQUIRED
+        default: 0
+      - name: payer_billed_cents
+        type: integer
+        source: computed
+        description: Open payer-billed position; sum of amount_cents over Charge rows of this study with billing_state == BILLED_PAYER
+        default: 0
+      - name: payer_refunded_cents
+        type: integer
+        source: computed
+        description: Sum of refunded_amount_cents over Charge rows of this study with billing_state == REFUNDED
+        default: 0
+      - name: sponsor_unbilled_cents
+        type: integer
+        source: computed
+        description: Sum of amount_cents over Charge rows with routing_state == ROUTED_SPONSOR and billing_state == UNBILLED
+        default: 0
+      - name: sponsor_receivable_cents
+        type: integer
+        source: computed
+        description: Sum of amount_cents over Charge rows with billing_state == INVOICED_SPONSOR
+        default: 0
+      - name: sponsor_collected_cents
+        type: integer
+        source: computed
+        description: Sum of amount_paid_cents over SponsorInvoice rows of this study with status == PAID
+        default: 0
+      - name: sponsor_written_off_cents
+        type: integer
+        source: computed
+        description: Sum of (total_cents - amount_paid_cents) over SponsorInvoice rows with status == PAID and short_paid == true
+        default: 0
+      - name: improper_payer_exposure_cents
+        type: integer
+        source: computed
+        description: Sum of amount_cents over Charge rows of this study with improper_flag == true
+        default: 0
+      - name: delinquent_sponsor_cents
+        type: integer
+        source: computed
+        description: Sum of amount_cents over Charge rows with billing_state == UNBILLED and aging_bucket == DELINQUENT_90_PLUS; refreshed only by the aging run
+        default: 0
+
+  - name: CoverageAnalysis
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id; protocol this analysis classifies"
+      - name: supersedes_analysis_id
+        type: string
+        source: input
+        description: "FK -> CoverageAnalysis.id; prior APPROVED analysis this revision replaces; null for the first analysis"
+        default: null
+      - name: revision_number
+        type: integer
+        source: computed
+        description: 1 when supersedes_analysis_id is null, else supersedes.revision_number + 1
+      - name: status
+        type: enum
+        source: computed
+        description: Review lifecycle with a bounded return loop
+        default: DRAFT
+        constraints: "DRAFT | UNDER_REVIEW | RETURNED | APPROVED | SUPERSEDED"
+      - name: prepared_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the CoverageAnalyst that created the analysis
+      - name: returned_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the last reviewer that returned it
+        default: null
+      - name: approved_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the approving reviewer; MUST differ from prepared_by_user_id
+        default: null
+      - name: return_reason
+        type: string
+        source: input
+        description: Free text captured on the most recent return
+        default: null
+      - name: return_count
+        type: integer
+        source: computed
+        description: Number of UNDER_REVIEW -> RETURNED transitions so far
+        default: 0
+      - name: approved_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of approval; the ordering key for effective-analysis selection
+        default: null
+      - name: item_count
+        type: integer
+        source: computed
+        description: Count of CoverageItem rows with coverage_analysis_id == this
+        default: 0
+      - name: routine_care_item_count
+        type: integer
+        source: computed
+        description: Count of child items with classification == ROUTINE_CARE
+        default: 0
+      - name: research_paid_item_count
+        type: integer
+        source: computed
+        description: Count of child items with classification == RESEARCH_PAID
+        default: 0
+      - name: promotional_item_count
+        type: integer
+        source: computed
+        description: Count of child items with classification == PROMOTIONAL
+        default: 0
+      - name: qct_conditional_item_count
+        type: integer
+        source: computed
+        description: Count of child items with classification == ROUTINE_CARE and medicare_coverage_basis == QCT_CONDITIONAL
+        default: 0
+
+  - name: CoverageItem
+    parent: null
+    common_fields: false
+    fields:
+      - name: coverage_analysis_id
+        type: string
+        source: input
+        description: "FK -> CoverageAnalysis.id; owning analysis revision (items are immutable once created)"
+      - name: item_code
+        type: string
+        source: input
+        description: CPT/HCPCS or institutional charge code
+        constraints: "unique per (coverage_analysis_id, item_code)"
+      - name: description
+        type: string
+        source: input
+        description: Item description as it appears on the coverage analysis grid
+      - name: classification
+        type: enum
+        source: input
+        description: Coverage-analysis classification of the item
+        constraints: "ROUTINE_CARE | RESEARCH_PAID | PROMOTIONAL"
+      - name: medicare_coverage_basis
+        type: enum
+        source: input
+        description: Why Medicare would pay for this item
+        constraints: "STANDARD_OF_CARE | QCT_CONDITIONAL | NOT_COVERED"
+      - name: billable_to
+        type: enum
+        source: computed
+        description: "Derived party of record: ROUTINE_CARE->PAYER, RESEARCH_PAID->SPONSOR, PROMOTIONAL->NONE"
+        constraints: "PAYER | SPONSOR | NONE"
+      - name: budget_category
+        type: enum
+        source: input
+        description: Where the item lands in the sponsor budget
+        constraints: "PER_PATIENT | INVOICEABLE | NOT_BUDGETED"
+      - name: charge_master_unit_cents
+        type: integer
+        source: input
+        description: Hospital charge-master price per unit, used when the charge routes to PAYER
+        constraints: ">= 0"
+      - name: negotiated_unit_cents
+        type: integer
+        source: input
+        description: Sponsor-negotiated price per unit, used when the charge routes to SPONSOR
+        constraints: ">= 0"
+      - name: units_per_occurrence
+        type: integer
+        source: input
+        description: Units billed each time the item is performed
+        default: 1
+        constraints: ">= 1"
+      - name: expected_occurrences
+        type: integer
+        source: input
+        description: Protocol-expected number of occurrences per subject (COVERAGE_DRIVEN budget input)
+        constraints: ">= 0"
+
+  - name: StudyCalendar
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: source_analysis_id
+        type: string
+        source: input
+        description: "FK -> CoverageAnalysis.id; the APPROVED analysis this calendar realizes in the EHR"
+      - name: build_generation
+        type: integer
+        source: computed
+        description: 1 + max(build_generation) over existing calendars of this study
+      - name: status
+        type: enum
+        source: computed
+        description: EHR build lifecycle
+        default: DRAFT
+        constraints: "DRAFT | PUBLISHED | REBUILD_REQUIRED | RETIRED"
+      - name: visit_count
+        type: integer
+        source: computed
+        description: Count of CalendarVisit rows with study_calendar_id == this
+        default: 0
+      - name: routed_item_count
+        type: integer
+        source: computed
+        description: Count of distinct coverage_item_id values across VisitChargeRoute rows of this calendar's visits
+        default: 0
+      - name: unrouted_per_patient_item_count
+        type: integer
+        source: computed
+        description: Count of CoverageItem rows of source_analysis_id with budget_category == PER_PATIENT and billable_to IN {PAYER, SPONSOR} that have zero VisitChargeRoute on this calendar
+        default: 0
+      - name: published_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of publication
+        default: null
+
+  - name: CalendarVisit
+    parent: null
+    common_fields: false
+    fields:
+      - name: study_calendar_id
+        type: string
+        source: input
+        description: "FK -> StudyCalendar.id; owning calendar generation"
+      - name: visit_name
+        type: string
+        source: input
+        description: Visit label as shown on the EHR study calendar
+      - name: sequence_index
+        type: integer
+        source: input
+        description: Visit order within the calendar
+        constraints: ">= 1; unique per (study_calendar_id, sequence_index)"
+      - name: target_day_offset
+        type: integer
+        source: input
+        description: Target day relative to the subject's consent_date (day 0)
+        constraints: ">= 0"
+      - name: window_before_days
+        type: integer
+        source: input
+        description: Allowed days before target_day_offset
+        constraints: ">= 0"
+      - name: window_after_days
+        type: integer
+        source: input
+        description: Allowed days after target_day_offset
+        constraints: ">= 0"
+      - name: window_start_day
+        type: integer
+        source: computed
+        description: target_day_offset - window_before_days
+      - name: window_end_day
+        type: integer
+        source: computed
+        description: target_day_offset + window_after_days
+      - name: expected_charge_total_cents
+        type: integer
+        source: computed
+        description: Sum of expected_amount_cents over VisitChargeRoute rows of this visit
+        default: 0
+
+  - name: VisitChargeRoute
+    parent: null
+    common_fields: false
+    fields:
+      - name: calendar_visit_id
+        type: string
+        source: input
+        description: "FK -> CalendarVisit.id"
+      - name: coverage_item_id
+        type: string
+        source: input
+        description: "FK -> CoverageItem.id; MUST belong to the calendar's source_analysis_id"
+      - name: occurrences
+        type: integer
+        source: input
+        description: Times the item is performed at this visit
+        default: 1
+        constraints: ">= 1"
+      - name: routing_target
+        type: enum
+        source: computed
+        description: Snapshot of coverage_item.billable_to taken at route creation; never re-derived
+        constraints: "PAYER | SPONSOR | NONE"
+      - name: expected_amount_cents
+        type: integer
+        source: computed
+        description: Output of calculations.visit_route_expected_amount
+
+  - name: StudySubject
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: subject_number
+        type: string
+        source: input
+        description: Subject identifier
+        constraints: "unique per (study_id, subject_number)"
+      - name: consented_calendar_id
+        type: string
+        source: computed
+        description: "FK -> StudyCalendar.id; calendar pinned at consent; null while status == SCREENING"
+        default: null
+      - name: consented_calendar_generation
+        type: integer
+        source: computed
+        description: Snapshot of the pinned calendar's build_generation at consent
+        default: null
+      - name: consent_date
+        type: string
+        source: input
+        description: "Date of informed consent (YYYY-MM-DD); day 0 anchor for all visit windows"
+        default: null
+      - name: status
+        type: enum
+        source: computed
+        description: Subject lifecycle
+        default: SCREENING
+        constraints: "SCREENING | CONSENTED | OFF_STUDY"
+      - name: charge_count
+        type: integer
+        source: computed
+        description: Count of Charge rows whose subject_visit_id belongs to this subject
+        default: 0
+
+  - name: SubjectVisit
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_subject_id
+        type: string
+        source: input
+        description: "FK -> StudySubject.id"
+      - name: calendar_visit_id
+        type: string
+        source: input
+        description: "FK -> CalendarVisit.id; MUST belong to the subject's consented_calendar_id"
+      - name: actual_service_date
+        type: string
+        source: input
+        description: "Scheduled/actual service date (YYYY-MM-DD)"
+      - name: day_offset_actual
+        type: integer
+        source: computed
+        description: Whole days from the subject's consent_date to actual_service_date
+      - name: calendar_generation_at_schedule
+        type: integer
+        source: computed
+        description: Snapshot of the calendar's build_generation when the visit was scheduled
+      - name: status
+        type: enum
+        source: computed
+        description: Occurrence lifecycle
+        default: SCHEDULED
+        constraints: "SCHEDULED | OCCURRED | MISSED"
+      - name: generated_charge_count
+        type: integer
+        source: computed
+        description: Count of Charge rows cascade-created by completing this visit
+        default: 0
+
+  - name: Charge
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: subject_visit_id
+        type: string
+        source: input
+        description: "FK -> SubjectVisit.id; null for interface-posted charges with no visit link"
+        default: null
+      - name: coverage_item_id
+        type: string
+        source: computed
+        description: "FK -> CoverageItem.id; matched item on the effective analysis; null until matched"
+        default: null
+      - name: sponsor_invoice_id
+        type: string
+        source: computed
+        description: "FK -> SponsorInvoice.id; set when the charge is placed on an invoice"
+        default: null
+      - name: replaces_charge_id
+        type: string
+        source: computed
+        description: "FK -> Charge.id; set on the sponsor replacement charge created by a refund resolution"
+        default: null
+      - name: charge_code
+        type: string
+        source: input
+        description: Charge code as posted by the EHR charge interface
+      - name: service_date
+        type: string
+        source: input
+        description: "Date of service (YYYY-MM-DD); selects the analysis effective at service time"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: Posted charge amount in cents
+        constraints: ">= 0"
+      - name: source
+        type: enum
+        source: computed
+        description: How the charge entered the system
+        constraints: "VISIT_CASCADE | INTERFACE_POSTED | REFUND_REPLACEMENT"
+      - name: routing_state
+        type: enum
+        source: computed
+        description: Segregation dimension; evolves independently of billing_state
+        default: UNROUTED
+        constraints: "UNROUTED | ROUTED_PAYER | ROUTED_SPONSOR | ROUTED_NONE"
+      - name: billing_state
+        type: enum
+        source: computed
+        description: Fiscal dimension; evolves independently of routing_state
+        default: UNBILLED
+        constraints: "UNBILLED | BILLED_PAYER | INVOICED_SPONSOR | WRITTEN_OFF | REFUNDED"
+      - name: suggested_routing_target
+        type: enum
+        source: computed
+        description: Snapshot of the originating VisitChargeRoute.routing_target; null for interface-posted charges
+        default: null
+        constraints: "null | PAYER | SPONSOR | NONE"
+      - name: expected_routing_target
+        type: enum
+        source: computed
+        description: Output of calculations.charge_routing_expectation under the current_effective variant
+        constraints: "PAYER | SPONSOR | NONE | UNDETERMINED"
+      - name: improper_flag
+        type: boolean
+        source: computed
+        description: true when billing_state == BILLED_PAYER and expected_routing_target != PAYER
+        default: false
+      - name: hold_reason
+        type: enum
+        source: computed
+        description: Why the charge is being held out of billing
+        default: NONE
+        constraints: "NONE | CALENDAR_REBUILD | AUDIT_OPEN"
+      - name: hold_applied_at
+        type: datetime
+        source: system
+        description: Logical-clock instant hold_reason last became non-NONE
+        default: null
+      - name: unbilled_since
+        type: datetime
+        source: system
+        description: Logical-clock instant the charge entered billing_state == UNBILLED; aging baseline
+      - name: aging_days
+        type: integer
+        source: computed
+        description: Whole days from unbilled_since to the last aging run's run_date; stale between runs
+        default: 0
+      - name: aging_bucket
+        type: enum
+        source: computed
+        description: Bucket assigned by the last aging run; stale between runs
+        default: CURRENT
+        constraints: "CURRENT | AGING_31_60 | AGING_61_90 | DELINQUENT_90_PLUS"
+      - name: posted_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that posted the charge; null for cascade-created charges
+        default: null
+      - name: reviewed_by_user_id
+        type: string
+        source: system
+        description: X-User-ID of the reviewer that routed the charge
+        default: null
+      - name: reviewed_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the routing decision
+        default: null
+      - name: override_justification
+        type: string
+        source: input
+        description: Reviewer justification required when the decision contradicts the effective coverage analysis
+        default: null
+      - name: refunded_amount_cents
+        type: integer
+        source: computed
+        description: Amount refunded to the payer when an audit finding is resolved with a refund
+        default: 0
+
+  - name: SponsorInvoice
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: sequence_number
+        type: integer
+        source: computed
+        description: 1 + count of existing SponsorInvoice rows of this study
+      - name: invoice_number
+        type: string
+        source: computed
+        description: "Formatted as INV-{study.protocol_number}-{sequence_number padded to 3}"
+      - name: period_end_date
+        type: string
+        source: input
+        description: "Inclusive service-date cutoff (YYYY-MM-DD) for line selection"
+      - name: status
+        type: enum
+        source: computed
+        description: Invoice lifecycle with a dispute loop
+        default: DRAFT
+        constraints: "DRAFT | SUBMITTED | PAID | DISPUTED"
+      - name: line_count
+        type: integer
+        source: computed
+        description: Count of Charge rows with sponsor_invoice_id == this
+        default: 0
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: Sum of amount_cents over the invoice's charges
+        default: 0
+      - name: indirect_cents
+        type: integer
+        source: computed
+        description: Output of calculations.sponsor_invoice_indirect (round-per-line then sum)
+        default: 0
+      - name: gross_total_cents
+        type: integer
+        source: computed
+        description: subtotal_cents + indirect_cents; the tier key for the volume credit
+        default: 0
+      - name: volume_credit_cents
+        type: integer
+        source: computed
+        description: Output of calculations.sponsor_invoice_net_total, step 3
+        default: 0
+      - name: net_total_cents
+        type: integer
+        source: computed
+        description: gross_total_cents - volume_credit_cents
+        default: 0
+      - name: amount_paid_cents
+        type: integer
+        source: computed
+        description: Remitted amount recorded on the invoice
+        default: 0
+      - name: short_paid
+        type: boolean
+        source: computed
+        description: true when status == PAID and amount_paid_cents < net_total_cents
+        default: false
+      - name: submitted_at
+        type: datetime
+        source: system
+        description: Logical-clock instant of the most recent submission
+        default: null
+
+  - name: AuditFinding
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: charge_id
+        type: string
+        source: input
+        description: "FK -> Charge.id; null for study-level findings such as MISSING_REGISTRY_NUMBER"
+        default: null
+      - name: finding_type
+        type: enum
+        source: input
+        description: Auditor's asserted defect
+        constraints: "IMPROPER_PAYER_BILL | MISSING_REGISTRY_NUMBER | UNSUPPORTED_ROUTINE_CLASSIFICATION"
+      - name: claimed_amount_cents
+        type: integer
+        source: input
+        description: Amount the auditor asserts was improperly billed
+        constraints: ">= 0"
+      - name: status
+        type: enum
+        source: computed
+        description: Finding lifecycle; forks at resolution
+        default: OPEN
+        constraints: "OPEN | RESPONDED | CLOSED_REFUNDED | CLOSED_NO_ACTION"
+      - name: response_narrative
+        type: string
+        source: input
+        description: Billing office narrative response
+        default: null
+      - name: opened_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that opened the finding
+      - name: responded_by_user_id
+        type: string
+        source: system
+        description: X-User-ID that responded; MUST differ from opened_by_user_id
+        default: null
+      - name: refund_amount_cents
+        type: integer
+        source: computed
+        description: Amount refunded when resolved with disposition REFUND_AND_REROUTE
+        default: 0
+
+  - name: Amendment
+    parent: null
+    common_fields: true
+    fields:
+      - name: study_id
+        type: string
+        source: input
+        description: "FK -> Study.id"
+      - name: amendment_number
+        type: integer
+        source: computed
+        description: 1 + count of existing Amendment rows of this study
+      - name: scope
+        type: enum
+        source: input
+        description: Amendment scope; drives which downstream rebuilds are required
+        constraints: "ADMINISTRATIVE | ITEM_CHANGE | VISIT_SCHEDULE_CHANGE | ITEM_AND_SCHEDULE_CHANGE"
+      - name: effective_date
+        type: string
+        source: input
+        description: "Date the amendment takes effect (YYYY-MM-DD)"
+      - name: status
+        type: enum
+        source: computed
+        description: Amendment lifecycle
+        default: SUBMITTED
+        constraints: "SUBMITTED | IMPLEMENTED"
+      - name: reanalysis_required
+        type: boolean
+        source: computed
+        description: true when scope != ADMINISTRATIVE
+      - name: calendar_rebuild_required
+        type: boolean
+        source: computed
+        description: true when scope IN {VISIT_SCHEDULE_CHANGE, ITEM_AND_SCHEDULE_CHANGE}
+
+# ===========================================================================
+# 1.2 State Machine Table
+# ===========================================================================
+state_machines:
+  - entity: Study
+    initial_state: DRAFT
+    terminal_states: [CLOSED_TO_ACCRUAL]
+    note: |
+      Two independent dimensions on one row. Dimension A is lifecycle_status
+      (transitions below prefixed LC); dimension B is budget_status
+      (transitions prefixed BG). A CLOSED_TO_ACCRUAL study still accepts
+      BG transitions from an audit refund's ledger recompute but no further
+      LC transitions.
+    transitions:
+      - from: DRAFT
+        to: COVERAGE_PENDING
+        trigger: "POST /research-billing/coverage-analyses (first analysis for the study)"
+        actor: CoverageAnalyst
+        preconditions:
+          - "study.lifecycle_status == DRAFT"
+        side_effects:
+          - "Study.lifecycle_status = COVERAGE_PENDING"
+          - "increments Study.version by 1"
+        note: "LC-1"
+      - from: COVERAGE_PENDING
+        to: COVERAGE_APPROVED
+        trigger: "POST /research-billing/coverage-analyses/{id}/approve"
+        actor: ComplianceReviewer
+        preconditions:
+          - "the approved analysis' study_id == this study"
+          - "study.lifecycle_status == COVERAGE_PENDING"
+        side_effects:
+          - "Study.lifecycle_status = COVERAGE_APPROVED"
+          - "recompute calculations.study_billing_hold_posture"
+          - "increments Study.version by 1"
+        note: "LC-2"
+      - from: COVERAGE_APPROVED
+        to: OPEN_TO_ACCRUAL
+        trigger: "POST /research-billing/studies/{id}/accrual with target_status = OPEN_TO_ACCRUAL"
+        actor: ResearchBillingManager
+        preconditions:
+          - "study.lifecycle_status == COVERAGE_APPROVED"
+          - "study.budget_status == EXECUTED"
+          - "at least one StudyCalendar with study_id == this and status == PUBLISHED exists"
+          - "study.qct_determination != UNDETERMINED"
+          - "study.registry_number matches ^NCT[0-9]{8}$ when study.qct_determination IN {DEEMED_QUALIFYING, SELF_CERTIFIED_QUALIFYING}"
+        side_effects:
+          - "Study.lifecycle_status = OPEN_TO_ACCRUAL"
+          - "increments Study.version by 1"
+        note: "LC-3"
+      - from: OPEN_TO_ACCRUAL
+        to: COVERAGE_PENDING
+        trigger: "POST /research-billing/amendments/{id}/implement with amendment.reanalysis_required == true"
+        actor: ResearchBillingManager
+        preconditions:
+          - "amendment.status == SUBMITTED"
+          - "study.lifecycle_status IN {COVERAGE_APPROVED, OPEN_TO_ACCRUAL}"
+        side_effects:
+          - "Study.lifecycle_status = COVERAGE_PENDING"
+          - "Study.budget_status EXECUTED -> SUPERSEDED (BG-4)"
+          - "cascade link 3: every StudyCalendar of this study with status == PUBLISHED -> REBUILD_REQUIRED when amendment.calendar_rebuild_required"
+          - "increments Study.version by 1"
+        note: "LC-4 (cycle back into COVERAGE_PENDING; closes the analysis/calendar loop)"
+      - from: OPEN_TO_ACCRUAL
+        to: CLOSED_TO_ACCRUAL
+        trigger: "POST /research-billing/studies/{id}/accrual with target_status = CLOSED_TO_ACCRUAL"
+        actor: ResearchBillingManager
+        preconditions:
+          - "study.lifecycle_status == OPEN_TO_ACCRUAL"
+        side_effects:
+          - "Study.lifecycle_status = CLOSED_TO_ACCRUAL"
+          - "cascade down: every StudySubject of this study with status IN {SCREENING, CONSENTED} -> OFF_STUDY"
+          - "increments Study.version by 1"
+        note: "LC-5"
+      - from: NOT_BUILT
+        to: BUILT
+        trigger: "POST /research-billing/studies/{id}/budget-build"
+        actor: ResearchBillingManager
+        preconditions:
+          - "study.budget_status IN {NOT_BUILT, BUILT, EXECUTED, SUPERSEDED}"
+          - "source analysis status == APPROVED and source_analysis.study_id == study.id"
+          - "expected_study_version == study.version"
+          - "when basis == CALENDAR_DRIVEN, a StudyCalendar with source_analysis_id == source_analysis_id and status == PUBLISHED exists"
+        side_effects:
+          - "Study.budget_status = BUILT"
+          - "Study.budget_source_analysis_id = source_analysis_id; Study.budget_basis = basis"
+          - "Study.indirect_rate_pct = indirect_rate_pct"
+          - "run calculations.study_effective_indirect_rate then calculations.study_budget_totals"
+          - "Study.budget_built_by_user_id = X-User-ID; Study.budget_executed_by_user_id = null"
+          - "increments Study.version by 1"
+        note: "BG-1 (also the rebuild path from BUILT, EXECUTED or SUPERSEDED; rebuilding an EXECUTED budget mid-study drops it back to BUILT and clears budget_executed_by_user_id, so consent is blocked with ERR_BUDGET_NOT_EXECUTED until a second manager re-executes it)"
+      - from: BUILT
+        to: EXECUTED
+        trigger: "POST /research-billing/studies/{id}/budget-execute"
+        actor: ResearchBillingManager
+        preconditions:
+          - "study.budget_status == BUILT"
+          - "X-User-ID != study.budget_built_by_user_id"
+        side_effects:
+          - "Study.budget_status = EXECUTED"
+          - "Study.budget_executed_by_user_id = X-User-ID"
+          - "increments Study.version by 1"
+        note: "BG-2"
+      - from: EXECUTED
+        to: SUPERSEDED
+        trigger: "POST /research-billing/amendments/{id}/implement with amendment.reanalysis_required == true"
+        actor: ResearchBillingManager
+        preconditions:
+          - "study.budget_status == EXECUTED"
+        side_effects:
+          - "Study.budget_status = SUPERSEDED"
+        note: "BG-4 (fires inside LC-4's cascade; the two dimensions move in one request but are independent otherwise)"
+
+  - entity: CoverageAnalysis
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED]
+    note: "Cyclic: DRAFT -> UNDER_REVIEW -> RETURNED -> DRAFT, bounded by ANALYSIS_MAX_RETURNS."
+    transitions:
+      - from: DRAFT
+        to: UNDER_REVIEW
+        trigger: "POST /research-billing/coverage-analyses/{id}/submit"
+        actor: CoverageAnalyst
+        preconditions:
+          - "analysis.status == DRAFT"
+          - "analysis.item_count >= 1"
+        side_effects:
+          - "CoverageAnalysis.status = UNDER_REVIEW"
+          - "increments CoverageAnalysis.version by 1"
+      - from: UNDER_REVIEW
+        to: RETURNED
+        trigger: "POST /research-billing/coverage-analyses/{id}/return"
+        actor: ComplianceReviewer
+        preconditions:
+          - "analysis.status == UNDER_REVIEW"
+          - "analysis.return_count < ANALYSIS_MAX_RETURNS (2)"
+        side_effects:
+          - "CoverageAnalysis.status = RETURNED"
+          - "CoverageAnalysis.return_count += 1; returned_by_user_id = X-User-ID; return_reason = return_reason"
+          - "increments CoverageAnalysis.version by 1"
+      - from: RETURNED
+        to: DRAFT
+        trigger: "POST /research-billing/coverage-items (adding an item to a RETURNED analysis reopens it for editing)"
+        actor: CoverageAnalyst
+        preconditions:
+          - "analysis.status IN {DRAFT, RETURNED}"
+          - "expected_coverage_analysis_version == analysis.version"
+        side_effects:
+          - "CoverageAnalysis.status = DRAFT"
+          - "recompute item_count and the three classification counters plus qct_conditional_item_count"
+          - "increments CoverageAnalysis.version by 1"
+        note: "closes the review cycle"
+      - from: UNDER_REVIEW
+        to: APPROVED
+        trigger: "POST /research-billing/coverage-analyses/{id}/approve"
+        actor: ComplianceReviewer
+        preconditions:
+          - "analysis.status == UNDER_REVIEW"
+          - "X-User-ID != analysis.prepared_by_user_id"
+          - "study.qct_determination != UNDETERMINED when analysis.qct_conditional_item_count >= 1"
+        side_effects:
+          - "CoverageAnalysis.status = APPROVED; approved_at = current logical clock; approved_by_user_id = X-User-ID"
+          - "when analysis.supersedes_analysis_id is non-null: that analysis APPROVED -> SUPERSEDED"
+          - "Study.lifecycle_status COVERAGE_PENDING -> COVERAGE_APPROVED (LC-2)"
+          - "recompute calculations.charge_routing_expectation for every Charge of the study, then Study.improper_payer_exposure_cents"
+          - "increments CoverageAnalysis.version by 1"
+      - from: APPROVED
+        to: SUPERSEDED
+        trigger: "system: approval of a successor analysis whose supersedes_analysis_id == this id"
+        actor: system
+        preconditions:
+          - "analysis.status == APPROVED"
+        side_effects:
+          - "CoverageAnalysis.status = SUPERSEDED"
+          - "increments CoverageAnalysis.version by 1"
+
+  - entity: StudyCalendar
+    initial_state: DRAFT
+    terminal_states: [RETIRED]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /research-billing/study-calendars/{id}/publish"
+        actor: ComplianceReviewer
+        preconditions:
+          - "calendar.status == DRAFT"
+          - "calendar.source_analysis.status == APPROVED"
+          - "calendar.visit_count >= 1"
+          - "calendar.unrouted_per_patient_item_count == 0"
+        side_effects:
+          - "StudyCalendar.status = PUBLISHED; published_at = current logical clock"
+          - "every other StudyCalendar of this study with status IN {PUBLISHED, REBUILD_REQUIRED} -> RETIRED"
+          - "recompute Study.rebuild_required_calendar_count then calculations.study_billing_hold_posture"
+          - "increments StudyCalendar.version by 1"
+      - from: PUBLISHED
+        to: REBUILD_REQUIRED
+        trigger: "system: POST /research-billing/amendments/{id}/implement cascade link 3"
+        actor: system
+        preconditions:
+          - "calendar.status == PUBLISHED"
+          - "the implementing amendment has calendar_rebuild_required == true"
+          - "Study.lifecycle_status has just entered COVERAGE_PENDING (cascade link 2)"
+        side_effects:
+          - "StudyCalendar.status = REBUILD_REQUIRED"
+          - "cascade link 4: Study.rebuild_required_calendar_count += 1, recompute calculations.study_billing_hold_posture -> ALL_BLOCKED"
+          - "increments StudyCalendar.version by 1"
+      - from: REBUILD_REQUIRED
+        to: RETIRED
+        trigger: "system: publication of a newer calendar generation for the same study"
+        actor: system
+        preconditions:
+          - "calendar.status == REBUILD_REQUIRED"
+        side_effects:
+          - "StudyCalendar.status = RETIRED"
+          - "Study.rebuild_required_calendar_count -= 1, recompute calculations.study_billing_hold_posture"
+          - "increments StudyCalendar.version by 1"
+
+  - entity: StudySubject
+    initial_state: SCREENING
+    terminal_states: [OFF_STUDY]
+    transitions:
+      - from: SCREENING
+        to: CONSENTED
+        trigger: "POST /research-billing/study-subjects/{id}/consent"
+        actor: StudyCoordinator
+        preconditions:
+          - "subject.status == SCREENING"
+          - "study.lifecycle_status == OPEN_TO_ACCRUAL"
+          - "study.budget_status == EXECUTED"
+          - "exactly one StudyCalendar of the study has status == PUBLISHED"
+        side_effects:
+          - "StudySubject.status = CONSENTED; consent_date = consent_date"
+          - "StudySubject.consented_calendar_id = that PUBLISHED calendar's id (version pinning)"
+          - "StudySubject.consented_calendar_generation = that calendar's build_generation"
+          - "increments StudySubject.version by 1"
+      - from: SCREENING
+        to: OFF_STUDY
+        trigger: "system: Study LC-5 cascade"
+        actor: system
+        preconditions:
+          - "subject.status == SCREENING"
+        side_effects:
+          - "StudySubject.status = OFF_STUDY"
+          - "increments StudySubject.version by 1"
+      - from: CONSENTED
+        to: OFF_STUDY
+        trigger: "system: Study LC-5 cascade"
+        actor: system
+        preconditions:
+          - "subject.status == CONSENTED"
+        side_effects:
+          - "StudySubject.status = OFF_STUDY"
+          - "every SubjectVisit of this subject with status == SCHEDULED -> MISSED"
+          - "increments StudySubject.version by 1"
+
+  - entity: SubjectVisit
+    initial_state: SCHEDULED
+    terminal_states: [OCCURRED, MISSED]
+    transitions:
+      - from: SCHEDULED
+        to: OCCURRED
+        trigger: "POST /research-billing/subject-visits/{id}/complete"
+        actor: StudyCoordinator
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "subject.status == CONSENTED"
+          - "the calendar owning visit.calendar_visit_id is STILL status == PUBLISHED and its build_generation still equals visit.calendar_generation_at_schedule and subject.consented_calendar_generation (a RETIRED or REBUILD_REQUIRED generation raises ERR_STALE_CALENDAR_GENERATION)"
+        side_effects:
+          - "SubjectVisit.status = OCCURRED"
+          - "for every VisitChargeRoute of visit.calendar_visit_id ordered by created_at ASC: create one Charge with source = VISIT_CASCADE, routing_state = UNROUTED, billing_state = UNBILLED, unbilled_since = current logical clock, amount_cents from calculations.visit_route_expected_amount, suggested_routing_target = route.routing_target, coverage_item_id = route.coverage_item_id"
+          - "SubjectVisit.generated_charge_count = number of charges created"
+          - "recompute StudySubject.charge_count"
+          - "increments SubjectVisit.version by 1"
+      - from: SCHEDULED
+        to: MISSED
+        trigger: "system: POST /research-billing/_ops/aging-run when run_date > consent_date + calendar_visit.window_end_day"
+        actor: system
+        preconditions:
+          - "visit.status == SCHEDULED"
+        side_effects:
+          - "SubjectVisit.status = MISSED"
+          - "increments SubjectVisit.version by 1"
+
+  - entity: Charge
+    initial_state: UNROUTED
+    terminal_states: [WRITTEN_OFF, REFUNDED]
+    note: |
+      Two independent dimensions on one row: routing_state (RT transitions)
+      and billing_state (BL transitions). A review decision moves both in one
+      request; an audit refund moves only billing_state; the aging run moves
+      neither. The pair (ROUTED_SPONSOR, UNBILLED) is the only invoiceable
+      combination.
+    transitions:
+      - from: UNROUTED
+        to: ROUTED_PAYER
+        trigger: "POST /research-billing/charges/{id}/review with decision = CLEAR_TO_PAYER"
+        actor: ComplianceReviewer
+        preconditions:
+          - "charge.routing_state == UNROUTED"
+          - "study.billing_hold_posture == OPEN"
+          - "charge.expected_routing_target == PAYER, or override_justification is a non-empty string"
+          - "the effective analysis for charge.service_date exists and contains an item with item_code == charge.charge_code"
+        side_effects:
+          - "Charge.routing_state = ROUTED_PAYER; Charge.billing_state UNBILLED -> BILLED_PAYER (BL-1)"
+          - "Charge.coverage_item_id = matched item id; reviewed_by_user_id = X-User-ID; reviewed_at = clock"
+          - "recompute Study.payer_billed_cents, Study.sponsor_unbilled_cents, Charge.improper_flag, Study.improper_payer_exposure_cents"
+          - "increments Charge.version by 1"
+        note: "RT-1 / BL-1"
+      - from: UNROUTED
+        to: ROUTED_SPONSOR
+        trigger: "POST /research-billing/charges/{id}/review with decision = HOLD_FOR_SPONSOR"
+        actor: ComplianceReviewer
+        preconditions:
+          - "charge.routing_state == UNROUTED"
+          - "study.billing_hold_posture IN {OPEN, PAYER_BLOCKED}"
+          - "charge.expected_routing_target == SPONSOR, or override_justification is a non-empty string"
+          - "the effective analysis for charge.service_date exists and contains an item with item_code == charge.charge_code"
+        side_effects:
+          - "Charge.routing_state = ROUTED_SPONSOR; billing_state stays UNBILLED; unbilled_since unchanged"
+          - "Charge.coverage_item_id = matched item id; reviewed_by_user_id = X-User-ID; reviewed_at = clock"
+          - "recompute Study.sponsor_unbilled_cents"
+          - "increments Charge.version by 1"
+        note: "RT-2"
+      - from: UNROUTED
+        to: ROUTED_NONE
+        trigger: "POST /research-billing/charges/{id}/review with decision = NO_CHARGE_PROMOTIONAL"
+        actor: ComplianceReviewer
+        preconditions:
+          - "charge.routing_state == UNROUTED"
+          - "study.billing_hold_posture IN {OPEN, PAYER_BLOCKED}"
+          - "charge.expected_routing_target == NONE, or override_justification is a non-empty string"
+        side_effects:
+          - "Charge.routing_state = ROUTED_NONE; Charge.billing_state UNBILLED -> WRITTEN_OFF (BL-2)"
+          - "Charge.coverage_item_id = matched item id; reviewed_by_user_id = X-User-ID; reviewed_at = clock"
+          - "recompute Study.sponsor_unbilled_cents"
+          - "increments Charge.version by 1"
+        note: "RT-3 / BL-2"
+      - from: UNBILLED
+        to: INVOICED_SPONSOR
+        trigger: "POST /research-billing/sponsor-invoices/{id}/submit"
+        actor: ResearchBillingManager
+        preconditions:
+          - "charge.routing_state == ROUTED_SPONSOR and charge.billing_state == UNBILLED"
+          - "charge.sponsor_invoice_id == the submitted invoice's id"
+        side_effects:
+          - "Charge.billing_state = INVOICED_SPONSOR"
+          - "recompute Study.sponsor_unbilled_cents and Study.sponsor_receivable_cents (their sum is invariant)"
+          - "increments Charge.version by 1"
+        note: "BL-3"
+      - from: INVOICED_SPONSOR
+        to: UNBILLED
+        trigger: "POST /research-billing/sponsor-invoices/{id}/remittance with outcome = DISPUTED"
+        actor: ResearchBillingManager
+        preconditions:
+          - "charge.billing_state == INVOICED_SPONSOR"
+          - "charge.sponsor_invoice_id == the disputed invoice's id"
+        side_effects:
+          - "Charge.billing_state = UNBILLED; Charge.sponsor_invoice_id = null; Charge.unbilled_since UNCHANGED (aging continues to accrue across the dispute)"
+          - "recompute Study.sponsor_receivable_cents and Study.sponsor_unbilled_cents (their sum is invariant)"
+          - "increments Charge.version by 1"
+        note: "BL-4 (compensating action for BL-3)"
+      - from: BILLED_PAYER
+        to: REFUNDED
+        trigger: "POST /research-billing/audit-findings/{id}/resolve with disposition = REFUND_AND_REROUTE"
+        actor: AuditLiaison
+        preconditions:
+          - "charge.billing_state == BILLED_PAYER"
+          - "finding.status == RESPONDED and finding.charge_id == charge.id"
+        side_effects:
+          - "Charge.billing_state = REFUNDED; Charge.refunded_amount_cents = Charge.amount_cents"
+          - "cascade link 2: create a replacement Charge (source = REFUND_REPLACEMENT, replaces_charge_id = this charge, same charge_code/service_date/amount_cents/study_id/coverage_item_id, routing_state = ROUTED_SPONSOR, billing_state = UNBILLED, unbilled_since = current logical clock, hold_reason = NONE)"
+          - "cascade link 3: recompute Study.payer_billed_cents, Study.payer_refunded_cents (their sum is invariant), Study.sponsor_unbilled_cents, Charge.improper_flag, Study.improper_payer_exposure_cents"
+          - "increments Charge.version by 1"
+        note: "BL-5 (compensating action for BL-1)"
+
+  - entity: SponsorInvoice
+    initial_state: DRAFT
+    terminal_states: [PAID]
+    note: "Cyclic: SUBMITTED -> DISPUTED -> SUBMITTED, re-selecting lines on each submission."
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /research-billing/sponsor-invoices/{id}/submit"
+        actor: ResearchBillingManager
+        preconditions:
+          - "invoice.status IN {DRAFT, DISPUTED}"
+          - "invoice.line_count >= 1"
+          - "study.billing_hold_posture != ALL_BLOCKED"
+        side_effects:
+          - "SponsorInvoice.status = SUBMITTED; submitted_at = current logical clock"
+          - "every Charge with sponsor_invoice_id == this invoice: UNBILLED -> INVOICED_SPONSOR (BL-3)"
+          - "increments SponsorInvoice.version by 1"
+      - from: SUBMITTED
+        to: PAID
+        trigger: "POST /research-billing/sponsor-invoices/{id}/remittance with outcome IN {PAID_IN_FULL, SHORT_PAID}"
+        actor: ResearchBillingManager
+        preconditions:
+          - "invoice.status == SUBMITTED"
+          - "for PAID_IN_FULL: amount_paid_cents omitted or == invoice.net_total_cents"
+          - "for SHORT_PAID: 0 <= amount_paid_cents < invoice.net_total_cents"
+        side_effects:
+          - "SponsorInvoice.status = PAID; amount_paid_cents set; short_paid = (amount_paid_cents < net_total_cents)"
+          - "recompute Study.sponsor_collected_cents and Study.sponsor_written_off_cents"
+          - "increments SponsorInvoice.version by 1"
+      - from: SUBMITTED
+        to: DISPUTED
+        trigger: "POST /research-billing/sponsor-invoices/{id}/remittance with outcome = DISPUTED"
+        actor: ResearchBillingManager
+        preconditions:
+          - "invoice.status == SUBMITTED"
+        side_effects:
+          - "SponsorInvoice.status = DISPUTED"
+          - "every Charge with sponsor_invoice_id == this invoice: INVOICED_SPONSOR -> UNBILLED and sponsor_invoice_id = null (BL-4)"
+          - "SponsorInvoice.line_count = 0; subtotal_cents = 0; indirect_cents = 0; gross_total_cents = 0; volume_credit_cents = 0; net_total_cents = 0"
+          - "increments SponsorInvoice.version by 1"
+      - from: DISPUTED
+        to: SUBMITTED
+        trigger: "POST /research-billing/sponsor-invoices/{id}/submit (re-selects lines under calculations.sponsor_invoice_line_selection)"
+        actor: ResearchBillingManager
+        preconditions:
+          - "invoice.status == DISPUTED"
+          - "the re-selection yields line_count >= 1"
+        side_effects:
+          - "re-run calculations.sponsor_invoice_line_selection, sponsor_invoice_indirect, sponsor_invoice_net_total"
+          - "SponsorInvoice.status = SUBMITTED; submitted_at = current logical clock"
+          - "selected Charges: UNBILLED -> INVOICED_SPONSOR (BL-3)"
+          - "increments SponsorInvoice.version by 1"
+
+  - entity: AuditFinding
+    initial_state: OPEN
+    terminal_states: [CLOSED_REFUNDED, CLOSED_NO_ACTION]
+    note: "Branching at resolution: REFUND_AND_REROUTE and NO_ACTION carry disjoint side-effect sets."
+    transitions:
+      - from: OPEN
+        to: RESPONDED
+        trigger: "POST /research-billing/audit-findings/{id}/respond"
+        actor: AuditLiaison
+        preconditions:
+          - "finding.status == OPEN"
+          - "X-User-ID != finding.opened_by_user_id"
+        side_effects:
+          - "AuditFinding.status = RESPONDED; response_narrative set; responded_by_user_id = X-User-ID"
+          - "increments AuditFinding.version by 1"
+      - from: RESPONDED
+        to: CLOSED_REFUNDED
+        trigger: "POST /research-billing/audit-findings/{id}/resolve with disposition = REFUND_AND_REROUTE"
+        actor: AuditLiaison
+        preconditions:
+          - "finding.status == RESPONDED"
+          - "finding.charge_id is non-null and that charge has billing_state == BILLED_PAYER"
+        side_effects:
+          - "AuditFinding.status = CLOSED_REFUNDED; refund_amount_cents = charge.amount_cents"
+          - "cascade link 1 -> 2 -> 3: the linked Charge BILLED_PAYER -> REFUNDED (BL-5), which creates the ROUTED_SPONSOR replacement charge, which drives the Study ledger recompute"
+          - "cascade link 4: Study.open_finding_count -= 1, recompute calculations.study_billing_hold_posture"
+          - "increments AuditFinding.version by 1"
+      - from: RESPONDED
+        to: CLOSED_NO_ACTION
+        trigger: "POST /research-billing/audit-findings/{id}/resolve with disposition = NO_ACTION"
+        actor: AuditLiaison
+        preconditions:
+          - "finding.status == RESPONDED"
+        side_effects:
+          - "AuditFinding.status = CLOSED_NO_ACTION; refund_amount_cents stays 0"
+          - "no Charge is mutated"
+          - "Study.open_finding_count -= 1, recompute calculations.study_billing_hold_posture"
+          - "increments AuditFinding.version by 1"
+
+  - entity: Amendment
+    initial_state: SUBMITTED
+    terminal_states: [IMPLEMENTED]
+    transitions:
+      - from: SUBMITTED
+        to: IMPLEMENTED
+        trigger: "POST /research-billing/amendments/{id}/implement"
+        actor: ResearchBillingManager
+        preconditions:
+          - "amendment.status == SUBMITTED"
+          - "study.lifecycle_status IN {COVERAGE_APPROVED, OPEN_TO_ACCRUAL}"
+          - "amendment.effective_date <= current logical clock date"
+        side_effects:
+          - "cascade link 1: Amendment.status = IMPLEMENTED"
+          - "cascade link 2 (caused by link 1, only when reanalysis_required): Study.lifecycle_status -> COVERAGE_PENDING (LC-4) and Study.budget_status EXECUTED -> SUPERSEDED (BG-4)"
+          - "cascade link 3 (caused by link 2, only when calendar_rebuild_required): every StudyCalendar of the study with status == PUBLISHED -> REBUILD_REQUIRED"
+          - "cascade link 4 (caused by link 3): Study.rebuild_required_calendar_count += 1 and calculations.study_billing_hold_posture -> ALL_BLOCKED"
+          - "cascade link 5 (caused by link 4): every Charge of the study with billing_state == UNBILLED and routing_state == UNROUTED gets hold_reason = CALENDAR_REBUILD and hold_applied_at = current logical clock, ordered by created_at ASC"
+          - "increments Amendment.version by 1"
+
+# ===========================================================================
+# 1.2.1 Concurrency Rules
+# ===========================================================================
+concurrency_rules:
+  - rule_id: analysis-create-stale-study
+    parent_entity: Study
+    write_endpoint: "POST /research-billing/coverage-analyses"
+    occ_field: "expected_study_version"
+    description: |
+      Creating a CoverageAnalysis against a Study whose version has advanced
+      since the client last read it is rejected. A new analysis legitimately
+      supersedes the prior approved one and moves the study back into
+      COVERAGE_PENDING, so a writer holding a stale view of the study would
+      silently branch the coverage history from an outdated baseline.
+    error_id: ERR_STALE_STUDY_VERSION
+    http_status: 412
+
+  - rule_id: budget-build-stale-study
+    parent_entity: Study
+    write_endpoint: "POST /research-billing/studies/{id}/budget-build"
+    occ_field: "expected_study_version"
+    description: |
+      Building a budget against a Study whose version has advanced since the
+      client last read it is rejected. A rebuild legitimately supersedes the
+      prior budget totals from BUILT or SUPERSEDED, so a stale writer would
+      overwrite figures derived from an analysis or calendar it never saw.
+    error_id: ERR_STALE_STUDY_VERSION
+    http_status: 412
+
+  - rule_id: item-add-stale-analysis
+    parent_entity: CoverageAnalysis
+    write_endpoint: "POST /research-billing/coverage-items"
+    occ_field: "expected_coverage_analysis_version"
+    description: |
+      Adding a CoverageItem to a CoverageAnalysis whose version has advanced
+      since the client last read it is rejected. Adding a second, different
+      item legitimately succeeds on its own, so the guard is on the stale item
+      set: the qct_conditional_item_count and classification counters the
+      writer reasoned about no longer describe the analysis.
+    error_id: ERR_STALE_COVERAGE_ANALYSIS_VERSION
+    http_status: 412
+
+# ===========================================================================
+# 1.3 Calculation Rules Table
+# ===========================================================================
+calculations:
+  - name: study_effective_indirect_rate
+    trigger: "POST /research-billing/studies/{id}/budget-build, before study_budget_totals"
+    algorithm: threshold
+    formula: |
+      # inputs: study.funding_source, requested indirect_rate_pct,
+      #         per_patient_subtotal_cents (step 1 of study_budget_totals)
+      if funding_source == FEDERALLY_FUNDED:
+          rate = min(indirect_rate_pct, FEDERAL_INDIRECT_CAP_PCT)
+      elif funding_source == INDUSTRY_SPONSORED:
+          if per_patient_subtotal_cents >= INDUSTRY_TIER_THRESHOLD_CENTS:
+              rate = min(indirect_rate_pct, INDUSTRY_INDIRECT_CAP_PCT)
+          else:
+              rate = min(indirect_rate_pct + INDUSTRY_SMALL_STUDY_SURCHARGE_PCT,
+                         INDUSTRY_INDIRECT_CAP_PCT)
+      else:  # INVESTIGATOR_INITIATED
+          rate = 0.0
+      effective_indirect_rate_pct = rate     # one decimal place, exact
+    input_set: "study.funding_source and study.indirect_rate_pct as supplied on this build; per_patient_subtotal_cents from step 1 of study_budget_totals (sponsor-borne PER_PATIENT items only)"
+    constants:
+      FEDERAL_INDIRECT_CAP_PCT: 26.0
+      INDUSTRY_INDIRECT_CAP_PCT: 32.0
+      INDUSTRY_SMALL_STUDY_SURCHARGE_PCT: 3.0
+      INDUSTRY_TIER_THRESHOLD_CENTS: 500000
+    precision: "1 decimal place, exact (no rounding needed: inputs carry at most 2 decimals and caps are exact)"
+    variants: []
+    note: |
+      Combinatorial mode (a): three inputs (funding_source, requested rate,
+      per-patient subtotal) interacting through a branch, a threshold and two
+      nested min() caps. The surcharge is applied BEFORE the industry cap, so
+      a requested 30.0 on a small industry study yields 32.0, not 33.0.
+
+  - name: study_budget_totals
+    trigger: "POST /research-billing/studies/{id}/budget-build"
+    algorithm: aggregation
+    formula: |
+      # STEP 1 - per-patient subtotal (variant-dependent, see variants below)
+      # STEP 2 - invoiceable subtotal (identical in both variants)
+      invoiceable_subtotal_cents = sum over CoverageItem i where
+          i.coverage_analysis_id == source_analysis_id
+          and i.billable_to == SPONSOR
+          and i.budget_category == INVOICEABLE
+        of (i.units_per_occurrence * i.expected_occurrences * i.negotiated_unit_cents)
+      # STEP 3 - indirect, SUM-THEN-ROUND (pinned order for the budget)
+      per_patient_budget_cents = per_patient_subtotal_cents + round_half_up(
+          per_patient_subtotal_cents * effective_indirect_rate_pct / 100)
+      invoiceable_budget_cents = invoiceable_subtotal_cents + round_half_up(
+          invoiceable_subtotal_cents * effective_indirect_rate_pct / 100)
+    input_set: |
+      Only CoverageItem rows of the build's source_analysis_id with
+      billable_to == SPONSOR are included; ROUTINE_CARE (billable_to == PAYER)
+      and PROMOTIONAL (billable_to == NONE) items are excluded from both
+      subtotals. Items with budget_category == NOT_BUDGETED are excluded even
+      when billable_to == SPONSOR.
+    constants: {}
+    precision: "integer cents; round_half_up applied ONCE to each subtotal (sum-then-round). This is deliberately the opposite order from sponsor_invoice_indirect."
+    variants:
+      - name: coverage_driven_per_patient
+        when: "budget-build called with basis = COVERAGE_DRIVEN"
+        difference: |
+          per_patient_subtotal_cents = sum over CoverageItem i where
+            i.coverage_analysis_id == source_analysis_id
+            and i.billable_to == SPONSOR and i.budget_category == PER_PATIENT
+          of (i.units_per_occurrence * i.expected_occurrences * i.negotiated_unit_cents).
+          Uses the protocol's expected_occurrences declared on the analysis.
+      - name: calendar_driven_per_patient
+        when: "budget-build called with basis = CALENDAR_DRIVEN (requires a PUBLISHED calendar on the same source analysis)"
+        difference: |
+          per_patient_subtotal_cents = sum over VisitChargeRoute r whose
+            calendar_visit belongs to the PUBLISHED StudyCalendar with
+            source_analysis_id == source_analysis_id, where
+            r.routing_target == SPONSOR and r.coverage_item.budget_category == PER_PATIENT
+          of (r.occurrences * r.coverage_item.units_per_occurrence
+              * r.coverage_item.negotiated_unit_cents).
+          Counts what the EHR calendar will actually drop, which diverges from
+          expected_occurrences whenever the calendar routes an item a different
+          number of times than the analysis projected.
+
+  - name: charge_routing_expectation
+    trigger: "on Charge creation (POST /research-billing/charges, visit-completion cascade, refund replacement) and on every CoverageAnalysis UNDER_REVIEW -> APPROVED"
+    algorithm: projection
+    formula: |
+      # effective-analysis selector (both variants share the candidate shape)
+      # candidates = CoverageAnalysis a where a.study_id == charge.study_id
+      #              and a.status IN {APPROVED, SUPERSEDED}
+      def effective_as_of(charge):
+          c = [a for a in candidates if a.approved_at <= charge.service_date + '23:59:59.999Z']
+          if not c: return None
+          return sorted(c, key=lambda a: (a.approved_at, a.created_at), reverse=True)[0]
+      def effective_current(charge):
+          c = [a for a in candidates if a.status == APPROVED]
+          if not c: return None
+          return sorted(c, key=lambda a: (a.approved_at, a.created_at), reverse=True)[0]
+      # item match inside the chosen analysis
+      def target(analysis, charge):
+          if analysis is None: return 'UNDETERMINED'
+          items = [i for i in analysis.items if i.item_code == charge.charge_code]
+          if not items: return 'UNDETERMINED'
+          return sorted(items, key=lambda i: i.created_at)[0].billable_to
+      expected_routing_target = target(effective_current(charge), charge)   # persisted field
+    input_set: "CoverageAnalysis rows of the charge's study with status IN {APPROVED, SUPERSEDED} for the as_of_service_date variant; status == APPROVED only for the current_effective variant. DRAFT, UNDER_REVIEW and RETURNED analyses are never consulted."
+    constants: {}
+    precision: "enum-valued; no arithmetic"
+    variants:
+      - name: as_of_service_date
+        when: "evaluated by POST /research-billing/charges/{id}/review to decide whether the reviewer's decision contradicts coverage (ERR_ROUTING_CONTRADICTS_COVERAGE) and to pick the coverage_item_id to link"
+        difference: "Restricts candidates to analyses whose approved_at is at or before the end of charge.service_date, then takes the latest such approval (approved_at DESC, created_at DESC tie-break). This is the operational view: what the analysis said when the service happened."
+      - name: current_effective
+        when: "persisted into Charge.expected_routing_target and used to derive Charge.improper_flag and Study.improper_payer_exposure_cents"
+        difference: "Ignores service_date entirely and always uses the study's single APPROVED analysis. This is the audit view: after an amendment reclassifies an item, previously compliant payer-billed charges become improper without any request touching them."
+    note: |
+      Rule-1 dual variant on the Charge/routing domain: identical charge rows
+      yield PAYER under as_of_service_date and SPONSOR under current_effective
+      once a superseding analysis reclassifies the item_code.
+
+  - name: visit_route_expected_amount
+    trigger: "POST /research-billing/visit-charge-routes, and re-used verbatim as amount_cents when the visit-completion cascade creates each Charge"
+    algorithm: tiered_pricing
+    formula: |
+      unit = (charge_master_unit_cents if routing_target == PAYER
+              else negotiated_unit_cents if routing_target == SPONSOR
+              else 0)
+      expected_amount_cents = occurrences * coverage_item.units_per_occurrence * unit
+    input_set: "the single CoverageItem named by coverage_item_id, with routing_target snapshotted from its billable_to at route-creation time"
+    constants: {}
+    precision: "integer cents, exact multiplication (no rounding)"
+    variants: []
+    note: "Payer-routed items bill the charge master; sponsor-routed items bill the negotiated rate. The snapshot means a later reclassification does NOT change historical route amounts."
+
+  - name: sponsor_invoice_line_selection
+    trigger: "POST /research-billing/sponsor-invoices and every SponsorInvoice DRAFT|DISPUTED -> SUBMITTED"
+    algorithm: waterfall_allocation
+    formula: |
+      # eligibility filter (explicit, no adjectives)
+      candidates = [c for c in Charge
+                    if c.study_id == invoice.study_id
+                    and c.routing_state == 'ROUTED_SPONSOR'
+                    and c.billing_state == 'UNBILLED'
+                    and c.sponsor_invoice_id is None
+                    and c.hold_reason == 'NONE'
+                    and c.service_date <= invoice.period_end_date]
+      # ranking: oldest service first, then oldest row
+      candidates.sort(key=lambda c: (c.service_date, c.created_at))
+      selected, running_subtotal, running_indirect = [], 0, 0
+      for c in candidates:
+          line_indirect = round_half_up(
+              c.amount_cents * study.effective_indirect_rate_pct / 100)
+          if len(selected) + 1 > INVOICE_MAX_LINES:
+              break
+          if running_subtotal + c.amount_cents + running_indirect + line_indirect \
+             > INVOICE_MAX_GROSS_CENTS:
+              break                      # STOP, never skip-and-continue
+          selected.append(c); running_subtotal += c.amount_cents
+          running_indirect += line_indirect
+      if not selected: raise ERR_NO_INVOICEABLE_CHARGES
+      for c in selected: c.sponsor_invoice_id = invoice.id
+    input_set: "Charge rows of the study with routing_state == ROUTED_SPONSOR, billing_state == UNBILLED, sponsor_invoice_id == null, hold_reason == NONE and service_date <= period_end_date. Charges released back by a dispute (BL-4) re-enter this pool with their original unbilled_since."
+    constants:
+      INVOICE_MAX_LINES: 25
+      INVOICE_MAX_GROSS_CENTS: 2000000
+    precision: "integer cents; the cap comparison is strictly `> INVOICE_MAX_GROSS_CENTS`, so a candidate landing exactly on 2000000 IS selected"
+    variants: []
+    note: "Ranking key is (service_date ASC, created_at ASC); id is never consulted. Empty candidate set is an error, never an empty invoice."
+
+  - name: sponsor_invoice_indirect
+    trigger: "every SponsorInvoice line-selection run (create, submit, re-submit after dispute)"
+    algorithm: aggregation
+    formula: |
+      subtotal_cents = sum(c.amount_cents for c in selected)
+      # ROUND-PER-LINE THEN SUM (pinned; the opposite of study_budget_totals)
+      indirect_cents = sum(round_half_up(
+          c.amount_cents * study.effective_indirect_rate_pct / 100)
+          for c in selected)
+      gross_total_cents = subtotal_cents + indirect_cents
+    input_set: "exactly the Charge rows selected by sponsor_invoice_line_selection for this invoice"
+    constants: {}
+    precision: "integer cents, round_half_up per line, summed afterwards. `round_half_up(sum(...))` is WRONG and produces a different figure whenever two or more lines carry a fractional cent of indirect."
+    variants: []
+    note: "Combinatorial mode (b): the scaffold pins round-per-line-then-sum here and sum-then-round in study_budget_totals, so the same rate applied to the same money yields different cents in the two places."
+
+  - name: sponsor_invoice_net_total
+    trigger: "immediately after sponsor_invoice_indirect on the same request"
+    algorithm: threshold
+    formula: |
+      # STEP 1: gross_total_cents (already computed)
+      # STEP 2: tier the credit on the PRE-CREDIT gross, never on the net
+      credit_pct = (INVOICE_VOLUME_CREDIT_PCT
+                    if gross_total_cents >= INVOICE_VOLUME_CREDIT_THRESHOLD_CENTS
+                    else 0.0)
+      # STEP 3
+      volume_credit_cents = round_half_up(gross_total_cents * credit_pct / 100)
+      # STEP 4
+      net_total_cents = gross_total_cents - volume_credit_cents
+      # STEP 5: the tier is NEVER re-evaluated against net_total_cents
+    input_set: "the invoice's own gross_total_cents from sponsor_invoice_indirect"
+    constants:
+      INVOICE_VOLUME_CREDIT_THRESHOLD_CENTS: 1000000
+      INVOICE_VOLUME_CREDIT_PCT: 2.0
+    precision: "integer cents, round_half_up on the credit; evaluation order pinned as steps 1-5"
+    variants: []
+    note: |
+      Combinatorial mode (c): net_total depends on the credit and the credit's
+      tier depends on a total, which looks circular. The order is pinned - the
+      tier key is gross_total_cents. An invoice whose gross is 1009800 keeps a
+      20196 credit even though the resulting net 989604 falls below the
+      threshold; re-tiering on net would zero the credit and change the answer.
+
+  - name: study_billing_hold_posture
+    trigger: "recomputed at the end of any request that changes AuditFinding.status, StudyCalendar.status, Study.qct_determination or Study.lifecycle_status"
+    algorithm: constraint_propagation
+    formula: |
+      # first matching clause wins
+      if study.open_finding_count >= 1:                       posture = 'ALL_BLOCKED'
+      elif study.rebuild_required_calendar_count >= 1:         posture = 'ALL_BLOCKED'
+      elif study.qct_determination in ('UNDETERMINED','NON_QUALIFYING'):
+                                                               posture = 'PAYER_BLOCKED'
+      else:                                                    posture = 'OPEN'
+    input_set: "open_finding_count counts AuditFinding rows of the study with status IN {OPEN, RESPONDED}; rebuild_required_calendar_count counts StudyCalendar rows of the study with status == REBUILD_REQUIRED"
+    constants: {}
+    precision: "enum-valued; clause order is normative"
+    variants: []
+
+  - name: charge_aging
+    trigger: "POST /research-billing/_ops/aging-run ONLY (Charge.aging_days and Charge.aging_bucket are stale between runs by design)"
+    algorithm: threshold
+    formula: |
+      run_date = date part of the current logical clock, snapshotted once at
+                 the start of the run (buckets are frozen against this snapshot)
+      for c in [Charge of the study with billing_state == 'UNBILLED']:
+          c.aging_days = whole days from date(c.unbilled_since) to run_date
+                         (floor; negative values clamp to 0)
+          c.aging_bucket = ('CURRENT'            if c.aging_days <= 30
+                       else 'AGING_31_60'        if c.aging_days <= 60
+                       else 'AGING_61_90'        if c.aging_days <= 90
+                       else 'DELINQUENT_90_PLUS')
+    input_set: "Charge rows of the requested study with billing_state == UNBILLED, ordered by created_at ASC; charges in BILLED_PAYER, INVOICED_SPONSOR, WRITTEN_OFF or REFUNDED are skipped and keep their previous bucket"
+    constants:
+      AGING_CURRENT_MAX_DAYS: 30
+      AGING_31_60_MAX_DAYS: 60
+      AGING_61_90_MAX_DAYS: 90
+    precision: "whole days, floor; boundaries are inclusive upper bounds (30 -> CURRENT, 31 -> AGING_31_60, 90 -> AGING_61_90, 91 -> DELINQUENT_90_PLUS)"
+    variants: []
+
+  - name: study_ledger_rollup
+    trigger: "at the end of any request that changes a Charge.billing_state, Charge.routing_state, Charge.amount_cents or SponsorInvoice.status"
+    algorithm: aggregation
+    formula: |
+      payer_billed_cents        = sum(c.amount_cents          for c in charges if c.billing_state == 'BILLED_PAYER')
+      payer_refunded_cents      = sum(c.refunded_amount_cents for c in charges if c.billing_state == 'REFUNDED')
+      sponsor_unbilled_cents    = sum(c.amount_cents          for c in charges if c.routing_state == 'ROUTED_SPONSOR' and c.billing_state == 'UNBILLED')
+      sponsor_receivable_cents  = sum(c.amount_cents          for c in charges if c.billing_state == 'INVOICED_SPONSOR')
+      sponsor_collected_cents   = sum(i.amount_paid_cents     for i in invoices if i.status == 'PAID')
+      sponsor_written_off_cents = sum(i.net_total_cents - i.amount_paid_cents for i in invoices if i.status == 'PAID' and i.short_paid)
+      improper_payer_exposure_cents = sum(c.amount_cents      for c in charges if c.improper_flag)
+      delinquent_sponsor_cents  = sum(c.amount_cents          for c in charges if c.billing_state == 'UNBILLED' and c.aging_bucket == 'DELINQUENT_90_PLUS')
+      # INVARIANT P (payer position, conserved by BL-1/BL-5):
+      #   payer_billed_cents + payer_refunded_cents is unchanged by a refund
+      # INVARIANT S (sponsor position, conserved by BL-3/BL-4):
+      #   sponsor_unbilled_cents + sponsor_receivable_cents is unchanged by
+      #   an invoice submission and by a dispute release
+    input_set: "charges = Charge rows with study_id == this study; invoices = SponsorInvoice rows with study_id == this study. Replacement charges created by a refund are ordinary members of both pools."
+    constants: {}
+    precision: "integer cents, exact sums; no rounding"
+    variants: []
+
+# ===========================================================================
+# 1.4 Validation Rules Table (ordered by priority)
+# ===========================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers present and X-User-Role is one of the five declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: all
+  - priority: 2
+    category: auth
+    check: "the acting role appears in the endpoint's roles list"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: all
+  - priority: 3
+    category: business_constraint
+    check: "required body fields present; enum members valid; integers non-negative where constrained; dates ISO YYYY-MM-DD; registry_number matches ^NCT[0-9]{8}$ when supplied"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all POST endpoints"
+  - priority: 4
+    category: business_constraint
+    check: "limit within 1..100 and offset >= 0"
+    error_id: ERR_INVALID_PAGINATION
+    http_status: 400
+    applies_to: "all list GET endpoints"
+  - priority: 5
+    category: existence
+    check: "path-segment resources exist, validated left to right"
+    error_id: ERR_STUDY_NOT_FOUND
+    http_status: 404
+    applies_to: "all /studies/{id}... paths"
+  - priority: 6
+    category: existence
+    check: "path-segment coverage analysis, calendar, subject, visit, charge, invoice, finding or amendment exists"
+    error_id: ERR_ANALYSIS_NOT_FOUND
+    http_status: 404
+    applies_to: "/coverage-analyses/{id}..., and the sibling not-found codes ERR_CALENDAR_NOT_FOUND, ERR_SUBJECT_NOT_FOUND, ERR_SUBJECT_VISIT_NOT_FOUND, ERR_CHARGE_NOT_FOUND, ERR_INVOICE_NOT_FOUND, ERR_FINDING_NOT_FOUND, ERR_AMENDMENT_NOT_FOUND, ERR_ROUTE_NOT_FOUND on their own paths"
+  - priority: 7
+    category: existence
+    check: "FK values carried in the request body reference existing rows"
+    error_id: ERR_COVERAGE_ITEM_NOT_FOUND
+    http_status: 404
+    applies_to: "POST /visit-charge-routes (coverage_item_id), POST /coverage-items (coverage_analysis_id -> ERR_ANALYSIS_NOT_FOUND), POST /study-calendars (source_analysis_id -> ERR_ANALYSIS_NOT_FOUND), POST /subject-visits (calendar_visit_id -> ERR_CALENDAR_VISIT_NOT_FOUND), POST /audit-findings (charge_id -> ERR_CHARGE_NOT_FOUND), POST /studies/{id}/budget-build (source_analysis_id -> ERR_ANALYSIS_NOT_FOUND)"
+  - priority: 8
+    category: state
+    check: "optimistic-concurrency version matches the parent's current version"
+    error_id: ERR_STALE_STUDY_VERSION
+    http_status: 412
+    applies_to: "POST /coverage-analyses, POST /studies/{id}/budget-build, POST /sponsor-invoices (expected_study_version); POST /coverage-items uses ERR_STALE_COVERAGE_ANALYSIS_VERSION"
+  - priority: 10
+    category: state
+    check: "target resource is in a state the transition allows (study lifecycle/budget dimension, analysis status, calendar status, subject status, visit status, charge routing_state/billing_state, invoice status, finding status, amendment status)"
+    error_id: ERR_INVALID_STATE_TRANSITION
+    http_status: 409
+    applies_to: "every action endpoint; the domain-specific codes ERR_ANALYSIS_NOT_EDITABLE, ERR_ANALYSIS_NOT_UNDER_REVIEW, ERR_CALENDAR_NOT_DRAFT, ERR_CHARGE_ALREADY_ROUTED, ERR_CHARGE_NOT_BILLED_TO_PAYER, ERR_INVOICE_NOT_SUBMITTABLE, ERR_FINDING_NOT_OPEN, ERR_FINDING_NOT_RESPONDED, ERR_AMENDMENT_NOT_SUBMITTED and ERR_SUBJECT_NOT_SCREENING take precedence over the generic code on their own endpoints"
+  - priority: 12
+    category: state
+    check: "cross-entity state guard: study must be OPEN_TO_ACCRUAL for subject creation/consent; budget must be EXECUTED for consent; the subject's consented calendar must be PUBLISHED for visit scheduling and completion"
+    error_id: ERR_STUDY_NOT_OPEN_TO_ACCRUAL
+    http_status: 409
+    applies_to: "POST /study-subjects, POST /study-subjects/{id}/consent (also ERR_BUDGET_NOT_EXECUTED), POST /subject-visits (also ERR_CALENDAR_NOT_PUBLISHED when the subject's pinned calendar has moved to REBUILD_REQUIRED or RETIRED)"
+  - priority: 14
+    category: state
+    check: "at completion the calendar owning the visit is still the PUBLISHED generation and its build_generation still matches both the visit's calendar_generation_at_schedule and the subject's pinned consented_calendar_generation"
+    error_id: ERR_STALE_CALENDAR_GENERATION
+    http_status: 409
+    applies_to: "POST /subject-visits/{id}/complete"
+  - priority: 16
+    category: business_safety
+    check: "segregation of duties on user id: analysis approver != prepared_by_user_id; budget executor != budget_built_by_user_id; finding responder != opened_by_user_id"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /coverage-analyses/{id}/approve, POST /studies/{id}/budget-execute, POST /audit-findings/{id}/respond"
+  - priority: 18
+    category: business_safety
+    check: "QCT basis is supported by the study's regulatory footing (DEEMED_IND_IDE requires ind_ide_status IN {IND_HELD, IDE_CATEGORY_B}; DEEMED_FEDERALLY_FUNDED requires funding_source == FEDERALLY_FUNDED; SELF_CERTIFIED requires therapeutic_intent == true)"
+    error_id: ERR_QCT_BASIS_UNSUPPORTED
+    http_status: 422
+    applies_to: "POST /studies/{id}/qct-determination"
+  - priority: 19
+    category: business_safety
+    check: "a qualifying determination requires a registry number on the study (supplied here or already stored)"
+    error_id: ERR_REGISTRY_NUMBER_REQUIRED
+    http_status: 422
+    applies_to: "POST /studies/{id}/qct-determination, POST /studies/{id}/accrual with target_status = OPEN_TO_ACCRUAL"
+  - priority: 20
+    category: business_safety
+    check: "a determination that would leave qct_determination == NON_QUALIFYING is rejected while the study's APPROVED analysis has qct_conditional_item_count >= 1"
+    error_id: ERR_QCT_DOWNGRADE_BLOCKED
+    http_status: 409
+    applies_to: "POST /studies/{id}/qct-determination"
+  - priority: 21
+    category: business_safety
+    check: "ROUTINE_CARE items require Medicare support: medicare_coverage_basis != NOT_COVERED, and QCT_CONDITIONAL requires study.qct_determination != NON_QUALIFYING (a merely UNDETERMINED study is still allowed to draft the item; the qualifying determination itself is enforced later, at analysis approval, by priority 35)"
+    error_id: ERR_ROUTINE_CARE_REQUIRES_QCT
+    http_status: 422
+    applies_to: "POST /coverage-items"
+  - priority: 22
+    category: business_safety
+    check: "study.billing_hold_posture == ALL_BLOCKED blocks every charge review decision"
+    error_id: ERR_STUDY_BILLING_BLOCKED
+    http_status: 409
+    applies_to: "POST /charges/{id}/review, POST /sponsor-invoices/{id}/submit"
+  - priority: 23
+    category: business_safety
+    check: "study.billing_hold_posture == PAYER_BLOCKED blocks the CLEAR_TO_PAYER decision"
+    error_id: ERR_PAYER_BILLING_BLOCKED_NO_QCT
+    http_status: 409
+    applies_to: "POST /charges/{id}/review"
+  - priority: 24
+    category: business_referential
+    check: "an effective analysis exists for the charge's service_date under the as_of_service_date variant"
+    error_id: ERR_NO_EFFECTIVE_ANALYSIS
+    http_status: 409
+    applies_to: "POST /charges/{id}/review"
+  - priority: 25
+    category: business_referential
+    check: "the charge's charge_code matches an item_code on the effective analysis"
+    error_id: ERR_CHARGE_CODE_NOT_IN_COVERAGE_ANALYSIS
+    http_status: 422
+    applies_to: "POST /charges/{id}/review"
+  - priority: 26
+    category: business_referential
+    check: "the routed coverage item belongs to the calendar's source_analysis_id"
+    error_id: ERR_ITEM_ANALYSIS_MISMATCH
+    http_status: 422
+    applies_to: "POST /visit-charge-routes"
+  - priority: 27
+    category: business_referential
+    check: "the scheduled calendar visit belongs to the subject's consented_calendar_id"
+    error_id: ERR_CALENDAR_VISIT_NOT_ON_CONSENTED_CALENDAR
+    http_status: 422
+    applies_to: "POST /subject-visits"
+  - priority: 28
+    category: business_constraint
+    check: "the review decision agrees with charge.expected_routing_target under the as_of_service_date variant unless override_justification is a non-empty string"
+    error_id: ERR_ROUTING_CONTRADICTS_COVERAGE
+    http_status: 422
+    applies_to: "POST /charges/{id}/review"
+  - priority: 29
+    category: business_constraint
+    check: "uniqueness: protocol_number globally; (coverage_analysis_id, item_code); (study_calendar_id, sequence_index); (calendar_visit_id, coverage_item_id); (study_id, subject_number)"
+    error_id: ERR_DUPLICATE_ITEM_CODE
+    http_status: 409
+    applies_to: "POST /studies (ERR_DUPLICATE_PROTOCOL_NUMBER), POST /coverage-items, POST /calendar-visits (ERR_DUPLICATE_SEQUENCE_INDEX), POST /visit-charge-routes (ERR_DUPLICATE_VISIT_ROUTE), POST /study-subjects (ERR_DUPLICATE_SUBJECT_NUMBER)"
+  - priority: 30
+    category: business_constraint
+    check: "at most one CoverageAnalysis per study may be in status IN {DRAFT, UNDER_REVIEW, RETURNED}"
+    error_id: ERR_OPEN_ANALYSIS_EXISTS
+    http_status: 409
+    applies_to: "POST /coverage-analyses"
+  - priority: 31
+    category: business_constraint
+    check: "return_count < ANALYSIS_MAX_RETURNS (2) before a further return is allowed"
+    error_id: ERR_RETURN_LIMIT_EXCEEDED
+    http_status: 409
+    applies_to: "POST /coverage-analyses/{id}/return"
+  - priority: 32
+    category: business_constraint
+    check: "PROMOTIONAL items must carry budget_category == NOT_BUDGETED and negotiated_unit_cents == 0"
+    error_id: ERR_PROMOTIONAL_MUST_BE_ZERO_COST
+    http_status: 422
+    applies_to: "POST /coverage-items"
+  - priority: 33
+    category: business_constraint
+    check: "items with budget_category == INVOICEABLE cannot be attached to a calendar visit"
+    error_id: ERR_INVOICEABLE_ITEM_NOT_VISIT_ROUTABLE
+    http_status: 422
+    applies_to: "POST /visit-charge-routes"
+  - priority: 34
+    category: business_constraint
+    check: "publication requires unrouted_per_patient_item_count == 0 and visit_count >= 1"
+    error_id: ERR_UNROUTED_PER_PATIENT_ITEM
+    http_status: 422
+    applies_to: "POST /study-calendars/{id}/publish"
+  - priority: 35
+    category: business_safety
+    check: "approving an analysis whose qct_conditional_item_count >= 1 requires the study's qct_determination to be something other than UNDETERMINED (cascading validation: priority 21 lets the item be drafted, this rule refuses to bless it)"
+    error_id: ERR_QCT_DETERMINATION_REQUIRED
+    http_status: 409
+    applies_to: "POST /coverage-analyses/{id}/approve"
+  - priority: 36
+    category: business_temporal
+    check: "a new calendar visit's closed day interval [target_day_offset - window_before_days, target_day_offset + window_after_days] must not intersect any existing visit's interval on the same calendar; touching endpoints count as an intersection"
+    error_id: ERR_VISIT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /calendar-visits"
+  - priority: 37
+    category: business_temporal
+    check: "actual_service_date must fall within [consent_date + window_start_day, consent_date + window_end_day] of the referenced calendar visit"
+    error_id: ERR_VISIT_DATE_OUTSIDE_WINDOW
+    http_status: 422
+    applies_to: "POST /subject-visits"
+  - priority: 38
+    category: business_temporal
+    check: "amendment.effective_date must be at or before the current logical clock date"
+    error_id: ERR_AMENDMENT_NOT_YET_EFFECTIVE
+    http_status: 409
+    applies_to: "POST /amendments/{id}/implement"
+  - priority: 40
+    category: business_constraint
+    check: "at most RESEARCH_VISIT_DAILY_CAPACITY (2) SubjectVisit rows with status IN {SCHEDULED, OCCURRED} may share one (study_id, actual_service_date) pair"
+    error_id: ERR_RESEARCH_VISIT_DAILY_CAPACITY_EXCEEDED
+    http_status: 409
+    applies_to: "POST /subject-visits"
+  - priority: 42
+    category: business_fiscal
+    check: "budget build with basis == CALENDAR_DRIVEN requires a PUBLISHED calendar on the same source analysis"
+    error_id: ERR_NO_PUBLISHED_CALENDAR_FOR_BASIS
+    http_status: 422
+    applies_to: "POST /studies/{id}/budget-build"
+  - priority: 43
+    category: business_fiscal
+    check: "the invoice line selection must yield at least one charge"
+    error_id: ERR_NO_INVOICEABLE_CHARGES
+    http_status: 409
+    applies_to: "POST /sponsor-invoices, POST /sponsor-invoices/{id}/submit"
+  - priority: 44
+    category: business_fiscal
+    check: "remittance amount must respect the outcome: PAID_IN_FULL requires amount_paid_cents omitted or equal to net_total_cents; SHORT_PAID requires 0 <= amount_paid_cents < net_total_cents"
+    error_id: ERR_REMITTANCE_AMOUNT_INVALID
+    http_status: 422
+    applies_to: "POST /sponsor-invoices/{id}/remittance"
+
+# ===========================================================================
+# 1.5 API Endpoint Table
+# ===========================================================================
+endpoints:
+  # ---- Study -------------------------------------------------------------
+  - method: POST
+    path: "/research-billing/studies"
+    description: "Register a protocol in the research billing office. Starts at lifecycle_status DRAFT, budget_status NOT_BUILT, qct_determination UNDETERMINED, billing_hold_posture PAYER_BLOCKED."
+    roles: [ResearchBillingManager]
+    code: 201
+    input: [protocol_number, title, sponsor_name, funding_source, ind_ide_status, therapeutic_intent, "registry_number?"]
+    output: Study
+    side_effects: ["initialises all ledger rollup fields to 0", "sets billing_hold_posture = PAYER_BLOCKED via calculations.study_billing_hold_posture"]
+  - method: GET
+    path: "/research-billing/studies"
+    description: "List studies, optionally filtered by lifecycle status or by the analysis their current budget was built from."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["status?", "budget_source_analysis_id?", "limit?", "offset?"]
+    output: Study[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/studies/{id}"
+    description: "Read one study including all computed ledger and posture fields."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: []
+    output: Study
+    side_effects: []
+  - method: POST
+    path: "/research-billing/studies/{id}/qct-determination"
+    description: "Record or re-record the Medicare qualifying-clinical-trial determination and the registry number it depends on."
+    roles: [ComplianceReviewer]
+    code: 200
+    input: [basis, "registry_number?"]
+    output: Study
+    side_effects: ["sets qct_determination, qct_basis, qct_determined_by_user_id, qct_determined_at", "stores registry_number when supplied", "recompute calculations.study_billing_hold_posture", "increments Study.version by 1"]
+  - method: POST
+    path: "/research-billing/studies/{id}/budget-build"
+    description: "Build the sponsor budget from an APPROVED coverage analysis under the COVERAGE_DRIVEN or CALENDAR_DRIVEN variant."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: [source_analysis_id, basis, indirect_rate_pct, expected_study_version]
+    output: Study
+    side_effects: ["Study.budget_status -> BUILT (BG-1)", "runs calculations.study_effective_indirect_rate then calculations.study_budget_totals", "sets budget_built_by_user_id and clears budget_executed_by_user_id", "increments Study.version by 1"]
+  - method: POST
+    path: "/research-billing/studies/{id}/budget-execute"
+    description: "Execute the built budget. Segregation of duties: the executing X-User-ID must differ from budget_built_by_user_id."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: []
+    output: Study
+    side_effects: ["Study.budget_status BUILT -> EXECUTED (BG-2)", "sets budget_executed_by_user_id", "increments Study.version by 1"]
+  - method: POST
+    path: "/research-billing/studies/{id}/accrual"
+    description: "Open or close the protocol to accrual."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: [target_status]
+    output: Study
+    side_effects: ["LC-3 or LC-5", "on close: cascades every StudySubject in SCREENING or CONSENTED to OFF_STUDY and every SCHEDULED SubjectVisit of a consented subject to MISSED", "increments Study.version by 1"]
+  - method: GET
+    path: "/research-billing/studies/{id}/charge-review-summary"
+    description: "Computed read: the billing office's segregation dashboard for one study."
+    roles: [ComplianceReviewer, ResearchBillingManager, AuditLiaison]
+    code: 200
+    input: []
+    output: { study_id: string, billing_hold_posture: string, unrouted_charge_count: integer, sponsor_unbilled_cents: integer, sponsor_receivable_cents: integer, payer_billed_cents: integer, payer_refunded_cents: integer, improper_payer_exposure_cents: integer, delinquent_sponsor_cents: integer, open_finding_count: integer }
+    side_effects: []
+  - method: GET
+    path: "/research-billing/studies/{id}/sponsor-invoices"
+    description: "List the sponsor invoices raised for one study, newest sequence_number last."
+    roles: [ResearchBillingManager, ComplianceReviewer, AuditLiaison]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SponsorInvoice[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/studies/{id}/amendments"
+    description: "List the protocol amendments filed against one study, ordered by amendment_number ASC."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, AuditLiaison]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Amendment[]
+    side_effects: []
+
+  # ---- Coverage analysis --------------------------------------------------
+  - method: POST
+    path: "/research-billing/coverage-analyses"
+    description: "Open a coverage analysis revision for a protocol. Guarded by OCC on Study.version because a revision supersedes the prior approved analysis."
+    roles: [CoverageAnalyst]
+    code: 201
+    input: [study_id, expected_study_version, "supersedes_analysis_id?"]
+    output: CoverageAnalysis
+    side_effects: ["revision_number computed from the superseded analysis", "prepared_by_user_id = X-User-ID", "Study.lifecycle_status DRAFT -> COVERAGE_PENDING (LC-1)", "increments Study.version by 1"]
+  - method: GET
+    path: "/research-billing/coverage-analyses"
+    description: "List coverage analyses, filtered by study, by the analysis they supersede, or by status."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["study_id?", "supersedes_analysis_id?", "status?", "limit?", "offset?"]
+    output: CoverageAnalysis[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/coverage-analyses/{id}"
+    description: "Read one coverage analysis with its classification counters."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: []
+    output: CoverageAnalysis
+    side_effects: []
+  - method: GET
+    path: "/research-billing/coverage-analyses/{id}/items"
+    description: "List the coverage grid of one analysis revision, ordered by created_at ASC."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["classification?", "limit?", "offset?"]
+    output: CoverageItem[]
+    side_effects: []
+  - method: POST
+    path: "/research-billing/coverage-items"
+    description: "Add one immutable item to a DRAFT or RETURNED analysis. Guarded by OCC on CoverageAnalysis.version."
+    roles: [CoverageAnalyst]
+    code: 201
+    input: [coverage_analysis_id, expected_coverage_analysis_version, item_code, description, classification, medicare_coverage_basis, budget_category, charge_master_unit_cents, negotiated_unit_cents, expected_occurrences, "units_per_occurrence?"]
+    output: CoverageItem
+    side_effects: ["derives billable_to from classification", "CoverageAnalysis RETURNED -> DRAFT", "recomputes the analysis' five counters", "increments CoverageAnalysis.version by 1"]
+  - method: POST
+    path: "/research-billing/coverage-analyses/{id}/submit"
+    description: "Send a DRAFT analysis to compliance review."
+    roles: [CoverageAnalyst]
+    code: 200
+    input: []
+    output: CoverageAnalysis
+    side_effects: ["status DRAFT -> UNDER_REVIEW", "increments CoverageAnalysis.version by 1"]
+  - method: POST
+    path: "/research-billing/coverage-analyses/{id}/return"
+    description: "Return an analysis under review to the analyst, at most ANALYSIS_MAX_RETURNS times."
+    roles: [ComplianceReviewer]
+    code: 200
+    input: [return_reason]
+    output: CoverageAnalysis
+    side_effects: ["status UNDER_REVIEW -> RETURNED", "return_count += 1", "increments CoverageAnalysis.version by 1"]
+  - method: POST
+    path: "/research-billing/coverage-analyses/{id}/approve"
+    description: "Approve an analysis under review. SoD: the approving X-User-ID must differ from prepared_by_user_id."
+    roles: [ComplianceReviewer]
+    code: 200
+    input: []
+    output: CoverageAnalysis
+    side_effects: ["status UNDER_REVIEW -> APPROVED, approved_at stamped", "any superseded analysis APPROVED -> SUPERSEDED", "Study.lifecycle_status COVERAGE_PENDING -> COVERAGE_APPROVED (LC-2)", "recomputes calculations.charge_routing_expectation for every Charge of the study, then Charge.improper_flag and Study.improper_payer_exposure_cents", "increments CoverageAnalysis.version and Study.version by 1"]
+
+  # ---- Calendar ----------------------------------------------------------
+  - method: POST
+    path: "/research-billing/study-calendars"
+    description: "Start a new EHR study-calendar generation from an APPROVED analysis."
+    roles: [CoverageAnalyst]
+    code: 201
+    input: [study_id, source_analysis_id]
+    output: StudyCalendar
+    side_effects: ["build_generation = 1 + max existing generation for the study", "status = DRAFT"]
+  - method: GET
+    path: "/research-billing/study-calendars"
+    description: "List study calendars filtered by study, source analysis or status."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["study_id?", "source_analysis_id?", "status?", "limit?", "offset?"]
+    output: StudyCalendar[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/study-calendars/{id}"
+    description: "Read one calendar generation with its routing completeness counters."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: []
+    output: StudyCalendar
+    side_effects: []
+  - method: GET
+    path: "/research-billing/study-calendars/{id}/visits"
+    description: "List the visits of one calendar generation, ordered by sequence_index ASC."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: CalendarVisit[]
+    side_effects: []
+  - method: POST
+    path: "/research-billing/calendar-visits"
+    description: "Add a visit to a DRAFT calendar. Windows are closed intervals and may not touch another visit's window."
+    roles: [CoverageAnalyst]
+    code: 201
+    input: [study_calendar_id, visit_name, sequence_index, target_day_offset, window_before_days, window_after_days]
+    output: CalendarVisit
+    side_effects: ["computes window_start_day and window_end_day", "recomputes StudyCalendar.visit_count and unrouted_per_patient_item_count", "increments StudyCalendar.version by 1"]
+  - method: POST
+    path: "/research-billing/visit-charge-routes"
+    description: "Link a coverage item to a calendar visit so the EHR routes its charge on that visit."
+    roles: [CoverageAnalyst]
+    code: 201
+    input: [calendar_visit_id, coverage_item_id, "occurrences?"]
+    output: VisitChargeRoute
+    side_effects: ["snapshots routing_target from coverage_item.billable_to", "runs calculations.visit_route_expected_amount", "recomputes CalendarVisit.expected_charge_total_cents, StudyCalendar.routed_item_count and unrouted_per_patient_item_count", "increments StudyCalendar.version by 1"]
+  - method: GET
+    path: "/research-billing/visit-charge-routes"
+    description: "List visit-linked charge routes by visit or by coverage item."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["calendar_visit_id?", "coverage_item_id?", "limit?", "offset?"]
+    output: VisitChargeRoute[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/visit-charge-routes/{id}"
+    description: "Read one visit-linked charge route."
+    roles: [ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: []
+    output: VisitChargeRoute
+    side_effects: []
+  - method: POST
+    path: "/research-billing/study-calendars/{id}/publish"
+    description: "Publish a DRAFT calendar into the EHR; retires any earlier PUBLISHED or REBUILD_REQUIRED generation of the same study."
+    roles: [ComplianceReviewer]
+    code: 200
+    input: []
+    output: StudyCalendar
+    side_effects: ["status DRAFT -> PUBLISHED, published_at stamped", "earlier PUBLISHED / REBUILD_REQUIRED generations -> RETIRED", "recomputes Study.rebuild_required_calendar_count and calculations.study_billing_hold_posture", "increments StudyCalendar.version and Study.version by 1"]
+
+  # ---- Subjects and visits ------------------------------------------------
+  - method: POST
+    path: "/research-billing/study-subjects"
+    description: "Register a screening subject on a protocol open to accrual."
+    roles: [StudyCoordinator]
+    code: 201
+    input: [study_id, subject_number]
+    output: StudySubject
+    side_effects: ["status = SCREENING"]
+  - method: GET
+    path: "/research-billing/study-subjects"
+    description: "List subjects by study, by pinned consented calendar, or by status."
+    roles: [StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison]
+    code: 200
+    input: ["study_id?", "consented_calendar_id?", "status?", "limit?", "offset?"]
+    output: StudySubject[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/study-subjects/{id}"
+    description: "Read one subject with its pinned calendar generation."
+    roles: [StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison]
+    code: 200
+    input: []
+    output: StudySubject
+    side_effects: []
+  - method: POST
+    path: "/research-billing/study-subjects/{id}/consent"
+    description: "Record informed consent; pins the study's single PUBLISHED calendar generation onto the subject."
+    roles: [StudyCoordinator]
+    code: 200
+    input: [consent_date]
+    output: StudySubject
+    side_effects: ["status SCREENING -> CONSENTED", "pins consented_calendar_id and consented_calendar_generation", "increments StudySubject.version by 1"]
+  - method: POST
+    path: "/research-billing/subject-visits"
+    description: "Schedule a calendar visit for a consented subject inside its protocol window and under the daily research-visit capacity."
+    roles: [StudyCoordinator]
+    code: 201
+    input: [study_subject_id, calendar_visit_id, actual_service_date]
+    output: SubjectVisit
+    side_effects: ["computes day_offset_actual and snapshots calendar_generation_at_schedule", "status = SCHEDULED"]
+  - method: GET
+    path: "/research-billing/subject-visits"
+    description: "List subject visits by subject, by calendar visit, or by status."
+    roles: [StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison]
+    code: 200
+    input: ["study_subject_id?", "calendar_visit_id?", "status?", "limit?", "offset?"]
+    output: SubjectVisit[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/subject-visits/{id}"
+    description: "Read one subject visit."
+    roles: [StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison]
+    code: 200
+    input: []
+    output: SubjectVisit
+    side_effects: []
+  - method: POST
+    path: "/research-billing/subject-visits/{id}/complete"
+    description: "Record that the visit occurred; drops one Charge per visit-linked charge route."
+    roles: [StudyCoordinator]
+    code: 200
+    input: []
+    output: SubjectVisit
+    side_effects: ["status SCHEDULED -> OCCURRED", "cascade-creates one Charge per VisitChargeRoute of the calendar visit (created_at ASC) with routing_state UNROUTED, billing_state UNBILLED and amount_cents from calculations.visit_route_expected_amount", "sets each new Charge.expected_routing_target via calculations.charge_routing_expectation (current_effective)", "recomputes StudySubject.charge_count and Study ledger rollups", "increments SubjectVisit.version by 1"]
+
+  # ---- Charges -----------------------------------------------------------
+  - method: POST
+    path: "/research-billing/charges"
+    description: "Post a charge from the EHR charge interface, with or without a visit link."
+    roles: [StudyCoordinator]
+    code: 201
+    input: [study_id, charge_code, service_date, amount_cents, "subject_visit_id?"]
+    output: Charge
+    side_effects: ["source = INTERFACE_POSTED, routing_state = UNROUTED, billing_state = UNBILLED, unbilled_since = current logical clock", "sets expected_routing_target via calculations.charge_routing_expectation (current_effective)", "posted_by_user_id = X-User-ID"]
+  - method: GET
+    path: "/research-billing/charges"
+    description: "List charges by study, visit, coverage item, invoice, replaced charge, routing state, billing state or aging bucket."
+    roles: [ComplianceReviewer, ResearchBillingManager, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: ["study_id?", "subject_visit_id?", "coverage_item_id?", "sponsor_invoice_id?", "replaces_charge_id?", "routing_state?", "billing_state?", "aging_bucket?", "limit?", "offset?"]
+    output: Charge[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/charges/{id}"
+    description: "Read one charge including both state dimensions, the aging snapshot and improper_flag."
+    roles: [ComplianceReviewer, ResearchBillingManager, StudyCoordinator, AuditLiaison]
+    code: 200
+    input: []
+    output: Charge
+    side_effects: []
+  - method: POST
+    path: "/research-billing/charges/{id}/review"
+    description: "Charge review: route an UNROUTED charge to the payer, hold it for the sponsor, or write it off as promotional."
+    roles: [ComplianceReviewer]
+    code: 200
+    input: [decision, "override_justification?"]
+    output: Charge
+    side_effects: ["RT-1 / RT-2 / RT-3 plus the paired billing_state move (BL-1 or BL-2)", "links coverage_item_id from the as_of_service_date effective analysis", "recomputes Study ledger rollups and improper_flag", "increments Charge.version by 1"]
+
+  # ---- Sponsor invoicing -------------------------------------------------
+  - method: POST
+    path: "/research-billing/sponsor-invoices"
+    description: "Raise a DRAFT sponsor invoice; selects lines under the waterfall selector. Guarded by OCC on Study.version because the receivable position moves under the client's feet."
+    roles: [ResearchBillingManager]
+    code: 201
+    input: [study_id, period_end_date, expected_study_version]
+    output: SponsorInvoice
+    side_effects: ["runs calculations.sponsor_invoice_line_selection, sponsor_invoice_indirect and sponsor_invoice_net_total", "stamps sponsor_invoice_id on each selected Charge (billing_state stays UNBILLED until submission)", "increments Study.version by 1"]
+  - method: POST
+    path: "/research-billing/sponsor-invoices/{id}/submit"
+    description: "Submit a DRAFT invoice to the sponsor, or re-submit a DISPUTED one after re-selecting lines."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: []
+    output: SponsorInvoice
+    side_effects: ["status -> SUBMITTED, submitted_at stamped", "each invoiced Charge UNBILLED -> INVOICED_SPONSOR (BL-3)", "recomputes Study.sponsor_unbilled_cents and sponsor_receivable_cents, whose sum is invariant", "increments SponsorInvoice.version by 1"]
+  - method: POST
+    path: "/research-billing/sponsor-invoices/{id}/remittance"
+    description: "Record the sponsor's response: paid in full, short paid, or disputed (which releases every line back to the unbilled pool)."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: [outcome, "amount_paid_cents?"]
+    output: SponsorInvoice
+    side_effects: ["PAID_IN_FULL / SHORT_PAID -> status PAID and Study.sponsor_collected_cents / sponsor_written_off_cents recomputed", "DISPUTED -> status DISPUTED, every line INVOICED_SPONSOR -> UNBILLED with sponsor_invoice_id cleared and unbilled_since preserved (BL-4), invoice money fields zeroed", "increments SponsorInvoice.version by 1"]
+
+  # ---- Audit -------------------------------------------------------------
+  - method: POST
+    path: "/research-billing/audit-findings"
+    description: "Open an audit finding against a study or one of its charges. Opening a finding drives the study's posture to ALL_BLOCKED."
+    roles: [AuditLiaison]
+    code: 201
+    input: [study_id, finding_type, claimed_amount_cents, "charge_id?"]
+    output: AuditFinding
+    side_effects: ["status = OPEN, opened_by_user_id = X-User-ID", "Study.open_finding_count += 1 and calculations.study_billing_hold_posture -> ALL_BLOCKED", "increments Study.version by 1"]
+  - method: GET
+    path: "/research-billing/audit-findings"
+    description: "List audit findings by study, by charge or by status."
+    roles: [AuditLiaison, ComplianceReviewer, ResearchBillingManager]
+    code: 200
+    input: ["study_id?", "charge_id?", "status?", "limit?", "offset?"]
+    output: AuditFinding[]
+    side_effects: []
+  - method: GET
+    path: "/research-billing/audit-findings/{id}"
+    description: "Read one audit finding."
+    roles: [AuditLiaison, ComplianceReviewer, ResearchBillingManager]
+    code: 200
+    input: []
+    output: AuditFinding
+    side_effects: []
+  - method: POST
+    path: "/research-billing/audit-findings/{id}/respond"
+    description: "File the billing office's response. SoD: the responding X-User-ID must differ from opened_by_user_id."
+    roles: [AuditLiaison]
+    code: 200
+    input: [response_narrative]
+    output: AuditFinding
+    side_effects: ["status OPEN -> RESPONDED, responded_by_user_id set", "increments AuditFinding.version by 1"]
+  - method: POST
+    path: "/research-billing/audit-findings/{id}/resolve"
+    description: "Close a responded finding by refunding and re-routing the improperly billed claim, or with no action."
+    roles: [AuditLiaison]
+    code: 200
+    input: [disposition]
+    output: AuditFinding
+    side_effects: ["REFUND_AND_REROUTE: status -> CLOSED_REFUNDED, linked Charge BILLED_PAYER -> REFUNDED (BL-5), a ROUTED_SPONSOR replacement Charge is created with replaces_charge_id set, Study payer/sponsor rollups recomputed", "NO_ACTION: status -> CLOSED_NO_ACTION with no Charge mutation", "Study.open_finding_count -= 1 and calculations.study_billing_hold_posture recomputed", "increments AuditFinding.version and Study.version by 1"]
+
+  # ---- Amendments --------------------------------------------------------
+  - method: POST
+    path: "/research-billing/amendments"
+    description: "File a protocol amendment; scope decides whether re-analysis and calendar rebuild are required."
+    roles: [ResearchBillingManager]
+    code: 201
+    input: [study_id, scope, effective_date]
+    output: Amendment
+    side_effects: ["amendment_number = 1 + existing count", "derives reanalysis_required and calendar_rebuild_required from scope", "status = SUBMITTED"]
+  - method: POST
+    path: "/research-billing/amendments/{id}/implement"
+    description: "Implement an effective amendment, firing the five-link re-analysis and calendar-rebuild cascade."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: []
+    output: Amendment
+    side_effects: ["cascade links 1-5 as declared on Amendment SUBMITTED -> IMPLEMENTED", "increments Amendment.version, Study.version and each affected StudyCalendar.version by 1"]
+
+  # ---- Ops / test-driving ------------------------------------------------
+  - method: POST
+    path: "/research-billing/_ops/aging-run"
+    description: "Advance the unbilled-charge aging epoch for one study: refreshes aging_days and aging_bucket against the clock snapshot and misses expired scheduled visits."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: [study_id]
+    output: { study_id: string, run_date: string, charges_aged_count: integer, visits_missed_count: integer, delinquent_charge_count: integer, delinquent_sponsor_cents: integer }
+    side_effects: ["runs calculations.charge_aging over the study's UNBILLED charges", "SCHEDULED SubjectVisit rows past their window end -> MISSED", "recomputes Study.delinquent_sponsor_cents"]
+  - method: POST
+    path: "/research-billing/_clock/set_current_utc"
+    description: "Test-driving endpoint: set the server's logical clock. Before any call the logical clock reads exactly 2026-08-01T00:00:00Z and never falls back to real wall-clock time."
+    roles: [ResearchBillingManager]
+    code: 200
+    input: [to_iso8601]
+    output: { current_utc: string }
+    side_effects: ["all later created_at / updated_at / approved_at / published_at / unbilled_since / reviewed_at / hold_applied_at stamps and every date comparison use this instant"]
+
+# ===========================================================================
+# 1.6 Error Code Catalog
+# ===========================================================================
+errors:
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing, or the role is not one of the five declared roles"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "the acting role is not listed on the endpoint"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required body field, bad enum member, negative amount where non-negative is required, malformed date, or registry_number not matching ^NCT[0-9]{8}$"
+  - id: ERR_INVALID_PAGINATION
+    http: 400
+    condition: "limit outside 1..100 or offset negative"
+  - id: ERR_STUDY_NOT_FOUND
+    http: 404
+    condition: "study id in path or body does not exist"
+  - id: ERR_ANALYSIS_NOT_FOUND
+    http: 404
+    condition: "coverage analysis id in path or body does not exist"
+  - id: ERR_COVERAGE_ITEM_NOT_FOUND
+    http: 404
+    condition: "coverage_item_id does not exist"
+  - id: ERR_CALENDAR_NOT_FOUND
+    http: 404
+    condition: "study calendar id in path or body does not exist"
+  - id: ERR_CALENDAR_VISIT_NOT_FOUND
+    http: 404
+    condition: "calendar_visit_id does not exist"
+  - id: ERR_ROUTE_NOT_FOUND
+    http: 404
+    condition: "visit charge route id does not exist"
+  - id: ERR_SUBJECT_NOT_FOUND
+    http: 404
+    condition: "study subject id does not exist"
+  - id: ERR_SUBJECT_VISIT_NOT_FOUND
+    http: 404
+    condition: "subject visit id does not exist"
+  - id: ERR_CHARGE_NOT_FOUND
+    http: 404
+    condition: "charge id in path or body does not exist"
+  - id: ERR_INVOICE_NOT_FOUND
+    http: 404
+    condition: "sponsor invoice id does not exist"
+  - id: ERR_FINDING_NOT_FOUND
+    http: 404
+    condition: "audit finding id does not exist"
+  - id: ERR_AMENDMENT_NOT_FOUND
+    http: 404
+    condition: "amendment id does not exist"
+  - id: ERR_STALE_STUDY_VERSION
+    http: 412
+    condition: "expected_study_version does not equal the study's current version"
+  - id: ERR_STALE_COVERAGE_ANALYSIS_VERSION
+    http: 412
+    condition: "expected_coverage_analysis_version does not equal the analysis' current version"
+  - id: ERR_INVALID_STATE_TRANSITION
+    http: 409
+    condition: "the requested transition is not declared from the resource's current state and no domain-specific state code applies"
+  - id: ERR_ANALYSIS_NOT_EDITABLE
+    http: 409
+    condition: "adding an item to an analysis whose status is not DRAFT or RETURNED"
+  - id: ERR_ANALYSIS_NOT_UNDER_REVIEW
+    http: 409
+    condition: "returning or approving an analysis whose status is not UNDER_REVIEW"
+  - id: ERR_CALENDAR_NOT_DRAFT
+    http: 409
+    condition: "adding a visit or route to, or publishing, a calendar whose status is not DRAFT"
+  - id: ERR_CHARGE_ALREADY_ROUTED
+    http: 409
+    condition: "reviewing a charge whose routing_state is not UNROUTED"
+  - id: ERR_CHARGE_NOT_BILLED_TO_PAYER
+    http: 409
+    condition: "resolving a finding with REFUND_AND_REROUTE when the linked charge's billing_state is not BILLED_PAYER, or the finding has no charge_id"
+  - id: ERR_INVOICE_NOT_SUBMITTABLE
+    http: 409
+    condition: "submitting an invoice whose status is not DRAFT or DISPUTED, or recording remittance on an invoice whose status is not SUBMITTED"
+  - id: ERR_FINDING_NOT_OPEN
+    http: 409
+    condition: "responding to a finding whose status is not OPEN"
+  - id: ERR_FINDING_NOT_RESPONDED
+    http: 409
+    condition: "resolving a finding whose status is not RESPONDED"
+  - id: ERR_AMENDMENT_NOT_SUBMITTED
+    http: 409
+    condition: "implementing an amendment whose status is not SUBMITTED"
+  - id: ERR_SUBJECT_NOT_SCREENING
+    http: 409
+    condition: "consenting a subject whose status is not SCREENING"
+  - id: ERR_STUDY_NOT_OPEN_TO_ACCRUAL
+    http: 409
+    condition: "registering or consenting a subject on a study whose lifecycle_status is not OPEN_TO_ACCRUAL"
+  - id: ERR_BUDGET_NOT_EXECUTED
+    http: 409
+    condition: "consenting a subject on a study whose budget_status is not EXECUTED"
+  - id: ERR_CALENDAR_NOT_PUBLISHED
+    http: 409
+    condition: "scheduling a subject visit while the subject's consented calendar status is not PUBLISHED"
+  - id: ERR_STALE_CALENDAR_GENERATION
+    http: 409
+    condition: "completing a visit whose owning calendar is no longer the PUBLISHED generation (it has moved to RETIRED or REBUILD_REQUIRED), or whose calendar_generation_at_schedule differs from the subject's consented_calendar_generation"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the acting X-User-ID equals the counterparty user id the rule forbids (analysis preparer, budget builder, or finding opener)"
+  - id: ERR_QCT_BASIS_UNSUPPORTED
+    http: 422
+    condition: "the requested QCT basis is not supported by the study's ind_ide_status, funding_source or therapeutic_intent"
+  - id: ERR_REGISTRY_NUMBER_REQUIRED
+    http: 422
+    condition: "a qualifying determination or an accrual opening is attempted without a stored registry_number"
+  - id: ERR_QCT_DOWNGRADE_BLOCKED
+    http: 409
+    condition: "a NON_QUALIFYING determination is attempted while the study's APPROVED analysis carries at least one QCT_CONDITIONAL routine-care item"
+  - id: ERR_ROUTINE_CARE_REQUIRES_QCT
+    http: 422
+    condition: "a ROUTINE_CARE item is created with medicare_coverage_basis NOT_COVERED, or with QCT_CONDITIONAL on a study whose qct_determination is NON_QUALIFYING"
+  - id: ERR_QCT_DETERMINATION_REQUIRED
+    http: 409
+    condition: "an analysis carrying at least one QCT_CONDITIONAL routine-care item is approved while the study's qct_determination is still UNDETERMINED"
+  - id: ERR_STUDY_BILLING_BLOCKED
+    http: 409
+    condition: "a charge review or invoice submission is attempted while billing_hold_posture == ALL_BLOCKED"
+  - id: ERR_PAYER_BILLING_BLOCKED_NO_QCT
+    http: 409
+    condition: "CLEAR_TO_PAYER is attempted while billing_hold_posture == PAYER_BLOCKED"
+  - id: ERR_NO_EFFECTIVE_ANALYSIS
+    http: 409
+    condition: "no APPROVED or SUPERSEDED analysis of the study was approved at or before the charge's service_date"
+  - id: ERR_CHARGE_CODE_NOT_IN_COVERAGE_ANALYSIS
+    http: 422
+    condition: "the charge_code matches no item_code on the effective analysis"
+  - id: ERR_ITEM_ANALYSIS_MISMATCH
+    http: 422
+    condition: "the routed coverage item does not belong to the calendar's source_analysis_id"
+  - id: ERR_CALENDAR_VISIT_NOT_ON_CONSENTED_CALENDAR
+    http: 422
+    condition: "the calendar visit does not belong to the subject's consented_calendar_id"
+  - id: ERR_ROUTING_CONTRADICTS_COVERAGE
+    http: 422
+    condition: "the review decision disagrees with the as_of_service_date expectation and no override_justification was supplied"
+  - id: ERR_DUPLICATE_PROTOCOL_NUMBER
+    http: 409
+    condition: "protocol_number already registered"
+  - id: ERR_DUPLICATE_ITEM_CODE
+    http: 409
+    condition: "item_code already present on the analysis"
+  - id: ERR_DUPLICATE_SEQUENCE_INDEX
+    http: 409
+    condition: "sequence_index already used on the calendar"
+  - id: ERR_DUPLICATE_VISIT_ROUTE
+    http: 409
+    condition: "the coverage item is already routed on that calendar visit"
+  - id: ERR_DUPLICATE_SUBJECT_NUMBER
+    http: 409
+    condition: "subject_number already used on the study"
+  - id: ERR_OPEN_ANALYSIS_EXISTS
+    http: 409
+    condition: "the study already has an analysis in DRAFT, UNDER_REVIEW or RETURNED"
+  - id: ERR_RETURN_LIMIT_EXCEEDED
+    http: 409
+    condition: "a further return is attempted once return_count has reached ANALYSIS_MAX_RETURNS"
+  - id: ERR_PROMOTIONAL_MUST_BE_ZERO_COST
+    http: 422
+    condition: "a PROMOTIONAL item carries budget_category != NOT_BUDGETED or negotiated_unit_cents != 0"
+  - id: ERR_INVOICEABLE_ITEM_NOT_VISIT_ROUTABLE
+    http: 422
+    condition: "an item with budget_category INVOICEABLE is routed onto a calendar visit"
+  - id: ERR_UNROUTED_PER_PATIENT_ITEM
+    http: 422
+    condition: "publication attempted while unrouted_per_patient_item_count > 0 or visit_count == 0"
+  - id: ERR_VISIT_WINDOW_OVERLAP
+    http: 409
+    condition: "the new visit's closed day window intersects or touches an existing visit window on the same calendar"
+  - id: ERR_VISIT_DATE_OUTSIDE_WINDOW
+    http: 422
+    condition: "actual_service_date falls outside the calendar visit's window measured from consent_date"
+  - id: ERR_AMENDMENT_NOT_YET_EFFECTIVE
+    http: 409
+    condition: "effective_date is after the current logical clock date"
+  - id: ERR_RESEARCH_VISIT_DAILY_CAPACITY_EXCEEDED
+    http: 409
+    condition: "the study already has RESEARCH_VISIT_DAILY_CAPACITY subject visits in SCHEDULED or OCCURRED on that service date"
+  - id: ERR_NO_PUBLISHED_CALENDAR_FOR_BASIS
+    http: 422
+    condition: "basis CALENDAR_DRIVEN requested but no PUBLISHED calendar exists on the source analysis"
+  - id: ERR_NO_INVOICEABLE_CHARGES
+    http: 409
+    condition: "the invoice line selector produced an empty set"
+  - id: ERR_REMITTANCE_AMOUNT_INVALID
+    http: 422
+    condition: "amount_paid_cents contradicts the remittance outcome"
+
+# ===========================================================================
+# 1.7 RBAC Matrix
+# ===========================================================================
+roles:
+  - name: ResearchBillingManager
+    description: "Research billing office manager: owns protocol registration, budget build/execute, accrual status, sponsor invoicing, amendments and the aging epoch."
+    identity: opaque
+    exclusive_operations:
+      - "POST /research-billing/studies"
+      - "POST /research-billing/studies/{id}/budget-build"
+      - "POST /research-billing/studies/{id}/budget-execute"
+      - "POST /research-billing/studies/{id}/accrual"
+      - "POST /research-billing/sponsor-invoices"
+      - "POST /research-billing/sponsor-invoices/{id}/submit"
+      - "POST /research-billing/sponsor-invoices/{id}/remittance"
+      - "POST /research-billing/amendments"
+      - "POST /research-billing/amendments/{id}/implement"
+      - "POST /research-billing/_ops/aging-run"
+      - "POST /research-billing/_clock/set_current_utc"
+    shared_operations:
+      - "all GET endpoints"
+  - name: CoverageAnalyst
+    description: "Prepares the protocol-level coverage analysis and builds the EHR study calendar with its visit-linked charge routes."
+    identity: opaque
+    exclusive_operations:
+      - "POST /research-billing/coverage-analyses"
+      - "POST /research-billing/coverage-items"
+      - "POST /research-billing/coverage-analyses/{id}/submit"
+      - "POST /research-billing/study-calendars"
+      - "POST /research-billing/calendar-visits"
+      - "POST /research-billing/visit-charge-routes"
+    shared_operations:
+      - "GET /research-billing/studies, /studies/{id}, /studies/{id}/amendments"
+      - "all coverage-analysis, calendar, route, subject and visit GET endpoints"
+  - name: ComplianceReviewer
+    description: "Research billing compliance: QCT determination, analysis return/approval, calendar publication and charge review. Cannot prepare what it approves."
+    identity: opaque
+    exclusive_operations:
+      - "POST /research-billing/studies/{id}/qct-determination"
+      - "POST /research-billing/coverage-analyses/{id}/return"
+      - "POST /research-billing/coverage-analyses/{id}/approve"
+      - "POST /research-billing/study-calendars/{id}/publish"
+      - "POST /research-billing/charges/{id}/review"
+    shared_operations:
+      - "GET /research-billing/studies/{id}/charge-review-summary"
+      - "all GET endpoints"
+  - name: StudyCoordinator
+    description: "Study team: registers subjects, records consent, schedules and completes visits, and posts interface charges."
+    identity: opaque
+    exclusive_operations:
+      - "POST /research-billing/study-subjects"
+      - "POST /research-billing/study-subjects/{id}/consent"
+      - "POST /research-billing/subject-visits"
+      - "POST /research-billing/subject-visits/{id}/complete"
+      - "POST /research-billing/charges"
+    shared_operations:
+      - "GET /research-billing/studies, /studies/{id}"
+      - "coverage-analysis, calendar, route, subject, visit and charge GET endpoints"
+  - name: AuditLiaison
+    description: "Handles external payer audits: opens findings, files responses and resolves them with a refund or no action. Responder must differ from opener."
+    identity: opaque
+    exclusive_operations:
+      - "POST /research-billing/audit-findings"
+      - "POST /research-billing/audit-findings/{id}/respond"
+      - "POST /research-billing/audit-findings/{id}/resolve"
+    shared_operations:
+      - "GET /research-billing/studies/{id}/charge-review-summary"
+      - "GET /research-billing/audit-findings, /audit-findings/{id}, /charges, /charges/{id}"

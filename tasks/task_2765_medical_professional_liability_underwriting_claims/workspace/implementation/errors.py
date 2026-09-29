@@ -1,0 +1,85 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_PAGINATION_INVALID": 400,
+    "ERR_SPECIALTY_CLASS_NOT_FOUND": 404,
+    "ERR_INSURED_NOT_FOUND": 404,
+    "ERR_ENROLLMENT_NOT_FOUND": 404,
+    "ERR_PEER_REVIEW_CASE_NOT_FOUND": 404,
+    "ERR_POLICY_NOT_FOUND": 404,
+    "ERR_POLICY_TERM_NOT_FOUND": 404,
+    "ERR_TAIL_ENDORSEMENT_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_COUNSEL_FIRM_NOT_FOUND": 404,
+    "ERR_COUNSEL_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_NEGOTIATION_NOT_FOUND": 404,
+    "ERR_NPDB_REPORT_NOT_FOUND": 404,
+    "ERR_RATE_FILING_NOT_FOUND": 404,
+    "ERR_STALE_CLAIM_VERSION": 412,
+    "ERR_STALE_INSURED_VERSION": 412,
+    "ERR_STALE_POLICY_VERSION": 412,
+    "ERR_INSURED_STATE_INVALID": 409,
+    "ERR_ENROLLMENT_STATE_INVALID": 409,
+    "ERR_PEER_REVIEW_STATE_INVALID": 409,
+    "ERR_TERM_STATE_INVALID": 409,
+    "ERR_TAIL_STATE_INVALID": 409,
+    "ERR_CLAIM_STATE_INVALID": 409,
+    "ERR_COVERAGE_ALREADY_DECIDED": 409,
+    "ERR_ASSIGNMENT_STATE_INVALID": 409,
+    "ERR_NEGOTIATION_STATE_INVALID": 409,
+    "ERR_NPDB_STATE_INVALID": 409,
+    "ERR_FILING_STATE_INVALID": 409,
+    "ERR_CREDENTIALING_NOT_VALID_FOR_TERM": 409,
+    "ERR_COVERAGE_DENIED_NO_DEFENSE": 409,
+    "ERR_CONSENT_REQUIRED": 409,
+    "ERR_HAMMER_NOT_AVAILABLE": 409,
+    "ERR_RESERVE_DEFICIENCY_BLOCKS_FILING": 409,
+    "ERR_NPDB_SUBMISSION_DATE_INVALID": 422,
+    "ERR_REPORT_DATE_BEFORE_INCIDENT": 422,
+    "ERR_RETRO_DATE_INVALID": 422,
+    "ERR_EXPERIENCE_PERIOD_INVALID": 422,
+    "ERR_TERM_PERIOD_GAP": 422,
+    "ERR_TERM_PERIOD_OVERLAP": 409,
+    "ERR_CANCEL_DATE_INVALID": 422,
+    "ERR_TAIL_EFFECTIVE_DATE_INVALID": 422,
+    "ERR_TAIL_WINDOW_OVERLAP": 409,
+    "ERR_TAIL_NOT_APPLICABLE": 422,
+    "ERR_DDR_NOT_ELIGIBLE": 422,
+    "ERR_TAIL_ALREADY_ISSUED": 409,
+    "ERR_DUPLICATE_PROGRAM_ENROLLMENT": 409,
+    "ERR_REVIEW_TRACK_ALREADY_RECORDED": 409,
+    "ERR_COUNSEL_ALREADY_ASSIGNED": 409,
+    "ERR_AUTHORITY_GRANT_EXCEEDS_REQUEST": 422,
+    "ERR_RESERVE_METHOD_INPUT_MISMATCH": 422,
+    "ERR_ASSIGNMENT_CLAIM_MISMATCH": 422,
+    "ERR_NO_ELIGIBLE_COUNSEL": 409,
+    "ERR_AUTHORITY_INSUFFICIENT": 409,
+    "ERR_AGGREGATE_LIMIT_EXCEEDED": 409,
+    "ERR_PER_CLAIM_LIMIT_EXCEEDED": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or the role is not recognised.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this operation.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting insured does not own the addressed resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting user may not decide work it prepared itself.",
+    "ERR_VALIDATION": "The request payload failed validation.",
+    "ERR_PAGINATION_INVALID": "The pagination arguments are invalid.",
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request pipeline; rendered by the app error handler."""
+
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = ERROR_HTTP_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )
+        super().__init__(self.message)

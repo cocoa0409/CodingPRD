@@ -1,0 +1,63 @@
+"""Domain constants for the Childrens Product Testing & Certification API.
+
+Every value here is stated verbatim in the PRD; nothing is invented.
+"""
+
+# API surface
+API_PREFIX = "/compliance"
+
+# Pagination (PRD 2.3)
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# Logical clock (PRD 2.4)
+STARTUP_CLOCK = "2026-08-01T00:00:00Z"
+
+# Sample sizing (PRD 3.5)
+INITIAL_DIVISOR_UNITS = 2500
+INITIAL_BASE_SAMPLES = 3
+PERIODIC_DIVISOR_UNITS = 5000
+PERIODIC_BASE_SAMPLES = 1
+DURABLE_INFANT_MULTIPLIER = 2
+MAX_SAMPLE_UNITS = 40
+
+# Laboratory independence multipliers (PRD 3.6)
+INDEPENDENCE_MULTIPLIERS = {
+    "INDEPENDENT": 1.00,
+    "FIREWALLED_GOVERNMENT": 1.05,
+    "MANUFACTURER_OWNED": 1.20,
+}
+
+# Expedite ladder (PRD 3.6)
+EXPEDITE_TIER_1_MAX_CENTS = 50000
+EXPEDITE_TIER_2_MAX_CENTS = 150000
+EXPEDITE_RATE_BP_TIER_1 = 1500
+EXPEDITE_RATE_BP_TIER_2 = 1000
+EXPEDITE_RATE_BP_TIER_3 = 600
+
+# Reliance discount ladder (PRD 3.6)
+RELIANCE_DISCOUNT_THRESHOLD_CENTS = 60000
+RELIANCE_DISCOUNT_BP = 800
+RELIANCE_DISCOUNT_HIGH_THRESHOLD_CENTS = 120000
+RELIANCE_DISCOUNT_HIGH_BP = 1200
+
+# Gap score penalties (PRD 3.3)
+OPEN_CASE_PENALTY_POINTS = 15
+RESAMPLE_PENALTY_POINTS = 10
+
+# Component coverage quarantine buffer (PRD 3.4)
+COVERAGE_BUFFER_DAYS = 7
+
+# Noncompliance retest loop (PRD 3.9)
+MAX_RETEST_ROUNDS = 3
+
+# Certificate content slots (PRD 3.7)
+REQUIRED_CONTENT_SLOTS = 7
+
+# Product defaults (PRD 3.3)
+DEFAULT_TESTING_BUDGET_CENTS = 2000000
+
+# Sampling plan defaults (PRD 3.5)
+DEFAULT_RESAMPLE_GRACE_DAYS = 30

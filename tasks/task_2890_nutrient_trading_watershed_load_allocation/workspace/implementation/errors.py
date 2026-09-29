@@ -1,0 +1,102 @@
+"""Error catalogue and the ApiError exception carrying error_id + http status."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status if http_status is not None else ERROR_STATUS.get(error_id, 422)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_WATERSHED_NOT_FOUND": 404,
+    "ERR_REACH_NOT_FOUND": 404,
+    "ERR_TMDL_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_SOURCE_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_ALLOCATION_RUN_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_PRODUCER_NOT_FOUND": 404,
+    "ERR_PRACTICE_PROJECT_NOT_FOUND": 404,
+    "ERR_CREDIT_BATCH_NOT_FOUND": 404,
+    "ERR_CREDIT_TRANSACTION_NOT_FOUND": 404,
+    "ERR_ADAPTIVE_REVIEW_NOT_FOUND": 404,
+    "ERR_MONITORING_SAMPLE_NOT_FOUND": 404,
+    "ERR_VERIFICATION_EVENT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_DUPLICATE_CODE": 409,
+    "ERR_WATERSHED_MISMATCH": 422,
+    "ERR_STALE_BATCH_VERSION": 412,
+    "ERR_STALE_TMDL_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_TRADING_SUSPENDED": 409,
+    "ERR_BASELINE_NOT_MET": 422,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_PRACTICE_PERIOD_OVERLAP": 409,
+    "ERR_REVIEW_WINDOW_CONFLICT": 409,
+    "ERR_REPORTING_YEAR_MISMATCH": 422,
+    "ERR_ZONE_NOT_ELIGIBLE": 422,
+    "ERR_TMDL_NOT_APPROVED": 409,
+    "ERR_PROJECT_NOT_CERTIFIED": 409,
+    "ERR_WLA_NOT_ALLOCATED": 409,
+    "ERR_LIMITS_NOT_DERIVED": 409,
+    "ERR_ALLOCATION_RUN_IN_USE": 409,
+    "ERR_BATCH_HAS_OPEN_TRANSACTIONS": 409,
+    "ERR_NO_INCLUDED_SOURCES": 422,
+    "ERR_SOURCE_NOT_POINT": 422,
+    "ERR_ALLOCABLE_LOAD_NEGATIVE": 422,
+    "ERR_CREDIT_INSUFFICIENT": 409,
+    "ERR_NO_COMPLIANCE_GAP": 409,
+    "ERR_DELIVERY_BELOW_MINIMUM": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing, empty or name an unknown role.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorized for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting principal does not own the target resource.",
+    "ERR_INVALID_REQUEST": "The request payload or query parameters are invalid.",
+    "ERR_DUPLICATE_CODE": "A row with this code already exists.",
+    "ERR_WATERSHED_MISMATCH": "Cross-referenced rows belong to different watersheds.",
+    "ERR_STALE_BATCH_VERSION": "The declared credit batch version is stale.",
+    "ERR_STALE_TMDL_VERSION": "The declared TMDL assessment version is stale.",
+    "ERR_INVALID_STATE": "The target row does not declare the requested transition from its current state.",
+    "ERR_TRADING_SUSPENDED": "The watershed program is not ACTIVE, so trading operations are suspended.",
+    "ERR_BASELINE_NOT_MET": "The project's regulatory baseline requirement is not met.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this principal from acting here.",
+    "ERR_PRACTICE_PERIOD_OVERLAP": "A live practice project already occupies this tract and practice period.",
+    "ERR_REVIEW_WINDOW_CONFLICT": "The review window is not clear of every existing window on this watershed.",
+    "ERR_REPORTING_YEAR_MISMATCH": "The reporting period year does not match the buyer permit's reporting period year.",
+    "ERR_ZONE_NOT_ELIGIBLE": "Geographic eligibility is not satisfied.",
+    "ERR_TMDL_NOT_APPROVED": "The governing TMDL assessment is not APPROVED.",
+    "ERR_PROJECT_NOT_CERTIFIED": "The generating practice project is not CERTIFIED.",
+    "ERR_WLA_NOT_ALLOCATED": "No wasteload allocation exists.",
+    "ERR_LIMITS_NOT_DERIVED": "The permit's limits have not been derived.",
+    "ERR_ALLOCATION_RUN_IN_USE": "The allocation run has been relied upon by a permit.",
+    "ERR_BATCH_HAS_OPEN_TRANSACTIONS": "A transaction against this batch is still PROPOSED.",
+    "ERR_NO_INCLUDED_SOURCES": "No source assessment on this assessment is INVENTORIED or ADJUSTED.",
+    "ERR_SOURCE_NOT_POINT": "The referenced source assessment is not a POINT source.",
+    "ERR_ALLOCABLE_LOAD_NEGATIVE": "The allocable load is below zero.",
+    "ERR_CREDIT_INSUFFICIENT": "The requested quantity exceeds the batch's unencumbered balance.",
+    "ERR_NO_COMPLIANCE_GAP": "The buyer permit is not in SHORTFALL with a positive compliance gap.",
+    "ERR_DELIVERY_BELOW_MINIMUM": "The delivered quantity is not strictly above zero pounds.",
+}
+
+NOT_FOUND = {
+    "watershed_id": "ERR_WATERSHED_NOT_FOUND",
+    "reach_id": "ERR_REACH_NOT_FOUND",
+    "downstream_reach_id": "ERR_REACH_NOT_FOUND",
+    "tmdl_assessment_id": "ERR_TMDL_ASSESSMENT_NOT_FOUND",
+    "source_assessment_id": "ERR_SOURCE_ASSESSMENT_NOT_FOUND",
+    "allocation_run_id": "ERR_ALLOCATION_RUN_NOT_FOUND",
+    "permit_id": "ERR_PERMIT_NOT_FOUND",
+    "producer_id": "ERR_PRODUCER_NOT_FOUND",
+    "practice_project_id": "ERR_PRACTICE_PROJECT_NOT_FOUND",
+    "credit_batch_id": "ERR_CREDIT_BATCH_NOT_FOUND",
+    "credit_transaction_id": "ERR_CREDIT_TRANSACTION_NOT_FOUND",
+    "adaptive_review_id": "ERR_ADAPTIVE_REVIEW_NOT_FOUND",
+    "monitoring_sample_id": "ERR_MONITORING_SAMPLE_NOT_FOUND",
+    "verification_event_id": "ERR_VERIFICATION_EVENT_NOT_FOUND",
+}

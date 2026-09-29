@@ -1,0 +1,56 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_REFERENCED_ENTITY_NOT_FOUND": 404,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_CYCLE_PHASE_INVALID": 409,
+    "ERR_CYCLE_FROZEN": 409,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_STALE_PARENT_VERSION": 412,
+    "ERR_CONSENT_NOT_GRANTED": 403,
+    "ERR_EVALUATION_SEALED": 409,
+    "ERR_CONFIDENTIALITY_TIER_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_SELF_TRADE_FORBIDDEN": 422,
+    "ERR_DECLARATION_DEADLINE_PASSED": 409,
+    "ERR_OUTSIDE_COMBINE_WEEK": 422,
+    "ERR_CLOCK_ALREADY_EXPIRED": 409,
+    "ERR_UDFA_WINDOW_CLOSED": 409,
+    "ERR_CROSS_CYCLE_REFERENCE": 422,
+    "ERR_BOOKING_RESOURCE_MISMATCH": 422,
+    "ERR_BOOKING_NOT_MEDICAL_COMPLETED": 422,
+    "ERR_PICK_NOT_OWNED_BY_CLUB": 422,
+    "ERR_CONTRACT_PICK_MISMATCH": 422,
+    "ERR_PROSPECT_NOT_SELECTABLE": 422,
+    "ERR_LOTTERY_SEQUENCE_INVALID": 422,
+    "ERR_CLUB_CODE_DUPLICATE": 409,
+    "ERR_ALREADY_DECLARED": 409,
+    "ERR_WAIVER_ROUNDS_EXHAUSTED": 409,
+    "ERR_TRADE_ROUNDS_EXHAUSTED": 409,
+    "ERR_OUT_OF_ORDER_NOT_AUTHORIZED": 409,
+    "ERR_STATION_SLOT_CONFLICT": 409,
+    "ERR_ROOM_CAPACITY_EXCEEDED": 409,
+    "ERR_PROSPECT_ITINERARY_CONFLICT": 409,
+    "ERR_NO_ELIGIBLE_PROSPECTS": 422,
+    "ERR_TRADE_AUTHORIZATION_SUSPENDED": 403,
+    "ERR_TRADE_VALUE_IMBALANCED": 422,
+    "ERR_NO_TIMEOUTS_REMAINING": 409,
+    "ERR_ROOKIE_POOL_EXCEEDED": 422,
+    "ERR_UDFA_POOL_EXHAUSTED": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower().capitalize() + "."

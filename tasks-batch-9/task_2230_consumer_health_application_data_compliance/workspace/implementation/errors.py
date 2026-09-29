@@ -1,0 +1,87 @@
+"""Error catalogue (PRD section 5)."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_CONSUMER_SCOPE_VIOLATION": 403,
+    "ERR_APP_PRODUCT_NOT_FOUND": 404,
+    "ERR_CONSUMER_NOT_FOUND": 404,
+    "ERR_VENDOR_NOT_FOUND": 404,
+    "ERR_DATA_ELEMENT_NOT_FOUND": 404,
+    "ERR_PURPOSE_NOT_FOUND": 404,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_CROSS_PRODUCT_REFERENCE": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    "ERR_ELEMENT_RETIRED": 409,
+    "ERR_POLICY_NOT_IN_REVIEW": 409,
+    "ERR_VENDOR_AGREEMENT_NOT_EXECUTED": 409,
+    "ERR_STALE_PRODUCT_VERSION": 412,
+    "ERR_STALE_CONSUMER_VERSION": 412,
+    "ERR_GEOFENCE_PROHIBITED": 403,
+    "ERR_GEOFENCE_STANDOFF_VIOLATION": 422,
+    "ERR_MINOR_SALE_PROHIBITED": 403,
+    "ERR_CONSENT_BUNDLING_PROHIBITED": 422,
+    "ERR_COLLECTION_CONSENT_REQUIRED": 409,
+    "ERR_SHARING_CONSENT_REQUIRED": 409,
+    "ERR_DUPLICATE_ELEMENT_KEY": 409,
+    "ERR_DUPLICATE_PURPOSE_KEY": 409,
+    "ERR_DUPLICATE_CONSUMER_REF": 409,
+    "ERR_DUPLICATE_VENDOR_NAME": 409,
+    "ERR_DERIVATION_SOURCE_REQUIRED": 422,
+    "ERR_INFERENCE_CYCLE": 422,
+    "ERR_INFERENCE_DEPTH_EXCEEDED": 422,
+    "ERR_ELEMENT_PARENT_RETIRED": 409,
+    "ERR_ASSESSMENT_REVISION_LIMIT": 409,
+    "ERR_VERIFICATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_TASK_ATTEMPT_LIMIT": 409,
+    "ERR_EXTENSION_ALREADY_GRANTED": 409,
+    "ERR_ASSESSMENT_NOT_APPROVED": 409,
+    "ERR_APPLICABILITY_UNDETERMINED": 409,
+    "ERR_VENDOR_REQUIRED_FOR_DISCLOSURE": 422,
+    "ERR_VENDOR_AGREEMENT_DEFICIENT": 409,
+    "ERR_FLOW_DOWN_CLAUSE_MISSING": 422,
+    "ERR_AUDIT_RIGHTS_MISSING": 422,
+    "ERR_SUBPROCESSOR_PARENT_NOT_EXECUTED": 409,
+    "ERR_POLICY_LAPSED": 409,
+    "ERR_EFFECTIVE_DATE_IN_PAST": 422,
+    "ERR_POLICY_WINDOW_OVERLAP": 409,
+    "ERR_WINDOW_END_BEFORE_START": 422,
+    "ERR_CAMPAIGN_WINDOW_CONFLICT": 409,
+    "ERR_ZONE_COOLDOWN_ACTIVE": 409,
+    "ERR_VERIFICATION_WINDOW_EXPIRED": 409,
+    "ERR_VERIFICATION_TOKEN_MISMATCH": 422,
+    "ERR_RESPONSE_DEADLINE_PASSED": 409,
+    "ERR_DELETION_TASKS_OUTSTANDING": 409,
+    "ERR_NOTIFICATION_DEADLINE_PASSED": 409,
+    "ERR_MEDIA_NOTICE_REQUIRED": 422,
+    "ERR_POLICY_COMPLETENESS_BELOW_THRESHOLD": 422,
+    "ERR_REMEDIATION_PLAN_REQUIRED": 422,
+    "ERR_NO_ACTIVE_ELEMENTS": 409,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be recognised.",
+    "ERR_UNAUTHORIZED": "The caller's role is not permitted to perform this operation.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting operator may not review its own artefact.",
+    "ERR_CONSUMER_SCOPE_VIOLATION": "A consumer may only act on its own resources.",
+    "ERR_INVALID_REQUEST": "The request body is malformed.",
+    "ERR_INVALID_STATE": "The resource is not in a state from which this transition is declared.",
+    "ERR_ALREADY_TERMINAL": "The resource already sits in one of its terminal states.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        super().__init__(self.message)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

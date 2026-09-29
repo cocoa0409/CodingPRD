@@ -1,0 +1,84 @@
+"""Error catalogue (PRD 5) and the API exception type."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_CUSTOMER_SCOPE_VIOLATION": 403,
+    "ERR_ASSET_NOT_ASSIGNED": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_PORT_NOT_FOUND": 404,
+    "ERR_FUEL_GRADE_NOT_FOUND": 404,
+    "ERR_CUSTOMER_NOT_FOUND": 404,
+    "ERR_ASSET_NOT_FOUND": 404,
+    "ERR_NOMINATION_NOT_FOUND": 404,
+    "ERR_DELIVERY_ORDER_NOT_FOUND": 404,
+    "ERR_BDN_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_LAB_ANALYSIS_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_SPILL_INCIDENT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_STALE_NOMINATION_VERSION": 412,
+    "ERR_STALE_CLAIM_VERSION": 412,
+    "ERR_INVALID_NOMINATION_STATE": 409,
+    "ERR_COMPLIANCE_NOT_APPROVED": 409,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_MEASUREMENT_STATE": 409,
+    "ERR_MEASUREMENT_NOT_AGREED": 409,
+    "ERR_BDN_ALREADY_ISSUED": 409,
+    "ERR_BDN_NOT_ISSUED": 409,
+    "ERR_INVOICE_ALREADY_EXISTS": 409,
+    "ERR_INVALID_INVOICE_STATE": 409,
+    "ERR_INVOICE_NOT_ISSUED": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_SAMPLE_NOT_RELEASED": 409,
+    "ERR_RETEST_LIMIT_REACHED": 409,
+    "ERR_NO_OFFSPEC_FINDING": 409,
+    "ERR_NO_MEASUREMENT_DISCREPANCY": 409,
+    "ERR_ASSET_QUARANTINED": 409,
+    "ERR_INVALID_ASSET_STATE": 409,
+    "ERR_OPEN_SPILL_INCIDENT": 409,
+    "ERR_INVALID_SPILL_STATE": 409,
+    "ERR_ECA_SULFUR_VIOLATION": 422,
+    "ERR_ECA_DOCUMENTATION_MISSING": 422,
+    "ERR_BOOM_NOT_CERTIFIED": 422,
+    "ERR_GRADE_INCOMPATIBLE_ASSET": 422,
+    "ERR_CONTAINMENT_NOT_CONFIRMED": 422,
+    "ERR_ASSET_NOT_SUITABLE": 422,
+    "ERR_WINDOW_TOO_SHORT": 422,
+    "ERR_SLOT_OUTSIDE_WINDOW": 422,
+    "ERR_ASSET_SLOT_CONFLICT": 409,
+    "ERR_PORT_CAPACITY_EXCEEDED": 409,
+    "ERR_NOTICE_PERIOD_MISSED": 422,
+    "ERR_CLAIM_WINDOW_CLOSED": 422,
+    "ERR_SAMPLE_RETENTION_EXPIRED": 422,
+    "ERR_ASSET_CAPACITY_EXCEEDED": 422,
+    "ERR_AFFECTED_QUANTITY_EXCEEDS_BASIS": 422,
+    "ERR_MEASUREMENT_FIGURES_INCONSISTENT": 422,
+    "ERR_DUPLICATE_REFERENCE_CODE": 409,
+    "ERR_DUPLICATE_BDN_NUMBER": 409,
+    "ERR_DUPLICATE_SAMPLE_SEAL": 409,
+    "ERR_NO_ELIGIBLE_ASSET": 409,
+    "ERR_INDEX_QUOTE_UNAVAILABLE": 422,
+    "ERR_CUSTOMER_CREDIT_HOLD": 402,
+    "ERR_CREDIT_LIMIT_EXCEEDED": 402,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Missing or invalid authentication headers.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not permitted for this operation.",
+    "ERR_CUSTOMER_SCOPE_VIOLATION": "The acting customer representative may only act on its own records.",
+    "ERR_ASSET_NOT_ASSIGNED": "The acting barge master is not assigned to this delivery order's asset.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids the acting user from performing this operation.",
+    "ERR_INVALID_REQUEST": "The request payload is invalid.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.status = status if status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, "Request rejected: %s." % error_id
+        )

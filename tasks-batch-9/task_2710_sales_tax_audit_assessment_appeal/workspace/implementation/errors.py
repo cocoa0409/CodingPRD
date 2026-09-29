@@ -1,0 +1,98 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_TAXPAYER_NOT_FOUND": 404,
+    "ERR_INFORMATION_RETURN_NOT_FOUND": 404,
+    "ERR_INDUSTRY_PROJECT_NOT_FOUND": 404,
+    "ERR_AUDIT_LEAD_NOT_FOUND": 404,
+    "ERR_AUDIT_NOT_FOUND": 404,
+    "ERR_STATUTE_WAIVER_NOT_FOUND": 404,
+    "ERR_SAMPLING_AGREEMENT_NOT_FOUND": 404,
+    "ERR_SAMPLE_UNIT_NOT_FOUND": 404,
+    "ERR_EXEMPTION_CERTIFICATE_NOT_FOUND": 404,
+    "ERR_USE_TAX_PURCHASE_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_ADJUSTMENT_NOT_FOUND": 404,
+    "ERR_APPEAL_PROCEEDING_NOT_FOUND": 404,
+    "ERR_PAYMENT_ARRANGEMENT_NOT_FOUND": 404,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STALE_AUDIT_VERSION": 412,
+    "ERR_STALE_ASSESSMENT_VERSION": 412,
+    "ERR_LEAD_NOT_SELECTED": 409,
+    "ERR_TAXPAYER_AUDIT_IN_PROGRESS": 409,
+    "ERR_AGREEMENT_NOT_AGREED": 409,
+    "ERR_PROJECTION_STALE": 409,
+    "ERR_PREDECESSOR_NOT_DECIDED": 409,
+    "ERR_APPEAL_PENDING": 409,
+    "ERR_AUDIT_SCOPE_OVERLAP": 409,
+    "ERR_STRATUM_OVERLAP": 422,
+    "ERR_STRATUM_GAP": 422,
+    "ERR_STRATUM_INDEX_INVALID": 422,
+    "ERR_INVOICE_DATE_OUT_OF_STRATUM": 422,
+    "ERR_STATUTE_EXPIRED": 409,
+    "ERR_STATUTE_NOT_EXPIRED": 409,
+    "ERR_WAIVER_NOT_EXTENDING": 422,
+    "ERR_WAIVER_ALREADY_PENDING": 409,
+    "ERR_NOTICE_DATE_INVALID": 422,
+    "ERR_PROTEST_WINDOW_CLOSED": 409,
+    "ERR_ESCALATION_WINDOW_CLOSED": 409,
+    "ERR_ADJUSTMENT_EXCEEDS_BALANCE": 422,
+    "ERR_REDUCTION_EXCEEDS_BALANCE": 422,
+    "ERR_PLAN_UNDERFUNDED": 422,
+    "ERR_OFFER_BELOW_MINIMUM": 422,
+    "ERR_HARDSHIP_NOT_DOCUMENTED": 422,
+    "ERR_CAPITAL_ASSET_FMV_REQUIRED": 422,
+    "ERR_ERROR_AMOUNT_REQUIRED": 422,
+    "ERR_GOOD_FAITH_STANDARD_NOT_MET": 422,
+    "ERR_ABATEMENT_NOT_ALLOWED": 422,
+    "ERR_NO_ELIGIBLE_CANDIDATES": 422,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 422,
+    "ERR_SAMPLE_SET_EMPTY": 422,
+    "ERR_SAMPLE_SIZE_NOT_MET": 422,
+    "ERR_ASSESSMENT_ALREADY_OPEN": 409,
+    "ERR_FORUM_SEQUENCE_INVALID": 409,
+    "ERR_ADJUSTMENT_KIND_SYSTEM_ONLY": 422,
+    "ERR_ARRANGEMENT_NOT_ACTIVE": 409,
+    "ERR_ASSESSMENT_NOT_FINALIZABLE": 409,
+    "ERR_DUPLICATE_PERMIT_NUMBER": 409,
+}
+
+# entity family -> not-found error id (PRD 2.8 tier 3 / tier 6)
+NOT_FOUND = {
+    "taxpayers": "ERR_TAXPAYER_NOT_FOUND",
+    "information_returns": "ERR_INFORMATION_RETURN_NOT_FOUND",
+    "industry_projects": "ERR_INDUSTRY_PROJECT_NOT_FOUND",
+    "audit_leads": "ERR_AUDIT_LEAD_NOT_FOUND",
+    "audits": "ERR_AUDIT_NOT_FOUND",
+    "statute_waivers": "ERR_STATUTE_WAIVER_NOT_FOUND",
+    "sampling_agreements": "ERR_SAMPLING_AGREEMENT_NOT_FOUND",
+    "sample_units": "ERR_SAMPLE_UNIT_NOT_FOUND",
+    "exemption_certificates": "ERR_EXEMPTION_CERTIFICATE_NOT_FOUND",
+    "use_tax_purchases": "ERR_USE_TAX_PURCHASE_NOT_FOUND",
+    "assessments": "ERR_ASSESSMENT_NOT_FOUND",
+    "assessment_adjustments": "ERR_ASSESSMENT_ADJUSTMENT_NOT_FOUND",
+    "appeal_proceedings": "ERR_APPEAL_PROCEEDING_NOT_FOUND",
+    "payment_arrangements": "ERR_PAYMENT_ARRANGEMENT_NOT_FOUND",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    text = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return text.capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

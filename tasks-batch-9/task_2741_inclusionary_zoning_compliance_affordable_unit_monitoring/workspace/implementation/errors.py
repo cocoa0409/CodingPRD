@@ -1,0 +1,186 @@
+"""Error catalog for the Inclusionary Zoning Compliance API.
+
+Every error_id declared by the PRD error catalog is mapped to its HTTP status.
+The refusal ladder order (PRD 2.9) lives in the route handlers; this module only
+owns identity, message text and status code.
+"""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message if message else DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = http_status if http_status else HTTP_STATUS.get(error_id, 400)
+
+
+HTTP_STATUS = {
+    # --- authentication / authorization -----------------------------------
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # --- payload ----------------------------------------------------------
+    "ERR_INVALID_REQUEST": 400,
+    # --- existence --------------------------------------------------------
+    "ERR_ORDINANCE_NOT_FOUND": 404,
+    "ERR_AMI_SCHEDULE_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_UNIT_NOT_FOUND": 404,
+    "ERR_MARKETING_PLAN_NOT_FOUND": 404,
+    "ERR_LOTTERY_EVENT_NOT_FOUND": 404,
+    "ERR_HOUSEHOLD_NOT_FOUND": 404,
+    "ERR_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_MONITORING_REVIEW_NOT_FOUND": 404,
+    "ERR_RESALE_TRANSACTION_NOT_FOUND": 404,
+    "ERR_FEE_NOT_FOUND": 404,
+    "ERR_DISBURSEMENT_NOT_FOUND": 404,
+    # --- optimistic concurrency -------------------------------------------
+    "ERR_STALE_PROJECT_VERSION": 412,
+    "ERR_STALE_UNIT_VERSION": 412,
+    # --- state conflicts (409) --------------------------------------------
+    "ERR_INVALID_PROJECT_STATE": 409,
+    "ERR_AGREEMENT_NOT_RECORDED": 409,
+    "ERR_UNIT_NOT_RESTRICTED": 409,
+    "ERR_UNIT_OCCUPANCY_STATE_INVALID": 409,
+    "ERR_RESALE_IN_PROGRESS": 409,
+    "ERR_PLAN_NOT_APPROVED": 409,
+    "ERR_PROJECT_NOT_READY_FOR_MARKETING": 409,
+    "ERR_LOTTERY_STATE_INVALID": 409,
+    "ERR_REDRAW_AFTER_CERTIFICATION": 409,
+    "ERR_HOUSEHOLD_STATE_INVALID": 409,
+    "ERR_CERTIFICATION_NOT_ACTIVE": 409,
+    "ERR_REVIEW_STATE_INVALID": 409,
+    "ERR_RESALE_STATE_INVALID": 409,
+    "ERR_FEE_NOT_PAYABLE": 409,
+    "ERR_DISBURSEMENT_STATE_INVALID": 409,
+    "ERR_OPEN_FINDING_BLOCKS_CLOSEOUT": 409,
+    "ERR_DUPLICATE_RESOURCE": 409,
+    "ERR_MARKETING_WINDOW_OVERLAP": 409,
+    "ERR_APPLICATION_WINDOW_OPEN": 409,
+    "ERR_CERTIFICATION_PERIOD_OVERLAP": 409,
+    "ERR_ROFR_WINDOW_EXPIRED": 409,
+    "ERR_SOURCE_FEE_NOT_PAID": 409,
+    "ERR_FEE_OUTSTANDING": 409,
+    # --- business rules (422) ---------------------------------------------
+    "ERR_AGREEMENT_NOT_REQUIRED": 422,
+    "ERR_RECORDING_PREDATES_APPROVAL": 422,
+    "ERR_RESTRICTION_TENURE_MISMATCH": 422,
+    "ERR_RECERT_NOT_APPLICABLE": 422,
+    "ERR_UNIT_OUT_OF_COMPLIANCE": 422,
+    "ERR_CURE_INSUFFICIENT": 422,
+    "ERR_COMPARABILITY_STANDARD_FAILED": 422,
+    "ERR_BEDROOM_DISTRIBUTION_FAILED": 422,
+    "ERR_NO_GOVERNING_ORDINANCE": 422,
+    "ERR_NO_AMI_SCHEDULE": 422,
+    "ERR_PATH_NOT_PERMITTED": 422,
+    "ERR_EMPTY_ELIGIBLE_POOL": 422,
+    "ERR_NO_SUBSTITUTION_FEE": 422,
+    "ERR_INVALID_MARKETING_WINDOW": 422,
+    "ERR_APPLICATION_WINDOW_CLOSED": 422,
+    "ERR_RECERT_WINDOW_NOT_OPEN": 422,
+    "ERR_UNIT_PROJECT_MISMATCH": 422,
+    "ERR_PRIOR_TRANSACTION_MISMATCH": 422,
+    "ERR_BUYER_CERTIFICATION_MISMATCH": 422,
+    "ERR_HOUSEHOLD_NOT_ELIGIBLE": 422,
+    "ERR_NO_REMAINING_OBLIGATION": 422,
+    "ERR_PAYMENT_EXCEEDS_BALANCE": 422,
+    "ERR_RESALE_PRICE_EXCEEDS_MAX": 422,
+    "ERR_REFINANCE_EXCEEDS_CAP": 422,
+    "ERR_SUBSTITUTION_FEE_PAID": 422,
+    "ERR_ADMIN_USE_CAP_EXCEEDED": 422,
+    "ERR_INSUFFICIENT_FUND_BALANCE": 422,
+    "ERR_OBLIGATION_UNSATISFIED": 422,
+    # --- fallbacks --------------------------------------------------------
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_MISSING_AUTH_HEADERS": "X-User-ID and X-User-Role headers are required.",
+    "ERR_UNKNOWN_ROLE": "X-User-Role is not a recognised role.",
+    "ERR_UNAUTHORIZED": "This role may not perform this operation.",
+    "ERR_NOT_RESOURCE_OWNER": "The caller does not own the target resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "The same user may not perform both halves of this control.",
+    "ERR_INVALID_REQUEST": "The request payload is not well formed.",
+    "ERR_ORDINANCE_NOT_FOUND": "Ordinance not found.",
+    "ERR_AMI_SCHEDULE_NOT_FOUND": "AMI schedule not found.",
+    "ERR_PROJECT_NOT_FOUND": "Project not found.",
+    "ERR_UNIT_NOT_FOUND": "Affordable unit not found.",
+    "ERR_MARKETING_PLAN_NOT_FOUND": "Marketing plan not found.",
+    "ERR_LOTTERY_EVENT_NOT_FOUND": "Lottery event not found.",
+    "ERR_HOUSEHOLD_NOT_FOUND": "Household not found.",
+    "ERR_CERTIFICATION_NOT_FOUND": "Income certification not found.",
+    "ERR_AGREEMENT_NOT_FOUND": "Regulatory agreement not found.",
+    "ERR_MONITORING_REVIEW_NOT_FOUND": "Monitoring review not found.",
+    "ERR_RESALE_TRANSACTION_NOT_FOUND": "Resale transaction not found.",
+    "ERR_FEE_NOT_FOUND": "In-lieu fee not found.",
+    "ERR_DISBURSEMENT_NOT_FOUND": "Trust fund disbursement not found.",
+    "ERR_STALE_PROJECT_VERSION": "expected_project_version does not match the stored project version.",
+    "ERR_STALE_UNIT_VERSION": "expected_unit_version does not match the stored unit version.",
+    "ERR_INVALID_PROJECT_STATE": "The project is not in a state that permits this operation.",
+    "ERR_AGREEMENT_NOT_RECORDED": "The regulatory agreement is not in the required state.",
+    "ERR_UNIT_NOT_RESTRICTED": "The unit restriction state does not permit this operation.",
+    "ERR_UNIT_OCCUPANCY_STATE_INVALID": "The unit occupancy status does not permit this operation.",
+    "ERR_RESALE_IN_PROGRESS": "A resale transaction is still in progress for this unit.",
+    "ERR_PLAN_NOT_APPROVED": "The marketing plan is not in the required state.",
+    "ERR_PROJECT_NOT_READY_FOR_MARKETING": "The project is not ready for marketing.",
+    "ERR_LOTTERY_STATE_INVALID": "The lottery event state does not permit this operation.",
+    "ERR_REDRAW_AFTER_CERTIFICATION": "A selected household has already been certified.",
+    "ERR_HOUSEHOLD_STATE_INVALID": "The household state does not permit this operation.",
+    "ERR_CERTIFICATION_NOT_ACTIVE": "The certification is not active.",
+    "ERR_REVIEW_STATE_INVALID": "The monitoring review state does not permit this operation.",
+    "ERR_RESALE_STATE_INVALID": "The resale transaction state does not permit this operation.",
+    "ERR_FEE_NOT_PAYABLE": "The in-lieu fee is not payable.",
+    "ERR_DISBURSEMENT_STATE_INVALID": "The disbursement state does not permit this operation.",
+    "ERR_OPEN_FINDING_BLOCKS_CLOSEOUT": "An open monitoring finding blocks close-out.",
+    "ERR_DUPLICATE_RESOURCE": "A resource with that identifying value already exists.",
+    "ERR_MARKETING_WINDOW_OVERLAP": "The marketing window overlaps an existing plan for this project.",
+    "ERR_APPLICATION_WINDOW_OPEN": "The application window has not closed yet.",
+    "ERR_CERTIFICATION_PERIOD_OVERLAP": "The certification period overlaps an active certification for this unit.",
+    "ERR_ROFR_WINDOW_EXPIRED": "The right-of-first-refusal window has expired.",
+    "ERR_SOURCE_FEE_NOT_PAID": "The source in-lieu fee is not fully paid.",
+    "ERR_FEE_OUTSTANDING": "An in-lieu fee assessment is still outstanding.",
+    "ERR_AGREEMENT_NOT_REQUIRED": "No regulatory agreement is required for this compliance path.",
+    "ERR_RECORDING_PREDATES_APPROVAL": "recorded_at precedes the project's approval_date.",
+    "ERR_RESTRICTION_TENURE_MISMATCH": "Only OWNERSHIP units carry a recorded resale restriction.",
+    "ERR_RECERT_NOT_APPLICABLE": "The certification carries no term and cannot be recertified.",
+    "ERR_UNIT_OUT_OF_COMPLIANCE": "The unit is out of compliance.",
+    "ERR_CURE_INSUFFICIENT": "The corrected rent still exceeds the maximum allowed rent.",
+    "ERR_COMPARABILITY_STANDARD_FAILED": "The unit fails the comparability standard.",
+    "ERR_BEDROOM_DISTRIBUTION_FAILED": "The bedroom distribution standard is not met.",
+    "ERR_NO_GOVERNING_ORDINANCE": "No ordinance governs the project's approval date.",
+    "ERR_NO_AMI_SCHEDULE": "No AMI schedule has been published.",
+    "ERR_PATH_NOT_PERMITTED": "The governing ordinance does not permit that compliance path.",
+    "ERR_EMPTY_ELIGIBLE_POOL": "The eligible applicant pool is empty.",
+    "ERR_NO_SUBSTITUTION_FEE": "No open substitution in-lieu fee exists for this project.",
+    "ERR_INVALID_MARKETING_WINDOW": "lottery_open_at must be strictly before lottery_close_at.",
+    "ERR_APPLICATION_WINDOW_CLOSED": "The application window is not open.",
+    "ERR_RECERT_WINDOW_NOT_OPEN": "The recertification window is not open yet.",
+    "ERR_UNIT_PROJECT_MISMATCH": "The agreement does not belong to the unit's project.",
+    "ERR_PRIOR_TRANSACTION_MISMATCH": "The prior transaction does not belong to this unit or is not closed.",
+    "ERR_BUYER_CERTIFICATION_MISMATCH": "The certification does not match the buyer household and unit.",
+    "ERR_HOUSEHOLD_NOT_ELIGIBLE": "The household is not eligible for this unit.",
+    "ERR_NO_REMAINING_OBLIGATION": "There is no remaining obligation to price.",
+    "ERR_PAYMENT_EXCEEDS_BALANCE": "The payment exceeds the outstanding balance.",
+    "ERR_RESALE_PRICE_EXCEEDS_MAX": "The proposed price exceeds the maximum resale price.",
+    "ERR_REFINANCE_EXCEEDS_CAP": "The requested balance exceeds the refinance cap.",
+    "ERR_SUBSTITUTION_FEE_PAID": "The substitution fee has already received payment.",
+    "ERR_ADMIN_USE_CAP_EXCEEDED": "The administrative use cap would be exceeded.",
+    "ERR_INSUFFICIENT_FUND_BALANCE": "The trust fund has insufficient unencumbered balance.",
+    "ERR_OBLIGATION_UNSATISFIED": "The project's obligation is not satisfied.",
+    "ERR_NOT_FOUND": "Resource not found.",
+    "ERR_METHOD_NOT_ALLOWED": "Method not allowed.",
+    "ERR_INTERNAL": "Internal server error.",
+}
+
+
+def err(error_id, message=None):
+    return ApiError(error_id, message)
+
+
+def invalid(message="The request payload is not well formed."):
+    return ApiError("ERR_INVALID_REQUEST", message)

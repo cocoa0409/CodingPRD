@@ -1,0 +1,111 @@
+"""Domain thresholds and numeric constants stated in the PRD narrative."""
+
+# ─── Logical clock (PRD §2.4) ──────────────────────────────────────────────
+
+INITIAL_CLOCK = "2026-08-01T00:00:00Z"
+
+
+# ─── Work sizing (PRD §3.3) ────────────────────────────────────────────────
+
+SIZE_BASE_MINUTES = {
+    "STUDIO": 90,
+    "ONE_BR": 120,
+    "TWO_BR": 150,
+    "THREE_BR_PLUS": 200,
+}
+MINUTES_PER_BATHROOM = 12
+MINUTES_PER_BED = 8
+PET_CLEAN_MULTIPLIER = 1.20
+INSPECTION_BUFFER_MINUTES = 30
+VACANT_WINDOW_HOURS = 48
+VACANT_WINDOW_MINUTES = 2880
+TIGHT_SLACK_MINUTES = 45
+
+
+# ─── Cleaner pay (PRD §3.8) ────────────────────────────────────────────────
+
+SIZE_BASE_PAY_CENTS = {
+    "STUDIO": 4550,
+    "ONE_BR": 6175,
+    "TWO_BR": 8325,
+    "THREE_BR_PLUS": 11450,
+}
+RUSH_PCT_SAME_DAY = 0.15
+RUSH_PCT_OVERNIGHT = 0.05
+TIGHT_PCT = 0.075
+CROSS_ZONE_PCT = 0.045
+LINEN_HANDLING_CENTS_PER_UNIT = 120
+ON_TIME_BONUS_CENTS = 800
+PHOTO_PASS_BONUS_CENTS = 500
+LATE_PENALTY_CENTS_PER_BLOCK = 250
+LATE_BLOCK_MINUTES = 15
+LATE_PENALTY_CAP_PCT = 0.30
+PHOTO_REJECT_PENALTY_CENTS = 300
+PHOTO_PENALTY_CAP_CENTS = 900
+
+
+# ─── Stock and chargeback (PRD §3.6, §3.1) ─────────────────────────────────
+
+WASTE_FACTOR = 1.075
+DEFAULT_SUPPLY_UNIT = "each"
+DEFAULT_REORDER_POINT = 0
+
+
+# ─── Match score (PRD §3.4) ────────────────────────────────────────────────
+
+W_QUALITY = 0.50
+W_ZONE = 0.30
+W_SKILL = 0.20
+SKILL_HEADROOM_DIVISOR = 4
+ZONE_FACTOR_HOME = 1.0
+ZONE_FACTOR_SECONDARY = 0.4
+ZONE_FACTOR_CROSS = 0.0
+
+
+# ─── Quality audit (PRD §3.9) ──────────────────────────────────────────────
+
+W_AUDIT = 0.60
+W_GUEST = 0.40
+GUEST_RATING_SCALE = 20
+CARRYOVER_WEIGHT = 0.70
+OBSERVED_WEIGHT = 0.30
+AUDIT_BONUS_SCORE = 95
+AUDIT_BONUS_CENTS = 1000
+AUDIT_PENALTY_SCORE = 70
+AUDIT_PENALTY_CENTS = -1200
+AUDIT_WINDOW_HOURS = 72
+
+
+# ─── Scheduling buffers (PRD §2.6) ─────────────────────────────────────────
+
+SAME_ZONE_BUFFER_MINUTES = 15
+CROSS_ZONE_BUFFER_MINUTES = 45
+OCCUPANCY_BUFFER_MINUTES = 0
+
+
+# ─── Miscellaneous limits ──────────────────────────────────────────────────
+
+MAX_LATE_CHECKOUT_MINUTES = 240
+DEFAULT_MIN_CLEAN_MINUTES = 60
+DEFAULT_MIN_SKILL_LEVEL = 1
+DEFAULT_OWNER_NOTIFY_MIN_COST_CENTS = 5000
+DEFAULT_QUALITY_SCORE = 80.0
+DEFAULT_MAX_DAILY_TURNOVERS = 2
+DEFAULT_PARTY_SIZE = 1
+PAGINATION_DEFAULT_LIMIT = 10
+PAGINATION_MAX_LIMIT = 100
+
+
+# ─── Checklist template (PRD §3.5) ─────────────────────────────────────────
+
+CHECKLIST_TEMPLATE_ALL_TIERS = [
+    ("STRIP_LINENS", 10, "CLEANING", False),
+    ("BATHROOM_DEEP_CLEAN", 20, "CLEANING", True),
+    ("BED_STAGING", 30, "STAGING", True),
+    ("SUPPLY_RESTOCK", 40, "RESTOCK", True),
+]
+CHECKLIST_TEMPLATE_THREE_BR_ONLY = ("PATIO_STAGING", 50, "STAGING", True)
+
+# A well-formed UUID matching no row of any entity.
+MISSING_UUID = "33333333-3333-3333-3333-333333333333"
+MISSING_UUID_ALT = "22222222-2222-2222-2222-222222222222"

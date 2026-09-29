@@ -1,0 +1,428 @@
+# Research Billing Coverage Analysis API — Product Requirements Document
+
+## 1. Introduction
+
+An academic medical center that runs clinical trials carries a structural billing risk that has nothing to do with clinical quality: the same encounter can legitimately generate a charge owed by the patient's insurer, a charge owed by the trial's sponsor, and a charge that nobody may be billed for at all. Getting that split wrong in the direction of the payer is a false claim. The Research Billing Coverage Analysis API is the system of record the research billing office uses to make that split defensible — from the protocol-level coverage analysis that classifies every item, through the sponsor budget derived from it, the study calendar built in the electronic health record, the charge-by-charge review that keeps sponsor-paid work off the payer's claim, and finally the audit response that refunds what should never have been billed.
+
+The product spans five working groups whose duties are deliberately kept apart. Coverage analysts prepare the analysis grid and the calendar; compliance reviewers decide the Medicare qualifying-clinical-trial question, approve the analysis, publish the calendar, and adjudicate individual charges; the billing office manager registers protocols, builds and executes budgets, opens and closes accrual, raises sponsor invoices, files amendments, and drives the aging epoch; study coordinators enroll and consent subjects, schedule and complete visits, and post interface charges; and an audit liaison group handles external payer audits. No single person may both prepare and bless the same artifact, and the system enforces that at the level of the acting user identifier rather than the role.
+
+Three characteristics shape almost every requirement that follows. First, the ledger is derived, not asserted: every monetary position on a study is recomputed from its charges and invoices at the end of any request that could move them, and two conservation invariants must hold across refunds and disputes. Second, coverage is versioned in time — an amendment can supersede an approved analysis, which means the same charge row can be "correctly billed to the payer as of the service date" and "improperly billed to the payer today", and both readings are needed. Third, aging is an explicit epoch rather than a continuous clock: unbilled-charge age is refreshed only when the billing office runs the aging job, and is intentionally stale between runs. All resources are mounted under the `/research-billing` path prefix.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contract-level rules that hold across every endpoint: authentication, envelope shape, pagination, identity and timestamps, segregation of duties, version guards, money handling, the derived study ledger, the billing hold posture, cascade discipline, and the order in which validations fire.
+
+### 2.1. Billing Office Roles and Request Authentication
+
+Every request must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the capacity that user is acting in. If either header is absent, or if `X-User-Role` is not one of the five declared role names, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). The five roles are spelled exactly `ResearchBillingManager`, `CoverageAnalyst`, `ComplianceReviewer`, `StudyCoordinator`, and `AuditLiaison`. When the headers are well formed but the acting role is not listed as authorized for the endpoint being called, the rejection is `ERR_UNAUTHORIZED` (HTTP 403).
+
+All five roles are operator identities rather than persisted records. When `X-User-Role` is `ResearchBillingManager`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server records it where a transition writes it (for example as `budget_built_by_user_id` or `budget_executed_by_user_id` on a study) but never compares it to any entity's `id`. The same holds for `CoverageAnalyst`, whose identifier is recorded as `prepared_by_user_id` on the analysis it opens; for `ComplianceReviewer`, whose identifier is recorded as `qct_determined_by_user_id` on a study, as `returned_by_user_id` or `approved_by_user_id` on an analysis, and as `reviewed_by_user_id` on a charge; for `StudyCoordinator`, whose identifier is recorded as `posted_by_user_id` on an interface-posted charge; and for `AuditLiaison`, whose identifier is recorded as `opened_by_user_id` and `responded_by_user_id` on an audit finding. There is no resource-ownership check anywhere in this system — the acting identifier is only ever compared against another *recorded operator identifier* for the segregation-of-duties rules described in §2.5.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+List endpoints accept two query parameters. `limit` caps the number of rows returned; it defaults to 10, may not be smaller than 1, and may not be larger than 100. `offset` is the number of rows to skip and defaults to 0; it may not be negative. A `limit` outside the range 1 through 100 inclusive, or a negative `offset`, is rejected with `ERR_INVALID_PAGINATION` (HTTP 400). Every list response reports `limit`, `offset`, `total_count`, and `has_more` inside the `meta` object of the envelope.
+
+Unless a specific endpoint says otherwise, list endpoints return rows sorted by their creation timestamp in ascending order. Four collections carry a domain-specific order instead: the items of one coverage analysis are returned oldest-created first, the visits of one calendar generation are returned in ascending `sequence_index`, the amendments of one study are returned in ascending `amendment_number`, and the sponsor invoices of one study are returned in ascending `sequence_number` so that the newest invoice appears last.
+
+### 2.4. Record Identity, Timestamps, and the Logical Clock
+
+Every resource in the system carries an `id`, which is a server-minted UUID with no type prefix, and a `created_at` timestamp in ISO 8601 UTC notation with three fractional digits. Most resources additionally carry `updated_at`, refreshed on every mutation, and `version`, an integer that starts at 1 on creation and increments by exactly one on every mutation of that row. Studies, coverage analyses, study calendars, study subjects, subject visits, charges, sponsor invoices, audit findings, and amendments all carry the full set. Three record types are write-once and therefore carry only `id` and `created_at`, with **no** `updated_at` and **no** `version` field at all: coverage items, calendar visits, and visit charge routes. A coverage item in particular is immutable once created — the way to change a classification is to open a new analysis revision, not to edit the item.
+
+Time in this system is a logical clock, never wall-clock time. Before any client sets it, the logical clock reads exactly `2026-08-01T00:00:00Z`, and it never falls back to real time. An administrative test-driving capability accepts a `to_iso8601` instant and moves the clock to it, answering with the resulting `current_utc` value. Every timestamp the server stamps afterwards — `created_at`, `updated_at`, `approved_at`, `published_at`, `qct_determined_at`, `unbilled_since`, `reviewed_at`, `hold_applied_at`, `submitted_at` — and every date comparison the business rules perform read that instant.
+
+Path identifiers are resolved strictly left to right. For a nested read such as the invoices of one study or the items of one analysis, the outer resource is looked up first and its absence is reported before the system attempts to interpret anything further to the right. A request naming a study that does not exist fails with `ERR_STUDY_NOT_FOUND` regardless of what the rest of the path says. Foreign keys carried in a request body are resolved after the path but before any state or business rule is evaluated.
+
+### 2.5. Segregation of Duties Across the Billing Office
+
+Three decisions in this system may not be made by the same person who set them up, and the comparison is on the acting `X-User-ID` rather than on the role. An analysis may not be approved by the user recorded in its `prepared_by_user_id`. A built budget may not be executed by the user recorded in the study's `budget_built_by_user_id`. An audit finding may not be responded to by the user recorded in its `opened_by_user_id`. All three violations report `ERR_SEGREGATION_OF_DUTIES` with HTTP 403. Note the asymmetry that follows from this: rebuilding a budget re-stamps `budget_built_by_user_id` with the rebuilding user and clears `budget_executed_by_user_id` back to null, so a manager who rebuilds a previously executed budget cannot then execute it alone.
+
+### 2.6. Version Guards on Study and Analysis Writes
+
+Three write operations take an explicit optimistic-concurrency field, and on those three the field is required — not optional — in the request body.
+
+Raising a coverage analysis revision requires `expected_study_version` in the body, carrying the client's last observed `version` of the target study. If that number does not equal the study's current `version`, the create is rejected with `ERR_STALE_STUDY_VERSION` (HTTP 412). The guard exists because a revision supersedes the prior approved analysis and pushes the study's `lifecycle_status` back to `COVERAGE_PENDING`; a client working from an outdated view of the study would branch the coverage history from a baseline it never saw.
+
+Building a study budget likewise requires `expected_study_version` matching the study's current `version`, and a mismatch is rejected with `ERR_STALE_STUDY_VERSION` (HTTP 412). A rebuild legitimately overwrites the prior budget totals whether the budget stood at `BUILT`, `EXECUTED`, or `SUPERSEDED`, so a stale writer would silently replace figures derived from an analysis or a calendar it had not observed.
+
+Raising a sponsor invoice also requires `expected_study_version` matching the study's current `version`, rejected on mismatch with `ERR_STALE_STUDY_VERSION` (HTTP 412), because the study's receivable position moves as other writers route and invoice charges.
+
+Adding an item to a coverage analysis requires `expected_coverage_analysis_version` in the body, carrying the client's last observed `version` of the owning analysis. If that number does not equal the analysis' current `version`, the add is rejected with `ERR_STALE_COVERAGE_ANALYSIS_VERSION` (HTTP 412). Adding a second, different item is a perfectly legitimate operation on its own; what the guard protects is the *item set the writer reasoned about* — the classification counters and `qct_conditional_item_count` the writer saw no longer describe the analysis once another item has landed.
+
+No other endpoint in this specification accepts a version field of any kind, and none may be required to.
+
+### 2.7. Money, Rounding, and the Two Pinned Indirect Orders
+
+All money in this system is expressed as an integer number of cents. Multiplications of units by unit prices are exact and are never rounded. Wherever an indirect (facilities and administrative) percentage is applied to a cents figure, the product is rounded half up to a whole cent.
+
+The evaluation *order* of that rounding is pinned differently in the two places it appears, and the difference is deliberate. On the study budget the order is **sum then round**: each subtotal is accumulated exactly, and the indirect uplift is rounded once, for the subtotal as a whole. On a sponsor invoice the order is **round per line then sum**: the indirect for each selected charge line is rounded half up on its own, and those rounded per-line figures are added together. Computing the invoice as a single rounding of the total indirect is wrong and produces a different number whenever two or more lines each carry a fractional cent of indirect. The `effective_indirect_rate_pct` itself is carried to one decimal place and is exact — the inputs it derives from carry at most two decimals and the caps it applies are exact values, so no rounding of the rate is required.
+
+### 2.8. The Study Ledger and Its Conservation Invariants
+
+A study carries a derived money ledger that is recomputed at the end of any request that changes a charge's `billing_state`, a charge's `routing_state`, a charge's `amount_cents`, or a sponsor invoice's `status`. All eight positions are pure aggregates over the study's own charges and invoices; replacement charges created by a refund are ordinary members of those pools.
+
+- `payer_billed_cents` is the sum of `amount_cents` over the study's charges whose `billing_state` is `BILLED_PAYER`.
+- `payer_refunded_cents` is the sum of `refunded_amount_cents` over the study's charges whose `billing_state` is `REFUNDED`.
+- `sponsor_unbilled_cents` is the sum of `amount_cents` over charges whose `routing_state` is `ROUTED_SPONSOR` and whose `billing_state` is `UNBILLED`.
+- `sponsor_receivable_cents` is the sum of `amount_cents` over charges whose `billing_state` is `INVOICED_SPONSOR`.
+- `sponsor_collected_cents` is the sum of `amount_paid_cents` over the study's sponsor invoices whose `status` is `PAID`.
+- `sponsor_written_off_cents` is the sum, over the study's sponsor invoices whose `status` is `PAID` and whose `short_paid` flag is true, of that invoice's `net_total_cents` less its `amount_paid_cents`.
+- `improper_payer_exposure_cents` is the sum of `amount_cents` over charges whose `improper_flag` is true.
+- `delinquent_sponsor_cents` is the sum of `amount_cents` over charges whose `billing_state` is `UNBILLED` and whose `aging_bucket` is `DELINQUENT_90_PLUS`. Because the bucket itself is refreshed only by the aging epoch, this figure moves only when the aging job runs.
+
+Two invariants must hold. The **payer position** — `payer_billed_cents` plus `payer_refunded_cents` — is unchanged by refunding a payer-billed charge. The **sponsor position** — `sponsor_unbilled_cents` plus `sponsor_receivable_cents` — is unchanged both by submitting an invoice and by a dispute releasing its lines. Alongside the money positions the study keeps two counters used by the posture rule below: `open_finding_count`, the number of audit findings on the study whose `status` is either `OPEN` or `RESPONDED`, and `rebuild_required_calendar_count`, the number of the study's calendars whose `status` is `REBUILD_REQUIRED`.
+
+### 2.9. The Billing Hold Posture
+
+The single gate over charge segregation is the study's `billing_hold_posture`, one of `OPEN`, `PAYER_BLOCKED`, or `ALL_BLOCKED`. It is recomputed at the end of any request that changes an audit finding's status, a study calendar's status, the study's `qct_determination`, or the study's `lifecycle_status`. The clauses are evaluated in this exact order and the first one that matches wins:
+
+1. If `open_finding_count` is at least 1, the posture is `ALL_BLOCKED`.
+2. Otherwise, if `rebuild_required_calendar_count` is at least 1, the posture is `ALL_BLOCKED`.
+3. Otherwise, if `qct_determination` is either `UNDETERMINED` or `NON_QUALIFYING`, the posture is `PAYER_BLOCKED`.
+4. Otherwise the posture is `OPEN`.
+
+A freshly registered protocol therefore sits at `PAYER_BLOCKED`, because its qualifying determination has not yet been made. `ALL_BLOCKED` refuses every charge review decision and every invoice submission with `ERR_STUDY_BILLING_BLOCKED`. `PAYER_BLOCKED` still permits sponsor-side and promotional dispositions but refuses to clear anything to the payer, with `ERR_PAYER_BILLING_BLOCKED_NO_QCT`.
+
+### 2.10. Cascade Discipline
+
+Every cascade in this system completes inside the request that triggers it — there is no deferred or background reconciliation — with exactly one exception: a charge's `aging_days` and `aging_bucket` are refreshed only by the aging epoch job and are deliberately stale between runs.
+
+When a cascade touches a row, that row is mutated in the ordinary way: its `updated_at` is refreshed and its `version` increments by one. This applies to rows the client did not name. Approving an analysis increments both the analysis' `version` and the study's `version`; publishing a calendar increments the published calendar's `version`, the `version` of every generation it retires, and the study's `version`; implementing an amendment increments the amendment's `version`, the study's `version`, and the `version` of each calendar it moves to `REBUILD_REQUIRED`. Where a cascade creates or mutates a set of rows, the iteration order is oldest-created first unless stated otherwise, so that any derived counter or sequence the cascade produces is deterministic.
+
+### 2.11. Validation Order
+
+When several checks could reject the same request, they are evaluated in the fixed order below and the first failure is the one reported. Text order elsewhere in this document does not imply precedence; this list does.
+
+1. Header presence and role validity — `ERR_UNAUTHENTICATED` (401), on every endpoint.
+2. Role authorization for the endpoint — `ERR_UNAUTHORIZED` (403), on every endpoint.
+3. Body shape: required fields present, enum members valid, integers non-negative where constrained, dates in `YYYY-MM-DD` form, and `registry_number` matching the required pattern when supplied — `ERR_INVALID_REQUEST` (400), on every POST endpoint.
+4. Pagination bounds — `ERR_INVALID_PAGINATION` (400), on every list GET endpoint.
+5. Existence of the study named in the path — `ERR_STUDY_NOT_FOUND` (404), on every path under `/research-billing/studies/{id}`.
+6. Existence of the other path-segment resources, each on its own paths: `ERR_ANALYSIS_NOT_FOUND` under `/research-billing/coverage-analyses/{id}`, and likewise `ERR_CALENDAR_NOT_FOUND`, `ERR_SUBJECT_NOT_FOUND`, `ERR_SUBJECT_VISIT_NOT_FOUND`, `ERR_CHARGE_NOT_FOUND`, `ERR_INVOICE_NOT_FOUND`, `ERR_FINDING_NOT_FOUND`, `ERR_AMENDMENT_NOT_FOUND`, and `ERR_ROUTE_NOT_FOUND` (all 404).
+7. Existence of the foreign keys carried in the request body: `coverage_item_id` on route creation reports `ERR_COVERAGE_ITEM_NOT_FOUND`; `coverage_analysis_id` on item creation, `source_analysis_id` on calendar creation, and `source_analysis_id` on budget build all report `ERR_ANALYSIS_NOT_FOUND`; `calendar_visit_id` on subject-visit creation reports `ERR_CALENDAR_VISIT_NOT_FOUND`; `charge_id` on finding creation reports `ERR_CHARGE_NOT_FOUND`.
+8. The optimistic-concurrency guards of §2.6 — `ERR_STALE_STUDY_VERSION` on `POST /research-billing/coverage-analyses`, `POST /research-billing/studies/{id}/budget-build`, and `POST /research-billing/sponsor-invoices`; `ERR_STALE_COVERAGE_ANALYSIS_VERSION` on `POST /research-billing/coverage-items` (both 412).
+9. The target's own state permits the transition — `ERR_INVALID_STATE_TRANSITION` (409) on every action endpoint, except that the domain-specific codes `ERR_ANALYSIS_NOT_EDITABLE`, `ERR_ANALYSIS_NOT_UNDER_REVIEW`, `ERR_CALENDAR_NOT_DRAFT`, `ERR_CHARGE_ALREADY_ROUTED`, `ERR_CHARGE_NOT_BILLED_TO_PAYER`, `ERR_INVOICE_NOT_SUBMITTABLE`, `ERR_FINDING_NOT_OPEN`, `ERR_FINDING_NOT_RESPONDED`, `ERR_AMENDMENT_NOT_SUBMITTED`, and `ERR_SUBJECT_NOT_SCREENING` take precedence over the generic code on their own endpoints.
+10. Cross-entity state guards — `ERR_STUDY_NOT_OPEN_TO_ACCRUAL` (409) on subject registration and on consent; `ERR_BUDGET_NOT_EXECUTED` (409) also on consent; `ERR_CALENDAR_NOT_PUBLISHED` (409) on subject-visit scheduling when the subject's pinned calendar has moved to `REBUILD_REQUIRED` or `RETIRED`. The pinned calendar must still be `PUBLISHED` at visit completion too, but there the drift is reported by the generation-freshness rule immediately below rather than by this code.
+11. Calendar-generation freshness at visit completion — `ERR_STALE_CALENDAR_GENERATION` (409).
+12. Segregation of duties — `ERR_SEGREGATION_OF_DUTIES` (403) on analysis approval, budget execution, and finding response.
+13. QCT basis supportability — `ERR_QCT_BASIS_UNSUPPORTED` (422) on the qualifying-trial determination.
+14. Registry number availability — `ERR_REGISTRY_NUMBER_REQUIRED` (422) on the qualifying-trial determination and on opening a study to accrual.
+15. Downgrade protection — `ERR_QCT_DOWNGRADE_BLOCKED` (409) on the qualifying-trial determination.
+16. Routine-care Medicare support — `ERR_ROUTINE_CARE_REQUIRES_QCT` (422) on coverage-item creation.
+17. Total billing block — `ERR_STUDY_BILLING_BLOCKED` (409) on charge review and on invoice submission.
+18. Payer-side block — `ERR_PAYER_BILLING_BLOCKED_NO_QCT` (409) on charge review.
+19. An effective analysis exists for the charge's service date — `ERR_NO_EFFECTIVE_ANALYSIS` (409) on charge review.
+20. The charge code appears on that analysis — `ERR_CHARGE_CODE_NOT_IN_COVERAGE_ANALYSIS` (422) on charge review.
+21. The routed item belongs to the calendar's source analysis — `ERR_ITEM_ANALYSIS_MISMATCH` (422) on route creation.
+22. The calendar visit belongs to the subject's pinned calendar — `ERR_CALENDAR_VISIT_NOT_ON_CONSENTED_CALENDAR` (422) on subject-visit creation.
+23. The review decision agrees with the coverage expectation, or an override justification was supplied — `ERR_ROUTING_CONTRADICTS_COVERAGE` (422) on charge review.
+24. Uniqueness (all 409): `protocol_number` globally on study registration reports `ERR_DUPLICATE_PROTOCOL_NUMBER`; `item_code` within one analysis reports `ERR_DUPLICATE_ITEM_CODE`; `sequence_index` within one calendar reports `ERR_DUPLICATE_SEQUENCE_INDEX`; one coverage item per calendar visit reports `ERR_DUPLICATE_VISIT_ROUTE`; `subject_number` within one study reports `ERR_DUPLICATE_SUBJECT_NUMBER`.
+25. At most one open analysis per study — `ERR_OPEN_ANALYSIS_EXISTS` (409) on analysis creation.
+26. Return budget not exhausted — `ERR_RETURN_LIMIT_EXCEEDED` (409) on analysis return.
+27. Promotional items are zero-cost — `ERR_PROMOTIONAL_MUST_BE_ZERO_COST` (422) on coverage-item creation.
+28. Invoiceable items are not visit-routable — `ERR_INVOICEABLE_ITEM_NOT_VISIT_ROUTABLE` (422) on route creation.
+29. Publication completeness — `ERR_UNROUTED_PER_PATIENT_ITEM` (422) on calendar publication.
+30. A determination exists before conditional items are blessed — `ERR_QCT_DETERMINATION_REQUIRED` (409) on analysis approval.
+31. Visit windows do not collide — `ERR_VISIT_WINDOW_OVERLAP` (409) on calendar-visit creation.
+32. Service date inside the protocol window — `ERR_VISIT_DATE_OUTSIDE_WINDOW` (422) on subject-visit creation.
+33. Amendment is effective — `ERR_AMENDMENT_NOT_YET_EFFECTIVE` (409) on amendment implementation.
+34. Daily research-visit capacity — `ERR_RESEARCH_VISIT_DAILY_CAPACITY_EXCEEDED` (409) on subject-visit creation.
+35. A published calendar exists for a calendar-driven basis — `ERR_NO_PUBLISHED_CALENDAR_FOR_BASIS` (422) on budget build.
+36. The line selector produced something — `ERR_NO_INVOICEABLE_CHARGES` (409) on invoice creation and on invoice submission.
+37. Remittance amount consistent with the outcome — `ERR_REMITTANCE_AMOUNT_INVALID` (422) on remittance.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Registering a Protocol and Settling the Medicare Question
+
+A `ResearchBillingManager` brings a protocol into the billing office by registering it with a `protocol_number`, a `title`, a `sponsor_name`, a `funding_source`, an `ind_ide_status`, a `therapeutic_intent` boolean, and optionally a `registry_number`. The `protocol_number` is between 1 and 40 characters long and must be unique across every study on file; a repeat is refused with `ERR_DUPLICATE_PROTOCOL_NUMBER`. The `funding_source` is one of `INDUSTRY_SPONSORED`, `FEDERALLY_FUNDED`, or `INVESTIGATOR_INITIATED`, and it later selects the indirect-rate branch. The `ind_ide_status` records the FDA footing as one of `IND_HELD`, `IDE_CATEGORY_A`, `IDE_CATEGORY_B`, or `NONE`. The `registry_number` is the ClinicalTrials.gov identifier; it is null until the trial is registered, and whenever it is non-null it must consist of the literal characters `NCT` followed by exactly eight digits — anything else is `ERR_INVALID_REQUEST`. A new study opens with `lifecycle_status` at `DRAFT`, `budget_status` at `NOT_BUILT`, `qct_determination` at `UNDETERMINED`, `qct_basis` at null, every ledger position at zero, and — as clause 3 of the posture rule dictates — `billing_hold_posture` at `PAYER_BLOCKED`.
+
+The Medicare qualifying-clinical-trial question is a compliance decision, not a billing one, and only a `ComplianceReviewer` may record it. The request carries a `basis` and may carry a `registry_number` to be stored alongside. Four `basis` values are accepted, and each writes a matching pair of outcome fields: `DEEMED_IND_IDE` and `DEEMED_FEDERALLY_FUNDED` both set `qct_determination` to `DEEMED_QUALIFYING`; `SELF_CERTIFIED` sets it to `SELF_CERTIFIED_QUALIFYING`; and `NOT_QUALIFYING_DECLARED` sets it to `NON_QUALIFYING`. The `basis` supplied is stored verbatim in `qct_basis`, the acting user is stamped into `qct_determined_by_user_id`, and the current logical instant into `qct_determined_at`. The determination may be re-recorded later, which simply overwrites all four.
+
+Each basis must be supported by the study's own facts, or the request fails with `ERR_QCT_BASIS_UNSUPPORTED`. `DEEMED_IND_IDE` requires the study's `ind_ide_status` to be either `IND_HELD` or `IDE_CATEGORY_B` — notably `IDE_CATEGORY_A` does not qualify. `DEEMED_FEDERALLY_FUNDED` requires the `funding_source` to be `FEDERALLY_FUNDED`. `SELF_CERTIFIED` requires `therapeutic_intent` to be true. `NOT_QUALIFYING_DECLARED` needs no supporting fact. Two further gates then apply. Any determination that would leave the study qualifying — that is, `DEEMED_QUALIFYING` or `SELF_CERTIFIED_QUALIFYING` — requires a registry number to be available, either supplied on this request or already stored on the study; absent one, the answer is `ERR_REGISTRY_NUMBER_REQUIRED`. And a determination that would leave `qct_determination` at `NON_QUALIFYING` is refused with `ERR_QCT_DOWNGRADE_BLOCKED` while the study's `APPROVED` analysis carries at least one routine-care item whose Medicare basis is conditional on trial qualification — the billing office cannot retroactively strip the justification out from under items it has already blessed. Because the determination changes `qct_determination`, the posture is recomputed before the response is returned, which is how a study first becomes `OPEN`.
+
+### 3.2. Building the Coverage Analysis Grid
+
+The coverage analysis is the artifact that decides, item by item, who pays. A `CoverageAnalyst` opens one against a study, supplying the `study_id`, the required `expected_study_version`, and optionally a `supersedes_analysis_id` naming the prior approved analysis this revision replaces. The first analysis for a protocol leaves `supersedes_analysis_id` null and takes `revision_number` 1; a revision takes one more than the `revision_number` of the analysis it supersedes. The acting user is recorded as `prepared_by_user_id`, the new analysis starts at `status` `DRAFT` with `return_count` at zero and all five counters at zero, and a study still sitting at `lifecycle_status` `DRAFT` advances `DRAFT → COVERAGE_PENDING` on this first analysis, incrementing the study's `version`. Only one analysis per study may be open at a time: if the study already has an analysis whose `status` is `DRAFT`, `UNDER_REVIEW`, or `RETURNED`, the create is refused with `ERR_OPEN_ANALYSIS_EXISTS`.
+
+Items are added to the grid one at a time and are immutable once written. Each carries its owning `coverage_analysis_id`, the matching `expected_coverage_analysis_version`, an `item_code` (a CPT/HCPCS or institutional charge code, unique within the analysis), a human-readable `description`, a `classification`, a `medicare_coverage_basis`, a `budget_category`, a `charge_master_unit_cents`, a `negotiated_unit_cents`, an `expected_occurrences`, and optionally a `units_per_occurrence` that defaults to 1 when omitted. `classification` is one of `ROUTINE_CARE`, `RESEARCH_PAID`, or `PROMOTIONAL`, and from it the server derives the party of record in `billable_to`: `ROUTINE_CARE` items are billable to `PAYER`, `RESEARCH_PAID` items to `SPONSOR`, and `PROMOTIONAL` items to `NONE`. `medicare_coverage_basis` is one of `STANDARD_OF_CARE`, `QCT_CONDITIONAL`, or `NOT_COVERED`. `budget_category` is one of `PER_PATIENT`, `INVOICEABLE`, or `NOT_BUDGETED`. Both unit prices must be at least zero, `units_per_occurrence` must be at least 1, and `expected_occurrences` must be at least zero.
+
+Two content rules guard the grid. A `ROUTINE_CARE` item asserts that the payer may be billed, so it must have Medicare support: its `medicare_coverage_basis` may not be `NOT_COVERED`, and if it is `QCT_CONDITIONAL` then the study's `qct_determination` may not be `NON_QUALIFYING`. Either violation is `ERR_ROUTINE_CARE_REQUIRES_QCT`. Note deliberately what this rule does *not* demand: a study still at `UNDETERMINED` may draft a conditional routine-care item, because the qualifying determination is not enforced here but later, at approval, by the rule described in §3.3. Separately, a `PROMOTIONAL` item is by definition free to everyone: it must carry `budget_category` `NOT_BUDGETED` and `negotiated_unit_cents` of exactly zero, or it is refused with `ERR_PROMOTIONAL_MUST_BE_ZERO_COST`.
+
+Every accepted item refreshes the analysis' five counters: `item_count` is the number of items on the analysis; `routine_care_item_count`, `research_paid_item_count`, and `promotional_item_count` are the numbers whose `classification` is `ROUTINE_CARE`, `RESEARCH_PAID`, and `PROMOTIONAL` respectively; and `qct_conditional_item_count` is the number that are both `ROUTINE_CARE` and carry `medicare_coverage_basis` `QCT_CONDITIONAL`. Items may only be added while the analysis is `DRAFT` or `RETURNED`; on any other status the add fails with `ERR_ANALYSIS_NOT_EDITABLE`. Adding an item to a `RETURNED` analysis is also how the analyst reopens it — the analysis moves `RETURNED → DRAFT` in the same request, which closes the review cycle and lets the analyst submit again.
+
+### 3.3. Compliance Review, Approval, and Supersession
+
+Once the grid has at least one item, the analyst sends it to compliance, moving the analysis `DRAFT → UNDER_REVIEW`. A submission from any other status, or with an empty grid, is refused — an empty grid on a `DRAFT` analysis fails the state guard for this transition. Review then forks two ways, and the review loop is bounded.
+
+A `ComplianceReviewer` who is not satisfied returns the analysis with a `return_reason`, moving it `UNDER_REVIEW → RETURNED`. The reason is stored, the acting user is stamped into `returned_by_user_id`, and `return_count` increases by one. A study's analysis may be returned at most twice: a return attempted when `return_count` has already reached two is refused with `ERR_RETURN_LIMIT_EXCEEDED`, and returning anything not currently `UNDER_REVIEW` is `ERR_ANALYSIS_NOT_UNDER_REVIEW`.
+
+Approval moves the analysis `UNDER_REVIEW → APPROVED` and is the busiest single request in the system. The approver must not be the preparer, as §2.5 requires. If the analysis carries at least one `QCT_CONDITIONAL` routine-care item — that is, `qct_conditional_item_count` is at least 1 — the study's `qct_determination` must be something other than `UNDETERMINED`, or the approval is refused with `ERR_QCT_DETERMINATION_REQUIRED`. On success the analysis' `approved_at` is stamped with the current logical instant, `approved_by_user_id` records the approver, and four cascades fire. If the analysis named a `supersedes_analysis_id`, that predecessor moves `APPROVED → SUPERSEDED`. The study's `lifecycle_status` moves `COVERAGE_PENDING → COVERAGE_APPROVED`, and the posture is recomputed. Every charge already on the study has its coverage expectation recomputed, and from those the study's improper-payer exposure is re-derived — which is how an approval that reclassifies an item can turn a previously compliant payer-billed charge into an improper one without any request touching that charge. Approval increments the analysis' `version` and the study's `version`.
+
+`APPROVED` is not terminal; `SUPERSEDED` is. A superseded analysis is never edited again but remains a first-class historical record, because the operational view of coverage described in §3.7 still consults it.
+
+### 3.4. Realizing the Analysis as an EHR Study Calendar
+
+The coverage analysis says what the protocol costs; the study calendar says when each item is expected to happen and where its charge should be routed. A `CoverageAnalyst` starts a new calendar generation for a study from an `APPROVED` analysis, naming the `study_id` and the `source_analysis_id`. The new calendar's `build_generation` is one greater than the highest `build_generation` among the study's existing calendars, so the first is generation 1; it opens at `status` `DRAFT` with `visit_count`, `routed_item_count`, and `unrouted_per_patient_item_count` all at zero and `published_at` null.
+
+Visits are added to a `DRAFT` calendar with a `study_calendar_id`, a `visit_name`, a `sequence_index` giving the visit's order within the calendar, a `target_day_offset` measured in days from the subject's consent date (day zero), and the two tolerances `window_before_days` and `window_after_days`. All four integers must be at least zero except `sequence_index`, which must be at least 1 and must be unique within the calendar — a repeat is `ERR_DUPLICATE_SEQUENCE_INDEX`. From the tolerances the server derives `window_start_day` as the target day offset less the days allowed before it, and `window_end_day` as the target day offset plus the days allowed after it. Those two numbers define a closed day interval, and no two visits on the same calendar may have intervals that intersect — touching endpoints count as an intersection, so a visit ending on day 14 and a visit starting on day 14 collide and the second is refused with `ERR_VISIT_WINDOW_OVERLAP`. Adding a visit to a calendar that is no longer `DRAFT` is `ERR_CALENDAR_NOT_DRAFT`.
+
+Charge routing is the many-to-many link between a calendar visit and a coverage item, and it is what tells the EHR to drop a charge on that visit. Creating one takes a `calendar_visit_id`, a `coverage_item_id`, and an optional `occurrences` count that defaults to 1 and must be at least 1. The routed item must belong to the calendar's `source_analysis_id`, or the link is refused with `ERR_ITEM_ANALYSIS_MISMATCH`. An item whose `budget_category` is `INVOICEABLE` represents milestone or one-time money that is never dropped on a patient visit, so routing one onto a visit is refused with `ERR_INVOICEABLE_ITEM_NOT_VISIT_ROUTABLE`. The same coverage item may not be routed twice onto the same visit — that is `ERR_DUPLICATE_VISIT_ROUTE`.
+
+Each route freezes two derived values at creation and never re-derives them. `routing_target` is a snapshot of the coverage item's `billable_to` at that moment, one of `PAYER`, `SPONSOR`, or `NONE`. `expected_amount_cents` is the money the route is expected to drop, computed as the route's `occurrences` multiplied by the coverage item's `units_per_occurrence`, multiplied by a unit price chosen from the snapshotted target: the item's `charge_master_unit_cents` when the target is `PAYER`, its `negotiated_unit_cents` when the target is `SPONSOR`, and zero when the target is `NONE`. The multiplication is exact and is never rounded. Because both values are snapshots, a later analysis revision that reclassifies the item leaves historical route amounts untouched. Each accepted route refreshes the owning visit's `expected_charge_total_cents`, which is the sum of `expected_amount_cents` across that visit's routes, and refreshes the calendar's `routed_item_count`, the number of distinct coverage items routed anywhere across the calendar's visits, and its `unrouted_per_patient_item_count`, the number of coverage items on the source analysis whose `budget_category` is `PER_PATIENT` and whose `billable_to` is either `PAYER` or `SPONSOR` that have no route at all on this calendar. Both refreshes increment the calendar's `version`.
+
+Publication is a compliance act. A `ComplianceReviewer` moves a calendar `DRAFT → PUBLISHED` only when its source analysis stands at `APPROVED`, it has at least one visit, and nothing is left unrouted — a calendar with `unrouted_per_patient_item_count` above zero or with `visit_count` at zero is refused with `ERR_UNROUTED_PER_PATIENT_ITEM`, and publishing something that is not `DRAFT` is `ERR_CALENDAR_NOT_DRAFT`. On success `published_at` is stamped, and every other calendar of the same study whose `status` is `PUBLISHED` or `REBUILD_REQUIRED` is moved to `RETIRED`, which is terminal. Retiring a `REBUILD_REQUIRED` generation lowers the study's `rebuild_required_calendar_count` by one, so publishing a fresh generation is exactly how a study climbs out of a rebuild-induced `ALL_BLOCKED` posture; the posture is recomputed at the end of the request.
+
+### 3.5. Building and Executing the Sponsor Budget
+
+The sponsor budget is the money side of the same analysis, and only a `ResearchBillingManager` touches it. A build names the `source_analysis_id` to draw from, a `basis` of either `COVERAGE_DRIVEN` or `CALENDAR_DRIVEN`, the requested `indirect_rate_pct`, and the `expected_study_version` guard from §2.6. The source analysis must be `APPROVED` and must belong to this study. The requested rate must be at least 0 and at most 100 with at most two decimal places. Choosing `CALENDAR_DRIVEN` additionally requires that a calendar built from that same source analysis be standing at `PUBLISHED`; if none is, the build is refused with `ERR_NO_PUBLISHED_CALENDAR_FOR_BASIS`. A build is permitted whether the budget currently sits at `NOT_BUILT`, `BUILT`, `EXECUTED`, or `SUPERSEDED`, and always lands at `BUILT`.
+
+Only sponsor-borne items enter the budget. Items whose `billable_to` is `PAYER` (the routine-care ones) and items whose `billable_to` is `NONE` (the promotional ones) are excluded from both subtotals, and items whose `budget_category` is `NOT_BUDGETED` are excluded even when the sponsor is the party of record. What remains splits by budget category.
+
+The per-patient subtotal is where the two bases diverge, and the divergence is the point of having both. Under `COVERAGE_DRIVEN`, `per_patient_subtotal_cents` is the sum, over the source analysis' items whose `billable_to` is `SPONSOR` and whose `budget_category` is `PER_PATIENT`, of that item's `units_per_occurrence` multiplied by its `expected_occurrences` multiplied by its `negotiated_unit_cents` — the protocol's own projection. Under `CALENDAR_DRIVEN`, the same subtotal is instead the sum, over the visit charge routes belonging to the visits of the `PUBLISHED` calendar built from that source analysis where the route's `routing_target` is `SPONSOR` and the routed item's `budget_category` is `PER_PATIENT`, of the route's `occurrences` multiplied by the item's `units_per_occurrence` multiplied by its `negotiated_unit_cents` — what the EHR will actually drop. The two figures differ whenever the calendar routes an item a different number of times than the analysis projected.
+
+The invoiceable subtotal is identical under both bases. `invoiceable_subtotal_cents` is the sum, over the source analysis' items whose `billable_to` is `SPONSOR` and whose `budget_category` is `INVOICEABLE`, of `units_per_occurrence` multiplied by `expected_occurrences` multiplied by `negotiated_unit_cents`.
+
+With the per-patient subtotal in hand the server settles the indirect rate, writing the answer to `effective_indirect_rate_pct`. A `FEDERALLY_FUNDED` study takes the lesser of the requested `indirect_rate_pct` and the federal cap of 26.0 percent. An `INVESTIGATOR_INITIATED` study takes 0.0 percent outright, whatever was requested. An `INDUSTRY_SPONSORED` study is tiered on the per-patient subtotal just computed: at or above 500,000 cents — that is, five thousand dollars of sponsor-borne per-patient work — it takes the lesser of the requested rate and the industry cap of 32.0 percent; below that threshold a small-study surcharge of 3.0 percentage points is added to the requested rate *first* and the industry cap of 32.0 percent is applied to that sum. The order matters: a small industry study requesting 30.0 percent lands on 32.0 percent, not 33.0 percent, because the surcharge is capped along with the rate rather than added on top of the cap. The resulting rate is carried to one decimal place and is exact.
+
+The indirect uplift is then applied once to each subtotal, sum-then-round as §2.7 pins it. `per_patient_budget_cents` is `per_patient_subtotal_cents` plus the subtotal multiplied by `effective_indirect_rate_pct` divided by 100 and rounded half up to a whole cent. `invoiceable_budget_cents` is `invoiceable_subtotal_cents` plus that subtotal multiplied by the same rate divided by 100 and rounded half up to a whole cent. The build also records `budget_source_analysis_id` as the analysis drawn from, `budget_basis` as the `COVERAGE_DRIVEN` or `CALENDAR_DRIVEN` variant used, `indirect_rate_pct` as the rate requested, and `budget_built_by_user_id` as the acting user — and it clears `budget_executed_by_user_id` back to null. The study's `version` increments.
+
+Execution is the second signature. A different `ResearchBillingManager` moves the budget `BUILT → EXECUTED` and is stamped into `budget_executed_by_user_id`; the builder attempting it is `ERR_SEGREGATION_OF_DUTIES`, and executing a budget that is not `BUILT` is a state-transition failure. Because a rebuild drops an executed budget back to `BUILT` and clears the executing user, a mid-study rebuild suspends consent — the study's `budget_status` is no longer `EXECUTED`, so consent fails with `ERR_BUDGET_NOT_EXECUTED` until a second manager executes the rebuilt figures.
+
+Opening the protocol to accrual is the manager's declaration that everything upstream is done. The request carries a `target_status`, and with `OPEN_TO_ACCRUAL` the study moves `COVERAGE_APPROVED → OPEN_TO_ACCRUAL` only when all of the following hold: `budget_status` is `EXECUTED`; at least one of the study's calendars stands at `PUBLISHED`; `qct_determination` is something other than `UNDETERMINED`; and, when `qct_determination` is either `DEEMED_QUALIFYING` or `SELF_CERTIFIED_QUALIFYING`, the study's `registry_number` is present and matches the pattern of the literal characters `NCT` followed by exactly eight digits — a qualifying trial without a registry number is refused with `ERR_REGISTRY_NUMBER_REQUIRED`. With `target_status` of `CLOSED_TO_ACCRUAL` the study moves `OPEN_TO_ACCRUAL → CLOSED_TO_ACCRUAL`, which is the terminal lifecycle state, and cascades downward: every subject of the study whose `status` is `SCREENING` or `CONSENTED` moves to `OFF_STUDY`, and for the consented ones every subject visit still standing at `SCHEDULED` moves to `MISSED`. A closed study accepts no further lifecycle movement, though its budget dimension may still move — an audit refund's ledger recompute reaches it regardless. Either accrual change increments the study's `version`.
+
+### 3.6. Accrual: Subjects, Consent, and Visit Execution
+
+A `StudyCoordinator` registers a subject on a study open to accrual with a `study_id` and a `subject_number` that must be unique within the study, or `ERR_DUPLICATE_SUBJECT_NUMBER`. Registration requires the study's `lifecycle_status` to be `OPEN_TO_ACCRUAL`, or the attempt is `ERR_STUDY_NOT_OPEN_TO_ACCRUAL`. The subject starts at `status` `SCREENING` with `consented_calendar_id`, `consented_calendar_generation`, and `consent_date` all null and `charge_count` at zero.
+
+Consent is version pinning. The coordinator supplies the `consent_date`, and the subject moves `SCREENING → CONSENTED` only when the subject is currently `SCREENING` (otherwise `ERR_SUBJECT_NOT_SCREENING`), the study's `lifecycle_status` is `OPEN_TO_ACCRUAL`, the study's `budget_status` is `EXECUTED` (otherwise `ERR_BUDGET_NOT_EXECUTED`), and exactly one calendar of the study stands at `PUBLISHED`. That calendar's `id` is pinned onto the subject as `consented_calendar_id` and its `build_generation` is snapshotted as `consented_calendar_generation`. From that moment the subject's schedule is anchored to that specific generation, and the supplied `consent_date` is day zero for every window computation.
+
+Scheduling an occurrence takes a `study_subject_id`, a `calendar_visit_id`, and an `actual_service_date`. The named calendar visit must belong to the subject's `consented_calendar_id`, or the request is refused with `ERR_CALENDAR_VISIT_NOT_ON_CONSENTED_CALENDAR`, and the pinned calendar must still be `PUBLISHED` — one that has moved to `REBUILD_REQUIRED` or `RETIRED` yields `ERR_CALENDAR_NOT_PUBLISHED`. The service date must fall inside the protocol window: on or after the subject's `consent_date` advanced by the visit's `window_start_day`, and on or before the `consent_date` advanced by the visit's `window_end_day`; outside that closed range the answer is `ERR_VISIT_DATE_OUTSIDE_WINDOW`. Research visits are also capacity-constrained: at most two subject visits of the same study whose `status` is `SCHEDULED` or `OCCURRED` may share one service date, and a third is refused with `ERR_RESEARCH_VISIT_DAILY_CAPACITY_EXCEEDED`. On success the server computes `day_offset_actual` as the whole number of days from the subject's `consent_date` to the `actual_service_date`, snapshots the owning calendar's `build_generation` into `calendar_generation_at_schedule`, and opens the row at `status` `SCHEDULED`.
+
+Completing a visit is what actually generates money. The coordinator moves it `SCHEDULED → OCCURRED`, permitted only while the subject's `status` is `CONSENTED` and only while the calendar owning the referenced calendar visit is *still* the `PUBLISHED` generation with a `build_generation` still equal both to the visit's `calendar_generation_at_schedule` and to the subject's `consented_calendar_generation`; a generation that has drifted to `RETIRED` or `REBUILD_REQUIRED`, or a mismatch between the two snapshots, raises `ERR_STALE_CALENDAR_GENERATION`. On success the server walks the visit charge routes of the referenced calendar visit oldest-created first and creates one charge per route. Each new charge takes `source` `VISIT_CASCADE`, `routing_state` `UNROUTED`, `billing_state` `UNBILLED`, `unbilled_since` set to the current logical instant, `amount_cents` copied from the route's `expected_amount_cents` computed exactly as §3.4 describes, `suggested_routing_target` copied from the route's `routing_target`, and `coverage_item_id` copied from the route's `coverage_item_id`; `posted_by_user_id` stays null because no operator posted it. Each new charge also receives its `expected_routing_target` under the audit view described in §3.7. The visit's `generated_charge_count` is set to the number of charges created, the subject's `charge_count` is refreshed to the number of charges whose subject visit belongs to that subject, and the study ledger is rolled up.
+
+A visit that was never completed can expire. During the aging epoch described in §3.9, any subject visit still at `SCHEDULED` whose window has closed — the run date is past the subject's `consent_date` advanced by the calendar visit's `window_end_day` — moves `SCHEDULED → MISSED`. Both `OCCURRED` and `MISSED` are terminal.
+
+Charges can also arrive without a visit at all. The EHR charge interface lets a `StudyCoordinator` post a charge directly with a `study_id`, a `charge_code`, a `service_date`, an `amount_cents` of at least zero, and optionally a `subject_visit_id` linking it to an occurrence. Such a charge takes `source` `INTERFACE_POSTED`, opens `UNROUTED` and `UNBILLED` with `unbilled_since` at the current logical instant, records the acting user in `posted_by_user_id`, leaves `suggested_routing_target` null because no route suggested anything, and receives its `expected_routing_target` under the audit view.
+
+### 3.7. Charge Review and Study Charge Segregation
+
+Every charge carries two independent state dimensions on one row. `routing_state` is the segregation dimension and runs `UNROUTED`, `ROUTED_PAYER`, `ROUTED_SPONSOR`, `ROUTED_NONE`. `billing_state` is the fiscal dimension and runs `UNBILLED`, `BILLED_PAYER`, `INVOICED_SPONSOR`, `WRITTEN_OFF`, `REFUNDED`, the last two being terminal. The pair of `ROUTED_SPONSOR` with `UNBILLED` is the only combination a sponsor invoice will pick up. A review decision moves both dimensions in one request; an audit refund moves only the fiscal dimension; the aging epoch moves neither.
+
+Deciding which analysis governs a charge is the crux of the whole product, and there are two answers, both needed. The candidate set is always the coverage analyses of the charge's study whose `status` is either `APPROVED` or `SUPERSEDED`; analyses still at `DRAFT`, `UNDER_REVIEW`, or `RETURNED` are never consulted for either answer. The **operational view**, used at review time, keeps only those candidates whose `approved_at` falls at or before the very end of the charge's `service_date` — that is, at or before `23:59:59.999` UTC on that calendar date — and then takes the one with the latest `approved_at`, breaking a tie by the later `created_at`. This is what the analysis said when the service happened. The **audit view**, which is what gets persisted, ignores `service_date` entirely and takes the study's analysis whose `status` is `APPROVED`, again by latest `approved_at` with later `created_at` as tie-break. Within whichever analysis was chosen, the server looks for items whose `item_code` equals the charge's `charge_code` and takes the oldest-created match, yielding that item's `billable_to` as the answer; if no analysis was found, or no item matched, the answer is `UNDETERMINED`.
+
+The audit view is written into `expected_routing_target`, which therefore holds one of `PAYER`, `SPONSOR`, `NONE`, or `UNDETERMINED`. It is set when a charge is created — whether by the visit cascade, by an interface post, or as a refund replacement — and recomputed for every charge of the study whenever an analysis is approved. Its consequence is `improper_flag`, which is true exactly when the charge's `billing_state` is `BILLED_PAYER` and its `expected_routing_target` is anything other than `PAYER`. The two views deliberately disagree: a charge routed to the payer entirely correctly under the analysis in force on its service date becomes improper the moment a superseding analysis reclassifies its item code, and the study's `improper_payer_exposure_cents` picks that up with no request having touched the charge.
+
+Charge review itself belongs to a `ComplianceReviewer`, who supplies a `decision` and optionally an `override_justification`. A charge may only be reviewed while its `routing_state` is `UNROUTED`; anything else is `ERR_CHARGE_ALREADY_ROUTED`. The posture gate applies first: an `ALL_BLOCKED` study refuses all three decisions with `ERR_STUDY_BILLING_BLOCKED`. Review also requires an operational-view analysis to exist for the charge's `service_date` — none means `ERR_NO_EFFECTIVE_ANALYSIS` — and requires the charge's `charge_code` to match an `item_code` on that analysis, failing otherwise with `ERR_CHARGE_CODE_NOT_IN_COVERAGE_ANALYSIS`. The matched item's `id` becomes the charge's `coverage_item_id`. Finally, the decision must agree with the operational view's answer unless the reviewer supplies a non-empty `override_justification`; a contradiction without one is `ERR_ROUTING_CONTRADICTS_COVERAGE`. Every successful review stamps `reviewed_by_user_id` with the acting user and `reviewed_at` with the current logical instant, and increments the charge's `version`.
+
+The three decisions are parallel but not symmetric in what they permit or what they move. A `decision` of `CLEAR_TO_PAYER` moves the charge `UNROUTED → ROUTED_PAYER` and simultaneously `UNBILLED → BILLED_PAYER`; it agrees with coverage when the operational view says `PAYER`; and it is the one decision a `PAYER_BLOCKED` study refuses, with `ERR_PAYER_BILLING_BLOCKED_NO_QCT`, so it requires the posture to be `OPEN`. A `decision` of `HOLD_FOR_SPONSOR` moves the charge `UNROUTED → ROUTED_SPONSOR` while `billing_state` stays `UNBILLED` and `unbilled_since` is left exactly as it was — the charge simply becomes invoiceable, and its age keeps accruing from its original baseline. It agrees with coverage when the operational view says `SPONSOR`, and it is permitted while the posture is `OPEN` or `PAYER_BLOCKED`. A `decision` of `NO_CHARGE_PROMOTIONAL` moves the charge `UNROUTED → ROUTED_NONE` and simultaneously `UNBILLED → WRITTEN_OFF`, which is terminal; it agrees with coverage when the operational view says `NONE`, and like the sponsor decision it is permitted while the posture is `OPEN` or `PAYER_BLOCKED`. Clearing to the payer recomputes the study's `payer_billed_cents`, its `sponsor_unbilled_cents`, the charge's `improper_flag`, and the study's `improper_payer_exposure_cents`; the sponsor and promotional decisions each recompute `sponsor_unbilled_cents`.
+
+A charge also carries a hold, expressed in `hold_reason`, which is one of `NONE`, `CALENDAR_REBUILD`, or `AUDIT_OPEN`, together with `hold_applied_at`, the logical instant the reason last became something other than `NONE`. Charges open at `NONE`. The amendment cascade in §3.9 is the operation that writes `CALENDAR_REBUILD`; `AUDIT_OPEN` is part of the field's declared domain but no operation in this specification writes it. A held charge is invisible to the invoice line selector.
+
+The billing office watches all of this through a per-study segregation dashboard, a computed read that returns the `study_id`, the current `billing_hold_posture`, an `unrouted_charge_count` giving the number of the study's charges still at `routing_state` `UNROUTED`, and the study's `sponsor_unbilled_cents`, `sponsor_receivable_cents`, `payer_billed_cents`, `payer_refunded_cents`, `improper_payer_exposure_cents`, `delinquent_sponsor_cents`, and `open_finding_count`.
+
+### 3.8. Sponsor Invoicing, Remittance, and the Dispute Loop
+
+A `ResearchBillingManager` raises a sponsor invoice against a study with a `period_end_date` acting as an inclusive service-date cutoff, plus the `study_id` and the `expected_study_version` guard. The invoice takes a `sequence_number` one greater than the count of invoices already on the study, and an `invoice_number` formatted as the literal `INV-`, then the study's `protocol_number`, then a hyphen, then the `sequence_number` left-padded with zeros to three digits — so the first invoice on protocol `PRO-2026-014` is `INV-PRO-2026-014-001`. It opens at `status` `DRAFT` with `submitted_at` and `amount_paid_cents` at their initial values and `short_paid` false.
+
+Line selection is a strict waterfall, run when the invoice is created and re-run on every submission. The candidate pool is the charges of the invoice's study whose `routing_state` is `ROUTED_SPONSOR`, whose `billing_state` is `UNBILLED`, whose `sponsor_invoice_id` is null, whose `hold_reason` is `NONE`, and whose `service_date` is on or before the invoice's `period_end_date`. Candidates are ranked by `service_date` ascending and then by `created_at` ascending; the row identifier is never consulted. The selector then walks that ranking in order, keeping a running subtotal and a running indirect total. For each candidate it computes the line's indirect as the candidate's `amount_cents` multiplied by the study's `effective_indirect_rate_pct` divided by 100, rounded half up to a whole cent. It **stops** — it does not skip the candidate and continue — the moment either of two caps would be breached: taking this candidate would make the number of selected lines exceed 25, or the running subtotal plus this candidate's `amount_cents` plus the running indirect plus this line's indirect would be strictly greater than 2,000,000 cents. Because the comparison is strictly greater, a candidate that lands the total exactly on 2,000,000 cents *is* selected. If the walk selects nothing at all, the request fails with `ERR_NO_INVOICEABLE_CHARGES`; an empty invoice is never created. Every selected charge has the invoice's identifier stamped into its `sponsor_invoice_id`, while its `billing_state` stays `UNBILLED` until submission. Raising an invoice increments the study's `version`.
+
+The invoice's money follows immediately, in a pinned order. `subtotal_cents` is the exact sum of `amount_cents` over the selected charges. `indirect_cents` is the sum of the per-line rounded indirect figures — each line rounded half up on its own, then added — which as §2.7 warns is not the same number as rounding the total indirect once. `gross_total_cents` is `subtotal_cents` plus `indirect_cents`. The volume credit is then tiered on that pre-credit gross and never on the net: `volume_credit_cents` is 2.0 percent of `gross_total_cents`, rounded half up to a whole cent, when `gross_total_cents` is at least 1,000,000 cents, and zero otherwise. `net_total_cents` is `gross_total_cents` less `volume_credit_cents`. The tier is never re-evaluated against the net — an invoice grossing 1,009,800 cents keeps its 20,196-cent credit even though the resulting net of 989,604 cents sits below the threshold, and `line_count` records how many charges were selected.
+
+Submission moves the invoice to `SUBMITTED` and stamps `submitted_at` with the current logical instant. It is permitted from `DRAFT` and from `DISPUTED`, requires at least one line, and requires the study's `billing_hold_posture` to be anything other than `ALL_BLOCKED` — a blocked study is refused with `ERR_STUDY_BILLING_BLOCKED`, and an invoice in a status that is neither `DRAFT` nor `DISPUTED` is `ERR_INVOICE_NOT_SUBMITTABLE`. Every charge carrying this invoice's identifier moves `UNBILLED → INVOICED_SPONSOR`, and the study's `sponsor_unbilled_cents` and `sponsor_receivable_cents` are recomputed — their sum being invariant across the move. Re-submitting a `DISPUTED` invoice is not a simple status flip: the selector is re-run from scratch under the same waterfall, the indirect and net-total computations are re-run on the new selection, and the re-selection must yield at least one line or the submission fails with `ERR_NO_INVOICEABLE_CHARGES`.
+
+The sponsor's answer arrives as a remittance carrying an `outcome` and optionally an `amount_paid_cents`, and it may only be recorded while the invoice is `SUBMITTED` — otherwise `ERR_INVOICE_NOT_SUBMITTABLE`. Three outcomes exist and their money rules are checked before anything moves. `PAID_IN_FULL` requires `amount_paid_cents` to be either omitted or exactly equal to `net_total_cents`. `SHORT_PAID` requires `amount_paid_cents` to be at least zero and strictly less than `net_total_cents`. Either violation is `ERR_REMITTANCE_AMOUNT_INVALID`. Both paying outcomes move the invoice `SUBMITTED → PAID`, which is terminal, record `amount_paid_cents`, and set `short_paid` to true exactly when the recorded amount is less than `net_total_cents`; the study's `sponsor_collected_cents` and `sponsor_written_off_cents` are then recomputed.
+
+`DISPUTED` is the compensating path and moves the invoice `SUBMITTED → DISPUTED`. Every charge carrying this invoice's identifier moves `INVOICED_SPONSOR → UNBILLED` and has its `sponsor_invoice_id` cleared to null, while `unbilled_since` is left **unchanged** so that age keeps accruing across the dispute — a disputed charge does not get a fresh aging baseline. The invoice's own money fields are zeroed: `line_count`, `subtotal_cents`, `indirect_cents`, `gross_total_cents`, `volume_credit_cents`, and `net_total_cents` all return to zero. The study's `sponsor_receivable_cents` and `sponsor_unbilled_cents` are recomputed, their sum again invariant. The released charges re-enter the candidate pool for the next selection with their original `unbilled_since` intact, which is what makes `SUBMITTED → DISPUTED → SUBMITTED` a genuine loop rather than a dead end.
+
+### 3.9. Amendments, the Aging Epoch, and Audit Response
+
+Protocols change, and a change to items or schedule invalidates the artifacts derived from them. A `ResearchBillingManager` files an amendment with a `study_id`, a `scope`, and an `effective_date`. The amendment takes an `amendment_number` one greater than the count of amendments already on the study, opens at `status` `SUBMITTED`, and derives two booleans from `scope`. `reanalysis_required` is true for every scope other than `ADMINISTRATIVE` — that is, for `ITEM_CHANGE`, `VISIT_SCHEDULE_CHANGE`, and `ITEM_AND_SCHEDULE_CHANGE`. `calendar_rebuild_required` is true only for `VISIT_SCHEDULE_CHANGE` and `ITEM_AND_SCHEDULE_CHANGE`.
+
+Implementation fires a five-link cascade in one request, and each link is caused by the one before it. The amendment must be `SUBMITTED` (otherwise `ERR_AMENDMENT_NOT_SUBMITTED`), the study's `lifecycle_status` must be either `COVERAGE_APPROVED` or `OPEN_TO_ACCRUAL`, and the `effective_date` must be at or before the current logical clock's date — a future-dated amendment is refused with `ERR_AMENDMENT_NOT_YET_EFFECTIVE`. The first link moves the amendment `SUBMITTED → IMPLEMENTED`, which is terminal. The second link fires only when `reanalysis_required` is true: the study's `lifecycle_status` moves to `COVERAGE_PENDING` — cycling back from `COVERAGE_APPROVED` or from `OPEN_TO_ACCRUAL` — and, if the budget stood at `EXECUTED`, `budget_status` moves `EXECUTED → SUPERSEDED`. The third link fires only when `calendar_rebuild_required` is also true: every calendar of the study whose `status` is `PUBLISHED` moves `PUBLISHED → REBUILD_REQUIRED`. The fourth link follows from the third: `rebuild_required_calendar_count` rises by one for each such calendar and the posture recomputes to `ALL_BLOCKED`. The fifth link follows from the fourth: every charge of the study whose `billing_state` is `UNBILLED` and whose `routing_state` is `UNROUTED`, walked oldest-created first, gets `hold_reason` set to `CALENDAR_REBUILD` and `hold_applied_at` set to the current logical instant. The amendment's `version`, the study's `version`, and the `version` of each affected calendar all increment. Escaping this state means preparing a fresh analysis revision, getting it approved, building and publishing a new calendar generation — which retires the `REBUILD_REQUIRED` one and drops the counter — and re-executing the budget.
+
+Unbilled money ages only when the billing office says so. The aging epoch is a manager-driven job scoped to one study by `study_id`. It snapshots the date part of the current logical clock once, at the start of the run, and freezes every bucket against that snapshot. Walking the study's charges whose `billing_state` is `UNBILLED` oldest-created first, it sets each charge's `aging_days` to the whole number of days from the date part of that charge's `unbilled_since` to the run date, taking the floor and clamping any negative result to zero, and then assigns `aging_bucket` by inclusive upper bounds: `CURRENT` at 30 days or fewer, `AGING_31_60` above 30 and at most 60, `AGING_61_90` above 60 and at most 90, and `DELINQUENT_90_PLUS` above 90 — so 30 days is `CURRENT`, 31 is `AGING_31_60`, 90 is `AGING_61_90`, and 91 is `DELINQUENT_90_PLUS`. Charges in `BILLED_PAYER`, `INVOICED_SPONSOR`, `WRITTEN_OFF`, or `REFUNDED` are skipped entirely and keep whatever bucket they last had. The same run expires stale scheduled visits as described in §3.6 and refreshes the study's `delinquent_sponsor_cents`. The run answers with the `study_id`, the `run_date` it snapshotted, a `charges_aged_count`, a `visits_missed_count`, a `delinquent_charge_count`, and the resulting `delinquent_sponsor_cents`.
+
+An external payer audit begins when an `AuditLiaison` opens a finding against a study, and optionally against one of its charges, with a `finding_type` of `IMPROPER_PAYER_BILL`, `MISSING_REGISTRY_NUMBER`, or `UNSUPPORTED_ROUTINE_CLASSIFICATION`, and a `claimed_amount_cents` of at least zero asserting what was improperly billed. Study-level findings such as `MISSING_REGISTRY_NUMBER` leave `charge_id` null. The finding opens at `status` `OPEN` with `response_narrative` null and `refund_amount_cents` at zero, and the acting user recorded in `opened_by_user_id`. Opening a finding raises the study's `open_finding_count` by one, which by clause 1 of the posture rule drives the posture straight to `ALL_BLOCKED` and freezes both charge review and invoice submission for that study; the study's `version` increments.
+
+A different liaison files the billing office's `response_narrative`, moving the finding `OPEN → RESPONDED` and stamping `responded_by_user_id`; the opener attempting it is `ERR_SEGREGATION_OF_DUTIES`, and responding to anything not `OPEN` is `ERR_FINDING_NOT_OPEN`. Resolution then takes a `disposition` and forks into two disjoint outcomes; resolving a finding that is not `RESPONDED` is `ERR_FINDING_NOT_RESPONDED`.
+
+A `disposition` of `NO_ACTION` moves the finding `RESPONDED → CLOSED_NO_ACTION`, leaves `refund_amount_cents` at zero, and mutates no charge whatsoever. The study's `open_finding_count` drops by one and the posture is recomputed, which is how a study with no other findings and no rebuild-required calendar returns to `OPEN` or to `PAYER_BLOCKED`.
+
+A `disposition` of `REFUND_AND_REROUTE` moves the finding `RESPONDED → CLOSED_REFUNDED` and requires the finding to name a charge whose `billing_state` is `BILLED_PAYER`; a finding with no `charge_id`, or one whose charge is in any other billing state, is refused with `ERR_CHARGE_NOT_BILLED_TO_PAYER`. On success the finding's `refund_amount_cents` is set to the charge's `amount_cents`, and a chain of four consequences runs. The linked charge moves `BILLED_PAYER → REFUNDED`, which is terminal, and its `refunded_amount_cents` is set to its own `amount_cents`. A replacement charge is then created carrying `source` `REFUND_REPLACEMENT` and `replaces_charge_id` pointing at the refunded row, copying that row's `charge_code`, `service_date`, `amount_cents`, `study_id`, and `coverage_item_id`, opening at `routing_state` `ROUTED_SPONSOR` and `billing_state` `UNBILLED` with `unbilled_since` set to the current logical instant and `hold_reason` `NONE` — so the money moves off the payer and onto the sponsor's invoiceable pool in the same request. The study's `payer_billed_cents` and `payer_refunded_cents` are recomputed (their sum invariant across the refund), along with `sponsor_unbilled_cents`, the charges' `improper_flag`, and the study's `improper_payer_exposure_cents`. Finally `open_finding_count` drops by one and the posture is recomputed. The finding's `version`, the study's `version`, and the affected charges' `version` all increment. Because the budget dimension of a study still accepts this recompute after accrual has closed, a refund can be processed against a `CLOSED_TO_ACCRUAL` protocol.
+
+## 4. Endpoint Definitions
+
+Operations that bring a genuinely new resource into existence — registering a protocol, opening an analysis revision, adding an item, starting a calendar generation, adding a visit or a charge route, registering a subject, scheduling a visit, posting a charge, raising an invoice, opening a finding, filing an amendment — answer with `201 Created`. Every other operation, including all reads and every action that transitions or recomputes an existing resource, answers with `200 OK`. Reconstructing the request body for any action endpoint below means reading the §3 narrative that governs it; this table intentionally records only the HTTP contract.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/research-billing/studies` | Register a protocol in the research billing office | ResearchBillingManager |
+| GET | `/research-billing/studies` | List studies, optionally filtered by lifecycle status or by the analysis the current budget was built from | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/studies/{id}` | Read one study including all computed ledger and posture fields | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| POST | `/research-billing/studies/{id}/qct-determination` | Record or re-record the Medicare qualifying-clinical-trial determination and the registry number it depends on | ComplianceReviewer |
+| POST | `/research-billing/studies/{id}/budget-build` | Build the sponsor budget from an approved coverage analysis under the coverage-driven or calendar-driven variant | ResearchBillingManager |
+| POST | `/research-billing/studies/{id}/budget-execute` | Execute the built budget under segregation of duties | ResearchBillingManager |
+| POST | `/research-billing/studies/{id}/accrual` | Open or close the protocol to accrual | ResearchBillingManager |
+| GET | `/research-billing/studies/{id}/charge-review-summary` | Computed read: the billing office's segregation dashboard for one study | ComplianceReviewer, ResearchBillingManager, AuditLiaison |
+| GET | `/research-billing/studies/{id}/sponsor-invoices` | List the sponsor invoices raised for one study | ResearchBillingManager, ComplianceReviewer, AuditLiaison |
+| GET | `/research-billing/studies/{id}/amendments` | List the protocol amendments filed against one study | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, AuditLiaison |
+| POST | `/research-billing/coverage-analyses` | Open a coverage analysis revision for a protocol | CoverageAnalyst |
+| GET | `/research-billing/coverage-analyses` | List coverage analyses by study, by the analysis they supersede, or by status | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/coverage-analyses/{id}` | Read one coverage analysis with its classification counters | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/coverage-analyses/{id}/items` | List the coverage grid of one analysis revision | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| POST | `/research-billing/coverage-items` | Add one immutable item to a draft or returned analysis | CoverageAnalyst |
+| POST | `/research-billing/coverage-analyses/{id}/submit` | Send a draft analysis to compliance review | CoverageAnalyst |
+| POST | `/research-billing/coverage-analyses/{id}/return` | Return an analysis under review to the analyst | ComplianceReviewer |
+| POST | `/research-billing/coverage-analyses/{id}/approve` | Approve an analysis under review | ComplianceReviewer |
+| POST | `/research-billing/study-calendars` | Start a new EHR study-calendar generation from an approved analysis | CoverageAnalyst |
+| GET | `/research-billing/study-calendars` | List study calendars by study, source analysis or status | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/study-calendars/{id}` | Read one calendar generation with its routing completeness counters | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/study-calendars/{id}/visits` | List the visits of one calendar generation | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| POST | `/research-billing/calendar-visits` | Add a visit to a draft calendar | CoverageAnalyst |
+| POST | `/research-billing/visit-charge-routes` | Link a coverage item to a calendar visit so the EHR routes its charge on that visit | CoverageAnalyst |
+| GET | `/research-billing/visit-charge-routes` | List visit-linked charge routes by visit or by coverage item | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/visit-charge-routes/{id}` | Read one visit-linked charge route | ResearchBillingManager, ComplianceReviewer, CoverageAnalyst, StudyCoordinator, AuditLiaison |
+| POST | `/research-billing/study-calendars/{id}/publish` | Publish a draft calendar into the EHR and retire earlier generations | ComplianceReviewer |
+| POST | `/research-billing/study-subjects` | Register a screening subject on a protocol open to accrual | StudyCoordinator |
+| GET | `/research-billing/study-subjects` | List subjects by study, by pinned consented calendar, or by status | StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison |
+| GET | `/research-billing/study-subjects/{id}` | Read one subject with its pinned calendar generation | StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison |
+| POST | `/research-billing/study-subjects/{id}/consent` | Record informed consent and pin the study's published calendar generation | StudyCoordinator |
+| POST | `/research-billing/subject-visits` | Schedule a calendar visit for a consented subject | StudyCoordinator |
+| GET | `/research-billing/subject-visits` | List subject visits by subject, by calendar visit, or by status | StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison |
+| GET | `/research-billing/subject-visits/{id}` | Read one subject visit | StudyCoordinator, ResearchBillingManager, ComplianceReviewer, AuditLiaison |
+| POST | `/research-billing/subject-visits/{id}/complete` | Record that the visit occurred and drop one charge per visit-linked charge route | StudyCoordinator |
+| POST | `/research-billing/charges` | Post a charge from the EHR charge interface, with or without a visit link | StudyCoordinator |
+| GET | `/research-billing/charges` | List charges by study, visit, coverage item, invoice, replaced charge, routing state, billing state or aging bucket | ComplianceReviewer, ResearchBillingManager, StudyCoordinator, AuditLiaison |
+| GET | `/research-billing/charges/{id}` | Read one charge including both state dimensions, the aging snapshot and the improper flag | ComplianceReviewer, ResearchBillingManager, StudyCoordinator, AuditLiaison |
+| POST | `/research-billing/charges/{id}/review` | Charge review: route an unrouted charge to the payer, hold it for the sponsor, or write it off as promotional | ComplianceReviewer |
+| POST | `/research-billing/sponsor-invoices` | Raise a draft sponsor invoice and select its lines under the waterfall selector | ResearchBillingManager |
+| POST | `/research-billing/sponsor-invoices/{id}/submit` | Submit a draft invoice to the sponsor, or re-submit a disputed one after re-selecting lines | ResearchBillingManager |
+| POST | `/research-billing/sponsor-invoices/{id}/remittance` | Record the sponsor's response: paid in full, short paid, or disputed | ResearchBillingManager |
+| POST | `/research-billing/audit-findings` | Open an audit finding against a study or one of its charges | AuditLiaison |
+| GET | `/research-billing/audit-findings` | List audit findings by study, by charge or by status | AuditLiaison, ComplianceReviewer, ResearchBillingManager |
+| GET | `/research-billing/audit-findings/{id}` | Read one audit finding | AuditLiaison, ComplianceReviewer, ResearchBillingManager |
+| POST | `/research-billing/audit-findings/{id}/respond` | File the billing office's response under segregation of duties | AuditLiaison |
+| POST | `/research-billing/audit-findings/{id}/resolve` | Close a responded finding by refunding and re-routing the improperly billed claim, or with no action | AuditLiaison |
+| POST | `/research-billing/amendments` | File a protocol amendment | ResearchBillingManager |
+| POST | `/research-billing/amendments/{id}/implement` | Implement an effective amendment, firing the five-link re-analysis and calendar-rebuild cascade | ResearchBillingManager |
+| POST | `/research-billing/_ops/aging-run` | Advance the unbilled-charge aging epoch for one study and expire visits past their window | ResearchBillingManager |
+| POST | `/research-billing/_clock/set_current_utc` | Test-driving endpoint: set the server's logical clock | ResearchBillingManager |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_INVALID_PAGINATION` | 400 Bad Request |
+| `ERR_STUDY_NOT_FOUND` | 404 Not Found |
+| `ERR_ANALYSIS_NOT_FOUND` | 404 Not Found |
+| `ERR_COVERAGE_ITEM_NOT_FOUND` | 404 Not Found |
+| `ERR_CALENDAR_NOT_FOUND` | 404 Not Found |
+| `ERR_CALENDAR_VISIT_NOT_FOUND` | 404 Not Found |
+| `ERR_ROUTE_NOT_FOUND` | 404 Not Found |
+| `ERR_SUBJECT_NOT_FOUND` | 404 Not Found |
+| `ERR_SUBJECT_VISIT_NOT_FOUND` | 404 Not Found |
+| `ERR_CHARGE_NOT_FOUND` | 404 Not Found |
+| `ERR_INVOICE_NOT_FOUND` | 404 Not Found |
+| `ERR_FINDING_NOT_FOUND` | 404 Not Found |
+| `ERR_AMENDMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_STALE_STUDY_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_COVERAGE_ANALYSIS_VERSION` | 412 Precondition Failed |
+| `ERR_INVALID_STATE_TRANSITION` | 409 Conflict |
+| `ERR_ANALYSIS_NOT_EDITABLE` | 409 Conflict |
+| `ERR_ANALYSIS_NOT_UNDER_REVIEW` | 409 Conflict |
+| `ERR_CALENDAR_NOT_DRAFT` | 409 Conflict |
+| `ERR_CHARGE_ALREADY_ROUTED` | 409 Conflict |
+| `ERR_CHARGE_NOT_BILLED_TO_PAYER` | 409 Conflict |
+| `ERR_INVOICE_NOT_SUBMITTABLE` | 409 Conflict |
+| `ERR_FINDING_NOT_OPEN` | 409 Conflict |
+| `ERR_FINDING_NOT_RESPONDED` | 409 Conflict |
+| `ERR_AMENDMENT_NOT_SUBMITTED` | 409 Conflict |
+| `ERR_SUBJECT_NOT_SCREENING` | 409 Conflict |
+| `ERR_STUDY_NOT_OPEN_TO_ACCRUAL` | 409 Conflict |
+| `ERR_BUDGET_NOT_EXECUTED` | 409 Conflict |
+| `ERR_CALENDAR_NOT_PUBLISHED` | 409 Conflict |
+| `ERR_STALE_CALENDAR_GENERATION` | 409 Conflict |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_QCT_BASIS_UNSUPPORTED` | 422 Unprocessable Entity |
+| `ERR_REGISTRY_NUMBER_REQUIRED` | 422 Unprocessable Entity |
+| `ERR_QCT_DOWNGRADE_BLOCKED` | 409 Conflict |
+| `ERR_ROUTINE_CARE_REQUIRES_QCT` | 422 Unprocessable Entity |
+| `ERR_QCT_DETERMINATION_REQUIRED` | 409 Conflict |
+| `ERR_STUDY_BILLING_BLOCKED` | 409 Conflict |
+| `ERR_PAYER_BILLING_BLOCKED_NO_QCT` | 409 Conflict |
+| `ERR_NO_EFFECTIVE_ANALYSIS` | 409 Conflict |
+| `ERR_CHARGE_CODE_NOT_IN_COVERAGE_ANALYSIS` | 422 Unprocessable Entity |
+| `ERR_ITEM_ANALYSIS_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_CALENDAR_VISIT_NOT_ON_CONSENTED_CALENDAR` | 422 Unprocessable Entity |
+| `ERR_ROUTING_CONTRADICTS_COVERAGE` | 422 Unprocessable Entity |
+| `ERR_DUPLICATE_PROTOCOL_NUMBER` | 409 Conflict |
+| `ERR_DUPLICATE_ITEM_CODE` | 409 Conflict |
+| `ERR_DUPLICATE_SEQUENCE_INDEX` | 409 Conflict |
+| `ERR_DUPLICATE_VISIT_ROUTE` | 409 Conflict |
+| `ERR_DUPLICATE_SUBJECT_NUMBER` | 409 Conflict |
+| `ERR_OPEN_ANALYSIS_EXISTS` | 409 Conflict |
+| `ERR_RETURN_LIMIT_EXCEEDED` | 409 Conflict |
+| `ERR_PROMOTIONAL_MUST_BE_ZERO_COST` | 422 Unprocessable Entity |
+| `ERR_INVOICEABLE_ITEM_NOT_VISIT_ROUTABLE` | 422 Unprocessable Entity |
+| `ERR_UNROUTED_PER_PATIENT_ITEM` | 422 Unprocessable Entity |
+| `ERR_VISIT_WINDOW_OVERLAP` | 409 Conflict |
+| `ERR_VISIT_DATE_OUTSIDE_WINDOW` | 422 Unprocessable Entity |
+| `ERR_AMENDMENT_NOT_YET_EFFECTIVE` | 409 Conflict |
+| `ERR_RESEARCH_VISIT_DAILY_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_NO_PUBLISHED_CALENDAR_FOR_BASIS` | 422 Unprocessable Entity |
+| `ERR_NO_INVOICEABLE_CHARGES` | 409 Conflict |
+| `ERR_REMITTANCE_AMOUNT_INVALID` | 422 Unprocessable Entity |

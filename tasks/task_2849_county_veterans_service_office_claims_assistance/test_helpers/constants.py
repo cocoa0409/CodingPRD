@@ -1,0 +1,288 @@
+"""
+Domain constants for the County Veterans Service Office API.
+
+Every value here is copied from the PRD; nothing is invented. Where the PRD
+names a literal string the server stamps onto a row, the literal is reproduced
+exactly.
+"""
+
+# ─── Mount point and clock ────────────────────────────
+
+API_PREFIX = "/cvso"
+
+# "The clock's startup value is exactly 2026-08-01T00:00:00Z."
+CLOCK_START_INSTANT = "2026-08-01T00:00:00.000Z"
+CLOCK_START_DATE = "2026-08-01"
+
+# ─── Roles ────────────────────────────────────────────
+
+ROLE_SYSTEM_ADMIN = "SystemAdmin"
+ROLE_INTAKE_CLERK = "IntakeClerk"
+ROLE_COUNTY_OFFICER = "CountyOfficer"
+ROLE_STATE_AUDITOR = "StateAuditor"
+ROLE_VETERAN_CLIENT = "VeteranClient"
+
+ALL_ROLES = [
+    ROLE_SYSTEM_ADMIN,
+    ROLE_INTAKE_CLERK,
+    ROLE_COUNTY_OFFICER,
+    ROLE_STATE_AUDITOR,
+    ROLE_VETERAN_CLIENT,
+]
+
+# ─── Accreditation registry ───────────────────────────
+
+ACCREDITATION_TYPES = ["COUNTY_CVSO", "VSO_ORG", "ATTORNEY", "CLAIMS_AGENT"]
+ACCREDITATION_STATUSES = ["PENDING", "ACTIVE", "LAPSED", "REVOKED"]
+
+# "their active_poa_count must be strictly less than the 40-designation ceiling"
+POA_CEILING = 40
+
+# "the caller supplies ce_credits, which must be at least 12"
+CE_CREDITS_MINIMUM = 12
+
+# Caseload weight point schedule (§3.1).
+CASELOAD_POINTS_PER_ACTIVE_POA = 1
+CASELOAD_POINTS_EVIDENCE_DEVELOPMENT = 3
+CASELOAD_POINTS_PEER_REVIEW = 5
+CASELOAD_POINTS_READY_TO_FILE = 2
+CASELOAD_POINTS_FILED = 4
+CASELOAD_POINTS_PLANNED_OUTREACH = 2
+
+# Automatic assignment selector admits only these two channels.
+AUTO_ASSIGNABLE_ACCREDITATION_TYPES = ["COUNTY_CVSO", "VSO_ORG"]
+
+# ─── Intake ───────────────────────────────────────────
+
+INTAKE_STATUSES = ["INTAKE_STARTED", "SCREENED", "ACTIVE", "INACTIVE", "DECEASED"]
+HOMELESS_STATUSES = ["NOT_HOMELESS", "AT_RISK", "SHELTERED", "UNSHELTERED"]
+REFERRAL_SOURCES = [
+    "WALK_IN",
+    "OUTREACH_EVENT",
+    "JAIL_INREACH",
+    "SHELTER_REFERRAL",
+    "STATE_HOTLINE",
+]
+CHARACTERS_OF_SERVICE = [
+    "HONORABLE",
+    "GENERAL",
+    "OTHER_THAN_HONORABLE",
+    "BAD_CONDUCT",
+    "DISHONORABLE",
+    "UNCHARACTERIZED",
+]
+DOCUMENT_TYPES = ["DD214", "NGB22", "DD215", "STATEMENT_OF_SERVICE"]
+DOCUMENT_SOURCES = ["VETERAN_PROVIDED", "NPRC_RESPONSE", "STATE_ARCHIVE"]
+DISCHARGE_DOC_STATUSES = [
+    "NOT_SUBMITTED",
+    "PENDING_VERIFICATION",
+    "VERIFIED",
+    "DISCREPANCY_HELD",
+    "REJECTED",
+]
+
+# "28 February 1961 through 7 May 1975, 2 August 1990 through 11 April 1991,
+#  and 11 September 2001 through 30 August 2021"
+WARTIME_WINDOWS = [
+    ("1961-02-28", "1975-05-07"),
+    ("1990-08-02", "1991-04-11"),
+    ("2001-09-11", "2021-08-30"),
+]
+
+# ─── Screening ────────────────────────────────────────
+
+BASIC_ELIGIBILITY_CHARACTERS = ["HONORABLE", "GENERAL"]
+
+INCOME_LIMIT_BASE_CENTS = 1884000
+INCOME_LIMIT_PER_DEPENDENT_CENTS = 483000
+NET_WORTH_LIMIT_CENTS = 15506000
+PENSION_WARTIME_MINIMUM_DAYS = 90
+
+SCREEN_CATEGORY_KEYS = [
+    "DISABILITY_COMPENSATION",
+    "PENSION",
+    "DEPENDENCY_INDEMNITY",
+    "STATE_PROPERTY_TAX_EXEMPTION",
+    "STATE_TUITION_WAIVER",
+    "BURIAL_BENEFIT",
+]
+
+PRIORITY_GROUPS = ["P1", "P2", "P3", "P4"]
+
+# ─── Designations ─────────────────────────────────────
+
+POA_FORM_TYPES = ["VA_21_22", "VA_21_22A"]
+POA_SCOPES = ["ALL_BENEFITS", "SPECIFIC_CLAIM"]
+POA_STATUSES = ["OFFERED", "ACTIVE", "REVOKED", "SUPERSEDED"]
+
+# ─── Claims ───────────────────────────────────────────
+
+CLAIM_TYPES = [
+    "DISABILITY_COMPENSATION",
+    "PENSION",
+    "DEPENDENCY_INDEMNITY",
+    "SURVIVOR_PENSION",
+]
+CLAIM_STATUSES = [
+    "DRAFT",
+    "EVIDENCE_DEVELOPMENT",
+    "PEER_REVIEW",
+    "READY_TO_FILE",
+    "FILED",
+    "DECIDED",
+    "WITHDRAWN",
+]
+
+# "requires evidence_completeness_pct to be at least the ready-to-file
+#  threshold of 80.00 percent"
+READY_TO_FILE_THRESHOLD_PCT = 80.00
+
+MAX_CLAIMED_CONDITIONS = 8
+MIN_CLAIMED_CONDITIONS = 1
+
+# ─── Evidence ─────────────────────────────────────────
+
+EVIDENCE_TYPES = [
+    "SERVICE_TREATMENT_RECORD",
+    "PRIVATE_MEDICAL",
+    "VA_MEDICAL",
+    "LAY_STATEMENT",
+    "NEXUS_LETTER",
+    "DBQ",
+]
+EVIDENCE_STATUSES = ["REQUESTED", "RECEIVED", "INSUFFICIENT", "WAIVED"]
+
+EVIDENCE_BASE_WEIGHTS = {
+    "SERVICE_TREATMENT_RECORD": 20.0,
+    "PRIVATE_MEDICAL": 12.5,
+    "VA_MEDICAL": 12.5,
+    "LAY_STATEMENT": 6.0,
+    "NEXUS_LETTER": 22.5,
+    "DBQ": 17.5,
+}
+
+NEXUS_STRENGTHS = ["NONE", "POSSIBLE", "AT_LEAST_AS_LIKELY_AS_NOT", "HIGHLY_PROBABLE"]
+
+NEXUS_MULTIPLIERS = {
+    "NONE": 1.00,
+    "POSSIBLE": 1.00,
+    "AT_LEAST_AS_LIKELY_AS_NOT": 1.15,
+    "HIGHLY_PROBABLE": 1.30,
+}
+
+WAIVED_CREDIT_FACTOR = 0.5
+LATE_TIMELINESS_FACTOR = 0.85
+ON_TIME_TIMELINESS_FACTOR = 1.00
+TIMELINESS_WINDOW_DAYS = 30
+
+REQUIRED_POINTS_BASE = 40
+REQUIRED_POINTS_PER_CONDITION = 15
+
+# ─── Examination sites and appointments ───────────────
+
+DEFAULT_BUFFER_MINUTES = 15
+DEFAULT_CONCURRENT_CAPACITY = 2
+MAX_BUFFER_MINUTES = 120
+MIN_CONCURRENT_CAPACITY = 1
+
+APPOINTMENT_STATUSES = ["SCHEDULED", "COMPLETED", "NO_SHOW", "CANCELLED"]
+
+# ─── Decisions ────────────────────────────────────────
+
+DECISION_OUTCOMES = ["GRANTED", "PARTIAL_GRANT", "DENIED"]
+FAVORABLE_DECISION_OUTCOMES = ["GRANTED", "PARTIAL_GRANT"]
+
+EFFECTIVE_DATE_BASES = ["INTENT_TO_FILE_ANCHORED", "FILED_DATE_ANCHORED"]
+
+# "a gap of exactly 365 days still anchors on the intent to file"
+INTENT_TO_FILE_ANCHOR_MAX_DAYS = 365
+
+# Statutory monthly rate schedule in integer cents.
+MONTHLY_RATE_CENTS = {
+    0: 0,
+    10: 17500,
+    20: 34600,
+    30: 53700,
+    40: 77400,
+    50: 110200,
+    60: 139500,
+    70: 175900,
+    80: 204400,
+    90: 229800,
+    100: 383100,
+}
+
+DEPENDENT_ADD_ON_CENTS = 8200
+DEPENDENT_ADD_ON_CAP = 3
+DEPENDENT_ADD_ON_RATING_FLOOR = 30
+
+# ─── Decision reviews ─────────────────────────────────
+
+REVIEW_LANES = [
+    "HIGHER_LEVEL_REVIEW",
+    "SUPPLEMENTAL_CLAIM",
+    "BOARD_APPEAL_DIRECT",
+    "BOARD_APPEAL_EVIDENCE",
+    "BOARD_APPEAL_HEARING",
+]
+REVIEW_STATUSES = ["COUNSELED", "ELECTED", "FILED", "WITHDRAWN", "EXPIRED"]
+
+# "deadline_on is decision_notice_date plus 365 days"
+APPEAL_WINDOW_DAYS = 365
+
+# ─── State programs and applications ──────────────────
+
+PROGRAM_TYPES = ["PROPERTY_TAX_EXEMPTION", "TUITION_WAIVER", "BURIAL_BENEFIT"]
+DETERMINATION_STATUSES = ["SUBMITTED", "APPROVED", "DENIED"]
+DISBURSEMENT_STATUSES = ["NOT_APPLICABLE", "PENDING", "ISSUED", "CLAWED_BACK"]
+
+# Exemption rate bands, first match from the top.
+EXEMPTION_RATE_BANDS = [(100, 1.00), (70, 0.60), (50, 0.40), (30, 0.25)]
+EXEMPTION_RATE_FLOOR = 0.00
+
+TUITION_CREDIT_UNIT_COST_CENTS = 45000
+BURIAL_FLAT_ALLOWANCE_CENTS = 90000
+MAX_TUITION_CREDITS = 30
+
+# Administration fee bands, keyed on the gross award.
+ADMIN_FEE_BANDS = [(5000000, 0.02), (2000000, 0.01)]
+ADMIN_FEE_FLOOR_RATE = 0.00
+
+PROGRAM_WARTIME_MINIMUM_DAYS = 90
+
+MIN_FISCAL_YEAR = 2020
+MAX_FISCAL_YEAR = 2100
+
+# ─── Outreach ─────────────────────────────────────────
+
+OUTREACH_EVENT_TYPES = [
+    "HOMELESS_STANDDOWN",
+    "RURAL_CLINIC",
+    "TRIBAL_OUTREACH",
+    "JAIL_INREACH",
+]
+OUTREACH_STATUSES = ["PLANNED", "HELD", "CANCELLED"]
+
+# "30 minutes reserved before starts_at and 30 minutes after ends_at"
+OUTREACH_TRAVEL_BUFFER_MINUTES = 30
+
+# ─── Outcome reports ──────────────────────────────────
+
+REPORT_STATUSES = ["OPEN", "SUBMITTED", "RETURNED", "ACCEPTED"]
+WEIGHTING_BASES = ["CLAIM_WEIGHTED", "VETERAN_WEIGHTED"]
+
+# ─── Literal reason strings the server stamps ─────────
+
+REASON_REPRESENTATIVE_ACCREDITATION_REVOKED = "REPRESENTATIVE_ACCREDITATION_REVOKED"
+REASON_REPRESENTATION_CASCADE = "REPRESENTATION_CASCADE"
+REASON_CLAIM_WITHDRAWN = "CLAIM_WITHDRAWN"
+REASON_CLAIMANT_DECEASED = "CLAIMANT_DECEASED"
+REASON_RATING_REDUCED = "RATING_REDUCED_BELOW_PROGRAM_MINIMUM"
+REASON_DEADLINE_SWEEP = "DEADLINE_SWEEP"
+
+# ─── Pagination ───────────────────────────────────────
+
+DEFAULT_LIMIT = 10
+DEFAULT_OFFSET = 0
+MIN_LIMIT = 1
+MAX_LIMIT = 100

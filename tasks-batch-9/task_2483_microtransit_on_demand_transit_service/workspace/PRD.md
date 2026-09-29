@@ -1,0 +1,510 @@
+# Microtransit On-Demand API — Product Requirements Document
+
+## 1. Introduction
+
+Fixed-route transit leaves gaps. Low-density neighbourhoods, late-evening shifts and the first and last mile between a rider's door and a rail platform are all poorly served by a timetable that assumes dense, predictable corridors. Our answer is a microtransit service: a fleet of small vehicles operating inside a defined service zone, picking riders up at *virtual stops* placed along a corridor, pooling compatible trips into shared rides, and timing arrivals to the rail and bus departures riders actually need to catch. This document specifies the backend API that runs that service end to end — zone and stop planning, demand forecasting and fleet sizing, real-time matching, the driver's manifest, fare settlement with transfer credits and fare caps, and the subsidy-per-trip reporting we owe the funding agency that pays for the difference.
+
+Three pressures shape almost every rule that follows. The first is **equity of service**: a rider who uses a wheelchair must wait no meaningfully longer than an ambulatory rider, and the system measures that continuously rather than asserting it. The second is **cost accountability**: the agency funds us per trip, so every revenue hour we schedule and every cent we collect must be reconstructable from the ledger months later, which forces an append-only fare ledger and a segregation of duties between the staff who file subsidy reports and the auditors who certify them. The third is **determinism**: dispatch decisions, transfer windows, curb congestion and fare-cap periods all depend on time, and a service that cannot be replayed cannot be audited. Every travel time in this system is therefore a deterministic function of corridor position, and every "now" is read from a server-side logical clock rather than wall-clock time.
+
+Readers should treat Section 2 as the fixed contract — headers, envelopes, pagination, rounding, concurrency and the order in which rejections are evaluated — and Section 3 as the operating manual, which is where the domain rules actually live. Sections 4 and 5 are indexes back into that narrative, not substitutes for it.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the caller, and `X-User-Role`, naming the capability set the caller is acting under. If either header is absent or present but empty, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401) before anything else is examined.
+
+The system recognises exactly six roles, spelled exactly as follows:
+
+- **`ZoneAdmin`** — the service planner. Defines service zones, places and approves virtual stops, registers fixed-route connections, onboards vehicles, drivers and rider accounts, and publishes demand forecasts.
+- **`Dispatcher`** — the operations controller. Schedules, opens, closes and cancels vehicle blocks, drives real-time matching, dispatches offers by hand, cancels trips and issues fare refunds.
+- **`Rider`** — a passenger acting on their own account, able to request and cancel their own trips only.
+- **`DriverUser`** — a driver acting on their own roster, able to accept, decline, board and complete offers on blocks they are rostered on.
+- **`FinanceAnalyst`** — operator finance staff who prepare, file and amend subsidy-per-trip reports. A `FinanceAnalyst` may never certify a report.
+- **`FundingAgencyAuditor`** — the funding agency's reviewer, who certifies or rejects filed reports. A `FundingAgencyAuditor` may never prepare, file or amend one.
+
+If `X-User-Role` is not one of those six strings, or is one of them but is not among the roles authorised for the endpoint being called (see the Authorized Role(s) column in Section 4), the request is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+How `X-User-ID` is interpreted depends on the role, and the distinction matters because two of the six roles are tied to persisted records:
+
+- When `X-User-Role` is `Rider`, `X-User-ID` is the `id` of the acting `Rider` row; ownership checks on any resource that references a `Rider` compare the resource's rider foreign key to `X-User-ID`.
+- When `X-User-Role` is `DriverUser`, `X-User-ID` is the `id` of the acting `Driver` row; ownership checks on any resource that references a `Driver` compare the resource's driver foreign key to `X-User-ID`.
+- When `X-User-Role` is `ZoneAdmin`, `Dispatcher`, `FinanceAnalyst` or `FundingAgencyAuditor`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it — for instance as `submitted_by_user_id` or `certified_by_user_id` on a subsidy report — but never compares it to any entity's `id`.
+
+For the two entity-backed roles, the identifier must resolve. A caller acting as `Rider` whose `X-User-ID` does not name an existing `Rider` row, or acting as `DriverUser` whose `X-User-ID` does not name an existing `Driver` row, is rejected with `ERR_IDENTITY_NOT_FOUND` (HTTP 403).
+
+Ownership is then enforced on nine operations. A `Rider` may create a trip request only for themselves (the `rider_id` in the payload must equal `X-User-ID`), may cancel only their own trip, and may read only a trip request, a pool assignment or a fare-ledger row that belongs to them. A `DriverUser` may accept, decline, board or complete only an assignment whose block names them as driver, and may read only such an assignment. Concretely, the ownership check guards trip-request creation, trip cancellation, offer acceptance, offer decline, boarding, completion, single trip-request reads, single pool-assignment reads and single fare-transaction reads. Any violation is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403).
+
+One further access rule is structural rather than per-resource: the operator identifier that filed a subsidy report can never be the one that certifies it. That segregation of duties is described in Section 3.9 and rejects with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every collection listing accepts two query parameters. `limit` controls page size: its default is 10, its minimum accepted value is 1, and its maximum accepted value is 100. `offset` controls the starting position: its default is 0 and its minimum accepted value is 0. A value outside those bounds is a request-shape violation and is rejected with `ERR_INVALID_REQUEST` (HTTP 422).
+
+Every list endpoint returns its rows sorted by `created_at` in ascending order. The `meta` object of a list response carries `limit` (the effective page size), `offset` (the effective starting position), `total_count` (the number of rows matching the filters before pagination) and `has_more` (true when rows remain beyond the current page).
+
+Beyond `limit` and `offset`, each collection accepts a set of equality filters, all optional and combinable:
+
+- Service zones filter on `status`.
+- Virtual stops filter on `zone_id`, `paired_stop_id`, `status` and `accessibility`.
+- Transit connections filter on `zone_id`, `stop_id` and `mode`.
+- Vehicles filter on `zone_id`, `status` and `is_wav`.
+- Drivers filter on `zone_id`, `status` and `wav_certified`.
+- Riders filter on `zone_id`, `fare_category` and `mobility_device`.
+- Demand forecasts filter on `zone_id` and `state`.
+- Vehicle blocks filter on `zone_id`, `vehicle_id`, `driver_id`, `state` and `block_type`.
+- Trip requests filter on `zone_id`, `rider_id`, `origin_stop_id`, `destination_stop_id`, `connection_id`, `assigned_block_id`, `status`, `fare_status` and `wav_required`.
+- Pool assignments filter on `block_id`, `trip_request_id`, `state` and `offer_origin`.
+- Fare transactions filter on `trip_request_id`, `rider_id`, `kind` and `service_date`.
+- Subsidy reports filter on `zone_id`, `state` and `variant`.
+
+### 2.4. Common Resource Properties
+
+Eleven of the twelve resource types — service zones, virtual stops, transit connections, vehicles, drivers, riders, demand forecasts, vehicle blocks, trip requests, pool assignments and subsidy reports — carry the same four system-managed properties:
+
+- `id` (string): a server-minted UUID. It carries no type prefix and no domain-flavoured formatting.
+- `created_at` (string): the ISO 8601 UTC instant at which the row was first persisted, with three fractional digits.
+- `updated_at` (string): the ISO 8601 UTC instant of the row's most recent mutation, with three fractional digits, refreshed on every change to any of the resource's own properties — including changes to purely derived fields such as a zone's `avg_wait_minutes` or a block's `seats_committed`.
+- `version` (integer): a counter that starts at 1 when the row is created and increases by exactly 1 on every mutation of that row.
+
+The twelfth resource type, the fare transaction, is an append-only ledger row and is never modified after it is written. A fare transaction therefore carries only `id` and `created_at`; it has no `updated_at` field and no `version` field at all.
+
+Because the topology of this API is flat — every collection is addressed at the top level, and relationships are expressed by foreign-key fields rather than by nested URLs — path validation is short but still ordered. Where a path carries an identifier segment, that segment is resolved before any request body is inspected, and where more than one segment exists they are resolved strictly left to right, so the leftmost unresolvable segment determines which not-found code is returned. The twelve not-found codes are `ERR_SERVICE_ZONE_NOT_FOUND`, `ERR_VIRTUAL_STOP_NOT_FOUND`, `ERR_TRANSIT_CONNECTION_NOT_FOUND`, `ERR_VEHICLE_NOT_FOUND`, `ERR_DRIVER_NOT_FOUND`, `ERR_RIDER_NOT_FOUND`, `ERR_DEMAND_FORECAST_NOT_FOUND`, `ERR_VEHICLE_BLOCK_NOT_FOUND`, `ERR_TRIP_REQUEST_NOT_FOUND`, `ERR_POOL_ASSIGNMENT_NOT_FOUND`, `ERR_FARE_TRANSACTION_NOT_FOUND` and `ERR_SUBSIDY_REPORT_NOT_FOUND`, each returned with HTTP 404. The same twelve codes are reused when a foreign key supplied in a request body fails to resolve; in that case the fields are checked in the order the endpoint declares its inputs, so the first unresolvable reference in declared order decides the code.
+
+### 2.5. The Logical Clock
+
+Nothing in this service reads the operating system clock. Block windows, transfer buffers, curb-congestion buckets, service dates, fare-cap periods, promised pickups and every stamped timestamp all read a single server-side **logical clock**. At server start-up the logical clock reads exactly `2026-08-01T00:00:00Z`, and it continues to read that instant until it is moved; it never falls back to real wall-clock time.
+
+An administrative capability, available to `ZoneAdmin` and `Dispatcher` callers, sets the logical clock to an arbitrary instant supplied as `to_iso8601`. It responds with the new reading as `current_utc`. This capability exists so that the temporal behaviour of the whole system is replayable: setting the clock, opening a block, offering a trip and completing it will produce identical stamps every time.
+
+### 2.6. Corridor Geometry and the Travel-Time Model
+
+Every service zone in this system is modelled as a single corridor, and every virtual stop on it holds an integer `corridor_index` giving its position along that corridor. All travel time is derived from index distance: **one index step is three minutes of running time**. There is no geography, no wall-clock traffic model and no randomness anywhere in the travel-time computation, which is what makes matching decisions reproducible.
+
+The **baseline direct ride** of a trip is therefore three minutes multiplied by the absolute difference between the `corridor_index` of the destination stop and the `corridor_index` of the origin stop; that value is stored on the trip as `baseline_direct_minutes` and copied onto each offer.
+
+Pooling a new trip onto a block widens the block's corridor envelope, and the width of that envelope is what determines the detour. A block tracks the envelope in `committed_index_min` and `committed_index_max`, computed over the origin and destination stops of the block's assignments whose state is `OFFERED`, `ACCEPTED` or `ONBOARD`; assignments in `DECLINED`, `RELEASED` or `COMPLETED` never contribute. When a block currently holds none of those three states, both fields are null.
+
+To evaluate a candidate pairing of trip and block, the system computes a prospective envelope. If the block's `committed_index_min` is null, the prospective low end is the smaller and the prospective high end is the larger of the trip's own origin and destination indexes. Otherwise, the prospective low end is the smallest of the block's `committed_index_min`, the trip's origin index and the trip's destination index, and the prospective high end is the largest of the block's `committed_index_max`, the trip's origin index and the trip's destination index. The prospective envelope width in index steps is the high end minus the low end. The **projected detour** in minutes is three minutes multiplied by that envelope width, minus the trip's baseline direct ride; it is stored as `projected_detour_minutes` on both the trip and the offer.
+
+The zone decides how much detour a pooled rider must tolerate through two configuration fields. `detour_tolerance_pct` expresses the allowance as a fraction of the baseline direct ride, and `detour_tolerance_floor_minutes` expresses an absolute minimum allowance that wins whenever the percentage allowance would be smaller. The **detour allowance** is therefore the larger of `detour_tolerance_floor_minutes` and the baseline direct ride multiplied by `detour_tolerance_pct` rounded up to the next whole minute. That rounding-up is the only rounding applied anywhere in the corridor-geometry computation; every other quantity here is exact integer minutes.
+
+### 2.7. Numeric Precision and Rounding
+
+Rounding in this system is always **round half up**, and the number of places depends on what is being expressed:
+
+- **Money** is always whole integer cents. Fare quotes, settled charges, cap rebates, transfer credits, ledger amounts, operating costs and the subsidy per trip are all integers; no monetary field carries a fractional cent. In the fare computation, the half-up rounding to whole cents is applied exactly once — at the fare-category multiplication step — and nowhere else. In the subsidy computation, half-up rounding to whole cents is applied once per vehicle block and once more on the final division.
+- **Minute quantities** carried on trips and offers — `baseline_direct_minutes`, `projected_detour_minutes`, `wait_minutes`, `ride_minutes` and the detour allowance — are whole integers. Where a minute value derives from a difference between two instants, that difference in seconds is divided by 60 and rounded half up to the nearest whole minute.
+- **Block counts** produced by fleet sizing are whole integers, and both divisions in that rule round *up* to the next whole block rather than half up.
+- **Revenue hours** on a vehicle block — both `scheduled_revenue_hours` and `actual_revenue_hours` — are expressed in hours to exactly 2 decimal places, rounded half up.
+- **Zone performance means** — `avg_wait_minutes`, `avg_ride_minutes`, `wav_avg_wait_minutes`, `nonwav_avg_wait_minutes` and `boardings_per_revenue_hour` — are carried to exactly 2 decimal places, rounded half up.
+- **The wheelchair-accessible equivalence ratio** `wav_equivalence_ratio` is carried to exactly 3 decimal places, rounded half up.
+- **Configuration ratios** supplied by a planner — `detour_tolerance_pct` and `peak_factor` — are accepted with at most 2 decimal places and preserved as given.
+
+Match scores produced by the matching engine are plain integers and require no rounding.
+
+### 2.8. Stale-View Protection on Capacity-Bearing Writes
+
+Two write operations consume something that another writer may have consumed first, so both are guarded by optimistic concurrency control on the *parent* resource's `version`. In each case the version field is a required, non-optional element of the request body.
+
+A `POST /pool-assignments` request must carry `expected_vehicle_block_version` holding the client's last observed `version` of the target `VehicleBlock`. If that value does not equal the block's current `version`, the request is rejected with `ERR_STALE_VEHICLE_BLOCK_VERSION` (HTTP 412). The reason is concrete: an offer already placed on that block has consumed part of its seat and securement-position capacity and widened its corridor envelope, so the dispatcher's view of `seats_committed`, `wav_positions_committed`, `committed_index_min` and `committed_index_max` — the exact fields the capacity and detour checks read — is no longer the state the server holds.
+
+A `POST /demand-forecasts` request must carry `expected_service_zone_version` holding the client's last observed `version` of the target `ServiceZone`. If that value does not equal the zone's current `version`, the request is rejected with `ERR_STALE_SERVICE_ZONE_VERSION` (HTTP 412). A new forecast legitimately supersedes any published forecast whose window it overlaps, so a create issued from a stale view would silently retire fleet-sizing numbers the planner never saw.
+
+No other endpoint in this API accepts a version field of any kind. In particular, none of the state-transition operations, the trip-request intake, the vehicle-block create or any subsidy-report operation takes an expected-version input, and supplying one has no effect.
+
+### 2.9. Rejection Precedence
+
+Many operations are guarded by several checks at once, and which rejection a client sees is part of the contract. Checks are evaluated in the following fixed order, and the first one that fails determines the response; later checks are not evaluated at all.
+
+1. **Header presence.** `X-User-Role` and `X-User-ID` must both be present and non-empty, on every endpoint — otherwise `ERR_UNAUTHENTICATED`.
+2. **Role admission.** `X-User-Role` must be one of the six recognised role strings and must appear in the called endpoint's authorised set, on every endpoint — otherwise `ERR_ROLE_NOT_PERMITTED`.
+3. **Identity resolution.** On any endpoint called as `Rider` or `DriverUser`, `X-User-ID` must resolve to an existing rider row or driver row respectively — otherwise `ERR_IDENTITY_NOT_FOUND`.
+4. **Path existence.** On every endpoint with a path identifier, that identifier must resolve, checked left to right — otherwise the matching not-found code.
+5. **Body reference existence.** On every create endpoint that carries foreign keys — virtual-stop create, transit-connection create, vehicle create, driver create, rider create, demand-forecast create, vehicle-block create, trip-request create, pool-assignment create and subsidy-report create — each supplied foreign key must resolve, checked in the order the endpoint declares its inputs, otherwise the matching not-found code.
+6. **Ownership.** On the nine owned operations listed in Section 2.1 — otherwise `ERR_NOT_RESOURCE_OWNER`.
+7. **Request shape.** On every endpoint with a request body: required fields present, values of the declared type, enum values drawn from the declared members, every numeric range respected, and a trip request's `destination_stop_id` different from its `origin_stop_id` — otherwise `ERR_INVALID_REQUEST`.
+8. **Zone code uniqueness**, on service-zone create — otherwise `ERR_DUPLICATE_ZONE_CODE`.
+9. **Stop pairing validity**, on virtual-stop create — otherwise `ERR_PAIRED_STOP_INVALID`.
+10. **Reporting period ordering**, on subsidy-report create — otherwise `ERR_REPORT_PERIOD_INVALID`.
+11. **Declared transition.** On every state-transition operation — that is, every action endpoint of the form collection, identifier, action — the target resource must currently be in a state from which the requested transition is declared, and on pool-assignment create the trip must be in `RECEIVED` or `MATCHING` and the block must be `OPEN`. The rejection carries the code for the entity whose state is wrong: `ERR_INVALID_ZONE_STATE`, `ERR_INVALID_STOP_STATE`, `ERR_INVALID_VEHICLE_STATE`, `ERR_INVALID_DRIVER_STATE`, `ERR_INVALID_BLOCK_STATE`, `ERR_INVALID_TRIP_STATE`, `ERR_INVALID_ASSIGNMENT_STATE` or `ERR_INVALID_REPORT_STATE`.
+12. **Zone must be `ACTIVE`.** Trip-request intake, trip matching, pool-assignment create and vehicle-block open all require the touched zone to be `ACTIVE` — otherwise `ERR_ZONE_NOT_ACTIVE`.
+13. **Zone must be `DRAFT` or `ACTIVE`.** Virtual-stop create, transit-connection create, vehicle create, driver create, rider create, demand-forecast create, vehicle-block create and virtual-stop approve all require the zone to be in either `DRAFT` or `ACTIVE` — otherwise `ERR_ZONE_NOT_ACTIVE`.
+14. **Optimistic concurrency**, on pool-assignment create and demand-forecast create — otherwise `ERR_STALE_VEHICLE_BLOCK_VERSION` or `ERR_STALE_SERVICE_ZONE_VERSION` respectively.
+15. **Cross-zone consistency.** On virtual-stop create, transit-connection create, vehicle-block create, trip-request create and pool-assignment create, every referenced stop, connection, rider, vehicle, driver and block must belong to the same zone as the operation, and on pool-assignment create the trip's `zone_id` must equal the block's `zone_id` — otherwise `ERR_ZONE_MISMATCH`.
+16. **Segregation of duties**, on subsidy-report certify — otherwise `ERR_SEGREGATION_OF_DUTIES`.
+17. **Stops approved**, on trip-request create — otherwise `ERR_STOP_NOT_APPROVED`.
+18. **Walking-distance standard**, on virtual-stop approve — otherwise `ERR_WALK_DISTANCE_EXCEEDED`.
+19. **Stop accessibility**, on trip-request create — otherwise `ERR_STOP_NOT_ACCESSIBLE`.
+20. **Wheelchair-accessible dispatch capability**, on pool-assignment create — otherwise `ERR_WAV_UNAVAILABLE`.
+21. **Equivalent-service verdict**, on subsidy-report certify — otherwise `ERR_EQUIVALENCE_DEFICIENT`.
+22. **Vehicle occupation**, on vehicle-block create — otherwise `ERR_VEHICLE_BLOCK_OVERLAP`.
+23. **Driver rest buffer**, on vehicle-block create — otherwise `ERR_DRIVER_REST_BUFFER`.
+24. **Pickup inside the block window**, on pool-assignment create — otherwise `ERR_PICKUP_OUTSIDE_BLOCK_WINDOW`.
+25. **Transfer window**, on trip-request create — otherwise `ERR_TRANSFER_WINDOW_MISSED`.
+26. **Curb capacity**, on pool-assignment create — otherwise `ERR_CURB_CAPACITY_EXCEEDED`.
+27. **Reporting period overlap**, on subsidy-report create — otherwise `ERR_REPORT_PERIOD_OVERLAP`.
+28. **Detour tolerance**, on pool-assignment create — otherwise `ERR_DETOUR_TOLERANCE_EXCEEDED`.
+29. **Block has no active assignments**, on vehicle-block close and vehicle-block cancel — otherwise `ERR_BLOCK_HAS_ACTIVE_ASSIGNMENTS`.
+30. **Stop not in use**, on virtual-stop retire — otherwise `ERR_STOP_IN_USE`.
+31. **Trip has been charged**, on trip-request refund — otherwise `ERR_TRIP_NOT_CHARGED`.
+32. **Seat capacity**, on pool-assignment create — otherwise `ERR_SEAT_CAPACITY_EXCEEDED`.
+33. **Securement-position capacity**, on pool-assignment create — otherwise `ERR_WAV_POSITION_UNAVAILABLE`.
+34. **Peak-surge fleet sizing**, on vehicle-block open — otherwise `ERR_FLEET_SIZE_EXCEEDED`.
+35. **Blocks finalised**, on subsidy-report certify — otherwise `ERR_BLOCKS_NOT_FINALIZED`.
+
+Note what this ordering buys on the busiest endpoint in the system. Manual dispatch of a trip onto a block runs, in order: assignment-state legality, zone active, the block-version concurrency check, cross-zone consistency, wheelchair-accessible dispatch capability, the pickup-inside-window check, curb capacity, detour tolerance, seat capacity and finally securement-position capacity. A stale block version therefore surfaces as `ERR_STALE_VEHICLE_BLOCK_VERSION` rather than being masked by a capacity failure computed from the stale view, and a full vehicle reports `ERR_SEAT_CAPACITY_EXCEEDED` only when the detour was already acceptable. Similarly, certifying a subsidy report reports `ERR_SEGREGATION_OF_DUTIES` before `ERR_EQUIVALENCE_DEFICIENT`, and `ERR_EQUIVALENCE_DEFICIENT` before `ERR_BLOCKS_NOT_FINALIZED`.
+
+### 2.10. Cascades, Ordering and Version Propagation
+
+Several operations in this service touch more than one row, and the specification of a cascade is as binding as the specification of the primary write. Three principles govern all of them.
+
+**Consistency is immediate.** When an operation's cascade recomputes a derived field — a block's committed seat count, a zone's average wait, a rider's daily fare counter — that recomputation happens inside the same request, and the very next read observes the settled values. There is no deferred or eventual reconciliation anywhere in the system.
+
+**Cascades are ordered deterministically.** Whenever a cascade touches a set of rows rather than one row, the order is pinned so that replays produce identical results. Trip requests swept by a zone suspension and trip requests re-priced by a fare cap are processed in `created_at` ascending order. Pool assignments released by a block cancellation are processed in `created_at` ascending order. Vehicle blocks cancelled by a driver suspension are processed in `start_utc` ascending order and, among blocks sharing a start instant, in `created_at` ascending order. Stops whose pairing is broken by a retirement are processed in `created_at` ascending order.
+
+**Every mutated row advances.** Any row a request writes to — the primary target or a cascade victim — gets a fresh `updated_at` and a `version` one higher than before. That includes rows mutated purely as bookkeeping: when an offer is placed, the vehicle block's `version` advances because its committed capacity changed, and it is precisely that advance that makes a second dispatcher's cached block version stale under Section 2.8. When a demand forecast is published, the parent service zone's `version` advances as well.
+
+### 2.11. Zone Scoping and Referential Integrity
+
+A service zone is the boundary of everything operational. Virtual stops, transit connections, vehicles, drivers, rider accounts, demand forecasts, vehicle blocks, trip requests and subsidy reports all name their zone through a `zone_code`-bearing zone via the `zone_id` field, and an operation may never mix zones. When a virtual stop is created the referenced pairing stop must sit in the same zone; when a transit connection is created its `stop_id` must name a stop in the zone; when a block is created its `vehicle_id` and `driver_id` must both be rostered in the zone; when a trip is created its rider and both stops must belong to the zone, and its `connection_id`, when supplied, must too. When a trip is dispatched onto a block, the trip's zone and the block's zone must be the same zone. Every one of these violations is a `ERR_ZONE_MISMATCH` (HTTP 409).
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a Zone: Policy, Corridor Stops and Fixed-Route Anchors
+
+Everything begins with a `ZoneAdmin` defining a **service zone**. The definition is as much a policy document as a geography: alongside a human-readable `name` of between 1 and 120 characters and an operator-assigned `zone_code` of between 2 and 12 characters that must be unique across every zone in the system, the planner fixes the walking-distance standard, the shared-ride detour tolerance, the fare policy and the curb-congestion ceiling in a single act. A duplicate `zone_code` is rejected with `ERR_DUPLICATE_ZONE_CODE`.
+
+The walking-distance standard is `max_walk_meters`, which must be at least 100 and at most 1200; it is the largest walk shed a virtual stop in this zone may advertise and still be approved. The detour policy is the pair described in Section 2.6: `detour_tolerance_pct`, a fraction between 0 and 1.0 inclusive carried to at most 2 decimal places, and `detour_tolerance_floor_minutes`, an absolute allowance of at least 0 and at most 60 minutes. The fare policy is `base_fare_cents`, which must be zero or greater, together with the two fare-capping ceilings `fare_cap_cents_daily` and `fare_cap_cents_weekly`, each of which must also be zero or greater; the daily ceiling is the most a rider can be charged across one UTC service date in this zone, and the weekly ceiling is the most across one Monday-anchored ISO week. Two operational tolerances complete the definition: `on_time_window_minutes`, which defaults to 5 and must be between 0 and 30 inclusive, defines on-time performance for the zone — a pickup counts as on time when the actual pickup instant is no later than the promised pickup instant plus that many minutes — and `curb_capacity_per_bucket`, which defaults to 2 and must be at least 1, caps how many non-terminal offers may hold a promised pickup at the same stop inside one quarter-hour.
+
+A newly defined zone lands in `DRAFT` with `version` 1 and every performance field zeroed: `completed_trip_count` and `unserved_trip_count` at 0, `avg_wait_minutes`, `avg_ride_minutes`, `boardings_per_revenue_hour`, `wav_avg_wait_minutes` and `nonwav_avg_wait_minutes` at 0.00, `wav_equivalence_ratio` at 0.000, and `equivalence_verdict` at `COMPLIANT`.
+
+A zone's `status` cycles rather than terminating. Activation moves it `DRAFT → ACTIVE` on first opening and `SUSPENDED → ACTIVE` on every reopening; either way, the only precondition is that the zone currently be in the matching origin state, and the only effect is that `status` becomes `ACTIVE` and `version` advances by 1. Requesting activation from a zone already `ACTIVE` is rejected with `ERR_INVALID_ZONE_STATE`, as is requesting suspension from a zone that is not `ACTIVE`.
+
+Suspension — an `ACTIVE → SUSPENDED` move, optionally annotated with a free-text `note` — is the more consequential direction, because it evicts unfulfilled demand. Every trip request in the zone whose `status` is `RECEIVED` or `MATCHING` is swept to `NO_SERVICE` with `no_service_reason` set to `ZONE_SUSPENDED` and `assigned_block_id` cleared to null, processed in trip `created_at` ascending order. For each swept trip that was carrying a quote, the fare axis is voided as well: a `fare_status` of `QUOTED` reverts to `UNPRICED` and `quoted_fare_cents` is cleared to null. The zone's `unserved_trip_count` is then recomputed, and the zone's own `version` advances by 1. Trips that were already offered, assigned or picked up are deliberately left alone — a suspension halts intake and dispatch, not rides already in motion. Note also what reactivation does *not* do: `NO_SERVICE` is terminal, so reopening a zone never restores the trips its suspension evicted.
+
+Within a zone, the `ZoneAdmin` places **virtual stops** along the corridor. A stop names its zone through `zone_id` and carries an operator-assigned `stop_code` that must be unique within that zone, an integer `corridor_index` between 0 and 500 inclusive giving its position on the corridor, and a `walk_shed_meters` value of zero or more stating the farthest walking distance the stop is advertised to serve. The curb-side path condition is recorded in `accessibility`, one of `ACCESSIBLE_PATH`, `STAIRS_ONLY` or `UNKNOWN`, defaulting to `UNKNOWN` when omitted. A stop may optionally name its opposite-direction twin across the street through `paired_stop_id`, which defaults to null; when supplied it must reference a virtual stop in the same zone whose `status` is not `RETIRED`, and it may not name the stop being created, with any of those three violations rejected as `ERR_PAIRED_STOP_INVALID`. New stops begin in `PROPOSED` with `version` 1.
+
+Approval is where the walking-distance standard bites. A `ZoneAdmin` moves a stop `PROPOSED → APPROVED` only while the stop is still `PROPOSED`, only while its zone is in `DRAFT` or `ACTIVE`, and only when the stop's `walk_shed_meters` is less than or equal to the zone's `max_walk_meters` — the comparison is inclusive, so a stop advertising exactly the standard is approvable. A stop advertising more is rejected with `ERR_WALK_DISTANCE_EXCEEDED`. A successful approval sets `status` to `APPROVED` and advances the stop's `version` by 1.
+
+Retirement takes a stop out of service permanently and is available from either of the two live states, `PROPOSED → RETIRED` and `APPROVED → RETIRED`. Both branches carry the same guard: no trip request whose `status` is `RECEIVED`, `MATCHING`, `OFFERED`, `ASSIGNED` or `PICKED_UP` may name the stop as either its `origin_stop_id` or its `destination_stop_id`, and an attempt that violates this is rejected with `ERR_STOP_IN_USE`. Both branches set `status` to `RETIRED` and advance the stop's `version` by 1. Retiring a stop that had reached `APPROVED` additionally sweeps the self-referential pairing: every virtual stop whose `paired_stop_id` names the retiring stop has that field reset to null, processed in `created_at` ascending order. `RETIRED` is terminal.
+
+First and last-mile service is anchored by **transit connections**, each registering one published fixed-route departure that microtransit trips can be timed to. A connection names its `zone_id` and the `stop_id` of the virtual stop co-located with the rail platform or bus bay, declares its `mode` as either `RAIL` or `BUS`, records the agency's `route_code` for the line, and states the `scheduled_departure_utc` instant of the fixed-route trip. Two policy numbers accompany it: `guaranteed_transfer_buffer_minutes`, between 0 and 60 inclusive, is the slack on either side of the scheduled departure inside which a microtransit pickup counts as a guaranteed transfer, and `transfer_credit_cents`, zero or greater, is what the rider is credited against their microtransit fare when the transfer is guaranteed. Connections are created with `version` 1 and have no lifecycle of their own — they are reference data that the fare engine and intake validation read.
+
+### 3.2. Fleet, Roster and Rider Accounts
+
+Fleet onboarding is deliberately spare. A `ZoneAdmin` adds a **vehicle** to a zone with a `vehicle_code` unique within that `zone_id`, a `seat_capacity` of at least 1 and at most 24 ambulatory seats available for pooling, and a `wav_positions` count of wheelchair securement positions between 0 and 4 inclusive, defaulting to 0. The read-only flag `is_wav` is derived, never supplied: it is true exactly when `wav_positions` is 1 or more, and a value for it in the request body is ignored. Vehicles are created `AVAILABLE` with `version` 1.
+
+A vehicle's availability is moved by submitting the desired `status` to the vehicle's status capability, which `ZoneAdmin` and `Dispatcher` callers share. Four transitions are declared: `AVAILABLE → IN_MAINTENANCE` and `IN_MAINTENANCE → AVAILABLE` are unconditional beyond the origin state, while both `AVAILABLE → RETIRED` and `IN_MAINTENANCE → RETIRED` additionally require that no vehicle block in state `SCHEDULED` or `OPEN` still names this vehicle. Each of the four sets `status` to the requested value and advances the vehicle's `version` by 1. A requested move that is not one of the four — for instance any move out of `RETIRED`, which is terminal — is rejected with `ERR_INVALID_VEHICLE_STATE`, and so is an attempt to retire a vehicle that a scheduled or open block still depends on.
+
+Drivers are rostered the same way. A **driver** record names its `zone_id`, carries a `driver_code` unique within the zone, and records `wav_certified` — whether the driver holds current securement and lift certification — which defaults to false. A driver is created `ACTIVE`, with `consecutive_decline_count` at 0 and `version` 1. That counter tracks how many offers this driver has declined since their last acceptance or their last manual reinstatement, and Section 3.6 explains why it matters.
+
+A driver's `status` moves between exactly two states by submitting the desired `status`, again a capability shared by `ZoneAdmin` and `Dispatcher`. The `ACTIVE → SUSPENDED` direction cascades: every vehicle block whose `driver_id` is this driver and whose `state` is `SCHEDULED` is moved to `CANCELLED`, processed in block `start_utc` ascending order and then, among blocks sharing a start instant, in block `created_at` ascending order. Only `SCHEDULED` blocks are cancelled by this sweep, which is why suspension never triggers the offer-release chain that cancelling an *open* block triggers — a scheduled block cannot yet hold assignments. The `SUSPENDED → ACTIVE` direction is the reinstatement: it clears `consecutive_decline_count` back to 0 so the driver starts with a clean streak. Both directions set `status` to the requested value and advance the driver's `version` by 1; a move that is not declared from the current state is rejected with `ERR_INVALID_DRIVER_STATE`.
+
+Rider accounts are the third piece of reference data, and the identifier a rider account is minted with is exactly the `X-User-ID` that a `Rider` caller presents. A **rider** names its `zone_id`, carries a `rider_code` unique within the zone, and declares two things that drive money and dispatch respectively. `fare_category` is one of `FULL`, `REDUCED` or `PARATRANSIT` and defaults to `FULL`; it selects the multiplier applied to the gross fare. `mobility_device` is either `NONE` or `WHEELCHAIR` and defaults to `NONE`; a rider who declares `WHEELCHAIR` forces wheelchair-accessible handling on every trip they book, and no request body can opt out of that. A new rider's fare counters start empty: `fare_counter_date` and `fare_counter_week_start` are both null until the first fare-ledger row is written for them, `daily_fare_paid_cents` and `weekly_fare_paid_cents` are both 0, and `version` is 1.
+
+### 3.3. Forecasting Demand and Sizing the Peak Fleet
+
+Before a zone can run at scale, a `ZoneAdmin` publishes a **demand forecast** for a service window. A forecast names its `zone_id`, an inclusive `window_start_utc` and an exclusive `window_end_utc` that must be strictly later than the start, an expected count of boarded trips inside the window as `forecast_trips` which must be zero or greater, and a `peak_factor` between 1.00 and 4.00 inclusive carried to at most 2 decimal places expressing how much heavier the busiest interval is than the window average. Because publishing a forecast changes the dispatch envelope of the whole zone, the create also requires `expected_service_zone_version` to match the zone's current `version`, exactly as described in Section 2.8.
+
+From those inputs alone — no other row in the system contributes — the fleet-sizing rule derives the two block counts the forecast publishes. First, the window's length is taken in hours: the difference between `window_end_utc` and `window_start_utc` expressed in seconds, divided by 3600. One vehicle block is assumed to be able to serve four boarded trips per hour of service, so the **trip capacity of a single block** over this window is 4 multiplied by the window length in hours. `required_base_blocks` is then the expected trip count divided by that per-block capacity, rounded **up** to the next whole block.
+
+Surge sizing runs off the peak factor. The peak trip count is the expected trip count multiplied by `peak_factor`, rounded up to a whole trip, and the surge trip count is that peak count minus the expected count. If `peak_factor` is 1.50 or lower, `required_surge_blocks` is 0 — the threshold is inclusive, so a forecast with a peak factor of exactly 1.50 requires no surge blocks at all. Otherwise `required_surge_blocks` is the surge trip count divided by the same per-block trip capacity and rounded up to the next whole block, but never more than 6 surge blocks however extreme the peak.
+
+Publication is a supersede-on-create operation. A newly published forecast lands in `PUBLISHED` with `version` 1, and every existing forecast for the *same* zone that is currently `PUBLISHED` and whose window overlaps the incoming window moves to `SUPERSEDED`, with that forecast's own `version` advancing by 1. Overlap here is half-open interval intersection: an existing forecast overlaps the incoming one when the existing window's start is strictly earlier than the incoming window's end **and** the incoming window's start is strictly earlier than the existing window's end. Two windows that merely touch — where one ends at exactly the instant the other begins — do not overlap and the earlier forecast survives. `SUPERSEDED` is terminal. As a final effect of publication, the parent zone's `version` advances by 1, which is why a planner publishing two forecasts back to back must re-read the zone between them.
+
+### 3.4. Scheduling and Running Vehicle Blocks
+
+A **vehicle block** is one vehicle and one driver committed to a service window. Both `ZoneAdmin` and `Dispatcher` callers may schedule one, supplying the `zone_id` it runs in, the `vehicle_id` pinned to it, the `driver_id` rostered on it, a `block_type` of either `BASE` or `SURGE` declaring whether the block counts against base or peak-surge fleet sizing, and the window itself as an inclusive `start_utc` and an exclusive `end_utc` that must be strictly later than the start.
+
+Scheduling enforces two temporal exclusions, and their boundary behaviour differs on purpose. **Vehicle occupation** treats the window as half-open: a create is rejected when some existing block naming the same `vehicle_id` and sitting in state `SCHEDULED` or `OPEN` has a start strictly earlier than the new block's end and a start on the new block that is strictly earlier than that existing block's end. Exact adjacency is therefore allowed — a block ending at the same instant another begins is fine, because a vehicle needs no turnaround it does not have. No buffer is applied. A violation is `ERR_VEHICLE_BLOCK_OVERLAP`. **The driver rest buffer** is the opposite: drivers need thirty minutes between shifts, so the comparison is made against windows shifted thirty minutes earlier. A create is rejected when some existing block naming the same `driver_id` and sitting in state `SCHEDULED` or `OPEN` satisfies both of these: that existing block's start, moved thirty minutes earlier, is strictly before the new block's end, and the new block's start, moved thirty minutes earlier, is strictly before the existing block's end. Under this arithmetic exact adjacency is rejected, and a gap of exactly thirty minutes between the two windows is allowed. A violation is `ERR_DRIVER_REST_BUFFER`.
+
+A scheduled block is created in `SCHEDULED` with `version` 1, with `seats_committed`, `wav_positions_committed` and `boardings_count` all at 0, with `committed_index_min` and `committed_index_max` both null, with `opened_at` and `closed_at` both null, with `actual_revenue_hours` at 0.00, and with `scheduled_revenue_hours` derived from the window: the difference between `end_utc` and `start_utc` expressed in hours, to 2 decimal places, rounded half up.
+
+Pulling a block out for service is a `Dispatcher` action that moves it `SCHEDULED → OPEN`. Four things must hold beyond the origin state: the block's zone must be `ACTIVE` (otherwise `ERR_ZONE_NOT_ACTIVE`), the pinned vehicle's `status` must be `AVAILABLE` (otherwise `ERR_INVALID_VEHICLE_STATE`), the rostered driver's `status` must be `ACTIVE` (otherwise `ERR_INVALID_DRIVER_STATE`), and the peak-surge fleet-sizing ceiling must not be breached. On success `state` becomes `OPEN`, `opened_at` is stamped with the current logical clock reading, and `version` advances by 1.
+
+The fleet-sizing ceiling is the operational teeth of Section 3.3. To evaluate it, take the demand forecast for this block's zone whose `state` is `PUBLISHED` and whose window overlaps the block's half-open window under the same half-open intersection test used for supersession. When no such published forecast exists, the check is skipped entirely and the block opens freely. When one does exist, count — as the state would stand *after* this open succeeded — the blocks whose `state` is `OPEN`, whose `block_type` equals this block's `block_type`, and whose own window half-open-overlaps that forecast's window. For a `BASE` block that count must be less than or equal to the forecast's `required_base_blocks`; for a `SURGE` block it must be less than or equal to `required_surge_blocks`. An open that would push the count above the applicable ceiling is rejected with `ERR_FLEET_SIZE_EXCEEDED`.
+
+Closing a block ends its service day: a `Dispatcher` moves it `OPEN → CLOSED`, but only once its manifest is quiet. If any pool assignment on the block is still in `OFFERED`, `ACCEPTED` or `ONBOARD`, the close is rejected with `ERR_BLOCK_HAS_ACTIVE_ASSIGNMENTS`. On success `state` becomes `CLOSED`, `closed_at` is stamped with the current logical clock reading, and `actual_revenue_hours` is recomputed as the difference between `closed_at` and `opened_at` expressed in hours to 2 decimal places rounded half up. Because `actual_revenue_hours` is defined as 0.00 for any block not in `CLOSED`, closing is the moment a block starts contributing revenue hours to anything. That in turn triggers a recomputation of the zone's `boardings_per_revenue_hour`, and the block's `version` advances by 1.
+
+Cancellation is available from both live states, and the two branches behave very differently. `SCHEDULED → CANCELLED` is trivial: a scheduled block can hold no assignments, so nothing is released, `state` becomes `CANCELLED` and `version` advances by 1. `OPEN → CANCELLED` is the largest cascade in the system. It is refused outright, with `ERR_BLOCK_HAS_ACTIVE_ASSIGNMENTS`, whenever any assignment on the block is `ONBOARD` — a rider already in the vehicle cannot be un-ridden. When no rider is onboard, the cancellation runs in four ordered hops, and both branches accept an optional free-text `note`.
+
+The first hop zeroes the block's own commitments: `seats_committed` and `wav_positions_committed` are set to 0, and `committed_index_min` and `committed_index_max` are set to null. The second hop, caused by the first, releases the manifest: every pool assignment on this block whose `state` is `OFFERED` or `ACCEPTED` moves to `RELEASED`, processed in assignment `created_at` ascending order. The third hop, caused by the second, un-books each released trip: a trip request whose `status` is `OFFERED` or `ASSIGNED` has `assigned_block_id`, `projected_detour_minutes`, `promised_pickup_utc` and `promised_dropoff_utc` all cleared to null, has a `fare_status` of `QUOTED` reverted to `UNPRICED` with `quoted_fare_cents` cleared to null, and — provided its `match_attempt_count` is still below the two-attempt budget — returns to `MATCHING` to be re-offered. The fourth hop, caused by the third, handles trips that have run out of chances: any such trip whose `match_attempt_count` has already reached 2 moves instead to `NO_SERVICE` with `no_service_reason` set to `MAX_ATTEMPTS_EXHAUSTED`, and the `unserved_trip_count` of that trip's zone is recomputed. Finally the block's `state` becomes `CANCELLED` and its `version` advances by 1. Both `CLOSED` and `CANCELLED` are terminal for a block.
+
+### 3.5. Trip Intake and Real-Time Matching
+
+A **trip request** is created either by the rider themselves or by a `Dispatcher` acting on their behalf, and requires the zone to be `ACTIVE`. The payload names the `zone_id`, the `rider_id`, the boarding stop as `origin_stop_id`, the alighting stop as `destination_stop_id` — which must differ from the origin, with an equal pair rejected as `ERR_INVALID_REQUEST` — and the rider's desired boarding instant as `requested_pickup_utc`. Three optional inputs complete it: `party_size`, the number of ambulatory seats wanted, which defaults to 1 and must be at least 1 and at most 6; `wav_required`, a request that the trip be handled as wheelchair-accessible; and `connection_id`, naming the rail or bus departure this first or last-mile trip is timed to, which defaults to null. When the caller is a `Rider`, the `rider_id` in the payload must be their own `X-User-ID`.
+
+Intake enforces four domain rules on top of the shape and reference checks. Both named stops must have `status` equal to `APPROVED`; a proposed or retired stop is rejected with `ERR_STOP_NOT_APPROVED`. The effective wheelchair-accessible flag is then resolved and stored on the trip as `wav_required`: it is true when the request body supplied `wav_required` as true **or** when the rider's `mobility_device` is `WHEELCHAIR`. A rider who has declared a wheelchair therefore always gets accessible handling — a request body value of false never overrides that declaration. When the effective `wav_required` is true, both the origin and the destination stop must have `accessibility` equal to `ACCESSIBLE_PATH`; a stop that is `STAIRS_ONLY` or `UNKNOWN` is rejected with `ERR_STOP_NOT_ACCESSIBLE`. Finally, when a `connection_id` is supplied, the requested pickup must actually be able to make that departure: the absolute difference between `requested_pickup_utc` and the connection's `scheduled_departure_utc` must be less than or equal to that connection's `guaranteed_transfer_buffer_minutes`, inclusively, and a pickup further away than the buffer is rejected with `ERR_TRANSFER_WINDOW_MISSED`.
+
+A newly intaken trip sits in `status` `RECEIVED` on the fulfilment axis and `fare_status` `UNPRICED` on the fare axis, with `version` 1. Its `baseline_direct_minutes` is computed straight away from the corridor geometry of its two stops as described in Section 2.6, and recomputed again on every subsequent offer creation. Its `match_attempt_count` starts at 0. Its `assigned_block_id`, `projected_detour_minutes`, `promised_pickup_utc`, `promised_dropoff_utc`, `quoted_fare_cents`, `charged_fare_cents`, `applied_cap` and `no_service_reason` are all null, along with `actual_pickup_utc`, `actual_dropoff_utc`, `wait_minutes` and `ride_minutes`.
+
+**Real-time matching** is a `Dispatcher` capability and also requires the zone to be `ACTIVE`. It runs against a trip in `RECEIVED` or `MATCHING` and does two things: it builds a candidate set of open blocks, and if that set is non-empty it scores them and offers the trip onto the winner.
+
+A vehicle block enters the candidate set only when every one of the following holds. The block runs in the trip's own zone. Its `state` is `OPEN` — blocks that are `SCHEDULED`, `CLOSED` or `CANCELLED` are never candidates. Its pinned vehicle's `status` is `AVAILABLE` and its rostered driver's `status` is `ACTIVE`. The trip's `requested_pickup_utc` falls inside the block's half-open window, meaning at or after `start_utc` and strictly before `end_utc`. The block's `seats_committed` plus the trip's `party_size` is less than or equal to the vehicle's `seat_capacity`. If the trip does not require wheelchair accessibility this next condition is vacuous, but if it does, the vehicle's `wav_positions` minus the block's `wav_positions_committed` must be at least 1 **and** the block's driver must have `wav_certified` true. The projected detour the pairing would impose is less than or equal to the trip's detour allowance, both as defined in Section 2.6. And the curb at the origin stop must have room: the number of pool assignments in state `OFFERED`, `ACCEPTED` or `ONBOARD` whose trip shares this trip's `origin_stop_id` and whose trip's `promised_pickup_utc` falls in the same quarter-hour bucket as this offer's prospective promised pickup must be strictly less than the zone's `curb_capacity_per_bucket`. Quarter-hour buckets are formed by taking the promised pickup as whole minutes since the Unix epoch and dividing by 15, discarding the remainder, so two promised pickups share a bucket exactly when that quotient matches.
+
+Among the candidates, **the lowest score wins**. A candidate's `match_score` is the sum of four terms. The first is the detour term: the projected detour in minutes multiplied by 4, but never counted as more than 100 however long the detour, so that beyond a twenty-five-minute detour the term saturates and stops discriminating. The second is a surge penalty: 0 when the block's `block_type` is `BASE`, and 15 when it is `SURGE`, which keeps peak-only capacity in reserve while base capacity is still viable. The third is a securement-headroom penalty that only applies to wheelchair-accessible trips: 0 when the trip does not require accessibility, 0 when it does and the block's remaining securement headroom — the vehicle's `wav_positions` minus the block's `wav_positions_committed` — is 2 or more, and 8 when it does and that headroom is exactly 1, so the last securement position on a vehicle is spent reluctantly. The fourth is a seat-slack term that prefers fuller vehicles: take the seats that would remain after this trip boarded, that is the vehicle's `seat_capacity` minus the block's `seats_committed` minus the trip's `party_size`, cap that at 12, and multiply by 2. When two candidates tie on `match_score`, the block with the earlier `start_utc` wins; if they also share a start instant, the block with the earlier `created_at` wins.
+
+When the candidate set is empty, matching is **not** an error — the response is 200 either way. A trip in `RECEIVED` moves to `MATCHING`, and a trip already in `MATCHING` stays in `MATCHING` as a self-loop, staying queued for another round; either way `match_attempt_count` is *not* incremented, because no offer was created, and the trip's `version` advances by 1. Both of those paths require `match_attempt_count` to still be below the two-attempt budget. Once a trip in `MATCHING` has exhausted that budget — `match_attempt_count` of 2 or more — an empty candidate set is final: the trip moves `MATCHING → NO_SERVICE` with `no_service_reason` set to `NO_ELIGIBLE_BLOCK`, and the zone's `unserved_trip_count` is recomputed.
+
+When a block does win, the trip is offered onto it and the fulfilment axis advances `RECEIVED → OFFERED` or `MATCHING → OFFERED`; the two share an identical side-effect set. A pool assignment is created on the winning block in state `OFFERED`, with `offer_origin` set to `AUTO_MATCH` and `match_score` set to the winning score. On the trip, `assigned_block_id` is set to the winning block, `match_attempt_count` increases by 1, `baseline_direct_minutes` and `projected_detour_minutes` are written from the corridor geometry, `promised_pickup_utc` is set to the later of `requested_pickup_utc` and the current logical clock reading, and `promised_dropoff_utc` is set to the promised pickup plus the sum of `baseline_direct_minutes` and `projected_detour_minutes` in minutes. The fare axis moves `UNPRICED → QUOTED` and `quoted_fare_cents` is written under the provisional-quote pricing described in Section 3.7. On the block, `seats_committed` increases by the trip's `party_size`, `wav_positions_committed` increases by 1 when the trip requires a securement position and by 0 otherwise, `committed_index_min` and `committed_index_max` are recomputed over the widened envelope, and the block's `version` advances by 1.
+
+**Manual dispatch** exists for the cases automation cannot reach: a `Dispatcher` places a specific trip onto a specific open block by supplying `trip_request_id`, `block_id` and the `expected_vehicle_block_version` guard. The resulting offer carries `offer_origin` of `MANUAL_DISPATCH` and, because no ranking took place, a `match_score` of null; everything else about the resulting offer and the resulting trip state is identical to an automatic win, including the `UNPRICED → QUOTED` fare move and the block's capacity and version updates. Manual dispatch skips the ranking but not the guards: the trip must be in `RECEIVED` or `MATCHING` (otherwise `ERR_INVALID_TRIP_STATE`), the block must be `OPEN` (otherwise `ERR_INVALID_BLOCK_STATE`), and the trip's zone must match the block's zone. A wheelchair-accessible trip may only be placed on a block whose vehicle has at least one securement position and whose driver is `wav_certified`, with a failure reported as `ERR_WAV_UNAVAILABLE`, and separately the block's remaining securement headroom must still be at least 1, with exhaustion reported as `ERR_WAV_POSITION_UNAVAILABLE`. The trip's `requested_pickup_utc` must fall inside the block's half-open window, at or after its start and strictly before its end, with a violation reported as `ERR_PICKUP_OUTSIDE_BLOCK_WINDOW`. The quarter-hour curb ceiling applies as it does in automatic matching, reported as `ERR_CURB_CAPACITY_EXCEEDED`. The projected detour must be less than or equal to the trip's detour allowance — the comparison is inclusive — with a violation reported as `ERR_DETOUR_TOLERANCE_EXCEEDED`. And the block's `seats_committed` plus the trip's `party_size` must not exceed the vehicle's `seat_capacity`, with a violation reported as `ERR_SEAT_CAPACITY_EXCEEDED`.
+
+Every offer, however produced, freezes what it holds. A pool assignment's `seats_held` is copied from the trip's `party_size` at creation and never changes thereafter, and its `wav_positions_held` is 1 when the trip's `wav_required` is true and 0 otherwise, likewise frozen. Its `baseline_direct_minutes` and `projected_detour_minutes` are the values evaluated at creation, retained even as the block's envelope later shifts. Its `seq_pickup` is the 1-based pickup order along the corridor among that block's assignments in state `OFFERED`, `ACCEPTED` or `ONBOARD`, ordered by the `corridor_index` of the origin stop ascending and, for stops sharing an index, by the assignment's own `created_at` ascending.
+
+A rider or a `Dispatcher` may cancel a trip that has not yet been picked up, optionally with a free-text `note`. From `RECEIVED → CANCELLED` and `MATCHING → CANCELLED` nothing but the trip changes: `status` becomes `CANCELLED` and `version` advances by 1. From `OFFERED → CANCELLED` and `ASSIGNED → CANCELLED` the offer must be given back, and both branches carry the same effects: the trip's pool assignment — in `OFFERED` for the first branch, in `ACCEPTED` for the second — moves to `RELEASED`; the block reduces `seats_committed` by that assignment's `seats_held` and `wav_positions_committed` by its `wav_positions_held`, recomputes `committed_index_min` and `committed_index_max`, and advances its `version` by 1; the trip's `assigned_block_id`, `promised_pickup_utc`, `promised_dropoff_utc` and `projected_detour_minutes` are cleared to null; and a `fare_status` of `QUOTED` reverts to `UNPRICED` with `quoted_fare_cents` cleared to null. `CANCELLED`, `COMPLETED` and `NO_SERVICE` are the three terminal statuses on the fulfilment axis, and a cancellation requested from any of them is rejected with `ERR_INVALID_TRIP_STATE`.
+
+### 3.6. The Driver's Manifest: Offer Outcomes and the Ride
+
+An offer sits on a driver's manifest as a pool assignment in state `OFFERED`, and from there it forks three ways — `ACCEPTED`, `DECLINED` or `RELEASED`. Only the first two are driver decisions; the third is what the system does to an offer when the block underneath it is cancelled or the rider walks away. All four driver actions are restricted to the `DriverUser` role and all four require that `X-User-ID` equal the `driver_id` of the block the assignment sits on, with a mismatch reported as `ERR_NOT_RESOURCE_OWNER`. Each of the four advances the assignment's own `version` by 1. An action requested from a state that does not declare it is rejected with `ERR_INVALID_ASSIGNMENT_STATE`.
+
+**Accepting** moves the assignment `OFFERED → ACCEPTED` and requires the underlying block to still be `OPEN`, with a block in any other state reported as `ERR_INVALID_BLOCK_STATE`. The trip advances `OFFERED → ASSIGNED` in lockstep. The driver's `consecutive_decline_count` is reset to 0, rewarding the acceptance by wiping the streak. Notably, the block's `seats_committed` and `wav_positions_committed` do **not** change here: the capacity was already held from the moment the offer was created, so acceptance merely confirms a reservation rather than making one.
+
+**Declining** moves the assignment `OFFERED → DECLINED`, also requires the block to be `OPEN`, and may carry an optional free-text `reason`. Unlike acceptance, this branch gives capacity back, moves the driver's decline counter and can take the driver off the road, in three ordered hops. The first hop returns the block's capacity: `seats_committed` is reduced by the assignment's `seats_held`, `wav_positions_committed` is reduced by its `wav_positions_held`, `committed_index_min` and `committed_index_max` are recomputed over the narrowed envelope, and the block's `version` advances by 1. The second hop, caused by the first, does two things at once: the driver's `consecutive_decline_count` increases by 1, and the trip is un-booked — `assigned_block_id`, `promised_pickup_utc`, `promised_dropoff_utc` and `projected_detour_minutes` are cleared to null and a `fare_status` of `QUOTED` or `CAPPED` reverts to `UNPRICED` with `quoted_fare_cents` cleared to null, after which the trip returns `OFFERED → MATCHING` if its `match_attempt_count` is still below 2, or instead moves `OFFERED → NO_SERVICE` with `no_service_reason` set to `MAX_ATTEMPTS_EXHAUSTED` and the zone's `unserved_trip_count` recomputed when that count has already reached 2. The third hop, caused by the second, is the roster consequence: a driver whose `consecutive_decline_count` has reached three declines in a row is moved `ACTIVE → SUSPENDED`, their `version` advances by 1, and every vehicle block of theirs in state `SCHEDULED` is cancelled, processed in block `start_utc` ascending and then block `created_at` ascending order. Because only `SCHEDULED` blocks are swept, this third hop can never re-enter the offer-release chain of Section 3.4 — a scheduled block holds nothing to release.
+
+**Releasing** is the system's own move, never a driver's. It fires as a cascade when an open block is cancelled or when a rider cancels a trip, and it applies from both live assignment states: `OFFERED → RELEASED` and `ACCEPTED → RELEASED`, with an identical effect set on each. That effect set is the same capacity give-back as a decline — `seats_committed` reduced by `seats_held`, `wav_positions_committed` reduced by `wav_positions_held`, and `committed_index_min` and `committed_index_max` recomputed — but with one deliberate difference: the driver's `consecutive_decline_count` is **not** touched. A driver is never penalised for an offer that was taken away from them.
+
+**Boarding** moves the assignment `ACCEPTED → ONBOARD` and, like the two decision actions, requires the block to still be `OPEN`. The trip advances `ASSIGNED → PICKED_UP`, `actual_pickup_utc` is stamped with the current logical clock reading, and the wait metric is derived: `wait_minutes` is the difference between `actual_pickup_utc` and `requested_pickup_utc` taken in seconds, divided by 60 and rounded half up to a whole minute, and then floored at 0 so that a pickup earlier than the rider asked for records a wait of 0 rather than a negative number.
+
+**Completing** the ride moves the assignment `ONBOARD → COMPLETED` and is the only one of the four driver actions that does not require the block to be `OPEN` — a ride in progress must always be closable out, even if the dispatcher has moved on. It runs in three ordered hops. The first hop settles the block: `seats_committed` is reduced by `seats_held`, `wav_positions_committed` is reduced by `wav_positions_held`, `boardings_count` increases by `seats_held`, `committed_index_min` and `committed_index_max` are recomputed, and the block's `version` advances by 1. The second hop, caused by the first, settles the trip: `status` advances `PICKED_UP → COMPLETED`, `actual_dropoff_utc` is stamped with the current logical clock reading, `ride_minutes` is derived as the difference between `actual_dropoff_utc` and `actual_pickup_utc` taken in seconds, divided by 60 and rounded half up to a whole minute, and the fare axis advances from `QUOTED` or `CAPPED` to `CHARGED`, writing `charged_fare_cents` and `applied_cap` under the settled-charge pricing of Section 3.7, appending the fare-ledger rows described there, and recomputing the rider's `fare_counter_date`, `fare_counter_week_start`, `daily_fare_paid_cents` and `weekly_fare_paid_cents`. The same hop recomputes the zone's `completed_trip_count`, `avg_wait_minutes`, `avg_ride_minutes`, `boardings_per_revenue_hour`, `wav_avg_wait_minutes`, `nonwav_avg_wait_minutes`, `wav_equivalence_ratio` and `equivalence_verdict`. The third hop, caused by the second, propagates the daily fare cap sideways: if after settlement the rider's `daily_fare_paid_cents` has reached or passed the zone's `fare_cap_cents_daily`, then every **other** trip request belonging to that same rider whose `fare_status` is `QUOTED` has its `quoted_fare_cents` set to 0 and its `fare_status` moved to `CAPPED`, processed in trip `created_at` ascending order. That is the moment a rider's other outstanding quotes visibly become free.
+
+`DECLINED`, `RELEASED` and `COMPLETED` are the three terminal states of an assignment.
+
+### 3.7. Fares, Transfer Credit and Fare Capping
+
+A trip request carries two independent state axes on the same row. The fulfilment axis, `status`, has already been described. The fare axis, `fare_status`, runs `UNPRICED`, `QUOTED`, `CAPPED`, `CHARGED` and `REFUNDED`, and it evolves on its own schedule: a trip can be `ASSIGNED` and `QUOTED`, or `COMPLETED` and `CHARGED`, or `MATCHING` and back to `UNPRICED` after an offer was withdrawn. `REFUNDED` is the fare axis's only terminal state.
+
+**The fare rule runs in eight pinned steps, and it runs in exactly one of two variants.** The apparent circularity in it — the distance surcharge is waived when a guaranteed transfer applies, while the transfer credit is itself bounded by the post-multiplier fare — is broken at step 2, where the waiver is decided purely from whether the trip names a connection and where the relevant pickup instant falls, never from any money figure. The steps run strictly in order from 1 to 8 with no re-entry.
+
+*Step 1 — the distance band.* The variant supplies a minute basis. A basis of 10 minutes or less puts the trip in the `SHORT` band; more than 10 but no more than 20 minutes puts it in the `MEDIUM` band; anything above 20 minutes is `LONG`.
+
+*Step 2 — the guaranteed-transfer waiver.* If the trip's `connection_id` is null, no waiver applies. Otherwise, take the connection the trip names and compare the variant's pickup instant with that connection's `scheduled_departure_utc`: the waiver applies when the absolute difference between them is less than or equal to the connection's `guaranteed_transfer_buffer_minutes`, inclusively.
+
+*Step 3 — the gross fare.* Start from the zone's `base_fare_cents`. Add the band surcharge unless the waiver applies, in which case add nothing. The surcharge is 0 cents for a `SHORT` trip, 75 cents for a `MEDIUM` trip and 150 cents for a `LONG` trip.
+
+*Step 4 — the fare-category multiplier, and the only rounding.* Multiply the gross fare by the rider's category multiplier and round the product half up to whole cents. A `FULL` rider's multiplier is 1.00, a `REDUCED` rider's is 0.50, and a `PARATRANSIT` rider's is 0.00 — paratransit trips are fare-free in this service. This is the single rounding operation in the entire fare rule; no other step rounds anything.
+
+*Step 5 — the transfer credit.* If no waiver applies, the transfer credit is 0. If it does, the credit is the smaller of the connection's `transfer_credit_cents` and the post-multiplier fare from step 4, so a credit can never exceed the fare it offsets and can never make a fare negative.
+
+*Step 6 — the net fare before capping.* Subtract the transfer credit from the post-multiplier fare.
+
+*Step 7 — fare capping.* Compute the rider's daily headroom as the zone's `fare_cap_cents_daily` minus the rider's `daily_fare_paid_cents`, floored at 0, and the weekly headroom as the zone's `fare_cap_cents_weekly` minus the rider's `weekly_fare_paid_cents`, also floored at 0. The amount actually charged is the smallest of three numbers: the net fare before capping, the daily headroom and the weekly headroom.
+
+*Step 8 — attribution and the rebate.* If the charged amount equals the net fare before capping, `applied_cap` is `NONE` — no ceiling bound this trip. Otherwise a ceiling bound it, and attribution goes to the tighter one: `applied_cap` is `DAILY` when the daily headroom is less than or equal to the weekly headroom, and `WEEKLY` when the weekly headroom is strictly smaller. The cap rebate is the net fare before capping minus the charged amount.
+
+The **provisional-quote variant** runs at offer creation, when the fare axis moves `UNPRICED → QUOTED`, and writes `quoted_fare_cents`. Its minute basis is the offer's `baseline_direct_minutes` — the projected direct ride, not the detoured one — and its pickup instant is the trip's `requested_pickup_utc`. It reads the rider's fare counters as they stand at offer creation.
+
+The **settled-charge variant** runs at drop-off, when the fare axis moves `QUOTED → CHARGED` or `CAPPED → CHARGED`, and writes both `charged_fare_cents` and `applied_cap`. Its minute basis is the trip's `ride_minutes` — the actual measured ride — and its pickup instant is `actual_pickup_utc`. Two consequences follow deliberately from that substitution. A ride that ran long can land in a higher distance band than the quote assumed, and a pickup that arrived late can fall outside the connection's guaranteed transfer buffer and so lose the surcharge waiver the quote enjoyed. It also reads the rider's fare counters as they stand at drop-off, so settlements that landed in between shrink the available headroom.
+
+Fare counters are period-scoped, and the period is read from the logical clock. `fare_counter_date` names the UTC service date that `daily_fare_paid_cents` currently covers, and `fare_counter_week_start` names the Monday that anchors the ISO week `weekly_fare_paid_cents` currently covers; both are null until the rider's first fare-ledger row exists. Whenever the fare rule needs the daily counter, it compares `fare_counter_date` with the UTC calendar date of the logical clock at that moment: if they differ, the daily counter is treated as 0, and the stored counter is reset to the new date before any new ledger rows are appended. The weekly counter follows the same rule against the Monday-anchored ISO week that the logical clock falls in. Structurally, `daily_fare_paid_cents` is the sum of the `amount_cents` of that rider's fare-ledger rows whose `service_date` equals `fare_counter_date`, and `weekly_fare_paid_cents` is the sum over rows whose `service_date` falls in the ISO week beginning at `fare_counter_week_start`.
+
+Settlement writes the **fare ledger**, an append-only sequence of immutable rows. Each row names the `trip_request_id` it belongs to and the `rider_id` whose counters it moves, declares its `kind` as one of `CHARGE`, `TRANSFER_CREDIT`, `CAP_REBATE` or `REFUND`, carries a signed `amount_cents` in which a `CHARGE` is positive and a `TRANSFER_CREDIT`, `CAP_REBATE` or `REFUND` is negative, records the `service_date` as the UTC calendar date of the logical clock at the moment the row was appended, and records the `applied_cap` that bound the settlement the row belongs to as `NONE`, `DAILY` or `WEEKLY`. Completing a ride appends a `CHARGE` row for the full post-multiplier fare from step 4, then a `TRANSFER_CREDIT` row for the negative of the transfer credit **only when that credit is greater than zero**, then a `CAP_REBATE` row for the negative of the cap rebate **only when that rebate is greater than zero**. The three rows therefore net to exactly the charged amount, and the counters recomputed from them agree with `charged_fare_cents` by construction. There is no endpoint that creates a ledger row directly; the collection listing is the only discovery channel for rows that completion, capping and refund append as side effects.
+
+Two more fare-axis moves complete the picture. A quote is voided whenever the offer behind it goes away: when a trip's pool assignment leaves `OFFERED` or `ACCEPTED` for `DECLINED` or `RELEASED`, a `fare_status` of `QUOTED` reverts to `UNPRICED` and so does a `fare_status` of `CAPPED`, and in both cases `quoted_fare_cents` is cleared to null. And a quote can be zeroed without being voided: when another trip of the same rider settles and pushes that rider's `daily_fare_paid_cents` to or past the zone's `fare_cap_cents_daily`, this trip's `quoted_fare_cents` becomes 0 and its `fare_status` moves `QUOTED → CAPPED`, which is the state a rider's remaining trips sit in once they have hit the daily ceiling.
+
+Reversal is a `Dispatcher` capability and requires a mandatory free-text `reason`. It moves the fare axis `CHARGED → REFUNDED`, and a trip whose `fare_status` is anything other than `CHARGED` is rejected with `ERR_TRIP_NOT_CHARGED`. The reversal appends one ledger row of `kind` `REFUND` whose `amount_cents` is the negative of the net cents previously settled for this trip, sets `charged_fare_cents` to 0, recomputes the rider's `daily_fare_paid_cents` and `weekly_fare_paid_cents` so their cap counters return to their pre-charge values, and advances the trip's `version` by 1. The zone's performance metrics are deliberately left untouched by a refund: the ride still happened, and revenue for reporting purposes is read from the ledger at report-submission time rather than from any stored zone total.
+
+### 3.8. Zone Performance and the Equivalent-Service Test
+
+A service zone carries a live scorecard, recomputed inside the same request whenever the underlying facts change. Three events trigger a recomputation: a trip advancing `PICKED_UP → COMPLETED`, a vehicle block advancing `OPEN → CLOSED`, and a trip arriving in `NO_SERVICE` by any of its routes.
+
+The population for the wait and ride statistics is the set of trip requests in the zone whose `status` is `COMPLETED`. Trips that were cancelled or ended in `NO_SERVICE` never contribute to any mean. `avg_wait_minutes` is the arithmetic mean of `wait_minutes` over that set, rounded half up to 2 decimal places, and `avg_ride_minutes` is the arithmetic mean of `ride_minutes` over the same set, likewise to 2 decimal places. When the set is empty both read 0.00. `completed_trip_count` is simply the size of that set, and `unserved_trip_count` is the count of trip requests in the zone whose `status` is `NO_SERVICE`.
+
+The equivalent-service test splits the completed population in two by the effective `wav_required` flag. `wav_avg_wait_minutes` is the mean `wait_minutes` over completed trips whose `wav_required` is true, and `nonwav_avg_wait_minutes` is the mean over completed trips whose `wav_required` is false; both are carried to 2 decimal places rounded half up, and both read 0.00 when their respective subset is empty. The ratio between them, `wav_equivalence_ratio`, is `wav_avg_wait_minutes` divided by `nonwav_avg_wait_minutes`, rounded half up to 3 decimal places; when `nonwav_avg_wait_minutes` is 0.00 the ratio reads 0.000 rather than being undefined. The verdict follows directly: `equivalence_verdict` is `COMPLIANT` when the ratio is less than or equal to 1.25, and `DEFICIENT` when it is above. The threshold is inclusive, so a zone where wheelchair-accessible riders wait exactly a quarter longer than ambulatory riders is still compliant, and one where they wait any more than that is not. This single field is the gate on subsidy certification, described next.
+
+Productivity is measured over closed blocks only. `boardings_per_revenue_hour` is the sum of `boardings_count` across the zone's vehicle blocks whose `state` is `CLOSED`, divided by the sum of `actual_revenue_hours` across the same blocks, rounded half up to 2 decimal places; when that divisor is 0 the metric reads 0.00. Because `actual_revenue_hours` is 0.00 for any block that is not `CLOSED`, and because `boardings_count` only grows when a ride completes, this metric is a strictly retrospective figure — it moves when a block closes, not when a ride ends.
+
+### 3.9. Subsidy Reporting and Certification
+
+The funding agency pays the gap between what the service costs to operate and what riders pay, and the **subsidy report** is how that gap is quantified and attested. A `FinanceAnalyst` opens one for a `zone_id` and a reporting period given as an inclusive `period_start_date` and an inclusive `period_end_date`, both as UTC calendar dates, and declares a `variant` of either `PROVISIONAL` or `FINAL`. An end date earlier than the start date is rejected with `ERR_REPORT_PERIOD_INVALID`. A period that overlaps the inclusive date range of another report for the same `zone_id` and the same `variant` whose `state` is `DRAFT`, `SUBMITTED`, `CERTIFIED` or `AMENDED` is rejected with `ERR_REPORT_PERIOD_OVERLAP` — a report already superseded or rejected does not block a new filing, and the two variants are tracked independently, so a provisional and a final report may cover the same days.
+
+A report's `state` takes one of five values over its life — `DRAFT`, `SUBMITTED`, `CERTIFIED`, `REJECTED` and `AMENDED` — and none of them is terminal. A new report lands in `DRAFT` with `version` 1, `amendment_count` at 0, and `submitted_by_user_id`, `certified_by_user_id` and `rejection_reason` all null. Its four totals are computed immediately at creation under the declared variant, and recomputed from scratch on every submission thereafter.
+
+**The subsidy computation has a pinned rounding order, and getting it wrong changes the answer.** Each vehicle block in scope is costed individually: take that block's revenue hours, multiply by 8250 cents — the operating cost of one revenue hour, that is 82.50 dollars — then multiply by 1.12 to add the twelve percent administrative overhead the agency allows, and round the product half up to whole cents. `total_operating_cost_cents` is the sum of those **already-rounded** per-block figures. Summing the unrounded per-block costs and rounding once at the end produces a different total and is not what this specification requires. The blocks in scope are visited in `start_utc` ascending order and then, among blocks sharing a start instant, in `created_at` ascending order; the order does not change the sum but is pinned so an auditor can replay the arithmetic line by line.
+
+`total_fare_revenue_cents` is the sum of the `amount_cents` of every fare-ledger row whose `trip_request_id` names a trip in scope. Because refunds and rebates are negative rows on the same ledger, they net out of revenue automatically with no special handling. `total_trips` is the count of trips in scope. `subsidy_per_trip_cents` is then `total_operating_cost_cents` minus `total_fare_revenue_cents`, divided by `total_trips`, rounded half up to whole cents — and when `total_trips` is 0 it reads 0 rather than being undefined.
+
+What is *in scope* is the entire difference between the two variants. A vehicle block is in period when the UTC calendar date of its `start_utc` falls inside the inclusive range from `period_start_date` to `period_end_date`; a trip is in period when the UTC calendar date of its `created_at` falls inside that same inclusive range. From there:
+
+- Under the `PROVISIONAL` variant — filed while the period is still running — the block scope is the in-period blocks whose `state` is `SCHEDULED`, `OPEN` or `CLOSED`, and each such block contributes its `scheduled_revenue_hours`. The trip scope is the in-period trips whose `status` is `ASSIGNED`, `PICKED_UP` or `COMPLETED`.
+- Under the `FINAL` variant — filed once every block in the period is finalised — the block scope is the in-period blocks whose `state` is `CLOSED` and nothing else, and each such block contributes its `actual_revenue_hours`. The trip scope is the in-period trips whose `status` is `COMPLETED` and nothing else.
+
+Filing the report is a `FinanceAnalyst` action available from three states — `DRAFT → SUBMITTED` for a first filing, `REJECTED → SUBMITTED` for a correction, and `AMENDED → SUBMITTED` for the second leg of an amendment cycle — and all three carry an identical effect set: all four totals are recomputed from live data under the report's variant, `submitted_by_user_id` is set to the calling `X-User-ID`, `rejection_reason` is cleared to null, and `version` advances by 1. Recomputation on every submission is what makes a provisional report meaningful; the numbers a report carries are always the numbers as of its most recent filing.
+
+Certification belongs to the `FundingAgencyAuditor` and moves the report `SUBMITTED → CERTIFIED`, optionally recording a free-text `note`. Three preconditions guard it, and they are evaluated in this order. First, **segregation of duties**: the certifying `X-User-ID` must differ from the report's `submitted_by_user_id`, and an attempt by the filer to certify their own filing is rejected with `ERR_SEGREGATION_OF_DUTIES`. Second, **equivalent service**: the report's zone must have `equivalence_verdict` equal to `COMPLIANT`, so a zone that is making wheelchair-accessible riders wait disproportionately cannot have its subsidy attested at all; the rejection is `ERR_EQUIVALENCE_DEFICIENT`. Third, **finalisation**: every vehicle block of the report's zone whose `start_utc` falls on a UTC calendar date inside the inclusive reporting period must be in `CLOSED` or `CANCELLED`, and a block still `SCHEDULED` or `OPEN` is rejected with `ERR_BLOCKS_NOT_FINALIZED`. On success `certified_by_user_id` is set to the calling `X-User-ID` and `version` advances by 1.
+
+Rejection is the auditor's other move, `SUBMITTED → REJECTED`, and it requires a `rejection_reason` in the payload. That text is recorded on the report, `submitted_by_user_id` is cleared to null, and `version` advances by 1. The report is then back in the analyst's hands, and refiling it clears the recorded reason again.
+
+Amendment closes the loop. A `FinanceAnalyst` may reopen a certified report with a `CERTIFIED → AMENDED` move, which increases `amendment_count` by 1, clears `certified_by_user_id` to null, clears `submitted_by_user_id` to null and advances `version` by 1. From `AMENDED` the report must be refiled and recertified, which is why the report workflow has no terminal state at all: the cycle `CERTIFIED → AMENDED → SUBMITTED → CERTIFIED` can run as many times as the period needs restating, with `amendment_count` recording how often it has. Any transition requested from a state that does not declare it — certifying a `DRAFT`, amending a `SUBMITTED`, submitting a `CERTIFIED` — is rejected with `ERR_INVALID_REPORT_STATE`.
+
+## 4. Endpoint Definitions
+
+Every collection in this API is mounted at the top level; there are no nested resource paths. Operations that bring a new resource into existence — a service zone, a virtual stop, a transit connection, a vehicle, a driver, a rider, a demand forecast, a vehicle block, a trip request, a pool assignment or a subsidy report — return `201 Created`. Every other successful operation, including all state transitions, all reads and the logical-clock capability, returns `200 OK`. Request bodies, response bodies and side effects are not restated here: they are specified in Sections 2 and 3, and this table is only an index. In the Authorized Role(s) column, **All roles** means all six roles named in Section 2.1: `ZoneAdmin`, `Dispatcher`, `FinanceAnalyst`, `FundingAgencyAuditor`, `Rider` and `DriverUser`.
+
+| Method | Path | Description | Authorized Role(s) |
+|---|---|---|---|
+| POST | `/service-zones` | Define a microtransit service zone with its walking-distance standard, detour tolerance, fare policy and curb capacity. Created in `DRAFT`. | `ZoneAdmin` |
+| POST | `/service-zones/{id}/activate` | Open the zone for trip intake and dispatch. | `ZoneAdmin` |
+| POST | `/service-zones/{id}/suspend` | Suspend the zone, blocking new intake and dispatch and evicting unfulfilled demand. | `ZoneAdmin` |
+| GET | `/service-zones/{id}` | Read one service zone including all recomputed performance metrics and the equivalence verdict. | All roles |
+| GET | `/service-zones` | List service zones. | All roles |
+| POST | `/virtual-stops` | Place a virtual stop on the zone corridor with its advertised walk shed, curb accessibility and optional opposite-direction pair. Created in `PROPOSED`. | `ZoneAdmin` |
+| POST | `/virtual-stops/{id}/approve` | Approve a proposed virtual stop for revenue use, enforcing the zone's walking-distance standard. | `ZoneAdmin` |
+| POST | `/virtual-stops/{id}/retire` | Retire a virtual stop so no new trip may reference it. | `ZoneAdmin` |
+| GET | `/virtual-stops/{id}` | Read one virtual stop. | All roles |
+| GET | `/virtual-stops` | List virtual stops. | All roles |
+| POST | `/transit-connections` | Register a fixed-route rail or bus departure that first/last-mile trips are timed to, with its guaranteed transfer buffer and transfer credit. | `ZoneAdmin` |
+| GET | `/transit-connections/{id}` | Read one fixed-route transit connection. | All roles |
+| GET | `/transit-connections` | List transit connections. | All roles |
+| POST | `/vehicles` | Add a vehicle to the zone fleet with its ambulatory seat capacity and wheelchair securement positions. Created `AVAILABLE`. | `ZoneAdmin` |
+| POST | `/vehicles/{id}/status` | Move a vehicle between `AVAILABLE`, `IN_MAINTENANCE` and `RETIRED` per the declared transitions. | `ZoneAdmin`, `Dispatcher` |
+| GET | `/vehicles/{id}` | Read one vehicle. | All roles |
+| GET | `/vehicles` | List vehicles. | All roles |
+| POST | `/drivers` | Roster a driver in the zone, recording whether they hold current securement certification. Created `ACTIVE`. | `ZoneAdmin` |
+| POST | `/drivers/{id}/status` | Move a driver between `ACTIVE` and `SUSPENDED` per the declared transitions, cascading block cancellations on suspension and clearing the decline streak on reinstatement. | `ZoneAdmin`, `Dispatcher` |
+| GET | `/drivers/{id}` | Read one driver including the running decline streak. | All roles |
+| GET | `/drivers` | List drivers. | All roles |
+| POST | `/riders` | Register a rider account with fare category and declared mobility device; the returned `id` is the `X-User-ID` used for the `Rider` role. | `ZoneAdmin` |
+| GET | `/riders/{id}` | Read one rider including the live daily and weekly fare-cap counters. | All roles |
+| GET | `/riders` | List riders. | All roles |
+| POST | `/demand-forecasts` | Publish a demand forecast for a service window, deriving the required base and peak-surge block counts and superseding any overlapping published forecast. | `ZoneAdmin` |
+| GET | `/demand-forecasts/{id}` | Read one demand forecast including the derived peak-surge fleet sizing. | All roles |
+| GET | `/demand-forecasts` | List demand forecasts. | All roles |
+| POST | `/vehicle-blocks` | Schedule a driver-and-vehicle block over a half-open service window, enforcing vehicle occupation and the driver rest buffer. Created `SCHEDULED`. | `ZoneAdmin`, `Dispatcher` |
+| POST | `/vehicle-blocks/{id}/open` | Pull the block out for service, enforcing the peak-surge fleet-sizing ceiling. | `Dispatcher` |
+| POST | `/vehicle-blocks/{id}/close` | End the block's service and settle its actual revenue hours. | `Dispatcher` |
+| POST | `/vehicle-blocks/{id}/cancel` | Cancel the block and cascade the release of its manifest. | `Dispatcher` |
+| GET | `/vehicle-blocks/{id}` | Read one vehicle block including committed seats, securement positions, corridor envelope and revenue hours. | All roles |
+| GET | `/vehicle-blocks` | List vehicle blocks. | All roles |
+| POST | `/trip-requests` | Intake an on-demand trip request between two approved virtual stops, optionally timed to a fixed-route connection. Created `RECEIVED` and `UNPRICED`. | `Rider`, `Dispatcher` |
+| POST | `/trip-requests/{id}/match` | Run real-time matching for the trip, offering it onto the winning open block or leaving it queued. | `Dispatcher` |
+| POST | `/trip-requests/{id}/cancel` | Cancel a trip that has not yet been picked up, releasing any live offer and voiding the fare axis. | `Rider`, `Dispatcher` |
+| POST | `/trip-requests/{id}/refund` | Reverse a settled fare, appending the compensating ledger row. | `Dispatcher` |
+| GET | `/trip-requests/{id}` | Read one trip request including both state axes, promised and actual timestamps, wait and ride minutes and the fare fields. | All roles |
+| GET | `/trip-requests` | List trip requests. | All roles |
+| POST | `/pool-assignments` | Manually dispatch a trip onto a specific open block, bypassing automatic matching. Created `OFFERED` with manual offer origin. | `Dispatcher` |
+| POST | `/pool-assignments/{id}/accept` | Driver accepts the offer, clearing their decline streak. | `DriverUser` |
+| POST | `/pool-assignments/{id}/decline` | Driver refuses the offer, returning the block's capacity, re-queueing or exhausting the trip and advancing the decline streak. | `DriverUser` |
+| POST | `/pool-assignments/{id}/board` | Driver boards the rider, stamping the actual pickup and deriving the wait metric. | `DriverUser` |
+| POST | `/pool-assignments/{id}/complete` | Driver alights the rider, settling the fare, appending the ledger rows and recomputing the zone scorecard. | `DriverUser` |
+| GET | `/pool-assignments/{id}` | Read one pool assignment including seats held, securement positions held, pickup sequence, detour minutes and match score. | All roles |
+| GET | `/pool-assignments` | List pool assignments. | All roles |
+| GET | `/fare-transactions/{id}` | Read one immutable fare-ledger row. | All roles |
+| GET | `/fare-transactions` | List fare-ledger rows; the only discovery channel for rows appended by completion, capping and refund. | All roles |
+| POST | `/subsidy-reports` | Open a subsidy-per-trip report for a reporting period under the `PROVISIONAL` or `FINAL` variant. Created `DRAFT` with all totals computed. | `FinanceAnalyst` |
+| POST | `/subsidy-reports/{id}/submit` | File the report with the funding agency, recomputing every total at submission time. | `FinanceAnalyst` |
+| POST | `/subsidy-reports/{id}/certify` | Funding agency certifies the filed report. | `FundingAgencyAuditor` |
+| POST | `/subsidy-reports/{id}/reject` | Funding agency rejects the filed report, returning it to the analyst for correction. | `FundingAgencyAuditor` |
+| POST | `/subsidy-reports/{id}/amend` | Reopen a certified report for amendment, clearing the certification. | `FinanceAnalyst` |
+| GET | `/subsidy-reports/{id}` | Read one subsidy report including all four derived totals and the workflow attribution fields. | All roles |
+| GET | `/subsidy-reports` | List subsidy reports. | All roles |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock to an arbitrary instant so block windows, transfer buffers, curb buckets, service dates and fare-cap periods are deterministic. | `ZoneAdmin`, `Dispatcher` |
+
+## 5. Error Code Catalogue
+
+Every error response carries one of the identifiers below in `data.error_id`, with the HTTP status shown. The conditions that trigger each one are specified in Sections 2 and 3 alongside the rule they guard; Section 2.9 fixes the order in which competing conditions are evaluated.
+
+| Error ID | HTTP Status Code |
+|---|---|
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_IDENTITY_NOT_FOUND` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_SERVICE_ZONE_NOT_FOUND` | 404 |
+| `ERR_VIRTUAL_STOP_NOT_FOUND` | 404 |
+| `ERR_TRANSIT_CONNECTION_NOT_FOUND` | 404 |
+| `ERR_VEHICLE_NOT_FOUND` | 404 |
+| `ERR_DRIVER_NOT_FOUND` | 404 |
+| `ERR_RIDER_NOT_FOUND` | 404 |
+| `ERR_DEMAND_FORECAST_NOT_FOUND` | 404 |
+| `ERR_VEHICLE_BLOCK_NOT_FOUND` | 404 |
+| `ERR_TRIP_REQUEST_NOT_FOUND` | 404 |
+| `ERR_POOL_ASSIGNMENT_NOT_FOUND` | 404 |
+| `ERR_FARE_TRANSACTION_NOT_FOUND` | 404 |
+| `ERR_SUBSIDY_REPORT_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 422 |
+| `ERR_DUPLICATE_ZONE_CODE` | 409 |
+| `ERR_PAIRED_STOP_INVALID` | 422 |
+| `ERR_REPORT_PERIOD_INVALID` | 422 |
+| `ERR_INVALID_ZONE_STATE` | 409 |
+| `ERR_INVALID_STOP_STATE` | 409 |
+| `ERR_INVALID_VEHICLE_STATE` | 409 |
+| `ERR_INVALID_DRIVER_STATE` | 409 |
+| `ERR_INVALID_BLOCK_STATE` | 409 |
+| `ERR_INVALID_TRIP_STATE` | 409 |
+| `ERR_INVALID_ASSIGNMENT_STATE` | 409 |
+| `ERR_INVALID_REPORT_STATE` | 409 |
+| `ERR_ZONE_NOT_ACTIVE` | 409 |
+| `ERR_STALE_VEHICLE_BLOCK_VERSION` | 412 |
+| `ERR_STALE_SERVICE_ZONE_VERSION` | 412 |
+| `ERR_ZONE_MISMATCH` | 409 |
+| `ERR_STOP_NOT_APPROVED` | 409 |
+| `ERR_STOP_IN_USE` | 409 |
+| `ERR_WALK_DISTANCE_EXCEEDED` | 422 |
+| `ERR_STOP_NOT_ACCESSIBLE` | 409 |
+| `ERR_WAV_UNAVAILABLE` | 409 |
+| `ERR_WAV_POSITION_UNAVAILABLE` | 409 |
+| `ERR_EQUIVALENCE_DEFICIENT` | 409 |
+| `ERR_SEAT_CAPACITY_EXCEEDED` | 409 |
+| `ERR_DETOUR_TOLERANCE_EXCEEDED` | 409 |
+| `ERR_CURB_CAPACITY_EXCEEDED` | 409 |
+| `ERR_VEHICLE_BLOCK_OVERLAP` | 409 |
+| `ERR_DRIVER_REST_BUFFER` | 409 |
+| `ERR_PICKUP_OUTSIDE_BLOCK_WINDOW` | 422 |
+| `ERR_TRANSFER_WINDOW_MISSED` | 422 |
+| `ERR_FLEET_SIZE_EXCEEDED` | 409 |
+| `ERR_REPORT_PERIOD_OVERLAP` | 409 |
+| `ERR_BLOCKS_NOT_FINALIZED` | 409 |
+| `ERR_BLOCK_HAS_ACTIVE_ASSIGNMENTS` | 409 |
+| `ERR_TRIP_NOT_CHARGED` | 409 |

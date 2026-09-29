@@ -1,0 +1,98 @@
+"""Domain thresholds and numeric constants stated in the PRD."""
+
+# ─── Governance bounds ────────────────────────────────
+
+GOVERNANCE = {
+    "MAX_REMANDS": 2,
+    "MIN_SCORED_PEER_REVIEWS": 2,
+    "QUORUM_MIN_CAST_BALLOTS": 2,
+    "POINTS_CAP_PER_BALLOT": 1000.00,
+    "SERVICE_PERIOD_BUFFER_DAYS": 1,
+    "MAX_REOPENS": 1,
+    "PEER_SCORE_MIN": 1,
+    "PEER_SCORE_MAX": 5,
+    "LOCKSTEP_STEP_MIN": 0,
+    "LOCKSTEP_STEP_MAX": 12,
+}
+
+# ─── Money and scoring constants ──────────────────────
+
+OVERHEAD_RATE_CENTS_PER_HOUR = 9000
+
+ROLE_WEIGHTS = {
+    "ORIGINATING": 0.40,
+    "BILLING": 0.20,
+    "RESPONSIBLE": 0.15,
+    "WORKING": 0.25,
+}
+
+SHARING_CONVENTION_PCT = {
+    "NEW_CLIENT": 100.00,
+    "EXPANDED_MATTER": 60.00,
+    "CROSS_SELL": 50.00,
+}
+
+NON_BILLABLE_WEIGHTS = {
+    "FIRM_MANAGEMENT": 1.50,
+    "RECRUITING": 1.00,
+    "PRO_BONO": 1.25,
+    "TRAINING": 0.75,
+}
+
+NON_BILLABLE_CAPS = {
+    "FIRM_MANAGEMENT": 300,
+    "RECRUITING": 150,
+    "PRO_BONO": 200,
+    "TRAINING": 100,
+}
+
+DIMINISHING_THRESHOLD_HOURS = 400
+DIMINISHING_FACTOR = 0.50
+PRO_BONO_FLOOR_HOURS = 50
+PRO_BONO_SHORTFALL_PENALTY = 0.90
+
+MODEL_MULTIPLIER = {
+    "LOCKSTEP": 0.60,
+    "FORMULA": 1.00,
+    "DISCRETIONARY": 1.20,
+}
+
+FORMULA_WEIGHTS = {
+    "CREDIT": 0.45,
+    "HOURS": 0.20,
+    "NON_BILLABLE": 0.15,
+    "PROFITABILITY": 0.20,
+}
+
+FIRM_NORMALIZATION_TARGET_CENTS = 1_000_000_000
+HOURS_NORMALIZATION_DIVISOR = 1800
+
+REALIZATION_TIERS = [
+    (0.9500, 1.10),
+    (0.8500, 1.00),
+    (0.7500, 0.90),
+]
+REALIZATION_TIER_FLOOR_MULTIPLIER = 0.75
+
+HAIRCUT_FLOOR_PCT = 0.70
+MAX_HAIRCUT_PCT = 0.3000
+
+# ─── Clock ────────────────────────────────────────────
+
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+
+# ─── Test defaults ────────────────────────────────────
+
+TEST_DEFAULTS = {
+    "FISCAL_YEAR": 2026,
+    "DISTRIBUTABLE_POOL_CENTS": 100_000_000,
+    "LOCKSTEP_UNIT_CENTS": 0,
+    "DISCRETIONARY_POOL_PCT": 0.2000,
+    "DRAW_PCT": 0.8000,
+    "CLAIM_DEADLINE_ON": "2026-09-30",
+    "ASSESSMENT_DEADLINE_ON": "2026-10-31",
+    "ADMISSION_YEAR": 2010,
+}
+
+# A syntactically valid UUID that never resolves to a stored row.
+UNKNOWN_UUID = "99999999-9999-4999-8999-999999999999"

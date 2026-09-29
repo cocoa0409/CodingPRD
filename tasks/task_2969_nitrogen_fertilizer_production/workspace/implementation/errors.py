@@ -1,0 +1,106 @@
+"""The complete error catalogue of PRD section 5."""
+
+HTTP_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_TERMINAL_NOT_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_PLANT_NOT_FOUND": 404,
+    "ERR_TRAIN_NOT_FOUND": 404,
+    "ERR_CATALYST_CHARGE_NOT_FOUND": 404,
+    "ERR_HEDGE_LOT_NOT_FOUND": 404,
+    "ERR_PRODUCT_LINE_NOT_FOUND": 404,
+    "ERR_RUN_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_STORAGE_ASSET_NOT_FOUND": 404,
+    "ERR_SHIPMENT_NOT_FOUND": 404,
+    "ERR_QUOTE_NOT_FOUND": 404,
+    "ERR_TURNAROUND_NOT_FOUND": 404,
+    "ERR_TASK_NOT_FOUND": 404,
+    "ERR_EMISSIONS_READING_NOT_FOUND": 404,
+    "ERR_DUPLICATE_CODE": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_RUN_NOT_COMPLETED": 409,
+    "ERR_ORDER_ALREADY_PRODUCED": 409,
+    "ERR_QUOTE_EXPIRED": 409,
+    "ERR_PLANT_FROZEN": 409,
+    "ERR_CATALYST_ACTIVITY_TOO_LOW": 409,
+    "ERR_TRAIN_UNAVAILABLE": 409,
+    "ERR_PSM_REVIEW_MISSING": 409,
+    "ERR_SECURITY_CLASS_INSUFFICIENT": 403,
+    "ERR_SECURITY_CHECK_NOT_CLEARED": 409,
+    "ERR_STALE_RUN_VERSION": 412,
+    "ERR_STALE_STORAGE_VERSION": 412,
+    "ERR_PRODUCT_MISMATCH": 409,
+    "ERR_RUN_WINDOW_OVERLAP": 409,
+    "ERR_TURNAROUND_BUFFER_CONFLICT": 409,
+    "ERR_EMISSIONS_READING_IN_FUTURE": 422,
+    "ERR_TASK_CYCLE_DETECTED": 409,
+    "ERR_OUTAGE_WINDOW_TOO_SHORT": 422,
+    "ERR_TASK_PREDECESSOR_NOT_DONE": 409,
+    "ERR_AMMONIA_BALANCE_EXCEEDED": 409,
+    "ERR_STORAGE_CAPACITY_EXCEEDED": 409,
+    "ERR_STORAGE_AVAILABILITY_EXCEEDED": 409,
+    "ERR_PRODUCED_EXCEEDS_RESERVED": 409,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = HTTP_STATUS[error_id]
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)
+
+
+_DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required.",
+    "ERR_UNKNOWN_ROLE": "X-User-Role is not one of the six declared roles.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not authorised for this endpoint.",
+    "ERR_TERMINAL_NOT_OWNER": "The acting terminal operator does not own the destination asset.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this actor from performing this step.",
+    "ERR_INVALID_REQUEST": "The request body failed schema validation.",
+    "ERR_DUPLICATE_CODE": "A business code collides inside its declared uniqueness scope.",
+    "ERR_INVALID_STATE": "The resource's current state does not permit the requested transition.",
+    "ERR_RUN_NOT_COMPLETED": "The production run has not been settled, so no final unit cost exists.",
+    "ERR_ORDER_ALREADY_PRODUCED": "An order on this run has already been produced.",
+    "ERR_QUOTE_EXPIRED": "The quote's expires_at has already been reached.",
+    "ERR_PLANT_FROZEN": "The governing plant's operating posture is FROZEN.",
+    "ERR_CATALYST_ACTIVITY_TOO_LOW": "The train's active catalyst charge is below the minimum activity for service.",
+    "ERR_TRAIN_UNAVAILABLE": "The reformer train is not available for this campaign operation.",
+    "ERR_PSM_REVIEW_MISSING": "The turnaround does not carry an ENDORSED pre-startup safety review.",
+    "ERR_SECURITY_CLASS_INSUFFICIENT": "A regulated product may not be routed through this storage asset.",
+    "ERR_SECURITY_CHECK_NOT_CLEARED": "The regulated-substance clearance is not CLEARED or EXEMPT.",
+    "ERR_STALE_RUN_VERSION": "expected_run_version does not match the run's current version.",
+    "ERR_STALE_STORAGE_VERSION": "expected_origin_asset_version does not match the asset's current version.",
+    "ERR_PRODUCT_MISMATCH": "Product identity disagrees along the chain.",
+    "ERR_RUN_WINDOW_OVERLAP": "Another live campaign on this train holds an overlapping window.",
+    "ERR_TURNAROUND_BUFFER_CONFLICT": "Another outage on this plant conflicts with this window.",
+    "ERR_EMISSIONS_READING_IN_FUTURE": "reading_at is after the logical clock.",
+    "ERR_TASK_CYCLE_DETECTED": "The proposed predecessor is invalid for this outage.",
+    "ERR_OUTAGE_WINDOW_TOO_SHORT": "critical_path_days exceeds window_days.",
+    "ERR_TASK_PREDECESSOR_NOT_DONE": "The task's predecessor is not DONE.",
+    "ERR_AMMONIA_BALANCE_EXCEEDED": "The campaign's ammonia pool cannot support this request.",
+    "ERR_STORAGE_CAPACITY_EXCEEDED": "The storage asset's capacity would be exceeded.",
+    "ERR_STORAGE_AVAILABILITY_EXCEEDED": "The origin asset's uncommitted position would be exceeded.",
+    "ERR_PRODUCED_EXCEEDS_RESERVED": "produced_tons exceeds the order's reserved_tons.",
+    "ERR_PLANT_NOT_FOUND": "No plant with the referenced id.",
+    "ERR_TRAIN_NOT_FOUND": "No reformer train with the referenced id.",
+    "ERR_CATALYST_CHARGE_NOT_FOUND": "No catalyst charge with the referenced id.",
+    "ERR_HEDGE_LOT_NOT_FOUND": "No gas hedge lot with the referenced id.",
+    "ERR_PRODUCT_LINE_NOT_FOUND": "No product line with the referenced id.",
+    "ERR_RUN_NOT_FOUND": "No production run with the referenced id.",
+    "ERR_ORDER_NOT_FOUND": "No production order with the referenced id.",
+    "ERR_STORAGE_ASSET_NOT_FOUND": "No storage asset with the referenced id.",
+    "ERR_SHIPMENT_NOT_FOUND": "No shipment with the referenced id.",
+    "ERR_QUOTE_NOT_FOUND": "No price quote with the referenced id.",
+    "ERR_TURNAROUND_NOT_FOUND": "No turnaround with the referenced id.",
+    "ERR_TASK_NOT_FOUND": "No turnaround task with the referenced id.",
+    "ERR_EMISSIONS_READING_NOT_FOUND": "No emissions reading with the referenced id.",
+}

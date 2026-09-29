@@ -1,0 +1,163 @@
+"""Test infrastructure for the concert promoter show settlement and risk service.
+
+Importing this package registers the error-id to HTTP-status mapping, so tests
+may call ``validate_error`` with an error id alone.
+"""
+
+from prd_bench_local_runner.testing.assertions import (
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+)
+from prd_bench_local_runner.testing.constants import NON_EXISTENT_UUID
+from prd_bench_local_runner.testing.headers import build_user_headers
+from prd_bench_local_runner.testing.validators import (
+    get_success_data,
+    set_error_http_status_map,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+from . import api_errors, assertions, constants, factories, types
+from .api_client import ShowSettlementApiClient
+from .api_errors import ERROR_HTTP_STATUS  # noqa: F401  (import registers the map)
+from .assertions import (
+    apply_pct_to_cents,
+    assert_common_fields,
+    assert_coop_is_lesser_leg,
+    assert_created_at_ascending,
+    assert_empty_data_object,
+    assert_ids_in_order,
+    assert_integer_cents,
+    assert_iso_timestamp,
+    assert_list_response,
+    assert_market_exposure,
+    assert_millisecond_precision,
+    assert_no_pagination_meta,
+    assert_tier_inventory_conserved,
+    assert_timestamp_equals,
+    assert_two_decimal_percent,
+    assert_unchanged,
+    assert_version_bumped_by,
+    assert_waterfall_buckets,
+    canonical_timestamp,
+    card_fee_on,
+    comp_allowance_for,
+    expected_adjusted_gross,
+    expected_insurance_recovery,
+    expected_posture,
+    pct_of,
+    round_half_up,
+    whole_percent_of,
+)
+from .constants import ALL_ROLES, DEFAULT_CLOCK
+from .fixtures import (
+    ACCOUNTANT_ALICE,
+    ACCOUNTANT_BOB,
+    BUYER_ID,
+    RISK_RITA,
+    RISK_ROB,
+    Builder,
+)
+from .test_users import (
+    make_artist_rep_headers,
+    make_headers_for_role,
+    make_headers_with_empty_role,
+    make_headers_with_empty_user_id,
+    make_headers_with_no_identity,
+    make_headers_without_role,
+    make_headers_without_user_id,
+    make_risk_officer_headers,
+    make_talent_buyer_headers,
+    make_tour_accountant_headers,
+    make_unknown_role_headers,
+    make_venue_operator_headers,
+    new_user_id,
+)
+
+__all__ = [
+    # framework
+    "assert_at_least_one_succeeds",
+    "assert_cost_precision",
+    "assert_exactly_one_succeeds",
+    "assert_race_outcome",
+    "assert_timestamp_format",
+    "assert_version_incremented",
+    "build_user_headers",
+    "get_success_data",
+    "is_iso8601_timestamp",
+    "is_valid_uuid",
+    "run_race",
+    "set_error_http_status_map",
+    "validate_error",
+    "validate_error_is_one_of",
+    "validate_paginated",
+    "validate_success",
+    "NON_EXISTENT_UUID",
+    # modules
+    "api_errors",
+    "assertions",
+    "constants",
+    "factories",
+    "types",
+    # client and builder
+    "ShowSettlementApiClient",
+    "Builder",
+    "ALL_ROLES",
+    "DEFAULT_CLOCK",
+    "ACCOUNTANT_ALICE",
+    "ACCOUNTANT_BOB",
+    "BUYER_ID",
+    "RISK_RITA",
+    "RISK_ROB",
+    # domain assertions
+    "apply_pct_to_cents",
+    "assert_common_fields",
+    "assert_coop_is_lesser_leg",
+    "assert_created_at_ascending",
+    "assert_empty_data_object",
+    "assert_ids_in_order",
+    "assert_integer_cents",
+    "assert_iso_timestamp",
+    "assert_list_response",
+    "assert_market_exposure",
+    "assert_millisecond_precision",
+    "assert_no_pagination_meta",
+    "assert_tier_inventory_conserved",
+    "assert_timestamp_equals",
+    "assert_two_decimal_percent",
+    "assert_unchanged",
+    "assert_version_bumped_by",
+    "assert_waterfall_buckets",
+    "canonical_timestamp",
+    "card_fee_on",
+    "comp_allowance_for",
+    "expected_adjusted_gross",
+    "expected_insurance_recovery",
+    "expected_posture",
+    "pct_of",
+    "round_half_up",
+    "whole_percent_of",
+    # header builders
+    "make_artist_rep_headers",
+    "make_headers_for_role",
+    "make_headers_with_empty_role",
+    "make_headers_with_empty_user_id",
+    "make_headers_with_no_identity",
+    "make_headers_without_role",
+    "make_headers_without_user_id",
+    "make_risk_officer_headers",
+    "make_talent_buyer_headers",
+    "make_tour_accountant_headers",
+    "make_unknown_role_headers",
+    "make_venue_operator_headers",
+    "new_user_id",
+]

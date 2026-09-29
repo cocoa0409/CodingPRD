@@ -1,0 +1,76 @@
+"""Error catalogue (PRD Section 5 / SCAFFOLD 1.6)."""
+
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_OWNER_NOT_FOUND": 404,
+    "ERR_RENTER_NOT_FOUND": 404,
+    "ERR_LISTING_NOT_FOUND": 404,
+    "ERR_DOCUMENT_NOT_FOUND": 404,
+    "ERR_QUALIFICATION_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_POLICY_NOT_FOUND": 404,
+    "ERR_CAMPGROUND_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_READING_NOT_FOUND": 404,
+    "ERR_PHOTO_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_STALE_PARENT_VERSION": 412,
+    "ERR_BOOKING_STATE_INVALID": 409,
+    "ERR_SETTLEMENT_STATE_INVALID": 409,
+    "ERR_LISTING_STATE_INVALID": 409,
+    "ERR_CLAIM_STATE_INVALID": 409,
+    "ERR_ASSIGNMENT_STATE_INVALID": 409,
+    "ERR_LISTING_NOT_BOOKABLE": 409,
+    "ERR_BOOKING_SETTLEMENT_CLOSED": 409,
+    "ERR_RENTER_AGE_BELOW_MINIMUM": 422,
+    "ERR_DRIVING_RECORD_INVALID": 422,
+    "ERR_DRIVING_RECORD_POINTS_EXCEEDED": 422,
+    "ERR_TOWING_EXPERIENCE_MISSING": 422,
+    "ERR_TOWING_TIER_INSUFFICIENT": 422,
+    "ERR_RENTER_BLOCKED": 422,
+    "ERR_LISTING_INSURANCE_NOT_VERIFIED": 422,
+    "ERR_PHOTO_BASELINE_MISSING": 422,
+    "ERR_LISTING_DATES_UNAVAILABLE": 409,
+    "ERR_DROPOFF_WINDOW_CONFLICT": 409,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_RIG_LENGTH_EXCEEDS_CAMPGROUND": 422,
+    "ERR_INSPECTION_PHOTOS_INCOMPLETE": 422,
+    "ERR_REQUIRED_DOCUMENT_MISSING": 422,
+    "ERR_OWNER_SUSPENDED": 422,
+    "ERR_METER_READING_REGRESSION": 422,
+    "ERR_INFO_ROUND_LIMIT_REACHED": 422,
+    "ERR_ADJUDICATION_OVERRIDE_REASON_REQUIRED": 422,
+    "ERR_PLAN_CLASS_NOT_ELIGIBLE": 422,
+    "ERR_DELIVERY_NOT_OFFERED": 422,
+    "ERR_DELIVERY_NOT_APPLICABLE": 422,
+    "ERR_METER_READINGS_INCOMPLETE": 422,
+    "ERR_TRIP_PHOTOS_INCOMPLETE": 422,
+    "ERR_INSUFFICIENT_RENTER_FUNDS": 402,
+    # Fallback for unroutable requests; not part of the published catalogue.
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    words = error_id.replace("ERR_", "").replace("_", " ").lower()
+    return words[:1].upper() + words[1:] + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

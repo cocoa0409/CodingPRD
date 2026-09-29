@@ -1,0 +1,528 @@
+# Apartment Doorstep Trash Valet Service API — Product Requirements Document
+
+## 1. Introduction
+
+Doorstep trash valet is a deceptively simple amenity: five nights a week, a contracted valet walks a corridor, lifts a tote from each door, and carries it to the compactor. The operational reality behind that amenity is anything but simple. The service is sold to an apartment community as a per-door monthly fee, passed through to residents on their ledger, with a slice of the collected revenue shared back to the property owner. It is delivered by a bench of independent valets whose worker classification must be defensible to a tax auditor. It is verified by handheld scans that either prove a door was serviced or record why it was not. And it is policed in two directions at once — residents are tagged and fined for early set-out, wrong containers, and contaminated recycling, while the property is credited when the valet company itself fails to show up.
+
+This document specifies the backend service that runs that business. It is the system of record for property contracts and their weekly service-night schedules, for resident occupancy and pass-through eligibility, for valet onboarding and employer-control classification, for nightly route dispatch and scan-based verification, for non-compliance tagging and the resident fine dispute cycle, for compactor jam and overflow escalation against an acknowledgement clock, and for the monthly statement that reconciles all of it into a single net figure owed by the property. Every one of these concerns feeds a money number or a compliance record, so the arithmetic is pinned to the cent and the evaluation order of each calculation is part of the contract rather than an implementation detail.
+
+Two properties of the domain shape the whole design. First, almost every write ripples: escalating one compactor incident can suspend a property, which cancels its scheduled nights, which cancels the routes assigned to them. Second, several ledger quantities are conserved — a resident's outstanding fine balance, a property's escalation level, and a night's assigned unit coverage must each equal a re-derivation from their constituent rows after every forward action and after every compensating action that reverses one. The service is mounted under the `/valet` path prefix and is consumed by seven distinct operator populations, each with a narrow remit described below.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Operators, Identity and Role-Based Access Control
+
+Every request to this API must carry two headers. `X-User-ID` identifies the acting principal and `X-User-Role` names the role it is acting under. If either header is absent, is present but blank, or `X-User-Role` names a role outside the seven declared below, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401) before anything else about the request is examined. When both headers are well formed but the named role is not among the roles authorized for the endpoint being called, the rejection is `ERR_UNAUTHORIZED` (HTTP 403). The authorized role list for each endpoint appears in the table in §4.
+
+The seven roles are `PlatformAdmin`, `PropertyManager`, `ValetOpsManager`, `ComplianceOfficer`, `Valet`, `Resident`, and `BillingAnalyst`. Their remits are as follows.
+
+- `PlatformAdmin` is the Valet Living platform operator. It alone registers a property, activates a service contract, terminates a service contract, voids a monthly statement, and repositions the logical clock. It also shares in nearly every read and in most create paths, and holds the break-glass compensating actions.
+- `PropertyManager` is the on-site manager of one apartment community. It alone assesses a resident fine against an open tag, voids a non-compliance tag, and adjudicates a disputed fine. It also creates and moves out residents of its own property, reads its own property's records, and reports, acknowledges and resolves compactor incidents.
+- `ValetOpsManager` is the regional valet operations manager. It alone closes a service night and reschedules a service night. It also schedules nights, creates and abandons route assignments, creates, documents and deactivates valet contractors, reports, escalates and resolves compactor incidents, and reads across properties.
+- `ComplianceOfficer` owns worker screening. It alone records a background-check result and runs the worker-classification screen under either basis. Otherwise it reads contractors, routes, scans, fines, residents and compactor incidents.
+- `Valet` is the doorstep valet who walks a unit range. It alone accepts a route assignment, completes a route assignment, and records a doorstep scan. It may also abandon its own route assignment, report a compactor incident from the field, and read its own contractor record, its route assignments, the nights it serves and its own scans.
+- `Resident` is the apartment resident who pays the pass-through fee. It alone disputes a resident fine, and otherwise reads only its own resident record, scans and fines.
+- `BillingAnalyst` is the revenue-operations analyst. It drafts service contracts, cuts provisional monthly statements, issues statements drafted by a different analyst, and reads properties, contracts, residents, nights, fines and statements. It holds no operation exclusively.
+
+Three of the seven roles are **entity-backed**, meaning `X-User-ID` is the `id` of a persisted row and ownership is checked against it:
+
+- When `X-User-Role` is `PropertyManager`, `X-User-ID` is the `id` of the acting `Property`. Ownership checks on any resource that references a property compare that resource's property linkage to `X-User-ID` — directly for a resident or a compactor incident, and transitively for a scan (through the scanned resident) or a fine (through the fined resident).
+- When `X-User-Role` is `Valet`, `X-User-ID` is the `id` of the acting `ValetContractor`. Ownership checks on a route assignment compare `contractor_id` to `X-User-ID`, and a scan is owned through the route it is recorded against.
+- When `X-User-Role` is `Resident`, `X-User-ID` is the `id` of the acting `Resident`. Ownership checks on a fine compare `resident_id` to `X-User-ID`.
+
+The remaining four roles are **opaque**. When `X-User-Role` is `PlatformAdmin`, `ValetOpsManager`, `ComplianceOfficer` or `BillingAnalyst`, `X-User-ID` is an operator identifier that is not tied to any persisted entity and is never compared to any row's `id`. The server does record it where a transition demands an audit trail — `created_by_user_id` on a contractor created by a `ValetOpsManager`, `background_checked_by_user_id` on a contractor screened by a `ComplianceOfficer`, and `created_by_user_id` and `issued_by_user_id` on a statement drafted and issued by `BillingAnalyst` operators — and it compares two such recorded values against each other where segregation of duties applies (§2.11), but it never resolves an opaque identifier to an entity.
+
+When an entity-backed role addresses a write endpoint for a resource it does not own, the rejection is `ERR_NOT_RESOURCE_OWNER` (HTTP 403). This applies to every write endpoint reachable by `Valet`, `Resident` or `PropertyManager`: a valet acting on another valet's route, a resident disputing another resident's fine, or a property manager touching another property's resident, scan, fine or incident.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination, Sorting and Collection Filters
+
+Every collection endpoint is paginated through two query parameters. `limit` caps the number of rows returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` is the number of rows to skip before the page begins; when omitted it defaults to 0 and its minimum accepted value is 0. A `limit` below 1 or above 100, or a negative `offset`, is a shape violation and is rejected with `ERR_INVALID_REQUEST` (HTTP 422).
+
+Unless a specific endpoint states otherwise, collection results are ordered by their creation timestamp `created_at` in ascending order. List responses carry `limit`, `offset`, `total_count` and `has_more` in the `meta` object of the envelope, where `total_count` is the number of rows matching the filters before pagination is applied and `has_more` indicates whether rows remain beyond the current page.
+
+Each collection accepts its own set of optional equality filters in addition to `limit` and `offset`. All of them are exact-match, and combining several narrows the result set conjunctively.
+
+- Properties may be filtered by `status`, by `market_code`, and by `active_contract_id`.
+- Contracts may be filtered by `property_id` and by `status`.
+- Residents may be filtered by `property_id`, by `status`, and by `collections_status`.
+- Contractors may be filtered by `onboarding_status` and by `classification`.
+- Service nights may be filtered by `contract_id`, by `rescheduled_from_night_id`, by `verification_status`, by `billing_status`, and by `service_date`.
+- Route assignments may be filtered by `service_night_id`, by `contractor_id`, and by `status`.
+- Doorstep scans may be filtered by `route_assignment_id`, by `service_night_id`, by `resident_id`, by `scan_result`, by `tag_status`, and by `non_compliance_type`.
+- Resident fines may be filtered by `resident_id`, by `scan_id`, by `status`, and by `origin`.
+- Compactor incidents may be filtered by `property_id`, by `incident_type`, and by `status`.
+- Monthly statements may be filtered by `contract_id`, by `billing_period`, by `status`, by `variant`, and by `superseded_statement_id`.
+
+Two of these filters exist because the resource they reach is not returned anywhere else. A makeup night created by a schedule shift is not present in the response body of the request that created it, so the only way to discover it is to filter service nights by `rescheduled_from_night_id`. Likewise, a fine created automatically by the scan cascade is not returned by the scan response, so it is discovered by filtering resident fines by `scan_id` or by `origin`.
+
+### 2.4. Common Resource Properties
+
+Every persisted resource in this system — `Property`, `ServiceContract`, `Resident`, `ValetContractor`, `ServiceNight`, `RouteAssignment`, `ServiceScan`, `ResidentFine`, `CompactorIncident` and `MonthlyStatement` — carries the same four system-managed fields. No entity in this domain is exempt from any of them.
+
+- `id` (string): a server-minted UUID. It carries no type prefix and no domain-flavoured formatting; it is a plain UUID string.
+- `created_at` (string): the ISO 8601 UTC instant at which the row was first created, rendered with exactly three fractional-second digits, for example `2026-08-01T00:00:00.000Z`.
+- `updated_at` (string): the ISO 8601 UTC instant, in the same format, at which the row was last modified. Every mutation refreshes it, including mutations that only touch a derived rollup field.
+- `version` (integer): a counter that starts at 1 on creation and increases by exactly 1 on every mutation of that row. A cascade that mutates a parent or sibling row increments that row's `version` too — cascades are mutations, not bookkeeping.
+
+Two consequences of the `version` rule deserve emphasis because they are load-bearing elsewhere. First, a write that touches three rows increments three counters: assigning a route bumps the route's `version` (from creation) and the night's `version` (because the night's coverage rollup changed). Second, because derived rollups are versioned mutations, a night's `version` advances when a route is abandoned, when a route is completed, and when a scan lands — which is exactly what makes the stale-version guard in §2.8 useful.
+
+Datetime fields written by the server from the logical clock — `accepted_at`, `completed_at`, `scanned_at`, `reported_at`, `acknowledged_at`, `escalated_at`, `resolved_at`, `ack_deadline_at` — use the same ISO 8601 UTC representation with three fractional digits. Fields typed as calendar dates — `effective_from`, `effective_to`, `move_in_date`, `move_out_date`, `service_date`, `makeup_service_date` — are plain `YYYY-MM-DD` strings with no time component. `billing_period` and `last_invoiced_period` are `YYYY-MM` month strings.
+
+### 2.5. Request Admission Order and Path Resolution
+
+Because a single request can violate several rules at once, the order in which rejections are evaluated is part of the contract: the first rule in the ladder below that fails is the one whose error is returned, and no later rule is consulted. Readers should treat this as a strict precedence list, not as a set of independent checks.
+
+Path identifiers are resolved left to right, before any body content is examined. Where a path carries more than one identifier, the leftmost missing one determines the error. The ten path identifiers used by this API are `property_id`, `contract_id`, `resident_id`, `contractor_id`, `night_id`, `route_id`, `scan_id`, `fine_id`, `incident_id` and `statement_id`, and each maps to its own not-found code: `ERR_PROPERTY_NOT_FOUND`, `ERR_CONTRACT_NOT_FOUND`, `ERR_RESIDENT_NOT_FOUND`, `ERR_CONTRACTOR_NOT_FOUND`, `ERR_SERVICE_NIGHT_NOT_FOUND`, `ERR_ROUTE_NOT_FOUND`, `ERR_SCAN_NOT_FOUND`, `ERR_FINE_NOT_FOUND`, `ERR_INCIDENT_NOT_FOUND` and `ERR_STATEMENT_NOT_FOUND`, all at HTTP 404.
+
+The full admission ladder, highest precedence first:
+
+1. **Authentication.** Both headers present and non-blank, and `X-User-Role` a declared role — otherwise `ERR_UNAUTHENTICATED` (401). Applies to every endpoint.
+2. **Authorization.** The acting role appears in the endpoint's authorized-role list in §4 — otherwise `ERR_UNAUTHORIZED` (403). Applies to every endpoint.
+3. **Path existence.** Every identifier in the path resolves, left to right — otherwise the corresponding 404 code above. Applies to every endpoint that has a path identifier.
+4. **Resource ownership.** For an entity-backed role, `X-User-ID` owns the addressed resource — otherwise `ERR_NOT_RESOURCE_OWNER` (403). Applies to every write endpoint reachable by `Valet`, `Resident` or `PropertyManager`.
+5. **Body shape.** Every required field present and non-null; every enum value a declared member; every integer inside its declared range; every date a well-formed `YYYY-MM-DD`; every instant a well-formed ISO 8601 UTC value; `unit_from` no greater than `unit_to`; `limit` between 1 and 100 inclusive and `offset` at least 0 — otherwise `ERR_INVALID_REQUEST` (422). Applies to every endpoint.
+6. **Body foreign keys resolve.** The `contractor_id` supplied when creating a route assignment must name an existing contractor, and the `resident_id` supplied when recording a scan must name an existing resident — otherwise `ERR_CONTRACTOR_NOT_FOUND` or `ERR_RESIDENT_NOT_FOUND` (404). Applies to exactly those two endpoints.
+7. **Aggregate scope of a body foreign key.** The scanned resident's property must be the same property as the one behind the night's contract — otherwise `ERR_CROSS_PROPERTY_REFERENCE` (409). Applies to scan recording only.
+8. **Declared transition.** The addressed resource must currently be in a state from which the requested transition is declared in this document — otherwise `ERR_INVALID_STATE` (409), or one of its two specialisations: `ERR_TAG_NOT_FINEABLE` (409) when a scan's tag is not `OPEN` at fine time, and `ERR_ALREADY_TERMINAL` (409) when the addressed resource has already reached a terminal state for its machine. Applies to every transition endpoint. Concretely this rung is what rejects fining a tag that is not `OPEN`, issuing a statement that is not `DRAFT`, accepting a route that is not `ASSIGNED`, closing a night that is already terminal, escalating an incident that is not `REPORTED`, and activating a contract that is not `DRAFT`.
+9. **Property posture.** The owning property must not be `SUSPENDED` or `TERMINATED` — otherwise `ERR_PROPERTY_SUSPENDED` (409). This gate guards exactly four service-delivery writes: creating a route assignment on a night, accepting a route, completing a route, and recording a scan.
+10. **Stale parent version.** The supplied expected-version field must equal the parent's current `version` — otherwise `ERR_STALE_SERVICE_NIGHT_VERSION` or `ERR_STALE_CONTRACT_VERSION` (412). Applies to route-assignment creation and statement drafting, as detailed in §2.8.
+11. **Contractor service eligibility.** The contractor being assigned must have `onboarding_status` equal to `CLEARED` and a `classification` other than `UNCLASSIFIED` — otherwise `ERR_CONTRACTOR_NOT_ELIGIBLE` (409). Applies to route-assignment creation.
+12. **Compactor blockage.** The property must have no compactor incident whose `incident_type` is `JAM` and whose `status` is `ESCALATED`; an escalated jam blocks doorstep collection outright — otherwise `ERR_COMPACTOR_BLOCKED` (409). Applies to two endpoints: route-assignment creation and scan recording.
+13. **Segregation of duties.** The `BillingAnalyst` issuing a statement must not be the one who drafted it, and the `ComplianceOfficer` running an `OBSERVED` reclassification must not be the one who recorded that contractor's background check — otherwise `ERR_SEGREGATION_OF_DUTIES` (403). Applies to two endpoints: statement issue and contractor classification.
+14. **Contract period overlap.** The new contract's closed date interval must not intersect the interval of any existing contract of the same property whose `status` is `DRAFT` or `ACTIVE` — otherwise `ERR_CONTRACT_PERIOD_OVERLAP` (409). Applies to contract drafting.
+15. **Contractor window conflict.** The contractor must hold no other route assignment in `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS` whose night's service window intersects this night's window — otherwise `ERR_CONTRACTOR_WINDOW_CONFLICT` (409). Applies to route-assignment creation.
+16. **Service date on schedule.** The night's `service_date` must fall on a weekday listed in the contract's `service_night_days` and inside the contract's closed effective period — otherwise `ERR_SERVICE_DATE_NOT_SCHEDULED` (422). Applies to service-night creation. A makeup night created by a shift reschedule is exempt from the weekday half of this rule only.
+17. **Makeup date validity.** On a shift reschedule, `makeup_service_date` must be present, strictly later than the original `service_date`, no more than fourteen days after it, inside the contract's closed effective period, and not already occupied by a non-cancelled night of the same contract — otherwise `ERR_INVALID_MAKEUP_DATE` (422). Applies to service-night rescheduling.
+18. **Escalation window elapsed.** Escalation must be attempted at or after the incident's `ack_deadline_at` on the logical clock — otherwise `ERR_ESCALATION_WINDOW_NOT_ELAPSED` (409). Applies to incident escalation.
+19. **Unit numbers in range.** Any unit number must lie inside the property's closed unit range, which runs from 101 through 100 plus `unit_count` — otherwise `ERR_UNIT_RANGE_OUT_OF_BOUNDS` (422). This covers a resident's `unit_number` at resident creation and both ends of a route's range at route-assignment creation.
+20. **Route range overlap.** The requested closed unit range must not intersect the range of any route assignment of the same night whose `status` is `ASSIGNED`, `ACCEPTED`, `IN_PROGRESS` or `COMPLETED` — otherwise `ERR_UNIT_RANGE_OVERLAP` (409). Applies to route-assignment creation.
+21. **Unit vacancy.** No other resident of the property whose `status` is `ACTIVE` may already occupy the requested `unit_number` — otherwise `ERR_UNIT_ALREADY_OCCUPIED` (409). Applies to resident creation.
+22. **Unit inside the walked range.** The scanned resident's `unit_number` must lie inside the route's closed range — otherwise `ERR_UNIT_NOT_IN_ROUTE` (409). Applies to scan recording.
+23. **Scan uniqueness.** No scan may already exist for this combination of route assignment and resident — otherwise `ERR_DUPLICATE_SCAN` (409). Applies to scan recording.
+24. **Dispute budget.** The fine's `dispute_round` must be below two — otherwise `ERR_DISPUTE_ROUNDS_EXHAUSTED` (409). Applies to fine disputes.
+25. **Period not yet invoiced.** No statement of this contract whose `status` is `ISSUED` may already cover the requested `billing_period` — otherwise `ERR_PERIOD_ALREADY_INVOICED` (409). Applies to statement drafting.
+26. **Period fully closed.** Every service night of the contract whose `service_date` falls inside `billing_period` must already be terminal, that is `VERIFIED`, `PARTIAL`, `MISSED` or `CANCELLED` — otherwise `ERR_PERIOD_NOT_CLOSED` (409). Applies to statement issue.
+27. **Pass-through eligibility.** The resident must have `fee_passthrough_enabled` set to true; a resident excluded from pass-through cannot be fined — otherwise `ERR_PASSTHROUGH_DISABLED` (409). Applies to manual fine assessment.
+28. **Monthly cap headroom.** The resident's remaining monthly fine headroom must be greater than zero — otherwise `ERR_FINE_CAP_EXHAUSTED` (409). Applies to manual fine assessment.
+
+The practical consequence of this ordering is worth spelling out. A `Valet` who sends a malformed scan body for a resident belonging to another property receives the shape error, not the cross-property error, because rung 5 precedes rung 7. A dispatcher who supplies both a stale night version and an ineligible contractor receives the stale-version error, because rung 10 precedes rung 11. And a request that is simultaneously unauthorized and addressed at a non-existent property receives the authorization error, because rung 2 precedes rung 3.
+
+### 2.6. Cents, Basis Points and Rounding Discipline
+
+Money in this system is never a decimal. Every monetary quantity — `per_unit_monthly_fee_cents`, `gross_passthrough_cents`, `missed_service_credit_cents`, `property_revenue_share_cents`, `net_due_from_property_cents`, `base_cents`, `amount_cents`, `uncapped_amount_cents`, `fines_outstanding_cents`, `fines_assessed_this_period_cents` and `pending_fine_revenue_cents` — is an integer number of cents, and every ratio — `property_revenue_share_bps`, `sla_missed_threshold_bps`, `coverage_bps`, `missed_service_bps` and `sla_credit_rate_bps` — is an integer number of basis points, where 10000 basis points is the whole. `escalation_multiplier` and `missed_equivalent_nights` are the only two numeric fields carried as fractional numbers, and `observed_weekly_hours` is carried with at most two decimal places.
+
+Wherever a computation produces a non-integer intermediate value, it is converted to an integer by the **round half up** method: the fractional part is examined and a value of exactly one half rounds away from zero, upward. There is no banker's rounding anywhere in this specification.
+
+The single most consequential rule in this section is that **the point at which rounding is applied is pinned per calculation and is never a free choice**. Rounding a set of exact values individually and then summing them does not equal summing them exactly and rounding once; the difference can reach half a cent per line. Each calculation below states its own rounding point, and the two most sensitive cases are called out where they live: the per-resident pass-through lines are each rounded before they are added (§3.8), and a fine is rounded exactly once, before its floor and before its cap are applied (§3.6).
+
+### 2.7. The Logical Service Clock
+
+Nothing in this system reads the host machine's wall clock. Instead the server maintains a **logical UTC clock** that every deadline comparison, occupancy test and trailing-window computation reads. Before any client repositions it, the logical clock reads exactly `2026-08-01T00:00:00Z`; it must not fall back to real time under any circumstance, including on a freshly started process.
+
+A `PlatformAdmin` may reposition the clock by supplying a target instant in the `to_iso8601` field. The response reports the resulting clock value as `current_utc`. Repositioning the clock is not a mutation of the domain: no entity is written, no `updated_at` is refreshed, and no `version` is incremented. Nor does it retroactively re-evaluate anything — moving the clock past an acknowledgement deadline does not escalate an incident by itself, it merely makes the escalation permissible.
+
+The clock is the source of `accepted_at`, `completed_at`, `scanned_at`, `reported_at`, `acknowledged_at`, `escalated_at` and `resolved_at`, the basis of `ack_deadline_at`, the reference point of the ninety-day offense lookback and the seven-day observed-hours window, and the definition of "the current billing period" for the monthly fine cap.
+
+### 2.8. Stale-Version Guards on Coverage Maps and Contract Terms
+
+Two write endpoints are supersede operations: they are perfectly legal on state grounds, yet they silently overwrite a picture the client may no longer hold. Both are therefore protected by an explicit expected-version field that must be supplied on every request — the field is required, never optional, and omitting it is a shape violation rejected with `ERR_INVALID_REQUEST`.
+
+Creating a route assignment on a service night requires `expected_service_night_version` carrying the `version` of that `ServiceNight` as the client last observed it. If that value does not equal the night's current `version`, the request is rejected with `ERR_STALE_SERVICE_NIGHT_VERSION` at HTTP 412 and nothing is created. The reason this guard exists rather than a state check is that re-issuing a unit range is legitimate: a range previously walked by a route that has since been abandoned may be handed to another valet. Only the version tells the dispatcher that the night's coverage map — its `assigned_unit_coverage_count` and the set of live ranges — is no longer the one they planned against.
+
+Drafting a monthly statement on a contract requires `expected_contract_version` carrying the `version` of that `ServiceContract` as the client last observed it. If that value does not equal the contract's current `version`, the request is rejected with `ERR_STALE_CONTRACT_VERSION` at HTTP 412 and no draft is created. Again the write itself is legal — a new draft is allowed to supersede an existing draft for the same period — so the version is the only thing standing between an analyst and a statement drafted against contract terms (`per_unit_monthly_fee_cents`, `property_revenue_share_bps`, `sla_missed_threshold_bps`, `last_invoiced_period`) that have moved since they were read.
+
+No other endpoint in this API accepts an expected-version field. Requests to endpoints outside these two must not be rejected for version reasons, and supplying an unrecognised version field to them has no effect.
+
+### 2.9. Cascade Propagation and Conserved Ledger Quantities
+
+Writes in this system propagate. A cascade is not an optional convenience: when this document says a transition cancels its children, that cancellation is part of the same request and its effects are visible in the very next read. Cascades chain to arbitrary depth — escalating a compactor incident can suspend a property, which cancels its scheduled nights, which cancels those nights' live routes, which recomputes each night's assigned coverage. Every row touched anywhere along that chain has its `updated_at` refreshed and its `version` incremented.
+
+Three quantities in this system are **conserved**, meaning their stored value must always equal a fresh re-derivation from their constituent rows — after a forward action and equally after a compensating action that reverses one:
+
+- A night's `assigned_unit_coverage_count` must equal the sum of `unit_coverage_count` over that night's route assignments whose `status` is `ASSIGNED`, `ACCEPTED`, `IN_PROGRESS` or `COMPLETED`. It is always recomputed as a full re-aggregation over those rows, never adjusted by an incremental delta. The practical test of this rule: abandoning a route and re-issuing the identical unit range to another valet must leave `assigned_unit_coverage_count` exactly as it was before the abandonment.
+- A resident's `fines_outstanding_cents` must equal the sum of `amount_cents` over that resident's fines whose `status` is `ASSESSED`, `DISPUTED` or `UPHELD`; and a property's `pending_fine_revenue_cents` must equal the sum of that quantity across all of the property's residents, regardless of each resident's own `status`.
+- A property's `escalation_level` must equal the count of that property's compactor incidents whose `status` is `ESCALATED`.
+
+One quantity is deliberately **not** conserved, and the asymmetry is intentional: `fines_assessed_this_period_cents` only ever increases within a billing period. It grows when a fine is created and is never reduced by a waiver or a void. Monthly cap headroom consumed by an assessment is not returned.
+
+### 2.10. Property Posture as the Master Service Gate
+
+A property's `status` is a compound posture rather than a hand-set flag. It is `ONBOARDING` at registration, becomes `ACTIVE` when a contract of that property is activated, is forced to `SUSPENDED` whenever its `escalation_level` reaches two, returns to `ACTIVE` when its `escalation_level` falls back below two, and becomes `TERMINATED` when its last non-terminated contract is terminated. No endpoint sets `status` directly.
+
+That posture gates service delivery. While a property is `SUSPENDED` or `TERMINATED`, four operations are refused with `ERR_PROPERTY_SUSPENDED`: creating a route assignment on one of its nights, accepting one of its routes, completing one of its routes, and recording a doorstep scan. Reads are never gated by posture, and neither are billing operations — a suspended property still gets its statements drafted, issued and voided, because the shortfall the suspension caused is precisely what the settlement arithmetic must account for.
+
+Separately from posture, an escalated compactor jam blocks collection outright. When a property holds any compactor incident whose `incident_type` is `JAM` and whose `status` is `ESCALATED`, route creation and scan recording are refused with `ERR_COMPACTOR_BLOCKED` even if the property's `status` is still `ACTIVE`. An `OVERFLOW` incident, however escalated, does not carry this block — an overflowing chute degrades collection but does not stop it.
+
+### 2.11. Segregation of Duties Between Peer Operators
+
+Two rules in this system separate duties between **two operators holding the same role**, which means role-based access control alone cannot satisfy them; the check is on `X-User-ID`.
+
+First, the analyst who drafts a monthly statement may not be the analyst who issues it. The drafting operator's identifier is retained as `created_by_user_id`, and at issue time the acting `X-User-ID` is compared against it; if they match, the issue is refused with `ERR_SEGREGATION_OF_DUTIES` at HTTP 403. When the issue succeeds, the issuing operator is recorded as `issued_by_user_id`.
+
+Second, the compliance officer who recorded a contractor's background check may not perform that contractor's `OBSERVED` reclassification audit. The screening operator's identifier is retained as `background_checked_by_user_id`, and an `OBSERVED` classification run whose `X-User-ID` matches it is refused with the same `ERR_SEGREGATION_OF_DUTIES` at HTTP 403. A `DECLARED` classification run is deliberately **not** subject to this restriction: the declared screen simply reads the onboarding packet and carries no audit independence requirement, so the same officer who cleared the background check may run it.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Bringing a Community Onto the Network
+
+Everything in this system hangs off an apartment community. A `PlatformAdmin` registers one by supplying its `name` — the community's marketing name, between 1 and 120 characters and not blank — the billable door count as `unit_count`, and the three-letter uppercase `market_code` of the operating market it belongs to. The door count must be at least 1 and no more than 500. An optional `compactor_capacity_lbs` records the rated capacity of the on-site compactor; it defaults to 6000 pounds and, when supplied, must be at least 1000.
+
+The door count does more than size the invoice: it **fixes the community's unit numbering permanently at registration**. Units are numbered as the closed integer range beginning at 101 and ending at 100 plus `unit_count`, so a 40-door community owns units 101 through 140 and nothing else. Every unit number anywhere in the system — a resident's door, either end of a valet's walked range — is checked against that range, and a number outside it is rejected with `ERR_UNIT_RANGE_OUT_OF_BOUNDS`.
+
+A freshly registered community is born in `status` `ONBOARDING` with `active_contract_id` null, `escalation_level` 0, `pending_fine_revenue_cents` 0 and `delinquent_resident_count` 0. It cannot yet be served; that requires a contract.
+
+A **service contract** captures the commercial terms and is drafted against the community by either a `PlatformAdmin` or a `BillingAnalyst`. Its `property_id` is always taken from the community it is drafted under and is never accepted from the request body. The terms are: `per_unit_monthly_fee_cents`, the monthly doorstep-valet fee passed through per billable unit, at least 100 cents and no more than 100000 cents; `property_revenue_share_bps`, the basis points of the credited pass-through retained by the owner, from 0 up to 5000 inclusive (in other words, the owner may keep anything from nothing up to half); `service_night_days`, a non-empty array of between one and seven distinct weekday names drawn from `SUN`, `MON`, `TUE`, `WED`, `THU`, `FRI` and `SAT`; `effective_from` and `effective_to`, which delimit the coverage period as a **closed** interval with both endpoints included and with `effective_to` no earlier than `effective_from`; and `sla_missed_threshold_bps`, the missed-service ratio at or above which the property is owed a credit, between 1 and 10000 inclusive.
+
+Because both interval endpoints are inclusive, two contracts of the same community that merely share a single boundary date do overlap. A draft whose closed period intersects the closed period of any existing contract of that community whose `status` is `DRAFT` or `ACTIVE` is rejected with `ERR_CONTRACT_PERIOD_OVERLAP`; a new period starting on the exact day an existing period ends is an intersection, not an adjacency. Contracts already `TERMINATED` are ignored by this test.
+
+A new contract is born `DRAFT` with `last_invoiced_period` null. Activation, reserved to a `PlatformAdmin`, moves it `DRAFT → ACTIVE` and is permitted only when the contract is still `DRAFT`, when its community is not `TERMINATED`, and when no other contract of the same community is already `ACTIVE`. Activation is where the community itself comes alive: alongside setting the contract's `status` to `ACTIVE` and incrementing its `version`, the community's `active_contract_id` is set to that contract and its `status` moves `ONBOARDING → ACTIVE`, incrementing the community's `version` in the same request. A community already `ACTIVE` stays `ACTIVE` and simply re-points `active_contract_id`.
+
+Termination, also reserved to a `PlatformAdmin`, accepts an optional `reason` and behaves differently depending on where the contract stands. A contract still `DRAFT` moves `DRAFT → TERMINATED` with nothing else disturbed beyond its own `version`. A contract that is `ACTIVE` moves `ACTIVE → TERMINATED`, but only if no monthly statement of that contract is currently sitting in `DRAFT` — an outstanding draft must be voided or issued first, otherwise the termination is refused as an invalid state transition. When an active contract does terminate, three cascades fire in the same request: every service night of the contract that has not yet reached a terminal verification outcome (one still `SCHEDULED`, or one already `IN_PROGRESS` because scanning had begun) moves to `CANCELLED`, and each of those cancellations in turn cancels that night's route assignments still in `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS`; and the community, provided no other contract of it remains in `DRAFT` or `ACTIVE`, has its `active_contract_id` cleared to null and its own `status` moved to `TERMINATED`. That community-level move is available both from `ACTIVE → TERMINATED` and from `SUSPENDED → TERMINATED`: a suspended community whose last contract is terminated ends up `TERMINATED`, not stuck in suspension. Each of those rows has its `version` incremented.
+
+`TERMINATED` is terminal for both a contract and a community. Neither can be revived; a community that needs service again needs a new contract, and a community whose scheduled nights were cancelled by a cascade needs new nights.
+
+### 3.2. Residents, Occupancy Windows and Pass-Through Eligibility
+
+Residents are the billable population and the doors a valet actually knocks on. A `PropertyManager` (or a `PlatformAdmin` acting on its behalf) adds one to a community by giving the door it occupies as `unit_number`, the resident of record on the lease as `full_name` (1 to 120 characters, not blank), and the first occupied day as `move_in_date`. A boolean `fee_passthrough_enabled` decides whether the per-unit valet fee and any non-compliance fines are billed to this resident at all; when omitted it defaults to true. The resident's `property_id` comes from the community the resident is added under, never from the body.
+
+Two rules police the door itself. The `unit_number` must lie inside the community's closed unit range, or the request fails with `ERR_UNIT_RANGE_OUT_OF_BOUNDS`. And no other resident of that community whose `status` is `ACTIVE` may already hold that door, or the request fails with `ERR_UNIT_ALREADY_OCCUPIED` — note that a resident who has already moved out releases the door, so the same `unit_number` can be reused by the next tenant.
+
+A new resident is born with `status` `ACTIVE`, `collections_status` `CURRENT`, `fines_outstanding_cents` 0, `fines_assessed_this_period_cents` 0 and `move_out_date` null.
+
+The pair of date fields defines an **occupancy window whose two ends are deliberately asymmetric**, and every proration and door count in the system depends on getting it right. `move_in_date` is inclusive: the resident occupies the unit on that date. `move_out_date` is exclusive: the last day the resident is considered in place, and therefore the last day billed, is the day immediately before `move_out_date`. A resident whose `move_out_date` is null is in place indefinitely. Concretely, a calendar date falls inside a resident's occupancy exactly when it is on or after `move_in_date` and, if a `move_out_date` exists, strictly before it.
+
+Recording a move-out advances the resident `ACTIVE → MOVED_OUT`. Either a `PropertyManager` or a `PlatformAdmin` may do so, supplying `move_out_date` in the payload. Two conditions apply: the resident must still be `ACTIVE`, and the supplied `move_out_date` must be strictly later than the resident's `move_in_date` — a same-day move-out is not accepted. On success the date is stored, the `status` becomes `MOVED_OUT`, and the resident's `version` increments. One cascade follows, and it is easy to overlook: because the community's occupied-door population just shrank, every service night belonging to the community's currently active contract whose `verification_status` is still `SCHEDULED` has its `expected_door_count` recomputed against its own `service_date` using the occupancy rule above. Nights already `IN_PROGRESS` or already terminal are left alone. `MOVED_OUT` is terminal for a resident.
+
+A resident's collections posture is derived, never set. `collections_status` reads `CURRENT` while `fines_outstanding_cents` is below the delinquency threshold of 7500 cents — that is, below seventy-five dollars of unresolved fines — and flips to `DELINQUENT` the moment the outstanding balance reaches or passes that threshold. It flips back to `CURRENT` if the balance later falls below it. Because delinquency is a community-level concern too, a community carries `pending_fine_revenue_cents`, the total unresolved fine balance across all of its residents whatever their own `status`, and `delinquent_resident_count`, the number of its residents currently reading `DELINQUENT`. Both are re-derived every time any resident's balance moves, and both mutations increment the community's `version`.
+
+Pass-through eligibility has three separate consequences that must all hold. A resident with `fee_passthrough_enabled` false contributes nothing to the monthly pass-through gross and is excluded from the line list entirely; that same resident cannot be fined, and a manual attempt to fine them is refused with `ERR_PASSTHROUGH_DISABLED`; and that same resident is not counted in a night's `expected_door_count`, so their door is not treated as coverage the valet owed.
+
+### 3.3. Building the Valet Bench: Screening and Worker Classification
+
+The people who walk the corridors are onboarded as **valet contractors**, and the single most legally sensitive thing this system does is decide whether each of them is genuinely an independent contractor or is, in substance, an employee.
+
+Onboarding starts when a `ValetOpsManager` (or a `PlatformAdmin`) applies a valet to the network. The application carries the contractor's `legal_name` as it appears on the onboarding packet, between 1 and 120 characters and not blank, plus four self-declared engagement terms that the classification screen later reads: `equipment_provided_by_company` (does the company supply the tote, gloves and scanner?), `sets_own_schedule` (does the valet pick their own nights?), `works_exclusively` (does the valet serve only this company?), and `weekly_committed_hours`, the weekly hours committed in the packet, at least 0 and no more than 80. The new record is born with `onboarding_status` `APPLIED`, `classification` `UNCLASSIFIED`, `classification_basis` null, `control_score` 0, `observed_weekly_hours` 0, `tax_form_type` null, `direct_deposit_on_file` false, `background_checked_by_user_id` null and `deactivation_reason` null. The identifier of the operator who filed the application is retained as `created_by_user_id`.
+
+Document intake moves the applicant `APPLIED → BACKGROUND_PENDING`. A `ValetOpsManager` or `PlatformAdmin` records the tax packet as `tax_form_type` — `W9` for a valet expected to be paid as a 1099 contractor, `W4` for one expected to be paid as a W2 employee — together with `direct_deposit_on_file`, indicating whether payment details were captured. Both values are written onto the contractor and its `version` increments. Note that the collected form is a declaration of intent only; it does not determine, and is not overridden by, the classification the screen later computes.
+
+Screening is the `ComplianceOfficer`'s exclusive act and is a genuine fork. The officer records the outcome in `result`: a value of `CLEAR` advances the contractor `BACKGROUND_PENDING → CLEARED`, while a value of `FAIL` advances it `BACKGROUND_PENDING → REJECTED`. Both branches stamp the acting `X-User-ID` onto `background_checked_by_user_id` and increment `version`. The branches differ in exactly one further respect, and it matters: the rejected branch leaves `classification` at `UNCLASSIFIED` forever, because a rejected applicant is never classified. `REJECTED` is terminal.
+
+A cleared contractor is then run through the **employer-control screen**, again by a `ComplianceOfficer`, who selects a `basis` of either `DECLARED` or `OBSERVED`. This is a self-loop: a cleared contractor stays `CLEARED` and may be re-screened any number of times, and the `OBSERVED` run is the periodic reclassification audit. The screen requires the contractor to be `CLEARED`; running it on an applicant still in screening, on a rejected applicant or on a deactivated one is refused as an invalid state transition. An `OBSERVED` run additionally requires that the acting `X-User-ID` differ from the contractor's `background_checked_by_user_id`, per §2.11.
+
+The screen computes a `control_score` on a 0-to-100 scale from four independent factors, each of which contributes its full weight or nothing at all. Two factors always read the declared packet:
+
+- **Company-supplied equipment** contributes 30 points when `equipment_provided_by_company` is true, and 0 otherwise.
+- **Company-set schedule** contributes 25 points when `sets_own_schedule` is false — that is, when the valet does *not* choose their own nights — and 0 when the valet does set their own schedule. The polarity is inverted relative to the field name because it is company control, not valet autonomy, that is being scored.
+
+The remaining two factors are where the two bases diverge, and each basis must be implemented with the same care as the other.
+
+Under `DECLARED`, the packet is taken at face value. **Full-time hours** contributes 25 points when `weekly_committed_hours` is at least 30, and 0 otherwise. **Exclusivity** contributes 20 points when `works_exclusively` is true, and 0 otherwise. A `DECLARED` run does not write `observed_weekly_hours`; whatever value that field already held is left exactly as it was.
+
+Under `OBSERVED`, both factors are recomputed from real route history over a trailing window of seven whole days, closed at both ends: the window begins six days before the logical clock's current date and ends on the clock's current date inclusive. The audited set is every route assignment of this contractor whose `status` is `COMPLETED` and whose service night's `service_date` falls inside that window, considered in order of `service_date` ascending and then `created_at` ascending. Route assignments in `ASSIGNED`, `ACCEPTED`, `IN_PROGRESS`, `ABANDONED` or `CANCELLED` are excluded, as are completed routes whose night falls outside the window. From that set, `observed_weekly_hours` is the total elapsed length in hours of the audited nights' service windows — for each audited route, the difference between its night's `service_window_end` and `service_window_start` expressed in hours, all summed and then rounded half up to two decimal places. **Full-time hours** then contributes 25 points when `observed_weekly_hours` is at least 30, and 0 otherwise. **Exclusivity** contributes 20 points only when both conditions hold: the audited set contains at least 3 routes, and every audited route's night belongs to the same community. Fewer than three audited routes, or routes spread across two or more communities, contributes 0.
+
+The four factor values are added to produce `control_score`, which is written onto the contractor. A score of 70 or more classifies the valet as `EMPLOYEE_W2`; anything below 70 classifies them as `CONTRACTOR_1099`. The `classification_basis` records which basis produced the current answer. Consider a valet whose packet says the company supplies equipment, who sets their own schedule, who does not work exclusively, and who committed to 20 hours a week, but who in fact completed three ten-hour routes at a single community inside the window: the declared screen scores 30 points and calls them `CONTRACTOR_1099`, while the observed screen scores 30 plus 25 plus 20, or 75, and reclassifies them `EMPLOYEE_W2` on 30.0 observed hours. That divergence — the same packet, two answers — is the whole purpose of the audit.
+
+Deactivation, available to a `ValetOpsManager` or `PlatformAdmin`, moves a contractor `CLEARED → DEACTIVATED` and requires a `reason`, stored as `deactivation_reason`. It is permitted only from `CLEARED`, and only when the contractor holds no route assignment in `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS`; a contractor with live work must have that work abandoned first, and a request that violates this is refused as an invalid state transition. Should any live route nevertheless exist at deactivation time, it is moved to `ABANDONED` with its `abandon_reason` set to the literal string `CONTRACTOR_DEACTIVATED`, and its night's `assigned_unit_coverage_count` is recomputed. `DEACTIVATED` is terminal.
+
+One consequence links this subsection to the next: a valet may only be handed a route once they are both `CLEARED` and carry a `classification` other than `UNCLASSIFIED`. Clearing the background check is not sufficient — the classification screen must have run at least once — and a dispatch attempt against a contractor failing either half is refused with `ERR_CONTRACTOR_NOT_ELIGIBLE`.
+
+### 3.4. The Weekly Schedule: Service Nights, Seasonal Volume and Holiday Adjustment
+
+A **service night** is one collection round on one calendar date for one contract. A `ValetOpsManager` or `PlatformAdmin` schedules one against the contract, and the night's `contract_id` is taken from the contract it is scheduled under rather than from the body. The payload gives `service_date`, the calendar date of the round; `service_window_start`, the instant the doorstep round opens; and `service_window_end`, the instant it closes, which must be strictly later than the start. The occupied window is **half-open**: it includes the start instant and excludes the end instant, which is what allows one valet's round to end at the exact instant another begins without the two conflicting. Two optional inputs complete the picture: `seasonal_volume_index`, an integer between 50 and 300 inclusive that defaults to 100 and expresses how heavy the night's volume is expected to be, and `holiday_flag`, a boolean defaulting to false that marks a night falling on an observed holiday.
+
+The seasonal index is not decoration. A night whose `seasonal_volume_index` is 120 or above is a **peak night**, and peak nights uplift the fines assessed on them by a quarter, as §3.6 describes. The `holiday_flag` carries no arithmetic of its own; it is the operational signal that a night is a candidate for the schedule adjustment described below.
+
+A night may only be scheduled on a date the contract actually covers. Its `service_date` must fall on a weekday named in the contract's `service_night_days` and must lie inside the contract's closed effective period, or the request is refused with `ERR_SERVICE_DATE_NOT_SCHEDULED`.
+
+A new night is born with `verification_status` `SCHEDULED`, `billing_status` `UNBILLED`, `scanned_door_count` 0, `coverage_bps` 0, `assigned_unit_coverage_count` 0, `rescheduled_from_night_id` null and `reschedule_action` null. Its `expected_door_count` is computed immediately from the occupancy picture on its `service_date`: the number of the community's residents whose `fee_passthrough_enabled` is true and whose occupancy window (inclusive of `move_in_date`, exclusive of `move_out_date`) contains that date.
+
+**A night carries two state dimensions that advance independently and must never be collapsed into one.** `verification_status` tracks service delivery and moves through `SCHEDULED`, `IN_PROGRESS`, and then one of `VERIFIED`, `PARTIAL`, `MISSED` or `CANCELLED`. `billing_status` tracks revenue recognition and moves through `UNBILLED`, `ACCRUED`, and then `INVOICED` or `CREDITED`. Scans and the close drive the first dimension; the close and the statement issue drive the second. Every combination the two dimensions can legally produce is meaningful: a night can be `MISSED` and `ACCRUED`, `VERIFIED` and `ACCRUED`, `MISSED` and `CREDITED`, or `VERIFIED` and `INVOICED`. An operation that advances one dimension leaves the other untouched.
+
+Holiday and seasonal schedule adjustment is the `ValetOpsManager`'s tool (a `PlatformAdmin` may also apply it), and it is a fork with two genuinely different outcomes selected by the `action` field. An optional `reason` may accompany either branch. The adjustment is permitted only while the night's `verification_status` is `SCHEDULED`, and only when the night's `rescheduled_from_night_id` is null — a makeup night cannot itself be rescheduled, which bounds the chain at one hop.
+
+Under `action` `SKIP`, the community simply loses the round. The night moves `SCHEDULED → CANCELLED` and its `reschedule_action` records `SKIP`. Every route assignment of that night still in `ASSIGNED` or `ACCEPTED` moves to `CANCELLED`, and the night's `assigned_unit_coverage_count` is recomputed, which necessarily leaves it at 0. The billing dimension does *not* advance: a skipped night stays `UNBILLED` forever, is never accrued, and is excluded from the period's `scheduled_night_count` — a skipped night is not a missed night, and it must not push the SLA ratio around. No new night is created.
+
+Under `action` `SHIFT`, the round is moved rather than lost. The addressed night moves `SCHEDULED → CANCELLED` exactly as in the skip branch, with `reschedule_action` recording `SHIFT` and every route assignment still in `ASSIGNED` or `ACCEPTED` moving to `CANCELLED` and the coverage rollup recomputed. In addition, a **makeup night** is created on the supplied `makeup_service_date`. The makeup night belongs to the same contract; its `rescheduled_from_night_id` points at the night it replaces; it starts `SCHEDULED` and `UNBILLED`; its `holiday_flag` is set to false regardless of the original night's flag; its `seasonal_volume_index` is copied verbatim from the original night; and its `service_window_start` and `service_window_end` are the original night's window instants shifted forward by exactly the whole-day difference between the two service dates, so the round keeps its clock time and only changes its date. A shifted makeup night is exempt from the weekday membership check — that is precisely the point, since a holiday makeup usually lands on an off-schedule day — but it is not exempt from the contract's effective period.
+
+The makeup night is **not** returned in the response body of the reschedule; the response describes the cancelled night. The only way for a client to find the makeup night is to list service nights filtered by `rescheduled_from_night_id` set to the cancelled night's identifier.
+
+The supplied `makeup_service_date` is validated tightly: it must be present, strictly later than the original `service_date`, no more than fourteen days after it, inside the contract's closed effective period, and not already occupied by another night of the same contract whose `verification_status` is anything other than `CANCELLED`. Any of those failures produces `ERR_INVALID_MAKEUP_DATE`. A `SKIP` request needs no makeup date and must ignore one if supplied.
+
+Both branches increment the addressed night's `version`, and each cancelled route increments its own.
+
+### 3.5. Dispatch and the Doorstep Round: Ranges, Scans and the Close
+
+Dispatching a night means carving its doors into contiguous ranges and handing each range to a cleared, classified valet. A `ValetOpsManager` or `PlatformAdmin` creates a **route assignment** against a night, naming the valet as `contractor_id`, the first door of the range as `unit_from`, and the last door as `unit_to`. The range is **closed** — both endpoints are walked — and `unit_from` must not exceed `unit_to`. Every route creation also carries `expected_service_night_version` per §2.8. The route's `service_night_id` comes from the night it is created under.
+
+Dispatch is where the largest cluster of guards in the system sits, and they fire in the precedence order given in §2.5. The named `contractor_id` must resolve, or `ERR_CONTRACTOR_NOT_FOUND`. The community must not be `SUSPENDED` or `TERMINATED`, or `ERR_PROPERTY_SUSPENDED`. The supplied night version must be current, or `ERR_STALE_SERVICE_NIGHT_VERSION`. The valet must be `CLEARED` with a `classification` other than `UNCLASSIFIED`, or `ERR_CONTRACTOR_NOT_ELIGIBLE`. The community must hold no `ESCALATED` `JAM` incident, or `ERR_COMPACTOR_BLOCKED`. Both `unit_from` and `unit_to` must lie inside the community's closed unit range, or `ERR_UNIT_RANGE_OUT_OF_BOUNDS`. The valet must not already hold a route in `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS` on a night whose half-open service window intersects this night's window, or `ERR_CONTRACTOR_WINDOW_CONFLICT` — and because the windows are half-open, back-to-back rounds where one ends at the exact instant the next begins do not conflict. Finally, the requested closed range must not intersect the range of any route on the same night whose `status` is `ASSIGNED`, `ACCEPTED`, `IN_PROGRESS` or `COMPLETED`, or `ERR_UNIT_RANGE_OVERLAP`.
+
+A new route is born `ASSIGNED`, with `accepted_at` and `completed_at` null, `abandon_reason` null, `scan_count` 0, and `unit_coverage_count` set to the number of doors in the range: the last door minus the first door plus one. Creating it recomputes the night's `assigned_unit_coverage_count` and increments the night's `version`.
+
+That rollup is defined as a **full re-aggregation, never an incremental adjustment**: it is the sum of `unit_coverage_count` across the night's route assignments whose `status` is `ASSIGNED`, `ACCEPTED`, `IN_PROGRESS` or `COMPLETED`. Routes that have become `ABANDONED` or `CANCELLED` drop out of the sum entirely. When the sum is materialised for audit, the contributing routes are considered in `created_at` ascending order.
+
+Acceptance belongs exclusively to the `Valet`. The route moves `ASSIGNED → ACCEPTED` and `accepted_at` is stamped from the logical clock. Four conditions hold: the route must still be `ASSIGNED`, the acting `X-User-ID` must equal the route's `contractor_id`, the valet's `onboarding_status` must still be `CLEARED`, and the community must still be `ACTIVE`.
+
+Recording a doorstep scan is likewise the `Valet`'s exclusive act, and it is the busiest write in the system. The payload names the door as `resident_id`, reports what happened as `scan_result`, reports what was standing at the door as `container_type`, and optionally reports a violation as `non_compliance_type`. The `scan_result` is one of `SERVICED` (the tote was collected), `NO_SET_OUT` (nothing was at the door), or `TAGGED_NOT_SERVICED` (the container was left in place with a tag on it). The `container_type` is one of `TRASH_BIN`, `RECYCLING_BIN` or `LOOSE_BAG`. The `non_compliance_type`, when present, is one of `EARLY_SET_OUT`, `IMPROPER_CONTAINER` or `RECYCLING_CONTAMINATION`; when absent, the door was compliant.
+
+A scan is admitted only when the route is `ACCEPTED` or `IN_PROGRESS`, the named resident exists, that resident's community is the community behind the night's contract (otherwise `ERR_CROSS_PROPERTY_REFERENCE`), the resident's `unit_number` lies inside the route's closed range (otherwise `ERR_UNIT_NOT_IN_ROUTE`), and no scan already exists for this same route and this same resident (otherwise `ERR_DUPLICATE_SCAN`). The community must be `ACTIVE` and free of an `ESCALATED` `JAM`, per §2.10.
+
+On success the scan is persisted with `scanned_at` stamped from the logical clock and with `service_night_id` copied down from the route it belongs to — deliberately denormalised so that night-level aggregates and queries never have to traverse the route. Its `tag_status` is set to `OPEN` when a `non_compliance_type` was reported and to `NONE` when it was not, and its `offense_ordinal` is computed as described in §3.6. Scans are append-only: the row itself never transitions, only its tag dimension does, and a compliant scan born `NONE` never transitions at all.
+
+Three rollups follow every scan. The route's `scan_count` increments by one and, on the route's first scan, the route moves `ACCEPTED → IN_PROGRESS`. On the night's first scan from any of its routes, the night moves `SCHEDULED → IN_PROGRESS`. And the night's `expected_door_count`, `scanned_door_count` and `coverage_bps` are all recomputed. `scanned_door_count` is the number of the night's scans whose `scan_result` is `SERVICED` or `NO_SET_OUT`; a `TAGGED_NOT_SERVICED` scan is excluded from it, because the door was not actually cleared — yet that scan still counts toward the route's `scan_count`. `coverage_bps` is 0 when `expected_door_count` is 0, and otherwise ten thousand multiplied by `scanned_door_count`, divided by `expected_door_count`, rounded half up to a whole basis point.
+
+The valet closes out their own range by completing it, which is permitted from `ACCEPTED` or from `IN_PROGRESS` and requires the acting `X-User-ID` to equal the route's `contractor_id`. The route moves to `COMPLETED`, `completed_at` is stamped from the logical clock, and the night's `assigned_unit_coverage_count` is recomputed — completed routes remain inside the live sum. Completing straight from `ACCEPTED` without a single scan is legal and has a consequence worth stating: the night's `scanned_door_count` is still zero, so the night will close `MISSED`.
+
+Abandonment is the escape hatch and is available to the `Valet` who holds the route as well as to a `ValetOpsManager` or `PlatformAdmin`. It is permitted from `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS`, requires a `reason` which is stored as `abandon_reason`, and when the actor is a `Valet` requires that `X-User-ID` equal the route's `contractor_id`. The route moves to `ABANDONED`, its own `version` increments, and the night's `assigned_unit_coverage_count` is recomputed and the night's `version` increments too — the abandoned range leaves the conserved sum. This is exactly why re-issuing that same range to another valet must restore `assigned_unit_coverage_count` to the value it had before the abandonment.
+
+Closing the night is the `ValetOpsManager`'s exclusive act (a `PlatformAdmin` may also perform it), and it settles both dimensions at once. The night must currently be `SCHEDULED` or `IN_PROGRESS`; a night already `VERIFIED`, `PARTIAL`, `MISSED` or `CANCELLED` is terminal and a further close is refused. The close first recomputes `expected_door_count`, `scanned_door_count` and `coverage_bps`, then selects the verification outcome **in this exact order**:
+
+1. If `scanned_door_count` is 0, the outcome is `MISSED`. This branch is evaluated first and unconditionally, before any coverage comparison. A night with `expected_door_count` 0 and `scanned_door_count` 0 therefore closes `MISSED`, never `VERIFIED`, even though nobody could argue coverage was incomplete.
+2. Otherwise, if `coverage_bps` is at or above the verification threshold of 7500 basis points — that is, three quarters of the expected doors or better — the outcome is `VERIFIED`. The comparison is inclusive: coverage of exactly 7500 basis points is `VERIFIED`. Four expected doors with three scanned yields 7500 and verifies; four expected with two scanned yields 5000 and does not.
+3. Otherwise the outcome is `PARTIAL`.
+
+Whichever of the three outcomes is selected, the same three things follow: the night's `verification_status` becomes that outcome; the billing dimension advances `UNBILLED → ACCRUED`; and every route assignment of the night still in `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS` moves to `ABANDONED` with `abandon_reason` set to the literal string `NIGHT_CLOSED`, each recomputing the night's `assigned_unit_coverage_count` and incrementing its own `version`. The night's `version` increments as well. Note the two distinct routes into `MISSED`: a night still `SCHEDULED` at close time, where nobody scanned anything at all, and a night already `IN_PROGRESS` where every recorded scan was `TAGGED_NOT_SERVICED` so that `scanned_door_count` never left zero.
+
+A night cancelled by a schedule adjustment or by a cascade never reaches the close, and its billing dimension is never accrued.
+
+### 3.6. Non-Compliance Tags, Resident Fines and the Dispute Cycle
+
+When a valet reports a `non_compliance_type` on a scan, that scan acquires a **tag**. The tag is a small state machine layered on an otherwise immutable scan row: `tag_status` reads `NONE` when no violation was recorded, `OPEN` once a tag has been left at the door, `FINED` once a fine rests on it, and `VOIDED` after the community's manager retracts it. A compliant scan is born `NONE` and stays there permanently; `VOIDED` is terminal.
+
+Repeat offending is tracked by `offense_ordinal`, computed at the moment the scan is recorded. For a compliant scan it is 0. For a scan carrying a violation it is one plus the number of that same resident's earlier scans that reported the **same** `non_compliance_type`, whose `tag_status` is currently `OPEN` or `FINED`, and whose `created_at` falls inside the trailing ninety-day window ending at the logical clock — the history is walked in `created_at` ascending order. Two exclusions follow directly from that definition and both matter: a scan whose tag was voided is no longer `OPEN` or `FINED`, so it drops out of every later ordinal computation, effectively erasing that offence from the resident's record; and a different violation type never contributes, so a resident's second early set-out is ordinal 2 even if they also have four contaminated-recycling tags.
+
+The fine amount is computed from four inputs in a **strictly nested order that must not be rearranged**: round, then floor, then cap.
+
+- **Base.** `base_cents` is the flat penalty for the violation type: 2500 cents for `EARLY_SET_OUT`, 1500 cents for `IMPROPER_CONTAINER`, and 5000 cents for `RECYCLING_CONTAMINATION` — twenty-five, fifteen, and fifty dollars respectively.
+- **Escalation.** `escalation_multiplier` is selected by the offence ordinal, with the ordinal first clamped down to a maximum of 3: a first offence multiplies by 0.5, a second by 1.5, and a third or any later one by 2.0. A resident's ninth early set-out is therefore priced identically to their third.
+- **Seasonal uplift.** When the scan's night has a `seasonal_volume_index` of 120 or more, the amount is multiplied by a further 1.25 and `seasonal_uplift_applied` records true; otherwise the factor is 1.0 and `seasonal_uplift_applied` records false.
+- **Round once.** Those three values are multiplied together as an exact quantity and the product is rounded half up to a whole number of cents. This is the only rounding step in the whole fine calculation.
+
+The rounded value is then put through two clamps, in this order. First a **floor**: no fine may be smaller than 1000 cents, so the rounded value is replaced by 1000 whenever it falls below ten dollars. The result of that floor is stored as `uncapped_amount_cents`. Then a **monthly cap**: a resident may be assessed at most 15000 cents — one hundred and fifty dollars — of fines within a single calendar month, so the remaining headroom is 15000 minus that resident's `fines_assessed_this_period_cents`, treated as 0 if the subtraction would go negative, and `amount_cents` is the smaller of the floored amount and that remaining headroom. When the cap does not bind, `amount_cents` and `uncapped_amount_cents` are equal.
+
+The nesting order is load-bearing. Applying the floor before rounding, or the cap before the floor, changes the answer whenever a clamp binds. A first early set-out on a night indexed at 130 works out as 2500 multiplied by 0.5 multiplied by 1.25, giving exactly 1562.5, which rounds to 1563 and clears the floor untouched. A first improper container on an ordinary night works out as 1500 multiplied by 0.5, giving 750, which the floor lifts to 1000 — not 750. Contaminated recycling costs 2500 at first offence, 7500 at second, and 10000 at third or beyond; a third such offence for a resident who has already been assessed 12500 cents this month is capped to the 2500 cents of headroom left, with `uncapped_amount_cents` still recording 10000. And crucially, **zero remaining headroom is not a zero-cent fine** — it is a refusal, reported as `ERR_FINE_CAP_EXHAUSTED`.
+
+`fines_assessed_this_period_cents` is the running total of `amount_cents` for every fine ever created for that resident within the current billing period, where the period is the calendar month of the logical clock at the moment of assessment. It counts every such fine regardless of what later became of it, and it never decreases inside a period.
+
+Fines arrive by two routes, and both produce the same arithmetic. The **automatic** route fires as part of recording the scan itself: when the computed `offense_ordinal` is 3 or above, **or** when the `non_compliance_type` is `RECYCLING_CONTAMINATION` regardless of ordinal, the system immediately creates a fine with `origin` `AUTO` and `assessed_by_user_id` set to the literal string `system`, moving the scan's tag `OPEN → FINED` in the same request. Contaminated recycling is fined on the first offence precisely because a contaminated load can spoil an entire recycling pull. If the automatic route encounters a resident whose `fee_passthrough_enabled` is false, or a resident whose monthly headroom is already zero, no fine is created and the tag simply remains `OPEN`; the scan itself still succeeds, since the valet's report is not the resident's billing problem.
+
+The **manual** route is the `PropertyManager`'s exclusive act against an already-open tag, with an optional `note` for the file. It creates a fine with `origin` `MANUAL` and `assessed_by_user_id` set to the acting `X-User-ID`. It requires the tag to be `OPEN` — a tag reading `NONE`, `FINED` or `VOIDED` is refused with `ERR_TAG_NOT_FINEABLE` — the resident to have `fee_passthrough_enabled` true, and the monthly headroom to be positive.
+
+However it was created, a fine records `scan_id` for the tagged scan it rests on, `resident_id` and `tag_type` copied from that scan's resident and `non_compliance_type`, `offense_ordinal` copied from the scan, the `base_cents`, `escalation_multiplier` and `seasonal_uplift_applied` that produced it, both `amount_cents` and `uncapped_amount_cents`, `status` `ASSESSED`, `dispute_round` 0, `adjudicated_by_user_id` null and `dispute_reason` null. Creation also moves the resident ledger: `fines_outstanding_cents` and `fines_assessed_this_period_cents` each rise by `amount_cents`, `collections_status` is re-evaluated against the seventy-five-dollar delinquency threshold, and the community's `pending_fine_revenue_cents` and `delinquent_resident_count` are re-derived.
+
+Voiding a tag is the correction path for a scan recorded in error, and it is the `PropertyManager`'s exclusive act against a tag currently `OPEN` or `FINED`, requiring a `reason` stored as `void_reason` and requiring that the acting `X-User-ID` be the community that owns the scanned resident. The tag becomes `VOIDED`, the scan's `version` increments, and the scan leaves the offence history for good. When the voided tag carried a fine, the correction cascades two levels: every fine resting on that scan whose `status` is `ASSESSED`, `DISPUTED` or `UPHELD` moves to `VOIDED`, and each of those transitions in turn subtracts that fine's `amount_cents` from the resident's `fines_outstanding_cents` and from the community's `pending_fine_revenue_cents`; if the resident's balance thereby falls below the delinquency threshold, `collections_status` returns `DELINQUENT → CURRENT` and the community's `delinquent_resident_count` drops by one. `fines_assessed_this_period_cents` is untouched by any of this.
+
+The dispute loop is genuinely **cyclic and bounded**. A `Resident` — and only the resident the fine belongs to, checked by comparing `X-User-ID` to the fine's `resident_id` — may dispute a fine that is `ASSESSED` or `UPHELD`, supplying a `reason` stored as `dispute_reason`. The fine moves to `DISPUTED`, `dispute_round` increases by one, and the balance is deliberately **not** touched: a disputed fine remains outstanding while it is argued. A dispute is permitted only while `dispute_round` is still below two; a third attempt is refused with `ERR_DISPUTE_ROUNDS_EXHAUSTED`.
+
+Adjudication is the `PropertyManager`'s exclusive act on a fine currently `DISPUTED`, requiring that the acting `X-User-ID` be the community owning the fined resident, and taking an `outcome` plus an optional `note`. The two outcomes are deliberately asymmetric and each must be implemented in full.
+
+- An `outcome` of `UPHELD` moves the fine `DISPUTED → UPHELD` and stamps `adjudicated_by_user_id` with the acting `X-User-ID`. The resident ledger is unchanged — the fine still stands and still counts as outstanding. `UPHELD` is **not** terminal: it is re-enterable input to the loop, so a resident with round budget left may dispute again, giving the sequence `ASSESSED → DISPUTED → UPHELD → DISPUTED → UPHELD` before the budget is spent.
+- An `outcome` of `WAIVED` moves the fine `DISPUTED → WAIVED`, stamps `adjudicated_by_user_id`, and performs a compensating ledger action: the resident's `fines_outstanding_cents` and the community's `pending_fine_revenue_cents` each drop by the fine's `amount_cents`, and if the resident's balance falls below the delinquency threshold their `collections_status` returns `DELINQUENT → CURRENT` and the community's `delinquent_resident_count` drops by one. `fines_assessed_this_period_cents` is **not** reduced: cap headroom consumed by an assessment is not returned by a waiver, which is what stops a resident from farming waivers to reset their monthly ceiling. `WAIVED` is terminal, as is `VOIDED`.
+
+Every one of these fine transitions increments the fine's `version`, and every rollup they touch increments the `version` of the resident or community row that carries it.
+
+### 3.7. Compactor Incidents, the Acknowledgement Clock and Property Escalation
+
+Doorstep collection depends on somewhere to put the trash, so the compactor is a first-class operational hazard. Anyone with eyes on the equipment may file an incident against a community: a `Valet` from the field, a `PropertyManager` on site, a `ValetOpsManager`, or a `PlatformAdmin`. The filing names the `incident_type` — `JAM` when the compactor is stuck and doorstep collection is blocked outright, or `OVERFLOW` when the chute is full and collection is merely degraded — and may carry a free-text `description` of what the reporter saw.
+
+The incident is created in `status` `REPORTED` with `reported_at` stamped from the logical clock, `acknowledged_at`, `escalated_at` and `resolved_at` all null, and `resolution_note` null. Two provenance fields capture who filed it: `reported_by_role` records the acting `X-User-Role`, and `reported_by_user_id` records the acting `X-User-ID`. The second field is deliberately polymorphic and is interpreted through the first — when the reporter's role is `Valet` the identifier is a valet contractor's `id`, when it is `PropertyManager` the identifier is a community's `id`, and when an opaque operator files the report the identifier is that operator's own handle and resolves to no entity at all.
+
+The **acknowledgement deadline** is stamped at filing time as `ack_deadline_at`, computed as `reported_at` advanced by the window belonging to the incident's type: four hours for a `JAM`, and a full twenty-four hours for an `OVERFLOW`. A jam gets a much shorter fuse because it stops collection dead. The two types are otherwise interchangeable in the escalation arithmetic — they count identically toward a community's escalation level, differing only in this window.
+
+The community's escape hatch is to acknowledge in time. A `PropertyManager` (whose `X-User-ID` must be the community the incident belongs to) or a `PlatformAdmin` moves the incident `REPORTED → ACKNOWLEDGED`, stamping `acknowledged_at` from the logical clock. Acknowledgement is permitted only while the incident is still `REPORTED` and only while the logical clock is **strictly before** `ack_deadline_at`; at or past the deadline the window has shut. Once acknowledged, the incident can never be escalated — there is no transition from `ACKNOWLEDGED` to `ESCALATED`, by design.
+
+Escalation is the operator's lever when the community stays silent, exercised by a `ValetOpsManager` or `PlatformAdmin`. It moves the incident `REPORTED → ESCALATED` and stamps `escalated_at`. It requires the incident to still be `REPORTED`, and it requires the logical clock to have reached `ack_deadline_at` — the boundary is **inclusive**, so an escalation attempted at exactly the deadline instant is allowed, while one attempted a millisecond earlier is refused with `ERR_ESCALATION_WINDOW_NOT_ELAPSED`.
+
+Escalation is where the deepest cascade in the system begins. The community's `escalation_level`, which is always the count of its incidents currently in `ESCALATED`, rises by one. If that new level reaches two and the community's `status` is `ACTIVE`, the community is forced `ACTIVE → SUSPENDED`. That suspension in turn cancels every service night of the community's active contract whose `verification_status` is `SCHEDULED`, leaving each such night's `reschedule_action` null — this is not a reschedule and must not be recorded as one. And each of those night cancellations cascades once more: every route assignment of that night whose `status` is `ASSIGNED`, `ACCEPTED` or `IN_PROGRESS` moves to `CANCELLED`, and the night's `assigned_unit_coverage_count` is recomputed, necessarily to 0. Every row along the chain — the incident, the community, each night, each route — has its `version` incremented.
+
+Resolution closes an incident out and is available to a `PropertyManager` (again ownership-checked against the community), a `ValetOpsManager`, or a `PlatformAdmin`. It requires a `resolution_note`, stamps `resolved_at` from the logical clock, and moves the incident to `RESOLVED` from any of its three non-terminal states — `REPORTED → RESOLVED`, `ACKNOWLEDGED → RESOLVED` or `ESCALATED → RESOLVED` — with the escalation arithmetic differing between them:
+
+- Resolving from `REPORTED` leaves `escalation_level` untouched, because the incident never counted toward it.
+- Resolving from `ACKNOWLEDGED` likewise leaves `escalation_level` untouched, for the same reason.
+- Resolving from `ESCALATED` decrements `escalation_level` by one. If the decremented level is then below two and the community's `status` is `SUSPENDED`, the community is reinstated `SUSPENDED → ACTIVE`.
+
+`RESOLVED` is terminal. Reinstatement is deliberately **not** symmetrical with suspension: the service nights and route assignments that the suspension cancelled are gone for good and are never restored. Recovering the community's coverage requires scheduling fresh nights and dispatching fresh routes. And because `escalation_level` is a conserved count, its stored value must always equal a fresh count of the community's `ESCALATED` incidents after every escalation and after every resolution.
+
+One last interaction ties this subsection back to dispatch: while any `JAM` incident of a community sits in `ESCALATED`, route creation and scan recording on that community are refused with `ERR_COMPACTOR_BLOCKED` — a block that bites even when only one jam has escalated and the community is therefore still `ACTIVE`. An `ESCALATED` `OVERFLOW` carries no such block.
+
+### 3.8. Monthly Settlement: Provisional Drafts, Final Issue and Reversal
+
+Every month, each contract is settled into a single **monthly statement** that answers one question: how much does the community owe the valet company, net of the credit it is due for service that never happened and net of the owner's share of what was collected? A `BillingAnalyst` or `PlatformAdmin` cuts the draft against the contract, naming the month as `billing_period` in `YYYY-MM` form and supplying `expected_contract_version` per §2.8. The named period must intersect the contract's closed effective period. The statement's `contract_id` comes from the contract it is drafted under.
+
+Drafting is a supersede operation. If a statement of that same contract and that same `billing_period` is already sitting in `DRAFT`, that earlier statement is moved `DRAFT → VOID` with its `void_reason` set to the literal string `SUPERSEDED` and its `version` incremented, and the new statement records the voided one's identifier in `superseded_statement_id`. When there is nothing to supersede, `superseded_statement_id` stays null. What may **not** be superseded is a period already settled: if any statement of the contract with `status` `ISSUED` already covers the requested `billing_period`, the draft is refused with `ERR_PERIOD_ALREADY_INVOICED`. A successful draft is born `DRAFT` with `variant` `PROVISIONAL`, `created_by_user_id` set to the drafting operator's `X-User-ID`, `issued_by_user_id` null, and `void_reason` null, and it increments the contract's `version`.
+
+The settlement itself is a **four-step waterfall whose evaluation order is the definition of the arithmetic**. The three money figures look mutually dependent — the credit rate keys off a ratio, the owner's share keys off an amount net of that credit, and the net due keys off both — so any order other than the one below produces a different and incorrect answer, however reasonable it may look.
+
+**Step one — the gross pass-through.** `gross_passthrough_cents` is the total per-unit valet fee billed for the month, and this is the first place the two variants diverge. Under the `PROVISIONAL` variant it is simply `per_unit_monthly_fee_cents` multiplied by the community's `unit_count`: the contracted door count, with vacant doors billed and no proration whatsoever. Under the `FINAL` variant it is the occupancy-prorated per-resident line sum described immediately below.
+
+The prorated computation works like this. Let the number of calendar days in `billing_period` be the month's own length — thirty for September 2026, thirty-one for August. The exact daily rate is `per_unit_monthly_fee_cents` divided by that day count, held as an exact quantity and **not rounded at this point**. Then, for each resident of the contract's community whose `fee_passthrough_enabled` is true — regardless of that resident's own `status`, so a resident who has since moved out still contributes the days they occupied — count that resident's billable days as the number of dates in the month that fall on or after their `move_in_date` and, when a `move_out_date` exists, strictly before it. Multiply the exact daily rate by that day count and **round the resulting line half up to whole cents**. Finally add the rounded lines together. Residents whose `fee_passthrough_enabled` is false contribute nothing and are excluded from the line list entirely.
+
+The rounding order there is pinned and the forbidden alternative — adding the exact line values and rounding the total once — differs by up to half a cent per resident. Worked through: a fee of 3495 cents across a thirty-day month gives an exact daily rate of 116.5 cents; a resident present all thirty days lines at 3495, and two residents present seventeen days each line at exactly 1980.5, which rounds to 1981 apiece, for a gross of 7457. Summing the exact values first would have produced 7456. The first figure is correct.
+
+**Step one-b — the service shortfall ratio.** `scheduled_night_count` is the number of the contract's service nights whose `service_date` falls inside `billing_period` and whose `verification_status` is anything other than `CANCELLED` — cancelled and skipped nights are excluded from the denominator and from the shortfall counts entirely, so they can never move the ratio. `missed_equivalent_nights` weighs a `MISSED` night as a whole failure and a `PARTIAL` night as half of one: it is the count of `MISSED` nights plus one half multiplied by the count of `PARTIAL` nights. Here the variants diverge a second time. Under `PROVISIONAL`, only nights that have already reached a terminal verification state (`VERIFIED`, `PARTIAL` or `MISSED`) are counted; nights still `SCHEDULED` or `IN_PROGRESS` are optimistically assumed to succeed and contribute nothing. Under `FINAL`, every night in the period is terminal by precondition, so every `MISSED` and every `PARTIAL` night counts. `missed_service_bps` is then 0 when `scheduled_night_count` is 0, and otherwise ten thousand multiplied by `missed_equivalent_nights`, divided by `scheduled_night_count`, rounded half up to a whole basis point.
+
+**Step two — the SLA credit.** `sla_credit_rate_bps` is selected from a two-tier ladder gated by the contract's own `sla_missed_threshold_bps`. When `missed_service_bps` is below that contractual threshold, the rate is 0 and no credit is owed. When `missed_service_bps` is at or above the threshold but below the tier-two entry point of 2000 basis points, the rate is 500 basis points. When `missed_service_bps` is at or above 2000 basis points and also at or above the contractual threshold, the rate is 1200 basis points. Then `missed_service_credit_cents` is `gross_passthrough_cents` multiplied by `sla_credit_rate_bps`, divided by ten thousand, rounded half up. Note carefully that the credit is keyed on the **gross** figure and never on any net figure.
+
+**Step three — the owner's revenue share.** `property_revenue_share_cents` is the gross **minus the credit just computed**, multiplied by the contract's `property_revenue_share_bps`, divided by ten thousand, rounded half up. The subtraction is deliberate and reflects the commercial deal: the owner does not earn a share of service the community did not receive.
+
+**Step four — the net due.** `net_due_from_property_cents` is `gross_passthrough_cents` minus `missed_service_credit_cents` minus `property_revenue_share_cents`. This step is exact integer subtraction with no rounding at all.
+
+Working the whole waterfall on one fixture makes the variant divergence concrete. Take a contract with a 3495-cent fee, a community of 4 units, a 1500-basis-point owner share and a 1000-basis-point SLA threshold, a month holding two scheduled nights of which one closed `MISSED`, and residents billable for thirty, seventeen and seventeen days. Under `FINAL`: the gross is 7457; the shortfall ratio is ten thousand times one, divided by two, or 5000 basis points, which clears the 2000 tier-two entry and therefore selects the 1200-basis-point rate; the credit is 7457 multiplied by 1200 over ten thousand, or 894.84, rounding to 895; the owner's share is 7457 minus 895, multiplied by 1500 over ten thousand, or 984.30, rounding to 984; and the net due is 7457 minus 895 minus 984, or 5578. Under `PROVISIONAL` on the same contract with no night yet terminal: the gross is 3495 multiplied by 4, or 13980; the shortfall is nothing, so the ratio and the rate are both 0 and the credit is 0; the owner's share is 13980 multiplied by 1500 over ten thousand, or 2097; and the net due is 11883. The same contract, the same month, two very different numbers — a draft cut before the nights close shows the optimistic, forward-looking accrual, and the issue replaces it with the settled truth.
+
+A draft is re-read as `PROVISIONAL` for as long as it remains a draft. Issue is what converts it. A `BillingAnalyst` or `PlatformAdmin` issues a statement that is still `DRAFT`, and three conditions hold: the statement must be `DRAFT`; the acting `X-User-ID` must differ from `created_by_user_id`, per §2.11; and every service night of the contract whose `service_date` falls inside `billing_period` must already be terminal, that is `VERIFIED`, `PARTIAL`, `MISSED` or `CANCELLED`, or the issue is refused with `ERR_PERIOD_NOT_CLOSED`.
+
+Issuing does five things in one request. The `variant` switches `PROVISIONAL → FINAL` and all six money and ratio fields — `gross_passthrough_cents`, `missed_service_bps`, `sla_credit_rate_bps`, `missed_service_credit_cents`, `property_revenue_share_cents` and `net_due_from_property_cents` — are recomputed from scratch under the final variant, alongside `scheduled_night_count` and `missed_equivalent_nights`. The statement moves `DRAFT → ISSUED` and `issued_by_user_id` records the acting operator. The contract's `last_invoiced_period` is set to `billing_period` and the contract's `version` increments. And the billing dimension of the period's nights advances: every night of the period whose `billing_status` is `ACCRUED` moves `ACCRUED → INVOICED` when its `verification_status` is `VERIFIED`, and moves `ACCRUED → CREDITED` when its `verification_status` is `MISSED` or `PARTIAL`. That crediting fires even when `sla_credit_rate_bps` came out as 0, because the night's shortfall is what the SLA arithmetic consumed whether or not it crossed the threshold. Nights whose `billing_status` is still `UNBILLED` — the cancelled and skipped ones — are left alone, and no night's `verification_status` is touched by the issue. The statement's own `version` increments too.
+
+Voiding is the `PlatformAdmin`'s compensating action and requires a `reason`, stored as `void_reason`. Voiding a statement still in `DRAFT` simply moves it `DRAFT → VOID` and increments its `version`; nothing else moves. Voiding a statement already `ISSUED` is a genuine reversal and is permitted only for the most recently settled period: the contract's `last_invoiced_period` must equal that statement's `billing_period`, so an operator cannot reach back past a later settlement. When it is permitted, the statement moves `ISSUED → VOID`, every service night of that period whose `billing_status` is `INVOICED` or `CREDITED` returns to `ACCRUED`, and the contract's `last_invoiced_period` is cleared back to null. Both the statement's `version` and the contract's `version` increment. `VOID` and `ISSUED` are both terminal for a statement, with the single exception that an issued statement may still be voided as just described.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted beneath the `/valet` prefix. Endpoints that bring a new resource into existence answer with HTTP 201 and the created resource in `data`; endpoints that mutate an existing resource, including every state-transition action, answer with HTTP 200 and the updated resource in `data`; read endpoints answer with HTTP 200. List endpoints answer with `response_type` of `"array"` and populate the four pagination keys in `meta`; every other endpoint answers with `response_type` of `"object"`. The Authorized Role(s) column is exhaustive — a role absent from a row's list is rejected on that route with `ERR_UNAUTHORIZED`, and for the entity-backed roles authorization is additionally narrowed to owned resources as described in §2.1.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/valet/properties` | Register a managed apartment community. Unit numbering is fixed at creation as the closed range from 101 through 100 plus `unit_count`. | PlatformAdmin |
+| GET | `/valet/properties/{property_id}` | Read one community, including its derived escalation and collections rollups. | PlatformAdmin, ValetOpsManager, ComplianceOfficer, BillingAnalyst, PropertyManager |
+| GET | `/valet/properties` | List communities, filterable by lifecycle status, market and active contract. | PlatformAdmin, ValetOpsManager, ComplianceOfficer, BillingAnalyst |
+| POST | `/valet/properties/{property_id}/contracts` | Draft a service contract for a community: per-unit pass-through fee, owner revenue share in basis points, the weekly service-night schedule, the closed effective date interval and the SLA missed-service threshold. | PlatformAdmin, BillingAnalyst |
+| GET | `/valet/contracts/{contract_id}` | Read one service contract. | PlatformAdmin, ValetOpsManager, BillingAnalyst, PropertyManager |
+| GET | `/valet/contracts` | List service contracts, filterable by community and status. | PlatformAdmin, ValetOpsManager, BillingAnalyst |
+| POST | `/valet/contracts/{contract_id}/activate` | Activate a `DRAFT` contract, which also brings the community live. | PlatformAdmin |
+| POST | `/valet/contracts/{contract_id}/terminate` | Terminate an `ACTIVE` contract; cascades to the community and to every night not yet closed. | PlatformAdmin |
+| POST | `/valet/properties/{property_id}/residents` | Add a resident to a unit. `move_in_date` is the inclusive first billable day; `fee_passthrough_enabled` defaults to true. | PlatformAdmin, PropertyManager |
+| GET | `/valet/residents/{resident_id}` | Read one resident, including the fines and collections rollups. | PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident |
+| GET | `/valet/residents` | List residents, filterable by community, lifecycle status and collections status. | PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer |
+| POST | `/valet/residents/{resident_id}/move-out` | Record a move-out. `move_out_date` is exclusive: the resident is billed through the preceding day. | PlatformAdmin, PropertyManager |
+| POST | `/valet/contractors` | Apply a valet to the network with the declared engagement terms used by the classification screen. | PlatformAdmin, ValetOpsManager |
+| GET | `/valet/contractors/{contractor_id}` | Read one valet contractor, including `control_score` and `classification`. | PlatformAdmin, ValetOpsManager, ComplianceOfficer, Valet |
+| GET | `/valet/contractors` | List valet contractors, filterable by onboarding status and worker classification. | PlatformAdmin, ValetOpsManager, ComplianceOfficer |
+| POST | `/valet/contractors/{contractor_id}/documents` | Record the tax packet (`W9` for a 1099 contractor, `W4` for a W2 employee) and deposit details, moving the applicant into background screening. | PlatformAdmin, ValetOpsManager |
+| POST | `/valet/contractors/{contractor_id}/background-check` | Record the background-check outcome. `CLEAR` advances to `CLEARED`; `FAIL` is terminal `REJECTED`. The recording operator is retained for the later segregation-of-duties check. | ComplianceOfficer |
+| POST | `/valet/contractors/{contractor_id}/classification` | Run the employer-control classification screen. A `DECLARED` basis reads the onboarding packet; an `OBSERVED` basis recomputes hours and exclusivity from completed routes in the trailing window. | ComplianceOfficer |
+| POST | `/valet/contractors/{contractor_id}/deactivate` | Deactivate a contractor; any live route assignment is abandoned. | PlatformAdmin, ValetOpsManager |
+| POST | `/valet/contracts/{contract_id}/service-nights` | Schedule one service night on the contract. The service window is half-open from `service_window_start` up to but excluding `service_window_end`; `seasonal_volume_index` defaults to 100 and drives the peak fine uplift at 120 or above. | PlatformAdmin, ValetOpsManager |
+| GET | `/valet/service-nights/{night_id}` | Read one service night, including the `version` used for the stale-version guard on route creation. | PlatformAdmin, ValetOpsManager, PropertyManager, BillingAnalyst, Valet |
+| GET | `/valet/service-nights` | List service nights, filterable by contract, verification state, billing state, service date and the makeup back-reference. | PlatformAdmin, ValetOpsManager, PropertyManager, BillingAnalyst |
+| POST | `/valet/service-nights/{night_id}/close` | Close the night and select its verification outcome: `MISSED` on an empty scan set, `VERIFIED` at or above the coverage threshold, otherwise `PARTIAL`. Routes still open are abandoned. | PlatformAdmin, ValetOpsManager |
+| POST | `/valet/service-nights/{night_id}/reschedule` | Apply a holiday or seasonal schedule adjustment to a `SCHEDULED` night. A `SKIP` cancels the night outright; a `SHIFT` cancels it and creates a makeup night that points back at it. | PlatformAdmin, ValetOpsManager |
+| POST | `/valet/service-nights/{night_id}/route-assignments` | Assign a cleared, classified valet a closed unit range on this night. `expected_service_night_version` must match the night's current `version`. | PlatformAdmin, ValetOpsManager |
+| GET | `/valet/route-assignments/{route_id}` | Read one route assignment. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet |
+| GET | `/valet/route-assignments` | List route assignments, filterable by night, contractor and status — the discovery channel for routes cancelled or abandoned by cascade. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet |
+| POST | `/valet/route-assignments/{route_id}/accept` | The assigned valet accepts the route. | Valet |
+| POST | `/valet/route-assignments/{route_id}/complete` | The valet closes out the route. Completed routes are the audited input set of the observed classification. | Valet |
+| POST | `/valet/route-assignments/{route_id}/abandon` | Abandon a live route; its unit range leaves the night's assigned coverage and can be re-issued to another valet. | PlatformAdmin, ValetOpsManager, Valet |
+| POST | `/valet/route-assignments/{route_id}/scans` | Record the doorstep scan for one unit on this route. A non-null `non_compliance_type` opens a tag; recycling contamination and any third-or-later repeat offense auto-assess the fine. | Valet |
+| GET | `/valet/service-scans/{scan_id}` | Read one doorstep scan and its tag state. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet, Resident |
+| GET | `/valet/service-scans` | List doorstep scans, filterable by route, night, resident, scan result and tag state. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet, Resident |
+| POST | `/valet/service-scans/{scan_id}/fine` | Assess the resident fine for an `OPEN` tag, as the manual counterpart of the automatic cascade. | PropertyManager |
+| POST | `/valet/service-scans/{scan_id}/void-tag` | Void a non-compliance tag recorded in error; any fine resting on it is voided and the resident ledger is unwound. | PropertyManager |
+| GET | `/valet/resident-fines/{fine_id}` | Read one resident fine, including the capped and uncapped amounts and the dispute round counter. | PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident |
+| GET | `/valet/resident-fines` | List resident fines, filterable by resident, originating scan, status and origin — the discovery channel for fines created by the automatic cascade. | PlatformAdmin, PropertyManager, BillingAnalyst, ComplianceOfficer, Resident |
+| POST | `/valet/resident-fines/{fine_id}/dispute` | The fined resident disputes the fine, bounded by the maximum dispute round count. | Resident |
+| POST | `/valet/resident-fines/{fine_id}/adjudicate` | The property manager rules on a disputed fine. `UPHELD` returns it to the dispute loop; `WAIVED` is terminal and reverses the resident ledger without returning monthly cap headroom. | PropertyManager |
+| POST | `/valet/properties/{property_id}/compactor-incidents` | Report a compactor jam or overflow. The acknowledgement deadline is stamped from the incident type's window: four hours for a jam, twenty-four for an overflow. | PlatformAdmin, ValetOpsManager, PropertyManager, Valet |
+| GET | `/valet/compactor-incidents/{incident_id}` | Read one compactor incident with its acknowledgement deadline and escalation timestamps. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer, Valet |
+| GET | `/valet/compactor-incidents` | List compactor incidents, filterable by community, type and status. | PlatformAdmin, ValetOpsManager, PropertyManager, ComplianceOfficer |
+| POST | `/valet/compactor-incidents/{incident_id}/acknowledge` | The community acknowledges the incident inside its window, which forecloses escalation. | PropertyManager, PlatformAdmin |
+| POST | `/valet/compactor-incidents/{incident_id}/escalate` | Escalate an unacknowledged incident to the community once its acknowledgement window has elapsed. Escalation is permitted at the deadline instant itself. | ValetOpsManager, PlatformAdmin |
+| POST | `/valet/compactor-incidents/{incident_id}/resolve` | Resolve an incident. Resolving an escalated incident lowers the community's escalation level and can reinstate a suspended community. | PropertyManager, ValetOpsManager, PlatformAdmin |
+| POST | `/valet/contracts/{contract_id}/statements` | Cut a `PROVISIONAL` draft statement for a billing period. `expected_contract_version` must match the contract's current `version`. | BillingAnalyst, PlatformAdmin |
+| GET | `/valet/statements/{statement_id}` | Read one monthly statement with the full settlement waterfall: gross, SLA credit, revenue share and net due. | PlatformAdmin, BillingAnalyst, PropertyManager |
+| GET | `/valet/statements` | List monthly statements, filterable by contract, billing period, status and the supersede back-reference. | PlatformAdmin, BillingAnalyst, PropertyManager |
+| POST | `/valet/statements/{statement_id}/issue` | Issue a `DRAFT` statement, recomputing it under the `FINAL` variant with the occupancy-prorated gross and the full shortfall ratio. The issuer must not be the drafter. | BillingAnalyst, PlatformAdmin |
+| POST | `/valet/statements/{statement_id}/void` | Void a statement. Voiding an `ISSUED` statement is a compensating action that returns its nights to `ACCRUED` and clears the contract's `last_invoiced_period`. | PlatformAdmin |
+| POST | `/valet/_clock/set_current_utc` | Set the server's logical UTC clock, which every deadline, occupancy and trailing-window rule reads. | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+Every rejection carries the error envelope of §2.2 with one of the identifiers below in `error_id`, at the HTTP status shown. When more than one condition holds on a single request, the identifier reported is the one selected by the precedence ladder of §2.5.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_PROPERTY_NOT_FOUND` | 404 |
+| `ERR_CONTRACT_NOT_FOUND` | 404 |
+| `ERR_RESIDENT_NOT_FOUND` | 404 |
+| `ERR_CONTRACTOR_NOT_FOUND` | 404 |
+| `ERR_SERVICE_NIGHT_NOT_FOUND` | 404 |
+| `ERR_ROUTE_NOT_FOUND` | 404 |
+| `ERR_SCAN_NOT_FOUND` | 404 |
+| `ERR_FINE_NOT_FOUND` | 404 |
+| `ERR_INCIDENT_NOT_FOUND` | 404 |
+| `ERR_STATEMENT_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 422 |
+| `ERR_SERVICE_DATE_NOT_SCHEDULED` | 422 |
+| `ERR_INVALID_MAKEUP_DATE` | 422 |
+| `ERR_UNIT_RANGE_OUT_OF_BOUNDS` | 422 |
+| `ERR_CROSS_PROPERTY_REFERENCE` | 409 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_ALREADY_TERMINAL` | 409 |
+| `ERR_TAG_NOT_FINEABLE` | 409 |
+| `ERR_PROPERTY_SUSPENDED` | 409 |
+| `ERR_CONTRACTOR_NOT_ELIGIBLE` | 409 |
+| `ERR_COMPACTOR_BLOCKED` | 409 |
+| `ERR_CONTRACT_PERIOD_OVERLAP` | 409 |
+| `ERR_CONTRACTOR_WINDOW_CONFLICT` | 409 |
+| `ERR_ESCALATION_WINDOW_NOT_ELAPSED` | 409 |
+| `ERR_UNIT_RANGE_OVERLAP` | 409 |
+| `ERR_UNIT_ALREADY_OCCUPIED` | 409 |
+| `ERR_UNIT_NOT_IN_ROUTE` | 409 |
+| `ERR_DUPLICATE_SCAN` | 409 |
+| `ERR_DISPUTE_ROUNDS_EXHAUSTED` | 409 |
+| `ERR_PERIOD_ALREADY_INVOICED` | 409 |
+| `ERR_PERIOD_NOT_CLOSED` | 409 |
+| `ERR_PASSTHROUGH_DISABLED` | 409 |
+| `ERR_FINE_CAP_EXHAUSTED` | 409 |
+| `ERR_STALE_SERVICE_NIGHT_VERSION` | 412 |
+| `ERR_STALE_CONTRACT_VERSION` | 412 |

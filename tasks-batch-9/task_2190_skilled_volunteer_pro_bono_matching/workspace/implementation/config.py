@@ -1,0 +1,210 @@
+"""Declared constants, enumerations and tunables (PRD sections 2 and 3)."""
+from decimal import Decimal as D
+
+# --- roles -------------------------------------------------------------------
+ROLE_PROGRAM_MANAGER = "ProgramManager"
+ROLE_SCOPING_SPECIALIST = "ScopingSpecialist"
+ROLE_VOLUNTEER = "Volunteer"
+ROLE_PARTNER_CONTACT = "PartnerContact"
+ROLE_QUALITY_REVIEWER = "QualityReviewer"
+
+ALL_ROLES = (
+    ROLE_PROGRAM_MANAGER,
+    ROLE_SCOPING_SPECIALIST,
+    ROLE_VOLUNTEER,
+    ROLE_PARTNER_CONTACT,
+    ROLE_QUALITY_REVIEWER,
+)
+
+# --- enumerations ------------------------------------------------------------
+SECTORS = ("HEALTH", "EDUCATION", "HOUSING", "ENVIRONMENT", "ARTS", "CIVIC")
+CAPACITY_CLASSES = ("MICRO", "SMALL", "MID", "LARGE")
+PARTNER_STATUSES = ("ACTIVE", "PROBATION", "SUSPENDED")
+PROBATION_REASONS = ("LOW_SATISFACTION", "SCOPE_CREEP_ABUSE", "MANUAL")
+
+CYCLE_POSTURES = ("OPEN", "RESTRICTED", "FROZEN")
+
+DISCIPLINES = ("LEGAL", "ACCOUNTING", "TECHNOLOGY", "MARKETING", "HR", "STRATEGY")
+URGENCIES = ("ROUTINE", "ELEVATED", "CRITICAL")
+REQUEST_STATUSES = (
+    "DRAFT",
+    "SCOPING",
+    "SCOPED",
+    "MATCHING",
+    "RESCOPING",
+    "ENGAGED",
+    "IN_DELIVERY",
+    "CLOSED",
+    "ABANDONED",
+)
+
+CONFIDENTIALITY_TIERS = ("STANDARD", "ELEVATED", "RESTRICTED")
+IP_DISPOSITIONS = ("ASSIGN_TO_PARTNER", "LICENSE_PERPETUAL", "RETAINED_BY_VOLUNTEER")
+SCOPE_STATUSES = ("DRAFT", "APPROVED", "SUPERSEDED", "WITHDRAWN")
+
+DELIVERABLE_REVIEW_STATUSES = ("PENDING", "ACCEPTED", "REJECTED", "WAIVED")
+DELIVERABLE_WAIVED_REASONS = ("DESCOPED_BY_CHANGE", "PARTNER_WITHDRAWN")
+
+SENIORITIES = ("ASSOCIATE", "SENIOR", "PRINCIPAL", "PARTNER")
+VOLUNTEER_STATUSES = ("PENDING_VETTING", "ACTIVE", "PAUSED", "DEACTIVATED")
+VOLUNTEER_PAUSE_REASONS = ("RELIABILITY_FLOOR", "SELF_REQUESTED", "ADMIN")
+
+WINDOW_KINDS = ("HARD", "SOFT")
+WINDOW_STATUSES = ("OPEN", "EXHAUSTED", "EXPIRED")
+
+OFFER_STATUSES = ("OFFERED", "ACCEPTED", "DECLINED", "EXPIRED", "WITHDRAWN")
+DECLINE_REASONS = (
+    "SCOPE_TOO_LARGE",
+    "SCHEDULE_CONFLICT",
+    "OUTSIDE_EXPERTISE",
+    "IP_TERMS_UNACCEPTABLE",
+)
+WITHDRAW_REASONS = (
+    "CYCLE_FROZEN",
+    "RESCOPED",
+    "PARTNER_SUSPENDED",
+    "VOLUNTEER_PAUSED",
+    "ADMIN",
+)
+
+WORK_STATUSES = (
+    "NOT_STARTED",
+    "IN_PROGRESS",
+    "SUBMITTED",
+    "ACCEPTED",
+    "HANDED_OFF",
+    "TERMINATED",
+)
+LIVE_WORK_STATUSES = ("NOT_STARTED", "IN_PROGRESS", "SUBMITTED", "ACCEPTED")
+VALUATION_STATUSES = ("UNVALUED", "PROVISIONAL", "FINAL", "RESTATED")
+QUALITY_GATES = ("PENDING", "PASSED", "CONDITIONAL", "FAILED")
+TERMINATION_REASONS = (
+    "QUALITY_FAILURE",
+    "SCOPE_BREACH",
+    "AGREEMENT_VOIDED",
+    "PARTNER_SUSPENDED",
+    "ADMIN",
+)
+
+AGREEMENT_STATUSES = ("DRAFTED", "SENT", "COUNTERED", "EXECUTED", "VOIDED")
+AGREEMENT_VOID_REASONS = (
+    "COUNTER_LIMIT_EXCEEDED",
+    "TERMS_REJECTED",
+    "ENGAGEMENT_TERMINATED",
+)
+COUNTER_PARTIES = ("VOLUNTEER", "PARTNER")
+
+CHECKIN_STATUSES = ("SCHEDULED", "HELD", "MISSED", "WAIVED")
+MILESTONE_WAIVER_REASONS = ("RESCOPED", "ENGAGEMENT_TERMINATED", "ADMIN")
+
+ACTIVITY_CLASSES = ("DELIVERY", "ADMIN", "TRAVEL")
+
+SCR_DECISION_TIERS = ("AUTO_APPROVABLE", "MANAGER_REVIEW", "RESCOPE_REQUIRED")
+SCR_STATUSES = ("PENDING", "APPROVED", "REJECTED", "ESCALATED", "VOIDED")
+
+REVIEW_OUTCOMES = ("PENDING", "PASS", "CONDITIONAL", "FAIL")
+REVIEW_STATUSES = ("OPEN", "SCORED", "DECIDED", "REWORK_REQUESTED")
+
+VALUATION_METHODS = ("MARKET_RATE", "INDEPENDENT_SECTOR")
+VALUATION_VARIANTS = ("PROVISIONAL", "FINAL", "RESTATED")
+
+# --- partner capacity --------------------------------------------------------
+# (upper bound exclusive, class, max_concurrent_engagements)
+CAPACITY_TIERS = (
+    (D("250000"), "MICRO", 1),
+    (D("2000000"), "SMALL", 2),
+    (D("10000000"), "MID", 4),
+    (None, "LARGE", 6),
+)
+
+# --- match scoring -----------------------------------------------------------
+SKILL_TIER_WEIGHT = {
+    1: D("0.20"),
+    2: D("0.45"),
+    3: D("0.70"),
+    4: D("0.88"),
+    5: D("1.00"),
+}
+SENIORITY_MULTIPLIER = {
+    "ASSOCIATE": D("0.90"),
+    "SENIOR": D("1.00"),
+    "PRINCIPAL": D("1.08"),
+    "PARTNER": D("1.12"),
+}
+URGENCY_AVAILABILITY_WEIGHT = {
+    "ROUTINE": D("0.20"),
+    "ELEVATED": D("0.30"),
+    "CRITICAL": D("0.45"),
+}
+RELIABILITY_WEIGHT = D("0.25")
+VERIFIED_SKILL_BONUS = D("0.05")
+SHORTFALL_PENALTY_PER_HOUR = D("0.004")
+SHORTFALL_PENALTY_CAP = D("0.30")
+VOLUNTEER_MAX_CONCURRENT = 2
+OFFER_TTL_HOURS = {"ROUTINE": 120, "ELEVATED": 72, "CRITICAL": 24}
+
+# --- valuation ---------------------------------------------------------------
+INDEPENDENT_SECTOR_RATE_USD = D("34.79")
+MARKET_RATE_CAP_USD = {
+    "ASSOCIATE": D("180"),
+    "SENIOR": D("320"),
+    "PRINCIPAL": D("480"),
+    "PARTNER": D("650"),
+}
+CLASS_FACTOR = {"DELIVERY": D("1.00"), "ADMIN": D("0.50"), "TRAVEL": D("0.00")}
+
+# admin overhead: (upper bound exclusive on base, rate)
+OVERHEAD_TIERS = (
+    (D("2500"), D("0.12")),
+    (D("10000"), D("0.09")),
+    (None, D("0.06")),
+)
+ADMIN_OVERHEAD_MIN_USD = D("45.00")
+
+# --- reliability -------------------------------------------------------------
+DECAY_LAMBDA = D("0.85")
+DECAY_WINDOW_N = 8
+MISSED_CHECKIN_PENALTY = D("0.10")
+RELIABILITY_BASELINE = D("0.7500")
+RELIABILITY_FLOOR = D("0.4000")
+
+# --- quality -----------------------------------------------------------------
+SCORE_SCALE = D("20")
+PASS_THRESHOLD = D("78.00")
+CONDITIONAL_THRESHOLD = D("60.00")
+
+# --- creep -------------------------------------------------------------------
+CREEP_WATCH = D("0.1500")
+CREEP_ESCALATED = D("0.3000")
+CREEP_BREACH = D("0.5000")
+
+# --- cycle posture -----------------------------------------------------------
+POSTURE_RESTRICTED_AT = D("0.8000")
+POSTURE_FROZEN_AT = D("1.0000")
+
+# --- satisfaction ------------------------------------------------------------
+SATISFACTION_WEIGHTS = {
+    "expertise": D("0.40"),
+    "deliverable_fit": D("0.35"),
+    "responsiveness": D("0.25"),
+}
+RECENCY_WEIGHTS = (D("0.34"), D("0.26"), D("0.18"), D("0.13"), D("0.09"))
+SATISFACTION_SAMPLE_MAX = 5
+PROBATION_MIN_SAMPLE = 3
+PROBATION_CEILING = D("55.00")
+RECOVERY_FLOOR = D("70.00")
+
+# --- misc limits -------------------------------------------------------------
+MAX_RESCOPES = 3  # PRD is the contract: three rescopes
+MAX_FAILED_MATCH_ROUNDS = 2
+MAX_COUNTER_ROUNDS = 3
+MILESTONE_MIN_SPACING_HOURS = 72
+MILESTONE_SATURATION_WINDOW_DAYS = 14
+CHECKIN_SATURATION_LIMIT = 2  # the third check-in in a rolling fortnight is refused
+MILESTONE_GRACE_HOURS = 24
+MILESTONE_EARLY_HOLD_HOURS = 24
+MISSED_CHECKIN_TERMINATION_THRESHOLD = 2
+MAX_REVIEW_ROUNDS = 2
+REWORK_DEADLINE_HOURS = 168  # PRD 3.8: one week
+
+CLOCK_START_ISO = "2026-08-01T00:00:00Z"

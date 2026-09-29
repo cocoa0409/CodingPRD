@@ -1,0 +1,102 @@
+"""Enumerations and calculation constants (SCAFFOLD 1.1 / 1.3, PRD 3)."""
+
+ROLES = (
+    "ElitesDirector",
+    "AthleteAgent",
+    "TechnicalOfficial",
+    "AntiDopingLiaison",
+    "SanctioningBody",
+    "FinanceOfficer",
+)
+
+EDITION_STATUSES = (
+    "PLANNING",
+    "FIELD_OPEN",
+    "FIELD_LOCKED",
+    "RACED",
+    "RESULTS_CERTIFIED",
+    "PURSE_SETTLED",
+)
+
+DIVISIONS = ("ELITE", "SUB_ELITE", "WHEELCHAIR")
+GENDERS = ("MALE", "FEMALE")
+PURSE_CATEGORIES = ("OVERALL", "DIVISION", "MASTERS", "TIME_BONUS", "RECORD_BONUS")
+CATEGORY_ORDER = {name: idx for idx, name in enumerate(PURSE_CATEGORIES)}
+PLACE_CATEGORIES = ("OVERALL", "DIVISION", "MASTERS")
+BONUS_CATEGORIES = ("TIME_BONUS", "RECORD_BONUS")
+
+AIR_CLASSES = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS")
+ASSISTANCE_RULES = ("LEAD_ONLY", "FLUIDS_ALLOWED")
+
+INVITATION_STATUSES = (
+    "DRAFT",
+    "OFFERED",
+    "COUNTERED",
+    "ACCEPTED",
+    "DECLINED",
+    "WITHDRAWN",
+    "EXPIRED",
+    "BREACHED",
+)
+
+AGENT_STATUSES = ("ACTIVE", "SUSPENDED")
+VERIFICATION_STATUSES = ("SUBMITTED", "VERIFIED", "REJECTED")
+NEGOTIATION_SIDES = ("COMMITTEE", "AGENT")
+SLOT_STATUSES = ("RESERVED", "RELEASED")
+
+TEST_TYPES = ("IN_COMPETITION", "OUT_OF_COMPETITION")
+DOPING_TEST_STATUSES = ("SCHEDULED", "COLLECTED", "CLEARED", "ADVERSE", "MISSED")
+
+CERTIFICATION_STATUSES = ("PROVISIONAL", "CERTIFIED", "DISQUALIFIED")
+RECORD_CLAIM_STATUSES = ("NONE", "CLAIMED", "SUBMITTED", "RATIFIED", "REJECTED")
+DQ_REASONS = (
+    "PACER_BEYOND_RANGE",
+    "UNAUTHORIZED_FLUID_HANDOFF",
+    "COURSE_CUTTING",
+    "ADVERSE_ANALYTICAL_FINDING",
+    "MISSED_TEST_THRESHOLD",
+)
+BREACH_DQ_REASONS = (
+    "PACER_BEYOND_RANGE",
+    "UNAUTHORIZED_FLUID_HANDOFF",
+    "COURSE_CUTTING",
+    "ADVERSE_ANALYTICAL_FINDING",
+)
+
+AWARD_STATUSES = ("COMPUTED", "APPROVED", "PAID", "VOID", "CLAWBACK_PENDING")
+ALLOCATED_AWARD_STATUSES = ("COMPUTED", "APPROVED", "PAID", "CLAWBACK_PENDING")
+
+WITHHOLDING_VARIANTS = ("NONE", "PER_AWARD", "AGGREGATED")
+
+# --- invitation_package_valuation -------------------------------------------
+AIR_CLASS_VALUE_CENTS = {"ECONOMY": 120000, "PREMIUM_ECONOMY": 260000, "BUSINESS": 540000}
+HOTEL_NIGHTLY_CENTS = 32000
+GROUND_TRANSPORT_CENTS = 18000
+MAX_HOTEL_NIGHTS = 7
+
+# --- withholding_computation -------------------------------------------------
+DOMESTIC_TAX_COUNTRY = "USA"
+STATUTORY_WITHHOLDING_BPS = 3000
+DE_MINIMIS_AWARD_CENTS = 60000
+AGGREGATE_DE_MINIMIS_CENTS = 150000
+
+# --- bonus_determination -----------------------------------------------------
+WHEELCHAIR_BONUS_FACTOR_BPS = 7500
+
+# --- doping_availability_compliance -----------------------------------------
+MISSED_TEST_LIMIT = 2
+MISSED_LOOKBACK_DAYS = 365
+OOC_CLEARANCE_DAYS = 90
+
+# --- fluid_slot_occupancy ----------------------------------------------------
+ALLOWED_STATION_KM = (5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0)
+MAX_TABLE_POSITION = 40
+ADJACENCY_BUFFER = 1
+
+# --- pacing_range_occupancy --------------------------------------------------
+MAX_PACING_KM = 32.0
+COURSE_LENGTH_KM = 42.195
+
+# --- testing_window_occupancy -----------------------------------------------
+MAX_TESTS_PER_WINDOW = 2
+FREQUENCY_WINDOW_DAYS = 7

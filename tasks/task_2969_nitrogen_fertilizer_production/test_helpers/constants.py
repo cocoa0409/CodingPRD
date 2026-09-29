@@ -1,0 +1,135 @@
+"""Domain constants for the Nitrogen Fertilizer Production API test suite.
+
+Every literal in this module is taken from the PRD contract: the API prefix,
+the role vocabulary, the enum vocabularies, the fixed calculation constants and
+the precision classes of section 2.6.
+"""
+
+API_PREFIX = "/nitrogen-ops"
+
+# --- Roles (PRD 2.1) -------------------------------------------------------
+ROLE_REGULATORY_ADMIN = "RegulatoryAdmin"
+ROLE_PROCESS_ENGINEER = "ProcessEngineer"
+ROLE_SAFETY_OFFICER = "SafetyOfficer"
+ROLE_COMMERCIAL_MANAGER = "CommercialManager"
+ROLE_LOGISTICS_COORDINATOR = "LogisticsCoordinator"
+ROLE_TERMINAL_OPERATOR = "TerminalOperator"
+
+ALL_ROLES = (
+    ROLE_REGULATORY_ADMIN,
+    ROLE_PROCESS_ENGINEER,
+    ROLE_SAFETY_OFFICER,
+    ROLE_COMMERCIAL_MANAGER,
+    ROLE_LOGISTICS_COORDINATOR,
+    ROLE_TERMINAL_OPERATOR,
+)
+
+# --- Logical clock (PRD 2.4) ----------------------------------------------
+# "Before any client moves it, the clock reads exactly 2026-08-01T00:00:00Z".
+DEFAULT_CLOCK_ISO = "2026-08-01T00:00:00Z"
+DEFAULT_CLOCK_STAMP = "2026-08-01T00:00:00.000Z"
+
+# --- Enum vocabularies ----------------------------------------------------
+PERMIT_STATUSES = ("ACTIVE", "SUSPENDED")
+PSM_PROGRAM_STATUSES = ("CURRENT", "DUE", "OVERDUE")
+OPERATING_POSTURES = ("NORMAL", "RESTRICTED", "FROZEN")
+
+TRAIN_STATUSES = ("IDLE", "RUNNING", "DERATED", "DOWN_FOR_TURNAROUND")
+CHARGE_STATUSES = ("ACTIVE", "SPENT", "RETIRED")
+HEDGE_LOT_STATUSES = ("OPEN", "CLOSED")
+
+PRODUCT_CODES = ("ANHYDROUS_AMMONIA", "AMMONIUM_NITRATE", "UAN_SOLUTION", "UREA")
+
+RUN_STATUSES = ("PLANNED", "APPROVED", "RUNNING", "COMPLETED", "ABORTED")
+ALLOCATION_STATUSES = ("UNALLOCATED", "RESERVED", "CONSUMED", "RELEASED")
+SECURITY_STATUSES = ("PENDING", "CLEARED", "DENIED", "EXEMPT")
+
+ASSET_KINDS = ("DOME", "TANK", "TERMINAL")
+SECURITY_CLASSES = ("BASIC", "CONTROLLED", "HIGH_SECURITY")
+
+SHIPMENT_MODES = ("BARGE", "RAIL", "TRUCK")
+SHIPMENT_STATUSES = ("DRAFT", "BOOKED", "IN_TRANSIT", "DELIVERED", "CANCELLED")
+
+QUOTE_STATUSES = ("DRAFT", "ISSUED", "WITHDRAWN", "EXPIRED")
+PASS_THROUGH_BASES = ("HEDGED_BLEND", "SPOT_INDEX")
+
+TURNAROUND_SCOPES = ("CATALYST_CHANGE", "VESSEL_INSPECTION", "COMBINED")
+TURNAROUND_STATUSES = (
+    "DRAFT",
+    "SUBMITTED",
+    "APPROVED",
+    "REJECTED",
+    "IN_PROGRESS",
+    "COMPLETED",
+)
+PSM_REVIEW_DECISIONS = ("NONE", "ENDORSED", "OBJECTED", "VOID")
+TASK_STATUSES = ("PENDING", "READY", "DONE", "BLOCKED")
+
+POLLUTANTS = ("N2O", "NH3", "NOX", "PM")
+
+# --- Cascade reason vocabularies ------------------------------------------
+ABORT_REASON_TRAIN_DOWN = "TRAIN_DOWN_FOR_TURNAROUND"
+RELEASE_REASON_RUN_ABORTED = "RUN_ABORTED"
+RELEASE_REASON_RUN_REOPENED = "RUN_REOPENED"
+RELEASE_REASON_PLANT_FROZEN = "PLANT_FROZEN"
+CANCEL_REASON_UPSTREAM_RELEASED = "UPSTREAM_ALLOCATION_RELEASED"
+WITHDRAW_REASON_POSTURE_DEGRADED = "PLANT_POSTURE_DEGRADED"
+
+# --- Fixed calculation constants (PRD 3.2, 3.4, 3.6, 3.7, 3.8, 3.10) -----
+GAS_INTENSITY_MMBTU_PER_TON = 33.0
+FIXED_CONVERSION_USD_PER_TON = 42.50
+
+CATALYST_MIN_ACTIVITY_PCT = 55.00
+SEVERITY_WEIGHT = 0.45
+REGEN_RECOVERY_PCT = 12.00
+MAX_REGENERATIONS = 3
+
+STORAGE_HANDLING_USD_PER_TON = 1.333
+SECURITY_FEE_USD_PER_TON = 2.755
+
+MODE_RATE_USD_PER_TON_MILE = {"RAIL": 0.0412, "BARGE": 0.0189, "TRUCK": 0.1075}
+MIN_CHARGE_USD = {"RAIL": 2200.00, "BARGE": 4800.00, "TRUCK": 450.00}
+SURCHARGE_RATE_UNDER_25K = 0.085
+SURCHARGE_RATE_25K_TO_100K = 0.062
+SURCHARGE_RATE_100K_PLUS = 0.041
+SURCHARGE_TIER_1_CEILING_USD = 25000.00
+SURCHARGE_TIER_2_CEILING_USD = 100000.00
+
+MARGIN_FLOOR_USD_PER_TON = 25.00
+TARGET_MARGIN_PCT = 0.22
+SPRING_MULTIPLIER = 1.18
+OFF_SEASON_MULTIPLIER = 1.00
+VOLUME_TIER_25K_FACTOR = 0.94
+VOLUME_TIER_5K_FACTOR = 0.97
+VOLUME_TIER_BASE_FACTOR = 1.00
+RESTRICTED_POSTURE_FACTOR = 1.06
+
+LB_PER_TON = 2000
+ROLLING_WINDOW_DAYS = 30
+FROZEN_EXCEEDED_POLLUTANT_COUNT = 2
+RESTRICTED_EXCEEDED_POLLUTANT_COUNT = 1
+SEASONAL_RESERVE_MONTHS = (12, 1, 2)
+TURNAROUND_SEPARATION_BUFFER_DAYS = 14
+
+# --- Precision tolerances (PRD 2.6) ---------------------------------------
+# Half of the least significant unit of each declared decimal class, so an
+# answer that is off by one unit in the last place always fails.
+TOL_MONEY = 0.005        # 2 decimal places
+TOL_TONS = 0.0005        # 3 decimal places
+TOL_GAS_PRICE = 0.00005  # 4 decimal places
+TOL_HOURS = 0.05         # 1 decimal place
+TOL_PCT = 0.005          # 2 decimal places
+TOL_MMBTU = 0.05         # 1 decimal place
+
+# --- Pagination defaults (PRD 2.3) ----------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Entities exempt from updated_at / version (PRD 2.4) ------------------
+IMMUTABLE_ENTITIES = ("ProductLine", "EmissionsReading")
+
+# A syntactically valid UUID that is never minted by the server.
+UNKNOWN_UUID = "00000000-0000-4000-8000-000000000000"
+OTHER_UNKNOWN_UUID = "00000000-0000-4000-8000-0000000000ff"

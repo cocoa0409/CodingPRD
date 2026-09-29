@@ -1,0 +1,108 @@
+"""Error catalogue (PRD section 5 / SCAFFOLD section 1.6).
+
+Every declared error id maps to exactly one HTTP status.  The table below is the
+complete catalogue; an id that is not listed is a bug and answers 409 so the
+mistake surfaces as a failing assertion rather than a 500.
+"""
+
+STATUS = {
+    # --- authentication (401) ---
+    "ERR_UNAUTHENTICATED": 401,
+    # --- authorization / ownership / duties (403) ---
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_NOT_PANEL_CHAIR": 403,
+    # --- request shape (400) ---
+    "ERR_INVALID_REQUEST": 400,
+    # --- existence (404) ---
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_DISCIPLINE_CATEGORY_NOT_FOUND": 404,
+    "ERR_ARTIST_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_WORK_SAMPLE_NOT_FOUND": 404,
+    "ERR_PANEL_NOT_FOUND": 404,
+    "ERR_PANELIST_NOT_FOUND": 404,
+    "ERR_CONFLICT_NOT_FOUND": 404,
+    "ERR_REVIEW_NOT_FOUND": 404,
+    "ERR_SLOT_NOT_FOUND": 404,
+    "ERR_AWARD_NOT_FOUND": 404,
+    "ERR_INSTALLMENT_NOT_FOUND": 404,
+    "ERR_FINAL_REPORT_NOT_FOUND": 404,
+    "ERR_APPEAL_NOT_FOUND": 404,
+    # --- optimistic concurrency (412) ---
+    "ERR_STALE_CYCLE_VERSION": 412,
+    "ERR_STALE_PANEL_VERSION": 412,
+}
+
+# Business-rule / state conflicts — all 409.
+CONFLICTS = (
+    "ERR_CYCLE_STATE_INVALID",
+    "ERR_APPLICATION_STATE_INVALID",
+    "ERR_WORK_SAMPLE_STATE_INVALID",
+    "ERR_PANEL_STATE_INVALID",
+    "ERR_PANELIST_STATE_INVALID",
+    "ERR_CONFLICT_STATE_INVALID",
+    "ERR_REVIEW_STATE_INVALID",
+    "ERR_SLOT_STATE_INVALID",
+    "ERR_AWARD_STATE_INVALID",
+    "ERR_INSTALLMENT_STATE_INVALID",
+    "ERR_FINAL_REPORT_STATE_INVALID",
+    "ERR_APPEAL_STATE_INVALID",
+    "ERR_CYCLE_POSTURE_FROZEN",
+    "ERR_CYCLE_POSTURE_RESTRICTED",
+    "ERR_ARTIST_NOT_IN_GOOD_STANDING",
+    "ERR_ANONYMITY_BREACH_UNRESOLVED",
+    "ERR_CONFLICT_BLOCKS_REVIEW",
+    "ERR_MANDATORY_CONFLICT_NOT_WAIVABLE",
+    "ERR_APPLICATION_WINDOW_NOT_OPEN",
+    "ERR_APPLICATION_DEADLINE_PASSED",
+    "ERR_DEADLINE_NOT_REACHED",
+    "ERR_PANELIST_WINDOW_CONFLICT",
+    "ERR_ACCEPTANCE_DEADLINE_PASSED",
+    "ERR_INSTALLMENT_NOT_DUE",
+    "ERR_APPEAL_WINDOW_CLOSED",
+    "ERR_AWARD_PERIOD_COOLING_VIOLATION",
+    "ERR_FINAL_REPORT_NOT_DUE",
+    "ERR_DUPLICATE_APPLICATION",
+    "ERR_WORK_SAMPLE_REQUIREMENTS_NOT_MET",
+    "ERR_ELIGIBILITY_CRITERIA_NOT_MET",
+    "ERR_INELIGIBILITY_REASON_UNSUPPORTED",
+    "ERR_INSUFFICIENT_REVIEWS",
+    "ERR_PANEL_NOT_READY",
+    "ERR_SCORE_SPREAD_REQUIRES_ANOTHER_ROUND",
+    "ERR_INCOMPLETE_SLATE",
+    "ERR_SLOTS_PENDING_BOARD_ACTION",
+    "ERR_CYCLE_HAS_OPEN_AWARDS",
+    "ERR_AWARD_HAS_DISBURSEMENTS",
+    "ERR_TAX_CERTIFICATION_REQUIRED",
+    "ERR_NON_PROCEDURAL_APPEAL_GROUNDS",
+    "ERR_REMEDY_NOT_PERMITTED_FOR_GROUNDS",
+    "ERR_DUPLICATE_APPEAL",
+    "ERR_DUPLICATE_FINAL_REPORT",
+    "ERR_MAX_REVISIONS_REACHED",
+    "ERR_DUPLICATE_CONFLICT",
+    "ERR_DUPLICATE_REVIEW",
+    "ERR_CYCLE_HAS_NO_DISCIPLINES",
+    "ERR_PANELIST_NOT_ON_PANEL",
+    "ERR_APPLICATION_NOT_ON_PANEL",
+    "ERR_SLOT_RANK_ORDER_VIOLATION",
+    "ERR_DISCIPLINE_PANEL_CAPACITY",
+    "ERR_DISCIPLINE_ALLOCATION_EXHAUSTED",
+    "ERR_ALLOCATION_EXCEEDS_BUDGET",
+)
+for _e in CONFLICTS:
+    STATUS.setdefault(_e, 409)
+
+
+def _humanize(error_id):
+    body = error_id[4:] if error_id.startswith("ERR_") else error_id
+    return body.replace("_", " ").capitalize() + "."
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or STATUS.get(error_id, 409)
+        self.message = message or _humanize(error_id)

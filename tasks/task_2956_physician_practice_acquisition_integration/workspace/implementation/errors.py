@@ -1,0 +1,113 @@
+"""Error catalog (PRD section 5) -- 46 error identifiers with their HTTP statuses."""
+
+ERROR_STATUS = {
+    # Authentication / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_PLAN_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_COMPLIANCE_CLEARANCE_BLOCKED": 403,
+    # Existence / shape / concurrency
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_ACQUISITION_VERSION": 412,
+    # Conflicts
+    "ERR_ACQUISITION_SCOPE_MISMATCH": 409,
+    "ERR_DUPLICATE_NPI": 409,
+    "ERR_DUPLICATE_TASK_CODE": 409,
+    "ERR_DUPLICATE_BATCH_LABEL": 409,
+    "ERR_DUPLICATE_CREDENTIALING_PACKAGE": 409,
+    "ERR_DUPLICATE_REPORT_PERIOD": 409,
+    "ERR_PAYER_CONTRACT_INTERVAL_OVERLAP": 409,
+    "ERR_COMMITTEE_CYCLE_CAPACITY_EXCEEDED": 409,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    # Business rules
+    "ERR_MISSING_VALUATION_INPUT": 422,
+    "ERR_OPINION_METHOD_MISMATCH": 422,
+    "ERR_VALUER_INDEPENDENCE_NOT_ATTESTED": 422,
+    "ERR_VALUATION_OPINION_EXPIRED": 422,
+    "ERR_FMV_OPINION_NOT_ACCEPTED": 422,
+    "ERR_COMMERCIAL_REASONABLENESS_NOT_ESTABLISHED": 422,
+    "ERR_REFERRAL_LINKED_COMPENSATION": 422,
+    "ERR_COMP_EXCEEDS_FMV_SAFE_HARBOR": 422,
+    "ERR_STARK_EXCEPTION_REQUIRED": 422,
+    "ERR_PHYSICIAN_LICENSE_EXPIRED": 422,
+    "ERR_COMP_PLAN_MISSING": 422,
+    "ERR_NO_EXECUTED_COMP_PLAN": 422,
+    "ERR_TAIL_COVERAGE_INSUFFICIENT": 422,
+    "ERR_TAIL_RESERVE_INSUFFICIENT": 422,
+    "ERR_LIABILITY_DISPOSITION_NOT_PERMITTED": 422,
+    "ERR_LIABILITY_UNASSIGNED": 422,
+    "ERR_ESCROW_INSUFFICIENT": 422,
+    "ERR_CREDENTIALING_LEAD_TIME_MISSED": 422,
+    "ERR_PAYER_NOVATION_INCOMPLETE": 422,
+    "ERR_PATIENT_NOTICE_LEAD_TIME_SHORT": 422,
+    "ERR_PATIENT_NOTICE_COVERAGE_INCOMPLETE": 422,
+    "ERR_EMPTY_MIGRATION_BATCH": 422,
+    "ERR_MIGRATION_COUNT_INVALID": 422,
+    "ERR_MIGRATION_INCOMPLETE": 422,
+    "ERR_RETENTION_POOL_EXCEEDED": 422,
+    "ERR_WAIVER_JUSTIFICATION_REQUIRED": 422,
+    "ERR_READINESS_NOT_READY": 422,
+    "ERR_ACQUISITION_NOT_CLOSED": 422,
+    "ERR_INVALID_REPORT_PERIOD": 422,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or hold an unrecognised value.",
+    "ERR_FORBIDDEN_ROLE": "The caller's role is not authorised for this operation.",
+    "ERR_NOT_PLAN_OWNER": "The caller does not own the record being acted on.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids the same user from performing both steps.",
+    "ERR_COMPLIANCE_CLEARANCE_BLOCKED": "The acquisition's compliance clearance blocks this operation.",
+    "ERR_RESOURCE_NOT_FOUND": "The referenced resource does not exist.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+    "ERR_STALE_ACQUISITION_VERSION": "The supplied acquisition version is stale.",
+    "ERR_ACQUISITION_SCOPE_MISMATCH": "The referenced records do not belong to the same acquisition.",
+    "ERR_DUPLICATE_NPI": "An active physician with that npi already exists on the acquisition.",
+    "ERR_DUPLICATE_TASK_CODE": "A readiness task with that task_code already exists on the acquisition.",
+    "ERR_DUPLICATE_BATCH_LABEL": "A migration batch with that batch_label already exists on the acquisition.",
+    "ERR_DUPLICATE_CREDENTIALING_PACKAGE": "A credentialing package already exists for that physician and payer contract.",
+    "ERR_DUPLICATE_REPORT_PERIOD": "A performance report already exists for that physician and period.",
+    "ERR_PAYER_CONTRACT_INTERVAL_OVERLAP": "The payer contract interval overlaps an existing contract for the same payer.",
+    "ERR_COMMITTEE_CYCLE_CAPACITY_EXCEEDED": "The credentialing committee cycle has no remaining slots.",
+    "ERR_INVALID_STATE_TRANSITION": "The requested transition is not available from the current state.",
+    "ERR_MISSING_VALUATION_INPUT": "The valuation inputs required by the chosen method are incomplete.",
+    "ERR_OPINION_METHOD_MISMATCH": "The chosen method is not permitted for that opinion type.",
+    "ERR_VALUER_INDEPENDENCE_NOT_ATTESTED": "Valuer independence has not been attested.",
+    "ERR_VALUATION_OPINION_EXPIRED": "The valuation opinion has expired.",
+    "ERR_FMV_OPINION_NOT_ACCEPTED": "No accepted fair market value opinion is on file.",
+    "ERR_COMMERCIAL_REASONABLENESS_NOT_ESTABLISHED": "Commercial reasonableness has not been established.",
+    "ERR_REFERRAL_LINKED_COMPENSATION": "Compensation may not be linked to referral volume or value.",
+    "ERR_COMP_EXCEEDS_FMV_SAFE_HARBOR": "Compensation exceeds the fair market value safe harbour.",
+    "ERR_STARK_EXCEPTION_REQUIRED": "A Stark exception must be named for this compensation model.",
+    "ERR_PHYSICIAN_LICENSE_EXPIRED": "The physician's state license has expired.",
+    "ERR_COMP_PLAN_MISSING": "Not every physician on the acquisition has a compensation plan.",
+    "ERR_NO_EXECUTED_COMP_PLAN": "No executed compensation plan is on file.",
+    "ERR_TAIL_COVERAGE_INSUFFICIENT": "The malpractice tail coverage period is insufficient.",
+    "ERR_TAIL_RESERVE_INSUFFICIENT": "The escrow reserve does not cover the malpractice tail premium.",
+    "ERR_LIABILITY_DISPOSITION_NOT_PERMITTED": "That disposition is not permitted for this liability under the deal structure.",
+    "ERR_LIABILITY_UNASSIGNED": "One or more liability items are still unassigned.",
+    "ERR_ESCROW_INSUFFICIENT": "The indemnity escrow has insufficient available funds.",
+    "ERR_CREDENTIALING_LEAD_TIME_MISSED": "The credentialing lead time cannot be met before the target close date.",
+    "ERR_PAYER_NOVATION_INCOMPLETE": "Payer novation is incomplete.",
+    "ERR_PATIENT_NOTICE_LEAD_TIME_SHORT": "The patient notice lead time is shorter than required.",
+    "ERR_PATIENT_NOTICE_COVERAGE_INCOMPLETE": "Patient notice coverage is incomplete.",
+    "ERR_EMPTY_MIGRATION_BATCH": "The migration batch holds no records.",
+    "ERR_MIGRATION_COUNT_INVALID": "The reconciliation counts exceed the batch record count.",
+    "ERR_MIGRATION_INCOMPLETE": "Chart migration is incomplete.",
+    "ERR_RETENTION_POOL_EXCEEDED": "The retention pool has insufficient available funds.",
+    "ERR_WAIVER_JUSTIFICATION_REQUIRED": "A waiver justification is required.",
+    "ERR_READINESS_NOT_READY": "The acquisition's readiness posture is not READY.",
+    "ERR_ACQUISITION_NOT_CLOSED": "The acquisition has not closed.",
+    "ERR_INVALID_REPORT_PERIOD": "The reporting period is invalid.",
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request pipeline; rendered by the Flask error handler."""
+
+    def __init__(self, error_id, message=None):
+        self.error_id = error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+        super().__init__(self.message)

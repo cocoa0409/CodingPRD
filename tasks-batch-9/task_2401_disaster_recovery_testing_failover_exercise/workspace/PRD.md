@@ -1,0 +1,484 @@
+# DR Failover Exercise API — Product Requirements Document
+
+## 1. Introduction
+
+Regulated institutions are required to prove — not assert — that their critical applications can be recovered inside the recovery time and recovery point objectives their business owners signed up to. In practice that proof is assembled by hand: tiering spreadsheets drift out of step with the dependency diagrams, runbooks are validated once and then quietly rot, failover rehearsals are timed on a stopwatch, and the evidence pack the regulator eventually reads is reconstructed months later from memory. The DR Failover Exercise API replaces that with a single system of record for the whole resilience cycle, from the moment a tier is proposed to the moment a sealed evidence package is handed to an auditor.
+
+The service models the estate as a graph. Applications and assets — data stores and infrastructure components — are peer nodes joined by directed dependency edges, and recovery groups draw a boundary around the subset of nodes that must come back together at a named recovery site. Every recovery group carries a derived **posture** that answers one question for the coordinator: is this group fit to be rehearsed right now? Posture is never set by hand. It falls out of whether the group's current runbook revision is validated, whether the step-level validations behind that runbook are still fresh, and whether any critical finding from a previous rehearsal has failed re-test twice. Because posture is derived, a single administrative act — suspending a step owner, re-tiering an application, recording a failed re-test — can ripple outward and unschedule work that was already on the calendar. Those ripples are specified in this document as explicit, ordered cascades; they are not incidental.
+
+Two further constraints shape the design. First, resilience work is subject to segregation of duties: the coordinator who proposes a tier may not agree it, the coordinator who runs an exercise may not approve its production impact, the engineer who owns a runbook step may not time their own step, and the audit liaison who assembles an evidence package may not sign it off. Second, almost every rule in this system is time-sensitive — validation freshness decays, runbook validity expires, exercise windows collide, replication observations must not come from the future. To make those rules deterministic and testable, the server keeps a **logical clock** rather than reading wall-clock time.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contracts, headers, envelopes and cross-cutting invariants that hold for every endpoint in the API. Endpoints are mounted at the root of the service; there is no shared prefix.
+
+### 2.1. Participants, Headers and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting individual, and `X-User-Role`, declaring the operational capacity they are acting in. If either header is absent, or if `X-User-Role` is not one of the six declared roles, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If the headers are well formed but the declared role is not listed as an authorised role for the endpoint being called, the rejection is `ERR_UNAUTHORIZED` (HTTP 403).
+
+The six roles are `ResilienceCoordinator`, `BusinessOwner`, `ITOperator`, `RiskApprover`, `AuditLiaison` and `PlatformAdmin`.
+
+- A `ResilienceCoordinator` owns recovery groups, dependency mapping, runbook revisions and exercise orchestration. This role exclusively creates recovery groups and dependency edges, assigns applications and assets to groups, opens runbook revisions and drives runbook transitions, proposes application tiers, creates exercises, adds scope items, submits production impact, schedules exercises, drives execution transitions and drives finding transitions. It shares application creation with `PlatformAdmin`, asset creation with `ITOperator`, runbook-step creation and step-execution recording with `ITOperator`, finding creation with `ITOperator` and `AuditLiaison`, and posture refresh with `AuditLiaison`.
+- A `BusinessOwner` agrees or requests changes on tier proposals, and only for applications they personally own.
+- An `ITOperator` runs the technical work: registering assets, appending replication observations, validating runbook steps, recording step timings, and driving the data-validation and failback axes of an exercise.
+- A `RiskApprover` approves or rejects an exercise's production impact and signs off evidence packages.
+- An `AuditLiaison` assembles, submits, returns and seals audit and regulator evidence packages, may raise findings, and may refresh a recovery group's posture.
+- A `PlatformAdmin` is the operational administrator: it registers and patches stakeholders, creates sites, drives the logical clock, and may also create applications and propose tiers.
+
+**Identity semantics.** `ResilienceCoordinator`, `BusinessOwner`, `ITOperator`, `RiskApprover` and `AuditLiaison` are all *stakeholder-backed* roles. When `X-User-Role` is any of those five, `X-User-ID` is the `id` of the acting `Stakeholder` row, and every ownership or segregation-of-duties check compares a resource's stakeholder-valued field to `X-User-ID` directly. For those five roles the server additionally requires that `X-User-ID` resolves to a `Stakeholder` whose `status` is `ACTIVE` and whose `org_roles` array contains the organisational hat that corresponds to the declared role: `BusinessOwner` maps to `BUSINESS_OWNER`, `ResilienceCoordinator` to `RESILIENCE_COORDINATOR`, `ITOperator` to `IT_OPERATOR`, `RiskApprover` to `RISK_APPROVER`, and `AuditLiaison` to `AUDIT_LIAISON`. A mismatch — unknown id, `SUSPENDED` status, or a missing organisational hat — is rejected with `ERR_ROLE_IDENTITY_MISMATCH` (HTTP 403).
+
+When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server does not resolve it against the stakeholder register and does not compare it to any entity's `id`. Consequently the stakeholder-identity check above is skipped on exactly the three administrator endpoints that `PlatformAdmin` alone owns: `POST /stakeholders`, `PATCH /stakeholders/{id}` and `POST /_clock/set_current_utc`. On every other endpoint the check applies.
+
+A person may legitimately wear several organisational hats at once — `org_roles` is a non-empty array drawn from `BUSINESS_OWNER`, `RESILIENCE_COORDINATOR`, `IT_OPERATOR`, `RISK_APPROVER` and `AUDIT_LIAISON` — which is precisely why the segregation-of-duties rules in §2.6 are enforced on identity rather than on role.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination, Sorting and List Filters
+
+List endpoints are paginated through two query parameters. `limit` caps the number of rows returned; it defaults to 10, may not be below 1, and may not exceed 100. `offset` is the number of rows to skip and defaults to 0; it may not be negative. A `limit` outside the range 1 through 100, or a negative `offset`, is a malformed request and is rejected with `ERR_INVALID_REQUEST`.
+
+Unless a specific endpoint says otherwise, list endpoints return rows sorted by `created_at` in ascending order. There is exactly one exception in this API: an asset's replication-observation log is returned with the most recent `observed_at` first.
+
+Every list response repeats `limit` and `offset` in the `meta` object alongside `total_count`, the number of rows matching the filter before pagination, and `has_more`, a boolean that is true when rows remain beyond the current page.
+
+Lists also accept optional equality filters, which combine conjunctively with each other and with pagination. The stakeholder list filters on `status`. The site list filters on `role`. The application list filters on `business_owner_id`, `primary_site_id`, `recovery_group_id`, `proposed_by_id` and `tier_agreement_status`. The asset list filters on `site_id`, `recovery_group_id` and `asset_kind`. The dependency-edge list filters on `from_node_id`, `to_node_id` and `edge_kind`. The recovery-group list filters on `recovery_site_id`, `lead_coordinator_id`, `current_runbook_id` and `posture`. The runbook list filters on `recovery_group_id`, `author_id` and `status`. The runbook-step list filters on `runbook_id`, `owner_id`, `covers_application_id`, `covers_asset_id` and `validation_status`. The exercise list filters on `recovery_site_id`, `coordinator_id`, `impact_approved_by_id` and `execution_state`. The scope-item list filters on `exercise_id`, `recovery_group_id` and `runbook_id_snapshot`. The step-execution list filters on `exercise_id`, `runbook_step_id` and `outcome`. The finding list filters on `exercise_id`, `recovery_group_id`, `owner_id`, `retest_exercise_id`, `state` and `severity`. The evidence-package list filters on `exercise_id`, `prepared_by_id`, `signed_off_by_id` and `state`.
+
+### 2.4. The Logical Clock
+
+Every age, decay, validity, window and freshness rule in this specification is evaluated against a server-held **logical clock**, never against real wall-clock time. Before the clock has ever been set, it reads exactly `2026-08-01T00:00:00Z`, and it never falls back to wall-clock time afterwards. A `PlatformAdmin` moves the clock by supplying a `to_iso8601` instant to `POST /_clock/set_current_utc`, which answers 200 OK with the new `current_utc` and mutates no entity. Every computed timestamp the server stamps thereafter — `validated_at`, `last_validated_at`, `execution_started_at`, `failover_completed_at`, `sealed_at` — reads the logical clock, and every age computation reads it too.
+
+### 2.5. Common Resource Properties
+
+Resources in this API carry a standard set of server-managed fields:
+
+- `id` (string): a server-minted UUID. It carries no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits, recording when the row was first created.
+- `updated_at` (string): an ISO 8601 UTC timestamp, refreshed on every mutation of the row — including mutations the server performs on its own initiative, such as recomputing a derived field.
+- `version` (integer): a server-managed integer that starts at 1 on creation and increments by 1 on every mutation of the row.
+
+One entity is deliberately exempt. A `ReplicationObservation` is an append-only event log row: it carries only `id` and `created_at`. It has **no** `updated_at` and **no** `version`, because it is never updated and never deleted, and there is no endpoint that would do either. Every other entity in the system — `Stakeholder`, `Site`, `Application`, `Asset`, `DependencyEdge`, `RecoveryGroup`, `Runbook`, `RunbookStep`, `Exercise`, `ExerciseScopeItem`, `StepExecution`, `Finding` and `EvidencePackage` — carries all four.
+
+Derived fields count as mutations. When the server recomputes `projected_recovery_minutes` on a recovery group, or `readiness_score` on a runbook, or `reserved_capacity_units` on a site, the affected row's `updated_at` is refreshed and its `version` increments exactly as it would for a client-driven edit.
+
+### 2.6. Segregation of Duties and Approval Authority
+
+Resilience assurance only means something if the person who proposed a control is not the person who blessed it. Four independent identity checks enforce that, and all four compare `X-User-ID` against a stored stakeholder reference rather than against a role name, because one individual may hold several organisational hats.
+
+1. The stakeholder agreeing an application's tier must not be the stakeholder recorded in `proposed_by_id` on that application. A self-agreed proposal is rejected with `ERR_SOD_TIER_PROPOSER` (HTTP 422).
+2. The stakeholder deciding an exercise's production impact — approving or rejecting — must not be the exercise's `coordinator_id`. Violations yield `ERR_SOD_IMPACT_APPROVER` (HTTP 422).
+3. The stakeholder recording a step execution must not be the `owner_id` of the runbook step being timed. Violations yield `ERR_SOD_STEP_OWNER` (HTTP 422).
+4. The stakeholder signing off an evidence package must not be its `prepared_by_id`. Violations yield `ERR_SOD_EVIDENCE_SIGNER` (HTTP 422).
+
+Separately, each stakeholder carries an `approval_authority_level` — one of `LEVEL_1`, `LEVEL_2` or `LEVEL_3`, ordered so that `LEVEL_1` is lowest and `LEVEL_3` highest — which defaults to `LEVEL_1` when the person is registered without one. An exercise derives a `required_approval_level` from its production-impact score, and an approver may only approve when their own `approval_authority_level` is at or above that requirement in this ordering. A `LEVEL_2` approver may therefore clear a `LEVEL_1` or `LEVEL_2` exercise but not a `LEVEL_3` one; the shortfall is reported as `ERR_INSUFFICIENT_APPROVAL_AUTHORITY` (HTTP 403).
+
+Ownership is also identity-scoped for tier decisions: the acting `X-User-ID` must equal the application's `business_owner_id`. Holding the `BUSINESS_OWNER` organisational hat is not sufficient to decide somebody else's application, and the mismatch is reported as `ERR_NOT_APPLICATION_OWNER` (HTTP 403).
+
+### 2.7. Optimistic Concurrency on Recovery Groups and Exercises
+
+Two write operations in this API append to an aggregate whose meaning depends on facts the client must have read first. Both are guarded by optimistic concurrency control, and on both the version field is a **required** input, not an optional one.
+
+Opening a new runbook revision — `POST /runbooks` — requires `expected_recovery_group_version`, carrying the client's last observed `version` of the target `RecoveryGroup`. Publishing a revision legitimately supersedes the group's earlier revision and re-points the group's `current_runbook_id`, so a writer holding a stale view of the group's membership, posture or projected recovery path would silently author against superseded facts. If `expected_recovery_group_version` does not equal the group's current `version`, the create is rejected with `ERR_STALE_RECOVERY_GROUP_VERSION` (HTTP 412).
+
+Bringing a recovery group into an exercise's scope — `POST /exercises/{id}/scope-items` — requires `expected_exercise_version`, carrying the client's last observed `version` of the target `Exercise`. Each accepted scope item re-derives the exercise's `required_capacity_units` and therefore changes what a later capacity and window evaluation will see, so a writer working from a stale exercise view would append scope on top of facts it never read. If `expected_exercise_version` does not equal the exercise's current `version`, the request is rejected with `ERR_STALE_EXERCISE_VERSION` (HTTP 412).
+
+No other endpoint in this API accepts a version field, and no other endpoint performs a version check.
+
+### 2.8. Numeric Precision and Rounding Discipline
+
+Two families of numbers coexist in this system and they round differently.
+
+Counts, capacity units and everything measured in minutes are integers and are never rounded to decimals. `projected_recovery_minutes`, `restore_minutes`, `rto_minutes`, `rpo_minutes`, `rto_objective_minutes`, `rpo_objective_minutes`, `achieved_rto_minutes`, `achieved_rpo_minutes`, `elapsed_minutes`, `required_capacity_units`, `reserved_capacity_units`, `usable_capacity_units`, `capacity_units_contributed`, `open_finding_count`, `manifest_line_count`, `retest_failure_count`, `retier_count` and `revision` are all whole numbers. Where a conversion from a finer unit is involved the direction is always *ceiling*, so a partially consumed minute counts as a full minute against an objective.
+
+Scores are decimal and carry exactly two decimal places, rounded half up. `readiness_score`, `provisional_impact_score` and `production_impact_score` are all two-decimal values. Half-up rounding is applied at the specific points named in the respective calculations in §3 and nowhere else — in particular, the readiness score rounds twice per step and never rounds the final sum, while the impact score rounds its capacity term, its provisional total and its final total.
+
+### 2.9. Validation Ordering
+
+When several checks could reject the same request, the server evaluates them in a fixed global order and reports the **first** failure only. The ordering below is normative; a later check never masks an earlier one.
+
+1. Header presence and role validity, as described in §2.1 — `ERR_UNAUTHENTICATED` (401), on every endpoint.
+2. The acting role is authorised for the endpoint — `ERR_UNAUTHORIZED` (403), on every endpoint.
+3. Stakeholder-identity resolution for the five stakeholder-backed roles — `ERR_ROLE_IDENTITY_MISMATCH` (403), on every endpoint except `POST /stakeholders`, `PATCH /stakeholders/{id}` and `POST /_clock/set_current_utc`.
+4. Existence of every id templated into the path, validated **left to right**, on every endpoint with a templated segment. The first identifier that does not resolve determines the error, drawn from `ERR_STAKEHOLDER_NOT_FOUND`, `ERR_SITE_NOT_FOUND`, `ERR_APPLICATION_NOT_FOUND`, `ERR_ASSET_NOT_FOUND`, `ERR_DEPENDENCY_EDGE_NOT_FOUND`, `ERR_RECOVERY_GROUP_NOT_FOUND`, `ERR_RUNBOOK_NOT_FOUND`, `ERR_RUNBOOK_STEP_NOT_FOUND`, `ERR_EXERCISE_NOT_FOUND`, `ERR_SCOPE_ITEM_NOT_FOUND`, `ERR_STEP_EXECUTION_NOT_FOUND`, `ERR_FINDING_NOT_FOUND` and `ERR_EVIDENCE_PACKAGE_NOT_FOUND`, each HTTP 404.
+5. Existence of every foreign key supplied in the request body, validated in the order the fields are listed for that endpoint, on every creating or patching endpoint that carries foreign keys — HTTP 404 with the corresponding not-found identifier from the list above.
+6. Request shape: required fields present, enum values members of their declared sets, integers inside their declared ranges, datetimes well-formed ISO 8601 UTC, and pagination within bounds — `ERR_INVALID_REQUEST` (400), on every endpoint.
+7. The optimistic-concurrency field matches its parent's current `version`, as specified in §2.7 — `ERR_STALE_RECOVERY_GROUP_VERSION` or `ERR_STALE_EXERCISE_VERSION` (412), on `POST /runbooks` and `POST /exercises/{id}/scope-items`.
+8. The exercise's `execution_state` is a declared from-state for the requested action — `ERR_INVALID_EXERCISE_STATE` (409), on scope-item creation, impact submission, impact decision, scheduling, execution transitions and step-execution recording.
+9. The exercise's `data_state` is a declared from-state for the requested data action **and** its `execution_state` is `FAILOVER_COMPLETE` — `ERR_INVALID_DATA_STATE` (409), on data transitions and on the `CLOSE` execution transition.
+10. The exercise's `failback_state` is a declared from-state for the requested failback action **and** its `execution_state` is `FAILOVER_COMPLETE` — `ERR_INVALID_FAILBACK_STATE` (409), on failback transitions and on the `CLOSE` execution transition.
+11. The runbook's `status` is a declared from-state for the requested action and that action's own preconditions hold — `ERR_INVALID_RUNBOOK_STATE` (409), on runbook transitions.
+12. The owning runbook is not `SUPERSEDED` — `ERR_INVALID_STEP_STATE` (409), on both runbook-step creation and step validation.
+13. The application's `tier_agreement_status` is a declared from-state for the requested tier action — `ERR_INVALID_APPLICATION_TIER_STATE` (409), on tier proposals and tier decisions.
+14. The finding's `state` is a declared from-state for the requested action — `ERR_INVALID_FINDING_STATE` (409), on finding transitions.
+15. The evidence package's `state` is a declared from-state for the requested action — `ERR_INVALID_EVIDENCE_STATE` (409), on evidence-package transitions.
+16. A `SEALED` evidence package accepts no further transition at all — `ERR_EVIDENCE_SEALED` (409), on evidence-package transitions.
+17. Segregation of duties on tier agreement — `ERR_SOD_TIER_PROPOSER` (422), on a tier decision whose `action` is `AGREE`.
+18. Segregation of duties on the impact decision — `ERR_SOD_IMPACT_APPROVER` (422), on impact decisions, for both `APPROVE` and `REJECT`.
+19. Segregation of duties on step timing — `ERR_SOD_STEP_OWNER` (422), on step-execution recording.
+20. Segregation of duties on evidence sign-off — `ERR_SOD_EVIDENCE_SIGNER` (422), on an evidence-package transition whose `action` is `SIGN_OFF`.
+21. The approver's authority level is sufficient — `ERR_INSUFFICIENT_APPROVAL_AUTHORITY` (403), on an impact decision whose `action` is `APPROVE`.
+22. The scoped group has a non-null `current_runbook_id`, that runbook's `status` is `VALIDATED`, and its `readiness_score`, recomputed as of the current logical clock, is at least 80.00 — `ERR_RUNBOOK_STALE` (422), on scope-item creation.
+23. Every in-scope group's `posture` is `READY` — `ERR_GROUP_NOT_READY` (422), on impact submission.
+24. The group being scoped is not in `posture` `FROZEN` — `ERR_GROUP_FROZEN` (422), on scope-item creation.
+25. A step that names a `covers_application_id` covers an application whose `tier_agreement_status` is `AGREED` — `ERR_STEP_COVERS_UNAGREED_APPLICATION` (422), on step validation.
+26. The group's `recovery_site_id` equals the exercise's `recovery_site_id` — `ERR_GROUP_SITE_MISMATCH` (422), on scope-item creation.
+27. A dependency edge's two endpoints are not the same node — `ERR_SELF_DEPENDENCY` (422), on dependency-edge creation.
+28. A new `HARD` dependency edge does not close a directed cycle among `HARD` edges — `ERR_DEPENDENCY_CYCLE` (422), on dependency-edge creation.
+29. No existing edge already has the same `from_node_id`, `to_node_id` and `edge_kind` — `ERR_DUPLICATE_DEPENDENCY_EDGE` (409), on dependency-edge creation.
+30. No existing scope item on this exercise already names the same `recovery_group_id` — `ERR_DUPLICATE_SCOPE_ITEM` (409), on scope-item creation.
+31. The cited step belongs to a runbook revision snapshotted by one of this exercise's scope items — `ERR_STEP_NOT_IN_SCOPE` (422), on step-execution recording.
+32. The nominated re-test exercise scopes the finding's own recovery group — `ERR_RETEST_SCOPE_MISMATCH` (422), on a finding transition whose `action` is `SCHEDULE_RETEST`.
+33. The proposed recovery time objective is within the cap for the proposed tier — `ERR_TIER_RTO_EXCEEDS_CAP` (422), on tier proposals.
+34. The proposed recovery point objective is within the cap for the proposed tier — `ERR_TIER_RPO_EXCEEDS_CAP` (422), on tier proposals.
+35. `site_code`, `app_code`, `asset_code`, `group_code` and stakeholder `email` are each unique within their own entity — `ERR_DUPLICATE_CODE` (409), on site, application, asset, recovery-group and stakeholder creation.
+36. `step_number` is unique within its runbook — `ERR_DUPLICATE_STEP_NUMBER` (409), on runbook-step creation.
+37. The exercise window does not collide with another occupation of the same recovery site — `ERR_SITE_WINDOW_CONFLICT` (409), on scheduling.
+38. The exercise window does not intersect an in-scope group's change freeze — `ERR_GROUP_CHANGE_FREEZE_CONFLICT` (409), on scope-item creation.
+39. The snapshotted runbook's validation is still inside its validity period — `ERR_RUNBOOK_VALIDITY_EXPIRED` (422), on scope-item creation.
+40. The evidenced exercise's `execution_state` is `CLOSED` — `ERR_EXERCISE_NOT_CLOSED` (422), on an evidence-package transition whose `action` is `SUBMIT`.
+41. The recovery site has capacity headroom for the exercise — `ERR_SITE_CAPACITY_EXCEEDED` (409), on scheduling.
+42. At least one `AGREED` application belongs to an in-scope group — `ERR_NO_RTO_BASELINE` (422), on an execution transition whose `action` is `START`.
+43. Every in-scope data store has at least one replication observation at or before the current logical clock — `ERR_NO_REPLICATION_OBSERVATION` (422), on an execution transition whose `action` is `COMPLETE_FAILOVER`.
+44. Interval sanity: `planned_end_at` is strictly after `planned_start_at`, and `change_freeze_end_at` is at or after `change_freeze_start_at` — `ERR_INVALID_WINDOW` (422), on exercise creation and on setting a group's change freeze.
+45. `observed_at` is at or before the current logical clock — `ERR_OBSERVATION_IN_FUTURE` (422), on appending a replication observation.
+46. The acting stakeholder is the application's own business owner — `ERR_NOT_APPLICATION_OWNER` (403), on tier decisions. This check sits deliberately at the very bottom of the ladder: an application in the wrong tier state reports its state error at rank 13, and a self-agreed proposal reports its segregation-of-duties error at rank 17, both before ownership is ever considered.
+
+The left-to-right rule at rank 4 also governs path resolution generally. Where a path names a parent and then a child, the parent's non-existence is reported before the child is even looked for.
+
+### 2.10. Cascade Discipline: How One Write Ripples
+
+Three administrative acts in this system are heads of ordered cascades. Each hop is caused by the hop before it, all hops land inside the same request, and each row a hop touches has its `updated_at` refreshed and its `version` incremented.
+
+**Cascade A — re-tiering an already agreed application.** Hop 1 records the new proposal and increments the application's `retier_count` by 1. Hop 2, caused by hop 1, moves every runbook step whose `covers_application_id` is that application and whose `validation_status` is `VALIDATED` to `INVALIDATED`. Hop 3, caused by hop 2, moves every runbook that owns one of those newly invalidated steps and whose `status` is `VALIDATED` to `STALE` with `stale_reason` `APPLICATION_RETIERED`, recomputing its `readiness_score`. Hop 4, caused by hop 3, re-derives the `posture` of every recovery group whose `current_runbook_id` now points at a `STALE` runbook, landing on `RESTRICTED` with `posture_reason` `RUNBOOK_STALE`. Hop 5, caused by hop 4, reverts every exercise in `execution_state` `SCHEDULED` that holds a scope item on such a group back to `SCOPED`, leaving its `closure_reason` at `NONE`. Hop 6, caused by hop 5, recomputes `reserved_capacity_units` on each reverted exercise's recovery site, which therefore decreases by that exercise's `required_capacity_units`.
+
+**Cascade B — a critical finding failing re-test a second time.** Hop 1 increments the finding's `retest_failure_count` by 1. Hop 2, caused by hop 1, sets `escalated` to true when the count has reached at least 2 and the finding's `severity` is `CRITICAL`. Hop 3, caused by hop 2, re-derives the owning recovery group's `posture` to `FROZEN` with `posture_reason` `OPEN_CRITICAL_FINDING`. Hop 4, caused by hop 3, cancels every exercise holding a scope item on that group whose `execution_state` is `SCOPED`, `PENDING_IMPACT_APPROVAL`, `APPROVED` or `SCHEDULED`, setting `execution_state` to `CANCELLED` and `closure_reason` to `CANCELLED_GROUP_FROZEN`. Hop 5, caused by hop 4, recomputes `reserved_capacity_units` on each cancelled exercise's recovery site. Only exercises cancelled out of `SCHEDULED` actually release anything: they held a reservation, so the site's reserved figure falls by their `required_capacity_units`. Exercises cancelled out of `SCOPED`, `PENDING_IMPACT_APPROVAL` or `APPROVED` held no reservation at all, so the recompute leaves the site's figure unchanged.
+
+**Cascade C — suspending a stakeholder.** Hop 1 moves the stakeholder's `status` from `ACTIVE` to `SUSPENDED`. Hop 2, caused by hop 1, moves every runbook step whose `owner_id` is that person and whose `validation_status` is `VALIDATED` to `INVALIDATED`. Hop 3, caused by hop 2, moves each owning runbook whose `status` is `VALIDATED` to `STALE` with `stale_reason` `STEP_OWNER_SUSPENDED` and recomputes its `readiness_score`. Hop 4, caused by hop 3, re-derives each affected recovery group's `posture`, which lands on `RESTRICTED` with `posture_reason` `RUNBOOK_STALE` whenever no escalated critical finding is outstanding.
+
+Cascades are not reversible. When a later act clears the condition that froze a group, the group's posture recovers but the exercises cancelled along the way are **not** resurrected.
+
+### 2.11. Capacity as a Shared, Recomputed Resource
+
+Each site publishes a `usable_capacity_units` figure — how many failover capacity units it can host at once — and carries a derived `reserved_capacity_units` that starts at 0 when the site is registered. The reserved figure is always produced by a **full recomputation** from the exercise table, never by adding or subtracting a delta: it is the sum of `required_capacity_units` across every exercise whose `recovery_site_id` is this site and whose `execution_state` is `SCHEDULED`, `IN_EXECUTION` or `FAILOVER_COMPLETE`. Exercises in `DRAFT`, `SCOPED`, `PENDING_IMPACT_APPROVAL`, `APPROVED`, `CLOSED`, `CANCELLED` or `ABORTED` contribute nothing. Because the figure is always rebuilt from scratch, a schedule-then-cancel sequence can never leave the site drifting away from the truth. The recomputation fires whenever an exercise on the site enters or leaves that three-state window: on scheduling, on each execution transition that starts, completes, closes, aborts or cancels an exercise, and on the capacity hops of cascades A and B.
+
+## 3. Business Logic & Workflows
+
+### 3.1. The Resilience Estate: People, Sites and Recoverable Nodes
+
+Everything begins with the register of people. A `PlatformAdmin` records a stakeholder with a `full_name`, an `email` that must be unique across the whole register, and the `org_roles` array of organisational hats that person wears. An `approval_authority_level` may be supplied at registration and defaults to `LEVEL_1` when it is not; `status` begins at `ACTIVE`. Later the administrator may patch any combination of `status`, `approval_authority_level` and `org_roles` on an existing person. Moving `status` to `SUSPENDED` is not a bookkeeping change — it is the head of cascade C described in §2.10, and it can pull runbooks out of validation and recovery groups out of readiness in a single request. Reusing an `email` that already exists is rejected with `ERR_DUPLICATE_CODE`.
+
+Sites are the physical estate. Each carries a display `name`, a `site_code` unique across all sites, a `role` that is either `PRIMARY` for a site that normally runs production or `RECOVERY` for one that receives failover, and a `usable_capacity_units` figure that must not be negative. Registration also initialises the derived `reserved_capacity_units` to 0. Duplicate `site_code` values are rejected with `ERR_DUPLICATE_CODE`.
+
+Applications are the business-facing nodes of the estate. Registering one requires a `name`, an `app_code` unique across applications, the `business_owner_id` of the stakeholder who will negotiate its objectives, the `primary_site_id` of the site where it normally runs, and a `criticality_weight` — an integer between 1 and 10 inclusive expressing how much this application contributes to production-impact scoring. A freshly registered application starts with `tier_agreement_status` at `DRAFT`, its `recovery_group_id` null until it is assigned to a group, `retier_count` at 0, and `tier`, `rto_minutes` and `rpo_minutes` all null because nothing has been agreed yet. A duplicate `app_code` is rejected with `ERR_DUPLICATE_CODE`.
+
+Assets are the technical nodes and sit as peers to applications rather than beneath them. An `ITOperator` or a `ResilienceCoordinator` registers one with a `name`, a unique `asset_code`, an `asset_kind` of either `DATA_STORE` for a node that holds data or `INFRA_COMPONENT` for pure infrastructure, the `site_id` where the asset normally lives, a `replication_mode` of `SYNCHRONOUS`, `ASYNCHRONOUS` or `BATCH_SNAPSHOT` describing how its data reaches the recovery site, and a non-negative `restore_minutes` that becomes this node's weight in the critical-path projection. An optional `expected_txn_rate_per_minute`, defaulting to 0 and never negative, records the steady-state write rate; §3.7 explains why that number decides how a data-loss window is measured. Like applications, an asset's `recovery_group_id` is null until it is assigned, and a repeated `asset_code` is rejected with `ERR_DUPLICATE_CODE`.
+
+Data stores also accumulate an immutable measurement log. An `ITOperator` appends a `ReplicationObservation` to a specific asset by supplying the instant the measurement was taken as `observed_at`, the `replication_lag_seconds` by which the recovery copy trails the primary, and the `unreplicated_txn_count` of writes still queued at the primary. Neither number may be negative. The server records the asset the observation belongs to as `asset_id` and stamps `recorded_by_user_id` with the acting `X-User-ID`; no other entity is mutated by the append. A measurement dated after the current logical clock is nonsense and is rejected with `ERR_OBSERVATION_IN_FUTURE`. Because the log is append-only there is no update and no delete path for these rows, and — as §2.5 states — they carry no `updated_at` and no `version`.
+
+### 3.2. Agreeing Tiers, Recovery Time and Recovery Point Objectives
+
+Tiering is a negotiation between a resilience coordinator and a business owner, and the application's `tier_agreement_status` tracks where that negotiation stands: `DRAFT` before anything is put forward, `TIER_PROPOSED` while a proposal awaits a decision, `AGREED` once the owner accepts, and `CHANGES_REQUESTED` when the owner sends it back.
+
+A `ResilienceCoordinator` opens or reopens the negotiation by proposing a `proposed_tier` of `TIER_1`, `TIER_2` or `TIER_3` together with a `proposed_rto_minutes` and a `proposed_rpo_minutes`, neither of which may be negative, and an optional `rationale`. Each tier carries hard ceilings on what may be promised under it. The recovery time objective may not exceed one hour for `TIER_1`, four hours for `TIER_2`, or twenty-four hours for `TIER_3` — that is, 60, 240 and 1440 minutes respectively — and a proposal that exceeds its tier's ceiling is rejected with `ERR_TIER_RTO_EXCEEDS_CAP`. The recovery point objective is capped more tightly: a quarter of an hour for `TIER_1`, one hour for `TIER_2`, and twenty-four hours for `TIER_3`, being 15, 60 and 1440 minutes; breaching that ceiling yields `ERR_TIER_RPO_EXCEEDS_CAP`. The recovery-time ceiling is evaluated before the recovery-point ceiling, so a proposal that violates both reports the recovery-time error. An accepted proposal stores the three proposed values, sets `tier_agreement_status` to `TIER_PROPOSED`, and records the acting `X-User-ID` in `proposed_by_id`. Proposals are accepted from `DRAFT` and from `CHANGES_REQUESTED` — where they simply overwrite the previous proposal fields and `proposed_by_id` — and, importantly, also from `AGREED`.
+
+Only the application's own business owner may decide the proposal, and only while the application sits in `TIER_PROPOSED`; a decision attempted from any other tier state is rejected with `ERR_INVALID_APPLICATION_TIER_STATE`. The decision carries an `action` of either `AGREE` or `REQUEST_CHANGES` and an optional `decision_note`. `AGREE` advances `tier_agreement_status` from `TIER_PROPOSED` to `AGREED` and copies the proposal into the agreed fields: `proposed_tier` becomes `tier`, `proposed_rto_minutes` becomes `rto_minutes`, and `proposed_rpo_minutes` becomes `rpo_minutes`. Because the application's agreed recovery time is its weight in the critical-path projection, agreement also recomputes `projected_recovery_minutes` and `recovery_sequence` on the application's recovery group whenever `recovery_group_id` is not null. `REQUEST_CHANGES` moves `tier_agreement_status` from `TIER_PROPOSED` to `CHANGES_REQUESTED` and deliberately leaves `tier`, `rto_minutes` and `rpo_minutes` exactly as they were. The two segregation checks that guard agreement are covered in §2.6: the acting stakeholder must not be the `proposed_by_id`, and must be the `business_owner_id`.
+
+Re-proposing a tier on an application that is already `AGREED` is the most consequential single write in the system. The transition itself looks unremarkable — `AGREED` back to `TIER_PROPOSED`, with `retier_count` incremented and `proposed_by_id` overwritten, while `tier`, `rto_minutes` and `rpo_minutes` retain their last agreed values so the projection does not collapse mid-flight. What follows is cascade A in full, as laid out in §2.10: every validated step covering this application is invalidated, the runbooks owning those steps go `STALE` with `stale_reason` `APPLICATION_RETIERED`, the affected groups drop to `RESTRICTED` with `posture_reason` `RUNBOOK_STALE`, scheduled exercises on those groups fall back to `SCOPED`, and the recovery sites those exercises had reserved give their capacity back.
+
+Assigning an application to a recovery group is a separate coordinator act that supplies the target `recovery_group_id`. It writes the application's `recovery_group_id`, recomputes the group's `projected_recovery_minutes` and `recovery_sequence`, and increments that group's `version` by 1. Assets are assigned to groups the same way and with the same three consequences.
+
+### 3.3. Recovery Groups, Dependency Mapping and the Critical-Path Projection
+
+A **recovery group** is the unit that actually fails over. A `ResilienceCoordinator` creates one with a `name`, a `group_code` unique across groups, the `recovery_site_id` of the site this group fails over to, the `lead_coordinator_id` of the stakeholder accountable for it, and a `recovery_order` of at least 1 giving its sequence position when several groups recover together. A duplicate `group_code` yields `ERR_DUPLICATE_CODE`. A brand-new group starts in `posture` `RESTRICTED` with `posture_reason` `NO_VALIDATED_RUNBOOK`, `projected_recovery_minutes` at 0, `recovery_sequence` empty, `open_finding_count` at 0, and `current_runbook_id` null.
+
+A coordinator may also give the group a change-freeze window by supplying `change_freeze_start_at` and `change_freeze_end_at`. Both endpoints of that interval are **inclusive** — it is a closed interval — and `change_freeze_end_at` must be at or after `change_freeze_start_at` or the request is rejected with `ERR_INVALID_WINDOW`. Storing the window increments the group's `version` by 1.
+
+Dependencies between nodes are declared one edge at a time. Each `DependencyEdge` names its dependent node through `from_node_kind` and `from_node_id`, and the node depended upon through `to_node_kind` and `to_node_id`. The two kind discriminators are each either `APPLICATION` or `ASSET`, and they decide which register the accompanying id is resolved against: an `APPLICATION` kind resolves its id among applications, an `ASSET` kind among assets. The `edge_kind` is either `HARD` or `SOFT`. `HARD` edges are real recovery dependencies: they participate in cycle detection and they carry the critical-path projection. `SOFT` edges are documentation only, contributing exactly zero to any projection and recorded without touching a single derived field. An edge whose `from_node_id` equals its `to_node_id` is rejected with `ERR_SELF_DEPENDENCY`; a `HARD` edge that would close a directed cycle among the existing `HARD` edges is rejected with `ERR_DEPENDENCY_CYCLE`, while `SOFT` edges are exempt from that check entirely; and an edge duplicating an existing combination of `from_node_id`, `to_node_id` and `edge_kind` is rejected with `ERR_DUPLICATE_DEPENDENCY_EDGE`. When a `HARD` edge is accepted, the projection is recomputed for every recovery group that contains **both** endpoints, and each such group's `version` increments by 1.
+
+The projection itself answers "how long will this group take to come back?" and is written to the group's `projected_recovery_minutes` and `recovery_sequence`. Its node set is every application and every asset whose `recovery_group_id` equals the group. Each application contributes its agreed `rto_minutes` as its node weight, or zero when `rto_minutes` is still null — which is exactly the case for applications whose `tier_agreement_status` has not yet reached `AGREED`. Each asset contributes its `restore_minutes`. The edge set is every `HARD` dependency edge whose two endpoints are both members of that node set; `SOFT` edges are excluded, and every edge that reaches outside the group's membership is excluded too. Over that directed subgraph — always acyclic, because cycle creation is blocked at write time — the server finds the directed path whose total node weight is greatest, and `projected_recovery_minutes` is that total. A single node with no edges is itself a path of length one, so an isolated member's own weight is a candidate; a group with no members at all projects 0. `recovery_sequence` is the ordered list of node ids along that winning path, running from the most dependent node at the head down to the deepest dependency at the tail, following the direction of the edges. When two paths tie on total weight, the path whose head node has the earlier `created_at` wins; if the heads were created at the same instant, the successive nodes of the two paths are compared pairwise by ascending `created_at` until the tie breaks. The result is whole minutes and is never rounded.
+
+The projection is refreshed whenever the graph or the weights change: on assigning an application to a group, on assigning an asset to a group, on accepting a `HARD` dependency edge, on a business owner's agreement of a tier, and on an explicit posture refresh.
+
+**Posture** is the group's readiness gate, and it is only ever derived — never written by a client. The derivation is evaluated in a strictly pinned order. First, the server asks whether any finding on this group has `escalated` set to true while its `state` is neither `CLOSED` nor `WITHDRAWN`. If one exists, `posture` is `FROZEN` and `posture_reason` is `OPEN_CRITICAL_FINDING`, and no runbook fact can override that — a frozen group stays `FROZEN` even while holding a perfectly fresh, fully validated runbook. Otherwise, if `current_runbook_id` is null, `posture` is `RESTRICTED` with `posture_reason` `NO_VALIDATED_RUNBOOK`. Otherwise, if the runbook named by `current_runbook_id` has a `status` other than `VALIDATED`, or its `readiness_score` is below 80.00, `posture` is `RESTRICTED` with `posture_reason` `RUNBOOK_STALE`. Only when none of those hold is `posture` `READY` with `posture_reason` `READY_ALL_CHECKS_PASSED`. Every request that touches a group's runbooks, steps, findings or membership ends by re-running this derivation, and a coordinator or audit liaison may re-run it deliberately: a posture refresh recomputes the current runbook's `readiness_score` against the current logical clock, recomputes `projected_recovery_minutes`, `recovery_sequence` and `open_finding_count`, and then re-derives `posture` and `posture_reason`, answering 200 OK with the group. A refresh that drops a group out of `READY` fires hop 5 of cascade A against any exercise still sitting in `SCHEDULED`.
+
+The group's `open_finding_count` is a plain aggregate: the number of findings whose `recovery_group_id` is this group and whose `state` is one of `OPEN`, `REMEDIATION_ASSIGNED`, `REMEDIATED`, `RETEST_SCHEDULED` or `RETEST_FAILED`. Findings in `CLOSED` or `WITHDRAWN` are excluded. It is recomputed when a finding is raised and on every finding transition.
+
+### 3.4. Runbook Revisions, Step Ownership and Readiness Decay
+
+Runbooks are versioned documents, never edited in place. A `ResilienceCoordinator` opens a revision for a group by naming the `recovery_group_id`, a `title`, the `author_id` of the authoring coordinator, and the `expected_recovery_group_version` demanded by §2.7. An optional `validity_days` — an integer from 1 to 3650, defaulting to 180 — declares how long a validation of this revision remains acceptable for exercise scoping. The server computes the new row's `revision` as one more than the number of runbooks that already exist on the same recovery group, counted in ascending `created_at` order, so the first revision is 1. The new revision starts with `status` `DRAFT`, `readiness_score` 0.00, `stale_reason` `NONE` and `validated_at` null, and opening it increments the owning group's `version` by 1.
+
+Steps carry the actual instructions and the actual accountability. A step is added to a runbook by naming its `runbook_id`, a `step_number` of at least 1 giving its execution order within that runbook, a `description` of what the operator must do, an `owner_id` naming the stakeholder accountable for the step, a non-negative `expected_minutes` giving its planned duration, and a `weight` from 1 to 20 setting how much this step counts toward its runbook's readiness. A step may name a `covers_application_id` when it recovers a particular application and a `covers_asset_id` when it recovers a particular asset; either may be null — the application reference is null when the step covers infrastructure only, and the asset reference is null when the step covers an application only. A step begins with `validation_status` `PENDING` and `last_validated_at` null. A repeated `step_number` inside the same runbook is rejected with `ERR_DUPLICATE_STEP_NUMBER`, and steps may not be added to a runbook whose `status` is `SUPERSEDED`, which is reported as `ERR_INVALID_STEP_STATE`.
+
+Only an `ITOperator` validates a step, and validation is the act that refreshes freshness. A validation may carry an optional `validation_note`. It is accepted while the owning runbook's `status` is `DRAFT`, `IN_REVIEW`, `VALIDATED` or `STALE`, and refused when that runbook is `SUPERSEDED` with `ERR_INVALID_STEP_STATE`. When the step names a `covers_application_id`, the covered application's `tier_agreement_status` must be `AGREED`; validating a step that covers an unagreed application is rejected with `ERR_STEP_COVERS_UNAGREED_APPLICATION`. Validation moves `validation_status` from `PENDING` to `VALIDATED` or from `INVALIDATED` back to `VALIDATED`, and it is also accepted on a step that is already `VALIDATED` — a re-validation that leaves `validation_status` at `VALIDATED` but advances `last_validated_at` to the current logical clock, resetting the decay origin without touching the runbook's own `validated_at`. In all three cases `last_validated_at` becomes the current logical clock, and the server then recomputes the owning runbook's `readiness_score` and, after that, the owning recovery group's `posture`. In the opposite direction, a step moves from `VALIDATED` to `INVALIDATED` only as a system consequence — hop 2 of cascade A when the application it covers is re-tiered, or hop 2 of cascade C when its `owner_id` is suspended. Invalidation clears nothing: `last_validated_at` is retained for audit even though the step now scores zero.
+
+**Readiness scoring** turns step freshness into a single number in the range 0.00 to 100.00. Start by summing the `weight` of every step of the runbook — every step, whatever its `validation_status`, including `PENDING` and `INVALIDATED` ones — to get the total weight. Then score each step. A step whose `validation_status` is `VALIDATED` has an age in whole days: take the elapsed time from its `last_validated_at` to the current logical clock, divide by 86400 seconds and discard any fraction, so a validation performed less than a full day ago has an age of zero days. Its step score is 100 multiplied by one minus the ratio of that age to a decay horizon of exactly 360 days, rounded half up to two decimal places, and then floored at 0.00 so a step older than the horizon scores 0.00 rather than a negative value. A step in any other status — `PENDING` or `INVALIDATED` — scores 0.00 outright. Each step's contribution is its step score multiplied by its `weight`, divided by the total weight, and rounded half up to two decimal places. The runbook's `readiness_score` is the plain sum of those per-step contributions, with **no further rounding applied to the sum**.
+
+The rounding order here is pinned and it is observable. Contributions are each rounded to two decimals *first* and the rounded values are *then* added; the alternative — summing the unrounded contributions and rounding once at the end — is explicitly not used. Three steps of `weight` 10, all `VALIDATED` today, therefore produce 33.33 plus 33.33 plus 33.33, for a `readiness_score` of 99.99 rather than 100.00. A runbook with no steps at all has a total weight of zero and a `readiness_score` of 0.00. The score is recomputed on every step validation, on every runbook transition, on every posture refresh, whenever a cascade drives a runbook from `VALIDATED` to `STALE`, and once more immediately before an exercise scope item tests the 80.00 readiness floor.
+
+The runbook lifecycle runs over `DRAFT`, `IN_REVIEW`, `VALIDATED`, `STALE` and the terminal `SUPERSEDED`, driven by a coordinator supplying an `action` and an optional `note`. `SUBMIT_FOR_REVIEW` moves a runbook from `DRAFT` to `IN_REVIEW` and requires at least one step to exist. `RETURN_TO_DRAFT` moves it from `IN_REVIEW` back to `DRAFT` with no precondition. `VALIDATE` moves it from `IN_REVIEW` to `VALIDATED` and requires every one of its steps to have `validation_status` `VALIDATED`. `SUBMIT_FOR_REVIEW` is also the way back for a runbook that has gone `STALE`: it returns `STALE` to `IN_REVIEW`, provided no step of that runbook is currently `INVALIDATED`. Every one of these actions recomputes `readiness_score`. Any action attempted from a status that does not declare it, or with its precondition unmet, is rejected with `ERR_INVALID_RUNBOOK_STATE`.
+
+Validation is what makes a runbook the group's operative one. On reaching `VALIDATED`, the server stamps `validated_at` with the current logical clock, resets `stale_reason` to `NONE`, recomputes `readiness_score`, re-points the owning group's `current_runbook_id` at this revision, marks any earlier revision of the same group `SUPERSEDED` with `stale_reason` `SUPERSEDED_BY_REVISION`, and re-derives the group's `posture` — which typically becomes `READY` with `posture_reason` `READY_ALL_CHECKS_PASSED`. Supersession reaches both a previously `VALIDATED` revision and a previously `STALE` one: whichever status an earlier revision of the same group held, it becomes `SUPERSEDED` with `stale_reason` `SUPERSEDED_BY_REVISION` once a later revision of that group validates. Conversely, a `VALIDATED` runbook is driven to `STALE` by the system whenever at least one of its steps was invalidated in the same request, with `stale_reason` set to `APPLICATION_RETIERED` when a covered application was re-tiered and to `STEP_OWNER_SUSPENDED` when a step owner was suspended; the transition recomputes `readiness_score` and then the owning group's `posture`.
+
+### 3.5. Bringing Groups into Exercise Scope
+
+An **exercise** is a rehearsal, and its `exercise_type` fixes how ambitious it is: `TABLETOP` for a discussion-only walkthrough, `COMPONENT_FAILOVER` for failing over part of the estate, or `FULL_SITE_FAILOVER` for the whole site. A `ResilienceCoordinator` creates one with a `name`, the `exercise_type`, the `recovery_site_id` of the site whose capacity and calendar the rehearsal will occupy, the `coordinator_id` of the stakeholder who will run it, and the planned occupation window given as `planned_start_at` and `planned_end_at`. That window is **half-open**: the start instant is inside the occupation and the end instant is outside it. `planned_end_at` must be strictly after `planned_start_at`, or the request is rejected with `ERR_INVALID_WINDOW`. A new exercise starts all three of its lifecycle axes at their initial values — `execution_state` `DRAFT`, `data_state` `DATA_NOT_STARTED`, `failback_state` `FAILBACK_NOT_PLANNED` — with `required_capacity_units` at 0 and every score, objective, measurement and approval field null.
+
+Scoping brings recovery groups into the rehearsal. Each accepted scope item names the `recovery_group_id` being brought in, and carries the `expected_exercise_version` that §2.7 requires. The checks a scope item must clear are substantial, and they are evaluated in the order set out in §2.9: the optimistic-concurrency match comes first, then the exercise's own `execution_state`, then the readiness floor, then the frozen-group bar, then the site match, then the duplicate-group bar, then the change-freeze window, then runbook validity. Concretely:
+
+- The group must have a non-null `current_runbook_id` whose runbook is `VALIDATED` and whose `readiness_score`, recomputed against the current logical clock as part of this very request, is at least 80.00. Anything less — no current runbook, a runbook that is `DRAFT`, `IN_REVIEW`, `STALE` or `SUPERSEDED`, or a score that has decayed below the floor — is rejected with `ERR_RUNBOOK_STALE`.
+- The group must not be in `posture` `FROZEN`, or the request is rejected with `ERR_GROUP_FROZEN`.
+- The group's `recovery_site_id` must equal the exercise's `recovery_site_id`; a group that fails over somewhere else cannot be rehearsed here, and the mismatch yields `ERR_GROUP_SITE_MISMATCH`.
+- The same group may not be scoped twice on one exercise; a repeat is rejected with `ERR_DUPLICATE_SCOPE_ITEM`.
+- The exercise's planned window must not intersect the group's change-freeze interval. Because that interval is closed on both ends while the exercise window is half-open, an exercise that merely touches a freeze endpoint **does** conflict, and the rejection is `ERR_GROUP_CHANGE_FREEZE_CONFLICT`.
+- The runbook being snapshotted must still be inside its validity period. Take the elapsed time from that runbook's `validated_at` to the current logical clock, divide by 86400 seconds and discard the fraction to get whole days; that figure must be at most the runbook's `validity_days`. A runbook validated longer ago than its declared validity is rejected with `ERR_RUNBOOK_VALIDITY_EXPIRED`.
+
+An accepted scope item pins the facts it was accepted against. It stores `runbook_id_snapshot`, the group's `current_runbook_id` at this instant — which is the revision whose steps may later be timed — and `group_projected_recovery_minutes_snapshot`, the group's `projected_recovery_minutes` at this instant. It also stores `capacity_units_contributed`, which is decided purely by the exercise's `exercise_type`: a `TABLETOP` rehearsal occupies no capacity at all and contributes 0 units, a `COMPONENT_FAILOVER` contributes 2 units per scoped group, and a `FULL_SITE_FAILOVER` contributes 6 units per scoped group. The exercise's `required_capacity_units` is then recomputed as the sum of `capacity_units_contributed` across all of its scope items; since scope items are never removed, that sum only ever grows while the exercise is accepting scope. Finally, every accepted scope item increments the exercise's `version` by 1 — which is why a client adding two groups in succession must re-read the exercise between the two writes.
+
+The first accepted scope item also advances the exercise's `execution_state` from `DRAFT` to `SCOPED`. Subsequent scope items are accepted while the exercise is `SCOPED` and leave it in `SCOPED`, subject to exactly the same checks plus the duplicate-group bar. Scoping is refused outright once the exercise has moved past `SCOPED`, reported as `ERR_INVALID_EXERCISE_STATE`.
+
+### 3.6. Production-Impact Approval and Reserving the Recovery Site
+
+Rehearsals touch production, and someone with authority has to own that. The coordinator submits the exercise for production-impact approval, advancing `execution_state` from `SCOPED` to `PENDING_IMPACT_APPROVAL`. At least one scope item must exist, and **every** in-scope group must be in `posture` `READY` at that moment; a group that has since slipped to `RESTRICTED` or `FROZEN` blocks the submission with `ERR_GROUP_NOT_READY`.
+
+Submission computes the impact score, and the order of that computation is pinned because the dependency between score and surcharge is superficially circular. It runs as exactly one forward pass:
+
+1. **The criticality component** is the sum of `criticality_weight` over every application whose `tier_agreement_status` is `AGREED` and whose `recovery_group_id` is one of the groups this exercise has in scope. Applications in `DRAFT`, `TIER_PROPOSED` or `CHANGES_REQUESTED` contribute nothing.
+2. **The capacity component** expresses how much of the recovery site the rehearsal will consume. Multiply the exercise's `required_capacity_units` by ten, divide by the recovery site's `usable_capacity_units`, and round the result half up to two decimal places.
+3. **The provisional score** is a base figure for the rehearsal's ambition — 5 for a `TABLETOP`, 20 for a `COMPONENT_FAILOVER`, 40 for a `FULL_SITE_FAILOVER` — plus the criticality component plus the capacity component, the total rounded half up to two decimal places. That value is stored as `provisional_impact_score`, retained so an auditor can later see the pinned order was honoured.
+4. **The provisional band** is read off the provisional score using a single banding rule: a score of at least 60.00 is `LEVEL_3`, a score of at least 40.00 but below 60.00 is `LEVEL_2`, and anything below 40.00 is `LEVEL_1`.
+5. **The governance surcharge** is keyed on that *provisional* band: 1 for `LEVEL_1`, 3 for `LEVEL_2`, 5 for `LEVEL_3`.
+6. **The final score** is the provisional score plus the surcharge, rounded half up to two decimal places, and is stored as `production_impact_score`.
+7. **The required authority** is read off the *final* score with the same banding rule, and stored as `required_approval_level`.
+
+That order matters in both directions. The surcharge keeps the value of the provisional band even when adding it pushes the final score into a higher band — the band is not re-derived a second time in order to grow the surcharge — while `required_approval_level` is derived exactly once and from the final score, not from the provisional one. There is no iteration to a fixed point.
+
+A `RiskApprover` then decides, supplying an `action` of `APPROVE` or `REJECT` with an optional `decision_note`. Neither decision may be taken by the exercise's own `coordinator_id`, per §2.6. `APPROVE` requires the approver's `approval_authority_level` to be at or above the exercise's `required_approval_level`, records the approver's `X-User-ID` in `impact_approved_by_id`, and advances `execution_state` from `PENDING_IMPACT_APPROVAL` to `APPROVED`. `REJECT` sends the exercise back from `PENDING_IMPACT_APPROVAL` to `SCOPED` and clears all three impact fields — `production_impact_score`, `provisional_impact_score` and `required_approval_level` — back to null, so a re-submission recomputes them from scratch against whatever the estate looks like then. Note that the authority check applies only to `APPROVE`; a rejection needs no particular authority level.
+
+Scheduling is the act that reserves the site, moving `execution_state` from `APPROVED` to `SCHEDULED` and optionally recording a `scheduling_note`. Two site-level constraints must hold, in this order.
+
+First, the calendar. The exercise's half-open window must not intersect the window of any other exercise on the same recovery site whose `execution_state` is `SCHEDULED` or `IN_EXECUTION`. Because both windows are half-open, two exercises that merely touch — one ending at the exact instant the other begins — do **not** conflict. On top of plain intersection there is a cool-down: no exercise window may start within 240 minutes, that is four hours, after the `planned_end_at` of such an exercise whose `exercise_type` is `FULL_SITE_FAILOVER`, because a whole-site rehearsal leaves the site needing settling time. Either kind of collision is reported as `ERR_SITE_WINDOW_CONFLICT`.
+
+Second, the capacity. The site's current `reserved_capacity_units` plus this exercise's `required_capacity_units` must not exceed the site's `usable_capacity_units`. Equality is allowed — a site may be booked to exactly its stated ceiling — and only genuinely exceeding it is rejected, with `ERR_SITE_CAPACITY_EXCEEDED`. On success the site's `reserved_capacity_units` is recomputed as described in §2.11, and because this exercise has just entered the reserving window, that figure rises by the exercise's `required_capacity_units`.
+
+### 3.7. Running the Exercise: Step Timing, Objectives, Data Validation and Failback
+
+An exercise carries three independent lifecycle axes. `execution_state` tracks the rehearsal itself, `data_state` tracks post-failover data validation and reconciliation, and `failback_state` tracks the return to the primary site. The three run independently and have exactly one join point: closing the exercise.
+
+**Starting.** The coordinator starts the rehearsal, advancing `execution_state` from `SCHEDULED` to `IN_EXECUTION`. At least one application whose `tier_agreement_status` is `AGREED` must be a member of an in-scope group, otherwise there is nothing to measure against and the request is rejected with `ERR_NO_RTO_BASELINE`. Starting stamps `execution_started_at` with the current logical clock and pins the objectives the rehearsal will be judged against. Those baseline applications are exactly the `AGREED` members of the in-scope groups; `rto_objective_minutes` is the smallest `rto_minutes` among them and `rpo_objective_minutes` is the smallest `rpo_minutes` among them — the tightest promise made to any in-scope business owner becomes the whole exercise's target. Both are whole minutes. Once pinned, they do not move even if a member application is subsequently re-tiered.
+
+**Timing steps.** While the exercise is `IN_EXECUTION`, an `ITOperator` or a `ResilienceCoordinator` records one step execution per step performed, naming the `runbook_step_id` being timed, the `outcome`, the measured wall time as `elapsed_seconds`, and an optional free-text `notes`. The `outcome` is one of `PASSED`, `PASSED_WITH_ISSUE`, `FAILED` or `SKIPPED`. `elapsed_seconds` may not be negative, and the server derives `elapsed_minutes` from it at write time by rounding *up* to a whole minute — a 61-second step is pinned at 2 minutes and stays pinned. The server also records the recorder's `X-User-ID` in `performed_by_user_id`, which per §2.6 must differ from the step's `owner_id`. The cited step must belong to the runbook revision one of this exercise's scope items snapshotted as `runbook_id_snapshot`; timing a step from some other revision, or from a group that was never in scope, is rejected with `ERR_STEP_NOT_IN_SCOPE`.
+
+**Completing the failover.** The coordinator completes the failover, advancing `execution_state` from `IN_EXECUTION` to `FAILOVER_COMPLETE`. At least one step execution must already exist for this exercise, and every in-scope asset whose `asset_kind` is `DATA_STORE` must have at least one replication observation whose `observed_at` is at or before the current logical clock — a data store nobody measured cannot be part of a defensible recovery-point claim, and its absence is rejected with `ERR_NO_REPLICATION_OBSERVATION`. Completion stamps `failover_completed_at` with the current logical clock and then measures both objectives.
+
+**Measuring recovery time.** How `achieved_rto_minutes` is measured depends on the rehearsal's ambition, and there are exactly two variants. For a `FULL_SITE_FAILOVER` the measure is the *elapsed outage window*: take the time from `execution_started_at` to `failover_completed_at` and round up to a whole minute. Idle time between steps counts against the objective, because a whole-site rehearsal is judged on how long the business was actually down. For a `TABLETOP` or a `COMPONENT_FAILOVER` the measure is *net hands-on time*: add up the `elapsed_minutes` of every step execution of this exercise whose `outcome` is `PASSED`, `PASSED_WITH_ISSUE` or `FAILED`. Executions recorded as `SKIPPED` are excluded from that sum, and gaps between steps are invisible. Because each step's `elapsed_minutes` was already rounded up when it was recorded, the net figure is a sum of per-step ceilings and is deliberately *not* the ceiling of the summed seconds. Either way the result is whole minutes, and `rto_met` is set to true exactly when `achieved_rto_minutes` is less than or equal to `rto_objective_minutes`.
+
+**Measuring the data-loss window.** `achieved_rpo_minutes` also has two variants, and here the deciding factor is replication technology rather than exercise type. The measurement set is every asset whose `asset_kind` is `DATA_STORE` and whose `recovery_group_id` is one of the in-scope groups; `INFRA_COMPONENT` assets are excluded. For each of those data stores the server picks a single observation: among that asset's observations whose `observed_at` is at or before the exercise's `failover_completed_at`, the one with the greatest `observed_at`, and where two share that instant, the one with the greater `created_at`. If any in-scope data store runs `replication_mode` `BATCH_SNAPSHOT`, the whole exercise is measured by transaction gap; otherwise it is measured by replication lag. Under replication lag, each data store yields its chosen observation's `replication_lag_seconds` converted to whole minutes by rounding up, and `achieved_rpo_minutes` is the largest of those per-asset figures. Under transaction gap, lag seconds are meaningless between snapshots, so each data store instead yields its chosen observation's `unreplicated_txn_count` divided by that asset's `expected_txn_rate_per_minute`, rounded up to a whole minute, and again the largest per-asset figure wins. A data store whose `expected_txn_rate_per_minute` is 0 is skipped entirely by the transaction-gap variant rather than dividing by zero, and if skipping leaves no data store to measure, `achieved_rpo_minutes` is 0. Finally `rpo_met` is set to true exactly when `achieved_rpo_minutes` is less than or equal to `rpo_objective_minutes`.
+
+**The data axis.** Once `execution_state` is `FAILOVER_COMPLETE` — and only then — an `ITOperator` drives `data_state` by supplying an `action` and an optional `note`. `BEGIN_VALIDATION` moves `DATA_NOT_STARTED` to `DATA_VALIDATING`. From `DATA_VALIDATING`, `VERIFY` moves to the terminal `DATA_VERIFIED`, which is what unblocks closure, while `FLAG_DIVERGENT` moves to `DATA_DIVERGENT` and leaves closure blocked. From `DATA_DIVERGENT`, `RECONCILE` moves to `DATA_RECONCILING`; from there `REVALIDATE` returns to `DATA_VALIDATING`, closing the reconciliation loop so that `VERIFY` or `FLAG_DIVERGENT` may fire again. None of these transitions has any cross-entity effect: `execution_state` and `failback_state` are untouched, and the exercise stays at `FAILOVER_COMPLETE` throughout. An action attempted from a `data_state` that does not declare it, or while `execution_state` is anything other than `FAILOVER_COMPLETE`, is rejected with `ERR_INVALID_DATA_STATE`.
+
+**The failback axis.** The same operator role drives `failback_state`, again only while `execution_state` is `FAILOVER_COMPLETE`, again with an `action` and an optional `note`. `PLAN` moves `FAILBACK_NOT_PLANNED` to `FAILBACK_PLANNED`. `START_SYNC` moves `FAILBACK_PLANNED` to `SYNC_IN_PROGRESS`. From `SYNC_IN_PROGRESS`, `RECORD_SYNC_FAILURE` moves to `SYNC_FAILED` and leaves closure blocked, while `COMPLETE` moves to the terminal `FAILBACK_COMPLETE`, which unblocks closure. `RETRY_SYNC` returns `SYNC_FAILED` to `SYNC_IN_PROGRESS`, closing the retry loop. Like the data axis, none of these transitions touches the other two axes. An action attempted from a `failback_state` that does not declare it, or while `execution_state` is anything other than `FAILOVER_COMPLETE`, is rejected with `ERR_INVALID_FAILBACK_STATE`.
+
+**Closing, aborting and cancelling.** Closure is the join point. The coordinator closes the exercise, advancing `execution_state` from `FAILOVER_COMPLETE` to the terminal `CLOSED`, but only when `data_state` has reached `DATA_VERIFIED` **and** `failback_state` has reached `FAILBACK_COMPLETE`. An unmet data axis is reported as `ERR_INVALID_DATA_STATE` and an unmet failback axis as `ERR_INVALID_FAILBACK_STATE`. Closing sets `closure_reason` to `CLOSED_NORMALLY` and recomputes the recovery site's `reserved_capacity_units`, which falls by this exercise's `required_capacity_units` because a `CLOSED` exercise no longer reserves anything.
+
+An exercise in trouble mid-flight is aborted instead: `IN_EXECUTION` moves to the terminal `ABORTED` with no precondition, `closure_reason` becomes `ABORTED_IN_EXECUTION`, and the site's `reserved_capacity_units` is recomputed downward by the exercise's `required_capacity_units`. Cancellation is available earlier and needs no precondition either: `DRAFT`, `SCOPED`, `PENDING_IMPACT_APPROVAL`, `APPROVED` and `SCHEDULED` all move to the terminal `CANCELLED` with `closure_reason` `CANCELLED_BY_COORDINATOR`. Only cancellation from `SCHEDULED` changes site capacity — that exercise held a reservation, so the recomputation lowers `reserved_capacity_units` by its `required_capacity_units`; the other four cancellations held no reservation and the recomputation leaves the site as it was. Execution transitions may also carry an optional `reason`. Any execution action attempted from a state that does not declare it is rejected with `ERR_INVALID_EXERCISE_STATE`.
+
+Two of these movements are driven by the system rather than by a coordinator. An exercise sitting in `SCHEDULED` reverts to `SCOPED` when an in-scope group leaves `posture` `READY` in the same request — hop 5 of cascade A — with `closure_reason` left at `NONE` and the site's `reserved_capacity_units` recomputed downward by `required_capacity_units`. And an exercise in `SCOPED`, `PENDING_IMPACT_APPROVAL`, `APPROVED` or `SCHEDULED` is cancelled outright when an in-scope group becomes `FROZEN` in the same request — hop 4 of cascade B — with `closure_reason` set to `CANCELLED_GROUP_FROZEN`. In that freeze-driven cancellation the site's capacity is recomputed for all four source states, but only the `SCHEDULED` case actually releases anything: that is the sole cancel-by-freeze path that lowers the site's `reserved_capacity_units`, while the `SCOPED`, `PENDING_IMPACT_APPROVAL` and `APPROVED` cases held no reservation and the recompute leaves the figure unchanged.
+
+### 3.8. Findings, Remediation, Re-Test and the Group Freeze
+
+Rehearsals exist to surface problems, and a problem becomes a **finding**. A coordinator, an operator or an audit liaison raises one against both the `exercise_id` that surfaced it and the `recovery_group_id` whose posture it will gate, with a `severity` of `CRITICAL`, `HIGH`, `MEDIUM` or `LOW`, a short `title`, a `description` of what went wrong, and an optional `due_at` remediation deadline. A new finding starts in `state` `OPEN` with `owner_id` null, `retest_exercise_id` null, `retest_failure_count` 0 and `escalated` false, and raising it recomputes the group's `open_finding_count`, which rises by 1.
+
+Remediation is driven by a `ResilienceCoordinator` supplying an `action`, together with whichever of `owner_id`, `retest_exercise_id`, `retest_result` and `note` that action needs. The declared movements are these. `ASSIGN` moves `OPEN` to `REMEDIATION_ASSIGNED` and writes the supplied `owner_id`, which must reference a stakeholder whose `status` is `ACTIVE`; because both states are non-terminal the group's `open_finding_count` is recomputed but does not change. `REMEDIATE` moves `REMEDIATION_ASSIGNED` to `REMEDIATED` and requires `owner_id` to be non-null, with no cross-entity effect. `SCHEDULE_RETEST` moves `REMEDIATED` to `RETEST_SCHEDULED` and writes the supplied `retest_exercise_id`, which must reference an exercise whose `execution_state` is not `CLOSED`, `CANCELLED` or `ABORTED`, and which must itself hold a scope item on this finding's own `recovery_group_id` — nominating an exercise that does not rehearse the affected group is rejected with `ERR_RETEST_SCOPE_MISMATCH`. `RECORD_RETEST_RESULT` requires `retest_exercise_id` to be non-null and branches on the supplied `retest_result`: `PASSED` moves `RETEST_SCHEDULED` to the terminal `CLOSED`, while `FAILED` moves `RETEST_SCHEDULED` to `RETEST_FAILED`. From `RETEST_FAILED`, `ASSIGN` sends the finding back to `REMEDIATION_ASSIGNED` with a new `owner_id` — again required to be an `ACTIVE` stakeholder — while `retest_failure_count` and `escalated` are deliberately retained across that loop. `WITHDRAW` moves `OPEN`, `REMEDIATION_ASSIGNED` or `RETEST_FAILED` to the terminal `WITHDRAWN` with no precondition. The action vocabulary a client may send is `ASSIGN`, `REMEDIATE`, `SCHEDULE_RETEST`, `RECORD_RETEST_RESULT`, `CLOSE` and `WITHDRAW`; the only declared route to `CLOSED` is a `RECORD_RETEST_RESULT` carrying `PASSED` from `RETEST_SCHEDULED`, and any action attempted from a `state` that does not declare it is rejected with `ERR_INVALID_FINDING_STATE`.
+
+Every movement into `CLOSED` or `WITHDRAWN` recomputes the group's `open_finding_count`, which falls by 1, and then re-derives the group's `posture`.
+
+The failed-re-test branch is where escalation lives. Recording a failed re-test increments `retest_failure_count` by 1, and `escalated` becomes true once that count has reached at least 2 **and** the finding's `severity` is `CRITICAL`. A `HIGH`, `MEDIUM` or `LOW` finding never escalates however many times it fails, and a `CRITICAL` finding that has failed only once does not either. Escalation is monotonic: once `escalated` is true it stays true, and it stops gating anything only when the finding itself reaches `CLOSED` or `WITHDRAWN`. An escalated critical finding immediately re-derives the owning group's `posture` to `FROZEN` with `posture_reason` `OPEN_CRITICAL_FINDING` — from `READY` or from `RESTRICTED` alike — and that freeze then cancels the group's pending and scheduled exercises and releases whatever site capacity the scheduled ones held, as cascade B lays out in §2.10.
+
+Withdrawing or closing the escalated critical finding lets the group thaw. With no finding on the group left holding `escalated` true outside `CLOSED` and `WITHDRAWN`, the group leaves `FROZEN`: it becomes `READY` with `posture_reason` `READY_ALL_CHECKS_PASSED` when its `current_runbook_id` names a `VALIDATED` runbook whose `readiness_score` is at least 80.00, and otherwise `RESTRICTED` — with `posture_reason` `NO_VALIDATED_RUNBOOK` when `current_runbook_id` is null and `RUNBOOK_STALE` when the runbook is present but not validated or has decayed below the floor. The exercises cancelled while the group was frozen are not brought back.
+
+The same asymmetry governs the ordinary readiness movements. A group moves from `RESTRICTED` to `READY` when its `current_runbook_id` is non-null, that runbook's `status` is `VALIDATED`, its `readiness_score` as of the current logical clock is at least 80.00, and no finding on the group is escalated outside the terminal states; the reason recorded is `READY_ALL_CHECKS_PASSED`. It falls from `READY` back to `RESTRICTED` when `current_runbook_id` becomes null, or the current runbook's `status` stops being `VALIDATED`, or its `readiness_score` drops below 80.00 — with `posture_reason` `NO_VALIDATED_RUNBOOK` in the null case and `RUNBOOK_STALE` otherwise.
+
+### 3.9. Audit and Regulator Evidence Packages
+
+The last act of a rehearsal is producing something an auditor or regulator can read. An `AuditLiaison` opens an `EvidencePackage` naming the `exercise_id` being evidenced and the `prepared_by_id` of the liaison who assembled it. The package starts in `state` `DRAFT` with `manifest_line_count` 0, `return_reason` `NONE`, `signed_off_by_id` null and `sealed_at` null.
+
+The package then moves through a submission lifecycle driven by an `action` and an optional `note`. `SUBMIT`, taken by an `AuditLiaison`, moves `DRAFT` to `SUBMITTED` and requires the evidenced exercise's `execution_state` to be `CLOSED`; submitting against an exercise that is still running, or that was cancelled or aborted, is rejected with `ERR_EXERCISE_NOT_CLOSED`. Submission computes `manifest_line_count`: one header line, plus one line for each scope item of the evidenced exercise, plus one line for each step execution of that exercise regardless of its `outcome`, plus one line for each finding raised against that exercise whose `state` is anything other than `WITHDRAWN`. `RETURN`, also an `AuditLiaison` action, sends `SUBMITTED` back to `RETURNED` with `return_reason` set to `INCOMPLETE_MANIFEST`. Re-submitting takes `RETURNED` back to `SUBMITTED`, again requiring the exercise to be `CLOSED`, recomputing `manifest_line_count` and clearing `return_reason` back to `NONE`.
+
+`SIGN_OFF` belongs to the `RiskApprover` and moves `SUBMITTED` to `SIGNED_OFF`, recording the approver's `X-User-ID` in `signed_off_by_id`. The signer may not be the package's `prepared_by_id`, per §2.6. `SEAL`, back in the hands of the `AuditLiaison`, moves `SIGNED_OFF` to the terminal `SEALED` and stamps `sealed_at` with the current logical clock. A sealed package is tamper-evident and immutable: any further transition on it, whatever the action, is rejected with `ERR_EVIDENCE_SEALED`, and that seal check is evaluated before any of the segregation or business checks. Any other action attempted from a `state` that does not declare it is rejected with `ERR_INVALID_EVIDENCE_STATE`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource, or that append a new record to a collection — a tier proposal, a group assignment, a scope item, a transition record — return `201 Created`. Operations that modify an existing resource in place without minting a new record, together with all reads, return `200 OK`. Patching a stakeholder, refreshing a recovery group's posture and setting the logical clock therefore answer 200, while every `POST` that mints a row or records an action answers 201.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/stakeholders` | Register a person and the organisational hats they wear | PlatformAdmin |
+| PATCH | `/stakeholders/{id}` | Update participation status, authority level or organisational roles | PlatformAdmin |
+| GET | `/stakeholders/{id}` | Read one stakeholder | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/stakeholders` | Paginated stakeholder list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/sites` | Register a data centre and its failover capacity | PlatformAdmin |
+| GET | `/sites/{id}` | Read one site including its reserved capacity | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/sites` | Paginated site list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/applications` | Register an application awaiting tier agreement | ResilienceCoordinator, PlatformAdmin |
+| GET | `/applications/{id}` | Read one application | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/applications` | Paginated application list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/applications/{id}/tier-proposals` | Propose tier, RTO and RPO | ResilienceCoordinator, PlatformAdmin |
+| POST | `/applications/{id}/tier-decisions` | Business owner agrees the proposal or requests changes | BusinessOwner |
+| POST | `/applications/{id}/group-assignments` | Assign the application to a recovery group | ResilienceCoordinator |
+| POST | `/assets` | Register a data store or infrastructure component | ITOperator, ResilienceCoordinator |
+| GET | `/assets/{id}` | Read one asset | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/assets` | Paginated asset list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/assets/{id}/group-assignments` | Assign the asset to a recovery group | ResilienceCoordinator |
+| POST | `/assets/{id}/replication-observations` | Append a replication measurement to the asset's immutable log | ITOperator |
+| GET | `/assets/{id}/replication-observations` | List an asset's replication observations, newest observed_at first | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/dependency-edges` | Declare a dependency between two application/asset nodes | ResilienceCoordinator |
+| GET | `/dependency-edges/{id}` | Read one dependency edge | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/dependency-edges` | Paginated dependency-edge list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/recovery-groups` | Create a recovery group targeting a recovery site | ResilienceCoordinator |
+| GET | `/recovery-groups/{id}` | Read one recovery group including posture, projection and version | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/recovery-groups` | Paginated recovery-group list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/recovery-groups/{id}/change-freeze` | Set the group's closed change-freeze interval | ResilienceCoordinator |
+| POST | `/recovery-groups/{id}/posture-refresh` | Re-derive readiness and then posture against the current logical clock | ResilienceCoordinator, AuditLiaison |
+| POST | `/runbooks` | Open a new runbook revision for a recovery group | ResilienceCoordinator |
+| GET | `/runbooks/{id}` | Read one runbook including readiness_score and validated_at | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/runbooks` | Paginated runbook list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/runbooks/{id}/transitions` | Advance the runbook lifecycle | ResilienceCoordinator |
+| POST | `/runbook-steps` | Add a step with an owner, expected duration and readiness weight | ResilienceCoordinator, ITOperator |
+| GET | `/runbook-steps/{id}` | Read one runbook step | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/runbook-steps` | Paginated step list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/runbook-steps/{id}/validations` | Record a step validation against the current logical clock | ITOperator |
+| POST | `/exercises` | Create an exercise with its planned site-occupation interval | ResilienceCoordinator |
+| GET | `/exercises/{id}` | Read one exercise including all three state axes and measurements | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/exercises` | Paginated exercise list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/exercises/{id}/scope-items` | Bring a recovery group into scope | ResilienceCoordinator |
+| GET | `/exercise-scope-items/{id}` | Read one scope item with its snapshots | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/exercise-scope-items` | Paginated scope-item list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/exercises/{id}/impact-submissions` | Submit the exercise for production-impact approval | ResilienceCoordinator |
+| POST | `/exercises/{id}/impact-decisions` | Risk approver approves or rejects the production impact | RiskApprover |
+| POST | `/exercises/{id}/schedule` | Reserve the recovery site window and capacity | ResilienceCoordinator |
+| POST | `/exercises/{id}/execution-transitions` | Drive the execution axis | ResilienceCoordinator |
+| POST | `/exercises/{id}/step-executions` | Record the timing and outcome of one runbook step | ITOperator, ResilienceCoordinator |
+| GET | `/step-executions/{id}` | Read one step execution | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/step-executions` | Paginated step-execution list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/exercises/{id}/data-transitions` | Drive the post-failover data-validation axis | ITOperator |
+| POST | `/exercises/{id}/failback-transitions` | Drive the failback axis | ITOperator |
+| POST | `/findings` | Raise a finding against an exercise and a recovery group | ResilienceCoordinator, ITOperator, AuditLiaison |
+| GET | `/findings/{id}` | Read one finding | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/findings` | Paginated finding list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/findings/{id}/transitions` | Drive remediation and the re-test loop | ResilienceCoordinator |
+| POST | `/evidence-packages` | Start an audit evidence package for an exercise | AuditLiaison |
+| GET | `/evidence-packages/{id}` | Read one evidence package | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| GET | `/evidence-packages` | Paginated evidence-package list | ResilienceCoordinator, BusinessOwner, ITOperator, RiskApprover, AuditLiaison, PlatformAdmin |
+| POST | `/evidence-packages/{id}/transitions` | Drive the audit submission lifecycle | AuditLiaison, RiskApprover |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_ROLE_IDENTITY_MISMATCH` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_STAKEHOLDER_NOT_FOUND` | 404 |
+| `ERR_SITE_NOT_FOUND` | 404 |
+| `ERR_APPLICATION_NOT_FOUND` | 404 |
+| `ERR_ASSET_NOT_FOUND` | 404 |
+| `ERR_DEPENDENCY_EDGE_NOT_FOUND` | 404 |
+| `ERR_RECOVERY_GROUP_NOT_FOUND` | 404 |
+| `ERR_RUNBOOK_NOT_FOUND` | 404 |
+| `ERR_RUNBOOK_STEP_NOT_FOUND` | 404 |
+| `ERR_EXERCISE_NOT_FOUND` | 404 |
+| `ERR_SCOPE_ITEM_NOT_FOUND` | 404 |
+| `ERR_STEP_EXECUTION_NOT_FOUND` | 404 |
+| `ERR_FINDING_NOT_FOUND` | 404 |
+| `ERR_EVIDENCE_PACKAGE_NOT_FOUND` | 404 |
+| `ERR_STALE_RECOVERY_GROUP_VERSION` | 412 |
+| `ERR_STALE_EXERCISE_VERSION` | 412 |
+| `ERR_INVALID_EXERCISE_STATE` | 409 |
+| `ERR_INVALID_DATA_STATE` | 409 |
+| `ERR_INVALID_FAILBACK_STATE` | 409 |
+| `ERR_INVALID_RUNBOOK_STATE` | 409 |
+| `ERR_INVALID_STEP_STATE` | 409 |
+| `ERR_INVALID_APPLICATION_TIER_STATE` | 409 |
+| `ERR_INVALID_FINDING_STATE` | 409 |
+| `ERR_INVALID_EVIDENCE_STATE` | 409 |
+| `ERR_EVIDENCE_SEALED` | 409 |
+| `ERR_SOD_TIER_PROPOSER` | 422 |
+| `ERR_SOD_IMPACT_APPROVER` | 422 |
+| `ERR_SOD_STEP_OWNER` | 422 |
+| `ERR_SOD_EVIDENCE_SIGNER` | 422 |
+| `ERR_INSUFFICIENT_APPROVAL_AUTHORITY` | 403 |
+| `ERR_RUNBOOK_STALE` | 422 |
+| `ERR_GROUP_NOT_READY` | 422 |
+| `ERR_GROUP_FROZEN` | 422 |
+| `ERR_STEP_COVERS_UNAGREED_APPLICATION` | 422 |
+| `ERR_GROUP_SITE_MISMATCH` | 422 |
+| `ERR_SELF_DEPENDENCY` | 422 |
+| `ERR_DEPENDENCY_CYCLE` | 422 |
+| `ERR_DUPLICATE_DEPENDENCY_EDGE` | 409 |
+| `ERR_DUPLICATE_SCOPE_ITEM` | 409 |
+| `ERR_STEP_NOT_IN_SCOPE` | 422 |
+| `ERR_RETEST_SCOPE_MISMATCH` | 422 |
+| `ERR_TIER_RTO_EXCEEDS_CAP` | 422 |
+| `ERR_TIER_RPO_EXCEEDS_CAP` | 422 |
+| `ERR_DUPLICATE_CODE` | 409 |
+| `ERR_DUPLICATE_STEP_NUMBER` | 409 |
+| `ERR_SITE_WINDOW_CONFLICT` | 409 |
+| `ERR_GROUP_CHANGE_FREEZE_CONFLICT` | 409 |
+| `ERR_RUNBOOK_VALIDITY_EXPIRED` | 422 |
+| `ERR_EXERCISE_NOT_CLOSED` | 422 |
+| `ERR_SITE_CAPACITY_EXCEEDED` | 409 |
+| `ERR_NO_RTO_BASELINE` | 422 |
+| `ERR_NO_REPLICATION_OBSERVATION` | 422 |
+| `ERR_INVALID_WINDOW` | 422 |
+| `ERR_OBSERVATION_IN_FUTURE` | 422 |
+| `ERR_NOT_APPLICATION_OWNER` | 403 |

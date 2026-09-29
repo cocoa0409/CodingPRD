@@ -1,0 +1,513 @@
+# Correspondent Mortgage Purchase API — Product Requirements Document
+
+## 1. Introduction
+
+A correspondent lending aggregator buys closed mortgage loans from third-party originators rather than originating them itself, and every dollar of that business rests on two questions the aggregator must answer continuously: *is this counterparty still good enough to sell to us?* and *is this specific loan file good enough to buy?* Today those two questions are answered in separate spreadsheets by separate desks — a counterparty risk team tracking audited financial statements and quality-control findings, a lock desk quoting prices and tracking mandatory delivery obligations, a purchase-review team combing closed files for curable and non-curable defects, and a post-purchase team chasing early payment defaults. The seams between those desks are where money leaks: a commitment gets priced against a retired adjustment grid, a loan clears for purchase while a non-curable compliance defect is still open, a repurchase is satisfied but the escrow transfer to the investor is never unwound, a seller whose defect rate has quietly doubled keeps locking new business.
+
+This document specifies a single API that closes those seams. The service governs the full correspondent lifecycle: seller onboarding and approval against tangible-net-worth and liquidity floors, the product eligibility matrix and its loan-level price adjustment grid, lock desk execution of mandatory and best-efforts commitments with pair-off fee assessment on unfulfilled obligations, purchase review of the delivered loan file with defect classification and suspense conditions, purchase advice pricing and funding, repurchase demand issuance and appeal, servicing-retained versus servicing-released elections with escrow transfer, and periodic seller scorecards whose defect rates can place a counterparty on watch or suspend it outright.
+
+Two design commitments run through everything that follows. First, **money and notional are conserved quantities**: a commitment's notional is always fully accounted for across what is allocated, filled, paired off and cancelled, and a seller's net funded balance always equals what the aggregator actually wired minus what it has actually recovered. Second, **the aggregator never grades its own homework**: the user who completes a quality-control review may not render the seller's approval decision, the user who issues a purchase advice may not settle it, and the user who issues a repurchase demand may not decide its appeal. Every rule below serves one of those two commitments.
+
+## 2. Global Specifications & System-Wide Principles
+
+The entire API is mounted under the `/correspondent` prefix. This section defines the contracts that hold across every endpoint; §3 defines the domain behaviour that sits on top of them.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the capacity in which that user acts. If either header is absent or empty, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401) before any other processing occurs. If both headers are present but the declared role is not among the roles authorized for the addressed endpoint (see the table in §4), the request is rejected with `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+Six roles exist, spelled exactly as follows: `SellerUser`, `CounterpartyAnalyst`, `QCReviewer`, `LockDeskTrader`, `PurchaseReviewer`, and `PlatformAdmin`.
+
+- A `SellerUser` is the correspondent seller itself, acting on its own file — submitting financial statements, locking and delivering loans, curing defects, appealing and satisfying repurchase demands. When `X-User-Role` is `SellerUser`, `X-User-ID` is the `id` of the acting `Seller`; ownership checks on any resource that references a `Seller` compare the resource's seller foreign-key field to `X-User-ID`. Concretely, a `SellerUser` may only address a `Seller` whose `id` equals `X-User-ID`, or a `Commitment`, `Loan`, `FinancialStatement`, `SellerScorecard` or `RepurchaseDemand` whose `seller_id` equals `X-User-ID` — whether that resource is reached through the URL path or named in the request body. A violation is rejected with `ERR_SELLER_SCOPE_VIOLATION` (HTTP 403).
+- A `CounterpartyAnalyst` is the counterparty risk analyst: onboards sellers, reviews financial statements, renders the approval decision, applies manual standing actions and runs the scorecard cycle. When `X-User-Role` is `CounterpartyAnalyst`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it — as `reviewed_by_user_id` on a reviewed `FinancialStatement` and as `approval_decided_by_user_id` on a decided `Seller` — but never compares it to any entity's `id`.
+- A `QCReviewer` opens and completes quality-control review files, and is deliberately barred from approving the seller it reviewed. When `X-User-Role` is `QCReviewer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it as `completed_by_user_id` on the completed review but never compares it to any entity's `id`.
+- A `LockDeskTrader` prices and locks commitments, runs the expiry sweep and executes pair-offs. When `X-User-Role` is `LockDeskTrader`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it as `locked_by_user_id` on a commitment it creates but never compares it to any entity's `id`.
+- A `PurchaseReviewer` is the purchase-review underwriter: opens review on delivered files, records and resolves defects and suspense conditions, clears or rejects the file, issues and settles purchase advices, and issues and decides repurchase demands. When `X-User-Role` is `PurchaseReviewer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it as `identified_by_user_id` on a recorded defect, as `issued_by_user_id` and `settled_by_user_id` on a purchase advice, and as `issued_by_user_id` and `decided_by_user_id` on a repurchase demand, but never compares it to any entity's `id`.
+- A `PlatformAdmin` is the platform operator: maintains the product and adjustment catalogue, drives the logical clock, records borrower first-payment events, and stands in on operational sweeps and settlements. When `X-User-Role` is `PlatformAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it wherever a transition writes an acting-user field but never compares it to any entity's `id`.
+
+Because five of the six roles carry opaque identifiers, the segregation-of-duties rules described in §2.9 are enforced by comparing `X-User-ID` string values against previously recorded acting-user fields, never against entity identifiers.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+Every endpoint that returns a collection accepts two query parameters. The `limit` parameter caps the number of items returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. The `offset` parameter skips that many items from the head of the result set and defaults to 0.
+
+Unless a specific endpoint says otherwise, list results are sorted by `created_at` in ascending order.
+
+List responses populate four pagination fields inside the envelope's `meta` object: `limit` (the effective limit for this request), `offset` (the effective offset), `total_count` (the number of items matching the filter before pagination is applied), and `has_more` (true when items remain beyond the current page).
+
+Collection endpoints also accept domain filters, which are applied before pagination. Products expose a `status` filter on their adjustment grid. Sellers may be filtered by `approval_status` and `delivery_standing`. Commitments may be filtered by `seller_id`, `product_id`, `commitment_type` and `status`. Loans may be filtered by `seller_id`, `commitment_id`, `product_id` and `purchase_status`. A loan's defects may be filtered by `status` and `classification`; its suspense conditions, purchase advices, escrow transfers and repurchase demands each by `status`. Financial statements, quality-control reviews and scorecards may be filtered by `status`. The cross-seller repurchase demand collection additionally accepts `seller_id`, `source_defect_id` and `reason`.
+
+### 2.4. Common Resource Properties and the Logical Clock
+
+Every resource the API persists — sellers, financial statements, quality-control reviews, products, pricing adjustments, commitments, loans, defects, suspense conditions, purchase advices, repurchase demands, escrow transfers and scorecards — carries the same four system-managed properties:
+
+- `id` (string): a server-minted UUID. It carries no type prefix and is never supplied by the client.
+- `created_at` (string): an ISO 8601 UTC timestamp with exactly three fractional digits (for example `2026-08-01T00:00:00.000Z`), stamped when the row is first written.
+- `updated_at` (string): an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the resource, including mutations the server performs on its own initiative as a cascade from some other resource's transition.
+- `version` (integer): a counter that starts at 1 on creation and increments by exactly 1 on every mutation of that resource. Recomputing a derived roll-up counts as a mutation: when a loan's delivery raises a commitment's allocated balance, that commitment's `version` increments and its `updated_at` refreshes even though no client addressed the commitment directly.
+
+All thirteen resource types carry all four properties; there is no resource in this domain that omits `updated_at` or `version`.
+
+Time in this system is **logical, not wall-clock**. The server holds a single logical clock that every deadline, expiry, accrual, window and staleness rule in this document reads. At startup the logical clock reads exactly `2026-08-01T00:00:00Z`, and it must never fall back to real wall-clock time. A `PlatformAdmin` moves the clock by supplying an explicit `current_utc` instant, after which every subsequent request observes that instant. Timestamps the server stamps onto resources — `created_at`, `updated_at`, `delivered_at`, `purchased_at`, `completed_at`, `cured_at`, `cleared_at`, `issued_at`, `settled_at`, `satisfied_at`, `closed_at` — are all taken from this logical clock.
+
+### 2.5. Validation Precedence
+
+When a single request violates more than one rule, the response reports exactly one error, and which one is fixed rather than arbitrary. Checks are evaluated in the following order, and the first violated check determines the response:
+
+1. **Authentication.** Both headers present and non-empty, else `ERR_UNAUTHENTICATED`.
+2. **Role authorization.** The declared role is listed for the endpoint, else `ERR_FORBIDDEN_ROLE`.
+3. **Path existence, resolved strictly left to right.** Each identifier embedded in the URL must resolve to a live row of the expected type before anything to its right is examined. A missing seller yields `ERR_SELLER_NOT_FOUND`; a missing product `ERR_PRODUCT_NOT_FOUND`; a missing financial statement `ERR_STATEMENT_NOT_FOUND`; a missing quality-control review `ERR_QC_REVIEW_NOT_FOUND`; a missing commitment `ERR_COMMITMENT_NOT_FOUND`; a missing loan `ERR_LOAN_NOT_FOUND`; a missing defect `ERR_DEFECT_NOT_FOUND`; a missing suspense condition `ERR_CONDITION_NOT_FOUND`; a missing purchase advice `ERR_ADVICE_NOT_FOUND`; a missing repurchase demand `ERR_DEMAND_NOT_FOUND`; a missing escrow transfer `ERR_TRANSFER_NOT_FOUND`; and a missing scorecard `ERR_SCORECARD_NOT_FOUND`. All twelve are HTTP 404, and they are evaluated in that relative order among themselves so that the outermost segment of a nested path always wins.
+4. **Request schema.** Every request that carries a body is checked for required fields, declared enum membership, scalar shape (any field whose name ends in `_cents`, `_count` or `_bps` must be an integer; any field whose name ends in `_pct` must be a number), ISO 8601 date formatting, and resolvability of body-referenced identifiers such as `product_id`, `commitment_id`, `seller_id` and `source_defect_id`. Any failure is `ERR_INVALID_REQUEST` (HTTP 400). Unknown fields in a body need not be honoured.
+5. **Seller ownership scope.** On every endpoint whose authorized roles include `SellerUser`, a caller acting as `SellerUser` must own the addressed resource, else `ERR_SELLER_SCOPE_VIOLATION`.
+6. **Segregation of duties**, else `ERR_SEGREGATION_OF_DUTIES` — see §2.9.
+7. **Optimistic concurrency**, else `ERR_STALE_COMMITMENT_VERSION` or `ERR_STALE_LOAN_VERSION` — see §2.8. The commitment check precedes the loan check in the ladder, though no single endpoint carries both.
+8. **State preconditions**, in this relative order: seller onboarding state (`ERR_INVALID_SELLER_STATE`), financial statement reviewability (`ERR_STATEMENT_NOT_REVIEWABLE`), review openness (`ERR_QC_REVIEW_NOT_OPEN`), commitment openness (`ERR_COMMITMENT_NOT_OPEN`), loan purchase state (`ERR_INVALID_LOAN_STATE`), defect openness (`ERR_DEFECT_NOT_OPEN`), condition openness (`ERR_CONDITION_NOT_OPEN`), advice settleability (`ERR_ADVICE_NOT_SETTLEABLE`), demand actionability (`ERR_DEMAND_NOT_ACTIONABLE`), demand settleability (`ERR_DEMAND_NOT_SETTLEABLE`), transfer pendency (`ERR_TRANSFER_NOT_PENDING`), scorecard openness (`ERR_SCORECARD_NOT_OPEN`), and finally outstanding allocation on a pair-off (`ERR_ALLOCATION_OUTSTANDING`). All thirteen are HTTP 409.
+9. **Counterparty eligibility and compliance gates**, in this relative order: `ERR_SELLER_NOT_APPROVED`, `ERR_SELLER_DELIVERY_SUSPENDED`, `ERR_NO_ACCEPTED_STATEMENT`, `ERR_FINANCIAL_STATEMENT_STALE`, `ERR_NET_WORTH_BELOW_MINIMUM`, `ERR_LIQUIDITY_BELOW_MINIMUM`, `ERR_QC_REVIEW_NOT_COMPLETED`, `ERR_QC_REVIEW_FAILED`, `ERR_NON_CURABLE_DEFECT_PRESENT`, `ERR_LOAN_UNDER_REPURCHASE`. All ten are HTTP 409.
+10. **Product-matrix referential gates**, in this relative order: `ERR_PRODUCT_NOT_ELIGIBLE`, `ERR_COMMITMENT_TYPE_NOT_ALLOWED`, `ERR_SERVICING_RETAINED_NOT_ELIGIBLE`. All three are HTTP 422.
+11. **Temporal windows**, in this relative order: `ERR_COMMITMENT_EXPIRED`, `ERR_DELIVERY_WINDOW_OVERLAP`, `ERR_SCORECARD_PERIOD_OVERLAP`, `ERR_SCORECARD_PERIOD_NOT_ENDED`, `ERR_CURE_WINDOW_EXPIRED`, `ERR_SUSPENSE_WINDOW_EXPIRED`, `ERR_EPD_WINDOW_EXPIRED`, `ERR_APPEAL_WINDOW_EXPIRED`, `ERR_ESCROW_TRANSFER_OVERDUE`. All nine are HTTP 409.
+12. **Uniqueness, evidence and outstanding-children constraints**, in this relative order: `ERR_DUPLICATE_TIN`, `ERR_DUPLICATE_PRODUCT_CODE`, `ERR_DUPLICATE_ADJUSTMENT_CODE`, `ERR_DUPLICATE_SELLER_LOAN_NUMBER`, `ERR_OPEN_DEFECTS_PRESENT`, `ERR_OPEN_SUSPENSE_CONDITIONS`, `ERR_DEFECT_NOT_CURABLE`, `ERR_NO_NON_CURABLE_DEFECT`, `ERR_DEFECT_EVIDENCE_REQUIRED` (HTTP 422; all others in this group are HTTP 409), `ERR_EPD_NOT_ESTABLISHED`.
+13. **Capacity and exposure limits, always last**: first `ERR_COMMITMENT_CAPACITY_EXCEEDED`, then `ERR_MANDATORY_EXPOSURE_LIMIT_EXCEEDED`. Both are HTTP 409. Because these sit at the bottom of the ladder, a request that is both over the line's remaining capacity and outside the delivery window reports the window error, not the capacity error.
+
+Two consequences of this ordering deserve emphasis, because they are easy to get backwards. Clearing a loan file evaluates the non-curable gate (`ERR_NON_CURABLE_DEFECT_PRESENT`, in group 9) **before** the open-defect and open-suspense gates (`ERR_OPEN_DEFECTS_PRESENT` and `ERR_OPEN_SUSPENSE_CONDITIONS`, in group 12), so a file carrying an open non-curable defect reports the non-curable error even though it also has open items. And issuing a repurchase demand for early payment default evaluates the temporal window (`ERR_EPD_WINDOW_EXPIRED`, group 11) before the evidentiary check that the first payment was actually missed (`ERR_EPD_NOT_ESTABLISHED`, group 12).
+
+### 2.6. Money, Percentages and Rounding Discipline
+
+All monetary amounts in this domain are integers in **cents**, and every field carrying one ends in `_cents`. No monetary field is ever a decimal number in a request or a response. Where a calculation produces a fractional cent, the result is rounded to a whole cent using **round half up** (a value of exactly one half of a cent rounds away from zero in the direction of larger magnitude).
+
+Percentages are decimal numbers. Price percentages — `base_price_pct`, `commitment_price_pct`, `final_purchase_price_pct`, `srp_pct`, `note_rate_pct` and `pair_off_market_price_pct` — carry **three decimal places**, rounded half up. Loan-to-value percentages — `max_ltv_pct`, `ltv_min_pct`, `ltv_max_pct`, `reference_ltv_pct` and `ltv_pct` — carry **one decimal place**. Basis points are always integers; one basis point is one hundredth of one percentage point, so converting a basis-point figure into a price percentage means dividing it by 100, and converting it into a fraction of a notional amount means dividing it by 10,000.
+
+Three rounding-order rules are load-bearing and must not be optimized away:
+
+- **Per-component rounding on a purchase advice.** Each money component of a purchase advice is rounded to whole cents on its own, and only the already-rounded components are summed. Summing exact fractional components and rounding once at the end is the wrong order and can differ by a cent.
+- **Per-defect rounding on price adjustments.** Each contributing defect's price hit is rounded to whole cents individually before the hits are summed.
+- **Clamp before rounding on commitment pricing.** The price floor and ceiling are applied to the exact computed value, and the clamped result is then rounded to three decimals.
+
+Tolerance on a commitment is the one place where rounding is **not** half up: it is computed with a floor (truncation toward zero), so any fractional cent of tolerance is discarded.
+
+### 2.7. Conserved Quantities
+
+Two invariants must hold after every request, and they are the fastest way to detect an incorrect implementation.
+
+**The commitment notional identity.** For every commitment, `available_amount_cents` always equals `notional_amount_cents` minus `allocated_amount_cents` minus `fulfilled_amount_cents` minus `paired_off_amount_cents` minus `cancelled_amount_cents`, and it is never negative. Delivering a loan moves amount from available into allocated. Settling that loan's purchase moves the same amount from allocated into fulfilled. Rejecting a delivered loan moves it back out of allocated into available. Pairing off moves the whole remaining available balance into `paired_off_amount_cents`. Expiry, a tolerance write-off, and a suspension- or termination-driven cancellation each move the remaining available balance into `cancelled_amount_cents`. In every case the five components continue to sum to the notional.
+
+**The seller cash identity.** For every seller, `net_funded_cents` always equals the sum of `net_wire_cents` across that seller's `SETTLED` purchase advices minus the sum of `funding_recovery_cents` across that seller's `SATISFIED` repurchase demands. Because a demand's recovery is pinned to the exact amount that was wired, satisfying a demand returns `net_funded_cents` to precisely its pre-purchase value with no drift. Fees are kept deliberately out of this identity: `fee_receivable_cents` accumulates every pair-off fee assessed on the seller's commitments plus the administrative fee on every satisfied repurchase demand, and it is **never decremented** — not on reinstatement, not on rescission, not on any other event.
+
+`open_mandatory_exposure_cents` is a third running quantity, narrower in scope: it is the sum of `notional_amount_cents` over the seller's commitments whose `commitment_type` is `MANDATORY` and whose `status` is either `LOCKED` or `PARTIALLY_FULFILLED`. It rises when a mandatory commitment is locked and falls by the full notional the moment that commitment reaches any terminal status.
+
+### 2.8. Optimistic Concurrency Control
+
+Exactly two write operations require the client to prove it has observed the current state of a parent resource. Both use the same mechanism: a mandatory integer field in the request body carrying the client's last observed `version` of the parent, compared for exact equality against that parent's current `version`.
+
+A `POST /correspondent/commitments/{id}/loans` request must carry `expected_commitment_version`, matching the addressed commitment's current `version`. A commitment's remaining capacity is the accumulated product of every prior delivery, rejection and fill on that line, so a delivery computed against a stale view of `allocated_amount_cents` and `available_amount_cents` would silently over-commit it. If the value does not match, the delivery is rejected with `ERR_STALE_COMMITMENT_VERSION` (HTTP 412). The behaviour is observable with two strictly sequential requests: the first delivery advances the commitment's `version`, so a second delivery still carrying the pre-delivery number is refused.
+
+A `POST /correspondent/loans/{id}/purchase-advices` request must carry `expected_loan_version`, matching the addressed loan's current `version`. Issuing a second advice on a loan is legitimate — re-pricing after a defect waiver or cure supersedes the earlier advice — so this conflict cannot be resolved by a state precondition; both the first and the second issuance are individually valid. The version pins which view of the loan the pricing was computed from. Any defect waiver, cure, condition clearance or review-cycle transition in between advances the loan's `version` and invalidates a request still carrying the earlier number, which is rejected with `ERR_STALE_LOAN_VERSION` (HTTP 412).
+
+`expected_commitment_version` and `expected_loan_version` are not optional on those two operations: a request omitting the field is rejected with `ERR_INVALID_REQUEST`. No other endpoint in this API accepts a version field, and no other endpoint performs a version check.
+
+### 2.9. Segregation of Duties
+
+Three decisions in this domain must be made by a different human than the one who prepared them, and in all three cases the check compares `X-User-ID` against an acting-user field recorded earlier. A violation is `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+On the seller approval decision, `X-User-ID` must differ from the `completed_by_user_id` of the governing quality-control review. On the settlement of a purchase advice, `X-User-ID` must differ from that advice's `issued_by_user_id`. On the decision of a repurchase demand — whether the decision upholds or rescinds — `X-User-ID` must differ from that demand's `issued_by_user_id`. Note the asymmetry: settling a *repurchase demand* is a seller action and carries no segregation check, while deciding one does.
+
+### 2.10. Cascades, Automatic Transitions and Cross-Dimension Effects
+
+Many transitions in this domain are not requested by a client at all. They fire as the consequence of some other resource's transition, and each one independently mutates its own resource — refreshing `updated_at` and incrementing `version` — exactly as a client-driven mutation would. The propagation is immediate and synchronous: by the time the response to the triggering request is written, every downstream effect has already landed.
+
+The `Seller` entity is unusual in carrying **two independent state dimensions on one row**. `approval_status` tracks the onboarding decision and moves through `APPLIED`, `UNDER_REVIEW`, `APPROVED` and `DECLINED`, with `DECLINED` terminal. `delivery_standing` tracks delivery eligibility and moves through `NOT_ELIGIBLE`, `GOOD_STANDING`, `WATCH`, `SUSPENDED` and `TERMINATED`, with `TERMINATED` terminal. The two dimensions evolve independently and are not derivable from one another; only one cross-dimension effect exists, described in §3.2.
+
+Where a cascade is conditional on the target's current state, the condition is part of the specification and not an implementation liberty. Recording a defect on a loan that is already `SUSPENDED` accumulates the counter without any transition; recording one on a `PURCHASED` loan likewise leaves the purchase alone. A suspension driven by a scorecard breach cancels the seller's unallocated open commitments, while a suspension applied manually by an analyst does not. These asymmetries are deliberate and are spelled out where each workflow is described.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Onboarding a Correspondent Seller
+
+A `CounterpartyAnalyst` brings a new counterparty onto the platform by registering it as a **Seller**, supplying the applicant's `legal_name` (a non-empty string of between 1 and 200 characters), its `tin` (a taxpayer identification number of exactly nine digits), and its `seller_type`, which is one of `BANK`, `CREDIT_UNION` or `NON_BANK_IMB`. Taxpayer identification numbers are unique across the whole platform; a second registration carrying an existing `tin` is refused with `ERR_DUPLICATE_TIN`. A freshly registered seller begins with `approval_status` at `APPLIED` and `delivery_standing` at `NOT_ELIGIBLE`, which together mean it may neither lock a commitment nor deliver a loan. Its derived fields all start empty: `approval_tier` and `suspension_reason` and `approval_decided_by_user_id` are null, `servicing_retained_eligible` is false, `current_scorecard_grade` is `UNRATED`, and `approved_tangible_net_worth_cents`, `mandatory_exposure_limit_cents`, `open_mandatory_exposure_cents`, `net_funded_cents`, `fee_receivable_cents` and `current_defect_rate_bps` are all zero.
+
+Financial due diligence begins with the applicant's books. Either the seller itself or a `CounterpartyAnalyst` may file a **FinancialStatement** against the seller, giving the `fiscal_year_end` of the reporting period as an ISO 8601 calendar date, an `audited` flag that is true when the statement carries a CPA audit opinion, the `tangible_net_worth_cents` and `liquid_assets_cents` reported on it (each an integer of zero or more), and optionally a `review_note`. The statement is filed in `SUBMITTED` status with `reviewed_by_user_id` still null. Statements may only be filed while the seller's `approval_status` is `APPLIED` or `UNDER_REVIEW`; filing against an `APPROVED` or `DECLINED` seller is refused with `ERR_INVALID_SELLER_STATE`.
+
+A `CounterpartyAnalyst` then adjudicates each statement by supplying a `decision` whose accepted values are exactly `ACCEPT` and `REJECT`, together with an optional `review_note` that is recorded on the statement. Accepting moves the statement `SUBMITTED → ACCEPTED`; rejecting moves it `SUBMITTED → REJECTED`. Both are terminal, both record the acting `X-User-ID` as `reviewed_by_user_id`, and both increment the statement's `version` by 1. Only a statement still in `SUBMITTED` may be adjudicated; a second attempt on an already-decided statement is refused with `ERR_STATEMENT_NOT_REVIEWABLE`. A `REJECTED` statement is thereafter invisible to the approval machinery — it can never become the governing statement described in §3.2.
+
+In parallel with the financial file, a `QCReviewer` opens a **QualityControlReview** on the seller, declaring a `review_type` of either `PRE_APPROVAL` or `ANNUAL_RECERT`. A new review is created in `OPEN` status with `outcome` null, `findings_count` and `critical_findings_count` at zero, and `completed_by_user_id` and `completed_at` null. Opening the seller's **first** review is what starts the formal underwriting: it automatically advances the seller `APPLIED → UNDER_REVIEW` on the approval dimension and increments the seller's `version` by 1. Opening a second or later review while the seller is already `UNDER_REVIEW` does not re-fire that transition and leaves the seller row untouched on the approval dimension. As with statements, reviews may only be opened while the seller's `approval_status` is `APPLIED` or `UNDER_REVIEW`, else `ERR_INVALID_SELLER_STATE`.
+
+Completing a review is where the QC verdict is manufactured rather than asserted. The `QCReviewer` supplies only two numbers — `findings_count`, the total number of findings recorded, and `critical_findings_count`, the subset graded critical. Both must be integers of zero or more, and `critical_findings_count` must not exceed `findings_count`; a violation is `ERR_INVALID_REQUEST`. Only an `OPEN` review may be completed, else `ERR_QC_REVIEW_NOT_OPEN`. The review then moves `OPEN → COMPLETED`, its `completed_by_user_id` is set to the acting `X-User-ID`, its `completed_at` is stamped from the logical clock, and its `version` increments by 1. The `outcome` is derived, never supplied: if `critical_findings_count` is at least 1 the outcome is `FAIL`; otherwise, if `findings_count` is at least 5 the outcome is `CONDITIONAL_PASS` — a count of exactly five findings already yields `CONDITIONAL_PASS`; otherwise the outcome is `PASS`. A single critical finding therefore outranks any number of ordinary findings.
+
+### 3.2. The Approval Decision, the Exposure Limit, and Manual Standing Actions
+
+Approval is the moment the aggregator commits capital-at-risk to a counterparty, and it is the most heavily gated operation in the system. A `CounterpartyAnalyst` renders it by supplying a `decision` of `APPROVE` or `DECLINE`, optionally with a `review_note`. Either way the seller must currently be `UNDER_REVIEW` on the approval dimension, else `ERR_INVALID_SELLER_STATE`.
+
+Two "governing" records are selected before anything else is evaluated, and the selection rules are exact. The **governing financial statement** is drawn from the seller's statements whose `status` is `ACCEPTED` **and** whose `audited` flag is true, ordered by `fiscal_year_end` from latest to earliest and, among statements sharing a `fiscal_year_end`, by `created_at` from latest to earliest; the first row of that ordering governs. If that set is empty — no accepted statement, or only accepted-but-unaudited ones — approval fails with `ERR_NO_ACCEPTED_STATEMENT`. The **governing quality-control review** is drawn from the seller's reviews whose `status` is `COMPLETED`, ordered by `completed_at` from latest to earliest and, among ties, by `created_at` from latest to earliest; again the first row governs, and an empty set fails with `ERR_QC_REVIEW_NOT_COMPLETED`.
+
+Against those two records, approval imposes four substantive gates. The governing statement must not be stale: its `fiscal_year_end` advanced by 455 days must fall on or after the current logical clock date, and a statement older than that fails with `ERR_FINANCIAL_STATEMENT_STALE`. The governing statement's `tangible_net_worth_cents` must be at least 250,000,000 cents — two and a half million dollars — with a value exactly at the floor passing and anything below it failing with `ERR_NET_WORTH_BELOW_MINIMUM`. Its `liquid_assets_cents` must likewise be at least 50,000,000 cents — half a million dollars — with exactly the floor passing and anything below failing with `ERR_LIQUIDITY_BELOW_MINIMUM`. And the governing review's `outcome` must be either `PASS` or `CONDITIONAL_PASS`; a `FAIL` outcome blocks approval outright with `ERR_QC_REVIEW_FAILED`.
+
+Segregation of duties applies here too, and it sits **above** all four substantive gates in the precedence ladder of §2.5. Whenever a governing completed review can be identified and its `completed_by_user_id` equals the acting `X-User-ID`, the request is refused with `ERR_SEGREGATION_OF_DUTIES` even if the statement is also stale or the net worth also short. Where no completed review exists at all there is nobody to compare against, and the request instead fails the eligibility gates in their own declared order.
+
+An approval that clears every gate moves the seller `UNDER_REVIEW → APPROVED` on the approval dimension and writes a substantial amount of derived state onto it in one atomic step. `approved_tangible_net_worth_cents` copies the governing statement's `tangible_net_worth_cents`, freezing the net worth the approval was granted against. `approval_tier` becomes `STANDARD` when the governing review's outcome was `PASS` and `CONDITIONAL` when it was `CONDITIONAL_PASS`. `servicing_retained_eligible` becomes true **only** when that outcome was `PASS`; a conditionally-passed seller stays ineligible to retain servicing. `mandatory_exposure_limit_cents` is computed as the smaller of two figures: the approved tangible net worth multiplied by a leverage multiplier, and an absolute platform cap of 5,000,000,000 cents (fifty million dollars). The multiplier is ten times net worth for a `PASS` outcome and only five times net worth for a `CONDITIONAL_PASS` outcome, so the conditional tier is penalised twice over — once on servicing eligibility and once on how much mandatory exposure it may carry. This arithmetic is exact integer arithmetic in whole cents with no rounding. On the second state dimension, `delivery_standing` moves `NOT_ELIGIBLE → GOOD_STANDING` and `suspension_reason` is set to null — the single cross-dimension effect in the seller machine. Finally `approval_decided_by_user_id` records the acting `X-User-ID`, and the seller's `version` increments by 1.
+
+A decline is far simpler and deliberately one-way. The seller moves `UNDER_REVIEW → DECLINED`, which is terminal on the approval dimension, `approval_decided_by_user_id` records the acting `X-User-ID`, and the seller's `version` increments by 1. There is **no** cross-dimension effect: `delivery_standing` stays exactly where it was at `NOT_ELIGIBLE`. A declined seller can never lock a commitment or deliver a loan, and no operation exists to reopen its approval.
+
+Separately from the scorecard machinery of §3.9, a `CounterpartyAnalyst` or `PlatformAdmin` may move a seller's delivery standing by hand, supplying an `action` of `SUSPEND`, `REINSTATE`, `TERMINATE` or `PLACE_ON_WATCH` together with an optional `note`. Manual standing actions require the seller to be `APPROVED` on the approval dimension, else `ERR_INVALID_SELLER_STATE`; an action that is unavailable from the seller's current `delivery_standing` — a `PLACE_ON_WATCH` on a seller that is not in `GOOD_STANDING`, a `REINSTATE` on a seller already in `GOOD_STANDING`, a `SUSPEND` on a seller already `SUSPENDED`, or any action at all on a `TERMINATED` seller — is likewise refused with `ERR_INVALID_SELLER_STATE`. Each successful action increments the seller's `version` by 1.
+
+The four actions differ in consequence, and the difference matters more than it appears. `PLACE_ON_WATCH` moves `GOOD_STANDING → WATCH`; a seller on watch may still lock and deliver, because only `SUSPENDED`, `TERMINATED` and `NOT_ELIGIBLE` block delivery. `REINSTATE` moves either `WATCH → GOOD_STANDING` or `SUSPENDED → GOOD_STANDING` and clears `suspension_reason` back to null. `SUSPEND` moves either `GOOD_STANDING → SUSPENDED` or `WATCH → SUSPENDED` and sets `suspension_reason` to `MANUAL_COUNTERPARTY_ACTION`; crucially, a manual suspension **cancels nothing** — existing locks survive it untouched. `TERMINATE` moves `GOOD_STANDING → TERMINATED`, `WATCH → TERMINATED` or `SUSPENDED → TERMINATED`, and does cancel: every commitment of that seller whose `status` is `LOCKED` or `PARTIALLY_FULFILLED` **and** whose `allocated_amount_cents` is zero is cancelled, each one picking up the administrative flat pair-off fee described in §3.5, with each fee accruing to the seller's `fee_receivable_cents`. Commitments that still carry an outstanding allocation are left alone. Reinstatement never restores a cancelled commitment; it only reopens the seller's ability to lock new business.
+
+### 3.3. The Product Eligibility Matrix and the Adjustment Grid
+
+Nothing can be locked or delivered until a `PlatformAdmin` has published the product side of the eligibility matrix. Each **ProductEligibility** row is registered with a `product_code` of between 3 and 32 uppercase characters that is unique platform-wide — a collision is `ERR_DUPLICATE_PRODUCT_CODE` — an optional human-readable `description`, and a `base_price_pct` between 90.000 and 110.000 expressing the base purchase price as a percentage of the note amount. The row also declares its credit box: `min_fico`, the lowest representative FICO the product accepts, between 300 and 850 and treated as inclusive; `max_ltv_pct`, the highest loan-to-value percentage accepted, between 1.0 and 100.0 and likewise inclusive; and `max_loan_amount_cents`, the largest note amount accepted, a positive integer and again inclusive. Two array fields fence the product in further: `allowed_commitment_types` is a non-empty subset of `MANDATORY` and `BEST_EFFORTS`, and `allowed_occupancies` is a non-empty subset of `PRIMARY`, `SECOND_HOME` and `INVESTMENT`. The `srp_pct` field, between 0.000 and 5.000, is the service release premium the aggregator pays as a percentage of the note amount, and it is paid only where servicing is released. A `status` may be supplied and defaults to `ACTIVE`; the only other accepted value is `RETIRED`, which withdraws the row from new business.
+
+On top of each product a `PlatformAdmin` builds the loan-level price adjustment grid, whose rows are **PricingAdjustment** records. Each row carries an `adjustment_code` of between 3 and 48 characters, unique within its product — a repeat within the same product is `ERR_DUPLICATE_ADJUSTMENT_CODE`, while the same code on a different product is perfectly legal — and a signed `price_adjustment_bps` between -300 and 100 that is applied when the row's band matches. The band itself is where the asymmetry lives, and it is deliberate. The FICO band runs from `fico_min` to `fico_max`, both between 300 and 850 with `fico_max` no smaller than `fico_min`, and **both bounds are inclusive**. The loan-to-value band runs from `ltv_min_pct` to `ltv_max_pct`, both between 0.0 and 100.0 with `ltv_max_pct` strictly greater than `ltv_min_pct`, and here the **lower bound is exclusive while the upper bound is inclusive**. A grid row also carries a `status` defaulting to `ACTIVE`, with `RETIRED` as the only alternative; a retired row is invisible to pricing. Each `PricingAdjustment` belongs to exactly one product, and the grid of a product is discoverable by listing the adjustment rows underneath it, optionally filtered by `status`.
+
+### 3.4. Lock Desk Execution: Locking and Pricing a Commitment
+
+A **Commitment** is the aggregator's promise to buy and the seller's promise to deliver. Either a `LockDeskTrader` or the seller itself may lock one, naming the `seller_id` it belongs to and the `product_id` of the eligibility-matrix row it is locked against, choosing a `commitment_type` of `MANDATORY` or `BEST_EFFORTS`, and stating a `notional_amount_cents` of at least 1,000,000 cents — ten thousand dollars — as the committed delivery amount. The delivery period is given as two ISO 8601 calendar dates: `delivery_window_start`, the first date on which loans may be delivered, and `delivery_expiry_date`, which must fall strictly after the start and no more than 60 days after it. The window itself is **half-open**: it runs from `delivery_window_start` at midnight UTC up to but not including `delivery_expiry_date` at midnight UTC, so the expiry date itself is already outside the window. Finally, the lock carries a `reference_fico` between 300 and 850 and a `reference_ltv_pct` between 0.1 and 100.0, which are the representative credit characteristics used to select adjustment-grid rows at lock time — they are not the eventual borrower's actual numbers.
+
+Before any price is computed, the counterparty must be fit to lock. The seller's `approval_status` must be `APPROVED`, else `ERR_SELLER_NOT_APPROVED`. Its `delivery_standing` must be `GOOD_STANDING` or `WATCH`; a seller sitting at `NOT_ELIGIBLE`, `SUSPENDED` or `TERMINATED` is refused with `ERR_SELLER_DELIVERY_SUSPENDED`. The named product must be `ACTIVE`, and a lock against a `RETIRED` product is refused with `ERR_PRODUCT_NOT_ELIGIBLE` — note that at lock time only the product's availability is examined, because no borrower characteristics exist yet to test against the credit box; the full matrix is applied later, at delivery. The requested `commitment_type` must appear in the product's `allowed_commitment_types`, else `ERR_COMMITMENT_TYPE_NOT_ALLOWED`.
+
+Mandatory commitments additionally occupy the delivery calendar exclusively. A new `MANDATORY` lock's half-open window must not overlap the half-open window of any existing `MANDATORY` commitment of the **same seller and the same product** whose `status` is `LOCKED` or `PARTIALLY_FULFILLED`; an overlap is `ERR_DELIVERY_WINDOW_OVERLAP`. Because the windows are half-open, two windows that merely touch — one beginning exactly on the day another expires — do not overlap and are both permitted. `BEST_EFFORTS` commitments are exempt from this rule in both directions: a best-efforts lock never triggers it, and a best-efforts window never blocks a later mandatory lock.
+
+Mandatory commitments also consume the seller's exposure line, which is the last gate evaluated on a lock. The seller's current `open_mandatory_exposure_cents` plus the new `notional_amount_cents` must not exceed its `mandatory_exposure_limit_cents`; landing exactly on the limit is permitted, and only exceeding it is refused with `ERR_MANDATORY_EXPOSURE_LIMIT_EXCEEDED`. Once that check passes, the new notional is added to `open_mandatory_exposure_cents`. Best-efforts commitments neither consume nor check the exposure line.
+
+**Pricing happens exactly once, at lock creation, and is never revisited.** Three inputs are combined into a basis-point adjustment against the product's `base_price_pct`.
+
+The first input is the **lock-term tier**. `lock_term_days` is derived as the number of whole days from `delivery_window_start` to `delivery_expiry_date` and is stored on the commitment. The tier is then the largest tabled term that does not exceed `lock_term_days`, drawn from a four-row table: a term of 15 days contributes 0 basis points, 30 days contributes -12, 45 days contributes -25, and 60 days contributes -40. A lock term shorter than 15 days falls below the whole table and contributes 0 basis points. A lock term of, say, 44 days therefore takes the 30-day row's -12, not the 45-day row's -25.
+
+The second input is the **adjustment grid**, whose contribution is stored as `llpa_bps_applied`. Every `PricingAdjustment` row belonging to the commitment's product whose `status` is `ACTIVE`, whose FICO band contains `reference_fico` with both `fico_min` and `fico_max` treated as inclusive, and whose loan-to-value band contains `reference_ltv_pct` with `ltv_min_pct` treated as exclusive and `ltv_max_pct` as inclusive, contributes its `price_adjustment_bps`. Every matching row contributes: this is a **sum over all matches**, not a single-winner selection, and the order in which matches are found cannot change the total. Rows whose `status` is `RETIRED`, and rows belonging to any other product, are excluded entirely. When no row matches, the contribution is zero.
+
+The third input is the **commitment-type spread**: a `MANDATORY` commitment adds 25 basis points, while a `BEST_EFFORTS` commitment subtracts 35 basis points — a 60-basis-point advantage to the seller that takes on a firm delivery obligation.
+
+The three contributions are added together as basis points, converted to a price percentage by dividing by 100, and added to the product's `base_price_pct`. That exact result is then clamped into the range from a floor of 98.000 to a ceiling of 104.000 — a computed value below the floor becomes the floor, and one above the ceiling becomes the ceiling — and only the clamped value is rounded half up to three decimal places, becoming `commitment_price_pct`. Clamping before rounding is the pinned order.
+
+A newly locked commitment is created in `LOCKED` status with `locked_by_user_id` set to the acting `X-User-ID`. Its conserved amounts are initialised so that `available_amount_cents` equals the full `notional_amount_cents` while `allocated_amount_cents`, `fulfilled_amount_cents`, `paired_off_amount_cents` and `cancelled_amount_cents` are all zero. Its `tolerance_cents` is fixed at this moment as 2.00 percent of the notional with any fraction of a cent truncated away — two cents of tolerance per dollar of notional, floored. And its pair-off fields start empty: `pair_off_fee_cents` is zero, `pair_off_market_price_pct` is null, and `pair_off_method` is null.
+
+### 3.5. Retiring a Commitment: Pair-Off, Expiry Sweep, and Administrative Cancellation
+
+A commitment can leave the live set in four ways, and three of them can carry a fee. It reaches `FULFILLED` when deliveries fill it (§3.7), `PAIRED_OFF` when the lock desk explicitly closes out the remainder, `EXPIRED` when the sweep catches it past its window, and `CANCELLED` when the seller's standing collapses beneath it. `FULFILLED`, `PAIRED_OFF`, `EXPIRED` and `CANCELLED` are all terminal — a commitment in any of them accepts nothing further, and an attempt to deliver against one or pair one off is refused with `ERR_COMMITMENT_NOT_OPEN`.
+
+The fee arithmetic is shared across all three fee-bearing exits and rests on a single idea: **only shortfall beyond tolerance is billable.** The shortfall is the commitment's `available_amount_cents` measured *before* the exit writes it down. The billable amount is that shortfall reduced by `tolerance_cents`, floored at zero, so an under-delivery entirely inside tolerance is billable at nothing. Whenever the billable amount is greater than zero, a flat administrative component of 25,000 cents — 250 dollars — is assessed; whenever the billable amount is zero, the fee is zero in **every** variant, the administrative one included.
+
+Three variants sit on top of that base, and which one applies is recorded on the commitment as `pair_off_method`.
+
+- **Mark-to-market**, recorded as `MANDATORY_MARK_TO_MARKET`, applies to an explicit pair-off of a `MANDATORY` commitment. The market loss is the billable amount multiplied by the excess of the locked `commitment_price_pct` over the observed `pair_off_market_price_pct`, that excess floored at zero, the product divided by 100, and the result rounded half up to whole cents. The fee is that market loss plus the administrative component. Because the price excess is floored at zero, a market price *above* the locked price produces no market loss at all and never a credit back to the seller.
+- **Administrative only**, recorded as `BEST_EFFORTS_ADMIN_ONLY`, applies to an explicit pair-off of a `BEST_EFFORTS` commitment. The fee is the administrative component alone; no mark-to-market element is assessed. For identical notional, fill and market-price inputs, this variant is strictly cheaper than the mandatory variant whenever the locked price exceeds the observed market price.
+- **Administrative flat**, recorded as `ADMINISTRATIVE_FLAT`, applies whenever a commitment leaves the live set with **no observed market price** — the expiry sweep, and cancellation driven by seller suspension or termination — and it applies that way for both commitment types. No market price exists on those paths, so no mark-to-market is assessed even for a `MANDATORY` line. The fee is the administrative component alone.
+
+An explicit **pair-off** is a `LockDeskTrader` operation and the only place a market price enters the system: the trader supplies `pair_off_market_price_pct`, the market price percentage observed at the desk. The commitment must be `LOCKED` or `PARTIALLY_FULFILLED`, else `ERR_COMMITMENT_NOT_OPEN`, and its `allocated_amount_cents` must be exactly zero, else `ERR_ALLOCATION_OUTSTANDING` — loans already delivered and still moving through the purchase pipeline must be purchased or rejected before the line can be closed out. For a commitment still in `LOCKED` or `PARTIALLY_FULFILLED` the remaining `available_amount_cents` is structurally guaranteed to be greater than zero, since the residual can only reach zero through a fill, pair-off, write-off or cancellation that simultaneously drives the status terminal. The pair-off then moves the commitment `LOCKED → PAIRED_OFF` or `PARTIALLY_FULFILLED → PAIRED_OFF`, absorbing the whole remaining `available_amount_cents` into `paired_off_amount_cents` and driving the residual to zero, records the supplied `pair_off_market_price_pct`, writes `pair_off_fee_cents` and `pair_off_method`, adds the fee to the seller's `fee_receivable_cents`, releases the seller's mandatory exposure by the full `notional_amount_cents` when the commitment was `MANDATORY`, and increments the commitment's `version` by 1. When the line had already taken partial fills, the billable shortfall is measured on the residual net of those fills, so a partially filled line pairs off more cheaply than an untouched one.
+
+The **expiry sweep** is an operational capability available to a `LockDeskTrader` or a `PlatformAdmin`, optionally narrowed to a single seller with a `seller_id` filter. It selects every commitment whose `status` is `LOCKED` or `PARTIALLY_FULFILLED`, whose `delivery_expiry_date` at midnight UTC has been reached or passed on the logical clock, and whose `allocated_amount_cents` is zero. Commitments with loans still in the purchase pipeline are deliberately **skipped** rather than expired. Each selected commitment is processed in ascending `created_at` order and moves `LOCKED → EXPIRED` or `PARTIALLY_FULFILLED → EXPIRED`, absorbing its remaining `available_amount_cents` into `cancelled_amount_cents`, taking the administrative-flat fee with `pair_off_method` set to `ADMINISTRATIVE_FLAT`, adding that fee to the seller's `fee_receivable_cents`, releasing mandatory exposure per commitment where applicable, and incrementing its own `version` by 1. The sweep answers with a summary rather than a resource: `expired_count`, the number of commitments swept; `expired_commitment_ids`, their identifiers as an array of strings; and `total_pair_off_fee_cents`, the sum of the fees assessed in this run.
+
+**Administrative cancellation** reaches commitments from above rather than beside. When a seller's `delivery_standing` moves to `SUSPENDED` along the scorecard-breach path, or to `TERMINATED` along any path, every commitment of that seller whose `status` is `LOCKED` or `PARTIALLY_FULFILLED` and whose `allocated_amount_cents` is zero moves `LOCKED → CANCELLED` or `PARTIALLY_FULFILLED → CANCELLED`, in ascending `created_at` order. The side-effect set is the same as expiry: the residual moves into `cancelled_amount_cents`, the administrative-flat fee is assessed with `pair_off_method` recorded as `ADMINISTRATIVE_FLAT`, the fee accrues to the seller's `fee_receivable_cents`, mandatory exposure is released by the full notional, and the commitment's `version` increments by 1. Commitments with an outstanding allocation are untouched, and a **manual** suspension cancels nothing at all.
+
+### 3.6. Delivering the Closed Loan File and Reviewing It: Defects, Suspense Conditions and the Cure Cycle
+
+Delivery is where an abstract commitment becomes a specific mortgage. Either the seller itself or a `LockDeskTrader` delivers a **Loan** against a named commitment, and the payload is the closed file's essential terms: `seller_loan_number`, the seller's own reference of between 1 and 32 characters; `note_amount_cents`, the original principal balance as a positive integer; `note_rate_pct`, the note interest rate between 0.001 and 25.000; `fico`, the borrower's representative credit score between 300 and 850; `ltv_pct`, the loan-to-value percentage between 0.1 and 150.0; `occupancy`, one of `PRIMARY`, `SECOND_HOME` or `INVESTMENT`; `servicing_election`, either `RETAINED` or `RELEASED`; `closing_date`, the note closing date; `first_payment_due_date`, which must fall strictly after the closing date and anchors the early-payment-default clock; and optionally `escrow_balance_cents`, the escrow held by the seller at closing, defaulting to zero and never negative. The mandatory `expected_commitment_version` field described in §2.8 travels with every delivery.
+
+Note that `ltv_pct` on a delivered loan may run as high as 150.0 even though no product's `max_ltv_pct` can exceed 100.0. That is intentional: the field accepts the file as closed, and the eligibility matrix then decides whether the aggregator will buy it.
+
+A delivery must pass through a long gauntlet. The addressed commitment must be `LOCKED` or `PARTIALLY_FULFILLED`, else `ERR_COMMITMENT_NOT_OPEN`. The owning seller's `delivery_standing` must be `GOOD_STANDING` or `WATCH`, else `ERR_SELLER_DELIVERY_SUSPENDED` — a seller suspended after locking may not deliver into its surviving lines. The full product eligibility matrix now applies, and every bound in it is inclusive: the product's `status` must be `ACTIVE`, the delivered `fico` must be at least the product's `min_fico`, the `ltv_pct` must be no greater than `max_ltv_pct`, the `note_amount_cents` must be no greater than `max_loan_amount_cents`, and the `occupancy` must appear in the product's `allowed_occupancies`. Any failure among those five is `ERR_PRODUCT_NOT_ELIGIBLE`. A `servicing_election` of `RETAINED` is accepted only from a seller whose `servicing_retained_eligible` flag is true, else `ERR_SERVICING_RETAINED_NOT_ELIGIBLE`; a `RELEASED` election is always accepted. The logical clock must fall inside the commitment's half-open delivery window, from `delivery_window_start` at midnight UTC up to but not including `delivery_expiry_date` at midnight UTC — a delivery attempted on the expiry date itself is already too late and is refused with `ERR_COMMITMENT_EXPIRED`. The `seller_loan_number` must be unique across all loans of that same seller, regardless of which commitment they were delivered against; a repeat is `ERR_DUPLICATE_SELLER_LOAN_NUMBER`, while the same number used by a different seller is fine. And last of all, the delivered `note_amount_cents` must not exceed the commitment's `available_amount_cents`, else `ERR_COMMITMENT_CAPACITY_EXCEEDED`.
+
+A successful delivery creates the loan in `DELIVERED` status with `delivered_at` stamped from the logical clock and `purchased_at` still null. Its `commitment_id` names the line it was delivered against, while its `seller_id` and `product_id` are copied down from that commitment rather than supplied by the client — the loan can never disagree with its commitment about who sold it or under which product it was priced. Its review roll-ups all start at zero: `review_cycle_count`, `open_defect_count`, `non_curable_defect_count`, `open_suspense_count` and `advice_count`. Its `first_payment_status` starts at `PENDING`. On the commitment side, `allocated_amount_cents` rises by the delivered `note_amount_cents`, `available_amount_cents` falls by the same amount, and the commitment's `version` increments by 1 — which is precisely what makes a second delivery carrying the original `expected_commitment_version` stale. Every child record later raised against the file — its defects, its suspense conditions, its purchase advices, its repurchase demands and its escrow transfer — carries a `loan_id` pointing back to it.
+
+A `PurchaseReviewer` then opens purchase review on a delivered file, optionally recording a `note`, which advances the loan `DELIVERED → IN_REVIEW`. Only a loan still in `DELIVERED` may be opened this way, else `ERR_INVALID_LOAN_STATE`; a file that has fallen into `SUSPENDED` returns to `IN_REVIEW` by resolving its open items, never by re-opening review.
+
+**Defects** are the reviewer's findings against the file. Recording one supplies a `defect_code` of between 2 and 48 characters from the aggregator's taxonomy, a `category` drawn from `CREDIT`, `INCOME`, `COLLATERAL`, `COMPLIANCE` and `DOCUMENTATION`, and a `severity` drawn from `LOW`, `MEDIUM`, `HIGH` and `CRITICAL`. Defects may be recorded while the loan is `IN_REVIEW` or `SUSPENDED` — a file may carry several at once — and also on a `PURCHASED` loan, where the finding is booked as a post-purchase quality-control observation without disturbing the completed purchase. Any other purchase status is refused with `ERR_INVALID_LOAN_STATE`. The new defect starts in `OPEN` status with `identified_by_user_id` set to the acting `X-User-ID`, `price_adjustment_bps` at zero, and `cure_document_reference` and `cured_at` null.
+
+The defect's `classification` is **derived, and any value supplied in the body is ignored**. A defect is `NON_CURABLE` when its `severity` is `CRITICAL`, and also when its `category` is `COMPLIANCE` and its `severity` is `HIGH`; in every other combination it is `CURABLE`. A `HIGH` severity defect in a category other than `COMPLIANCE` is therefore curable, while a `HIGH` compliance defect is not — the compliance category is singled out because a compliance failure in a closed file cannot be papered over after the fact. The `cure_deadline_at` follows from the same derivation: a `NON_CURABLE` defect has none and carries null, while a `CURABLE` defect's deadline is its `created_at` advanced by a severity-dependent window — 15 days for `LOW`, 10 days for `MEDIUM`, and only 5 days for `HIGH`. The sharper the finding, the shorter the rope.
+
+Recording a defect raises the loan's `open_defect_count` by one and, when the classification came out `NON_CURABLE`, also raises `non_curable_defect_count` by one; the loan's `version` increments by 1. What happens to the loan's status depends on where the loan already stood, and the conditionality is the whole point. A loan in `IN_REVIEW` moves `IN_REVIEW → SUSPENDED`. A loan in `CLEARED_FOR_PURCHASE` moves `CLEARED_FOR_PURCHASE → SUSPENDED`, and that transition additionally moves **every** purchase advice of that loan still in `ISSUED` status `ISSUED → VOIDED` — a late finding cannot leave a priced advice standing. A loan already in `SUSPENDED` simply accumulates the item with no transition at all, and a `PURCHASED` loan likewise stays `PURCHASED`.
+
+**Suspense conditions** are the paperwork side of the same review. A `PurchaseReviewer` adds a **SuspenseCondition** with a `condition_code` of between 2 and 48 characters and an optional `description` spelling out what the seller must deliver to clear it. Conditions may be added while the loan is `IN_REVIEW` or `SUSPENDED` only; anything else is `ERR_INVALID_LOAN_STATE`. The condition starts `OPEN` with `cleared_at` and `document_reference` null, and its `due_at` is its `created_at` advanced by one week — seven days. It raises the loan's `open_suspense_count` by one, increments the loan's `version` by 1, and drives exactly the same conditional status cascade as a defect does, including the voiding of `ISSUED` advices when the loan was `CLEARED_FOR_PURCHASE`.
+
+Open items are resolved in four ways, and each of them can close the cure cycle.
+
+A **cure** is the seller's own act: acting as `SellerUser` on a defect belonging to one of its own loans, it supplies a `cure_document_reference`. The defect must be `OPEN`, else `ERR_DEFECT_NOT_OPEN`; its `classification` must be `CURABLE`, else `ERR_DEFECT_NOT_CURABLE`; the logical clock must be at or before the defect's `cure_deadline_at`, with a cure landing exactly **on** the deadline instant counting as on time and anything strictly later refused with `ERR_CURE_WINDOW_EXPIRED`; and the acting `X-User-ID` must equal the loan's `seller_id`, else `ERR_SELLER_SCOPE_VIOLATION`. The defect moves `OPEN → CURED` with `cured_at` stamped from the logical clock, the loan's `open_defect_count` falls by one, and both the defect's and the loan's `version` increment by 1.
+
+A **waiver** is the reviewer's alternative: a `PurchaseReviewer` or `PlatformAdmin` accepts the defect against a price concession, supplying `price_adjustment_bps` as an integer from -100 to 0 inclusive — a value outside that range is `ERR_INVALID_REQUEST`. The defect must be `OPEN` and `CURABLE`, on pain of `ERR_DEFECT_NOT_OPEN` and `ERR_DEFECT_NOT_CURABLE` respectively. The defect moves `OPEN → WAIVED` with the supplied `price_adjustment_bps` recorded on it, the loan's `open_defect_count` falls by one, and both versions increment by 1. A waived defect **keeps its severity**, which matters later: a waived `HIGH` or `CRITICAL` defect still marks the loan defective on the seller's scorecard.
+
+A **condition clearance** is performed by a `PurchaseReviewer` on receipt of the missing paperwork, supplying a `document_reference`. The condition must be `OPEN`, else `ERR_CONDITION_NOT_OPEN`, and the logical clock must be at or before its `due_at`, with a clearance strictly after that instant refused with `ERR_SUSPENSE_WINDOW_EXPIRED`. The condition moves `OPEN → CLEARED` with `cleared_at` stamped, the loan's `open_suspense_count` falls by one, and both the condition's and the loan's `version` increment by 1.
+
+The fourth route is the **condition sweep**, an operational capability a `PurchaseReviewer` or `PlatformAdmin` runs against one loan with no request body. It expires stale items in both families: every `OPEN` defect whose `classification` is `CURABLE` and whose `cure_deadline_at` the logical clock has passed **strictly** moves `OPEN → EXPIRED`, and every `OPEN` suspense condition whose `due_at` the clock has passed strictly moves `OPEN → EXPIRED`. Nothing expires exactly on its deadline; the sweep and the cure window are complementary, not overlapping. Non-curable defects are never swept and so remain `OPEN` indefinitely. The loan's `open_defect_count` and `open_suspense_count` fall by the number of items expired in each family, each affected child's `version` increments by 1, and the loan's `version` increments by 1. The sweep answers with `expired_defect_count`, `expired_condition_count`, and `loan_purchase_status` reporting where the file stands once the sweep is done. An expired condition simply stops blocking the file; an **expired defect**, by contrast, leaves a permanent mark — it contributes a fixed penalty of -50 basis points to any purchase advice issued later, described in §3.7.
+
+All four resolutions share one cascade. When the resolving mutation leaves the loan with `open_defect_count` at zero **and** `open_suspense_count` at zero, and the loan was in `SUSPENDED`, the loan moves `SUSPENDED → IN_REVIEW` and its `review_cycle_count` rises by one. That counter is the meter on the cure cycle `IN_REVIEW → SUSPENDED → IN_REVIEW`, which a file may traverse any number of times. If open items remain in either family, the loan stays `SUSPENDED` and `review_cycle_count` is untouched.
+
+One roll-up deserves a caveat. `non_curable_defect_count` counts the loan's non-curable defects in **any** status, and because a non-curable defect can never be cured, never be waived and never be swept, it stays `OPEN` for the life of the file. The count therefore only ever rises, and a file that has ever received a non-curable finding can never be cleared for purchase.
+
+### 3.7. Clearing, Rejection, and the Purchase Advice
+
+A file leaves review by one of two doors. **Clearing** is performed by a `PurchaseReviewer` with an optional `note`. The state gate admits a loan in `IN_REVIEW` or `SUSPENDED` — anything else is `ERR_INVALID_LOAN_STATE` — but a `SUSPENDED` file always then fails one of the three open-item gates, so in practice only an `IN_REVIEW` file with a clean slate is ever cleared. Those three gates are: no defect of the loan may be non-curable, else `ERR_NON_CURABLE_DEFECT_PRESENT`; `open_defect_count` must be zero, else `ERR_OPEN_DEFECTS_PRESENT`; and `open_suspense_count` must be zero, else `ERR_OPEN_SUSPENSE_CONDITIONS`. The non-curable gate is evaluated **first** (see §2.5), so a file carrying both an open non-curable defect and an open suspense condition reports the non-curable defect, which is the finding that actually decides the file's fate. Clearing moves the loan `IN_REVIEW → CLEARED_FOR_PURCHASE` and increments its `version` by 1. Note that waived and expired defects, and cleared and expired conditions, are no longer open and therefore do not block clearing — but a waived or expired defect will still cost the seller money at pricing time.
+
+**Rejection** is the other door, and it is only available when the file is genuinely unbuyable: a `PurchaseReviewer` rejects a loan in `IN_REVIEW` or `SUSPENDED` with an optional `note`, and the loan must carry at least one open non-curable defect, else `ERR_NO_NON_CURABLE_DEFECT`. A file whose defects are all curable must be cured, waived or expired — it cannot simply be thrown back. Rejection moves the loan `IN_REVIEW → REJECTED` or `SUSPENDED → REJECTED`, a terminal status, and **compensates the delivery**: the parent commitment's `allocated_amount_cents` falls by the loan's `note_amount_cents` and its `available_amount_cents` rises by the same amount, restoring the conserved notional identity of §2.7 exactly as it stood before delivery. The commitment's `status` is deliberately **not** changed by a rejection — a `PARTIALLY_FULFILLED` line stays partially fulfilled, and a `LOCKED` line stays locked with its capacity restored and available for a replacement delivery. Both the commitment's and the loan's `version` increment by 1.
+
+Once a loan is `CLEARED_FOR_PURCHASE`, a `PurchaseReviewer` issues a **PurchaseAdvice** — the settlement statement that prices the purchase to the cent. The only field in the request is the `expected_loan_version` of §2.8. Everything else is computed and then frozen: the advice is a snapshot, and it is never recomputed at settlement.
+
+Pricing begins with the **volume incentive**, a monthly loyalty rebate. The `month_start` is the first day of the advice's issuance calendar month at midnight UTC. The month-to-date unpaid principal balance is the sum of `note_amount_cents` over the **same seller's** loans whose `purchase_status` is `PURCHASED`, `REPURCHASE_DEMANDED` or `REPURCHASED` and whose `purchased_at` falls at or after `month_start` and strictly before the issuance instant. Other sellers' loans are excluded, `REJECTED` loans are excluded, and — critically — the loan under advice is excluded, because it is still `CLEARED_FOR_PURCHASE` and has no `purchased_at` at all. This evaluation order is pinned deliberately: the incentive raises the price, the price raises the proceeds, and the proceeds would raise the volume that selects the incentive, so the tier must be measured only over volume already purchased. The resulting `volume_incentive_bps` is 0 below 100,000,000 cents of month-to-date balance, 5 at or above 100,000,000 cents, and 10 at or above 250,000,000 cents. The `final_purchase_price_pct` is the commitment's `commitment_price_pct` plus the incentive divided by 100, rounded half up to 3 decimals.
+
+The money components are then computed, and the rounding order is pinned: **each component is rounded to whole cents independently with round-half-up, and only then are the components summed.** Summing exact values first and rounding once at the end is the wrong order and can differ by a cent.
+
+- `accrued_days` is the whole number of days from the loan's `closing_date` to the advice's issuance date.
+- `principal_purchase_cents` is the `note_amount_cents` multiplied by `final_purchase_price_pct` divided by 100, rounded.
+- `accrued_interest_cents` is the `note_amount_cents` multiplied by `note_rate_pct`, divided by 100, multiplied by `accrued_days`, divided by a 360-day year basis, rounded.
+- `escrow_funding_cents` is the loan's `escrow_balance_cents` when `servicing_election` is `RELEASED`, and 0 when it is `RETAINED` — a seller keeping the servicing keeps the escrow.
+- `service_release_premium_cents` is the `note_amount_cents` multiplied by the **product's** `srp_pct` divided by 100, rounded, when `servicing_election` is `RELEASED`, and 0 when it is `RETAINED`. Servicing is only paid for when it is actually released.
+- `defect_price_adjustment_cents` is the negation of the sum, over the loan's own defects whose `status` is `WAIVED` or `EXPIRED`, of the `note_amount_cents` multiplied by the absolute value of that defect's basis-point hit, divided by 10000, each hit rounded on its own before the sum. A `WAIVED` defect's hit is the `price_adjustment_bps` negotiated at waiver; an `EXPIRED` defect's hit is the fixed penalty of -50 basis points regardless of severity. `CURED` defects contribute nothing, and no `OPEN` defect can exist at issuance because the loan had to be cleared. The resulting field is negative or zero.
+- `wire_fee_cents` is a flat 3,500 cents on every advice.
+
+Finally, `net_wire_cents` is `principal_purchase_cents` plus `accrued_interest_cents` plus `escrow_funding_cents` plus `service_release_premium_cents` plus `defect_price_adjustment_cents` — which is itself negative or zero — minus `wire_fee_cents`.
+
+The new advice is created in `ISSUED` status with `issued_by_user_id` set to the acting `X-User-ID` and `issued_at` stamped from the logical clock. Any prior advice of the same loan still in `ISSUED` status moves `ISSUED → SUPERSEDED`, so at most one advice is live at a time; superseded and voided advices are retained for audit. The loan's `advice_count` rises by one and its `version` increments by 1 — which is exactly why a re-issue must carry a fresh `expected_loan_version`.
+
+**Settlement** is the wire. A `PurchaseReviewer` or `PlatformAdmin` settles an advice by supplying a `funding_reference`. The advice must be in `ISSUED` status, else `ERR_ADVICE_NOT_SETTLEABLE` — a superseded, voided, already-settled or reversed advice cannot be wired. The loan must also still be in `CLEARED_FOR_PURCHASE`, which the advice-status gate already guarantees: any loan falling back into suspense voids its issued advice, so an advice that is still `ISSUED` necessarily belongs to a cleared loan. And the acting `X-User-ID` must differ from the advice's `issued_by_user_id` under the segregation-of-duties rule of §2.9, else `ERR_SEGREGATION_OF_DUTIES`. The advice moves `ISSUED → SETTLED` with `settled_by_user_id` and `settled_at` recorded, and the settlement fans out:
+
+1. The loan moves `CLEARED_FOR_PURCHASE → PURCHASED` with `purchased_at` stamped from the logical clock, and its `version` increments by 1.
+2. When the loan's `servicing_election` is `RELEASED`, an **EscrowTransfer** is created in `PENDING` status with `transfer_amount_cents` frozen at the loan's `escrow_balance_cents` and `transfer_due_at` set to `purchased_at` advanced by 15 days. No escrow transfer is created for a `RETAINED` loan, because the escrow never moved.
+3. The parent commitment fills: `fulfilled_amount_cents` rises by the loan's `note_amount_cents` and `allocated_amount_cents` falls by the same amount, so `available_amount_cents` is unchanged by this hop — the allocation simply converts into fulfilment. If the post-fill `fulfilled_amount_cents` is still strictly below `notional_amount_cents` minus `tolerance_cents`, the commitment moves `LOCKED → PARTIALLY_FULFILLED` (and a second fill on a line already `PARTIALLY_FULFILLED` repeats the amount updates with no status change at all). If the post-fill `fulfilled_amount_cents` reaches or exceeds `notional_amount_cents` minus `tolerance_cents`, the commitment moves `LOCKED → FULFILLED` or `PARTIALLY_FULFILLED → FULFILLED` and the **tolerance write-off** fires: `cancelled_amount_cents` rises by whatever `available_amount_cents` remains, driving `available_amount_cents` to zero so the conserved notional identity holds, while `pair_off_fee_cents` stays at zero — a shortfall inside tolerance is never billable. Because `FULFILLED` is terminal, a `MANDATORY` commitment releases its full `notional_amount_cents` from the seller's `open_mandatory_exposure_cents` at that moment. The commitment's `version` increments by 1.
+4. The seller's `net_funded_cents` rises by the advice's `net_wire_cents`, and the advice's own `version` increments by 1.
+
+Once a loan is purchased, a `PlatformAdmin` records the borrower's first-payment outcome by supplying an `event_type` of either `FIRST_PAYMENT_PAID`, which sets `first_payment_status` to `PAID`, or `FIRST_PAYMENT_MISSED`, which sets it to `MISSED`. Either way the loan's `version` increments by 1. This single flag is what establishes — or forecloses — an early-payment-default repurchase demand, and it may be corrected by recording the opposite event.
+
+### 3.8. Unwinding a Purchase: Repurchase Demands and the Escrow Transfer
+
+A purchase is not irrevocable. When a purchased loan turns out to be defective, or when the borrower never makes the first payment, the aggregator demands that the seller buy it back.
+
+A `PurchaseReviewer` or `CounterpartyAnalyst` issues a **RepurchaseDemand** against a loan in `PURCHASED` status — any other purchase status is `ERR_INVALID_LOAN_STATE`. The request carries a `reason`, one of `EPD`, `DEFECT` or `MISREPRESENTATION`; a `demand_letter_reference` of between 1 and 64 characters identifying the letter sent to the seller; and optionally a `source_defect_id`.
+
+The evidentiary requirements differ sharply by reason, and this is the heart of the demand gate.
+
+- A `DEFECT` or `MISREPRESENTATION` demand **requires** a `source_defect_id` naming a defect **of this same loan** whose `severity` is `HIGH` or `CRITICAL` and whose `status` is `WAIVED` or `EXPIRED`. A cured defect is not repurchase evidence — the seller fixed it. A low or medium severity defect is not repurchase evidence either. A missing, foreign, mis-severity or wrong-status reference is refused with `ERR_DEFECT_EVIDENCE_REQUIRED`.
+- An `EPD` demand must carry no `source_defect_id` at all, and instead depends entirely on the payment record: the loan's `first_payment_status` must be `MISSED`, else `ERR_EPD_NOT_ESTABLISHED`, and the logical clock must be within 120 days after the loan's `first_payment_due_date`, else `ERR_EPD_WINDOW_EXPIRED`. The window check is evaluated **before** the missed-payment check (§2.5), so a demand raised long after the window closed on a loan whose payment was never even recorded reports the expired window rather than the unestablished default.
+
+The demand's money is pinned to the wire, not recomputed. The `funding_recovery_cents` is set to the `net_wire_cents` of the loan's single `SETTLED` purchase advice — superseded, voided and reversed advices are ignored, and exactly one settled advice exists for any loan that reached `PURCHASED` or beyond. The `admin_fee_cents` is a flat 50,000 cents, and the `repurchase_price_cents` is the sum of the two. Pinning the recovery to the exact amount wired is what allows satisfaction to return the seller's `net_funded_cents` to its pre-purchase value with zero drift, while the administrative fee is booked to `fee_receivable_cents` instead and never contaminates the funding figure. The demand is created in `ISSUED` status with `issued_by_user_id` set to the acting `X-User-ID`, `seller_id` copied down from the loan, and `appeal_deadline_at` set to the issuance instant advanced by 30 days. The loan moves `PURCHASED → REPURCHASE_DEMANDED` and its `version` increments by 1.
+
+The seller may **appeal**, acting as `SellerUser` and supplying an `appeal_reason`. The demand must be in `ISSUED` status, else `ERR_DEMAND_NOT_ACTIONABLE` — a demand already appealed, decided or satisfied cannot be appealed again; the logical clock must be at or before `appeal_deadline_at`, else `ERR_APPEAL_WINDOW_EXPIRED`; and the acting `X-User-ID` must equal the demand's `seller_id`, else `ERR_SELLER_SCOPE_VIOLATION`. The demand moves `ISSUED → APPEALED` with the `appeal_reason` recorded and its `version` incremented by 1. The loan stays `REPURCHASE_DEMANDED` throughout — an appeal buys argument, not relief.
+
+A `PurchaseReviewer` **decides** a demand by supplying a `decision` of `UPHOLD` or `RESCIND` and an optional `note`, and the acting `X-User-ID` must differ from the demand's `issued_by_user_id` under §2.9, else `ERR_SEGREGATION_OF_DUTIES`. The two branches are deliberately asymmetric in their reachability:
+
+- `RESCIND` is available from either `ISSUED` or `APPEALED` — the aggregator may withdraw a demand at any point, whether or not the seller pushed back. Rescission moves the demand `ISSUED → RESCINDED` or `APPEALED → RESCINDED`, a terminal status, cascades the loan `REPURCHASE_DEMANDED → PURCHASED`, and removes the loan from the defective population this demand had contributed to the seller's scorecard. The seller's `net_funded_cents` is explicitly **not** changed, because no money ever moved on the demand.
+- `UPHOLD` is available **only** from `APPEALED`, else `ERR_DEMAND_NOT_ACTIONABLE`. There is nothing to uphold on a demand nobody contested; an un-appealed demand is simply settled or rescinded as it stands. Upholding moves the demand `APPEALED → UPHELD` and does not touch the loan, which stays `REPURCHASE_DEMANDED`.
+
+Either branch records `decided_by_user_id` and increments the demand's `version` by 1.
+
+**Satisfaction** is the seller's remittance, and it is the one step in this chapter performed by the seller rather than the aggregator: acting as `SellerUser` and supplying a `remittance_reference`. The demand must be in `ISSUED` or `UPHELD` status, else `ERR_DEMAND_NOT_SETTLEABLE` — a rescinded demand is dead and an appealed demand must be decided first — and the acting `X-User-ID` must equal the demand's `seller_id`, else `ERR_SELLER_SCOPE_VIOLATION`. Note the deliberate asymmetry with advice settlement: because the payer here is the seller and not a second employee of the aggregator, no segregation-of-duties check applies. The demand moves `ISSUED → SATISFIED` or `UPHELD → SATISFIED`, a terminal status, with `satisfied_at` stamped from the logical clock, and the unwind runs end to end:
+
+1. The loan moves `REPURCHASE_DEMANDED → REPURCHASED`, a terminal status, and its `version` increments by 1.
+2. The loan's purchase advice in `SETTLED` status moves `SETTLED → REVERSED`, with its `version` incremented by 1.
+3. Any escrow transfer of that loan moves `PENDING → REVERSED` or `COMPLETED → REVERSED`, a terminal status, with `reversal_reason` set to `REPURCHASE_SATISFIED` — an escrow balance already handed to the investor has to come back too — and its `version` increments by 1.
+4. The seller's `net_funded_cents` falls by the demand's `funding_recovery_cents`, restoring the conserved cash identity of §2.7 to its pre-purchase value, and `fee_receivable_cents` rises by the demand's `admin_fee_cents`.
+5. The parent commitment's amounts are **not** adjusted. The commitment was fulfilled at purchase and stays fulfilled; a repurchase is a dispute between aggregator and seller about one file, not a retraction of the seller's delivery obligation. This is the one place where the notional identity is intentionally left as it stands.
+
+The **EscrowTransfer** created by settlement of a servicing-released loan is completed by a `PurchaseReviewer` or `PlatformAdmin` supplying a `goodbye_letter_reference` — the notice sent to the borrower telling them where to send payments. The transfer must be in `PENDING` status, else `ERR_TRANSFER_NOT_PENDING`. The loan must be in `PURCHASED` status: a loan whose `purchase_status` is `REPURCHASE_DEMANDED` or `REPURCHASED` is refused with `ERR_LOAN_UNDER_REPURCHASE`, because escrow may not be moved to the investor while the file is being pulled back to the seller. And the logical clock must be at or before `transfer_due_at`, else `ERR_ESCROW_TRANSFER_OVERDUE` — a late transfer must be escalated off-platform rather than booked on time. Completion moves the transfer `PENDING → COMPLETED` with `completed_at` stamped and the `goodbye_letter_reference` recorded, and increments its `version` by 1. Because the transfer is synthesised by settlement rather than requested by a client, listing a loan's escrow transfers is the only way to discover its `id`.
+
+### 3.9. Seller Scorecards, Defect Rates and Automatic Suspension
+
+The scorecard is the loop that closes the whole system: purchase outcomes feed back into the seller's standing, which in turn governs whether the seller may deliver at all.
+
+A `CounterpartyAnalyst` or `PlatformAdmin` opens a **SellerScorecard** for a seller by supplying `period_start` and `period_end`, where `period_end` must be on or after `period_start` — a single-day period is legitimate. The period is a **closed interval on both ends**, and no two scorecards of the same seller may overlap, regardless of the other scorecard's status: a closed period blocks a new overlapping one just as an open one does. Because both ends are inclusive, two periods that merely share one endpoint date **do** overlap, and the second is refused with `ERR_SCORECARD_PERIOD_OVERLAP`. Different sellers' periods never interact. The new scorecard is created in `OPEN` status with every metric zeroed — `purchased_loan_count`, `purchased_upb_cents`, `defective_loan_count`, `defective_upb_cents`, `defect_rate_bps` and `upb_weighted_defect_rate_bps` — its `grade` at `UNRATED`, its `breach` flag false, its `standing_action_applied` at `NONE`, and `closed_at` null.
+
+Closing is performed by a `CounterpartyAnalyst` with no request body. The scorecard must be `OPEN`, else `ERR_SCORECARD_NOT_OPEN`, and the logical clock must be strictly past the **end** of the period — that is, past `period_end` at 23:59:59.999Z — else `ERR_SCORECARD_PERIOD_NOT_ENDED`. A period cannot be graded while it is still running.
+
+The **scored population** is the seller's own loans whose `purchase_status` is `PURCHASED`, `REPURCHASE_DEMANDED` or `REPURCHASED` and whose `purchased_at` falls inside the inclusive window running from `period_start` at 00:00:00.000Z through `period_end` at 23:59:59.999Z. Loans of other sellers, `REJECTED` loans and loans still in the review pipeline are all outside it. `purchased_loan_count` is the size of that population and `purchased_upb_cents` is the sum of its `note_amount_cents`.
+
+A scored loan counts as **defective** when either of two independent conditions holds: it carries at least one defect whose `severity` is `HIGH` or `CRITICAL` **and** whose `status` is `WAIVED` or `EXPIRED`; or it carries at least one repurchase demand whose `status` is `ISSUED`, `APPEALED`, `UPHELD` or `SATISFIED`. Two exclusions are deliberate and must be honoured exactly: a **cured** defect never marks a loan defective at any severity, because the seller fixed the file; and a **rescinded** demand never marks a loan defective, because the aggregator itself withdrew the accusation. `RESCINDED` is therefore the only demand status absent from the defective set. A loan that satisfies both conditions at once is still counted once — the metric counts loans, not findings. `defective_loan_count` is the size of the defective subset and `defective_upb_cents` is the sum of its `note_amount_cents`.
+
+Two defect rates are then computed, and they have very different standing:
+
+- `defect_rate_bps`, the **governing** rate, is 10000 multiplied by `defective_loan_count` divided by `purchased_loan_count`, rounded half up to a whole basis point. This is a count-weighted rate: every loan carries equal weight regardless of size.
+- `upb_weighted_defect_rate_bps` is 10000 multiplied by `defective_upb_cents` divided by `purchased_upb_cents`, rounded half up to a whole basis point. It is **reporting only**. It is never used to grade the seller, never used to set the breach flag, and never used to drive a suspension, even when it is dramatically higher than the governing rate because the defective loans happened to be the large ones.
+
+When the scored population is empty, both rates are recorded as 0 and no division is attempted; the `grade` is `UNRATED`.
+
+The `grade` is assigned from the governing rate, but only once the sample is meaningful. A scorecard with fewer than 2 purchased loans is graded `UNRATED` no matter what its rate says — a single defective loan in a one-loan period is a 10000 basis point rate and means nothing statistically. Otherwise the grade is `A` at 1000 basis points or less, `B` at 2500 or less, `C` at 5000 or less, and `D` above 5000. The `breach` flag is true only when `purchased_loan_count` is at least 2 **and** the governing `defect_rate_bps` is **strictly** greater than 5000; a rate landing exactly on 5000 grades `C` and is not a breach.
+
+Closing also selects a `standing_action_applied`, and the selection is a strict ladder evaluated in this order:
+
+1. If `purchased_loan_count` is less than 2, the action is `NONE` — the small-sample floor overrides everything below, so even a 10000 basis point rate on a single loan takes no action.
+2. Otherwise, if the governing rate is strictly greater than 5000, the action is `SUSPENDED`.
+3. Otherwise, if the governing rate is strictly greater than 1000, the action is `WATCH`.
+4. Otherwise the action is `RECOVERED` when the seller's `delivery_standing` is currently `WATCH`, and `NONE` otherwise. A clean quarter restores a watched seller and leaves an already-good seller untouched.
+
+Both thresholds are strict: a rate of exactly 5000 does not suspend, and a rate of exactly 1000 does not place the seller on watch.
+
+The selected action is then applied to the seller's `delivery_standing`, and each application has its own admissible origin.
+
+- `SUSPENDED` applies only from `GOOD_STANDING` or `WATCH`, setting `delivery_standing` to `SUSPENDED` with `suspension_reason` recorded as `SCORECARD_DEFECT_RATE` — distinguishing an automatic scorecard suspension from a manual counterparty action. It additionally cancels commitments, but selectively: every commitment of that seller whose `status` is `LOCKED` or `PARTIALLY_FULFILLED` **and** whose `allocated_amount_cents` is zero is cancelled, processed in ascending `created_at` order, each taking the administrative flat fee that accrues to the seller's `fee_receivable_cents` and each releasing mandatory exposure where applicable. Commitments with an outstanding allocation are left untouched, because loans already in the purchase pipeline must be purchased or rejected before their line can be retired. A seller already `SUSPENDED` or `TERMINATED` is not disturbed.
+- `WATCH` applies only from `GOOD_STANDING`, moving `delivery_standing` to `WATCH`. It cancels nothing — a watched seller keeps delivering.
+- `RECOVERED` applies only from `WATCH`, moving `delivery_standing` back to `GOOD_STANDING` and clearing the watch.
+- `NONE` leaves `delivery_standing` entirely alone.
+
+Finally, the scorecard moves `OPEN → CLOSED` with `closed_at` stamped from the logical clock, and the seller adopts the closed figures: `current_defect_rate_bps` takes the governing `defect_rate_bps` and `current_scorecard_grade` takes the `grade`, so the seller record always reflects its most recently closed period. Both the scorecard's and the seller's `version` increment by 1.
+
+## 4. Endpoint Definitions
+
+Every endpoint below is mounted under the `/correspondent` prefix and obeys the envelope, pagination, header and validation rules of §2. Endpoints that create a new resource answer with HTTP 201; endpoints that modify an existing resource, run a sweep, or read data answer with HTTP 200. Every successful mutation returns the created or updated resource in the `data` field, except for the two sweep capabilities and the clock control, which return their own summary objects as described in §2.4, §3.5 and §3.6.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | /correspondent/_clock/set_current_utc | Sets the logical clock to the supplied `current_utc` instant. | PlatformAdmin |
+| POST | /correspondent/products | Creates a product eligibility definition with its credit box, servicing release premium and base price. | PlatformAdmin |
+| GET | /correspondent/products/{id} | Reads one product eligibility definition. | PlatformAdmin, CounterpartyAnalyst, LockDeskTrader, PurchaseReviewer, SellerUser |
+| POST | /correspondent/products/{id}/pricing-adjustments | Adds a loan-level price adjustment row to the product's grid. | PlatformAdmin |
+| GET | /correspondent/products/{id}/pricing-adjustments | Lists the product's price adjustment grid rows. | PlatformAdmin, LockDeskTrader, CounterpartyAnalyst |
+| POST | /correspondent/sellers | Registers a correspondent seller applicant. | CounterpartyAnalyst |
+| GET | /correspondent/sellers/{id} | Reads one seller including approval status, delivery standing, exposure and scorecard roll-ups. | CounterpartyAnalyst, PlatformAdmin, LockDeskTrader, PurchaseReviewer, SellerUser |
+| GET | /correspondent/sellers | Lists sellers with filters on approval status and delivery standing. | CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/sellers/{id}/financial-statements | Submits a period financial statement for the seller. | SellerUser, CounterpartyAnalyst |
+| GET | /correspondent/sellers/{id}/financial-statements | Lists the seller's financial statements. | CounterpartyAnalyst, PlatformAdmin, SellerUser |
+| POST | /correspondent/financial-statements/{id}/review | Accepts or rejects a submitted financial statement. | CounterpartyAnalyst |
+| POST | /correspondent/sellers/{id}/qc-reviews | Opens a pre-approval or annual recertification quality control review. | QCReviewer |
+| GET | /correspondent/sellers/{id}/qc-reviews | Lists the seller's quality control reviews. | QCReviewer, CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/qc-reviews/{id}/complete | Completes a quality control review, deriving its outcome from the finding counts. | QCReviewer |
+| POST | /correspondent/sellers/{id}/approval-decision | Approves or declines the seller, setting the mandatory exposure limit on approval. | CounterpartyAnalyst |
+| POST | /correspondent/sellers/{id}/standing-actions | Applies a manual delivery standing action: suspend, reinstate, terminate or place on watch. | CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/commitments | Locks a commitment, computing the all-in commitment price from the base price, lock term and adjustment grid. | LockDeskTrader, SellerUser |
+| GET | /correspondent/commitments | Lists commitments with filters on seller, product, commitment type and status. | LockDeskTrader, CounterpartyAnalyst, PurchaseReviewer, PlatformAdmin, SellerUser |
+| GET | /correspondent/commitments/{id} | Reads one commitment including its notional, allocation, fulfilment and residual amounts. | LockDeskTrader, CounterpartyAnalyst, PurchaseReviewer, PlatformAdmin, SellerUser |
+| POST | /correspondent/commitments/{id}/pair-off | Pairs off the unfilled residual of a commitment and assesses the pair-off fee. | LockDeskTrader |
+| POST | /correspondent/commitments/expire-due | Expiry sweep: expires every unallocated commitment past its delivery window with the administrative flat fee. | LockDeskTrader, PlatformAdmin |
+| POST | /correspondent/commitments/{id}/loans | Delivers a closed loan file against the commitment; requires `expected_commitment_version`. | SellerUser, LockDeskTrader |
+| GET | /correspondent/loans | Lists loans with filters on seller, commitment and purchase status. | PurchaseReviewer, LockDeskTrader, CounterpartyAnalyst, PlatformAdmin, SellerUser |
+| GET | /correspondent/loans/{id} | Reads one loan including its review roll-ups and purchase status. | PurchaseReviewer, LockDeskTrader, CounterpartyAnalyst, PlatformAdmin, SellerUser |
+| POST | /correspondent/loans/{id}/review | Opens purchase review on a delivered loan file. | PurchaseReviewer |
+| POST | /correspondent/loans/{id}/defects | Records a defect against the loan file, deriving its curability and cure deadline. | PurchaseReviewer |
+| GET | /correspondent/loans/{id}/defects | Lists the loan's defects. | PurchaseReviewer, SellerUser, CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/defects/{id}/cure | Seller cures a curable defect inside its cure window with supporting documentation. | SellerUser |
+| POST | /correspondent/defects/{id}/waive | Waives a curable defect against a price concession in basis points. | PurchaseReviewer, PlatformAdmin |
+| POST | /correspondent/loans/{id}/suspense-conditions | Adds a suspense condition the seller must clear within one week. | PurchaseReviewer |
+| GET | /correspondent/loans/{id}/suspense-conditions | Lists the loan's suspense conditions. | PurchaseReviewer, SellerUser, CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/suspense-conditions/{id}/clear | Clears a suspense condition on receipt of the required document. | PurchaseReviewer |
+| POST | /correspondent/loans/{id}/expire-conditions | Condition sweep for one loan: expires overdue curable defects and overdue suspense conditions. | PurchaseReviewer, PlatformAdmin |
+| POST | /correspondent/loans/{id}/clear | Clears the loan file for purchase once no open or non-curable item remains. | PurchaseReviewer |
+| POST | /correspondent/loans/{id}/reject | Rejects the loan file on a non-curable defect and releases the commitment allocation. | PurchaseReviewer |
+| POST | /correspondent/loans/{id}/purchase-advices | Issues a purchase advice, freezing the volume incentive, final price and every money component; requires `expected_loan_version`. | PurchaseReviewer |
+| GET | /correspondent/loans/{id}/purchase-advices | Lists the loan's purchase advices, current and superseded. | PurchaseReviewer, SellerUser, CounterpartyAnalyst, PlatformAdmin |
+| POST | /correspondent/purchase-advices/{id}/settle | Settles an issued purchase advice, purchasing the loan and filling the commitment. | PurchaseReviewer, PlatformAdmin |
+| POST | /correspondent/loans/{id}/payment-events | Records the borrower's first payment outcome as paid or missed. | PlatformAdmin |
+| POST | /correspondent/loans/{id}/repurchase-demands | Issues a repurchase demand for early payment default, a defect or misrepresentation. | PurchaseReviewer, CounterpartyAnalyst |
+| GET | /correspondent/loans/{id}/repurchase-demands | Lists the loan's repurchase demands. | PurchaseReviewer, SellerUser, CounterpartyAnalyst, PlatformAdmin |
+| GET | /correspondent/repurchase-demands | Lists repurchase demands with filters on seller, source defect, reason and status. | PurchaseReviewer, CounterpartyAnalyst, PlatformAdmin, SellerUser |
+| GET | /correspondent/repurchase-demands/{id} | Reads one repurchase demand including its pinned recovery amounts and appeal deadline. | PurchaseReviewer, CounterpartyAnalyst, PlatformAdmin, SellerUser |
+| POST | /correspondent/repurchase-demands/{id}/appeal | Seller appeals an issued demand inside the appeal window. | SellerUser |
+| POST | /correspondent/repurchase-demands/{id}/decision | Upholds an appealed demand or rescinds an issued or appealed one. | PurchaseReviewer |
+| POST | /correspondent/repurchase-demands/{id}/settle | Seller remits the repurchase price, satisfying the demand and unwinding the purchase. | SellerUser |
+| GET | /correspondent/loans/{id}/escrow-transfers | Lists the loan's escrow transfers, the only discovery channel for a transfer created by settlement. | PurchaseReviewer, PlatformAdmin, SellerUser |
+| POST | /correspondent/escrow-transfers/{id}/complete | Completes the escrow balance transfer with the borrower goodbye letter. | PurchaseReviewer, PlatformAdmin |
+| POST | /correspondent/sellers/{id}/scorecards | Opens a non-overlapping scorecard period for the seller. | CounterpartyAnalyst, PlatformAdmin |
+| GET | /correspondent/sellers/{id}/scorecards | Lists the seller's scorecards. | CounterpartyAnalyst, SellerUser, PlatformAdmin |
+| POST | /correspondent/scorecards/{id}/close | Closes a scorecard period, computes both defect rates, grades the seller and applies the standing action. | CounterpartyAnalyst |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| ERR_UNAUTHENTICATED | 401 |
+| ERR_FORBIDDEN_ROLE | 403 |
+| ERR_SELLER_NOT_FOUND | 404 |
+| ERR_PRODUCT_NOT_FOUND | 404 |
+| ERR_STATEMENT_NOT_FOUND | 404 |
+| ERR_QC_REVIEW_NOT_FOUND | 404 |
+| ERR_COMMITMENT_NOT_FOUND | 404 |
+| ERR_LOAN_NOT_FOUND | 404 |
+| ERR_DEFECT_NOT_FOUND | 404 |
+| ERR_CONDITION_NOT_FOUND | 404 |
+| ERR_ADVICE_NOT_FOUND | 404 |
+| ERR_DEMAND_NOT_FOUND | 404 |
+| ERR_TRANSFER_NOT_FOUND | 404 |
+| ERR_SCORECARD_NOT_FOUND | 404 |
+| ERR_INVALID_REQUEST | 400 |
+| ERR_SELLER_SCOPE_VIOLATION | 403 |
+| ERR_SEGREGATION_OF_DUTIES | 403 |
+| ERR_STALE_COMMITMENT_VERSION | 412 |
+| ERR_STALE_LOAN_VERSION | 412 |
+| ERR_INVALID_SELLER_STATE | 409 |
+| ERR_STATEMENT_NOT_REVIEWABLE | 409 |
+| ERR_QC_REVIEW_NOT_OPEN | 409 |
+| ERR_COMMITMENT_NOT_OPEN | 409 |
+| ERR_INVALID_LOAN_STATE | 409 |
+| ERR_DEFECT_NOT_OPEN | 409 |
+| ERR_CONDITION_NOT_OPEN | 409 |
+| ERR_ADVICE_NOT_SETTLEABLE | 409 |
+| ERR_DEMAND_NOT_ACTIONABLE | 409 |
+| ERR_DEMAND_NOT_SETTLEABLE | 409 |
+| ERR_TRANSFER_NOT_PENDING | 409 |
+| ERR_SCORECARD_NOT_OPEN | 409 |
+| ERR_ALLOCATION_OUTSTANDING | 409 |
+| ERR_SELLER_NOT_APPROVED | 409 |
+| ERR_SELLER_DELIVERY_SUSPENDED | 409 |
+| ERR_NO_ACCEPTED_STATEMENT | 409 |
+| ERR_FINANCIAL_STATEMENT_STALE | 409 |
+| ERR_NET_WORTH_BELOW_MINIMUM | 409 |
+| ERR_LIQUIDITY_BELOW_MINIMUM | 409 |
+| ERR_QC_REVIEW_NOT_COMPLETED | 409 |
+| ERR_QC_REVIEW_FAILED | 409 |
+| ERR_NON_CURABLE_DEFECT_PRESENT | 409 |
+| ERR_LOAN_UNDER_REPURCHASE | 409 |
+| ERR_PRODUCT_NOT_ELIGIBLE | 422 |
+| ERR_COMMITMENT_TYPE_NOT_ALLOWED | 422 |
+| ERR_SERVICING_RETAINED_NOT_ELIGIBLE | 422 |
+| ERR_COMMITMENT_EXPIRED | 409 |
+| ERR_DELIVERY_WINDOW_OVERLAP | 409 |
+| ERR_SCORECARD_PERIOD_OVERLAP | 409 |
+| ERR_SCORECARD_PERIOD_NOT_ENDED | 409 |
+| ERR_CURE_WINDOW_EXPIRED | 409 |
+| ERR_SUSPENSE_WINDOW_EXPIRED | 409 |
+| ERR_EPD_WINDOW_EXPIRED | 409 |
+| ERR_APPEAL_WINDOW_EXPIRED | 409 |
+| ERR_ESCROW_TRANSFER_OVERDUE | 409 |
+| ERR_DUPLICATE_TIN | 409 |
+| ERR_DUPLICATE_PRODUCT_CODE | 409 |
+| ERR_DUPLICATE_ADJUSTMENT_CODE | 409 |
+| ERR_DUPLICATE_SELLER_LOAN_NUMBER | 409 |
+| ERR_OPEN_DEFECTS_PRESENT | 409 |
+| ERR_OPEN_SUSPENSE_CONDITIONS | 409 |
+| ERR_DEFECT_NOT_CURABLE | 409 |
+| ERR_NO_NON_CURABLE_DEFECT | 409 |
+| ERR_DEFECT_EVIDENCE_REQUIRED | 422 |
+| ERR_EPD_NOT_ESTABLISHED | 409 |
+| ERR_COMMITMENT_CAPACITY_EXCEEDED | 409 |
+| ERR_MANDATORY_EXPOSURE_LIMIT_EXCEEDED | 409 |

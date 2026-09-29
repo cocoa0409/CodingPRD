@@ -1,0 +1,86 @@
+"""Error catalogue (PRD 5) and the ApiError exception."""
+
+ERROR_HTTP = {
+    # authentication / authorization
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_PRINTER_IDENTITY_MISMATCH": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # existence
+    "ERR_BRIEF_NOT_FOUND": 404,
+    "ERR_MARKETING_CLAIM_NOT_FOUND": 404,
+    "ERR_ARTWORK_ASSET_NOT_FOUND": 404,
+    "ERR_ARTWORK_VERSION_NOT_FOUND": 404,
+    "ERR_ELEMENT_CHECK_NOT_FOUND": 404,
+    "ERR_REVIEW_ROUTE_NOT_FOUND": 404,
+    "ERR_REVIEW_TASK_NOT_FOUND": 404,
+    "ERR_PRINTER_NOT_FOUND": 404,
+    "ERR_PRINTER_PROOF_NOT_FOUND": 404,
+    "ERR_PLATE_ORDER_NOT_FOUND": 404,
+    "ERR_INVENTORY_RUNOUT_NOT_FOUND": 404,
+    "ERR_ERROR_ESCAPE_NOT_FOUND": 404,
+    # request schema / uniqueness
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_DUPLICATE_SKU_CODE": 409,
+    "ERR_DUPLICATE_PRINTER_NAME": 409,
+    "ERR_DUPLICATE_ASSET_VARIANT": 409,
+    # optimistic concurrency
+    "ERR_STALE_ASSET_VERSION": 412,
+    "ERR_STALE_ESCAPE_VERSION": 412,
+    # state preconditions
+    "ERR_BRIEF_STATE_INVALID": 409,
+    "ERR_VERSION_STATE_INVALID": 409,
+    "ERR_CLAIM_STATE_INVALID": 409,
+    "ERR_ELEMENT_CHECK_NOT_FAILED": 409,
+    "ERR_ROUTE_STAGE_NOT_ACTIVE": 409,
+    "ERR_TASK_ALREADY_DECIDED": 409,
+    "ERR_PROOF_STATE_INVALID": 409,
+    "ERR_PROOF_DIMENSION_ALREADY_DECIDED": 409,
+    "ERR_PRESS_CHECK_NOT_REQUIRED": 409,
+    "ERR_PLATE_ORDER_NOT_CANCELLABLE": 409,
+    "ERR_RUNOUT_STATE_INVALID": 409,
+    "ERR_ESCAPE_STATE_INVALID": 409,
+    "ERR_BRIEF_NOT_APPROVED": 409,
+    # regulatory / compliance safety
+    "ERR_MANDATORY_ELEMENT_FAILED": 422,
+    "ERR_COMPLIANCE_SCORE_BELOW_THRESHOLD": 422,
+    "ERR_CLAIM_NOT_CLEARED": 422,
+    "ERR_CLAIM_CLEARANCE_EXPIRED": 422,
+    "ERR_REVERIFICATION_REQUIRED": 422,
+    "ERR_REVISION_CYCLE_CAP_EXCEEDED": 422,
+    # referential coherence
+    "ERR_MARKET_CODE_NOT_IN_BRIEF": 422,
+    "ERR_LANGUAGE_CODE_NOT_IN_BRIEF": 422,
+    "ERR_CLAIM_MARKET_MISMATCH": 422,
+    "ERR_SUPERSEDES_VERSION_MISMATCH": 422,
+    "ERR_PROOF_VERSION_MISMATCH": 422,
+    # constraint satisfaction
+    "ERR_SUBSTRATE_NOT_CERTIFIED": 422,
+    "ERR_PRINTER_ON_PROBATION": 422,
+    "ERR_PROOF_NOT_APPROVED": 422,
+    "ERR_SHARE_INCONSISTENT_WITH_PARTY": 422,
+    "ERR_UNIT_CONSERVATION_VIOLATION": 422,
+    # temporal conflicts
+    "ERR_PRESS_CHECK_OVERLAP": 409,
+    "ERR_CLAIM_CLEARANCE_OVERLAP": 409,
+    "ERR_DEPLETION_RECORD_OUT_OF_ORDER": 409,
+    # fiscal ceilings
+    "ERR_PLATE_BUDGET_EXCEEDED": 422,
+    "ERR_RECOVERY_EXCEEDS_LIABILITY_CAP": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)
+
+
+def invalid(message):
+    raise ApiError("ERR_INVALID_REQUEST", message)

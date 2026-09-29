@@ -1,0 +1,511 @@
+# Electronic Resource Licensing & Consortium Purchasing API — Product Requirements Document
+
+## 1. Introduction
+
+An academic library consortium buys electronic content the way no single library can: by pooling its members' purchasing power, negotiating one license on behalf of everybody, and then splitting the invoice by institutional size. The collections office that runs this process currently coordinates it across spreadsheets, shared mailboxes and vendor portals — and the coordination cost is where the money leaks. A member library pledges to a package, discovers three months later that the confirmed price is higher than the projection it budgeted against, and has already committed the rest of its materials budget elsewhere. A negotiator concedes an interlibrary-loan term the publisher never actually offered. A cancellation is executed two weeks after the notice deadline and the consortium is silently renewed for another year at full list price. Nobody can say, on the day the renewal ballot opens, whether the package is worth what it costs.
+
+This document specifies the Electronic Resource Licensing & Consortium Purchasing API, mounted under `/erm`, which turns that coordination into an auditable state machine. The system covers the entire lifecycle of a licensed package: trial setup with weighted evaluation criteria and stakeholder feedback; multi-round license negotiation over interlibrary loan, text and data mining, accessibility conformance and perpetual-access terms; consortium tier pricing driven by how many members actually participate; authentication configuration and off-campus access troubleshooting; COUNTER usage collection with cost-per-use analysis; renewal decisions bounded by inflation caps and cancellation notice deadlines; package restructuring by title swap; and post-cancellation access predicated on verified archival deposit.
+
+Two properties of the design deserve emphasis up front, because they shape almost every rule that follows. First, **money is conserved**. Every cent a member is on the hook for is derived, never typed in; when a pledge is withdrawn or a subscription is cancelled, the exact amount that was added to that member's committed-spend ledger is subtracted again. Second, **nothing important happens without a countersignature**. The negotiator who last sent terms to a publisher cannot be the operator who signs the resulting contract; a renewal cannot be decided without a quorum of participating members; a cancellation cannot be executed until an independent archival deposit check has verified that the consortium keeps what it paid for.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers. `X-User-ID` identifies the acting principal, and `X-User-Role` names the capability set that principal is exercising. If either header is absent, present but empty, or if `X-User-Role` does not name one of the five roles below, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). Authentication is decided before anything else about the request is inspected — before the URL is resolved, before the body is parsed.
+
+The five roles are `ConsortiumAdmin`, `MemberLibrarian`, `LicenseNegotiator`, `VendorRep` and `AccessEngineer`.
+
+- A `ConsortiumAdmin` is the collections-office operator. Admins register member libraries, vendors and products, open negotiations and sign them, evaluate trials, drive the whole renewal-decision lifecycle, open and verify archival deposit checks, and move the server's logical clock.
+- A `MemberLibrarian` is the electronic resources librarian at one member library. Librarians set up and run trials, submit stakeholder feedback, pledge and withdraw participation, report and reopen access incidents, and cast their library's renewal ballot.
+- A `LicenseNegotiator` drafts, submits and revises license terms across negotiation rounds. A negotiator never signs.
+- A `VendorRep` represents a publisher or aggregator. Vendor representatives answer negotiation rounds, file COUNTER usage statistics, and attest archival deposits — for their own products only.
+- An `AccessEngineer` belongs to the consortium's access services team. Engineers configure authentication realms, record the outcome of on-campus and off-campus probes, and diagnose and resolve access incidents.
+
+Once the role is recognised, the second gate is whether that role is listed for the endpoint being called. The authoritative listing is the Authorized Role(s) column of the endpoint table in §4; a role that does not appear there for a given endpoint receives `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+Two of the five roles are **entity-backed**, meaning `X-User-ID` is not merely an audit label but a foreign key that ownership checks compare against.
+
+- When `X-User-Role` is `MemberLibrarian`, `X-User-ID` is the `id` of the acting `Member`. Ownership checks on any resource that references a `Member` compare the resource's member foreign-key field to `X-User-ID`: a librarian may only set up a trial whose `member_id` is its own, only open, close or submit feedback on a trial whose `member_id` is its own, only pledge or withdraw a commitment whose `member_id` is its own, only report an incident with its own `member_id`, only reopen an incident whose `member_id` is its own, and only cast a ballot whose `member_id` is its own. A mismatch is `ERR_MEMBER_SCOPE_VIOLATION` (HTTP 403).
+- When `X-User-Role` is `VendorRep`, `X-User-ID` is the `id` of the acting `Vendor`. Ownership checks compare `X-User-ID` against the `vendor_id` of the product behind the targeted resource: answering a negotiation round requires that the negotiation's product belongs to the acting vendor, filing usage requires that the subscription's product belongs to the acting vendor, and attesting an archival deposit requires the same. A mismatch is `ERR_VENDOR_SCOPE_VIOLATION` (HTTP 403).
+
+The remaining three roles are **opaque**. When `X-User-Role` is `ConsortiumAdmin`, `LicenseNegotiator` or `AccessEngineer`, `X-User-ID` is an operator identifier that is not tied to any persisted entity and is never compared against any entity's `id`. The server does record it where a transition demands an audit trail — a negotiation submit stores the acting negotiator's identifier in `last_submitted_by_user_id`, and a feedback submission stores the acting librarian's identifier in `submitted_by_user_id` — but no lookup is performed against those values. The one place an opaque identifier participates in a decision is the segregation-of-duties rule described in §2.9, which compares two opaque identifiers to each other rather than resolving either one.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination and List Ordering
+
+Every list endpoint accepts two optional query parameters. `limit` controls page size: its default is 10, its minimum accepted value is 1, and its maximum accepted value is 100. `offset` controls how many records are skipped before the page begins: its default is 0 and its minimum accepted value is 0. A `limit` above 100, a `limit` below 1, or a negative `offset` is a malformed request.
+
+Unless a specific narrative in §3 says otherwise, list results are ordered by `created_at` ascending, so the oldest record appears first and paging forward through a stable dataset never revisits a record.
+
+List responses populate four pagination fields inside `meta`: the `limit` and `offset` actually applied, the `total_count` of records matching the filter before the page window is applied, and the boolean `has_more`, which is true when the sum of `offset` and the number of records returned is still less than `total_count`. Single-resource responses omit all four.
+
+### 2.4. Resource Identity, Timestamps and Version Counters
+
+Every persisted resource carries a server-minted `id` in UUID form. Identifiers are never prefixed with a type tag and are never supplied by the client: a create request that includes an `id` has that value ignored. Every resource also carries `created_at`, an ISO 8601 UTC timestamp with exactly three fractional-second digits, stamped once when the row is inserted and never modified afterwards.
+
+Most resources additionally carry `updated_at` — same format as `created_at`, refreshed on every mutation of the row — and `version`, an integer that starts at 1 when the row is created and increments by exactly 1 on every mutation. `Member`, `Vendor`, `Product`, `Trial`, `Negotiation`, `Subscription`, `Commitment`, `AuthConfig`, `AccessIncident`, `RenewalDecision` and `ArchivalDepositCheck` all carry the full quartet.
+
+Two resource types are deliberately append-only ledger rows and carry only `id` and `created_at`: `FeedbackEntry` and `UsageReport`. Neither exposes `updated_at` and neither exposes `version` — those two keys are absent from their representations entirely, because a stakeholder score and a month of COUNTER statistics are historical facts that are never edited in place.
+
+Because so much of this domain is derived state, it is worth stating plainly what a version bump means: any write that changes a persisted field of a row refreshes that row's `updated_at` and increments that row's `version`, including writes that arrive as the downstream effect of an operation aimed at a different resource. When signing a negotiation confirms a member's commitment and that confirmation moves the member's committed-spend ledger, the `Member` row's `version` advances too.
+
+### 2.5. Left-to-Right Path Resolution and the Order of Rejection
+
+URLs in this API nest at most one level deep — a subscription's authentication configurations, a product's trials, a trial's feedback. Path segments are resolved strictly left to right, and the first segment that names a non-existent row decides the response. Asking for the archival checks of a subscription that does not exist yields `ERR_SUBSCRIPTION_NOT_FOUND` and never a downstream code, even if the rest of the request is also defective. Each resource type has its own not-found code: `ERR_MEMBER_NOT_FOUND`, `ERR_VENDOR_NOT_FOUND`, `ERR_PRODUCT_NOT_FOUND`, `ERR_TRIAL_NOT_FOUND`, `ERR_NEGOTIATION_NOT_FOUND`, `ERR_SUBSCRIPTION_NOT_FOUND`, `ERR_COMMITMENT_NOT_FOUND`, `ERR_AUTH_CONFIG_NOT_FOUND`, `ERR_INCIDENT_NOT_FOUND`, `ERR_USAGE_REPORT_NOT_FOUND`, `ERR_RENEWAL_DECISION_NOT_FOUND` and `ERR_ARCHIVAL_CHECK_NOT_FOUND` — all HTTP 404.
+
+Because many operations in this system are guarded by several independent conditions at once, the order in which those conditions are evaluated is itself part of the contract. A single request that violates three rules must always report the same one. The system evaluates in the following strict priority order, and returns on the first failure:
+
+1. **Authentication.** Both headers present and non-empty, and `X-User-Role` naming one of the five declared roles — otherwise `ERR_UNAUTHENTICATED` (401). Applies to every endpoint.
+2. **Role authorization.** The acting role appears in the endpoint's authorized-role list in §4 — otherwise `ERR_ROLE_NOT_PERMITTED` (403). Applies to every endpoint.
+3. **Path existence**, left to right as described above — the matching 404 code. Applies to every endpoint that has a path parameter.
+4. **Body foreign-key existence.** Every foreign key supplied in the request body resolves to an existing row, yielding `ERR_MEMBER_NOT_FOUND`, `ERR_VENDOR_NOT_FOUND`, `ERR_PRODUCT_NOT_FOUND` or `ERR_TRIAL_NOT_FOUND` (404) as appropriate. This applies to exactly seven operations: registering a product (its `vendor_id`), setting up a trial on a product (its `member_id`), pledging participation in a product (its `member_id`), opening a negotiation (its `product_id` and `trial_id`), reporting an access incident on a subscription (its `member_id`), filing a usage report on a subscription (its `member_id`), and casting a renewal ballot (its `member_id`).
+5. **Entity-backed identity scope.** A `MemberLibrarian`'s `X-User-ID` equals the member the request targets, and a `VendorRep`'s `X-User-ID` equals the `vendor_id` of the product behind the targeted resource — otherwise `ERR_MEMBER_SCOPE_VIOLATION` or `ERR_VENDOR_SCOPE_VIOLATION` (403). Applies to every write endpoint authorized for `MemberLibrarian` or `VendorRep`.
+6. **Request shape.** All required body fields present; every enum-typed value inside its declared set; integer fields non-negative where non-negativity is required; a trial's criterion weights summing to exactly 100 with no repeated criterion code; `period_month` matching a four-digit year, a hyphen and a two-digit month in the range 01 through 12; `ip_ranges` non-empty; and `proxy_prefix` present whenever `auth_method` is `EZPROXY`. Any violation is `ERR_INVALID_REQUEST` (422). Applies to every write endpoint.
+7. **Subscription version match.** Where an operation requires `expected_subscription_version`, that value equals the subscription's current `version` — otherwise `ERR_STALE_SUBSCRIPTION_VERSION` (412). See §2.6.
+8. **State admissibility.** The target row is in a state from which the requested transition exists, per the lifecycles described throughout §3. The code names the entity whose state was wrong: `ERR_TRIAL_INVALID_STATE`, `ERR_NEGOTIATION_INVALID_STATE`, `ERR_COMMITMENT_INVALID_STATE`, `ERR_INCIDENT_INVALID_STATE`, `ERR_RENEWAL_INVALID_STATE`, `ERR_ARCHIVAL_CHECK_INVALID_STATE`, `ERR_SUBSCRIPTION_CONTRACT_INVALID_STATE`, `ERR_SUBSCRIPTION_ACCESS_INVALID_STATE` or `ERR_AUTH_CONFIG_INVALID_STATE` — all HTTP 409. Applies to every state-transition endpoint.
+9. **Member standing.** The acting member's `standing` is `IN_GOOD_STANDING` — otherwise `ERR_MEMBER_OVER_COMMITTED` (409). Applies to exactly three operations: pledging participation in a product, setting up a trial on a product, and opening a `DRAFT` trial.
+10. **Accessibility terms at signing** — `ERR_ACCESSIBILITY_TERM_MISSING` (422), on the signing operation only.
+11. **Segregation of duties at signing** — `ERR_SEGREGATION_OF_DUTIES` (403), on the signing operation only.
+12. **Granted terms within the product's offer** — `ERR_TERM_EXCEEDS_PRODUCT_OFFER` (422), on the vendor-response operation only.
+13. **Trial endorsement at signing** — `ERR_TRIAL_NOT_ENDORSED` (409), on the signing operation only.
+14. **Verified archival deposit before cancellation** — `ERR_ARCHIVAL_DEPOSIT_UNVERIFIED` (409), when executing a decision whose `resolved_action` is `CANCEL`.
+15. **Archival agency agreement** — `ERR_ARCHIVAL_AGENCY_MISMATCH` (422), when opening an archival deposit check on a subscription.
+16. **Trial window and cooldown** — `ERR_TRIAL_WINDOW_CONFLICT` (409), when setting up a trial on a product.
+17. **Federation realm capacity** — `ERR_REALM_CAPACITY_EXCEEDED` (409), when configuring authentication on a subscription.
+18. **Cancellation notice deadline** — `ERR_NOTICE_DEADLINE_PASSED` (409), when executing a decision whose `resolved_action` is `CANCEL`.
+19. **Usage month inside the term** — `ERR_USAGE_PERIOD_OUT_OF_TERM` (422), when filing a usage report on a subscription.
+20. **Ballot quorum** — `ERR_VOTE_QUORUM_NOT_MET` (409), on the decide operation.
+21. **One ballot per member** — `ERR_DUPLICATE_BALLOT` (409), on the vote operation.
+22. **Voter is a confirmed participant** — `ERR_MEMBER_NOT_PARTICIPANT` (409), on the vote operation.
+23. **Title-swap well-formedness** — `ERR_TITLE_SWAP_INVALID` (422), on the decide operation.
+24. **Entitled-title floor** — `ERR_TITLE_COUNT_FLOOR_BREACHED` (409), when executing a decision whose `resolved_action` is `RESTRUCTURE`.
+25. **One usage report per subscription, member and month** — `ERR_DUPLICATE_USAGE_REPORT` (409), when filing a usage report.
+26. **One live commitment per product and member** — `ERR_DUPLICATE_COMMITMENT` (409), when pledging participation.
+27. **Feedback criterion is declared** — `ERR_UNKNOWN_CRITERION` (422), when submitting trial feedback.
+28. **Minimum feedback volume** — `ERR_INSUFFICIENT_FEEDBACK` (409), when evaluating a trial.
+29. **Archival count discrepancy tolerance** — `ERR_ARCHIVAL_COUNT_DISCREPANCY` (409), when verifying an archival deposit check.
+30. **Negotiation round budget** — `ERR_NEGOTIATION_ROUND_LIMIT` (409), on both the submit and the revise operations.
+31. **Clock monotonicity** — `ERR_CLOCK_NOT_MONOTONIC` (422), on the logical-clock operation.
+32. **Member budget ceiling** — `ERR_BUDGET_CEILING_EXCEEDED` (409), when pledging participation.
+33. **Inflation cap** — `ERR_INFLATION_CAP_EXCEEDED` (422), when deciding `RENEW`.
+
+The consequence worth internalising is that structural failures always mask business failures, and that within the business band the ordering above is authoritative. A cancellation execution attempted after the notice deadline **and** without a verified archival deposit reports `ERR_ARCHIVAL_DEPOSIT_UNVERIFIED`, because the archival gate sits at priority 14 and the deadline gate at priority 18. A `RENEW` decision that lacks quorum **and** breaches the inflation cap reports `ERR_VOTE_QUORUM_NOT_MET`, because quorum sits at priority 20 and the cap at priority 33.
+
+### 2.6. Optimistic Concurrency on the Subscription Aggregate
+
+A subscription is the hub of this data model: renewal decisions, archival checks, authentication bindings, incidents and usage all hang off it, and several of them read subscription-level figures that another writer may already have moved. Two create operations therefore participate in optimistic concurrency control, and both key on the subscription's `version`.
+
+`POST /erm/subscriptions/{id}/renewal-decisions` requires `expected_subscription_version` as a non-optional body field, carrying the `version` the client last observed on that subscription. If the value does not equal the subscription's current `version`, the request is rejected with `ERR_STALE_SUBSCRIPTION_VERSION` (HTTP 412). The guard is load-bearing rather than decorative: a newly created decision legitimately supersedes any decision on the same subscription that is still `DRAFT` or `VOTING`, so without the check a client working from a stale view would silently discard offer figures another operator had already put to the member vote.
+
+`POST /erm/subscriptions/{id}/archival-checks` likewise requires `expected_subscription_version` as a non-optional body field carrying the client's last observed subscription `version`, and likewise rejects a mismatch with `ERR_STALE_SUBSCRIPTION_VERSION` (HTTP 412). Here the risk is evidentiary: a new check supersedes the value of an earlier `FAILED` check for the cancellation gate, and coverage is measured against the subscription's current entitled title count, so a stale view would let the collections office record coverage against a title count that a restructuring has already changed.
+
+Both of these creates also **increment the subscription's `version` by 1** as part of their own side effects, which means a client that opens two renewal decisions back to back must re-read the subscription between them. No other endpoint in this API takes a version field of any kind; every other write is unconditional with respect to concurrency.
+
+### 2.7. Cents, Percentages and Rounding Discipline
+
+All monetary amounts in this system are integers denominated in whole cents. There are no fractional cents anywhere in a stored field or a response body. Wherever a computation produces a non-integral cent amount, the result is rounded **half up** — a value whose fractional part is exactly one half rounds away from zero, so 1,250.5 cents becomes 1,251 cents.
+
+Percentage-valued fields — `inflation_cap_pct`, `vendor_requested_increase_pct`, `capped_increase_pct`, `applied_discount_pct`, `discount_pct` inside a tier band, `weight_pct` inside a trial criterion — are decimal numbers carried to two decimal places, and where a percentage is itself computed the same half-up rule to two decimal places applies. `coverage_pct` and the two trial score fields `provisional_score` and `final_score` are likewise two-decimal numbers rounded half up.
+
+The subtlety that trips implementations is **where** in a multi-step formula the rounding happens, and this specification pins it in every case. Rounding is applied at the points named by each calculation's narrative in §3 and nowhere else; in particular, no formula in this system rounds an intermediate sum that its narrative does not name, and no formula defers a named rounding step to the end. Two examples make the stakes concrete. The trial endorsement score rounds each criterion's weighted average to two decimals *before* the criteria are combined, and then rounds the combined figure again — summing unrounded averages and rounding once produces a different number. The per-member invoice allocation rounds each member's line to whole cents *first* and then reconciles the leftover cent or two against a single line — summing exact shares and rounding the total is explicitly forbidden because it distributes cents differently.
+
+`access_health_score` is the one purely integral quantity: it is computed from integer penalties and needs no rounding at all.
+
+### 2.8. The Logical Clock, Calendar Dates and Month Windows
+
+The server does not read wall-clock time for business decisions. It maintains a **logical clock** whose value before any client sets it is exactly `2026-08-01T00:00:00Z`, and which never falls back to real time. A `ConsortiumAdmin` moves it by supplying `to_iso8601`, an ISO 8601 instant that must be greater than or equal to the clock's current value; an earlier instant is rejected with `ERR_CLOCK_NOT_MONOTONIC` (422). The response reports the resulting `current_utc` together with `activated_subscription_ids` and `expired_subscription_ids`, the two lists of subscriptions the advance moved along the contract axis. Whenever a rule in this document speaks of "today", "the current date" or "the clock date", it means the calendar date of the logical clock's UTC value.
+
+Three temporal shapes recur and they are not interchangeable.
+
+A **calendar date** field holds a `YYYY-MM-DD` string: `start_date`, `end_date`, `target_term_start`, `target_term_end`, `term_start`, `term_end`, `activation_start_date` and `notice_deadline_date` are all of this kind.
+
+A **trial window** is half-open. The pair `start_date` and `end_date` denotes the interval that includes `start_date` and excludes `end_date`, so two trials whose windows abut exactly do not overlap.
+
+A **subscription term** is closed on both ends. `term_start` and `term_end` are both inside the term, and so is the subscription window `activation_start_date` through `term_end` used by the realm-capacity check. Month intervals derived from a term — the cost-per-use aggregation window and the legal range for a usage report's `period_month` — are likewise inclusive at both ends.
+
+### 2.9. Segregation of Duties and the Countersignature Principle
+
+Contract execution in this consortium separates the operator who proposes from the operator who commits. A `LicenseNegotiator` submits terms to the vendor, and the acting operator's `X-User-ID` is stamped onto the negotiation as `last_submitted_by_user_id`. Signing is a `ConsortiumAdmin` capability, and the signer's `X-User-ID` must differ from `last_submitted_by_user_id`; if the two are equal, the signature is refused with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). Because both identifiers are opaque, the comparison is a plain string comparison of the two header values, with no entity lookup on either side.
+
+The same instinct governs collective decisions. A renewal cannot be decided on the collections office's word alone: participating members cast ballots, and quorum must be reached before any branch is chosen. A cancellation cannot be executed on the collections office's word alone: an archival deposit check must have reached `VERIFIED` first, which requires the vendor to attest a title count and the office to confirm the coverage independently.
+
+### 2.10. The Committed-Spend Ledger and Member Standing
+
+Each member library carries a running ledger field, `annual_committed_cents`, defined as the sum of `tier_price_cents` across that member's commitment rows whose `status` is `CONFIRMED`. The field is maintained **incrementally** — every confirmation adds a price, every withdrawal and every release subtracts the same price back out — and the incremental maintenance must always agree with that definition. Summed across all members, `annual_committed_cents` equals the sum of `tier_price_cents` over every `CONFIRMED` commitment in the system; this is the invariant the compensating actions of §2.11 exist to protect. A newly registered member starts with `annual_committed_cents` of 0.
+
+Against that ledger sits `budget_ceiling_cents`, the hard annual ceiling the member declares at registration, and `standing`, a derived enum with exactly two values. A member is `IN_GOOD_STANDING` while `annual_committed_cents` is less than or equal to `budget_ceiling_cents`, and becomes `OVER_COMMITTED` the moment `annual_committed_cents` exceeds `budget_ceiling_cents`. The flag is not sticky: when a withdrawal or a release brings the ledger back to a value less than or equal to the ceiling, `standing` returns to `IN_GOOD_STANDING`. A newly registered member starts `IN_GOOD_STANDING`.
+
+Standing gates the three forward-looking things a librarian can do — pledging participation, setting up a new trial, and opening a `DRAFT` trial — each refused with `ERR_MEMBER_OVER_COMMITTED` (409) while the member is `OVER_COMMITTED`. It gates nothing else. In particular, standing never excludes a member from pricing or from participant counting: an `OVER_COMMITTED` member's confirmed commitment still carries a price and still counts as a participant when the tier band is selected for everybody else.
+
+### 2.11. Cascades, Conserved Quantities and Compensating Actions
+
+Several operations in this system set off a chain in which each link is caused by the mutation the previous link performed, not by the original request. Two such chains run four levels deep — one from signing a negotiation, one from reopening an access incident — and both are described in full in §3. The discipline they share is worth stating once in general terms.
+
+A cascade propagates **only where its precondition holds at the moment the hop runs**. When a signature drives a member over its budget ceiling and that member's `standing` flips to `OVER_COMMITTED`, the flip withdraws that member's trials that are in `DRAFT` and leaves every other trial of that member untouched — `ACTIVE`, `CLOSED` and terminal trials are not affected. A hop that finds no eligible rows is not an error; it simply does nothing.
+
+Every hop that changes a row refreshes that row's `updated_at` and increments its `version`, exactly as §2.4 requires, including hops the client never named.
+
+Two operations exist purely to undo another operation, and each must restore the conserved quantity its counterpart moved. Withdrawing a `CONFIRMED` commitment subtracts precisely the `tier_price_cents` that the confirmation added, then clears `tier_price_cents` back to null. Reverting an executed restructuring puts back precisely the titles and precisely the price delta the execution moved, leaving the subscription's entitled title count and negotiated price exactly as they were before execution. In both cases "precisely" means the amount that was actually applied, not a freshly recomputed one.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Registering the Landscape: Members, Publishers and Packages
+
+Nothing can be licensed until the collections office has described who is buying, who is selling, and what is on offer. All three registrations are `ConsortiumAdmin` capabilities, and all three answer 201 with the created resource.
+
+A member library is registered with its institution `name`, its `fte_count` — the full-time-equivalent enrolled population, which must be at least 1 — its `carnegie_class`, and its `budget_ceiling_cents`, which must be at least 0. The `carnegie_class` is one of `R1`, `R2`, `MASTERS` or `BACCALAUREATE`; it is not cosmetic, because it selects a multiplier in the consortium pricing formula, just as `fte_count` selects a size multiplier and later becomes the weight by which the invoice is divided. A freshly registered member has `annual_committed_cents` of 0 and `standing` of `IN_GOOD_STANDING`, as §2.10 describes.
+
+A publisher or aggregator is registered with its legal `name` and two optional compliance attributes. `archival_agency_code` names the third-party preservation agency the vendor deposits its content with — one of `PORTICO`, `CLOCKSS` or `LOCKSS` — and defaults to null, meaning the vendor deposits nowhere. `vpat_on_file` is a boolean that defaults to false and records whether a current accessibility conformance report (a VPAT) is held by the collections office. Both fields sit quietly in the vendor record for months and then decide whether a contract can be signed and whether a subscription can ever be cancelled with archival protection.
+
+A licensable package is registered against its vendor by supplying `vendor_id` together with the package `name`, its `base_list_price_cents` (at least 1), its `title_count` (at least 1), and a block of negotiating parameters that bound what the consortium will accept and what the vendor is willing to give. `inflation_cap_pct` is the maximum annual price increase the collections office will tolerate at renewal, a two-decimal percentage between 0 and 25 inclusive. `cancellation_notice_days` is the number of days before a term ends by which a cancellation must be executed, and must be at least 0. Three ceiling fields record the strongest terms the vendor will offer: `perpetual_access_mode_offered` is one of `NONE`, `POST_CANCELLATION_SUBSET` or `FULL_ARCHIVE`; `ill_mode_offered`, governing interlibrary loan, is one of `PROHIBITED`, `PRINT_ONLY` or `SECURE_ELECTRONIC`; and `text_mining_offered` is a boolean recording whether a text and data mining right is available at all.
+
+The last registration field is the consortium's discount schedule, `tier_bands`. It is an ordered array of objects, each carrying a `min_participants` integer and a `discount_pct` percentage. At least one band must be supplied, the first band must have a `min_participants` of exactly 1 so that a lone participant is always priced, and `min_participants` must be strictly increasing across the array. When the schedule is applied, the system selects the **single** band with the largest `min_participants` that is less than or equal to the participant count — never the first matching band, never a blend of bands.
+
+Reading back is broadly permitted: all five roles may read an individual member, vendor or product, and may page through the product catalogue. The catalogue listing accepts an optional `vendor_id` filter alongside `limit` and `offset`.
+
+### 3.2. Trials: Windows, Stakeholder Feedback and the Endorsement Score
+
+Before the consortium negotiates for a package, a member library trials it. A `MemberLibrarian` sets up a trial against a product by supplying `member_id` — which must equal the librarian's own `X-User-ID` — the half-open window `start_date` and `end_date`, and the `criteria` the trial will be judged on. The trial is created in `DRAFT` status, with `provisional_score` and `final_score` both null, `feedback_count` and `distinct_stakeholder_group_count` both 0, and `quorum_penalty_applied` false.
+
+The `criteria` array carries between one and six entries, each an object with a `code` and a `weight_pct`. Each `code` is one of `CONTENT_FIT`, `INTERFACE`, `ILL_TERMS`, `TEXT_MINING`, `ACCESSIBILITY` or `PRICE_VALUE`, no code may repeat, and the `weight_pct` values must sum to exactly 100 — a schedule summing to 99.99 or 100.01 is `ERR_INVALID_REQUEST`. The **order of the array is significant** and is preserved, because the endorsement score iterates the criteria in exactly the order they were supplied.
+
+A member library may not trial the same package back to back. Setup is refused with `ERR_TRIAL_WINDOW_CONFLICT` (409) when any existing trial on the same product and member pair — in *any* status whatsoever, including `WITHDRAWN`, `DECLINED` and `ENDORSED` — conflicts with the requested window. A conflict exists when both of two conditions hold: the new trial's `start_date` falls strictly before the existing trial's `end_date` advanced by a thirty-day cooldown buffer, and the existing trial's `start_date` falls strictly before the new trial's `end_date`. In plain terms, windows may not overlap, and a new window must additionally clear the previous window's end by a full month of cooldown. Trials can be paged with optional `product_id`, `member_id` and `status` filters.
+
+Opening a trial advances it `DRAFT → ACTIVE` and is available only to the librarian that owns it. Three conditions guard the opening: the trial must be in `DRAFT`, the owning member must be `IN_GOOD_STANDING`, and the logical clock's calendar date must fall strictly before the trial's `end_date` — there is no point opening a window that has already closed. Closing a trial advances it `ACTIVE → CLOSED`, is likewise restricted to the owning librarian, and does real work on the way: it stamps `provisional_score` and refreshes `feedback_count` and `distinct_stakeholder_group_count`.
+
+Stakeholder feedback arrives one row at a time, submitted by the owning `MemberLibrarian` on behalf of a respondent. Each submission carries the respondent's `stakeholder_group` — `FACULTY`, `GRADUATE`, `UNDERGRADUATE` or `LIBRARIAN` — the `criterion_code` being scored, an integer `score` on a 0 to 100 scale inclusive, and an optional free-text `comment` that defaults to null. The row is bound to its trial through `trial_id`. If `criterion_code` is not one of the codes the trial declared, the submission is refused with `ERR_UNKNOWN_CRITERION` (422). Feedback is accepted while the trial is `ACTIVE` and also during the post-close grace period while it is `CLOSED`; a submission against a `DRAFT` trial or a trial in any terminal status is `ERR_TRIAL_INVALID_STATE` (409). On acceptance the server stamps two fields the client cannot set: `submitted_during_status`, holding the trial's status at the instant of acceptance and therefore either `ACTIVE` or `CLOSED`, and `submitted_by_user_id`, holding the acting librarian's `X-User-ID` for audit only — that identifier never influences a price or an ordering. Each acceptance also refreshes the trial's `feedback_count` (the number of feedback rows on the trial) and `distinct_stakeholder_group_count` (the number of distinct `stakeholder_group` values among them). Feedback rows of a trial can be paged by the collections office and by librarians.
+
+The **endorsement score** is the heart of the trial workflow, and it is computed twice with deliberately different inputs. Both computations follow the same six steps.
+
+1. Walk the trial's `criteria` in the exact order of the input array.
+2. For each criterion, gather the feedback rows of this trial whose `criterion_code` equals that criterion's `code` and whose `submitted_during_status` is one of the statuses the variant includes.
+3. If no row matches, that criterion's average is 0.00. The criterion is **not** dropped from the weighted sum — it contributes a zero, which is materially different from renormalising the remaining weights.
+4. If rows do match, form a weighted average using each row's stakeholder weight: `FACULTY` counts 1.5, `LIBRARIAN` counts 1.25, `GRADUATE` counts 1.0 and `UNDERGRADUATE` counts 0.5. The numerator is the sum, over the matching rows, of the row's stakeholder weight multiplied by its `score`; the denominator is the sum of those same stakeholder weights. Divide, then round half up to two decimal places. This per-criterion rounding happens **before** the criteria are combined.
+5. Combine the criterion averages into a raw score: for each criterion, multiply its rounded average by that criterion's `weight_pct` and divide by 100, then add the results together. Round the total half up to two decimal places.
+6. Apply the quorum penalty if — and only if — the variant calls for it, as described below.
+
+The **provisional** computation runs when the trial is closed and is written to `provisional_score`. It includes only feedback rows whose `submitted_during_status` is `ACTIVE`, and it never applies the quorum penalty.
+
+The **final** computation runs when the collections office evaluates the trial and is written to `final_score`. It includes feedback rows whose `submitted_during_status` is `ACTIVE` **or** `CLOSED`, so scores gathered during the post-close grace period do count. It then applies the quorum penalty: if the trial's `distinct_stakeholder_group_count` is fewer than 3 distinct stakeholder groups, the score is multiplied by 0.90 and the product is rounded half up to two decimal places again. Whether the penalty fired is recorded on the trial as `quorum_penalty_applied`.
+
+Evaluation is a `ConsortiumAdmin` capability and forks the trial out of `CLOSED` on a single threshold comparison. The trial must be in `CLOSED`, and its `feedback_count` must be at least 3 rows — fewer is `ERR_INSUFFICIENT_FEEDBACK` (409). Whichever way the fork goes, the same two fields are written first: `final_score` receives the final computation's result and `quorum_penalty_applied` records whether the 0.90 multiplier was applied. Then, if `final_score` is greater than or equal to 70.00, the trial advances `CLOSED → ENDORSED`; a final score of exactly 70.00 endorses. If `final_score` is strictly below 70.00, the trial advances `CLOSED → DECLINED` instead. Both are terminal, as is `WITHDRAWN`, and only `ENDORSED` unlocks a signature downstream.
+
+One trial transition is never requested by a client. When a signature pushes a member's committed spend past its budget ceiling and the member's `standing` flips to `OVER_COMMITTED`, every trial of that member that is still in `DRAFT` moves `DRAFT → WITHDRAWN` — a bookkeeping mercy that stops a library from evaluating content it can no longer afford. Trials of that member in `ACTIVE`, `CLOSED` or any terminal status are untouched.
+
+### 3.3. Pledging Participation and Consortium Tier Pricing
+
+Participation in a consortium purchase is a many-to-many affair: a member pledges to a package, and the number of members that pledge is what earns everybody the discount. A `MemberLibrarian` pledges by naming its own `member_id` against a product; the pledge is created with `status` of `PLEDGED`, `subscription_id` of null and `tier_price_cents` of null, because a pledge is not yet attached to any contract.
+
+Two gates precede a pledge. A member may hold only one live pledge per package, so if a commitment row already exists on the same product and member pair with `status` of `PLEDGED` or `CONFIRMED`, the request is refused with `ERR_DUPLICATE_COMMITMENT` (409) — rows already `WITHDRAWN` or `RELEASED` do not block a fresh pledge. And a pledge must fit the budget: the member's current `annual_committed_cents` plus the projected price of the new pledge must be less than or equal to `budget_ceiling_cents`, otherwise `ERR_BUDGET_CEILING_EXCEEDED` (409). Note the asymmetry that makes this system interesting — the *projected* price is what the ceiling check uses at pledge time, but it is the *settled* price that eventually lands in the ledger, and the two are not always equal.
+
+The pricing formula, **member tier price**, takes exactly one member and one product and produces a whole-cent amount. It runs in seven steps.
+
+1. Determine the participant count. This is the one input that differs between the formula's two variants, and it is described immediately after these steps.
+2. Select the discount band: the single entry of the product's `tier_bands` whose `min_participants` is the largest value less than or equal to the participant count.
+3. Determine the size factor from the member's `fte_count`: a population below 5,000 gives a factor of 0.60; a population of 5,000 or more but below 20,000 gives 0.85; a population of 20,000 or more gives 1.15.
+4. Determine the classification factor from the member's `carnegie_class`: `R1` gives 1.10, `R2` gives 1.00, `MASTERS` gives 0.85 and `BACCALAUREATE` gives 0.75.
+5. Compute the gross amount: the product's `base_list_price_cents`, multiplied by the size factor, multiplied by the classification factor, multiplied by one minus the selected band's `discount_pct` divided by 100.
+6. Compute the fairness ceiling: the product's `base_list_price_cents` multiplied by 60 and divided by 100 — that is, no single member ever pays more than sixty percent of the whole package's list price — rounded half up to whole cents.
+7. Round the gross amount half up to whole cents, take the smaller of that rounded gross and the rounded ceiling, and then take the larger of the result and the consortium's floor of 150,000 cents (fifteen hundred dollars). Both roundings happen **before** the clamping; the clamp is never applied to an unrounded figure and no rounding is applied after it.
+
+The two variants differ only in step 1, and the divergence is the point.
+
+- The **projection** variant runs when a member pledges, and its result is stamped on the commitment as `projected_price_cents`. Its participant count is the number of commitment rows on the product whose `status` is `PLEDGED` or `CONFIRMED`, **including the row being created**. Early pledgers therefore see a small participant count, land in a lower band of `tier_bands`, and are quoted a higher price than they will eventually pay.
+- The **settled** variant runs when a signature confirms the pledges, and again on renewal execution, restructure execution and restructure reversal; its result is stamped as `tier_price_cents`. Its participant count is the number of commitment rows on the product whose `status` is `CONFIRMED`, **evaluated after the whole confirmation pass has run**, so every co-participant is counted. The same member and the same product therefore yield different prices under the two variants whenever the two counts fall in different bands.
+
+Whichever variant produced the latest price on a commitment row also refreshes two observability fields: `applied_discount_pct` records the `discount_pct` of the band that variant selected, and `participant_count_at_pricing` records the participant count that variant counted. Together they make the divergence auditable rather than mysterious. Members are never excluded from either count by their standing — an `OVER_COMMITTED` member's confirmed commitment still prices and still counts as a participant for everybody else.
+
+Withdrawal is the librarian's escape hatch and has two shapes. A pledge that is still `PLEDGED` simply moves `PLEDGED → WITHDRAWN` with no financial consequence, since it never entered the ledger. A commitment that has already been `CONFIRMED` moves `CONFIRMED → WITHDRAWN` only while its subscription's `contract_status` is `PENDING_ACTIVATION` or `ACTIVE`; on any other contract state the request is `ERR_COMMITMENT_INVALID_STATE` (409). That withdrawal is the exact compensating action of the confirmation: it decreases the owning member's `annual_committed_cents` by precisely the `tier_price_cents` the confirmation added, re-derives `standing` — restoring `IN_GOOD_STANDING` if the ledger now sits at or below `budget_ceiling_cents` — and then clears `tier_price_cents` back to null. Rows already `WITHDRAWN` or `RELEASED` cannot be withdrawn again. Commitments are readable individually, showing both the projected and the settled price side by side, and can be paged with optional `product_id`, `member_id`, `subscription_id` and `status` filters.
+
+### 3.4. Negotiating the License
+
+A negotiation is opened by the collections office and is anchored on two things: the package it concerns, named by `product_id`, and the trial whose endorsement will gate the eventual signature, named by `trial_id`. Alongside those the office states what it wants: the requested term, as the calendar dates `target_term_start` and `target_term_end`, and four term requests. `requested_ill_mode` is one of `PROHIBITED`, `PRINT_ONLY` or `SECURE_ELECTRONIC`. `requested_text_mining` is a boolean. `requested_accessibility_conformance` is one of `NONE`, `VPAT_PARTIAL` or `WCAG_2_1_AA`. `requested_perpetual_access` is one of `NONE`, `POST_CANCELLATION_SUBSET` or `FULL_ARCHIVE`. The negotiation is created in `DRAFTING` with `round_count` of 0, all four `granted_` fields null, `vendor_counter_price_cents` and `agreed_price_cents` null, and both `last_submitted_by_user_id` and `last_vendor_disposition` null.
+
+From there the negotiation cycles. A `LicenseNegotiator` sends the current draft to the publisher, advancing `DRAFTING → VENDOR_REVIEW`; the transition increments `round_count` by 1 and stamps the acting negotiator's `X-User-ID` into `last_submitted_by_user_id`. The publisher's representative answers, and the answer forks on a `disposition` of `ACCEPT` or `COUNTER`. If the answer is a counter, the negotiator revises the consortium's asks and the negotiation returns `COUNTERED → DRAFTING`, closing one full cycle. The loop is bounded: both sending to the vendor and revising after a counter require `round_count` to be strictly less than 3 rounds, and a negotiation that has already burned its three rounds is refused with `ERR_NEGOTIATION_ROUND_LIMIT` (409).
+
+The vendor's answer is a `VendorRep` capability and is admissible only from `VENDOR_REVIEW`; the acting representative's `X-User-ID` must equal the `vendor_id` of the negotiation's product. Whichever disposition it carries, the answer states all four granted terms — `granted_ill_mode`, `granted_text_mining`, `granted_accessibility_conformance` and `granted_perpetual_access` — and those four values replace whatever the negotiation held before. A publisher may not concede in the negotiation what it never put on the table for the package: on any vendor response, `granted_ill_mode` must be no stronger than the product's `ill_mode_offered` on the ordering where `PROHIBITED` is weakest, `PRINT_ONLY` is stronger and `SECURE_ELECTRONIC` is strongest; `granted_perpetual_access` must be no stronger than the product's `perpetual_access_mode_offered` on the ordering where `NONE` is weakest, `POST_CANCELLATION_SUBSET` is stronger and `FULL_ARCHIVE` is strongest; and `granted_text_mining` must be false whenever the product's `text_mining_offered` is false. Equality is permitted at both ceilings — granting exactly what the product offers is fine. A breach is `ERR_TERM_EXCEEDS_PRODUCT_OFFER` (422).
+
+A `COUNTER` answer must carry `counter_price_cents`, present and at least 1. That amount is recorded as `vendor_counter_price_cents`, `last_vendor_disposition` becomes `COUNTER`, and the negotiation advances `VENDOR_REVIEW → COUNTERED`. An `ACCEPT` answer instead carries `accepted_price_cents`, which is locked into `agreed_price_cents`; `last_vendor_disposition` becomes `ACCEPT` and the negotiation advances `VENDOR_REVIEW → AGREED`. Negotiations can be read individually — exposing `round_count`, the granted terms and the signer-segregation audit field — and paged with optional `product_id`, `trial_id` and `status` filters.
+
+Signing is where five independent gates converge, and it is a `ConsortiumAdmin` capability that answers 201 rather than 200 because its whole purpose is to bring a new resource into existence. The negotiation must be in `AGREED`. The trial named by the negotiation's `trial_id` must be in `ENDORSED`, otherwise `ERR_TRIAL_NOT_ENDORSED` (409). Accessibility must be genuinely settled: `granted_accessibility_conformance` must not be `NONE`, **and** the product's vendor must have `vpat_on_file` set to true — either failing gives `ERR_ACCESSIBILITY_TERM_MISSING` (422). The signer's `X-User-ID` must differ from `last_submitted_by_user_id`, otherwise `ERR_SEGREGATION_OF_DUTIES` (403). And at least one commitment row on the negotiation's product must still be in `PLEDGED`, because a consortium purchase with no participants has nobody to invoice. The signature's own request body carries a single field, `activation_start_date`, the calendar date on which the resulting contract will come alive.
+
+### 3.5. Signing: the Four-Hop Confirmation Cascade, then Activation and Expiry
+
+A signature does far more than move a negotiation to `SIGNED`. It sets off four hops, each caused by the mutation the previous hop performed rather than by the signature itself, running from the negotiation through a new subscription, through the pledges, into the member ledgers, and finally back out into the trials.
+
+**Hop one** creates the subscription. Its `negotiation_id` points back at the negotiation just signed and its `product_id` is denormalised from that negotiation for direct lookups. It opens on both state axes at their initial values — `contract_status` of `PENDING_ACTIVATION` and `access_status` of `UNCONFIGURED`. Its `negotiated_price_cents` is taken from the negotiation's `agreed_price_cents`. Its `term_start` and `term_end` are taken from the negotiation's `target_term_start` and `target_term_end`, and its `activation_start_date` is the date supplied on the signature. Its `entitled_title_count` starts as the product's `title_count`. Its `perpetual_access_mode` is locked from the negotiation's `granted_perpetual_access` and never changes thereafter — this single field decides, months later, whether cancellation leaves the consortium with archived content or with nothing. Its `notice_deadline_date` is computed as `term_end` minus the product's `cancellation_notice_days`, expressed as a calendar date. Its derived counters start clean: `access_health_score` of 100, `degrade_count` of 0, `sla_credit_cents` of 0 and `renewal_term_count` of 0.
+
+**Hop two** is caused by that creation and confirms participation. Every commitment row on the signed negotiation's product whose `status` is `PLEDGED` has its `subscription_id` set to the new subscription's `id`, has `tier_price_cents` stamped by the settled variant of the member tier price, has `applied_discount_pct` and `participant_count_at_pricing` refreshed, and advances `PLEDGED → CONFIRMED`. Because the settled variant counts `CONFIRMED` rows after the entire pass has run, all the newly confirmed members count each other, and the price each of them settles at is generally lower than the projection they were quoted at pledge time.
+
+**Hop three** is caused by each of those confirmations: the confirmed commitment's `tier_price_cents` is added to `annual_committed_cents` on the `Member` identified by that commitment's `member_id`.
+
+**Hop four** is caused by those ledger movements. Any member whose `annual_committed_cents` now exceeds its `budget_ceiling_cents` has `standing` flipped to `OVER_COMMITTED`, and that flip in turn transitions every trial belonging to that member whose `status` is `DRAFT` to `WITHDRAWN`. Members whose ledger still sits at or below the ceiling are left `IN_GOOD_STANDING` and their trials are untouched.
+
+Once the subscription exists it lives on two independent axes. The **contract axis** is driven by time and by renewal decisions; the **access axis** is driven by authentication verification and incident volume. They evolve without reference to each other except at exactly one point — cancellation execution — where the contract axis reaches in and writes the access axis.
+
+Time enters the system only through the logical clock, and every advance of the clock sweeps the subscription table twice. Any subscription in `PENDING_ACTIVATION` whose `activation_start_date` is less than or equal to the new clock date advances `PENDING_ACTIVATION → ACTIVE`. Any subscription in `ACTIVE` whose `term_end` is strictly earlier than the new clock date advances `ACTIVE → EXPIRED`, and expiry writes the access axis according to the term locked at signing: `access_status` becomes `SUSPENDED` when `perpetual_access_mode` is `NONE`, and `POST_CANCELLATION` otherwise. Both sweeps evaluate candidate subscriptions in `created_at` ascending order, and the identifiers of the rows each sweep touched come back on the response as `activated_subscription_ids` and `expired_subscription_ids`. `CANCELLED` and `EXPIRED` are the contract axis's terminal states. Subscriptions are readable individually — exposing both axes, the access health score, the accrued SLA credit, the entitled title count and the notice deadline — and can be paged with optional `product_id`, `negotiation_id`, `contract_status` and `access_status` filters.
+
+### 3.6. Bringing Access Online and Keeping It There
+
+A signed contract that nobody can log into is worthless, so the access services team configures an authentication binding for the subscription. An `AccessEngineer` supplies the `auth_method` — one of `IP_RANGE`, `EZPROXY`, `SHIBBOLETH` or `OPENATHENS` — an `auth_realm_code` naming the shared federation realm the binding will live in, an `ip_ranges` array of CIDR strings registered with the publisher, and, when and only when `auth_method` is `EZPROXY`, a `proxy_prefix` giving the off-campus proxy URL prefix. `ip_ranges` may not be empty and `proxy_prefix` defaults to null for every method other than `EZPROXY`; a missing `proxy_prefix` on an `EZPROXY` binding is `ERR_INVALID_REQUEST` (422). The binding records the `subscription_id` it configures and is created with `verification_status` of `PENDING` and `last_probe_result` of null. Configuring authentication requires the subscription's `contract_status` to be `ACTIVE`; on any other contract state the attempt is `ERR_SUBSCRIPTION_CONTRACT_INVALID_STATE` (409).
+
+A federation realm is a finite resource, and this is the one capacity constraint in the system. Before a new binding is admitted, the system counts the existing authentication bindings that share the same `auth_realm_code`, whose `verification_status` is either `PENDING` or `VERIFIED`, and whose subscription's window overlaps the new subscription's window. A subscription's window for this purpose runs from its `activation_start_date` to its `term_end` and is closed at both ends, so windows that merely touch at a single day do count as overlapping. Bindings whose `verification_status` is `FAILED` are not counted at all. If that count is already 3 or more, the request is refused with `ERR_REALM_CAPACITY_EXCEEDED` (409); it is admitted only while the count is strictly below 3 overlapping bindings. The bindings of a subscription can be paged by the collections office, by librarians and by engineers.
+
+Verification is how a binding earns its keep. An engineer runs an on-campus and off-campus access probe and records the outcome as `probe_result`, one of `PASS`, `FAIL_OFF_CAMPUS` or `FAIL_ON_CAMPUS`. The probe is admissible while the binding's `verification_status` is `PENDING` or `FAILED`, and requires the subscription's `contract_status` to be `ACTIVE`; a binding that is already `VERIFIED` cannot be re-probed and yields `ERR_AUTH_CONFIG_INVALID_STATE` (409). The two outcomes are treated with deliberate symmetry in what they record and deliberate asymmetry in what they cascade.
+
+- A `PASS` sets `verification_status` to `VERIFIED` and `last_probe_result` to `PASS`, whether the binding was previously `PENDING` or `FAILED`. It also reaches into the subscription: `access_status` advances to `CONFIGURED`, and `access_health_score` is reset to 100. From that reset point, future incidents decay the score downwards again.
+- A `FAIL_OFF_CAMPUS` or `FAIL_ON_CAMPUS` sets `verification_status` to `FAILED` and `last_probe_result` to the reported outcome. It touches nothing on the subscription — `access_status` stays exactly where it was, which for a first probe means it stays `UNCONFIGURED`, and `access_health_score` is not reset. A failed binding can be re-probed as often as necessary.
+
+Once access is configured, member libraries report what breaks. A `MemberLibrarian` files an access incident against a subscription with its own `member_id`, a `symptom_code` of `OFF_CAMPUS_DENIED`, `WALK_IN_BLOCKED`, `PROXY_LOOP` or `SAML_ATTRIBUTE_MISSING`, and the boolean `off_campus`, true when the failure was observed from outside the registered IP ranges. The incident opens in `OPEN` with `root_cause_code` and `remedy_code` null and `reopen_count` of 0. An engineer then records the root cause, advancing the incident `OPEN → DIAGNOSED` and writing `root_cause_code` — one of `IP_RANGE_STALE`, `PROXY_MISCONFIGURED`, `VENDOR_SIDE` or `ENTITLEMENT_MISSING`. Resolution advances `DIAGNOSED → RESOLVED` and writes `remedy_code` — one of `IP_RANGE_UPDATED`, `PROXY_FIXED`, `VENDOR_TICKET_CLOSED` or `ENTITLEMENT_LOADED`. If the member still cannot reach the resource, the owning librarian reopens it, advancing `RESOLVED → REOPENED`; a reopened incident is re-diagnosed by an engineer, advancing `REOPENED → DIAGNOSED` and closing the cycle `RESOLVED → REOPENED → DIAGNOSED → RESOLVED`. Incidents can be read individually and paged with optional `subscription_id`, `member_id` and `status` filters.
+
+The **access health score** is a decay function recomputed from scratch over *every* incident row on the subscription, regardless of status, whenever an incident is created, reopened or resolved. Its computation is a single accumulating penalty:
+
+- Each incident contributes a base penalty of 8 points when its `off_campus` flag is true, and 4 points when it is false. An off-campus failure therefore costs exactly twice what an on-campus failure costs, because remote access is where the consortium's users actually live.
+- Each incident additionally contributes 15 points for every reopen it has suffered — that is, 15 multiplied by its `reopen_count`.
+- Each incident whose `status` is exactly `RESOLVED` gives back 5 points of recovery. An incident that has been reopened is no longer `RESOLVED`, so it forfeits that recovery while keeping both its base penalty and its accumulated reopen penalties.
+
+The score is then 100 minus the accumulated penalty, clamped to the closed range from 0 to 100. It is an integer throughout — no rounding is involved. A verification `PASS` short-circuits all of this and simply sets the score to 100.
+
+Two threshold comparisons on that score drive the access axis, and their inclusivity differs. When a recomputation triggered by an incident report or a reopen leaves the score **strictly below** 60 while the subscription's `access_status` is `CONFIGURED`, the axis advances `CONFIGURED → DEGRADED`. When a recomputation triggered by a resolution leaves the score **greater than or equal to** 60 while the axis is `DEGRADED`, it advances `DEGRADED → CONFIGURED`; a recomputed score of exactly 60 restores `CONFIGURED`.
+
+Entering `DEGRADED` is not merely a label change — it is the origin of a financial obligation, and it is the second and third hop of the cascade that a reopen sets off. A reopen's **first hop** increments the incident's `reopen_count` by 1, sets its `status` to `REOPENED` and clears `remedy_code` back to null. The **second hop** is caused by that mutation: the subscription's `access_health_score` is recomputed, and if the recomputed score is below 60 while the axis is `CONFIGURED`, the axis moves to `DEGRADED` and the subscription's `degrade_count` is incremented by 1. The **third hop** is caused by that degradation: an SLA credit accrues. Each entry into `DEGRADED` adds to `sla_credit_cents` an amount equal to two percent of the subscription's current `negotiated_price_cents`, rounded half up to whole cents — but only while the newly incremented `degrade_count` is less than or equal to 3 events. From the fourth degradation onward `degrade_count` keeps climbing while `sla_credit_cents` stays exactly where it is, so a chronically broken package cannot be milked indefinitely. The **fourth hop** is caused by the credit movement: every renewal decision on this subscription whose `status` is `VOTING` has its offer recomputed, refreshing `sla_credit_applied_cents` and `offer_price_cents` so that members voting right now see the credit they have actually earned. Creating a new incident follows the same second and third hops when it pushes the score below the threshold, and it likewise triggers the offer refresh on `VOTING` decisions through the credit accrual.
+
+### 3.7. Usage Statistics, Cost-Per-Use and the Invoice Split
+
+Publishers file usage, not libraries. A `VendorRep` reports one month of COUNTER statistics for one member library on one subscription, supplying that library's `member_id`, the `period_month` as a four-digit year and two-digit month joined by a hyphen, and three non-negative counters: `full_text_requests` (the COUNTER total item requests, and the denominator of every cost-per-use figure), `searches` (regular searches) and `denials` (no-license denials). Usage rows are append-only ledger entries; they carry no `updated_at` and no `version`.
+
+Two rules police the filing. The month must lie inside the subscription's term: `period_month` must fall within the closed month interval running from the month of `term_start` to the month of `term_end`, and a month outside that interval is `ERR_USAGE_PERIOD_OUT_OF_TERM` (422). And no two rows may describe the same subscription, member and month; a repeat is `ERR_DUPLICATE_USAGE_REPORT` (409). Usage rows are readable individually and can be paged with optional `subscription_id`, `member_id` and `period_month` filters.
+
+**Cost-per-use** answers the question the renewal ballot turns on: what did each successful full-text request actually cost? The analysis is available to the collections office and to member libraries and accepts one optional query parameter, `as_of_month`, which sets the far end of the aggregation window. It is computed as follows. The window starts at the year-and-month prefix of the subscription's `term_start`. It ends at `as_of_month` when the request supplies it, and otherwise at the year-and-month prefix of the logical clock's calendar date. The window is **inclusive at both ends**. Every usage row of this subscription whose `period_month` falls inside that window contributes, no matter which member filed it — all members are pooled — and rows for months outside the window are excluded even though they belong to the same subscription. The pooled `usage_count` is the sum of `full_text_requests` across the contributing rows, and `settled_invoice_total_cents` is the subscription's current `negotiated_price_cents`. If `usage_count` is 0, the response reports a `usage_count` of 0, a `cost_per_use_cents` of null, a `band` of `NO_USE` and the `settled_invoice_total_cents` as stated — division is never attempted and no error is raised. Otherwise `cost_per_use_cents` is `settled_invoice_total_cents` divided by `usage_count`, rounded half up to whole cents. The `band` reported alongside it is `EXCELLENT` when `cost_per_use_cents` is strictly below 500 cents, `GOOD` when it is 500 cents or more but strictly below 1,500 cents, and `POOR` at 1,500 cents or above.
+
+**Invoice allocation** answers the other money question: who owes what. The analysis, also open to the collections office and to member libraries, divides the subscription's `negotiated_price_cents` across the commitment rows on that subscription whose `status` is `CONFIRMED`. Rows that are `PLEDGED`, `WITHDRAWN` or `RELEASED` are excluded from both the amounts and the weighting denominator entirely. The lines are ordered by the owning member's `created_at` ascending, and where two lines share a member creation instant, by the commitment's own `created_at` ascending. The denominator is the sum of `fte_count` over the members behind those lines.
+
+The allocation then proceeds in a pinned order that matters more than it looks.
+
+1. For each line, compute its exact unrounded share: the subscription's `negotiated_price_cents` multiplied by that member's `fte_count`, divided by the summed `fte_count` of all lines. Keep this value exact — it is the fractional part of these exact shares that decides the residual below.
+2. Round **each line individually** to whole cents, half up. Summing the exact shares and rounding the total instead is explicitly forbidden, because it distributes the cents differently.
+3. Compute the residual: the subscription's `negotiated_price_cents` minus the sum of the rounded lines. The residual may be positive or negative.
+4. Assign the entire residual to a single line — the line whose exact unrounded share had the **largest fractional part**, where the fractional part is that share minus its whole-number floor. If two lines tie on fractional part, the tie is broken by the owning member's `created_at` ascending, and then by the commitment's `created_at` ascending. That line's amount is adjusted by the residual.
+
+The response reports `total_cents` (the subscription's negotiated price), `lines` (one object per contributing commitment, each carrying `commitment_id`, `member_id`, `allocated_cents` and `fte_weight`), `residual_cents`, and `residual_assigned_commitment_id` naming the line that absorbed the residual. The invariant the whole procedure exists to guarantee is that the `allocated_cents` of all lines sum exactly to `total_cents`.
+
+### 3.8. Renewal: Ballots, the Offer Price and the Three-Way Fork
+
+Every term ends with a decision, and the collections office frames it. A renewal decision is opened against a subscription with a `recommended_action` of `RENEW`, `CANCEL` or `RESTRUCTURE`, the `vendor_requested_increase_pct` the publisher has asked for (a two-decimal percentage of at least 0), and the `expected_subscription_version` that §2.6 requires. When the recommendation is a restructuring, the office may also supply `titles_out` and `titles_in`, two arrays of title identifier strings that default to empty. The decision is created in `DRAFT` with `resolved_action` null, `capped_increase_pct`, `cost_per_use_cents`, `cost_per_use_band` and `offer_price_cents` all null, `loyalty_credit_cents` and `sla_credit_applied_cents` both 0, `ballots` empty, `yes_count` 0, `quorum_met` false and `delta_price_cents` null.
+
+Creating a decision also housekeeps: any earlier decision on the same subscription whose `status` is `DRAFT` or `VOTING` is moved to `SUPERSEDED`, and the subscription's own `version` is incremented by 1. Decisions of a subscription can be paged, with an optional `status` filter, by the collections office and by member libraries.
+
+Putting the decision to the members advances it `DRAFT → VOTING`. Two conditions guard it: the subscription's `contract_status` must be `ACTIVE`, and at least one commitment row on that subscription must be `CONFIRMED` — there must be somebody entitled to vote. The transition also stamps a **preliminary offer**, computing `cost_per_use_cents`, `cost_per_use_band`, `capped_increase_pct`, `loyalty_credit_cents`, `sla_credit_applied_cents` and `offer_price_cents` so that members can see, before they vote, what renewal would cost.
+
+A participating member then casts its ballot, naming its own `member_id` and its `ballot`. Two checks precede acceptance. The member must actually be a participant — it must hold a commitment row with `status` of `CONFIRMED` on the decision's subscription, otherwise `ERR_MEMBER_NOT_PARTICIPANT` (409). And it must not have voted already: at most one entry per member is permitted on a decision, and a second attempt is `ERR_DUPLICATE_BALLOT` (409). Acceptance appends an object to `ballots` carrying the `member_id`, the `ballot` as cast, and `cast_at`, the logical clock instant of the vote in ISO 8601 UTC form with three fractional digits. Two counters are then recomputed: `yes_count` is the number of `ballots` entries whose `ballot` is `YES`, and `quorum_met` becomes true once the number of entries in `ballots` reaches or exceeds the number of confirmed participants multiplied by 60 and divided by 100, **rounded up to the next whole number**. Note that quorum counts turnout, not agreement — a ballot that is not `YES` still advances quorum even though it does not advance `yes_count`. With four confirmed participants, quorum needs three ballots; with five, three; with six, four.
+
+The **renewal offer price** is computed at three moments — as the preliminary offer when the vote opens, as the final figures when the decision is decided, and as the fourth hop of the reopen cascade for any decision still in `VOTING`. Its dependency graph looks circular: the offer depends on a loyalty credit that is keyed on a cost-per-use band, and cost-per-use is a price divided by usage. The circle is broken by pinning the evaluation order, and the pin is not negotiable: **the band is always keyed on the prior term's price, never on the offer being computed**. Re-deriving the band from `offer_price_cents` is forbidden. The nine steps run in this order.
+
+1. Take the prior price: the subscription's current `negotiated_price_cents`, which is the price of the running term.
+2. Compute cost-per-use exactly as §3.7 describes, using that prior price as the invoice total. This yields a pooled usage count and a cost-per-use amount.
+3. Determine the band. If the pooled usage count is 0, the band is `NO_USE`. Otherwise the band is `EXCELLENT` when the cost-per-use amount is strictly below 500 cents, `GOOD` when it is 500 cents or more but strictly below 1,500 cents, and `POOR` in every remaining case.
+4. Cap the increase: `capped_increase_pct` is the smaller of the decision's `vendor_requested_increase_pct` and the product's `inflation_cap_pct`.
+5. Escalate the prior price: multiply the prior price by one plus `capped_increase_pct` divided by 100, and round the result half up to whole cents.
+6. Compute the loyalty credit: multiply the prior price by the band's credit percentage divided by 100, and round half up to whole cents. The percentages reward exactly the packages that need rewarding — an `EXCELLENT` band earns 0 percent, a `GOOD` band earns 2 percent, a `POOR` band earns 5 percent, and a `NO_USE` band earns 0 percent. Heavily used content is already worth its price; lightly used content has to buy its way back in.
+7. Take the SLA credit: `sla_credit_applied_cents` is a straight snapshot of the subscription's current `sla_credit_cents`.
+8. Compute the floor: multiply the prior price by 50 and divide by 100 — half the running-term price — and round half up to whole cents.
+9. Set `offer_price_cents` to the larger of that floor and the escalated amount less the loyalty credit less the applied SLA credit. Rounding was applied at steps 5, 6 and 8 independently and is never applied to the intermediate difference in this step.
+
+Deciding forks the decision three ways, and the branches share a single trigger while diverging in both their preconditions and their eventual effects. All three require the decision to be in `VOTING` and require `quorum_met` to be true — a decision put without quorum is `ERR_VOTE_QUORUM_NOT_MET` (409). Beyond that shared floor:
+
+- **The renew branch** additionally requires that either the decision's `vendor_requested_increase_pct` is less than or equal to the product's `inflation_cap_pct`, or the request explicitly carries `accept_capped_offer` set to true, acknowledging that the consortium will pay only the capped increase. Neither being satisfied is `ERR_INFLATION_CAP_EXCEEDED` (422). The transition sets `resolved_action` to `RENEW`, re-runs the offer computation so that `capped_increase_pct`, `cost_per_use_cents`, `cost_per_use_band`, `loyalty_credit_cents`, `sla_credit_applied_cents` and `offer_price_cents` hold their final values, and advances `VOTING → DECIDED_RENEW`.
+- **The cancel branch** has no additional precondition beyond quorum. It sets `resolved_action` to `CANCEL`, advances `VOTING → DECIDED_CANCEL`, and reaches into the subscription to advance its contract axis `ACTIVE → NOTICE_GIVEN`. Notice is thereby formally given, and the clock starts running against the deadline.
+- **The restructure branch** additionally requires a well-formed title swap: `titles_out` and `titles_in` must both be non-empty, neither may contain a duplicate identifier within itself, and the two may not share any identifier with each other; and `delta_price_cents` must be present on the request, carrying the price adjustment the publisher attached to the swap. Any of those failing is `ERR_TITLE_SWAP_INVALID` (422). The transition sets `resolved_action` to `RESTRUCTURE`, records `delta_price_cents` on the decision, and advances `VOTING → DECIDED_RESTRUCTURE`.
+
+Execution then carries out whatever was decided, and the three executions are as different from one another as the branches were.
+
+**Executing a renewal** requires the decision to be in `DECIDED_RENEW` and the subscription's `contract_status` to be `ACTIVE`. The decision advances `DECIDED_RENEW → EXECUTED` and the subscription's contract axis takes a self-loop from `ACTIVE` back to `ACTIVE` while its books roll forward: `negotiated_price_cents` is replaced by the decision's `offer_price_cents`; `term_start` becomes the previous `term_end` plus one day and `term_end` becomes the previous `term_end` plus one year, with `notice_deadline_date` recomputed from the new `term_end` and the product's `cancellation_notice_days`; both `sla_credit_cents` and `degrade_count` are reset to 0, because the credit has just been consumed by the offer; and `renewal_term_count` is incremented by 1. Finally, every commitment row on the subscription whose `status` is `CONFIRMED` is re-priced by the settled variant of the member tier price, and each affected member's `annual_committed_cents` is adjusted by the difference between the new price and the old one.
+
+**Executing a restructuring** requires the decision to be in `DECIDED_RESTRUCTURE`, the subscription's `contract_status` to be `ACTIVE`, and its `access_status` to be exactly `CONFIGURED` — a package whose access is degraded or suspended is in no condition to have its title list rewritten, and an attempt yields `ERR_SUBSCRIPTION_ACCESS_INVALID_STATE` (409). The swap must also leave the consortium with something: the resulting `entitled_title_count` must be at least 1 title, otherwise `ERR_TITLE_COUNT_FLOOR_BREACHED` (409). The decision advances `DECIDED_RESTRUCTURE → EXECUTED`; the subscription's `entitled_title_count` becomes its current value less the number of identifiers in `titles_out` plus the number of identifiers in `titles_in`; its `negotiated_price_cents` has `delta_price_cents` added to it; and every `CONFIRMED` commitment is re-priced by the settled variant with each member's `annual_committed_cents` adjusted by its own price delta. Read as a standing definition, `entitled_title_count` equals the product's `title_count` less the total size of `titles_out` plus the total size of `titles_in` across every decision on the subscription that is `EXECUTED` with a `resolved_action` of `RESTRUCTURE`.
+
+An executed restructuring can be undone. Reverting requires the decision to be `EXECUTED` with `resolved_action` of `RESTRUCTURE` and the subscription's `contract_status` to be `ACTIVE`; attempting to revert a decision whose resolved action was anything else is `ERR_RENEWAL_INVALID_STATE` (409). The reversal is the exact compensating action of the execution: `entitled_title_count` gains back the number of identifiers in `titles_out` and loses the number in `titles_in`, `negotiated_price_cents` has `delta_price_cents` subtracted from it, every `CONFIRMED` commitment is re-priced by the settled variant with member ledgers adjusted by the deltas, and the decision advances `EXECUTED → REVERTED`. The conserved quantity is the entitled title count: after a revert, it must equal exactly what it was before the execution. `EXECUTED`, `REVERTED` and `SUPERSEDED` are the decision's terminal states.
+
+### 3.9. Cancellation, Archival Deposit and Post-Cancellation Access
+
+Cancelling a consortium subscription is the operation with the most at stake, because it is irreversible and because what the members keep afterwards depends entirely on paperwork done in advance. Two independent gates therefore stand between a decided cancellation and an executed one, and both are evaluated when the cancel branch is executed.
+
+The first gate is **archival**: at least one archival deposit check on the subscription must have reached `VERIFIED`, otherwise `ERR_ARCHIVAL_DEPOSIT_UNVERIFIED` (409). The second is **temporal**: the logical clock's calendar date must be less than or equal to the subscription's `notice_deadline_date`, otherwise `ERR_NOTICE_DEADLINE_PASSED` (409). Executing on the deadline date itself is timely; executing the day after is not, and the consortium is stuck with another term. The decision must of course be in `DECIDED_CANCEL` and the subscription's `contract_status` must be `NOTICE_GIVEN`.
+
+When those gates clear, the decision advances `DECIDED_CANCEL → EXECUTED` and three things happen to the wider system. The subscription's contract axis advances `NOTICE_GIVEN → CANCELLED`. Its access axis is written — this is the single point at which the contract axis writes the access axis — becoming `POST_CANCELLATION` when `perpetual_access_mode` is either `POST_CANCELLATION_SUBSET` or `FULL_ARCHIVE`, and `SUSPENDED` when `perpetual_access_mode` is `NONE`. That write applies whether the access axis was sitting at `CONFIGURED` or `DEGRADED`; a subscription still `UNCONFIGURED` at cancellation with no perpetual access simply becomes `SUSPENDED`. `SUSPENDED` is the access axis's terminal state. And the money unwinds: every commitment row on the subscription whose `status` is `CONFIRMED` becomes `RELEASED`, with its `tier_price_cents` subtracted from `annual_committed_cents` on the owning member, and any member whose ledger falls back to a value at or below its `budget_ceiling_cents` has `standing` restored to `IN_GOOD_STANDING`.
+
+The archival evidence that gate one demands is built in three moves. The collections office opens a check against the subscription, supplying the `agency_code` the deposit is claimed with — `PORTICO`, `CLOCKSS` or `LOCKSS` — the `deposited_title_count` the office itself observed in the agency's holdings report (an integer of at least 0), and the `expected_subscription_version` that §2.6 requires. The claimed agency must be the one the publisher actually deposits with: `agency_code` must equal the `archival_agency_code` of the subscription's product's vendor, and that vendor field must not be null. A mismatch, or a vendor that deposits nowhere at all, is `ERR_ARCHIVAL_AGENCY_MISMATCH` (422). The check is created in `PENDING` with `attested_title_count` and `coverage_pct` both null, and the creation increments the subscription's `version` by 1. Checks of a subscription can be paged with an optional `status` filter by the collections office, by librarians and by the publisher's representative.
+
+The publisher then attests. A `VendorRep` whose `X-User-ID` equals the vendor behind the subscription's product supplies `attested_title_count`, the number of titles it claims to have deposited. Attestation is admissible from `PENDING`, advancing `PENDING → ATTESTED`, and also from `FAILED`, advancing `FAILED → ATTESTED`; the re-attestation path additionally clears `coverage_pct` back to null so that a stale coverage figure never survives a fresh claim.
+
+Verification closes the loop and is a `ConsortiumAdmin` capability admissible only from `ATTESTED`. Before any coverage is computed, the two title counts must agree within tolerance: the absolute difference between `attested_title_count` and `deposited_title_count` must be no more than 5 titles, and a wider gap is `ERR_ARCHIVAL_COUNT_DISCREPANCY` (409) — the publisher and the agency are telling materially different stories and no coverage figure computed from either would mean anything. When they agree, **archival coverage** is computed as `attested_title_count` divided by the subscription's current `entitled_title_count`, multiplied by 100, and rounded half up to two decimal places. The result is written to `coverage_pct` on both outcomes of the fork. If `coverage_pct` is greater than or equal to 95.00 percent the check advances `ATTESTED → VERIFIED`, and exactly 95.00 verifies; if it is strictly below 95.00 the check advances `ATTESTED → FAILED` instead, from where the publisher may attest again. `VERIFIED` is terminal.
+
+Because coverage is measured against the subscription's *current* `entitled_title_count` rather than a figure snapshotted at attestation, a restructuring that changed the entitled title count changes the coverage of an already-attested check. A package that was comfortably above the threshold before a hundred titles were swapped in may fall below it afterwards, and the collections office will discover this only when it tries to verify — which is precisely why the archival check participates in optimistic concurrency on the subscription version.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted under the `/erm` prefix. An operation that brings a new resource into existence answers **201 Created**; every other successful operation, including all reads and all state transitions on existing resources, answers **200 OK**. Note that signing a negotiation answers 201 because its purpose is to create the subscription, and that its response body is the created subscription rather than the negotiation. The table below is a routing summary only: request bodies, response bodies and side effects are specified in the §3 narratives, not here.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/erm/members` | Register a consortium member library with its FTE population, Carnegie class and annual budget ceiling. | ConsortiumAdmin |
+| GET | `/erm/members/{id}` | Read one member including the derived committed-spend ledger and standing. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| POST | `/erm/vendors` | Register a publisher or aggregator, including the preservation agency it deposits with and whether an accessibility conformance report is on file. | ConsortiumAdmin |
+| GET | `/erm/vendors/{id}` | Read one vendor. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| POST | `/erm/products` | Register a licensable package with its list price, title count, inflation cap, cancellation notice period, offered ILL / text-mining / perpetual-access ceilings and the consortium tier discount schedule. | ConsortiumAdmin |
+| GET | `/erm/products/{id}` | Read one product. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| GET | `/erm/products` | List products, optionally filtered by vendor; paginated. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| POST | `/erm/products/{id}/trials` | Set up a trial of a package for one member library, with the evaluation criteria and their weights. | MemberLibrarian |
+| GET | `/erm/trials/{id}` | Read one trial including the provisional and final scores and the feedback counters. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| GET | `/erm/trials` | List trials, optionally filtered by product, member or status; paginated. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator |
+| POST | `/erm/trials/{id}/open` | Open a `DRAFT` trial for stakeholder use. | MemberLibrarian |
+| POST | `/erm/trials/{id}/close` | Close an `ACTIVE` trial and stamp the provisional endorsement score. | MemberLibrarian |
+| POST | `/erm/trials/{id}/evaluate` | Evaluate a `CLOSED` trial: compute the final endorsement score including post-close feedback and the quorum penalty, then fork to `ENDORSED` or `DECLINED`. | ConsortiumAdmin |
+| POST | `/erm/trials/{id}/feedback` | Submit one stakeholder score against one evaluation criterion of the trial. | MemberLibrarian |
+| GET | `/erm/trials/{id}/feedback` | List the feedback rows of one trial; paginated. | ConsortiumAdmin, MemberLibrarian |
+| POST | `/erm/negotiations` | Open a license negotiation for a package, anchored on the trial whose endorsement will gate signing, with the requested ILL, text-mining, accessibility and perpetual-access terms. | ConsortiumAdmin |
+| GET | `/erm/negotiations/{id}` | Read one negotiation including the round count, the granted terms and the signer-segregation audit field. | ConsortiumAdmin, LicenseNegotiator, VendorRep |
+| GET | `/erm/negotiations` | List negotiations, optionally filtered by product, trial or status; paginated. | ConsortiumAdmin, LicenseNegotiator, VendorRep |
+| POST | `/erm/negotiations/{id}/submit` | Send the current draft terms to the vendor for review; records the submitting negotiator for the segregation-of-duties check at signing. | LicenseNegotiator |
+| POST | `/erm/negotiations/{id}/vendor-response` | Vendor answers the round: an `ACCEPT` disposition locks the agreed price and moves to `AGREED`; a `COUNTER` disposition records the counter price and moves to `COUNTERED`. | VendorRep |
+| POST | `/erm/negotiations/{id}/revise` | Revise the consortium's requested terms after a counter and return the negotiation to `DRAFTING`. | LicenseNegotiator |
+| POST | `/erm/negotiations/{id}/sign` | Sign an `AGREED` negotiation. Creates the subscription and drives the four-hop confirmation cascade. | ConsortiumAdmin |
+| POST | `/erm/products/{id}/commitments` | Pledge a member library's participation in a package; stamps the projected price using the participant count at pledge time. | MemberLibrarian |
+| GET | `/erm/commitments/{id}` | Read one participation commitment including both the projected and the settled price. | ConsortiumAdmin, MemberLibrarian, VendorRep |
+| GET | `/erm/commitments` | List commitments, optionally filtered by product, member, subscription or status; paginated. | ConsortiumAdmin, MemberLibrarian, VendorRep |
+| POST | `/erm/commitments/{id}/withdraw` | Withdraw a member's pledge or confirmed participation; the compensating action of the confirmation hop. | MemberLibrarian |
+| GET | `/erm/subscriptions/{id}` | Read one subscription including both state axes, the access health score, the accrued SLA credit, the entitled title count and the notice deadline. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| GET | `/erm/subscriptions` | List subscriptions, optionally filtered by product, negotiation, contract state or access state; paginated. | ConsortiumAdmin, MemberLibrarian, LicenseNegotiator, VendorRep, AccessEngineer |
+| GET | `/erm/subscriptions/{id}/cost-per-use` | Cost-per-use analysis over the running term: pooled full-text requests inside the closed month window, the settled invoice total and the resulting band. | ConsortiumAdmin, MemberLibrarian |
+| GET | `/erm/subscriptions/{id}/invoice-allocation` | Per-member invoice allocation of the negotiated price across confirmed commitments by FTE weight, with the rounding residual assigned to a single line. | ConsortiumAdmin, MemberLibrarian |
+| POST | `/erm/subscriptions/{id}/auth-configs` | Configure authentication for a subscription and bind it to a shared federation realm. | AccessEngineer |
+| GET | `/erm/subscriptions/{id}/auth-configs` | List the authentication configurations of one subscription; paginated. | ConsortiumAdmin, MemberLibrarian, AccessEngineer |
+| POST | `/erm/auth-configs/{id}/verify` | Record the outcome of an on-campus / off-campus access probe. | AccessEngineer |
+| POST | `/erm/subscriptions/{id}/access-incidents` | Report an off-campus or on-campus access failure. | MemberLibrarian |
+| GET | `/erm/access-incidents/{id}` | Read one access incident including its reopen count. | ConsortiumAdmin, MemberLibrarian, AccessEngineer |
+| GET | `/erm/access-incidents` | List access incidents, optionally filtered by subscription, member or status; paginated. | ConsortiumAdmin, MemberLibrarian, AccessEngineer |
+| POST | `/erm/access-incidents/{id}/diagnose` | Record the root cause of an `OPEN` or `REOPENED` incident. | AccessEngineer |
+| POST | `/erm/access-incidents/{id}/resolve` | Record the remedy for a `DIAGNOSED` incident. | AccessEngineer |
+| POST | `/erm/access-incidents/{id}/reopen` | Reopen a `RESOLVED` incident; origin of the four-hop access cascade. | MemberLibrarian |
+| POST | `/erm/subscriptions/{id}/usage-reports` | Vendor files one month of COUNTER usage for one member on this subscription. | VendorRep |
+| GET | `/erm/usage-reports/{id}` | Read one usage report. | ConsortiumAdmin, MemberLibrarian, VendorRep |
+| GET | `/erm/usage-reports` | List usage reports, optionally filtered by subscription, member or month; paginated. | ConsortiumAdmin, MemberLibrarian, VendorRep |
+| POST | `/erm/subscriptions/{id}/renewal-decisions` | Open a renewal decision on a subscription with the recommended action and the vendor's requested increase; requires the subscription version the client last observed. | ConsortiumAdmin |
+| GET | `/erm/subscriptions/{id}/renewal-decisions` | List the renewal decisions of one subscription, optionally filtered by status; paginated. | ConsortiumAdmin, MemberLibrarian |
+| POST | `/erm/renewal-decisions/{id}/open-vote` | Put the decision to the participating members and stamp the preliminary renewal offer. | ConsortiumAdmin |
+| POST | `/erm/renewal-decisions/{id}/vote` | A participating member casts its ballot on a `VOTING` decision. | MemberLibrarian |
+| POST | `/erm/renewal-decisions/{id}/decide` | Fork the decision to `RENEW`, `CANCEL` or `RESTRUCTURE` once quorum is met. | ConsortiumAdmin |
+| POST | `/erm/renewal-decisions/{id}/execute` | Execute the decided branch: roll the term and price forward, cancel with post-cancellation access handling, or apply the title swap. | ConsortiumAdmin |
+| POST | `/erm/renewal-decisions/{id}/revert-restructure` | Reverse an executed package restructuring. | ConsortiumAdmin |
+| POST | `/erm/subscriptions/{id}/archival-checks` | Open an archival deposit verification against the preservation agency the vendor deposits with; requires the subscription version the client last observed. | ConsortiumAdmin |
+| GET | `/erm/subscriptions/{id}/archival-checks` | List the archival deposit checks of one subscription, optionally filtered by status; paginated. | ConsortiumAdmin, MemberLibrarian, VendorRep |
+| POST | `/erm/archival-checks/{id}/attest` | Vendor attests the number of titles it has deposited with the agency. | VendorRep |
+| POST | `/erm/archival-checks/{id}/verify` | Verify the attested deposit against the current entitled title count; forks to `VERIFIED` or `FAILED` on the coverage threshold. | ConsortiumAdmin |
+| POST | `/erm/_clock/set_current_utc` | Test-driving capability: set the server's logical clock, activating and expiring subscriptions along the contract axis. | ConsortiumAdmin |
+
+## 5. Error Code Catalogue
+
+Trigger conditions for every code below are specified in the §2 and §3 narratives, alongside the rule each code guards; the priority order in which competing conditions are evaluated is given in §2.5.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_MEMBER_SCOPE_VIOLATION` | 403 |
+| `ERR_VENDOR_SCOPE_VIOLATION` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_MEMBER_NOT_FOUND` | 404 |
+| `ERR_VENDOR_NOT_FOUND` | 404 |
+| `ERR_PRODUCT_NOT_FOUND` | 404 |
+| `ERR_TRIAL_NOT_FOUND` | 404 |
+| `ERR_NEGOTIATION_NOT_FOUND` | 404 |
+| `ERR_SUBSCRIPTION_NOT_FOUND` | 404 |
+| `ERR_COMMITMENT_NOT_FOUND` | 404 |
+| `ERR_AUTH_CONFIG_NOT_FOUND` | 404 |
+| `ERR_INCIDENT_NOT_FOUND` | 404 |
+| `ERR_USAGE_REPORT_NOT_FOUND` | 404 |
+| `ERR_RENEWAL_DECISION_NOT_FOUND` | 404 |
+| `ERR_ARCHIVAL_CHECK_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 422 |
+| `ERR_STALE_SUBSCRIPTION_VERSION` | 412 |
+| `ERR_TRIAL_INVALID_STATE` | 409 |
+| `ERR_NEGOTIATION_INVALID_STATE` | 409 |
+| `ERR_COMMITMENT_INVALID_STATE` | 409 |
+| `ERR_INCIDENT_INVALID_STATE` | 409 |
+| `ERR_RENEWAL_INVALID_STATE` | 409 |
+| `ERR_ARCHIVAL_CHECK_INVALID_STATE` | 409 |
+| `ERR_SUBSCRIPTION_CONTRACT_INVALID_STATE` | 409 |
+| `ERR_SUBSCRIPTION_ACCESS_INVALID_STATE` | 409 |
+| `ERR_AUTH_CONFIG_INVALID_STATE` | 409 |
+| `ERR_MEMBER_OVER_COMMITTED` | 409 |
+| `ERR_ACCESSIBILITY_TERM_MISSING` | 422 |
+| `ERR_TERM_EXCEEDS_PRODUCT_OFFER` | 422 |
+| `ERR_TRIAL_NOT_ENDORSED` | 409 |
+| `ERR_ARCHIVAL_DEPOSIT_UNVERIFIED` | 409 |
+| `ERR_ARCHIVAL_AGENCY_MISMATCH` | 422 |
+| `ERR_TRIAL_WINDOW_CONFLICT` | 409 |
+| `ERR_REALM_CAPACITY_EXCEEDED` | 409 |
+| `ERR_NOTICE_DEADLINE_PASSED` | 409 |
+| `ERR_USAGE_PERIOD_OUT_OF_TERM` | 422 |
+| `ERR_VOTE_QUORUM_NOT_MET` | 409 |
+| `ERR_DUPLICATE_BALLOT` | 409 |
+| `ERR_MEMBER_NOT_PARTICIPANT` | 409 |
+| `ERR_TITLE_SWAP_INVALID` | 422 |
+| `ERR_TITLE_COUNT_FLOOR_BREACHED` | 409 |
+| `ERR_DUPLICATE_USAGE_REPORT` | 409 |
+| `ERR_DUPLICATE_COMMITMENT` | 409 |
+| `ERR_UNKNOWN_CRITERION` | 422 |
+| `ERR_INSUFFICIENT_FEEDBACK` | 409 |
+| `ERR_ARCHIVAL_COUNT_DISCREPANCY` | 409 |
+| `ERR_NEGOTIATION_ROUND_LIMIT` | 409 |
+| `ERR_CLOCK_NOT_MONOTONIC` | 422 |
+| `ERR_BUDGET_CEILING_EXCEEDED` | 409 |
+| `ERR_INFLATION_CAP_EXCEEDED` | 422 |

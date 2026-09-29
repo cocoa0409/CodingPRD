@@ -1,0 +1,88 @@
+"""Error catalogue — PRD §5.  http status is looked up from the error id, so a raise
+site never has to restate it."""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_CARRIER_NOT_FOUND": 404,
+    "ERR_QUALIFICATION_REVIEW_NOT_FOUND": 404,
+    "ERR_BID_EVENT_NOT_FOUND": 404,
+    "ERR_LANE_NOT_FOUND": 404,
+    "ERR_BID_ROUND_NOT_FOUND": 404,
+    "ERR_INVITATION_NOT_FOUND": 404,
+    "ERR_LANE_BID_NOT_FOUND": 404,
+    "ERR_OPTIMIZATION_RUN_NOT_FOUND": 404,
+    "ERR_AWARD_ALLOCATION_NOT_FOUND": 404,
+    "ERR_CONTRACT_NOT_FOUND": 404,
+    "ERR_RATE_RECORD_NOT_FOUND": 404,
+    "ERR_MINI_BID_NOT_FOUND": 404,
+    "ERR_SCORECARD_NOT_FOUND": 404,
+    "ERR_STALE_BID_EVENT_VERSION": 412,
+    "ERR_STALE_CONTRACT_VERSION": 412,
+    "ERR_LANE_NOT_VALIDATED": 409,
+    "ERR_LANES_NOT_LOCKED": 409,
+    "ERR_ROUND_NOT_OPEN": 409,
+    "ERR_ROUND_STILL_OPEN": 409,
+    "ERR_EVENT_NOT_OPTIMIZING": 409,
+    "ERR_ALLOCATION_NOT_PROPOSED": 409,
+    "ERR_CONTRACT_NOT_FULLY_SIGNED": 409,
+    "ERR_RATE_RECORD_NOT_LOADED": 409,
+    "ERR_RATE_RECORD_NOT_LIVE": 409,
+    "ERR_MINI_BID_NOT_OPEN": 409,
+    "ERR_MINI_BID_NOT_APPLIED": 409,
+    "ERR_REVIEW_NOT_SCREENED": 409,
+    "ERR_SCORECARD_ALREADY_PUBLISHED": 409,
+    "ERR_SCORECARD_NOT_PUBLISHED": 409,
+    "ERR_CARRIER_SUSPENDED": 409,
+    "ERR_CARRIER_INSURANCE_EXPIRED": 409,
+    "ERR_CARRIER_NOT_QUALIFIED": 409,
+    "ERR_LANE_DATA_QUALITY_BLOCKED": 409,
+    "ERR_CARRIER_NOT_INVITED": 409,
+    "ERR_INVITATION_NOT_ACCEPTED": 409,
+    "ERR_DUPLICATE_SCAC": 409,
+    "ERR_DUPLICATE_LANE_CODE": 409,
+    "ERR_DUPLICATE_INVITATION": 409,
+    "ERR_DUPLICATE_LANE_BID": 409,
+    "ERR_DUPLICATE_LOAD_REFERENCE": 409,
+    "ERR_RATE_INTERVAL_OVERLAP": 409,
+    "ERR_RATE_NOT_IN_EFFECTIVE_WINDOW": 409,
+    "ERR_MINI_BID_WINDOW_CONFLICT": 409,
+    "ERR_MINI_BID_COOLDOWN_ACTIVE": 409,
+    "ERR_LANE_NOT_IN_EVENT_SCOPE": 409,
+    "ERR_TRANSIT_DAYS_EXCEEDED": 409,
+    "ERR_NDA_NOT_SIGNED": 409,
+    "ERR_ROUND_LIMIT_EXCEEDED": 409,
+    "ERR_REMEDIATION_LIMIT_EXCEEDED": 409,
+    "ERR_MINI_BID_QUOTA_EXCEEDED": 409,
+    "ERR_RATE_BELOW_FLOOR": 422,
+    "ERR_RATE_ABOVE_ROUND_TARGET": 422,
+    "ERR_ADJUSTMENT_EXCEEDS_CAP": 422,
+    "ERR_AWARD_SHARE_EXCEEDED": 422,
+    "ERR_DIVERSITY_MINIMUM_NOT_MET": 422,
+    "ERR_COVERAGE_BELOW_MINIMUM": 422,
+    "ERR_NO_FEASIBLE_ALLOCATION": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = ERROR_STATUS.get(error_id, 400)
+
+
+_DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Missing or invalid X-User-ID / X-User-Role headers.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorised for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting carrier does not own the target resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "The operator who approved the award may not countersign it.",
+    "ERR_INVALID_REQUEST": "The request payload is invalid.",
+}
+
+
+def bad_request(message="The request payload is invalid."):
+    return ApiError("ERR_INVALID_REQUEST", message)

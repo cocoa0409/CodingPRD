@@ -1,0 +1,111 @@
+"""Domain thresholds — numeric constants the PRD states for its formulas."""
+
+# The logical clock reads exactly this instant before it is ever set (PRD §2.5).
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# Freight program tiers (PRD §3.1)
+FREIGHT = {
+    "TRAILING_WINDOW_DAYS": 365,
+    "TIER_2_MIN_LBS": 40000,
+    "TIER_3_MIN_LBS": 120000,
+    "RATE_CENTS_PER_LB_TIER_1": 12,
+    "RATE_CENTS_PER_LB_TIER_2": 8,
+    "RATE_CENTS_PER_LB_TIER_3": 5,
+    "MINIMUM_CENTS_TIER_1": 25000,
+    "MINIMUM_CENTS_TIER_2": 15000,
+    "MINIMUM_CENTS_TIER_3": 0,
+    "REEFER_SURCHARGE_CENTS": 18000,
+}
+
+# Order fee assessment (PRD §3.8)
+ORDER_FEES = {
+    "DISCOUNT_TIER_1_CENTS": 1000000,
+    "DISCOUNT_TIER_2_CENTS": 5000000,
+    "DISCOUNT_TIER_1_PCT": 1.5,
+    "DISCOUNT_TIER_2_PCT": 3.0,
+    "PALLET_BREAK_FEE_CENTS": 4500,
+    "MOQ_ORDER_LBS": 2000,
+    "SMALL_ORDER_SURCHARGE_CENTS": 7500,
+}
+
+# Credit posture (PRD §3.1)
+CREDIT = {
+    "WATCH_THRESHOLD_PCT": 85.00,
+}
+
+# Default settlement (PRD §3.5)
+SETTLEMENT = {
+    "LIQUIDATED_DAMAGES_PCT": 35,
+    "ADMIN_FEE_TIER_CENTS": 1000000,
+    "ADMIN_FEE_LOW_PCT": 1.0,
+    "ADMIN_FEE_HIGH_PCT": 2.0,
+}
+
+# Carry-forward (PRD §3.5)
+CARRY_FORWARD = {
+    "CAP_PCT": 25,
+    "FEE_PCT": 8,
+}
+
+# Malt specification matching (PRD §3.6)
+SPEC_MATCH = {
+    "WEIGHT_COLOR": 0.40,
+    "WEIGHT_EXTRACT": 0.35,
+    "WEIGHT_PROTEIN": 0.25,
+    "TOLERANCE_COLOR": 1.5,
+    "TOLERANCE_EXTRACT": 1.0,
+    "TOLERANCE_PROTEIN": 0.8,
+    "ADJUNCT_DP_BONUS": 10.0,
+    "GRADE_EXACT_MIN": 95.00,
+    "GRADE_ACCEPTABLE_MIN": 80.00,
+    "GRADE_SUBSTITUTE_MIN": 60.00,
+}
+
+# Yeast pitch advisory (PRD §3.7)
+PITCH = {
+    "LITRES_PER_BBL": 117.348,
+    "ALE_TARGET_RATE": 0.75,
+    "LAGER_TARGET_RATE": 1.50,
+    "VIABILITY_DECAY_PER_DAY": 0.02,
+    "VIABILITY_FLOOR": 0.50,
+    "SAFETY_FACTOR": 1.15,
+    "ADVICE_BAND_PCT": 10,
+}
+
+# Cold chain (PRD §3.9)
+COLD_CHAIN = {
+    "MAX_EXCURSION_MINUTES": 30,
+}
+
+# Field defaults the PRD names explicitly, used to assert omitted-input behaviour.
+FIELD_DEFAULTS = {
+    "BREWER_CREDIT_TERMS_DAYS": 30,
+    "BREWER_CREDIT_LIMIT_CENTS": 500000,
+    "BREWER_COLD_CHAIN_CERTIFIED": False,
+    "BREWER_LEGACY_TRAILING_LBS": 0,
+    "VARIETY_COLD_STORAGE_REQUIRED": True,
+    "VARIETY_PALLET_QUANTITY_LBS": 880,
+    "VARIETY_MIN_ORDER_LBS": 44,
+    "VARIETY_AVAILABLE_SPOT_LBS": 0,
+    "MALT_MAX_MOISTURE_PCT": 5.0,
+    "MALT_MIN_DIASTATIC_POWER": 60.0,
+    "MALT_PALLET_QUANTITY_LBS": 2200,
+    "MALT_MIN_ORDER_LBS": 55,
+    "MALT_COLD_STORAGE_REQUIRED": False,
+    "STRAIN_VIABILITY_PCT_AT_SHIP": 92.0,
+    "STRAIN_CELLS_PER_ML_SLURRY_BILLION": 1.2,
+    "STRAIN_MIN_BATCH_L": 20.0,
+    "STRAIN_VESSEL_MAX_L": 2000.0,
+    "STRAIN_COLD_STORAGE_REQUIRED": True,
+    "ZONE_TOLERANCE_C": 2.0,
+    "REEFER_TOLERANCE_C": 2.0,
+    "RECIPE_ADJUNCT_PCT": 0,
+}
+
+# Pagination (PRD §2.3)
+PAGINATION = {
+    "DEFAULT_LIMIT": 10,
+    "MIN_LIMIT": 1,
+    "MAX_LIMIT": 100,
+    "DEFAULT_OFFSET": 0,
+}

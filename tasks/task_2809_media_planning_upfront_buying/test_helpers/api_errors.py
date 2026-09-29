@@ -1,0 +1,260 @@
+"""Error identifiers of the Media Planning & Upfront Buying API and their statuses.
+
+Every identifier the requirement catalogues appears here exactly once with the
+HTTP status it must be answered with.  Registering the mapping with the shared
+validator makes ``validate_error`` cross-check the status automatically, so a
+test names only the identifier it expects.
+
+The rejection ladder is reproduced as an ordered tuple.  A test that stages two
+faults at once uses it to name the rung that must win rather than restating the
+ordering inline.
+"""
+
+from typing import Dict, Tuple
+
+from prd_bench_local_runner.testing.validators import set_error_http_status_map
+
+
+class ApiErrorId:
+    """Namespace of every catalogued error identifier."""
+
+    # --- authentication and authorisation ---------------------------------
+    UNAUTHENTICATED = "ERR_UNAUTHENTICATED"
+    ROLE_NOT_PERMITTED = "ERR_ROLE_NOT_PERMITTED"
+    NOT_RESOURCE_OWNER = "ERR_NOT_RESOURCE_OWNER"
+
+    # --- request shape ----------------------------------------------------
+    INVALID_REQUEST = "ERR_INVALID_REQUEST"
+
+    # --- existence --------------------------------------------------------
+    ADVERTISER_NOT_FOUND = "ERR_ADVERTISER_NOT_FOUND"
+    CAMPAIGN_NOT_FOUND = "ERR_CAMPAIGN_NOT_FOUND"
+    ALLOCATION_NOT_FOUND = "ERR_ALLOCATION_NOT_FOUND"
+    SELLER_NOT_FOUND = "ERR_SELLER_NOT_FOUND"
+    FORECAST_NOT_FOUND = "ERR_FORECAST_NOT_FOUND"
+    NEGOTIATION_NOT_FOUND = "ERR_NEGOTIATION_NOT_FOUND"
+    BUY_NOT_FOUND = "ERR_BUY_NOT_FOUND"
+    BUY_UNIT_NOT_FOUND = "ERR_BUY_UNIT_NOT_FOUND"
+    REPORT_NOT_FOUND = "ERR_REPORT_NOT_FOUND"
+    MAKE_GOOD_NOT_FOUND = "ERR_MAKE_GOOD_NOT_FOUND"
+    RIGHTS_EXERCISE_NOT_FOUND = "ERR_RIGHTS_EXERCISE_NOT_FOUND"
+    RECONCILIATION_RUN_NOT_FOUND = "ERR_RECONCILIATION_RUN_NOT_FOUND"
+    INVOICE_NOT_FOUND = "ERR_INVOICE_NOT_FOUND"
+
+    # --- version guards ---------------------------------------------------
+    STALE_NEGOTIATION_VERSION = "ERR_STALE_NEGOTIATION_VERSION"
+    STALE_CAMPAIGN_VERSION = "ERR_STALE_CAMPAIGN_VERSION"
+
+    # --- state ------------------------------------------------------------
+    ALREADY_TERMINAL = "ERR_ALREADY_TERMINAL"
+    CAMPAIGN_PLAN_NOT_IN_EXPECTED_STATE = "ERR_CAMPAIGN_PLAN_NOT_IN_EXPECTED_STATE"
+    NEGOTIATION_NOT_IN_EXPECTED_STATE = "ERR_NEGOTIATION_NOT_IN_EXPECTED_STATE"
+    BUY_NOT_IN_EXPECTED_STATE = "ERR_BUY_NOT_IN_EXPECTED_STATE"
+    UNIT_NOT_SCHEDULED = "ERR_UNIT_NOT_SCHEDULED"
+    REPORT_NOT_SUBMITTED = "ERR_REPORT_NOT_SUBMITTED"
+    MAKE_GOOD_NOT_IN_EXPECTED_STATE = "ERR_MAKE_GOOD_NOT_IN_EXPECTED_STATE"
+    INVOICE_NOT_IN_EXPECTED_STATE = "ERR_INVOICE_NOT_IN_EXPECTED_STATE"
+    ALLOCATION_LOCKED = "ERR_ALLOCATION_LOCKED"
+    CAMPAIGN_PLAN_NOT_APPROVED = "ERR_CAMPAIGN_PLAN_NOT_APPROVED"
+    FORECAST_NOT_PUBLISHED = "ERR_FORECAST_NOT_PUBLISHED"
+    FORECAST_NOT_IN_EXPECTED_STATE = "ERR_FORECAST_NOT_IN_EXPECTED_STATE"
+    PLAN_POSTURE_REPLAN_REQUIRED = "ERR_PLAN_POSTURE_REPLAN_REQUIRED"
+
+    # --- temporal ---------------------------------------------------------
+    RIGHTS_WINDOW_CLOSED = "ERR_RIGHTS_WINDOW_CLOSED"
+    AIR_WINDOW_NOT_ELAPSED = "ERR_AIR_WINDOW_NOT_ELAPSED"
+    REPORT_PERIOD_OUTSIDE_FLIGHT = "ERR_REPORT_PERIOD_OUTSIDE_FLIGHT"
+    MAKE_GOOD_WINDOW_INVALID = "ERR_MAKE_GOOD_WINDOW_INVALID"
+    CLOCK_NOT_MONOTONIC = "ERR_CLOCK_NOT_MONOTONIC"
+
+    # --- declared constraints ---------------------------------------------
+    RIGHTS_PCT_ABOVE_CEILING = "ERR_RIGHTS_PCT_ABOVE_CEILING"
+    ALLOCATION_PCT_SUM_INVALID = "ERR_ALLOCATION_PCT_SUM_INVALID"
+    NEGOTIATION_ROUND_CAP_REACHED = "ERR_NEGOTIATION_ROUND_CAP_REACHED"
+    MAKE_GOOD_OFFER_CAP_REACHED = "ERR_MAKE_GOOD_OFFER_CAP_REACHED"
+    MAKE_GOOD_OFFER_INSUFFICIENT = "ERR_MAKE_GOOD_OFFER_INSUFFICIENT"
+    MAKE_GOOD_NOT_PERMITTED = "ERR_MAKE_GOOD_NOT_PERMITTED"
+    EXCLUSIVE_AVAIL_CONFLICT = "ERR_EXCLUSIVE_AVAIL_CONFLICT"
+
+    # --- referential integrity -------------------------------------------
+    UNIT_FORECAST_MISMATCH = "ERR_UNIT_FORECAST_MISMATCH"
+    ALLOCATION_CAMPAIGN_MISMATCH = "ERR_ALLOCATION_CAMPAIGN_MISMATCH"
+    NO_BILLABLE_LINES = "ERR_NO_BILLABLE_LINES"
+
+    # --- safety -----------------------------------------------------------
+    ADVERTISER_CREDIT_HOLD = "ERR_ADVERTISER_CREDIT_HOLD"
+    SEGREGATION_OF_DUTIES = "ERR_SEGREGATION_OF_DUTIES"
+    CATEGORY_SEPARATION_CONFLICT = "ERR_CATEGORY_SEPARATION_CONFLICT"
+
+    # --- fiscal -----------------------------------------------------------
+    FORECAST_AVAIL_EXCEEDED = "ERR_FORECAST_AVAIL_EXCEEDED"
+    MAKE_GOOD_CAPACITY_EXCEEDED = "ERR_MAKE_GOOD_CAPACITY_EXCEEDED"
+    UNIT_COVERAGE_SHORT = "ERR_UNIT_COVERAGE_SHORT"
+    CREDIT_LIMIT_EXCEEDED = "ERR_CREDIT_LIMIT_EXCEEDED"
+    CAMPAIGN_BUDGET_EXCEEDED = "ERR_CAMPAIGN_BUDGET_EXCEEDED"
+    CAMPAIGN_ALREADY_FUNDED = "ERR_CAMPAIGN_ALREADY_FUNDED"
+    CAMPAIGN_FUNDING_INSUFFICIENT = "ERR_CAMPAIGN_FUNDING_INSUFFICIENT"
+    PAYMENT_EXCEEDS_INVOICE = "ERR_PAYMENT_EXCEEDS_INVOICE"
+    SEQUENTIAL_LIABILITY_EXCEEDED = "ERR_SEQUENTIAL_LIABILITY_EXCEEDED"
+
+
+#: error_id -> HTTP status, exactly as catalogued.
+HTTP_STATUS_CODES: Dict[str, int] = {
+    ApiErrorId.UNAUTHENTICATED: 401,
+    ApiErrorId.ROLE_NOT_PERMITTED: 403,
+    ApiErrorId.NOT_RESOURCE_OWNER: 403,
+    ApiErrorId.ADVERTISER_CREDIT_HOLD: 403,
+    ApiErrorId.SEGREGATION_OF_DUTIES: 403,
+    ApiErrorId.INVALID_REQUEST: 400,
+    ApiErrorId.ADVERTISER_NOT_FOUND: 404,
+    ApiErrorId.CAMPAIGN_NOT_FOUND: 404,
+    ApiErrorId.ALLOCATION_NOT_FOUND: 404,
+    ApiErrorId.SELLER_NOT_FOUND: 404,
+    ApiErrorId.FORECAST_NOT_FOUND: 404,
+    ApiErrorId.NEGOTIATION_NOT_FOUND: 404,
+    ApiErrorId.BUY_NOT_FOUND: 404,
+    ApiErrorId.BUY_UNIT_NOT_FOUND: 404,
+    ApiErrorId.REPORT_NOT_FOUND: 404,
+    ApiErrorId.MAKE_GOOD_NOT_FOUND: 404,
+    ApiErrorId.RIGHTS_EXERCISE_NOT_FOUND: 404,
+    ApiErrorId.RECONCILIATION_RUN_NOT_FOUND: 404,
+    ApiErrorId.INVOICE_NOT_FOUND: 404,
+    ApiErrorId.STALE_NEGOTIATION_VERSION: 412,
+    ApiErrorId.STALE_CAMPAIGN_VERSION: 412,
+    ApiErrorId.ALREADY_TERMINAL: 409,
+    ApiErrorId.CAMPAIGN_PLAN_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.NEGOTIATION_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.BUY_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.UNIT_NOT_SCHEDULED: 409,
+    ApiErrorId.REPORT_NOT_SUBMITTED: 409,
+    ApiErrorId.MAKE_GOOD_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.INVOICE_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.ALLOCATION_LOCKED: 409,
+    ApiErrorId.CAMPAIGN_PLAN_NOT_APPROVED: 409,
+    ApiErrorId.FORECAST_NOT_PUBLISHED: 409,
+    ApiErrorId.FORECAST_NOT_IN_EXPECTED_STATE: 409,
+    ApiErrorId.PLAN_POSTURE_REPLAN_REQUIRED: 409,
+    ApiErrorId.NEGOTIATION_ROUND_CAP_REACHED: 409,
+    ApiErrorId.MAKE_GOOD_OFFER_CAP_REACHED: 409,
+    ApiErrorId.MAKE_GOOD_NOT_PERMITTED: 409,
+    ApiErrorId.EXCLUSIVE_AVAIL_CONFLICT: 409,
+    ApiErrorId.CATEGORY_SEPARATION_CONFLICT: 409,
+    ApiErrorId.FORECAST_AVAIL_EXCEEDED: 409,
+    ApiErrorId.MAKE_GOOD_CAPACITY_EXCEEDED: 409,
+    ApiErrorId.UNIT_COVERAGE_SHORT: 409,
+    ApiErrorId.CREDIT_LIMIT_EXCEEDED: 409,
+    ApiErrorId.CAMPAIGN_BUDGET_EXCEEDED: 409,
+    ApiErrorId.CAMPAIGN_ALREADY_FUNDED: 409,
+    ApiErrorId.CAMPAIGN_FUNDING_INSUFFICIENT: 409,
+    ApiErrorId.RIGHTS_WINDOW_CLOSED: 422,
+    ApiErrorId.AIR_WINDOW_NOT_ELAPSED: 422,
+    ApiErrorId.REPORT_PERIOD_OUTSIDE_FLIGHT: 422,
+    ApiErrorId.MAKE_GOOD_WINDOW_INVALID: 422,
+    ApiErrorId.CLOCK_NOT_MONOTONIC: 422,
+    ApiErrorId.RIGHTS_PCT_ABOVE_CEILING: 422,
+    ApiErrorId.ALLOCATION_PCT_SUM_INVALID: 422,
+    ApiErrorId.MAKE_GOOD_OFFER_INSUFFICIENT: 422,
+    ApiErrorId.UNIT_FORECAST_MISMATCH: 422,
+    ApiErrorId.ALLOCATION_CAMPAIGN_MISMATCH: 422,
+    ApiErrorId.NO_BILLABLE_LINES: 422,
+    ApiErrorId.PAYMENT_EXCEEDS_INVOICE: 422,
+    ApiErrorId.SEQUENTIAL_LIABILITY_EXCEEDED: 422,
+}
+
+
+#: The rejection ladder, highest priority first.  When one request breaks two
+#: rules, the identifier appearing earlier in this tuple is the one answered.
+REJECTION_LADDER: Tuple[str, ...] = (
+    ApiErrorId.UNAUTHENTICATED,
+    ApiErrorId.ROLE_NOT_PERMITTED,
+    ApiErrorId.INVALID_REQUEST,
+    # path identifiers, leftmost first
+    ApiErrorId.CAMPAIGN_NOT_FOUND,
+    ApiErrorId.NEGOTIATION_NOT_FOUND,
+    ApiErrorId.BUY_NOT_FOUND,
+    ApiErrorId.BUY_UNIT_NOT_FOUND,
+    ApiErrorId.FORECAST_NOT_FOUND,
+    ApiErrorId.REPORT_NOT_FOUND,
+    ApiErrorId.MAKE_GOOD_NOT_FOUND,
+    ApiErrorId.INVOICE_NOT_FOUND,
+    ApiErrorId.RIGHTS_EXERCISE_NOT_FOUND,
+    ApiErrorId.RECONCILIATION_RUN_NOT_FOUND,
+    # body foreign keys, in declared input order
+    ApiErrorId.ADVERTISER_NOT_FOUND,
+    ApiErrorId.SELLER_NOT_FOUND,
+    ApiErrorId.ALLOCATION_NOT_FOUND,
+    ApiErrorId.NOT_RESOURCE_OWNER,
+    ApiErrorId.STALE_NEGOTIATION_VERSION,
+    ApiErrorId.STALE_CAMPAIGN_VERSION,
+    ApiErrorId.ALREADY_TERMINAL,
+    ApiErrorId.CAMPAIGN_PLAN_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.NEGOTIATION_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.BUY_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.UNIT_NOT_SCHEDULED,
+    ApiErrorId.REPORT_NOT_SUBMITTED,
+    ApiErrorId.MAKE_GOOD_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.INVOICE_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.ALLOCATION_LOCKED,
+    ApiErrorId.CAMPAIGN_PLAN_NOT_APPROVED,
+    ApiErrorId.FORECAST_NOT_PUBLISHED,
+    ApiErrorId.FORECAST_NOT_IN_EXPECTED_STATE,
+    ApiErrorId.PLAN_POSTURE_REPLAN_REQUIRED,
+    ApiErrorId.RIGHTS_WINDOW_CLOSED,
+    ApiErrorId.AIR_WINDOW_NOT_ELAPSED,
+    ApiErrorId.REPORT_PERIOD_OUTSIDE_FLIGHT,
+    ApiErrorId.MAKE_GOOD_WINDOW_INVALID,
+    ApiErrorId.CLOCK_NOT_MONOTONIC,
+    ApiErrorId.RIGHTS_PCT_ABOVE_CEILING,
+    ApiErrorId.ALLOCATION_PCT_SUM_INVALID,
+    ApiErrorId.NEGOTIATION_ROUND_CAP_REACHED,
+    ApiErrorId.MAKE_GOOD_OFFER_CAP_REACHED,
+    ApiErrorId.MAKE_GOOD_OFFER_INSUFFICIENT,
+    ApiErrorId.MAKE_GOOD_NOT_PERMITTED,
+    ApiErrorId.UNIT_FORECAST_MISMATCH,
+    ApiErrorId.ALLOCATION_CAMPAIGN_MISMATCH,
+    ApiErrorId.NO_BILLABLE_LINES,
+    ApiErrorId.ADVERTISER_CREDIT_HOLD,
+    ApiErrorId.SEGREGATION_OF_DUTIES,
+    ApiErrorId.CATEGORY_SEPARATION_CONFLICT,
+    ApiErrorId.EXCLUSIVE_AVAIL_CONFLICT,
+    ApiErrorId.FORECAST_AVAIL_EXCEEDED,
+    ApiErrorId.MAKE_GOOD_CAPACITY_EXCEEDED,
+    ApiErrorId.UNIT_COVERAGE_SHORT,
+    ApiErrorId.CREDIT_LIMIT_EXCEEDED,
+    ApiErrorId.CAMPAIGN_BUDGET_EXCEEDED,
+    ApiErrorId.CAMPAIGN_ALREADY_FUNDED,
+    ApiErrorId.CAMPAIGN_FUNDING_INSUFFICIENT,
+    ApiErrorId.PAYMENT_EXCEEDS_INVOICE,
+    ApiErrorId.SEQUENTIAL_LIABILITY_EXCEEDED,
+)
+
+#: Collection segment -> the not-found identifier that collection answers with.
+NOT_FOUND_BY_COLLECTION: Dict[str, str] = {
+    "advertisers": ApiErrorId.ADVERTISER_NOT_FOUND,
+    "campaigns": ApiErrorId.CAMPAIGN_NOT_FOUND,
+    "channel-allocations": ApiErrorId.ALLOCATION_NOT_FOUND,
+    "sellers": ApiErrorId.SELLER_NOT_FOUND,
+    "inventory-forecasts": ApiErrorId.FORECAST_NOT_FOUND,
+    "negotiations": ApiErrorId.NEGOTIATION_NOT_FOUND,
+    "buys": ApiErrorId.BUY_NOT_FOUND,
+    "buy-units": ApiErrorId.BUY_UNIT_NOT_FOUND,
+    "delivery-reports": ApiErrorId.REPORT_NOT_FOUND,
+    "make-goods": ApiErrorId.MAKE_GOOD_NOT_FOUND,
+    "rights-exercises": ApiErrorId.RIGHTS_EXERCISE_NOT_FOUND,
+    "reconciliation-runs": ApiErrorId.RECONCILIATION_RUN_NOT_FOUND,
+    "invoices": ApiErrorId.INVOICE_NOT_FOUND,
+}
+
+
+def ladder_position(error_id: str) -> int:
+    """Position of an identifier on the rejection ladder; lower wins."""
+    return REJECTION_LADDER.index(error_id)
+
+
+def outranks(higher: str, lower: str) -> bool:
+    """True when ``higher`` must be answered in preference to ``lower``."""
+    return ladder_position(higher) < ladder_position(lower)
+
+
+# Register the mapping so the shared error validator cross-checks statuses.
+set_error_http_status_map(HTTP_STATUS_CODES)

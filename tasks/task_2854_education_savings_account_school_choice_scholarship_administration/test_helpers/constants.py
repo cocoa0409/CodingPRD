@@ -1,0 +1,182 @@
+"""Literal constants declared by the requirements document.
+
+Money is always whole cents expressed as a Python ``int`` so that it travels as a
+JSON integer; the three ratios that are not money keep the precision they were
+supplied with.
+"""
+
+# --- The logical programme clock -------------------------------------------------
+
+CLOCK_EPOCH = "2026-08-01T00:00:00Z"
+
+# --- Programme year defaults -----------------------------------------------------
+
+DEFAULT_BASE_AWARD_CENTS = 731500
+DEFAULT_ROLLOVER_CAP_PCT = 0.25
+DEFAULT_ADMIN_FEE_PCT = 0.0175
+DEFAULT_ACCEPTANCE_DEADLINE_DAYS = 14
+DEFAULT_MIN_ASSESSMENT_PERCENTILE = 40
+DEFAULT_MIN_PORTFOLIO_ARTIFACTS = 6
+
+PROGRAM_YEAR_STATUSES = ("DRAFT", "WINDOW_OPEN", "AWARDING", "ACTIVE", "CLOSED")
+
+# --- Award computation -----------------------------------------------------------
+
+INCOME_MULTIPLIERS = {"BAND_A": 1.00, "BAND_B": 0.90, "BAND_C": 0.75}
+ADDON_PCTS = {
+    "DISABILITY_IEP": 0.375,
+    "FOSTER": 0.225,
+    "MILITARY": 0.125,
+    "PRIOR_PUBLIC_SCHOOL": 0.0625,
+}
+ADDON_AGGREGATE_CAP_PCT = 0.45
+
+CATEGORY_FLAG_CODES = ("DISABILITY_IEP", "FOSTER", "MILITARY", "PRIOR_PUBLIC_SCHOOL")
+INCOME_BANDS = ("BAND_A", "BAND_B", "BAND_C")
+PRIOR_ENROLLMENTS = (
+    "PUBLIC_SCHOOL_FULL_YEAR",
+    "PUBLIC_SCHOOL_PARTIAL",
+    "PRIVATE_SCHOOL",
+    "HOMESCHOOL",
+    "ENTERING_KINDERGARTEN",
+)
+
+# Award figures the requirements document states verbatim against the default base.
+AWARD_BAND_A_NO_FLAGS = 731500
+AWARD_BAND_C_NO_FLAGS = 548625
+AWARD_BAND_B_ONLY = 658350
+AWARD_BAND_B_IEP_AND_PRIOR_PUBLIC = 978382
+AWARD_BAND_B_IEP = 932663
+AWARD_BAND_A_IEP_AND_FOSTER = 1060676
+
+# Proration of the 932663 verified figure across the quarters that remain.
+PRORATED_932663_FOUR_QUARTERS = 932663
+PRORATED_932663_THREE_QUARTERS = 699497
+PRORATED_932663_TWO_QUARTERS = 466332
+
+# --- Priority scoring ------------------------------------------------------------
+
+INCOME_WEIGHTS = {"BAND_A": 1.0, "BAND_B": 0.6, "BAND_C": 0.25}
+CATEGORY_POINTS = {
+    "DISABILITY_IEP": 40,
+    "FOSTER": 30,
+    "MILITARY": 15,
+    "PRIOR_PUBLIC_SCHOOL": 10,
+}
+SIBLING_TERM_POINTS = 25
+
+APPLICATION_STATUSES = (
+    "DRAFT",
+    "SUBMITTED",
+    "ELIGIBLE",
+    "DENIED",
+    "UNDER_APPEAL",
+    "DENIED_FINAL",
+    "AWARD_OFFERED",
+    "WAITLISTED",
+    "ACCEPTED",
+    "EXPIRED",
+    "WITHDRAWN",
+    "COMPLETED",
+)
+
+# --- Quarterly disbursement of the 932663 award ----------------------------------
+
+Q1_GROSS_CENTS = 233168
+Q1_ADMIN_FEE_CENTS = 4080
+Q1_NET_CENTS = 229088
+Q2_GROSS_CENTS = 233165
+Q2_ADMIN_FEE_CENTS = 4080
+Q2_NET_CENTS = 229085
+BALANCE_AFTER_TWO_QUARTERS = 458173
+LIFETIME_DISBURSED_TWO_QUARTERS = 466333
+LIFETIME_ADMIN_FEE_TWO_QUARTERS = 8160
+
+ACCOUNT_STATUSES = ("ACTIVE", "SUSPENDED", "CLOSED")
+
+# --- Provider screening ----------------------------------------------------------
+
+SCREENING_FLAG_WEIGHTS = {
+    "OFAC_HIT": 60,
+    "PRIOR_DELISTING": 40,
+    "NO_STATE_REGISTRATION": 35,
+    "SHARED_BANK_ACCOUNT": 25,
+    "ADDRESS_MISMATCH": 20,
+    "NEW_ENTITY_UNDER_12_MONTHS": 15,
+}
+SCREENING_SCORE_CEILING = 100
+RECOMMEND_APPROVE_BELOW = 40
+RECOMMEND_REJECT_AT = 60
+ADMISSION_MAX_SCORE_EXCLUSIVE = 60
+ADMISSION_APPROVED_BELOW = 40
+
+SURVEILLANCE_DECAY_PER_MONTH = 0.1
+SURVEILLANCE_DECAY_FLOOR = 0.5
+SURVEILLANCE_POINTS_PER_CASE = 25
+AUTO_DELIST_AT = 90
+AUTO_PROBATION_AT = 75
+REINSTATE_MAX_SURVEILLANCE_EXCLUSIVE = 75
+
+ELEVATED_SCREENING_SCORE = "ELEVATED_SCREENING_SCORE"
+DELISTING_OVERTURNED_ON_APPEAL = "DELISTING_OVERTURNED_ON_APPEAL"
+MISUSE_SUBSTANTIATED = "MISUSE_SUBSTANTIATED"
+SYSTEM_USER_ID = "system"
+
+PROVIDER_STATUSES = (
+    "DRAFT",
+    "SCREENED",
+    "APPROVED",
+    "PROBATION",
+    "DELISTED",
+    "PERMANENTLY_BARRED",
+)
+PROVIDER_TYPES = ("SCHOOL", "TUTOR", "THERAPY", "CURRICULUM_VENDOR", "TRANSPORT")
+
+# --- Purchase requests -----------------------------------------------------------
+
+APPROVAL_STATUSES = ("PENDING_REVIEW", "APPROVED", "DENIED", "VOID")
+SETTLEMENT_STATUSES = ("UNSETTLED", "CLAIMED", "PAID", "REVERSED", "CANCELLED")
+
+# --- Misuse cases and clawback ---------------------------------------------------
+
+DETECTION_RULES = (
+    "DUPLICATE_INVOICE",
+    "NON_ALLOWABLE_EXPENSE",
+    "PROVIDER_COLLUSION",
+    "FALSIFIED_ENROLLMENT",
+    "CAP_CIRCUMVENTION",
+)
+MISUSE_CASE_STATUSES = (
+    "OPEN",
+    "UNDER_REVIEW",
+    "SUBSTANTIATED",
+    "DISMISSED",
+    "CLAWBACK_ISSUED",
+    "UNDER_APPEAL",
+    "RESOLVED",
+    "REVERSED",
+)
+PENALTY_RATE_LOW = 0.10
+PENALTY_RATE_MID = 0.20
+PENALTY_RATE_HIGH = 0.35
+PENALTY_BAND_LOW_MAX_CENTS = 50000
+PENALTY_BAND_MID_MAX_CENTS = 250000
+
+# --- Renewals and appeals --------------------------------------------------------
+
+RENEWAL_REVIEW_STATUSES = ("SUBMITTED", "APPROVED", "DENIED", "SUPERSEDED")
+ASSESSMENT_TYPES = ("NORM_REFERENCED_TEST", "PORTFOLIO")
+APPEAL_SUBJECT_TYPES = ("APPLICATION_DENIAL", "CLAWBACK", "PROVIDER_DELISTING")
+APPEAL_STATUSES = ("FILED", "OVERTURNED", "UPHELD")
+APPEAL_ROUND_CAP = 2
+
+# --- Pagination ------------------------------------------------------------------
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+MIN_OFFSET = 0
+
+# --- Identifiers that name nothing ----------------------------------------------
+
+MISSING_ID = "00000000-0000-4000-8000-000000000000"

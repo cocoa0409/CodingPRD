@@ -1,0 +1,84 @@
+"""Error catalogue for the camp accreditation domain (PRD section 5)."""
+
+ERROR_STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_SCOPE": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # schema
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_CAMP_NOT_FOUND": 404,
+    "ERR_STANDARDS_SET_NOT_FOUND": 404,
+    "ERR_STANDARD_NOT_FOUND": 404,
+    "ERR_CYCLE_NOT_FOUND": 404,
+    "ERR_EVALUATION_NOT_FOUND": 404,
+    "ERR_WRITTEN_PLAN_NOT_FOUND": 404,
+    "ERR_VISITOR_NOT_FOUND": 404,
+    "ERR_VISIT_NOT_FOUND": 404,
+    "ERR_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_DEFICIENCY_NOT_FOUND": 404,
+    "ERR_MED_RECORD_NOT_FOUND": 404,
+    "ERR_ANNUAL_REPORT_NOT_FOUND": 404,
+    "ERR_DISCLOSURE_NOT_FOUND": 404,
+    # optimistic concurrency
+    "ERR_STALE_CAMP_VERSION": 412,
+    "ERR_STALE_CYCLE_VERSION": 412,
+    # state
+    "ERR_STANDARDS_SET_ALREADY_PUBLISHED": 409,
+    "ERR_STANDARDS_SET_NOT_PUBLISHED": 409,
+    "ERR_CYCLE_NOT_IN_SELF_ASSESSMENT": 409,
+    "ERR_VISIT_INVALID_STATE": 409,
+    "ERR_DEFICIENCY_INVALID_STATE": 409,
+    "ERR_ANNUAL_REPORT_INVALID_STATE": 409,
+    "ERR_EVALUATION_LOCKED": 409,
+    "ERR_VISITOR_INACTIVE": 409,
+    "ERR_CAMP_POSTURE_FROZEN": 409,
+    "ERR_DUPLICATE_CYCLE_YEAR": 409,
+    # business safety
+    "ERR_STATE_LICENSE_BLOCKS_VISIT": 422,
+    "ERR_WRITTEN_PLAN_NOT_VERIFIED": 422,
+    "ERR_HEALTH_STAFFING_INSUFFICIENT": 422,
+    "ERR_PHYSICIAN_REVIEW_REQUIRED": 422,
+    "ERR_VISITOR_CONFLICT_OF_INTEREST": 422,
+    "ERR_SPECIALIST_CERTIFICATION_REQUIRED": 422,
+    "ERR_MED_ROLE_NOT_PERMITTED": 422,
+    "ERR_CONTROLLED_SECOND_SIGNATURE_REQUIRED": 422,
+    "ERR_CONTROLLED_STOCK_INSUFFICIENT": 422,
+    # business constraint
+    "ERR_VISITOR_TRAVEL_CONFLICT": 422,
+    "ERR_CONTROLLED_DOSE_WINDOW_EXCEEDED": 422,
+    "ERR_TEAM_COMPOSITION_INCOMPLETE": 422,
+    "ERR_VISITOR_TRAINING_EXPIRED": 422,
+    "ERR_PLAN_REVISION_LIMIT": 422,
+    "ERR_SELF_ASSESSMENT_INCOMPLETE": 422,
+    "ERR_MANDATORY_SCORING_INCOMPLETE": 422,
+    "ERR_DECLARED_COUNT_BELOW_DISCLOSED": 422,
+    # business referential
+    "ERR_STANDARD_NOT_APPLICABLE": 422,
+    "ERR_PLAN_CAMP_MISMATCH": 422,
+    "ERR_VISIT_CYCLE_MISMATCH": 422,
+    # business temporal
+    "ERR_VISIT_WINDOW_INVALID": 422,
+    "ERR_TRAVEL_BLOCK_OUTSIDE_WINDOW": 422,
+    "ERR_OUTSIDE_VISIT_WINDOW": 422,
+    "ERR_CORRECTION_WINDOW_EXPIRED": 422,
+    "ERR_INCIDENT_OUTSIDE_REPORT_YEAR": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or _default_message(error_id)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower().capitalize() + "."
+
+
+def api_error(error_id, message=None):
+    return ApiError(error_id, message)

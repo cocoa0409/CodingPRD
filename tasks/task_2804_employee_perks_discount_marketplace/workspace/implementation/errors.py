@@ -1,0 +1,85 @@
+"""Error catalog. HTTP statuses come verbatim from PRD section 5."""
+
+ERROR_STATUS = {
+    # identity
+    "ERR_IDENTITY_REQUIRED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_SCOPE_VIOLATION": 403,
+    "ERR_PRIVACY_RESTRICTED": 403,
+    # existence
+    "ERR_MERCHANT_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_EMPLOYER_NOT_FOUND": 404,
+    "ERR_ELIGIBILITY_FILE_NOT_FOUND": 404,
+    "ERR_MEMBERSHIP_NOT_FOUND": 404,
+    "ERR_OFFER_NOT_FOUND": 404,
+    "ERR_PLACEMENT_SLOT_NOT_FOUND": 404,
+    "ERR_REDEMPTION_NOT_FOUND": 404,
+    "ERR_DISPUTE_NOT_FOUND": 404,
+    "ERR_STATEMENT_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    # schema
+    "ERR_VALIDATION": 422,
+    "ERR_INVALID_ENUM_VALUE": 422,
+    "ERR_INVALID_PAGINATION": 422,
+    "ERR_INVALID_WINDOW": 422,
+    "ERR_DISCOUNT_SHAPE_MISMATCH": 422,
+    "ERR_REGION_NOT_COVERED": 422,
+    "ERR_DUPLICATE_EMPLOYEE_REF": 422,
+    # concurrency
+    "ERR_STALE_VERSION": 412,
+    # own state
+    "ERR_MERCHANT_INVALID_STATE": 409,
+    "ERR_MERCHANT_SCORE_NOT_DECAYED": 409,
+    "ERR_AGREEMENT_INVALID_STATE": 409,
+    "ERR_DUPLICATE_AGREEMENT": 409,
+    "ERR_EMPLOYER_INVALID_STATE": 409,
+    "ERR_FILE_INVALID_STATE": 409,
+    "ERR_MEMBERSHIP_REVOKED": 409,
+    "ERR_OFFER_INVALID_STATE": 409,
+    "ERR_SLOT_INVALID_STATE": 409,
+    "ERR_REDEMPTION_INVALID_STATE": 409,
+    "ERR_DISPUTE_INVALID_STATE": 409,
+    "ERR_STATEMENT_INVALID_STATE": 409,
+    # cross entity
+    "ERR_AGREEMENT_NOT_ACTIVE": 409,
+    "ERR_MERCHANT_SUSPENDED": 409,
+    "ERR_MEMBERSHIP_NOT_ELIGIBLE": 409,
+    "ERR_PROGRAM_NOT_LIVE": 409,
+    "ERR_PROGRAM_FROZEN": 409,
+    "ERR_PROGRAM_RESTRICTED": 409,
+    # temporal
+    "ERR_OFFER_WINDOW_CLOSED": 422,
+    "ERR_MEMBERSHIP_WINDOW_CLOSED": 422,
+    "ERR_VERIFICATION_EXPIRED": 422,
+    "ERR_DISPUTE_WINDOW_CLOSED": 422,
+    "ERR_DISPUTE_DEADLINE_PASSED": 422,
+    "ERR_PERIOD_NOT_CLOSED": 422,
+    "ERR_EXCLUSIVITY_OVERLAP": 409,
+    # capacity
+    "ERR_NEGOTIATION_ROUND_LIMIT": 409,
+    "ERR_OFFER_SOLD_OUT": 409,
+    "ERR_PER_MEMBER_LIMIT": 409,
+    "ERR_SLOT_CAPACITY_CONFLICT": 409,
+    "ERR_SLOT_COOLDOWN_CONFLICT": 409,
+    "ERR_MAX_INFO_REQUESTS": 409,
+    "ERR_CATEGORY_COVERAGE_FLOOR": 409,
+    # economics and privacy
+    "ERR_MIN_SPEND_NOT_MET": 422,
+    "ERR_VERIFICATION_TOKEN_INVALID": 422,
+    "ERR_FRAUD_RISK_BLOCKED": 422,
+    "ERR_CREDIT_EXCEEDS_NET": 422,
+    "ERR_EXCLUSIVITY_TERMS_MISSING": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."

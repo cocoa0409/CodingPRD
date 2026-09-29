@@ -1,0 +1,193 @@
+"""Domain thresholds and derived-figure constants taken from the PRD."""
+
+# The logical clock's startup value.
+CLOCK_STARTUP_UTC = "2026-08-01T00:00:00Z"
+
+# Pagination (PRD section 2.3).
+PAGINATION = {
+    "DEFAULT_LIMIT": 10,
+    "MIN_LIMIT": 1,
+    "MAX_LIMIT": 100,
+    "DEFAULT_OFFSET": 0,
+}
+
+# County tier multipliers on the licence base fee.
+COUNTY_TIER_MULTIPLIERS = {
+    "TIER_1": 1.25,
+    "TIER_2": 1.00,
+    "TIER_3": 0.80,
+}
+
+# Reference-data ranges for a franchisor and a hearing room.
+MANUFACTURER_LIMITS = {
+    "LINE_MAKE_MIN_LEN": 2,
+    "LINE_MAKE_MAX_LEN": 20,
+    "POSTED_RATE_MIN_CENTS": 1000,
+    "POSTED_RATE_MAX_CENTS": 100000,
+}
+
+HEARING_ROOM_LIMITS = {
+    "ROOM_CODE_MIN_LEN": 2,
+    "ROOM_CODE_MAX_LEN": 12,
+    "SEATING_CAPACITY_MIN": 10,
+    "SEATING_CAPACITY_MAX": 400,
+    "MAX_HEARINGS_PER_DAY_MIN": 1,
+    "MAX_HEARINGS_PER_DAY_MAX": 4,
+    "MAX_HEARINGS_PER_DAY_DEFAULT": 2,
+    "BUFFER_MINUTES_MIN": 0,
+    "BUFFER_MINUTES_MAX": 240,
+    "BUFFER_MINUTES_DEFAULT": 60,
+}
+
+# Statutory minimums for the sufficiency scan, by dealer type.
+DEALER_TYPE_MINIMUMS = {
+    "NEW_MOTOR_VEHICLE": {
+        "facility_sqft": 8000,
+        "display_spaces": 10,
+        "service_bays": 3,
+        "bond_amount_cents": 5000000,
+        "insurance_liability_cents": 100000000,
+    },
+    "USED_ONLY": {
+        "facility_sqft": 2000,
+        "display_spaces": 3,
+        "service_bays": 0,
+        "bond_amount_cents": 2500000,
+        "insurance_liability_cents": 50000000,
+    },
+}
+
+# Licence fee assembly.
+FEE = {
+    "BASE_INITIAL_CENTS": 120000,
+    "BASE_RENEWAL_CENTS": 90000,
+    "BASE_CHANGE_OF_OWNERSHIP_CENTS": 150000,
+    "BASE_RELOCATION_CENTS": 75000,
+    "LINE_MAKE_SURCHARGE_CENTS": 25000,
+    "LINE_MAKE_SURCHARGE_CAP_CENTS": 100000,
+    "FACILITY_CREDIT_BASELINE_SQFT": 8000,
+    "FACILITY_CREDIT_STEP_SQFT": 1000,
+    "FACILITY_CREDIT_PER_STEP_CENTS": 4000,
+    "FACILITY_CREDIT_CAP_CENTS": 30000,
+    "LATE_RENEWAL_PER_DAY_CENTS": 5000,
+    "LATE_RENEWAL_CAP_CENTS": 50000,
+}
+
+# Licence terms and windows, in days.
+TERMS = {
+    "DEALER_TERM_DAYS": 730,
+    "SALESPERSON_TERM_DAYS": 365,
+    "RENEWAL_WINDOW_OPENS_DAYS_BEFORE_EXPIRY": 60,
+    "RENEWAL_GRACE_DAYS_AFTER_EXPIRY": 30,
+    "MAX_RESUBMISSIONS": 2,
+    "MAX_AMENDMENTS": 2,
+}
+
+# Salesperson and dealer discipline.
+DISCIPLINE = {
+    "POINT_WINDOW_DAYS": 730,
+    "SALESPERSON_PROBATION_POINTS": 6,
+    "SALESPERSON_SUSPENSION_POINTS": 9,
+    "SALESPERSON_RENEWAL_BAR_POINTS": 9,
+    "DEALER_SUSPENSION_POINTS": 12,
+    "DEALER_REVOCATION_POINTS": 18,
+}
+
+SANCTION_POINTS = {
+    "WARNING": 0,
+    "CIVIL_PENALTY": 3,
+    "PROBATION": 6,
+    "SUSPENSION_RECOMMENDED": 9,
+}
+
+ALLEGATION_PENALTY_BASE_CENTS = {
+    "ODOMETER_MISREPRESENTATION": 200000,
+    "FAILURE_TO_TRANSFER_TITLE": 100000,
+    "ADVERTISING_VIOLATION": 50000,
+    "DEPOSIT_RETENTION": 75000,
+    "UNLICENSED_SALESPERSON": 150000,
+}
+
+RESTITUTION = {
+    "CAP_CENTS": 1500000,
+    "CIVIL_PENALTY_CAP_CENTS": 500000,
+    "PENALTY_LOSS_RATE": 0.05,
+    "TERM_DAYS": 30,
+}
+
+
+# Franchise notice periods and the protest window.
+NOTICE = {
+    "TERMINATION_MIN_DAYS": 60,
+    "RELOCATION_MIN_DAYS": 60,
+    "ADDITIONAL_POINT_MIN_DAYS": 30,
+    "PROTEST_WINDOW_DAYS": 30,
+}
+
+# Protest standing and the good-cause standard.
+PROTEST = {
+    "RELEVANT_MARKET_RADIUS_KM": 24.00,
+    "GOOD_CAUSE_THRESHOLD_TERMINATION": 40.00,
+    "GOOD_CAUSE_THRESHOLD_OTHER": 60.00,
+    "APPEAL_WINDOW_DAYS": 30,
+}
+
+# Hearing docket.
+DOCKET = {
+    "HEARING_WINDOW_OPENS_DAYS_AFTER_FILING": 30,
+    "HEARING_WINDOW_CLOSES_DAYS_AFTER_FILING": 180,
+    "EVIDENCE_DEADLINE_DAYS_BEFORE_HEARING": 7,
+    "SESSION_COUNT_MIN": 1,
+    "SESSION_COUNT_MAX": 3,
+    "PAGE_COUNT_MIN": 1,
+    "PAGE_COUNT_MAX": 5000,
+}
+
+# Good-cause weighting.
+GOOD_CAUSE = {
+    "INADEQUACY_PTS_MULTIPLIER": 8,
+    "INVESTMENT_CENTS_PER_POINT": 500000,
+    "ACCESS_MINUTE_MULTIPLIER": 4,
+    "ACCESS_NEUTRAL_POINTS": 50.00,
+    "GROWTH_PCT_MULTIPLIER": 5,
+    "COMPONENT_CAP": 100.00,
+    "WEIGHT_INADEQUACY": 0.40,
+    "WEIGHT_INVESTMENT": 0.25,
+    "WEIGHT_ACCESS": 0.20,
+    "WEIGHT_GROWTH": 0.15,
+}
+
+# Hearing cost assessment.
+ASSESSMENT = {
+    "ROOM_SESSION_RATE_CENTS": 45000,
+    "TRANSCRIPT_PER_PAGE_CENTS": 350,
+    "SURCHARGE_BAND_1_MAX_SUBTOTAL_CENTS": 100000,
+    "SURCHARGE_BAND_1_RATE": 0.05,
+    "SURCHARGE_BAND_2_MAX_SUBTOTAL_CENTS": 250000,
+    "SURCHARGE_BAND_2_RATE": 0.08,
+    "SURCHARGE_BAND_3_RATE": 0.12,
+    "PREVAILING_SHARE_RATE": 0.30,
+}
+
+# Warranty reimbursement rate disputes.
+RATE_DISPUTE = {
+    "MIN_QUALIFYING_LABOR_HOURS": 0.5,
+    "MIN_QUALIFYING_LINES": 5,
+    "MAX_REPAIR_ORDER_LINES": 100,
+    "SPREAD_TOLERANCE_PCT": 5.00,
+    "RESPONSE_WINDOW_DAYS": 30,
+    "RATE_EFFECTIVE_LAG_DAYS": 30,
+}
+
+# Values reused as payload defaults across setup chains.
+TEST_DEFAULTS = {
+    "LINE_MAKE": "AURORA",
+    "HOME_OFFICE_STATE": "MI",
+    "POSTED_RATE_CENTS": 6000,
+    "FACILITY_SQFT": 9000,
+    "DISPLAY_SPACES": 12,
+    "SERVICE_BAYS": 4,
+    "BOND_AMOUNT_CENTS": 5000000,
+    "INSURANCE_LIABILITY_CENTS": 100000000,
+    "SEATING_CAPACITY": 40,
+}

@@ -1,0 +1,126 @@
+"""Error catalog and exception type (PRD section 5)."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)
+
+
+# error_id -> http status
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_VALIDATION": 422,
+    "ERR_NOT_FOUND": 404,
+    # existence
+    "ERR_ELECTION_NOT_FOUND": 404,
+    "ERR_CONTEST_NOT_FOUND": 404,
+    "ERR_BALLOT_BATCH_NOT_FOUND": 404,
+    "ERR_CUSTODY_EVENT_NOT_FOUND": 404,
+    "ERR_AUDIT_NOT_FOUND": 404,
+    "ERR_AUDIT_ROUND_NOT_FOUND": 404,
+    "ERR_AUDIT_BATCH_NOT_FOUND": 404,
+    "ERR_TALLY_TEAM_NOT_FOUND": 404,
+    "ERR_MANUAL_TALLY_NOT_FOUND": 404,
+    "ERR_DISCREPANCY_NOT_FOUND": 404,
+    "ERR_BALLOT_INTERPRETATION_NOT_FOUND": 404,
+    "ERR_RECOUNT_NOT_FOUND": 404,
+    "ERR_CORRECTIVE_ACTION_NOT_FOUND": 404,
+    "ERR_OBSERVER_CREDENTIAL_NOT_FOUND": 404,
+    # ownership / identity
+    "ERR_TALLY_TEAM_MISMATCH": 403,
+    "ERR_OBSERVER_CREDENTIAL_REVOKED": 403,
+    "ERR_OBSERVER_ACCESS_WINDOW_CLOSED": 403,
+    "ERR_NOT_REQUESTING_PARTY": 403,
+    # optimistic concurrency
+    "ERR_STALE_CONTEST_VERSION": 412,
+    "ERR_STALE_AUDIT_VERSION": 412,
+    "ERR_STALE_BALLOT_BATCH_VERSION": 412,
+    # invalid state family
+    "ERR_INVALID_ELECTION_STATE": 409,
+    "ERR_INVALID_CONTEST_STATE": 409,
+    "ERR_INVALID_BATCH_STATE": 409,
+    "ERR_INVALID_AUDIT_STATE": 409,
+    "ERR_INVALID_AUDIT_BATCH_STATE": 409,
+    "ERR_INVALID_TALLY_STATE": 409,
+    "ERR_INVALID_DISCREPANCY_STATE": 409,
+    "ERR_INVALID_INTERPRETATION_STATE": 409,
+    "ERR_INVALID_RECOUNT_STATE": 409,
+    "ERR_INVALID_CORRECTIVE_ACTION_STATE": 409,
+    "ERR_INVALID_TEAM_STATE": 409,
+    "ERR_INVALID_CREDENTIAL_STATE": 409,
+    "ERR_PUBLIC_REPORT_NOT_PUBLISHED": 409,
+    # lifecycle gates
+    "ERR_CONTEST_NOT_CANVASSED": 409,
+    "ERR_ELECTION_NOT_CANVASSED": 409,
+    "ERR_ELECTION_ALREADY_CERTIFIED": 409,
+    "ERR_AUDIT_NOT_TERMINAL": 409,
+    "ERR_RECOUNT_NOT_TERMINAL": 409,
+    "ERR_TALLY_TEAM_NOT_READY": 409,
+    # custody safety
+    "ERR_BATCH_QUARANTINED": 409,
+    "ERR_RETRIEVAL_NOT_AUTHORIZED": 409,
+    "ERR_SEAL_NUMBER_MISMATCH": 409,
+    "ERR_BATCH_NOT_CHECKED_OUT": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_TEAM_NOT_BIPARTISAN": 409,
+    # referential / shape business rules
+    "ERR_CROSS_ELECTION_REFERENCE": 422,
+    "ERR_BATCH_NOT_IN_CONTEST": 422,
+    "ERR_CANDIDATE_NAME_UNKNOWN": 422,
+    "ERR_INVALID_TIME_WINDOW": 422,
+    "ERR_RECOUNT_REQUEST_WINDOW_CLOSED": 409,
+    "ERR_CERTIFICATION_DEADLINE_PASSED": 409,
+    "ERR_TEAM_SESSION_OVERLAP": 409,
+    "ERR_BATCH_SESSION_OVERLAP": 409,
+    "ERR_OBSERVER_ROOM_CAPACITY_EXCEEDED": 409,
+    "ERR_AUDIT_CONFIG_INVALID": 422,
+    "ERR_DUPLICATE_CONTEST_LABEL": 409,
+    "ERR_DUPLICATE_BATCH_LABEL": 409,
+    "ERR_DUPLICATE_TEAM_LABEL": 409,
+    "ERR_BALLOT_ACCOUNTING_EXCEEDED": 422,
+    "ERR_NO_UNSAMPLED_BATCHES": 409,
+    "ERR_DUPLICATE_TALLY": 409,
+    "ERR_TALLY_BALLOT_COUNT_MISMATCH": 422,
+    "ERR_REOPEN_LIMIT_EXCEEDED": 409,
+    "ERR_INTERPRETATION_LIMIT_EXCEEDED": 409,
+    "ERR_DUPLICATE_BALLOT_REF": 409,
+    "ERR_DUPLICATE_BOARD_VOTE": 409,
+    "ERR_TALLY_INCOMPLETE": 409,
+    "ERR_BATCH_NOT_RETURNED": 409,
+    "ERR_DEADLOCKED_INTERPRETATION_PENDING": 409,
+    "ERR_UNRESOLVED_DISCREPANCY": 409,
+    "ERR_EQUIPMENT_ACTION_UNVERIFIED": 409,
+    "ERR_MARGIN_NOT_RECOUNT_ELIGIBLE": 409,
+    "ERR_RECOUNT_SCOPE_OVERLAP": 409,
+    "ERR_DEPOSIT_NOT_REQUIRED": 409,
+    "ERR_DEPOSIT_INSUFFICIENT": 402,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Missing or unrecognized authentication headers.",
+    "ERR_UNAUTHORIZED": "The acting role may not perform this operation.",
+    "ERR_VALIDATION": "The request payload failed shape validation.",
+    "ERR_ELECTION_NOT_FOUND": "Election not found.",
+    "ERR_CONTEST_NOT_FOUND": "Contest not found.",
+    "ERR_BALLOT_BATCH_NOT_FOUND": "Ballot batch not found.",
+    "ERR_CUSTODY_EVENT_NOT_FOUND": "Custody event not found.",
+    "ERR_AUDIT_NOT_FOUND": "Audit not found.",
+    "ERR_AUDIT_ROUND_NOT_FOUND": "Audit round not found.",
+    "ERR_AUDIT_BATCH_NOT_FOUND": "Audit batch not found.",
+    "ERR_TALLY_TEAM_NOT_FOUND": "Tally team not found.",
+    "ERR_MANUAL_TALLY_NOT_FOUND": "Manual tally not found.",
+    "ERR_DISCREPANCY_NOT_FOUND": "Discrepancy not found.",
+    "ERR_BALLOT_INTERPRETATION_NOT_FOUND": "Ballot interpretation not found.",
+    "ERR_RECOUNT_NOT_FOUND": "Recount not found.",
+    "ERR_CORRECTIVE_ACTION_NOT_FOUND": "Corrective action not found.",
+    "ERR_OBSERVER_CREDENTIAL_NOT_FOUND": "Observer credential not found.",
+    "ERR_NOT_FOUND": "Resource not found.",
+}

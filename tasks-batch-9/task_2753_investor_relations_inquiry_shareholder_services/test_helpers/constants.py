@@ -1,0 +1,266 @@
+"""Domain constants for the Investor Relations & Shareholder Services API.
+
+Every value here is transcribed from the PRD (sections 2.x and 3.x).
+"""
+
+# ---------------------------------------------------------------------------
+# Roles (PRD 2.1)
+# ---------------------------------------------------------------------------
+ROLE_IR_ADMIN = "IRAdmin"
+ROLE_IR_ANALYST = "IRAnalyst"
+ROLE_DISCLOSURE_OFFICER = "DisclosureOfficer"
+ROLE_TRANSFER_AGENT_LIAISON = "TransferAgentLiaison"
+ROLE_INVESTOR = "Investor"
+
+ALL_ROLES = [
+    ROLE_IR_ADMIN,
+    ROLE_IR_ANALYST,
+    ROLE_DISCLOSURE_OFFICER,
+    ROLE_TRANSFER_AGENT_LIAISON,
+    ROLE_INVESTOR,
+]
+
+# ---------------------------------------------------------------------------
+# Logical clock (PRD 2.4)
+# ---------------------------------------------------------------------------
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# ---------------------------------------------------------------------------
+# Pagination (PRD 2.3)
+# ---------------------------------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ---------------------------------------------------------------------------
+# Disclosure posture (PRD 2.7)
+# ---------------------------------------------------------------------------
+POSTURE_OPEN = "OPEN"
+POSTURE_RESTRICTED = "RESTRICTED"
+POSTURE_BLACKOUT = "BLACKOUT"
+
+# ---------------------------------------------------------------------------
+# Contact enumerations (PRD 3.2, 3.3)
+# ---------------------------------------------------------------------------
+CONTACT_INSTITUTIONAL_HOLDER = "INSTITUTIONAL_HOLDER"
+CONTACT_RETAIL_HOLDER = "RETAIL_HOLDER"
+CONTACT_SELL_SIDE_ANALYST = "SELL_SIDE_ANALYST"
+
+HOLDER_CONTACT_TYPES = [CONTACT_INSTITUTIONAL_HOLDER, CONTACT_RETAIL_HOLDER]
+
+COVERAGE_NOT_COVERING = "NOT_COVERING"
+COVERAGE_INITIATED = "INITIATED"
+COVERAGE_SUSPENDED = "SUSPENDED"
+
+MODEL_ACCESS_NONE = "NONE"
+MODEL_ACCESS_GRANTED = "GRANTED"
+MODEL_ACCESS_REVOKED = "REVOKED"
+
+THREAT_NONE = "NONE"
+THREAT_WATCH = "WATCH"
+THREAT_ELEVATED = "ELEVATED"
+THREAT_CRITICAL = "CRITICAL"
+
+TIER_1 = "TIER_1"
+TIER_2 = "TIER_2"
+TIER_3 = "TIER_3"
+UNTIERED = "UNTIERED"
+
+# Tier thresholds on the rounded ownership_pct (PRD 3.2)
+TIER_1_MIN_PCT = 5.0
+TIER_2_MIN_PCT = 1.0
+
+# Activist escalation (PRD 3.2)
+ACTIVIST_STAKE_THRESHOLD_PCT = 5.0
+
+SERVICING_GRANT_MODEL_ACCESS = "GRANT_MODEL_ACCESS"
+SERVICING_REVOKE_MODEL_ACCESS = "REVOKE_MODEL_ACCESS"
+SERVICING_SET_THREAT_LEVEL = "SET_THREAT_LEVEL"
+
+# ---------------------------------------------------------------------------
+# Disclosure enumerations (PRD 3.4)
+# ---------------------------------------------------------------------------
+DISCLOSURE_EARNINGS_RELEASE = "EARNINGS_RELEASE"
+DISCLOSURE_GUIDANCE_UPDATE = "GUIDANCE_UPDATE"
+DISCLOSURE_PRESS_RELEASE = "PRESS_RELEASE"
+DISCLOSURE_FORM_8K = "FORM_8K"
+
+METRIC_REVENUE = "REVENUE"
+METRIC_EPS = "EPS"
+METRIC_FCF_MARGIN = "FCF_MARGIN"
+METRIC_NONE = "NONE"
+
+DISCLOSURE_STATUS_DRAFT = "DRAFT"
+DISCLOSURE_STATUS_PUBLISHED = "PUBLISHED"
+DISCLOSURE_STATUS_SUPERSEDED = "SUPERSEDED"
+DISCLOSURE_STATUS_WITHDRAWN = "WITHDRAWN"
+
+# ---------------------------------------------------------------------------
+# Inquiry enumerations and scoring (PRD 3.5)
+# ---------------------------------------------------------------------------
+TOPIC_DIVIDEND = "DIVIDEND"
+TOPIC_RECORD_DATE = "RECORD_DATE"
+TOPIC_PROXY = "PROXY"
+TOPIC_GUIDANCE = "GUIDANCE"
+TOPIC_MODEL_REQUEST = "MODEL_REQUEST"
+TOPIC_OTHER = "OTHER"
+
+INQUIRY_NEW = "NEW"
+INQUIRY_ROUTED = "ROUTED"
+INQUIRY_DRAFTING = "DRAFTING"
+INQUIRY_AWAITING_APPROVAL = "AWAITING_APPROVAL"
+INQUIRY_ESCALATED = "ESCALATED"
+INQUIRY_ANSWERED = "ANSWERED"
+
+# open_inquiry_count counts every status except ANSWERED (PRD 2.11)
+OPEN_INQUIRY_STATUSES = [
+    INQUIRY_NEW,
+    INQUIRY_ROUTED,
+    INQUIRY_DRAFTING,
+    INQUIRY_AWAITING_APPROVAL,
+    INQUIRY_ESCALATED,
+]
+
+QUEUE_DISCLOSURE_COMMITTEE = "DISCLOSURE_COMMITTEE"
+QUEUE_IR_DESK = "IR_DESK"
+QUEUE_TRANSFER_AGENT_DESK = "TRANSFER_AGENT_DESK"
+QUEUE_SHAREHOLDER_SERVICES = "SHAREHOLDER_SERVICES"
+
+# Sensitivity base points by topic (PRD 3.5)
+TOPIC_BASE_POINTS = {
+    TOPIC_GUIDANCE: 40,
+    TOPIC_MODEL_REQUEST: 30,
+    TOPIC_PROXY: 20,
+    TOPIC_DIVIDEND: 15,
+    TOPIC_RECORD_DATE: 15,
+    TOPIC_OTHER: 10,
+}
+NONPUBLIC_DETAIL_POINTS = 25
+ANALYST_CONTACT_POINTS = 15
+ACTIVIST_CONTACT_POINTS = 10
+ESCALATED_PRIOR_LINK_POINTS = 10
+POSTURE_TERM_POINTS = {POSTURE_BLACKOUT: 20, POSTURE_RESTRICTED: 10, POSTURE_OPEN: 0}
+SENSITIVITY_SCORE_CAP = 100
+
+# Routing thresholds (PRD 3.5): 50 exclusive, 60 inclusive, 80 escalation
+TA_DESK_MAX_SENSITIVITY = 50
+DISCLOSURE_COMMITTEE_MIN_SENSITIVITY = 60
+ESCALATION_MIN_SENSITIVITY = 80
+
+# SLA allowances in hours by queue (PRD 3.5)
+SLA_HOURS_BY_QUEUE = {
+    QUEUE_DISCLOSURE_COMMITTEE: 48,
+    QUEUE_IR_DESK: 72,
+    QUEUE_TRANSFER_AGENT_DESK: 96,
+    QUEUE_SHAREHOLDER_SERVICES: 120,
+}
+
+# ---------------------------------------------------------------------------
+# ResponseDraft enumerations (PRD 3.6)
+# ---------------------------------------------------------------------------
+CLASS_PUBLIC_DOMAIN = "PUBLIC_DOMAIN"
+CLASS_GUIDANCE_REPEAT = "GUIDANCE_REPEAT"
+CLASS_MATERIAL_NONPUBLIC = "MATERIAL_NONPUBLIC"
+
+DRAFT_DRAFT = "DRAFT"
+DRAFT_IN_REVIEW = "IN_REVIEW"
+DRAFT_CHANGES_REQUESTED = "CHANGES_REQUESTED"
+DRAFT_APPROVED = "APPROVED"
+DRAFT_BLOCKED = "BLOCKED"
+DRAFT_SENT = "SENT"
+
+BLOCKED_CITED_DISCLOSURE_WITHDRAWN = "CITED_DISCLOSURE_WITHDRAWN"
+BLOCKED_POSTURE_BLACKOUT = "POSTURE_BLACKOUT"
+
+DECISION_APPROVE = "APPROVE"
+DECISION_REQUEST_CHANGES = "REQUEST_CHANGES"
+
+# A draft is born at revision_round 1 and may not be revised once it has
+# already reached 3 (PRD 3.6).
+INITIAL_REVISION_ROUND = 1
+MAX_REVISION_ROUND = 3
+
+# ---------------------------------------------------------------------------
+# Estimates and consensus (PRD 3.7)
+# ---------------------------------------------------------------------------
+ESTIMATE_ACCEPTED = "ACCEPTED"
+ESTIMATE_SUPERSEDED = "SUPERSEDED"
+
+CONSENSUS_WINDOW_DAYS = 90
+GUIDANCE_BAND_LOW_FACTOR = 0.85
+GUIDANCE_BAND_HIGH_FACTOR = 1.15
+VARIANT_SIMPLE = "SIMPLE"
+VARIANT_ANCHORED = "ANCHORED"
+
+MEAN_DECIMALS = 4
+DISPERSION_DECIMALS = 2
+OWNERSHIP_PCT_DECIMALS = 4
+PRIORITY_SCORE_DECIMALS = 2
+
+# ---------------------------------------------------------------------------
+# Roadshow events and meeting requests (PRD 3.8)
+# ---------------------------------------------------------------------------
+EVENT_CONFERENCE = "CONFERENCE"
+EVENT_NDR = "NDR"
+
+EVENT_PLANNING = "PLANNING"
+EVENT_OPEN_FOR_REQUESTS = "OPEN_FOR_REQUESTS"
+EVENT_LOCKED = "LOCKED"
+EVENT_COMPLETED = "COMPLETED"
+
+REQUEST_REQUESTED = "REQUESTED"
+REQUEST_ALLOCATED = "ALLOCATED"
+REQUEST_WAITLISTED = "WAITLISTED"
+REQUEST_RELEASED = "RELEASED"
+REQUEST_DECLINED = "DECLINED"
+
+ALLOWED_SLOT_MINUTES = [20, 30, 45, 60]
+DOUBLE_BOOKING_BUFFER_MINUTES = 30
+
+# Priority score components (PRD 3.8)
+TIER_POINTS = {TIER_1: 50, TIER_2: 35, TIER_3: 20, UNTIERED: 5}
+NDA_POINTS = 8
+ENGAGEMENT_MULTIPLIER = 4
+ENGAGEMENT_CAP = 20
+ACTIVIST_PENALTY = 15
+ACTIVIST_PENALTY_LEVELS = [THREAT_ELEVATED, THREAT_CRITICAL]
+TYPE_MULTIPLIER = {
+    CONTACT_INSTITUTIONAL_HOLDER: 1.20,
+    CONTACT_SELL_SIDE_ANALYST: 1.00,
+    CONTACT_RETAIL_HOLDER: 0.60,
+}
+LEAD_BONUS_LONG_DAYS = 14
+LEAD_BONUS_LONG_POINTS = 5
+LEAD_BONUS_SHORT_DAYS = 7
+LEAD_BONUS_SHORT_POINTS = 2
+ALLOCATION_SCORE_THRESHOLD = 25
+
+# ---------------------------------------------------------------------------
+# Transfer agent instructions (PRD 3.9)
+# ---------------------------------------------------------------------------
+INSTRUCTION_RECORD_DATE_SET = "RECORD_DATE_SET"
+INSTRUCTION_DIVIDEND_PAYMENT = "DIVIDEND_PAYMENT"
+INSTRUCTION_RECORD_INQUIRY = "RECORD_INQUIRY"
+
+INSTRUCTION_SUBMITTED = "SUBMITTED"
+INSTRUCTION_ACKNOWLEDGED = "ACKNOWLEDGED"
+INSTRUCTION_REJECTED = "REJECTED"
+INSTRUCTION_EXECUTED = "EXECUTED"
+INSTRUCTION_REVERSED = "REVERSED"
+
+ACK_DECISION_ACKNOWLEDGE = "ACKNOWLEDGE"
+ACK_DECISION_REJECT = "REJECT"
+
+FUNDING_DECLARED_RATE = "DECLARED_RATE"
+FUNDING_RESERVE_CAPPED = "RESERVE_CAPPED"
+
+MIN_PAYABLE_LAG_DAYS = 10
+REVERSAL_WINDOW_HOURS = 72
+
+# Statuses that a competing dividend cycle must be in to collide (PRD 3.9)
+LIVE_DIVIDEND_STATUSES = [
+    INSTRUCTION_SUBMITTED,
+    INSTRUCTION_ACKNOWLEDGED,
+    INSTRUCTION_EXECUTED,
+]

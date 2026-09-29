@@ -1,0 +1,81 @@
+"""Error catalogue (PRD §5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+# error_id -> http status
+CATALOG = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED_ROLE": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_PARCEL_NOT_FOUND": 404,
+    "ERR_TAXPAYER_NOT_FOUND": 404,
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_APPLICATION_NOT_FOUND": 404,
+    "ERR_GRANT_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_FRAUD_CASE_NOT_FOUND": 404,
+    "ERR_NOTICE_NOT_FOUND": 404,
+    "ERR_DOCKET_NOT_FOUND": 404,
+    "ERR_APPEAL_NOT_FOUND": 404,
+    "ERR_STALE_PARCEL_VERSION": 412,
+    "ERR_STALE_GRANT_VERSION": 412,
+    "ERR_APPLICATION_NOT_DRAFT": 409,
+    "ERR_APPLICATION_NOT_UNDER_REVIEW": 409,
+    "ERR_APPLICATION_NOT_INFO_REQUESTED": 409,
+    "ERR_GRANT_NOT_ACTIVE": 409,
+    "ERR_GRANT_NOT_SUSPENDED": 409,
+    "ERR_GRANT_ALREADY_TERMINAL": 409,
+    "ERR_CLAIM_NOT_PENDING": 409,
+    "ERR_CASE_ALREADY_ADJUDICATED": 409,
+    "ERR_RECOVERY_NOT_ASSESSED": 409,
+    "ERR_APPEAL_NOT_SCHEDULABLE": 409,
+    "ERR_APPEAL_NOT_SCHEDULED": 409,
+    "ERR_DOCKET_CLOSED": 409,
+    "ERR_TAXPAYER_BARRED": 403,
+    "ERR_FRAUD_HOLD_ACTIVE": 409,
+    "ERR_RESIDENCY_VERIFICATION_FAILED": 422,
+    "ERR_RISK_SCORE_BELOW_THRESHOLD": 422,
+    "ERR_OWNERSHIP_NOT_VERIFIED": 422,
+    "ERR_DESTINATION_NOT_OWNED": 422,
+    "ERR_EXEMPTION_TYPE_NOT_ELIGIBLE": 422,
+    "ERR_OCCUPANCY_INTERVAL_OVERLAP": 409,
+    "ERR_DUPLICATE_PRIMARY_RESIDENCE": 409,
+    "ERR_HEARING_SLOT_CONFLICT": 409,
+    "ERR_APPEAL_DEADLINE_PASSED": 422,
+    "ERR_NOTICE_NOT_APPEALABLE": 422,
+    "ERR_NO_ELIGIBLE_CLAIM_YEARS": 422,
+    "ERR_STATUTORY_LOOKBACK_EXCEEDED": 422,
+    "ERR_CLAIM_YEARS_OVERLAP": 409,
+    "ERR_DUPLICATE_APPLICATION": 409,
+    "ERR_DUPLICATE_GRANT": 409,
+    "ERR_INFO_REQUEST_LIMIT_REACHED": 409,
+    "ERR_CONTINUANCE_LIMIT_REACHED": 409,
+    "ERR_DOCKET_CAPACITY_REACHED": 409,
+    "ERR_APPEAL_ALREADY_EXISTS": 409,
+    "ERR_INCOME_CERTIFICATION_REQUIRED": 422,
+    "ERR_INCOME_LIMIT_EXCEEDED": 422,
+    "ERR_ASSET_LIMIT_EXCEEDED": 422,
+    "ERR_PORTABLE_BALANCE_EXHAUSTED": 422,
+    "ERR_PAYMENT_EXCEEDS_BALANCE": 422,
+}
+
+_DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers are required and the role must be a declared role.",
+    "ERR_UNAUTHORIZED_ROLE": "The acting role is not authorised for this operation.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting taxpayer does not own the addressed resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting user is barred from this step by segregation of duties.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, CATALOG[error_id], message)

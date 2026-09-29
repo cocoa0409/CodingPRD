@@ -1,0 +1,148 @@
+"""The sixty-identifier error catalogue (PRD §5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    # --- 401 ---------------------------------------------------------------
+    "ERR_UNAUTHENTICATED": 401,
+    # --- 403 ---------------------------------------------------------------
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_NOT_SESSION_SUPERVISOR": 403,
+    "ERR_NOT_SESSION_OWNER": 403,
+    # --- 404 ---------------------------------------------------------------
+    "ERR_BLOCK_NOT_FOUND": 404,
+    "ERR_CREW_NOT_FOUND": 404,
+    "ERR_PICKER_NOT_FOUND": 404,
+    "ERR_WINDOW_NOT_FOUND": 404,
+    "ERR_SESSION_NOT_FOUND": 404,
+    "ERR_PAYROLL_RUN_NOT_FOUND": 404,
+    "ERR_LOT_NOT_FOUND": 404,
+    "ERR_TUNNEL_NOT_FOUND": 404,
+    "ERR_COMMITMENT_NOT_FOUND": 404,
+    "ERR_ALLOCATION_NOT_FOUND": 404,
+    "ERR_WATER_TEST_NOT_FOUND": 404,
+    # --- 400 ---------------------------------------------------------------
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_ENUM": 400,
+    "ERR_VALUE_OUT_OF_RANGE": 400,
+    "ERR_CULL_EXCEEDS_TALLY": 400,
+    "ERR_INVALID_DATE_RANGE": 400,
+    # --- 412 ---------------------------------------------------------------
+    "ERR_STALE_TUNNEL_VERSION": 412,
+    "ERR_STALE_COMMITMENT_VERSION": 412,
+    # --- 409 ---------------------------------------------------------------
+    "ERR_INVALID_BLOCK_STATE": 409,
+    "ERR_INVALID_CREW_STATE": 409,
+    "ERR_INVALID_WINDOW_STATE": 409,
+    "ERR_WINDOW_NOT_OPEN": 409,
+    "ERR_INVALID_SESSION_STATE": 409,
+    "ERR_SESSION_NOT_TALLIED": 409,
+    "ERR_SESSION_PAYROLL_LOCKED": 409,
+    "ERR_INVALID_PAYROLL_STATE": 409,
+    "ERR_PERIOD_HAS_UNRESOLVED_SESSIONS": 409,
+    "ERR_CREW_RUN_ALREADY_LOCKED": 409,
+    "ERR_INVALID_COLD_CHAIN_STATE": 409,
+    "ERR_INVALID_DISPOSITION_STATE": 409,
+    "ERR_INVALID_ALLOCATION_STATE": 409,
+    "ERR_INVALID_COMMITMENT_STATE": 409,
+    "ERR_BLOCK_QUARANTINED": 409,
+    "ERR_BLOCK_NOT_CLEARED": 409,
+    "ERR_LOT_ON_FOOD_SAFETY_HOLD": 409,
+    "ERR_BLOCK_WATER_NOT_COMPLIANT": 409,
+    "ERR_HYGIENE_TRAINING_INVALID": 409,
+    "ERR_SUPPORT_PLAN_INCOMPLETE": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_TALLY_REVISION_LIMIT": 409,
+    "ERR_DUPLICATE_RECORD": 409,
+    "ERR_BLOCK_REENTRY_CONFLICT": 409,
+    # --- 422 ---------------------------------------------------------------
+    "ERR_REPACK_MASS_BALANCE": 422,
+    "ERR_LOT_BLOCK_MISMATCH": 422,
+    "ERR_VARIETY_MISMATCH": 422,
+    "ERR_CREW_MISMATCH": 422,
+    "ERR_PICK_DATE_OUTSIDE_WINDOW": 422,
+    "ERR_WORK_DATE_OUTSIDE_WINDOW": 422,
+    "ERR_TEMPORAL_ORDER_VIOLATION": 422,
+    "ERR_SHIP_OUTSIDE_PROGRAM_WINDOW": 422,
+    "ERR_INSUFFICIENT_PICKERS": 422,
+    "ERR_BRIX_BELOW_MINIMUM": 422,
+    "ERR_TUNNEL_CAPACITY_EXCEEDED": 422,
+    "ERR_LOT_VOLUME_EXCEEDED": 422,
+    "ERR_COMMITMENT_OVERBOOKED": 422,
+    "ERR_CREW_LEDGER_NOT_CLEAR": 422,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing, empty or carry an unknown role.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorized for this endpoint.",
+    "ERR_NOT_SESSION_SUPERVISOR": "The acting operator is not the supervisor of the session's crew.",
+    "ERR_NOT_SESSION_OWNER": "The acting picker does not own this pick session.",
+    "ERR_BLOCK_NOT_FOUND": "The referenced production block does not exist.",
+    "ERR_CREW_NOT_FOUND": "The referenced crew does not exist.",
+    "ERR_PICKER_NOT_FOUND": "The referenced picker does not exist.",
+    "ERR_WINDOW_NOT_FOUND": "The referenced harvest window does not exist.",
+    "ERR_SESSION_NOT_FOUND": "The referenced pick session does not exist.",
+    "ERR_PAYROLL_RUN_NOT_FOUND": "The referenced payroll run does not exist.",
+    "ERR_LOT_NOT_FOUND": "The referenced fruit lot does not exist.",
+    "ERR_TUNNEL_NOT_FOUND": "The referenced cooling tunnel does not exist.",
+    "ERR_COMMITMENT_NOT_FOUND": "The referenced buyer commitment does not exist.",
+    "ERR_ALLOCATION_NOT_FOUND": "The referenced lot allocation does not exist.",
+    "ERR_WATER_TEST_NOT_FOUND": "The referenced water test does not exist.",
+    "ERR_INVALID_REQUEST": "The request body is missing a required field or carries a malformed value.",
+    "ERR_INVALID_ENUM": "An enumerated field carries a value outside its declared set.",
+    "ERR_VALUE_OUT_OF_RANGE": "A numeric field falls outside its declared range.",
+    "ERR_CULL_EXCEEDS_TALLY": "culled_clamshells may not exceed clamshells_filled.",
+    "ERR_INVALID_DATE_RANGE": "The supplied date or instant pair is incorrectly ordered.",
+    "ERR_STALE_TUNNEL_VERSION": "The supplied expected_cooling_tunnel_version is stale.",
+    "ERR_STALE_COMMITMENT_VERSION": "The supplied expected_buyer_commitment_version is stale.",
+    "ERR_INVALID_BLOCK_STATE": "The block is not in a state that admits this operation.",
+    "ERR_INVALID_CREW_STATE": "The crew is not in a state that admits this operation.",
+    "ERR_INVALID_WINDOW_STATE": "The harvest window is not in a state that admits this operation.",
+    "ERR_WINDOW_NOT_OPEN": "The harvest window is not OPEN.",
+    "ERR_INVALID_SESSION_STATE": "The pick session is not in a state that admits this operation.",
+    "ERR_SESSION_NOT_TALLIED": "The pick session carries no tally figures yet.",
+    "ERR_SESSION_PAYROLL_LOCKED": "The pick session is bound into a locked payroll run.",
+    "ERR_INVALID_PAYROLL_STATE": "The payroll run is not in a state that admits this operation.",
+    "ERR_PERIOD_HAS_UNRESOLVED_SESSIONS": "The period still holds unresolved pick sessions.",
+    "ERR_CREW_RUN_ALREADY_LOCKED": "Another payroll run of this crew is already LOCKED.",
+    "ERR_INVALID_COLD_CHAIN_STATE": "The lot's cold_chain_status does not admit this operation.",
+    "ERR_INVALID_DISPOSITION_STATE": "The lot's disposition_status does not admit this operation.",
+    "ERR_INVALID_ALLOCATION_STATE": "The allocation line is not in a state that admits this operation.",
+    "ERR_INVALID_COMMITMENT_STATE": "The buyer commitment is not in a state that admits this operation.",
+    "ERR_BLOCK_QUARANTINED": "The block is under a food-safety quarantine.",
+    "ERR_BLOCK_NOT_CLEARED": "The block's food_safety_posture is not CLEARED.",
+    "ERR_LOT_ON_FOOD_SAFETY_HOLD": "The lot is under a food-safety hold.",
+    "ERR_BLOCK_WATER_NOT_COMPLIANT": "The traceability block's water_status is not COMPLIANT.",
+    "ERR_HYGIENE_TRAINING_INVALID": "Worker hygiene training is missing or expired.",
+    "ERR_SUPPORT_PLAN_INCOMPLETE": "The crew's support plan is not complete.",
+    "ERR_SEGREGATION_OF_DUTIES": "The acting operator may not perform both halves of this duty split.",
+    "ERR_TALLY_REVISION_LIMIT": "The session has exhausted its permitted tally revisions.",
+    "ERR_DUPLICATE_RECORD": "A record with the same unique key already exists.",
+    "ERR_BLOCK_REENTRY_CONFLICT": "The window violates the twelve-hour block re-entry separation.",
+    "ERR_REPACK_MASS_BALANCE": "The repack output counts do not balance the source lot.",
+    "ERR_LOT_BLOCK_MISMATCH": "The lot's block_id does not match its window's block_id.",
+    "ERR_VARIETY_MISMATCH": "The variety does not match the related record's variety.",
+    "ERR_CREW_MISMATCH": "The crew does not match the related records.",
+    "ERR_PICK_DATE_OUTSIDE_WINDOW": "pick_date falls outside the window's calendar span.",
+    "ERR_WORK_DATE_OUTSIDE_WINDOW": "work_date falls outside the window's calendar span.",
+    "ERR_TEMPORAL_ORDER_VIOLATION": "The supplied instants violate the required temporal ordering.",
+    "ERR_SHIP_OUTSIDE_PROGRAM_WINDOW": "The shipment falls outside the program window or the lot's shelf life.",
+    "ERR_INSUFFICIENT_PICKERS": "The crew does not satisfy the window's staffing requirement.",
+    "ERR_BRIX_BELOW_MINIMUM": "forecast_brix is below the variety's minimum.",
+    "ERR_TUNNEL_CAPACITY_EXCEEDED": "The tunnel has insufficient free slots over the requested interval.",
+    "ERR_LOT_VOLUME_EXCEEDED": "allocated_lbs exceeds the lot's available_lbs.",
+    "ERR_COMMITMENT_OVERBOOKED": "allocated_lbs exceeds the commitment's open_lbs.",
+    "ERR_CREW_LEDGER_NOT_CLEAR": "The crew still holds accrued wages, a live window or an unresolved session.",
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request path; converted to the error envelope."""
+
+    def __init__(self, error_id, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.status = ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

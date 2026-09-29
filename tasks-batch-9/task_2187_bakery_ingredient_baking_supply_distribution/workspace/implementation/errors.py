@@ -1,0 +1,53 @@
+"""Error catalogue (PRD §5) and the ApiError exception."""
+
+ERROR_HTTP = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNKNOWN_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_VALIDATION": 400,
+    "ERR_RESOURCE_NOT_FOUND": 404,
+    "ERR_REFERENCED_ENTITY_NOT_FOUND": 404,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_STALE_ORDER_VERSION": 412,
+    "ERR_STALE_ROUTE_VERSION": 412,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_ORDER_DIMENSION_GATE": 409,
+    "ERR_RELATED_ENTITY_STATE_INVALID": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ALLERGEN_PROGRAM_CONFLICT": 422,
+    "ERR_ALLERGEN_ZONE_MISMATCH": 422,
+    "ERR_ROUTE_ALLERGEN_LOCK_CONFLICT": 409,
+    "ERR_NO_ELIGIBLE_LOT": 409,
+    "ERR_ENTITY_LINK_MISMATCH": 409,
+    "ERR_STOP_WINDOW_CONFLICT": 409,
+    "ERR_SILO_FILL_WINDOW_CONFLICT": 409,
+    "ERR_ZONE_LOCKOUT_CONFLICT": 409,
+    "ERR_CONTRACT_TERM_NOT_COVERING": 422,
+    "ERR_CONTRACT_TERM_OVERLAP": 409,
+    "ERR_INDEX_QUOTE_MISSING": 422,
+    "ERR_ROUTE_DATE_MISMATCH": 409,
+    "ERR_DUPLICATE_RESOURCE": 409,
+    "ERR_ROUTE_CAPACITY_EXCEEDED": 409,
+    "ERR_PRODUCT_NOT_BULK_CAPABLE": 422,
+    "ERR_NO_SILO_FOR_PRODUCT": 422,
+    "ERR_SILO_HEADROOM_INSUFFICIENT": 422,
+    "ERR_BULK_FILL_BELOW_MIN": 422,
+    "ERR_ROUND_LIMIT_REACHED": 409,
+    "ERR_CONTRACT_VOLUME_EXCEEDED": 409,
+    "ERR_MIN_DROP_NOT_MET": 422,
+    "ERR_CREDIT_LIMIT_EXCEEDED": 402,
+    "ERR_ENGAGEMENT_NOT_ATTACHED": 409,
+    "ERR_SHORT_QUANTITY_INVALID": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

@@ -1,0 +1,100 @@
+"""Test infrastructure for the guest-screening and damage-protection contract.
+
+Importing this package registers the error-to-status map with the framework, so
+``validate_error`` cross-checks the HTTP status of every refusal automatically.
+The framework generics are re-exported here alongside the domain modules, so a
+test file needs a single import block.
+"""
+
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    GenericApiClient,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+from . import assertions, constants, factories, fixtures, types
+from .api_client import OMIT, ApiClient, api_client
+from .api_errors import HTTP_STATUS_CODES, NOT_FOUND_ERROR_IDS, ApiErrorId
+from .test_users import (
+    ADJUDICATOR,
+    COMPLIANCE_OFFICER,
+    PLACEHOLDER_GUEST_USER_ID,
+    PLACEHOLDER_HOST_USER_ID,
+    PLATFORM_ADMIN,
+    READER_HOST,
+    SECOND_ADJUDICATOR,
+    SECOND_COMPLIANCE_OFFICER,
+    TEST_USERS,
+    make_adjudicator_headers,
+    make_compliance_officer_headers,
+    make_guest_headers,
+    make_headers,
+    make_headers_without_role,
+    make_headers_without_user_id,
+    make_headers_with_empty_user_id,
+    make_host_headers,
+    make_platform_admin_headers,
+)
+
+__all__ = [
+    "ADJUDICATOR",
+    "ApiClient",
+    "ApiErrorId",
+    "COMPLIANCE_OFFICER",
+    "GenericApiClient",
+    "HTTP_STATUS_CODES",
+    "NON_EXISTENT_UUID",
+    "NOT_FOUND_ERROR_IDS",
+    "OMIT",
+    "PLACEHOLDER_GUEST_USER_ID",
+    "PLACEHOLDER_HOST_USER_ID",
+    "PLATFORM_ADMIN",
+    "READER_HOST",
+    "SECOND_ADJUDICATOR",
+    "SECOND_COMPLIANCE_OFFICER",
+    "TEST_USERS",
+    "api_client",
+    "assert_at_least_one_succeeds",
+    "assert_cost_precision",
+    "assert_exactly_one_succeeds",
+    "assert_race_outcome",
+    "assert_timestamp_format",
+    "assert_version_incremented",
+    "assertions",
+    "build_user_headers",
+    "constants",
+    "factories",
+    "fixtures",
+    "get_success_data",
+    "is_iso8601_timestamp",
+    "is_valid_uuid",
+    "make_adjudicator_headers",
+    "make_compliance_officer_headers",
+    "make_guest_headers",
+    "make_headers",
+    "make_headers_with_empty_user_id",
+    "make_headers_without_role",
+    "make_headers_without_user_id",
+    "make_host_headers",
+    "make_platform_admin_headers",
+    "run_race",
+    "types",
+    "validate_error",
+    "validate_error_is_one_of",
+    "validate_paginated",
+    "validate_success",
+]

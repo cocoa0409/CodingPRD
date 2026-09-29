@@ -1,0 +1,101 @@
+"""Domain thresholds and pinned literals from the PRD's calculations."""
+
+# PRD §2.4 — the logical clock reads exactly this before it has ever been set.
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# PRD §3.4 — stage weights for the acuity computation.
+STAGE_WEIGHT = {
+    "NONE": 0,
+    "MUCOSAL": 15,
+    "STAGE_1": 20,
+    "STAGE_2": 35,
+    "DTI": 45,
+    "STAGE_3": 60,
+    "UNSTAGEABLE": 70,
+    "STAGE_4": 80,
+}
+
+TYPE_MULTIPLIER = {"WOUND": 1.00, "OSTOMY": 1.15, "INCONTINENCE": 0.90}
+
+ACUITY = {
+    "COMORBIDITY_POINTS_EACH": 5,
+    "COMORBIDITY_POINTS_CAP": 25,
+    "DEVICE_RELATED_POINTS": 10,
+    "AREA_POINTS_STEP_CM2": 10,
+    "AREA_POINTS_PER_STEP": 5,
+    "AREA_POINTS_CAP": 15,
+    "ACUITY_MAX": 100,
+    "P1_THRESHOLD": 70.0,
+    "P2_THRESHOLD": 40.0,
+}
+
+# PRD §3.4 — response allowance per band: 4 hours for P1, a day for P2, three days for P3.
+SLA_HOURS_BY_BAND = {"P1": 4, "P2": 24, "P3": 72}
+
+# PRD §3.3 — max_consult_load is derived solely from certification_status.
+MAX_LOAD_BY_CERT = {"TRAINEE": 0, "CANDIDATE": 3, "CERTIFIED": 8, "LAPSED": 0}
+
+# PRD §3.3 — the certification eligibility score.
+CERTIFICATION = {
+    "MONTH_HOURS": 720,
+    "RECENCY_BASE": 100,
+    "RECENCY_DECAY_PER_MONTH": 5,
+    "CREDIT_POINTS_PER_UNIT": 2,
+    "CREDIT_COMPONENT_CAP": 60,
+    "MENTORED_POINTS_PER_CONSULT": 10,
+    "MENTORED_CONSULT_CAP": 4,
+    "WEIGHT_RECENCY": 0.4,
+    "WEIGHT_CREDITS": 0.4,
+    "WEIGHT_MENTORED": 0.2,
+    "ELIGIBILITY_SCORE_FLOOR": 55.00,
+    "CE_CREDIT_FLOOR": 30,
+    "SIGNOFF_FLOOR": 2,
+}
+
+# PRD §3.8 — the tiered per-day rental rate and the vendor service fee.
+RENTAL = {
+    "BILLABLE_DAY_HOURS": 24,
+    "TIER_1_LAST_DAY": 7,
+    "TIER_2_LAST_DAY": 21,
+    "TIER_1_FACTOR": 1.00,
+    "TIER_2_FACTOR": 0.90,
+    "TIER_3_FACTOR": 0.75,
+    "RECLEAN_BUFFER_HOURS": 12,
+}
+
+VENDOR_FEE = {
+    "FEE_TIER_2_FLOOR": 50000,
+    "FEE_TIER_3_FLOOR": 200000,
+    "FEE_PCT_TIER_1": 0.08,
+    "FEE_PCT_TIER_2": 0.05,
+    "FEE_PCT_TIER_3": 0.03,
+}
+
+# PRD §3.9 — dressing protocol weekly cost.
+PROTOCOL = {"HOURS_PER_WEEK": 168, "NON_FORMULARY_SURCHARGE_PCT": 0.20}
+
+# PRD §2.5 / §3.5 / §3.6 — window and deadline constants.
+POA_WINDOW_HOURS = 24
+RCA_DUE_HOURS = 72
+MAX_REVISIONS = 2
+TEACH_BACK_PASS_SCORE = 80
+PERCENT_SCALE = 100
+EMPTY_DENOMINATOR_RESULT = 0.00
+
+# PRD §2.3 — pagination.
+PAGINATION = {"DEFAULT_LIMIT": 10, "MIN_LIMIT": 1, "MAX_LIMIT": 100, "DEFAULT_OFFSET": 0}
+
+# Well-formed UUIDs that no row in a freshly started server can ever carry.
+UNKNOWN_UNIT_ID = "00000000-0000-4000-8000-000000000000"
+UNKNOWN_PATIENT_ID = "11111111-1111-4111-8111-111111111111"
+UNKNOWN_NURSE_ID = "22222222-2222-4222-8222-222222222222"
+UNKNOWN_CONSULT_ID = "33333333-3333-4333-8333-333333333333"
+UNKNOWN_ASSESSMENT_ID = "44444444-4444-4444-8444-444444444444"
+UNKNOWN_CASE_ID = "55555555-5555-4555-8555-555555555555"
+UNKNOWN_ROUND_ID = "66666666-6666-4666-8666-666666666666"
+UNKNOWN_OBSERVATION_ID = "77777777-7777-4777-8777-777777777777"
+UNKNOWN_ORDER_ID = "88888888-8888-4888-8888-888888888888"
+UNKNOWN_PRODUCT_ID = "99999999-9999-4999-8999-999999999999"
+UNKNOWN_PROTOCOL_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+UNKNOWN_PLAN_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+UNKNOWN_SURFACE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"

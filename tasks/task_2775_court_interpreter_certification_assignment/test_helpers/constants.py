@@ -1,0 +1,102 @@
+"""Domain thresholds and canonical test values (PRD §2.5, §2.8-§2.12, §3.x)."""
+
+# The logical clock's default instant (PRD §2.5).
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# Hearing priority scoring (PRD §3.5).
+TYPE_WEIGHTS = {
+    "ARRAIGNMENT": 50,
+    "DETENTION_REVIEW": 45,
+    "TRIAL": 40,
+    "PLEA": 30,
+    "SENTENCING": 30,
+    "MOTION": 20,
+    "CIVIL_MOTION": 10,
+}
+CUSTODY_BONUS = 25
+RARITY_BONUS = {"RARE": 15, "NON_DESIGNATED": 5, "DESIGNATED": 0}
+URGENCY_BASE = 20
+URGENCY_PER_DAY = 2
+PRIORITY_SCORE_CAP = 100
+CLASS_A_FLOOR = 80
+CLASS_B_FLOOR = 55
+
+# Tier ordering (PRD §3.6).
+TIER_RANK = {"MASTER": 3, "CERTIFIED": 2, "REGISTERED": 1, "PROVISIONAL": 0}
+
+# Examination floors (PRD §3.3).
+WRITTEN_PASS_FLOOR = {"MASTER": 90, "CERTIFIED": 80, "REGISTERED": 80, "PROVISIONAL": 80}
+ORAL_PASS_FLOOR = {"MASTER": 85, "CERTIFIED": 70}
+MAX_ATTEMPTS_PER_EXAM_TYPE = 3
+RETAKE_WAIT_DAYS = 90
+
+# Credential cycle (PRD §3.3, §3.4).
+CYCLE_DAYS_STANDARD = 730
+CYCLE_DAYS_PROVISIONAL = 365
+GRACE_DAYS = 90
+RENEWAL_MINIMUM_CREDIT_HOURS = 16.0
+
+# Quality scoring (PRD §3.2).
+RECENT_WEIGHT = 4
+OLDER_WEIGHT = 2
+LOOKBACK_DAYS = 365
+QUALITY_FLOOR = 60
+SANCTION_POINTS = {"LETTER": 5, "PROBATION": 10, "SUSPENSION": 12, "REVOCATION": 20}
+SANCTION_WINDOW_DAYS = {"LETTER": 365, "PROBATION": 180}
+
+# Scheduling geometry (PRD §3.6).
+TRAVEL_BUFFER_MINUTES = 60
+
+# Money (PRD §2.8, §3.8).
+QUARTER_HOUR_DIVISIONS = 4
+BILLABLE_HOURS_INCREMENT = 0.25
+
+# Coverage reporting (PRD §3.10).
+COMPLIANT_FLOOR = 95.00
+CORRECTIVE_FLOOR = 85.00
+EMPTY_POOL_COVERAGE_PCT = 100.00
+MAX_REPORT_PERIOD_DAYS = 400
+
+# Appeals (PRD §3.9).
+APPEAL_WINDOW_DAYS = 30
+
+# Pagination (PRD §2.3).
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ---------------------------------------------------------------------------
+# Canonical configuration values used by the composite fixtures. These mirror
+# the setup payloads that the design indices reuse across instances.
+# ---------------------------------------------------------------------------
+TEST_DEFAULTS = {
+    "LANGUAGE_CODE": "spa",
+    "LANGUAGE_NAME": "Spanish",
+    "RARE_LANGUAGE_CODE": "mix",
+    "RARE_LANGUAGE_NAME": "Mixteco Bajo",
+    "COURTHOUSE_NAME": "Capitol Main Courthouse",
+    "COURTHOUSE_COUNTY": "CAS",
+    "NORTH_COURTHOUSE_NAME": "North Annex",
+    "NORTH_COURTHOUSE_COUNTY": "NOR",
+    "PAY_BUDGET_CENTS": 5_000_000,
+    "NORTH_PAY_BUDGET_CENTS": 1_000_000,
+    "RATE_EFFECTIVE_FROM": "2026-01-01",
+    "MASTER_HOURLY_CENTS": 10_500,
+    "CERTIFIED_HOURLY_CENTS": 8_750,
+    "REGISTERED_HOURLY_CENTS": 6_500,
+    "PROVISIONAL_HOURLY_CENTS": 4_900,
+    "MINIMUM_CALL_HOURS": 2.0,
+    "TRAVEL_MILEAGE_RATE_CENTS": 67.5,
+    "TRAVEL_FREE_RADIUS_MILES": 30.0,
+    "REMOTE_RATE_MULTIPLIER": 0.90,
+    "LATE_CANCELLATION_HOURS": 48,
+    "LATE_CANCELLATION_PAY_HOURS": 2.0,
+    "RARE_PREMIUM_LOW_PCT": 0.10,
+    "RARE_PREMIUM_HIGH_PCT": 0.15,
+    "RARE_PREMIUM_BRACKET_CENTS": 30_000,
+    "ETHICS_PROVIDER": "AOC Court Interpreter Ethics",
+    "WRITTEN_PASS_SCORE": 86,
+    "ORAL_PASS_SCORE": 74,
+    "REGISTERED_WRITTEN_SCORE": 84,
+}

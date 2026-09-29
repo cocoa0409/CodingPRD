@@ -1,0 +1,497 @@
+# Busy Season Resource Scheduling API — Product Requirements Document
+
+## 1. Introduction
+
+Every public accounting firm lives or dies by the ninety days in which most of its statutory deadlines land at once. During that window the firm's resource management office must hold four things in balance simultaneously: an inventory of engagements each broken into phases with expected hours, deadlines and required skill profiles; a roster of staff whose real availability is punctured by paid time off, licensure study leave, training commitments and firm holidays; a finite amount of manager and partner review capacity that offshore and shared-service work must charge against; and a hard regulatory perimeter of independence and partner-rotation rules that dictates who may not serve which client at all. Today that balance is struck in spreadsheets, which is why a client whose readiness slips by three weeks quietly turns into two blown deadlines and one senior manager who resigns in April.
+
+This service replaces those spreadsheets with a scheduling system of record, mounted under the `/scheduling` prefix. It holds the engagement inventory and its phase windows, books named staff or lets a selector pick the best-fitting candidate, enforces per-date availability and per-week workload caps, meters review capacity, tracks burnout and turnover risk from both logged history and forward bookings, and unwinds bookings automatically when a client block or an independence restriction lands. It also supports the question every partner asks at the end of the season — what did we actually realize on this engagement, and how much of the answer depends on the staffing model we chose — by computing realization two different ways from the same underlying records.
+
+Two design commitments run through everything that follows. First, the system is deterministic and clock-driven: all deadline arithmetic, ISO-week bucketing and risk banding are evaluated against a server-held logical clock rather than wall-clock time, so the same inputs always produce the same schedule. Second, capacity is never silently overrun. Where a booking would breach a daily availability figure, a weekly cap, a reviewer's weekly allotment or an independence boundary, the request is rejected with a specific, machine-readable reason rather than accepted and flagged.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request to the API must carry two headers: `X-User-ID`, identifying the acting person, and `X-User-Role`, naming the capacity in which they act. If either header is absent or empty, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If `X-User-Role` is not one of the five recognised role names, the rejection is `ERR_INVALID_ROLE` (HTTP 401). If the role is recognised but is not among the roles authorised for the endpoint being called (see the authorisation column of §4), the rejection is `ERR_UNAUTHORIZED` (HTTP 403).
+
+The five roles are `FirmAdmin`, `SchedulingManager`, `EngagementPartner`, `EngagementStaff` and `IndependenceOfficer`.
+
+`FirmAdmin` is the firm's operations back office. It owns reference data — clients, the staff roster, availability exceptions and review capacity windows — plus the logical clock. It never books work and never approves anything. `SchedulingManager` is the resource management office: it builds the engagement inventory, books and reschedules work, and drives the staffing and phase lifecycles, but cannot approve overtime allowances, cannot review offshore work and cannot impose independence restrictions. `EngagementPartner` is the signing partner: it clears client blocks, delivers engagements, reviews offshore and shared-service work, and approves or denies overtime allowances. `EngagementStaff` is any staff member charging time: it logs hours against its own active bookings and requests overtime allowances for itself, and can never book, approve or review. `IndependenceOfficer` is the independence and ethics function: it imposes and lifts client-level restrictions on individual staff and has no scheduling, review or approval authority.
+
+Three of the roles are backed by a persisted entity. When `X-User-Role` is `SchedulingManager`, `X-User-ID` is the `id` of the acting `StaffMember`; ownership checks on any resource that references a `StaffMember` compare the resource's foreign-key field to `X-User-ID`. When `X-User-Role` is `EngagementPartner`, `X-User-ID` is the `id` of the acting `StaffMember`, and the same comparison applies. When `X-User-Role` is `EngagementStaff`, `X-User-ID` is likewise the `id` of the acting `StaffMember`. The remaining two are not entity-backed. When `X-User-Role` is `FirmAdmin`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity; the server may record it but never compares it to any entity's `id`. When `X-User-Role` is `IndependenceOfficer`, `X-User-ID` is likewise an opaque operator identifier not tied to any persisted entity and is never compared to an entity's `id`.
+
+For the entity-backed roles, acting on a resource that is not yours is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403). This check guards exactly nine operations, and the field it compares differs by operation. An `EngagementStaff` logging a time entry must present the `X-User-ID` that equals the target assignment's `staff_member_id`, and an `EngagementStaff` requesting an overtime allowance must present the `X-User-ID` that equals the `staff_member_id` in the request body. An `EngagementPartner` clearing a client block or delivering an engagement must present the `X-User-ID` that equals that engagement's `engagement_partner_staff_id`, and the same comparison applies when an `EngagementPartner` approves or denies an overtime allowance, evaluated against the engagement named by the waiver's `engagement_id`. An `EngagementPartner` opening a review, sending work back for rework, or accepting a review must instead present the `X-User-ID` that equals the assignment's `review_owner_staff_id`. Only one of the two identifiers is recorded on a persisted record: on an overtime allowance, the approving or denying operator's `X-User-ID` is stamped onto `approved_by_user_id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. `limit` caps the number of items returned; it defaults to 10, has a minimum of 1 and a maximum of 100. `offset` is the number of items to skip; it defaults to 0 and its minimum is 0. A `limit` below 1 or above 100, or an `offset` below 0, or a non-integer value for either, is rejected with `ERR_INVALID_PAGINATION` (HTTP 422).
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending.
+
+Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope.
+
+### 2.4. The Logical Clock and ISO Week Arithmetic
+
+The server holds a logical clock, and every time-sensitive figure in the system is evaluated against it — deadline distance, ISO-week bucketing, burnout windows, risk bands and the default week of the workload read. Before any call is made, the logical clock reads exactly `2026-08-01T00:00:00Z`. This startup default is mandatory; the server never falls back to real wall-clock time. A `FirmAdmin` may advance the clock by supplying a `to_iso8601` instant, and the response reports `current_utc`, `current_date` and `iso_week_start_date`. Throughout this document, *the current date* means the date portion of the logical clock.
+
+Advancing the clock has consequences well beyond the returned payload. Every engagement's `schedule_risk_band` is recomputed, and for every staff member the server recomputes `committed_hours_current_week`, `effective_weekly_cap_hours`, `daily_capacity_hours`, `workload_status`, `burnout_risk_score_actual`, `burnout_risk_score_committed` and `turnover_risk_band`.
+
+ISO weeks begin on Monday. Wherever this document refers to *the ISO week start* for some date, it means the Monday on or before that date; *the ISO week containing* a date means the closed seven-day range from that Monday through the following Sunday. Wherever an input field named `week_start_date` is accepted, its value must itself be a Monday, or the request is rejected with `ERR_NOT_WEEK_START` (HTTP 422). This applies to review capacity window creation, overtime allowance requests, and the per-staff workload read.
+
+### 2.5. Interval Conventions: Half-Open Bookings, Closed Windows
+
+The system deliberately uses two different interval conventions, and confusing them is the most common source of off-by-one scheduling errors.
+
+A booking's occupation of a staff member's calendar is **half-open**: it covers `start_date` through the day before `end_date`, and `end_date` itself is never occupied. `end_date` must therefore be strictly later than `start_date`. The *last worked day* of a booking is `end_date` minus one day, and the number of occupied dates — the booking's `calendar_day_count` — is the whole number of days from `start_date` to `end_date`, which is at least 1. Two bookings whose intervals abut, such as one running to a given Monday and the next starting on that same Monday, share no date at all and never aggregate against each other.
+
+Every other date window in the system is **closed-inclusive on both ends**. A phase window covers `window_start_date` through `window_end_date`, and `window_end_date` must be on or after `window_start_date`. An availability exception covers `start_date` through `end_date`, and `end_date` must be on or after `start_date`. An independence restriction covers `effective_start_date` through `effective_end_date`, and `effective_end_date` must be on or after `effective_start_date`.
+
+Any violation of this date geometry — a booking whose `end_date` is on or before its `start_date`, or a closed window whose end precedes its start — is rejected with `ERR_INVALID_DATE_RANGE` (HTTP 422). The check guards six operations: phase creation, booking creation, reassignment, auto-staffing, availability-exception creation and independence-restriction creation.
+
+### 2.6. Hours Precision and Rounding Discipline
+
+All hour figures, monetary figures and percentages are decimal values carrying exactly two fractional digits, rounded half away from zero (commonly "round half up") at each point this document names a rounding. Two intermediate ratios are the exceptions and carry four fractional digits, also rounded half away from zero: the prior-week utilisation ratio that selects a staff member's burnout tier, and the slack ratio inside the auto-staffing fit score. Counts — day counts, rework cycles, dropped-booking counts, block counts, cap-breach counts, scope-change counts and version numbers — are plain integers.
+
+Where this document states a capacity comparison, the comparison is inclusive: a booking that lands exactly on a daily capacity figure, exactly on an effective weekly cap or exactly on a reviewer's `review_capacity_hours` is admissible. Where a threshold is stated as strict, it is written as strict. **Rounding order is part of the contract, not a matter of taste.** Where a formula says to round each line and then sum, summing raw products and rounding once at the end is a different and rejected reading; where a formula says a per-day figure is rounded once and then multiplied by a day count, recomputing from the unrounded total is likewise rejected. The individual formulas in §3 state their order explicitly.
+
+### 2.7. Common Resource Properties and Immutable Records
+
+Clients, staff members, engagements, engagement phases, assignments, independence restrictions, review capacity windows, reschedule plans and workload waivers all carry the same four system-managed properties:
+
+- `id` — a server-minted UUID, with no type prefix of any kind.
+- `created_at` — an ISO 8601 UTC timestamp with three fractional digits, recording when the row was first written.
+- `updated_at` — an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the row, including mutations of purely derived fields such as a recomputed risk band or a re-derived staffing figure.
+- `version` — an integer that increments by one on every mutation of the row.
+
+Two record types are append-only and deliberately narrower. An availability exception and a time entry each carry only `id` and `created_at`: both `updated_at` and `version` are absent from these two record types, because neither record can ever be changed after it is written.
+
+### 2.8. Derivation Cascades and Hierarchical Consistency
+
+The system is arranged as three layers of derived truth. An assignment is the atom: an operator books it, confirms it, activates it, or releases it. A phase's staffing figures and its `staffing_status` are *derived* from its assignment rows rather than set directly. An engagement's `staffing_completion_pct` and `schedule_risk_band` are in turn derived from its phases. Consequently a single write at the assignment layer normally mutates three rows, and every one of those mutations refreshes that row's `updated_at` and increments its `version`.
+
+Derivation runs in one direction only, and it can be switched off. Once a phase has been explicitly started, its `staffing_status` is frozen: while it sits in `IN_PROGRESS` or `COMPLETE` the status is no longer re-derived from its staffed hours, even though `staffed_hours` and `unstaffed_hours` continue to be recomputed. Before that point the status follows the hours mechanically, in both directions — bookings can drive a phase up to `FULLY_STAFFED`, and releases or a scope expansion can drive it back down to `PARTIALLY_STAFFED` or all the way to `NOT_STAFFED`.
+
+Downgrades bubble upward. When the last non-released booking on a phase disappears the phase falls to `NOT_STAFFED`, and when *every* phase of an engagement sits at `NOT_STAFFED` while the engagement itself is `SCHEDULED`, the engagement reverts to `SETUP`. This reversion is performed by the server without any explicit client request against the engagement, and it too increments the engagement's `version`.
+
+### 2.9. Rejection Precedence
+
+Validations are evaluated in a single, strictly ordered ladder. **The first check that fails determines the response, and no later check is evaluated.** A request that violates both a skill requirement and a weekly cap always reports the skill requirement, because skill checks sit higher on the ladder. The ladder, from first-evaluated to last, is:
+
+1. Both auth headers present and non-empty — `ERR_UNAUTHENTICATED`. All endpoints.
+2. `X-User-Role` is one of the five declared roles — `ERR_INVALID_ROLE`. All endpoints.
+3. The presented role appears in the endpoint's authorised roles — `ERR_UNAUTHORIZED`. All endpoints.
+4. Every identifier in the URL path resolves to an existing row, validated left to right — the 404 family described in §2.10. All endpoints carrying a path identifier.
+5. Every foreign-key identifier in the request body resolves to an existing row, validated in the order the fields are declared for that operation — the 404 family. This guards engagement creation, phase creation, booking creation, reassignment, availability-exception creation, time-entry creation, independence-restriction creation, review-capacity-window creation, reschedule-plan creation and overtime-allowance creation.
+6. Request shape: every required field present, every type correct, every enumerated value a declared member, and every numeric field inside its declared range — including a phase's `expected_hours` strictly greater than zero and a booking's `allocated_hours` strictly greater than zero — `ERR_INVALID_REQUEST`. All endpoints with a request body.
+7. `limit` an integer from 1 through 100 and `offset` an integer of at least 0 — `ERR_INVALID_PAGINATION`. All list endpoints.
+8. Date geometry per §2.5 — `ERR_INVALID_DATE_RANGE`.
+9. `week_start_date` is a Monday — `ERR_NOT_WEEK_START`.
+10. Resource ownership for entity-backed roles per §2.1 — `ERR_NOT_RESOURCE_OWNER`.
+11. The target row is in a state its requested transition allows, including terminal-state lockdown — the invalid-state family described in §2.10. This guards every state-transition operation, plus booking creation (whose target phase must not be `COMPLETE`) and time-entry creation (whose target booking must be `ACTIVE` or `COMPLETED`).
+12. The engagement owning the targeted phase or booking is `SETUP`, `SCHEDULED` or `IN_FIELDWORK` — `ERR_ENGAGEMENT_BLOCKED`. This guards booking creation, confirmation, reassignment, phase creation, auto-staffing and scope expansion.
+13. The owning phase is `IN_PROGRESS` — `ERR_PHASE_NOT_IN_PROGRESS`. This guards activation and time-entry creation.
+14. No conflicting active independence restriction — `ERR_INDEPENDENCE_RESTRICTED`. This guards booking creation, confirmation, reassignment and auto-staffing.
+15. Partner rotation — `ERR_PARTNER_ROTATION_LIMIT`. Engagement creation only.
+16. Segregation of duties — `ERR_SEGREGATION_OF_DUTIES`. This guards six operations: booking creation, reassignment, review opening, review acceptance, and overtime-allowance approval and denial.
+17. Turnover-risk gate — `ERR_TURNOVER_RISK_BLOCK`. Confirmation only.
+18. Grade match — `ERR_LEVEL_MISMATCH`. Booking creation and reassignment.
+19. Industry specialisation match — `ERR_SPECIALIZATION_MISMATCH`. Booking creation and reassignment.
+20. CPA licensure requirement — `ERR_LICENSURE_REQUIRED`. Booking creation and reassignment.
+21. Review owner present exactly when required — `ERR_REVIEW_OWNER_REQUIRED`. Booking creation and reassignment.
+22. Nominated review owner is review-capable — `ERR_REVIEW_OWNER_NOT_ELIGIBLE`. Booking creation and reassignment.
+23. A review capacity window exists for the charge week — `ERR_REVIEW_WINDOW_MISSING`. Booking creation, reassignment and auto-staffing.
+24. No duplicate engagement for the same client, partner and busy season — `ERR_DUPLICATE_ENGAGEMENT_YEAR`. Engagement creation only.
+25. No duplicate review capacity window for the same reviewer and ISO week — `ERR_DUPLICATE_REVIEW_WINDOW`. Review-capacity-window creation only.
+26. No duplicate live overtime allowance for the same staff member and ISO week — `ERR_DUPLICATE_WAIVER`. Overtime-allowance creation only.
+27. No duplicate active restriction for the same client and staff member — `ERR_DUPLICATE_RESTRICTION`. Independence-restriction creation only.
+28. Phase window ends no later than the engagement deadline — `ERR_PHASE_WINDOW_AFTER_DEADLINE`. Phase creation only.
+29. Booking sits inside its phase window — `ERR_ASSIGNMENT_OUTSIDE_PHASE_WINDOW`. Booking creation, reassignment and auto-staffing.
+30. New availability exception does not overlap an existing one — `ERR_EXCEPTION_OVERLAP`. Availability-exception creation only.
+31. No fully-unavailable date inside the booking interval — `ERR_STAFF_UNAVAILABLE`. Booking creation, reassignment and auto-staffing.
+32. Per-date aggregate capacity — `ERR_DAILY_CAPACITY_EXCEEDED`. Booking creation, reassignment and auto-staffing.
+33. Per-week effective cap — `ERR_WORKLOAD_CAP_EXCEEDED`. Booking creation, reassignment and auto-staffing.
+34. Reviewer weekly review capacity — `ERR_REVIEW_CAPACITY_EXCEEDED`. Booking creation, reassignment, rework requests and auto-staffing.
+35. Rework cycle ceiling — `ERR_REWORK_LIMIT_EXCEEDED`. Rework requests only.
+36. Time entry inside its booking's occupied dates — `ERR_TIME_ENTRY_OUT_OF_WINDOW`. Time-entry creation only.
+37. Logged-hours overrun tolerance — `ERR_TIME_ENTRY_EXCEEDS_ALLOCATION`. Time-entry creation only.
+38. Projection freshness — `ERR_SIMULATION_STALE`. Reschedule apply only.
+39. Phase still has hours to fill — `ERR_PHASE_FULLY_STAFFED`. Auto-staffing only.
+40. Candidate pool non-empty — `ERR_NO_ELIGIBLE_STAFF`. Auto-staffing only.
+41. `expected_phase_version` matches — `ERR_STALE_PHASE_VERSION`. Reassignment only.
+42. `expected_engagement_version` matches — `ERR_STALE_ENGAGEMENT_VERSION`. Reschedule apply only.
+43. The nominated engagement partner is a domestic partner — `ERR_PARTNER_LEVEL_REQUIRED`. Engagement creation only.
+44. The nominated reviewer of a review capacity window is review-capable — `ERR_REVIEW_OWNER_NOT_ELIGIBLE`. Review-capacity-window creation only.
+
+Two consequences of this ordering are worth calling out because they are counter-intuitive. First, engagement creation checks partner rotation (stage 15) and duplicate-year uniqueness (stage 24) *before* it checks that the nominated partner is even a domestic partner (stage 43). Second, the two optimistic-concurrency checks sit at stages 41 and 42, near the very bottom: a reassignment carrying a stale phase version but also violating a skill requirement reports the skill requirement, not the stale version.
+
+### 2.10. Path Resolution and the Not-Found Families
+
+Path identifiers are resolved strictly left to right, and the first identifier that resolves to nothing determines the rejection — the server does not attempt to locate later segments. Each identifier has its own code, all of them HTTP 404: `ERR_CLIENT_NOT_FOUND` for a `client_id`, `ERR_STAFF_MEMBER_NOT_FOUND` for a `staff_member_id`, `engagement_partner_staff_id`, `review_owner_staff_id` or `reviewer_staff_id`, `ERR_ENGAGEMENT_NOT_FOUND` for an `engagement_id`, `ERR_PHASE_NOT_FOUND` for an `engagement_phase_id`, `ERR_ASSIGNMENT_NOT_FOUND` for an `assignment_id`, `ERR_RESTRICTION_NOT_FOUND` for an `independence_restriction_id`, `ERR_REVIEW_WINDOW_NOT_FOUND` for a `review_capacity_window_id`, `ERR_RESCHEDULE_PLAN_NOT_FOUND` for a `reschedule_plan_id`, and `ERR_WAIVER_NOT_FOUND` for a `workload_waiver_id`. The same families apply to foreign keys carried in a request body, evaluated in the field order that operation declares.
+
+State-transition rejections are similarly split by target row, all of them HTTP 409: `ERR_ENGAGEMENT_INVALID_STATE` when an engagement is not in a state its requested transition allows (including `DELIVERED` terminal lockdown), `ERR_PHASE_INVALID_STATE` for a phase (including `COMPLETE` lockdown), `ERR_ASSIGNMENT_INVALID_STATE` for a booking's staffing dimension (including `COMPLETED` and `RELEASED` lockdown, and covering a time entry logged against a booking that is neither `ACTIVE` nor `COMPLETED`), `ERR_REVIEW_INVALID_STATE` for a booking's review dimension (including `NOT_REQUIRED` and `REVIEW_ACCEPTED` lockdown), `ERR_RESTRICTION_INVALID_STATE` when a restriction is already `LIFTED`, `ERR_PLAN_INVALID_STATE` for a reschedule plan (including `APPLIED` and `SUPERSEDED` lockdown), and `ERR_WAIVER_INVALID_STATE` when an overtime allowance is not `REQUESTED` (that is, already `APPROVED`, `DENIED` or `EXPIRED`).
+
+### 2.11. Optimistic Concurrency on Staffing Parents
+
+Two write operations change the staffing composition of a parent row that the caller must have observed first, and both are therefore guarded by optimistic concurrency control against that parent's `version`.
+
+Reassigning a booking creates a replacement booking on the same phase and releases the original, so the phase's staffing composition changes. The reassignment request must therefore carry `expected_phase_version`, a non-optional integer field holding the `version` of the owning `EngagementPhase` that the client last observed. If that value does not equal the phase's current `version` — because another writer has staffed, released or expanded that phase since the client read it — the reassignment is rejected with `ERR_STALE_PHASE_VERSION` (HTTP 412). Applying the replacement on a stale view of the phase would book hours against capacity the caller never saw.
+
+Applying a reschedule plan shifts every phase window of an engagement and legitimately supersedes any other plan on the same engagement, so the apply request must carry `expected_engagement_version`, a non-optional integer field holding the `version` of the target `Engagement` that the client last observed. If that value does not equal the engagement's current `version`, the apply is rejected with `ERR_STALE_ENGAGEMENT_VERSION` (HTTP 412), because the projection the caller approved was computed against an engagement state that has since advanced.
+
+No other endpoint accepts a version field, and no other endpoint performs a version check. In particular, ordinary booking creation, confirmation, activation, release, review transitions and overtime-allowance decisions take no expected-version input at all.
+
+### 2.12. Segregation of Duties and the Independence Perimeter
+
+Two regulatory principles are enforced structurally rather than by policy document.
+
+**Segregation of duties.** The staff member executing a booking may never be the person who reviews it, and the beneficiary of an overtime allowance may never be the person who approves or denies it. Concretely: at booking time the nominated `review_owner_staff_id` must differ from the assigned `staff_member_id`; when a review is opened or accepted, the acting `X-User-ID` must differ from the booking's `staff_member_id`; and when an overtime allowance is approved or denied, the acting `X-User-ID` must differ from the allowance's `staff_member_id`. Any of these collisions is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 409).
+
+**Independence and rotation.** Independence is enforced at two moments and rotation at one. A conflicting active restriction blocks a booking at creation, at confirmation, at reassignment and at auto-staffing time; a partner's consecutive-years run on a client is tested once, at engagement creation. Both are treated as safety rules and sit above every skill, capacity and concurrency check on the ladder in §2.9, because a firm would rather refuse to schedule than schedule an impermissible engagement team.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Reference Data: Clients and the Staff Roster
+
+A `FirmAdmin` registers a **Client** with a `name` of 1 to 120 characters, an `industry_code` drawn from `FINANCIAL_SERVICES`, `MANUFACTURING`, `GOVERNMENT`, `TECHNOLOGY` or `HEALTHCARE`, and a `fiscal_year_end` given as an ISO date. The optional `public_interest_entity` flag marks listed and other public-interest clients and defaults to false when omitted. That flag has one immediate effect: the server sets the derived `partner_rotation_limit_years` to 5 when `public_interest_entity` is true and to 7 otherwise. A newly registered client also starts with `engagement_count` at 0; that counter tracks the client's engagements whose `status` is anything other than `DELIVERED`, and it rises by one each time an engagement is created for the client. Clients may be listed with `industry_code` and `public_interest_entity` as filters.
+
+A `FirmAdmin` also registers each **StaffMember**, supplying `full_name` (1 to 120 characters), a `level` of `STAFF`, `SENIOR`, `MANAGER` or `PARTNER`, a `service_center` of `DOMESTIC` or `OFFSHORE`, an `industry_specialization` from the same five-member enumeration as a client's industry, a `cpa_licensed` flag recording whether the person holds an active CPA licence, a `base_weekly_cap_hours` figure between 20.00 and 60.00 inclusive, and an `hourly_bill_rate` between 50.00 and 900.00 inclusive. From `level` and `service_center` the server derives `review_capable`, which is true exactly when the level is `MANAGER` or `PARTNER` **and** the service centre is `DOMESTIC`. Only review-capable people may own the review of somebody else's work.
+
+A freshly registered staff member starts from a clean workload slate: `committed_hours_current_week` is 0.00, `workload_status` is `GREEN`, both `burnout_risk_score_actual` and `burnout_risk_score_committed` are 0.00, and `turnover_risk_band` is `LOW`. `effective_weekly_cap_hours` and `daily_capacity_hours` are computed immediately by the weekly-cap rule of §3.4; with no prior-week actuals on file the burnout tier resolves to `GREEN`. The roster can be listed with `level`, `service_center`, `industry_specialization` and `turnover_risk_band` as filters, and each staff member's derived workload and risk fields are visible on the individual read.
+
+### 3.2. The Engagement Inventory and Its Phases
+
+A `SchedulingManager` opens an **Engagement** by naming the `client_id` it serves, the `engagement_partner_staff_id` who signs it, a `service_line` of `AUDIT`, `TAX` or `ADVISORY`, the `busy_season_year` it belongs to (an integer from 2020 through 2035), the `deadline_date` by which it must be delivered, and the `budget_fee_amount` agreed with the client, which must be strictly greater than zero. The nominated partner must be a staff member whose `level` is `PARTNER` and whose `service_center` is `DOMESTIC`; anyone else is refused with `ERR_PARTNER_LEVEL_REQUIRED`. No two engagements may share the same combination of `client_id`, `engagement_partner_staff_id` and `busy_season_year`, and an attempt to create one is refused with `ERR_DUPLICATE_ENGAGEMENT_YEAR`.
+
+**Partner rotation** is tested at this moment and nowhere else. The server walks backwards from the year immediately before the requested `busy_season_year`, looking for an engagement with the same `client_id` and the same `engagement_partner_staff_id` in that year; each year it finds adds one to the run and it steps back another year, stopping at the first year with no such engagement. The number of consecutive years including the request is that run plus one. If that number is strictly greater than the client's `partner_rotation_limit_years` — 5 for a public-interest entity, 7 otherwise — the request is refused with `ERR_PARTNER_ROTATION_LIMIT`. Prior engagements count regardless of their status. Only an unbroken backwards run counts: a single missing year resets the run to nothing, which is precisely the effect a cooling-off period is supposed to have.
+
+A newly created engagement is `SETUP`. Its `client_block_count` and `scope_change_count` both start at 0, `staffing_completion_pct` starts at 0.00, both `realization_pct_provisional` and `realization_pct_final` start at 0.00, `pre_block_status` is null, and `schedule_risk_band` is computed straight away. Engagements can be listed filtered by `client_id`, `engagement_partner_staff_id`, `status` and `schedule_risk_band`.
+
+**Phases.** Within an engagement a `SchedulingManager` creates one or more **EngagementPhase** rows, each carrying the owning `engagement_id`, a `phase_type` of `PLANNING`, `INTERIM`, `FIELDWORK`, `REVIEW` or `WRAP_UP`, the `expected_hours` the phase should consume (strictly greater than zero), and its closed window `window_start_date` through `window_end_date`. A phase window may never extend past its engagement's `deadline_date`; a `window_end_date` later than the deadline is refused with `ERR_PHASE_WINDOW_AFTER_DEADLINE`. Each phase also declares the skill profile a booking against it must satisfy: a mandatory `required_level` naming the exact grade, an optional `required_industry_specialization` which defaults to null and, when non-null, must be matched exactly, and an optional `requires_cpa_licensed` flag which defaults to false. A new phase begins at `NOT_STAFFED` with `staffed_hours` 0.00 and `unstaffed_hours` equal to its `expected_hours`; creating it refreshes the engagement's `staffing_completion_pct` and `schedule_risk_band` and increments the engagement's `version`. Phases are listable filtered by `engagement_id`, `phase_type` and `staffing_status`.
+
+**Derived staffing figures.** A phase's `staffed_hours` is the sum of `allocated_hours` over its bookings in `PROPOSED`, `CONFIRMED`, `ACTIVE` or `COMPLETED` — released bookings are excluded — rounded to two decimals. Its `unstaffed_hours` is the expected hours minus the staffed hours, floored at 0.00 and rounded to two decimals; the two therefore add back to exactly `expected_hours` whenever staffing has not overshot. Unless the phase has been frozen by starting it, the status is then re-derived: `NOT_STAFFED` when staffed hours are exactly 0.00, `FULLY_STAFFED` when staffed hours are greater than or equal to expected hours (exact equality counts as fully staffed), and `PARTIALLY_STAFFED` in every other case.
+
+The engagement's `staffing_completion_pct` follows from the phases. The server sums `expected_hours` across every phase of the engagement in any status and rounds to two decimals, sums `staffed_hours` the same way, and reports 0.00 when the expected total is 0.00. Otherwise it takes the smaller of the staffed total and the expected total, divides by the expected total, multiplies by 100 and rounds to two decimals — so over-staffed phases cannot push the figure above 100.00.
+
+The `schedule_risk_band` is a threshold read over that completion figure and the distance to the deadline. Days to deadline is the whole number of days from the current date to the engagement's `deadline_date` and may be negative when the deadline has passed. The branches are evaluated top to bottom and **the first match wins**: if the engagement's `client_block_count` is 2 or more the band is `HIGH`; otherwise, if completion is strictly below 60.00 percent and there are 30 or fewer days to the deadline the band is `HIGH`; otherwise, if completion is strictly below 90.00 percent and there are 60 or fewer days to the deadline the band is `MEDIUM`; otherwise the band is `LOW`. Note that a twice-blocked engagement is `HIGH` regardless of how well staffed it is or how far away the deadline sits.
+
+**Scope expansion.** When a client's scope grows, a `SchedulingManager` expands a phase by supplying `additional_expected_hours` and an optional `reason_note`. The phase's `expected_hours` rises by that amount, the staffing figures and status are re-derived — which is the one path by which a `FULLY_STAFFED` phase falls back to `PARTIALLY_STAFFED` without any booking being touched — the engagement's `scope_change_count` rises by one, its `staffing_completion_pct` and `schedule_risk_band` are recomputed, and the phase's `version` increments. Scope expansion is refused with `ERR_ENGAGEMENT_BLOCKED` while the owning engagement is `CLIENT_BLOCKED` or `DELIVERED`.
+
+**Reaching `SCHEDULED`.** A `SchedulingManager` moves an engagement from `SETUP` to `SCHEDULED` once it has at least one phase and *every* phase of the engagement sits at `PARTIALLY_STAFFED` or `FULLY_STAFFED`. A single phase still at `NOT_STAFFED`, `IN_PROGRESS` or `COMPLETE` blocks the move, as does an engagement carrying no phase at all; either failure is refused with `ERR_ENGAGEMENT_INVALID_STATE` (HTTP 409), which names the engagement whose transition was refused rather than the phase. The transition recomputes `staffing_completion_pct` and `schedule_risk_band` and increments the engagement's `version`. The reverse edge exists too but is never requested directly: when releases leave every phase of a `SCHEDULED` engagement at `NOT_STAFFED`, the server reverts the engagement `SCHEDULED → SETUP`, sets `staffing_completion_pct` to 0.00, recomputes `schedule_risk_band` and increments `version`.
+
+From `SCHEDULED`, the manager starts fieldwork, advancing the engagement `SCHEDULED → IN_FIELDWORK`, provided `staffing_completion_pct` is at least 50.00. That transition recomputes `schedule_risk_band` and increments `version`.
+
+### 3.3. Booking Named Staff: The Admission Gauntlet
+
+A `SchedulingManager` books a named person onto a phase by supplying the `engagement_phase_id`, the `staff_member_id`, the half-open interval `start_date` and `end_date`, the `allocated_hours` for the booking (strictly greater than zero and no more than 400.00), and — only in the offshore case described in §3.5 — a `review_owner_staff_id`. The booking is created in `PROPOSED` with `fit_score` 0.00, because no selector ranked it.
+
+Three derived quantities are fixed at creation. The `calendar_day_count` is the whole number of days from `start_date` to `end_date`, at least 1. The `daily_hours` figure is `allocated_hours` divided by `calendar_day_count`, **rounded half up to two decimals exactly once, here**. Every downstream weekly figure multiplies this already-rounded per-day figure by a day count, so a seven-day booking of 50.00 hours flattens to 7.14 hours per day and commits 49.98 hours in that week, not 50.00; recomputing a weekly figure from the raw total instead is a different and rejected reading. The `rate_model` is derived from the assigned person's `service_center`: `ONSHORE_STANDARD` for `DOMESTIC`, `OFFSHORE_SHARED_SERVICE` for `OFFSHORE`.
+
+A booking request runs a long gauntlet, and §2.9 fixes the order in which the gates fire. In business terms:
+
+*Container gates.* The booking's phase must not be `COMPLETE`, or the request is refused with `ERR_PHASE_INVALID_STATE`. The engagement owning the phase must be `SETUP`, `SCHEDULED` or `IN_FIELDWORK`; a `CLIENT_BLOCKED` or `DELIVERED` engagement accepts no staffing write at all and refuses with `ERR_ENGAGEMENT_BLOCKED`.
+
+*Independence.* No independence restriction with status `ACTIVE` may exist for the pair formed by the engagement's client and the target staff member whose closed window `effective_start_date` through `effective_end_date` shares any date with the booking's occupied dates — that is, with `start_date` through the day before `end_date`. Any intersection is refused with `ERR_INDEPENDENCE_RESTRICTED`.
+
+*Segregation of duties.* A nominated `review_owner_staff_id` equal to the `staff_member_id` being booked is refused with `ERR_SEGREGATION_OF_DUTIES`.
+
+*Skill profile.* The person's `level` must equal the phase's `required_level` exactly — a `MANAGER` cannot fill a `SENIOR` slot any more than a `STAFF` can — and a mismatch is `ERR_LEVEL_MISMATCH`. If the phase's `required_industry_specialization` is non-null, the person's `industry_specialization` must equal it, or the request is `ERR_SPECIALIZATION_MISMATCH`; when the phase leaves that field null, any specialisation is acceptable. If the phase's `requires_cpa_licensed` is true, the person's `cpa_licensed` must be true, or the request is `ERR_LICENSURE_REQUIRED`; when the flag is false, licensure is irrelevant.
+
+*Window containment.* The booking must sit inside its phase's closed window: `window_start_date` must be on or before `start_date`, and the booking's last worked day — `end_date` minus one day — must be on or before `window_end_date`. A booking that starts before the window opens or whose last worked day falls after the window closes is refused with `ERR_ASSIGNMENT_OUTSIDE_PHASE_WINDOW`. Note the asymmetry that the two interval conventions create: a booking whose `end_date` equals the day after `window_end_date` is perfectly legal, because that final date is not occupied.
+
+*Availability and capacity.* These are covered in §3.4.
+
+When every gate passes, the server writes the booking, then re-derives the phase's `staffed_hours`, `unstaffed_hours` and `staffing_status`, recomputes the assigned person's `committed_hours_current_week`, `workload_status`, `burnout_risk_score_committed` and `turnover_risk_band`, recomputes the engagement's `staffing_completion_pct`, `schedule_risk_band` and `realization_pct_provisional`, and increments the phase's `version`.
+
+**Confirmation.** A `SchedulingManager` advances a booking `PROPOSED → CONFIRMED`. Confirmation deliberately re-runs two gates that could have gone stale since the proposal: the engagement must still be `SETUP`, `SCHEDULED` or `IN_FIELDWORK`, so a `CLIENT_BLOCKED` engagement refuses with `ERR_ENGAGEMENT_BLOCKED`; and no active independence restriction may have appeared covering the pair and the booking's occupied dates. It adds one gate of its own, the turnover-risk brake described in §3.4. Confirmation recomputes the person's `committed_hours_current_week` and `workload_status`, and increments the booking's `version`.
+
+**Activation.** A confirmed booking becomes chargeable when the manager advances it `CONFIRMED → ACTIVE`. This requires the owning phase to be `IN_PROGRESS`; otherwise the request is refused with `ERR_PHASE_NOT_IN_PROGRESS`. Activation is what makes time entries loggable against the booking, and it increments the booking's `version`.
+
+**Release.** A `SchedulingManager` releases a booking that is `PROPOSED` or `CONFIRMED`, optionally recording a `reason_note`; an `ACTIVE`, `COMPLETED` or already-`RELEASED` booking refuses with `ERR_ASSIGNMENT_INVALID_STATE`. Release is a **compensating** operation and exactly reverses the booking's footprint: the person's `committed_hours_current_week` loses precisely this booking's contribution, and their `workload_status`, `burnout_risk_score_committed` and `turnover_risk_band` are recomputed; when the booking had bound a `review_capacity_window_id`, that window's `committed_review_hours` and `remaining_review_hours` are recomputed; the phase's `staffed_hours`, `unstaffed_hours` and `staffing_status` are re-derived, possibly bubbling the engagement `SCHEDULED → SETUP` per §2.8; the engagement's `staffing_completion_pct`, `schedule_risk_band` and `realization_pct_provisional` are recomputed; a booking whose review dimension was `PENDING_REVIEW`, `IN_REVIEW` or `REWORK_REQUESTED` has that dimension reset to `NOT_REQUIRED`; and the booking's `version` increments.
+
+**Reassignment.** Swapping one person for another is a single operation rather than a release-then-rebook. The `SchedulingManager` supplies `expected_phase_version` (see §2.11) and the replacement `staff_member_id`, and may optionally override `start_date`, `end_date`, `allocated_hours` and `review_owner_staff_id`; anything not overridden is inherited from the original booking. The original booking moves `PROPOSED → RELEASED` or `CONFIRMED → RELEASED` with `superseded_by_assignment_id` set to the replacement's `id`, and a new booking is created on the same phase in `PROPOSED`. The replacement's `daily_hours`, `calendar_day_count`, `rate_model`, `review_status`, `review_hours_charged` and `review_capacity_window_id` are all computed fresh. Both people's `committed_hours_current_week`, `workload_status`, both burnout scores and `turnover_risk_band` are recomputed; the phase's staffing figures, `staffing_status` and the engagement's `staffing_completion_pct` are re-derived; and the phase's `version` increments. Reassignment runs the same skill, independence, window, availability, capacity and review-owner gates as an ordinary booking, because it is creating one.
+
+Bookings are listable with `engagement_phase_id`, `staff_member_id`, `review_owner_staff_id`, `review_capacity_window_id`, `superseded_by_assignment_id`, `staffing_status` and `review_status` as filters — the last of these being how the supersede chain is walked in reverse.
+
+### 3.4. Availability, Weekly Caps, Burnout and Overtime Relief
+
+**Availability exceptions.** A `FirmAdmin` records an **AvailabilityException** against a `staff_member_id` with an `exception_type` of `PTO`, `LICENSURE_STUDY_LEAVE`, `TRAINING` or `FIRM_HOLIDAY`, a closed window `start_date` through `end_date`, and the `available_hours_per_day` the person can still work on each covered date, between 0.00 and 8.00 inclusive. A value of 0.00 means fully unavailable. These records are immutable once written, and they may never overlap: a new exception whose closed window shares any date with an existing exception of the same person is refused with `ERR_EXCEPTION_OVERLAP`, which guarantees that at most one exception ever governs a given date. Recording an exception immediately recomputes the affected person's `daily_capacity_hours` effects for every date the exception covers. Each staff member's exceptions can be read back as a sub-resource collection, filterable by `exception_type`.
+
+**Daily capacity.** The hours a person may be booked for on one specific calendar date start from a baseline: their effective weekly cap for the ISO week containing that date, divided by the five standard working days of a week, rounded half up to two decimals — the figure surfaced as `daily_capacity_hours`. If an availability exception covers the date, that exception's `available_hours_per_day` **replaces** the baseline rather than reducing it. Against that capacity the server sets the hours already booked on the date: the sum, rounded to two decimals, of `daily_hours` over every booking of that person in `PROPOSED`, `CONFIRMED`, `ACTIVE` or `COMPLETED` whose half-open occupation includes the date. A candidate booking is admissible only if, for **every** date it occupies, the already-booked hours plus the candidate's own `daily_hours` are less than or equal to that date's capacity; exact equality is admissible. Failure is `ERR_DAILY_CAPACITY_EXCEEDED`. This is an aggregate test, not a double-booking ban: two bookings may share dates freely so long as their summed per-day hours fit. Separately and earlier on the ladder, if any date the booking occupies is governed by an exception whose `available_hours_per_day` is 0.00, the booking is refused outright with `ERR_STAFF_UNAVAILABLE`.
+
+**The effective weekly cap.** Each person's `effective_weekly_cap_hours` for a given ISO week is built in a pinned order that deliberately breaks an apparent circularity. First the server looks one week back — the Monday seven days before the week being capped — and sums, rounded to two decimals, the `hours` of every time entry whose `work_date` falls in that prior ISO week and whose booking belongs to this person and is not `RELEASED`; all three entry types count. That prior-week logged total divided by the person's `base_weekly_cap_hours`, rounded half up to four decimals, is the utilisation ratio. The burnout tier follows from it with inclusive upper bounds: `GREEN` when utilisation is at most 1.0000, `AMBER` when utilisation is greater than 1.0000 and at most 1.2500, `RED` when utilisation is greater than 1.2500. The tier supplies a multiplier — a quarter more than contracted hours for `GREEN`, fifteen percent more for `AMBER`, and no uplift at all for `RED`, so the multipliers are 1.25, 1.15 and 1.00 respectively. The counter-intuitive direction is intentional: the harder somebody worked last week, the *less* headroom they are given this week.
+
+The raw cap is `base_weekly_cap_hours` multiplied by that tier multiplier, rounded to two decimals. To it the server adds the allowance: the sum, rounded to two decimals, of `extra_hours_allowance` over every overtime allowance for this person and this `week_start_date` whose status is `APPROVED`. An absolute ceiling of forty percent above contracted hours — `base_weekly_cap_hours` multiplied by 1.40, rounded to two decimals — is then applied, and `effective_weekly_cap_hours` is the smaller of the raw cap plus allowance and that ceiling, rounded to two decimals. The tier is therefore always read from **logged** hours of the **prior** ISO week and never from committed hours of the week being capped; reading the tier from the week's own committed hours, which are themselves gated by the cap, is undefined and explicitly rejected.
+
+**Committed hours and the weekly gate.** A person's committed load in one ISO week is the sum, rounded to two decimals, over their bookings in `PROPOSED`, `CONFIRMED`, `ACTIVE` or `COMPLETED` of that booking's `daily_hours` multiplied by the number of its occupied dates that fall inside that week's seven days; released bookings are excluded and review hours never enter this figure at all. `committed_hours_current_week` is that figure for the ISO week containing the current date. A candidate booking is admissible only if, for **every** ISO week its occupied dates touch, the existing committed load plus the candidate's contribution to that week is less than or equal to the person's effective weekly cap for that week; exact equality is admissible. A breach in any touched week is `ERR_WORKLOAD_CAP_EXCEEDED`. Because a booking spanning a Sunday-Monday boundary contributes to two weeks, both weeks are tested independently.
+
+`workload_status` is the traffic light over these two figures: `GREEN` while `committed_hours_current_week` is at most `base_weekly_cap_hours`, `AMBER` when it exceeds `base_weekly_cap_hours` but is at most `effective_weekly_cap_hours`, and `RED` when it exceeds `effective_weekly_cap_hours`.
+
+**Burnout and turnover risk.** Two burnout scores are computed for every person from the same four-week decay curve, and they routinely disagree because they look in opposite directions. Both walk four ISO weeks indexed 0 through 3, and in both the week at index 0 is the ISO week containing the current date. The retrospective variant, surfaced as `burnout_risk_score_actual`, walks *backwards*: week *i* is the week starting seven times *i* days before the current week's Monday. For each of those weeks it sums, rounded to two decimals, the `hours` of the person's time entries whose `work_date` falls in that week, over bookings that are not `RELEASED`, and the week's overage is that logged total minus `base_weekly_cap_hours`, floored at 0.00 and rounded to two decimals. The forward-looking variant, surfaced as `burnout_risk_score_committed`, walks *forwards*: week *i* is the week starting seven times *i* days after the current week's Monday, and the week's overage is that week's committed load minus `base_weekly_cap_hours`, floored at 0.00 and rounded to two decimals.
+
+Both variants then apply the same decay weights — the current week at full weight, then three-quarters, then one-half, then one-quarter — sum the four weighted overages, divide by the total weight of 2.50, and round to two decimals. The consequence of the two directions is worth internalising: somebody who has logged nothing scores 0.00 on the retrospective variant however heavily they are booked, while somebody booked well over cap next month scores above 0.00 on the forward-looking variant with no logged history at all.
+
+`turnover_risk_band` is banded over the **larger** of the two scores, with inclusive lower boundaries: `LOW` when that maximum is strictly below 3.00, `ELEVATED` when it is at least 3.00 and strictly below 6.00 — that is, from 3.00 through 5.99 at two-decimal precision — and `HIGH` when it is at least 6.00. Exactly 3.00 is `ELEVATED`; exactly 6.00 is `HIGH`.
+
+The band has teeth at exactly one moment. Confirming a booking for somebody whose `turnover_risk_band` is `HIGH` is refused with `ERR_TURNOVER_RISK_BLOCK` **unless** an overtime allowance with status `APPROVED` exists for that person for the ISO week containing the booking's `start_date`. A `HIGH` band does not block proposal, activation or time logging — only the confirmation step.
+
+**Overtime relief.** An `EngagementStaff` requests a **WorkloadWaiver** for themselves, naming their own `staff_member_id`, the `engagement_id` justifying the overtime, the `week_start_date` Monday the relief applies to, an `extra_hours_allowance` between 0.25 and 10.00 inclusive, and an optional `justification_note`. The request is created `REQUESTED` and changes no cap yet. A person may not hold two live requests for the same week: a second allowance for the same `staff_member_id` and `week_start_date` while one is `REQUESTED` or `APPROVED` is refused with `ERR_DUPLICATE_WAIVER`. Allowances are listable filtered by `staff_member_id`, `engagement_id`, `status` and `week_start_date`.
+
+The engagement partner of the justifying engagement decides. Approval moves the allowance `REQUESTED → APPROVED`, stamps the deciding operator's `X-User-ID` onto `approved_by_user_id`, recomputes the beneficiary's `effective_weekly_cap_hours` and `daily_capacity_hours` for that ISO week so the extra hours become spendable, recomputes their `workload_status`, and increments the allowance's `version`. Approval additionally requires that the justifying engagement is not `DELIVERED`. Denial moves the allowance `REQUESTED → DENIED`, likewise stamps `approved_by_user_id`, and increments `version`; it changes no cap. Either decision requires the acting `X-User-ID` to be the engagement's `engagement_partner_staff_id` and to differ from the allowance's `staff_member_id`.
+
+An approved allowance can also be withdrawn by events rather than by a person, always as `APPROVED → EXPIRED` and always recording why in `expiry_reason`. Delivering the engagement and the client-block cascade of §3.8 both set `expiry_reason` to `ENGAGEMENT_BLOCKED`; the independence-restriction cascade sets it to `RESTRICTION_IMPOSED`. Every expiry recomputes the beneficiary's `effective_weekly_cap_hours` and `daily_capacity_hours` with the allowance removed, and increments the allowance's `version`.
+
+**The workload read.** A per-staff computed read reports one ISO week's picture, defaulting to the ISO week of the logical clock when no `week_start_date` is supplied and rejecting a non-Monday value with `ERR_NOT_WEEK_START`. It returns `staff_member_id`, the `week_start_date` it resolved to, `committed_hours`, `logged_hours`, `effective_weekly_cap_hours`, `daily_capacity_hours`, `approved_waiver_hours`, `remaining_week_hours`, `workload_status`, `burnout_risk_score_actual`, `burnout_risk_score_committed` and `turnover_risk_band`.
+
+### 3.5. Offshore Delivery and the Independent Review Dimension
+
+Offshore and shared-service-centre work is permitted, but never unsupervised. Whether a booking is offshore is not an input: the server derives `rate_model` from the assigned person's `service_center`, and a booking of an `OFFSHORE` person is `OFFSHORE_SHARED_SERVICE`. Exactly those bookings must nominate a `review_owner_staff_id`, and exactly the domestic ones must not: a missing review owner on an offshore booking and a supplied review owner on a `ONSHORE_STANDARD` booking are both refused with `ERR_REVIEW_OWNER_REQUIRED`. The nominated person must have `review_capable` true — a `MANAGER` or `PARTNER` whose `service_center` is `DOMESTIC` — or the request is refused with `ERR_REVIEW_OWNER_NOT_ELIGIBLE`. The same eligibility rule applies when a `FirmAdmin` declares a review capacity window for a `reviewer_staff_id`, and the refusal there carries the same code.
+
+**Review capacity windows.** A `FirmAdmin` declares a **ReviewCapacityWindow** for a `reviewer_staff_id`, a `week_start_date` Monday, and the `review_capacity_hours` that reviewer has available for review work in that ISO week — strictly greater than zero and no more than 40.00. A reviewer may hold at most one window per week: a second window for the same `reviewer_staff_id` and `week_start_date` is refused with `ERR_DUPLICATE_REVIEW_WINDOW`. A new window starts with `committed_review_hours` 0.00 and `remaining_review_hours` equal to its `review_capacity_hours`. Thereafter `committed_review_hours` is the sum, rounded to two decimals, of `review_hours_charged` over every booking bound to that window whose staffing dimension is `PROPOSED`, `CONFIRMED`, `ACTIVE` or `COMPLETED` — released bookings are excluded — and `remaining_review_hours` is `review_capacity_hours` minus that committed figure, rounded to two decimals. Windows are listable filtered by `reviewer_staff_id` and `week_start_date`.
+
+**The review charge.** A booking whose `rate_model` is `ONSHORE_STANDARD` carries `review_hours_charged` of 0.00 and leaves `review_capacity_window_id` null. For an `OFFSHORE_SHARED_SERVICE` booking the charge starts as one-fifth of `allocated_hours`, rounded to two decimals, but floored at a two-hour minimum review block: the base is the larger of those two figures. A six-hour booking therefore charges 2.00 review hours, not 1.20. To that base the server adds one hour for each rework cycle the booking has accumulated, and rounds the total to two decimals to obtain `review_hours_charged`.
+
+The whole charge lands in exactly **one** weekly bucket, and the bucket is keyed by the booking's **last worked day** — `end_date` minus one day — regardless of how many ISO weeks the booking spans. The `review_capacity_window_id` is the window whose `reviewer_staff_id` equals the booking's `review_owner_staff_id` and whose `week_start_date` is the Monday on or before that last worked day; the uniqueness rule above guarantees at most one such window. If no such window exists, the write is refused with `ERR_REVIEW_WINDOW_MISSING`. If the window exists but its `committed_review_hours` plus this booking's charge would exceed its `review_capacity_hours`, the write is refused with `ERR_REVIEW_CAPACITY_EXCEEDED`; landing exactly on the capacity figure is admissible.
+
+**The review dimension.** A booking carries two entirely independent status dimensions. `staffing_status` tracks the booking through `PROPOSED`, `CONFIRMED`, `ACTIVE`, `COMPLETED` and `RELEASED` as described in §3.3. `review_status` tracks the review through `NOT_REQUIRED`, `PENDING_REVIEW`, `IN_REVIEW`, `REWORK_REQUESTED` and `REVIEW_ACCEPTED`, and is initialised at creation to `PENDING_REVIEW` when the `rate_model` is `OFFSHORE_SHARED_SERVICE` and to `NOT_REQUIRED` otherwise. Advancing one dimension never touches the other.
+
+The review owner drives the review dimension, and every one of these actions requires the acting `X-User-ID` to equal the booking's `review_owner_staff_id`. Opening a review advances it `PENDING_REVIEW → IN_REVIEW`, or reopens it `REWORK_REQUESTED → IN_REVIEW` after a rework round; in either case the booking's `staffing_status` must be `CONFIRMED` or `ACTIVE`, and when opening from `PENDING_REVIEW` the acting `X-User-ID` must additionally differ from the booking's `staff_member_id`. Accepting the review advances it `IN_REVIEW → REVIEW_ACCEPTED` and likewise requires the acting `X-User-ID` to differ from the booking's `staff_member_id`. Both transitions increment the booking's `version` and leave `staffing_status` untouched.
+
+Sending work back advances the review `IN_REVIEW → REWORK_REQUESTED` with an optional `reason_note`, and it costs the reviewer real capacity. It is permitted only while `rework_cycles` is strictly below two, so a booking may go round the rework loop at most twice; a third attempt is refused with `ERR_REWORK_LIMIT_EXCEEDED`. It is also permitted only if the recomputed charge — the base plus one hour for the incremented cycle count — keeps the bound window's `committed_review_hours` at or below its `review_capacity_hours`; otherwise the request is refused with `ERR_REVIEW_CAPACITY_EXCEEDED`. On success `rework_cycles` rises by one, `review_hours_charged` is recomputed with the extra hour charged to the **same** `review_capacity_window_id`, the window's `committed_review_hours` and `remaining_review_hours` are recomputed, and the booking's `version` increments. The cycle `IN_REVIEW → REWORK_REQUESTED → IN_REVIEW` may thus close twice before the ceiling bites.
+
+### 3.6. Automated Staff Selection
+
+Rather than name a person, a `SchedulingManager` may ask the system to pick one, supplying only the `start_date`, `end_date` and `allocated_hours` for the booking it wants placed on the phase. The selector books exactly one person — the single best fit — and creates one booking in `PROPOSED` with its `fit_score` recorded.
+
+The selector refuses to run on a phase that has nothing left to fill: the phase must be `NOT_STAFFED` or `PARTIALLY_STAFFED` with `unstaffed_hours` strictly greater than 0.00, and otherwise the request is refused with `ERR_PHASE_FULLY_STAFFED`.
+
+**Eligibility.** The candidate pool is every staff member who satisfies all eight of the following. Their `level` equals the phase's `required_level`. Either the phase's `required_industry_specialization` is null, or their `industry_specialization` equals it. Either the phase's `requires_cpa_licensed` is false, or their `cpa_licensed` is true. Their `service_center` is `DOMESTIC` — the selector never books offshore work, which is why an auto-staffed booking never needs a review owner. No independence restriction with status `ACTIVE` exists for the pair formed by the phase's engagement's client and that person whose closed window shares any date with `start_date` through the day before `end_date`. Their `turnover_risk_band` is not `HIGH`. For every date in the requested half-open interval, their already-booked hours plus the candidate per-day figure fit within that date's capacity, exactly as in §3.4. And for every ISO week the requested interval touches, their committed load plus the candidate's contribution fits within their effective weekly cap for that week.
+
+If the pool is empty the request is refused with `ERR_NO_ELIGIBLE_STAFF` (HTTP 422) and **no booking row is created**.
+
+**Scoring.** For each surviving candidate the per-day figure is the requested `allocated_hours` divided by the `calendar_day_count`, rounded to two decimals. The week's remaining headroom is that person's effective weekly cap for the ISO week containing the requested `start_date` minus their committed load in that week, rounded to two decimals. The slack ratio is that headroom divided by the phase's `unstaffed_hours`, rounded to four decimals and then capped at 1.0000 — the phase's unstaffed hours are guaranteed positive, because a fully staffed phase never reaches the selector. The `fit_score` is then the sum of three components, rounded to two decimals: forty points always, because matching the required grade is an eligibility condition rather than a differentiator; a further thirty points when — and only when — the phase declares a non-null `required_industry_specialization`, which rewards specialist-demanding phases uniformly across their eligible candidates; and thirty points multiplied by the slack ratio, which favours the person with the most headroom relative to the hole being filled.
+
+**Ranking.** Candidates are ordered by `fit_score` descending. The first tie-break is `hourly_bill_rate` ascending, putting cheaper staff first; the second is `created_at` ascending. The row `id` is never used as a tie-break. The first candidate under that ordering is selected.
+
+The remaining behaviour matches a named booking exactly: the server computes the new booking's `daily_hours`, `calendar_day_count`, `rate_model` and `review_status`, re-derives the phase's `staffed_hours`, `unstaffed_hours` and `staffing_status`, recomputes the selected person's `committed_hours_current_week`, `workload_status`, `burnout_risk_score_committed` and `turnover_risk_band`, recomputes the engagement's `staffing_completion_pct`, `schedule_risk_band` and `realization_pct_provisional`, and increments the phase's `version`. The date-geometry, window-containment, availability, capacity, independence and review-window checks of §2.9 all apply to the selector's write too, which is why the pool's own filters mirror them.
+
+### 3.7. Fieldwork Execution and Phase Completion
+
+**Starting a phase.** A `SchedulingManager` starts a phase that is `PARTIALLY_STAFFED` or `FULLY_STAFFED`, advancing it to `IN_PROGRESS`, provided the owning engagement is `IN_FIELDWORK` and at least one booking on the phase is `CONFIRMED`. Starting freezes derivation: from that point the phase's `staffing_status` is no longer re-derived from its staffed hours, in either direction. The transition increments the phase's `version`.
+
+**Logging hours.** An `EngagementStaff` logs a **TimeEntry** against their own booking, supplying the `assignment_id`, the `work_date` on which the hours were worked, the `hours` (between 0.25 and 16.00 inclusive), and an `entry_type` of `EXECUTION`, `REVIEW` or `REWORK`. All three types count identically toward logged hours everywhere in this document. Time entries are immutable and append-only. Four gates guard them. The acting `X-User-ID` must equal the booking's `staff_member_id`, or the entry is refused with `ERR_NOT_RESOURCE_OWNER`. The booking's `staffing_status` must be `ACTIVE` or `COMPLETED`, or the entry is refused with `ERR_ASSIGNMENT_INVALID_STATE`. The owning phase must be `IN_PROGRESS`, or the entry is refused with `ERR_PHASE_NOT_IN_PROGRESS`. The `work_date` must be one of the booking's occupied dates — on or after `start_date` and strictly before `end_date` — or the entry is refused with `ERR_TIME_ENTRY_OUT_OF_WINDOW`. Finally, the firm tolerates a quarter of overrun but no more: the total logged `hours` for the booking including the new entry may not exceed its `allocated_hours` multiplied by 1.25, and a breach is refused with `ERR_TIME_ENTRY_EXCEEDS_ALLOCATION`.
+
+A successful entry has three effects beyond its own creation. The person's `burnout_risk_score_actual` and `turnover_risk_band` are recomputed. Their `effective_weekly_cap_hours` and `daily_capacity_hours` are recomputed for the **following** ISO week, since the tier rule of §3.4 reads prior-week actuals — logging heavily this week shrinks next week's headroom. And the engagement's `realization_pct_final` is recomputed. A booking's time entries can be read back as a sub-resource collection, filterable by `entry_type`.
+
+**Completing a phase.** A `SchedulingManager` completes an `IN_PROGRESS` phase, advancing it to `COMPLETE`. Two preconditions apply: at least one booking on the phase must be `ACTIVE`, and *every* `ACTIVE` booking on the phase must have a review dimension of `NOT_REQUIRED` or `REVIEW_ACCEPTED` — an offshore booking still sitting at `PENDING_REVIEW`, `IN_REVIEW` or `REWORK_REQUESTED` blocks the completion. On success every `ACTIVE` booking on the phase advances `ACTIVE → COMPLETED` and increments its own `version`, the engagement's `realization_pct_provisional` and `realization_pct_final` are both recomputed, and the phase's `version` increments. `COMPLETE` is terminal for a phase.
+
+### 3.8. Disruption: Client Blocks, Independence Restrictions and Rescheduling
+
+Busy season plans do not survive contact with clients, and three kinds of disruption are modelled explicitly.
+
+**Client readiness slips.** A `SchedulingManager` reports a client block, supplying a `reason_note` and optionally a `blocked_until_date`. An engagement that is `SCHEDULED` or `IN_FIELDWORK` moves to `CLIENT_BLOCKED`, the status it held immediately before is stored in `pre_block_status`, and `client_block_count` rises by one. What follows is a four-hop cascade in which each hop is caused by the previous hop rather than by the original request.
+
+The first hop releases work: every booking whose phase belongs to this engagement and whose `staffing_status` is `PROPOSED` or `CONFIRMED` moves to `RELEASED`. The second hop is caused by those releases: for each affected person the server recomputes `committed_hours_current_week`, `workload_status`, `burnout_risk_score_committed` and `turnover_risk_band`. The third hop is caused by the second: for each person whose recomputed `committed_hours_current_week` has fallen back to at most their `base_weekly_cap_hours` — that is, whose overtime relief is no longer justified — every overtime allowance of theirs on this engagement with status `APPROVED` moves to `EXPIRED` with `expiry_reason` set to `ENGAGEMENT_BLOCKED`. The fourth hop is caused by the third: each expiry recomputes that person's `effective_weekly_cap_hours` and `daily_capacity_hours`, dropping the withdrawn allowance. Alongside the cascade, every phase of the engagement has its `staffed_hours`, `unstaffed_hours` and `staffing_status` re-derived, the engagement's `staffing_completion_pct` and `schedule_risk_band` are recomputed, and the engagement's `version` increments. Note the interaction with §3.2: two client blocks on one engagement pin its `schedule_risk_band` to `HIGH` permanently.
+
+Only the engagement's own partner can lift the block. Clearing it returns the engagement to the status recorded in `pre_block_status` — `CLIENT_BLOCKED → IN_FIELDWORK` when the stored value was `IN_FIELDWORK`, and `CLIENT_BLOCKED → SCHEDULED` when it was `SCHEDULED`. Both branches behave identically otherwise: `pre_block_status` is set back to null, `schedule_risk_band` is recomputed, and the engagement's `version` increments. `pre_block_status` is null whenever the engagement is not `CLIENT_BLOCKED`. Crucially, **released bookings are not restored** by clearing a block; re-staffing is an explicit new booking, which is the whole point of the cascade being compensating rather than reversible.
+
+**Independence restrictions.** An `IndependenceOfficer` bars a person from a client by creating an **IndependenceRestriction** naming the `client_id`, the `staff_member_id`, a `restriction_type` of `FINANCIAL_INTEREST`, `EMPLOYMENT_NEGOTIATION`, `ROTATION_COOLING_OFF` or `RELATIVE_EMPLOYED`, and the closed window `effective_start_date` through `effective_end_date`. A newly created restriction takes `status` `ACTIVE` immediately, with `released_assignment_count` starting at 0. Only one restriction may be `ACTIVE` for a given client and person at a time; a duplicate is refused with `ERR_DUPLICATE_RESTRICTION`. Restrictions are listable filtered by `client_id`, `staff_member_id`, `status` and `restriction_type`.
+
+Creation is not passive — it unwinds conflicting work immediately, in a three-hop cascade. The first hop releases: every booking with `staffing_status` `PROPOSED` or `CONFIRMED` whose `staff_member_id` is this person, whose phase belongs to an engagement for this client, and whose occupied dates share any date with the restriction's closed window, moves to `RELEASED`; the count of bookings released is recorded on the restriction as `released_assignment_count`. The second hop is caused by those releases: each one re-derives its phase's `staffed_hours`, `unstaffed_hours` and `staffing_status`, taking a phase from `FULLY_STAFFED` down to `NOT_STAFFED` when its staffed hours reach 0.00. The third hop is caused by the second: when the downgrades leave every phase of an engagement at `NOT_STAFFED` while that engagement is `SCHEDULED`, the engagement reverts `SCHEDULED → SETUP`. Alongside the cascade, every overtime allowance of that person on an affected engagement with status `APPROVED` moves to `EXPIRED` with `expiry_reason` set to `RESTRICTION_IMPOSED`, and the affected person's `committed_hours_current_week`, `workload_status`, `burnout_risk_score_committed` and `turnover_risk_band` are recomputed.
+
+The same officer may lift a restriction, moving it `ACTIVE → LIFTED` and incrementing its `version`; `LIFTED` is terminal, and lifting an already-lifted restriction is refused with `ERR_RESTRICTION_INVALID_STATE`. Lifting does **not** restore the bookings the restriction released; re-staffing is again an explicit new booking.
+
+**Rescheduling.** A `SchedulingManager` drafts a **ReschedulePlan** against an `engagement_id`, declaring a `trigger_reason` of `CLIENT_READINESS_SLIP`, `SCOPE_EXPANSION` or `STAFF_ATTRITION`, the `shift_days` by which every phase window of the engagement should move later (a whole number from 0 through 60), and optionally the `added_hours` to be poured into one phase on apply (from 0 through 400.00, defaulting to 0). A new plan is `DRAFT` with `simulation_stale` true, `simulated_at_engagement_version` null, `target_phase_id` null, and all four projected figures — `projected_unstaffed_hours`, `projected_dropped_assignment_count`, `projected_cap_breach_count` and `projected_realization_pct` — null. Plans are listable filtered by `engagement_id`, `target_phase_id` and `status`.
+
+Simulating the plan is a purely read-only projection that mutates no phase, booking or engagement row. It is permitted while the plan is `DRAFT`, advancing it `DRAFT → SIMULATED`, and also while it is already `SIMULATED`, in which case it re-simulates in place as `SIMULATED → SIMULATED` after the engagement has moved. Either way, the owning engagement must be `SCHEDULED`, `IN_FIELDWORK` or `CLIENT_BLOCKED`. The projection works as follows. The `target_phase_id` is the phase of this engagement with the greatest `window_start_date`, ties broken by earliest `created_at` and never by `id`. Each phase's window is projected forward by `shift_days` at both ends, and the target phase's projected expected hours are its `expected_hours` plus `added_hours` while every other phase keeps its `expected_hours` unchanged. **Booking dates are not shifted** — only phase windows move, which is exactly why bookings can end up outside their own phase. A booking is *kept* when the phase's projected window start is on or before the booking's `start_date` **and** the booking's last worked day is on or before the phase's projected window end; the projection considers only bookings in `PROPOSED` or `CONFIRMED`, since `ACTIVE` and `COMPLETED` work is never dropped. `projected_dropped_assignment_count` is the number of those bookings that are not kept. `projected_unstaffed_hours` is the sum over the engagement's phases of the projected expected hours minus the sum of `allocated_hours` over that phase's kept, non-released bookings (rounded to two decimals), each phase's shortfall floored at 0.00, with the total rounded to two decimals. `projected_cap_breach_count` is the number of distinct pairs of a staff member and an ISO week start for which the committed load computed over kept bookings only would strictly exceed that person's effective weekly cap for that week. `projected_realization_pct` values the kept, non-released bookings: it is 0.00 when the projected standard value is 0.00, and otherwise the engagement's `budget_fee_amount` divided by the sum (rounded to two decimals) of each kept booking's `allocated_hours` multiplied by its effective rate and rounded to two decimals per booking, multiplied by 100 and rounded to two decimals. Simulation sets `simulated_at_engagement_version` to the engagement's current `version`, sets `simulation_stale` to false, and increments the plan's `version`.
+
+Staleness is what keeps a projection honest: `simulation_stale` is true whenever `simulated_at_engagement_version` is null or differs from the engagement's current `version`. Applying a plan requires the plan to be `SIMULATED` and `simulation_stale` to be false — a stale projection is refused with `ERR_SIMULATION_STALE` — and requires the `expected_engagement_version` check of §2.11. On apply, the plan advances `SIMULATED → APPLIED` and the projection becomes reality: every phase of the engagement has `window_start_date` and `window_end_date` moved later by `shift_days`; when `added_hours` is greater than 0, that amount is added to the `expected_hours` of the phase named by `target_phase_id` and the engagement's `scope_change_count` rises by one; every booking in `PROPOSED` or `CONFIRMED` that no longer fits its shifted phase window moves to `RELEASED`, cascading into phase derivation and, when every phase reaches `NOT_STAFFED` while the engagement is `SCHEDULED`, into the engagement reverting `SCHEDULED → SETUP`; every phase's `staffed_hours`, `unstaffed_hours` and `staffing_status` are re-derived; the engagement's `staffing_completion_pct`, `schedule_risk_band` and `realization_pct_provisional` are recomputed; the engagement's `version` increments; and the plan's `version` increments.
+
+An apply also settles the competition between plans: every *other* reschedule plan on the same engagement whose status is `DRAFT` or `SIMULATED` moves to `SUPERSEDED`, has its `simulation_stale` set to true, and has its own `version` incremented. `APPLIED` and `SUPERSEDED` are both terminal for a plan.
+
+### 3.9. Realization Analysis and Delivery
+
+Realization answers the partner's question: how much of the standard value of the work we performed did the agreed fee actually cover? Every booking has an **effective rate** — the assigned person's `hourly_bill_rate` multiplied by a factor for the staffing model, rounded to two decimals. Onshore work carries a factor of 1.00; offshore and shared-service work is valued at 0.55, a little over half the standard rate, which is exactly why the staffing model changes the reported answer.
+
+The same records support two variants that diverge on identical data, and both are stored on the engagement.
+
+The **provisional** variant, surfaced as `realization_pct_provisional`, values what has been *booked*. Its input is every booking on this engagement's phases whose `staffing_status` is `PROPOSED`, `CONFIRMED`, `ACTIVE` or `COMPLETED`; released bookings are excluded. It draws **one line per booking**: the booking's `allocated_hours` multiplied by its effective rate, rounded to two decimals. Those per-booking lines are summed and the sum rounded to two decimals to give the provisional standard value; the percentage is the engagement's `budget_fee_amount` divided by that value, multiplied by 100, rounded to two decimals.
+
+The **final** variant, surfaced as `realization_pct_final`, values what was actually *logged*. Its input is every time entry whose booking belongs to this engagement and whose booking's `staffing_status` is `CONFIRMED`, `ACTIVE` or `COMPLETED` — note that, unlike the provisional variant, merely proposed bookings contribute nothing here, and released bookings are excluded from both. All three entry types are included. It draws **one line per time entry**: the entry's `hours` multiplied by the effective rate of its booking, rounded to two decimals. Those per-entry lines are summed and the sum rounded to two decimals to give the final standard value, and the percentage is computed the same way.
+
+Both variants report 0.00 when their standard value is 0.00, with no division performed. **The rounding order is pinned in both**: round each line first, then sum. Summing the raw products and rounding once at the end is a different and rejected reading — three entries of 3.33 hours at an effective rate of 183.75 give 1835.67 when each line is rounded first and 1835.66 when the sum is rounded once, and that one-cent difference shifts the reported percentage.
+
+Both figures are refreshed whenever a phase completes, whenever a booking is released (which touches the provisional figure), whenever an engagement is delivered, and whenever the realization read is called. A dedicated computed read reports the full analysis for one engagement, split by staffing model: `engagement_id`, `budget_fee_amount`, `committed_hours_total`, `logged_hours_total`, `standard_value_provisional`, `realization_pct_provisional`, `standard_value_final`, `realization_pct_final`, `onshore_standard_value` and `offshore_standard_value`.
+
+**Delivery.** The engagement's own partner closes the season by delivering an `IN_FIELDWORK` engagement, advancing it to `DELIVERED`. Every phase of the engagement must be `COMPLETE` first, and the acting `X-User-ID` must equal the engagement's `engagement_partner_staff_id`. Delivery recomputes both realization variants, moves every `APPROVED` overtime allowance on the engagement to `EXPIRED` with `expiry_reason` set to `ENGAGEMENT_BLOCKED` — the season's overtime relief has served its purpose and must not survive into next year's cap arithmetic — and increments the engagement's `version`. `DELIVERED` is terminal: the engagement accepts no further transition, and a delivered engagement also stops counting toward its client's `engagement_count`.
+
+## 4. Endpoint Definitions
+
+Operations that create a new resource return `201 Created`. Operations that modify an existing resource — every state transition, every derived-figure refresh and the logical-clock advance — return `200 OK`, as do all reads. Note that two write operations create a resource even though their path reads like an action on an existing one: reassignment creates the replacement booking, and auto-staffing creates the selected booking; both return `201 Created`.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/scheduling/_clock/set_current_utc` | Sets the server's logical clock and recomputes every clock-dependent figure. | FirmAdmin |
+| POST | `/scheduling/clients` | Registers a client of the firm. | FirmAdmin |
+| GET | `/scheduling/clients/{client_id}` | Reads one client. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| GET | `/scheduling/clients` | Lists clients with pagination. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| POST | `/scheduling/staff-members` | Registers a staff member with grade, service center, specialization, licensure and contracted weekly cap. | FirmAdmin |
+| GET | `/scheduling/staff-members/{staff_member_id}` | Reads one staff member including all computed workload and risk fields. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff, IndependenceOfficer |
+| GET | `/scheduling/staff-members` | Lists staff members, filterable by grade, service center, specialization and turnover risk band. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| GET | `/scheduling/staff-members/{staff_member_id}/workload` | Computed read: committed hours, effective cap, daily capacity, workload status and both burnout variants for one ISO week. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| GET | `/scheduling/staff-members/{id}/availability-exceptions` | Lists every availability exception of one staff member. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| POST | `/scheduling/engagements` | Creates an engagement in the busy-season inventory; runs the partner rotation test. | SchedulingManager |
+| GET | `/scheduling/engagements/{engagement_id}` | Reads one engagement including derived staffing, risk and realization fields. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff, IndependenceOfficer |
+| GET | `/scheduling/engagements` | Lists engagements, filterable by client, engagement partner, status and risk band. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| GET | `/scheduling/engagements/{engagement_id}/realization` | Computed read: realization analysis under both variants, split by staffing model. | FirmAdmin, SchedulingManager, EngagementPartner |
+| POST | `/scheduling/engagements/{engagement_id}/schedule` | Moves a staffed engagement from SETUP to SCHEDULED. | SchedulingManager |
+| POST | `/scheduling/engagements/{engagement_id}/start-fieldwork` | Moves a SCHEDULED engagement into fieldwork. | SchedulingManager |
+| POST | `/scheduling/engagements/{engagement_id}/report-client-block` | Records that client readiness slipped; releases pending bookings and unwinds the workload relief they justified. | SchedulingManager |
+| POST | `/scheduling/engagements/{engagement_id}/clear-client-block` | Engagement partner confirms the client is ready again; the engagement returns to its pre-block status. | EngagementPartner |
+| POST | `/scheduling/engagements/{engagement_id}/deliver` | Engagement partner delivers the engagement once every phase is COMPLETE. | EngagementPartner |
+| POST | `/scheduling/engagement-phases` | Adds a phase with expected hours, window and required skill profile to an engagement. | SchedulingManager |
+| GET | `/scheduling/engagement-phases/{engagement_phase_id}` | Reads one phase including derived staffing figures. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| GET | `/scheduling/engagement-phases` | Lists phases, filterable by engagement, phase type and staffing status. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| POST | `/scheduling/engagement-phases/{engagement_phase_id}/expand-scope` | Raises the phase's expected hours, re-deriving staffing coverage downward. | SchedulingManager |
+| POST | `/scheduling/engagement-phases/{engagement_phase_id}/start` | Starts fieldwork on a phase, freezing its derived staffing status. | SchedulingManager |
+| POST | `/scheduling/engagement-phases/{engagement_phase_id}/complete` | Completes a phase once every active booking has passed review. | SchedulingManager |
+| POST | `/scheduling/engagement-phases/{engagement_phase_id}/auto-staff` | Selector: books the single best-fitting domestic candidate onto the phase for the requested window. | SchedulingManager |
+| POST | `/scheduling/assignments` | Books a named staff member onto a phase for a half-open date interval. | SchedulingManager |
+| GET | `/scheduling/assignments/{assignment_id}` | Reads one assignment including both status dimensions and all computed hours. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| GET | `/scheduling/assignments` | Lists assignments, filterable by every assignment foreign key including the supersede link. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| GET | `/scheduling/assignments/{id}/time-entries` | Lists every time entry logged against one assignment. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| POST | `/scheduling/assignments/{assignment_id}/confirm` | Confirms a proposed booking after re-running independence and turnover-risk gates. | SchedulingManager |
+| POST | `/scheduling/assignments/{assignment_id}/activate` | Activates a confirmed booking so hours can be logged against it. | SchedulingManager |
+| POST | `/scheduling/assignments/{assignment_id}/release` | Releases a proposed or confirmed booking, exactly reversing its capacity footprint. | SchedulingManager |
+| POST | `/scheduling/assignments/{assignment_id}/reassign` | Replaces a booking with an equivalent booking on a different staff member. | SchedulingManager |
+| POST | `/scheduling/assignments/{assignment_id}/start-review` | Review owner opens or reopens the review of an offshore booking. | EngagementPartner |
+| POST | `/scheduling/assignments/{assignment_id}/request-rework` | Review owner sends work back, adding one rework block to the reviewer's weekly review capacity. | EngagementPartner |
+| POST | `/scheduling/assignments/{assignment_id}/accept-review` | Review owner accepts the work, clearing the phase to complete. | EngagementPartner |
+| POST | `/scheduling/availability-exceptions` | Records time off, licensure study leave, training or a firm holiday. Immutable. | FirmAdmin |
+| POST | `/scheduling/time-entries` | Logs actual hours against an active booking. Immutable, append-only. | EngagementStaff |
+| POST | `/scheduling/independence-restrictions` | Bars a staff member from a client for a closed date window; unwinds conflicting pending bookings. | IndependenceOfficer |
+| GET | `/scheduling/independence-restrictions/{independence_restriction_id}` | Reads one independence restriction. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| GET | `/scheduling/independence-restrictions` | Lists independence restrictions, filterable by client, staff member and status. | FirmAdmin, SchedulingManager, EngagementPartner, IndependenceOfficer |
+| POST | `/scheduling/independence-restrictions/{independence_restriction_id}/lift` | Lifts an active restriction; already-released bookings are not restored. | IndependenceOfficer |
+| POST | `/scheduling/review-capacity-windows` | Declares how many review hours a manager or partner has available in one ISO week. | FirmAdmin |
+| GET | `/scheduling/review-capacity-windows/{review_capacity_window_id}` | Reads one review capacity window including its committed and remaining hours. | FirmAdmin, SchedulingManager, EngagementPartner |
+| GET | `/scheduling/review-capacity-windows` | Lists review capacity windows, filterable by reviewer and ISO week. | FirmAdmin, SchedulingManager, EngagementPartner |
+| POST | `/scheduling/reschedule-plans` | Drafts a reschedule for an engagement whose readiness slipped or whose scope expanded. | SchedulingManager |
+| GET | `/scheduling/reschedule-plans/{reschedule_plan_id}` | Reads one reschedule plan including its projection and staleness flag. | FirmAdmin, SchedulingManager, EngagementPartner |
+| GET | `/scheduling/reschedule-plans` | Lists reschedule plans, filterable by engagement, target phase and status. | FirmAdmin, SchedulingManager, EngagementPartner |
+| POST | `/scheduling/reschedule-plans/{reschedule_plan_id}/simulate` | Runs the read-only projection and pins the engagement version it was computed against. | SchedulingManager |
+| POST | `/scheduling/reschedule-plans/{reschedule_plan_id}/apply` | Applies a fresh simulation: shifts phase windows, adds scope and drops bookings that no longer fit. | SchedulingManager |
+| POST | `/scheduling/workload-waivers` | Staff member requests extra weekly hours allowance for one ISO week, justified by an engagement. | EngagementStaff |
+| GET | `/scheduling/workload-waivers/{workload_waiver_id}` | Reads one workload waiver. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| GET | `/scheduling/workload-waivers` | Lists workload waivers, filterable by staff member, engagement, ISO week and status. | FirmAdmin, SchedulingManager, EngagementPartner, EngagementStaff |
+| POST | `/scheduling/workload-waivers/{workload_waiver_id}/approve` | Engagement partner approves the overtime allowance for that ISO week. | EngagementPartner |
+| POST | `/scheduling/workload-waivers/{workload_waiver_id}/deny` | Engagement partner denies the overtime allowance. | EngagementPartner |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_INVALID_ROLE` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_CLIENT_NOT_FOUND` | 404 |
+| `ERR_STAFF_MEMBER_NOT_FOUND` | 404 |
+| `ERR_ENGAGEMENT_NOT_FOUND` | 404 |
+| `ERR_PHASE_NOT_FOUND` | 404 |
+| `ERR_ASSIGNMENT_NOT_FOUND` | 404 |
+| `ERR_RESTRICTION_NOT_FOUND` | 404 |
+| `ERR_REVIEW_WINDOW_NOT_FOUND` | 404 |
+| `ERR_RESCHEDULE_PLAN_NOT_FOUND` | 404 |
+| `ERR_WAIVER_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 422 |
+| `ERR_INVALID_PAGINATION` | 422 |
+| `ERR_INVALID_DATE_RANGE` | 422 |
+| `ERR_NOT_WEEK_START` | 422 |
+| `ERR_ENGAGEMENT_INVALID_STATE` | 409 |
+| `ERR_PHASE_INVALID_STATE` | 409 |
+| `ERR_ASSIGNMENT_INVALID_STATE` | 409 |
+| `ERR_REVIEW_INVALID_STATE` | 409 |
+| `ERR_RESTRICTION_INVALID_STATE` | 409 |
+| `ERR_PLAN_INVALID_STATE` | 409 |
+| `ERR_WAIVER_INVALID_STATE` | 409 |
+| `ERR_ENGAGEMENT_BLOCKED` | 409 |
+| `ERR_PHASE_NOT_IN_PROGRESS` | 409 |
+| `ERR_INDEPENDENCE_RESTRICTED` | 409 |
+| `ERR_PARTNER_ROTATION_LIMIT` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 409 |
+| `ERR_TURNOVER_RISK_BLOCK` | 409 |
+| `ERR_LEVEL_MISMATCH` | 422 |
+| `ERR_SPECIALIZATION_MISMATCH` | 422 |
+| `ERR_LICENSURE_REQUIRED` | 422 |
+| `ERR_REVIEW_OWNER_REQUIRED` | 422 |
+| `ERR_REVIEW_OWNER_NOT_ELIGIBLE` | 422 |
+| `ERR_REVIEW_WINDOW_MISSING` | 422 |
+| `ERR_DUPLICATE_ENGAGEMENT_YEAR` | 409 |
+| `ERR_DUPLICATE_REVIEW_WINDOW` | 409 |
+| `ERR_DUPLICATE_WAIVER` | 409 |
+| `ERR_DUPLICATE_RESTRICTION` | 409 |
+| `ERR_PHASE_WINDOW_AFTER_DEADLINE` | 422 |
+| `ERR_ASSIGNMENT_OUTSIDE_PHASE_WINDOW` | 422 |
+| `ERR_EXCEPTION_OVERLAP` | 409 |
+| `ERR_STAFF_UNAVAILABLE` | 409 |
+| `ERR_DAILY_CAPACITY_EXCEEDED` | 409 |
+| `ERR_WORKLOAD_CAP_EXCEEDED` | 409 |
+| `ERR_REVIEW_CAPACITY_EXCEEDED` | 409 |
+| `ERR_REWORK_LIMIT_EXCEEDED` | 409 |
+| `ERR_TIME_ENTRY_OUT_OF_WINDOW` | 422 |
+| `ERR_TIME_ENTRY_EXCEEDS_ALLOCATION` | 409 |
+| `ERR_SIMULATION_STALE` | 409 |
+| `ERR_PHASE_FULLY_STAFFED` | 409 |
+| `ERR_NO_ELIGIBLE_STAFF` | 422 |
+| `ERR_STALE_PHASE_VERSION` | 412 |
+| `ERR_STALE_ENGAGEMENT_VERSION` | 412 |
+| `ERR_PARTNER_LEVEL_REQUIRED` | 422 |

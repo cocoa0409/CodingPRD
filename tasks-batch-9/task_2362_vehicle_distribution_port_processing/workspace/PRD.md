@@ -1,0 +1,404 @@
+# Vehicle Distribution & Port Processing API — Product Requirements Document
+
+## 1. Introduction
+
+A vehicle processing center is the narrow point through which every imported unit must pass, and it is a place where three very different clocks run at once. Ocean voyages arrive on berth windows negotiated weeks in advance. Bodyshop and accessory crews work a unit at a time, sometimes twice over when an inspector rejects their work. Meanwhile the commercial side — dealers waiting on allocation, inland carriers committing tractors, finance tracking storage revenue and recovery from ocean carriers — needs a defensible number for every unit on the ground, every day it sits there. Today those three clocks are reconciled by spreadsheet and phone call, which is why a recall notice can arrive on a Tuesday and still find units on trucks by Thursday.
+
+This document specifies the API that replaces that reconciliation with a single system of record. It governs the whole path a unit travels: discharge off a vessel into the holding yard, arrival damage survey and the transportation damage claim raised against the ocean carrier, port-installed option installation drawn from kit stock, quality inspection with its rework loop, preparation to shipping condition, allocation to a dealer with server-chosen carrier and routing, gate-out, and delivery acknowledgement. Layered across that path are the controls the business actually cares about: recall and stop-ship holds that must reach units already allocated, repair authorization thresholds that escalate expensive work to a manager, segregation of duties between the people who do work and the people who sign it off, and storage cost and dwell-time metrics reported by model line.
+
+Two structural decisions shape everything that follows. First, a unit's processing progress and its damage condition are **two independent state dimensions** that advance on their own schedules and interact only at the few explicitly named gates — a unit can be receiving accessories while its damage claim is still in dispute. Second, all resources are mounted as top-level collections under the `/vpc` prefix, with ownership carried in request bodies rather than in URL hierarchies, and every instant the server records comes from a settable logical clock rather than from wall time, so that dwell-day arithmetic is reproducible under test.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request — reads included — must carry two headers: `X-User-ID`, identifying the acting user, and `X-User-Role`, declaring the capacity in which they act. If either header is absent, or if `X-User-Role` is not one of the six declared roles, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). When the headers are well-formed but the declared role is not among the roles authorized for the requested operation in §4, the rejection is `ERR_FORBIDDEN_ROLE` (HTTP 403).
+
+The six roles are `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, and `Dealer`. Their remits are as follows. A `PortOperationsPlanner` registers processing centers and berths, schedules voyages, opens and closes discharge, and discharges individual units into the yard. A `DamageSurveyor` raises arrival damage surveys, submits them, files and revises carrier claims, and creates and completes repair orders. An `AccessoryTechnician` receives kit stock and runs the port-installed option work orders — planning, kitting, installing, voiding. A `QualityInspector` opens and completes quality inspections and records preparation to shipping condition. A `DistributionManager` administers dealers and inland carriers, applies and lifts holds, adjudicates escalated repairs and carrier responses, settles claims, and drives allocation, dispatch, gate-out and cancellation. A `Dealer` is a consignee: it reads units and release orders and confirms delivery.
+
+Identity semantics differ between the operator roles and the consignee role, and the difference matters for every ownership and segregation check in this specification. When `X-User-Role` is `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, or `DistributionManager`, `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity. The server records it wherever a scaffold transition writes an actor — as `surveyed_by_user_id` on a damage survey, `filed_by_user_id` and `settled_by_user_id` on a carrier claim, `estimated_by_user_id` and `authorized_by_user_id` on a repair order, `installed_by_user_id` on an accessory work order, `inspector_user_id` on a quality inspection, and `applied_by_user_id` and `lifted_by_user_id` on a hold order — but it never compares that value to any entity's `id`. When `X-User-Role` is `Dealer`, by contrast, `X-User-ID` **is** the `id` of the acting `Dealer` record; ownership checks on a release order compare the order's `dealer_id` field to `X-User-ID`, and a mismatch on delivery confirmation is rejected with `ERR_NOT_RESOURCE_OWNER` (HTTP 403). Note that this ownership comparison is scoped to delivery confirmation alone: a `Dealer` reading the unit collection or the release-order collection is not filtered to its own consignments and is not rejected for reading another dealer's order.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+Every collection read is paginated through two query parameters. `limit` caps the number of records returned; when the client omits it the server uses 10, the smallest accepted value is 1 and the largest accepted value is 100. `offset` is the number of records to skip and defaults to 0. A value outside the accepted range for either parameter is a request-schema violation and is rejected with `ERR_INVALID_REQUEST`.
+
+Unless a specific endpoint states otherwise, list results are ordered by `created_at` ascending. List responses carry `limit`, `offset`, `total_count` and `has_more` in the envelope's `meta` object, where `total_count` counts every record matching the filters before pagination is applied and `has_more` indicates whether records remain beyond the current window.
+
+### 2.4. Record Identity, Timestamps and the Logical Clock
+
+Every resource in this system carries an `id`, which is a server-minted UUID with no type prefix, and a `created_at` timestamp, which is an ISO 8601 UTC instant with three fractional digits. Almost all resources additionally carry an `updated_at` timestamp in the same format, refreshed on every mutation, and a `version` integer that starts at 1 on creation and increments by one on every mutation of the record — including mutations the server performs on its own initiative, such as recomputing a center's occupancy counters or reverting a unit to a prior processing state as part of a cascade. The one exception is the **Berth**: a berth is an immutable facility record, so it carries only `id` and `created_at`. A berth has no `updated_at` field, no `version` field, and no update operation.
+
+All timestamps the server *stamps into business fields* are read from a **logical clock** rather than from wall time. The clock's value when it has never been set is `2026-08-01T00:00:00Z`. Any of the six roles may advance or rewind it through a test-driving capability that accepts a single `current_utc` instant and echoes it back, and any of the six roles may read it. The fields fed by this clock are a unit's `yard_in_at` and `gate_out_at`, its `damage_opened_at` and `damage_cleared_at`, and a release order's `allocated_at`, `dispatched_at` and `gated_out_at`. Berth-window admission and dwell-day arithmetic both read the same clock, so a test that moves the clock forward by three days moves every dwell calculation with it.
+
+### 2.5. Path Resolution and Reference Integrity
+
+When a URL carries more than one identifier, the server resolves them strictly left to right and rejects on the first one that does not resolve, before evaluating any business rule. Each identifier has its own dedicated not-found code: `centerId` yields `ERR_CENTER_NOT_FOUND`, `berthId` yields `ERR_BERTH_NOT_FOUND`, `vesselId` yields `ERR_VESSEL_NOT_FOUND`, `vehicleId` yields `ERR_VEHICLE_NOT_FOUND`, `surveyId` yields `ERR_SURVEY_NOT_FOUND`, `claimId` yields `ERR_CLAIM_NOT_FOUND`, `repairOrderId` yields `ERR_REPAIR_ORDER_NOT_FOUND`, `kitId` yields `ERR_KIT_NOT_FOUND`, `workOrderId` yields `ERR_WORK_ORDER_NOT_FOUND`, `inspectionId` yields `ERR_INSPECTION_NOT_FOUND`, `holdOrderId` yields `ERR_HOLD_ORDER_NOT_FOUND`, `dealerId` yields `ERR_DEALER_NOT_FOUND`, `carrierId` yields `ERR_CARRIER_NOT_FOUND`, and `releaseOrderId` yields `ERR_RELEASE_ORDER_NOT_FOUND`. All fourteen are HTTP 404.
+
+Foreign keys supplied in a request *body* are resolved separately and share a single code, `ERR_REFERENCE_NOT_FOUND` (HTTP 404). This check guards six write operations: berth creation (its `processing_center_id`), voyage scheduling (its `processing_center_id` and `berth_id`), accessory work order planning (its `accessory_kit_id`), repair estimate creation (its optional `carrier_claim_id`), allocation (its `dealer_id`), and hold application (the `vehicle_id` of a single-VIN hold). Because body references are resolved at a lower precedence than path identifiers, a request that names both a missing path resource and a missing body reference reports the path failure.
+
+Uniqueness is enforced on creation and reported as `ERR_DUPLICATE_KEY` (HTTP 409). A center's `port_code` is unique system-wide, as are a dealer's `dealer_code` and a carrier's `carrier_code` and a unit's `vin`. A voyage's `voyage_code`, a berth's `berth_code` and a kit record's `kit_code` are each unique within their owning processing center, so the same berth designation may legitimately exist at two different ports.
+
+### 2.6. Validation Precedence
+
+Several checks can be true at once on a single request, and the code the client receives must be predictable. The server evaluates admission concerns in the following fixed order and returns the first failure it finds:
+
+1. Header presence and role validity — `ERR_UNAUTHENTICATED` (401).
+2. Role authorization for the requested operation — `ERR_FORBIDDEN_ROLE` (403).
+3. Path identifier resolution, left to right — the fourteen 404 codes named in §2.5.
+4. Body foreign-key resolution — `ERR_REFERENCE_NOT_FOUND` (404).
+5. Request body schema: required fields present, enum members valid, numeric ranges honored, a `vin` of exactly 17 characters, and every interval's end strictly after its start — `ERR_INVALID_REQUEST` (400). This band also carries the cross-field body checks: a `PASS` inspection outcome accompanied by a `defect_count` of 1 or more, a `FAIL` outcome with a `defect_count` of 0, a `DISPUTE` carrier response whose `disputed_amount_cents` is absent or not below the claim's `claimed_amount_cents`, a `revised_claim_amount_cents` above the claim's current `claimed_amount_cents`, a `MODEL_LINE` hold with no `model_line`, and a `SINGLE_VIN` hold with no `vehicle_id`.
+6. Uniqueness on create — `ERR_DUPLICATE_KEY` (409).
+7. Optimistic concurrency: `expected_vehicle_version` on allocation and `expected_damage_survey_version` on claim filing must equal the parent record's current `version` — `ERR_STALE_VEHICLE_VERSION` or `ERR_STALE_SURVEY_VERSION` (412).
+8. State legality: the requested transition must exist from the target's current state — `ERR_INVALID_STATE` (409).
+9. Segregation of duties — `ERR_SEGREGATION_OF_DUTIES` (403).
+10. Resource ownership for a `Dealer` — `ERR_NOT_RESOURCE_OWNER` (403).
+11. Recall and stop-ship blocking — `ERR_VEHICLE_STOP_SHIP_BLOCKED` (409).
+12. The damage gate on preparation to shipping condition — `ERR_VEHICLE_DAMAGE_BLOCKED` (409).
+13. The mandatory-claim gate — `ERR_CLAIM_REQUIRED` (409).
+14. Yard posture on discharge — `ERR_YARD_GRIDLOCK` (409).
+15. Berth window exclusivity — `ERR_BERTH_WINDOW_CONFLICT` (409).
+16. Berth window opening time — `ERR_BERTH_WINDOW_NOT_OPEN` (409).
+17. Carrier pickup-window concurrency — `ERR_CARRIER_WINDOW_CAPACITY` (409).
+18. Voyage discharge completeness — `ERR_VESSEL_DISCHARGE_INCOMPLETE` (409).
+19. Outstanding kitted accessory work at inspection — `ERR_ACCESSORY_WORK_OPEN` (409).
+20. Kit stock sufficiency at kitting — `ERR_KIT_INSUFFICIENT` (409).
+21. The claim revision ceiling — `ERR_CLAIM_REVISION_LIMIT` (409).
+22. Claim filing preconditions, in this internal order: the survey's severity threshold first (`ERR_CLAIM_NOT_WARRANTED`), then the absence of a live prior claim (`ERR_CLAIM_ALREADY_OPEN`) — both 409.
+23. Carrier eligibility for allocation — `ERR_NO_ELIGIBLE_CARRIER` (409).
+24. The requirement that a voyage have discharged at least one unit before it is closed — `ERR_NO_UNITS_DISCHARGED` (409).
+25. The dealer allocation quota — `ERR_DEALER_QUOTA_EXCEEDED` (409).
+26. The settlement ceiling — `ERR_SETTLEMENT_EXCEEDS_RECOVERABLE` (422).
+
+Two consequences of this ordering are worth calling out because they are easy to get backwards. On allocation, carrier eligibility (band 23) is evaluated **before** the dealer's allocation quota (band 25), so a request that both exhausts a dealer's quota and finds no eligible carrier reports `ERR_NO_ELIGIBLE_CARRIER`. And on preparation to shipping condition, the damage gate (band 12) outranks the mandatory-claim gate (band 13), so a unit whose damage is still open reports `ERR_VEHICLE_DAMAGE_BLOCKED` even when it is also missing its required claim.
+
+### 2.7. Holding Yard Capacity and Posture
+
+A processing center's holding yard is sized by `yard_capacity_slots`, which must be at least 1. Against that ceiling the server maintains `yard_occupied_slots` — the number of units whose `processing_center_id` is this center and whose `yard_presence` is `IN_YARD` — and `yard_free_slots`, which is `yard_capacity_slots` less `yard_occupied_slots`. A newly registered center starts with zero occupied slots, free slots equal to its capacity, and a posture of `OPEN`.
+
+From the same two numbers the server derives `yard_posture`, a three-valued signal of how tight the yard is. The occupancy ratio is occupied slots divided by capacity slots. When that ratio is at least 0.95, posture is `GRIDLOCK`; otherwise, when it is at least 0.80, posture is `CONSTRAINED`; otherwise it is `OPEN`. The ratio is never rounded or truncated to a decimal before comparison — it is compared as an exact rational, equivalently by multiplying occupied slots by 100 and comparing against capacity multiplied by the threshold percentage — so a yard holding 19 of 20 slots is exactly at 0.95 and is `GRIDLOCK`, while 15 of 20 is exactly 0.75 and remains `OPEN`. Both recomputations happen the instant occupancy changes, which is at unit discharge and at gate-out; a unit that has just gated out stops counting toward occupancy in the very same request that records its departure.
+
+### 2.8. Cent Arithmetic, Rounding and Rate Precision
+
+Every monetary amount in this system is an integer count of cents, and every field carrying one is named with a `_cents` suffix. There are no fractional-cent values in stored data or in responses. Where a computation produces a fractional intermediate — a markup, a percentage surcharge, a per-minute labor rate — the server rounds to whole cents using the **round half up** convention, meaning a value exactly halfway between two whole cents rounds away from zero to the larger magnitude. Each calculation in §3 states exactly where its rounding steps fall, and those positions are normative: rounding earlier or later than specified produces a different cent total and is wrong.
+
+Two non-cent numeric precisions also matter. A center's `fuel_surcharge_pct` is a fractional rate supplied by the client, constrained to at least 0 and at most 0.5 and carrying up to 4 decimal places; it is stored as supplied rather than rounded. The `avg_dwell_days` figure in the dwell-metrics report is a number rounded half up to exactly 1 decimal place; every other figure in that report is an integer. Day counts derived from instants are whole days throughout, computed over intervals of 86,400 seconds.
+
+### 2.9. Conserved Inventories: Kit Units and Tractor Slots
+
+Two quantities in this system are physically conserved, and the server must be able to prove it after every single request — including the compensating operations that undo earlier work.
+
+The first is **kit units**. For every accessory kit stock record, `on_hand_qty` plus `consumed_qty` always equals `received_qty_total`. `consumed_qty` is the sum of `qty` over that kit's work orders whose status is `INSTALLED`; `reserved_qty` is the sum of `qty` over that kit's work orders whose status is `KITTED`; and `available_qty` is `on_hand_qty` less `reserved_qty`. Work orders in `PLANNED` or `VOIDED` contribute to none of these. At creation, `on_hand_qty` is initialized to `received_qty_total`, `reserved_qty` and `consumed_qty` are 0, and `available_qty` therefore equals `received_qty_total`. The invariant must still hold after a work order is voided out of `INSTALLED` and after the inspection-failure reopen described in §3.6, both of which return units to `on_hand_qty`.
+
+The second is **tractor slots**. For every inland carrier, `committed_slots` plus `available_slots` always equals `slot_capacity`. `committed_slots` counts release orders whose `truck_carrier_id` is this carrier and whose status is either `ALLOCATED` or `RELEASED`; `available_slots` is the remainder. Statuses `GATED_OUT`, `DELIVERED`, `CANCELLED` and `CANCELLED_BY_HOLD` release the slot. The parallel counter on the consignee side, `open_allocation_count`, counts release orders whose `dealer_id` is this dealer and whose status is `ALLOCATED` or `RELEASED`, on the same membership rule. A freshly registered carrier has zero committed slots and available slots equal to its capacity; a freshly registered dealer has an open allocation count of 0.
+
+### 2.10. Stale-View Protection on Allocation and Claim Filing
+
+Two write operations in this system can legitimately supersede an existing record, and both are therefore protected against a client acting on a view of the world that has already moved on.
+
+Allocating a unit to a dealer requires the request to carry `expected_vehicle_version`, holding the `version` of the target unit as the client last observed it. This is a mandatory field, not an optional one. If it does not equal the unit's current `version`, the allocation is rejected with `ERR_STALE_VEHICLE_VERSION` (HTTP 412). The protection exists because a re-allocation legitimately cancels the prior release order — a dealer swap — and a writer whose view of the unit predates an earlier allocation is reasoning about an allocation, a provisional storage accrual and a carrier commitment that no longer exist. A successful allocation increments the unit's `version` by 1, so the value that admitted one allocation will not admit the next.
+
+Filing a carrier claim against a damage survey requires the request to carry `expected_damage_survey_version`, holding the `version` of the target survey as the client last observed it, again as a mandatory field. A mismatch against the survey's current `version` is rejected with `ERR_STALE_SURVEY_VERSION` (HTTP 412). Here the superseding case is a re-file after denial: because a survey whose entire claim history is denied may be filed against again, a writer holding an older survey version is reasoning about a claim history that has already changed. A successful filing increments the survey's `version` by 1.
+
+No other operation in this API takes a version field. Dispatch, gate-out, cancellation, hold lifting, inspection completion, kitting, installation, voiding, repair authorization, claim resubmission and settlement are all admitted purely on state and business rules, and a client must not send a version expectation to them.
+
+### 2.11. Segregation of Duties
+
+Three places in this workflow require that two different people be involved, and all three are enforced by comparing the acting `X-User-ID` against an identifier the server recorded earlier. All three report `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+The first protects inspection independence: the `QualityInspector` opening an inspection on a unit must not be the operator recorded as `installed_by_user_id` on any accessory work order of that unit whose status is `INSTALLED`, nor on any work order that is back in `KITTED` after a reopen. `installed_by_user_id` is deliberately retained when a work order is reopened by an inspection failure precisely so this check survives the rework cycle — the technician who installed the accessory the first time still cannot inspect the unit after their work is sent back.
+
+The second protects hold governance: the `DistributionManager` lifting a hold order must not be the one recorded as its `applied_by_user_id`. The third protects claim recovery: the `DistributionManager` settling a carrier claim must not be the one recorded as its `filed_by_user_id`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Berthing, Voyage Discharge and Yard Intake
+
+A `PortOperationsPlanner` begins by registering a processing center, giving it a `name`, a `port_code`, a `yard_capacity_slots` figure of at least 1, and the rate card that drives everything financial downstream: `daily_storage_rate_cents` charged per chargeable dwell day per unit, `labor_rate_cents_per_hour` used to price accessory installation labor, and `fuel_surcharge_pct` applied to base linehaul at dispatch. One further rate-card element, `free_storage_days`, is optional on the request and defaults to 5 when omitted; it is the number of dwell days granted free of charge before storage billing begins. A center also exposes three read-only ledgers that accumulate as work proceeds — `provisional_storage_accrued_cents`, `realized_storage_revenue_cents` and `repair_spend_cents` — whose composition is described in §3.9 and §3.4.
+
+Berths are created against a center by supplying the owning `processing_center_id` and a `berth_code`. The only other property a berth carries is `turnaround_buffer_minutes`, the mandatory idle gap the port requires between two occupations of the same berth; it is optional on the request and defaults to 120 minutes — two hours — when the planner does not state one.
+
+Scheduling a voyage means reserving a berth window. The planner supplies the destination `processing_center_id`, the reserved `berth_id`, a `voyage_code`, the ocean carrier's `carrier_scac` (which becomes the respondent on any damage claim raised against that voyage), the `berth_window_start` and `berth_window_end` bounding the occupation, and `declared_unit_count`, the number of units the manifest declares, which must be at least 1. The window is treated as half-open — start inclusive, end exclusive — and its end must fall strictly after its start. A new voyage is created in `SCHEDULED` with `discharged_unit_count` at 0.
+
+Berth occupancy is exclusive, and adjacency is *not* good enough. Before accepting a new voyage the server compares the requested window against every other voyage on the same `berth_id` whose `discharge_status` is `SCHEDULED` or `DISCHARGING` — voyages already in `DISCHARGE_COMPLETE` have released the berth and are ignored. Taking the berth's turnaround buffer as a duration, a conflict exists when the new window's start falls before the neighbour's end extended forward by that buffer, and at the same time the neighbour's start falls before the new window's end extended forward by that buffer. In plain operational terms, a new window must clear its neighbour on either side by at least the full buffer; a window that begins at the exact instant a neighbour ends is a conflict, because zero gap is less than the buffer. Instants are compared at second precision, and a conflict is rejected with `ERR_BERTH_WINDOW_CONFLICT`.
+
+Discharge opens in two steps. Starting discharge advances the voyage from `SCHEDULED` to `DISCHARGING`, and is admitted only once the logical clock has reached the reserved `berth_window_start` — at or after that instant is acceptable, before it is rejected with `ERR_BERTH_WINDOW_NOT_OPEN`. Units may be discharged only while the voyage sits in `DISCHARGING`; attempting to discharge a unit off a voyage that is still `SCHEDULED` or already `DISCHARGE_COMPLETE` is rejected with `ERR_INVALID_STATE`. Closing the voyage advances `DISCHARGING` to `DISCHARGE_COMPLETE` and requires that `discharged_unit_count` be at least 1 — a voyage that discharged nothing cannot be closed, and the attempt yields `ERR_NO_UNITS_DISCHARGED`. Closing has two forward consequences: the berth window stops participating in the conflict comparison above, freeing the berth for the next voyage; and every unit off that voyage becomes eligible for preparation to shipping condition, which §3.6 revisits.
+
+Discharging a unit is where a `Vehicle` record comes into being. The planner supplies only three things: the `vin`, which must be exactly 17 characters and unique across all units; the `model_line`, one of `LX500`, `TX300` or `EV900`; and an optional `pio_program_code` naming the port-installed-option program the unit belongs to, which is null when the unit ships base. Both `processing_center_id` and `vessel_id` are copied from the voyage by the server and cannot be set by the client. The new unit lands with `yard_presence` of `IN_YARD`, `yard_in_at` stamped from the logical clock as the origin of its dwell clock, `gate_out_at` null, `processing_status` of `DISCHARGED`, `damage_status` of `NONE`, `damage_opened_at` and `damage_cleared_at` null, `severity_index` 0, `claim_mandatory` false, `stop_ship_blocked` false with a null `blocking_hold_order_id`, `rework_cycle_count` 0, `blocked_credit_days` 0, and `storage_charge_provisional_cents`, `storage_charge_final_cents` and `accessory_billed_cents` all 0.
+
+Three things happen alongside that creation. The voyage's `discharged_unit_count` is recomputed. The center's `yard_occupied_slots`, `yard_free_slots` and `yard_posture` are recomputed on the rules of §2.7 — and if the destination center's posture is already `GRIDLOCK` at the moment of the request, the discharge is refused outright with `ERR_YARD_GRIDLOCK`, because a full yard cannot absorb another unit. Finally, if the center has any open model-line-scoped hold whose targeted `model_line` matches the arriving unit, the unit is born blocked: `stop_ship_blocked` is set to true and `blocking_hold_order_id` points at that hold. A recall campaign therefore continues to catch units that had not yet arrived when it was raised.
+
+### 3.2. Arrival Damage Survey and Severity Scoring
+
+A `DamageSurveyor` opens an arrival survey against a unit by submitting `line_items`, an array of at least one damage line. Each line names a `damage_zone` — one of `GLASS`, `BODY_PANEL`, `INTERIOR` or `UNDERBODY` — an integer `severity_points` between 1 and 60 inclusive, and a `repair_estimate_cents` of 0 or more. The survey is created in `DRAFT` with `line_count` set to the number of lines supplied and `surveyed_by_user_id` recorded from the acting `X-User-ID`; its `severity_index` and `claimed_amount_cents` stay unset until submission. The unit's `vehicle_id` is taken from the path, not from the body.
+
+Submitting the survey is the act that scores it, and it is the single most consequential calculation in the arrival phase. Submission is admitted only when the survey itself is still in `DRAFT` and the unit's `processing_status` is still `DISCHARGED`; anything else is `ERR_INVALID_STATE`. Scoring proceeds as follows. Each line is weighted by its zone: an underbody line carries a weight of 1.8, a glass line 1.5, a body-panel line 1.2, and an interior line 1.0. Multiply each line's `severity_points` by its zone weight to get that line's weighted score. Take the **largest** weighted score across all lines, and only then round that single figure half up to a whole number — this is the *peak*, and the rounding happens after the maximum is taken, never to each line beforehand. Separately, compute a *breadth* term of 5 points for each line beyond the first, that is, 5 multiplied by the line count less one. The survey's `severity_index` is the peak plus the breadth, capped at 100. The result is always a whole number, and only the lines of the survey being submitted contribute — no other survey on the same unit feeds into it.
+
+Submission then carries the score outward. The survey advances from `DRAFT` to `SUBMITTED`, its `claimed_amount_cents` is computed on the survey basis described in §3.3, and the unit's `processing_status` advances `DISCHARGED → SURVEYED`. The unit's own `severity_index` is set to the survey's, and `claim_mandatory` is set to true exactly when that index is 60 or more. The damage dimension moves independently: when the index is 25 or more, `damage_status` advances `NONE → SURVEY_DAMAGE_OPEN` and `damage_opened_at` is stamped from the logical clock; when the index is below 25, the damage is treated as cosmetic and `damage_status` stays `NONE` with `damage_opened_at` left null. Three bands therefore emerge from one number: below 25 the unit is cosmetically marked but operationally clean; from 25 up to but not including 60 the damage dimension opens and a carrier claim is permitted but not required; from 60 upward the damage dimension opens and a carrier claim becomes mandatory before the unit can be prepared for shipping.
+
+Because `damage_status` and `processing_status` are independent dimensions, a unit with open damage continues through accessory work and inspection normally. The two dimensions meet at exactly two gates — preparation to shipping condition, which reads the damage dimension, and allocation, which can only be reached from a state the damage gate has already cleared.
+
+### 3.3. Carrier Claim Initiation, the Dispute Cycle and Settlement
+
+Filing a transportation damage claim turns a submitted survey into a recovery action against the carrier. The `DamageSurveyor` supplies the respondent's `carrier_scac` and the mandatory `expected_damage_survey_version` described in §2.10; the server takes `damage_survey_id` from the path and records `filed_by_user_id` from the acting `X-User-ID`. Filing is refused when the survey's `severity_index` is below 25, with `ERR_CLAIM_NOT_WARRANTED` — cosmetic damage is not recoverable. It is also refused with `ERR_CLAIM_ALREADY_OPEN` when any claim already exists for that survey in `FILED`, `ACCEPTED_PENDING_SETTLEMENT`, `DISPUTED` or `SETTLED`. On success a claim is created in `FILED`, the survey advances `SUBMITTED → CLAIMED`, and the survey's `version` increments.
+
+A survey in `CLAIMED` can be filed against a second time, but only in one circumstance: every claim already attached to it must be in `DENIED`. When that holds, a new claim is created in `FILED`, the survey stays in `CLAIMED` (a self-transition), its `version` increments again, and the denied predecessors are left exactly as they are — nothing is rewritten or reparented. When it does not hold, the re-file is refused with `ERR_CLAIM_ALREADY_OPEN`. The version expectation applies identically on this path, so a writer whose survey view predates the denial that made re-filing possible is turned away with `ERR_STALE_SURVEY_VERSION`.
+
+The amount at stake is computed the same way on both filing paths. For each line of the originating survey, take its `repair_estimate_cents` but never more than 80,000 cents from any single line — an individual damage line cannot claim more than eight hundred dollars regardless of what the estimate says. Sum those capped line figures: that total is `claimed_amount_cents`, and it is gross of the deductible. The recoverable figure then subtracts a flat claim deductible of 25,000 cents from the basis amount, with a floor of 0 — a claim whose basis does not clear the two-hundred-and-fifty-dollar deductible recovers nothing rather than a negative amount. All inputs are integer cents and no rounding is involved.
+
+What varies is which basis amount enters that subtraction, and the claim records this in `recoverable_basis`. At filing, and on every resubmission while the basis has not changed, the basis is `SURVEY_BASED`: the basis amount is `claimed_amount_cents` itself, so the claim recovers the surveyor's capped projection of what repair will cost. The basis latches to `REPAIR_ACTUAL` the moment a repair order carrying this claim's identifier reaches completion while the claim is still non-terminal, and once latched it never reverts. Under `REPAIR_ACTUAL` the basis amount is the *lesser* of `claimed_amount_cents` and the sum of `actual_cost_cents` over every completed repair order pointing at this claim. The consequence is deliberate: two claims built from identical survey data will recover different amounts as soon as the real repair bill differs from the capped estimate, and the claim can never recover more than it originally claimed.
+
+The carrier's answer is recorded by a `DistributionManager` against a claim in `FILED`, and the `outcome` selects one of three branches. An `ACCEPT` moves the claim `FILED → ACCEPTED_PENDING_SETTLEMENT` and changes nothing else. A `DISPUTE` moves it `FILED → DISPUTED` and records the `disputed_amount_cents` the carrier concedes; that amount is required on a dispute and must be at least 0 and strictly below the claim's current `claimed_amount_cents`, since a carrier conceding the full amount is not disputing — a violation is `ERR_INVALID_REQUEST`. A `DENY` moves it `FILED → DENIED`, which is terminal for that claim and which is what opens the survey to the re-file path above. Recording a response against a claim in any state other than `FILED` is `ERR_INVALID_STATE`.
+
+A disputed claim can be revised and put back in front of the carrier, which is the cyclic edge of the claim lifecycle. The `DamageSurveyor` resubmits with a `revised_claim_amount_cents`, moving the claim `DISPUTED → FILED`. The revision is bounded three ways. The claim must be in `DISPUTED`. The revised amount must not exceed the claim's current `claimed_amount_cents` — revisions may only come down, and an increase is `ERR_INVALID_REQUEST`. And `revision_round`, which counts completed resubmissions and starts at 0, must still be below the ceiling of three revisions; a claim that has already used all three is refused with `ERR_CLAIM_REVISION_LIMIT`. On success `revision_round` increases by one, `claimed_amount_cents` becomes the revised amount, `disputed_amount_cents` is cleared back to null, and `recoverable_amount_cents` is recomputed under whichever basis the claim currently carries — a claim already latched to `REPAIR_ACTUAL` stays on actual cost through the revision.
+
+Settlement closes the recovery. A `DistributionManager` supplies `settled_amount_cents` against a claim in `ACCEPTED_PENDING_SETTLEMENT`, moving it to `SETTLED` and recording `settled_by_user_id`. Two guards apply beyond the state check: the settler must not be the claim's filer, per §2.11, and the settled amount must not exceed the claim's `recoverable_amount_cents` under its currently active basis — an overpayment attempt is rejected with `ERR_SETTLEMENT_EXCEEDS_RECOVERABLE`, which is the one HTTP 422 in this API. `settled_amount_cents` is null until settlement occurs.
+
+### 3.4. Repair Authorization and Damage Clearance
+
+Repair work is authorized on a threshold, and the threshold is what makes some repairs a surveyor's own call and others a manager's decision. A `DamageSurveyor` creates a repair estimate against a unit with a `description` of the scope, an `estimate_cents` figure of 0 or more, and optionally a `carrier_claim_id` naming the claim this repair is to be recovered against — omitted for own-account repairs. The server records `estimated_by_user_id` from the acting `X-User-ID`, leaves `actual_cost_cents` null, and immediately decides the `authorization_tier` from the single supplied estimate alone: an estimate of 150,000 cents or more — fifteen hundred dollars, inclusive at the boundary — is `ESCALATED`, and anything below it is `AUTO`. Prior repair orders on the same unit do not aggregate into this decision; each estimate is judged on its own.
+
+The two tiers diverge in what they do, and the difference is not cosmetic. An `AUTO` estimate is born already approved: the order is created in `AUTHORIZED`, `authorized_by_user_id` is written with the same operator who supplied the estimate, and the unit's damage dimension advances `SURVEY_DAMAGE_OPEN → REPAIR_AUTHORIZED`. An `ESCALATED` estimate is created in `ESCALATED`, `authorized_by_user_id` stays null, and the unit's damage dimension is **not** advanced — it remains in `SURVEY_DAMAGE_OPEN`, and the unit stays damage-blocked until a manager acts.
+
+Adjudicating an escalated order is a `DistributionManager` decision expressed as a `decision` of either `AUTHORIZE` or `REJECT`, and it is only available from `ESCALATED`. On `AUTHORIZE` the order moves `ESCALATED → AUTHORIZED`, `authorized_by_user_id` is written with the manager's `X-User-ID`, and the unit's damage dimension advances `SURVEY_DAMAGE_OPEN → REPAIR_AUTHORIZED`; the two escalated-to-authorized paths therefore rejoin the automatic path at the same place. `AUTHORIZE` carries one additional precondition that the automatic tier does not: there must be a live carrier claim behind the spend, meaning a claim on this unit's survey whose status is `FILED`, `ACCEPTED_PENDING_SETTLEMENT` or `DISPUTED`. Without one the authorization is refused with `ERR_CLAIM_REQUIRED` — the port does not authorize expensive repair it has no recovery path for. On `REJECT` the order moves `ESCALATED → REJECTED`, which is terminal, and the unit's damage dimension deliberately stays in `SURVEY_DAMAGE_OPEN` so the unit remains damage-blocked. `REJECT` has no claim precondition of its own; a manager may always decline.
+
+Completing a repair is again the `DamageSurveyor`'s action, available only from `AUTHORIZED`, and it records the `actual_cost_cents` that were really spent, which must be 0 or more. The order moves to `COMPLETED` and four consequences follow. The unit's damage dimension advances `REPAIR_AUTHORIZED → REPAIRED` and `damage_cleared_at` is stamped from the logical clock. The unit's `blocked_credit_days` is recomputed as the number of whole 86,400-second days between `damage_opened_at` and `damage_cleared_at`, discarding any partial day, or 0 when either instant is null. The owning center's `repair_spend_cents` is recomputed as the sum of `actual_cost_cents` over all completed repair orders on that center's units. And if the order carries a `carrier_claim_id` whose claim is not yet terminal — that is, in `FILED`, `ACCEPTED_PENDING_SETTLEMENT` or `DISPUTED` — that claim's `recoverable_basis` latches to `REPAIR_ACTUAL` and its `recoverable_amount_cents` is recomputed on the actual-cost basis of §3.3.
+
+Note the asymmetry the damage dimension carries as a whole: it opens on survey submission, advances to `REPAIR_AUTHORIZED` whenever any repair order on the unit reaches authorization by either route, and reaches `REPAIRED` only through repair completion. It has no terminal state, because a repaired unit could in principle be surveyed again.
+
+### 3.5. Port-Installed Options: Kit Stock and Installation
+
+Kit stock is received into a center by an `AccessoryTechnician`, who supplies a `kit_code` identifying the part, the `program_code` of the port-installed-option program it belongs to, a `received_qty_total` of 0 or more counting every kit ever received into that stock record, the `unit_cost_cents` of parts per kit unit before markup, and `install_minutes_per_unit`, the standard installation time for one kit unit. The `processing_center_id` is taken from the path. The four derived quantities on the record — `on_hand_qty`, `reserved_qty`, `consumed_qty` and `available_qty` — are maintained exactly as §2.9 specifies, and the read for a kit record always shows the live ledger.
+
+Installing an option on a unit runs through a three-step work order. Planning creates an `AccessoryWorkOrder` in `PLANNED` against a unit, naming the `accessory_kit_id` to be drawn from and a `qty` of at least 1. Planning moves no stock at all: the kit's quantities are untouched, `billed_cents` sits at 0, `installed_by_user_id` is null, and `reopen_count` is 0.
+
+Kitting reserves the stock. A work order in `PLANNED` advances to `KITTED` provided the kit's `available_qty` is greater than or equal to the work order's `qty` — equality is sufficient, and a shortfall is refused with `ERR_KIT_INSUFFICIENT`. On success the kit's `reserved_qty` and `available_qty` are recomputed, which reserves the units without yet consuming them. Kitting also drives the unit's processing dimension: the first work order kitted on a unit advances it `SURVEYED → ACCESSORY_IN_PROGRESS`, and subsequent kittings on a unit already in `ACCESSORY_IN_PROGRESS` leave the dimension where it is. The unit must be in `SURVEYED` or `ACCESSORY_IN_PROGRESS` for kitting to be admitted at all; anything else is `ERR_INVALID_STATE`.
+
+Installation consumes the stock and bills the program. A work order in `KITTED` advances to `INSTALLED`, and the unit must be in `ACCESSORY_IN_PROGRESS` at that moment or the request is `ERR_INVALID_STATE`. The kit's `on_hand_qty` is reduced by the work order's `qty`, and `consumed_qty`, `reserved_qty` and `available_qty` are recomputed so that the conservation invariant of §2.9 still holds. `installed_by_user_id` is recorded from the acting `X-User-ID` — the value the inspection segregation check in §2.11 will later consult.
+
+The billing figure stamped at installation is computed per unit and only then multiplied out, and the order of operations is pinned. First, the parts component for a single kit unit: take the kit's `unit_cost_cents`, apply a parts markup of 12.5 percent (that is, multiply by one plus the markup), and round the result half up to whole cents. Second, the labor component for a single kit unit: take the kit's `install_minutes_per_unit`, multiply by the center's `labor_rate_cents_per_hour`, divide by 60 to convert the hourly rate to a per-minute rate, and round that result half up to whole cents. Add the two rounded per-unit components together and multiply the sum by the work order's `qty`; that product is `billed_cents`, and it is not rounded again. Rounding happens exactly twice, once per per-unit component, and never after the multiplication — summing unrounded components, or multiplying by quantity before rounding, yields a different cent total and is incorrect. The center's `labor_rate_cents_per_hour` is read at the moment of installation, so a reopened work order that is installed again recomputes its billing from scratch. Whenever `billed_cents` changes, the unit's `accessory_billed_cents` is recomputed as the sum of `billed_cents` across that unit's work orders currently in `INSTALLED`.
+
+Voiding is available from three states and behaves differently in each, which is why the differences are spelled out rather than summarized. From `PLANNED` the work order simply becomes `VOIDED`; no quantity moves, because none was ever reserved. From `KITTED` it becomes `VOIDED` and the reservation is released — `reserved_qty` and `available_qty` are recomputed, while `on_hand_qty` was never touched. From `INSTALLED` voiding is the exact compensating half of installation: the kit's `on_hand_qty` is increased by the work order's `qty`, `consumed_qty`, `reserved_qty` and `available_qty` are recomputed, `billed_cents` is reset to 0, and the unit's `accessory_billed_cents` is recomputed — restoring the conservation invariant to the state it held before installation. Voiding from `INSTALLED` additionally requires the unit's processing dimension to be in `ACCESSORY_IN_PROGRESS` or `INSPECTION_PASSED`; from any other processing state the void is refused with `ERR_INVALID_STATE`. A voided work order is terminal and contributes to no kit quantity thereafter.
+
+### 3.6. Quality Inspection, the Rework Cascade and Preparation to Shipping Condition
+
+A `QualityInspector` opens an inspection against a unit; the request has no body, the inspection is created in `OPEN` with `inspector_user_id` recorded from the acting `X-User-ID`, and both `outcome` and `defect_count` stay unset while it remains open. The only gate on opening is the independence rule of §2.11: an inspector who is on record as having installed accessories on this unit is turned away with `ERR_SEGREGATION_OF_DUTIES`.
+
+Completing the inspection records an `outcome` of `PASS` or `FAIL` together with a `defect_count`, and the two must agree: a `PASS` must be accompanied by a `defect_count` of exactly 0 and a `FAIL` by a `defect_count` of at least 1, with any other combination rejected as `ERR_INVALID_REQUEST`. Completion is only available from `OPEN`.
+
+On `PASS` the inspection becomes `PASSED` and the unit's processing dimension advances to `INSPECTION_PASSED`. One further precondition guards the pass: no accessory work order of that unit may still be sitting in `KITTED`, because reserved-but-uninstalled stock means the option work is not actually finished — such a pass is refused with `ERR_ACCESSORY_WORK_OPEN`. Two starting points reach `INSPECTION_PASSED`. A unit that received port-installed options arrives from `ACCESSORY_IN_PROGRESS`. A base unit with no accessory work orders at all skips the accessory stage entirely and arrives directly from `SURVEYED`. Both are legitimate; the pass rules are identical in each case.
+
+On `FAIL` the inspection becomes `FAILED` and a four-link cascade fires. Link one is the inspection's own transition to `FAILED`. Link two, caused by link one, returns the unit's processing dimension to `ACCESSORY_IN_PROGRESS` from `INSPECTION_PASSED` and increases the unit's `rework_cycle_count` by one — this is the cyclic edge of the processing dimension. Link three, caused by link two, walks every accessory work order of that unit currently in `INSTALLED`, in ascending `created_at` order, and returns each one from `INSTALLED` to `KITTED`, increasing its `reopen_count` by one and resetting its `billed_cents` to 0; `installed_by_user_id` is deliberately retained. Link four, caused by link three, restores stock for each reopened order — the kit's `on_hand_qty` is increased by that order's `qty`, and `consumed_qty`, `reserved_qty` and `available_qty` are recomputed, along with the unit's `accessory_billed_cents`.
+
+There is a second `FAIL` shape that must not be overlooked. When the unit was still in `ACCESSORY_IN_PROGRESS` at the moment of failure rather than in `INSPECTION_PASSED`, the processing dimension does not move — it is already where the rework cascade would put it — but the rest of the cascade runs unchanged: `rework_cycle_count` still increases by one, every `INSTALLED` work order of the unit is still reopened to `KITTED` in ascending `created_at` order with `reopen_count` increased and `billed_cents` cleared, and the kit quantities and the unit's `accessory_billed_cents` are still restored. After either shape of failure the unit re-runs installation and a fresh inspection, and because `installed_by_user_id` survived the reopen, the technician whose work was rejected still cannot be the one to inspect it.
+
+Preparation to shipping condition is the `QualityInspector`'s last act on a unit — wax removal and final preparation — and it advances the processing dimension `INSPECTION_PASSED → SHIPPING_READY`. The request has no body and three preconditions guard it beyond the state check. The unit's discharging voyage must have reached `DISCHARGE_COMPLETE`; a unit off a voyage still `SCHEDULED` or `DISCHARGING` is refused with `ERR_VESSEL_DISCHARGE_INCOMPLETE`. The unit's damage dimension must be `NONE` or `REPAIRED`; a unit sitting in `SURVEY_DAMAGE_OPEN` or `REPAIR_AUTHORIZED` is refused with `ERR_VEHICLE_DAMAGE_BLOCKED`. And if the unit's `claim_mandatory` flag is true, a carrier claim must exist against that unit's survey; without one the request is refused with `ERR_CLAIM_REQUIRED`. Units whose `claim_mandatory` is false clear this last gate unconditionally. Because the damage gate is evaluated ahead of the claim gate, a unit that fails both reports the damage failure.
+
+### 3.7. Recall and Stop-Ship Holds
+
+Holds are how a regulatory event reaches units that are already deep in the pipeline. A `DistributionManager` applies a hold against a center by supplying a `hold_type` of `RECALL` or `STOP_SHIP`, a `scope_type` selecting the targeting mode, a `reference_code` naming the campaign, and exactly the targeting field the scope requires. A `MODEL_LINE` hold must carry a `model_line` of `LX500`, `TX300` or `EV900` and leaves `vehicle_id` null; it covers every matching unit in the yard. A `SINGLE_VIN` hold must carry a `vehicle_id` and leaves `model_line` null; it covers exactly that one unit. Supplying the wrong targeting field for the declared scope is `ERR_INVALID_REQUEST`, and a `SINGLE_VIN` hold naming a unit that does not exist is `ERR_REFERENCE_NOT_FOUND`. The hold is created in `OPEN` with `applied_by_user_id` recorded from the acting `X-User-ID`.
+
+Application is a depth-four cascade, and each link is caused by the one before it. Link one creates the hold in `OPEN`. Link two, caused by link one, walks every in-scope unit whose `yard_presence` is `IN_YARD`, setting each one's `stop_ship_blocked` to true and its `blocking_hold_order_id` to the new hold's identifier; the count of units so blocked is stamped onto the hold as `affected_vehicle_count`. Link three, caused by link two, reaches the release orders of those units: any order sitting in `ALLOCATED` is moved to `CANCELLED_BY_HOLD` with its `cancelled_by_hold_order_id` set to this hold, processed in ascending `created_at` order. An order that has already reached `RELEASED` is emphatically **not** cancelled — the unit is frozen in place instead, and its gate-out is refused with `ERR_VEHICLE_STOP_SHIP_BLOCKED` for as long as the hold stands. Link four, caused by link three, unwinds the commercial commitments of every order the cascade cancelled: the assigned carrier's `committed_slots` and `available_slots` are recomputed and the consignee dealer's `open_allocation_count` is recomputed, both preserving the slot conservation invariant; each affected unit's processing dimension reverts to `SHIPPING_READY`; and each unit's `storage_charge_provisional_cents` is reset to 0 with the center's `provisional_storage_accrued_cents` recomputed accordingly.
+
+Lifting a hold moves it `OPEN → LIFTED` and records `lifted_by_user_id`. It is available only from `OPEN`, and the lifter must not be the applier per §2.11. Unblocking is careful about overlapping campaigns: for every unit whose `blocking_hold_order_id` points at the hold being lifted, if no other open hold still covers that unit then `stop_ship_blocked` returns to false and `blocking_hold_order_id` returns to null; but if another open hold does still cover it, the unit stays blocked and `blocking_hold_order_id` is repointed to the remaining open hold with the earliest `created_at`. Two units under two overlapping recalls therefore do not become releasable when only one campaign closes.
+
+What lifting does *not* do is restore cancelled work. Release orders already in `CANCELLED_BY_HOLD` stay cancelled — the unit must be allocated again from `SHIPPING_READY`, with a fresh carrier selection and a fresh provisional storage accrual. Orders that were merely frozen in `RELEASED` need no re-allocation: once the hold is lifted, their gate-out is admitted again.
+
+### 3.8. Dealer Allocation, Carrier Selection and Release
+
+Before any unit can be allocated, the commercial parties must exist. A `DistributionManager` registers a consignee dealer with a `dealer_code`, a `name`, a `route_zone` of `A`, `B` or `C`, a `distance_miles` figure of at least 1 giving the billable linehaul distance from the port, and an `allocation_quota` of at least 1 capping how many allocations the dealer may hold open at once. Inland carriers are registered with a `carrier_code`, a `name`, a `served_route_zones` array that must be a non-empty subset of `A`, `B` and `C`, a `linehaul_rate_cents_per_mile`, a `slot_capacity` of at least 1 counting the tractor slots committed to this port, and a `concurrent_load_capacity` of at least 1 capping how many released pickup windows may overlap at any instant. A carrier's `status` is optional on registration and defaults to `ACTIVE`; the alternative is `SUSPENDED`. A carrier's `status`, `linehaul_rate_cents_per_mile` and `concurrent_load_capacity` may each be updated later; suspending a carrier removes it from future selection without disturbing any release order it already holds, and already-committed slots are retained.
+
+Allocation binds a shipping-ready unit to a dealer, and the client does **not** choose the carrier. The manager supplies the consignee `dealer_id`, the requested `pickup_window_start` and `pickup_window_end` (half-open, end strictly after start), and the mandatory `expected_vehicle_version` of §2.10. Beyond the version check, allocation is guarded three further ways in the precedence order of §2.6: the unit must not be covered by an open hold, or the allocation is refused with `ERR_VEHICLE_STOP_SHIP_BLOCKED`; the carrier candidate set must be non-empty, or the allocation is refused with `ERR_NO_ELIGIBLE_CARRIER`; and the consignee dealer's `open_allocation_count` must be strictly below its `allocation_quota`, or the allocation is refused with `ERR_DEALER_QUOTA_EXCEEDED`. A quota of 3 therefore admits a fourth allocation only after one of the three open ones has left `ALLOCATED` and `RELEASED`.
+
+The server picks the carrier by a fixed, deterministic policy. The candidate set is every carrier whose `status` is `ACTIVE`, whose `served_route_zones` includes the route zone of this allocation (which is the dealer's `route_zone`), and whose `slot_capacity` less `committed_slots` is at least 1. Candidates are ranked by `linehaul_rate_cents_per_mile` ascending — cheapest first. Ties on rate are broken by free slot count descending, so the carrier with the most headroom wins. Ties still remaining are broken by `created_at` ascending, so the longest-standing carrier wins. A carrier's `id` is never a decision input. If the candidate set is empty the allocation is rejected rather than queued.
+
+A successful allocation creates a `ReleaseOrder` in `ALLOCATED`. Its `vehicle_id` is the unit from the path, `truck_carrier_id` is the selected carrier, `route_zone` is copied from the dealer's `route_zone` at this moment (so a later change to the dealer does not retroactively re-route the shipment), and `allocated_at` is stamped from the logical clock while `dispatched_at` and `gated_out_at` stay null. The seven freight fields — `base_linehaul_cents`, `fuel_surcharge_cents`, `zone_accessorial_cents`, `gross_freight_cents`, `freight_discount_cents` and `freight_total_cents` — all remain 0 at this point; they are stamped at dispatch, not at allocation. Both `superseded_release_order_id` and `cancelled_by_hold_order_id` are null on a first allocation. Alongside the order, the carrier's `committed_slots` and `available_slots` and the dealer's `open_allocation_count` are recomputed, the unit's processing dimension advances `SHIPPING_READY → ALLOCATED`, the unit's `storage_charge_provisional_cents` is stamped on the provisional basis of §3.9 with the center's `provisional_storage_accrued_cents` recomputed, and the unit's `version` increments by one.
+
+Allocating a unit that is already allocated is a legitimate dealer swap and is handled as a self-transition on `ALLOCATED`. It carries the same version expectation and the same stop-ship check, and the dealer quota check is applied against the **new** dealer. It additionally requires that the existing release order for that unit be in `ALLOCATED`: an order that has already reached `RELEASED` cannot be superseded, and the attempt is `ERR_INVALID_STATE`. On success the prior order moves to `CANCELLED` and the new order's `superseded_release_order_id` points at it; the prior order's carrier has its `committed_slots` recomputed and the prior dealer has its `open_allocation_count` recomputed; the unit's `storage_charge_provisional_cents` is recomputed against the new allocation instant; and the unit's `version` increments by one again.
+
+Dispatch releases the unit to its assigned carrier, moving the order `ALLOCATED → RELEASED`, stamping `dispatched_at` from the logical clock and advancing the unit's processing dimension `ALLOCATED → RELEASED`. It is available only from `ALLOCATED`. Before it is admitted, the carrier's concurrency ceiling is checked. Pickup windows are half-open, and adjacency is explicitly allowed — a window that begins exactly when another ends does not overlap it. The peers considered are the same carrier's other release orders in `RELEASED` only; orders in `ALLOCATED`, `CANCELLED`, `CANCELLED_BY_HOLD`, `GATED_OUT` and `DELIVERED` occupy no capacity. Two windows overlap when each one's start falls strictly before the other one's end. The server evaluates, at every peer window boundary instant that lies inside the candidate window's own half-open span, how many windows would be simultaneously occupied — the candidate itself plus every peer covering that instant — and takes the largest such count. If that maximum exceeds the carrier's `concurrent_load_capacity`, dispatch is refused with `ERR_CARRIER_WINDOW_CAPACITY`; reaching the capacity exactly is permitted. Instants are compared at second precision.
+
+Dispatch is also where freight is settled, in seven steps whose order is normative because the discount appears circular otherwise. Step one: multiply the dealer's `distance_miles` by the selected carrier's `linehaul_rate_cents_per_mile` and round half up to whole cents, giving `base_linehaul_cents`. Step two: multiply that base by the center's `fuel_surcharge_pct` as read at dispatch time and round half up to whole cents, giving `fuel_surcharge_cents` — the surcharge applies to the base linehaul only, never to the accessorial. Step three: set `zone_accessorial_cents` from the release order's `route_zone` — zone `A` adds nothing, zone `B` adds 4,500 cents, zone `C` adds 9,800 cents. Step four: add the base, the surcharge and the accessorial to get `gross_freight_cents`, an exact integer sum. Step five: choose the volume discount rate from that gross figure and from nothing else — 6 percent when `gross_freight_cents` is 120,000 cents or more, otherwise 3 percent when it is 60,000 cents or more, otherwise no discount at all; both comparisons are inclusive at the boundary. Step six: multiply `gross_freight_cents` by the chosen rate and round half up to whole cents, giving `freight_discount_cents`. Step seven: subtract the discount from the gross to get `freight_total_cents`, again an exact integer. The discount tier is keyed on `gross_freight_cents` from step four and never on the post-discount `freight_total_cents`; rounding occurs at steps one, two and six and nowhere else.
+
+Cancellation is available manually from either `ALLOCATED` or `RELEASED` and moves the order to `CANCELLED`. From `ALLOCATED`, the carrier's `committed_slots` and `available_slots` and the dealer's `open_allocation_count` are recomputed, the unit's processing dimension reverts to `SHIPPING_READY`, and the unit's `storage_charge_provisional_cents` is reset to 0 with the center's `provisional_storage_accrued_cents` recomputed. From `RELEASED` the same four consequences apply, and one more besides: the pickup window stops occupying the carrier's `concurrent_load_capacity`, which frees room for another dispatch in the same span. Note the contrast with §3.7 — a hold cascade cancels an `ALLOCATED` order automatically, but never a `RELEASED` one; only an explicit cancellation ends a released order.
+
+### 3.9. Gate-Out, Storage Finalization, Delivery and Dwell Reporting
+
+Storage is billed on dwell days, and the same formula is evaluated twice in a unit's life with two different end instants and two different credit treatments. The dwell interval always begins at the unit's `yard_in_at`. Dwell days are the interval's length in whole 86,400-second days rounded **up** to the next whole day, with a floor of one day, so a unit that arrives and leaves within the same hour still counts as one dwell day. The chargeable days are the dwell days less the center's `free_storage_days` less whatever credit days apply, floored at zero, and the charge is that chargeable-day count multiplied by the center's `daily_storage_rate_cents`. Units already `DEPARTED` are never recharged.
+
+The **provisional** evaluation is stamped at allocation into the unit's `storage_charge_provisional_cents`. Its end instant is the allocation instant advanced forward by two days — a forward-looking projection of when the unit will actually leave — and its credit days are zero, because at allocation time nobody knows yet whether the carrier will concede the damage-open period. The **final** evaluation is stamped at gate-out into the unit's `storage_charge_final_cents`, and `storage_charge_provisional_cents` is reset to 0 in the same request. Its end instant is the actual gate-out instant, and its credit days are the unit's `blocked_credit_days` — the whole days between `damage_opened_at` and `damage_cleared_at`, or zero when either is null. Identical `yard_in_at` and identical rates therefore produce two different amounts, and that is intended: the provisional figure is an accrual estimate, the final figure is the bill.
+
+Gate-out is the `DistributionManager`'s act of releasing the unit through the gate, moving the release order `RELEASED → GATED_OUT` and stamping `gated_out_at`. It is available only from `RELEASED`, and it is refused with `ERR_VEHICLE_STOP_SHIP_BLOCKED` when any open hold covers the unit — this is the check that makes a frozen released unit stay put. On success the unit's `yard_presence` becomes `DEPARTED`, its `gate_out_at` is stamped from the logical clock, and its processing dimension advances `RELEASED → GATED_OUT`, which is terminal for the processing dimension. Final storage is stamped as described above. The center then recomputes `realized_storage_revenue_cents` — the sum of `storage_charge_final_cents` over its departed units — and `provisional_storage_accrued_cents` — the sum of `storage_charge_provisional_cents` over its units in `ALLOCATED` or `RELEASED` — along with `yard_occupied_slots`, `yard_free_slots` and `yard_posture`, since the yard just gained a slot. The carrier's `committed_slots` and `available_slots` are recomputed too, because `GATED_OUT` releases the tractor slot.
+
+Delivery confirmation is the one action reserved for the consignee. A `Dealer` acknowledges receipt of a gated-out unit, moving the release order `GATED_OUT → DELIVERED`, which is terminal. Only the consignee may do it: the acting `X-User-ID` must equal the order's `dealer_id`, and any other dealer is refused with `ERR_NOT_RESOURCE_OWNER`. An order in any state other than `GATED_OUT` is `ERR_INVALID_STATE`. Confirmation changes no yard field and no carrier field — it is purely an acknowledgement.
+
+Finally, the center-level dwell report gives operations a standing view of aging and accrued cost by model line. It reads only that center's units whose `yard_presence` is `IN_YARD`, so departed units never double-count against realized revenue. Each in-yard unit's dwell days are computed from `yard_in_at` to the current logical clock instant on exactly the same rule as above — whole 86,400-second days rounded up, floored at one. For each model line the report emits `unit_count`, the number of matching units; `avg_dwell_days`, the sum of those units' dwell days divided by the unit count and rounded half up to one decimal place; three aging buckets, `aging_0_15` counting units at 15 dwell days or fewer, `aging_16_30` counting units from 16 through 30 dwell days inclusive, and `aging_31_plus` counting units at 31 dwell days or more; `blocked_count`, counting units that either have `stop_ship_blocked` true or have a `damage_status` of `SURVEY_DAMAGE_OPEN` or `REPAIR_AUTHORIZED`; and `accrued_storage_cents`, the sum of `storage_charge_provisional_cents` across those units. The report returns a `rows` array with one entry per model line, each carrying its `model_line`, sorted by `model_line` ascending. Every declared model line is always emitted: a line with no units in the yard appears with a `unit_count` of 0, an `avg_dwell_days` of 0.0, and every counter at 0 rather than being omitted.
+
+## 4. Endpoint Definitions
+
+All endpoints are mounted under the `/vpc` prefix. Operations that bring a new resource into existence answer with HTTP 201 and the created resource in `data`; every other successful operation, including all reads, all state transitions and the carrier update, answers with HTTP 200 and the affected resource. Failures answer with the error envelope of §2.2 and the status code listed in §5. The table below is a routing summary only — the request payloads, response side effects and business preconditions for each operation are specified in §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/vpc/_clock/set_current_utc` | Test-driving endpoint: set the logical clock. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| GET | `/vpc/_clock` | Read the current logical clock instant. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| POST | `/vpc/processing-centers` | Register a vehicle processing center with its yard capacity and rate card. | `PortOperationsPlanner` |
+| GET | `/vpc/processing-centers/{centerId}` | Read one processing center including live yard occupancy, posture and storage ledgers. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/processing-centers` | List processing centers. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/processing-centers/{centerId}/dwell-metrics` | Computed read: storage cost and dwell-time metrics by model line, one row per model line sorted ascending. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/berths` | Create a berth. Immutable record — no version and no update operation. | `PortOperationsPlanner` |
+| GET | `/vpc/berths/{berthId}` | Read one berth. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/berths` | List berths, optionally filtered by owning center. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/vessels` | Schedule a voyage discharge against a berth window. | `PortOperationsPlanner` |
+| GET | `/vpc/vessels/{vesselId}` | Read one voyage. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/vessels` | List voyages, optionally filtered by center, berth or discharge status. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/vessels/{vesselId}/start-discharge` | Begin discharging a voyage. Rejected before the reserved berth window opens. | `PortOperationsPlanner` |
+| POST | `/vpc/vessels/{vesselId}/complete-discharge` | Close a voyage. Releases the berth for conflict purposes and unlocks preparation to shipping condition on its units. | `PortOperationsPlanner` |
+| POST | `/vpc/vessels/{vesselId}/vehicles` | Discharge one unit off the vessel into the holding yard. | `PortOperationsPlanner` |
+| GET | `/vpc/vehicles/{vehicleId}` | Read one unit with both state dimensions, dwell and charge fields. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| GET | `/vpc/vehicles` | List units with filtering across both state dimensions, yard presence, blocking hold and owning voyage. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| POST | `/vpc/vehicles/{vehicleId}/prep-complete` | Record wax removal and preparation to shipping condition. | `QualityInspector` |
+| POST | `/vpc/vehicles/{vehicleId}/damage-surveys` | Open an arrival damage survey in `DRAFT` with its damage line items. | `DamageSurveyor` |
+| GET | `/vpc/damage-surveys/{surveyId}` | Read one damage survey. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/damage-surveys` | List damage surveys, optionally filtered by unit or status. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/damage-surveys/{surveyId}/submit` | Submit the survey; scores it and advances both unit dimensions. | `DamageSurveyor` |
+| POST | `/vpc/damage-surveys/{surveyId}/claims` | File a transportation damage claim from a submitted survey. Guarded by the survey version expectation. | `DamageSurveyor` |
+| GET | `/vpc/carrier-claims/{claimId}` | Read one carrier claim. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/carrier-claims` | List carrier claims, optionally filtered by originating survey, status, respondent or recoverable basis. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/carrier-claims/{claimId}/carrier-response` | Record the carrier's response: `ACCEPT`, `DISPUTE` (with a conceded amount) or `DENY`. | `DistributionManager` |
+| POST | `/vpc/carrier-claims/{claimId}/resubmit` | Re-file a disputed claim at a revised amount; bounded by the revision ceiling. | `DamageSurveyor` |
+| POST | `/vpc/carrier-claims/{claimId}/settle` | Settle an accepted claim. The settler may not be the filer. | `DistributionManager` |
+| POST | `/vpc/vehicles/{vehicleId}/repair-orders` | Create a repair estimate. The authorization tier decides automatic approval versus escalation at creation. | `DamageSurveyor` |
+| GET | `/vpc/repair-orders/{repairOrderId}` | Read one repair order. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/repair-orders` | List repair orders, optionally filtered by unit, recovery claim, status or authorization tier. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/repair-orders/{repairOrderId}/authorize` | Adjudicate an escalated repair: `AUTHORIZE` or `REJECT`. | `DistributionManager` |
+| POST | `/vpc/repair-orders/{repairOrderId}/complete` | Complete an authorized repair at its actual cost; may latch the linked claim onto the actual-cost basis. | `DamageSurveyor` |
+| POST | `/vpc/processing-centers/{centerId}/accessory-kits` | Receive port-installed-option kit stock into a center. | `AccessoryTechnician` |
+| GET | `/vpc/accessory-kits/{kitId}` | Read one kit stock record with its live quantity ledger. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/accessory-kits` | List kit stock records, optionally filtered by center or program. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/vehicles/{vehicleId}/accessory-work-orders` | Plan a port-installed option install on a unit. | `AccessoryTechnician` |
+| GET | `/vpc/accessory-work-orders/{workOrderId}` | Read one accessory work order. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/accessory-work-orders` | List accessory work orders, optionally filtered by unit, kit or status. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/accessory-work-orders/{workOrderId}/kit` | Reserve kit units for the work order. | `AccessoryTechnician` |
+| POST | `/vpc/accessory-work-orders/{workOrderId}/install` | Record the install; consumes kit units and bills the program. | `AccessoryTechnician` |
+| POST | `/vpc/accessory-work-orders/{workOrderId}/void` | Void a work order from `PLANNED`, `KITTED` or `INSTALLED`; the installed case is the compensating half of install. | `AccessoryTechnician` |
+| POST | `/vpc/vehicles/{vehicleId}/quality-inspections` | Open a quality inspection. The inspector may not be an operator who installed accessories on this unit. | `QualityInspector` |
+| GET | `/vpc/quality-inspections/{inspectionId}` | Read one quality inspection. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/quality-inspections` | List quality inspections, optionally filtered by unit, status or outcome. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/quality-inspections/{inspectionId}/complete` | Complete the inspection. A failing outcome drives the four-link rework cascade. | `QualityInspector` |
+| POST | `/vpc/processing-centers/{centerId}/hold-orders` | Apply a recall or stop-ship hold to units in the yard before release, by model line or by single VIN. | `DistributionManager` |
+| GET | `/vpc/hold-orders/{holdOrderId}` | Read one hold order. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/hold-orders` | List hold orders, optionally filtered by center, single-VIN target, type, scope or status. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/hold-orders/{holdOrderId}/lift` | Lift a hold. The lifter may not be the applier. | `DistributionManager` |
+| POST | `/vpc/dealers` | Register a consignee dealer with its route zone, linehaul distance and allocation quota. | `DistributionManager` |
+| GET | `/vpc/dealers/{dealerId}` | Read one dealer with its live open allocation count. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/dealers` | List dealers. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| POST | `/vpc/truck-carriers` | Register an inland truck carrier with its served zones, rate, slot capacity and concurrent load capacity. | `DistributionManager` |
+| GET | `/vpc/truck-carriers/{carrierId}` | Read one carrier with its live slot ledger. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| GET | `/vpc/truck-carriers` | List carriers, optionally filtered by availability or served zone. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager` |
+| PATCH | `/vpc/truck-carriers/{carrierId}` | Update a carrier's availability or commercial terms. Suspension affects only future selections. | `DistributionManager` |
+| POST | `/vpc/vehicles/{vehicleId}/allocations` | Allocate a shipping-ready unit to a dealer; the server assigns the carrier. Re-allocating supersedes the prior allocated order. Guarded by the unit version expectation. | `DistributionManager` |
+| GET | `/vpc/release-orders/{releaseOrderId}` | Read one release order with its freight settlement breakdown. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| GET | `/vpc/release-orders` | List release orders, filterable by unit, dealer, carrier, route zone, supersede lineage, hold-cancellation lineage and status. | `PortOperationsPlanner`, `DamageSurveyor`, `AccessoryTechnician`, `QualityInspector`, `DistributionManager`, `Dealer` |
+| POST | `/vpc/release-orders/{releaseOrderId}/dispatch` | Release the unit to the assigned carrier and settle freight. | `DistributionManager` |
+| POST | `/vpc/release-orders/{releaseOrderId}/gate-out` | Gate the unit out of the yard and finalize storage. | `DistributionManager` |
+| POST | `/vpc/release-orders/{releaseOrderId}/cancel` | Cancel an allocation or release manually; reverses the carrier commitment, dealer quota usage and provisional storage accrual. | `DistributionManager` |
+| POST | `/vpc/release-orders/{releaseOrderId}/delivery-confirmation` | Consignee dealer acknowledges delivery of a gated-out unit. | `Dealer` |
+
+## 5. Error Code Catalogue
+
+The trigger condition for each code is specified in the §2 and §3 narrative that governs the rule it enforces; this table fixes only the identifier and its HTTP status.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_FORBIDDEN_ROLE` | 403 |
+| `ERR_CENTER_NOT_FOUND` | 404 |
+| `ERR_BERTH_NOT_FOUND` | 404 |
+| `ERR_VESSEL_NOT_FOUND` | 404 |
+| `ERR_VEHICLE_NOT_FOUND` | 404 |
+| `ERR_SURVEY_NOT_FOUND` | 404 |
+| `ERR_CLAIM_NOT_FOUND` | 404 |
+| `ERR_REPAIR_ORDER_NOT_FOUND` | 404 |
+| `ERR_KIT_NOT_FOUND` | 404 |
+| `ERR_WORK_ORDER_NOT_FOUND` | 404 |
+| `ERR_INSPECTION_NOT_FOUND` | 404 |
+| `ERR_HOLD_ORDER_NOT_FOUND` | 404 |
+| `ERR_DEALER_NOT_FOUND` | 404 |
+| `ERR_CARRIER_NOT_FOUND` | 404 |
+| `ERR_RELEASE_ORDER_NOT_FOUND` | 404 |
+| `ERR_REFERENCE_NOT_FOUND` | 404 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_DUPLICATE_KEY` | 409 |
+| `ERR_STALE_VEHICLE_VERSION` | 412 |
+| `ERR_STALE_SURVEY_VERSION` | 412 |
+| `ERR_INVALID_STATE` | 409 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_VEHICLE_STOP_SHIP_BLOCKED` | 409 |
+| `ERR_VEHICLE_DAMAGE_BLOCKED` | 409 |
+| `ERR_CLAIM_REQUIRED` | 409 |
+| `ERR_YARD_GRIDLOCK` | 409 |
+| `ERR_BERTH_WINDOW_CONFLICT` | 409 |
+| `ERR_BERTH_WINDOW_NOT_OPEN` | 409 |
+| `ERR_CARRIER_WINDOW_CAPACITY` | 409 |
+| `ERR_VESSEL_DISCHARGE_INCOMPLETE` | 409 |
+| `ERR_ACCESSORY_WORK_OPEN` | 409 |
+| `ERR_KIT_INSUFFICIENT` | 409 |
+| `ERR_CLAIM_REVISION_LIMIT` | 409 |
+| `ERR_CLAIM_NOT_WARRANTED` | 409 |
+| `ERR_CLAIM_ALREADY_OPEN` | 409 |
+| `ERR_NO_ELIGIBLE_CARRIER` | 409 |
+| `ERR_NO_UNITS_DISCHARGED` | 409 |
+| `ERR_DEALER_QUOTA_EXCEEDED` | 409 |
+| `ERR_SETTLEMENT_EXCEEDS_RECOVERABLE` | 422 |

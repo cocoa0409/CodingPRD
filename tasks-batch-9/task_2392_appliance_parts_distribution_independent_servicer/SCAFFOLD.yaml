@@ -1,0 +1,3082 @@
+scenario: "2392. Appliance Parts Distribution & Independent Servicer Network (Marcone Supply): model-to-part cross-reference and supersession chain resolution, servicer account credit terms & core deposit handling, will-call vs overnight drop-ship allocation from multi-branch inventory, warranty part claim submission to the OEM on the servicer's behalf, obsolete part sourcing and substitute approval, return authorization with restocking fee and electrical-part non-returnable rule, technician training/certification tied to OEM authorization, price file updates and contract-pricing tiers"
+domain_name: "appliance-parts-distribution-servicer-network"
+api_prefix: ""           # flat peer-entity topology: every collection is a top-level path (/parts, /part-orders, /inventory-records, ...)
+
+complexity_profile:
+  primary_archetype: quota_allocation          # finite multi-branch inventory reserved / committed / released per order line
+  secondary_archetype: graph_constraint        # self-referential part supersession chain resolution with cycle + depth limits
+  complexity_layers:
+    - optimistic_concurrency                   # OCC on PartOrder.version and Part.version (§1.2.1)
+    - cascading_side_effects                   # depth-4 chains from price-file publish and from RA receipt
+    - dual_variant_calculation                 # quoted-at-order-date vs invoiced-at-ship-date; rolling vs lifetime delinquency
+    - rate_threshold_triggers                  # credit limit, core-liability cap, free-freight, restocking-fee tiers, 180-day rolling window
+
+  entity_topology: graph
+  # graph: Part.superseded_by_part_id is self-referential (supersession chain / DAG), ModelPartXref is a
+  # many-to-many junction between appliance model numbers and parts, InventoryRecord is a (Branch x Part)
+  # junction, and OrderLine points at two different Part rows (requested vs resolved). No nesting in URL
+  # paths except the two composition endpoints (/part-orders/{id}/lines, /price-files/{id}/lines).
+
+  state_machine_shape: cyclic
+  # WarrantyClaim cycles SUBMITTED -> OEM_INFO_REQUESTED -> SUBMITTED (bounded at 2 resubmissions) and
+  # ServicerAccount cycles ACTIVE <-> CREDIT_HOLD. PartOrder carries two independent dimensions
+  # (fulfillment_status x settlement_status). SubstituteRequest and ReturnAuthorization are branching
+  # fork machines with divergent side-effect sets per branch.
+
+  relationship_patterns:
+    - one_to_many          # PartOrder -> OrderLine, PriceFile -> PriceFileLine, ServicerAccount -> TechnicianCertification
+    - many_to_many         # ModelPartXref (model_number x Part), InventoryRecord (Branch x Part)
+    - self_referential     # Part.superseded_by_part_id -> Part.id (supersession chain)
+    - cross_aggregate      # OrderLine allocation mutates InventoryRecord; RA credit mutates ServicerAccount
+
+  role_model: segregation_of_duties
+  # The CreditManager X-User-ID that approved an order's credit (PartOrder.credit_decided_by_user_id)
+  # may not later waive the restocking fee on a ReturnAuthorization for a line of that same order.
+  # Servicer is entity_backed:ServicerAccount, BranchCounterRep is entity_backed:Branch, so ownership
+  # checks compare X-User-ID against the resource's foreign key.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+
+  - name: Branch
+    parent: null
+    common_fields: true
+    fields:
+      - name: code
+        type: string
+        source: input
+        description: "Short branch code used on pick tickets"
+        constraints: "unique across Branch; 3-6 characters"
+      - name: name
+        type: string
+        source: input
+        description: "Branch display name"
+      - name: region_code
+        type: string
+        source: input
+        description: "Distribution region the branch belongs to"
+      - name: will_call_enabled
+        type: boolean
+        source: input
+        description: "Whether servicers may pick up at this branch counter"
+        default: true
+      - name: cutoff_hour_utc
+        type: integer
+        source: input
+        description: "Hour (UTC) after which an overnight drop-ship allocation incurs the late-cutoff surcharge"
+        default: 20
+        constraints: "0..23"
+      - name: overnight_surcharge_cents
+        type: integer
+        source: input
+        description: "Per-shipment surcharge added to freight when this branch is the shipping branch; also the primary drop-ship ranking key (ascending)"
+        default: 0
+        constraints: ">= 0"
+      - name: branch_status
+        type: enum
+        source: input
+        description: "Operational posture of the branch"
+        default: OPEN
+        constraints: "one of {OPEN, COUNT_FREEZE, CLOSED}; only OPEN branches are allocation candidates"
+
+  - name: Part
+    parent: null
+    common_fields: true
+    fields:
+      - name: part_number
+        type: string
+        source: input
+        description: "Manufacturer part number"
+        constraints: "unique across Part"
+      - name: oem_code
+        type: string
+        source: input
+        description: "OEM brand code the part belongs to (e.g. WHIRLPOOL, GE); matched against ServicerAccount.oem_authorizations"
+      - name: description
+        type: string
+        source: input
+        description: "Part description"
+      - name: category
+        type: enum
+        source: input
+        description: "Commodity category; drives contract discount selection, cert requirement and returnability"
+        constraints: "one of {ELECTRICAL, MECHANICAL, COSMETIC, SEALED_SYSTEM}"
+      - name: lifecycle_status
+        type: enum
+        source: input
+        description: "Catalog lifecycle state; SUPERSEDED parts are walked through superseded_by_part_id during resolution"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUPERSEDED, OBSOLETE, NLA}; set at creation and later by POST /parts/{id}/supersession or by a published PriceFileLine.new_lifecycle_status"
+      - name: superseded_by_part_id
+        type: string
+        source: system
+        description: "FK -> Part.id; self-referential supersession pointer written by POST /parts/{id}/supersession; null unless a supersession has been recorded"
+        default: null
+      - name: list_price_cents
+        type: integer
+        source: input
+        description: "Current catalog list price in cents; overwritten at PriceFile publish"
+        constraints: "> 0"
+      - name: core_required
+        type: boolean
+        source: input
+        description: "Whether a used core must be returned for this part"
+        default: false
+      - name: core_deposit_cents
+        type: integer
+        source: input
+        description: "Per-unit core deposit charged when core_required is true"
+        default: 0
+        constraints: ">= 0"
+      - name: weight_grams
+        type: integer
+        source: input
+        description: "Shipping weight per unit, used by the freight weight-block formula"
+        constraints: "> 0"
+      - name: cert_level_required
+        type: enum
+        source: computed
+        description: "Minimum technician certification level a servicer must hold to order this part: SEALED_SYSTEM when category == SEALED_SYSTEM, ADVANCED when category == ELECTRICAL, otherwise NONE"
+        constraints: "one of {NONE, BASIC, ADVANCED, SEALED_SYSTEM}"
+      - name: is_returnable
+        type: boolean
+        source: computed
+        description: "True when category != ELECTRICAL AND lifecycle_status != NLA; electrical parts are non-returnable once shipped"
+
+  - name: ModelPartXref
+    parent: null
+    common_fields: false
+    fields:
+      - name: model_number
+        type: string
+        source: input
+        description: "Appliance model number the part fits"
+      - name: part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; the catalog part fitted by this model position"
+      - name: position_code
+        type: string
+        source: input
+        description: "Exploded-view position code within the model"
+      - name: xref_source
+        type: enum
+        source: input
+        description: "Provenance of the cross-reference row"
+        constraints: "one of {OEM_PUBLICATION, MANUAL_ENTRY}"
+    # Immutable append-only configuration row: no update endpoint, no version field.
+    # Uniqueness: (model_number, part_id, position_code).
+
+  - name: PricingTier
+    parent: null
+    common_fields: true
+    fields:
+      - name: tier_code
+        type: string
+        source: input
+        description: "Contract pricing tier code; also the deterministic tie-break key (ascending) during tier reassignment"
+        constraints: "unique across PricingTier"
+      - name: name
+        type: string
+        source: input
+        description: "Tier display name"
+      - name: discount_pct_electrical
+        type: number
+        source: input
+        description: "Contract discount applied to ELECTRICAL parts"
+        constraints: "0 <= value <= 0.45"
+      - name: discount_pct_mechanical
+        type: number
+        source: input
+        description: "Contract discount applied to MECHANICAL parts"
+        constraints: "0 <= value <= 0.45"
+      - name: discount_pct_cosmetic
+        type: number
+        source: input
+        description: "Contract discount applied to COSMETIC parts"
+        constraints: "0 <= value <= 0.45"
+      - name: discount_pct_sealed_system
+        type: number
+        source: input
+        description: "Contract discount applied to SEALED_SYSTEM parts"
+        constraints: "0 <= value <= 0.45"
+      - name: min_annual_volume_cents
+        type: integer
+        source: input
+        description: "Minimum rolling-12-month invoiced volume that qualifies an account for this tier"
+        constraints: ">= 0"
+
+  - name: ServicerAccount
+    parent: null
+    common_fields: true
+    fields:
+      - name: business_name
+        type: string
+        source: input
+        description: "Independent servicer business name"
+      - name: oem_authorizations
+        type: array
+        source: input
+        description: "OEM codes this servicer is factory-authorized for; a part whose oem_code is absent cannot be ordered"
+      - name: credit_terms
+        type: enum
+        source: input
+        description: "Payment terms; PREPAY requires settlement_status == PAID before fulfillment"
+        default: PREPAY
+        constraints: "one of {PREPAY, NET_15, NET_30, NET_45}"
+      - name: credit_limit_cents
+        type: integer
+        source: input
+        description: "Open-credit ceiling compared against credit_used_cents"
+        default: 0
+        constraints: ">= 0"
+      - name: core_liability_limit_cents
+        type: integer
+        source: input
+        description: "Ceiling on outstanding core deposits the account may carry"
+        default: 0
+        constraints: ">= 0"
+      - name: pricing_tier_id
+        type: string
+        source: input
+        description: "FK -> PricingTier.id; contract tier whose category discounts price this account's lines"
+      - name: account_status
+        type: enum
+        source: system
+        description: "ACTIVE accounts may order and allocate; CREDIT_HOLD freezes allocated orders; SUSPENDED is terminal"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, CREDIT_HOLD, SUSPENDED}"
+      - name: credit_used_cents
+        type: integer
+        source: computed
+        description: "Open credit exposure per calculations.servicer_credit_exposure; floored at 0"
+      - name: core_liability_cents
+        type: integer
+        source: computed
+        description: "Outstanding core deposit liability per calculations.core_liability_balance"
+      - name: delinquency_score
+        type: integer
+        source: computed
+        description: "Rolling-window variant of calculations.servicer_delinquency_score, refreshed on credit-decision and tier-review"
+      - name: rolling_12m_volume_cents
+        type: integer
+        source: computed
+        description: "Sum of invoiced_total_cents over orders with settlement_status IN {INVOICED, PAID} whose fulfilled_at >= now - 365 days"
+
+  - name: TechnicianCertification
+    parent: ServicerAccount
+    common_fields: true
+    fields:
+      - name: servicer_account_id
+        type: string
+        source: input
+        description: "FK -> ServicerAccount.id; the employing servicer account"
+      - name: technician_name
+        type: string
+        source: input
+        description: "Technician the certification belongs to"
+      - name: oem_code
+        type: string
+        source: input
+        description: "OEM whose training this certification records"
+      - name: cert_level
+        type: enum
+        source: input
+        description: "Certification level; ordered BASIC(1) < ADVANCED(2) < SEALED_SYSTEM(3) when compared with Part.cert_level_required"
+        constraints: "one of {BASIC, ADVANCED, SEALED_SYSTEM}"
+      - name: training_completed_at
+        type: datetime
+        source: input
+        description: "Inclusive start of the certification coverage interval"
+      - name: expires_at
+        type: datetime
+        source: input
+        description: "Inclusive end of the certification coverage interval"
+        constraints: "must be strictly after training_completed_at"
+      - name: cert_status
+        type: enum
+        source: system
+        description: "ACTIVE until revoked by POST /technician-certifications/{id}/revoke or expired by the tier-review sweep"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, EXPIRED, REVOKED}"
+      - name: is_effective
+        type: boolean
+        source: computed
+        description: "True when cert_status == ACTIVE AND training_completed_at <= logical now <= expires_at"
+
+  - name: InventoryRecord
+    parent: null
+    common_fields: true
+    fields:
+      - name: branch_id
+        type: string
+        source: input
+        description: "FK -> Branch.id; branch holding the stock"
+      - name: part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; part held"
+      - name: on_hand_units
+        type: integer
+        source: input
+        description: "Physical units on the shelf; decremented at fulfillment, incremented on a restockable return receipt"
+        default: 0
+        constraints: ">= 0"
+      - name: reserved_units
+        type: integer
+        source: system
+        description: "Units reserved by ALLOCATED order lines"
+        default: 0
+        constraints: ">= 0"
+      - name: available_units
+        type: integer
+        source: computed
+        description: "on_hand_units - reserved_units; the allocation eligibility metric"
+      - name: reorder_point
+        type: integer
+        source: input
+        description: "Replenishment trigger level (reporting only)"
+        default: 0
+      - name: last_counted_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the last quantity adjustment"
+    # Uniqueness: (branch_id, part_id).
+
+  - name: PriceFile
+    parent: null
+    common_fields: true
+    fields:
+      - name: file_version
+        type: integer
+        source: input
+        description: "Monotonic price file version supplied by the publisher"
+        constraints: "unique across PriceFile; > 0"
+      - name: effective_at
+        type: datetime
+        source: input
+        description: "Inclusive start of this file's pricing window; publish requires effective_at <= logical now"
+      - name: effective_until
+        type: datetime
+        source: input
+        description: "Exclusive end of this file's pricing window; null means open-ended, auto-closed to the next file's effective_at at publish"
+        default: null
+      - name: price_file_status
+        type: enum
+        source: system
+        description: "Lifecycle of the price file"
+        default: DRAFT
+        constraints: "one of {DRAFT, PUBLISHED, SUPERSEDED, ROLLED_BACK}"
+      - name: line_count
+        type: integer
+        source: computed
+        description: "Count of PriceFileLine rows whose price_file_id == this file"
+      - name: published_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp when the file was published; null while DRAFT"
+        default: null
+
+  - name: PriceFileLine
+    parent: PriceFile
+    common_fields: true
+    fields:
+      - name: price_file_id
+        type: string
+        source: input
+        description: "FK -> PriceFile.id; owning price file"
+      - name: part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; part repriced by this line"
+      - name: new_list_price_cents
+        type: integer
+        source: input
+        description: "List price written to Part.list_price_cents at publish"
+        constraints: "> 0"
+      - name: new_core_deposit_cents
+        type: integer
+        source: input
+        description: "Core deposit written to Part.core_deposit_cents at publish; null leaves the existing deposit untouched"
+        default: null
+      - name: new_lifecycle_status
+        type: enum
+        source: input
+        description: "Lifecycle written to Part.lifecycle_status at publish; null leaves it untouched"
+        default: null
+        constraints: "one of {ACTIVE, SUPERSEDED, OBSOLETE, NLA} or null"
+      - name: previous_list_price_cents
+        type: integer
+        source: system
+        description: "Snapshot of Part.list_price_cents taken at publish, replayed by rollback"
+        default: null
+      - name: previous_lifecycle_status
+        type: enum
+        source: system
+        description: "Snapshot of Part.lifecycle_status taken at publish, replayed by rollback"
+        default: null
+      - name: previous_core_deposit_cents
+        type: integer
+        source: system
+        description: "Snapshot of Part.core_deposit_cents taken at publish, replayed by rollback"
+        default: null
+
+  - name: PartOrder
+    parent: null
+    common_fields: true
+    fields:
+      - name: servicer_account_id
+        type: string
+        source: input
+        description: "FK -> ServicerAccount.id; ordering servicer"
+      - name: fulfillment_mode
+        type: enum
+        source: input
+        description: "WILL_CALL allocates only from pickup_branch_id; OVERNIGHT_DROP_SHIP ranks all OPEN branches"
+        constraints: "one of {WILL_CALL, OVERNIGHT_DROP_SHIP}"
+      - name: pickup_branch_id
+        type: string
+        source: input
+        description: "FK -> Branch.id; required when fulfillment_mode == WILL_CALL, must be null otherwise"
+        default: null
+      - name: ship_to_zip
+        type: string
+        source: input
+        description: "Destination postal code; required when fulfillment_mode == OVERNIGHT_DROP_SHIP, must be null otherwise"
+        default: null
+      - name: purchase_order_ref
+        type: string
+        source: input
+        description: "Servicer's own PO reference"
+        default: null
+      - name: fulfillment_status
+        type: enum
+        source: system
+        description: "Physical dimension of the order lifecycle, independent of settlement_status"
+        default: DRAFT
+        constraints: "one of {DRAFT, ALLOCATED, HELD, FULFILLED, CANCELLED}"
+      - name: hold_reason
+        type: enum
+        source: system
+        description: "Why the order is HELD; null whenever fulfillment_status != HELD"
+        default: null
+        constraints: "one of {SUBSTITUTE_PENDING, CREDIT_HOLD, BACKORDER} or null"
+      - name: settlement_status
+        type: enum
+        source: system
+        description: "Money dimension of the order lifecycle, independent of fulfillment_status"
+        default: PENDING_CREDIT
+        constraints: "one of {PENDING_CREDIT, CREDIT_APPROVED, CREDIT_DECLINED, INVOICED, PAID, WRITTEN_OFF}"
+      - name: pricing_basis
+        type: enum
+        source: system
+        description: "Which variant of calculations.order_line_pricing currently governs the billed amount: ORDER_DATE until fulfillment, SHIP_DATE afterwards"
+        default: ORDER_DATE
+        constraints: "one of {ORDER_DATE, SHIP_DATE}"
+      - name: credit_decided_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the CreditManager who ran POST /part-orders/{id}/credit-decision; the segregation-of-duties key for restocking-fee waivers"
+        default: null
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Quoted subtotal: sum of extended_price_cents over lines with line_status IN {RESOLVED, ALLOCATED, SHIPPED, RETURNED}"
+      - name: core_deposit_total_cents
+        type: integer
+        source: computed
+        description: "Sum of core_deposit_cents * quantity over the same line set once fulfilled; 0 before fulfillment"
+      - name: freight_cents
+        type: integer
+        source: computed
+        description: "Freight per calculations.freight_assessment; 0 until allocation, recomputed at fulfillment"
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "subtotal_cents + core_deposit_total_cents + freight_cents on the quoted (ORDER_DATE) basis"
+      - name: invoiced_total_cents
+        type: integer
+        source: system
+        description: "Billed total locked at fulfillment on the SHIP_DATE basis; null before fulfillment"
+        default: null
+      - name: price_variance_cents
+        type: integer
+        source: computed
+        description: "invoiced_total_cents - total_cents; 0 while invoiced_total_cents is null"
+      - name: fulfilled_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of fulfillment; the anchor for return-window and warranty-window arithmetic"
+        default: null
+      - name: tracking_ref
+        type: string
+        source: system
+        description: "Carrier tracking reference captured at fulfillment"
+        default: null
+
+  - name: OrderLine
+    parent: PartOrder
+    common_fields: true
+    fields:
+      - name: part_order_id
+        type: string
+        source: input
+        description: "FK -> PartOrder.id; owning order"
+      - name: requested_part_id
+        type: string
+        source: input
+        description: "FK -> Part.id; part number the servicer asked for"
+      - name: resolved_part_id
+        type: string
+        source: system
+        description: "FK -> Part.id; terminal part of the supersession chain walked at line creation, or the approved substitute"
+      - name: quantity
+        type: integer
+        source: input
+        description: "Units ordered"
+        constraints: ">= 1"
+      - name: supersession_hops
+        type: integer
+        source: computed
+        description: "Number of superseded_by_part_id hops walked from requested_part_id to resolved_part_id"
+      - name: unit_price_cents
+        type: integer
+        source: computed
+        description: "Quoted per-unit net price locked at line creation (ORDER_DATE variant)"
+      - name: extended_price_cents
+        type: integer
+        source: computed
+        description: "unit_price_cents * quantity (rounding happens per unit, before multiplication)"
+      - name: invoiced_unit_price_cents
+        type: integer
+        source: system
+        description: "Per-unit net price recomputed at fulfillment from the then-current Part.list_price_cents (SHIP_DATE variant); null before fulfillment"
+        default: null
+      - name: core_deposit_cents
+        type: integer
+        source: computed
+        description: "Per-unit core deposit snapshotted from the resolved part at fulfillment; 0 before fulfillment or when core_required is false"
+      - name: returned_units
+        type: integer
+        source: system
+        description: "Cumulative units credited back through CREDITED non-core ReturnAuthorizations"
+        default: 0
+      - name: line_status
+        type: enum
+        source: system
+        description: "Line lifecycle; REQUESTED exists only inside the creating request, which resolves it before responding"
+        default: REQUESTED
+        constraints: "one of {REQUESTED, RESOLVED, ALLOCATED, BACKORDERED, SUBSTITUTE_PENDING, SHIPPED, RETURNED, CANCELLED}"
+      - name: allocation_branch_id
+        type: string
+        source: system
+        description: "FK -> Branch.id; branch whose InventoryRecord holds the reservation; null unless line_status IN {ALLOCATED, SHIPPED, RETURNED}"
+        default: null
+
+  - name: SubstituteRequest
+    parent: OrderLine
+    common_fields: true
+    fields:
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; line blocked on obsolete-part sourcing"
+      - name: obsolete_part_id
+        type: string
+        source: system
+        description: "FK -> Part.id; the OBSOLETE part that blocked the line"
+      - name: proposed_substitute_part_id
+        type: string
+        source: system
+        description: "FK -> Part.id; substitute supplied on the APPROVE decision; null while PENDING, REJECTED or WITHDRAWN"
+        default: null
+      - name: request_status
+        type: enum
+        source: system
+        description: "Branching fork with divergent side-effect sets per outcome"
+        default: PENDING
+        constraints: "one of {PENDING, APPROVED, REJECTED, WITHDRAWN}"
+      - name: price_variance_pct
+        type: number
+        source: computed
+        description: "(substitute unit price - obsolete quoted unit price) / obsolete quoted unit price, 4 decimals round_half_up; null while PENDING"
+      - name: source
+        type: enum
+        source: system
+        description: "CHAIN_TERMINAL_OBSOLETE when created by line resolution, PRICE_FILE_OBSOLESCENCE when created by a publish cascade"
+        constraints: "one of {CHAIN_TERMINAL_OBSOLETE, PRICE_FILE_OBSOLESCENCE}"
+      - name: created_by_price_file_id
+        type: string
+        source: system
+        description: "FK -> PriceFile.id; the publishing file when source == PRICE_FILE_OBSOLESCENCE, else null"
+        default: null
+      - name: decided_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the WarrantyAdmin who decided the request"
+        default: null
+
+  - name: WarrantyClaim
+    parent: null
+    common_fields: true
+    fields:
+      - name: servicer_account_id
+        type: string
+        source: input
+        description: "FK -> ServicerAccount.id; servicer on whose behalf the claim is filed"
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; the shipped line whose part failed under OEM warranty"
+      - name: oem_code
+        type: string
+        source: system
+        description: "Copied from the resolved part's oem_code at claim creation"
+      - name: defect_code
+        type: string
+        source: input
+        description: "OEM defect code"
+      - name: appliance_model_number
+        type: string
+        source: input
+        description: "Model number of the appliance the part was installed in"
+      - name: claim_status
+        type: enum
+        source: system
+        description: "Cyclic machine: SUBMITTED -> OEM_INFO_REQUESTED -> SUBMITTED, bounded by MAX_RESUBMISSIONS"
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, OEM_INFO_REQUESTED, OEM_APPROVED, OEM_DENIED, CREDITED, VOID}"
+      - name: resubmission_count
+        type: integer
+        source: system
+        description: "Number of times the claim re-entered SUBMITTED from OEM_INFO_REQUESTED"
+        default: 0
+      - name: submitted_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of the most recent submission"
+        default: null
+      - name: oem_reference
+        type: string
+        source: system
+        description: "OEM-side claim reference recorded at submission or on an OEM response"
+        default: null
+      - name: claim_amount_cents
+        type: integer
+        source: computed
+        description: "Part cost plus labor allowance per calculations.warranty_claim_amount, locked at first submission"
+      - name: credit_amount_cents
+        type: integer
+        source: computed
+        description: "Credit posted to the servicer's exposure when claim_status == CREDITED; equals claim_amount_cents, else 0"
+
+  - name: ReturnAuthorization
+    parent: null
+    common_fields: true
+    fields:
+      - name: servicer_account_id
+        type: string
+        source: input
+        description: "FK -> ServicerAccount.id; returning servicer"
+      - name: order_line_id
+        type: string
+        source: input
+        description: "FK -> OrderLine.id; the shipped line being returned"
+      - name: quantity
+        type: integer
+        source: input
+        description: "Units to return"
+        constraints: ">= 1"
+      - name: reason_code
+        type: enum
+        source: input
+        description: "Return reason; drives fee waiver, restock eligibility and which window applies"
+        constraints: "one of {WRONG_PART, DEFECTIVE_ON_ARRIVAL, NO_LONGER_NEEDED, CORE_RETURN}"
+      - name: return_branch_id
+        type: string
+        source: input
+        description: "FK -> Branch.id; branch that will physically receive the return"
+      - name: ra_status
+        type: enum
+        source: system
+        description: "Branching machine: REQUESTED -> {APPROVED, REJECTED}; APPROVED -> RECEIVED -> CREDITED"
+        default: REQUESTED
+        constraints: "one of {REQUESTED, APPROVED, REJECTED, RECEIVED, CREDITED}"
+      - name: days_since_fulfilled_at_request
+        type: integer
+        source: computed
+        description: "floor((logical now - PartOrder.fulfilled_at) / 86400 s) evaluated at RA creation; the pinned basis for the restocking-fee tier"
+      - name: gross_return_cents
+        type: integer
+        source: computed
+        description: "OrderLine.unit_price_cents * quantity for non-core reasons; 0 for CORE_RETURN"
+      - name: restocking_fee_pct
+        type: number
+        source: computed
+        description: "Fee rate selected at approval per calculations.restocking_fee_and_credit; null while REQUESTED"
+      - name: restocking_fee_cents
+        type: integer
+        source: computed
+        description: "round_half_up(gross_return_cents * restocking_fee_pct); 0 when waived"
+      - name: credit_amount_cents
+        type: integer
+        source: computed
+        description: "gross_return_cents - restocking_fee_cents; 0 for CORE_RETURN"
+      - name: core_deposit_refund_cents
+        type: integer
+        source: computed
+        description: "OrderLine.core_deposit_cents * quantity when reason_code == CORE_RETURN, else 0"
+      - name: fee_waived
+        type: boolean
+        source: system
+        description: "True when the approving CreditManager waived the restocking fee"
+        default: false
+      - name: created_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the Servicer that raised the RA"
+      - name: decided_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the CreditManager that approved or rejected the RA"
+        default: null
+      - name: received_at
+        type: datetime
+        source: system
+        description: "Logical-clock timestamp of physical receipt at return_branch_id"
+        default: null
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+
+  # ---------------------------------------------------------------------------
+  # PartOrder carries TWO independent state dimensions on the same row.
+  # Dimension A: fulfillment_status (physical). Dimension B: settlement_status (money).
+  # Neither dimension's transitions are triggered by the other; they only read each other
+  # as preconditions (allocate reads settlement_status, fulfill reads settlement_status).
+  # ---------------------------------------------------------------------------
+  - entity: PartOrder
+    initial_state: DRAFT              # dimension A: fulfillment_status
+    terminal_states: [FULFILLED, CANCELLED]
+    transitions:
+      - from: DRAFT
+        to: ALLOCATED
+        trigger: "POST /part-orders/{id}/allocate"
+        actor: BranchCounterRep
+        preconditions:
+          - "fulfillment_status == DRAFT"
+          - "settlement_status IN {CREDIT_APPROVED, PAID}"
+          - "ServicerAccount.account_status == ACTIVE"
+          - "for WILL_CALL: X-User-ID == pickup_branch_id AND Branch.branch_status == OPEN AND Branch.will_call_enabled == true"
+          - "for OVERNIGHT_DROP_SHIP: X-User-ID resolves to a Branch with branch_status == OPEN"
+          - "count(OrderLine where part_order_id == this order AND line_status != CANCELLED) >= 1"
+          - "at least one line ends the allocation sweep in line_status == ALLOCATED"
+        side_effects:
+          - "runs calculations.branch_allocation_selection over lines with line_status == RESOLVED in OrderLine.created_at ASC order"
+          - "each allocated line: line_status := ALLOCATED, allocation_branch_id := selected branch, InventoryRecord(selected branch, resolved_part_id).reserved_units += quantity, InventoryRecord.available_units recomputed, InventoryRecord.version += 1"
+          - "each line with an empty candidate set: line_status := BACKORDERED, allocation_branch_id := null"
+          - "recomputes freight_cents via calculations.freight_assessment, then total_cents"
+          - "recomputes ServicerAccount.credit_used_cents via calculations.servicer_credit_exposure"
+        note: "When every non-cancelled line ends BACKORDERED, the order does NOT enter ALLOCATED; see the DRAFT -> HELD transition."
+      - from: DRAFT
+        to: HELD
+        trigger: "POST /part-orders/{id}/allocate when zero lines could be reserved"
+        actor: BranchCounterRep
+        preconditions:
+          - "same preconditions as DRAFT -> ALLOCATED except the last one"
+          - "every non-cancelled line ends the allocation sweep in line_status == BACKORDERED"
+        side_effects:
+          - "hold_reason := BACKORDER"
+          - "no InventoryRecord.reserved_units change"
+          - "freight_cents := 0, total_cents recomputed"
+      - from: ALLOCATED
+        to: HELD
+        trigger: "system: a line of this order enters SUBSTITUTE_PENDING through the PriceFile publish cascade"
+        actor: system
+        preconditions:
+          - "fulfillment_status == ALLOCATED"
+          - "at least one OrderLine of this order transitioned to SUBSTITUTE_PENDING in the current request"
+        side_effects:
+          - "hold_reason := SUBSTITUTE_PENDING"
+          - "subtotal_cents / total_cents recomputed excluding SUBSTITUTE_PENDING lines"
+          - "recomputes ServicerAccount.credit_used_cents (cascade hop 4 of transitive_cascade.price_file_obsolescence_chain)"
+      - from: ALLOCATED
+        to: HELD
+        trigger: "system: ServicerAccount.account_status becomes CREDIT_HOLD"
+        actor: system
+        preconditions:
+          - "fulfillment_status == ALLOCATED"
+          - "the owning ServicerAccount transitioned ACTIVE -> CREDIT_HOLD in the current request"
+        side_effects:
+          - "hold_reason := CREDIT_HOLD"
+          - "every line with line_status == ALLOCATED: line_status := BACKORDERED, InventoryRecord.reserved_units -= quantity, allocation_branch_id := null"
+        note: "Conditional cascade: FULFILLED, CANCELLED and DRAFT orders of the same account are untouched."
+      - from: HELD
+        to: ALLOCATED
+        trigger: "system: last PENDING SubstituteRequest of this order is decided, or ServicerAccount returns to ACTIVE"
+        actor: system
+        preconditions:
+          - "fulfillment_status == HELD"
+          - "count(SubstituteRequest where order_line_id IN this order's lines AND request_status == PENDING) == 0"
+          - "ServicerAccount.account_status == ACTIVE"
+          - "at least one line ends the re-allocation sweep in line_status == ALLOCATED"
+        side_effects:
+          - "hold_reason := null"
+          - "each line with line_status IN {RESOLVED, BACKORDERED}: re-run calculations.branch_allocation_selection; on success line_status := ALLOCATED and InventoryRecord.reserved_units += quantity, else line_status := BACKORDERED"
+          - "freight_cents, total_cents recomputed; ServicerAccount.credit_used_cents recomputed"
+      - from: ALLOCATED
+        to: FULFILLED
+        trigger: "POST /part-orders/{id}/fulfill"
+        actor: BranchCounterRep
+        preconditions:
+          - "fulfillment_status == ALLOCATED"
+          - "for credit_terms == PREPAY: settlement_status == PAID"
+          - "for credit_terms IN {NET_15, NET_30, NET_45}: settlement_status == CREDIT_APPROVED"
+          - "ServicerAccount.account_status == ACTIVE"
+          - "for WILL_CALL: X-User-ID == pickup_branch_id; for OVERNIGHT_DROP_SHIP: X-User-ID equals the allocation_branch_id of at least one ALLOCATED line"
+          - "ServicerAccount.core_liability_cents + sum(resolved_part.core_deposit_cents * quantity over ALLOCATED lines whose resolved part has core_required == true) <= ServicerAccount.core_liability_limit_cents"
+        side_effects:
+          - "pricing_basis := SHIP_DATE; each ALLOCATED line: invoiced_unit_price_cents := calculations.order_line_pricing variant invoiced_at_ship_date, core_deposit_cents := resolved part's core_deposit_cents when core_required else 0, line_status := SHIPPED"
+          - "each SHIPPED line: InventoryRecord(allocation_branch_id, resolved_part_id).on_hand_units -= quantity, reserved_units -= quantity"
+          - "core_deposit_total_cents, freight_cents recomputed; invoiced_total_cents := ship-date subtotal + core_deposit_total_cents + freight_cents; price_variance_cents := invoiced_total_cents - total_cents"
+          - "fulfilled_at := logical now; tracking_ref := input tracking_ref"
+          - "ServicerAccount.core_liability_cents and credit_used_cents recomputed"
+          - "lines left in BACKORDERED / SUBSTITUTE_PENDING are untouched and remain queryable"
+      - from: DRAFT
+        to: CANCELLED
+        trigger: "POST /part-orders/{id}/cancel"
+        actor: Servicer | CreditManager
+        preconditions:
+          - "fulfillment_status IN {DRAFT, ALLOCATED, HELD}"
+          - "settlement_status != INVOICED"
+          - "acting Servicer's X-User-ID == servicer_account_id (CreditManager is unrestricted)"
+        side_effects:
+          - "every line with line_status IN {RESOLVED, ALLOCATED, BACKORDERED, SUBSTITUTE_PENDING}: line_status := CANCELLED and, when it was ALLOCATED, InventoryRecord.reserved_units -= quantity"
+          - "every SubstituteRequest of those lines with request_status == PENDING: request_status := WITHDRAWN"
+          - "settlement_status := CREDIT_DECLINED when it was CREDIT_APPROVED; subtotal_cents / total_cents := 0"
+          - "ServicerAccount.credit_used_cents recomputed"
+      - from: ALLOCATED
+        to: CANCELLED
+        trigger: "POST /part-orders/{id}/cancel"
+        actor: Servicer | CreditManager
+        preconditions:
+          - "fulfillment_status == ALLOCATED"
+          - "settlement_status != INVOICED"
+        side_effects:
+          - "same side effects as DRAFT -> CANCELLED (reservations released, invariant compensating_invariant.inventory_unit_conservation holds)"
+      - from: HELD
+        to: CANCELLED
+        trigger: "POST /part-orders/{id}/cancel"
+        actor: Servicer | CreditManager
+        preconditions:
+          - "fulfillment_status == HELD"
+          - "settlement_status != INVOICED"
+        side_effects:
+          - "same side effects as DRAFT -> CANCELLED"
+
+  - entity: PartOrder
+    initial_state: PENDING_CREDIT     # dimension B: settlement_status
+    terminal_states: [PAID, CREDIT_DECLINED, WRITTEN_OFF]
+    transitions:
+      - from: PENDING_CREDIT
+        to: CREDIT_APPROVED
+        trigger: "POST /part-orders/{id}/credit-decision with decision == APPROVE"
+        actor: CreditManager
+        preconditions:
+          - "settlement_status == PENDING_CREDIT"
+          - "fulfillment_status == DRAFT"
+          - "ServicerAccount.account_status == ACTIVE"
+          - "ServicerAccount.credit_used_cents (which already includes this order's total_cents, per calculations.servicer_credit_exposure) <= ServicerAccount.credit_limit_cents"
+        side_effects:
+          - "credit_decided_by_user_id := X-User-ID (segregation-of-duties key)"
+          - "ServicerAccount.delinquency_score := calculations.servicer_delinquency_score variant rolling_recent"
+          - "ServicerAccount.credit_used_cents recomputed"
+        note: "An order with zero lines approves at total_cents == 0; the empty-set rejection happens later, at allocate."
+      - from: PENDING_CREDIT
+        to: CREDIT_DECLINED
+        trigger: "POST /part-orders/{id}/credit-decision with decision == DECLINE"
+        actor: CreditManager
+        preconditions:
+          - "settlement_status == PENDING_CREDIT"
+          - "fulfillment_status == DRAFT"
+        side_effects:
+          - "credit_decided_by_user_id := X-User-ID"
+          - "ServicerAccount.delinquency_score refreshed (rolling_recent variant)"
+          - "when ServicerAccount.delinquency_score < DELINQUENCY_HOLD_THRESHOLD: ServicerAccount.account_status := CREDIT_HOLD, which cascades the ALLOCATED -> HELD(CREDIT_HOLD) freeze onto that account's other orders"
+      - from: CREDIT_APPROVED
+        to: INVOICED
+        trigger: "system: POST /part-orders/{id}/fulfill for an account whose credit_terms != PREPAY"
+        actor: system
+        preconditions:
+          - "settlement_status == CREDIT_APPROVED"
+          - "fulfillment_status transitioned ALLOCATED -> FULFILLED in the current request"
+          - "ServicerAccount.credit_terms IN {NET_15, NET_30, NET_45}"
+        side_effects:
+          - "ServicerAccount.credit_used_cents recomputed: this order now contributes invoiced_total_cents instead of total_cents"
+      - from: CREDIT_APPROVED
+        to: PAID
+        trigger: "POST /part-orders/{id}/payments for an account whose credit_terms == PREPAY"
+        actor: CreditManager
+        preconditions:
+          - "settlement_status == CREDIT_APPROVED"
+          - "ServicerAccount.credit_terms == PREPAY"
+          - "amount_cents == total_cents"
+        side_effects:
+          - "ServicerAccount.credit_used_cents recomputed (PAID orders leave the exposure set)"
+        note: "Dimension independence: fulfillment_status may still be DRAFT, ALLOCATED or HELD when this fires."
+      - from: INVOICED
+        to: PAID
+        trigger: "POST /part-orders/{id}/payments"
+        actor: CreditManager
+        preconditions:
+          - "settlement_status == INVOICED"
+          - "amount_cents == invoiced_total_cents"
+        side_effects:
+          - "ServicerAccount.credit_used_cents recomputed"
+          - "when ServicerAccount.account_status == CREDIT_HOLD AND credit_used_cents <= credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO: ServicerAccount.account_status := ACTIVE, cascading the HELD(CREDIT_HOLD) -> ALLOCATED release"
+      - from: INVOICED
+        to: WRITTEN_OFF
+        trigger: "PATCH /servicer-accounts/{id} setting account_status == SUSPENDED"
+        actor: CreditManager
+        preconditions:
+          - "settlement_status == INVOICED"
+          - "the owning ServicerAccount transitioned to SUSPENDED in the current request"
+        side_effects:
+          - "ServicerAccount.credit_used_cents recomputed (WRITTEN_OFF orders leave the exposure set)"
+
+  - entity: OrderLine
+    initial_state: REQUESTED
+    terminal_states: [CANCELLED, RETURNED]
+    transitions:
+      - from: REQUESTED
+        to: RESOLVED
+        trigger: "POST /part-orders/{id}/lines (same request; REQUESTED never persists past the response)"
+        actor: Servicer
+        preconditions:
+          - "PartOrder.fulfillment_status == DRAFT AND settlement_status == PENDING_CREDIT"
+          - "calculations.supersession_chain_resolution terminates on a Part with lifecycle_status == ACTIVE within MAX_SUPERSESSION_HOPS"
+          - "resolved part's oem_code IN ServicerAccount.oem_authorizations"
+          - "servicer holds an effective TechnicianCertification for the resolved part's oem_code at cert_level >= resolved part's cert_level_required"
+          - "calculations.servicer_credit_exposure recomputed WITH this line included <= ServicerAccount.credit_limit_cents (the order's own total is already inside the exposure aggregate, so it is never added twice)"
+        side_effects:
+          - "resolved_part_id, supersession_hops set from the chain walk"
+          - "unit_price_cents, extended_price_cents set from calculations.order_line_pricing variant quoted_at_order_date"
+          - "PartOrder.subtotal_cents / total_cents recomputed; PartOrder.version += 1"
+      - from: REQUESTED
+        to: SUBSTITUTE_PENDING
+        trigger: "POST /part-orders/{id}/lines when the chain terminates on an OBSOLETE part"
+        actor: Servicer
+        preconditions:
+          - "same preconditions as REQUESTED -> RESOLVED except the chain terminates on lifecycle_status == OBSOLETE"
+        side_effects:
+          - "resolved_part_id := terminal obsolete part; unit_price_cents priced off that part"
+          - "creates SubstituteRequest(order_line_id, obsolete_part_id := resolved_part_id, request_status := PENDING, source := CHAIN_TERMINAL_OBSOLETE)"
+          - "PartOrder.subtotal_cents excludes this line; PartOrder.version += 1"
+      - from: RESOLVED
+        to: ALLOCATED
+        trigger: "POST /part-orders/{id}/allocate"
+        actor: BranchCounterRep
+        preconditions:
+          - "line_status == RESOLVED"
+          - "calculations.branch_allocation_selection returns a non-empty candidate set"
+        side_effects:
+          - "allocation_branch_id := selected branch; InventoryRecord.reserved_units += quantity"
+      - from: RESOLVED
+        to: BACKORDERED
+        trigger: "POST /part-orders/{id}/allocate with an empty candidate set"
+        actor: BranchCounterRep
+        preconditions:
+          - "line_status == RESOLVED"
+          - "calculations.branch_allocation_selection returns an empty candidate set"
+        side_effects:
+          - "allocation_branch_id stays null; no InventoryRecord mutation"
+      - from: BACKORDERED
+        to: ALLOCATED
+        trigger: "system: PartOrder HELD -> ALLOCATED re-allocation sweep"
+        actor: system
+        preconditions:
+          - "line_status == BACKORDERED"
+          - "calculations.branch_allocation_selection now returns a non-empty candidate set"
+        side_effects:
+          - "allocation_branch_id set; InventoryRecord.reserved_units += quantity"
+      - from: ALLOCATED
+        to: BACKORDERED
+        trigger: "system: ServicerAccount ACTIVE -> CREDIT_HOLD freeze cascade"
+        actor: system
+        preconditions:
+          - "line_status == ALLOCATED"
+          - "parent PartOrder transitioned ALLOCATED -> HELD(CREDIT_HOLD) in the current request"
+        side_effects:
+          - "InventoryRecord.reserved_units -= quantity; allocation_branch_id := null"
+      - from: ALLOCATED
+        to: SUBSTITUTE_PENDING
+        trigger: "system: PriceFile publish sets the resolved part's lifecycle_status to OBSOLETE"
+        actor: system
+        preconditions:
+          - "line_status IN {RESOLVED, ALLOCATED}"
+          - "resolved_part_id's lifecycle_status became OBSOLETE in the current request"
+        side_effects:
+          - "when it was ALLOCATED: InventoryRecord.reserved_units -= quantity, allocation_branch_id := null"
+          - "creates SubstituteRequest(request_status := PENDING, source := PRICE_FILE_OBSOLESCENCE, created_by_price_file_id := publishing file)"
+          - "parent PartOrder ALLOCATED -> HELD(SUBSTITUTE_PENDING) (cascade hop 3)"
+      - from: SUBSTITUTE_PENDING
+        to: RESOLVED
+        trigger: "system: POST /substitute-requests/{id}/decision with decision == APPROVE, or POST /price-files/{id}/rollback"
+        actor: system
+        preconditions:
+          - "line_status == SUBSTITUTE_PENDING"
+          - "the governing SubstituteRequest left PENDING in the current request"
+        side_effects:
+          - "on APPROVE: resolved_part_id := substitute_part_id, unit_price_cents / extended_price_cents repriced off the substitute, supersession_hops unchanged"
+          - "on rollback: resolved_part_id unchanged (its part is ACTIVE again), unit_price_cents unchanged"
+          - "re-allocation sweep may immediately move the line to ALLOCATED or BACKORDERED"
+      - from: SUBSTITUTE_PENDING
+        to: CANCELLED
+        trigger: "system: POST /substitute-requests/{id}/decision with decision == REJECT"
+        actor: system
+        preconditions:
+          - "line_status == SUBSTITUTE_PENDING"
+        side_effects:
+          - "extended_price_cents := 0; PartOrder.subtotal_cents / total_cents recomputed; ServicerAccount.credit_used_cents recomputed"
+      - from: SUBSTITUTE_PENDING
+        to: BACKORDERED
+        trigger: "POST /substitute-requests/{id}/withdraw"
+        actor: Servicer
+        preconditions:
+          - "line_status == SUBSTITUTE_PENDING"
+          - "X-User-ID == PartOrder.servicer_account_id"
+        side_effects:
+          - "line stays priced off the obsolete part and waits for the servicer to source it elsewhere"
+      - from: RESOLVED
+        to: CANCELLED
+        trigger: "POST /order-lines/{id}/cancel"
+        actor: Servicer
+        preconditions:
+          - "line_status IN {RESOLVED, ALLOCATED, BACKORDERED}"
+          - "PartOrder.fulfillment_status IN {DRAFT, ALLOCATED, HELD}"
+          - "X-User-ID == PartOrder.servicer_account_id"
+        side_effects:
+          - "when it was ALLOCATED: InventoryRecord.reserved_units -= quantity, available_units restored, allocation_branch_id := null"
+          - "PartOrder.subtotal_cents / freight_cents / total_cents recomputed; ServicerAccount.credit_used_cents recomputed"
+      - from: ALLOCATED
+        to: CANCELLED
+        trigger: "POST /order-lines/{id}/cancel"
+        actor: Servicer
+        preconditions:
+          - "line_status == ALLOCATED"
+          - "PartOrder.fulfillment_status IN {ALLOCATED, HELD}"
+        side_effects:
+          - "compensating action for RESOLVED -> ALLOCATED: InventoryRecord.reserved_units -= quantity and available_units returns to its pre-allocation value (compensating_invariant.inventory_unit_conservation)"
+      - from: ALLOCATED
+        to: SHIPPED
+        trigger: "POST /part-orders/{id}/fulfill"
+        actor: BranchCounterRep
+        preconditions:
+          - "line_status == ALLOCATED"
+          - "parent PartOrder transitioned ALLOCATED -> FULFILLED in the current request"
+        side_effects:
+          - "invoiced_unit_price_cents, core_deposit_cents snapshotted; InventoryRecord.on_hand_units -= quantity, reserved_units -= quantity"
+          - "ServicerAccount.core_liability_cents += core_deposit_cents * quantity when the resolved part has core_required == true"
+      - from: SHIPPED
+        to: RETURNED
+        trigger: "system: ReturnAuthorization RECEIVED -> CREDITED with returned_units reaching quantity"
+        actor: system
+        preconditions:
+          - "line_status == SHIPPED"
+          - "returned_units + credited RA quantity == quantity"
+          - "RA.reason_code != CORE_RETURN"
+        side_effects:
+          - "returned_units := quantity"
+        note: "A partial return leaves the line in SHIPPED with returned_units < quantity."
+
+  - entity: SubstituteRequest
+    initial_state: PENDING
+    terminal_states: [APPROVED, REJECTED, WITHDRAWN]
+    transitions:
+      - from: PENDING
+        to: APPROVED
+        trigger: "POST /substitute-requests/{id}/decision with decision == APPROVE"
+        actor: WarrantyAdmin
+        preconditions:
+          - "request_status == PENDING"
+          - "substitute_part_id is supplied and resolves to a Part with lifecycle_status == ACTIVE"
+          - "substitute part's oem_code == obsolete part's oem_code"
+          - "abs(calculations.substitute_price_variance) <= SUBSTITUTE_VARIANCE_CAP_PCT"
+        side_effects:
+          - "proposed_substitute_part_id := substitute_part_id; price_variance_pct set; decided_by_user_id := X-User-ID"
+          - "OrderLine SUBSTITUTE_PENDING -> RESOLVED with resolved_part_id := substitute and repriced unit_price_cents"
+          - "when no PENDING SubstituteRequest remains on the order: PartOrder HELD -> ALLOCATED with a re-allocation sweep"
+      - from: PENDING
+        to: REJECTED
+        trigger: "POST /substitute-requests/{id}/decision with decision == REJECT"
+        actor: WarrantyAdmin
+        preconditions:
+          - "request_status == PENDING"
+        side_effects:
+          - "proposed_substitute_part_id stays null; price_variance_pct stays null; decided_by_user_id := X-User-ID"
+          - "OrderLine SUBSTITUTE_PENDING -> CANCELLED (divergent from the APPROVE branch, which resolves the line instead)"
+          - "PartOrder subtotal/total recomputed; ServicerAccount.credit_used_cents recomputed; PartOrder HELD -> ALLOCATED when no PENDING request remains"
+      - from: PENDING
+        to: WITHDRAWN
+        trigger: "POST /substitute-requests/{id}/withdraw, or PartOrder cancel, or PriceFile rollback"
+        actor: Servicer | system
+        preconditions:
+          - "request_status == PENDING"
+          - "for the Servicer-triggered form: X-User-ID == owning PartOrder.servicer_account_id"
+        side_effects:
+          - "OrderLine SUBSTITUTE_PENDING -> BACKORDERED (servicer form) or -> RESOLVED (rollback form)"
+          - "PartOrder HELD -> ALLOCATED when no PENDING request remains"
+
+  - entity: WarrantyClaim
+    initial_state: DRAFT
+    terminal_states: [CREDITED, VOID]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /warranty-claims/{id}/submit"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim_status == DRAFT"
+          - "OrderLine.line_status IN {SHIPPED, RETURNED}"
+          - "floor((logical now - PartOrder.fulfilled_at)/86400 s) <= WARRANTY_CLAIM_WINDOW_DAYS"
+          - "the servicer holds an effective TechnicianCertification for claim.oem_code (cross-entity dependency on TechnicianCertification.cert_status and its coverage interval)"
+        side_effects:
+          - "submitted_at := logical now; oem_reference := input oem_reference"
+          - "claim_amount_cents locked via calculations.warranty_claim_amount"
+      - from: SUBMITTED
+        to: OEM_INFO_REQUESTED
+        trigger: "POST /warranty-claims/{id}/oem-response with outcome == INFO_REQUESTED"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim_status == SUBMITTED"
+        side_effects:
+          - "oem_reference updated when supplied; claim_amount_cents unchanged"
+      - from: OEM_INFO_REQUESTED
+        to: SUBMITTED
+        trigger: "POST /warranty-claims/{id}/resubmit"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim_status == OEM_INFO_REQUESTED"
+          - "resubmission_count < MAX_RESUBMISSIONS"
+        side_effects:
+          - "resubmission_count += 1; submitted_at := logical now"
+        note: "This edge closes the cycle SUBMITTED -> OEM_INFO_REQUESTED -> SUBMITTED; the counter bounds it at MAX_RESUBMISSIONS."
+      - from: SUBMITTED
+        to: OEM_APPROVED
+        trigger: "POST /warranty-claims/{id}/oem-response with outcome == APPROVED"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim_status == SUBMITTED"
+        side_effects:
+          - "oem_reference updated when supplied"
+      - from: SUBMITTED
+        to: OEM_DENIED
+        trigger: "POST /warranty-claims/{id}/oem-response with outcome == DENIED"
+        actor: WarrantyAdmin
+        preconditions:
+          - "claim_status == SUBMITTED"
+        side_effects:
+          - "ServicerAccount.delinquency_score inputs change: this claim now counts as a denied claim in both variants of calculations.servicer_delinquency_score"
+      - from: OEM_APPROVED
+        to: CREDITED
+        trigger: "POST /warranty-claims/{id}/credit"
+        actor: CreditManager
+        preconditions:
+          - "claim_status == OEM_APPROVED"
+        side_effects:
+          - "credit_amount_cents := claim_amount_cents"
+          - "ServicerAccount.credit_used_cents recomputed (claim credit subtracts from exposure)"
+      - from: OEM_DENIED
+        to: VOID
+        trigger: "POST /warranty-claims/{id}/oem-response with outcome == DENIED on an already denied claim is rejected; VOID is reached from OEM_DENIED via POST /warranty-claims/{id}/credit with a denied claim"
+        actor: CreditManager
+        preconditions:
+          - "claim_status == OEM_DENIED"
+        side_effects:
+          - "credit_amount_cents := 0; no exposure change"
+        note: "Closing a denied claim is the only path into VOID; the denied-claim penalty in servicer_delinquency_score persists."
+
+  - entity: ReturnAuthorization
+    initial_state: REQUESTED
+    terminal_states: [REJECTED, CREDITED]
+    transitions:
+      - from: REQUESTED
+        to: APPROVED
+        trigger: "POST /return-authorizations/{id}/decision with decision == APPROVE"
+        actor: CreditManager
+        preconditions:
+          - "ra_status == REQUESTED"
+          - "when waive_restocking_fee == true: X-User-ID != PartOrder.credit_decided_by_user_id of the RA's line's order (segregation of duties)"
+        side_effects:
+          - "restocking_fee_pct, restocking_fee_cents, credit_amount_cents, core_deposit_refund_cents set via calculations.restocking_fee_and_credit using days_since_fulfilled_at_request"
+          - "fee_waived := input waive_restocking_fee; decided_by_user_id := X-User-ID"
+      - from: REQUESTED
+        to: REJECTED
+        trigger: "POST /return-authorizations/{id}/decision with decision == REJECT"
+        actor: CreditManager
+        preconditions:
+          - "ra_status == REQUESTED"
+        side_effects:
+          - "restocking_fee_pct := null, restocking_fee_cents := 0, credit_amount_cents := 0, core_deposit_refund_cents := 0"
+          - "decided_by_user_id := X-User-ID; no inventory, exposure or core-liability change (divergent from the APPROVE branch)"
+      - from: APPROVED
+        to: RECEIVED
+        trigger: "POST /return-authorizations/{id}/receive"
+        actor: BranchCounterRep
+        preconditions:
+          - "ra_status == APPROVED"
+          - "X-User-ID == return_branch_id"
+          - "Branch.branch_status == OPEN"
+        side_effects:
+          - "received_at := logical now"
+          - "when reason_code IN {WRONG_PART, NO_LONGER_NEEDED}: InventoryRecord(return_branch_id, resolved_part_id).on_hand_units += quantity (creating the record with on_hand_units == quantity when absent)"
+          - "when reason_code == DEFECTIVE_ON_ARRIVAL: no restock (unit is scrapped) — conditional cascade"
+          - "when reason_code == CORE_RETURN: no restock (core ships to the OEM)"
+      - from: RECEIVED
+        to: CREDITED
+        trigger: "system: same request as POST /return-authorizations/{id}/receive"
+        actor: system
+        preconditions:
+          - "ra_status == RECEIVED"
+        side_effects:
+          - "OrderLine.returned_units += quantity for non-core reasons; OrderLine SHIPPED -> RETURNED when returned_units reaches quantity"
+          - "ServicerAccount.credit_used_cents -= credit_amount_cents; ServicerAccount.core_liability_cents -= core_deposit_refund_cents (cascade hop 2)"
+          - "when account_status == CREDIT_HOLD AND credit_used_cents <= credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO: ServicerAccount CREDIT_HOLD -> ACTIVE (cascade hop 3), which releases HELD(CREDIT_HOLD) orders (hop 4) and re-reserves inventory (hop 5)"
+
+  - entity: ServicerAccount
+    initial_state: ACTIVE
+    terminal_states: [SUSPENDED]
+    transitions:
+      - from: ACTIVE
+        to: CREDIT_HOLD
+        trigger: "PATCH /servicer-accounts/{id} with account_status == CREDIT_HOLD, POST /servicer-accounts/{id}/tier-review, or a DECLINE credit-decision"
+        actor: CreditManager | system
+        preconditions:
+          - "account_status == ACTIVE"
+          - "for the tier-review form: calculations.servicer_delinquency_score variant lifetime < DELINQUENCY_HOLD_THRESHOLD"
+        side_effects:
+          - "every PartOrder of this account with fulfillment_status == ALLOCATED: -> HELD with hold_reason := CREDIT_HOLD, its ALLOCATED lines -> BACKORDERED, reservations released"
+      - from: CREDIT_HOLD
+        to: ACTIVE
+        trigger: "PATCH /servicer-accounts/{id} with account_status == ACTIVE, or system release when credit_used_cents <= credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO"
+        actor: CreditManager | system
+        preconditions:
+          - "account_status == CREDIT_HOLD"
+          - "for the system form: credit_used_cents <= credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO after the triggering credit posting"
+        side_effects:
+          - "every PartOrder of this account with fulfillment_status == HELD AND hold_reason == CREDIT_HOLD: re-allocation sweep, -> ALLOCATED when at least one line reserves, otherwise stays HELD with hold_reason := BACKORDER"
+        note: "Closes the ACTIVE <-> CREDIT_HOLD cycle."
+      - from: ACTIVE
+        to: SUSPENDED
+        trigger: "PATCH /servicer-accounts/{id} with account_status == SUSPENDED"
+        actor: CreditManager
+        preconditions:
+          - "account_status IN {ACTIVE, CREDIT_HOLD}"
+        side_effects:
+          - "every PartOrder with settlement_status == INVOICED: -> WRITTEN_OFF"
+          - "every PartOrder with fulfillment_status IN {DRAFT, ALLOCATED, HELD}: -> CANCELLED with reservations released"
+          - "credit_used_cents recomputed"
+      - from: CREDIT_HOLD
+        to: SUSPENDED
+        trigger: "PATCH /servicer-accounts/{id} with account_status == SUSPENDED"
+        actor: CreditManager
+        preconditions:
+          - "account_status == CREDIT_HOLD"
+        side_effects:
+          - "same side effects as ACTIVE -> SUSPENDED"
+
+  - entity: PriceFile
+    initial_state: DRAFT
+    terminal_states: [SUPERSEDED, ROLLED_BACK]
+    transitions:
+      - from: DRAFT
+        to: PUBLISHED
+        trigger: "POST /price-files/{id}/publish"
+        actor: PricingAdmin
+        preconditions:
+          - "price_file_status == DRAFT"
+          - "line_count >= 1"
+          - "effective_at <= logical now"
+          - "calculations.price_window_reconciliation finds no half-open collision against any PUBLISHED file sharing a part_id"
+        side_effects:
+          - "price_file_status := PUBLISHED; published_at := logical now"
+          - "hop 1: each PriceFileLine snapshots previous_list_price_cents / previous_lifecycle_status / previous_core_deposit_cents, then writes Part.list_price_cents, Part.core_deposit_cents and Part.lifecycle_status; Part.version += 1"
+          - "hop 2: for each part whose lifecycle_status became OBSOLETE, every OrderLine with resolved_part_id == that part and line_status IN {RESOLVED, ALLOCATED} -> SUBSTITUTE_PENDING with a PENDING SubstituteRequest(source := PRICE_FILE_OBSOLESCENCE) and released reservations"
+          - "hop 3: each such line's PartOrder ALLOCATED -> HELD(SUBSTITUTE_PENDING) with subtotal/total recomputed"
+          - "hop 4: each such order's ServicerAccount.credit_used_cents recomputed"
+          - "each PUBLISHED file with a null effective_until and an earlier effective_at that shares a part: effective_until := this file's effective_at and price_file_status := SUPERSEDED"
+          - "existing OrderLine.unit_price_cents values are NOT repriced — quoted prices stay locked; only fulfillment re-prices on the SHIP_DATE basis"
+      - from: PUBLISHED
+        to: SUPERSEDED
+        trigger: "system: a later PriceFile sharing at least one part_id is published"
+        actor: system
+        preconditions:
+          - "price_file_status == PUBLISHED"
+          - "effective_until is null AND effective_at < the publishing file's effective_at"
+        side_effects:
+          - "effective_until := publishing file's effective_at (half-open adjacency, zero gap)"
+      - from: PUBLISHED
+        to: ROLLED_BACK
+        trigger: "POST /price-files/{id}/rollback"
+        actor: PricingAdmin
+        preconditions:
+          - "price_file_status == PUBLISHED"
+          - "every SubstituteRequest with created_by_price_file_id == this file has request_status == PENDING"
+        side_effects:
+          - "each PriceFileLine replays its snapshot back onto the Part (list price, core deposit, lifecycle status); Part.version += 1"
+          - "each SubstituteRequest created by this file: PENDING -> WITHDRAWN with its OrderLine SUBSTITUTE_PENDING -> RESOLVED"
+          - "each affected PartOrder HELD(SUBSTITUTE_PENDING) -> ALLOCATED with a re-allocation sweep and recomputed totals"
+          - "each SUPERSEDED file this publish had auto-closed: effective_until := null and price_file_status := PUBLISHED"
+          - "invariant: sum of Part.list_price_cents over all parts returns to its pre-publish value (compensating_invariant.catalog_price_conservation)"
+
+  - entity: TechnicianCertification
+    initial_state: ACTIVE
+    terminal_states: [REVOKED]
+    transitions:
+      - from: ACTIVE
+        to: REVOKED
+        trigger: "POST /technician-certifications/{id}/revoke"
+        actor: WarrantyAdmin
+        preconditions:
+          - "cert_status == ACTIVE"
+        side_effects:
+          - "is_effective becomes false, which immediately gates new order lines for that oem_code / cert level and blocks warranty-claim submission"
+      - from: ACTIVE
+        to: EXPIRED
+        trigger: "system: POST /servicer-accounts/{id}/tier-review sweep"
+        actor: system
+        preconditions:
+          - "cert_status == ACTIVE"
+          - "expires_at < logical now"
+        side_effects:
+          - "is_effective becomes false"
+      - from: EXPIRED
+        to: REVOKED
+        trigger: "POST /technician-certifications/{id}/revoke"
+        actor: WarrantyAdmin
+        preconditions:
+          - "cert_status == EXPIRED"
+        side_effects:
+          - "terminal lockdown: no further transitions"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules  (OCC on the parent's `version` — the only sanctioned mechanism)
+# =============================================================================
+concurrency_rules:
+  - rule_id: order-line-create-stale-order
+    parent_entity: PartOrder
+    write_endpoint: "POST /part-orders/{id}/lines"
+    occ_field: "expected_part_order_version"
+    description: |
+      Adding a line to a PartOrder whose version has advanced since the client last
+      observed it is rejected. Line creation is legitimately repeatable — a second
+      request for the same part and quantity is a valid second line, so no state
+      precondition can catch a writer working from a stale order view. The stale-version
+      check is what protects the client's credit-exposure and total_cents assumptions,
+      because every accepted line recomputes PartOrder.total_cents and the account's
+      projected credit headroom.
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+
+  - rule_id: supersession-set-stale-part
+    parent_entity: Part
+    write_endpoint: "POST /parts/{id}/supersession"
+    occ_field: "expected_part_version"
+    description: |
+      Recording a supersession pointer on a Part whose version has advanced since the
+      client last observed it is rejected. A supersession legitimately supersedes any
+      pointer already recorded, so a second sequential request would itself succeed
+      under the product semantics; the stale-version check is what stops a writer from
+      overwriting a chain link (or a price-file lifecycle change) it never saw.
+    error_id: ERR_STALE_PART_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+
+  - name: supersession_chain_resolution
+    trigger: "POST /part-orders/{id}/lines, for the requested_part_id; also re-run when a SubstituteRequest is approved"
+    algorithm: topological
+    formula: |
+      cursor := requested_part
+      hops   := 0
+      visited := { cursor.id }
+      loop:
+        if cursor.lifecycle_status == ACTIVE:
+            return (cursor, hops)                       # resolved
+        if cursor.lifecycle_status == OBSOLETE:
+            return (cursor, hops) with substitute_required := true
+        if cursor.lifecycle_status == NLA:
+            raise ERR_PART_NO_LONGER_AVAILABLE
+        # cursor.lifecycle_status == SUPERSEDED
+        if cursor.superseded_by_part_id is null:
+            raise ERR_SUPERSESSION_CHAIN_BROKEN
+        next := Part(cursor.superseded_by_part_id)
+        if next.id in visited:
+            raise ERR_SUPERSESSION_CYCLE_DETECTED
+        hops := hops + 1
+        if hops > MAX_SUPERSESSION_HOPS:
+            raise ERR_SUPERSESSION_CHAIN_TOO_LONG
+        visited := visited + { next.id }
+        cursor := next
+      # writes: OrderLine.resolved_part_id := cursor.id, OrderLine.supersession_hops := hops
+    input_set: "Part rows reachable from requested_part_id by following superseded_by_part_id; every lifecycle_status is inspected, no state filtering"
+    constants:
+      MAX_SUPERSESSION_HOPS: 5
+    precision: "integer hop count; hops == 0 when the requested part is already ACTIVE or OBSOLETE"
+
+  - name: order_line_pricing
+    trigger: "line creation (quoted basis) and POST /part-orders/{id}/fulfill (invoiced basis)"
+    algorithm: tiered_pricing
+    formula: |
+      part := the OrderLine's resolved part (see variants for WHICH snapshot of it)
+      tier := ServicerAccount.pricing_tier
+      base_discount_pct := select by part.category:
+          ELECTRICAL      -> tier.discount_pct_electrical
+          MECHANICAL      -> tier.discount_pct_mechanical
+          COSMETIC        -> tier.discount_pct_cosmetic
+          SEALED_SYSTEM   -> tier.discount_pct_sealed_system
+      volume_bonus_pct := VOLUME_DISCOUNT_PCT if OrderLine.quantity >= VOLUME_DISCOUNT_MIN_QTY else 0
+      effective_discount_pct := min(base_discount_pct + volume_bonus_pct, MAX_DISCOUNT_PCT)
+      unit_price_cents := round_half_up(part.list_price_cents * (1 - effective_discount_pct))
+      extended_price_cents := unit_price_cents * OrderLine.quantity
+      # MANDATORY ORDER: discount and rounding are applied to the UNIT price first, then the
+      # rounded unit price is multiplied by quantity. Multiplying the raw extended amount and
+      # rounding once at the end yields a different total (off-by-one cent per line at some
+      # price points) and is wrong.
+    input_set: "the single resolved Part of this line plus the account's PricingTier; no aggregation"
+    constants:
+      VOLUME_DISCOUNT_PCT: 0.02
+      VOLUME_DISCOUNT_MIN_QTY: 10
+      MAX_DISCOUNT_PCT: 0.45
+    precision: "round_half_up to whole cents on the UNIT price, before multiplying by quantity"
+    variants:
+      - name: quoted_at_order_date
+        when: "line creation (POST /part-orders/{id}/lines) — writes OrderLine.unit_price_cents / extended_price_cents and PartOrder.subtotal_cents; PartOrder.pricing_basis == ORDER_DATE"
+        difference: "reads the Part's list_price_cents / category as they stand at line-creation time and locks the result; a later PriceFile publish does NOT reprice this field"
+      - name: invoiced_at_ship_date
+        when: "POST /part-orders/{id}/fulfill — writes OrderLine.invoiced_unit_price_cents and PartOrder.invoiced_total_cents; PartOrder.pricing_basis becomes SHIP_DATE"
+        difference: "re-reads the Part's CURRENT list_price_cents (post-publish) and the account's CURRENT pricing_tier, so identical line data yields a different amount whenever a PriceFile published between order and ship; PartOrder.price_variance_cents := invoiced_total_cents - total_cents records the divergence"
+
+  - name: order_totals
+    trigger: "any line add/cancel, allocate, substitute decision, and fulfill"
+    algorithm: aggregation
+    formula: |
+      subtotal_cents := sum over OrderLine of extended_price_cents
+                        where line_status IN {RESOLVED, ALLOCATED, BACKORDERED, SHIPPED, RETURNED}
+                        # excludes CANCELLED and SUBSTITUTE_PENDING lines
+      core_deposit_total_cents := sum over OrderLine of (core_deposit_cents * quantity)
+                        where line_status IN {SHIPPED, RETURNED} and the resolved part has core_required == true
+                        # zero until fulfillment; core deposits are not quoted, they are invoiced
+      freight_cents := calculations.freight_assessment
+      total_cents := subtotal_cents + core_deposit_total_cents + freight_cents
+      # ORDER: each line's extended_price_cents is already a rounded-unit product; the subtotal
+      # is a plain sum of those integers. Freight is computed AFTER the subtotal because the
+      # free-freight collapse reads the subtotal.
+    input_set: "OrderLine rows of this PartOrder filtered by line_status as shown; SUBSTITUTE_PENDING lines are excluded from subtotal_cents, which is why an obsolescence cascade lowers an order's total"
+    constants: {}
+    precision: "integer cents throughout; no re-rounding of already-rounded line amounts"
+
+  - name: freight_assessment
+    trigger: "allocate, fulfill, line cancel, and the HELD -> ALLOCATED re-allocation sweep"
+    algorithm: waterfall_allocation
+    formula: |
+      if PartOrder.fulfillment_mode == WILL_CALL:
+          return 0                                        # customer pickup, never any freight
+      shipment_weight_grams := sum(resolved_part.weight_grams * quantity)
+                               over lines with line_status IN {ALLOCATED, SHIPPED}
+      base_cents      := OVERNIGHT_BASE_CENTS
+      weight_cents    := ceil(shipment_weight_grams / WEIGHT_BLOCK_GRAMS) * WEIGHT_BLOCK_CENTS
+      surcharge_cents := max over the DISTINCT allocation_branch_id values of those lines
+                         of Branch.overnight_surcharge_cents      # one truck per order, worst branch wins
+      late_cents      := LATE_CUTOFF_SURCHARGE_CENTS
+                         if hour_utc(logical now) >= min over those same branches of Branch.cutoff_hour_utc
+                         else 0
+      if subtotal_cents >= FREE_FREIGHT_SUBTOTAL_CENTS:
+          return late_cents                               # bucket 1+2+3 collapse to zero; bucket 4 SURVIVES
+      return base_cents + weight_cents + surcharge_cents + late_cents
+      # ORDER TRAP: the free-freight waiver is applied AFTER the four buckets are computed and
+      # waives only the first three. Applying the waiver first (returning 0) or last over the
+      # whole sum (returning 0 including late_cents) both give wrong answers.
+    input_set: "lines with line_status IN {ALLOCATED, SHIPPED} only; BACKORDERED and SUBSTITUTE_PENDING lines contribute neither weight nor branch surcharge"
+    constants:
+      OVERNIGHT_BASE_CENTS: 1495
+      WEIGHT_BLOCK_GRAMS: 5000
+      WEIGHT_BLOCK_CENTS: 250
+      LATE_CUTOFF_SURCHARGE_CENTS: 500
+      FREE_FREIGHT_SUBTOTAL_CENTS: 50000
+    precision: "integer cents; ceil on the weight-block count, never round"
+
+  - name: branch_allocation_selection
+    trigger: "POST /part-orders/{id}/allocate and the HELD -> ALLOCATED re-allocation sweep, once per line in OrderLine.created_at ASC order"
+    algorithm: waterfall_allocation
+    formula: |
+      candidates := InventoryRecord rows where part_id == line.resolved_part_id
+                    and available_units >= line.quantity
+                    and Branch.branch_status == OPEN
+      if PartOrder.fulfillment_mode == WILL_CALL:
+          candidates := candidates where branch_id == PartOrder.pickup_branch_id
+                        and Branch.will_call_enabled == true
+      if candidates is empty:
+          return none                                     # line becomes BACKORDERED
+      rank candidates by, in order:
+        1. available_units DESC                           # deepest stock first
+        2. Branch.overnight_surcharge_cents ASC           # cheapest to ship from
+        3. Branch.created_at ASC                          # deterministic final tie-break
+      return the first candidate
+      # Lines are processed in OrderLine.created_at ASC, and each accepted line's reservation is
+      # applied before the next line is ranked, so an earlier line can starve a later one at the
+      # same branch and push it to a different branch (or to BACKORDERED).
+    input_set: "InventoryRecord rows of OPEN branches whose available_units (on_hand - reserved) covers the full line quantity; partial fills are never made"
+    constants: {}
+    precision: "whole units; no partial allocation"
+
+  - name: servicer_credit_exposure
+    trigger: "line add/cancel, allocate, credit decision, fulfill, payment, RA credit, warranty credit, substitute decision, account status change"
+    algorithm: aggregation
+    formula: |
+      open_exposure := sum over PartOrder of this account of:
+          invoiced_total_cents  when settlement_status == INVOICED
+          total_cents           when settlement_status IN {PENDING_CREDIT, CREDIT_APPROVED}
+                                     and fulfillment_status IN {DRAFT, ALLOCATED, HELD}
+          0                     otherwise            # PAID, CREDIT_DECLINED, WRITTEN_OFF, CANCELLED
+      credits := sum(ReturnAuthorization.credit_amount_cents where ra_status == CREDITED)
+               + sum(WarrantyClaim.credit_amount_cents  where claim_status == CREDITED)
+      credit_used_cents := max(0, open_exposure - credits)
+      # ORDER: credits are subtracted from the aggregate, never from individual orders, and the
+      # result is floored at zero so an over-credited account reads 0 rather than a negative.
+    input_set: "PartOrder rows filtered on BOTH state dimensions as shown, minus CREDITED ReturnAuthorization and CREDITED WarrantyClaim amounts of the same account"
+    constants:
+      CREDIT_HOLD_RELEASE_RATIO: 0.90
+    precision: "integer cents; the auto-release comparison uses credit_used_cents <= floor(credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO)"
+
+  - name: core_liability_balance
+    trigger: "fulfill (adds), RA receive with reason_code == CORE_RETURN (releases)"
+    algorithm: aggregation
+    formula: |
+      core_liability_cents :=
+          sum(OrderLine.core_deposit_cents * OrderLine.quantity
+              over lines with line_status IN {SHIPPED, RETURNED}
+              whose resolved part has core_required == true)
+        - sum(ReturnAuthorization.core_deposit_refund_cents
+              over RAs of this account with ra_status == CREDITED and reason_code == CORE_RETURN)
+      # CONSERVED QUANTITY: for any part shipped with a core deposit and later core-returned in
+      # full, the account's core_liability_cents returns to exactly its pre-shipment value. The
+      # refund is computed from the line's SNAPSHOTTED core_deposit_cents, not from the Part's
+      # current core_deposit_cents, so a PriceFile that changes the deposit cannot break the
+      # invariant.
+    input_set: "SHIPPED/RETURNED OrderLines of this account whose resolved part has core_required == true, minus CREDITED CORE_RETURN authorizations"
+    constants: {}
+    precision: "integer cents; exact reversal, no proration"
+
+  - name: restocking_fee_and_credit
+    trigger: "POST /return-authorizations/{id}/decision with decision == APPROVE"
+    algorithm: threshold
+    formula: |
+      line  := the RA's OrderLine
+      gross_return_cents := 0 if RA.reason_code == CORE_RETURN
+                            else line.invoiced_unit_price_cents * RA.quantity
+      # A core return refunds the DEPOSIT only, never the part price, so its gross is zero.
+      days := RA.days_since_fulfilled_at_request
+      if RA.reason_code IN {DEFECTIVE_ON_ARRIVAL, CORE_RETURN}:
+          restocking_fee_pct := 0.0
+      else if days <= RESTOCK_TIER1_MAX_DAYS:
+          restocking_fee_pct := RESTOCK_FEE_PCT_TIER1
+      else:
+          restocking_fee_pct := RESTOCK_FEE_PCT_TIER2
+      if gross_return_cents >= LARGE_RETURN_GROSS_CENTS and restocking_fee_pct > 0:
+          restocking_fee_pct := restocking_fee_pct + LARGE_RETURN_FEE_ADDER_PCT
+      if RA.fee_waived == true:
+          restocking_fee_pct := 0.0
+      restocking_fee_cents := round_half_up(gross_return_cents * restocking_fee_pct)
+      credit_amount_cents  := gross_return_cents - restocking_fee_cents
+      core_deposit_refund_cents := (line.core_deposit_cents * RA.quantity)
+                                   if RA.reason_code == CORE_RETURN else 0
+      # KEY TRAP: every percentage in this rule is keyed on gross_return_cents — the amount
+      # BEFORE the fee is deducted. Keying the large-return adder (or the tier lookup) on the
+      # post-fee credit amount changes which branch is taken and produces a different fee.
+    input_set: "one OrderLine (must be line_status == SHIPPED with returned_units + RA.quantity <= quantity); the fee tier reads the RA's days_since_fulfilled_at_request snapshot, not the current clock"
+    constants:
+      RESTOCK_FEE_PCT_TIER1: 0.10
+      RESTOCK_TIER1_MAX_DAYS: 15
+      RESTOCK_FEE_PCT_TIER2: 0.20
+      LARGE_RETURN_GROSS_CENTS: 100000
+      LARGE_RETURN_FEE_ADDER_PCT: 0.05
+    precision: "round_half_up to whole cents on the fee; the credit is the exact integer remainder so fee + credit == gross_return_cents always"
+
+  - name: return_window_days
+    trigger: "POST /return-authorizations (write-time snapshot into days_since_fulfilled_at_request)"
+    algorithm: chronological
+    formula: |
+      days_since_fulfilled_at_request :=
+          floor((logical_now_epoch_seconds - PartOrder.fulfilled_at_epoch_seconds) / 86400)
+      window := CORE_RETURN_WINDOW_DAYS if reason_code == CORE_RETURN else RETURN_WINDOW_DAYS
+      if days_since_fulfilled_at_request > window:
+          raise ERR_RETURN_WINDOW_EXPIRED
+      # Boundary: days == window is INSIDE the window (accepted); days == window + 1 is outside.
+    input_set: "the fulfilled PartOrder of the RA's line; unfulfilled orders have fulfilled_at == null and are rejected earlier by ERR_LINE_NOT_SHIPPED"
+    constants:
+      RETURN_WINDOW_DAYS: 30
+      CORE_RETURN_WINDOW_DAYS: 60
+    precision: "floor to whole days on the epoch-second difference; the comparison is > window, so exactly window days passes"
+
+  - name: servicer_delinquency_score
+    trigger: "credit decision, POST /servicer-accounts/{id}/tier-review, and GET /servicer-accounts/{id}/credit-summary"
+    algorithm: weighted_scoring
+    formula: |
+      score := DELINQUENCY_BASE_SCORE
+             - DELINQUENCY_OVERDUE_PENALTY     * overdue_invoice_count
+             - DELINQUENCY_DENIED_CLAIM_PENALTY * denied_claim_count
+             - DELINQUENCY_NLN_RETURN_PENALTY   * nln_return_count
+             + min(DELINQUENCY_CERT_BONUS_PER * effective_cert_count, DELINQUENCY_CERT_BONUS_CAP)
+      score := clamp(score, 0, 100)
+      where, for this account:
+        overdue_invoice_count := count(PartOrder with settlement_status == INVOICED
+                                       and floor((now - fulfilled_at)/86400) > credit_term_days)
+                                 # credit_term_days: NET_15 -> 15, NET_30 -> 30, NET_45 -> 45, PREPAY -> 0
+        denied_claim_count    := count(WarrantyClaim with claim_status IN {OEM_DENIED, VOID})
+        nln_return_count      := count(ReturnAuthorization with ra_status == CREDITED
+                                       and reason_code == NO_LONGER_NEEDED)
+        effective_cert_count  := count(TechnicianCertification with is_effective == true)
+      # The cert bonus is identical in both variants; only the penalty inclusion set differs.
+    input_set: "see the three counting sets above; the cert bonus counts only certifications whose is_effective is true right now"
+    constants:
+      DELINQUENCY_BASE_SCORE: 80
+      DELINQUENCY_OVERDUE_PENALTY: 15
+      DELINQUENCY_DENIED_CLAIM_PENALTY: 20
+      DELINQUENCY_NLN_RETURN_PENALTY: 8
+      DELINQUENCY_CERT_BONUS_PER: 5
+      DELINQUENCY_CERT_BONUS_CAP: 15
+      DELINQUENCY_HOLD_THRESHOLD: 40
+      DELINQUENCY_ROLLING_WINDOW_DAYS: 180
+    precision: "integer score clamped to [0, 100]; the CREDIT_HOLD trigger is score < DELINQUENCY_HOLD_THRESHOLD (strictly below 40)"
+    variants:
+      - name: rolling_recent
+        when: "POST /part-orders/{id}/credit-decision — the per-order risk gate; also reported as delinquency_score_rolling on GET /servicer-accounts/{id}/credit-summary and stored in ServicerAccount.delinquency_score"
+        difference: "counts only source rows whose anchor timestamp is within DELINQUENCY_ROLLING_WINDOW_DAYS of logical now — anchors are PartOrder.fulfilled_at for overdue invoices, WarrantyClaim.submitted_at for denied claims, ReturnAuthorization.received_at for NLN returns; older rows are ignored, so a rehabilitated account scores higher"
+      - name: lifetime
+        when: "POST /servicer-accounts/{id}/tier-review — the periodic account review that can force CREDIT_HOLD; also reported as delinquency_score_lifetime on the credit-summary read"
+        difference: "counts every qualifying row regardless of age (no window filter), so identical data yields a strictly lower-or-equal score than rolling_recent whenever any penalty row is older than the window"
+
+  - name: pricing_tier_assignment
+    trigger: "POST /servicer-accounts/{id}/tier-review"
+    algorithm: threshold
+    formula: |
+      rolling_12m_volume_cents := sum over PartOrder of this account of invoiced_total_cents
+          where settlement_status IN {INVOICED, PAID}
+            and floor((now - fulfilled_at)/86400) <= TIER_LOOKBACK_DAYS
+      eligible := PricingTier rows where min_annual_volume_cents <= rolling_12m_volume_cents
+      if eligible is empty:
+          new_tier := the PricingTier with the smallest min_annual_volume_cents
+                      (tie-break: tier_code ASC)
+      else:
+          new_tier := the eligible tier with the largest min_annual_volume_cents
+                      (tie-break: tier_code ASC)
+      ServicerAccount.pricing_tier_id := new_tier.id
+      # Existing OrderLine.unit_price_cents values are NOT repriced; only future line creations
+      # and ship-date invoicing see the new tier.
+    input_set: "INVOICED and PAID orders fulfilled within TIER_LOOKBACK_DAYS; CANCELLED, WRITTEN_OFF and unfulfilled orders never count toward volume"
+    constants:
+      TIER_LOOKBACK_DAYS: 365
+    precision: "integer cents; the tier test is min_annual_volume_cents <= volume, so an account exactly at a tier's floor qualifies for it"
+
+  - name: substitute_price_variance
+    trigger: "POST /substitute-requests/{id}/decision with decision == APPROVE"
+    algorithm: threshold
+    formula: |
+      obsolete_list  := Part(SubstituteRequest.obsolete_part_id).list_price_cents
+      substitute_list := Part(substitute_part_id).list_price_cents
+      price_variance_pct := round_half_up_4dp((substitute_list - obsolete_list) / obsolete_list)
+      if abs(price_variance_pct) > SUBSTITUTE_VARIANCE_CAP_PCT:
+          raise ERR_SUBSTITUTE_PRICE_VARIANCE
+      # Signed: a cheaper substitute yields a negative variance, and the cap is applied to the
+      # absolute value, so a substitute more than 25% cheaper is also rejected.
+    input_set: "the two Part rows' CURRENT list_price_cents (post-publish values, not the order's quoted price)"
+    constants:
+      SUBSTITUTE_VARIANCE_CAP_PCT: 0.25
+    precision: "4 decimal places, round_half_up, on the signed ratio; the cap test is a strict >, so exactly 0.2500 is accepted"
+
+  - name: warranty_claim_amount
+    trigger: "POST /warranty-claims/{id}/submit (locks claim_amount_cents)"
+    algorithm: aggregation
+    formula: |
+      line := the claim's OrderLine
+      claim_amount_cents := line.invoiced_unit_price_cents * (line.quantity - line.returned_units)
+      # Units the servicer already returned for credit are excluded, so the OEM is never billed
+      # for a part the distributor took back. credit_amount_cents stays null until the claim
+      # reaches CREDITED, at which point it is set to this locked claim_amount_cents.
+    input_set: "one SHIPPED (or partially RETURNED) OrderLine; the invoiced unit price, never the quoted unit price"
+    constants:
+      WARRANTY_CLAIM_WINDOW_DAYS: 90
+      MAX_RESUBMISSIONS: 2
+    precision: "integer cents; recomputed never — the amount is frozen at submit even if units are returned afterwards"
+
+  - name: price_window_reconciliation
+    trigger: "POST /price-files/{id}/publish"
+    algorithm: interval_merge
+    formula: |
+      new_parts := { line.part_id for line in this file's PriceFileLines }
+      for each PUBLISHED PriceFile F whose lines touch any part in new_parts:
+          F_end := F.effective_until or +infinity
+          N_end := this.effective_until or +infinity
+          # HALF-OPEN semantics [effective_at, effective_until):
+          if F.effective_at < N_end and this.effective_at < F_end:
+              # a genuine overlap, EXCEPT the auto-close case below
+              if F.effective_until is null and F.effective_at < this.effective_at:
+                  F.effective_until := this.effective_at        # adjacency, zero gap
+                  F.price_file_status := SUPERSEDED
+              else:
+                  raise ERR_PRICE_WINDOW_OVERLAP
+      # ADJACENCY IS LEGAL: a file ending exactly at 2026-09-01T00:00:00Z and one starting at
+      # 2026-09-01T00:00:00Z do NOT collide, because the earlier window excludes its end instant.
+    input_set: "PUBLISHED PriceFiles sharing at least one part_id with the publishing file; DRAFT, SUPERSEDED and ROLLED_BACK files are ignored, and files touching disjoint parts never collide"
+    constants: {}
+    precision: "instant comparison at second granularity; the resource being protected is the Part, not the file"
+
+  - name: cert_coverage_overlap
+    trigger: "POST /technician-certifications"
+    algorithm: interval_merge
+    formula: |
+      peers := TechnicianCertification rows with the same servicer_account_id, technician_name
+               and oem_code, and cert_status == ACTIVE
+      for each P in peers:
+          # CLOSED semantics [training_completed_at, expires_at] — both endpoints inclusive:
+          if new.training_completed_at <= P.expires_at
+             and P.training_completed_at <= new.expires_at:
+              raise ERR_CERT_WINDOW_OVERLAP
+      # TOUCHING IS ILLEGAL here, unlike price windows: a certification expiring exactly at
+      # 2026-06-01T00:00:00Z and a renewal trained at 2026-06-01T00:00:00Z DO collide, because a
+      # technician cannot hold two live certifications for the same OEM at the same instant.
+      # REVOKED and EXPIRED peers are excluded, so a revoked cert can be replaced immediately.
+    input_set: "ACTIVE certifications of the same (servicer_account_id, technician_name, oem_code) triple; REVOKED and EXPIRED rows never block"
+    constants: {}
+    precision: "instant comparison at second granularity; the resource being protected is the (technician_name, oem_code) pair, not the account"
+
+  - name: cert_effectiveness
+    trigger: "line creation, warranty-claim submit, delinquency scoring, credit-summary read"
+    algorithm: threshold
+    formula: |
+      is_effective := cert_status == ACTIVE
+                      and training_completed_at <= logical now
+                      and expires_at >= logical now
+      required_level := Part.cert_level_required            # NONE / ADVANCED / SEALED_SYSTEM
+      rank := { NONE: 0, BASIC: 1, ADVANCED: 2, SEALED_SYSTEM: 3 }
+      satisfied := required_level == NONE
+                   or exists an effective cert with oem_code == part.oem_code
+                      and rank[cert_level] >= rank[required_level]
+      # Boundary: expires_at exactly equal to logical now is still effective (inclusive end).
+    input_set: "TechnicianCertification rows of the ordering ServicerAccount only; certifications of other accounts never satisfy the requirement"
+    constants: {}
+    precision: "inclusive on both interval endpoints; level comparison by rank, so SEALED_SYSTEM satisfies an ADVANCED requirement but ADVANCED does not satisfy SEALED_SYSTEM"
+
+# =============================================================================
+# §1.4 Validation Rules Table (evaluated strictly in ascending priority; the FIRST
+#      violated rule decides the response, and no later rule is evaluated)
+# =============================================================================
+validations:
+
+  # --- auth / request shape -------------------------------------------------
+  - priority: 1
+    category: auth
+    check: "X-User-Role and X-User-ID headers are both present and X-User-Role is one of the six declared roles"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all"
+
+  - priority: 2
+    category: auth
+    check: "the acting X-User-Role appears in the called endpoint's roles list"
+    error_id: ERR_UNAUTHORIZED
+    http_status: 403
+    applies_to: "all"
+
+  - priority: 3
+    category: auth
+    check: "request body conforms to the endpoint's input schema: all required fields present, no unknown fields, enum values in range, integers non-negative, quantity >= 1, discount percentages in [0, 1], datetimes ISO-8601 UTC"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+
+  # --- existence ------------------------------------------------------------
+  - priority: 4
+    category: existence
+    check: "every path parameter resolves to a persisted row, validated left-to-right"
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path parameter"
+
+  - priority: 5
+    category: existence
+    check: "every foreign key in the request body resolves to a persisted row (part_id, pricing_tier_id, pickup_branch_id, return_branch_id, order_line_id, substitute_part_id, branch_id, servicer_account_id)"
+    error_id: "ERR_<ENTITY>_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with FK fields in input"
+
+  # --- ownership / scope ----------------------------------------------------
+  - priority: 6
+    category: auth
+    check: "when X-User-Role == Servicer, X-User-ID equals the servicer_account_id of the targeted PartOrder / OrderLine / SubstituteRequest / ReturnAuthorization / WarrantyClaim / ServicerAccount"
+    error_id: ERR_ACCOUNT_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "POST /part-orders, POST /part-orders/{id}/lines, POST /part-orders/{id}/cancel, POST /order-lines/{id}/cancel, POST /substitute-requests/{id}/withdraw, POST /return-authorizations, GET /part-orders/{id}, GET /servicer-accounts/{id}, GET /servicer-accounts/{id}/credit-summary"
+
+  - priority: 7
+    category: auth
+    check: "when X-User-Role == BranchCounterRep, X-User-ID equals the branch the operation acts for: pickup_branch_id for WILL_CALL allocate/fulfill, an allocation_branch_id of the order for OVERNIGHT_DROP_SHIP fulfill, return_branch_id for RA receive, branch_id for inventory writes"
+    error_id: ERR_BRANCH_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "POST /part-orders/{id}/allocate, POST /part-orders/{id}/fulfill, POST /return-authorizations/{id}/receive, POST /inventory-records, POST /inventory-records/{id}/adjustments"
+
+  # --- cross-entity state gates --------------------------------------------
+  - priority: 8
+    category: state
+    check: "the owning ServicerAccount.account_status == ACTIVE (CREDIT_HOLD and SUSPENDED accounts cannot open orders, add lines, allocate, fulfill, or file warranty claims)"
+    error_id: ERR_SERVICER_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /part-orders, POST /part-orders/{id}/lines, POST /part-orders/{id}/allocate, POST /part-orders/{id}/fulfill, POST /warranty-claims/{id}/submit"
+
+  - priority: 9
+    category: state
+    check: "every Branch the operation acts through has branch_status == OPEN (COUNT_FREEZE blocks reservations and receipts; CLOSED blocks everything)"
+    error_id: ERR_BRANCH_NOT_OPEN
+    http_status: 409
+    applies_to: "POST /part-orders/{id}/allocate, POST /part-orders/{id}/fulfill, POST /return-authorizations/{id}/receive, POST /inventory-records/{id}/adjustments"
+
+  # --- target state preconditions ------------------------------------------
+  - priority: 10
+    category: state
+    check: "PartOrder.fulfillment_status == DRAFT and settlement_status == PENDING_CREDIT"
+    error_id: ERR_ORDER_NOT_DRAFT
+    http_status: 409
+    applies_to: "POST /part-orders/{id}/lines, POST /part-orders/{id}/credit-decision"
+
+  - priority: 11
+    category: state
+    check: "PartOrder.fulfillment_status == DRAFT for allocate, == ALLOCATED for fulfill, IN {DRAFT, ALLOCATED, HELD} for cancel; and settlement_status IN {CREDIT_APPROVED, PAID} before allocate"
+    error_id: ERR_ORDER_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /part-orders/{id}/allocate, POST /part-orders/{id}/fulfill, POST /part-orders/{id}/cancel"
+
+  - priority: 12
+    category: state
+    check: "PartOrder.settlement_status is PENDING_CREDIT for a credit decision, and IN {CREDIT_APPROVED, INVOICED} for a payment"
+    error_id: ERR_SETTLEMENT_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /part-orders/{id}/credit-decision, POST /part-orders/{id}/payments"
+
+  - priority: 13
+    category: state
+    check: "OrderLine.line_status IN {RESOLVED, ALLOCATED, BACKORDERED} for cancel, and IN {SHIPPED, RETURNED} for a return authorization or warranty claim"
+    error_id: ERR_LINE_NOT_SHIPPED
+    http_status: 409
+    applies_to: "POST /return-authorizations, POST /warranty-claims"
+
+  - priority: 14
+    category: state
+    check: "OrderLine.line_status IN {RESOLVED, ALLOCATED, BACKORDERED} and the parent order is not FULFILLED or CANCELLED"
+    error_id: ERR_LINE_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /order-lines/{id}/cancel"
+
+  - priority: 15
+    category: state
+    check: "WarrantyClaim.claim_status is DRAFT for submit, SUBMITTED for an oem-response, OEM_INFO_REQUESTED for resubmit, IN {OEM_APPROVED, OEM_DENIED} for credit"
+    error_id: ERR_CLAIM_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /warranty-claims/{id}/submit, POST /warranty-claims/{id}/oem-response, POST /warranty-claims/{id}/resubmit, POST /warranty-claims/{id}/credit"
+
+  - priority: 16
+    category: state
+    check: "ReturnAuthorization.ra_status is REQUESTED for a decision and APPROVED for receive"
+    error_id: ERR_RA_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /return-authorizations/{id}/decision, POST /return-authorizations/{id}/receive"
+
+  - priority: 17
+    category: state
+    check: "SubstituteRequest.request_status == PENDING"
+    error_id: ERR_SUBSTITUTE_ALREADY_DECIDED
+    http_status: 409
+    applies_to: "POST /substitute-requests/{id}/decision, POST /substitute-requests/{id}/withdraw"
+
+  - priority: 18
+    category: state
+    check: "PriceFile.price_file_status is DRAFT for adding lines and for publish, PUBLISHED for rollback; and no SubstituteRequest created by this file has left PENDING"
+    error_id: ERR_PRICE_FILE_STATE_INVALID
+    http_status: 409
+    applies_to: "POST /price-files/{id}/lines, POST /price-files/{id}/publish, POST /price-files/{id}/rollback"
+
+  - priority: 19
+    category: state
+    check: "TechnicianCertification.cert_status != REVOKED"
+    error_id: ERR_CERT_ALREADY_REVOKED
+    http_status: 409
+    applies_to: "POST /technician-certifications/{id}/revoke"
+
+  - priority: 20
+    category: business_temporal
+    check: "PriceFile.effective_at <= logical now — a file whose window has not opened yet cannot be published"
+    error_id: ERR_PRICE_FILE_NOT_YET_EFFECTIVE
+    http_status: 409
+    applies_to: "POST /price-files/{id}/publish"
+
+  - priority: 21
+    category: business_constraint
+    check: "PriceFile.line_count >= 1"
+    error_id: ERR_PRICE_FILE_HAS_NO_LINES
+    http_status: 422
+    applies_to: "POST /price-files/{id}/publish"
+
+  # --- optimistic concurrency ---------------------------------------------
+  - priority: 22
+    category: state
+    check: "expected_part_order_version equals the PartOrder's current version"
+    error_id: ERR_STALE_ORDER_VERSION
+    http_status: 412
+    applies_to: "POST /part-orders/{id}/lines"
+
+  - priority: 23
+    category: state
+    check: "expected_part_version equals the Part's current version"
+    error_id: ERR_STALE_PART_VERSION
+    http_status: 412
+    applies_to: "POST /parts/{id}/supersession"
+
+  # --- safety / compliance (OEM authorization and technician competence) ----
+  - priority: 24
+    category: business_safety
+    check: "the resolved part's oem_code appears in ServicerAccount.oem_authorizations"
+    error_id: ERR_OEM_AUTHORIZATION_MISSING
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines, POST /warranty-claims, POST /substitute-requests/{id}/decision"
+
+  - priority: 25
+    category: business_safety
+    check: "the account holds an effective TechnicianCertification for the part's oem_code at cert_level >= the part's cert_level_required (calculations.cert_effectiveness)"
+    error_id: ERR_TECHNICIAN_CERT_REQUIRED
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines, POST /warranty-claims/{id}/submit"
+
+  - priority: 26
+    category: business_safety
+    check: "the user waiving a restocking fee is not the user who approved the order's credit (X-User-ID != PartOrder.credit_decided_by_user_id)"
+    error_id: ERR_SEGREGATION_OF_DUTIES
+    http_status: 403
+    applies_to: "POST /return-authorizations/{id}/decision"
+
+  # --- referential / graph integrity --------------------------------------
+  - priority: 27
+    category: business_referential
+    check: "the supersession walk does not terminate on a Part with lifecycle_status == NLA"
+    error_id: ERR_PART_NO_LONGER_AVAILABLE
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines"
+
+  - priority: 28
+    category: business_referential
+    check: "no Part in the walk has lifecycle_status == SUPERSEDED with a null superseded_by_part_id"
+    error_id: ERR_SUPERSESSION_CHAIN_BROKEN
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines"
+
+  - priority: 29
+    category: business_referential
+    check: "the walk does not revisit a Part already seen"
+    error_id: ERR_SUPERSESSION_CYCLE_DETECTED
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines"
+
+  - priority: 30
+    category: business_referential
+    check: "the walk terminates within MAX_SUPERSESSION_HOPS hops"
+    error_id: ERR_SUPERSESSION_CHAIN_TOO_LONG
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/lines"
+
+  - priority: 31
+    category: business_referential
+    check: "a supersession target is a different Part than the source, is not itself SUPERSEDED-to the source (no immediate 2-cycle), and shares the source's oem_code"
+    error_id: ERR_SUPERSESSION_TARGET_INVALID
+    http_status: 422
+    applies_to: "POST /parts/{id}/supersession"
+
+  # --- return constraints -------------------------------------------------
+  - priority: 32
+    category: business_constraint
+    check: "the resolved part is returnable — Part.is_returnable is true, i.e. category != ELECTRICAL and lifecycle_status != NLA; the ELECTRICAL prohibition is absolute and is NOT lifted by reason_code"
+    error_id: ERR_PART_NON_RETURNABLE
+    http_status: 422
+    applies_to: "POST /return-authorizations"
+
+  - priority: 33
+    category: business_constraint
+    check: "requested quantity plus the quantities already committed to REQUESTED / APPROVED / RECEIVED / CREDITED authorizations of the same line <= OrderLine.quantity; CORE_RETURN authorizations are counted in their own class, independent of goods returns, because they release deposits rather than units"
+    error_id: ERR_RETURN_QUANTITY_EXCEEDS_SHIPPED
+    http_status: 422
+    applies_to: "POST /return-authorizations"
+
+  - priority: 34
+    category: business_temporal
+    check: "days_since_fulfilled_at_request <= RETURN_WINDOW_DAYS (or CORE_RETURN_WINDOW_DAYS when reason_code == CORE_RETURN)"
+    error_id: ERR_RETURN_WINDOW_EXPIRED
+    http_status: 422
+    applies_to: "POST /return-authorizations"
+
+  - priority: 35
+    category: business_temporal
+    check: "floor((logical now - PartOrder.fulfilled_at)/86400) <= WARRANTY_CLAIM_WINDOW_DAYS"
+    error_id: ERR_WARRANTY_PERIOD_EXPIRED
+    http_status: 422
+    applies_to: "POST /warranty-claims/{id}/submit"
+
+  # --- interval / temporal resource conflicts -----------------------------
+  - priority: 36
+    category: business_constraint
+    check: "calculations.price_window_reconciliation finds no half-open [effective_at, effective_until) collision on any shared part against a PUBLISHED PriceFile (adjacency is legal; auto-close of an open-ended earlier file is not a collision)"
+    error_id: ERR_PRICE_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /price-files/{id}/publish"
+
+  - priority: 37
+    category: business_constraint
+    check: "calculations.cert_coverage_overlap finds no closed [training_completed_at, expires_at] collision against an ACTIVE certification of the same (servicer_account_id, technician_name, oem_code) triple (touching endpoints DO collide)"
+    error_id: ERR_CERT_WINDOW_OVERLAP
+    http_status: 409
+    applies_to: "POST /technician-certifications"
+
+  - priority: 38
+    category: business_constraint
+    check: "training_completed_at < expires_at"
+    error_id: ERR_CERT_INTERVAL_INVALID
+    http_status: 422
+    applies_to: "POST /technician-certifications"
+
+  - priority: 39
+    category: business_constraint
+    check: "effective_until is null or strictly after effective_at"
+    error_id: ERR_PRICE_INTERVAL_INVALID
+    http_status: 422
+    applies_to: "POST /price-files"
+
+  # --- substitute constraints ---------------------------------------------
+  - priority: 40
+    category: business_constraint
+    check: "an APPROVE decision supplies a substitute_part_id whose Part has lifecycle_status == ACTIVE, oem_code equal to the obsolete part's oem_code, and id different from the obsolete part; a REJECT decision supplies none"
+    error_id: ERR_SUBSTITUTE_PART_INVALID
+    http_status: 422
+    applies_to: "POST /substitute-requests/{id}/decision"
+
+  - priority: 41
+    category: business_fiscal
+    check: "abs(calculations.substitute_price_variance) <= SUBSTITUTE_VARIANCE_CAP_PCT"
+    error_id: ERR_SUBSTITUTE_PRICE_VARIANCE
+    http_status: 422
+    applies_to: "POST /substitute-requests/{id}/decision"
+
+  - priority: 42
+    category: business_constraint
+    check: "WarrantyClaim.resubmission_count < MAX_RESUBMISSIONS"
+    error_id: ERR_RESUBMISSION_LIMIT_REACHED
+    http_status: 409
+    applies_to: "POST /warranty-claims/{id}/resubmit"
+
+  # --- fulfillment-shape constraints --------------------------------------
+  - priority: 43
+    category: business_constraint
+    check: "the order has at least one non-CANCELLED OrderLine — the empty-collection case is rejected rather than allocating an empty shipment"
+    error_id: ERR_ORDER_HAS_NO_LINES
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/allocate"
+
+  - priority: 44
+    category: business_constraint
+    check: "fulfillment_mode == WILL_CALL requires pickup_branch_id and forbids ship_to_zip; fulfillment_mode == OVERNIGHT_DROP_SHIP requires ship_to_zip and forbids pickup_branch_id"
+    error_id: ERR_FULFILLMENT_MODE_MISMATCH
+    http_status: 422
+    applies_to: "POST /part-orders"
+
+  - priority: 45
+    category: business_constraint
+    check: "the pickup Branch has will_call_enabled == true"
+    error_id: ERR_WILL_CALL_NOT_ENABLED
+    http_status: 422
+    applies_to: "POST /part-orders, POST /part-orders/{id}/allocate"
+
+  - priority: 46
+    category: business_constraint
+    check: "an inventory adjustment leaves on_hand_units >= reserved_units and on_hand_units >= 0"
+    error_id: ERR_INVENTORY_NEGATIVE
+    http_status: 422
+    applies_to: "POST /inventory-records/{id}/adjustments"
+
+  # --- uniqueness ---------------------------------------------------------
+  - priority: 47
+    category: business_constraint
+    check: "part_number is unique; tier_code is unique; file_version is unique; (branch_id, part_id) is unique for InventoryRecord; (model_number, part_id, position_code) is unique for ModelPartXref; (price_file_id, part_id) is unique for PriceFileLine"
+    error_id: ERR_DUPLICATE_KEY
+    http_status: 409
+    applies_to: "POST /parts, POST /pricing-tiers, POST /price-files, POST /inventory-records, POST /model-part-xrefs, POST /price-files/{id}/lines"
+
+  # --- fiscal (evaluated last, after every safety and constraint check) ----
+  - priority: 48
+    category: business_fiscal
+    check: "calculations.servicer_credit_exposure recomputed with the pending change applied <= ServicerAccount.credit_limit_cents; the order's own total is already inside the exposure aggregate and is never added twice, and an exposure exactly equal to the limit passes while one cent more fails"
+    error_id: ERR_CREDIT_LIMIT_EXCEEDED
+    http_status: 402
+    applies_to: "POST /part-orders/{id}/lines, POST /part-orders/{id}/credit-decision"
+
+  - priority: 49
+    category: business_fiscal
+    check: "an account with credit_terms == PREPAY must have settlement_status == PAID before fulfillment"
+    error_id: ERR_PREPAY_REQUIRED
+    http_status: 402
+    applies_to: "POST /part-orders/{id}/fulfill"
+
+  - priority: 50
+    category: business_fiscal
+    check: "ServicerAccount.core_liability_cents plus the deposits this shipment would add <= ServicerAccount.core_liability_limit_cents"
+    error_id: ERR_CORE_LIABILITY_LIMIT_EXCEEDED
+    http_status: 402
+    applies_to: "POST /part-orders/{id}/fulfill"
+
+  - priority: 51
+    category: business_fiscal
+    check: "amount_cents equals total_cents for a CREDIT_APPROVED order and invoiced_total_cents for an INVOICED order — partial payments are not accepted"
+    error_id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http_status: 422
+    applies_to: "POST /part-orders/{id}/payments"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+#   api_prefix is "" — every collection sits at the top level so that each entity
+#   has a single-resource read `GET /<collection>/{id}` and each FK has a
+#   filtered-list reverse-reachability read `GET /<collection>?<fk_field>`.
+# =============================================================================
+endpoints:
+
+  # ------------------------------- Branch ----------------------------------
+  - method: POST
+    path: "/branches"
+    description: "Register a distribution branch."
+    roles: [PlatformAdmin]
+    code: 201
+    input: [code, name, region_code, "will_call_enabled?", "cutoff_hour_utc?", "overnight_surcharge_cents?"]
+    output: Branch
+    side_effects: ["branch_status defaults to OPEN"]
+
+  - method: PATCH
+    path: "/branches/{id}"
+    description: "Update branch operating attributes, including branch_status (OPEN / COUNT_FREEZE / CLOSED)."
+    roles: [PlatformAdmin]
+    code: 200
+    input: ["name?", "will_call_enabled?", "cutoff_hour_utc?", "overnight_surcharge_cents?", "branch_status?"]
+    output: Branch
+    side_effects: ["increments Branch.version by 1", "a COUNT_FREEZE or CLOSED branch stops satisfying branch_allocation_selection candidacy"]
+
+  - method: GET
+    path: "/branches"
+    description: "List branches, newest first by created_at DESC."
+    roles: [PlatformAdmin, CreditManager, PricingAdmin, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["region_code?", "branch_status?", "limit?", "offset?"]
+    output: Branch[]
+    side_effects: []
+
+  - method: GET
+    path: "/branches/{id}"
+    description: "Read one branch."
+    roles: [PlatformAdmin, CreditManager, PricingAdmin, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: Branch
+    side_effects: []
+
+  # -------------------------------- Part -----------------------------------
+  - method: POST
+    path: "/parts"
+    description: "Create a catalog part."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 201
+    input: [part_number, oem_code, description, category, list_price_cents, weight_grams, "lifecycle_status?", "core_required?", "core_deposit_cents?"]
+    output: Part
+    side_effects: ["cert_level_required and is_returnable derived from category and lifecycle_status", "superseded_by_part_id starts null"]
+
+  - method: POST
+    path: "/parts/{id}/supersession"
+    description: "Record that this part is superseded by another part, setting lifecycle_status to SUPERSEDED and linking the chain. CREATE-with-supersede write guarded by optimistic concurrency on the Part."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 200
+    input: [superseded_by_part_id, expected_part_version]
+    output: Part
+    side_effects: ["increments Part.version by 1", "lifecycle_status := SUPERSEDED, superseded_by_part_id := input", "is_returnable and cert_level_required re-derived", "lengthens the chain walked by calculations.supersession_chain_resolution"]
+
+  - method: GET
+    path: "/parts"
+    description: "List parts. Filtering by superseded_by_part_id yields the parts that a given part replaces (reverse chain lookup)."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["part_number?", "oem_code?", "category?", "lifecycle_status?", "superseded_by_part_id?", "core_required?", "limit?", "offset?"]
+    output: Part[]
+    side_effects: []
+
+  - method: GET
+    path: "/parts/{id}"
+    description: "Read one part, including its computed cert_level_required and is_returnable."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: Part
+    side_effects: []
+
+  # ----------------------------- ModelPartXref -----------------------------
+  - method: POST
+    path: "/model-part-xrefs"
+    description: "Create an immutable model-number to part cross-reference row."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 201
+    input: [model_number, part_id, position_code, xref_source]
+    output: ModelPartXref
+    side_effects: ["immutable entity: no version, no update endpoint"]
+
+  - method: GET
+    path: "/model-part-xrefs"
+    description: "Look up the parts that fit an appliance model, or the models a part fits."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["model_number?", "part_id?", "xref_source?", "limit?", "offset?"]
+    output: ModelPartXref[]
+    side_effects: []
+
+  - method: GET
+    path: "/model-part-xrefs/{id}"
+    description: "Read one cross-reference row."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: ModelPartXref
+    side_effects: []
+
+  # ------------------------------ PricingTier ------------------------------
+  - method: POST
+    path: "/pricing-tiers"
+    description: "Create a contract-pricing tier with per-category discount percentages."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 201
+    input: [tier_code, name, discount_pct_electrical, discount_pct_mechanical, discount_pct_cosmetic, discount_pct_sealed_system, min_annual_volume_cents]
+    output: PricingTier
+    side_effects: []
+
+  - method: GET
+    path: "/pricing-tiers"
+    description: "List contract-pricing tiers ordered by tier_code ASC."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["limit?", "offset?"]
+    output: PricingTier[]
+    side_effects: []
+
+  - method: GET
+    path: "/pricing-tiers/{id}"
+    description: "Read one pricing tier."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: PricingTier
+    side_effects: []
+
+  # ---------------------------- ServicerAccount ----------------------------
+  - method: POST
+    path: "/servicer-accounts"
+    description: "Open an independent-servicer account with OEM authorizations, credit terms and a pricing tier."
+    roles: [CreditManager, PlatformAdmin]
+    code: 201
+    input: [business_name, oem_authorizations, pricing_tier_id, "credit_terms?", "credit_limit_cents?", "core_liability_limit_cents?"]
+    output: ServicerAccount
+    side_effects: ["account_status defaults to ACTIVE", "credit_used_cents, core_liability_cents, rolling_12m_volume_cents start at 0", "delinquency_score initialised from calculations.servicer_delinquency_score variant rolling_recent"]
+
+  - method: PATCH
+    path: "/servicer-accounts/{id}"
+    description: "Update credit terms, limits, OEM authorizations, pricing tier, or account_status."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: ["credit_terms?", "credit_limit_cents?", "core_liability_limit_cents?", "oem_authorizations?", "pricing_tier_id?", "account_status?"]
+    output: ServicerAccount
+    side_effects: ["increments ServicerAccount.version by 1", "ACTIVE -> CREDIT_HOLD freezes the account's ALLOCATED orders to HELD and releases their reservations", "CREDIT_HOLD -> ACTIVE re-runs the allocation sweep on HELD(CREDIT_HOLD) orders", "-> SUSPENDED writes off INVOICED orders and cancels open ones"]
+
+  - method: POST
+    path: "/servicer-accounts/{id}/tier-review"
+    description: "Run the periodic account review: expire lapsed certifications, recompute lifetime delinquency, reassign the pricing tier from rolling 12-month volume, and force CREDIT_HOLD when the lifetime score is below threshold."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: ServicerAccount
+    side_effects: ["increments ServicerAccount.version by 1", "each ACTIVE TechnicianCertification whose expires_at is in the past becomes EXPIRED", "rolling_12m_volume_cents and pricing_tier_id recomputed via calculations.pricing_tier_assignment", "delinquency_score := calculations.servicer_delinquency_score variant lifetime", "when that score is below DELINQUENCY_HOLD_THRESHOLD: account_status := CREDIT_HOLD with the freeze cascade"]
+
+  - method: GET
+    path: "/servicer-accounts"
+    description: "List servicer accounts; filter by pricing_tier_id to find every account on a tier."
+    roles: [PlatformAdmin, CreditManager, PricingAdmin, WarrantyAdmin, BranchCounterRep]
+    code: 200
+    input: ["pricing_tier_id?", "account_status?", "credit_terms?", "limit?", "offset?"]
+    output: ServicerAccount[]
+    side_effects: []
+
+  - method: GET
+    path: "/servicer-accounts/{id}"
+    description: "Read one servicer account with its computed exposure fields."
+    roles: [PlatformAdmin, CreditManager, PricingAdmin, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: ServicerAccount
+    side_effects: []
+
+  - method: GET
+    path: "/servicer-accounts/{id}/credit-summary"
+    description: "Computed read: current credit and core exposure plus BOTH delinquency variants side by side, so the divergence between the rolling-window and lifetime scores is directly observable."
+    roles: [PlatformAdmin, CreditManager, Servicer]
+    code: 200
+    input: []
+    output: "{ credit_limit_cents: integer, credit_used_cents: integer, available_credit_cents: integer, core_liability_cents: integer, core_liability_limit_cents: integer, delinquency_score_rolling: integer, delinquency_score_lifetime: integer, rolling_12m_volume_cents: integer, open_order_count: integer, effective_cert_count: integer }"
+    side_effects: ["runs calculations.servicer_credit_exposure and both variants of calculations.servicer_delinquency_score without persisting either"]
+
+  # ------------------------ TechnicianCertification ------------------------
+  - method: POST
+    path: "/technician-certifications"
+    description: "Record a technician's OEM training certification for a servicer account."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 201
+    input: [servicer_account_id, technician_name, oem_code, cert_level, training_completed_at, expires_at]
+    output: TechnicianCertification
+    side_effects: ["cert_status defaults to ACTIVE", "runs calculations.cert_coverage_overlap against the account's ACTIVE certifications for the same technician_name and oem_code", "is_effective derived from the closed coverage interval and the logical clock"]
+
+  - method: POST
+    path: "/technician-certifications/{id}/revoke"
+    description: "Revoke a certification, immediately removing the competence it granted."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 200
+    input: [revocation_reason]
+    output: TechnicianCertification
+    side_effects: ["increments TechnicianCertification.version by 1", "cert_status := REVOKED and is_effective := false", "later order lines for parts requiring that level fail ERR_TECHNICIAN_CERT_REQUIRED", "the account's delinquency cert bonus drops"]
+
+  - method: GET
+    path: "/technician-certifications"
+    description: "List certifications; filter by servicer_account_id for an account's roster."
+    roles: [PlatformAdmin, WarrantyAdmin, CreditManager, PricingAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["servicer_account_id?", "oem_code?", "cert_status?", "technician_name?", "limit?", "offset?"]
+    output: TechnicianCertification[]
+    side_effects: []
+
+  - method: GET
+    path: "/technician-certifications/{id}"
+    description: "Read one certification, including computed is_effective."
+    roles: [PlatformAdmin, WarrantyAdmin, CreditManager, PricingAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: TechnicianCertification
+    side_effects: []
+
+  # ----------------------------- InventoryRecord ---------------------------
+  - method: POST
+    path: "/inventory-records"
+    description: "Open a branch-part inventory position."
+    roles: [BranchCounterRep, PlatformAdmin]
+    code: 201
+    input: [branch_id, part_id, "on_hand_units?", "reorder_point?"]
+    output: InventoryRecord
+    side_effects: ["reserved_units starts 0; available_units := on_hand_units - reserved_units", "unique on (branch_id, part_id)"]
+
+  - method: POST
+    path: "/inventory-records/{id}/adjustments"
+    description: "Post a signed physical-count adjustment to on_hand_units."
+    roles: [BranchCounterRep, PlatformAdmin]
+    code: 200
+    input: [delta_units, adjustment_reason]
+    output: InventoryRecord
+    side_effects: ["increments InventoryRecord.version by 1", "on_hand_units += delta_units, available_units recomputed", "last_counted_at := logical now", "rejected when the result would drive on_hand_units below reserved_units"]
+
+  - method: GET
+    path: "/inventory-records"
+    description: "List inventory positions; filter by branch_id or part_id for multi-branch availability."
+    roles: [PlatformAdmin, BranchCounterRep, CreditManager, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: ["branch_id?", "part_id?", "limit?", "offset?"]
+    output: InventoryRecord[]
+    side_effects: []
+
+  - method: GET
+    path: "/inventory-records/{id}"
+    description: "Read one inventory position with computed available_units."
+    roles: [PlatformAdmin, BranchCounterRep, CreditManager, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: []
+    output: InventoryRecord
+    side_effects: []
+
+  # -------------------------------- PriceFile ------------------------------
+  - method: POST
+    path: "/price-files"
+    description: "Open a DRAFT price file with a half-open effectivity window [effective_at, effective_until)."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 201
+    input: [file_version, effective_at, "effective_until?"]
+    output: PriceFile
+    side_effects: ["price_file_status defaults to DRAFT", "line_count starts 0"]
+
+  - method: POST
+    path: "/price-files/{id}/lines"
+    description: "Add a part-level price / deposit / lifecycle change to a DRAFT price file."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 201
+    input: [part_id, new_list_price_cents, "new_core_deposit_cents?", "new_lifecycle_status?"]
+    output: PriceFileLine
+    side_effects: ["increments PriceFile.version by 1 and PriceFile.line_count by 1", "previous_* snapshot columns stay null until publish"]
+
+  - method: POST
+    path: "/price-files/{id}/publish"
+    description: "Publish a DRAFT price file: apply every line to its Part, auto-close any open-ended earlier file on the same parts, and cascade obsolescence into open order lines."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 200
+    input: []
+    output: PriceFile
+    side_effects: ["increments PriceFile.version by 1", "price_file_status := PUBLISHED, published_at := logical now", "each PriceFileLine snapshots previous_list_price_cents / previous_core_deposit_cents / previous_lifecycle_status then writes the Part (Part.version += 1)", "parts turned OBSOLETE push their RESOLVED/ALLOCATED order lines to SUBSTITUTE_PENDING, creating PENDING SubstituteRequests with source PRICE_FILE_OBSOLESCENCE and releasing reservations", "those lines' orders go ALLOCATED -> HELD(SUBSTITUTE_PENDING) with recomputed subtotal_cents / total_cents", "those orders' ServicerAccount.credit_used_cents recomputed", "runs calculations.price_window_reconciliation; open-ended earlier files become SUPERSEDED with effective_until := this file's effective_at", "existing OrderLine.unit_price_cents values are NOT repriced"]
+
+  - method: POST
+    path: "/price-files/{id}/rollback"
+    description: "Roll a PUBLISHED price file back, replaying every snapshot onto its Part and undoing the obsolescence cascade."
+    roles: [PricingAdmin, PlatformAdmin]
+    code: 200
+    input: [rollback_reason]
+    output: PriceFile
+    side_effects: ["increments PriceFile.version by 1", "price_file_status := ROLLED_BACK", "each PriceFileLine restores Part.list_price_cents / core_deposit_cents / lifecycle_status from its previous_* snapshot (Part.version += 1)", "SubstituteRequests created by this file: PENDING -> WITHDRAWN with their lines SUBSTITUTE_PENDING -> RESOLVED", "affected orders HELD(SUBSTITUTE_PENDING) -> ALLOCATED with a re-allocation sweep and recomputed totals", "files this publish had auto-closed return to PUBLISHED with effective_until := null", "conserves the sum of Part.list_price_cents across the catalog"]
+
+  - method: GET
+    path: "/price-files"
+    description: "List price files."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["price_file_status?", "file_version?", "limit?", "offset?"]
+    output: PriceFile[]
+    side_effects: []
+
+  - method: GET
+    path: "/price-files/{id}"
+    description: "Read one price file with computed line_count."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: PriceFile
+    side_effects: []
+
+  - method: GET
+    path: "/price-file-lines"
+    description: "List price-file lines; filter by price_file_id for a file's contents or by part_id for a part's price history."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["price_file_id?", "part_id?", "limit?", "offset?"]
+    output: PriceFileLine[]
+    side_effects: []
+
+  - method: GET
+    path: "/price-file-lines/{id}"
+    description: "Read one price-file line, including its previous_* snapshot columns after publish."
+    roles: [PlatformAdmin, PricingAdmin, CreditManager, WarrantyAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: PriceFileLine
+    side_effects: []
+
+  # -------------------------------- PartOrder ------------------------------
+  - method: POST
+    path: "/part-orders"
+    description: "Open a DRAFT parts order for a servicer account in either WILL_CALL or OVERNIGHT_DROP_SHIP mode."
+    roles: [Servicer, BranchCounterRep, PlatformAdmin]
+    code: 201
+    input: [servicer_account_id, fulfillment_mode, "pickup_branch_id?", "ship_to_zip?", "purchase_order_ref?"]
+    output: PartOrder
+    side_effects: ["fulfillment_status := DRAFT, settlement_status := PENDING_CREDIT, pricing_basis := ORDER_DATE", "subtotal_cents / core_deposit_total_cents / freight_cents / total_cents start at 0", "rejected when the owning account is not ACTIVE"]
+
+  - method: POST
+    path: "/part-orders/{id}/lines"
+    description: "Add a line to a DRAFT order. Resolves the requested part through its supersession chain, prices it on the ORDER_DATE basis, and checks OEM authorization, technician certification and credit headroom. Guarded by optimistic concurrency on the PartOrder."
+    roles: [Servicer, BranchCounterRep, PlatformAdmin]
+    code: 201
+    input: [requested_part_id, quantity, expected_part_order_version]
+    output: OrderLine
+    side_effects: ["increments PartOrder.version by 1", "runs calculations.supersession_chain_resolution to set resolved_part_id and supersession_hops", "runs calculations.order_line_pricing variant quoted_at_order_date to set unit_price_cents and extended_price_cents", "line_status := RESOLVED, or SUBSTITUTE_PENDING with a PENDING SubstituteRequest (source CHAIN_TERMINAL_OBSOLETE) when the chain ends on an OBSOLETE part", "runs calculations.order_totals then calculations.servicer_credit_exposure"]
+
+  - method: POST
+    path: "/order-lines/{id}/cancel"
+    description: "Cancel a single order line, releasing any reservation it holds."
+    roles: [Servicer, BranchCounterRep, PlatformAdmin]
+    code: 200
+    input: [cancellation_reason]
+    output: OrderLine
+    side_effects: ["increments OrderLine.version by 1 and PartOrder.version by 1", "line_status := CANCELLED", "when the line was ALLOCATED: InventoryRecord.reserved_units -= quantity and available_units returns to its pre-allocation value", "any PENDING SubstituteRequest of the line becomes WITHDRAWN", "recomputes calculations.order_totals, calculations.freight_assessment and calculations.servicer_credit_exposure"]
+
+  - method: POST
+    path: "/part-orders/{id}/credit-decision"
+    description: "Credit-manager decision on a DRAFT order: APPROVE moves settlement_status to CREDIT_APPROVED, DECLINE to CREDIT_DECLINED. Records the deciding user for later segregation-of-duties checks."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: [decision, "decision_note?"]
+    output: PartOrder
+    side_effects: ["increments PartOrder.version by 1", "credit_decided_by_user_id := X-User-ID", "settlement_status := CREDIT_APPROVED or CREDIT_DECLINED", "ServicerAccount.delinquency_score := calculations.servicer_delinquency_score variant rolling_recent", "on DECLINE with a score below DELINQUENCY_HOLD_THRESHOLD: ServicerAccount ACTIVE -> CREDIT_HOLD with the freeze cascade", "enforces ERR_CREDIT_LIMIT_EXCEEDED against the order's total_cents"]
+
+  - method: POST
+    path: "/part-orders/{id}/allocate"
+    description: "Allocate a credit-approved order from multi-branch inventory, reserving units line by line in OrderLine.created_at ASC order."
+    roles: [BranchCounterRep, PlatformAdmin]
+    code: 200
+    input: []
+    output: PartOrder
+    side_effects: ["increments PartOrder.version by 1", "requires settlement_status IN {CREDIT_APPROVED, PAID}", "runs calculations.branch_allocation_selection per line: ALLOCATED with a reservation, or BACKORDERED", "each reservation increments InventoryRecord.reserved_units and InventoryRecord.version", "fulfillment_status := ALLOCATED, or HELD with hold_reason BACKORDER when no line could be reserved", "recomputes calculations.freight_assessment, calculations.order_totals and calculations.servicer_credit_exposure", "rejected with ERR_ORDER_HAS_NO_LINES when the order has no non-cancelled line"]
+
+  - method: POST
+    path: "/part-orders/{id}/fulfill"
+    description: "Ship or hand over an allocated order. Re-prices every shipping line on the SHIP_DATE basis, snapshots core deposits, and consumes inventory."
+    roles: [BranchCounterRep, PlatformAdmin]
+    code: 200
+    input: ["tracking_ref?"]
+    output: PartOrder
+    side_effects: ["increments PartOrder.version by 1", "pricing_basis := SHIP_DATE; each ALLOCATED line gets invoiced_unit_price_cents from calculations.order_line_pricing variant invoiced_at_ship_date and line_status := SHIPPED", "core_deposit_cents snapshotted per line for core-required parts", "InventoryRecord.on_hand_units and reserved_units both decrease by the line quantity", "invoiced_total_cents and price_variance_cents written", "fulfillment_status := FULFILLED, fulfilled_at := logical now, tracking_ref stored", "settlement_status CREDIT_APPROVED -> INVOICED for NET terms; PREPAY orders must already be PAID", "ServicerAccount.core_liability_cents and credit_used_cents recomputed"]
+
+  - method: POST
+    path: "/part-orders/{id}/cancel"
+    description: "Cancel an order that has not shipped, releasing all reservations."
+    roles: [Servicer, CreditManager, PlatformAdmin]
+    code: 200
+    input: [cancellation_reason]
+    output: PartOrder
+    side_effects: ["increments PartOrder.version by 1", "fulfillment_status := CANCELLED and every open line := CANCELLED with reservations released", "PENDING SubstituteRequests of those lines := WITHDRAWN", "settlement_status CREDIT_APPROVED -> CREDIT_DECLINED", "subtotal_cents / total_cents := 0 and ServicerAccount.credit_used_cents recomputed"]
+
+  - method: POST
+    path: "/part-orders/{id}/payments"
+    description: "Post a full payment against an order: the prepay settlement before shipment, or the invoice settlement after it."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: [amount_cents, "payment_reference?"]
+    output: PartOrder
+    side_effects: ["increments PartOrder.version by 1", "settlement_status := PAID", "ServicerAccount.credit_used_cents recomputed", "when the account is on CREDIT_HOLD and credit_used_cents falls to or below credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO: CREDIT_HOLD -> ACTIVE with the HELD-order release cascade", "rejected when amount_cents does not equal the exact amount due"]
+
+  - method: GET
+    path: "/part-orders"
+    description: "List orders; filter by servicer_account_id for an account's book or by pickup_branch_id for a branch's will-call queue."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: ["servicer_account_id?", "pickup_branch_id?", "fulfillment_status?", "settlement_status?", "fulfillment_mode?", "hold_reason?", "limit?", "offset?"]
+    output: PartOrder[]
+    side_effects: []
+
+  - method: GET
+    path: "/part-orders/{id}"
+    description: "Read one order with both state dimensions and all computed money fields."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: []
+    output: PartOrder
+    side_effects: []
+
+  - method: GET
+    path: "/order-lines"
+    description: "List order lines; filter by part_order_id for an order's lines, by requested_part_id or resolved_part_id for a part's demand, or by allocation_branch_id for a branch's pick list."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: ["part_order_id?", "requested_part_id?", "resolved_part_id?", "allocation_branch_id?", "line_status?", "limit?", "offset?"]
+    output: OrderLine[]
+    side_effects: []
+
+  - method: GET
+    path: "/order-lines/{id}"
+    description: "Read one order line with its resolved part, supersession hop count and both price bases."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, PricingAdmin, WarrantyAdmin, Servicer]
+    code: 200
+    input: []
+    output: OrderLine
+    side_effects: []
+
+  # ---------------------------- SubstituteRequest ---------------------------
+  - method: POST
+    path: "/substitute-requests/{id}/decision"
+    description: "Approve a substitute part for an obsolete line (repricing the line) or reject it (cancelling the line)."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 200
+    input: [decision, "substitute_part_id?", "decision_note?"]
+    output: SubstituteRequest
+    side_effects: ["increments SubstituteRequest.version by 1", "decided_by_user_id := X-User-ID", "on APPROVE: proposed_substitute_part_id set, price_variance_pct from calculations.substitute_price_variance, OrderLine SUBSTITUTE_PENDING -> RESOLVED with resolved_part_id := the substitute and repriced unit_price_cents", "on REJECT: OrderLine SUBSTITUTE_PENDING -> CANCELLED with extended_price_cents := 0", "when no PENDING request remains on the order: PartOrder HELD -> ALLOCATED with a re-allocation sweep", "recomputes calculations.order_totals and calculations.servicer_credit_exposure"]
+
+  - method: POST
+    path: "/substitute-requests/{id}/withdraw"
+    description: "Servicer withdraws a substitute request, leaving the line backordered so the part can be sourced elsewhere."
+    roles: [Servicer, PlatformAdmin]
+    code: 200
+    input: [withdrawal_reason]
+    output: SubstituteRequest
+    side_effects: ["increments SubstituteRequest.version by 1", "request_status := WITHDRAWN", "OrderLine SUBSTITUTE_PENDING -> BACKORDERED", "PartOrder HELD -> ALLOCATED when no PENDING request remains"]
+
+  - method: GET
+    path: "/substitute-requests"
+    description: "List substitute requests; filter by order_line_id, by obsolete_part_id or proposed_substitute_part_id for part-level history, or by created_by_price_file_id to see everything one publish created."
+    roles: [PlatformAdmin, WarrantyAdmin, PricingAdmin, CreditManager, BranchCounterRep, Servicer]
+    code: 200
+    input: ["order_line_id?", "obsolete_part_id?", "proposed_substitute_part_id?", "created_by_price_file_id?", "request_status?", "source?", "limit?", "offset?"]
+    output: SubstituteRequest[]
+    side_effects: []
+
+  - method: GET
+    path: "/substitute-requests/{id}"
+    description: "Read one substitute request with its computed price_variance_pct."
+    roles: [PlatformAdmin, WarrantyAdmin, PricingAdmin, CreditManager, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: SubstituteRequest
+    side_effects: []
+
+  # ------------------------------ WarrantyClaim -----------------------------
+  - method: POST
+    path: "/warranty-claims"
+    description: "Open a DRAFT warranty claim against a shipped line, to be filed with the OEM on the servicer's behalf."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 201
+    input: [servicer_account_id, order_line_id, defect_code, appliance_model_number]
+    output: WarrantyClaim
+    side_effects: ["claim_status := DRAFT, resubmission_count := 0", "oem_code copied from the line's resolved part", "requires the account to hold that OEM's authorization"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/submit"
+    description: "Submit the claim to the OEM, locking the claim amount."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 200
+    input: ["oem_reference?"]
+    output: WarrantyClaim
+    side_effects: ["increments WarrantyClaim.version by 1", "claim_status := SUBMITTED, submitted_at := logical now", "claim_amount_cents locked via calculations.warranty_claim_amount", "requires an effective TechnicianCertification for the claim's oem_code and a fulfillment date inside WARRANTY_CLAIM_WINDOW_DAYS"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/oem-response"
+    description: "Record the OEM's response: APPROVED, DENIED, or INFO_REQUESTED (which sends the claim back for resubmission)."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 200
+    input: [outcome, "oem_reference?", "oem_note?"]
+    output: WarrantyClaim
+    side_effects: ["increments WarrantyClaim.version by 1", "claim_status := OEM_APPROVED / OEM_DENIED / OEM_INFO_REQUESTED", "a DENIED outcome adds a denied-claim penalty to both variants of calculations.servicer_delinquency_score"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/resubmit"
+    description: "Resubmit a claim the OEM sent back for more information; bounded by MAX_RESUBMISSIONS."
+    roles: [WarrantyAdmin, PlatformAdmin]
+    code: 200
+    input: [additional_info]
+    output: WarrantyClaim
+    side_effects: ["increments WarrantyClaim.version by 1", "claim_status := SUBMITTED, resubmission_count += 1, submitted_at := logical now", "claim_amount_cents is NOT recomputed", "rejected with ERR_RESUBMISSION_LIMIT_REACHED once resubmission_count reaches MAX_RESUBMISSIONS"]
+
+  - method: POST
+    path: "/warranty-claims/{id}/credit"
+    description: "Close an adjudicated claim: credit the servicer for an approved claim, or void a denied one."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: ["increments WarrantyClaim.version by 1", "on OEM_APPROVED: claim_status := CREDITED and credit_amount_cents := claim_amount_cents", "on OEM_DENIED: claim_status := VOID and credit_amount_cents := 0", "ServicerAccount.credit_used_cents recomputed via calculations.servicer_credit_exposure"]
+
+  - method: GET
+    path: "/warranty-claims"
+    description: "List warranty claims; filter by servicer_account_id or order_line_id."
+    roles: [PlatformAdmin, WarrantyAdmin, CreditManager, PricingAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: ["servicer_account_id?", "order_line_id?", "claim_status?", "oem_code?", "limit?", "offset?"]
+    output: WarrantyClaim[]
+    side_effects: []
+
+  - method: GET
+    path: "/warranty-claims/{id}"
+    description: "Read one warranty claim."
+    roles: [PlatformAdmin, WarrantyAdmin, CreditManager, PricingAdmin, BranchCounterRep, Servicer]
+    code: 200
+    input: []
+    output: WarrantyClaim
+    side_effects: []
+
+  # --------------------------- ReturnAuthorization --------------------------
+  - method: POST
+    path: "/return-authorizations"
+    description: "Request a return authorization against a shipped line. Snapshots the elapsed-days figure that later drives the restocking-fee tier, and enforces the electrical-part non-returnable rule."
+    roles: [Servicer, BranchCounterRep, PlatformAdmin]
+    code: 201
+    input: [servicer_account_id, order_line_id, quantity, reason_code, return_branch_id]
+    output: ReturnAuthorization
+    side_effects: ["ra_status := REQUESTED, fee_waived := false, created_by_user_id := X-User-ID", "days_since_fulfilled_at_request := calculations.return_window_days", "gross_return_cents := invoiced_unit_price_cents * quantity for goods returns and 0 for CORE_RETURN", "rejected with ERR_PART_NON_RETURNABLE for ELECTRICAL or NLA parts, before the return-window check"]
+
+  - method: POST
+    path: "/return-authorizations/{id}/decision"
+    description: "Approve or reject a return request; approval computes the restocking fee and the credit. Waiving the fee requires a different user than the one who approved the order's credit."
+    roles: [CreditManager, PlatformAdmin]
+    code: 200
+    input: [decision, "waive_restocking_fee?", "decision_note?"]
+    output: ReturnAuthorization
+    side_effects: ["increments ReturnAuthorization.version by 1", "decided_by_user_id := X-User-ID, fee_waived := waive_restocking_fee", "on APPROVE: restocking_fee_pct / restocking_fee_cents / credit_amount_cents / core_deposit_refund_cents from calculations.restocking_fee_and_credit", "on REJECT: all four amounts zeroed and no downstream effect", "enforces ERR_SEGREGATION_OF_DUTIES on a fee waiver by the order's credit approver"]
+
+  - method: POST
+    path: "/return-authorizations/{id}/receive"
+    description: "Receive the returned goods at the return branch and post the credit in the same request."
+    roles: [BranchCounterRep, PlatformAdmin]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects: ["increments ReturnAuthorization.version by 1", "ra_status := RECEIVED then CREDITED, received_at := logical now", "WRONG_PART and NO_LONGER_NEEDED restock InventoryRecord.on_hand_units at return_branch_id (creating the record when absent); DEFECTIVE_ON_ARRIVAL and CORE_RETURN do not restock", "OrderLine.returned_units += quantity and SHIPPED -> RETURNED at full quantity for non-core reasons", "ServicerAccount.credit_used_cents -= credit_amount_cents and core_liability_cents -= core_deposit_refund_cents", "when the account is on CREDIT_HOLD and exposure falls to or below credit_limit_cents * CREDIT_HOLD_RELEASE_RATIO: CREDIT_HOLD -> ACTIVE, releasing HELD(CREDIT_HOLD) orders and re-reserving their inventory"]
+
+  - method: GET
+    path: "/return-authorizations"
+    description: "List return authorizations; filter by servicer_account_id, order_line_id or return_branch_id for a branch's receiving queue."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, WarrantyAdmin, PricingAdmin, Servicer]
+    code: 200
+    input: ["servicer_account_id?", "order_line_id?", "return_branch_id?", "ra_status?", "reason_code?", "limit?", "offset?"]
+    output: ReturnAuthorization[]
+    side_effects: []
+
+  - method: GET
+    path: "/return-authorizations/{id}"
+    description: "Read one return authorization with its fee and credit breakdown."
+    roles: [PlatformAdmin, CreditManager, BranchCounterRep, WarrantyAdmin, PricingAdmin, Servicer]
+    code: 200
+    input: []
+    output: ReturnAuthorization
+    side_effects: []
+
+  # ------------------------------ test-driving ------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical UTC clock to an arbitrary instant so return windows, warranty windows, certification intervals and price-file effectivity are deterministic. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z; it never falls back to wall-clock time."
+    roles: [PlatformAdmin]
+    code: 200
+    input: [current_utc]
+    output: "{ current_utc: string }"
+    side_effects: ["every subsequent logical-now read, day-count computation and is_effective / interval evaluation uses this instant", "no stored state is recomputed by the call itself"]
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+
+  # --- auth / request shape -------------------------------------------------
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role or X-User-ID header missing, or X-User-Role is not one of the six declared roles"
+  - id: ERR_UNAUTHORIZED
+    http: 403
+    condition: "the acting role is not listed in the called endpoint's roles"
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "missing required input field, unknown field, out-of-range enum, negative money or unit value, quantity < 1, discount percentage outside [0, 1], or malformed datetime"
+  - id: ERR_ACCOUNT_SCOPE_VIOLATION
+    http: 403
+    condition: "a Servicer acts on a PartOrder, OrderLine, SubstituteRequest, ReturnAuthorization, WarrantyClaim or ServicerAccount belonging to a different servicer_account_id"
+  - id: ERR_BRANCH_SCOPE_VIOLATION
+    http: 403
+    condition: "a BranchCounterRep allocates, fulfills, receives a return, or writes inventory for a branch other than the one its X-User-ID identifies"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "the user waiving a restocking fee is the same user who approved that order's credit"
+
+  # --- existence ------------------------------------------------------------
+  - id: ERR_BRANCH_NOT_FOUND
+    http: 404
+    condition: "a branch id in the path or body does not exist"
+  - id: ERR_PART_NOT_FOUND
+    http: 404
+    condition: "a part id in the path or body does not exist"
+  - id: ERR_MODEL_PART_XREF_NOT_FOUND
+    http: 404
+    condition: "a model-part cross-reference id does not exist"
+  - id: ERR_PRICING_TIER_NOT_FOUND
+    http: 404
+    condition: "a pricing tier id does not exist"
+  - id: ERR_SERVICER_ACCOUNT_NOT_FOUND
+    http: 404
+    condition: "a servicer account id does not exist"
+  - id: ERR_TECHNICIAN_CERTIFICATION_NOT_FOUND
+    http: 404
+    condition: "a technician certification id does not exist"
+  - id: ERR_INVENTORY_RECORD_NOT_FOUND
+    http: 404
+    condition: "an inventory record id does not exist"
+  - id: ERR_PRICE_FILE_NOT_FOUND
+    http: 404
+    condition: "a price file id does not exist"
+  - id: ERR_PRICE_FILE_LINE_NOT_FOUND
+    http: 404
+    condition: "a price file line id does not exist"
+  - id: ERR_PART_ORDER_NOT_FOUND
+    http: 404
+    condition: "a part order id does not exist"
+  - id: ERR_ORDER_LINE_NOT_FOUND
+    http: 404
+    condition: "an order line id in the path or body does not exist"
+  - id: ERR_SUBSTITUTE_REQUEST_NOT_FOUND
+    http: 404
+    condition: "a substitute request id does not exist"
+  - id: ERR_WARRANTY_CLAIM_NOT_FOUND
+    http: 404
+    condition: "a warranty claim id does not exist"
+  - id: ERR_RETURN_AUTHORIZATION_NOT_FOUND
+    http: 404
+    condition: "a return authorization id does not exist"
+
+  # --- cross-entity state ---------------------------------------------------
+  - id: ERR_SERVICER_NOT_ACTIVE
+    http: 409
+    condition: "the owning ServicerAccount.account_status is CREDIT_HOLD or SUSPENDED when opening an order, adding a line, allocating, fulfilling, or submitting a warranty claim"
+  - id: ERR_BRANCH_NOT_OPEN
+    http: 409
+    condition: "a branch the operation acts through has branch_status COUNT_FREEZE or CLOSED"
+
+  # --- target state ---------------------------------------------------------
+  - id: ERR_ORDER_NOT_DRAFT
+    http: 409
+    condition: "a line add or credit decision targets an order whose fulfillment_status is not DRAFT or whose settlement_status is not PENDING_CREDIT"
+  - id: ERR_ORDER_STATE_INVALID
+    http: 409
+    condition: "allocate on a non-DRAFT order or one whose settlement_status is neither CREDIT_APPROVED nor PAID, fulfill on a non-ALLOCATED order, or cancel on a FULFILLED or already CANCELLED order"
+  - id: ERR_SETTLEMENT_STATE_INVALID
+    http: 409
+    condition: "a credit decision on an already decided order, or a payment on an order that is neither CREDIT_APPROVED nor INVOICED"
+  - id: ERR_LINE_NOT_SHIPPED
+    http: 409
+    condition: "a return authorization or warranty claim targets an OrderLine whose line_status is not SHIPPED or RETURNED"
+  - id: ERR_LINE_STATE_INVALID
+    http: 409
+    condition: "cancelling an OrderLine that is already SHIPPED, RETURNED, CANCELLED or SUBSTITUTE_PENDING, or whose order has shipped"
+  - id: ERR_CLAIM_STATE_INVALID
+    http: 409
+    condition: "a warranty-claim action is attempted from a claim_status the transition table does not allow, including any action on a CREDITED or VOID claim"
+  - id: ERR_RA_STATE_INVALID
+    http: 409
+    condition: "a return-authorization decision on a non-REQUESTED authorization, or a receive on one that is not APPROVED"
+  - id: ERR_SUBSTITUTE_ALREADY_DECIDED
+    http: 409
+    condition: "a decision or withdrawal targets a SubstituteRequest whose request_status is not PENDING"
+  - id: ERR_PRICE_FILE_STATE_INVALID
+    http: 409
+    condition: "adding lines to or publishing a non-DRAFT price file, rolling back a non-PUBLISHED file, or rolling back a file whose substitute requests have already been decided"
+  - id: ERR_CERT_ALREADY_REVOKED
+    http: 409
+    condition: "revoking a certification whose cert_status is already REVOKED"
+  - id: ERR_PRICE_FILE_NOT_YET_EFFECTIVE
+    http: 409
+    condition: "publishing a price file whose effective_at is later than the logical clock"
+  - id: ERR_PRICE_FILE_HAS_NO_LINES
+    http: 422
+    condition: "publishing a price file with line_count == 0"
+
+  # --- optimistic concurrency ---------------------------------------------
+  - id: ERR_STALE_ORDER_VERSION
+    http: 412
+    condition: "expected_part_order_version does not match the PartOrder's current version on a line add"
+  - id: ERR_STALE_PART_VERSION
+    http: 412
+    condition: "expected_part_version does not match the Part's current version on a supersession write"
+
+  # --- safety / compliance ------------------------------------------------
+  - id: ERR_OEM_AUTHORIZATION_MISSING
+    http: 422
+    condition: "the resolved part's oem_code is absent from the servicer account's oem_authorizations"
+  - id: ERR_TECHNICIAN_CERT_REQUIRED
+    http: 422
+    condition: "no effective TechnicianCertification of the account covers the part's oem_code at the required cert level (ADVANCED for ELECTRICAL, SEALED_SYSTEM for SEALED_SYSTEM)"
+
+  # --- supersession graph -------------------------------------------------
+  - id: ERR_PART_NO_LONGER_AVAILABLE
+    http: 422
+    condition: "the supersession walk terminates on a Part with lifecycle_status NLA"
+  - id: ERR_SUPERSESSION_CHAIN_BROKEN
+    http: 422
+    condition: "a Part in the walk is SUPERSEDED but has a null superseded_by_part_id"
+  - id: ERR_SUPERSESSION_CYCLE_DETECTED
+    http: 422
+    condition: "the walk revisits a Part it has already seen"
+  - id: ERR_SUPERSESSION_CHAIN_TOO_LONG
+    http: 422
+    condition: "the walk exceeds MAX_SUPERSESSION_HOPS hops without reaching a terminal lifecycle_status"
+  - id: ERR_SUPERSESSION_TARGET_INVALID
+    http: 422
+    condition: "a supersession target is the part itself, already points back at the source, or belongs to a different oem_code"
+
+  # --- returns ------------------------------------------------------------
+  - id: ERR_PART_NON_RETURNABLE
+    http: 422
+    condition: "the returned part's category is ELECTRICAL or its lifecycle_status is NLA — checked before the return window, so an out-of-window electrical return still reports this error"
+  - id: ERR_RETURN_QUANTITY_EXCEEDS_SHIPPED
+    http: 422
+    condition: "the requested return quantity plus quantities already committed to other authorizations of the line exceeds the line's shipped quantity"
+  - id: ERR_RETURN_WINDOW_EXPIRED
+    http: 422
+    condition: "more than RETURN_WINDOW_DAYS days (or CORE_RETURN_WINDOW_DAYS for a core return) have elapsed since the order was fulfilled"
+  - id: ERR_WARRANTY_PERIOD_EXPIRED
+    http: 422
+    condition: "more than WARRANTY_CLAIM_WINDOW_DAYS days have elapsed since the order was fulfilled"
+
+  # --- interval conflicts --------------------------------------------------
+  - id: ERR_PRICE_WINDOW_OVERLAP
+    http: 409
+    condition: "publishing a price file whose half-open [effective_at, effective_until) window collides with a PUBLISHED file covering a shared part; abutting windows do not collide"
+  - id: ERR_CERT_WINDOW_OVERLAP
+    http: 409
+    condition: "a new certification's closed [training_completed_at, expires_at] interval touches or overlaps an ACTIVE certification for the same technician_name and oem_code on the same account"
+  - id: ERR_CERT_INTERVAL_INVALID
+    http: 422
+    condition: "training_completed_at is not strictly before expires_at"
+  - id: ERR_PRICE_INTERVAL_INVALID
+    http: 422
+    condition: "effective_until is present and not strictly after effective_at"
+
+  # --- substitutes and resubmission ---------------------------------------
+  - id: ERR_SUBSTITUTE_PART_INVALID
+    http: 422
+    condition: "an APPROVE decision omits substitute_part_id, names the obsolete part itself, names a part that is not ACTIVE, or names a part with a different oem_code; or a REJECT decision supplies a substitute_part_id"
+  - id: ERR_SUBSTITUTE_PRICE_VARIANCE
+    http: 422
+    condition: "the absolute signed list-price variance between substitute and obsolete part exceeds SUBSTITUTE_VARIANCE_CAP_PCT"
+  - id: ERR_RESUBMISSION_LIMIT_REACHED
+    http: 409
+    condition: "resubmitting a claim whose resubmission_count has already reached MAX_RESUBMISSIONS"
+
+  # --- fulfillment shape ---------------------------------------------------
+  - id: ERR_ORDER_HAS_NO_LINES
+    http: 422
+    condition: "allocating an order with no non-cancelled OrderLine — the empty-collection case"
+  - id: ERR_FULFILLMENT_MODE_MISMATCH
+    http: 422
+    condition: "WILL_CALL without pickup_branch_id or with ship_to_zip, or OVERNIGHT_DROP_SHIP without ship_to_zip or with pickup_branch_id"
+  - id: ERR_WILL_CALL_NOT_ENABLED
+    http: 422
+    condition: "the designated pickup branch has will_call_enabled false"
+  - id: ERR_INVENTORY_NEGATIVE
+    http: 422
+    condition: "an inventory adjustment would drive on_hand_units below 0 or below reserved_units"
+
+  # --- uniqueness ---------------------------------------------------------
+  - id: ERR_DUPLICATE_KEY
+    http: 409
+    condition: "duplicate part_number, tier_code, file_version, (branch_id, part_id), (model_number, part_id, position_code) or (price_file_id, part_id)"
+
+  # --- fiscal --------------------------------------------------------------
+  - id: ERR_CREDIT_LIMIT_EXCEEDED
+    http: 402
+    condition: "the account's projected credit_used_cents after the pending line or decision would exceed credit_limit_cents; an exposure exactly equal to the limit is allowed"
+  - id: ERR_PREPAY_REQUIRED
+    http: 402
+    condition: "fulfilling an order for a PREPAY account whose settlement_status is not PAID"
+  - id: ERR_CORE_LIABILITY_LIMIT_EXCEEDED
+    http: 402
+    condition: "the deposits this shipment would add push core_liability_cents past core_liability_limit_cents"
+  - id: ERR_PAYMENT_AMOUNT_MISMATCH
+    http: 422
+    condition: "amount_cents does not equal total_cents (CREDIT_APPROVED) or invoiced_total_cents (INVOICED)"
+
+# =============================================================================
+# §1.7 RBAC Matrix  (role_model: segregation_of_duties)
+# =============================================================================
+roles:
+
+  - name: Servicer
+    description: "An independent appliance-repair business buying parts on account. Sees and acts only on its own account's orders, returns and substitute requests."
+    identity: "entity_backed:ServicerAccount"
+    exclusive_operations:
+      - "POST /substitute-requests/{id}/withdraw"
+      - "GET /servicer-accounts/{id}/credit-summary for its own account"
+    shared_operations:
+      - "POST /part-orders"
+      - "POST /part-orders/{id}/lines"
+      - "POST /part-orders/{id}/cancel"
+      - "POST /order-lines/{id}/cancel"
+      - "POST /return-authorizations"
+      - "all GET reads, scoped to its own account for account-bearing entities"
+
+  - name: BranchCounterRep
+    description: "Counter and warehouse staff at one distribution branch. Owns the physical side: inventory, allocation, hand-over, and receiving returns for its own branch only."
+    identity: "entity_backed:Branch"
+    exclusive_operations:
+      - "POST /part-orders/{id}/allocate"
+      - "POST /part-orders/{id}/fulfill"
+      - "POST /return-authorizations/{id}/receive"
+      - "POST /inventory-records"
+      - "POST /inventory-records/{id}/adjustments"
+    shared_operations:
+      - "POST /part-orders"
+      - "POST /part-orders/{id}/lines"
+      - "POST /order-lines/{id}/cancel"
+      - "POST /return-authorizations"
+      - "all GET reads"
+
+  - name: CreditManager
+    description: "Owns the money side: account terms and limits, order credit decisions, payments, return-credit approvals and warranty credits. Cannot allocate or ship, and cannot waive a restocking fee on an order whose credit it approved."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /servicer-accounts"
+      - "PATCH /servicer-accounts/{id}"
+      - "POST /servicer-accounts/{id}/tier-review"
+      - "POST /part-orders/{id}/credit-decision"
+      - "POST /part-orders/{id}/payments"
+      - "POST /return-authorizations/{id}/decision"
+      - "POST /warranty-claims/{id}/credit"
+    shared_operations:
+      - "POST /part-orders/{id}/cancel"
+      - "all GET reads"
+
+  - name: WarrantyAdmin
+    description: "Owns OEM-facing work: technician certifications, warranty claim lifecycle up to adjudication, and substitute-part approval for obsolete lines. Cannot issue the resulting credit."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /technician-certifications"
+      - "POST /technician-certifications/{id}/revoke"
+      - "POST /warranty-claims"
+      - "POST /warranty-claims/{id}/submit"
+      - "POST /warranty-claims/{id}/oem-response"
+      - "POST /warranty-claims/{id}/resubmit"
+      - "POST /substitute-requests/{id}/decision"
+    shared_operations:
+      - "all GET reads"
+
+  - name: PricingAdmin
+    description: "Owns the catalog and the price book: parts, supersession links, cross-references, pricing tiers, and price-file publish / rollback. Cannot touch accounts, orders or money."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /parts"
+      - "POST /parts/{id}/supersession"
+      - "POST /model-part-xrefs"
+      - "POST /pricing-tiers"
+      - "POST /price-files"
+      - "POST /price-files/{id}/lines"
+      - "POST /price-files/{id}/publish"
+      - "POST /price-files/{id}/rollback"
+    shared_operations:
+      - "all GET reads"
+
+  - name: PlatformAdmin
+    description: "Operator role for branch registration and test-time clock control. Also permitted on every business write as a break-glass operator, but is still bound by the segregation-of-duties check on restocking-fee waivers."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /branches"
+      - "PATCH /branches/{id}"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "every POST and PATCH declared above"
+      - "all GET reads"
+

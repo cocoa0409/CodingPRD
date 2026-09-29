@@ -1,0 +1,108 @@
+"""Error catalogue (PRD §5) and the ApiError exception.
+
+Every error_id below appears verbatim in PRD §5 with the HTTP status given there.
+"""
+
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_STEM_PACKAGE_NOT_FOUND": 404,
+    "ERR_DELIVERABLE_NOT_FOUND": 404,
+    "ERR_MIX_BOOKING_NOT_FOUND": 404,
+    "ERR_ADR_SESSION_NOT_FOUND": 404,
+    "ERR_LIBRARY_ASSET_NOT_FOUND": 404,
+    "ERR_REFERENCE_NOT_FOUND": 404,
+    "ERR_NOT_ASSIGNED_MIXER": 403,
+    "ERR_NOT_PROJECT_CLIENT": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    "ERR_STALE_PROJECT_VERSION": 412,
+    "ERR_STALE_STEM_PACKAGE_VERSION": 412,
+    "ERR_PROJECT_FROZEN": 409,
+    "ERR_PROJECT_ARCHIVED": 409,
+    "ERR_PICTURE_NOT_LOCKED": 409,
+    "ERR_INVALID_STATE": 409,
+    "ERR_STEM_NOT_CONFORMED": 409,
+    "ERR_BOOKING_NOT_COMPLETED": 409,
+    "ERR_CLIENT_SIGNOFF_REQUIRED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_MIXER_NOT_CERTIFIED": 422,
+    "ERR_UNLICENSED_MATERIAL_PRESENT": 409,
+    "ERR_LICENSE_RISK_TOO_HIGH": 409,
+    "ERR_REMEDIATION_LIMIT_EXCEEDED": 409,
+    "ERR_SPEC_PLATFORM_MISMATCH": 422,
+    "ERR_CROSS_PROJECT_REFERENCE": 422,
+    "ERR_STAGE_NO_REMOTE_REVIEW": 422,
+    "ERR_WINDOW_INVALID": 422,
+    "ERR_WINDOW_AFTER_DEADLINE": 422,
+    "ERR_STAGE_WINDOW_CONFLICT": 409,
+    "ERR_TALENT_WINDOW_CONFLICT": 409,
+    "ERR_TALENT_DAILY_CAP_EXCEEDED": 409,
+    "ERR_MIXER_DAILY_LIMIT_EXCEEDED": 409,
+    "ERR_WINDOW_ELAPSED": 409,
+    "ERR_EMPTY_STEM_SET": 422,
+    "ERR_ADR_LINES_EXCEEDED": 422,
+    "ERR_NO_DELIVERED_DELIVERABLE": 409,
+    "ERR_DELIVERABLE_STILL_OPEN": 409,
+    "ERR_STAGE_HOURS_EXCEEDED": 409,
+    "ERR_ALREADY_ARCHIVED": 409,
+    "ERR_ALREADY_SIGNED_OFF": 409,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "The X-User-ID header is absent or empty.",
+    "ERR_ROLE_NOT_PERMITTED": "The X-User-Role header is absent, unknown, or not authorised for this endpoint.",
+    "ERR_PROJECT_NOT_FOUND": "The project path parameter does not resolve to a project.",
+    "ERR_STEM_PACKAGE_NOT_FOUND": "The stem-package path parameter does not resolve to a stem package.",
+    "ERR_DELIVERABLE_NOT_FOUND": "The deliverable path parameter does not resolve to a deliverable.",
+    "ERR_MIX_BOOKING_NOT_FOUND": "The mix-booking path parameter does not resolve to a mix stage booking.",
+    "ERR_ADR_SESSION_NOT_FOUND": "The ADR-session path parameter does not resolve to an ADR session.",
+    "ERR_LIBRARY_ASSET_NOT_FOUND": "The library-asset path parameter does not resolve to a library asset.",
+    "ERR_REFERENCE_NOT_FOUND": "A referenced record does not exist.",
+    "ERR_NOT_ASSIGNED_MIXER": "Only the mixer assigned to this booking may perform this action.",
+    "ERR_NOT_PROJECT_CLIENT": "The acting user is not the client reviewer named on this project.",
+    "ERR_INVALID_REQUEST": "The request body failed schema validation.",
+    "ERR_INVALID_PAGINATION": "limit must be an integer between 1 and 100 and offset an integer of at least 0.",
+    "ERR_STALE_PROJECT_VERSION": "expected_project_version does not equal the project's current version.",
+    "ERR_STALE_STEM_PACKAGE_VERSION": "expected_stem_package_version does not equal the stem package's current version.",
+    "ERR_PROJECT_FROZEN": "The project's derived posture blocks this operation.",
+    "ERR_PROJECT_ARCHIVED": "The project has been archived and accepts no further writes.",
+    "ERR_PICTURE_NOT_LOCKED": "This operation requires the project's picture_status to be LOCKED.",
+    "ERR_INVALID_STATE": "The target entity's current status has no transition for the requested action.",
+    "ERR_STEM_NOT_CONFORMED": "The referenced stem package is not CONFORMED.",
+    "ERR_BOOKING_NOT_COMPLETED": "The referenced mix stage booking is not COMPLETED.",
+    "ERR_CLIENT_SIGNOFF_REQUIRED": "A remote-attendance booking requires client sign-off before completion.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this user from performing this QC operation.",
+    "ERR_MIXER_NOT_CERTIFIED": "The assigned mixer is not certified for the requested platform.",
+    "ERR_UNLICENSED_MATERIAL_PRESENT": "The project holds at least one unlicensed asset usage.",
+    "ERR_LICENSE_RISK_TOO_HIGH": "The project's licence risk audit score is at or above the block threshold.",
+    "ERR_REMEDIATION_LIMIT_EXCEEDED": "The deliverable has consumed its remediation allowance.",
+    "ERR_SPEC_PLATFORM_MISMATCH": "The platform specification does not match the booking's platform.",
+    "ERR_CROSS_PROJECT_REFERENCE": "A referenced record belongs to a different project.",
+    "ERR_STAGE_NO_REMOTE_REVIEW": "The mix stage is not wired for client remote review.",
+    "ERR_WINDOW_INVALID": "window_end_utc must be later than window_start_utc.",
+    "ERR_WINDOW_AFTER_DEADLINE": "window_end_utc falls after the project's delivery deadline.",
+    "ERR_STAGE_WINDOW_CONFLICT": "The requested stage window conflicts with an existing occupation.",
+    "ERR_TALENT_WINDOW_CONFLICT": "The requested window overlaps another session of the same talent.",
+    "ERR_TALENT_DAILY_CAP_EXCEEDED": "The talent's daily billable-minute cap would be exceeded.",
+    "ERR_MIXER_DAILY_LIMIT_EXCEEDED": "The mixer's daily reserved-hour maximum would be exceeded.",
+    "ERR_WINDOW_ELAPSED": "The booking window has already elapsed.",
+    "ERR_EMPTY_STEM_SET": "The stem package holds no ACTIVE music cues.",
+    "ERR_ADR_LINES_EXCEEDED": "lines_recorded exceeds the session's lines_scheduled.",
+    "ERR_NO_DELIVERED_DELIVERABLE": "The project has no delivered deliverable.",
+    "ERR_DELIVERABLE_STILL_OPEN": "The project still has an open deliverable.",
+    "ERR_STAGE_HOURS_EXCEEDED": "The reservation exceeds the project's available stage hours.",
+    "ERR_ALREADY_ARCHIVED": "An archive package already exists for this project.",
+    "ERR_ALREADY_SIGNED_OFF": "This booking has already been signed off.",
+}
+
+
+class ApiError(Exception):
+    """Carries an error_id from PRD §5 plus its HTTP status."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)

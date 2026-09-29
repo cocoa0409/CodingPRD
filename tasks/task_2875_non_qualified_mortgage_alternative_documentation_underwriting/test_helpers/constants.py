@@ -1,0 +1,140 @@
+"""Domain constants for the non-QM alternative-documentation underwriting API.
+
+Every literal here is taken from the PRD: role names (PRD 2.1), error identifiers
+and their HTTP statuses (PRD 5), numeric precision rules (PRD 2.5), the logical
+clock default (PRD 2.6) and the named calculation constants (PRD 3).
+"""
+
+# --- Roles (PRD 2.1) -------------------------------------------------------
+ROLE_PROGRAM_ADMIN = "ProgramAdmin"
+ROLE_LOAN_OFFICER = "LoanOfficer"
+ROLE_UNDERWRITER = "Underwriter"
+ROLE_CREDIT_COMMITTEE = "CreditCommittee"
+ROLE_CHIEF_CREDIT_OFFICER = "ChiefCreditOfficer"
+ROLE_APPRAISAL_REVIEWER = "AppraisalReviewer"
+ROLE_POST_CLOSE_AUDITOR = "PostCloseAuditor"
+ROLE_SECURITIZATION_ANALYST = "SecuritizationAnalyst"
+
+ALL_ROLES = [
+    ROLE_PROGRAM_ADMIN,
+    ROLE_LOAN_OFFICER,
+    ROLE_UNDERWRITER,
+    ROLE_CREDIT_COMMITTEE,
+    ROLE_CHIEF_CREDIT_OFFICER,
+    ROLE_APPRAISAL_REVIEWER,
+    ROLE_POST_CLOSE_AUDITOR,
+    ROLE_SECURITIZATION_ANALYST,
+]
+
+# --- Logical clock (PRD 2.6) ----------------------------------------------
+DEFAULT_CLOCK_UTC = "2026-08-01T00:00:00Z"
+
+# --- Pagination (PRD 2.3) -------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Common field sets (PRD 2.4) ------------------------------------------
+# Every resource carries id and created_at; every resource except CreditEvent
+# also carries updated_at and version.
+COMMON_FIELDS_FULL = ["id", "created_at", "updated_at", "version"]
+COMMON_FIELDS_WRITE_ONCE = ["id", "created_at"]
+
+# --- Named calculation constants (PRD 3) ----------------------------------
+HOEPA_TIER_BOUNDARY_CENTS = 2486600
+LARGE_LOAN_CAP_PCT = "5.00"
+SMALL_LOAN_CAP_PCT = "8.00"
+SMALL_LOAN_FLAT_CAP_CENTS = 124300
+RETIREMENT_FULL_ACCESS_AGE = 60
+BROKERAGE_HAIRCUT_FACTOR = "0.90"
+RETIREMENT_HAIRCUT_FACTOR = "0.70"
+LEASE_OVERAGE_CAP_FACTOR = "1.20"
+MARKET_RENT_VACANCY_FACTOR = "0.75"
+VARIANCE_ESCALATION_PCT = "10.00"
+VALIDITY_WINDOW_DAYS = 120
+REORDER_BUFFER_DAYS = 30
+FIRST_LIEN_HIGHER_PRICED_SPREAD_PCT = "6.500"
+SECOND_LIEN_HIGHER_PRICED_SPREAD_PCT = "8.500"
+WEIGHT_MINOR = 1
+WEIGHT_SIGNIFICANT = 3
+WEIGHT_MATERIAL = 6
+MATERIAL_SCORE_THRESHOLD = 6
+
+# --- Enumerations (PRD 2 / PRD 4) -----------------------------------------
+DOC_TYPES = ["BANK_STATEMENT", "ASSET_DEPLETION", "DSCR", "PROFIT_AND_LOSS"]
+INCOME_METHODS = ["BANK_STATEMENT", "ASSET_DEPLETION", "DSCR", "PROFIT_AND_LOSS"]
+OCCUPANCIES = ["PRIMARY", "SECOND_HOME", "INVESTMENT"]
+PURPOSES = ["PURCHASE", "RATE_TERM_REFI", "CASH_OUT_REFI"]
+LIEN_POSITIONS = ["FIRST", "SECOND"]
+AMORTIZATION_TYPES = ["FULLY_AMORTIZING", "INTEREST_ONLY"]
+EXPENSE_FACTOR_SOURCES = ["PROGRAM_DEFAULT", "CPA_LETTER"]
+VALUATION_TYPES = [
+    "PRIMARY_APPRAISAL",
+    "SECOND_APPRAISAL",
+    "DESK_REVIEW",
+    "FIELD_REVIEW",
+]
+CREDIT_EVENT_TYPES = [
+    "FORECLOSURE",
+    "SHORT_SALE",
+    "DEED_IN_LIEU",
+    "BK_CH7",
+    "BK_CH13",
+    "MODIFICATION",
+    "MORTGAGE_LATE_60",
+]
+PROGRAM_CODES = [
+    "BANK_STATEMENT_12MO",
+    "BANK_STATEMENT_24MO",
+    "ASSET_DEPLETION",
+    "DSCR",
+    "PROFIT_AND_LOSS",
+]
+FEE_CATEGORIES = [
+    "ORIGINATION_POINTS",
+    "DISCOUNT_POINTS",
+    "AFFILIATE_TITLE",
+    "THIRD_PARTY_UNAFFILIATED",
+    "PMI_UPFRONT",
+    "ESCROW_TAXES",
+    "PREPAYMENT_PENALTY",
+    "LOAN_LEVEL_PRICE_ADJUSTMENT",
+]
+FINDING_CATEGORIES = [
+    "INCOME_CALCULATION",
+    "ATR_DOCUMENTATION",
+    "POINTS_AND_FEES",
+    "APPRAISAL",
+    "SEASONING",
+    "OVERLAY_EXCEPTION",
+]
+FINDING_SEVERITIES = ["MINOR", "SIGNIFICANT", "MATERIAL"]
+AUDIT_GRADES = ["A_CLEAN", "B_MINOR", "C_MATERIAL"]
+SAMPLE_REASONS = ["RANDOM", "DISCRETIONARY", "INVESTOR_REQUEST"]
+ADJUDICATION_DECISIONS = ["UPHOLD", "WAIVE", "RETURN_FOR_MORE_INFO"]
+REMOVAL_REASONS = ["LOAN_INELIGIBLE", "ANALYST_DISCRETION", "SETTLEMENT_FINALIZED"]
+OVERLAY_METRICS = [
+    "MIN_FICO",
+    "MAX_LTV_PCT",
+    "MIN_DSCR",
+    "MAX_DTI_PCT",
+    "MIN_RESERVES_MONTHS",
+    "MIN_SEASONING_MONTHS",
+    "MAX_LOAN_AMOUNT_CENTS",
+]
+OVERLAY_COMPARATORS = ["GTE", "LTE"]
+OVERLAY_SEVERITIES = ["MINOR", "MATERIAL"]
+
+# --- The standard seasoning matrix used by the PRD's programs -------------
+SEASONING_MATRIX = {
+    "FORECLOSURE": 36,
+    "SHORT_SALE": 24,
+    "DEED_IN_LIEU": 24,
+    "BK_CH7": 24,
+    "BK_CH13": 12,
+    "MODIFICATION": 12,
+    "MORTGAGE_LATE_60": 12,
+}
+
+DEFAULT_INVESTOR_CODE = "INV-ATLAS"

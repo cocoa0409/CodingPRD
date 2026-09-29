@@ -1,0 +1,145 @@
+"""
+Test infrastructure for the Valve Manufacturing & Product Certification API.
+
+Layers:
+- ``constants``   — PRD-declared vocabularies, factors, thresholds and weights
+- ``types``       — status vocabularies and entity shapes
+- ``api_errors``  — the §5 error catalogue and its HTTP status mapping
+- ``api_client``  — one method per endpoint in the §4 table
+- ``factories``   — request-payload builders
+- ``assertions``  — domain-level assertions over returned resources
+- ``test_users``  — identity headers for the seven roles
+- ``fixtures``    — composite state builders that climb the traceability chain
+"""
+
+from . import assertions, constants, factories, fixtures, types  # noqa: F401
+from .api_client import ApiClient, api_client
+from .api_errors import HTTP_STATUS_CODES, ErrorId
+from .assertions import (
+    assert_common_fields,
+    assert_created,
+    assert_decimal_equals,
+    assert_emission_classes,
+    assert_finding_identity,
+    assert_foundry_band,
+    assert_immutable_test_record,
+    assert_index_band_consistent,
+    assert_list_contains_exactly,
+    assert_lot_mass_balance,
+    assert_mass,
+    assert_money_conservation,
+    assert_object_envelope,
+    assert_ok,
+    assert_percentage,
+    assert_torque,
+    assert_torque_envelope,
+    assert_unit_dimensions,
+)
+from .constants import (
+    API_PREFIX,
+    FRESH_CLOCK_UTC,
+    MAX_LIMIT,
+    ROLE_FIELD_SERVICE_COORDINATOR,
+    ROLE_MONOGRAM_AUDITOR,
+    ROLE_PROCUREMENT_SPECIALIST,
+    ROLE_PRODUCT_ENGINEER,
+    ROLE_QUALITY_MANAGER,
+    ROLE_SUPPLIER_REP,
+    ROLE_TEST_TECHNICIAN,
+)
+from .test_users import (
+    TEST_USERS,
+    make_field_service_coordinator_headers,
+    make_headers,
+    make_headers_without_identity,
+    make_monogram_auditor_headers,
+    make_procurement_specialist_headers,
+    make_product_engineer_headers,
+    make_quality_manager_headers,
+    make_supplier_rep_headers,
+    make_test_technician_headers,
+)
+from .types import (
+    AuditState,
+    BuildStatus,
+    CertStatus,
+    CompliancePosture,
+    ComponentStatus,
+    DocPackageStatus,
+    EmissionLeakClass,
+    FoundryStatus,
+    HeatLotStatus,
+    LicenseStatus,
+    ModelStatus,
+    OrderStatus,
+    QualificationStatus,
+    ServiceStatus,
+    SizingStatus,
+    TestResult,
+)
+
+__all__ = [
+    "ApiClient",
+    "api_client",
+    "ErrorId",
+    "HTTP_STATUS_CODES",
+    "TEST_USERS",
+    "API_PREFIX",
+    "FRESH_CLOCK_UTC",
+    "MAX_LIMIT",
+    "ROLE_PRODUCT_ENGINEER",
+    "ROLE_PROCUREMENT_SPECIALIST",
+    "ROLE_SUPPLIER_REP",
+    "ROLE_TEST_TECHNICIAN",
+    "ROLE_QUALITY_MANAGER",
+    "ROLE_MONOGRAM_AUDITOR",
+    "ROLE_FIELD_SERVICE_COORDINATOR",
+    "make_headers",
+    "make_headers_without_identity",
+    "make_product_engineer_headers",
+    "make_procurement_specialist_headers",
+    "make_test_technician_headers",
+    "make_quality_manager_headers",
+    "make_monogram_auditor_headers",
+    "make_field_service_coordinator_headers",
+    "make_supplier_rep_headers",
+    "assert_common_fields",
+    "assert_created",
+    "assert_decimal_equals",
+    "assert_emission_classes",
+    "assert_finding_identity",
+    "assert_foundry_band",
+    "assert_immutable_test_record",
+    "assert_index_band_consistent",
+    "assert_list_contains_exactly",
+    "assert_lot_mass_balance",
+    "assert_mass",
+    "assert_money_conservation",
+    "assert_object_envelope",
+    "assert_ok",
+    "assert_percentage",
+    "assert_torque",
+    "assert_torque_envelope",
+    "assert_unit_dimensions",
+    "AuditState",
+    "BuildStatus",
+    "CertStatus",
+    "CompliancePosture",
+    "ComponentStatus",
+    "DocPackageStatus",
+    "EmissionLeakClass",
+    "FoundryStatus",
+    "HeatLotStatus",
+    "LicenseStatus",
+    "ModelStatus",
+    "OrderStatus",
+    "QualificationStatus",
+    "ServiceStatus",
+    "SizingStatus",
+    "TestResult",
+    "assertions",
+    "constants",
+    "factories",
+    "fixtures",
+    "types",
+]

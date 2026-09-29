@@ -1,0 +1,90 @@
+"""Error catalog (PRD section 5) and the ApiError exception."""
+
+ERROR_STATUS = {
+    # ---- authentication / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    # ---- not found
+    "ERR_AFFILIATION_NOT_FOUND": 404,
+    "ERR_PRACTICE_NOT_FOUND": 404,
+    "ERR_DOCTOR_NOT_FOUND": 404,
+    "ERR_CONVERSION_VENDOR_NOT_FOUND": 404,
+    "ERR_DOCTOR_EMPLOYMENT_NOT_FOUND": 404,
+    "ERR_SERVICE_AGREEMENT_NOT_FOUND": 404,
+    "ERR_MIGRATION_BATCH_NOT_FOUND": 404,
+    "ERR_PAYER_CONTRACT_NOT_FOUND": 404,
+    "ERR_PAYER_ENROLLMENT_NOT_FOUND": 404,
+    "ERR_EARNOUT_TRANCHE_NOT_FOUND": 404,
+    "ERR_SUPPLY_EXCEPTION_NOT_FOUND": 404,
+    "ERR_VENDOR_CONSOLIDATION_NOT_FOUND": 404,
+    "ERR_QUALITY_REVIEW_NOT_FOUND": 404,
+    # ---- payload
+    "ERR_INVALID_REQUEST": 400,
+    # ---- optimistic concurrency
+    "ERR_STALE_AFFILIATION_VERSION": 412,
+    "ERR_STALE_PRACTICE_VERSION": 412,
+    # ---- state
+    "ERR_INVALID_AFFILIATION_STATE": 409,
+    "ERR_INVALID_TRANCHE_STATE": 409,
+    "ERR_INVALID_EMPLOYMENT_STATE": 409,
+    "ERR_INVALID_BATCH_STATE": 409,
+    "ERR_INVALID_ENROLLMENT_STATE": 409,
+    "ERR_INVALID_AGREEMENT_STATE": 409,
+    "ERR_INVALID_CONTRACT_STATE": 409,
+    "ERR_INVALID_WORKFLOW_STATE": 409,
+    "ERR_PRACTICE_NOT_AFFILIATED": 409,
+    "ERR_PRACTICE_POSTURE_BLOCKED": 409,
+    # ---- business rules
+    "ERR_LICENSE_STATE_MISMATCH": 422,
+    "ERR_CORPORATE_PRACTICE_VIOLATION": 422,
+    "ERR_SELF_REVIEW_PROHIBITED": 422,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_NON_COMPETE_EXPIRED": 422,
+    "ERR_NO_TARGET_PRACTICE": 422,
+    "ERR_NO_POST_CLOSE_EMPLOYMENT": 422,
+    "ERR_SERVICE_AGREEMENT_NOT_EFFECTIVE": 422,
+    "ERR_SERVICE_SCOPE_EMPTY": 422,
+    "ERR_FEE_SCHEDULE_EMPTY": 422,
+    "ERR_ENROLLMENTS_NOT_APPROVED": 422,
+    "ERR_ENROLLMENT_PERIOD_OVERLAP": 409,
+    "ERR_CUTOVER_WINDOW_CONFLICT": 409,
+    "ERR_MEASUREMENT_PERIOD_OVERLAP": 409,
+    "ERR_CUTOVER_WINDOW_NOT_STARTED": 409,
+    "ERR_CREDENTIALING_LEAD_TIME_SHORT": 422,
+    "ERR_MEASUREMENT_PERIOD_NOT_STARTED": 422,
+    "ERR_CLOCK_NOT_MONOTONIC": 422,
+    "ERR_VENDOR_WINDOW_CAPACITY": 409,
+    "ERR_QUARANTINE_COUNT_EXCEEDS_TOTAL": 422,
+    "ERR_SAMPLE_SIZE_TOO_SMALL": 422,
+    "ERR_DUPLICATE_NPI": 409,
+    "ERR_DUPLICATE_PROCEDURE_CODE": 409,
+    "ERR_DUPLICATE_SERVICE_CODE": 409,
+    "ERR_REPRICING_LIMIT_REACHED": 422,
+    "ERR_EARNOUT_POOL_LOCKED": 409,
+    "ERR_QUALITY_OUTCOME_MISMATCH": 422,
+    "ERR_STAFFING_RATIO_OUT_OF_RANGE": 422,
+    "ERR_MGMT_FEE_CAP_EXCEEDED": 422,
+    "ERR_FEE_EROSION_MATERIAL": 422,
+    "ERR_EARNOUT_POOL_EXCEEDED": 422,
+    "ERR_COMP_HARMONIZATION_CAP_EXCEEDED": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or malformed.",
+    "ERR_UNAUTHORIZED": "The caller's role is not permitted to perform this operation.",
+    "ERR_INVALID_REQUEST": "The request payload is invalid.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )
+
+
+def invalid(message="The request payload is invalid."):
+    return ApiError("ERR_INVALID_REQUEST", message)

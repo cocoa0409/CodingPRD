@@ -1,0 +1,2640 @@
+scenario: |
+  Generate task harder than expert level!
+
+  2442. Family Child Care Network & Shared Services (family child care network): provider recruitment, licensing support and network membership agreements, shared back-office services covering enrollment, billing and food program claiming, substitute pool coordination for provider illness and vacation, group purchasing of supplies, curriculum and insurance, coaching visits, quality standards and network compliance review, subsidy contract administration on behalf of providers with payment reconciliation, provider revenue modeling and tuition setting guidance, network exit and family transition support
+
+domain_name: family-child-care-network
+api_prefix: /fccn
+
+complexity_profile:
+  difficulty_level: expert_plus   # §0.4 Expert band, upper end (12 entities, 56 endpoints, 7 calculations, 7 state machines)
+  primary_archetype: ledger_reconciliation      # subsidy claiming: provisional advance vs final reconciliation over the same attendance data
+  secondary_archetype: quota_allocation         # substitute pool selection + contracted subsidy slot conservation
+  complexity_layers:
+    - optimistic_concurrency          # OCC on Provider.version and SubsidyContract.version (§1.2.1)
+    - cascading_side_effects          # 4-hop escalation cascade, 3-hop network-exit cascade
+    - dual_variant_calculation        # subsidy claim amount (fiscal) and provider quality score (quality)
+    - derived_field_reconciliation    # Provider.projected_monthly_revenue_cents vs GET revenue-model recompute
+
+  entity_topology: hybrid
+  # All writes are flat collections carrying FK fields in the body (POST /fccn/enrollments with
+  # provider_id, POST /fccn/subsidy-claims with contract_id). Read-only sub-resource GETs are nested
+  # under /fccn/providers/{id}/... and /fccn/subsidy-contracts/{id}/... purely for FK reverse
+  # reachability. Enrollment is self-referential (predecessor_enrollment_id) for family transitions.
+
+  state_machine_shape: cyclic
+  # MembershipAgreement SENT->COUNTERED->SENT (bounded negotiation rounds) and ComplianceReview
+  # CAP_SUBMITTED->CAP_REJECTED->CAP_SUBMITTED are cycles; Provider ACTIVE->PROBATION->ACTIVE is a
+  # cycle whose derived network_posture gates child creation (posture_driven); SubstituteAssignment
+  # carries two independent state dimensions (staffing_status x billing_status).
+
+  relationship_patterns:
+    - one_to_many          # Provider -> agreements / enrollments / contracts / visits / reviews / orders
+    - self_referential     # Enrollment.predecessor_enrollment_id -> Enrollment.id
+    - cross_aggregate      # SubsidyClaim -> SubsidyContract -> Provider; SubstituteAssignment -> Substitute + Provider
+
+  role_model: segregation_of_duties
+  # The QualityCoach user who opened a ComplianceReview (or conducted the CoachingVisit that opened
+  # it) may not be the QualityCoach user who closes it as compliant.
+
+  consistency_model: immediate
+
+response_envelope:
+  success: |
+    { "meta": { "api_request_id": "req_xxx", "api_request_timestamp": "ISO8601" },
+      "response_type": "object" | "array", "data": {} }
+  error: |
+    { "meta": { ... }, "response_type": "error",
+      "data": { "error_id": "ERR_XXX", "message": "..." } }
+  pagination_fields: ["limit", "offset", "total_count", "has_more"]
+  pagination_defaults: { limit: 10, min: 1, max: 100, offset: 0 }
+
+# =============================================================================
+# §1.1 Entity-Relationship Table
+# =============================================================================
+entities:
+  - name: Provider
+    parent: null
+    common_fields: true
+    fields:
+      - name: legal_name
+        type: string
+        source: input
+        description: "Licensed family child care home operator name"
+        constraints: "1..120 chars"
+      - name: county_tier
+        type: enum
+        source: input
+        description: "Service-area designation used by food program tiering and substitute eligibility"
+        default: STANDARD
+        constraints: "one of {HIGH_NEED, STANDARD}"
+      - name: license_number
+        type: string
+        source: input
+        description: "State child care license number; null until license verification"
+        default: null
+      - name: license_expires_on
+        type: datetime
+        source: input
+        description: "Date the state license expires (UTC midnight); null until license verification"
+        default: null
+      - name: capacity_slots
+        type: integer
+        source: input
+        description: "Licensed child capacity; null until license verification"
+        default: null
+        constraints: "1..12 when present"
+      - name: fixed_monthly_cost_cents
+        type: integer
+        source: input
+        description: "Provider-reported fixed monthly operating cost, used by revenue modeling"
+        default: 180000
+        constraints: ">= 0"
+      - name: membership_status
+        type: enum
+        source: system
+        description: "Network membership lifecycle state"
+        default: APPLICANT
+        constraints: "one of {APPLICANT, PENDING_AGREEMENT, ACTIVE, PROBATION, EXITING, EXITED}"
+      - name: network_posture
+        type: enum
+        source: computed
+        description: "Derived gate over child-record creation; recomputed on every membership_status change"
+        default: FROZEN
+        constraints: "one of {OPEN, RESTRICTED, FROZEN}; APPLICANT|PENDING_AGREEMENT|EXITING|EXITED -> FROZEN, ACTIVE -> OPEN, PROBATION -> RESTRICTED"
+      - name: network_fee_pct
+        type: number
+        source: computed
+        description: "Network shared-services fee percent copied from the EXECUTED MembershipAgreement"
+        default: 0
+        constraints: "0..15, one decimal place"
+      - name: quality_score
+        type: number
+        source: computed
+        description: "Quality score written by calculations.provider_quality_score (0..100, 2 decimals)"
+        default: 0
+        constraints: "0..100"
+      - name: quality_tier
+        type: enum
+        source: computed
+        description: "Tier banding of quality_score"
+        default: UNRATED
+        constraints: "one of {TIER_1, TIER_2, TIER_3, UNRATED}"
+      - name: quality_variant_applied
+        type: enum
+        source: computed
+        description: "Which variant of calculations.provider_quality_score last wrote quality_score"
+        default: NONE
+        constraints: "one of {COACHING_WEIGHTED, COMPLIANCE_ANCHORED, NONE}"
+      - name: open_finding_count
+        type: integer
+        source: computed
+        description: "Count of this provider's ComplianceReview rows with status IN {OPEN, CAP_SUBMITTED, CAP_REJECTED}"
+        default: 0
+      - name: projected_monthly_revenue_cents
+        type: integer
+        source: computed
+        description: "Denormalized monthly_revenue_cents from calculations.provider_revenue_projection; recomputed on enrollment/slot/food-claim/claim-hold changes"
+        default: 0
+      - name: exit_reason
+        type: string
+        source: input
+        description: "Reason recorded when the network exit is initiated; null before exit"
+        default: null
+
+  - name: MembershipAgreement
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the provider the agreement is offered to"
+      - name: network_fee_pct
+        type: number
+        source: input
+        description: "Network-offered shared-services fee percent for the current round"
+        constraints: "0..15, one decimal place"
+      - name: proposed_network_fee_pct
+        type: number
+        source: computed
+        description: "Fee percent proposed by the provider in the latest counter; null before any counter"
+        default: null
+      - name: shared_services
+        type: array
+        source: input
+        description: "Shared-service modules included in the agreement"
+        constraints: "non-empty subset of {ENROLLMENT, BILLING, FOOD_PROGRAM, SUBSTITUTE_POOL, GROUP_PURCHASING}"
+      - name: effective_on
+        type: datetime
+        source: input
+        description: "Date the membership term starts (UTC midnight)"
+      - name: round_index
+        type: integer
+        source: system
+        description: "Negotiation round counter; 1 on creation, +1 on every provider counter"
+        default: 1
+        constraints: "<= NEGOTIATION_MAX_ROUNDS (3)"
+      - name: status
+        type: enum
+        source: system
+        description: "Agreement negotiation state"
+        default: SENT
+        constraints: "one of {SENT, COUNTERED, EXECUTED, WITHDRAWN}"
+      - name: superseded
+        type: boolean
+        source: computed
+        description: "True when a newer agreement for the same provider replaced this one"
+        default: false
+      - name: withdrawal_reason
+        type: string
+        source: computed
+        description: "Reason recorded on withdrawal or supersede; null otherwise"
+        default: null
+      - name: executed_at
+        type: datetime
+        source: computed
+        description: "Logical-clock instant the provider executed the agreement; null before execution"
+        default: null
+
+  - name: Enrollment
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the home the child is enrolled in"
+      - name: predecessor_enrollment_id
+        type: string
+        source: computed
+        description: "FK -> Enrollment.id; set only on enrollments created by a family transition transfer, else null"
+        default: null
+      - name: child_ref
+        type: string
+        source: input
+        description: "Opaque child code used on food program meal lines"
+        constraints: "unique per provider among enrollments with status == ENROLLED"
+      - name: family_name
+        type: string
+        source: input
+        description: "Household name for transition support correspondence"
+      - name: days_per_week
+        type: integer
+        source: input
+        description: "Contracted care days per week"
+        constraints: "1..5"
+      - name: private_monthly_tuition_cents
+        type: integer
+        source: input
+        description: "Private-pay monthly tuition; 0 for subsidy-only families"
+        default: 0
+        constraints: ">= 0"
+      - name: subsidy_certified
+        type: boolean
+        source: input
+        description: "True when the family is certified for the subsidy program and occupies a contracted slot"
+        default: false
+      - name: start_on
+        type: datetime
+        source: input
+        description: "First day of care (UTC midnight)"
+      - name: status
+        type: enum
+        source: system
+        description: "Enrollment lifecycle state"
+        default: ENROLLED
+        constraints: "one of {ENROLLED, TRANSITION_PENDING, TRANSFERRED, WITHDRAWN}"
+      - name: slot_committed
+        type: boolean
+        source: computed
+        description: "True while this enrollment holds a contracted subsidy slot on the provider's SubsidyContract"
+        default: false
+      - name: exit_on
+        type: datetime
+        source: computed
+        description: "Date the child left this home; null while status == ENROLLED"
+        default: null
+
+  - name: SubsidyContract
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the provider the network administers this contract for"
+      - name: agency_code
+        type: string
+        source: input
+        description: "Subsidy agency identifier"
+      - name: daily_rate_cents
+        type: integer
+        source: input
+        description: "Contracted full-day reimbursement rate per child"
+        constraints: "> 0"
+      - name: absence_rate_pct
+        type: number
+        source: input
+        description: "Percent of daily_rate_cents payable for an allowed absence day in the FINAL_RECONCILED variant"
+        default: 50
+        constraints: "0..100"
+      - name: contracted_slots
+        type: integer
+        source: input
+        description: "Number of subsidy slots authorized by the agency"
+        constraints: ">= 1"
+      - name: committed_slots
+        type: integer
+        source: computed
+        description: "Slots currently held by enrollments with slot_committed == true"
+        default: 0
+      - name: available_slots
+        type: integer
+        source: computed
+        description: "contracted_slots - committed_slots; conserved quantity of invariant slot_conservation"
+        default: 0
+      - name: authorized_amount_cents
+        type: integer
+        source: input
+        description: "Ceiling on cumulative claimed_amount_cents for the contract period"
+        constraints: "> 0"
+      - name: claimed_amount_cents
+        type: integer
+        source: computed
+        description: "Cumulative amount of claims counted against authorized_amount_cents"
+        default: 0
+      - name: remitted_cents
+        type: integer
+        source: computed
+        description: "Cumulative POSTED remittance amount received from the agency for this contract"
+        default: 0
+      - name: unallocated_credit_cents
+        type: integer
+        source: computed
+        description: "Remitted cents not attached to any claim; conserved quantity of invariant remittance_cents_conservation"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Contract administration state"
+        default: ACTIVE
+        constraints: "one of {ACTIVE, SUSPENDED_FOR_QUALITY, TERMINATED}"
+      - name: period_start_on
+        type: datetime
+        source: input
+        description: "First day of the contract authorization period (UTC midnight)"
+
+  - name: SubsidyClaim
+    parent: SubsidyContract
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> SubsidyContract.id; the contract this monthly claim bills against"
+      - name: period_month
+        type: string
+        source: input
+        description: "Claim service month"
+        constraints: "format YYYY-MM; unique per contract among claims with status != REJECTED"
+      - name: lines
+        type: array
+        source: input
+        description: "Attendance lines, each an object { enrollment_id, attended_days, absent_days }"
+        constraints: "non-empty; attended_days 0..22; absent_days 0..22"
+      - name: provisional_amount_cents
+        type: integer
+        source: computed
+        description: "Output of calculations.subsidy_claim_amount variant PROVISIONAL_ADVANCE, written at submit"
+        default: 0
+      - name: final_amount_cents
+        type: integer
+        source: computed
+        description: "Output of calculations.subsidy_claim_amount variant FINAL_RECONCILED, written at reconcile"
+        default: 0
+      - name: advance_paid_cents
+        type: integer
+        source: computed
+        description: "Advance disbursed against the provisional amount"
+        default: 0
+      - name: paid_cents
+        type: integer
+        source: computed
+        description: "Cents allocated to this claim by POSTED remittances"
+        default: 0
+      - name: settlement_delta_cents
+        type: integer
+        source: computed
+        description: "final_amount_cents - advance_paid_cents, written at reconcile"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Claim lifecycle state"
+        default: DRAFT
+        constraints: "one of {DRAFT, SUBMITTED, ADVANCE_PAID, RECONCILED, SETTLED, HELD, REJECTED}"
+      - name: held_from_status
+        type: enum
+        source: computed
+        description: "Status the claim occupied before a quality hold, restored on provider reinstatement; null when not held"
+        default: null
+        constraints: "one of {DRAFT, SUBMITTED} when present"
+      - name: hold_reason
+        type: string
+        source: computed
+        description: "Reason recorded when the claim was moved to HELD; null otherwise"
+        default: null
+      - name: rejection_reason
+        type: string
+        source: computed
+        description: "Reason recorded on rejection; null otherwise"
+        default: null
+
+  - name: Remittance
+    parent: SubsidyContract
+    common_fields: true
+    fields:
+      - name: contract_id
+        type: string
+        source: input
+        description: "FK -> SubsidyContract.id; the contract the agency payment covers"
+      - name: agency_reference
+        type: string
+        source: input
+        description: "Agency payment reference"
+        constraints: "unique per contract among remittances with status == POSTED"
+      - name: amount_cents
+        type: integer
+        source: input
+        description: "Cents received from the agency"
+        constraints: "> 0"
+      - name: received_on
+        type: datetime
+        source: input
+        description: "Date the payment was received (UTC midnight)"
+      - name: allocations
+        type: array
+        source: computed
+        description: "Waterfall result, each an object { claim_id, allocated_cents }, in allocation order"
+        default: []
+      - name: unallocated_cents
+        type: integer
+        source: computed
+        description: "Portion of amount_cents left over after the waterfall, added to contract.unallocated_credit_cents"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Remittance posting state"
+        default: POSTED
+        constraints: "one of {POSTED, REVERSED}"
+      - name: reversal_reason
+        type: string
+        source: computed
+        description: "Reason recorded on reversal; null while POSTED"
+        default: null
+
+  - name: FoodProgramClaim
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the provider claiming meals"
+      - name: period_month
+        type: string
+        source: input
+        description: "Meal service month"
+        constraints: "format YYYY-MM; unique per provider"
+      - name: meal_lines
+        type: array
+        source: input
+        description: "Meal counts, each an object { child_ref, service_date, breakfasts, lunches, snacks }"
+        constraints: "non-empty; breakfasts 0..2; lunches 0..2; snacks 0..2"
+      - name: tier_applied
+        type: enum
+        source: computed
+        description: "Reimbursement tier selected by calculations.food_program_reimbursement at creation"
+        constraints: "one of {TIER_I, TIER_II}"
+      - name: subsidy_enrollment_share
+        type: number
+        source: computed
+        description: "Share of the provider's ENROLLED enrollments that are subsidy_certified, 4 decimals, frozen at creation"
+        default: 0
+      - name: claimed_amount_cents
+        type: integer
+        source: computed
+        description: "Reimbursement claimed from the meal lines at the applied tier"
+        default: 0
+      - name: reimbursed_amount_cents
+        type: integer
+        source: computed
+        description: "Amount approved after disallowances; 0 until approval"
+        default: 0
+      - name: disallowed_child_refs
+        type: array
+        source: computed
+        description: "child_ref values whose meal lines the reviewer disallowed at approval"
+        default: []
+      - name: status
+        type: enum
+        source: system
+        description: "Food program claim state"
+        default: SUBMITTED
+        constraints: "one of {SUBMITTED, APPROVED, APPROVED_WITH_DISALLOWANCE}"
+
+  - name: Substitute
+    parent: null
+    common_fields: true
+    fields:
+      - name: full_name
+        type: string
+        source: input
+        description: "Substitute caregiver name"
+      - name: credential_level
+        type: enum
+        source: input
+        description: "Credential held by the substitute; ranked NONE(0) < CDA(1) < CHILD_DEV_TEACHER(2)"
+        constraints: "one of {NONE, CDA, CHILD_DEV_TEACHER}"
+      - name: clearance_expires_on
+        type: datetime
+        source: input
+        description: "Background clearance expiry instant (UTC); assignments must end at or before it"
+      - name: hourly_rate_cents
+        type: integer
+        source: input
+        description: "Base hourly rate before credential premium"
+        constraints: "> 0"
+      - name: service_county_tiers
+        type: array
+        source: input
+        description: "County tiers this substitute will travel to"
+        constraints: "non-empty subset of {HIGH_NEED, STANDARD}"
+      - name: pool_status
+        type: enum
+        source: system
+        description: "Pool availability state"
+        default: AVAILABLE
+        constraints: "one of {AVAILABLE, SUSPENDED}"
+      - name: assignment_count_completed
+        type: integer
+        source: computed
+        description: "Number of assignments this substitute has completed; second selector ranking key"
+        default: 0
+
+  - name: SubstituteAssignment
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the home needing coverage"
+      - name: substitute_id
+        type: string
+        source: computed
+        description: "FK -> Substitute.id; null while staffing_status IN {REQUESTED, UNFILLED}"
+        default: null
+      - name: start_at
+        type: datetime
+        source: input
+        description: "Coverage window start (UTC), half-open interval start"
+      - name: end_at
+        type: datetime
+        source: input
+        description: "Coverage window end (UTC), exclusive"
+        constraints: "> start_at"
+      - name: reason
+        type: enum
+        source: input
+        description: "Why coverage is needed"
+        constraints: "one of {ILLNESS, VACATION, TRAINING}"
+      - name: min_credential_level
+        type: enum
+        source: input
+        description: "Minimum credential the provider requires"
+        default: NONE
+        constraints: "one of {NONE, CDA, CHILD_DEV_TEACHER}"
+      - name: staffing_status
+        type: enum
+        source: system
+        description: "Staffing dimension of the assignment"
+        default: REQUESTED
+        constraints: "one of {REQUESTED, OFFERED, CONFIRMED, COMPLETED, UNFILLED}"
+      - name: billing_status
+        type: enum
+        source: system
+        description: "Billing dimension of the assignment, evolving independently of staffing_status"
+        default: UNBILLED
+        constraints: "one of {UNBILLED, ACCRUED, INVOICED}"
+      - name: declined_substitute_ids
+        type: array
+        source: computed
+        description: "Substitute ids excluded from re-selection after declining this assignment"
+        default: []
+      - name: billable_hours
+        type: integer
+        source: computed
+        description: "Billable hours from calculations.substitute_assignment_cost, written at completion"
+        default: 0
+      - name: pre_fee_subtotal_cents
+        type: integer
+        source: computed
+        description: "Base plus credential premium, the value whose tier selects the network admin fee percent"
+        default: 0
+      - name: network_admin_fee_cents
+        type: integer
+        source: computed
+        description: "Network administration fee derived from the pre_fee_subtotal_cents tier"
+        default: 0
+      - name: total_cost_cents
+        type: integer
+        source: computed
+        description: "pre_fee_subtotal_cents + network_admin_fee_cents, written at completion"
+        default: 0
+
+  - name: CoachingVisit
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the home being coached"
+      - name: scheduled_on
+        type: datetime
+        source: input
+        description: "Visit date (UTC midnight); day-granularity interval used by the rolling-window capacity rule"
+      - name: focus_area
+        type: enum
+        source: input
+        description: "Coaching focus"
+        constraints: "one of {ENVIRONMENT, CURRICULUM, BUSINESS_PRACTICE, HEALTH_SAFETY}"
+      - name: coach_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the QualityCoach who scheduled the visit"
+      - name: conducted_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the QualityCoach who conducted the visit; null while SCHEDULED"
+        default: null
+      - name: visit_conducted_on
+        type: datetime
+        source: input
+        description: "Date the visit actually happened (UTC midnight); null while SCHEDULED"
+        default: null
+      - name: observation_score
+        type: number
+        source: input
+        description: "Observation score recorded at conduct; null while SCHEDULED"
+        default: null
+        constraints: "0..100, one decimal place"
+      - name: findings
+        type: array
+        source: input
+        description: "Finding codes recorded at conduct"
+        default: []
+      - name: critical_finding
+        type: boolean
+        source: input
+        description: "True when the visit produced a finding that opens a compliance review"
+        default: false
+      - name: status
+        type: enum
+        source: system
+        description: "Visit state"
+        default: SCHEDULED
+        constraints: "one of {SCHEDULED, COMPLETED}"
+
+  - name: ComplianceReview
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the provider under review"
+      - name: origin
+        type: enum
+        source: system
+        description: "How the review was opened"
+        default: SCHEDULED_AUDIT
+        constraints: "one of {COACHING_CRITICAL_FINDING, SCHEDULED_AUDIT}"
+      - name: standard_codes
+        type: array
+        source: input
+        description: "Network quality standard codes cited"
+        constraints: "non-empty"
+      - name: severity
+        type: enum
+        source: input
+        description: "Finding severity"
+        constraints: "one of {MINOR, MAJOR, CRITICAL}"
+      - name: cap_due_on
+        type: datetime
+        source: input
+        description: "Deadline for the corrective action plan (UTC midnight)"
+      - name: opened_by_user_id
+        type: string
+        source: system
+        description: "X-User-ID of the QualityCoach who opened the review, or of the coach who conducted the triggering visit"
+      - name: cap_narrative
+        type: string
+        source: computed
+        description: "Latest corrective action plan text; null before first submission"
+        default: null
+      - name: cap_submitted_at
+        type: datetime
+        source: computed
+        description: "Logical-clock instant of the latest CAP submission; null before first submission"
+        default: null
+      - name: cap_rejection_count
+        type: integer
+        source: computed
+        description: "Number of CAP rejections so far; escalation requires >= CAP_REJECTION_LIMIT (2)"
+        default: 0
+      - name: closed_by_user_id
+        type: string
+        source: computed
+        description: "X-User-ID of the QualityCoach who closed the review; null until closed"
+        default: null
+      - name: status
+        type: enum
+        source: system
+        description: "Review state"
+        default: OPEN
+        constraints: "one of {OPEN, CAP_SUBMITTED, CAP_REJECTED, CLOSED_COMPLIANT, ESCALATED_TO_LICENSING}"
+
+  - name: GroupPurchaseOrder
+    parent: Provider
+    common_fields: true
+    fields:
+      - name: provider_id
+        type: string
+        source: input
+        description: "FK -> Provider.id; the ordering provider"
+      - name: category
+        type: enum
+        source: input
+        description: "Purchasing category; INSURANCE adds the administration fee"
+        constraints: "one of {SUPPLIES, CURRICULUM, INSURANCE}"
+      - name: lines
+        type: array
+        source: input
+        description: "Order lines, each an object { sku, unit_price_cents, quantity }"
+        constraints: "non-empty; unit_price_cents > 0; quantity >= 1"
+      - name: total_quantity
+        type: integer
+        source: computed
+        description: "Sum of line quantities; selects the volume discount tier"
+        default: 0
+      - name: discount_pct
+        type: number
+        source: computed
+        description: "Volume discount percent selected from total_quantity at commit"
+        default: 0
+      - name: subtotal_cents
+        type: integer
+        source: computed
+        description: "Sum of per-line rounded discounted amounts (rounding order pinned per line, then summed)"
+        default: 0
+      - name: insurance_admin_fee_cents
+        type: integer
+        source: computed
+        description: "3 percent administration fee applied only when category == INSURANCE"
+        default: 0
+      - name: total_cents
+        type: integer
+        source: computed
+        description: "subtotal_cents + insurance_admin_fee_cents, written at commit"
+        default: 0
+      - name: status
+        type: enum
+        source: system
+        description: "Order state"
+        default: OPEN
+        constraints: "one of {OPEN, COMMITTED}"
+
+# =============================================================================
+# §1.2 State Machine Table
+# =============================================================================
+state_machines:
+  - entity: Provider
+    initial_state: APPLICANT
+    terminal_states: [EXITED]
+    transitions:
+      - from: APPLICANT
+        to: PENDING_AGREEMENT
+        trigger: "POST /fccn/providers/{id}/license-verification"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status == APPLICANT"
+          - "license_expires_on > logical clock now"
+          - "capacity_slots between 1 and 12"
+        side_effects:
+          - "sets license_number, license_expires_on, capacity_slots"
+          - "network_posture stays FROZEN (PENDING_AGREEMENT maps to FROZEN)"
+          - "increments Provider.version by 1"
+      - from: PENDING_AGREEMENT
+        to: ACTIVE
+        trigger: "POST /fccn/membership-agreements/{id}/execute"
+        actor: Provider
+        preconditions:
+          - "the agreement's provider_id == this provider"
+          - "agreement.status == SENT"
+          - "provider.license_expires_on > logical clock now"
+        side_effects:
+          - "network_posture recomputed to OPEN"
+          - "network_fee_pct := agreement.network_fee_pct"
+          - "increments Provider.version by 1"
+      - from: ACTIVE
+        to: PROBATION
+        trigger: "POST /fccn/compliance-reviews/{id}/escalate (cascade hop 1 of quality_escalation_cascade)"
+        actor: NetworkAdmin
+        preconditions:
+          - "review.provider_id == this provider"
+          - "provider.membership_status == ACTIVE"
+        side_effects:
+          - "network_posture recomputed to RESTRICTED"
+          - "hop 2: every SubsidyContract of this provider with status == ACTIVE moves to SUSPENDED_FOR_QUALITY (see SubsidyContract machine)"
+          - "increments Provider.version by 1"
+      - from: PROBATION
+        to: ACTIVE
+        trigger: "POST /fccn/providers/{id}/reinstate"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status == PROBATION"
+          - "provider.open_finding_count == 0"
+        side_effects:
+          - "network_posture recomputed to OPEN"
+          - "compensating hop 2: every SubsidyContract of this provider with status == SUSPENDED_FOR_QUALITY returns to ACTIVE"
+          - "compensating hop 3: every SubsidyClaim with status == HELD returns to held_from_status, held_from_status and hold_reason cleared, contract.claimed_amount_cents restored by that claim's provisional_amount_cents"
+          - "compensating hop 4: provider.projected_monthly_revenue_cents recomputed by calculations.provider_revenue_projection"
+          - "increments Provider.version by 1"
+        note: "Exact inverse of quality_escalation_cascade; conserves nothing new but must leave no drift in contract.claimed_amount_cents"
+      - from: ACTIVE
+        to: EXITING
+        trigger: "POST /fccn/providers/{id}/exit-network"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status IN {ACTIVE, PROBATION}"
+          - "exit_reason present"
+        side_effects:
+          - "network_posture recomputed to FROZEN"
+          - "hop 1 of network_exit_cascade: every Enrollment of this provider with status == ENROLLED moves to TRANSITION_PENDING"
+          - "increments Provider.version by 1"
+      - from: PROBATION
+        to: EXITING
+        trigger: "POST /fccn/providers/{id}/exit-network"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status IN {ACTIVE, PROBATION}"
+          - "exit_reason present"
+        side_effects:
+          - "same as ACTIVE -> EXITING, including hop 1 of network_exit_cascade"
+          - "increments Provider.version by 1"
+      - from: EXITING
+        to: EXITED
+        trigger: "POST /fccn/providers/{id}/complete-exit"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status == EXITING"
+          - "no Enrollment of this provider has status IN {ENROLLED, TRANSITION_PENDING}"
+        side_effects:
+          - "every SubsidyContract of this provider moves to TERMINATED"
+          - "network_posture stays FROZEN"
+          - "increments Provider.version by 1"
+
+  - entity: MembershipAgreement
+    initial_state: SENT
+    terminal_states: [EXECUTED, WITHDRAWN]
+    transitions:
+      - from: SENT
+        to: COUNTERED
+        trigger: "POST /fccn/membership-agreements/{id}/counter"
+        actor: Provider
+        preconditions:
+          - "agreement.status == SENT"
+          - "agreement.provider_id == X-User-ID"
+          - "agreement.round_index < 3 (NEGOTIATION_MAX_ROUNDS)"
+        side_effects:
+          - "proposed_network_fee_pct := request proposed_network_fee_pct"
+          - "round_index += 1"
+      - from: COUNTERED
+        to: SENT
+        trigger: "POST /fccn/membership-agreements/{id}/revise"
+        actor: NetworkAdmin
+        preconditions:
+          - "agreement.status == COUNTERED"
+          - "agreement.round_index <= 3"
+        side_effects:
+          - "network_fee_pct := request network_fee_pct"
+          - "proposed_network_fee_pct cleared to null"
+        note: "Cycle: SENT -> COUNTERED -> SENT, bounded by round_index <= 3"
+      - from: SENT
+        to: EXECUTED
+        trigger: "POST /fccn/membership-agreements/{id}/execute"
+        actor: Provider
+        preconditions:
+          - "agreement.status == SENT"
+          - "agreement.provider_id == X-User-ID"
+          - "provider.membership_status == PENDING_AGREEMENT"
+          - "provider.license_expires_on > logical clock now"
+        side_effects:
+          - "executed_at := logical clock now"
+          - "Provider PENDING_AGREEMENT -> ACTIVE, provider.network_fee_pct := this agreement's network_fee_pct"
+      - from: SENT
+        to: WITHDRAWN
+        trigger: "POST /fccn/membership-agreements/{id}/withdraw"
+        actor: NetworkAdmin
+        preconditions:
+          - "agreement.status IN {SENT, COUNTERED}"
+        side_effects:
+          - "withdrawal_reason := request reason"
+      - from: COUNTERED
+        to: WITHDRAWN
+        trigger: "POST /fccn/membership-agreements/{id}/withdraw"
+        actor: NetworkAdmin
+        preconditions:
+          - "agreement.status IN {SENT, COUNTERED}"
+        side_effects:
+          - "withdrawal_reason := request reason"
+      - from: SENT
+        to: WITHDRAWN
+        trigger: "POST /fccn/membership-agreements (supersede on a newer agreement for the same provider)"
+        actor: NetworkAdmin
+        preconditions:
+          - "a new agreement is created for the same provider_id"
+          - "this agreement's status IN {SENT, COUNTERED}"
+        side_effects:
+          - "superseded := true"
+          - "withdrawal_reason := 'SUPERSEDED_BY_NEWER_AGREEMENT'"
+        note: "This is the legitimate supersede semantics that makes plan-create a true race, resolved by OCC on Provider.version (§1.2.1)"
+
+  - entity: Enrollment
+    initial_state: ENROLLED
+    terminal_states: [TRANSFERRED, WITHDRAWN]
+    transitions:
+      - from: ENROLLED
+        to: TRANSITION_PENDING
+        trigger: "POST /fccn/providers/{id}/exit-network (hop 1 of network_exit_cascade)"
+        actor: NetworkAdmin
+        preconditions:
+          - "enrollment.status == ENROLLED"
+          - "enrollment.provider_id == the exiting provider"
+        side_effects:
+          - "hop 2: because the enrollment left ENROLLED, its committed subsidy slot is released — contract.committed_slots -= 1, contract.available_slots += 1, enrollment.slot_committed := false (only when slot_committed was true)"
+      - from: ENROLLED
+        to: WITHDRAWN
+        trigger: "POST /fccn/enrollments/{id}/withdraw"
+        actor: Provider
+        preconditions:
+          - "enrollment.status IN {ENROLLED, TRANSITION_PENDING}"
+          - "enrollment.provider_id == X-User-ID"
+        side_effects:
+          - "exit_on := request exit_on"
+          - "releases the committed subsidy slot when slot_committed == true (contract.committed_slots -= 1, contract.available_slots += 1)"
+          - "provider.projected_monthly_revenue_cents recomputed"
+      - from: TRANSITION_PENDING
+        to: WITHDRAWN
+        trigger: "POST /fccn/enrollments/{id}/withdraw"
+        actor: Provider
+        preconditions:
+          - "enrollment.status IN {ENROLLED, TRANSITION_PENDING}"
+          - "enrollment.provider_id == X-User-ID"
+        side_effects:
+          - "exit_on := request exit_on"
+          - "slot already released by the exit cascade; no second decrement (slot_committed == false)"
+      - from: TRANSITION_PENDING
+        to: TRANSFERRED
+        trigger: "POST /fccn/enrollments/{id}/transfer"
+        actor: NetworkAdmin
+        preconditions:
+          - "enrollment.status == TRANSITION_PENDING"
+          - "receiving provider.membership_status == ACTIVE and network_posture == OPEN"
+          - "receiving provider has fewer ENROLLED enrollments than capacity_slots"
+          - "when enrollment.subsidy_certified == true, the receiving provider has an ACTIVE SubsidyContract with available_slots >= 1"
+        side_effects:
+          - "exit_on := request transfer_on"
+          - "creates a new Enrollment at the receiving provider with predecessor_enrollment_id == this enrollment id, status ENROLLED, same child_ref / family_name / days_per_week / private_monthly_tuition_cents / subsidy_certified, start_on := transfer_on"
+          - "when subsidy_certified == true, commits a slot on the receiving provider's ACTIVE contract (committed_slots += 1, available_slots -= 1, new enrollment slot_committed := true)"
+          - "recomputes projected_monthly_revenue_cents on both providers"
+
+  - entity: SubsidyContract
+    initial_state: ACTIVE
+    terminal_states: [TERMINATED]
+    transitions:
+      - from: ACTIVE
+        to: SUSPENDED_FOR_QUALITY
+        trigger: "Provider ACTIVE -> PROBATION (hop 2 of quality_escalation_cascade)"
+        actor: system
+        preconditions:
+          - "contract.status == ACTIVE"
+          - "contract.provider_id == the provider entering PROBATION"
+        side_effects:
+          - "hop 3: because this contract became SUSPENDED_FOR_QUALITY, each of its SubsidyClaim rows with status IN {DRAFT, SUBMITTED} moves to HELD"
+      - from: SUSPENDED_FOR_QUALITY
+        to: ACTIVE
+        trigger: "Provider PROBATION -> ACTIVE (compensating hop 2)"
+        actor: system
+        preconditions:
+          - "contract.status == SUSPENDED_FOR_QUALITY"
+        side_effects:
+          - "compensating hop 3: each HELD SubsidyClaim of this contract returns to held_from_status"
+      - from: ACTIVE
+        to: TERMINATED
+        trigger: "POST /fccn/providers/{id}/complete-exit"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status == EXITING"
+        side_effects:
+          - "no further claims may be created against this contract"
+      - from: SUSPENDED_FOR_QUALITY
+        to: TERMINATED
+        trigger: "POST /fccn/providers/{id}/complete-exit"
+        actor: NetworkAdmin
+        preconditions:
+          - "provider.membership_status == EXITING"
+        side_effects:
+          - "no further claims may be created against this contract"
+
+  - entity: SubsidyClaim
+    initial_state: DRAFT
+    terminal_states: [SETTLED, REJECTED]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        trigger: "POST /fccn/subsidy-claims/{id}/submit"
+        actor: Provider
+        preconditions:
+          - "claim.status == DRAFT"
+          - "contract.status == ACTIVE"
+          - "provider.network_posture IN {OPEN, RESTRICTED}"
+          - "every line's enrollment_id belongs to an Enrollment whose provider_id == contract.provider_id"
+          - "contract.claimed_amount_cents + provisional_amount_cents <= contract.authorized_amount_cents"
+        side_effects:
+          - "provisional_amount_cents := calculations.subsidy_claim_amount variant PROVISIONAL_ADVANCE"
+          - "contract.claimed_amount_cents += provisional_amount_cents"
+      - from: SUBMITTED
+        to: ADVANCE_PAID
+        trigger: "POST /fccn/subsidy-claims/{id}/advance"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "contract.status == ACTIVE"
+        side_effects:
+          - "advance_paid_cents := floor(provisional_amount_cents * 80 / 100)"
+      - from: ADVANCE_PAID
+        to: RECONCILED
+        trigger: "POST /fccn/subsidy-claims/{id}/reconcile"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == ADVANCE_PAID"
+        side_effects:
+          - "final_amount_cents := calculations.subsidy_claim_amount variant FINAL_RECONCILED"
+          - "settlement_delta_cents := final_amount_cents - advance_paid_cents"
+          - "contract.claimed_amount_cents += (final_amount_cents - provisional_amount_cents)"
+      - from: RECONCILED
+        to: SETTLED
+        trigger: "POST /fccn/remittances (waterfall allocation fully covers the claim)"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == RECONCILED"
+          - "after allocation, claim.paid_cents == claim.final_amount_cents"
+        side_effects:
+          - "paid_cents increased by the allocated amount"
+      - from: SETTLED
+        to: RECONCILED
+        trigger: "POST /fccn/remittances/{id}/reverse"
+        actor: FiscalOfficer
+        preconditions:
+          - "remittance.status == POSTED"
+          - "after reversal, claim.paid_cents < claim.final_amount_cents"
+        side_effects:
+          - "paid_cents decreased by this remittance's allocation to the claim"
+        note: "Compensating transition of remittance_cents_conservation"
+      - from: SUBMITTED
+        to: REJECTED
+        trigger: "POST /fccn/subsidy-claims/{id}/reject"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == SUBMITTED"
+        side_effects:
+          - "rejection_reason := request rejection_reason"
+          - "contract.claimed_amount_cents -= provisional_amount_cents"
+          - "the claim's period_month becomes available for a replacement claim (uniqueness ignores REJECTED)"
+      - from: DRAFT
+        to: HELD
+        trigger: "SubsidyContract ACTIVE -> SUSPENDED_FOR_QUALITY (hop 3 of quality_escalation_cascade)"
+        actor: system
+        preconditions:
+          - "claim.status IN {DRAFT, SUBMITTED}"
+        side_effects:
+          - "held_from_status := DRAFT, hold_reason := 'CONTRACT_SUSPENDED_FOR_QUALITY'"
+          - "hop 4: because this claim is now HELD, provider.projected_monthly_revenue_cents is recomputed and the enrollments named on the held claim's lines drop out of the subsidy component"
+      - from: SUBMITTED
+        to: HELD
+        trigger: "SubsidyContract ACTIVE -> SUSPENDED_FOR_QUALITY (hop 3 of quality_escalation_cascade)"
+        actor: system
+        preconditions:
+          - "claim.status IN {DRAFT, SUBMITTED}"
+        side_effects:
+          - "held_from_status := SUBMITTED, hold_reason := 'CONTRACT_SUSPENDED_FOR_QUALITY'"
+          - "contract.claimed_amount_cents -= provisional_amount_cents"
+          - "hop 4: because this claim is now HELD, provider.projected_monthly_revenue_cents is recomputed and the enrollments named on the held claim's lines drop out of the subsidy component"
+      - from: HELD
+        to: DRAFT
+        trigger: "Provider PROBATION -> ACTIVE (compensating hop 3)"
+        actor: system
+        preconditions:
+          - "claim.status == HELD and held_from_status == DRAFT"
+        side_effects:
+          - "held_from_status and hold_reason cleared to null"
+          - "provider.projected_monthly_revenue_cents recomputed"
+      - from: HELD
+        to: SUBMITTED
+        trigger: "Provider PROBATION -> ACTIVE (compensating hop 3)"
+        actor: system
+        preconditions:
+          - "claim.status == HELD and held_from_status == SUBMITTED"
+        side_effects:
+          - "contract.claimed_amount_cents += provisional_amount_cents (restored with zero drift)"
+          - "held_from_status and hold_reason cleared to null"
+          - "provider.projected_monthly_revenue_cents recomputed"
+
+  - entity: SubstituteAssignment
+    initial_state: REQUESTED
+    terminal_states: [COMPLETED, UNFILLED]
+    transitions:
+      - from: REQUESTED
+        to: OFFERED
+        trigger: "POST /fccn/substitute-assignments (selector policy picks a substitute, or requested_substitute_id is honoured)"
+        actor: Provider
+        preconditions:
+          - "provider.network_posture IN {OPEN, RESTRICTED}"
+          - "the selected substitute passes every eligibility clause of calculations.substitute_selection"
+        side_effects:
+          - "substitute_id := selected substitute id"
+          - "staffing_status := OFFERED; billing_status stays UNBILLED"
+      - from: REQUESTED
+        to: UNFILLED
+        trigger: "POST /fccn/substitute-assignments (empty candidate set) or POST /fccn/substitute-assignments/{id}/decline (no candidate left)"
+        actor: Provider
+        preconditions:
+          - "calculations.substitute_selection candidate set is empty"
+        side_effects:
+          - "substitute_id stays null"
+          - "staffing_status := UNFILLED (terminal); billing_status stays UNBILLED"
+      - from: OFFERED
+        to: CONFIRMED
+        trigger: "POST /fccn/substitute-assignments/{id}/accept"
+        actor: Substitute
+        preconditions:
+          - "assignment.staffing_status == OFFERED"
+          - "assignment.substitute_id == X-User-ID"
+          - "substitute.pool_status == AVAILABLE"
+          - "substitute.clearance_expires_on >= assignment.end_at"
+        side_effects:
+          - "staffing_status := CONFIRMED; billing_status untouched"
+      - from: OFFERED
+        to: REQUESTED
+        trigger: "POST /fccn/substitute-assignments/{id}/decline"
+        actor: Substitute
+        preconditions:
+          - "assignment.staffing_status == OFFERED"
+          - "assignment.substitute_id == X-User-ID"
+        side_effects:
+          - "declined_substitute_ids += the declining substitute id; substitute_id cleared to null"
+          - "selector re-runs excluding declined_substitute_ids: on a hit the assignment immediately returns to OFFERED with the next-ranked substitute, on an empty candidate set it moves to UNFILLED"
+        note: "Cycle OFFERED -> REQUESTED -> OFFERED with monotonically growing exclusion set"
+      - from: CONFIRMED
+        to: COMPLETED
+        trigger: "POST /fccn/substitute-assignments/{id}/complete"
+        actor: Provider
+        preconditions:
+          - "assignment.staffing_status == CONFIRMED"
+          - "assignment.provider_id == X-User-ID"
+          - "assignment.end_at <= logical clock now"
+        side_effects:
+          - "billable_hours / pre_fee_subtotal_cents / network_admin_fee_cents / total_cost_cents := calculations.substitute_assignment_cost"
+          - "billing_status UNBILLED -> ACCRUED (billing dimension advances independently)"
+          - "substitute.assignment_count_completed += 1"
+      - from: COMPLETED
+        to: COMPLETED
+        trigger: "POST /fccn/substitute-assignments/{id}/invoice"
+        actor: FiscalOfficer
+        preconditions:
+          - "assignment.billing_status == ACCRUED"
+        side_effects:
+          - "billing_status ACCRUED -> INVOICED while staffing_status remains COMPLETED"
+        note: "Parallel dimension: the billing axis advances with no staffing-axis movement"
+
+  - entity: CoachingVisit
+    initial_state: SCHEDULED
+    terminal_states: [COMPLETED]
+    transitions:
+      - from: SCHEDULED
+        to: COMPLETED
+        trigger: "POST /fccn/coaching-visits/{id}/conduct"
+        actor: QualityCoach
+        preconditions:
+          - "visit.status == SCHEDULED"
+          - "request conducted_on >= visit.scheduled_on"
+          - "request conducted_on <= logical clock now (date part)"
+        side_effects:
+          - "visit_conducted_on / observation_score / findings / critical_finding stored, conducted_by_user_id := X-User-ID"
+          - "provider.quality_score / quality_tier recomputed by calculations.provider_quality_score variant COACHING_WEIGHTED, quality_variant_applied := COACHING_WEIGHTED"
+          - "when critical_finding == true, a ComplianceReview is created (origin COACHING_CRITICAL_FINDING, severity CRITICAL, status OPEN, cap_due_on := clock date + 14 days, opened_by_user_id := X-User-ID) and provider.open_finding_count += 1"
+
+  - entity: ComplianceReview
+    initial_state: OPEN
+    terminal_states: [CLOSED_COMPLIANT, ESCALATED_TO_LICENSING]
+    transitions:
+      - from: OPEN
+        to: CAP_SUBMITTED
+        trigger: "POST /fccn/compliance-reviews/{id}/submit-cap"
+        actor: Provider
+        preconditions:
+          - "review.status IN {OPEN, CAP_REJECTED}"
+          - "review.provider_id == X-User-ID"
+          - "logical clock date <= review.cap_due_on"
+        side_effects:
+          - "cap_narrative stored, cap_submitted_at := logical clock now"
+      - from: CAP_REJECTED
+        to: CAP_SUBMITTED
+        trigger: "POST /fccn/compliance-reviews/{id}/submit-cap"
+        actor: Provider
+        preconditions:
+          - "review.status IN {OPEN, CAP_REJECTED}"
+          - "review.provider_id == X-User-ID"
+          - "logical clock date <= review.cap_due_on"
+        side_effects:
+          - "cap_narrative replaced, cap_submitted_at := logical clock now"
+        note: "Cycle CAP_SUBMITTED -> CAP_REJECTED -> CAP_SUBMITTED, bounded by cap_rejection_count"
+      - from: CAP_SUBMITTED
+        to: CAP_REJECTED
+        trigger: "POST /fccn/compliance-reviews/{id}/reject-cap"
+        actor: QualityCoach
+        preconditions:
+          - "review.status == CAP_SUBMITTED"
+        side_effects:
+          - "cap_rejection_count += 1"
+      - from: CAP_SUBMITTED
+        to: CLOSED_COMPLIANT
+        trigger: "POST /fccn/compliance-reviews/{id}/close"
+        actor: QualityCoach
+        preconditions:
+          - "review.status == CAP_SUBMITTED"
+          - "X-User-ID != review.opened_by_user_id (segregation of duties)"
+        side_effects:
+          - "closed_by_user_id := X-User-ID"
+          - "provider.open_finding_count -= 1"
+          - "provider.quality_score / quality_tier recomputed by calculations.provider_quality_score variant COMPLIANCE_ANCHORED, quality_variant_applied := COMPLIANCE_ANCHORED"
+      - from: CAP_REJECTED
+        to: ESCALATED_TO_LICENSING
+        trigger: "POST /fccn/compliance-reviews/{id}/escalate"
+        actor: NetworkAdmin
+        preconditions:
+          - "review.status == CAP_REJECTED"
+          - "review.cap_rejection_count >= 2 (CAP_REJECTION_LIMIT)"
+          - "provider.membership_status == ACTIVE"
+        side_effects:
+          - "provider.open_finding_count -= 1"
+          - "hop 1 of quality_escalation_cascade: Provider ACTIVE -> PROBATION (see Provider machine for hops 2-4)"
+
+  - entity: FoodProgramClaim
+    initial_state: SUBMITTED
+    terminal_states: [APPROVED, APPROVED_WITH_DISALLOWANCE]
+    transitions:
+      - from: SUBMITTED
+        to: APPROVED
+        trigger: "POST /fccn/food-program-claims/{id}/approve with no disallowed_child_refs"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "request disallowed_child_refs is absent or empty"
+        side_effects:
+          - "reimbursed_amount_cents := claimed_amount_cents"
+          - "provider.projected_monthly_revenue_cents recomputed (food component)"
+      - from: SUBMITTED
+        to: APPROVED_WITH_DISALLOWANCE
+        trigger: "POST /fccn/food-program-claims/{id}/approve with a non-empty disallowed_child_refs"
+        actor: FiscalOfficer
+        preconditions:
+          - "claim.status == SUBMITTED"
+          - "every disallowed child_ref appears on at least one meal line of this claim"
+        side_effects:
+          - "disallowed_child_refs stored"
+          - "reimbursed_amount_cents := claimed_amount_cents - sum of the disallowed children's line amounts"
+          - "provider.projected_monthly_revenue_cents recomputed (food component)"
+
+  - entity: GroupPurchaseOrder
+    initial_state: OPEN
+    terminal_states: [COMMITTED]
+    transitions:
+      - from: OPEN
+        to: COMMITTED
+        trigger: "POST /fccn/group-purchase-orders/{id}/commit"
+        actor: Provider
+        preconditions:
+          - "order.status == OPEN"
+          - "order.provider_id == X-User-ID"
+          - "provider.network_posture == OPEN"
+        side_effects:
+          - "discount_pct / subtotal_cents / insurance_admin_fee_cents / total_cents := calculations.group_purchase_order_total"
+
+  - entity: Remittance
+    initial_state: POSTED
+    terminal_states: [REVERSED]
+    transitions:
+      - from: POSTED
+        to: REVERSED
+        trigger: "POST /fccn/remittances/{id}/reverse"
+        actor: FiscalOfficer
+        preconditions:
+          - "remittance.status == POSTED"
+        side_effects:
+          - "for each entry of allocations, claim.paid_cents -= allocated_cents and any SETTLED claim whose paid_cents drops below final_amount_cents returns to RECONCILED"
+          - "contract.remitted_cents -= amount_cents"
+          - "contract.unallocated_credit_cents -= unallocated_cents"
+          - "reversal_reason := request reversal_reason"
+        note: "Compensating action of remittance_cents_conservation; leaves contract.remitted_cents == sum(claim.paid_cents) + contract.unallocated_credit_cents"
+
+# =============================================================================
+# §1.2.1 Concurrency Rules (OCC on the parent's version — the only sanctioned mechanism)
+# =============================================================================
+concurrency_rules:
+  - rule_id: agreement-create-stale-provider
+    parent_entity: Provider
+    write_endpoint: "POST /fccn/membership-agreements"
+    occ_field: "expected_provider_version"
+    description: |
+      Creating a MembershipAgreement for a Provider whose version has advanced since the client last
+      observed it is rejected. A newly created agreement legitimately supersedes the provider's prior
+      SENT or COUNTERED agreement, so a writer holding a stale view of the provider would silently
+      withdraw an agreement it never saw; the stale-version check makes that observable instead.
+    error_id: ERR_STALE_PROVIDER_VERSION
+    http_status: 412
+  - rule_id: claim-create-stale-contract
+    parent_entity: SubsidyContract
+    write_endpoint: "POST /fccn/subsidy-claims"
+    occ_field: "expected_contract_version"
+    description: |
+      Creating a SubsidyClaim against a SubsidyContract whose version has advanced since the client
+      last observed it is rejected. Claim creation consumes period_month uniqueness and shifts the
+      contract's authorization headroom, both of which a stale reader may already have mis-measured.
+    error_id: ERR_STALE_CONTRACT_VERSION
+    http_status: 412
+
+# =============================================================================
+# §1.3 Calculation Rules Table
+# =============================================================================
+calculations:
+  - name: subsidy_claim_amount
+    trigger: "POST /fccn/subsidy-claims/{id}/submit writes provisional_amount_cents (variant PROVISIONAL_ADVANCE); POST /fccn/subsidy-claims/{id}/reconcile writes final_amount_cents (variant FINAL_RECONCILED)"
+    algorithm: forward_looking + chronological
+    formula: |
+      # Shared inputs: contract.daily_rate_cents, contract.absence_rate_pct,
+      # claim.lines[] = [{ enrollment_id, attended_days, absent_days }]
+      AUTHORIZED_DAYS_PER_MONTH = 22
+      ABSENCE_ALLOWANCE_DAYS_PER_LINE = 3
+
+      # variant PROVISIONAL_ADVANCE (written at submit)
+      provisional_amount_cents = 0
+      for line in claim.lines ordered by (Enrollment.created_at ASC):
+          payable_days = min(line.attended_days + line.absent_days, AUTHORIZED_DAYS_PER_MONTH)
+          provisional_amount_cents += payable_days * contract.daily_rate_cents
+
+      # variant FINAL_RECONCILED (written at reconcile)
+      final_amount_cents = 0
+      for line in claim.lines ordered by (Enrollment.created_at ASC):
+          enrollment = Enrollment[line.enrollment_id]
+          attended_component = min(line.attended_days, AUTHORIZED_DAYS_PER_MONTH) * contract.daily_rate_cents
+          if enrollment.status IN {WITHDRAWN, TRANSFERRED}:
+              absent_component = 0            # absence days are not payable for a child who left the home
+          else:
+              paid_absent_days = min(line.absent_days, ABSENCE_ALLOWANCE_DAYS_PER_LINE)
+              absent_component = round_half_up(paid_absent_days * contract.daily_rate_cents
+                                               * contract.absence_rate_pct / 100)   # rounded PER LINE
+          final_amount_cents += attended_component + absent_component
+
+      advance_paid_cents      = floor(provisional_amount_cents * 80 / 100)   # written at advance
+      settlement_delta_cents  = final_amount_cents - advance_paid_cents      # written at reconcile
+    input_set: "Every line of the claim; line ordering is Enrollment.created_at ASC (never id). Enrollment.status is read at the moment the variant runs, so a child who withdrew between submit and reconcile changes only the FINAL_RECONCILED result."
+    constants:
+      AUTHORIZED_DAYS_PER_MONTH: 22
+      ABSENCE_ALLOWANCE_DAYS_PER_LINE: 3
+      ADVANCE_PCT: 80
+    precision: "integer cents; per-line round_half_up on the absence component, then sum"
+    variants:
+      - name: PROVISIONAL_ADVANCE
+        when: "claim submit — the network fronts money before the agency verifies attendance"
+        difference: "Absence days are paid at the FULL daily rate with no per-line allowance cap and no enrollment-status filter; only the 22-day monthly cap applies to attended+absent combined."
+      - name: FINAL_RECONCILED
+        when: "claim reconcile — after the agency's attendance verification"
+        difference: "Absence days are capped at 3 per line and paid at absence_rate_pct of the daily rate, and drop to zero for lines whose enrollment is WITHDRAWN or TRANSFERRED; attended days are capped independently at 22."
+
+  - name: provider_quality_score
+    trigger: "POST /fccn/coaching-visits/{id}/conduct writes quality_score (variant COACHING_WEIGHTED); POST /fccn/compliance-reviews/{id}/close writes quality_score (variant COMPLIANCE_ANCHORED)"
+    algorithm: weighted_scoring
+    formula: |
+      OPEN_FINDING_PENALTY = 4.0
+      WEIGHTS = [0.5, 0.3, 0.2]        # most recent visit first
+      ANCHOR_WINDOW_DAYS = 180
+
+      # variant COACHING_WEIGHTED
+      visits = CoachingVisit[provider_id == provider.id AND status == COMPLETED]
+               ordered by (visit_conducted_on DESC, created_at DESC)
+      picked = first 3 of visits
+      if picked is empty: quality_score = 0.00; quality_tier = UNRATED; stop
+      used_weights = WEIGHTS[0 : len(picked)]
+      raw = sum(WEIGHTS[i] * picked[i].observation_score for i in 0..len(picked)-1) / sum(used_weights)
+      score = round_half_up(raw, 2)
+
+      # variant COMPLIANCE_ANCHORED
+      window = visits with visit_conducted_on >= (clock_date - 180 days) AND visit_conducted_on <= clock_date
+      if window is empty: quality_score = 0.00; quality_tier = UNRATED; stop
+      score = round_half_up(sum(v.observation_score for v in window) / count(window), 2)
+
+      # shared tail (both variants)
+      score = max(0.00, min(100.00, round_half_up(score - OPEN_FINDING_PENALTY * provider.open_finding_count, 2)))
+      quality_tier = TIER_1 if score >= 85 else TIER_2 if score >= 70 else TIER_3
+    input_set: "CoachingVisit rows of this provider with status == COMPLETED only; SCHEDULED visits never enter either variant. open_finding_count is read AFTER the triggering transition's own decrement/increment has been applied."
+    constants:
+      OPEN_FINDING_PENALTY: 4.0
+      WEIGHTS: [0.5, 0.3, 0.2]
+      ANCHOR_WINDOW_DAYS: 180
+      TIER_1_FLOOR: 85
+      TIER_2_FLOOR: 70
+    precision: "2 decimal places, round_half_up"
+    variants:
+      - name: COACHING_WEIGHTED
+        when: "a coaching visit is conducted"
+        difference: "Only the latest three completed visits count, recency-weighted 0.5/0.3/0.2 (renormalised when fewer than three exist), with no date window."
+      - name: COMPLIANCE_ANCHORED
+        when: "a compliance review is closed as compliant"
+        difference: "Every completed visit whose visit_conducted_on falls in the inclusive 180-day window ending at the clock date counts, unweighted arithmetic mean, regardless of how many visits that is."
+
+  - name: group_purchase_order_total
+    trigger: "POST /fccn/group-purchase-orders/{id}/commit writes discount_pct, subtotal_cents, insurance_admin_fee_cents and total_cents"
+    algorithm: tiered_pricing
+    formula: |
+      total_quantity = sum(line.quantity for line in order.lines)
+      discount_pct = 0.12 if total_quantity >= 100
+                     else 0.08 if total_quantity >= 50
+                     else 0.05 if total_quantity >= 15
+                     else 0.00
+
+      # ROUNDING ORDER IS PINNED: round each line, THEN sum. Summing gross first and rounding once
+      # yields a different cents figure whenever the per-line fractional parts each round down but
+      # their sum rounds up (e.g. two lines each ending in .4 cents).
+      subtotal_cents = 0
+      for line in order.lines in the order supplied in the request body:
+          gross = line.unit_price_cents * line.quantity
+          subtotal_cents += round_half_up(gross * (1 - discount_pct))     # per-line rounding
+
+      insurance_admin_fee_cents = round_half_up(subtotal_cents * 0.03) if order.category == INSURANCE else 0
+      total_cents = subtotal_cents + insurance_admin_fee_cents
+    input_set: "All lines of this order only; no cross-order or network-wide aggregation. Line order is the request-body order, which is also the persisted order."
+    constants:
+      TIER_100_PCT: 0.12
+      TIER_50_PCT: 0.08
+      TIER_15_PCT: 0.05
+      INSURANCE_ADMIN_FEE_PCT: 0.03
+    precision: "integer cents; round_half_up applied per line before summing, then once more on the insurance fee"
+
+  - name: substitute_assignment_cost
+    trigger: "POST /fccn/substitute-assignments/{id}/complete writes billable_hours, pre_fee_subtotal_cents, network_admin_fee_cents and total_cost_cents"
+    algorithm: threshold
+    formula: |
+      MIN_BILLABLE_HOURS = 4
+      duration_minutes = (assignment.end_at - assignment.start_at) in whole minutes
+      billable_hours = max(MIN_BILLABLE_HOURS, ceil(duration_minutes / 60))
+      base_cents = billable_hours * substitute.hourly_rate_cents
+
+      premium_pct = 0.00 if substitute.credential_level == NONE
+                    else 0.10 if substitute.credential_level == CDA
+                    else 0.18                                   # CHILD_DEV_TEACHER
+      premium_cents = round_half_up(base_cents * premium_pct)
+      pre_fee_subtotal_cents = base_cents + premium_cents
+
+      # EVALUATION ORDER IS PINNED: the admin-fee tier is keyed on pre_fee_subtotal_cents, NOT on
+      # total_cost_cents. The dependency looks circular (the fee is part of the total, and the total
+      # would select the tier) — reading the tier off total_cost_cents flips the bracket for any
+      # subtotal within one fee-width below a breakpoint.
+      fee_pct = 0.06 if pre_fee_subtotal_cents >= 30000
+                else 0.08 if pre_fee_subtotal_cents >= 15000
+                else 0.10
+      network_admin_fee_cents = round_half_up(pre_fee_subtotal_cents * fee_pct)
+      total_cost_cents = pre_fee_subtotal_cents + network_admin_fee_cents
+    input_set: "This assignment and its selected substitute only; the substitute's hourly_rate_cents and credential_level are read at completion time."
+    constants:
+      MIN_BILLABLE_HOURS: 4
+      CDA_PREMIUM_PCT: 0.10
+      CHILD_DEV_TEACHER_PREMIUM_PCT: 0.18
+      FEE_TIER_30000_PCT: 0.06
+      FEE_TIER_15000_PCT: 0.08
+      FEE_TIER_BASE_PCT: 0.10
+    precision: "integer cents; round_half_up on the premium, then round_half_up on the fee"
+
+  - name: food_program_reimbursement
+    trigger: "POST /fccn/food-program-claims writes tier_applied, subsidy_enrollment_share and claimed_amount_cents; POST /fccn/food-program-claims/{id}/approve writes reimbursed_amount_cents"
+    algorithm: tiered_pricing
+    formula: |
+      enrolled = Enrollment[provider_id == claim.provider_id AND status == ENROLLED]
+      subsidy_enrollment_share = 0.0000 if count(enrolled) == 0
+                                 else round_half_up(count(e in enrolled where e.subsidy_certified) / count(enrolled), 4)
+      tier_applied = TIER_I if (provider.county_tier == HIGH_NEED OR subsidy_enrollment_share >= 0.5000) else TIER_II
+
+      RATES = { TIER_I:  { breakfast: 187, lunch: 348, snack: 100 },
+                TIER_II: { breakfast:  67, lunch: 210, snack:  27 } }
+      r = RATES[tier_applied]
+      claimed_amount_cents = sum over meal_lines of
+            (line.breakfasts * r.breakfast + line.lunches * r.lunch + line.snacks * r.snack)
+
+      # at approval
+      disallowed_cents = sum of the per-line amounts of every meal line whose child_ref
+                         appears in request disallowed_child_refs
+      reimbursed_amount_cents = claimed_amount_cents - disallowed_cents
+    input_set: "Enrollments with status == ENROLLED at claim-creation time set the tier and the share is frozen on the claim; meal lines are the only revenue source. Lines whose child_ref is disallowed are removed at approval, never re-tiered."
+    constants:
+      TIER_I_BREAKFAST_CENTS: 187
+      TIER_I_LUNCH_CENTS: 348
+      TIER_I_SNACK_CENTS: 100
+      TIER_II_BREAKFAST_CENTS: 67
+      TIER_II_LUNCH_CENTS: 210
+      TIER_II_SNACK_CENTS: 27
+      SUBSIDY_SHARE_TIER_I_FLOOR: 0.5000
+      MAX_MEALS_PER_CHILD_DAY: 2
+      MAX_SNACKS_PER_CHILD_DAY: 1
+    precision: "integer cents; share to 4 decimal places, round_half_up"
+
+  - name: remittance_allocation
+    trigger: "POST /fccn/remittances writes allocations, unallocated_cents, each claim's paid_cents, contract.remitted_cents and contract.unallocated_credit_cents"
+    algorithm: waterfall_allocation
+    formula: |
+      candidates = SubsidyClaim[contract_id == remittance.contract_id
+                                AND status == RECONCILED
+                                AND paid_cents < final_amount_cents]
+                   ordered by (period_month ASC, created_at ASC)     # never by id
+      remaining = remittance.amount_cents
+      allocations = []
+      for claim in candidates:
+          if remaining == 0: break
+          take = min(remaining, claim.final_amount_cents - claim.paid_cents)
+          claim.paid_cents += take
+          if claim.paid_cents == claim.final_amount_cents: claim.status = SETTLED
+          allocations.append({ claim_id: claim.id, allocated_cents: take })
+          remaining -= take
+      unallocated_cents = remaining
+      contract.remitted_cents          += remittance.amount_cents
+      contract.unallocated_credit_cents += unallocated_cents
+
+      # INVARIANT remittance_cents_conservation (must hold after every post and every reversal):
+      #   contract.remitted_cents == sum(claim.paid_cents for claims of this contract)
+      #                              + contract.unallocated_credit_cents
+    input_set: "Only RECONCILED claims of the same contract with outstanding balance; SETTLED, HELD, SUBMITTED, ADVANCE_PAID, DRAFT and REJECTED claims are skipped entirely. Order is period_month ASC then created_at ASC; ties are impossible because period_month is unique per contract among non-REJECTED claims."
+    constants: {}
+    precision: "integer cents; no rounding — every cent is either allocated or credited"
+
+  - name: provider_revenue_projection
+    trigger: "GET /fccn/providers/{id}/revenue-model computes the whole projection on read; provider.projected_monthly_revenue_cents is written with monthly_revenue_cents whenever an enrollment status changes, a subsidy slot commitment changes, a food program claim is approved, or a subsidy claim is held or released"
+    algorithm: constraint_propagation
+    formula: |
+      AUTHORIZED_DAYS_PER_MONTH = 22
+      TARGET_MARGIN_PCT = 0.15
+      TUITION_ROUNDING_CENTS = 500
+      clock_month = the YYYY-MM of the logical clock
+
+      contract = the provider's SubsidyContract with status IN {ACTIVE, SUSPENDED_FOR_QUALITY}
+                 ordered by created_at ASC, first row (null when none)
+      held_enrollment_ids = enrollment_ids named on lines of SubsidyClaim rows of that contract with
+                            status == HELD AND period_month == clock_month
+      subsidy_enrollments = Enrollment[provider_id == provider.id AND status == ENROLLED
+                                      AND subsidy_certified == true AND slot_committed == true
+                                      AND id NOT IN held_enrollment_ids]
+      private_enrollments = Enrollment[provider_id == provider.id AND status == ENROLLED
+                                      AND subsidy_certified == false]
+
+      subsidy_component_cents = count(subsidy_enrollments) * (contract.daily_rate_cents if contract else 0)
+                                * AUTHORIZED_DAYS_PER_MONTH
+      private_component_cents = sum(e.private_monthly_tuition_cents for e in private_enrollments)
+      food_component_cents    = reimbursed_amount_cents of the provider's FoodProgramClaim rows with
+                                status IN {APPROVED, APPROVED_WITH_DISALLOWANCE}
+                                ordered by (period_month DESC, created_at DESC), first row, else 0
+      monthly_revenue_cents   = subsidy_component_cents + private_component_cents + food_component_cents
+
+      network_fee_cents    = round_half_up(monthly_revenue_cents * provider.network_fee_pct / 100)
+      substitute_cost_cents = sum(a.total_cost_cents for a in SubstituteAssignment
+                                 [provider_id == provider.id AND billing_status IN {ACCRUED, INVOICED}
+                                  AND the YYYY-MM of start_at == clock_month])
+      monthly_cost_cents   = provider.fixed_monthly_cost_cents + network_fee_cents + substitute_cost_cents
+
+      if count(subsidy_enrollments) + count(private_enrollments) == 0:
+          margin_pct = 0.0000
+          sustainability = INSUFFICIENT_DATA
+          recommended_private_tuition_cents = null
+      else:
+          margin_pct = round_half_up((monthly_revenue_cents - monthly_cost_cents) / monthly_revenue_cents, 4)
+          sustainability = SUSTAINABLE if margin_pct >= 0.1500
+                           else THIN    if margin_pct >= 0.0500
+                           else AT_RISK
+          if count(private_enrollments) == 0:
+              recommended_private_tuition_cents = null
+          else:
+              denominator = 1 - TARGET_MARGIN_PCT - provider.network_fee_pct / 100
+              needed_private = max(0, ceil((provider.fixed_monthly_cost_cents + substitute_cost_cents) / denominator)
+                                       - subsidy_component_cents - food_component_cents)
+              per_child = needed_private / count(private_enrollments)
+              recommended_private_tuition_cents = ceil(per_child / TUITION_ROUNDING_CENTS) * TUITION_ROUNDING_CENTS
+    input_set: "Only ENROLLED enrollments; TRANSITION_PENDING, TRANSFERRED and WITHDRAWN are excluded. The subsidy component is independent of contract.status but excludes enrollments named on a HELD claim for the clock month, which is what makes hop 4 of quality_escalation_cascade observable. Substitute cost counts assignments whose start_at falls in the clock month with billing_status ACCRUED or INVOICED."
+    constants:
+      AUTHORIZED_DAYS_PER_MONTH: 22
+      TARGET_MARGIN_PCT: 0.15
+      SUSTAINABLE_FLOOR: 0.1500
+      THIN_FLOOR: 0.0500
+      TUITION_ROUNDING_CENTS: 500
+    precision: "cents as integers; margin_pct to 4 decimal places round_half_up; recommended tuition rounded UP to the next 500-cent multiple"
+
+  - name: substitute_selection
+    trigger: "POST /fccn/substitute-assignments without requested_substitute_id, and POST /fccn/substitute-assignments/{id}/decline (re-selection)"
+    algorithm: selector_policy
+    formula: |
+      BUFFER_MINUTES = 30
+      CREDENTIAL_RANK = { NONE: 0, CDA: 1, CHILD_DEV_TEACHER: 2 }
+
+      # (a) eligibility filter — every clause must hold
+      candidates = Substitute[
+            pool_status == AVAILABLE
+        AND clearance_expires_on >= assignment.end_at
+        AND CREDENTIAL_RANK[credential_level] >= CREDENTIAL_RANK[assignment.min_credential_level]
+        AND provider.county_tier IN service_county_tiers
+        AND id NOT IN assignment.declined_substitute_ids
+        AND no SubstituteAssignment x exists with x.substitute_id == this substitute
+            AND x.staffing_status IN {OFFERED, CONFIRMED, COMPLETED}
+            AND (assignment.start_at - BUFFER_MINUTES) < x.end_at
+            AND (assignment.end_at + BUFFER_MINUTES) > x.start_at ]
+
+      # (b) ranking expression, (c) tie-breaks — all over entity fields, never id
+      winner = candidates ordered by (hourly_rate_cents ASC,
+                                     assignment_count_completed ASC,
+                                     created_at ASC) first row
+
+      # (d) empty-pool fallback
+      if candidates is empty: assignment.staffing_status = UNFILLED and substitute_id stays null
+      else: assignment.substitute_id = winner.id and staffing_status = OFFERED
+    input_set: "Every Substitute row is a candidate before filtering; the conflict clause considers the candidate's own assignments in staffing_status OFFERED, CONFIRMED or COMPLETED (REQUESTED and UNFILLED assignments hold no substitute and are irrelevant)."
+    constants:
+      BUFFER_MINUTES: 30
+      CREDENTIAL_RANK: { NONE: 0, CDA: 1, CHILD_DEV_TEACHER: 2 }
+    precision: "not applicable — deterministic single-row selection with a fully ordered ranking key"
+
+# =============================================================================
+# §1.4 Validation Rules Table (evaluated in strict ascending priority order;
+#      the first failing rule short-circuits and its error_id is returned)
+# =============================================================================
+validations:
+  - priority: 1
+    category: auth
+    check: "X-User-Role header present and equal to one of the six roles declared in §1.7"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /fccn/providers/apply"
+  - priority: 2
+    category: auth
+    check: "X-User-ID header present and non-empty; for roles whose identity is entity_backed, it must equal the id of an existing row of that entity"
+    error_id: ERR_UNAUTHENTICATED
+    http_status: 401
+    applies_to: "all except POST /fccn/providers/apply"
+  - priority: 3
+    category: auth
+    check: "The acting role appears in the endpoint's roles list"
+    error_id: ERR_FORBIDDEN_ROLE
+    http_status: 403
+    applies_to: "all"
+  - priority: 4
+    category: auth
+    check: "Ownership scope: a Provider actor may only address resources whose provider_id equals X-User-ID (directly, or via the parent chain contract_id -> SubsidyContract.provider_id); a Substitute actor may only address SubstituteAssignment rows whose substitute_id equals X-User-ID"
+    error_id: ERR_PROVIDER_SCOPE_VIOLATION
+    http_status: 403
+    applies_to: "all Provider-role and Substitute-role endpoints (Substitute-role violations return ERR_SUBSTITUTE_SCOPE_VIOLATION)"
+  - priority: 5
+    category: existence
+    check: "Every id in the path exists, validated left-to-right"
+    error_id: "ERR_PROVIDER_NOT_FOUND | ERR_AGREEMENT_NOT_FOUND | ERR_ENROLLMENT_NOT_FOUND | ERR_CONTRACT_NOT_FOUND | ERR_CLAIM_NOT_FOUND | ERR_REMITTANCE_NOT_FOUND | ERR_FOOD_CLAIM_NOT_FOUND | ERR_SUBSTITUTE_NOT_FOUND | ERR_ASSIGNMENT_NOT_FOUND | ERR_VISIT_NOT_FOUND | ERR_REVIEW_NOT_FOUND | ERR_ORDER_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with a path parameter"
+  - priority: 6
+    category: existence
+    check: "Every foreign key supplied in the request body exists (provider_id, contract_id, substitute_id / requested_substitute_id, enrollment_id inside claim lines, receiving_provider_id)"
+    error_id: "ERR_PROVIDER_NOT_FOUND | ERR_CONTRACT_NOT_FOUND | ERR_SUBSTITUTE_NOT_FOUND | ERR_ENROLLMENT_NOT_FOUND"
+    http_status: 404
+    applies_to: "all endpoints with FK fields in input"
+  - priority: 7
+    category: business_constraint
+    check: "Request shape: all required fields present; enum values in range; integers non-negative; capacity_slots in 1..12; days_per_week in 1..5; observation_score in 0..100; end_at strictly after start_at; period_month matches ^\\d{4}-(0[1-9]|1[0-2])$; arrays non-empty where required"
+    error_id: ERR_INVALID_REQUEST
+    http_status: 400
+    applies_to: "all"
+  - priority: 8
+    category: state
+    check: "Optimistic concurrency: expected_provider_version equals Provider.version (POST /fccn/membership-agreements); expected_contract_version equals SubsidyContract.version (POST /fccn/subsidy-claims)"
+    error_id: "ERR_STALE_PROVIDER_VERSION | ERR_STALE_CONTRACT_VERSION"
+    http_status: 412
+    applies_to: "POST /fccn/membership-agreements, POST /fccn/subsidy-claims"
+  - priority: 9
+    category: state
+    check: "The target resource's own status is a declared from-state of the requested transition in §1.2"
+    error_id: "ERR_INVALID_PROVIDER_STATE | ERR_INVALID_AGREEMENT_STATE | ERR_INVALID_ENROLLMENT_STATE | ERR_INVALID_CLAIM_STATE | ERR_INVALID_ASSIGNMENT_STATE | ERR_INVALID_VISIT_STATE | ERR_INVALID_REVIEW_STATE | ERR_INVALID_ORDER_STATE | ERR_INVALID_REMITTANCE_STATE"
+    http_status: 409
+    applies_to: "all transition endpoints"
+  - priority: 10
+    category: state
+    check: "Cross-entity state precondition on a DIFFERENT entity than the target: the referenced SubsidyContract must be ACTIVE for claim submit and for remittance posting"
+    error_id: ERR_CONTRACT_NOT_ACTIVE
+    http_status: 409
+    applies_to: "POST /fccn/subsidy-claims/{id}/submit, POST /fccn/remittances"
+  - priority: 11
+    category: state
+    check: "Provider network_posture gate: FROZEN blocks every provider-initiated write; RESTRICTED blocks new enrollments, new subsidy claims and new group purchase orders but allows compliance and substitute traffic"
+    error_id: ERR_PROVIDER_POSTURE_BLOCKED
+    http_status: 409
+    applies_to: "POST /fccn/enrollments, POST /fccn/subsidy-claims, POST /fccn/group-purchase-orders, POST /fccn/food-program-claims, POST /fccn/substitute-assignments"
+  - priority: 12
+    category: business_safety
+    check: "Child-safety and licensure gates evaluated before any scheduling or fiscal arithmetic: the selected/requested substitute's clearance_expires_on must be on or after the assignment end_at; the provider's license_expires_on must be on or after the logical clock date; the user closing a compliance review or conducting a coaching visit must not be the user who opened/scheduled it (segregation of duties)"
+    error_id: "ERR_SUBSTITUTE_CLEARANCE_EXPIRED | ERR_LICENSE_EXPIRED | ERR_SEGREGATION_OF_DUTIES"
+    http_status: "422 | 422 | 403"
+    applies_to: "POST /fccn/substitute-assignments, POST /fccn/enrollments, POST /fccn/subsidy-claims, POST /fccn/coaching-visits/{id}/conduct, POST /fccn/compliance-reviews/{id}/close"
+  - priority: 13
+    category: business_temporal
+    check: "Interval and calendar conflicts: requested substitute has no 30-minute-buffered overlap with an OFFERED/CONFIRMED/COMPLETED assignment; the provider has fewer than 2 SCHEDULED/COMPLETED coaching visits inside the inclusive +/-29-day window around scheduled_on; no other non-REJECTED claim exists for the same contract and period_month; a CAP submission arrives on or before cap_due_on; a coaching visit is not scheduled before the logical clock date"
+    error_id: "ERR_SUBSTITUTE_INTERVAL_CONFLICT | ERR_COACHING_WINDOW_SATURATED | ERR_CLAIM_PERIOD_DUPLICATE | ERR_CAP_DEADLINE_PASSED | ERR_VISIT_DATE_IN_PAST"
+    http_status: "409 | 409 | 409 | 422 | 422"
+    applies_to: "POST /fccn/substitute-assignments, POST /fccn/coaching-visits, POST /fccn/subsidy-claims, POST /fccn/compliance-reviews/{id}/submit-cap"
+  - priority: 14
+    category: business_referential
+    check: "Referential coherence of body collections: every claim line's enrollment_id belongs to the contract's provider and is subsidy_certified; every meal line's child_ref matches an Enrollment.child_ref of the claim's provider; a transfer's receiving_provider_id is a different ACTIVE provider with network_posture OPEN"
+    error_id: "ERR_CLAIM_LINE_ENROLLMENT_MISMATCH | ERR_MEAL_LINE_CHILD_UNKNOWN | ERR_RECEIVING_PROVIDER_INELIGIBLE"
+    http_status: 422
+    applies_to: "POST /fccn/subsidy-claims, POST /fccn/food-program-claims, POST /fccn/enrollments/{id}/transfer"
+  - priority: 15
+    category: business_constraint
+    check: "Aggregate and uniqueness constraints: agreement round_index must be <= MAX_NEGOTIATION_ROUNDS (3); per child_ref per service_date breakfasts+lunches <= 2 and snacks <= 1; count of ENROLLED+TRANSITION_PENDING enrollments < provider.capacity_slots; child_ref unique among the provider's non-terminal enrollments; a provider may not complete exit while any enrollment is TRANSITION_PENDING; a review may only be escalated once cap_rejection_count >= 2"
+    error_id: "ERR_NEGOTIATION_ROUNDS_EXHAUSTED | ERR_MEAL_CAP_EXCEEDED | ERR_CAPACITY_EXCEEDED | ERR_DUPLICATE_CHILD_REF | ERR_EXIT_TRANSITIONS_PENDING | ERR_CAP_REJECTION_LIMIT_NOT_REACHED"
+    http_status: "409 | 422 | 409 | 409 | 409 | 409"
+    applies_to: "POST /fccn/membership-agreements/{id}/counter, POST /fccn/food-program-claims, POST /fccn/enrollments, POST /fccn/providers/{id}/complete-exit, POST /fccn/compliance-reviews/{id}/escalate"
+  - priority: 16
+    category: business_fiscal
+    check: "Fiscal capacity checked last: contract.available_slots >= 1 before committing a subsidy slot; contract.claimed_amount_cents + this claim's provisional_amount_cents <= contract.authorized_amount_cents at submit"
+    error_id: "ERR_SUBSIDY_SLOTS_EXHAUSTED | ERR_CONTRACT_AUTHORIZATION_EXCEEDED"
+    http_status: "409 | 402"
+    applies_to: "POST /fccn/enrollments, POST /fccn/subsidy-claims/{id}/submit"
+
+# =============================================================================
+# §1.5 API Endpoint Table
+# =============================================================================
+endpoints:
+  # --- Provider lifecycle -----------------------------------------------------
+  - method: POST
+    path: "/fccn/providers/apply"
+    description: "A family child care home applies to join the network; created in APPLICANT with network_posture FROZEN."
+    roles: [Anonymous]
+    code: 201
+    input: [legal_name, county_tier, license_number, license_expires_on, capacity_slots, "fixed_monthly_cost_cents?"]
+    output: Provider
+    side_effects:
+      - "membership_status := APPLICANT, network_posture := FROZEN, quality_tier := UNRATED, quality_variant_applied := NONE"
+      - "fixed_monthly_cost_cents defaults to 180000 when omitted"
+  - method: POST
+    path: "/fccn/providers/{id}/license-verification"
+    description: "Network staff record the licensing verification result, advancing the applicant to PENDING_AGREEMENT."
+    roles: [NetworkAdmin]
+    code: 200
+    input: [license_number, license_expires_on, "capacity_slots?"]
+    output: Provider
+    side_effects:
+      - "Provider APPLICANT -> PENDING_AGREEMENT"
+      - "overwrites license_number, license_expires_on and (when supplied) capacity_slots"
+      - "increments Provider.version by 1"
+  - method: POST
+    path: "/fccn/providers/{id}/reinstate"
+    description: "Lift probation once no compliance finding remains open; runs the compensating inverse of quality_escalation_cascade."
+    roles: [NetworkAdmin]
+    code: 200
+    input: []
+    output: Provider
+    side_effects:
+      - "Provider PROBATION -> ACTIVE, network_posture -> OPEN"
+      - "every SUSPENDED_FOR_QUALITY SubsidyContract of this provider -> ACTIVE"
+      - "every HELD SubsidyClaim of those contracts -> held_from_status, hold_reason cleared, contract.claimed_amount_cents restored"
+      - "recomputes provider.projected_monthly_revenue_cents (calculations.provider_revenue_projection)"
+      - "increments Provider.version by 1"
+  - method: POST
+    path: "/fccn/providers/{id}/exit-network"
+    description: "Begin an orderly network exit; freezes the provider and marks every active enrollment for family transition."
+    roles: [NetworkAdmin]
+    code: 200
+    input: [exit_reason]
+    output: Provider
+    side_effects:
+      - "Provider ACTIVE|PROBATION -> EXITING, network_posture -> FROZEN"
+      - "every ENROLLED Enrollment of this provider -> TRANSITION_PENDING, releasing its committed subsidy slot"
+      - "recomputes provider.projected_monthly_revenue_cents"
+      - "increments Provider.version by 1"
+  - method: POST
+    path: "/fccn/providers/{id}/complete-exit"
+    description: "Finalize the exit after every child has transferred or withdrawn; terminates the subsidy contracts."
+    roles: [NetworkAdmin]
+    code: 200
+    input: []
+    output: Provider
+    side_effects:
+      - "Provider EXITING -> EXITED"
+      - "every SubsidyContract of this provider -> TERMINATED"
+      - "increments Provider.version by 1"
+
+  # --- Membership agreements (OCC write on Provider) --------------------------
+  - method: POST
+    path: "/fccn/membership-agreements"
+    description: "Issue a network membership agreement to a provider; supersedes any agreement still under negotiation. Requires the Provider version the caller last observed."
+    roles: [NetworkAdmin]
+    code: 201
+    input: [provider_id, network_fee_pct, shared_services, effective_on, expected_provider_version]
+    output: MembershipAgreement
+    side_effects:
+      - "any existing agreement of this provider with status IN {SENT, COUNTERED} -> WITHDRAWN with superseded := true and withdrawal_reason := 'SUPERSEDED_BY_NEWER_AGREEMENT'"
+      - "new agreement status := SENT, round_index := 0"
+      - "increments Provider.version by 1"
+  - method: POST
+    path: "/fccn/membership-agreements/{id}/counter"
+    description: "Provider counters the offered network fee; bounded by MAX_NEGOTIATION_ROUNDS."
+    roles: [Provider]
+    code: 200
+    input: [proposed_network_fee_pct]
+    output: MembershipAgreement
+    side_effects:
+      - "MembershipAgreement SENT -> COUNTERED"
+      - "round_index += 1"
+  - method: POST
+    path: "/fccn/membership-agreements/{id}/revise"
+    description: "Network staff answer a counter with a revised fee, returning the agreement to SENT."
+    roles: [NetworkAdmin]
+    code: 200
+    input: [network_fee_pct]
+    output: MembershipAgreement
+    side_effects:
+      - "MembershipAgreement COUNTERED -> SENT"
+      - "proposed_network_fee_pct cleared to null"
+  - method: POST
+    path: "/fccn/membership-agreements/{id}/execute"
+    description: "Provider signs the agreement, which activates network membership."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: MembershipAgreement
+    side_effects:
+      - "MembershipAgreement SENT -> EXECUTED, executed_at := logical clock now"
+      - "Provider PENDING_AGREEMENT -> ACTIVE, network_posture -> OPEN, network_fee_pct := agreement.network_fee_pct"
+      - "increments Provider.version by 1"
+  - method: POST
+    path: "/fccn/membership-agreements/{id}/withdraw"
+    description: "Network staff withdraw an agreement that is still under negotiation."
+    roles: [NetworkAdmin]
+    code: 200
+    input: [reason]
+    output: MembershipAgreement
+    side_effects:
+      - "MembershipAgreement SENT|COUNTERED -> WITHDRAWN, withdrawal_reason := reason"
+
+  # --- Enrollment and family transition --------------------------------------
+  - method: POST
+    path: "/fccn/enrollments"
+    description: "Enroll a child in the provider's home; a subsidy-certified child also commits a slot on the provider's active subsidy contract."
+    roles: [Provider]
+    code: 201
+    input: [provider_id, child_ref, family_name, days_per_week, private_monthly_tuition_cents, subsidy_certified, start_on]
+    output: Enrollment
+    side_effects:
+      - "status := ENROLLED, predecessor_enrollment_id := null"
+      - "when subsidy_certified: contract.committed_slots += 1, contract.available_slots -= 1, slot_committed := true"
+      - "recomputes provider.projected_monthly_revenue_cents"
+  - method: POST
+    path: "/fccn/enrollments/{id}/withdraw"
+    description: "The family leaves the home; releases any committed subsidy slot."
+    roles: [Provider]
+    code: 200
+    input: [exit_on]
+    output: Enrollment
+    side_effects:
+      - "Enrollment ENROLLED|TRANSITION_PENDING -> WITHDRAWN, exit_on := request exit_on"
+      - "releases the committed subsidy slot only when slot_committed was true"
+      - "recomputes provider.projected_monthly_revenue_cents"
+  - method: POST
+    path: "/fccn/enrollments/{id}/transfer"
+    description: "Place a transitioning child with another network provider; returns the newly created enrollment at the receiving home."
+    roles: [NetworkAdmin]
+    code: 201
+    input: [receiving_provider_id, transfer_on]
+    output: Enrollment
+    side_effects:
+      - "source Enrollment TRANSITION_PENDING -> TRANSFERRED, exit_on := transfer_on"
+      - "creates a new Enrollment at the receiving provider with predecessor_enrollment_id := source id and status ENROLLED"
+      - "when subsidy_certified: commits a slot on the receiving provider's ACTIVE contract"
+      - "recomputes projected_monthly_revenue_cents on both providers"
+
+  # --- Subsidy contract administration ---------------------------------------
+  - method: POST
+    path: "/fccn/subsidy-contracts"
+    description: "Register the subsidy contract the network administers on the provider's behalf."
+    roles: [NetworkAdmin]
+    code: 201
+    input: [provider_id, agency_code, daily_rate_cents, contracted_slots, authorized_amount_cents, period_start_on, "absence_rate_pct?"]
+    output: SubsidyContract
+    side_effects:
+      - "status := ACTIVE, committed_slots := 0, available_slots := contracted_slots"
+      - "claimed_amount_cents := 0, remitted_cents := 0, unallocated_credit_cents := 0"
+      - "absence_rate_pct defaults to 50 when omitted"
+
+  # --- Subsidy claiming and reconciliation (OCC write on SubsidyContract) -----
+  - method: POST
+    path: "/fccn/subsidy-claims"
+    description: "Draft the monthly attendance claim for a contract. Requires the SubsidyContract version the caller last observed; allowed while the contract is SUSPENDED_FOR_QUALITY so the draft survives a quality hold."
+    roles: [Provider]
+    code: 201
+    input: [contract_id, period_month, lines, expected_contract_version]
+    output: SubsidyClaim
+    side_effects:
+      - "status := DRAFT, paid_cents := 0"
+      - "increments SubsidyContract.version by 1"
+  - method: POST
+    path: "/fccn/subsidy-claims/{id}/submit"
+    description: "Submit the drafted claim to the agency; computes the PROVISIONAL_ADVANCE variant and consumes contract authorization."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: SubsidyClaim
+    side_effects:
+      - "SubsidyClaim DRAFT -> SUBMITTED"
+      - "provisional_amount_cents := calculations.subsidy_claim_amount variant PROVISIONAL_ADVANCE"
+      - "contract.claimed_amount_cents += provisional_amount_cents"
+  - method: POST
+    path: "/fccn/subsidy-claims/{id}/advance"
+    description: "Network fronts 80 percent of the provisional amount to the provider before the agency verifies attendance."
+    roles: [FiscalOfficer]
+    code: 200
+    input: []
+    output: SubsidyClaim
+    side_effects:
+      - "SubsidyClaim SUBMITTED -> ADVANCE_PAID"
+      - "advance_paid_cents := floor(provisional_amount_cents * 80 / 100)"
+  - method: POST
+    path: "/fccn/subsidy-claims/{id}/reconcile"
+    description: "Apply the agency's verified attendance: computes the FINAL_RECONCILED variant and the settlement delta against the advance."
+    roles: [FiscalOfficer]
+    code: 200
+    input: []
+    output: SubsidyClaim
+    side_effects:
+      - "SubsidyClaim ADVANCE_PAID -> RECONCILED"
+      - "final_amount_cents := calculations.subsidy_claim_amount variant FINAL_RECONCILED"
+      - "settlement_delta_cents := final_amount_cents - advance_paid_cents"
+      - "contract.claimed_amount_cents adjusted by (final_amount_cents - provisional_amount_cents)"
+  - method: POST
+    path: "/fccn/subsidy-claims/{id}/reject"
+    description: "Agency rejects the submitted claim; releases the authorization it consumed."
+    roles: [FiscalOfficer]
+    code: 200
+    input: [rejection_reason]
+    output: SubsidyClaim
+    side_effects:
+      - "SubsidyClaim SUBMITTED -> REJECTED, rejection_reason := request rejection_reason"
+      - "contract.claimed_amount_cents -= provisional_amount_cents"
+
+  # --- Agency remittances (waterfall + compensation) --------------------------
+  - method: POST
+    path: "/fccn/remittances"
+    description: "Post an agency payment against a contract and run the waterfall allocation over its reconciled claims."
+    roles: [FiscalOfficer]
+    code: 201
+    input: [contract_id, agency_reference, amount_cents, received_on]
+    output: Remittance
+    side_effects:
+      - "status := POSTED; allocations and unallocated_cents := calculations.remittance_allocation"
+      - "each allocated claim's paid_cents += allocated_cents; fully covered claims RECONCILED -> SETTLED"
+      - "contract.remitted_cents += amount_cents; contract.unallocated_credit_cents += unallocated_cents"
+      - "preserves invariant remittance_cents_conservation"
+  - method: POST
+    path: "/fccn/remittances/{id}/reverse"
+    description: "Reverse a mis-posted agency payment, undoing every allocation it made."
+    roles: [FiscalOfficer]
+    code: 200
+    input: [reversal_reason]
+    output: Remittance
+    side_effects:
+      - "Remittance POSTED -> REVERSED, reversal_reason := request reversal_reason"
+      - "each allocated claim's paid_cents -= allocated_cents; SETTLED claims return to RECONCILED"
+      - "contract.remitted_cents -= amount_cents; contract.unallocated_credit_cents -= unallocated_cents"
+      - "preserves invariant remittance_cents_conservation with zero drift"
+
+  # --- Food program claiming --------------------------------------------------
+  - method: POST
+    path: "/fccn/food-program-claims"
+    description: "File the monthly food program claim; freezes the reimbursement tier and the subsidy enrollment share at creation."
+    roles: [Provider]
+    code: 201
+    input: [provider_id, period_month, meal_lines]
+    output: FoodProgramClaim
+    side_effects:
+      - "status := SUBMITTED"
+      - "subsidy_enrollment_share, tier_applied and claimed_amount_cents := calculations.food_program_reimbursement"
+  - method: POST
+    path: "/fccn/food-program-claims/{id}/approve"
+    description: "Approve the food program claim, optionally disallowing meals for named children."
+    roles: [FiscalOfficer]
+    code: 200
+    input: ["disallowed_child_refs?"]
+    output: FoodProgramClaim
+    side_effects:
+      - "FoodProgramClaim SUBMITTED -> APPROVED when disallowed_child_refs is absent or empty, else -> APPROVED_WITH_DISALLOWANCE"
+      - "reimbursed_amount_cents := claimed_amount_cents minus the disallowed lines"
+      - "recomputes provider.projected_monthly_revenue_cents"
+
+  # --- Substitute pool --------------------------------------------------------
+  - method: POST
+    path: "/fccn/substitutes"
+    description: "Add a cleared substitute to the network pool."
+    roles: [NetworkAdmin]
+    code: 201
+    input: [full_name, credential_level, clearance_expires_on, hourly_rate_cents, service_county_tiers]
+    output: Substitute
+    side_effects:
+      - "pool_status := AVAILABLE, assignment_count_completed := 0"
+  - method: POST
+    path: "/fccn/substitutes/{id}/clearance"
+    description: "Record a background-check / clearance determination for a pool member, adjusting the clearance expiry and pool availability."
+    roles: [NetworkAdmin]
+    code: 200
+    input: ["clearance_expires_on?", "pool_status?"]
+    output: Substitute
+    side_effects:
+      - "overwrites clearance_expires_on and/or pool_status; already-CONFIRMED assignments are left untouched"
+  - method: POST
+    path: "/fccn/substitute-assignments"
+    description: "Request substitute coverage for a provider absence; runs calculations.substitute_selection unless a specific substitute is requested."
+    roles: [Provider]
+    code: 201
+    input: [provider_id, start_at, end_at, reason, min_credential_level, "requested_substitute_id?"]
+    output: SubstituteAssignment
+    side_effects:
+      - "staffing_status := REQUESTED then -> OFFERED with the selected substitute_id, or -> UNFILLED when no candidate is eligible"
+      - "billing_status := UNBILLED, declined_substitute_ids := []"
+  - method: POST
+    path: "/fccn/substitute-assignments/{id}/accept"
+    description: "Substitute accepts the offered coverage."
+    roles: [Substitute]
+    code: 200
+    input: []
+    output: SubstituteAssignment
+    side_effects:
+      - "SubstituteAssignment staffing_status OFFERED -> CONFIRMED"
+  - method: POST
+    path: "/fccn/substitute-assignments/{id}/decline"
+    description: "Substitute declines; the assignment returns to REQUESTED and re-selects, or becomes UNFILLED when the candidate set empties."
+    roles: [Substitute]
+    code: 200
+    input: []
+    output: SubstituteAssignment
+    side_effects:
+      - "declined_substitute_ids append the declining substitute_id, substitute_id cleared to null"
+      - "staffing_status OFFERED -> REQUESTED then -> OFFERED with the next candidate, or -> UNFILLED"
+  - method: POST
+    path: "/fccn/substitute-assignments/{id}/complete"
+    description: "Provider confirms the coverage was delivered; computes the billable cost."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: SubstituteAssignment
+    side_effects:
+      - "SubstituteAssignment staffing_status CONFIRMED -> COMPLETED, billing_status UNBILLED -> ACCRUED"
+      - "billable_hours, pre_fee_subtotal_cents, network_admin_fee_cents, total_cost_cents := calculations.substitute_assignment_cost"
+      - "substitute.assignment_count_completed += 1"
+      - "recomputes provider.projected_monthly_revenue_cents"
+  - method: POST
+    path: "/fccn/substitute-assignments/{id}/invoice"
+    description: "Bill the completed coverage to the provider's shared-services account; staffing_status stays COMPLETED."
+    roles: [FiscalOfficer]
+    code: 200
+    input: []
+    output: SubstituteAssignment
+    side_effects:
+      - "SubstituteAssignment billing_status ACCRUED -> INVOICED with staffing_status unchanged at COMPLETED"
+
+  # --- Coaching, quality standards and compliance -----------------------------
+  - method: POST
+    path: "/fccn/coaching-visits"
+    description: "Schedule a coaching visit; the scheduling coach is recorded and may not be the coach who conducts it."
+    roles: [QualityCoach]
+    code: 201
+    input: [provider_id, scheduled_on, focus_area]
+    output: CoachingVisit
+    side_effects:
+      - "status := SCHEDULED, coach_user_id := X-User-ID"
+  - method: POST
+    path: "/fccn/coaching-visits/{id}/conduct"
+    description: "Record the observation for a scheduled visit; recomputes quality_score with the COACHING_WEIGHTED variant and opens a compliance review when the finding is critical."
+    roles: [QualityCoach]
+    code: 200
+    input: [visit_conducted_on, observation_score, findings, critical_finding, "critical_standard_codes?", "cap_due_on?"]
+    output: CoachingVisit
+    side_effects:
+      - "CoachingVisit SCHEDULED -> COMPLETED, conducted_by_user_id := X-User-ID"
+      - "provider.quality_score / quality_tier := calculations.provider_quality_score variant COACHING_WEIGHTED, quality_variant_applied := COACHING_WEIGHTED"
+      - "when critical_finding: creates a ComplianceReview with origin COACHING_CRITICAL_FINDING, status OPEN, severity CRITICAL, standard_codes := critical_standard_codes (default ['QS-CRITICAL']), cap_due_on := request cap_due_on (default clock date + 30 days), opened_by_user_id := X-User-ID, and provider.open_finding_count += 1"
+  - method: POST
+    path: "/fccn/compliance-reviews"
+    description: "Open a scheduled network compliance review against quality standards."
+    roles: [QualityCoach]
+    code: 201
+    input: [provider_id, standard_codes, severity, cap_due_on]
+    output: ComplianceReview
+    side_effects:
+      - "status := OPEN, origin := SCHEDULED_AUDIT, opened_by_user_id := X-User-ID, cap_rejection_count := 0"
+      - "provider.open_finding_count += 1"
+  - method: POST
+    path: "/fccn/compliance-reviews/{id}/submit-cap"
+    description: "Provider submits a corrective action plan before the CAP deadline."
+    roles: [Provider]
+    code: 200
+    input: [cap_narrative]
+    output: ComplianceReview
+    side_effects:
+      - "ComplianceReview OPEN|CAP_REJECTED -> CAP_SUBMITTED, cap_narrative := request cap_narrative, cap_submitted_at := logical clock now"
+  - method: POST
+    path: "/fccn/compliance-reviews/{id}/reject-cap"
+    description: "Coach rejects the corrective action plan; the provider may resubmit."
+    roles: [QualityCoach]
+    code: 200
+    input: []
+    output: ComplianceReview
+    side_effects:
+      - "ComplianceReview CAP_SUBMITTED -> CAP_REJECTED, cap_rejection_count += 1"
+  - method: POST
+    path: "/fccn/compliance-reviews/{id}/close"
+    description: "Close the review as compliant; the closing coach must differ from the coach who opened it (segregation of duties)."
+    roles: [QualityCoach]
+    code: 200
+    input: []
+    output: ComplianceReview
+    side_effects:
+      - "ComplianceReview CAP_SUBMITTED -> CLOSED_COMPLIANT, closed_by_user_id := X-User-ID"
+      - "provider.open_finding_count -= 1"
+      - "provider.quality_score / quality_tier := calculations.provider_quality_score variant COMPLIANCE_ANCHORED, quality_variant_applied := COMPLIANCE_ANCHORED"
+  - method: POST
+    path: "/fccn/compliance-reviews/{id}/escalate"
+    description: "Escalate a repeatedly rejected CAP to the licensing authority; triggers the four-hop quality escalation cascade."
+    roles: [NetworkAdmin]
+    code: 200
+    input: []
+    output: ComplianceReview
+    side_effects:
+      - "ComplianceReview CAP_REJECTED -> ESCALATED_TO_LICENSING, provider.open_finding_count -= 1"
+      - "hop 1: Provider ACTIVE -> PROBATION, network_posture -> RESTRICTED"
+      - "hop 2: every ACTIVE SubsidyContract of this provider -> SUSPENDED_FOR_QUALITY"
+      - "hop 3: every DRAFT|SUBMITTED SubsidyClaim of those contracts -> HELD with held_from_status recorded and hold_reason := 'CONTRACT_SUSPENDED_FOR_QUALITY'"
+      - "hop 4: provider.projected_monthly_revenue_cents recomputed, dropping the enrollments named on the newly HELD claim lines for the clock month"
+      - "increments Provider.version by 1"
+
+  # --- Group purchasing -------------------------------------------------------
+  - method: POST
+    path: "/fccn/group-purchase-orders"
+    description: "Open a group purchasing order for supplies, curriculum or insurance."
+    roles: [Provider]
+    code: 201
+    input: [provider_id, category, lines]
+    output: GroupPurchaseOrder
+    side_effects:
+      - "status := OPEN; total_quantity, discount_pct, subtotal_cents, insurance_admin_fee_cents and total_cents stay 0 until commit"
+  - method: POST
+    path: "/fccn/group-purchase-orders/{id}/commit"
+    description: "Commit the order to the network buy; prices it with the volume discount ladder."
+    roles: [Provider]
+    code: 200
+    input: []
+    output: GroupPurchaseOrder
+    side_effects:
+      - "GroupPurchaseOrder OPEN -> COMMITTED"
+      - "total_quantity, discount_pct, subtotal_cents, insurance_admin_fee_cents, total_cents := calculations.group_purchase_order_total"
+
+  # --- Test-driving endpoint (logical clock) ----------------------------------
+  - method: POST
+    path: "/_clock/set_current_utc"
+    description: "Set the server's logical clock, used by every deadline, expiry and window rule. Before any call to this endpoint the logical clock reads exactly 2026-08-01T00:00:00Z; it never falls back to real wall-clock time."
+    roles: [NetworkAdmin]
+    code: 200
+    input: [current_utc]
+    output: { current_utc: datetime }
+    side_effects:
+      - "all subsequent date comparisons (license expiry, clearance expiry, CAP deadlines, coaching windows, clock-month aggregation) use the new value"
+
+  # --- Reads: providers -------------------------------------------------------
+  - method: GET
+    path: "/fccn/providers"
+    description: "List providers with filtering and pagination."
+    roles: [NetworkAdmin, FiscalOfficer, QualityCoach]
+    code: 200
+    input: ["county_tier?", "membership_status?", "quality_tier?", "limit?", "offset?"]
+    output: Provider[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}"
+    description: "Read one provider, including every derived quality and revenue field."
+    roles: [NetworkAdmin, FiscalOfficer, QualityCoach, Provider]
+    code: 200
+    input: []
+    output: Provider
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/revenue-model"
+    description: "Computed read: the provider's revenue model, cost stack, margin band and recommended private tuition."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: []
+    output: { monthly_revenue_cents: integer, subsidy_component_cents: integer, private_component_cents: integer, food_component_cents: integer, monthly_cost_cents: integer, network_fee_cents: integer, substitute_cost_cents: integer, margin_pct: number, sustainability: string, recommended_private_tuition_cents: integer }
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/membership-agreements"
+    description: "Every membership agreement issued to this provider, newest first."
+    roles: [NetworkAdmin, Provider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: MembershipAgreement[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/subsidy-contracts"
+    description: "Every subsidy contract the network administers for this provider."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: SubsidyContract[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/food-program-claims"
+    description: "Every food program claim this provider has filed."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["period_month?", "limit?", "offset?"]
+    output: FoodProgramClaim[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/coaching-visits"
+    description: "Every coaching visit scheduled or conducted for this provider."
+    roles: [NetworkAdmin, QualityCoach, Provider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: CoachingVisit[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/compliance-reviews"
+    description: "Every compliance review opened against this provider."
+    roles: [NetworkAdmin, QualityCoach, Provider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: ComplianceReview[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/group-purchase-orders"
+    description: "Every group purchase order this provider has opened."
+    roles: [NetworkAdmin, Provider]
+    code: 200
+    input: ["category?", "status?", "limit?", "offset?"]
+    output: GroupPurchaseOrder[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/providers/{id}/substitute-assignments"
+    description: "Every substitute coverage request raised by this provider."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["staffing_status?", "billing_status?", "limit?", "offset?"]
+    output: SubstituteAssignment[]
+    side_effects: []
+
+  # --- Reads: enrollments, substitutes, fiscal ---------------------------------
+  - method: GET
+    path: "/fccn/enrollments"
+    description: "List enrollments filtered by provider, by transition predecessor, or by status."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["provider_id?", "predecessor_enrollment_id?", "status?", "limit?", "offset?"]
+    output: Enrollment[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/enrollments/{id}"
+    description: "Read one enrollment, including its slot commitment and transition lineage."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: []
+    output: Enrollment
+    side_effects: []
+  - method: GET
+    path: "/fccn/membership-agreements/{id}"
+    description: "Read one membership agreement."
+    roles: [NetworkAdmin, Provider]
+    code: 200
+    input: []
+    output: MembershipAgreement
+    side_effects: []
+  - method: GET
+    path: "/fccn/substitutes/{id}"
+    description: "Read one pool member, including clearance expiry and completed-assignment count."
+    roles: [NetworkAdmin, FiscalOfficer, Substitute]
+    code: 200
+    input: []
+    output: Substitute
+    side_effects: []
+  - method: GET
+    path: "/fccn/substitutes/{id}/assignments"
+    description: "Every assignment offered to, confirmed by or completed by this pool member."
+    roles: [NetworkAdmin, FiscalOfficer, Substitute]
+    code: 200
+    input: ["staffing_status?", "limit?", "offset?"]
+    output: SubstituteAssignment[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/substitute-assignments/{id}"
+    description: "Read one substitute assignment, including both status dimensions and the cost breakdown."
+    roles: [NetworkAdmin, FiscalOfficer, Provider, Substitute]
+    code: 200
+    input: []
+    output: SubstituteAssignment
+    side_effects: []
+  - method: GET
+    path: "/fccn/subsidy-contracts/{id}"
+    description: "Read one subsidy contract, including slot and ledger counters."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: []
+    output: SubsidyContract
+    side_effects: []
+  - method: GET
+    path: "/fccn/subsidy-contracts/{id}/claims"
+    description: "Every subsidy claim filed against this contract."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["status?", "period_month?", "limit?", "offset?"]
+    output: SubsidyClaim[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/subsidy-contracts/{id}/remittances"
+    description: "Every agency remittance posted against this contract."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: ["status?", "limit?", "offset?"]
+    output: Remittance[]
+    side_effects: []
+  - method: GET
+    path: "/fccn/subsidy-claims/{id}"
+    description: "Read one subsidy claim, including both calculation variants and the settlement delta."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: []
+    output: SubsidyClaim
+    side_effects: []
+  - method: GET
+    path: "/fccn/compliance-reviews/{id}"
+    description: "Read one compliance review, including CAP history and segregation-of-duties actors."
+    roles: [NetworkAdmin, QualityCoach, Provider]
+    code: 200
+    input: []
+    output: ComplianceReview
+    side_effects: []
+  - method: GET
+    path: "/fccn/food-program-claims/{id}"
+    description: "Read one food program claim, including the frozen tier and share."
+    roles: [NetworkAdmin, FiscalOfficer, Provider]
+    code: 200
+    input: []
+    output: FoodProgramClaim
+    side_effects: []
+  - method: GET
+    path: "/fccn/group-purchase-orders/{id}"
+    description: "Read one group purchase order, including the priced totals."
+    roles: [NetworkAdmin, Provider]
+    code: 200
+    input: []
+    output: GroupPurchaseOrder
+    side_effects: []
+  - method: GET
+    path: "/fccn/coaching-visits/{id}"
+    description: "Read one coaching visit, including the observation score and both coach actors."
+    roles: [NetworkAdmin, QualityCoach, Provider]
+    code: 200
+    input: []
+    output: CoachingVisit
+    side_effects: []
+
+# =============================================================================
+# §1.6 Error Code Catalog
+# =============================================================================
+errors:
+  # --- auth / authorization ---
+  - id: ERR_UNAUTHENTICATED
+    http: 401
+    condition: "X-User-Role missing or not one of the six declared roles, or X-User-ID missing / not resolvable to a row of an entity_backed role's entity"
+  - id: ERR_FORBIDDEN_ROLE
+    http: 403
+    condition: "The acting role is not listed in the endpoint's roles"
+  - id: ERR_PROVIDER_SCOPE_VIOLATION
+    http: 403
+    condition: "A Provider actor addresses a resource whose provider_id (directly or through contract_id) is not the acting provider"
+  - id: ERR_SUBSTITUTE_SCOPE_VIOLATION
+    http: 403
+    condition: "A Substitute actor accepts or declines an assignment whose substitute_id is not the acting substitute"
+  - id: ERR_SEGREGATION_OF_DUTIES
+    http: 403
+    condition: "The coach conducting a visit is the coach who scheduled it, or the coach closing a compliance review is the coach who opened it"
+  # --- existence ---
+  - id: ERR_PROVIDER_NOT_FOUND
+    http: 404
+    condition: "provider id in the path or body matches no Provider"
+  - id: ERR_AGREEMENT_NOT_FOUND
+    http: 404
+    condition: "agreement id in the path matches no MembershipAgreement"
+  - id: ERR_ENROLLMENT_NOT_FOUND
+    http: 404
+    condition: "enrollment id in the path, or an enrollment_id inside a claim line, matches no Enrollment"
+  - id: ERR_CONTRACT_NOT_FOUND
+    http: 404
+    condition: "contract id in the path or body matches no SubsidyContract"
+  - id: ERR_CLAIM_NOT_FOUND
+    http: 404
+    condition: "claim id in the path matches no SubsidyClaim"
+  - id: ERR_REMITTANCE_NOT_FOUND
+    http: 404
+    condition: "remittance id in the path matches no Remittance"
+  - id: ERR_FOOD_CLAIM_NOT_FOUND
+    http: 404
+    condition: "food program claim id in the path matches no FoodProgramClaim"
+  - id: ERR_SUBSTITUTE_NOT_FOUND
+    http: 404
+    condition: "substitute id in the path, or requested_substitute_id in the body, matches no Substitute"
+  - id: ERR_ASSIGNMENT_NOT_FOUND
+    http: 404
+    condition: "assignment id in the path matches no SubstituteAssignment"
+  - id: ERR_VISIT_NOT_FOUND
+    http: 404
+    condition: "coaching visit id in the path matches no CoachingVisit"
+  - id: ERR_REVIEW_NOT_FOUND
+    http: 404
+    condition: "compliance review id in the path matches no ComplianceReview"
+  - id: ERR_ORDER_NOT_FOUND
+    http: 404
+    condition: "group purchase order id in the path matches no GroupPurchaseOrder"
+  # --- request shape ---
+  - id: ERR_INVALID_REQUEST
+    http: 400
+    condition: "Missing required field, unknown enum value, negative amount, capacity_slots outside 1..12, days_per_week outside 1..5, observation_score outside 0..100, end_at not after start_at, period_month not matching YYYY-MM, or an empty lines / meal_lines array"
+  # --- optimistic concurrency ---
+  - id: ERR_STALE_PROVIDER_VERSION
+    http: 412
+    condition: "expected_provider_version on POST /fccn/membership-agreements does not equal the provider's current version"
+  - id: ERR_STALE_CONTRACT_VERSION
+    http: 412
+    condition: "expected_contract_version on POST /fccn/subsidy-claims does not equal the contract's current version"
+  # --- own-entity state ---
+  - id: ERR_INVALID_PROVIDER_STATE
+    http: 409
+    condition: "The provider's membership_status is not a declared from-state of the requested transition"
+  - id: ERR_INVALID_AGREEMENT_STATE
+    http: 409
+    condition: "The agreement's status is not a declared from-state of counter, revise, execute or withdraw"
+  - id: ERR_INVALID_ENROLLMENT_STATE
+    http: 409
+    condition: "The enrollment's status is not a declared from-state of withdraw or transfer"
+  - id: ERR_INVALID_CLAIM_STATE
+    http: 409
+    condition: "The claim's status is not a declared from-state of submit, advance, reconcile or reject (including a claim HELD by a quality suspension)"
+  - id: ERR_INVALID_ASSIGNMENT_STATE
+    http: 409
+    condition: "The assignment's staffing_status or billing_status is not a declared from-state of accept, decline, complete or invoice"
+  - id: ERR_INVALID_VISIT_STATE
+    http: 409
+    condition: "The coaching visit is not SCHEDULED when conduct is called"
+  - id: ERR_INVALID_REVIEW_STATE
+    http: 409
+    condition: "The review's status is not a declared from-state of submit-cap, reject-cap, close or escalate"
+  - id: ERR_INVALID_ORDER_STATE
+    http: 409
+    condition: "The group purchase order is not OPEN when commit is called"
+  - id: ERR_INVALID_REMITTANCE_STATE
+    http: 409
+    condition: "The remittance is not POSTED when reverse is called"
+  # --- cross-entity state and posture ---
+  - id: ERR_CONTRACT_NOT_ACTIVE
+    http: 409
+    condition: "The referenced SubsidyContract is SUSPENDED_FOR_QUALITY or TERMINATED when a claim is submitted or a remittance is posted"
+  - id: ERR_PROVIDER_POSTURE_BLOCKED
+    http: 409
+    condition: "network_posture is FROZEN for any provider-initiated write, or RESTRICTED for a new enrollment, subsidy claim or group purchase order"
+  # --- business safety ---
+  - id: ERR_SUBSTITUTE_CLEARANCE_EXPIRED
+    http: 422
+    condition: "The requested substitute's clearance_expires_on is earlier than the assignment's end_at"
+  - id: ERR_LICENSE_EXPIRED
+    http: 422
+    condition: "The provider's license_expires_on is earlier than the logical clock date on an enrollment, claim or coverage request"
+  # --- business temporal ---
+  - id: ERR_SUBSTITUTE_INTERVAL_CONFLICT
+    http: 409
+    condition: "The requested substitute already holds an OFFERED, CONFIRMED or COMPLETED assignment inside the 30-minute-buffered window around the new interval"
+  - id: ERR_COACHING_WINDOW_SATURATED
+    http: 409
+    condition: "The provider already has 2 SCHEDULED or COMPLETED coaching visits with scheduled_on inside the inclusive plus/minus 29-day window around the requested date"
+  - id: ERR_CLAIM_PERIOD_DUPLICATE
+    http: 409
+    condition: "Another non-REJECTED SubsidyClaim already exists for the same contract and period_month"
+  - id: ERR_CAP_DEADLINE_PASSED
+    http: 422
+    condition: "A corrective action plan is submitted after the review's cap_due_on"
+  - id: ERR_VISIT_DATE_IN_PAST
+    http: 422
+    condition: "scheduled_on is earlier than the logical clock date"
+  # --- business referential ---
+  - id: ERR_CLAIM_LINE_ENROLLMENT_MISMATCH
+    http: 422
+    condition: "A claim line's enrollment_id belongs to a different provider than the contract, or names an enrollment with subsidy_certified false"
+  - id: ERR_MEAL_LINE_CHILD_UNKNOWN
+    http: 422
+    condition: "A meal line's child_ref matches no Enrollment child_ref of the claiming provider"
+  - id: ERR_RECEIVING_PROVIDER_INELIGIBLE
+    http: 422
+    condition: "The transfer target is the same provider, is not ACTIVE with network_posture OPEN, is at capacity, or lacks an ACTIVE contract with a free slot for a subsidy-certified child"
+  # --- business constraint ---
+  - id: ERR_NEGOTIATION_ROUNDS_EXHAUSTED
+    http: 409
+    condition: "A counter would push round_index above MAX_NEGOTIATION_ROUNDS (3)"
+  - id: ERR_MEAL_CAP_EXCEEDED
+    http: 422
+    condition: "For one child_ref on one service_date, breakfasts + lunches exceeds 2 or snacks exceeds 1"
+  - id: ERR_CAPACITY_EXCEEDED
+    http: 409
+    condition: "The provider's ENROLLED plus TRANSITION_PENDING enrollments already equal capacity_slots"
+  - id: ERR_DUPLICATE_CHILD_REF
+    http: 409
+    condition: "The child_ref is already used by a non-terminal enrollment of the same provider"
+  - id: ERR_EXIT_TRANSITIONS_PENDING
+    http: 409
+    condition: "complete-exit is called while an enrollment is still ENROLLED or TRANSITION_PENDING"
+  - id: ERR_CAP_REJECTION_LIMIT_NOT_REACHED
+    http: 409
+    condition: "escalate is called with cap_rejection_count below 2"
+  # --- business fiscal ---
+  - id: ERR_SUBSIDY_SLOTS_EXHAUSTED
+    http: 409
+    condition: "A subsidy-certified enrollment or transfer would commit a slot on a contract whose available_slots is 0"
+  - id: ERR_CONTRACT_AUTHORIZATION_EXCEEDED
+    http: 402
+    condition: "claimed_amount_cents plus the claim's provisional_amount_cents would exceed the contract's authorized_amount_cents at submit"
+
+# =============================================================================
+# §1.7 RBAC Matrix — role_model: segregation_of_duties
+# =============================================================================
+roles:
+  - name: Anonymous
+    description: "An unauthenticated prospective provider who may only file a network application."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fccn/providers/apply"
+    shared_operations: []
+  - name: NetworkAdmin
+    description: "Network staff who run recruitment, licensing support, membership negotiation, subsidy contracting, the substitute pool and network exits."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fccn/providers/{id}/license-verification"
+      - "POST /fccn/providers/{id}/reinstate"
+      - "POST /fccn/providers/{id}/exit-network"
+      - "POST /fccn/providers/{id}/complete-exit"
+      - "POST /fccn/membership-agreements"
+      - "POST /fccn/membership-agreements/{id}/revise"
+      - "POST /fccn/membership-agreements/{id}/withdraw"
+      - "POST /fccn/enrollments/{id}/transfer"
+      - "POST /fccn/subsidy-contracts"
+      - "POST /fccn/substitutes"
+      - "POST /fccn/substitutes/{id}/clearance"
+      - "POST /fccn/compliance-reviews/{id}/escalate"
+      - "POST /_clock/set_current_utc"
+    shared_operations:
+      - "GET /fccn/providers"
+      - "GET /fccn/providers/{id} and every provider sub-resource read"
+      - "GET /fccn/enrollments, GET /fccn/enrollments/{id}"
+      - "GET /fccn/subsidy-contracts/{id} and its claims / remittances reads"
+      - "GET /fccn/subsidy-claims/{id}, GET /fccn/food-program-claims/{id}"
+      - "GET /fccn/substitutes/{id}, GET /fccn/substitutes/{id}/assignments, GET /fccn/substitute-assignments/{id}"
+      - "GET /fccn/membership-agreements/{id}, GET /fccn/compliance-reviews/{id}, GET /fccn/coaching-visits/{id}, GET /fccn/group-purchase-orders/{id}"
+  - name: FiscalOfficer
+    description: "Shared back-office finance staff who move money: subsidy advances, reconciliation, rejections, agency remittances, food program approval and substitute invoicing. Never touches quality or membership decisions."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fccn/subsidy-claims/{id}/advance"
+      - "POST /fccn/subsidy-claims/{id}/reconcile"
+      - "POST /fccn/subsidy-claims/{id}/reject"
+      - "POST /fccn/remittances"
+      - "POST /fccn/remittances/{id}/reverse"
+      - "POST /fccn/food-program-claims/{id}/approve"
+      - "POST /fccn/substitute-assignments/{id}/invoice"
+    shared_operations:
+      - "GET /fccn/providers, GET /fccn/providers/{id}, GET /fccn/providers/{id}/revenue-model"
+      - "GET /fccn/providers/{id}/subsidy-contracts, /food-program-claims, /substitute-assignments"
+      - "GET /fccn/enrollments, GET /fccn/enrollments/{id}"
+      - "GET /fccn/subsidy-contracts/{id} and its claims / remittances reads"
+      - "GET /fccn/subsidy-claims/{id}, GET /fccn/food-program-claims/{id}"
+      - "GET /fccn/substitutes/{id}, GET /fccn/substitutes/{id}/assignments, GET /fccn/substitute-assignments/{id}"
+  - name: QualityCoach
+    description: "Coaching and quality-standards staff who schedule and conduct coaching visits and run compliance reviews. Cannot escalate to licensing and cannot close a review they opened."
+    identity: "opaque"
+    exclusive_operations:
+      - "POST /fccn/coaching-visits"
+      - "POST /fccn/coaching-visits/{id}/conduct"
+      - "POST /fccn/compliance-reviews"
+      - "POST /fccn/compliance-reviews/{id}/reject-cap"
+      - "POST /fccn/compliance-reviews/{id}/close"
+    shared_operations:
+      - "GET /fccn/providers, GET /fccn/providers/{id}"
+      - "GET /fccn/providers/{id}/coaching-visits, /compliance-reviews"
+      - "GET /fccn/compliance-reviews/{id}, GET /fccn/coaching-visits/{id}"
+  - name: Provider
+    description: "A family child care home acting on its own records: enrollments, subsidy claim drafting, food program claims, coverage requests, group purchasing, agreement negotiation and corrective action plans."
+    identity: "entity_backed:Provider"
+    exclusive_operations:
+      - "POST /fccn/membership-agreements/{id}/counter"
+      - "POST /fccn/membership-agreements/{id}/execute"
+      - "POST /fccn/enrollments"
+      - "POST /fccn/enrollments/{id}/withdraw"
+      - "POST /fccn/subsidy-claims"
+      - "POST /fccn/subsidy-claims/{id}/submit"
+      - "POST /fccn/food-program-claims"
+      - "POST /fccn/substitute-assignments"
+      - "POST /fccn/substitute-assignments/{id}/complete"
+      - "POST /fccn/compliance-reviews/{id}/submit-cap"
+      - "POST /fccn/group-purchase-orders"
+      - "POST /fccn/group-purchase-orders/{id}/commit"
+    shared_operations:
+      - "GET /fccn/providers/{id} and every provider sub-resource read, scoped to X-User-ID"
+      - "GET /fccn/providers/{id}/revenue-model, scoped to X-User-ID"
+      - "GET /fccn/enrollments, GET /fccn/enrollments/{id}, scoped to X-User-ID"
+      - "GET /fccn/subsidy-contracts/{id} and its claims / remittances reads, scoped to X-User-ID"
+      - "GET /fccn/subsidy-claims/{id}, GET /fccn/food-program-claims/{id}, GET /fccn/substitute-assignments/{id}"
+      - "GET /fccn/membership-agreements/{id}, GET /fccn/compliance-reviews/{id}, GET /fccn/coaching-visits/{id}, GET /fccn/group-purchase-orders/{id}"
+  - name: Substitute
+    description: "A pool member who answers coverage offers for their own assignments only."
+    identity: "entity_backed:Substitute"
+    exclusive_operations:
+      - "POST /fccn/substitute-assignments/{id}/accept"
+      - "POST /fccn/substitute-assignments/{id}/decline"
+    shared_operations:
+      - "GET /fccn/substitutes/{id}, scoped to X-User-ID"
+      - "GET /fccn/substitutes/{id}/assignments, scoped to X-User-ID"
+      - "GET /fccn/substitute-assignments/{id}, scoped to X-User-ID"

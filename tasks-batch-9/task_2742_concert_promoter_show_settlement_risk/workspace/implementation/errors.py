@@ -1,0 +1,66 @@
+"""Error catalog (PRD section 5 / scaffold section 1.6)."""
+
+ERROR_STATUS = {
+    # auth
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_FORBIDDEN": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_VARIANCE_APPROVAL_AUTHORITY": 403,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_MARKET_NOT_FOUND": 404,
+    "ERR_ARTIST_NOT_FOUND": 404,
+    "ERR_VENUE_NOT_FOUND": 404,
+    "ERR_SHOW_NOT_FOUND": 404,
+    "ERR_OFFER_NOT_FOUND": 404,
+    "ERR_BUDGET_LINE_NOT_FOUND": 404,
+    "ERR_VENDOR_INVOICE_NOT_FOUND": 404,
+    "ERR_TICKET_TIER_NOT_FOUND": 404,
+    "ERR_TICKET_HOLD_NOT_FOUND": 404,
+    "ERR_SETTLEMENT_NOT_FOUND": 404,
+    "ERR_CANCELLATION_EVENT_NOT_FOUND": 404,
+    # concurrency / state
+    "ERR_STALE_SHOW_VERSION": 412,
+    "ERR_INVALID_STATE": 409,
+    "ERR_ALREADY_TERMINAL": 409,
+    # referential
+    "ERR_BUDGET_LINE_SHOW_MISMATCH": 422,
+    "ERR_SETTLEMENT_ALREADY_OPEN": 409,
+    "ERR_UNRESOLVED_INVOICES": 409,
+    "ERR_UNRESOLVED_VARIANCE": 409,
+    "ERR_NO_TICKET_TIERS": 422,
+    "ERR_REPLACEMENT_SHOW_INVALID": 422,
+    # temporal
+    "ERR_INVALID_SHOW_WINDOW": 422,
+    "ERR_EVENT_DATE_IN_PAST": 422,
+    "ERR_VENUE_WINDOW_CONFLICT": 409,
+    "ERR_ARTIST_ROUTING_CONFLICT": 409,
+    "ERR_OFFER_EXPIRED": 409,
+    "ERR_ANNOUNCE_DATE_NOT_REACHED": 422,
+    "ERR_SHOW_NOT_YET_OCCURRED": 422,
+    "ERR_CLAIM_WINDOW_CLOSED": 422,
+    # deal / negotiation
+    "ERR_DEAL_TERMS_INCOHERENT": 422,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 409,
+    "ERR_VARIANCE_CAP_INVALID": 422,
+    # inventory
+    "ERR_VENUE_CAPACITY_EXCEEDED": 422,
+    "ERR_DUPLICATE_TIER_NAME": 409,
+    "ERR_COMP_ALLOWANCE_EXCEEDED": 422,
+    "ERR_INSUFFICIENT_TIER_INVENTORY": 422,
+    # fiscal / risk
+    "ERR_MARKET_POSTURE_FROZEN": 409,
+    "ERR_MARKET_EXPOSURE_EXCEEDED": 402,
+    "ERR_EXPOSURE_OVERRIDE_INVALID": 422,
+    "ERR_CASH_PAYMENT_LIMIT": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)

@@ -1,0 +1,73 @@
+"""Error catalogue (PRD section 5) and the exception the app raises."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super(ApiError, self).__init__(message or error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or error_id
+
+
+# Canonical error id -> HTTP status, straight from the PRD error catalogue.
+ERROR_STATUS = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_FORBIDDEN_AGREEMENT": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_LOOP_NOT_FOUND": 404,
+    "ERR_SEGMENT_NOT_FOUND": 404,
+    "ERR_FUEL_CONTRACT_NOT_FOUND": 404,
+    "ERR_ASSET_NOT_FOUND": 404,
+    "ERR_FORECAST_NOT_FOUND": 404,
+    "ERR_PLAN_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_RATE_SCHEDULE_NOT_FOUND": 404,
+    "ERR_AGREEMENT_NOT_FOUND": 404,
+    "ERR_METERING_POINT_NOT_FOUND": 404,
+    "ERR_READING_NOT_FOUND": 404,
+    "ERR_INVOICE_NOT_FOUND": 404,
+    "ERR_WORK_ORDER_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_FK_NOT_FOUND": 404,
+    "ERR_STALE_LOOP_VERSION": 412,
+    "ERR_STALE_AGREEMENT_VERSION": 412,
+    "ERR_DUPLICATE_CODE": 409,
+    "ERR_SEGMENT_CYCLE": 409,
+    "ERR_SEGMENT_LOOP_MISMATCH": 409,
+    "ERR_CUSTOMER_CLASS_MISMATCH": 409,
+    "ERR_SERVICE_MODE_MISMATCH": 409,
+    "ERR_FORECAST_LOOP_MISMATCH": 409,
+    "ERR_PLAN_STATE_INVALID": 409,
+    "ERR_FORECAST_STATE_INVALID": 409,
+    "ERR_AGREEMENT_STATE_INVALID": 409,
+    "ERR_INVOICE_STATE_INVALID": 409,
+    "ERR_WORK_ORDER_STATE_INVALID": 409,
+    "ERR_PROJECT_STATE_INVALID": 409,
+    "ERR_METER_STATE_INVALID": 409,
+    "ERR_AVAILABILITY_STATE_INVALID": 409,
+    "ERR_ISOLATION_CLEARANCE_DENIED": 409,
+    "ERR_RESERVE_MARGIN_INSUFFICIENT": 409,
+    "ERR_FUEL_DIVERSITY_BREACH": 409,
+    "ERR_LOOP_ISOLATED": 409,
+    "ERR_LOOP_NOT_NORMAL": 409,
+    "ERR_WORK_WINDOW_CONFLICT": 409,
+    "ERR_OUTSIDE_WORK_WINDOW": 409,
+    "ERR_INVOICE_PERIOD_OVERLAP": 409,
+    "ERR_READING_NOT_MONOTONIC": 409,
+    "ERR_NO_ELIGIBLE_ASSETS": 409,
+    "ERR_PLAN_HAS_NO_ORDERS": 409,
+    "ERR_INSUFFICIENT_GENERATION": 409,
+    "ERR_STORAGE_ENERGY_INSUFFICIENT": 409,
+    "ERR_NO_FEASIBLE_PIPE_SIZE": 422,
+    "ERR_INSUFFICIENT_METER_DATA": 422,
+    "ERR_LOOP_CAPACITY_EXCEEDED": 409,
+    "ERR_PROJECT_NPV_NEGATIVE": 422,
+    "ERR_PAYMENT_AMOUNT_MISMATCH": 409,
+}
+
+
+def fail(error_id, message=None):
+    """Raise the catalogued error with its declared HTTP status."""
+    raise ApiError(error_id, ERROR_STATUS[error_id], message)

@@ -1,0 +1,85 @@
+"""Error catalog and the ApiError exception."""
+
+ERROR_STATUS = {
+    # authentication / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_BOOKING_NOT_OWNED": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_AUDITOR_CANNOT_APPROVE": 403,
+    # shape
+    "ERR_VALIDATION": 400,
+    # existence
+    "ERR_PORT_NOT_FOUND": 404,
+    "ERR_MEETING_POINT_NOT_FOUND": 404,
+    "ERR_PORT_CALL_NOT_FOUND": 404,
+    "ERR_TENDER_WAVE_NOT_FOUND": 404,
+    "ERR_OPERATOR_NOT_FOUND": 404,
+    "ERR_AUDIT_NOT_FOUND": 404,
+    "ERR_EXCURSION_NOT_FOUND": 404,
+    "ERR_DEPARTURE_NOT_FOUND": 404,
+    "ERR_GUEST_NOT_FOUND": 404,
+    "ERR_BOOKING_NOT_FOUND": 404,
+    "ERR_LEDGER_ENTRY_NOT_FOUND": 404,
+    "ERR_INCIDENT_NOT_FOUND": 404,
+    "ERR_CLAIM_NOT_FOUND": 404,
+    "ERR_STATEMENT_NOT_FOUND": 404,
+    # uniqueness / collision
+    "ERR_DUPLICATE_PORT_CODE": 409,
+    "ERR_DUPLICATE_WAVE_INDEX": 409,
+    "ERR_TENDER_WAVE_OVERLAP": 409,
+    "ERR_MEETING_POINT_CONGESTED": 409,
+    # optimistic concurrency
+    "ERR_STALE_DEPARTURE_VERSION": 412,
+    "ERR_STALE_OPERATOR_VERSION": 412,
+    # business rules
+    "ERR_INVALID_TIME_WINDOW": 422,
+    "ERR_INVALID_PORT_CALL_ACTION": 422,
+    "ERR_INVALID_CATALOG_ACTION": 422,
+    "ERR_INVALID_VETTING_ACTION": 422,
+    "ERR_INVALID_DEPARTURE_STATE": 422,
+    "ERR_DEPARTURE_NOT_SELLING": 422,
+    "ERR_INVALID_BOOKING_ACTION": 422,
+    "ERR_INVALID_CLAIM_ACTION": 422,
+    "ERR_INVALID_STATEMENT_ACTION": 422,
+    "ERR_PORT_CALL_NOT_CLOSED": 422,
+    "ERR_INSURANCE_EXPIRED": 422,
+    "ERR_INSURANCE_LIMIT_INSUFFICIENT": 422,
+    "ERR_AUDIT_REQUIRED": 422,
+    "ERR_SAFETY_SCORE_BELOW_FLOOR": 422,
+    "ERR_VETTING_CYCLE_EXHAUSTED": 422,
+    "ERR_OPERATOR_NOT_APPROVED": 422,
+    "ERR_AGE_RESTRICTION": 422,
+    "ERR_MOBILITY_RESTRICTION": 422,
+    "ERR_MEDICAL_ACK_REQUIRED": 422,
+    "ERR_LANGUAGE_UNAVAILABLE": 422,
+    "ERR_VOYAGE_MISMATCH": 422,
+    "ERR_MEETING_TIME_OUTSIDE_CALL": 422,
+    "ERR_SALES_CUTOFF_PASSED": 422,
+    "ERR_TIMING_RISK_RED": 422,
+    "ERR_CHECKIN_WINDOW_CLOSED": 422,
+    "ERR_NO_ELIGIBLE_TENDER_WAVE": 422,
+    "ERR_OPEN_CLAIM_BLOCKS_ISSUE": 422,
+    "ERR_CLAIM_EXCEEDS_INSURANCE_LIMIT": 422,
+    "ERR_DISPUTE_ROUNDS_EXHAUSTED": 422,
+    "ERR_NO_ALTERNATIVE_AVAILABLE": 422,
+    "ERR_ALLOCATION_MISMATCH": 422,
+    "ERR_ALLOCATION_BELOW_SOLD": 422,
+    "ERR_CHANNEL_ALLOCATION_EXHAUSTED": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower()
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

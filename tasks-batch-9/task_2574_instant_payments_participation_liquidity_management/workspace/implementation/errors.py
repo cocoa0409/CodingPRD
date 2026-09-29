@@ -1,0 +1,96 @@
+"""Error catalog and the ApiError exception."""
+
+HTTP_STATUS = {
+    # 1 - authentication / authorisation
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_PARTICIPANT_SCOPE_VIOLATION": 403,
+    # 2 - existence
+    "ERR_PARTICIPANT_NOT_FOUND": 404,
+    "ERR_POSITION_ACCOUNT_NOT_FOUND": 404,
+    "ERR_LIQUIDITY_ALERT_NOT_FOUND": 404,
+    "ERR_CUSTOMER_ACCOUNT_NOT_FOUND": 404,
+    "ERR_CREDIT_TRANSFER_NOT_FOUND": 404,
+    "ERR_RFP_NOT_FOUND": 404,
+    "ERR_FRAUD_REVIEW_NOT_FOUND": 404,
+    "ERR_RETURN_REQUEST_NOT_FOUND": 404,
+    "ERR_SETTLEMENT_CYCLE_NOT_FOUND": 404,
+    "ERR_RECONCILIATION_RUN_NOT_FOUND": 404,
+    "ERR_OUTAGE_EVENT_NOT_FOUND": 404,
+    # 3 - payload shape
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_THRESHOLD_ORDERING": 422,
+    "ERR_INVALID_INTERVAL": 422,
+    # 4 - optimistic concurrency
+    "ERR_STALE_POSITION_VERSION": 412,
+    "ERR_STALE_PARTICIPANT_VERSION": 412,
+    # 5 - state
+    "ERR_PARTICIPANT_NOT_LIVE": 409,
+    "ERR_PARTICIPANT_OFFLINE": 409,
+    "ERR_PARTICIPANT_SEND_FROZEN": 409,
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_FRAUD_REVIEW_NOT_ASSIGNED": 409,
+    "ERR_TRANSFER_NOT_SETTLED": 409,
+    "ERR_TRANSFER_IRREVOCABLE": 409,
+    "ERR_ALERT_NOT_ACKNOWLEDGEABLE": 409,
+    "ERR_CYCLE_NOT_OPEN": 409,
+    "ERR_CYCLE_NOT_RECONCILABLE": 409,
+    # 6 - compliance / eligibility
+    "ERR_SEND_NOT_PERMITTED_FOR_MODEL": 422,
+    "ERR_REQUEST_NOT_PERMITTED_FOR_MODEL": 422,
+    "ERR_CUSTOMER_ACCOUNT_RESTRICTED": 422,
+    "ERR_FRAUD_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ALERT_SEGREGATION_OF_DUTIES": 403,
+    "ERR_ACTIVATION_PREREQUISITES_NOT_MET": 422,
+    "ERR_ATTESTATION_INCOMPLETE": 422,
+    # 7 - referential coherence
+    "ERR_CUSTOMER_ACCOUNT_PARTICIPANT_MISMATCH": 422,
+    "ERR_NO_GOVERNING_SEGMENT_POLICY": 422,
+    "ERR_RFP_FULFILMENT_MISMATCH": 422,
+    "ERR_RETURN_REQUESTOR_NOT_RECEIVER": 422,
+    "ERR_RETURN_AMOUNT_INVALID": 422,
+    # 8 - temporal
+    "ERR_CLOCK_NOT_MONOTONIC": 422,
+    "ERR_RETURN_WINDOW_EXPIRED": 422,
+    "ERR_POLICY_WINDOW_OVERLAP": 409,
+    "ERR_OUTAGE_WINDOW_CONFLICT": 409,
+    "ERR_RFP_EXPIRED": 422,
+    "ERR_RETURN_RESPONSE_DEADLINE_PASSED": 422,
+    "ERR_BUSINESS_DATE_NOT_REACHED": 422,
+    # 9 - uniqueness and limits
+    "ERR_DUPLICATE_ROUTING_NUMBER": 409,
+    "ERR_DUPLICATE_RESOURCE": 409,
+    "ERR_DUPLICATE_SETTLEMENT_CYCLE": 409,
+    "ERR_DUPLICATE_RETURN_REQUEST": 409,
+    "ERR_PER_TRANSACTION_LIMIT_EXCEEDED": 422,
+    "ERR_THROTTLED_CAP_EXCEEDED": 422,
+    "ERR_VELOCITY_LIMIT_EXCEEDED": 422,
+    "ERR_DAILY_LIMIT_EXCEEDED": 422,
+    "ERR_AMENDMENT_ROUNDS_EXHAUSTED": 422,
+    # 10 - fiscal safety
+    "ERR_PREFUND_BELOW_MINIMUM": 422,
+    "ERR_LEDGER_ADJUSTMENT_WOULD_GO_NEGATIVE": 422,
+    "ERR_INSUFFICIENT_LIQUIDITY": 422,
+    "ERR_VARIANCE_UNRESOLVED": 409,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or invalid.",
+    "ERR_FORBIDDEN_ROLE": "The caller role may not perform this operation.",
+    "ERR_PARTICIPANT_SCOPE_VIOLATION": "The caller may only act within its own participant.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super(ApiError, self).__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status or HTTP_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGE.get(
+            error_id, error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+        )
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

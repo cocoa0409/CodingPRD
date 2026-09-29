@@ -1,0 +1,82 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+        self.http_status = ERROR_STATUS[error_id]
+
+
+# PRD section 5 — Error Code Catalogue (error_id -> HTTP status)
+ERROR_STATUS = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_NOT_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_DESIGN_NOT_FOUND": 404,
+    "ERR_ORDER_NOT_FOUND": 404,
+    "ERR_WORK_ORDER_NOT_FOUND": 404,
+    "ERR_SUBASSEMBLY_NOT_FOUND": 404,
+    "ERR_ASSEMBLY_RECORD_NOT_FOUND": 404,
+    "ERR_PERFORMANCE_TEST_NOT_FOUND": 404,
+    "ERR_NAMEPLATE_NOT_FOUND": 404,
+    "ERR_WARRANTY_CLAIM_NOT_FOUND": 404,
+    "ERR_DISTRIBUTOR_NOT_FOUND": 404,
+    "ERR_OVEN_NOT_FOUND": 404,
+    "ERR_TEST_CELL_NOT_FOUND": 404,
+    "ERR_STANDARD_NOT_FOUND": 404,
+    "ERR_DUPLICATE_MODEL_CODE": 409,
+    "ERR_RESOURCE_IN_MAINTENANCE": 409,
+    "ERR_DUPLICATE_ACTIVE_SUBASSEMBLY": 409,
+    "ERR_INVALID_DESIGN_STATE": 409,
+    "ERR_INVALID_ORDER_STATE": 409,
+    "ERR_INVALID_WORK_ORDER_STATE": 409,
+    "ERR_INVALID_SUBASSEMBLY_STATE": 409,
+    "ERR_INVALID_PERFORMANCE_TEST_STATE": 409,
+    "ERR_INVALID_NAMEPLATE_STATE": 409,
+    "ERR_INVALID_CLAIM_STATE": 409,
+    "ERR_REQUALIFICATION_REQUIRED": 409,
+    "ERR_STALE_DESIGN_VERSION": 412,
+    "ERR_STALE_WORK_ORDER_VERSION": 412,
+    "ERR_DESIGN_NOT_RELEASED": 409,
+    "ERR_STOCKING_PROGRAM_NOT_ENROLLED": 409,
+    "ERR_ROTOR_CONSTRUCTION_MISMATCH": 409,
+    "ERR_INSULATION_SYSTEM_MISMATCH": 409,
+    "ERR_ROTOR_BAR_COUNT_MISMATCH": 409,
+    "ERR_JURISDICTION_MISMATCH": 409,
+    "ERR_SUBASSEMBLY_NOT_ACCEPTED": 409,
+    "ERR_NAMEPLATE_NOT_CERTIFIED": 409,
+    "ERR_SLOT_FILL_OUT_OF_RANGE": 422,
+    "ERR_CURE_TEMP_EXCEEDS_OVEN_LIMIT": 422,
+    "ERR_SURGE_OVERSTRESS": 422,
+    "ERR_SURGE_MARGIN_NEGATIVE": 422,
+    "ERR_AIR_GAP_OUT_OF_TOLERANCE": 422,
+    "ERR_UNBALANCE_EXCEEDS_GRADE_LIMIT": 422,
+    "ERR_SHAFT_FIT_OUT_OF_TOLERANCE": 422,
+    "ERR_LUBRICATION_FILL_OUT_OF_RANGE": 422,
+    "ERR_DESIGN_CLASS_SHORTFALL": 422,
+    "ERR_NO_APPLICABLE_STANDARD": 422,
+    "ERR_EFFICIENCY_BELOW_REGULATORY_MINIMUM": 422,
+    "ERR_TEARDOWN_EVIDENCE_REQUIRED": 422,
+    "ERR_TEST_WINDOW_NOT_STARTED": 409,
+    "ERR_OVEN_WINDOW_CONFLICT": 409,
+    "ERR_TEST_CELL_CAPACITY_EXCEEDED": 409,
+    "ERR_ROUND_LIMIT_EXCEEDED": 422,
+    "ERR_SHIP_DATE_UNACHIEVABLE": 422,
+    "ERR_STOCK_ALLOWANCE_EXCEEDED": 422,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "X-User-ID and X-User-Role headers must both be present and name a known role.",
+    "ERR_UNAUTHORIZED": "The acting role is not authorised for this operation.",
+    "ERR_NOT_OWNER": "The acting user does not own the target row.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this user from performing this action.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

@@ -1,0 +1,125 @@
+"""Domain constants for the OTA model / rate-parity administration API."""
+
+# ---------------------------------------------------------------- logical clock
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# ------------------------------------------------------------------ enumerations
+MARKET_STATUSES = ("ACTIVE", "CLOSED")
+PRICE_DISPLAY_MODES = ("TOTAL_UPFRONT", "NIGHTLY_PLUS_TAXES")
+SUPPLIER_TYPES = ("HOTEL", "AIR")
+SUPPLIER_VISIBILITY_STATUSES = ("PENDING_CERT", "ACTIVE", "SUSPENDED", "OFFBOARDED")
+CERTIFICATION_LEVELS = ("NONE", "PROVISIONAL", "CERTIFIED")
+CERTIFICATION_STATUSES = (
+    "SUBMITTED",
+    "IN_REVIEW",
+    "CERTIFIED",
+    "PROVISIONAL",
+    "REJECTED",
+    "REMEDIATION_SUBMITTED",
+    "EXPIRED",
+    "REVOKED",
+)
+CONNECTIVITY_PROTOCOLS = ("OTA_2011B", "JSON_V2", "GDS_EDIFACT")
+CERTIFICATION_DECISIONS = ("CERTIFY", "PROVISIONAL", "REJECT")
+SUSPENSION_REASONS = ("CERTIFICATION_REVOKED", "CERTIFICATION_EXPIRED")
+COLLECTION_MODELS = ("MERCHANT", "AGENCY")
+AGREEMENT_MODELS = ("MERCHANT", "AGENCY")
+AGREEMENT_STATUSES = ("DRAFT", "ACTIVE", "SUPERSEDED", "TERMINATED", "WITHDRAWN")
+OVERRIDE_TYPES = ("COMMISSION_PCT", "MARKUP_PCT", "FLAT_FEE_CENTS")
+OVERRIDE_STATUSES = ("PROPOSED", "ACTIVE", "REJECTED", "REVOKED", "EXPIRED")
+CANCELLATION_POLICY_CODES = ("FLEX", "MODERATE", "STRICT", "NON_REF")
+RATE_PLAN_STATUSES = ("ACTIVE", "PARITY_HOLD", "ARCHIVED")
+OFFER_STATUSES = ("PENDING", "LIVE", "SUPPRESSED", "SUPERSEDED", "CLOSED")
+SUPPRESSION_REASONS = ("SUPPLIER_SUSPENDED", "PARITY_HOLD")
+PARITY_SEVERITIES = ("NONE", "MINOR", "MAJOR", "SEVERE")
+PARITY_CASE_STATUSES = (
+    "OPEN",
+    "SUPPLIER_NOTIFIED",
+    "SUPPLIER_RESPONDED",
+    "ESCALATED",
+    "RESOLVED_COMPLIANT",
+    "WAIVED",
+)
+PARITY_RESPONSE_CODES = ("RATE_CORRECTED", "DISPUTED", "NO_ACTION")
+PARITY_CLOSE_OUTCOMES = ("COMPLIANT", "WAIVED")
+SORT_PROFILES = ("BEST_VALUE", "PRICE_ASC")
+OBSERVATION_CHANNELS = ("SUPPLIER_WEB", "SUPPLIER_APP", "META")
+PLACEMENT_STATUSES = ("PROPOSED", "ACTIVE", "REJECTED", "CANCELLED", "EXPIRED")
+RANKING_RUN_STATUSES = ("DRAFT", "PUBLISHED", "WITHDRAWN")
+DISCLOSURE_LABELS = ("ORGANIC", "SPONSORED", "PREFERRED_PARTNER")
+BOOST_DISCLOSURE_LABELS = ("SPONSORED", "PREFERRED_PARTNER")
+PACKAGE_STATUSES = ("DRAFT", "PRICED", "PUBLISHED", "WITHDRAWN")
+COMPONENT_TYPES = ("AIR", "HOTEL")
+PAYMENT_STATUSES = (
+    "AUTHORIZED",
+    "CAPTURED",
+    "REFUNDED_PARTIAL",
+    "REFUNDED_FULL",
+    "CHARGEBACK",
+)
+FULFILLMENT_STATUSES = ("RESERVED", "CONFIRMED", "CANCELLED", "COMPLETED")
+DISPUTE_STATUSES = ("FILED", "RESPONSE_REQUESTED", "MEDIATION", "RESOLVED")
+DISPUTE_TYPES = ("REFUND_PASSTHROUGH", "CHARGEBACK", "FRAUD")
+DISPUTE_OUTCOMES = (
+    "SUPPLIER_LIABLE",
+    "MARKETPLACE_LIABLE",
+    "SPLIT",
+    "REVERSE_REFUND",
+)
+SCORECARD_VARIANTS = ("PROVISIONAL", "FINAL")
+ROLES = (
+    "PlatformAdmin",
+    "CommercialManager",
+    "ComplianceOfficer",
+    "ParityAnalyst",
+    "SupplierUser",
+    "BookingAgent",
+)
+
+# ------------------------------------------------------------------ parity bands
+PARITY_MINOR_BPS = 100
+PARITY_MAJOR_BPS = 300
+PARITY_SEVERE_BPS = 800
+PARITY_SEVERITY_WEIGHTS = {"MINOR": 1, "MAJOR": 2, "SEVERE": 4}
+PARITY_ROUND_CAP = 3
+
+# ---------------------------------------------------------- certification windows
+CERT_CERTIFIED_VALIDITY_DAYS = 365
+CERT_PROVISIONAL_VALIDITY_DAYS = 90
+CERT_REMEDIATION_ROUND_CAP = 3
+
+# --------------------------------------------------------------- offer / booking
+TRAVEL_DATE_HORIZON_DAYS = 500
+ARRIVAL_HOUR_UTC = 15
+
+# -------------------------------------------------------------- package discount
+PACKAGE_DISCOUNT_TIERS = (
+    (600000, 0.12),
+    (300000, 0.09),
+    (100000, 0.06),
+)
+PACKAGE_MIN_COMPONENTS = 2
+
+# ------------------------------------------------------------------- mediation
+MEDIATION_BASE_FEE_CENTS = 2500
+MEDIATION_FEE_TIERS = ((200000, 0.05), (50000, 0.035))
+MEDIATION_TIER_LOW_PCT = 0.02
+MEDIATION_ROUND_CAP = 3
+
+# --------------------------------------------------------------------- ranking
+RANKING_WEIGHTS = {"price": 0.40, "content": 0.25, "parity": 0.20, "conversion": 0.15}
+RANKING_PARITY_PENALTY_PER_CASE = 10
+RANKING_BOOST_CAP = 15
+
+# -------------------------------------------------------------------- scorecard
+SCORECARD_PARITY_PENALTY_PER_POINT = 8
+SCORECARD_WEIGHTS = {
+    "content": 0.25,
+    "connectivity": 0.20,
+    "parity": 0.30,
+    "dispute": 0.25,
+}
+
+# ------------------------------------------------------------------- pagination
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 100

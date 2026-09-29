@@ -1,0 +1,458 @@
+# Camp Accreditation & Health Compliance API — Product Requirements Document
+
+## 1. Introduction
+
+Accrediting a summer camp is not a single audit event. A camp declares what kind of programme it runs, the national office decides which standards from a published edition even apply to that programme, the camp assesses itself against those standards and backs the claims with written plans, a trained visiting team travels to the site and scores the mandatory standards, and only then does the national office issue a decision — with a fee, a deficiency correction window, and, between visit cycles, an annual report that must disclose every serious incident. Running in parallel and entirely independently, a state health department maintains its own licence on the same camp, and a suspension there can stop an accreditation visit dead even though the accreditation record itself is untouched.
+
+This API exists because those two oversight tracks, the health-centre medication record requirements that sit underneath them, and the segregation-of-duties rules that keep scorers away from adjudication cannot be reconciled by hand at scale. The system carries a camp's accreditation standing and its state licensing standing as two separate status axes on the same record, derives a single **compliance posture** gate from both, and freezes downstream activity — new cycles, visits, controlled medication intake, plan verification — the moment the posture turns hostile. Every deadline, window and lateness test in the domain reads a logical clock the test harness controls, so the correction-window and annual-report rules are deterministically reproducible.
+
+The requirements below are written for the engineering team that will build the service. Everything under §2 is a contract that holds for every endpoint. Everything under §3 is domain behaviour: the applicability gates, the two independent scoring dimensions on a single evaluation row, the dual-variant compliance percentages, the penalty ledger and the decision thresholds. The endpoint list in §4 and the error catalogue in §5 are indexes back into that narrative, not substitutes for it. All resources are mounted under the `/accreditation` prefix, with the sole exception of the logical-clock control endpoint.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, declaring the capacity in which it acts. The system recognises exactly five roles: `CampDirector`, `HealthCareStaff`, `Visitor`, `AccreditationOfficer`, and `StateLicensingAgent`. If either header is absent, or if `X-User-Role` is any string other than those five, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). If both headers are well formed but the acting role is not among the roles authorised for the target endpoint in §4, the request is rejected with `ERR_UNAUTHORIZED` (HTTP 403). These two checks run before anything else — before the body is parsed and before any identifier is resolved.
+
+Three of the roles are entity-backed, which is what ties `X-User-ID` to resource ownership:
+
+- When `X-User-Role` is `CampDirector`, `X-User-ID` is the `id` of the acting `Camp`; ownership checks on any resource that references a `Camp` compare the resource's foreign-key field to `X-User-ID`. A director reaching a cycle, an evaluation, a written plan, a deficiency, a medication record, an annual report or an incident disclosure that resolves back to a different camp is rejected with `ERR_FORBIDDEN_SCOPE` (HTTP 403).
+- When `X-User-Role` is `HealthCareStaff`, `X-User-ID` is likewise the `id` of the acting `Camp`, and the same comparison and the same `ERR_FORBIDDEN_SCOPE` rejection apply to every camp-scoped read and write the health centre performs.
+- When `X-User-Role` is `Visitor`, `X-User-ID` is the `id` of the acting `Visitor`. Opening scoring on site and closing it both require `X-User-ID` to equal the visit's `lead_visitor_id`; writing a visitor verdict onto an evaluation requires the acting visitor to hold an `ASSIGNED` seat on the visit that §3.6 resolves as the reference visit for that write. Either failure is `ERR_FORBIDDEN_SCOPE`.
+
+The remaining two roles are opaque operator identities:
+
+- When `X-User-Role` is `AccreditationOfficer`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it — as `scheduled_by_user_id` on `AccreditationVisit`, as `decision_issued_by_user_id` on `AccreditationCycle`, and as `reviewer_user_id` on `WrittenPlan` and on `Deficiency` — but never compares it to any entity's `id`.
+- When `X-User-Role` is `StateLicensingAgent`, `X-User-ID` is likewise an opaque operator identifier not tied to any persisted entity. The server may record it for audit purposes but does not compare it to any entity's `id`.
+
+The one place an opaque identity is compared to a stored value is the **segregation-of-duties rule** at the heart of the accreditation chain. The officer who confirmed a visit is barred from issuing that cycle's decision: when a decision is requested and the acting `X-User-ID` equals the `scheduled_by_user_id` recorded on the cycle's visit, the request is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). The same separation is expressed structurally elsewhere — a `Visitor` scores standards but never adjudicates a written plan, a correction plan or a decision; a `CampDirector` authors self-assessments and correction plans but never verifies them; a `StateLicensingAgent` moves the licensing axis and reads for oversight but has no standing in the accreditation decision at all. On the annual reporting side, the director's `X-User-ID` is stamped onto `attested_by_user_id` at each submission.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination and Collection Filtering
+
+Collection endpoints are paginated through two query parameters. `limit` caps the number of items returned; it defaults to 10, may not be below 1, and may not exceed 100. `offset` is the number of items to skip; it defaults to 0 and may not be negative. A value outside those bounds is a schema failure and yields `ERR_INVALID_REQUEST`. Every list response echoes `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope.
+
+Unless a specific endpoint says otherwise, list results are ordered by `created_at` ascending.
+
+Each collection additionally accepts optional equality filters, and the filter names double as the reverse-reachability channels between aggregates. Camps may be filtered by `state_code`, `camp_type`, `accreditation_status`, `state_license_status` and `compliance_posture`. Standards editions accept `status` and `effective_year`; individual standards accept `standards_set_id`, `domain`, `mandatory` and `requires_state_licensed`. Cycles accept `camp_id`, `standards_set_id`, `status`, `cycle_year` and `decision_level`. Standard evaluations accept `cycle_id`, `standard_id`, `visit_id`, `scored_by_visitor_id`, `written_plan_id`, `applicable`, `mandatory`, `self_status`, `visit_status`, `self_score` and `visitor_score`. Written plans accept `camp_id`, `supersedes_plan_id`, `plan_type`, `status` and `physician_reviewed`. Visitors accept `employer_camp_id`, `home_state_code`, `status` and `trained_through_year`. Visits accept `cycle_id`, `lead_visitor_id` and `status`; team seats accept `visit_id`, `visitor_id`, `team_role` and `status`. Deficiencies accept `visit_id`, `standard_id`, `status` and `severity`. Medication records accept `camp_id`, `camper_reference`, `medication_class`, `record_status` and `compliance_flag`. Annual reports accept `camp_id`, `report_year` and `status`, and incident disclosures accept `annual_report_id`, `incident_type`, `status` and `state_notification_required`.
+
+### 2.4. Common Resource Properties and the Logical Clock
+
+Every resource in this domain — camps, standards editions, standards, cycles, standard evaluations, written plans, visitors, visits, team seats, deficiencies, medication administration records, annual reports and incident disclosures — carries the same four system-managed properties:
+
+- `id` (string): a server-minted UUID. It carries no type prefix of any kind.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits, recording when the row was first persisted.
+- `updated_at` (string): an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the row, including mutations the server performs as a side effect of a write to some other resource.
+- `version` (integer): a counter that increments by one on every mutation of the row. No resource in this domain is exempt: there is no entity here that carries only `id` and `created_at`.
+
+Because derived fields count as mutations, a recomputation of a camp's posture, penalty balance, controlled-substance balance or risk index refreshes that camp's `updated_at` and increments its `version` exactly as a client-supplied edit would. This matters directly for concurrency: the cascades described in §2.8 move a camp's `version` without the client ever addressing the camp.
+
+Time in this domain is a **logical clock**, never wall-clock time. Before any client sets it, the clock reads exactly `2026-08-01T00:00:00Z`, and the server never falls back to real time. An administrative test-driving capability sets the clock to a supplied `to_iso8601` instant and answers with the resulting `current_utc`, together with `escalated_deficiency_count` and `terminated_cycle_count` reporting how many deficiencies escalated and how many cycles terminated as a consequence of the advance. Every deadline comparison, visit-window test, dosing window, three-year incident window and lateness test in §3 reads this clock. Advancing the clock past an annual report's `due_date` does not by itself change that report's status; lateness is decided at the moment of submission.
+
+### 2.5. Validation Precedence and Path Resolution
+
+Many operations here are guarded by half a dozen rules at once, and which rejection a client sees is part of the contract. Checks are evaluated in the following strict order, and the first failure short-circuits the request:
+
+1. **Authentication** — headers present and role recognised: `ERR_UNAUTHENTICATED`.
+2. **Authorisation** — acting role listed for the endpoint: `ERR_UNAUTHORIZED`.
+3. **Schema** — the body parses, every required input field is present and non-null, every enum value belongs to its declared domain, integers declared non-negative are non-negative, calendar dates are ISO 8601 dates and instants are ISO 8601 UTC timestamps: `ERR_INVALID_REQUEST` (HTTP 400). This applies to every mutating endpoint and to every endpoint that accepts query parameters.
+4. **Existence** — identifiers are resolved strictly left to right along the URL path first and then across the body fields in the fixed order of resource kinds listed below, not in the order the endpoint's own payload description happens to name them. The order among resource kinds is fixed: a camp reached through `campId` or a `camp_id` body field yields `ERR_CAMP_NOT_FOUND`; then a standards edition reached through `setId` or `standards_set_id` yields `ERR_STANDARDS_SET_NOT_FOUND`; then `standardId` yields `ERR_STANDARD_NOT_FOUND`; then a cycle reached through `cycleId` or `cycle_id` yields `ERR_CYCLE_NOT_FOUND`; then `evaluationId` yields `ERR_EVALUATION_NOT_FOUND`; then a plan reached through `planId` or `written_plan_id` yields `ERR_WRITTEN_PLAN_NOT_FOUND`; then a visitor reached through `visitorId` or `visitor_id` yields `ERR_VISITOR_NOT_FOUND`; then a visit reached through `visitId` or `visit_id` yields `ERR_VISIT_NOT_FOUND`; then `assignmentId` yields `ERR_ASSIGNMENT_NOT_FOUND`; then `deficiencyId` yields `ERR_DEFICIENCY_NOT_FOUND`; then `recordId` yields `ERR_MED_RECORD_NOT_FOUND`; then a report reached through `reportId` or `annual_report_id` yields `ERR_ANNUAL_REPORT_NOT_FOUND`; and finally `disclosureId` yields `ERR_DISCLOSURE_NOT_FOUND`. All are HTTP 404. A request naming a non-existent camp and a non-existent visit therefore fails on the camp, and a seat request naming both a non-existent visitor and a non-existent visit fails on the visitor, because the visitor kind is reached first in this list even though the payload names `visit_id` before `visitor_id`.
+5. **Ownership and segregation of duties** — the scope comparisons of §2.1, yielding `ERR_FORBIDDEN_SCOPE`, then the decision-time officer comparison yielding `ERR_SEGREGATION_OF_DUTIES`.
+6. **Optimistic concurrency** — the version checks of §2.6, yielding `ERR_STALE_CAMP_VERSION` before `ERR_STALE_CYCLE_VERSION`.
+7. **State preconditions** — in this order: edition publication state (`ERR_STANDARDS_SET_ALREADY_PUBLISHED`, then `ERR_STANDARDS_SET_NOT_PUBLISHED`), cycle status (`ERR_CYCLE_NOT_IN_SELF_ASSESSMENT`), visit status (`ERR_VISIT_INVALID_STATE`), deficiency status (`ERR_DEFICIENCY_INVALID_STATE`), annual report status (`ERR_ANNUAL_REPORT_INVALID_STATE`), evaluation lock (`ERR_EVALUATION_LOCKED`), visitor roster status (`ERR_VISITOR_INACTIVE`), and finally the camp posture gate (`ERR_CAMP_POSTURE_FROZEN`). All are HTTP 409.
+8. **Safety rules** — in this order: `ERR_STATE_LICENSE_BLOCKS_VISIT`, `ERR_WRITTEN_PLAN_NOT_VERIFIED`, `ERR_HEALTH_STAFFING_INSUFFICIENT`, `ERR_PHYSICIAN_REVIEW_REQUIRED`, `ERR_VISITOR_CONFLICT_OF_INTEREST`, `ERR_SPECIALIST_CERTIFICATION_REQUIRED`, `ERR_MED_ROLE_NOT_PERMITTED`, `ERR_CONTROLLED_SECOND_SIGNATURE_REQUIRED`, `ERR_CONTROLLED_STOCK_INSUFFICIENT`. All are HTTP 422.
+9. **Quantitative and uniqueness constraints** — in this order: `ERR_VISITOR_TRAVEL_CONFLICT`, `ERR_CONTROLLED_DOSE_WINDOW_EXCEEDED`, `ERR_TEAM_COMPOSITION_INCOMPLETE`, `ERR_VISITOR_TRAINING_EXPIRED`, `ERR_DUPLICATE_CYCLE_YEAR` (HTTP 409), `ERR_PLAN_REVISION_LIMIT`, `ERR_SELF_ASSESSMENT_INCOMPLETE`, `ERR_MANDATORY_SCORING_INCOMPLETE`, `ERR_DECLARED_COUNT_BELOW_DISCLOSED`.
+10. **Referential coherence** — `ERR_STANDARD_NOT_APPLICABLE`, then `ERR_PLAN_CAMP_MISMATCH`, then `ERR_VISIT_CYCLE_MISMATCH`.
+11. **Temporal rules** — last of all: `ERR_VISIT_WINDOW_INVALID`, then `ERR_TRAVEL_BLOCK_OUTSIDE_WINDOW`, then `ERR_OUTSIDE_VISIT_WINDOW`, then `ERR_CORRECTION_WINDOW_EXPIRED`, then `ERR_INCIDENT_OUTSIDE_REPORT_YEAR`.
+
+Two consequences are worth calling out because implementations get them backwards. A frozen camp posture is a state-family rejection and therefore outranks every safety and temporal rule on the same endpoint — a visit start against a frozen camp reports `ERR_CAMP_POSTURE_FROZEN` even when the clock also sits outside the agreed window. And a seat request that violates the conflict-of-interest rule, the travel-calendar rule, the training-currency rule and the travel-block window rule all together reports the conflict of interest, because safety outranks quantitative constraints, which in turn outrank temporal ones.
+
+### 2.6. Version Pinning and Optimistic Concurrency Control
+
+Three write operations in this domain are supersede operations: they silently retire a resource the client may never have seen. Each therefore requires the client to pin the parent it believes it is acting against, and each names its own field and its own rejection.
+
+Opening an accreditation cycle requires `expected_camp_version` as a non-optional input field carrying the client's last observed `version` of the target `Camp`. If it does not equal the camp's current `version`, the request is rejected with `ERR_STALE_CAMP_VERSION` (HTTP 412). This guard exists because a new cycle legitimately terminates any prior cycle of the same camp still in `SELF_ASSESSMENT` and rescinds that cycle's visit; a create issued against a stale camp view would discard a cycle the client never observed.
+
+Filing a written plan likewise requires `expected_camp_version` as a non-optional input field, and a mismatch with the camp's current `version` is rejected with `ERR_STALE_CAMP_VERSION` (HTTP 412). Filing a plan whose `plan_type` already exists on the camp is a supersede: the prior plan of that type moves to `SUPERSEDED` and any evaluation citing it as verified evidence is knocked back. A stale camp view means the client's picture of which plan is currently in force is wrong.
+
+Creating a visit requires `expected_cycle_version` as a non-optional input field, carrying the client's last observed `version` of the target `AccreditationCycle`. A mismatch with the cycle's current `version` is rejected with `ERR_STALE_CYCLE_VERSION` (HTTP 412). Creating a visit for a cycle that already carries a `DRAFT` or `SCHEDULED` visit rescinds that visit and withdraws its seats, so a stale cycle view means the client's picture of the standing visit and its seated team is wrong.
+
+No other endpoint accepts a version field, and none of them performs a concurrency check. Note that the guarded creates themselves advance the pinned parent: opening a cycle increments the camp's `version` by one, filing a plan increments the camp's `version` by one, and creating a visit increments the cycle's `version` by one. A client issuing two such creates in sequence must therefore re-read the parent between them.
+
+### 2.7. The Two Camp Status Axes and the Compliance Posture Gate
+
+A camp record carries two lifecycle axes that never read or write each other. `accreditation_status` is the national office's axis and takes one of `NOT_ACCREDITED`, `ACCREDITED`, `ACCREDITED_WITH_CORRECTION`, `PROVISIONAL` or `REVOKED`; it starts at `NOT_ACCREDITED` and moves only through cycle decisions, correction clearances and escalations. `state_license_status` is the state health department's axis and takes one of `NONE`, `PENDING`, `ACTIVE`, `PROBATION` or `SUSPENDED`; it starts at `NONE`, is written only by a `StateLicensingAgent`, and never touches the accreditation axis. Neither axis has a terminal state — a revoked camp can be re-accredited by a later cycle, and a suspended licence can be restored.
+
+Over both axes sits a single derived gate, `compliance_posture`, taking `OPEN`, `RESTRICTED` or `FROZEN`. It is recomputed on every write that changes the camp's `penalty_point_balance`, its `state_license_status`, its `health_staffing_level`, its `required_health_staffing_level`, or the status of any deficiency belonging to the camp. Health staffing levels are ranked for comparison: `NONE` ranks 0, `FIRST_AIDER_ONLY` ranks 1, `LPN_ONSITE` ranks 2, `RN_ONSITE` ranks 3 and `PHYSICIAN_ONSITE` ranks 4. The posture is then decided by the first matching clause:
+
+- The posture is `FROZEN` when the camp's `penalty_point_balance` is at least 12, or its `state_license_status` is `SUSPENDED`, or at least one deficiency of the camp sits in `ESCALATED`.
+- Otherwise the posture is `RESTRICTED` when the camp's `penalty_point_balance` is at least 5, or its `state_license_status` is either `PENDING` or `PROBATION`, or the rank of its `health_staffing_level` is strictly below the rank of its `required_health_staffing_level`.
+- Otherwise the posture is `OPEN`.
+
+The `penalty_point_balance` that feeds the first two clauses is a conserved quantity: it is always the sum of `penalty_points` over exactly those deficiencies of the camp whose status is `OPEN`, `PLAN_SUBMITTED` or `ESCALATED`. Points leave the balance when a deficiency moves to `PLAN_ACCEPTED`, `CORRECTED` or `WAIVED`, and re-enter it if a `PLAN_ACCEPTED` finding is later escalated.
+
+A `FROZEN` posture is a hard gate. Opening a new cycle, confirming a visit, opening scoring on site, and creating a `CONTROLLED` or `PRESCRIPTION` medication record are all refused with `ERR_CAMP_POSTURE_FROZEN` (HTTP 409) while the posture is `FROZEN`. A `RESTRICTED` posture is informational for those four operations; it blocks nothing by itself, though the staffing-gap clause that often produces it is separately enforced when a self-assessment is submitted.
+
+### 2.8. The Freeze Cascade and Conserved Quantities
+
+Whenever a recomputation lands the posture on `FROZEN`, a fixed three-hop cascade runs, in this order, as part of the same request:
+
+1. The camp's `health_intake_status` is set to `SUSPENDED`, closing the health centre to new medication administration records.
+2. Every written plan of that camp whose `status` is `VERIFIED` is moved to `REVALIDATION_REQUIRED`.
+3. For each plan so moved, every standard evaluation whose `written_plan_id` names that plan and whose `self_status` is `VERIFIED` is knocked back to `self_status` `REJECTED`. The cycle's `self_assessment_submitted_at` is deliberately left untouched by this knock-back.
+
+When a recomputation lands on `OPEN` or `RESTRICTED`, `health_intake_status` is set back to `OPEN`. Plans already in `REVALIDATION_REQUIRED` are not automatically restored — an officer must verify them again — and evaluations knocked to `REJECTED` are not automatically restored either; the camp must re-submit those self scores.
+
+Three quantities in this domain are conserved and must hold after every request, including compensating ones. `penalty_point_balance` is described above. A visitor's `committed_travel_days` is always the sum of `travel_days` over that visitor's team seats whose `status` is `ASSIGNED` or `COMPLETED`; consequently an assign-then-withdraw pair returns the visitor to exactly the value held before the assignment, while a seat moving from `ASSIGNED` to `COMPLETED` at scoring finalisation leaves the quantity deliberately unchanged because `COMPLETED` remains inside the counted set. A camp's `controlled_on_hand_units` is always its `controlled_intake_units` minus the sum of `dose_units` over its medication records whose `medication_class` is `CONTROLLED` and whose `record_status` is `RECORDED`; voiding a controlled record therefore restores the balance exactly, and the balance may never become negative.
+
+### 2.9. Numeric Precision and the Camp Risk Index
+
+Every percentage in this domain — `provisional_mandatory_pct`, `final_mandatory_pct`, `final_weighted_pct` — and the camp's `risk_index` are carried to exactly two decimal places, rounded half up. Penalty points, staffing ranks, seat counts, travel days and medication units are integers. Money is carried in whole cents in `assessed_fee_cents`, rounded half up, and — as §3.7 spells out — the rounding is applied per fee line item before the line items are summed, never once at the end.
+
+The camp's `risk_index` is a single number between 0.00 and 100.00 that the state licensing agent, the camp and the national office all read. It is recomputed when a camp is registered, when the licensing axis moves, when the health centre configuration changes, when a self score is written, when a cycle is opened, when a self-assessment is submitted, when scoring is finalised, and when an incident is disclosed. A dedicated computed read exposes it broken out by component, answering with `camp_id`, `risk_index_variant`, `incident_component`, `program_component`, `staffing_gap_penalty`, `license_penalty`, `compliance_component`, `population_multiplier` and `risk_index`.
+
+The index starts from a base of 10.0 and adds five components.
+
+The **incident component** covers the disclosures filed under this camp's annual reports whose `occurred_at` falls in a three-year window — that is, whose calendar year is greater than or equal to the logical clock's calendar year minus two. Each qualifying disclosure contributes its incident weight multiplied by 1.5 when its `status` is `LATE_DISCLOSED` and by 1.0 when its `status` is `REPORTED`, with that product rounded half up to two decimal places **for each disclosure individually before the contributions are summed**. The incident weights, which are also what the server stamps onto a disclosure's `severity_weight`, are 25 for `DEATH`, 20 for `ABUSE_ALLEGATION`, 12 for `HOSPITALIZATION`, 8 for `SERIOUS_INJURY`, 8 for `COMMUNICABLE_DISEASE_OUTBREAK`, 6 for `TRANSPORTATION_COLLISION`, 5 for `AQUATICS_RESCUE` and 4 for `MEDICATION_ERROR`.
+
+The **program component** is the sum of the weights of the camp's declared `program_elements`: 8 for `AQUATICS_OPEN_WATER`, 7 for `ADVENTURE_CLIMBING`, 6 for `ADVENTURE_CHALLENGE_COURSE`, 6 for `HORSEBACK`, 5 for `AQUATICS_POOL`, 4 for `TRANSPORTATION` and 3 for `TRIP_CAMPING`.
+
+The **staffing gap penalty** is 15 when the rank of the camp's `health_staffing_level` is strictly below the rank of its `required_health_staffing_level`, and 0 otherwise.
+
+The **licence penalty** is read straight off the licensing axis: 6 when `state_license_status` is `NONE`, 4 when `PENDING`, 0 when `ACTIVE`, 10 when `PROBATION` and 20 when `SUSPENDED`.
+
+The **compliance component** depends on which of two variants applies, and the variant chosen is stamped onto `risk_index_variant`. The camp's newest cycle for this purpose is the one with the highest `cycle_year`, ties broken by the earliest `created_at`. When that newest cycle's status is `SELF_ASSESSMENT` or `VISIT_SCHEDULED`, or when the camp has no cycle at all, the variant is `PRE_VISIT`; when it is `VISIT_COMPLETED`, `IN_CORRECTION`, `CLOSED` or `TERMINATED`, the variant is `POST_VISIT`.
+
+- Under `PRE_VISIT`, count the newest cycle's evaluations that are applicable and mandatory and whose `self_score` is either absent or something other than `MET`; multiply that count by 30; divide by the larger of 1 and the cycle's `applicable_mandatory_count`; and round the quotient half up to two decimal places. With no cycle at all the compliance component is 0.
+- Under `POST_VISIT`, self scores are ignored entirely. Count instead the deficiencies raised on that cycle's non-rescinded visit whose `severity` is `MANDATORY_CRITICAL` or `MANDATORY` and whose `status` is `OPEN`, `PLAN_SUBMITTED` or `ESCALATED`; multiply that count by 30; divide by the larger of 1 and the cycle's `applicable_mandatory_count`; and round the quotient half up to two decimal places. The same stored rows therefore yield a different index under the two variants, which is the intended behaviour.
+
+Finally, the base and the five components are added together, the sum is multiplied by a population multiplier — 1.4 for `MEDICALLY_FRAGILE`, 1.1 for `ADULT_INCLUSIVE` and 1.0 for `YOUTH_ONLY` — the product is capped at 100.00, and the capped value is rounded half up to two decimal places to give `risk_index`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Registering a Camp, Sizing its Health Centre, and the State Licensing Axis
+
+A camp enters the system when an `AccreditationOfficer` registers it. Registration supplies the camp's legal operating `name` (between 1 and 160 characters, not blank), its `camp_type` — one of `RESIDENT`, `DAY`, `TRAVEL_TRIP`, `FAMILY` or `SPECIAL_NEEDS` — the two-uppercase-letter `state_code` of the primary site, and the `population_served`, one of `YOUTH_ONLY`, `ADULT_INCLUSIVE` or `MEDICALLY_FRAGILE`. Five further inputs are optional. `program_elements` is a list of distinct activity elements drawn from `AQUATICS_POOL`, `AQUATICS_OPEN_WATER`, `ADVENTURE_CHALLENGE_COURSE`, `ADVENTURE_CLIMBING`, `HORSEBACK`, `TRANSPORTATION` and `TRIP_CAMPING`, and defaults to the empty list. `resident_census` (peak overnight camper count), `max_daily_census` (maximum campers on site on any single day) and `distance_to_hospital_km` (road distance from the health centre to the nearest emergency department) each default to 0 and may not be negative. `health_staffing_level` records the staffing actually provided and defaults to `NONE`. Finally, `prior_accredited_cycle_count` may be seeded at registration for camps migrating from paper records; it defaults to 0, may not be negative, and is thereafter incremented by the system each time a cycle closes at the `ACCREDITED` level.
+
+Registration also fixes the camp's derived state. `state_license_number` is null until a licensing agent supplies one, `state_license_status` starts at `NONE`, `accreditation_status` at `NOT_ACCREDITED`, `penalty_point_balance` at 0, `health_intake_status` at `OPEN`, both `controlled_intake_units` and `controlled_on_hand_units` at 0, `last_accredited_year` null, and `risk_index_variant` at `PRE_VISIT`. The server then computes `required_health_staffing_level`, the compliance posture, and the risk index under its pre-visit variant.
+
+**How the required staffing level is derived.** `required_health_staffing_level` is the minimum health-centre staffing the camp's own configuration demands, expressed on the same five-level enumeration as `health_staffing_level` and using the same ranks (`NONE` 0, `FIRST_AIDER_ONLY` 1, `LPN_ONSITE` 2, `RN_ONSITE` 3, `PHYSICIAN_ONSITE` 4). Five component ranks are resolved first. The camp-type component is 1 for a `DAY` camp, 3 for a `RESIDENT` camp, and 2 for any of `TRAVEL_TRIP`, `FAMILY` or `SPECIAL_NEEDS`. The population component is 4 for `MEDICALLY_FRAGILE`, 2 for `ADULT_INCLUSIVE` and 1 for `YOUTH_ONLY`. The census component is 1 when `resident_census` is 50 or fewer, 2 when it is more than 50 but 120 or fewer, and 3 above 120. The distance component is 3 when `distance_to_hospital_km` is 40 or more, 2 when it is at least 20 but below 40, and 1 below 20. The programme component is 3 when the camp's `program_elements` include `AQUATICS_OPEN_WATER` or `ADVENTURE_CLIMBING`, and 1 otherwise. The required rank is then the largest of those five components, plus one further step when at least three of the five components are themselves 2 or greater, with the total capped at 4. `required_health_staffing_level` is the level whose rank equals that result. Consider a resident camp for a medically fragile population 45 km from hospital with a census of 60 and no water or climbing programme: the components are 3, 4, 2, 3 and 1, the largest is 4, and the cap holds the result at 4 — `PHYSICIAN_ONSITE`.
+
+**Changing the health centre.** Both `CampDirector` and `HealthCareStaff` may revise the health-centre configuration, supplying any subset of `health_staffing_level`, `resident_census`, `max_daily_census`, `distance_to_hospital_km` and `controlled_intake_units_added`. The last of these is the controlled-substance intake channel: the supplied number of units is added both to `controlled_intake_units` and to `controlled_on_hand_units`. Any such write recomputes `required_health_staffing_level`, then the controlled-substance balance, then the compliance posture, then the risk index, and increments the camp's `version` by one. Because the staffing-gap clause of §2.7 compares actual against required, lowering `health_staffing_level` or lengthening the hospital distance can move a camp from `OPEN` to `RESTRICTED` without any accreditation event at all.
+
+**The state licensing axis.** A `StateLicensingAgent` moves the licensing axis by supplying the target `state_license_status` and, optionally, the `state_license_number`. The permitted moves are `NONE → PENDING`, `PENDING → ACTIVE`, `NONE → ACTIVE`, `ACTIVE → PROBATION`, `ACTIVE → SUSPENDED`, `PROBATION → SUSPENDED`, `SUSPENDED → ACTIVE` and `PROBATION → ACTIVE`. Any move into `ACTIVE` requires a licence number: on `NONE → ACTIVE` the number must be supplied on the request, and on `PENDING → ACTIVE` and `SUSPENDED → ACTIVE` it must either be supplied on the request or already stored on the camp. A request that omits it when nothing is stored is rejected with `ERR_INVALID_REQUEST`. Every licensing write recomputes the compliance posture and the risk index and increments the camp's `version` by one, and none of them touches `accreditation_status`.
+
+Two of these moves have consequences beyond the camp row. `ACTIVE → PROBATION` drives the posture to `RESTRICTED` through the probation clause. `ACTIVE → SUSPENDED` and `PROBATION → SUSPENDED` drive it to `FROZEN` through the suspension clause, which runs the full freeze cascade of §2.8: `health_intake_status` becomes `SUSPENDED`, every `VERIFIED` written plan of the camp becomes `REVALIDATION_REQUIRED`, and every evaluation citing one of those plans with `self_status` `VERIFIED` is knocked to `REJECTED`. Restoring the licence with `SUSPENDED → ACTIVE` recomputes the posture and, only when the recomputed posture is not `FROZEN`, reopens `health_intake_status` to `OPEN` — a camp whose penalty balance is at least 12 or which holds an escalated deficiency stays frozen and stays closed to medication intake even after the licence is restored.
+
+### 3.2. The Standards Book: Editions, Standards and Publication
+
+The national office maintains the standards book as a sequence of editions. An `AccreditationOfficer` creates an edition with a unique `edition_code` of 1 to 40 characters and an `effective_year` between 2000 and 2100 naming the first accreditation year the edition governs. A new edition begins with `status` `DRAFT`, a null `published_at`, and both `standard_count` and `mandatory_count` at 0.
+
+Standards are added to a draft edition one at a time, each naming its owning edition through a `standards_set_id` in the payload. A standard carries a `code` such as HW.7 or PA.2, unique within its edition and 1 to 16 characters long; a `title` of 1 to 200 characters; and a `domain`, one of `SUPERVISION`, `HEALTH_WELLNESS`, `EMERGENCY_RESPONSE`, `AQUATICS`, `ADVENTURE`, `TRANSPORTATION` or `OPERATIONS`. The `mandatory` flag defaults to false. The `scoring_weight` defaults to 1 and must lie between 1 and 5 inclusive. `written_plan_type_required` names the written plan whose verification the standard presupposes; it defaults to null and, when present, is one of `SUPERVISION`, `HEALTH_CARE`, `EMERGENCY_RESPONSE`, `AQUATICS_SAFETY`, `TRANSPORTATION_SAFETY` or `ADVENTURE_OPERATIONS`. Four applicability gates complete the definition: `applies_to_camp_types` and `applies_to_populations` and `requires_program_elements_any` are lists of distinct members of the corresponding camp enumerations, each defaulting to the empty list, and `requires_state_licensed` is a boolean defaulting to false. An empty gate list means the gate excludes nobody. Adding a standard recomputes its edition's `standard_count` and `mandatory_count`.
+
+An edition accepts standards only while it is `DRAFT`. Adding a standard to an edition that is `PUBLISHED` or `RETIRED` is rejected with `ERR_STANDARDS_SET_ALREADY_PUBLISHED` (HTTP 409), and so is an attempt to publish an edition that is not `DRAFT`. Publication itself moves the edition `DRAFT → PUBLISHED` and stamps `published_at` with the current logical clock instant. Only a `PUBLISHED` edition may be pinned by a cycle.
+
+### 3.3. Opening a Cycle and Freezing Applicability
+
+An accreditation cycle is the unit of adjudication. An `AccreditationOfficer` opens one by naming the `camp_id`, the `standards_set_id` of the edition to pin, the `cycle_year` the cycle decides (between 2000 and 2100, and unique per camp), and the `expected_camp_version` described in §2.6. A second cycle for the same camp and the same `cycle_year` is rejected with `ERR_DUPLICATE_CYCLE_YEAR` (HTTP 409). If the named edition's `status` is not `PUBLISHED`, the request is rejected with `ERR_STANDARDS_SET_NOT_PUBLISHED` (HTTP 409). If the camp's posture is `FROZEN`, it is rejected with `ERR_CAMP_POSTURE_FROZEN`.
+
+The cycle opens in `SELF_ASSESSMENT` with `decision_level` null, `self_assessment_submitted_at` null, all three percentages null, `open_deficiency_count` 0, `assessed_fee_cents` null, `correction_deadline_at` null, and both `decision_issued_at` and `decision_issued_by_user_id` null. The edition is version-pinned at this instant and never re-read afterwards.
+
+**Applicability determination.** Opening the cycle materialises exactly one standard evaluation row for every standard belonging to the pinned edition, regardless of the order in which those standards were created. Each row records its `cycle_id` and `standard_id`, and receives a frozen applicability verdict in `applicable`, computed by running four gates in this fixed order and treating any gate that excludes the camp as decisive:
+
+1. **Camp type.** If the standard's `applies_to_camp_types` is non-empty and the camp's `camp_type` is not one of its members, the standard is not applicable.
+2. **Programme element, any-of.** If the standard's `requires_program_elements_any` is non-empty and it shares no member with the camp's `program_elements`, the standard is not applicable.
+3. **Population served.** If the standard's `applies_to_populations` is non-empty and the camp's `population_served` is not one of its members, the standard is not applicable.
+4. **State licensure.** If the standard's `requires_state_licensed` is true and the camp's `state_license_status` is neither `ACTIVE` nor `PROBATION`, the standard is not applicable.
+
+Each row also takes a pinned copy of the standard's `mandatory` flag and of its `scoring_weight`. Neither copy nor the applicability verdict is ever recomputed — a camp that later adds a programme element, gains a state licence or edits its census does not change the shape of an open cycle. The cycle then stamps `applicable_standard_count` (rows whose `applicable` is true) and `applicable_mandatory_count` (rows whose `applicable` is true and whose pinned `mandatory` is true). Every fresh row begins with `self_score` null, `self_status` `DRAFT`, `visitor_score` null, `score_source` null, `visit_status` `UNSCORED`, and `visit_id`, `scored_by_visitor_id`, `written_plan_id` and `note` all null.
+
+**Supersede.** Opening a cycle terminates any prior cycle of the same camp still sitting in `SELF_ASSESSMENT`, moving it `SELF_ASSESSMENT → TERMINATED`. That terminated cycle's standing visit moves `DRAFT → RESCINDED` or `SCHEDULED → RESCINDED`, and every `ASSIGNED` seat on the rescinded visit moves `ASSIGNED → WITHDRAWN`, releasing each seated visitor's `travel_days` from their `committed_travel_days`. Finally, opening a cycle recomputes the camp's risk index under the pre-visit variant and increments the camp's `version` by one.
+
+A computed read summarises where a cycle stands at any moment, answering with `cycle_id`, `applicable_standard_count`, `applicable_mandatory_count`, `provisional_denominator`, `provisional_numerator`, `provisional_mandatory_pct`, `final_denominator`, `final_numerator`, `final_mandatory_pct`, `weighted_total`, `weighted_met`, `final_weighted_pct`, `open_deficiency_count` and `projected_decision_level` — both compliance variants computed side by side over the very same stored rows, so a camp can see the gap between the field team's provisional figure and the office's final one before the decision is issued.
+
+### 3.4. Written Plans and the Camp Self-Assessment
+
+A camp cannot self-score a standard that presupposes a written plan until that plan has been verified, so the plan library and the self-assessment advance together. Either a `CampDirector` or `HealthCareStaff` files a plan, naming the `camp_id`, the `plan_type` (one of `SUPERVISION`, `HEALTH_CARE`, `EMERGENCY_RESPONSE`, `AQUATICS_SAFETY`, `TRANSPORTATION_SAFETY` or `ADVENTURE_OPERATIONS`), an opaque `body_ref` of 1 to 200 characters pointing at the document itself, the calendar dates `effective_date` and `expires_at` bounding the period the plan governs, an optional `physician_reviewed` flag defaulting to false, and the `expected_camp_version` of §2.6. The `expires_at` date must be strictly after `effective_date`; a plan filed with an expiry on or before its effective date is rejected with `ERR_INCIDENT_OUTSIDE_REPORT_YEAR` (HTTP 422). A new plan begins in `SUBMITTED` with `verified_at`, `reviewer_user_id` and `verification_note` all null.
+
+Filing a plan of a `plan_type` the camp already holds is a supersede. The prior plan of that type moves to `SUPERSEDED` — from `SUBMITTED`, from `VERIFIED`, from `REVALIDATION_REQUIRED` or from `REJECTED` alike — and the new plan's `supersedes_plan_id` is set to the retired plan's `id`. When and only when the retired plan was `VERIFIED`, every evaluation whose `written_plan_id` names it and whose `self_status` is `VERIFIED` is knocked back to `self_status` `REJECTED`; superseding a plan that was merely `SUBMITTED`, `REVALIDATION_REQUIRED` or `REJECTED` has no such knock-back. Filing increments the camp's `version` by one.
+
+An `AccreditationOfficer` reviews a filed plan by supplying a `decision` of either `VERIFY` or `REJECT` together with an optional `verification_note`. `VERIFY` is accepted from `SUBMITTED` and from `REVALIDATION_REQUIRED`, moves the plan to `VERIFIED`, and stamps `verified_at` with the current logical clock instant and `reviewer_user_id` with the acting `X-User-ID`. A `HEALTH_CARE` plan may only reach `VERIFIED` when its `physician_reviewed` flag is true; otherwise the review is rejected with `ERR_PHYSICIAN_REVIEW_REQUIRED` (HTTP 422). Re-verifying a plan out of `REVALIDATION_REQUIRED` additionally requires that the camp's posture no longer be `FROZEN`. `REJECT` is accepted only from `SUBMITTED`, moves the plan to `REJECTED`, and knocks every evaluation whose `written_plan_id` names that plan and whose `self_status` is `SUBMITTED` back to `self_status` `REJECTED`.
+
+**The self-assessment dimension.** Each evaluation row carries two status dimensions that evolve entirely independently: `self_status`, which moves on camp-side and plan-side events, and `visit_status`, which moves only on visitor events. A write to one never reads or writes the other on the same row. A `CampDirector` records the camp's own verdict on one row by supplying a `self_score` of `NOT_MET`, `PARTIAL` or `MET`, optionally a `written_plan_id` citing the plan offered as evidence, and optionally a free-text `note`. The write is refused unless the cycle is in `SELF_ASSESSMENT` (`ERR_CYCLE_NOT_IN_SELF_ASSESSMENT`, HTTP 409), unless the row's `self_status` is something other than `VERIFIED` (`ERR_EVALUATION_LOCKED`, HTTP 409), and unless the row's `applicable` flag is true (`ERR_STANDARD_NOT_APPLICABLE`, HTTP 422). A cited plan must belong to the same camp as the evaluation's cycle, or the write is rejected with `ERR_PLAN_CAMP_MISMATCH` (HTTP 422). And a `self_score` of `MET` on a standard whose pinned `written_plan_type_required` is not null requires `written_plan_id` to name a plan of that exact `plan_type`, belonging to the same camp, whose `status` is `VERIFIED`; otherwise the write is rejected with `ERR_WRITTEN_PLAN_NOT_VERIFIED` (HTTP 422). A successful write moves the row `DRAFT → SUBMITTED`, or `REJECTED → SUBMITTED` when the camp is repairing a knocked-back row, and recomputes the camp's risk index under the pre-visit variant.
+
+Two system events move `self_status` without any camp action. When a plan the row cites transitions `VERIFIED → REVALIDATION_REQUIRED` because the camp's posture became `FROZEN`, every citing row with `self_status` `VERIFIED` moves `VERIFIED → REJECTED`, and the cycle's `self_assessment_submitted_at` is deliberately left untouched. When an officer rejects a plan the row cites, every citing row with `self_status` `SUBMITTED` moves `SUBMITTED → REJECTED`.
+
+**Submitting the self-assessment.** The `CampDirector` closes the self-assessment in one act, with no request body. Two gates apply, and they are evaluated in the order the ladder of §2.5 dictates: first the staffing gate, then the completeness gate. The camp's actual `health_staffing_level` must rank at least as high as its `required_health_staffing_level`, or the submission is rejected with `ERR_HEALTH_STAFFING_INSUFFICIENT` (HTTP 422). Then every applicable evaluation on the cycle must carry a non-null `self_score` and sit in `self_status` `SUBMITTED`, or the submission is rejected with `ERR_SELF_ASSESSMENT_INCOMPLETE` (HTTP 422). On success every applicable evaluation whose `self_status` is `SUBMITTED` moves `SUBMITTED → VERIFIED`, the cycle's `self_assessment_submitted_at` is stamped with the current logical clock instant, and the risk index is recomputed under the pre-visit variant. Until `self_assessment_submitted_at` is non-null, no visit for the cycle can be confirmed.
+
+### 3.5. Assembling and Confirming the Visiting Team
+
+The visitor roster is national-office property. An `AccreditationOfficer` adds a visitor with a `full_name` of 1 to 120 characters, a two-uppercase-letter `home_state_code`, and a `trained_through_year` between 2000 and 2100 naming the last calendar year for which the visitor's ACA training is current. Optional `certifications` is a list of distinct endorsements drawn from `LEAD_VISITOR`, `AQUATICS_SPECIALIST`, `ADVENTURE_SPECIALIST` and `HEALTH_SPECIALIST`, defaulting to the empty list, and optional `employer_camp_id` records the camp that employs the visitor and therefore the conflict of interest that camp creates; it is null for an independent visitor. A new visitor starts with `status` `ACTIVE`, `committed_travel_days` 0 and `deactivated_reason` null.
+
+Removing a visitor from the roster takes an optional `deactivated_reason` and moves the visitor `ACTIVE → INACTIVE`. Deactivating a visitor who is already `INACTIVE` is rejected with `ERR_VISITOR_INACTIVE` (HTTP 409). The removal cascades: every seat of that visitor whose `status` is `ASSIGNED` moves `ASSIGNED → WITHDRAWN`, each withdrawal decrements the visitor's `committed_travel_days` by that seat's `travel_days`, each withdrawal decrements its visit's `team_size` by one, and a withdrawn `LEAD` seat clears that visit's `lead_visitor_id` to null. Where such a withdrawal breaks team completeness on a visit that was `SCHEDULED`, the visit reverts `SCHEDULED → DRAFT` with its `scheduled_by_user_id` cleared to null, and that reversion in turn drives the owning cycle `VISIT_SCHEDULED → SELF_ASSESSMENT`. One deactivation can therefore unwind three levels of the hierarchy in a single request.
+
+**Opening the visit.** An officer opens a visit against a cycle in `SELF_ASSESSMENT`, supplying the `cycle_id`, the agreed window as `window_start_date` and `window_end_date`, the `expected_cycle_version` of §2.6, and an optional `scheduled_note`. The window must satisfy three conditions together: `window_start_date` on or before `window_end_date`, a span of at most fourteen days counting both endpoints, and `window_start_date` on or after the logical clock's calendar date. Any violation is `ERR_VISIT_WINDOW_INVALID` (HTTP 422). A new visit begins in `DRAFT` with `lead_visitor_id` null, `team_size` 0, `mandatory_scored_count` and `mandatory_met_count` at 0, `provisional_mandatory_pct` null, `scheduled_by_user_id` null and `scored_at` null.
+
+Opening a visit also computes `required_specialist_domains`, the list of specialist domains the team must seat, drawn from `AQUATICS`, `ADVENTURE` and `HEALTH_WELLNESS`. `AQUATICS` is required when the camp's `program_elements` include `AQUATICS_POOL` or `AQUATICS_OPEN_WATER`. `ADVENTURE` is required when they include `ADVENTURE_CHALLENGE_COURSE` or `ADVENTURE_CLIMBING`. `HEALTH_WELLNESS` is required when the camp's `required_health_staffing_level` is `RN_ONSITE` or `PHYSICIAN_ONSITE`. Opening a visit for a cycle that already carries a standing visit supersedes it: a standing visit moves `DRAFT → RESCINDED` or `SCHEDULED → RESCINDED`, every `ASSIGNED` seat on it moves `ASSIGNED → WITHDRAWN`, and each affected visitor's committed travel days are released. When the superseded visit was `SCHEDULED`, the cycle is additionally driven `VISIT_SCHEDULED → SELF_ASSESSMENT`. A visit in `RESCINDED` is invisible to every later computation — the fee, the deficiency counts and both compliance variants all read only the cycle's non-rescinded visit — and it accepts no further transition of any kind. The create increments the cycle's `version` by one.
+
+**Seating the team.** Each seat names its `visit_id`, its `visitor_id`, the `team_role` — one of `LEAD`, `MEMBER`, `SPECIALIST_AQUATICS`, `SPECIALIST_ADVENTURE` or `SPECIALIST_HEALTH` — and the travel commitment as `travel_block_start_date` and `travel_block_end_date`. The seat's `travel_days` is computed as the inclusive day count from the start of the block to its end, that is the difference in whole days plus one, and is therefore always at least 1. Seats begin in `status` `ASSIGNED` with `withdrawal_reason` null; creating one recomputes the visitor's `committed_travel_days` and the visit's `team_size`, and a `LEAD` seat sets the visit's `lead_visitor_id`.
+
+Seating is guarded by five rules beyond existence, and the order matters because more than one commonly fails at once. The visit must be in `DRAFT` (`ERR_VISIT_INVALID_STATE`) and the visitor must be `ACTIVE` (`ERR_VISITOR_INACTIVE`). Then the conflict-of-interest rule: the visitor's `employer_camp_id` must not be the camp under review, and for a `LEAD` seat the visitor's `home_state_code` must not equal the camp's `state_code`, or the request is rejected with `ERR_VISITOR_CONFLICT_OF_INTEREST` (HTTP 422). Then the travel-calendar rule: the visitor must hold no other seat in `ASSIGNED` or `COMPLETED` whose travel block, widened by two buffer days on each side, overlaps the requested block — a visitor released on the 10th cannot be seated again before the 13th — or the request is rejected with `ERR_VISITOR_TRAVEL_CONFLICT` (HTTP 422). Then training currency: the visitor's `trained_through_year` must be at least the calendar year of the visit's `window_start_date`, or the request is rejected with `ERR_VISITOR_TRAINING_EXPIRED` (HTTP 422). Last, the travel block must lie wholly inside the visit window — `travel_block_start_date` on or after `window_start_date` and `travel_block_end_date` on or before `window_end_date` — or the request is rejected with `ERR_TRAVEL_BLOCK_OUTSIDE_WINDOW` (HTTP 422).
+
+Releasing a seat takes an optional `withdrawal_reason` and is permitted while the visit is `DRAFT` or `SCHEDULED`. It moves the seat `ASSIGNED → WITHDRAWN`, decrements the visitor's `committed_travel_days` by that seat's `travel_days`, decrements the visit's `team_size` by one, and clears `lead_visitor_id` to null when the released seat was the `LEAD`. If the visit was `SCHEDULED` and team completeness no longer holds afterwards, the visit reverts `SCHEDULED → DRAFT` with `scheduled_by_user_id` cleared, and the cycle reverts `VISIT_SCHEDULED → SELF_ASSESSMENT`.
+
+**Confirming the visit.** Confirmation is an officer act with no body, moving the visit `DRAFT → SCHEDULED`, stamping `scheduled_by_user_id` with the acting `X-User-ID` — the value the segregation-of-duties rule will later compare against — and driving the cycle `SELF_ASSESSMENT → VISIT_SCHEDULED`. Four preconditions guard it, in this order. The visit must be `DRAFT` (`ERR_VISIT_INVALID_STATE`). The camp's posture must not be `FROZEN` (`ERR_CAMP_POSTURE_FROZEN`). The camp's `state_license_status` must be one of `NONE`, `ACTIVE` or `PROBATION`; both `PENDING` and `SUSPENDED` block confirmation with `ERR_STATE_LICENSE_BLOCKS_VISIT` (HTTP 422). And the team must be complete: `lead_visitor_id` must be non-null, `team_size` must be at least 2, and for every domain in `required_specialist_domains` an `ASSIGNED` seat must exist whose `team_role` is the matching specialist seat and whose visitor holds the matching endorsement — `SPECIALIST_AQUATICS` with `AQUATICS_SPECIALIST` for `AQUATICS`, `SPECIALIST_ADVENTURE` with `ADVENTURE_SPECIALIST` for `ADVENTURE`, and `SPECIALIST_HEALTH` with `HEALTH_SPECIALIST` for `HEALTH_WELLNESS`. An incomplete team is rejected with `ERR_TEAM_COMPOSITION_INCOMPLETE` (HTTP 422). Confirmation additionally requires the cycle's `self_assessment_submitted_at` to be non-null.
+
+### 3.6. On-Site Scoring, Finalisation and Deficiency Creation
+
+The lead visitor opens scoring on arrival, advancing the visit `SCHEDULED → IN_PROGRESS`. Only the visitor whose `id` equals the visit's `lead_visitor_id` may do so; anyone else is refused with `ERR_FORBIDDEN_SCOPE`. The visit must be `SCHEDULED` (`ERR_VISIT_INVALID_STATE`), the camp's posture must not be `FROZEN` (`ERR_CAMP_POSTURE_FROZEN`), and the logical clock's calendar date must fall inside the agreed window counting both endpoints, or the request is refused with `ERR_OUTSIDE_VISIT_WINDOW` (HTTP 422).
+
+**The visit-scoring dimension.** Once the visit is `IN_PROGRESS`, any seated visitor records a verdict on one evaluation by supplying a `visitor_score` of `MET`, `NOT_MET` or `NOT_APPLICABLE`, a `score_source` naming the evidence channel behind it — `OBSERVED`, `DOCUMENT` or `INTERVIEW` — and an optional `note`. Every gate on the write is read against one **reference visit**, which is the visit on which the acting visitor holds an `ASSIGNED` seat: it is the non-rescinded visit of the row's own cycle when the visitor holds an `ASSIGNED` seat on that visit, and otherwise the earliest-seated of the visitor's other `ASSIGNED` seats whose visit is `IN_PROGRESS`; when the visitor holds no `ASSIGNED` seat at all the reference visit falls back to the row's cycle's non-rescinded visit. The write then requires that the acting visitor hold an `ASSIGNED` seat on the reference visit (`ERR_FORBIDDEN_SCOPE`, which is also the answer when no reference visit can be resolved at all), that the reference visit be `IN_PROGRESS` (`ERR_VISIT_INVALID_STATE`), that the row's `visit_status` not be `LOCKED` (`ERR_EVALUATION_LOCKED`), that the row's `applicable` flag be true (`ERR_STANDARD_NOT_APPLICABLE`), and that the row's `cycle_id` equal the reference visit's `cycle_id` — that the row belong to the same cycle as the visit on which the visitor holds their seat — or it is rejected with `ERR_VISIT_CYCLE_MISMATCH` (HTTP 422). One further gate is a certification gate: when the pinned standard's `domain` is `AQUATICS`, `ADVENTURE` or `HEALTH_WELLNESS`, the acting visitor must hold `AQUATICS_SPECIALIST`, `ADVENTURE_SPECIALIST` or `HEALTH_SPECIALIST` respectively, or the write is rejected with `ERR_SPECIALIST_CERTIFICATION_REQUIRED` (HTTP 422); standards in the other four domains carry no certification gate. A successful write moves the row `UNSCORED → SCORED`, or `SCORED → SCORED` when a visitor re-scores a row before finalisation, sets the row's `visit_id` and overwrites its `scored_by_visitor_id`, and recomputes the visit's `mandatory_scored_count` (applicable mandatory rows with a non-null `visitor_score`) and `mandatory_met_count` (applicable mandatory rows whose `visitor_score` is `MET`).
+
+**Closing scoring.** The lead visitor closes scoring, again with no body. Only the lead may do it, the visit must be `IN_PROGRESS`, and every applicable mandatory evaluation on the cycle must already carry a non-null `visitor_score`, or the request is refused with `ERR_MANDATORY_SCORING_INCOMPLETE` (HTTP 422). Non-mandatory applicable rows may be left unscored. On success a five-hop cascade runs within the one request:
+
+1. The visit moves `IN_PROGRESS → SCORED`, its `scored_at` is stamped with the current logical clock instant, and the cycle moves `VISIT_SCHEDULED → VISIT_COMPLETED`.
+2. The provisional mandatory percentage is computed and written to **both** the visit's `provisional_mandatory_pct` and the cycle's `provisional_mandatory_pct`.
+3. Every applicable evaluation's `visit_status` becomes `LOCKED` — rows already `SCORED` move `SCORED → LOCKED`, and a non-mandatory applicable row left unscored moves `UNSCORED → LOCKED` with its `visitor_score` still null. No further visitor verdict is accepted on a locked row.
+4. Every seat on the visit whose `status` is `ASSIGNED` moves `ASSIGNED → COMPLETED`, and every affected visitor's `committed_travel_days` is deliberately unchanged, because `COMPLETED` remains inside the counted set.
+5. One deficiency is raised for each applicable evaluation whose `visitor_score` is `NOT_MET`, the camp's `penalty_point_balance` is recomputed and then its posture, and if the posture lands on `FROZEN` the cascade of §2.8 runs — `health_intake_status` to `SUSPENDED`, `VERIFIED` plans to `REVALIDATION_REQUIRED`, and their citing evaluations with `self_status` `VERIFIED` knocked to `REJECTED`. Finally the camp's risk index is recomputed, now under the post-visit variant.
+
+**The provisional mandatory percentage.** Both compliance variants read the same evaluation rows of the same cycle — the applicable, mandatory ones — and differ only in which of those rows they count, which is precisely why the same stored data yields two different percentages. The provisional variant is the visiting team's own figure. Its denominator is the number of applicable mandatory rows whose `score_source` is `OBSERVED` or `DOCUMENT` and whose `visitor_score` is non-null and is not `NOT_APPLICABLE`; its numerator is the number of those same rows whose `visitor_score` is `MET`. Rows sourced from `INTERVIEW` are excluded entirely, and a visitor's `NOT_APPLICABLE` call removes the row from both sides. The percentage is one hundred times the numerator divided by the denominator, rounded half up to two decimal places; when the denominator is zero the result is 100.00.
+
+**Raising deficiencies.** The findings for one closing pass are produced together, over the applicable evaluations whose `visitor_score` is `NOT_MET`, processed in `created_at` ascending order. Each finding records its `visit_id` and the `standard_id` of the standard found not met, and is classified into a `severity`: `MANDATORY_CRITICAL` when the row's pinned `mandatory` flag is true and the pinned standard's `domain` is one of `HEALTH_WELLNESS`, `EMERGENCY_RESPONSE` or `AQUATICS`; `MANDATORY` when the row is mandatory in any other domain; and `SCORED` when the row is not mandatory. Severity carries points — 8 for `MANDATORY_CRITICAL`, 5 for `MANDATORY`, 2 for `SCORED` — and the finding's `base_points` is that figure multiplied by the row's pinned `scoring_weight`.
+
+The escalation tier is then chosen once, from the **base** total of this closing pass only, before any `penalty_points` is written; keying the tier on the post-surcharge total would be circular and is not the rule. Sum `base_points` over every finding this pass creates. A batch base total of 9 or less selects tier 0, a total from 10 through 19 selects tier 1, and a total of 20 or more selects tier 2. The tier's surcharge — 0 points at tier 0, 2 points at tier 1, 5 points at tier 2 — is then added uniformly to every finding in the batch, so each finding's `penalty_points` is its own `base_points` plus that one surcharge. The same tier fixes the correction window: each finding's `correction_due_date` is the logical clock's calendar date advanced by 90 days at tier 0, 60 days at tier 1 and 30 days at tier 2. Every new finding opens in `status` `OPEN` with `plan_revision_count` 0 and `correction_plan_text`, `last_plan_submitted_at`, `reviewer_user_id` and `reviewer_note` all null. Once the batch is written, the camp's `penalty_point_balance` is recomputed as the sum of `penalty_points` over every deficiency of the camp whose status is `OPEN`, `PLAN_SUBMITTED` or `ESCALATED`.
+
+### 3.7. The Accreditation Decision and Fee Assessment
+
+The decision is the national office's act and takes no request body. Its three preconditions are the cycle sitting in `VISIT_COMPLETED` (`ERR_CYCLE_NOT_IN_SELF_ASSESSMENT`), the acting `X-User-ID` differing from the `scheduled_by_user_id` of the cycle's visit (`ERR_SEGREGATION_OF_DUTIES`), and the cycle carrying exactly one non-rescinded visit whose `status` is `SCORED`.
+
+**The office-final mandatory percentage.** The final variant reads the same base rows — applicable and mandatory — but counts all of them. Its denominator is every applicable mandatory row on the cycle; its numerator is those whose `visitor_score` is `MET`. An `INTERVIEW`-sourced `MET` row now counts in the numerator, and a row the visitor marked `NOT_APPLICABLE` or left unscored stays in the denominator with no numerator credit, because the office does not accept a field not-applicable call on a mandatory standard. One hundred times the numerator divided by the denominator, rounded half up to two decimal places, is written to `final_mandatory_pct`; when the denominator is zero the result is 100.00.
+
+**The weighted percentage.** Over every applicable evaluation of the cycle, mandatory and non-mandatory alike, sum the pinned `scoring_weight` of the rows whose `visitor_score` is `MET`, divide by the sum of the pinned `scoring_weight` of all applicable rows, multiply by one hundred, and round half up to two decimal places to give `final_weighted_pct`. When the applicable weight total is zero the weighted percentage is 100.00.
+
+**The decision level.** `decision_level` is then resolved by the first matching clause, reading the camp's `state_license_status` as it stands at decision time:
+
+- `DENIED` when the camp's `state_license_status` is `SUSPENDED`, or when `final_mandatory_pct` is below 90.00.
+- Otherwise `PROVISIONAL` when `final_mandatory_pct` is below 100.00 — that is, anything from 90.00 up to but not including full mandatory compliance.
+- Otherwise `ACCREDITED_WITH_CORRECTION` when `final_weighted_pct` is below 95.00.
+- Otherwise `ACCREDITED`.
+
+The level fixes the cycle's landing state and the camp's accreditation axis together. A level of `DENIED` moves the cycle `VISIT_COMPLETED → TERMINATED`; otherwise a cycle whose `open_deficiency_count` is greater than zero moves `VISIT_COMPLETED → IN_CORRECTION`, and a cycle with no open findings moves `VISIT_COMPLETED → CLOSED`. The `open_deficiency_count` that decides this is the number of deficiencies on the cycle's non-rescinded visit whose `status` is `OPEN`, `PLAN_SUBMITTED` or `PLAN_ACCEPTED`. On the camp axis, `ACCREDITED` maps to `accreditation_status` `ACCREDITED`, `ACCREDITED_WITH_CORRECTION` maps to `ACCREDITED_WITH_CORRECTION`, `PROVISIONAL` maps to `PROVISIONAL`, and `DENIED` maps to `REVOKED`. All four branches stamp `decision_issued_at` with the current logical clock instant and `decision_issued_by_user_id` with the acting `X-User-ID`, and all four compute the same four figures: the office-final percentage, the weighted percentage, the decision level and the assessed fee.
+
+The branches differ in what else they do. The `CLOSED` branch, reached with no open findings, archives history: every annual report of the camp whose `status` is `ACCEPTED` and whose `report_year` is below the cycle's `cycle_year` moves `ACCEPTED → ARCHIVED`, after which that report accepts no further submissions and no further disclosures. A move to `ACCREDITED` on this branch additionally increments the camp's `prior_accredited_cycle_count` by one and sets `last_accredited_year` to the cycle's `cycle_year`. The `IN_CORRECTION` branch instead sets the cycle's `correction_deadline_at` to the latest `correction_due_date` among the deficiencies on that visit, expressed at 23:59:59.999Z on that date. The `TERMINATED` branch sets the camp's `accreditation_status` to `REVOKED` and escalates every deficiency on the visit whose `status` is `OPEN`, `PLAN_SUBMITTED` or `PLAN_ACCEPTED` to `ESCALATED`, then recomputes the camp's `penalty_point_balance` and, from it, the posture — which the escalated-finding clause of §2.7 will hold at `FROZEN`.
+
+**The fee.** `assessed_fee_cents` is stamped on every branch, including `DENIED`, and is built from four line items. First, the multi-year discount is read off loyalty: a `prior_accredited_cycle_count` of 0 earns no discount, a count of 1 earns 5 percent, and a count of 2 or more earns 10 percent — counts above 2 are treated as 2. Then the team travel days are totalled as the sum of `travel_days` over the seats of the cycle's non-rescinded visit whose `status` is `ASSIGNED` or `COMPLETED`, and the domains present are collected as the distinct set of pinned standard `domain` values over the cycle's applicable evaluations. The four line items are:
+
+- a flat base of 95,000 cents, taken undiscounted;
+- 350 cents per applicable standard on the cycle, multiplied by one minus the discount fraction;
+- one domain surcharge for each domain present, each multiplied by one minus the discount fraction — 18,125 cents for `AQUATICS`, 22,125 for `ADVENTURE`, 12,125 for `TRANSPORTATION`, 15,125 for `HEALTH_WELLNESS`, and zero for `SUPERVISION`, `EMERGENCY_RESPONSE` and `OPERATIONS`, with the surcharges evaluated in exactly that domain order;
+- 24,000 cents per visitor travel day, taken at three quarters of that rate — so 18,000 cents of billable value per day — multiplied by the total team travel days and then by one minus the discount fraction.
+
+The rounding order is pinned and is not negotiable: **each line item is rounded to whole cents half up first, and only then are the four line items added together.** Summing the raw products and rounding once at the end is not the rule and produces a different total — it differs by one cent whenever four domain lines each carrying a three-quarter-cent fraction meet a 5 percent discount. Each domain surcharge in the third line item is itself rounded individually before those surcharges are summed.
+
+### 3.8. Deficiency Correction, Escalation and the Logical Clock
+
+A cycle in `IN_CORRECTION` is a negotiation with a deadline. A `CampDirector` files a correction plan against one finding by supplying `correction_plan_text`. The finding must be in `OPEN` or `PLAN_SUBMITTED` (`ERR_DEFICIENCY_INVALID_STATE`), its `plan_revision_count` must be below the revision limit of 3 (`ERR_PLAN_REVISION_LIMIT`, HTTP 422), and the logical clock's calendar date must be on or before the finding's `correction_due_date` (`ERR_CORRECTION_WINDOW_EXPIRED`, HTTP 422). A filing from `OPEN` moves the finding `OPEN → PLAN_SUBMITTED`; a filing from `PLAN_SUBMITTED` replaces a plan the office has not yet looked at and leaves the finding in `PLAN_SUBMITTED`. Either way `plan_revision_count` increases by one, `correction_plan_text` and `last_plan_submitted_at` are overwritten with the new narrative and the current logical clock instant, and the camp's `penalty_point_balance` is deliberately unchanged because `PLAN_SUBMITTED` sits inside the counted set. Note the consequence of the self-loop: replacing an unreviewed plan spends revision budget with no office action at all, so a camp that files, replaces, and replaces again finds the fourth filing refused with `ERR_PLAN_REVISION_LIMIT`.
+
+An `AccreditationOfficer` adjudicates a finding by supplying a `decision` of `ACCEPT_PLAN`, `REJECT_PLAN`, `VERIFY_CORRECTION` or `WAIVE`, plus an optional `reviewer_note`, and each decision has its own required starting state:
+
+- `ACCEPT_PLAN` requires `PLAN_SUBMITTED` and moves the finding `PLAN_SUBMITTED → PLAN_ACCEPTED`. Because `PLAN_ACCEPTED` is outside the counted set, the finding's `penalty_points` leave the camp's `penalty_point_balance`, and the posture is recomputed — which is how accepting a plan can lift a camp out of `FROZEN` or `RESTRICTED`.
+- `REJECT_PLAN` requires `PLAN_SUBMITTED` and forks on the revision counter. While `plan_revision_count` is below 3 it moves the finding `PLAN_SUBMITTED → OPEN`, stamps `reviewer_user_id` with the acting `X-User-ID`, and leaves the balance unchanged because both states are inside the counted set; the camp may then file again. When `plan_revision_count` has reached 3, the same rejection instead moves the finding `PLAN_SUBMITTED → ESCALATED`, drives the cycle `IN_CORRECTION → TERMINATED`, sets the camp's `accreditation_status` to `REVOKED`, and recomputes the camp's `penalty_point_balance` and then its posture, which the escalated-finding clause holds at `FROZEN`.
+- `VERIFY_CORRECTION` requires `PLAN_ACCEPTED` and the logical clock's calendar date on or before the finding's `correction_due_date`, and moves the finding `PLAN_ACCEPTED → CORRECTED`. A finding sitting in `PLAN_SUBMITTED` past its due date is not escalated by the clock at all — the office holds the pending plan — but a review arriving after the date is refused with `ERR_CORRECTION_WINDOW_EXPIRED`. The same window test therefore guards all three of `ACCEPT_PLAN`, `REJECT_PLAN` and `VERIFY_CORRECTION`: each requires the logical clock's calendar date to be on or before the finding's `correction_due_date`. `WAIVE` carries no window rule and is admissible however late it arrives. Being a temporal rule, the window test runs after the required-starting-state test and after the severity test that `WAIVE` carries, so a decision whose starting state does not hold reports `ERR_DEFICIENCY_INVALID_STATE` even when the window has closed as well.
+- `WAIVE` requires `OPEN` and is permitted only when the finding's `severity` is `SCORED`; waiving a `MANDATORY` or `MANDATORY_CRITICAL` finding is refused with `ERR_DEFICIENCY_INVALID_STATE`. It moves the finding `OPEN → WAIVED`, its `penalty_points` leave the balance, and the posture is recomputed.
+
+Every one of the four decisions recomputes the cycle's `open_deficiency_count`. When that count reaches zero, the cycle moves `IN_CORRECTION → CLOSED`, its `correction_deadline_at` is cleared to null, and every annual report of the camp whose `status` is `ACCEPTED` and whose `report_year` is below the cycle's `cycle_year` moves `ACCEPTED → ARCHIVED`. And when the cycle's `decision_level` was `ACCREDITED_WITH_CORRECTION`, clearing the last finding upgrades the camp `ACCREDITED_WITH_CORRECTION → ACCREDITED`, increments `prior_accredited_cycle_count` by one, and sets `last_accredited_year` to the cycle's `cycle_year`. A camp that came out of the visit with correctable findings and repairs them all therefore ends the cycle indistinguishable from one accredited outright — which is why `prior_accredited_cycle_count`, and through it the fee discount, moves on both paths.
+
+**Clock-driven escalation.** Advancing the logical clock is the only way a deadline can expire. When the new clock calendar date is strictly after a finding's `correction_due_date` on a cycle in `IN_CORRECTION`, and that finding's `status` is `OPEN` or `PLAN_ACCEPTED`, the finding moves to `ESCALATED`, the cycle moves `IN_CORRECTION → TERMINATED`, the camp's `accreditation_status` moves to `REVOKED` — from `ACCREDITED`, from `ACCREDITED_WITH_CORRECTION` or from `PROVISIONAL` alike — and the camp's `penalty_point_balance` and then posture are recomputed, landing on `FROZEN`. A `PLAN_ACCEPTED` finding escalating this way sees its `penalty_points` re-enter the balance, since it had left the counted set on acceptance. A finding in `PLAN_SUBMITTED` is sheltered from clock escalation entirely. The advance answers with `escalated_deficiency_count` and `terminated_cycle_count` reporting the totals it produced.
+
+### 3.9. Health Centre Records, Annual Reporting and Incident Disclosure
+
+**Medication administration.** Only `HealthCareStaff` may record a dose. A record names the `camp_id`, a de-identified `camper_reference` of 1 to 64 characters used for per-camper dosing windows, the `medication_class` (`OTC`, `PRESCRIPTION` or `CONTROLLED`), the integer `dose_units` dispensed from stock (at least 1), the `administered_at` instant as an ISO 8601 UTC timestamp with three fractional digits, the `administered_by_role` licensure of the person administering (`RN`, `LPN`, `FIRST_AIDER`, `PHYSICIAN` or `UNLICENSED_DESIGNEE`), and an optional `second_signature_present` witness flag defaulting to false. A record is created with `record_status` `RECORDED`, `void_reason` null, and a `compliance_flag` stamped at creation: `DOCUMENTATION_INCOMPLETE` when the `medication_class` is `PRESCRIPTION` and `second_signature_present` is false, and `COMPLIANT` in every other case.
+
+Six rules guard the write. First, while the camp's posture is `FROZEN` — equivalently while its `health_intake_status` is `SUSPENDED` — a `CONTROLLED` or `PRESCRIPTION` record is refused with `ERR_CAMP_POSTURE_FROZEN`; an `OTC` record is still accepted. Then the staffing floor: the rank of the camp's `health_staffing_level` must be at least 3 (`RN_ONSITE`) for a `CONTROLLED` record, at least 2 (`LPN_ONSITE`) for a `PRESCRIPTION` record, and at least 1 (`FIRST_AIDER_ONLY`) for an `OTC` record, or the write is refused with `ERR_HEALTH_STAFFING_INSUFFICIENT`. Then licensure of the administering person: a `CONTROLLED` dose accepts only `RN` and `PHYSICIAN`; a `PRESCRIPTION` dose accepts `LPN`, `RN` and `PHYSICIAN`; an `OTC` dose accepts `FIRST_AIDER`, `LPN`, `RN` and `PHYSICIAN`. `UNLICENSED_DESIGNEE` is never permitted for any class. A violation is `ERR_MED_ROLE_NOT_PERMITTED`. Then the witness rule: a `CONTROLLED` record requires `second_signature_present` to be true, or it is refused with `ERR_CONTROLLED_SECOND_SIGNATURE_REQUIRED`. Then stock: `dose_units` on a `CONTROLLED` record may not exceed the camp's `controlled_on_hand_units`, or the write is refused with `ERR_CONTROLLED_STOCK_INSUFFICIENT`. Last, the per-camper dosing window: at most two `RECORDED` `CONTROLLED` records may already exist for the same `camper_reference` in the twenty-four hours ending at the new `administered_at`, counting the window as half-open — it includes the instant twenty-four hours earlier and excludes `administered_at` itself. A third dose inside that window is refused with `ERR_CONTROLLED_DOSE_WINDOW_EXCEEDED`. A successful `CONTROLLED` record recomputes the camp's controlled-substance balance, reducing `controlled_on_hand_units` by the dose.
+
+Voiding a record takes an optional `void_reason` and moves it `RECORDED → VOIDED`. Voided records leave the consumed set entirely, so the compensating write restores `controlled_on_hand_units` exactly to its pre-record value; the invariant that on-hand units plus consumed units equal `controlled_intake_units` holds after every request.
+
+**Annual reporting between cycles.** In the years between visit cycles a camp still reports. A `CampDirector` opens a report by naming the `camp_id` and the `report_year`, an integer between 2000 and 2100 that must be unique for that camp — a second report for the same camp and year is rejected with `ERR_DUPLICATE_CYCLE_YEAR` (HTTP 409). The server fixes `due_date` at March 1 of the year after `report_year`, so a 2026 season is due 2027-03-01. A new report opens in `DRAFT` with `declared_incident_count` 0, `disclosed_incident_count` 0, `reopen_count` 0, and `submitted_at`, `attested_by_user_id` and `reviewer_note` all null.
+
+Filing the report is an attestation: the director supplies `declared_incident_count`, the number of incidents the camp stands behind. The report must be in `DRAFT`, `REJECTED` or `REOPENED` (`ERR_ANNUAL_REPORT_INVALID_STATE`), and the declared count must be at least the report's `disclosed_incident_count`, or the filing is rejected with `ERR_DECLARED_COUNT_BELOW_DISCLOSED` (HTTP 422) — a camp cannot attest to fewer incidents than it has already disclosed. Lateness is decided at this moment and nowhere else: when the logical clock's calendar date is on or before `due_date` the report lands in `SUBMITTED`, and when it is after `due_date` the report lands in `LATE`. Both landings stamp `submitted_at` with the current logical clock instant and `attested_by_user_id` with the acting `X-User-ID`, and a re-filing out of `REJECTED` or `REOPENED` restamps both. An `AccreditationOfficer` then adjudicates with a `decision` of `ACCEPT` or `REJECT` and an optional `reviewer_note`; both `SUBMITTED` and `LATE` are reviewable, `ACCEPT` moves the report to `ACCEPTED` and `REJECT` moves it to `REJECTED`, and a rejected report may be filed again.
+
+**Incident disclosure.** A disclosure is filed by the `CampDirector` under a specific report, naming the `annual_report_id`, the `incident_type` — one of `SERIOUS_INJURY`, `HOSPITALIZATION`, `DEATH`, `ABUSE_ALLEGATION`, `MEDICATION_ERROR`, `AQUATICS_RESCUE`, `TRANSPORTATION_COLLISION` or `COMMUNICABLE_DISEASE_OUTBREAK` — and the `occurred_at` instant as an ISO 8601 UTC timestamp with three fractional digits. The parent report may be in any status except `ARCHIVED` (`ERR_ANNUAL_REPORT_INVALID_STATE`), and the calendar year of `occurred_at` must equal the report's `report_year`, or the filing is rejected with `ERR_INCIDENT_OUTSIDE_REPORT_YEAR` (HTTP 422). The server stamps `disclosed_at` with the current logical clock instant, `severity_weight` with the incident weight of §2.9, and `state_notification_required` true when the `incident_type` is one of `DEATH`, `ABUSE_ALLEGATION`, `HOSPITALIZATION` or `COMMUNICABLE_DISEASE_OUTBREAK` **and** the camp's `state_license_status` is `ACTIVE` or `PROBATION` — the state health department is only owed a notification where it actually holds the licence — and false otherwise.
+
+The disclosure's own `status` records whether it arrived in time. Filed against a report that has not yet been accepted, it is stamped `REPORTED`. Filed against a report already in `ACCEPTED`, it is stamped `LATE_DISCLOSED` and reopens the report: the report moves `ACCEPTED → REOPENED`, its `reopen_count` increases by one, and the camp must file again. Either way the report's `disclosed_incident_count` is recomputed as the number of disclosures under it, and the camp's risk index is recomputed — which for a late disclosure is where the 1.5 multiplier of §2.9 begins to apply, so a single late admission raises the camp's `risk_index` above what the same incident would have cost if disclosed on time.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence — registering a camp, creating a standards edition or a standard, opening a cycle, filing a written plan, adding a visitor, opening a visit, seating a team member, opening an annual report, disclosing an incident, recording a medication administration — answer with `201 Created`. Every other mutating operation, including all lifecycle transitions, all reviews and every logical-clock advance, answers with `200 OK`, as do all reads. The four-column table below is an index only: the request payloads, the side effects and the rejection conditions for each entry live in §2 and §3.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| GET | `/accreditation/camps/{campId}` | Fetch one camp with both status axes, the derived posture, staffing requirement, ledger balances and risk index | CampDirector, HealthCareStaff, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/camps` | List camps with filtering and pagination | AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/camps/{campId}/risk-index` | Computed read: the camp risk index broken out by component with the variant that produced it | CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/standards-sets/{setId}` | Fetch one standards edition with its publication status and standard counts | CampDirector, AccreditationOfficer |
+| GET | `/accreditation/standards-sets` | List standards editions with filtering and pagination | CampDirector, AccreditationOfficer |
+| GET | `/accreditation/standards/{standardId}` | Fetch one standard with every applicability gate and its scoring weight | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/standards` | List standards | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/cycles/{cycleId}` | Fetch one accreditation cycle with its pinned counts, both compliance percentages, decision level and assessed fee | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/cycles` | List accreditation cycles | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/cycles/{cycleId}/compliance-summary` | Computed read: both mandatory-compliance variants side by side for the same stored evaluation rows, plus the weighted percentage and the applicability breakdown | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/standard-evaluations/{evaluationId}` | Fetch one standard evaluation with both status dimensions, the applicability verdict and the pinned mandatory flag and scoring weight | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/standard-evaluations` | List standard evaluations | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/written-plans/{planId}` | Fetch one written plan with its verification lifecycle status | CampDirector, HealthCareStaff, AccreditationOfficer |
+| GET | `/accreditation/written-plans` | List written plans | CampDirector, HealthCareStaff, AccreditationOfficer |
+| GET | `/accreditation/visitors/{visitorId}` | Fetch one visitor with training currency, certifications and the committed travel-day ledger | AccreditationOfficer, Visitor |
+| GET | `/accreditation/visitors` | List visitors | AccreditationOfficer, Visitor |
+| GET | `/accreditation/visits/{visitId}` | Fetch one visit with its window, team composition, required specialist domains and provisional mandatory percentage | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/visits` | List visits | CampDirector, AccreditationOfficer, Visitor |
+| GET | `/accreditation/visit-assignments/{assignmentId}` | Fetch one team seat with its travel block and computed travel days | AccreditationOfficer, Visitor |
+| GET | `/accreditation/visit-assignments` | List team seats | AccreditationOfficer, Visitor |
+| GET | `/accreditation/deficiencies/{deficiencyId}` | Fetch one deficiency with its severity, base points, penalty points and correction due date | CampDirector, AccreditationOfficer |
+| GET | `/accreditation/deficiencies` | List deficiencies | CampDirector, AccreditationOfficer |
+| GET | `/accreditation/medication-records/{recordId}` | Fetch one medication administration record with its compliance flag | HealthCareStaff, CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/medication-records` | List medication administration records | HealthCareStaff, CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/annual-reports/{reportId}` | Fetch one annual report with its due date, lifecycle status, reopen count and disclosed incident count | CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/annual-reports` | List annual reports | CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/incident-disclosures/{disclosureId}` | Fetch one incident disclosure with its severity weight, state notification flag and reported-versus-late status | CampDirector, AccreditationOfficer, StateLicensingAgent |
+| GET | `/accreditation/incident-disclosures` | List incident disclosures | CampDirector, AccreditationOfficer, StateLicensingAgent |
+| POST | `/accreditation/camps` | Register a camp | AccreditationOfficer |
+| PATCH | `/accreditation/camps/{campId}/state-license` | Move the camp's state licensing axis and optionally record the licence number | StateLicensingAgent |
+| PATCH | `/accreditation/camps/{campId}/health-center` | Update health centre configuration and receive controlled-substance stock | HealthCareStaff, CampDirector |
+| POST | `/accreditation/standards-sets` | Create a draft standards edition | AccreditationOfficer |
+| POST | `/accreditation/standards` | Add a standard to a draft edition with its applicability gates, mandatory flag and scoring weight | AccreditationOfficer |
+| POST | `/accreditation/standards-sets/{setId}/publish` | Publish a draft edition so cycles may pin it | AccreditationOfficer |
+| POST | `/accreditation/cycles` | Open an accreditation cycle | AccreditationOfficer |
+| PATCH | `/accreditation/standard-evaluations/{evaluationId}/self-assessment` | Record the camp's own verdict on one applicable standard and optionally cite a written plan as evidence | CampDirector |
+| POST | `/accreditation/cycles/{cycleId}/submit-self-assessment` | Submit the completed self-assessment | CampDirector |
+| POST | `/accreditation/written-plans` | File a written plan for supervision, health care, emergency response, aquatics, transportation or adventure operations | CampDirector, HealthCareStaff |
+| POST | `/accreditation/written-plans/{planId}/review` | Verify or reject a filed written plan | AccreditationOfficer |
+| POST | `/accreditation/visitors` | Add a trained visitor to the roster | AccreditationOfficer |
+| POST | `/accreditation/visitors/{visitorId}/deactivate` | Remove a visitor from the roster | AccreditationOfficer |
+| POST | `/accreditation/visits` | Open a draft visit for a cycle with an agreed window | AccreditationOfficer |
+| POST | `/accreditation/visit-assignments` | Seat a trained visitor on a draft visit for a travel block inside the visit window | AccreditationOfficer |
+| POST | `/accreditation/visit-assignments/{assignmentId}/withdraw` | Release a seated visitor from a draft or scheduled visit | AccreditationOfficer |
+| POST | `/accreditation/visits/{visitId}/schedule` | Confirm the visit once the trained visitor team is complete and the camp's state licence does not block it | AccreditationOfficer |
+| POST | `/accreditation/visits/{visitId}/start` | The lead visitor opens scoring on site, only inside the agreed window | Visitor |
+| PATCH | `/accreditation/standard-evaluations/{evaluationId}/visitor-score` | Score one applicable standard with the evidence channel behind the verdict | Visitor |
+| POST | `/accreditation/visits/{visitId}/finalize-scoring` | The lead visitor closes scoring | Visitor |
+| POST | `/accreditation/cycles/{cycleId}/decision` | Issue the accreditation decision | AccreditationOfficer |
+| POST | `/accreditation/deficiencies/{deficiencyId}/correction-plan` | File or refile a correction plan against an open deficiency | CampDirector |
+| POST | `/accreditation/deficiencies/{deficiencyId}/review` | Adjudicate a correction plan: accept, reject back into the revision loop, verify the correction, or waive the finding | AccreditationOfficer |
+| POST | `/accreditation/medication-records` | Record a medication administration | HealthCareStaff |
+| POST | `/accreditation/medication-records/{recordId}/void` | Void a recorded administration | HealthCareStaff |
+| POST | `/accreditation/annual-reports` | Open the between-cycles annual report for a season year | CampDirector |
+| POST | `/accreditation/annual-reports/{reportId}/submit` | Attest and file the annual report | CampDirector |
+| POST | `/accreditation/annual-reports/{reportId}/review` | Accept or reject a filed annual report | AccreditationOfficer |
+| POST | `/accreditation/incident-disclosures` | Disclose an incident under an annual report | CampDirector |
+| POST | `/_clock/set_current_utc` | Set the logical clock used by every deadline, window and timestamp rule in this domain | AccreditationOfficer, CampDirector, HealthCareStaff, Visitor, StateLicensingAgent |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_FORBIDDEN_SCOPE` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_CAMP_NOT_FOUND` | 404 |
+| `ERR_STANDARDS_SET_NOT_FOUND` | 404 |
+| `ERR_STANDARD_NOT_FOUND` | 404 |
+| `ERR_CYCLE_NOT_FOUND` | 404 |
+| `ERR_EVALUATION_NOT_FOUND` | 404 |
+| `ERR_WRITTEN_PLAN_NOT_FOUND` | 404 |
+| `ERR_VISITOR_NOT_FOUND` | 404 |
+| `ERR_VISIT_NOT_FOUND` | 404 |
+| `ERR_ASSIGNMENT_NOT_FOUND` | 404 |
+| `ERR_DEFICIENCY_NOT_FOUND` | 404 |
+| `ERR_MED_RECORD_NOT_FOUND` | 404 |
+| `ERR_ANNUAL_REPORT_NOT_FOUND` | 404 |
+| `ERR_DISCLOSURE_NOT_FOUND` | 404 |
+| `ERR_STALE_CAMP_VERSION` | 412 |
+| `ERR_STALE_CYCLE_VERSION` | 412 |
+| `ERR_STANDARDS_SET_ALREADY_PUBLISHED` | 409 |
+| `ERR_STANDARDS_SET_NOT_PUBLISHED` | 409 |
+| `ERR_CYCLE_NOT_IN_SELF_ASSESSMENT` | 409 |
+| `ERR_VISIT_INVALID_STATE` | 409 |
+| `ERR_DEFICIENCY_INVALID_STATE` | 409 |
+| `ERR_ANNUAL_REPORT_INVALID_STATE` | 409 |
+| `ERR_EVALUATION_LOCKED` | 409 |
+| `ERR_VISITOR_INACTIVE` | 409 |
+| `ERR_CAMP_POSTURE_FROZEN` | 409 |
+| `ERR_DUPLICATE_CYCLE_YEAR` | 409 |
+| `ERR_STATE_LICENSE_BLOCKS_VISIT` | 422 |
+| `ERR_WRITTEN_PLAN_NOT_VERIFIED` | 422 |
+| `ERR_HEALTH_STAFFING_INSUFFICIENT` | 422 |
+| `ERR_PHYSICIAN_REVIEW_REQUIRED` | 422 |
+| `ERR_VISITOR_CONFLICT_OF_INTEREST` | 422 |
+| `ERR_SPECIALIST_CERTIFICATION_REQUIRED` | 422 |
+| `ERR_MED_ROLE_NOT_PERMITTED` | 422 |
+| `ERR_CONTROLLED_SECOND_SIGNATURE_REQUIRED` | 422 |
+| `ERR_CONTROLLED_STOCK_INSUFFICIENT` | 422 |
+| `ERR_VISITOR_TRAVEL_CONFLICT` | 422 |
+| `ERR_CONTROLLED_DOSE_WINDOW_EXCEEDED` | 422 |
+| `ERR_TEAM_COMPOSITION_INCOMPLETE` | 422 |
+| `ERR_VISITOR_TRAINING_EXPIRED` | 422 |
+| `ERR_PLAN_REVISION_LIMIT` | 422 |
+| `ERR_SELF_ASSESSMENT_INCOMPLETE` | 422 |
+| `ERR_MANDATORY_SCORING_INCOMPLETE` | 422 |
+| `ERR_DECLARED_COUNT_BELOW_DISCLOSED` | 422 |
+| `ERR_STANDARD_NOT_APPLICABLE` | 422 |
+| `ERR_PLAN_CAMP_MISMATCH` | 422 |
+| `ERR_VISIT_CYCLE_MISMATCH` | 422 |
+| `ERR_VISIT_WINDOW_INVALID` | 422 |
+| `ERR_TRAVEL_BLOCK_OUTSIDE_WINDOW` | 422 |
+| `ERR_OUTSIDE_VISIT_WINDOW` | 422 |
+| `ERR_CORRECTION_WINDOW_EXPIRED` | 422 |
+| `ERR_INCIDENT_OUTSIDE_REPORT_YEAR` | 422 |

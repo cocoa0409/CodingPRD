@@ -1,0 +1,98 @@
+"""Error catalogue for the DMC Ground Operations API (PRD section 5)."""
+
+ERROR_STATUS = {
+    # auth / authz
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # existence
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_VENUE_NOT_FOUND": 404,
+    "ERR_SUPPLIER_NOT_FOUND": 404,
+    "ERR_CONTRACT_NOT_FOUND": 404,
+    "ERR_ELEMENT_NOT_FOUND": 404,
+    "ERR_PERMIT_NOT_FOUND": 404,
+    "ERR_SEGMENT_NOT_FOUND": 404,
+    "ERR_MANIFEST_ENTRY_NOT_FOUND": 404,
+    "ERR_STAFF_MEMBER_NOT_FOUND": 404,
+    "ERR_STAFF_ASSIGNMENT_NOT_FOUND": 404,
+    "ERR_RECONCILIATION_LINE_NOT_FOUND": 404,
+    "ERR_SETTLEMENT_PAYMENT_NOT_FOUND": 404,
+    # request shape
+    "ERR_INVALID_REQUEST": 400,
+    # optimistic concurrency
+    "ERR_STALE_PROGRAM_VERSION": 412,
+    "ERR_STALE_CONTRACT_VERSION": 412,
+    # state
+    "ERR_INVALID_STATE_TRANSITION": 409,
+    "ERR_PROGRAM_DESIGN_LOCKED": 409,
+    "ERR_PROGRAM_ALREADY_RECONCILING": 409,
+    "ERR_PROGRAM_NOT_EXECUTION_FINAL": 409,
+    "ERR_PROGRAM_NOT_RECONCILING": 409,
+    "ERR_PROGRAM_NOT_CONFIRMED": 409,
+    "ERR_PROGRAM_NOT_IN_EXECUTION": 409,
+    "ERR_PROGRAM_WINDOW_NOT_OPEN": 409,
+    "ERR_PERMIT_NOT_APPROVED": 409,
+    "ERR_CONTRACT_NOT_ACTIVE": 409,
+    "ERR_NO_ACTIVE_SUPPLIER_CONTRACT": 409,
+    "ERR_PREDECESSOR_NOT_DELIVERED": 409,
+    "ERR_NO_WEATHER_ALTERNATIVE": 409,
+    "ERR_ELEMENT_NOT_WEATHER_DEPENDENT": 409,
+    "ERR_RECONCILIATION_LINES_PENDING": 409,
+    "ERR_PROGRAM_ALREADY_STAFFED_ON_SITE": 409,
+    "ERR_SETTLEMENT_ALREADY_PAID": 409,
+    "ERR_EMPTY_MANIFEST": 409,
+    "ERR_CHECKIN_WINDOW_NOT_OPEN": 409,
+    "ERR_SEGMENT_NOT_DUE": 409,
+    "ERR_ELEMENT_NOT_STARTED": 409,
+    "ERR_VENUE_TURNOVER_CONFLICT": 409,
+    "ERR_STAFF_ASSIGNMENT_OVERLAP": 409,
+    "ERR_STAFF_REST_GAP_VIOLATION": 409,
+    "ERR_SEGMENT_CAPACITY_EXCEEDED": 409,
+    "ERR_DUPLICATE_MANIFEST_ENTRY": 409,
+    # safety / insurance / credentialing
+    "ERR_SUPPLIER_INSURANCE_INSUFFICIENT": 422,
+    "ERR_SUPPLIER_NOT_APPROVED": 422,
+    "ERR_CREDENTIAL_EXPIRED": 422,
+    "ERR_STAFF_INACTIVE": 422,
+    "ERR_ACCESSIBILITY_UNMET": 422,
+    "ERR_PERMIT_LEAD_TIME_INSUFFICIENT": 422,
+    "ERR_STAFF_DAILY_LIMIT_EXCEEDED": 422,
+    # referential / constraint
+    "ERR_ELEMENT_OUTSIDE_PROGRAM_WINDOW": 422,
+    "ERR_ELEMENT_DEPENDENCY_CYCLE": 422,
+    "ERR_INVALID_WEATHER_ALTERNATIVE": 422,
+    "ERR_VENUE_CAPACITY_EXCEEDED": 422,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 422,
+    "ERR_SEGMENT_PROGRAM_MISMATCH": 422,
+    "ERR_STAFF_ROLE_MISMATCH": 422,
+    "ERR_PROGRAM_HAS_NO_ELEMENTS": 422,
+    "ERR_NO_RECONCILABLE_ELEMENTS": 422,
+    # fiscal
+    "ERR_MARKUP_PCT_OUT_OF_BAND": 422,
+    "ERR_VARIANCE_REASON_REQUIRED": 422,
+    "ERR_SETTLEMENT_EXCEEDS_OPEN_PAYABLE": 422,
+    # fallback for unrouted requests
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+    "ERR_INTERNAL": 500,
+}
+
+
+class ApiError(Exception):
+    """Domain error carrying the catalogue error id and its HTTP status."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").capitalize() + "."
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

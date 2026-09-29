@@ -1,0 +1,70 @@
+"""Error catalogue (PRD section 5 / scaffold section 1.6)."""
+
+ERROR_HTTP = {
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_PROJECT_CUSTOMER": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_SEGMENT_NOT_FOUND": 404,
+    "ERR_FLOW_LINK_NOT_FOUND": 404,
+    "ERR_STAGING_BAY_NOT_FOUND": 404,
+    "ERR_LOT_NOT_FOUND": 404,
+    "ERR_ZONE_NOT_FOUND": 404,
+    "ERR_WINDOW_NOT_FOUND": 404,
+    "ERR_CHANGE_ORDER_NOT_FOUND": 404,
+    "ERR_CERTIFICATE_NOT_FOUND": 404,
+    "ERR_DISPUTE_NOT_FOUND": 404,
+    "ERR_STALE_PROJECT_VERSION": 412,
+    "ERR_STALE_LOT_VERSION": 412,
+    "ERR_PROJECT_NOT_IN_DESIGN": 409,
+    "ERR_DUPLICATE_SEGMENT_CODE": 409,
+    "ERR_SIMULATION_STALE_OR_MISSING": 409,
+    "ERR_THROUGHPUT_SHORTFALL": 422,
+    "ERR_DESIGN_NOT_FROZEN": 409,
+    "ERR_LOT_INVALID_STATE": 409,
+    "ERR_LOT_SCRAPPED": 409,
+    "ERR_LOT_NOT_FAT_PASSED": 409,
+    "ERR_ZONE_NOT_READY": 409,
+    "ERR_WINDOW_INVALID_STATE": 409,
+    "ERR_WINDOW_BLOCKED_STALE_DESIGN": 409,
+    "ERR_WINDOW_NOT_DUE": 409,
+    "ERR_PROTECTED_SHIFT_COLLISION": 422,
+    "ERR_ZONE_WINDOW_OVERLAP": 409,
+    "ERR_STAGING_BAY_CAPACITY_EXCEEDED": 409,
+    "ERR_CROSS_PROJECT_REFERENCE": 422,
+    "ERR_FLOW_CYCLE": 422,
+    "ERR_SPLIT_SHARE_INVALID": 422,
+    "ERR_SOURCE_SHARE_INVALID": 422,
+    "ERR_ZONE_SHARE_INCOMPLETE": 422,
+    "ERR_CHANGE_ORDER_INVALID_STATE": 409,
+    "ERR_CHANGE_ORDER_ROUND_LIMIT": 409,
+    "ERR_CONTRACT_CEILING_EXCEEDED": 422,
+    "ERR_PROJECT_NOT_COMMISSIONING": 409,
+    "ERR_RAMP_SEQUENCE_VIOLATION": 409,
+    "ERR_ACCEPTANCE_PREREQ_NOT_MET": 409,
+    "ERR_OPEN_CHANGE_ORDER": 409,
+    "ERR_CERTIFICATE_ALREADY_DISPUTED": 409,
+    "ERR_DISPUTE_WINDOW_EXPIRED": 422,
+    "ERR_DISPUTE_INVALID_STATE": 409,
+    "ERR_NO_FUNDABLE_SPARE_LINES": 422,
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, http_status=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or _default_message(error_id)
+        self.http_status = http_status or ERROR_HTTP.get(error_id, 400)
+
+
+def _default_message(error_id):
+    return error_id.replace("ERR_", "").replace("_", " ").lower().capitalize() + "."
+
+
+def bad_request(message):
+    return ApiError("ERR_INVALID_REQUEST", message)

@@ -1,0 +1,196 @@
+"""Business constants for the Grocery Delivery Shopper Network & Batch Dispatch API.
+
+Every value here is transcribed from the PRD: role names, enum vocabularies,
+the logical-clock origin and the named numeric constants used by the pricing,
+scoring, pay and credit formulas.
+"""
+
+# --------------------------------------------------------------------------
+# Roles (PRD 2.1)
+# --------------------------------------------------------------------------
+ROLE_CUSTOMER = "Customer"
+ROLE_SHOPPER = "Shopper"
+ROLE_RETAILER_MANAGER = "RetailerManager"
+ROLE_DISPATCH_ADMIN = "DispatchAdmin"
+ROLE_CUSTOMER_SUPPORT = "CustomerSupport"
+
+ALL_ROLES = [
+    ROLE_CUSTOMER,
+    ROLE_SHOPPER,
+    ROLE_RETAILER_MANAGER,
+    ROLE_DISPATCH_ADMIN,
+    ROLE_CUSTOMER_SUPPORT,
+]
+
+# Roles whose X-User-ID is an opaque operator identifier (never ownership-checked)
+OPAQUE_ROLES = [ROLE_DISPATCH_ADMIN, ROLE_CUSTOMER_SUPPORT]
+
+# --------------------------------------------------------------------------
+# Logical clock (PRD 2.5)
+# --------------------------------------------------------------------------
+CLOCK_ORIGIN = "2026-08-01T00:00:00Z"
+CLOCK_0800 = "2026-08-01T08:00:00Z"
+CLOCK_0730 = "2026-08-01T07:30:00Z"
+
+OFFER_TTL_MINUTES = 30
+TIP_WINDOW_HOURS = 2
+REPLACEMENT_TTL_MINUTES = 20
+SHOPPER_TURNAROUND_BUFFER_MIN = 15
+
+# --------------------------------------------------------------------------
+# Money / pricing (PRD 2.6, 3.1, 3.2)
+# --------------------------------------------------------------------------
+MARKUP_PCT_DEFAULT = 0.15
+MARKUP_PCT_MIN = 0.00
+MARKUP_PCT_MAX = 0.60
+AUTH_BUFFER_MULT = 1.15
+SERVICE_FEE_CENTS = 399
+WEIGHT_VARIANCE_PCT = 0.20
+
+CONCURRENT_SHOPPER_CAP_DEFAULT = 2
+CONCURRENT_SHOPPER_CAP_MIN = 1
+CONCURRENT_SHOPPER_CAP_MAX = 10
+
+TIP_AMOUNT_MIN_CENTS = 0
+TIP_AMOUNT_MAX_CENTS = 20000
+TIP_ADJUSTMENT_MAX_COUNT = 2
+
+CREDIT_AMOUNT_MIN_CENTS = 1
+CREDIT_AMOUNT_MAX_CENTS = 100000
+
+DELIVERY_DISTANCE_MIN_MI = 0.0
+DELIVERY_DISTANCE_MAX_MI = 60.0
+
+REQUESTED_QTY_MIN = 1
+REQUESTED_QTY_MAX = 50
+
+VEHICLE_CAPACITY_MIN_UNITS = 1
+VEHICLE_CAPACITY_MAX_UNITS = 200
+
+# --------------------------------------------------------------------------
+# Shopper pay (PRD 3.8)
+# --------------------------------------------------------------------------
+BASE_PAY_CENTS = 700
+UNIT_RATE_CENTS = 25
+HEAVY_TIER_1_LB = 50.0
+HEAVY_TIER_2_LB = 80.0
+HEAVY_TIER_3_LB = 120.0
+HEAVY_TIER_1_CENTS = 300
+HEAVY_TIER_2_CENTS = 600
+HEAVY_TIER_3_CENTS = 900
+MILEAGE_FREE_MI = 8.0
+MILEAGE_RATE_CENTS_PER_MI = 60
+MILEAGE_BONUS_CAP_CENTS = 1200
+MULTI_STORE_BONUS_CENTS = 250
+TIP_BAIT_PCT_NUMERATOR = 50
+TIP_PROTECTION_CAP_CENTS = 1000
+GUARANTEE_PER_UNIT_CENTS = 80
+
+# --------------------------------------------------------------------------
+# Shopper tier scoring (PRD 3.3)
+# --------------------------------------------------------------------------
+ROLLING_WINDOW_N = 5
+RATING_WEIGHT = 0.70
+RELIABILITY_WEIGHT = 0.30
+ABANDONMENT_RELIABILITY_DIVISOR = 5
+DIAMOND_MIN_SCORE = 0.9200
+DIAMOND_MIN_COMPLETED = 3
+PLATINUM_MIN_SCORE = 0.8000
+STANDARD_MIN_SCORE = 0.6000
+ABANDONMENT_SUSPENSION_THRESHOLD = 2
+REINSTATEMENT_MIN_SCORE = 0.6000
+
+STARS_MIN = 1
+STARS_MAX = 5
+
+# --------------------------------------------------------------------------
+# Parity and abandonment credits (PRD 3.7, 3.9)
+# --------------------------------------------------------------------------
+PARITY_DISCLOSURE_THRESHOLD_PCT = 0.10
+FLAT_INCONVENIENCE_CENTS = 500
+ABANDON_CREDIT_CAP_CENTS = 2500
+
+# --------------------------------------------------------------------------
+# Enumerations
+# --------------------------------------------------------------------------
+RETAILER_STATUS_ACTIVE = "ACTIVE"
+RETAILER_STATUS_PAUSED = "PAUSED"
+
+PRICING_UNIT_EACH = "EACH"
+PRICING_UNIT_PER_LB = "PER_LB"
+
+AVAILABILITY_IN_STOCK = "IN_STOCK"
+AVAILABILITY_OUT_OF_STOCK = "OUT_OF_STOCK"
+
+CREDIT_REASON_ABANDONMENT_INCONVENIENCE = "ABANDONMENT_INCONVENIENCE"
+CREDIT_REASON_REPLACEMENT_REFUND = "REPLACEMENT_REFUND"
+CREDIT_REASON_PARITY_ADJUSTMENT = "PARITY_ADJUSTMENT"
+CREDIT_REASON_POST_CHECKOUT_REVERSAL = "POST_CHECKOUT_REVERSAL"
+CREDIT_REASON_SUPPORT_GOODWILL = "SUPPORT_GOODWILL"
+
+FULFILLMENT_DRAFT = "DRAFT"
+FULFILLMENT_PLACED = "PLACED"
+FULFILLMENT_IN_BATCH = "IN_BATCH"
+FULFILLMENT_SHOPPING = "SHOPPING"
+FULFILLMENT_CHECKED_OUT = "CHECKED_OUT"
+FULFILLMENT_DELIVERED = "DELIVERED"
+FULFILLMENT_REASSIGN_PENDING = "REASSIGN_PENDING"
+
+PAYMENT_UNAUTHORIZED = "UNAUTHORIZED"
+PAYMENT_AUTHORIZED = "AUTHORIZED"
+PAYMENT_REAUTH_HELD = "REAUTH_HELD"
+PAYMENT_CAPTURED = "CAPTURED"
+PAYMENT_REFUNDED = "REFUNDED"
+
+LINE_REQUESTED = "REQUESTED"
+LINE_REPLACEMENT_PENDING = "REPLACEMENT_PENDING"
+LINE_PICKED = "PICKED"
+LINE_REPLACED = "REPLACED"
+LINE_REFUNDED = "REFUNDED"
+
+BATCH_BUILDING = "BUILDING"
+BATCH_OFFERED = "OFFERED"
+BATCH_CLAIMED = "CLAIMED"
+BATCH_SHOPPING = "SHOPPING"
+BATCH_CHECKED_OUT = "CHECKED_OUT"
+BATCH_DELIVERED = "DELIVERED"
+BATCH_ABANDONED = "ABANDONED"
+
+REPLACEMENT_PENDING = "PENDING"
+REPLACEMENT_APPROVED = "APPROVED"
+REPLACEMENT_REJECTED = "REJECTED"
+REPLACEMENT_EXPIRED = "EXPIRED"
+
+REPLACEMENT_RESOLUTION_NONE = "NONE"
+REPLACEMENT_RESOLUTION_LINE_REPLACED = "LINE_REPLACED"
+REPLACEMENT_RESOLUTION_LINE_REFUNDED = "LINE_REFUNDED"
+
+SHOPPER_ACTIVE = "ACTIVE"
+SHOPPER_SUSPENDED_REVIEW = "SUSPENDED_REVIEW"
+
+TIER_PROBATION = "PROBATION"
+TIER_STANDARD = "STANDARD"
+TIER_PLATINUM = "PLATINUM"
+TIER_DIAMOND = "DIAMOND"
+
+TIER_RANK = {
+    TIER_PROBATION: 0,
+    TIER_STANDARD: 1,
+    TIER_PLATINUM: 2,
+    TIER_DIAMOND: 3,
+}
+
+PAYOUT_PROVISIONAL = "PROVISIONAL"
+PAYOUT_FINAL = "FINAL"
+PAYOUT_FORFEITED = "FORFEITED"
+
+# --------------------------------------------------------------------------
+# Pagination (PRD 2.3)
+# --------------------------------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# Fields that must never appear on append-only entities (PRD 2.4)
+APPEND_ONLY_FORBIDDEN_FIELDS = ("updated_at", "version")

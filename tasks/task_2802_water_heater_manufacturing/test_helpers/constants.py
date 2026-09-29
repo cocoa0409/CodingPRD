@@ -1,0 +1,193 @@
+"""Domain constants for the water-heater manufacturing compliance service.
+
+Every value here is transcribed from the PRD contract: enumerations, band
+thresholds, monetary allowances and rounding widths. Tests import these instead
+of repeating literals so that a single PRD reading is shared by the whole suite.
+"""
+
+# --- Logical clock (PRD section 2.5) --------------------------------------
+CLOCK_INITIAL_UTC = "2026-08-01T00:00:00Z"
+
+# --- Roles (PRD section 2.1) ---------------------------------------------
+ROLE_PLANT_ADMIN = "PlantAdmin"
+ROLE_PLANT_OPERATOR = "PlantOperator"
+ROLE_QUALITY_INSPECTOR = "QualityInspector"
+ROLE_COMPLIANCE_ENGINEER = "ComplianceEngineer"
+ROLE_CERTIFICATION_APPROVER = "CertificationApprover"
+ROLE_SUPPLIER_QUALITY_MANAGER = "SupplierQualityManager"
+ROLE_WARRANTY_ANALYST = "WarrantyAnalyst"
+ROLE_SUPPLIER_REP = "SupplierRep"
+
+OPAQUE_ROLES = (
+    ROLE_PLANT_ADMIN,
+    ROLE_PLANT_OPERATOR,
+    ROLE_QUALITY_INSPECTOR,
+    ROLE_COMPLIANCE_ENGINEER,
+    ROLE_CERTIFICATION_APPROVER,
+    ROLE_SUPPLIER_QUALITY_MANAGER,
+    ROLE_WARRANTY_ANALYST,
+)
+ALL_ROLES = OPAQUE_ROLES + (ROLE_SUPPLIER_REP,)
+
+# --- Pagination (PRD section 2.3) ----------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# --- Enumerations (PRD section 3) ----------------------------------------
+COMPONENT_CATEGORIES = (
+    "GAS_VALVE",
+    "THERMOSTAT",
+    "TP_RELIEF_VALVE",
+    "ANODE",
+    "COMPRESSOR",
+    "ECO_SWITCH",
+)
+FUEL_TYPES = ("GAS", "ELECTRIC", "HEAT_PUMP")
+CHANNELS = ("TRADE", "RETAIL", "BUILDER")
+TEST_TYPES = ("UEF", "FIRST_HOUR_RATING", "RECOVERY")
+INSPECTION_TYPES = ("ADHESION", "HOLIDAY")
+FAILURE_MODES = (
+    "TANK_LEAK",
+    "ANODE_DEPLETION",
+    "THERMOSTAT",
+    "GAS_VALVE",
+    "COMPRESSOR",
+    "OTHER",
+)
+REMEDY_TYPES = (
+    "TANK_REPLACEMENT",
+    "GAS_VALVE_KIT",
+    "TP_VALVE_KIT",
+    "FULL_UNIT_REPLACEMENT",
+)
+
+# --- Supplier qualification scoring (PRD section 3.1) --------------------
+SUPPLIER_AUDIT_WEIGHT = 0.40
+SUPPLIER_PPM_WEIGHT = 0.35
+SUPPLIER_CAPA_WEIGHT = 0.25
+SUPPLIER_PPM_DIVISOR = 50
+SUPPLIER_CAPA_PENALTY = 12.5
+QUALIFIED_SCORE_FLOOR = 85.00
+CONDITIONAL_SCORE_FLOOR = 70.00
+SUPPLIER_NAME_MAX_LEN = 120
+PART_NUMBER_MAX_LEN = 40
+AUDIT_SCORE_MIN = 0
+AUDIT_SCORE_MAX = 100
+
+# --- Product models (PRD section 3.2) ------------------------------------
+MODEL_CODE_MAX_LEN = 24
+BRAND_LABEL_MAX_LEN = 40
+CAPACITY_MIN_GALLONS = 20
+CAPACITY_MAX_GALLONS = 120
+R_VALUE_MIN = 10.0
+R_VALUE_MAX = 40.0
+
+# --- Furnaces and lining batches (PRD section 3.3) ----------------------
+FURNACE_CODE_MAX_LEN = 20
+FIRING_TEMP_MIN_C = 700
+FIRING_TEMP_MAX_C = 1000
+BATCH_QUARANTINE_REJECT_THRESHOLD = 2
+REPEAT_LINING_FAILURE_CODE = "REPEAT_LINING_FAILURE"
+
+# --- Tank lots and lining inspections (PRD section 3.4) -----------------
+LOT_CODE_MAX_LEN = 20
+PLANNED_QUANTITY_MIN = 1
+PLANNED_QUANTITY_MAX = 1000
+MIN_INSPECTION_SAMPLE = 3
+INSPECTION_SAMPLE_FRACTION = 0.05
+MAX_HOLIDAY_DENSITY = 0.50
+MAX_ADHESION_CLASS = 2
+MAX_REWORK_CYCLES = 2
+MIN_FOAM_THICKNESS_MM = 40
+R_VALUE_PER_MM = 0.4
+
+# --- Efficiency tests (PRD section 3.5) ---------------------------------
+CELL_CODE_MAX_LEN = 20
+PARALLEL_SLOTS_MIN = 1
+PARALLEL_SLOTS_MAX = 8
+COOLDOWN_HOURS_MIN = 0
+COOLDOWN_HOURS_MAX = 72
+TEST_SAMPLE_SIZE_MIN = 1
+TEST_SAMPLE_SIZE_MAX = 12
+SMALL_CAPACITY_CEILING_GALLONS = 55
+
+# Base UEF floors keyed by (fuel_type, is_large_tier).
+UEF_BASE_FLOOR = {
+    ("GAS", False): 0.58,
+    ("GAS", True): 0.55,
+    ("ELECTRIC", False): 0.92,
+    ("ELECTRIC", True): 1.90,
+    ("HEAT_PUMP", False): 2.20,
+    ("HEAT_PUMP", True): 2.90,
+}
+UEF_SAMPLE_DERATE = {1: 0.02, 2: 0.01}
+UEF_CREDIT_R_BASELINE = 16
+UEF_CREDIT_PER_R_POINT = 0.005
+UEF_CREDIT_CAP = 0.03
+FHR_EFFECTIVE_MINIMUM = 30.0
+RECOVERY_EFFECTIVE_MINIMUM = 10.0
+
+# --- Rating certifications (PRD section 3.6) ----------------------------
+MIN_UEF_PASSED_TESTS = 3
+MIN_FHR_PASSED_TESTS = 1
+MIN_RECOVERY_PASSED_TESTS = 1
+CERTIFIED_UEF_DECIMALS = 2
+CERTIFIED_FHR_DECIMALS = 0
+CERTIFIED_RECOVERY_DECIMALS = 1
+
+# --- Heater units (PRD section 3.7) -------------------------------------
+WARRANTY_ACCRUAL_CENTS_BY_FUEL = {
+    "GAS": 42000,
+    "ELECTRIC": 31000,
+    "HEAT_PUMP": 98000,
+}
+HARDNESS_BAND_SOFT_CEILING = 3.5
+HARDNESS_BAND_MODERATE_CEILING = 7.0
+HARDNESS_BAND_HARD_CEILING = 10.5
+HARDNESS_FACTORS = {
+    "SOFT": 0.80,
+    "MODERATE": 1.00,
+    "HARD": 1.35,
+    "VERY_HARD": 1.80,
+}
+DAYS_PER_SERVICE_MONTH = 30
+
+# --- Warranty claims (PRD section 3.8) ----------------------------------
+WARRANTY_PARTS_ALLOWANCE_CENTS = {
+    "TANK_LEAK": 41500,
+    "ANODE_DEPLETION": 41500,
+    "THERMOSTAT": 4200,
+    "GAS_VALVE": 8200,
+    "COMPRESSOR": 52000,
+    "OTHER": 0,
+}
+WARRANTY_LABOUR_ALLOWANCE_CENTS = 12525
+WARRANTY_FREIGHT_ALLOWANCE_CENTS = 3325
+TANK_COVERAGE_FULL_MONTHS = 72
+TANK_COVERAGE_HALF_MONTHS = 96
+COMPONENT_COVERAGE_FULL_MONTHS = 12
+HARDNESS_GPG_MIN = 0.0
+HARDNESS_GPG_MAX = 60.0
+
+# --- Recall campaigns (PRD section 3.9) ---------------------------------
+RECALL_LABOUR_RATE_CENTS_PER_HOUR = 9800
+RECALL_LABOUR_HOURS = {
+    "TANK_REPLACEMENT": 3.5,
+    "GAS_VALVE_KIT": 1.0,
+    "TP_VALVE_KIT": 0.5,
+    "FULL_UNIT_REPLACEMENT": 4.0,
+}
+RECALL_PARTS_CENTS = {
+    "TANK_REPLACEMENT": 41500,
+    "GAS_VALVE_KIT": 8200,
+    "TP_VALVE_KIT": 3100,
+    "FULL_UNIT_REPLACEMENT": 68000,
+}
+RECALL_FEE_TIER_LOW_CEILING = 20000
+RECALL_FEE_TIER_MID_CEILING = 50000
+RECALL_FEE_RATE_LOW = 0.15
+RECALL_FEE_RATE_MID = 0.10
+RECALL_FEE_RATE_HIGH = 0.06
+RECALL_COMPLETION_THRESHOLD_PCT = 80.00

@@ -1,0 +1,105 @@
+"""Error catalogue and exception type."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None, status=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.status = status if status is not None else ERROR_STATUS.get(error_id, 400)
+        self.message = message or DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+ERROR_STATUS = {
+    # auth / identity
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_FORBIDDEN_ROLE": 403,
+    "ERR_IDENTITY_NOT_RESOLVED": 403,
+    "ERR_OWNERSHIP_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # request shape
+    "ERR_VALIDATION": 400,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_INVALID_PAGINATION": 400,
+    # not found
+    "ERR_SITE_NOT_FOUND": 404,
+    "ERR_MENTOR_NOT_FOUND": 404,
+    "ERR_COHORT_NOT_FOUND": 404,
+    "ERR_NOVICE_NOT_FOUND": 404,
+    "ERR_MATCH_NOT_FOUND": 404,
+    "ERR_CONTACT_LOG_NOT_FOUND": 404,
+    "ERR_OBSERVATION_CYCLE_NOT_FOUND": 404,
+    "ERR_MILESTONE_NOT_FOUND": 404,
+    "ERR_ATTAINMENT_NOT_FOUND": 404,
+    "ERR_SEMINAR_SESSION_NOT_FOUND": 404,
+    "ERR_SEMINAR_ATTENDANCE_NOT_FOUND": 404,
+    "ERR_DISBURSEMENT_NOT_FOUND": 404,
+    "ERR_CERTIFICATION_NOT_FOUND": 404,
+    "ERR_NOT_FOUND": 404,
+    # concurrency
+    "ERR_STALE_PARENT_VERSION": 412,
+    # state (409)
+    "ERR_MATCH_STATE_INVALID": 409,
+    "ERR_CONTACT_LOG_STATE_INVALID": 409,
+    "ERR_OBSERVATION_PHASE_INVALID": 409,
+    "ERR_FEEDBACK_STATE_INVALID": 409,
+    "ERR_ATTAINMENT_STATE_INVALID": 409,
+    "ERR_DISBURSEMENT_STATE_INVALID": 409,
+    "ERR_PACKET_STATE_INVALID": 409,
+    "ERR_MENTOR_CERT_STATE_INVALID": 409,
+    "ERR_NOVICE_PROGRAM_STATE_INVALID": 409,
+    "ERR_SESSION_STATE_INVALID": 409,
+    # conflicts (409)
+    "ERR_OBSERVATION_WINDOW_CONFLICT": 409,
+    "ERR_SEMINAR_SESSION_OVERLAP": 409,
+    "ERR_DUPLICATE_ACTIVE_MATCH": 409,
+    "ERR_NOVICE_ALREADY_MATCHED": 409,
+    "ERR_DUPLICATE_CYCLE_INDEX": 409,
+    "ERR_DUPLICATE_SESSION_INDEX": 409,
+    "ERR_DUPLICATE_ATTENDANCE": 409,
+    "ERR_DUPLICATE_SITE_CODE": 409,
+    "ERR_DUPLICATE_MILESTONE_CODE": 409,
+    "ERR_DUPLICATE_DISBURSEMENT_PERIOD": 409,
+    "ERR_DUPLICATE_ATTAINMENT": 409,
+    "ERR_ACTIVE_PACKET_EXISTS": 409,
+    "ERR_RESUBMIT_LIMIT_REACHED": 409,
+    "ERR_FEEDBACK_RETURN_LIMIT_REACHED": 409,
+    "ERR_REVOCATION_LIMIT_REACHED": 409,
+    "ERR_PACKET_RESUBMISSION_LIMIT_REACHED": 409,
+    # business rules (422)
+    "ERR_SITE_CLOSED": 422,
+    "ERR_COHORT_STATE_INVALID": 422,
+    "ERR_MENTOR_NOT_CERTIFIED": 422,
+    "ERR_COHORT_WEEKLY_SEMINAR_CAP_EXCEEDED": 422,
+    "ERR_INVALID_WINDOW": 422,
+    "ERR_PERIOD_NOT_CLOSED": 422,
+    "ERR_SITE_MISMATCH": 422,
+    "ERR_COHORT_MISMATCH": 422,
+    "ERR_PREREQUISITE_NOT_ATTAINED": 422,
+    "ERR_MILESTONE_CYCLE": 422,
+    "ERR_LICENSE_RECOMMENDATION_MISSING": 422,
+    "ERR_MILESTONE_EVIDENCE_INSUFFICIENT": 422,
+    "ERR_CONTACT_DATE_OUT_OF_WINDOW": 422,
+    "ERR_CASELOAD_CAP_EXCEEDED": 422,
+    "ERR_SITE_SLOT_CAP_EXCEEDED": 422,
+    "ERR_FEEDBACK_INCOMPLETE": 422,
+    "ERR_DAILY_CREDIT_CAP_REACHED": 422,
+    "ERR_NO_ELIGIBLE_ACTIVITY": 422,
+    "ERR_ADJUSTMENT_EXCEEDS_GROSS": 422,
+    "ERR_NON_POSITIVE_NET_STIPEND": 422,
+    "ERR_NO_ELIGIBLE_MENTOR": 422,
+    "ERR_MILESTONE_REQUIREMENTS_NOT_MET": 422,
+    "ERR_TRAINING_REQUIREMENTS_NOT_MET": 422,
+    # server
+    "ERR_INTERNAL": 500,
+}
+
+DEFAULT_MESSAGES = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing or the role is unrecognized.",
+    "ERR_FORBIDDEN_ROLE": "The acting role is not authorized for this operation.",
+    "ERR_IDENTITY_NOT_RESOLVED": "The acting identity could not be resolved.",
+    "ERR_OWNERSHIP_VIOLATION": "The acting identity does not own the addressed resource.",
+    "ERR_SEGREGATION_OF_DUTIES": "Segregation of duties forbids this actor from taking this action.",
+    "ERR_INVALID_REQUEST": "The request body failed field validation.",
+    "ERR_INVALID_PAGINATION": "Pagination parameters are out of range.",
+    "ERR_STALE_PARENT_VERSION": "The supplied parent version does not match the stored version.",
+}

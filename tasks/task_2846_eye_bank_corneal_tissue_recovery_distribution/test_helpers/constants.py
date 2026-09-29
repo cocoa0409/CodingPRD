@@ -1,0 +1,337 @@
+"""
+Business constants, enum value sets and the shared instant literals used by the suite.
+
+Every numeric figure here is a literal taken from the specification: base recovery
+windows, cooling credits, screening question weights, quality-score coefficients,
+priority weights, fee bases and surcharge percentages, shelf-life allowances and
+temperature thresholds.
+"""
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+ROLE_COORDINATOR = "EyeBankCoordinator"
+ROLE_LAB_TECHNICIAN = "LabTechnician"
+ROLE_RECOVERY_TECHNICIAN = "RecoveryTechnician"
+ROLE_EVALUATION_TECHNICIAN = "EvaluationTechnician"
+ROLE_MEDICAL_DIRECTOR = "MedicalDirector"
+ROLE_SURGEON = "Surgeon"
+
+ALL_ROLES = (
+    ROLE_COORDINATOR,
+    ROLE_LAB_TECHNICIAN,
+    ROLE_RECOVERY_TECHNICIAN,
+    ROLE_EVALUATION_TECHNICIAN,
+    ROLE_MEDICAL_DIRECTOR,
+    ROLE_SURGEON,
+)
+
+ENTITY_BACKED_ROLES = (
+    ROLE_RECOVERY_TECHNICIAN,
+    ROLE_EVALUATION_TECHNICIAN,
+    ROLE_SURGEON,
+)
+
+# ---------------------------------------------------------------------------
+# Logical clock
+# ---------------------------------------------------------------------------
+CLOCK_STARTUP_DEFAULT = "2026-08-01T00:00:00.000Z"
+
+# The instant every chain in this suite pins the clock to before doing anything else.
+T_NOW = "2026-08-03T06:00:00.000Z"
+
+# Frequently reused instants on the 2026-08-03 timeline.
+T_DEATH = "2026-08-03T02:00:00.000Z"
+T_DEATH_0230 = "2026-08-03T02:30:00.000Z"
+T_COOLED = "2026-08-03T03:00:00.000Z"
+T_COOLED_0330 = "2026-08-03T03:30:00.000Z"
+T_DRAWN = "2026-08-03T04:00:00.000Z"
+T_DRAWN_0430 = "2026-08-03T04:30:00.000Z"
+T_DISPATCH = "2026-08-03T06:30:00.000Z"
+T_ARRIVE = "2026-08-03T07:00:00.000Z"
+T_PRESERVE = "2026-08-03T09:00:00.000Z"
+T_PLANNED_RELEASE = "2026-08-03T10:00:00.000Z"
+T_EVAL_SLIT = "2026-08-03T09:30:00.000Z"
+T_EVAL_SPECULAR = "2026-08-03T09:35:00.000Z"
+T_SHIPPED = "2026-08-03T10:00:00.000Z"
+T_DELIVERED = "2026-08-03T12:00:00.000Z"
+
+CERTIFICATION_EXPIRES_AT = "2027-01-01T00:00:00.000Z"
+
+# ---------------------------------------------------------------------------
+# Enumerations
+# ---------------------------------------------------------------------------
+REFERRAL_SOURCES = ("HOSPITAL", "HOSPICE", "MEDICAL_EXAMINER", "FUNERAL_HOME")
+DEATH_TIME_BASES = ("ASYSTOLE", "PRONOUNCED")
+CAUSE_OF_DEATH_CATEGORIES = (
+    "CARDIAC",
+    "TRAUMA",
+    "MALIGNANCY",
+    "NEUROLOGIC",
+    "INFECTIOUS",
+    "OTHER",
+)
+
+DONOR_STATUSES = (
+    "REFERRED",
+    "SCREENING",
+    "CONSENT_OBTAINED",
+    "APPROVED_FOR_RECOVERY",
+    "RECOVERED",
+    "DEFERRED",
+    "RULED_OUT",
+)
+
+SCREENING_QUESTION_CODES = (
+    "IV_DRUG_USE",
+    "HIV_RISK",
+    "HEP_B_C_HISTORY",
+    "SEPSIS",
+    "UNEXPLAINED_NEURO",
+    "CJD_FAMILY",
+    "TATTOO_12M",
+    "INCARCERATION_12M",
+)
+SCREENING_RESPONSES = ("YES", "NO", "UNKNOWN")
+HISTORIAN_RELATIONSHIPS = (
+    "SPOUSE",
+    "CHILD",
+    "PARENT",
+    "SIBLING",
+    "MEDICAL_RECORD",
+    "OTHER",
+)
+
+CONSENT_TYPES = ("FIRST_PERSON", "NEXT_OF_KIN", "NONE")
+CONSENT_SCOPES = (
+    "NONE",
+    "TRANSPLANT_ONLY",
+    "TRANSPLANT_AND_RESEARCH",
+    "RESEARCH_ONLY",
+    "TRAINING_ONLY",
+)
+
+SPECIMEN_TYPES = ("PRE_MORTEM", "POST_MORTEM")
+MARKER_RESULTS = ("NON_REACTIVE", "REACTIVE", "INDETERMINATE")
+PANEL_STATUSES = ("DRAWN", "RESULTED", "INVALIDATED")
+DONOR_SEROLOGY_STATUSES = ("PENDING", "NEGATIVE", "REACTIVE", "INDETERMINATE")
+
+CERTIFICATION_LEVELS = ("RECOVERY_ONLY", "RECOVERY_AND_EVAL")
+TECHNICIAN_STATUSES = ("ACTIVE", "INACTIVE")
+
+RECOVERY_STATUSES = ("DISPATCHED", "ON_SITE", "COMPLETED", "ABORTED")
+PRESERVATION_MEDIA = ("OPTISOL_GS", "LIFE4C")
+LATERALITIES = ("OD", "OS")
+TIME_LIMIT_BANDS = ("WITHIN_STANDARD", "WITHIN_EXTENDED", "EXCEEDED")
+
+DISPOSITION_STATUSES = (
+    "UNGRADED",
+    "ELIGIBLE",
+    "RESERVED",
+    "ISSUED",
+    "IMPLANTED",
+    "QUARANTINED",
+    "RELEASED_FOR_RESEARCH",
+    "RELEASED_FOR_TRAINING",
+    "DISCARDED",
+)
+CUSTODY_STATUSES = (
+    "IN_HOUSE",
+    "IN_TRANSIT",
+    "AT_SURGEON",
+    "RETURNED_TO_BANK",
+    "DESTROYED",
+)
+CLASSIFICATIONS = (
+    "TRANSPLANT_OPTICAL",
+    "TRANSPLANT_THERAPEUTIC",
+    "RESEARCH",
+    "TRAINING",
+    "UNSUITABLE",
+)
+SHELF_LIFE_VARIANT_PROVISIONAL = "PROVISIONAL_AT_RECOVERY"
+SHELF_LIFE_VARIANT_FINAL = "FINAL_AT_CLASSIFICATION"
+
+EVALUATION_METHODS = ("SLIT_LAMP", "SPECULAR")
+EVALUATION_STATUSES = ("RECORDED", "SUPERSEDED")
+
+PROCEDURE_TYPES = ("PK", "DSAEK", "DMEK", "THERAPEUTIC")
+URGENCIES = ("ROUTINE", "URGENT")
+LATERALITY_PREFERENCES = ("OD", "OS", "ANY")
+PRIORITY_TIERS = ("PLATINUM", "GOLD", "STANDARD")
+CREDENTIAL_STATUSES = ("ACTIVE", "PROBATION", "SUSPENDED")
+
+REQUEST_STATUSES = ("OPEN", "ALLOCATED", "FULFILLED", "CANCELLED", "EXPIRED")
+ALLOCATION_STATUSES = ("RESERVED", "CONFIRMED", "CONSUMED", "RELEASED", "CANCELLED")
+ALLOCATION_SOURCES = ("MANUAL", "RUN")
+
+CARRIERS = ("COURIER", "AIR")
+SHIPMENT_STATUSES = (
+    "PREPARED",
+    "IN_TRANSIT",
+    "DELIVERED",
+    "REJECTED_ON_ARRIVAL",
+    "RETURNED",
+)
+INTEGRITY_VERDICTS = ("PASS", "EXCURSION_MINOR", "EXCURSION_MAJOR")
+
+REACTION_TYPES = (
+    "PRIMARY_GRAFT_FAILURE",
+    "ENDOPHTHALMITIS",
+    "INFECTIOUS_KERATITIS",
+    "REJECTION",
+)
+SEVERITIES = ("MINOR", "SERIOUS")
+REPORT_STATUSES = ("SUBMITTED", "SUBSTANTIATED", "UNSUBSTANTIATED")
+
+INVESTIGATION_STATUSES = ("OPEN", "NOTIFIED", "CLOSED_NO_ACTION", "CLOSED_WITH_RECALL")
+TRIGGER_REASONS = ("ADVERSE_REACTION", "POSITIVE_RETEST")
+RESOLUTIONS = ("NO_ACTION", "RECALL")
+
+DISPOSAL_METHODS = ("INCINERATION", "AUTOCLAVE", "RESEARCH_TRANSFER")
+
+# Literal reason strings the specification pins by name.
+CANCEL_REASON_REQUEST_CANCELLED = "REQUEST_CANCELLED"
+CANCEL_REASON_TISSUE_QUARANTINED = "TISSUE_QUARANTINED"
+CANCEL_REASON_UNUSED_TISSUE_RETURNED = "UNUSED_TISSUE_RETURNED"
+ABORT_REASON_DONOR_DEFERRED = "DONOR_DEFERRED"
+QUARANTINE_REASON_COLD_CHAIN_MAJOR = "COLD_CHAIN_EXCURSION_MAJOR"
+
+# ---------------------------------------------------------------------------
+# Recovery window arithmetic
+# ---------------------------------------------------------------------------
+BASE_WINDOW_ASYSTOLE_MINUTES = 720
+BASE_WINDOW_PRONOUNCED_MINUTES = 660
+COOLING_CREDIT_FAST_MINUTES = 240      # cooling delay <= 240 minutes
+COOLING_CREDIT_SLOW_MINUTES = 120      # 240 < cooling delay <= 480 minutes
+COOLING_CREDIT_NONE_MINUTES = 0        # cooling delay > 480 minutes, or never cooled
+COOLING_DELAY_FAST_BOUND_MINUTES = 240
+COOLING_DELAY_SLOW_BOUND_MINUTES = 480
+AGE_PENALTY_MINUTES = 60
+AGE_PENALTY_THRESHOLD_YEARS = 71
+RECOVERY_WINDOW_FLOOR_MINUTES = 360
+
+# ---------------------------------------------------------------------------
+# Screening risk weights
+# ---------------------------------------------------------------------------
+SCREENING_WEIGHTS = {
+    "CJD_FAMILY": 60,
+    "UNEXPLAINED_NEURO": 50,
+    "IV_DRUG_USE": 40,
+    "HIV_RISK": 35,
+    "HEP_B_C_HISTORY": 30,
+    "SEPSIS": 25,
+    "INCARCERATION_12M": 15,
+    "TATTOO_12M": 10,
+}
+SCREENING_RISK_VARIANT_INTERVIEW = "INTERVIEW_ONLY"
+SCREENING_RISK_VARIANT_RECONCILED = "POST_SEROLOGY_RECONCILED"
+TRANSPLANT_RISK_CEILING = 50
+HEMODILUTION_GATE_PCT = 50.00
+
+# ---------------------------------------------------------------------------
+# Recovery time-limit bands and shelf life
+# ---------------------------------------------------------------------------
+BAND_STANDARD_MAX_MINUTES = 720
+BAND_EXTENDED_MAX_MINUTES = 900
+
+SHELF_LIFE_BASE_HOURS = {"OPTISOL_GS": 336, "LIFE4C": 264}
+SHELF_LIFE_EXTENDED_PENALTY_HOURS = 48
+SHELF_LIFE_COOLING_PENALTY_HOURS = 72
+SHELF_LIFE_LOW_ENDOTHELIUM_PENALTY_HOURS = 24
+SHELF_LIFE_LOW_ENDOTHELIUM_THRESHOLD = 2200
+SHELF_LIFE_FLOOR_HOURS = 24
+
+TECHNICIAN_TURNAROUND_MINUTES = 60
+
+# ---------------------------------------------------------------------------
+# Quality score
+# ---------------------------------------------------------------------------
+ENDOTHELIAL_BASELINE = 1800
+ENDOTHELIAL_DIVISOR = 50
+ENDOTHELIAL_POINTS_CAP = 40
+CLARITY_BASE_POINTS = 25
+CLARITY_POINTS_PER_GRADE = 5
+EPITHELIUM_BASE_POINTS = 15
+EPITHELIUM_POINTS_PER_GRADE = 4
+FOLDS_BASE_POINTS = 10
+FOLDS_POINTS_PER_GRADE = 3
+GUTTATA_BASE_POINTS = 10
+GUTTATA_POINTS_PER_GRADE = 5
+AGE_ADJUSTMENT_OLD = -8       # age_years >= 71
+AGE_ADJUSTMENT_MIDDLE = 0     # 46 <= age_years < 71
+AGE_ADJUSTMENT_YOUNG = 5      # age_years < 46
+QUALITY_SCORE_MIN = 0
+QUALITY_SCORE_MAX = 100
+
+# ---------------------------------------------------------------------------
+# Request priority
+# ---------------------------------------------------------------------------
+URGENCY_WEIGHT_URGENT = 30
+URGENCY_WEIGHT_ROUTINE = 10
+PROXIMITY_POINTS_IMMINENT = 40   # days <= 2
+PROXIMITY_POINTS_NEAR = 25       # 3 <= days <= 7
+PROXIMITY_POINTS_MID = 10        # 8 <= days <= 21
+PROXIMITY_POINTS_FAR = 0
+TIER_PLATINUM_FLOOR = 60
+TIER_GOLD_FLOOR = 40
+TIER_BONUS = {"PLATINUM": 15, "GOLD": 8, "STANDARD": 0}
+
+# ---------------------------------------------------------------------------
+# Fees
+# ---------------------------------------------------------------------------
+FEE_BASE_CENTS = {"TRANSPLANT_OPTICAL": 245000, "TRANSPLANT_THERAPEUTIC": 189000}
+SURCHARGE_URGENCY_PCT = 7.25
+SURCHARGE_PROCEDURE_PCT = 4.25
+SURCHARGE_SHORT_NOTICE_PCT = 1.75
+SURCHARGE_PROCEDURES = ("DMEK", "DSAEK")
+SHORT_NOTICE_DAY_BOUND = 2
+
+# Worked example from the specification: base 245000 with all three surcharges.
+FEE_OPTICAL_ALL_SURCHARGES_CENTS = 277464
+FEE_OPTICAL_URGENCY_SURCHARGE_CENTS = 17763
+FEE_OPTICAL_PROCEDURE_SURCHARGE_CENTS = 10413
+FEE_OPTICAL_SHORT_NOTICE_SURCHARGE_CENTS = 4288
+
+# ---------------------------------------------------------------------------
+# Procedure compatibility
+# ---------------------------------------------------------------------------
+PROCEDURES_FOR_OPTICAL = ("PK", "DSAEK", "DMEK", "THERAPEUTIC")
+PROCEDURES_FOR_THERAPEUTIC = ("THERAPEUTIC", "PK")
+SURGEON_DAY_CAPACITY = 2
+
+# ---------------------------------------------------------------------------
+# Cold chain
+# ---------------------------------------------------------------------------
+TEMP_IN_RANGE_LOW_C = 2.0
+TEMP_IN_RANGE_HIGH_C = 8.0
+TEMP_MINOR_MAX_C = 12.0
+TEMP_MINOR_MIN_C = -5.0
+EXCURSION_MINOR_MAX_MINUTES = 45
+SHIPMENT_MONITORING_WINDOW_HOURS = 168
+REISSUE_GENERATION_LIMIT = 1
+
+# ---------------------------------------------------------------------------
+# Pagination
+# ---------------------------------------------------------------------------
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+DEFAULT_OFFSET = 0
+
+# ---------------------------------------------------------------------------
+# Unknown-identifier literals used by the not-found probes
+# ---------------------------------------------------------------------------
+UNKNOWN_UUID = "00000000-0000-4000-8000-0000000000ff"
+UNKNOWN_DONOR_ID = "00000000-0000-4000-8000-0000000000d0"
+UNKNOWN_DONOR_ID_ALT = "00000000-0000-4000-8000-0000000000d1"
+UNKNOWN_PANEL_ID = "00000000-0000-4000-8000-0000000000b0"
+UNKNOWN_TECHNICIAN_ID = "00000000-0000-4000-8000-00000000000c"
+UNKNOWN_RECOVERY_ID = "00000000-0000-4000-8000-0000000000e1"
+UNKNOWN_TISSUE_ID = "00000000-0000-4000-8000-0000000000e2"
+UNKNOWN_SURGEON_ID = "00000000-0000-4000-8000-0000000000e3"
+UNKNOWN_REQUEST_ID = "00000000-0000-4000-8000-0000000000e4"
+UNKNOWN_ALLOCATION_ID = "00000000-0000-4000-8000-0000000000e5"
+UNKNOWN_SHIPMENT_ID = "00000000-0000-4000-8000-0000000000e6"
+UNKNOWN_REPORT_ID = "00000000-0000-4000-8000-0000000000e7"
+UNKNOWN_INVESTIGATION_ID = "00000000-0000-4000-8000-0000000000e8"

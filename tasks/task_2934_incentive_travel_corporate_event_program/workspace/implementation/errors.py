@@ -1,0 +1,79 @@
+"""Error catalogue (PRD section 5) and the ApiError exception."""
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, http_status, message=None):
+        super().__init__(error_id)
+        self.error_id = error_id
+        self.http_status = http_status
+        self.message = message or _DEFAULT_MESSAGES.get(error_id, error_id)
+
+
+# error_id -> HTTP status, verbatim from PRD section 5.
+CATALOGUE = {
+    "ERR_MISSING_AUTH_HEADERS": 401,
+    "ERR_INVALID_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_NOT_RESOURCE_OWNER": 403,
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_TIER_NOT_FOUND": 404,
+    "ERR_QUALIFIER_NOT_FOUND": 404,
+    "ERR_DESTINATION_NOT_FOUND": 404,
+    "ERR_CONTRACT_NOT_FOUND": 404,
+    "ERR_MILESTONE_NOT_FOUND": 404,
+    "ERR_REGISTRATION_NOT_FOUND": 404,
+    "ERR_ACTIVITY_NOT_FOUND": 404,
+    "ERR_SIGNUP_NOT_FOUND": 404,
+    "ERR_TAX_REPORT_NOT_FOUND": 404,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_STALE_PROGRAM_VERSION": 412,
+    "ERR_STALE_ACTIVITY_VERSION": 412,
+    "ERR_PROGRAM_STATE_INVALID": 409,
+    "ERR_QUALIFIER_STATE_INVALID": 409,
+    "ERR_DESTINATION_STATE_INVALID": 409,
+    "ERR_CONTRACT_STATE_INVALID": 409,
+    "ERR_MILESTONE_STATE_INVALID": 409,
+    "ERR_REGISTRATION_STATE_INVALID": 409,
+    "ERR_AIR_STATE_INVALID": 409,
+    "ERR_ACTIVITY_STATE_INVALID": 409,
+    "ERR_SIGNUP_STATE_INVALID": 409,
+    "ERR_TAX_REPORT_STATE_INVALID": 409,
+    "ERR_NO_EXECUTED_HOTEL_CONTRACT": 409,
+    "ERR_GROSS_UP_POLICY_LOCKED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 422,
+    "ERR_TAX_VOID_SELF_REVIEW": 422,
+    "ERR_ACTIVITY_WAIVER_REQUIRED": 422,
+    "ERR_DESTINATION_RISK_TOO_HIGH": 422,
+    "ERR_INSPECTION_SCORE_BELOW_MINIMUM": 422,
+    "ERR_NEGOTIATION_ROUNDS_EXHAUSTED": 422,
+    "ERR_GUEST_ALLOWANCE_EXCEEDED": 422,
+    "ERR_GUEST_LINK_INVALID": 422,
+    "ERR_DUPLICATE_EMPLOYEE_CODE": 409,
+    "ERR_DUPLICATE_TIER_KEY": 409,
+    "ERR_DUPLICATE_MILESTONE_SEQUENCE": 409,
+    "ERR_DUPLICATE_WINNER_REGISTRATION": 409,
+    "ERR_DUPLICATE_ACTIVITY_SIGNUP": 409,
+    "ERR_INVALID_DATE_RANGE": 422,
+    "ERR_ACTIVITY_TIME_CONFLICT": 409,
+    "ERR_DEVIATION_LIMIT_EXCEEDED": 422,
+    "ERR_STAY_WINDOW_VIOLATION": 422,
+    "ERR_ROOM_BLOCK_EXHAUSTED": 409,
+    "ERR_DEPOSIT_SCHEDULE_EXCEEDS_CONTRACT_VALUE": 422,
+    "ERR_TIER_BUDGET_EXCEEDED": 422,
+    "ERR_BUDGET_HEADROOM_EXCEEDED": 422,
+    "ERR_PROGRAM_SCOPE_MISMATCH": 422,
+    "ERR_TAX_REPORTING_INCOMPLETE": 422,
+    "ERR_ADVANCE_PREREQUISITES_UNMET": 422,
+}
+
+_DEFAULT_MESSAGES = {
+    "ERR_MISSING_AUTH_HEADERS": "X-User-ID and X-User-Role headers are required.",
+    "ERR_INVALID_ROLE": "X-User-Role is not one of the seven declared roles.",
+    "ERR_ROLE_NOT_PERMITTED": "The supplied role is not authorized for this endpoint.",
+    "ERR_NOT_RESOURCE_OWNER": "The acting participant does not own the targeted resource.",
+    "ERR_INVALID_REQUEST": "The request payload is invalid.",
+}
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, CATALOGUE[error_id], message)

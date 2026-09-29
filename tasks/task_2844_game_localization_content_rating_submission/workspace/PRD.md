@@ -1,0 +1,485 @@
+# Game Localization & Rating Submission API — Product Requirements Document
+
+## 1. Introduction
+
+Shipping a game into six territories on the same day is, in practice, six separate regulatory negotiations running in parallel against one shared body of content. Each market has its own rating board, its own mandatory disclosures, its own list of descriptors that simply cannot appear in a shippable build, and its own certification lead time. Meanwhile the localization programme itself — string extraction, translation memory reuse, voice recording under union and usage-rights constraints, linguistic and functional QA — produces a stream of changes that keeps invalidating the compliance picture that the rating package was built on. Publishers today reconcile this by hand, in spreadsheets, and discover the contradictions late: a market marked "ready" whose governing rating outcome was superseded three edits ago, or a booth double-booked because someone forgot the teardown gap.
+
+This document specifies the API for a single system of record that holds the whole picture: the source string set and its lock state, the per-market localization scope and its budget, the voice recording calendar with its booth and talent capacity arithmetic, the QA passes and their defect density, the rating submissions with their disclosure questionnaires and footage evidence, and the content edits filed to obtain a target rating. The system's defining property is that these are not independent ledgers. Applying a content edit to satisfy a rating board must reach all the way down — un-delivering the affected translations, dragging the market out of QA, reopening the passes that inspected those units, pulling their verified bugs back into the open set — and all the way up, reverting the title out of its certification window. Every such propagation is specified here as an ordered cascade, not as an eventual reconciliation.
+
+Two further properties shape the contract. First, duties are separated: the compliance officer who files a rating package is never the person who records its outcome, the tester who logs a defect is never the one who signs off on its fix, and a talent agent may act only for the one voice talent it represents. Second, the system is deliberately deterministic and clock-driven — there is no wall-clock dependency anywhere, so certification deadlines, usage-rights windows and expedite surcharges are all reproducible.
+
+Every path in this API is mounted at the root; there is no collection prefix and no nested resource path. Related records are joined by foreign-key fields carried in request bodies and by query filters on the list endpoints.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Actors, Identity Headers and Role-Based Access Control
+
+Every request — without exception, including every read — must carry two headers. `X-User-ID` identifies the acting user and `X-User-Role` declares the capacity in which they are acting. If either header is absent, or if `X-User-Role` is not exactly one of the seven role names below, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). This check runs before anything else the server does.
+
+The seven roles are `LocalizationProducer`, `TranslationVendor`, `LqaTester`, `ComplianceOfficer`, `RatingBoardLiaison`, `TalentAgent` and `PlatformAdmin`.
+
+- A `LocalizationProducer` is the publisher-side owner of the programme. It registers titles, extracts and edits source strings, locks the string set, adds and scopes markets, hands markets to the vendor, opens the QA phase, registers booths and voice talent, drafts and terminates talent contracts, and books and cancels recording sessions.
+- A `TranslationVendor` is the external language service provider. It writes target text into translation units, delivers them, and submits bug fixes.
+- An `LqaTester` runs linguistic and functional quality assurance. It opens, closes and reopens QA passes, records per-unit QA outcomes, logs defects and verifies fixes.
+- A `ComplianceOfficer` owns ratings and regional legal compliance. It drafts, files, appeals and withdraws rating submissions, blocks markets, applies content edits and declares a market release-ready.
+- A `RatingBoardLiaison` acts for the rating board itself. Its only two write capabilities are picking a filed submission up for review and recording the board's decision.
+- A `TalentAgent` acts on behalf of exactly one voice talent.
+- A `PlatformAdmin` operates the publishing platform. It is permitted on every endpoint in this specification, and it is the only role that may move the server's logical clock.
+
+If the acting role is not among the roles listed for the target endpoint in §4, the request is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403). All seven roles may call every read endpoint.
+
+**Identity semantics.** Six of the seven roles carry an opaque identity: when `X-User-Role` is `LocalizationProducer`, `TranslationVendor`, `LqaTester`, `ComplianceOfficer`, `RatingBoardLiaison` or `PlatformAdmin`, the `X-User-ID` value is an opaque operator identifier that is not tied to any persisted entity. The server records it where a workflow demands an audit trail — as `opened_by_user_id` on a QA pass, as `logged_by_user_id` and `verified_by_user_id` on a defect, as `submitted_by_user_id` and `reviewed_by_user_id` on a rating submission — but it never compares it to any entity's `id`.
+
+`TalentAgent` is the single exception and is entity-backed. When `X-User-Role` is `TalentAgent`, `X-User-ID` is the `id` of the acting `VoiceTalent` row; ownership checks on any resource that references a `VoiceTalent` compare the resource's `voice_talent_id` field to `X-User-ID`. Concretely, a `TalentAgent` may only sign a talent contract whose `voice_talent_id` equals its own `X-User-ID`, and may only start or complete a recording session whose `voice_talent_id` equals its own `X-User-ID`. A mismatch on any of those three operations is rejected with `ERR_OWNERSHIP_VIOLATION` (HTTP 403).
+
+**Segregation of duties.** Three duties are split and are enforced on `X-User-ID` regardless of role. The user recorded in a QA pass's `opened_by_user_id` may not close that pass. The user recorded in a defect's `logged_by_user_id` may not verify that defect's fix. The user recorded in a rating submission's `submitted_by_user_id` may not record that submission's outcome. Any of these three collisions is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403). Note that the review-entry step imposes the same separation from a different direction: a submission may only be picked up for review by a user whose `X-User-ID` differs from the submission's `submitted_by_user_id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination and List Ordering
+
+Every list endpoint accepts two optional query parameters. `limit` controls page size: it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` controls the starting position: it defaults to 0 and its minimum accepted value is 0. A `limit` outside the range 1 through 100, or a negative `offset`, is a request-shape violation and is rejected with `ERR_INVALID_REQUEST`. List responses carry `limit`, `offset`, `total_count` and `has_more` inside `meta`, where `total_count` is the number of rows matching the filters before pagination is applied and `has_more` is true when rows remain beyond the current page.
+
+Every list endpoint returns rows sorted by `created_at` ascending — oldest first, newest last. Because several operations in this system create sibling rows in a single request (the cascade that materialises translation units, for instance), two rows can share an identical `created_at`. In that case the tie is broken by the entity's declared natural key, ascending: a title by `title_code`, a market plan by `market_code`, a string key by `key_name`, a translation unit by the `key_name` of the string key it points at, a QA pass by `pass_index`, a defect by `summary`, a rating submission by `submission_round`, a recording session by `start_utc`, a talent contract by `rights_start_utc`, a content edit by `edit_kind`, a booth by `booth_code`, and a voice talent by `talent_name`. The `id` field is never a sort key and never a tie-break.
+
+Filters on a list endpoint are all optional and combine conjunctively. The filters available on each collection are named in the workflow narratives of §3 and follow the field names of the underlying resource.
+
+### 2.4. Common Resource Properties, Path Resolution and the Logical Clock
+
+Every resource in this system carries a server-minted `id` that is a UUID string with no type prefix, and a `created_at` timestamp. Clients never supply `id`. All twelve entities in this system — titles, market plans, string keys, translation units, recording booths, voice talents, talent contracts, voice sessions, QA passes, defects, rating submissions and content edits — additionally carry an `updated_at` timestamp and an integer `version`. Both `created_at` and `updated_at` are ISO 8601 UTC timestamps rendered with exactly three fractional-second digits. `version` starts at 1 when the row is created and increments by exactly 1 on every mutation of that row, including mutations caused by a cascade the client did not directly request.
+
+Two consequences of that last clause matter a great deal. First, a single request routinely bumps the `version` of several rows: completing a recording session, for example, increments the session's own `version`, the governing talent contract's `version` and the market plan's `version`. Second, `updated_at` is refreshed on every row whose `version` was bumped, cascade-driven or not.
+
+Path identifiers are validated left to right, and the first unresolvable identifier decides the error. The path identifiers used in this API are `title_id`, `market_plan_id`, `string_key_id`, `translation_unit_id`, `recording_booth_id`, `voice_talent_id`, `talent_contract_id`, `voice_session_id`, `qa_pass_id`, `lqa_bug_id`, `rating_submission_id` and `content_edit_id`. Each resolves to `ERR_TITLE_NOT_FOUND`, `ERR_MARKET_PLAN_NOT_FOUND`, `ERR_STRING_KEY_NOT_FOUND`, `ERR_TRANSLATION_UNIT_NOT_FOUND`, `ERR_BOOTH_NOT_FOUND`, `ERR_TALENT_NOT_FOUND`, `ERR_CONTRACT_NOT_FOUND`, `ERR_SESSION_NOT_FOUND`, `ERR_QA_PASS_NOT_FOUND`, `ERR_BUG_NOT_FOUND`, `ERR_SUBMISSION_NOT_FOUND` and `ERR_CONTENT_EDIT_NOT_FOUND` respectively, all HTTP 404.
+
+Foreign keys supplied inside a request body are resolved with the same error vocabulary, and they are resolved in the order the fields are declared on the target entity. Booking a recording session therefore resolves `market_plan_id` first, then `voice_talent_id`, then `recording_booth_id`, then `talent_contract_id` — so a request that names two nonexistent rows reports the earlier one. An unknown identifier inside a content edit's `affected_string_key_ids` array surfaces as `ERR_STRING_KEY_NOT_FOUND`, and an unknown `duplicate_of_bug_id` surfaces as `ERR_BUG_NOT_FOUND`.
+
+**The logical clock.** This system has no dependency on wall-clock time. The server maintains a logical clock whose startup value is exactly `2026-08-01T00:00:00Z`, and the server must never fall back to real time before that clock has been moved. A `PlatformAdmin` moves it by supplying a `current_utc` instant; the response body for that operation is the inline object `{ current_utc: <datetime> }` rather than a domain resource. Moving the clock also recomputes the release-gate posture of every title, because the certification-window arithmetic is a function of the clock. Every deadline evaluation, usage-rights window check, expedite-fee threshold and certification-window day count in this specification reads the logical clock and nothing else.
+
+### 2.5. The Rejection Ladder: Validation Precedence
+
+When one request violates several rules at once, the server returns the error of the highest-precedence rule that is violated and does not evaluate any later rule. The ladder is fixed and total; implementers must treat it as an ordered sequence, not as a set of independent checks.
+
+1. **Authentication** — headers present and role recognised, else `ERR_UNAUTHENTICATED` (401). Applies to every endpoint.
+2. **Role permission** — the acting role appears in the target endpoint's role list, else `ERR_ROLE_NOT_PERMITTED` (403). Applies to every endpoint.
+3. **Request shape** — every required field present, every enum value inside its declared set, every integer non-negative where declared, every datetime a valid RFC 3339 UTC instant, every array actually an array; else `ERR_INVALID_REQUEST` (400). Applies to every write endpoint. Two domain-specific shape checks live at this rung: on market-plan creation the supplied `rating_board` must equal the board that governs the supplied `market_code`, and on session booking `end_utc` must be strictly after `start_utc`. A third lives here too: when the board records a rating, the supplied `assigned_rating` must equal the submission's `projected_rating_band`, and a divergent value is an `ERR_INVALID_REQUEST` at this same rung.
+4. **Path existence** — the path resource exists, leftmost identifier first, else the matching 404 from §2.4. Applies to every endpoint with a path identifier.
+5. **Body foreign-key existence** — every foreign key in the body resolves, in entity field-declaration order, else the matching 404. Applies to every write endpoint carrying foreign keys.
+6. **Referential coherence** — two supplied references must share the ancestor the domain requires, else `ERR_CROSS_PARENT_MISMATCH` (422). This rung guards the cascade that creates translation units, session booking, defect logging and content-edit creation. Specifically: a translation unit's `string_key_id` must belong to the same title as its market plan; a session's `talent_contract_id` must reference a contract whose `voice_talent_id` equals the supplied `voice_talent_id` and whose `title_id` equals the market plan's `title_id`; a defect's `translation_unit_id` must belong to the market plan of the QA pass it is filed under; and every identifier in a content edit's `affected_string_key_ids` must belong to the submission's title.
+7. **Ownership** — the `TalentAgent` ownership check of §2.1, else `ERR_OWNERSHIP_VIOLATION` (403). Applies to contract signing, session start and session completion.
+8. **Segregation of duties** — the three split duties of §2.1, else `ERR_SEGREGATION_OF_DUTIES` (403). Applies to QA-pass closing, defect verification and outcome recording.
+9. **Optimistic concurrency** — the supplied expected parent version matches, else the matching 412 from §2.6. Applies to rating-submission creation and talent-contract creation.
+10. **Uniqueness** — else the matching 409 from §2.7. Applies to title creation, market-plan creation, string-key creation and QA-pass creation.
+11. **Own-state precondition** — the target resource is in a state that permits the requested transition, else the state-specific 409 named in the relevant §3 narrative (`ERR_TITLE_STRINGS_ALREADY_LOCKED`, `ERR_MARKET_PLAN_STATE_INVALID`, `ERR_STRING_KEY_LOCKED`, `ERR_UNIT_NOT_DELIVERED`, `ERR_CONTRACT_NOT_DRAFT`, `ERR_SESSION_STATE_INVALID`, `ERR_QA_PASS_NOT_OPEN`, `ERR_QA_PASS_NOT_CLOSED`, `ERR_BUG_STATE_INVALID`, `ERR_SUBMISSION_STATE_INVALID`, `ERR_CONTENT_EDIT_NOT_PROPOSED`). Applies to every action endpoint.
+12. **Cross-entity state precondition** — an ancestor or peer is not in the required state, else `ERR_PREREQUISITE_STATE_NOT_MET` (409). This rung guards five operations, and each has its own required companion state: handing a market to the vendor requires the title's `localization_state` to be `STRINGS_LOCKED`; booking a recording session requires the talent contract to be `SIGNED` and the market plan to be `IN_LOCALIZATION`; opening a QA pass requires the market plan to be in `IN_LOCALIZATION` or `LQA`; drafting a rating submission requires the market plan to be in `LQA` or `RELEASE_READY`; and proposing a content edit requires the rating submission to be `EDITS_REQUIRED`. The same code also reports the structural preconditions of string locking (at least one `EXTRACTED` string key of the title, and a non-null `context_note` on every `EXTRACTED` key whose `ui_surface` is `LEGAL`) and of declaring a market release-ready (every QA pass of the plan `CLOSED`, at least one pass with `pass_type` `LINGUISTIC` in existence, and the title's `release_gate_state` not `BLOCKED`).
+13. **Domain business rules**, in this internal order: legal and regulatory compliance first, then rights and contractual coverage, then quality gating, then scheduling and capacity, and finally fiscal. The individual rungs are, in precedence order: `ERR_MANDATORY_DISCLOSURE_MISSING`, `ERR_CONTENT_RESTRICTION_UNRESOLVED`, `ERR_FOOTAGE_EVIDENCE_MISSING`, `ERR_CONTRACT_TERRITORY_NOT_COVERED`, `ERR_CONTRACT_RIGHTS_WINDOW_EXCEEDED`, `ERR_SESSION_SPANS_TWO_DATES`, `ERR_DEFECT_DENSITY_EXCEEDED`, `ERR_TEXT_OVERFLOW_UNRESOLVED`, `ERR_LOCALIZATION_INCOMPLETE`, `ERR_RATING_BAND_MISMATCH`, `ERR_MAX_APPEALS_EXCEEDED`, `ERR_BOOTH_WINDOW_CONFLICT`, `ERR_TALENT_DAILY_CAPACITY_EXCEEDED`, and last of all `ERR_BUDGET_OVERAGE`.
+
+Three precedence pairs are worth calling out explicitly because a single well-formed request can violate both halves. Filing a rating package that is in the wrong state *and* missing a mandatory disclosure reports the state error `ERR_SUBMISSION_STATE_INVALID`, not `ERR_MANDATORY_DISCLOSURE_MISSING` — rung 11 beats rung 13. Booking a session whose contract does not cover the market *and* whose booth window collides reports `ERR_CONTRACT_TERRITORY_NOT_COVERED`, because rights coverage outranks scheduling. Declaring a market release-ready when a restricted descriptor is unresolved *and* the budget is overrun reports `ERR_CONTENT_RESTRICTION_UNRESOLVED`, because legal compliance outranks fiscal compliance.
+
+### 2.6. Optimistic Concurrency on the Two Supersede-Capable Creates
+
+Two create operations in this system legitimately terminate or supersede an existing row, and both therefore require the client to prove it was looking at a current view of the parent before it wrote.
+
+Filing a new rating submission requires the non-optional field `expected_market_plan_version`, carrying the client's last observed `version` of the target `MarketPlan`. If that value does not equal the market plan's current `version`, the create is rejected with `ERR_STALE_MARKET_PLAN_VERSION` (HTTP 412). The guard exists because a new submission supersedes the market's prior non-terminal submission — driving it to `WITHDRAWN` — and re-bases `submission_round`; a filing built on a stale view of the market would silently discard an outcome the client never saw. A successful create increments the market plan's `version`.
+
+Creating a talent contract requires the non-optional field `expected_voice_talent_version`, carrying the client's last observed `version` of the target `VoiceTalent`. If that value does not equal the talent's current `version`, the create is rejected with `ERR_STALE_TALENT_VERSION` (HTTP 412). The guard exists because a new contract for the same talent-and-title combination supersedes the prior `SIGNED` contract by terminating it; a create built on a stale view of the talent would terminate rights the client never observed. A successful create increments the voice talent's `version`.
+
+No other endpoint in this specification accepts a version field. Every other write is unconditional with respect to concurrency.
+
+### 2.7. Uniqueness Constraints
+
+Four uniqueness rules are enforced at HTTP 409. A title's `title_code` is unique across every title row; a collision is `ERR_DUPLICATE_TITLE_CODE`. A market plan's `market_code` is unique within its `title_id`; a collision is `ERR_DUPLICATE_MARKET_CODE`. A string key's `key_name` is unique within its `title_id`; a collision is `ERR_DUPLICATE_STRING_KEY`. And a market plan may hold at most one `OPEN` QA pass per `pass_type`; attempting to open a second is `ERR_OPEN_QA_PASS_EXISTS`. Translation units need no request-time uniqueness rule: they are created exclusively by the cascade that hands a market to the vendor, which produces exactly one unit per string-key-and-market-plan pair and is the only writer of that collection.
+
+### 2.8. Precision, Rounding and Conserved Quantities
+
+All monetary amounts in this system are integer cents. Wherever a money computation names a rounding step, that step rounds half up to zero decimal places — that is, to whole cents. Translation effort is a decimal quantity: each per-key contribution is rounded half up to one decimal place and the total is rounded half up to two decimal places, and the order of those two roundings is load-bearing (see §3.2). Defect density is rounded half up to four decimal places. Risk scores are integer points and need no rounding. Booth and talent minute totals are whole minutes and are computed exactly.
+
+Two quantities in this system are **conserved**, meaning a compensating operation must return them to exactly the value they held before the operation it compensates — no proration, no cancellation fee, no residual drift.
+
+- The money quantity is a talent contract's `committed_fee_cents`. Completing a recording session and then cancelling that same session must leave `committed_fee_cents` at exactly the value it held before completion.
+- The capacity quantity is a booth's `reserved_minutes_total`. Booking a session and then cancelling that same session must return `reserved_minutes_total` to exactly its pre-booking value, and the booth interval must be released so a booking that previously collided now succeeds.
+
+### 2.9. Regional Compliance Reference Data
+
+The following market-scoped reference data is fixed and is consulted by the rating and release-readiness workflows.
+
+Each market is governed by exactly one rating board: `JP` by `CERO`, `DE` by `USK`, `BR` by `DJCTQ`, `US` by `ESRB`, `AU` by `ACB`, and `KR` by `GRAC`. A market plan's `rating_board` must equal the board for its `market_code`.
+
+Mandatory disclosures — descriptors a market's questionnaire must declare — are: `DE` requires `GAMBLING_SIM`; `KR` requires `LOOTBOX_PAID`. The markets `JP`, `BR`, `US` and `AU` have no mandatory disclosures.
+
+Restricted descriptors — descriptors that may not remain in a market's effective disclosure set at release — are: `DE` restricts `BLOOD`; `AU` restricts `DRUG_REFERENCE`; `KR` restricts `GAMBLING_SIM`. The markets `JP`, `BR` and `US` restrict nothing.
+
+Four descriptors make gameplay footage evidence mandatory in every market: `VIOLENCE_REALISTIC`, `SEXUAL_CONTENT`, `GAMBLING_SIM` and `LOOTBOX_PAID`.
+
+Rating bands are ordered by strictness from least to most restrictive: `ALL_AGES`, then `TEEN_12`, then `MATURE_15`, then `MATURE_17`, then `ADULTS_ONLY_18`. Wherever this document says one rating is "no stricter than" another, it means its position in that ordering is at or before the other's.
+
+### 2.10. Cascade Discipline and Compound State
+
+A title's `localization_state` is not set directly by any client. It is a **compound** state derived from the state of the title's market plans, and the server re-evaluates it inside the same request that changed a child. Likewise a market plan's `status` can move without a client asking, when a descendant change invalidates the market's own readiness. Three principles govern this everywhere in the specification.
+
+**Cascades are ordered and complete within the request.** When a hop list is given for an operation (as it is for edit application, session cancellation, market blocking and contract termination), every hop in that list runs before the response is returned, in the stated order, and each hop's inputs are the outputs of the hops before it. The consistency model is immediate; there is no deferred reconciliation.
+
+**Downward cascades write children; upward cascades derive parents.** Locking a string set writes every eligible child string key. Handing a market to a vendor materialises child translation units. Blocking a market cancels its scheduled sessions. In the other direction, a title's `localization_state` and its `release_gate_state` are always recomputed from the current population of market plans rather than being nudged by a delta.
+
+**Every row a cascade touches is a mutation.** Its `version` increments by 1 and its `updated_at` refreshes, exactly as if the client had written it directly. A cascade that cancels four scheduled sessions bumps four session versions.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Registering a Title and Building the Source String Set
+
+A localization programme begins when a `LocalizationProducer` registers a **Title**. The registration payload carries a `title_code` — a publisher-facing short code that must match the pattern of three to sixteen characters drawn only from uppercase letters, digits and the hyphen, and must be unique across every title — together with a human-readable `name` of one to one hundred and twenty characters, the `source_language` the strings are authored in (either `EN` or `JA`, defaulting to `EN`), a `target_release_utc` contractual ship instant, and a `release_mode` of either `SIMULTANEOUS` or `STAGGERED`, defaulting to `SIMULTANEOUS`. The supplied `target_release_utc` must be strictly after the logical clock at the moment of creation. A newly registered title opens in `localization_state` `PLANNING` with `string_lock` false, `release_gate_state` `OPEN`, and `extracted_key_count`, `market_plan_count` and `ready_market_count` all initialised to zero. Titles can be listed and filtered by `localization_state`, `release_mode` and `release_gate_state`.
+
+Source strings arrive one at a time as **String Keys**. Each carries the `title_id` of the game it belongs to, a `key_name` extraction path of one to eighty characters that is unique within the title, the `source_text` itself (one to two thousand characters), an extractor-reported `source_char_count` of at least 1, a `ui_surface` describing where the string renders (`HUD`, `MENU`, `SUBTITLE` or `LEGAL`), a `display_char_limit` of at least 1 giving the maximum number of characters the target-side UI can render before it truncates, and a `tm_match_pct` integer between 0 and 100 inclusive recording the translation-memory match percentage observed at extraction time. An optional `context_note` of one to five hundred characters — or null — carries the explanation handed to translators. Every new key starts in `status` `EXTRACTED` and increments the title's `extracted_key_count`. String keys can be listed and filtered by `title_id`, `status` and `ui_surface`.
+
+While a key is still `EXTRACTED`, a `LocalizationProducer` may amend it: the amendment payload accepts an updated `context_note`, an updated `tm_match_pct`, and a boolean `retire` flag. Setting `retire` to true moves the key's `status` to `RETIRED` and decrements the title's `extracted_key_count`. Amendment is permitted only while the key is `EXTRACTED`; a key that is already `LOCKED` or `RETIRED` rejects the change with `ERR_STRING_KEY_LOCKED`.
+
+Freezing the string set is the title's first real transition, `PLANNING → STRINGS_LOCKED`, and only a `LocalizationProducer` may drive it. Three preconditions apply. The title must currently be in `PLANNING`; a title in any other `localization_state` is rejected with `ERR_TITLE_STRINGS_ALREADY_LOCKED`. At least one string key of the title must be in `EXTRACTED`. And every `EXTRACTED` key whose `ui_surface` is `LEGAL` must have a non-null `context_note` — legal copy is never handed to a translator without context. A failure of either of the latter two conditions is reported as `ERR_PREREQUISITE_STATE_NOT_MET`. On success, the title's `localization_state` becomes `STRINGS_LOCKED`, `string_lock` becomes true (which is the derived signal that source-string edits are now blocked, and which is true for every `localization_state` other than `PLANNING`), every `EXTRACTED` key of the title cascades to `LOCKED`, and `required_unit_count` is recomputed for every market plan of the title. The title's `version` increments by 1.
+
+A title's derived counters are worth stating precisely, because they are exposed on every read of the title. `extracted_key_count` is the number of string keys of the title whose `status` is either `EXTRACTED` or `LOCKED` — retired keys are excluded. `market_plan_count` is the number of market plans of the title with no status filter at all. `ready_market_count` is the number of market plans of the title whose `status` is `RELEASE_READY`.
+
+### 3.2. Market Scope Decisions and the Translation Effort Estimate
+
+A `LocalizationProducer` adds a target market to a title by creating a **Market Plan**. The payload names the `title_id`, the `market_code` (`JP`, `DE`, `BR`, `US`, `AU` or `KR`, unique within the title), the `rating_board` that governs it, the `target_rating` the publisher intends to obtain (one of `ALL_AGES`, `TEEN_12`, `MATURE_15`, `MATURE_17` or `ADULTS_ONLY_18`), the `scope_tier` describing localization depth (`TEXT_ONLY`, `SUBTITLED`, `FULL_VOICE` or `FULL_CULTURAL`, or null until scoped), the derived `cultural_adaptation_required` flag, a `budget_cap_cents` hard budget that must be a non-negative integer, and a `required_voice_line_count` of recorded voice lines the market must accumulate before QA, defaulting to 0 and never negative. The supplied `rating_board` must equal the board that governs the supplied `market_code` per §2.9; a mismatch is `ERR_INVALID_REQUEST`. `cultural_adaptation_required` is true exactly when `scope_tier` is `FULL_CULTURAL` and false otherwise. A new market plan opens in `status` `DRAFT` with `blocked_reason` null, `text_effort_units` 0, `text_effort_variant` null, `localization_cost_cents` 0 and `overage_cents` 0, and it increments the title's `market_plan_count`. Market plans can be listed and filtered by `title_id`, `market_code`, `status` and `scope_tier`.
+
+Locking the scope moves the plan `DRAFT → SCOPED` and is a `LocalizationProducer` action that takes no body — `scope_tier` and `cultural_adaptation_required` keep whatever values were supplied at creation. The plan must be in `DRAFT`, otherwise `ERR_MARKET_PLAN_STATE_INVALID`; and the owning title's `localization_state` must no longer be `PLANNING`, because scoping is meaningless against an unfrozen string set. Scoping computes the **translation effort estimate** under its first variant and sets `required_unit_count` to the count of the title's non-retired string keys.
+
+**Translation effort arithmetic.** `text_effort_units` is a per-key sum with a pinned rounding order, and getting the order wrong produces a different number. For each row in the input set, the raw contribution is the row's `source_char_count` divided by one hundred, multiplied by a translation-memory factor, multiplied by a surface uplift. The translation-memory factor is 0.10 when the match percentage is at least 95 (the exact band), 0.45 when it is at least 75 and less than 95 (the high-fuzzy band), 0.75 when it is at least 50 and less than 75 (the low-fuzzy band), and 1.00 when it is below 50 (the new-text band). The surface uplift is 1.50 for `LEGAL`, 1.20 for `SUBTITLE`, 1.10 for `HUD` and 1.00 for `MENU`. **Each row's raw contribution is rounded half up to one decimal place first.** Only then are the rounded per-row values summed, and the sum is rounded half up to two decimal places. Summing the unrounded contributions and rounding once at the end is incorrect and yields a different result. Rows may be iterated in ascending `key_name` order; because addition of already-rounded values is associative the order does not change the answer.
+
+The two variants differ only in their input set and in which match percentage they read, and the difference is the point of the design. Under the `SCOPE_ESTIMATE` variant — computed at scoping, before any translation exists — the input set is every string key of the plan's title whose `status` is `EXTRACTED` or `LOCKED`, `RETIRED` keys excluded; the match percentage read is the key's own `tm_match_pct`, and `source_char_count` and `ui_surface` come from the key. Under the `DELIVERED_ACTUAL` variant — computed when the market enters QA and recomputed on every revert out of QA — the input set is every translation unit of this market plan whose `translation_status` is `DELIVERED`; the match percentage read is the unit's `applied_tm_match_pct`, the match the vendor actually reused, while `source_char_count` and `ui_surface` still come from the unit's linked string key. Units in `PENDING` or `DRAFTED` are excluded, which is why a content-edit revert shrinks the input set. Identical key data therefore yields a different number whenever a vendor reused a weaker match than extraction predicted. Whichever variant last ran is recorded in `text_effort_variant` as either `SCOPE_ESTIMATE` or `DELIVERED_ACTUAL`.
+
+**Localization cost arithmetic.** `localization_cost_cents` and `overage_cents` are recomputed whenever the effort figure changes — at scoping, on entry to QA, on every revert out of QA, and on completion or cancellation of a recording session. The text component is `text_effort_units` multiplied by a text rate of 4,200 cents per effort unit, multiplied by a scope multiplier of 1.00 for `TEXT_ONLY`, 1.25 for `SUBTITLED`, 1.80 for `FULL_VOICE` or 2.40 for `FULL_CULTURAL`, with that product rounded half up to whole cents. The voice component is the sum, over every recording session of this market plan whose `status` is `RECORDED`, of that session's `recorded_line_count` multiplied by the `per_line_rate_cents` of the talent contract the session was booked against; sessions in `SCHEDULED`, `IN_PROGRESS` or `CANCELLED` contribute exactly zero. A cultural surcharge applies only when `scope_tier` is `FULL_CULTURAL`, and it has a hard floor: it is the greater of 1,500,000 cents and fifteen per cent of the sum of the text and voice components rounded half up to whole cents. For any other scope tier the surcharge is zero. The subtotal is the text component plus the voice component plus the cultural surcharge. `localization_cost_cents` is the lesser of that subtotal and `budget_cap_cents`, and `overage_cents` is the subtotal minus `budget_cap_cents` when that difference is positive and zero otherwise.
+
+### 3.3. Handing a Market to the Vendor: Translation Units on Two Independent Axes
+
+When a scoped market is handed to the language vendor, the plan moves `SCOPED → IN_LOCALIZATION` under a `LocalizationProducer`. The plan must be in `SCOPED`, else `ERR_MARKET_PLAN_STATE_INVALID`. The owning title's `localization_state` must be `STRINGS_LOCKED`, else `ERR_PREREQUISITE_STATE_NOT_MET`. One further precondition applies only to the voiced tiers: when `scope_tier` is `FULL_VOICE` or `FULL_CULTURAL`, at least one talent contract for the plan's `title_id` must already be in `SIGNED` status with the plan's `market_code` present in its `territory_scope`; without such coverage the hand-off is refused with `ERR_PREREQUISITE_STATE_NOT_MET`.
+
+The hand-off is a downward cascade. The server creates exactly one **Translation Unit** per string key of the title whose `status` is `LOCKED`, each opening with `translation_status` `PENDING`, `qa_status` `NOT_CHECKED`, `target_text` null, `target_char_count` 0, `applied_tm_match_pct` null, `overflow_chars` 0 and `open_bug_count` 0. Units are created in ascending string-key `created_at` order, so a subsequent listing filtered by `market_plan_id` returns them in that same order. Each unit records the `string_key_id` of the source string and the `market_plan_id` of the market it targets. The plan's `required_unit_count` is set to the number of units created and `delivered_unit_count` to zero, and the plan's `version` increments by 1. There is no create endpoint for translation units: this cascade is their only writer, and listing with a `market_plan_id`, `string_key_id`, `translation_status` or `qa_status` filter is the only way to discover them.
+
+A translation unit carries **two independent state axes** that never move each other implicitly. The first axis, `translation_status`, tracks production and runs `PENDING → DRAFTED → DELIVERED`. The second axis, `qa_status`, tracks quality and takes the values `NOT_CHECKED`, `LING_FLAGGED`, `FUNC_FLAGGED` and `PASSED`. Writing target text touches only the first axis; flagging a defect touches only the second.
+
+A `TranslationVendor` writes target text into a unit, moving it `PENDING → DRAFTED` (or updating a unit that is already `DRAFTED`). The payload carries the `target_text` itself, its `target_char_count`, and the `applied_tm_match_pct` the vendor actually reused. The unit's owning market plan must be in `IN_LOCALIZATION`; a unit that has already reached `DELIVERED` refuses further text writes with `ERR_UNIT_NOT_DELIVERED`. On success the server stores the text and recomputes `target_char_count` as the character length of `target_text` — zero when `target_text` is null — and recomputes `overflow_chars` as the amount by which `target_char_count` exceeds the linked string key's `display_char_limit`, floored at zero. The `qa_status` axis is untouched. The unit's `version` increments by 1.
+
+Delivering a unit moves it `DRAFTED → DELIVERED` and is likewise a `TranslationVendor` action; the unit must be in `DRAFTED` (else `ERR_UNIT_NOT_DELIVERED`) and its market plan must be in `IN_LOCALIZATION`. Delivery records `applied_tm_match_pct` and recomputes the market plan's `delivered_unit_count`, incrementing both the unit's and the market plan's `version` by 1. Delivery is deliberately permitted while `overflow_chars` is greater than zero: overflow is a QA finding, not a delivery gate.
+
+On the QA axis, an `LqaTester` records an inspection outcome by supplying the target `qa_status`. This action requires the unit's `translation_status` to be `DELIVERED` — a cross-axis guard, reported as `ERR_UNIT_NOT_DELIVERED` when it fails — and it may only advance a unit to `PASSED` when the unit's `open_bug_count` is zero and its `overflow_chars` is zero. A unit may reach `PASSED` from `NOT_CHECKED`, from `LING_FLAGGED` or from `FUNC_FLAGGED`, and all three routes carry exactly the same preconditions and the same effects: `qa_status` becomes `PASSED` and the unit's `version` increments by 1. `translation_status` does not move.
+
+The two flagged values are written by defect logging rather than by an inspection call, and they are not symmetric. Logging a defect whose derived axis is linguistic drives the unit to `LING_FLAGGED`, and it may do so from `NOT_CHECKED`, from `PASSED` or from `FUNC_FLAGGED` — linguistic findings dominate the axis. Logging a defect whose derived axis is functional drives the unit to `FUNC_FLAGGED`, but only from `NOT_CHECKED` or from `PASSED`; a unit already sitting at `LING_FLAGGED` is **not** overwritten by a functional finding. Either flagging recomputes `open_bug_count` and increments the unit's `version` by 1. Because the axes are independent, a unit still in `PENDING` can legitimately be `LING_FLAGGED`.
+
+A unit's `open_bug_count` is the number of defects pointing at it whose `status` is `NEW`, `TRIAGED` or `FIX_SUBMITTED`.
+
+Closing translation and opening the QA phase moves the plan `IN_LOCALIZATION → LQA` under a `LocalizationProducer`. The plan must be in `IN_LOCALIZATION`, else `ERR_MARKET_PLAN_STATE_INVALID`. Delivery must be complete: `delivered_unit_count` must equal `required_unit_count`, and `required_unit_count` must be at least 1. The voice quota must also be met: `voice_recorded_line_count` must be at least `required_voice_line_count` — the check that matters for the voiced tiers `FULL_VOICE` and `FULL_CULTURAL`, and one that a text-only or subtitled market satisfies trivially because `required_voice_line_count` is left at its default of 0. A failure of either completeness condition is `ERR_LOCALIZATION_INCOMPLETE`. On success the plan's `text_effort_units` is recomputed under the `DELIVERED_ACTUAL` variant with `text_effort_variant` set accordingly, `localization_cost_cents` and `overage_cents` are recomputed from the new effort figure, and the plan's `version` increments by 1. The same request then bubbles the title up: if every market plan of the title now sits in `LQA` or `RELEASE_READY` and the title has at least one market plan, the title moves `STRINGS_LOCKED → CERT_WINDOW`, its `release_gate_state` is recomputed, and its `version` increments by 1.
+
+A market plan's two derived unit counters are defined as follows. `required_unit_count` is the number of string keys of the plan's title whose `status` is `LOCKED`. `delivered_unit_count` is the number of translation units of this plan whose `translation_status` is `DELIVERED`.
+
+### 3.4. Voice Talent, Booths and the Recording Calendar
+
+Voiced markets need studio capacity, talent and cleared usage rights, and each of those is modelled separately.
+
+A **Recording Booth** is registered by a `LocalizationProducer` with a `booth_code` of one to twenty-four characters that is unique across all booths, a `studio_city` of one to sixty characters naming the city the booth physically sits in, and an optional `turnaround_buffer_minutes` between 0 and 240 inclusive that defaults to 30. That buffer is the mandatory teardown-and-setup gap appended to every booking of this booth, and it is always read from the booth row and never from the session. A new booth opens with `reserved_minutes_total` at 0. Booths can be listed and filtered by `studio_city`.
+
+A **Voice Talent** is registered with a `talent_name` of one to eighty characters, a `language_code` from `JA`, `DE`, `PT_BR`, `EN` and `KO`, a `union_flag` boolean recording whether union scale rules apply (defaulting to false), and an optional `max_daily_recording_minutes` between 1 and 720 inclusive that defaults to 240 and caps the aggregate minutes the talent may be booked for on a single UTC calendar date. Reading a talent exposes `reserved_minutes_on_clock_date`, which is that aggregate evaluated for the logical clock's current UTC date. Talents can be listed and filtered by `language_code` and `union_flag`.
+
+A **Talent Contract** is the junction that licenses a talent's recordings for a specific game. Drafting one names the `voice_talent_id` and the `title_id`, a non-empty `territory_scope` array of distinct market codes drawn from `JP`, `DE`, `BR`, `US`, `AU` and `KR` that the recording is licensed for, a `media_scope` of `IN_GAME_ONLY`, `IN_GAME_AND_TRAILER` or `ALL_MEDIA`, a non-negative `buyout_fee_cents` flat fee paid on signature, a non-negative `per_line_rate_cents` used by the commitment ledger, and the usage-rights window bounds `rights_start_utc` and `rights_end_utc`, where the start must be strictly before the end. The create also carries the `expected_voice_talent_version` guard described in §2.6. A new contract opens in `status` `DRAFT` with `signed_at_utc` null and `committed_fee_cents` 0, and it increments the talent's `version`. Contracts can be listed and filtered by `voice_talent_id`, `title_id`, `status` and `media_scope`.
+
+Signing moves the contract `DRAFT → SIGNED`. A `TalentAgent` may sign only its own contract, per the ownership rule of §2.1; a `LocalizationProducer` may also sign. The contract must be in `DRAFT`, else `ERR_CONTRACT_NOT_DRAFT`, and the logical clock must be strictly before `rights_end_utc`. Signature stamps `signed_at_utc` with the logical clock and opens the commitment ledger by setting `committed_fee_cents` to `buyout_fee_cents`, incrementing the contract's `version` by 1.
+
+**The commitment ledger.** A contract's `committed_fee_cents` is its `buyout_fee_cents` plus the sum, over every recording session booked against this contract whose `status` is `RECORDED`, of that session's `recorded_line_count` multiplied by the contract's `per_line_rate_cents`. Sessions in `SCHEDULED`, `IN_PROGRESS` or `CANCELLED` contribute exactly zero. The buyout term is present from the moment the contract is `SIGNED` and is never reversed. This figure is recomputed at signature, at session completion and at session cancellation, and it is the conserved money quantity of §2.8.
+
+Terminating a signed contract moves it `SIGNED → TERMINATED` under a `LocalizationProducer`; a contract that is not `SIGNED` is refused with `ERR_CONTRACT_NOT_DRAFT`. Termination cancels every session booked against that contract whose `status` is `SCHEDULED` — sessions already `RECORDED` or `CANCELLED` are untouched — which releases those bookings' booth minutes and talent minutes, recomputes the commitment ledger, and recomputes the localization cost of every market plan affected. The contract's `version` increments by 1. A contract also terminates without anyone asking: when a new contract is created for the same `voice_talent_id` and `title_id` pair, any existing `SIGNED` contract for that pair is superseded to `TERMINATED` with its `version` incremented. That legitimate supersede is exactly why contract creation carries an optimistic-concurrency guard.
+
+Contracts expire lazily rather than on a timer. Whenever a session booking or a session start reads a contract that is `SIGNED` and the logical clock has reached or passed its `rights_end_utc`, the server first moves that contract `SIGNED → EXPIRED` and increments its `version`; the referencing request is then evaluated against the new state and consequently fails because the contract is no longer `SIGNED`. The lazy evaluation always runs before the referencing request's own preconditions.
+
+### 3.5. Booking, Running and Reversing Recording Sessions
+
+A **Voice Session** is booked by a `LocalizationProducer` with the `market_plan_id` whose voice lines are being recorded, the `voice_talent_id` booked, the `recording_booth_id` occupied, the `talent_contract_id` whose usage rights authorise the work, an inclusive `start_utc`, an exclusive `end_utc` strictly after it, and a `planned_line_count` of at least 1. The booking runs a strictly ordered gauntlet, and the order is part of the contract.
+
+First the cross-entity state preconditions: the contract must be `SIGNED` (after the lazy expiry evaluation) and the market plan must be `IN_LOCALIZATION`, else `ERR_PREREQUISITE_STATE_NOT_MET`. Then rights coverage: the contract's `territory_scope` must contain the market plan's `market_code`, and the contract's `media_scope` must not be `IN_GAME_ONLY` when the market plan's `scope_tier` is `FULL_CULTURAL`; either failure is `ERR_CONTRACT_TERRITORY_NOT_COVERED`. Then the rights window: `rights_start_utc` must be at or before `start_utc` and `end_utc` must be at or before `rights_end_utc`, else `ERR_CONTRACT_RIGHTS_WINDOW_EXCEEDED`. Then single-date containment: `start_utc` and `end_utc` must fall on the same UTC calendar date, else `ERR_SESSION_SPANS_TWO_DATES`. Then booth geometry, then talent capacity.
+
+**Booth geometry.** Every session occupies its booth for a half-open interval that begins at `start_utc` and ends at `occupied_end_utc`, which is `end_utc` advanced by the booth's `turnaround_buffer_minutes`. The interval excludes its upper bound: the instant `occupied_end_utc` is free. A new booking is rejected with `ERR_BOOTH_WINDOW_CONFLICT` when there exists any other session on the same booth whose `status` is `SCHEDULED`, `IN_PROGRESS` or `RECORDED` and whose own half-open occupied interval intersects the new one. Because both intervals are half-open, a session starting exactly at an existing session's `occupied_end_utc` is accepted, while one starting a single minute earlier is rejected. `CANCELLED` sessions are excluded from the scan entirely. Consider a booth with a thirty-minute buffer holding a session from 09:00 to 12:00: its occupied interval runs from 09:00 up to but not including 12:30, so a second session starting at 12:30 is accepted and one starting at 12:29 is not.
+
+**Booth reservation accounting.** A booth's `reserved_minutes_total` is the sum, over every session on that booth whose `status` is `SCHEDULED`, `IN_PROGRESS` or `RECORDED`, of that session's `duration_minutes` plus the booth's `turnaround_buffer_minutes`. `CANCELLED` sessions contribute nothing. The three-hour session above therefore contributes 210 minutes. This total is recomputed on every booking, on every cancellation, and on every cascaded cancellation.
+
+**Talent capacity.** A talent's reserved minutes on a given UTC calendar date is the sum of `duration_minutes` over every session for that talent whose `status` is `SCHEDULED`, `IN_PROGRESS` or `RECORDED` and whose `start_utc` falls on that date; `CANCELLED` sessions are excluded. Because a session is required to start and end on the same UTC date, no session ever straddles two date buckets. A new booking is rejected with `ERR_TALENT_DAILY_CAPACITY_EXCEEDED` when the talent's already-reserved minutes on the date of the new session's `start_utc`, plus the new session's `duration_minutes`, is strictly greater than the talent's `max_daily_recording_minutes`. Booking a talent to exactly their daily cap is therefore accepted. This is an aggregate rule, not a pairwise one: a talent capped at four hours a day who already has a three-hour session on a date accepts a further one-hour session on that date (three hours plus one hour is exactly four hours, which is not greater than the cap) but rejects a ninety-minute one — even in a completely different booth at a completely non-overlapping time.
+
+A successful booking derives `duration_minutes` as the whole minutes between `start_utc` and `end_utc`, derives `occupied_end_utc`, opens the session in `status` `SCHEDULED` with `recorded_line_count` null and `line_fee_cents` 0, and increases the booth's `reserved_minutes_total` by the session's duration plus the booth buffer. Sessions can be listed and filtered by `market_plan_id`, `voice_talent_id`, `recording_booth_id`, `talent_contract_id` and `status`.
+
+Opening the booth door moves the session `SCHEDULED → IN_PROGRESS`. Either the owning `TalentAgent` or a `LocalizationProducer` may do it. The session must be `SCHEDULED` (else `ERR_SESSION_STATE_INVALID`), the contract must be `SIGNED` after the lazy expiry evaluation, the logical clock must be at or after `rights_start_utc` and strictly before `rights_end_utc`, the logical clock must be at or after the session's `start_utc`, and the market plan must be `IN_LOCALIZATION`. The session's `version` increments by 1.
+
+Completing the session moves it `IN_PROGRESS → RECORDED` and carries the `recorded_line_count` actually achieved, which must be at least 0 and at most the session's `planned_line_count`. The session must be `IN_PROGRESS`, else `ERR_SESSION_STATE_INVALID`. Completion stores `recorded_line_count`, sets `line_fee_cents` to `recorded_line_count` multiplied by the contract's `per_line_rate_cents`, recomputes the contract's `committed_fee_cents`, recomputes the market plan's `voice_recorded_line_count` together with its `localization_cost_cents` and `overage_cents`, and increments the `version` of the session, the contract and the market plan by 1 each. A market plan's `voice_recorded_line_count` is the sum of `recorded_line_count` over its sessions whose `status` is `RECORDED`.
+
+Cancellation is the compensating operation and it is exact. A `LocalizationProducer` may cancel a session in `SCHEDULED`, `IN_PROGRESS` or `RECORDED`; an already-`CANCELLED` session refuses with `ERR_SESSION_STATE_INVALID`, and cancellation is forbidden once the owning market plan has reached `RELEASE_READY`. Cancelling a `RECORDED` session runs a five-hop reversal. Hop one sets `status` to `CANCELLED` and `line_fee_cents` to 0, and recomputes the booth's `reserved_minutes_total` and the talent's reserved minutes for the clock date — the occupation is released, so a booking that previously collided now succeeds. Hop two, caused by hop one's fee reversal, recomputes the contract's `committed_fee_cents`, which drops back by exactly the reversed line fee. Hop three, caused by hop two, recomputes the market plan's `voice_recorded_line_count`, `localization_cost_cents` and `overage_cents`. Hop four, caused by hop three, applies when the market plan is in `LQA` and its `voice_recorded_line_count` has fallen below its `required_voice_line_count`: the plan reverts `LQA → IN_LOCALIZATION`. Hop five, caused by hop four, reverts the title `CERT_WINDOW → STRINGS_LOCKED`. The session's `version` increments by 1.
+
+Cancelling a session that was only `SCHEDULED` — whether by direct request or as a cascade from a market block or a contract termination — sets `status` to `CANCELLED`, recomputes the booth's `reserved_minutes_total` and the talent's reserved minutes for the clock date, leaves `committed_fee_cents` unchanged because a scheduled session contributed no line fee, and increments the session's `version` by 1. Cancelling a session that was `IN_PROGRESS` has exactly the same effects as cancelling a `SCHEDULED` one, for the same reason.
+
+### 3.6. Quality Assurance Passes, Defect Triage and the Density Gate
+
+Quality assurance is organised into **QA Passes**. An `LqaTester` opens one over a market plan by naming the `market_plan_id`, the `pass_type` (`LINGUISTIC` for a language pass or `FUNCTIONAL` for a functional pass) and an `inspected_unit_count` of at least 1, which is the denominator of the defect-density gate. The market plan must be in `IN_LOCALIZATION` or `LQA`, else `ERR_PREREQUISITE_STATE_NOT_MET`, and the plan may hold at most one `OPEN` pass of the requested `pass_type` at a time, else `ERR_OPEN_QA_PASS_EXISTS`. The server assigns `pass_index` as one more than the number of pre-existing passes with the same `market_plan_id` and `pass_type`, so the first linguistic pass over a market is index 1 and its successor is index 2. A new pass opens in `status` `OPEN` with `opened_by_user_id` set to the acting `X-User-ID`, `reopen_count` 0, `weighted_defect_points` 0, `defect_density` 0.0000 and `closed_at_utc` null. Passes can be listed and filtered by `market_plan_id`, `pass_type` and `status`.
+
+**The defect density formula.** Severity carries weight: `S1` weighs 8 points, `S2` weighs 4, `S3` weighs 2 and `S4` weighs 1. A pass's `weighted_defect_points` is the sum of the severity weights of every defect filed under that pass whose `status` is `NEW`, `TRIAGED` or `FIX_SUBMITTED` — the *open set*. Defects in `VERIFIED`, `REJECTED` or `DUPLICATE` are excluded, which is why rejecting a defect at triage, resolving it as a duplicate, or verifying its fix all lower the density. `defect_density` is `weighted_defect_points` divided by the pass's `inspected_unit_count`, rounded half up to four decimal places. Both figures are recomputed when a defect is logged and on every defect status transition, and both are evaluated as the gate when the pass is closed.
+
+Closing a pass moves it `OPEN → CLOSED` and is subject to three conditions. The pass must be `OPEN`, else `ERR_QA_PASS_NOT_OPEN`. The owning market plan must be in `LQA`. And the density gate must pass: `defect_density` must be **strictly less than** the ceiling of 0.0500, so a density exactly equal to the ceiling is a violation and is rejected with `ERR_DEFECT_DENSITY_EXCEEDED`. The user recorded in `opened_by_user_id` may not be the one closing, per §2.1. On success `status` becomes `CLOSED`, `closed_at_utc` is stamped with the logical clock, `weighted_defect_points` and `defect_density` are frozen at the values that passed the gate, and the pass's `version` increments by 1. To make the boundary concrete: a pass with an `inspected_unit_count` of 160 carrying two open `S2` defects has eight weighted points and a density of exactly 0.0500, and its close is refused; verifying one of those two fixes leaves four points and a density of 0.0250, and the close then succeeds.
+
+Reopening moves a pass `CLOSED → OPEN` and the cycle is unbounded — a pass may go open, closed, open again as many times as the content demands. A reopen may be requested directly by an `LqaTester`, in which case the pass must be `CLOSED` (else `ERR_QA_PASS_NOT_CLOSED`) and the owning market plan must be in `IN_LOCALIZATION` or `LQA`. It also happens as a system cascade whenever the owning market plan reverts `LQA → IN_LOCALIZATION` in the same request. Either way `status` becomes `OPEN`, `reopen_count` increases by 1, `closed_at_utc` is cleared to null, and the pass's `version` increments by 1. A reopen driven by a content edit additionally drags defects back: every defect of that pass whose `status` is `VERIFIED` and whose linked translation unit was invalidated by the applied edit reverts `VERIFIED → TRIAGED`.
+
+**Defects.** An `LqaTester` logs an **LqaBug** against an `OPEN` pass by naming the `qa_pass_id`, a `bug_class`, a `severity` from `S1` through `S4`, a one-line `summary` of one to two hundred characters, and optionally the `translation_unit_id` the finding concerns. A pass that is not `OPEN` refuses the filing with `ERR_QA_PASS_NOT_OPEN`. The `bug_class` is one of `TEXT_OVERFLOW`, `TRUNCATION`, `MISTRANSLATION`, `CULTURAL`, `LEGAL_TEXT` or `FUNCTIONAL_CRASH`, and `translation_unit_id` is null when the class is `FUNCTIONAL_CRASH`. Two fields are derived and never supplied: `severity_weight` is the weight of the declared `severity`, and `axis` is `LINGUISTIC` when `bug_class` is `MISTRANSLATION`, `CULTURAL` or `LEGAL_TEXT`, and `FUNCTIONAL` when it is `TEXT_OVERFLOW`, `TRUNCATION` or `FUNCTIONAL_CRASH`. That derived axis is what decides which of the linked unit's QA values is written, as described in §3.3. A new defect opens in `status` `NEW` with `logged_by_user_id` set to the acting `X-User-ID`, `verified_by_user_id` null and `duplicate_of_bug_id` null; the linked unit's `open_bug_count` is incremented, the pass's density figures are recomputed, and when the class is `LEGAL_TEXT` the board-adjusted risk arithmetic of §3.7 changes as a consequence. Defects can be listed and filtered by `qa_pass_id`, `translation_unit_id`, `duplicate_of_bug_id`, `bug_class`, `severity` and `status`.
+
+Triage is a three-way fork out of `NEW`, driven by a `triage_action` supplied by an `LqaTester` or a `LocalizationProducer`. In all three branches the defect must be in `NEW` (else `ERR_BUG_STATE_INVALID`) and the owning pass must be `OPEN` (else `ERR_QA_PASS_NOT_OPEN`), and in all three the defect's `version` increments by 1. The branches diverge in what they do to the open set.
+
+- `ACCEPT` moves the defect `NEW → TRIAGED`. The pass's `weighted_defect_points` and `defect_density` are recomputed, and the figures do not fall, because a triaged defect stays in the open set.
+- `REJECT` moves the defect `NEW → REJECTED`. The pass's `weighted_defect_points` and `defect_density` are recomputed and drop, because the defect leaves the open set. The linked unit's `open_bug_count` is recomputed, but its `qa_status` is deliberately **not** reset — it stays flagged until an inspection outcome is recorded.
+- `DUPLICATE` moves the defect `NEW → DUPLICATE` and additionally requires a `duplicate_of_bug_id` in the payload. That identifier must reference an existing defect under the same `qa_pass_id`, with a different `id` from the defect being triaged, and whose own `status` is not `DUPLICATE`. On success `duplicate_of_bug_id` is stored on the defect, and the pass's `weighted_defect_points` and `defect_density` are recomputed and drop, because the duplicate leaves the open set.
+
+Both `REJECTED` and `DUPLICATE` are terminal: a defect in either accepts nothing further.
+
+A `TranslationVendor` claims a fix, moving the defect `TRIAGED → FIX_SUBMITTED`. The defect must be `TRIAGED` and the owning pass must be `OPEN`. The claim may optionally carry a replacement `target_text`; when it does and the defect has a linked `translation_unit_id`, that unit's `target_text` is overwritten and its `target_char_count` and `overflow_chars` are recomputed, while its `translation_status` is left untouched. The pass's density is recomputed but does not change, because `FIX_SUBMITTED` is still inside the open set. The defect's `version` increments by 1.
+
+An `LqaTester` verifies the fix, moving the defect `FIX_SUBMITTED → VERIFIED`. The defect must be `FIX_SUBMITTED`, the owning pass must be `OPEN`, and the acting `X-User-ID` must differ from the defect's `logged_by_user_id`. One further condition applies to the overflow classes: when `bug_class` is `TEXT_OVERFLOW` or `TRUNCATION`, the linked translation unit's `overflow_chars` must be zero — the text must actually fit before the finding can be signed off. On success `verified_by_user_id` is set to the acting `X-User-ID`, the pass's `weighted_defect_points` and `defect_density` are recomputed and drop because the defect leaves the open set, the linked unit's `open_bug_count` is recomputed, and the defect's `version` increments by 1.
+
+A verified defect is not permanently closed. It can be dragged back `VERIFIED → TRIAGED` by the system, and only by the system, when the owning pass reopens `CLOSED → OPEN` in the same request as a content edit that reverted the defect's linked translation unit to `PENDING`. That revert clears `verified_by_user_id` back to null, recomputes the pass's density figures upward because the defect re-enters the open set, and increments the defect's `version` by 1. The cycle `VERIFIED → TRIAGED → FIX_SUBMITTED → VERIFIED` may repeat as often as the content churns.
+
+### 3.7. Filing a Rating Package, Board Review and Outcomes
+
+A **Rating Submission** is the disclosure questionnaire plus evidence package that a market's rating board actually reviews. A `ComplianceOfficer` drafts one by naming the `market_plan_id`, a non-empty `disclosed_content_codes` array of distinct descriptors, a non-negative `footage_asset_count` giving the number of gameplay footage assets attached as evidence of the disclosed content, a `target_rating`, and the `expected_market_plan_version` guard of §2.6. The market plan must be in `LQA` or `RELEASE_READY`, else `ERR_PREREQUISITE_STATE_NOT_MET`.
+
+The nine permitted descriptors are `VIOLENCE_REALISTIC`, `VIOLENCE_STYLIZED`, `BLOOD`, `SEXUAL_CONTENT`, `LANGUAGE_STRONG`, `DRUG_REFERENCE`, `GAMBLING_SIM`, `LOOTBOX_PAID` and `HORROR`. Two stored fields are copied from the market plan rather than trusted from the client: `rating_board` is copied from the market plan's `rating_board` at creation and is what drives the base fee, and `target_rating` is likewise copied from the market plan's `target_rating`. The create payload declares `target_rating` for symmetry, but the stored value always comes from the market plan, so a divergent supplied value is simply ignored rather than rejected. The server assigns `submission_round` as one more than the number of pre-existing submissions for that `market_plan_id`, so the first filing is round 1. A new submission opens in `status` `DRAFT` with `assigned_rating`, `self_assessed_risk_score`, `board_adjusted_risk_score`, `projected_rating_band`, `submitted_by_user_id`, `reviewed_by_user_id` and `submitted_at_utc` all null, `fee_cents` 0 and `appeal_count` 0, and the create increments the market plan's `version`. Creating a submission also supersedes the market's prior non-terminal submission into `WITHDRAWN`. Submissions can be listed and filtered by `market_plan_id`, `rating_board` and `status`.
+
+Filing the package with the board moves it `DRAFT → SUBMITTED` under a `ComplianceOfficer`. The submission must be in `DRAFT`, else `ERR_SUBMISSION_STATE_INVALID`, and the owning market plan must be in `LQA`, else `ERR_PREREQUISITE_STATE_NOT_MET`. Two compliance gates then apply in order. Every descriptor that §2.9 makes mandatory for the market's `market_code` must appear in `disclosed_content_codes`; a missing one is `ERR_MANDATORY_DISCLOSURE_MISSING`. And when the effective disclosure set shares at least one descriptor with the four footage-mandatory descriptors of §2.9, `footage_asset_count` must be at least 1; a zero count is `ERR_FOOTAGE_EVIDENCE_MISSING`. On success `status` becomes `SUBMITTED`, `submitted_at_utc` is stamped with the logical clock, `submitted_by_user_id` records the acting `X-User-ID`, `self_assessed_risk_score` is computed under the `SELF_ASSESSED` variant and frozen, `fee_cents` is computed and frozen, and the submission's `version` increments by 1.
+
+**The effective disclosure set** is the concept the whole rating workflow turns on. It is the submission's `disclosed_content_codes` minus the union of the `removed_content_codes` of every content edit filed against that submission whose `status` is `APPLIED`. Proposed and withdrawn edits do not shrink it; only applied ones do.
+
+**Risk score arithmetic.** Each descriptor carries a weight: `VIOLENCE_REALISTIC` 25, `VIOLENCE_STYLIZED` 12, `BLOOD` 15, `SEXUAL_CONTENT` 20, `LANGUAGE_STRONG` 10, `DRUG_REFERENCE` 14, `GAMBLING_SIM` 18, `LOOTBOX_PAID` 22 and `HORROR` 8. The base points are the sum of the weights of every descriptor in the effective disclosure set. Three counting terms accompany it. The unresolved legal-defect count is the number of defects whose `bug_class` is `LEGAL_TEXT` and whose `status` is `NEW`, `TRIAGED` or `FIX_SUBMITTED`, counted across every QA pass of the submission's market plan regardless of that pass's `pass_type` or `status`. The proposed-edit count is the number of content edits against this submission whose `status` is `PROPOSED`. The applied-edit count is the number whose `status` is `APPLIED`.
+
+The `SELF_ASSESSED` variant is the publisher's own questionnaire arithmetic: it is the base points alone, clamped to lie between 0 and 100 inclusive, and it ignores unresolved legal defects and content edits entirely. The `BOARD_ADJUSTED` variant starts from the same base points, adds 6 points for each unresolved legal defect, adds 9 points for each proposed edit, subtracts 5 points for each applied edit, and clamps the result to lie between 0 and 100 inclusive. Both are integer point totals and need no rounding. Because the board variant works over the shrunken effective disclosure set while adding penalties the publisher's own arithmetic ignores, identical questionnaire data can land in a stricter band than the self-assessment predicted.
+
+The score maps to a band as follows: a score of 20 or below is `ALL_AGES`; 21 through 40 inclusive is `TEEN_12`; 41 through 60 inclusive is `MATURE_15`; 61 through 80 inclusive is `MATURE_17`; and 81 or above is `ADULTS_ONLY_18`. As a worked illustration, a package disclosing `VIOLENCE_STYLIZED`, `BLOOD` and `LANGUAGE_STRONG` has base points of 37, so its self-assessment lands in `TEEN_12`; if the market plan also carries one triaged `LEGAL_TEXT` defect and no edits, the board-adjusted score is 43 and the projected band is `MATURE_15`. After an applied edit removes `LANGUAGE_STRONG` and the legal defect is verified, the base falls to 27 and the applied-edit credit brings the board-adjusted score to 22, back in `TEEN_12`.
+
+**Submission fee arithmetic.** The fee is frozen at filing and its evaluation order is pinned. Each board carries a base fee in cents: `CERO` 480,000, `USK` 350,000, `DJCTQ` 300,000, `ESRB` 320,000, `ACB` 290,000 and `GRAC` 260,000. The number of days to release is the difference between the title's `target_release_utc` and the logical clock at filing time, expressed in whole days and rounded down; the title is reached through the market plan's `title_id`. Step one computes a pre-discount subtotal as the board's base fee plus 75,000 cents for each round beyond the first — that is, the base fee plus `submission_round` minus one, multiplied by the round surcharge. Step two computes an expedite fee: when the days to release is fewer than 45, it is thirty per cent of the pre-discount subtotal rounded half up to whole cents, and otherwise it is zero. Step three selects a volume discount percentage **keyed on the pre-discount subtotal only**: ten per cent when that subtotal is at least 600,000 cents, otherwise five per cent when it is at least 400,000 cents, otherwise zero. Step four computes the volume discount as the pre-discount subtotal multiplied by that percentage, rounded half up to whole cents. Step five sets `fee_cents` to the pre-discount subtotal plus the expedite fee minus the volume discount. Keying the discount tier on the post-expedite total instead of the pre-discount subtotal is incorrect and produces a different fee, even though the expedite fee is added to that same subtotal. To make it concrete: a `CERO` round-one filing made 122 days before release has a pre-discount subtotal of 480,000, no expedite fee, a five per cent tier, a discount of 24,000, and a fee of 456,000. A `CERO` round-two filing made 26 days before release has a pre-discount subtotal of 555,000, an expedite fee of 166,500, a tier keyed on 555,000 and therefore five per cent, a discount of 27,750, and a fee of 693,750.
+
+A `RatingBoardLiaison` picks the package up, moving it `SUBMITTED → UNDER_REVIEW`. The submission must be in `SUBMITTED`, else `ERR_SUBMISSION_STATE_INVALID`, and the acting `X-User-ID` must differ from `submitted_by_user_id`. Review entry records `reviewed_by_user_id`, computes `board_adjusted_risk_score` under the `BOARD_ADJUSTED` variant, sets `projected_rating_band` to the band that score maps to, and increments the submission's `version` by 1.
+
+Recording the outcome is a two-way fork driven by a `board_decision` supplied by the `RatingBoardLiaison`, and the submission must be in `UNDER_REVIEW` in both branches, else `ERR_SUBMISSION_STATE_INVALID`. The user recorded in `submitted_by_user_id` may not record the outcome.
+
+- A `board_decision` of `RATE` moves the submission `UNDER_REVIEW → RATED` and requires `assigned_rating` to be present in the payload. The supplied value must equal the submission's current `projected_rating_band`; a divergent value is rejected with `ERR_INVALID_REQUEST` at the request-shape rung of §2.5. On success `assigned_rating` is stored and the `version` increments by 1.
+- A `board_decision` of `REQUIRE_EDITS` moves the submission `UNDER_REVIEW → EDITS_REQUIRED` and requires `assigned_rating` to be absent from the payload. `assigned_rating` stays null, the `version` increments by 1, and this is the state that unlocks the content-edit path.
+
+Appealing a rating drags the submission back into review, `RATED → UNDER_REVIEW`, under a `ComplianceOfficer`. Four conditions apply. The submission must be `RATED`, else `ERR_SUBMISSION_STATE_INVALID`. The `assigned_rating` must be strictly stricter than the submission's `target_rating` — there is nothing to appeal when the board already met or beat the publisher's target — and a failure here is reported with `ERR_RATING_BAND_MISMATCH`. The `appeal_count` must be below the maximum of 2, else `ERR_MAX_APPEALS_EXCEEDED`. And at least one content edit against this submission must already be in `APPLIED` status, because an appeal without a content change has nothing new to present; that failure is `ERR_PREREQUISITE_STATE_NOT_MET`. On success `appeal_count` increases by 1, `assigned_rating` is cleared to null, `board_adjusted_risk_score` and `projected_rating_band` are recomputed under the `BOARD_ADJUSTED` variant over the current effective disclosure set, and the `version` increments by 1. The cycle `UNDER_REVIEW → RATED → UNDER_REVIEW` may therefore run at most twice per submission.
+
+Withdrawal takes a submission from any of `DRAFT`, `SUBMITTED`, `UNDER_REVIEW` or `EDITS_REQUIRED` to `WITHDRAWN`, which is terminal; an already-withdrawn submission refuses with `ERR_SUBMISSION_STATE_INVALID`. All four source states behave identically: `status` becomes `WITHDRAWN` and the `version` increments by 1. Withdrawal also withdraws every content edit under that submission whose `status` is `PROPOSED`. A `ComplianceOfficer` may withdraw explicitly, and the server withdraws automatically when a new submission round is created for the same market. A submission that came back `EDITS_REQUIRED` is never re-filed: the next round is a brand-new submission whose creation supersedes the old one into `WITHDRAWN`.
+
+For any market plan, the **governing submission** is the one with the greatest `submission_round`, which is unique by construction. Release readiness is judged against that submission and no other.
+
+### 3.8. Content Edits and the Deepest Cascade in the System
+
+When a board comes back demanding changes, a `ComplianceOfficer` or a `LocalizationProducer` proposes a **Content Edit**. The payload names the `rating_submission_id` it is filed against, an `edit_kind` of `REMOVE_CONTENT`, `CENSOR_ASSET`, `AGE_GATE` or `TEXT_REWRITE`, a `rationale` of one to five hundred characters recorded for the audit trail, an optional `affected_string_key_ids` array of distinct string-key identifiers whose delivered translations this edit invalidates (possibly empty), and an optional `removed_content_codes` array of distinct descriptors this edit removes from the effective disclosure set once applied (also possibly empty). The target submission must be in `EDITS_REQUIRED`, else `ERR_PREREQUISITE_STATE_NOT_MET`. Every identifier in `affected_string_key_ids` must resolve to a string key belonging to the same title as the submission's market plan, and `removed_content_codes` must be a subset of the submission's `disclosed_content_codes`. A new edit opens in `status` `PROPOSED` with `invalidated_unit_count` 0 and `applied_at_utc` null, and merely proposing it raises the next board-adjusted score by 9 points. Edits can be listed and filtered by `rating_submission_id`, `edit_kind` and `status`.
+
+Applying an edit is the deepest cascade in this system, driven by a `ComplianceOfficer`, and it runs `PROPOSED → APPLIED`. The edit must be `PROPOSED`, else `ERR_CONTENT_EDIT_NOT_PROPOSED`. Its submission must be in `EDITS_REQUIRED` or `RATED`. Every identifier in `affected_string_key_ids` must still resolve to a string key of the submission's market plan's title. The hops then run in this order, all within the one request:
+
+1. The edit's `status` becomes `APPLIED`, `applied_at_utc` is stamped with the logical clock, and `invalidated_unit_count` is set to the number of units reverted in hop 2.
+2. Every translation unit belonging to the submission's market plan whose `string_key_id` appears in `affected_string_key_ids` and whose `translation_status` is `DRAFTED` or `DELIVERED` reverts to `translation_status` `PENDING` with `qa_status` reset to `NOT_CHECKED` — a deliberate cross-axis reset — clearing `target_text` to null, `target_char_count` to 0, `overflow_chars` to 0 and `applied_tm_match_pct` to null, and incrementing each unit's `version` by 1. The market plan's `delivered_unit_count` is recomputed and falls. A unit that was only `DRAFTED` receives exactly the same field resets, but `delivered_unit_count` is unaffected by it because that unit was never counted.
+3. Conditionally, and only when `edit_kind` is `REMOVE_CONTENT`: every string key named in `affected_string_key_ids` whose `status` is `LOCKED` transitions to `RETIRED`, which lowers the market plan's `required_unit_count`.
+4. Because `delivered_unit_count` has fallen below `required_unit_count`, the market plan reverts `LQA → IN_LOCALIZATION`, its `text_effort_units` is recomputed under the `DELIVERED_ACTUAL` variant over the now-shrunken delivered set with `text_effort_variant` set accordingly, its `localization_cost_cents` and `overage_cents` are recomputed, and its `version` increments by 1.
+5. Because the market plan left `LQA`, every QA pass of that market plan whose `status` is `CLOSED` reopens `CLOSED → OPEN` with `reopen_count` increased by 1 and `closed_at_utc` cleared to null.
+6. Because those passes reopened, every defect of those passes whose `status` is `VERIFIED` and whose `translation_unit_id` was reverted in hop 2 goes `VERIFIED → TRIAGED`, which raises the passes' `weighted_defect_points` and `defect_density` again.
+7. Because the market plan left `LQA`, the title reverts `CERT_WINDOW → STRINGS_LOCKED` and its `release_gate_state` is recomputed, with its `version` incremented by 1.
+
+Alongside those hops, the descriptors in `removed_content_codes` leave the submission's effective disclosure set, which lowers the next board-adjusted risk score by their descriptor weights and additionally credits 5 points because the edit is now `APPLIED`. The edit's own `version` increments by 1.
+
+Withdrawing a proposed edit moves it `PROPOSED → WITHDRAWN` under a `ComplianceOfficer` or a `LocalizationProducer`; an edit that is not `PROPOSED` refuses with `ERR_CONTENT_EDIT_NOT_PROPOSED`. There is no cascade, because nothing was applied: no translation unit, QA pass or market plan changes state. The only knock-on effect is arithmetic — the 9-point proposed-edit penalty disappears from the next board-adjusted score. The edit's `version` increments by 1.
+
+### 3.9. Release Readiness, the Simultaneous-Release Gate and Blocking a Market
+
+Declaring a market shippable moves the plan `LQA → RELEASE_READY` and is reserved to a `ComplianceOfficer`. It is the most heavily gated operation in the system, and its gates are evaluated in the precedence order of §2.5 — legal compliance, then quality, then rating band, then fiscal.
+
+The plan must be in `LQA`, else `ERR_MARKET_PLAN_STATE_INVALID`. Every QA pass of the plan must be `CLOSED`, and at least one pass with `pass_type` `LINGUISTIC` must exist; the title's `release_gate_state` must not be `BLOCKED`. Failures of those structural preconditions are reported with `ERR_PREREQUISITE_STATE_NOT_MET`. Then, in order: every descriptor that §2.9 makes restricted for the plan's `market_code` must have left the governing submission's effective disclosure set — and a restricted descriptor leaves that set only by being named in the `removed_content_codes` of an `APPLIED` content edit of that submission — else `ERR_CONTENT_RESTRICTION_UNRESOLVED`. Every descriptor §2.9 makes mandatory for the market must be present in the governing submission's effective disclosure set. No translation unit of the plan may still carry `overflow_chars` greater than zero while its `qa_status` is anything other than `PASSED`, and no defect of `bug_class` `TEXT_OVERFLOW` or `TRUNCATION` may remain in `NEW`, `TRIAGED` or `FIX_SUBMITTED`; either leftover is `ERR_TEXT_OVERFLOW_UNRESOLVED`. The governing submission must be in `RATED` and its `assigned_rating` must be no stricter than the plan's `target_rating` in the strictness ordering of §2.9; a submission that is not `RATED`, or one whose assigned rating is stricter than the target, is `ERR_RATING_BAND_MISMATCH`. Finally the fiscal gate: the plan's `overage_cents` must be exactly 0, else `ERR_BUDGET_OVERAGE`.
+
+On success the plan's `status` becomes `RELEASE_READY`, the title's `ready_market_count` and `release_gate_state` are recomputed, and the plan's `version` increments by 1. The same request then bubbles the title up: when the title has at least one market plan and its `ready_market_count` now equals its `market_plan_count`, the title moves `CERT_WINDOW → SHIPPED`, its `release_gate_state` is set to `CLEARED`, and its `version` increments by 1. `SHIPPED` is terminal for a title.
+
+**The release gate posture.** A title's `release_gate_state` is recomputed whenever any of its market plans changes `status`, whenever its own `localization_state` changes, and whenever the logical clock moves. It is decided by an ordered chain in which the first matching clause wins, evaluated over the ready count (market plans of the title in `RELEASE_READY`), the blocked count (market plans in `BLOCKED`), the total count (all market plans of the title, with no status filter) and the number of whole days from the logical clock to the title's `target_release_utc`, rounded down.
+
+1. If the blocked count is at least 1, the posture is `BLOCKED`.
+2. Otherwise, if the total count is at least 1 and the ready count equals the total count, the posture is `CLEARED`.
+3. Otherwise, if the title's `release_mode` is `SIMULTANEOUS` and the ready count is at least 1 and strictly less than the total count, the posture is `AT_RISK` — a simultaneous-release title with some markets ready and some not is, by definition, at risk.
+4. Otherwise, if the total count is at least 1, the ready count is less than the total count, and the number of days to release is fewer than 30, the posture is `AT_RISK`.
+5. Otherwise the posture is `OPEN`. A title with zero market plans is therefore `OPEN`.
+
+For illustration: a `SIMULTANEOUS` title with two market plans of which one is `RELEASE_READY` matches clause 3 and is `AT_RISK`; a `STAGGERED` title with the same two plans and 122 days still to run matches no clause before the last and is `OPEN`.
+
+**Blocking.** A `ComplianceOfficer` may block a market from `SCOPED`, `IN_LOCALIZATION` or `LQA`, supplying a `blocked_reason` of `LEGAL_RESTRICTION`, `RATING_TOO_STRICT` or `CERT_DEADLINE_MISSED`. A plan in `DRAFT`, `RELEASE_READY` or already `BLOCKED` refuses with `ERR_MARKET_PLAN_STATE_INVALID`. All three permitted source states behave identically: `status` becomes `BLOCKED` and `blocked_reason` records the supplied reason (it remains null for any plan that is not `BLOCKED`); every recording session of that plan whose `status` is `SCHEDULED` is conditionally cancelled, releasing its booth and talent minutes, while sessions already `RECORDED` or `CANCELLED` are left untouched; the title's `release_gate_state` is set to `BLOCKED`; and the plan's `version` increments by 1. `BLOCKED` and `RELEASE_READY` are the two terminal statuses for a market plan.
+
+A market plan also reverts out of QA without anyone asking. Whenever its `delivered_unit_count` falls below its `required_unit_count`, or its `voice_recorded_line_count` falls below its `required_voice_line_count`, and its `status` is `LQA`, the plan reverts `LQA → IN_LOCALIZATION`. The two causes are a content edit un-delivering translation units and a session cancellation dropping the recorded line tally below quota. That revert recomputes `text_effort_units` under the `DELIVERED_ACTUAL` variant with `text_effort_variant` updated, reopens every `CLOSED` QA pass of the plan with `reopen_count` incremented, reverts the title `CERT_WINDOW → STRINGS_LOCKED`, and increments the plan's `version` by 1.
+
+The title-level half of that compensating revert has its own precondition, and it is stated in terms of the population rather than the trigger: a title moves `CERT_WINDOW → STRINGS_LOCKED` when at least one of its market plans is in `DRAFT`, `SCOPED` or `IN_LOCALIZATION`. On that transition the title's `localization_state` becomes `STRINGS_LOCKED`, its `release_gate_state` is recomputed by the ordered chain above, and its `version` increments by 1.
+
+## 4. Endpoint Definitions
+
+Every endpoint in the table below requires the `X-User-ID` and `X-User-Role` headers described in §2.1, and every path is mounted at the root with no collection prefix. Operations that bring a new resource into existence return HTTP 201; every other successful operation, including every read and every state transition on an existing resource, returns HTTP 200. Successful responses carry the created or updated resource in `data`, with the single exception of the logical-clock operation, whose body is the inline object described in §2.4. Where the table says "All roles", every one of the seven roles named in §2.1 is permitted. Request bodies, response shapes and side effects are deliberately not repeated here; they are specified in the §3 narratives.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/titles` | Register a game title. | LocalizationProducer, PlatformAdmin |
+| GET | `/titles/{title_id}` | Fetch one title with its derived counters and release-gate posture. | All roles |
+| GET | `/titles` | List titles. Filters: `localization_state`, `release_mode`, `release_gate_state`. | All roles |
+| POST | `/titles/{title_id}/lock-strings` | Freeze the source string set for translation. | LocalizationProducer, PlatformAdmin |
+| POST | `/market-plans` | Add a target market to a title. | LocalizationProducer, PlatformAdmin |
+| GET | `/market-plans/{market_plan_id}` | Fetch one market plan with its effort, cost and overage figures. | All roles |
+| GET | `/market-plans` | List market plans. Filters: `title_id`, `market_code`, `status`, `scope_tier`. | All roles |
+| POST | `/market-plans/{market_plan_id}/scope` | Lock the localization scope for this market. | LocalizationProducer, PlatformAdmin |
+| POST | `/market-plans/{market_plan_id}/start-localization` | Hand the market to the vendor and materialise its translation units. | LocalizationProducer, PlatformAdmin |
+| POST | `/market-plans/{market_plan_id}/enter-lqa` | Close translation and open the QA phase. | LocalizationProducer, PlatformAdmin |
+| POST | `/market-plans/{market_plan_id}/mark-release-ready` | Declare the market shippable, running the full gate ladder. | ComplianceOfficer, PlatformAdmin |
+| POST | `/market-plans/{market_plan_id}/block` | Block the market with a recorded reason. | ComplianceOfficer, PlatformAdmin |
+| POST | `/string-keys` | Extract one source string. | LocalizationProducer, PlatformAdmin |
+| GET | `/string-keys/{string_key_id}` | Fetch one string key. | All roles |
+| GET | `/string-keys` | List string keys. Filters: `title_id`, `status`, `ui_surface`. | All roles |
+| PATCH | `/string-keys/{string_key_id}` | Amend translator context or translation-memory match, or retire the key. | LocalizationProducer, PlatformAdmin |
+| GET | `/translation-units/{translation_unit_id}` | Fetch one translation unit with its overflow and QA state. | All roles |
+| GET | `/translation-units` | List translation units; the only discovery channel for cascade-created units. Filters: `market_plan_id`, `string_key_id`, `translation_status`, `qa_status`. | All roles |
+| PUT | `/translation-units/{translation_unit_id}` | Vendor writes or replaces the target text. | TranslationVendor, PlatformAdmin |
+| POST | `/translation-units/{translation_unit_id}/deliver` | Vendor delivers the unit. | TranslationVendor, PlatformAdmin |
+| POST | `/translation-units/{translation_unit_id}/qa-mark` | Record an inspection outcome on the unit's QA axis. | LqaTester, PlatformAdmin |
+| POST | `/booths` | Register a recording booth. | LocalizationProducer, PlatformAdmin |
+| GET | `/booths/{recording_booth_id}` | Fetch one booth with its conserved reserved-minute total. | All roles |
+| GET | `/booths` | List booths. Filter: `studio_city`. | All roles |
+| POST | `/voice-talents` | Register voice talent. | LocalizationProducer, PlatformAdmin |
+| GET | `/voice-talents/{voice_talent_id}` | Fetch one talent, with reserved minutes evaluated for the clock's UTC date. | All roles |
+| GET | `/voice-talents` | List voice talent. Filters: `language_code`, `union_flag`. | All roles |
+| POST | `/talent-contracts` | Draft a usage-rights contract between a talent and a title. | LocalizationProducer, PlatformAdmin |
+| GET | `/talent-contracts/{talent_contract_id}` | Fetch one contract with its conserved committed fee. | All roles |
+| GET | `/talent-contracts` | List contracts. Filters: `voice_talent_id`, `title_id`, `status`, `media_scope`. | All roles |
+| POST | `/talent-contracts/{talent_contract_id}/sign` | Execute the contract and open its commitment ledger. | TalentAgent, LocalizationProducer, PlatformAdmin |
+| POST | `/talent-contracts/{talent_contract_id}/terminate` | Terminate a signed contract and cancel its scheduled sessions. | LocalizationProducer, PlatformAdmin |
+| POST | `/voice-sessions` | Book a recording session against a booth, a talent and a contract. | LocalizationProducer, PlatformAdmin |
+| GET | `/voice-sessions/{voice_session_id}` | Fetch one session with its occupation end and line fee. | All roles |
+| GET | `/voice-sessions` | List sessions. Filters: `market_plan_id`, `voice_talent_id`, `recording_booth_id`, `talent_contract_id`, `status`. | All roles |
+| POST | `/voice-sessions/{voice_session_id}/start` | Open the booth door for a scheduled session. | TalentAgent, LocalizationProducer, PlatformAdmin |
+| POST | `/voice-sessions/{voice_session_id}/complete` | Record the delivered line count. | TalentAgent, LocalizationProducer, PlatformAdmin |
+| POST | `/voice-sessions/{voice_session_id}/cancel` | Cancel the session and reverse every effect it applied. | LocalizationProducer, PlatformAdmin |
+| POST | `/qa-passes` | Open a linguistic or functional QA pass over a market plan. | LqaTester, PlatformAdmin |
+| GET | `/qa-passes/{qa_pass_id}` | Fetch one QA pass with its weighted points and density. | All roles |
+| GET | `/qa-passes` | List QA passes. Filters: `market_plan_id`, `pass_type`, `status`. | All roles |
+| POST | `/qa-passes/{qa_pass_id}/close` | Close the pass, subject to the defect-density gate. | LqaTester, PlatformAdmin |
+| POST | `/qa-passes/{qa_pass_id}/reopen` | Reopen a closed pass. | LqaTester, PlatformAdmin |
+| POST | `/lqa-bugs` | Log a defect against an open QA pass. | LqaTester, PlatformAdmin |
+| GET | `/lqa-bugs/{lqa_bug_id}` | Fetch one defect. | All roles |
+| GET | `/lqa-bugs` | List defects. Filters: `qa_pass_id`, `translation_unit_id`, `duplicate_of_bug_id`, `bug_class`, `severity`, `status`. | All roles |
+| POST | `/lqa-bugs/{lqa_bug_id}/triage` | Triage a new defect: accept, reject or resolve as a duplicate. | LqaTester, LocalizationProducer, PlatformAdmin |
+| POST | `/lqa-bugs/{lqa_bug_id}/submit-fix` | Vendor claims a fix for a triaged defect. | TranslationVendor, PlatformAdmin |
+| POST | `/lqa-bugs/{lqa_bug_id}/verify` | Verify a submitted fix. | LqaTester, PlatformAdmin |
+| POST | `/rating-submissions` | Draft a rating submission for a market. | ComplianceOfficer, PlatformAdmin |
+| GET | `/rating-submissions/{rating_submission_id}` | Fetch one submission with both risk-score variants, its projected band and its frozen fee. | All roles |
+| GET | `/rating-submissions` | List submissions. Filters: `market_plan_id`, `rating_board`, `status`. | All roles |
+| POST | `/rating-submissions/{rating_submission_id}/submit` | File the questionnaire with the board. | ComplianceOfficer, PlatformAdmin |
+| POST | `/rating-submissions/{rating_submission_id}/begin-review` | Board picks the submission up for review. | RatingBoardLiaison, PlatformAdmin |
+| POST | `/rating-submissions/{rating_submission_id}/record-outcome` | Board issues its decision. | RatingBoardLiaison, PlatformAdmin |
+| POST | `/rating-submissions/{rating_submission_id}/appeal` | Appeal a rated outcome back into review. | ComplianceOfficer, PlatformAdmin |
+| POST | `/rating-submissions/{rating_submission_id}/withdraw` | Withdraw a non-terminal submission. | ComplianceOfficer, PlatformAdmin |
+| POST | `/content-edits` | Propose an edit to reach the target rating. | ComplianceOfficer, LocalizationProducer, PlatformAdmin |
+| GET | `/content-edits/{content_edit_id}` | Fetch one content edit. | All roles |
+| GET | `/content-edits` | List content edits. Filters: `rating_submission_id`, `edit_kind`, `status`. | All roles |
+| POST | `/content-edits/{content_edit_id}/apply` | Apply the edit and run its full cascade. | ComplianceOfficer, PlatformAdmin |
+| POST | `/content-edits/{content_edit_id}/withdraw` | Withdraw a proposed edit. | ComplianceOfficer, LocalizationProducer, PlatformAdmin |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock to a supplied `current_utc` instant. | PlatformAdmin |
+
+## 5. Error Code Catalogue
+
+Every error response uses the envelope of §2.2, carrying the identifier below in `data.error_id`. Trigger conditions are not repeated here; each one is specified in the §2 or §3 narrative that governs the operation it guards, and the precedence between them is fixed by the rejection ladder of §2.5.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_OWNERSHIP_VIOLATION` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_TITLE_NOT_FOUND` | 404 |
+| `ERR_MARKET_PLAN_NOT_FOUND` | 404 |
+| `ERR_STRING_KEY_NOT_FOUND` | 404 |
+| `ERR_TRANSLATION_UNIT_NOT_FOUND` | 404 |
+| `ERR_BOOTH_NOT_FOUND` | 404 |
+| `ERR_TALENT_NOT_FOUND` | 404 |
+| `ERR_CONTRACT_NOT_FOUND` | 404 |
+| `ERR_SESSION_NOT_FOUND` | 404 |
+| `ERR_QA_PASS_NOT_FOUND` | 404 |
+| `ERR_BUG_NOT_FOUND` | 404 |
+| `ERR_SUBMISSION_NOT_FOUND` | 404 |
+| `ERR_CONTENT_EDIT_NOT_FOUND` | 404 |
+| `ERR_CROSS_PARENT_MISMATCH` | 422 |
+| `ERR_STALE_MARKET_PLAN_VERSION` | 412 |
+| `ERR_STALE_TALENT_VERSION` | 412 |
+| `ERR_DUPLICATE_TITLE_CODE` | 409 |
+| `ERR_DUPLICATE_MARKET_CODE` | 409 |
+| `ERR_DUPLICATE_STRING_KEY` | 409 |
+| `ERR_OPEN_QA_PASS_EXISTS` | 409 |
+| `ERR_TITLE_STRINGS_ALREADY_LOCKED` | 409 |
+| `ERR_MARKET_PLAN_STATE_INVALID` | 409 |
+| `ERR_STRING_KEY_LOCKED` | 409 |
+| `ERR_UNIT_NOT_DELIVERED` | 409 |
+| `ERR_CONTRACT_NOT_DRAFT` | 409 |
+| `ERR_SESSION_STATE_INVALID` | 409 |
+| `ERR_QA_PASS_NOT_OPEN` | 409 |
+| `ERR_QA_PASS_NOT_CLOSED` | 409 |
+| `ERR_BUG_STATE_INVALID` | 409 |
+| `ERR_SUBMISSION_STATE_INVALID` | 409 |
+| `ERR_CONTENT_EDIT_NOT_PROPOSED` | 409 |
+| `ERR_PREREQUISITE_STATE_NOT_MET` | 409 |
+| `ERR_BOOTH_WINDOW_CONFLICT` | 409 |
+| `ERR_TALENT_DAILY_CAPACITY_EXCEEDED` | 409 |
+| `ERR_MANDATORY_DISCLOSURE_MISSING` | 422 |
+| `ERR_CONTENT_RESTRICTION_UNRESOLVED` | 422 |
+| `ERR_FOOTAGE_EVIDENCE_MISSING` | 422 |
+| `ERR_CONTRACT_TERRITORY_NOT_COVERED` | 422 |
+| `ERR_CONTRACT_RIGHTS_WINDOW_EXCEEDED` | 422 |
+| `ERR_SESSION_SPANS_TWO_DATES` | 422 |
+| `ERR_DEFECT_DENSITY_EXCEEDED` | 422 |
+| `ERR_TEXT_OVERFLOW_UNRESOLVED` | 422 |
+| `ERR_LOCALIZATION_INCOMPLETE` | 422 |
+| `ERR_RATING_BAND_MISMATCH` | 422 |
+| `ERR_MAX_APPEALS_EXCEEDED` | 422 |
+| `ERR_BUDGET_OVERAGE` | 422 |

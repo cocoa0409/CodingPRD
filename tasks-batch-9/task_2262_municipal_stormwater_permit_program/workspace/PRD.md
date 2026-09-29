@@ -1,0 +1,496 @@
+# Municipal Stormwater Permit Program API — Product Requirements Document
+
+## 1. Introduction
+
+A municipal separate storm sewer system operator holds a single discharge permit that obliges it to run six minimum control measures at once — public education, illicit discharge detection and elimination, construction runoff control, post-construction control, municipal operations pollution prevention, and monitoring — and to prove annually, with numbers rather than narrative, that each of them met a measurable goal. Today that proof lives in spreadsheets maintained by six different groups: the investigator who screens outfalls in dry weather, the inspector who reviews erosion and sediment control plans, the enforcement officer who issues notices of violation, the operations supervisor who logs street-sweeping lane miles, the billing clerk who assesses stormwater utility fees, and the program manager who has to sign the annual report. The numbers rarely agree, and the moment a late-arriving inspection or a rescinded penalty changes one of them, the report that was already assembled is quietly wrong.
+
+This API is the single system of record for the whole program. It holds the permit term and its control-measure set, the outfall inventory and its screening and monitoring history, the illicit discharge caseload from suspect indicator panel through source tracing to enforcement, the construction site file with its two independent dimensions of plan review and field condition, the inventory of permanent post-construction controls with their recorded maintenance agreements, the enforcement ladder with its penalty ledger, and the stormwater utility with its tiered fee schedule and credit programme. Every mutation that can move a measurable goal, a pollutant load, or a penalty total is required to propagate: the control measure's goal attainment recomputes, the program's compliance posture recomputes from that census, and an annual report that has already been compiled or certified against the old numbers is pushed back to draft so that it cannot be submitted with figures the program no longer stands behind.
+
+Two design commitments run through everything that follows. First, the program's posture is *derived*, never asserted: no operator can declare the program compliant, and certification of an annual report is refused outright while the derived posture is non-compliant. Second, duties are segregated at the identity level: the person who records a monitoring sample may not adjudicate it, the inspector who finalized an inspection may not issue the enforcement action that cites it, and the manager who compiled an annual report may not certify it.
+
+## 2. Global Specifications & System-Wide Principles
+
+Every path in this document is mounted under the `/stormwater` prefix, with the sole exception of the test-driving clock endpoint described in §2.4. The rules in this section apply to every endpoint unless a §3 narrative explicitly narrows them.
+
+### 2.1. Actors, Headers and Role-Based Access Control
+
+Every request — including the clock endpoint — must carry two headers. `X-User-ID` identifies the acting individual and `X-User-Role` declares the capacity in which they are acting. If `X-User-ID` is absent or does not name a known actor, the request is refused with `ERR_MISSING_USER_ID` (HTTP 401). If the role in `X-User-Role` is not among those authorised for the endpoint, the request is refused with `ERR_UNAUTHORIZED` (HTTP 403).
+
+Seven roles exist, spelled exactly as follows.
+
+- `StormwaterProgramManager` — owns the permit term, the minimum control measure set, monitoring assessment and the annual report. Exclusively creates, activates and expires permit terms; registers and retires control measures; retires outfalls; and opens, compiles, certifies and submits annual reports.
+- `IDDEInvestigator` — screens outfalls and works the illicit discharge caseload. Exclusively starts tracing, identifies sources, reopens tracing and resolves cases. Cannot adjudicate a wet-weather sample at all and cannot issue enforcement.
+- `ConstructionInspector` — exclusively submits and reviews erosion and sediment control plans, closes stabilised sites, and opens, populates and finalizes both inspection programmes. Holds no stop-work authority of its own: a site is stopped either by the finalize cascade or by an `EnforcementOfficer`.
+- `EnforcementOfficer` — holds stop-work and release authority and the whole enforcement ladder: issuing, escalating, closing and rescinding actions. Cannot create or finalize the inspection that documents a violation.
+- `MunicipalOperationsSupervisor` — runs municipal operations pollution prevention: exclusively appends street-sweeping runs, and shares outfall creation, observation recording, sample adjudication, load assessment and measurable-goal progress reporting.
+- `UtilityBillingClerk` — runs the utility: exclusively opens accounts, records impervious remeasurements, executes billing runs, and reviews and revokes credit applications. Cannot resubmit a returned application; only its applicant can.
+- `PropertyOwner` — a billed parcel owner. Exclusively resubmits its own returned credit application, may file an application jointly with the clerk, and may read its own account, its credit applications and the permanent-control inventory. The entire operational surface — screenings, cases, inspections, enforcement and reports — is closed to it.
+
+Identity semantics differ by role, and the difference matters for ownership checks. When `X-User-Role` is `PropertyOwner`, `X-User-ID` is the `id` of the acting `StormwaterAccount`; ownership checks on any resource that references a `StormwaterAccount` compare the resource's account foreign key to `X-User-ID`, and a fee credit application additionally records the submitting owner in `applicant_user_id` and compares it on resubmission. When `X-User-Role` is any of `StormwaterProgramManager`, `IDDEInvestigator`, `ConstructionInspector`, `EnforcementOfficer`, `MunicipalOperationsSupervisor` or `UtilityBillingClerk`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it wherever a transition captures the acting operator — as `recorded_by_user_id` and the reviewer of an observation, as `finalized_by_user_id` on an inspection, as `issued_by_user_id` on an enforcement action, as `reviewed_by_user_id` on a credit application, and as `compiled_by_user_id` and `certified_by_user_id` on an annual report — but never compares it to any entity's `id`.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Collection Retrieval: Pagination, Ordering and Filters
+
+List endpoints are paginated by two query parameters. `limit` is the maximum number of rows returned; it defaults to 10, has a minimum of 1 and a maximum of 100. `offset` is the number of rows skipped before the page begins; it defaults to 0 and may not be negative. A `limit` outside the range 1 to 100 inclusive, or a negative `offset`, is a request-shape failure and yields `ERR_VALIDATION` (HTTP 400). Every list response reports `limit`, `offset`, `total_count` and `has_more` in the `meta` object of the envelope.
+
+Unless a narrative says otherwise, list endpoints return rows sorted by `created_at` in ascending order.
+
+Collections accept optional equality filters, and a filter that is omitted does not narrow the result. Permit terms filter on `status` and `compliance_posture`. A term's control measures filter on `measure_code`, `status` and `goal_status`; its outfalls on `screening_status`, `tmdl_status`, `status` and `priority_tier`; its construction sites on `plan_status` and `field_status`; its accounts on `parcel_class`; its annual reports on `status`. Observations at one outfall filter on `observation_type`, `validation_status` and `screening_result`. Illicit discharge cases filter on `outfall_id`, `origin_observation_id` and `status`. Inspections filter on `inspection_type`, `construction_site_id`, `post_construction_facility_id` and `status`. Enforcement actions filter on `illicit_discharge_case_id`, `construction_site_id`, `post_construction_facility_id`, `source_inspection_id`, `status` and `action_type`. Fee credit applications filter on `stormwater_account_id`, `post_construction_facility_id` and `status`. Permanent controls under one site filter on `ownership` and `agreement_status`.
+
+### 2.4. Common Resource Properties and the Logical Clock
+
+All twelve stored resource kinds — permit terms, control measures, outfalls, outfall observations, illicit discharge cases, construction sites, post-construction facilities, inspections, enforcement actions, stormwater accounts, fee credit applications and annual reports — carry the same four system-managed properties:
+
+- `id` (string): a server-minted UUID with no type prefix.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits, recording when the row was first stored.
+- `updated_at` (string): an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the row, including mutations that only rewrite derived fields.
+- `version` (integer): an integer that increments by one on every mutation of the row.
+
+Time in this system is a logical clock, not wall-clock time. Before any request is made the clock reads exactly `2026-08-01T00:00:00Z`, and it must never fall back to the host's real time. An administrative test-driving capability at `POST /_clock/set_current_utc` accepts a `to_iso8601` instant and answers with the newly set instant as `current_utc`; every subsequent timestamp assignment, interval comparison, cooling-off evaluation and reporting-window test reads the new value. Every field described below as "the logical clock instant" of some event is stamped from this clock at the moment the transition succeeds.
+
+### 2.5. Order of Rejection: The Validation Precedence Ladder
+
+When a request violates more than one rule, exactly one error is returned: the one belonging to the highest-precedence violated rule. Nothing is persisted when a request is rejected — no partial writes, no counter increments, no cascades. The ladder, from first-evaluated to last, is:
+
+1. **Actor identification.** A missing or unknown `X-User-ID` yields `ERR_MISSING_USER_ID` (401).
+2. **Role authorisation.** A role not listed for the endpoint yields `ERR_UNAUTHORIZED` (403). Because this precedes every existence and state check, an unauthorised caller can never learn whether a resource exists or what state it is in.
+3. **Request shape.** Missing required body fields, wrong types, unknown enum members, out-of-range numbers, malformed ISO 8601 values and out-of-range pagination all yield `ERR_VALIDATION` (400). This layer also covers the cross-field shape rules: `term_end_date` must be strictly later than `term_start_date`, `disturbed_acres` must be at least 1.00, `requested_credit_pct` must be greater than 0.0000 and at most 0.5000, `weight` must be between 1 and 5 inclusive, an inspection's `period_end` may not precede its `period_start`, and a term declaring `tmdl_applicable` true must supply both `tmdl_pollutant` and `tmdl_wla_lb_per_year`.
+4. **Path existence.** Every identifier in the path must resolve to a stored row, yielding the 404 belonging to that entity kind.
+5. **Body referential integrity.** Every foreign key supplied in a request body must resolve, again yielding the entity's 404. This layer sits deliberately above every fiscal and safety rule: a credit application naming a facility that does not exist is `ERR_FACILITY_NOT_FOUND`, never a credit-ceiling failure.
+6. **Optimistic concurrency.** The version guards of §2.6 fire here, before any state or business rule, so that a stale writer is told it is stale rather than told its business intent is wrong.
+7. **Scoped uniqueness.** `permit_number` is unique across all permit terms; `measure_code` is unique per term; `outfall_code` is unique per term; `parcel_id` is unique per term. Collisions yield `ERR_DUPLICATE_PERMIT_NUMBER`, `ERR_DUPLICATE_MEASURE_CODE`, `ERR_DUPLICATE_OUTFALL_CODE` and `ERR_DUPLICATE_PARCEL_ID` respectively, all HTTP 409.
+8. **State-machine legality.** The target row must be in a state from which the requested transition exists; otherwise the entity's state error is returned with HTTP 409 — `ERR_PERMIT_TERM_NOT_ACTIVE`, `ERR_MEASURE_RETIRED`, `ERR_OUTFALL_RETIRED`, `ERR_CASE_INVALID_STATE`, `ERR_SITE_NOT_ACTIVE_DISTURBANCE`, `ERR_SITE_NOT_STOPPED`, `ERR_SITE_CLOSED`, `ERR_PLAN_NOT_IN_REVIEW`, `ERR_INSPECTION_NOT_DRAFT`, `ERR_OBSERVATION_NOT_PENDING`, `ERR_ENFORCEMENT_NOT_OPEN`, `ERR_CREDIT_APPLICATION_NOT_SUBMITTED`, `ERR_CREDIT_APPLICATION_NOT_RETURNED`, `ERR_CREDIT_APPLICATION_NOT_APPROVED`, `ERR_REPORT_NOT_DRAFT`, `ERR_REPORT_NOT_COMPILED`, `ERR_REPORT_NOT_CERTIFIED` or `ERR_AGREEMENT_ALREADY_RECORDED`.
+9. **Owning-term activity.** Field, enforcement, billing and compilation work happens only under an active permit term. Recording an observation, appending a sweeping run, starting tracing on a case, reviewing an erosion and sediment control plan, exercising stop-work authority, opening an inspection, issuing an enforcement action, executing a billing run and compiling an annual report all require the owning term's `status` to be `ACTIVE`, and otherwise yield `ERR_PERMIT_TERM_NOT_ACTIVE` (409).
+10. **Activation completeness.** Activating a term without its full measure set yields `ERR_MEASURE_SET_INCOMPLETE` (422).
+11. **Subject and field-set coherence.** Polymorphic and type-conditional shape rules evaluate together at this level: `ERR_INSPECTION_SUBJECT_MISMATCH`, `ERR_ESC_PLAN_NOT_APPROVED` at inspection creation, `ERR_ENFORCEMENT_SUBJECT_INVALID`, `ERR_SOURCE_INSPECTION_NOT_FINALIZED` and `ERR_OBSERVATION_TYPE_FIELDS_INVALID` (all 422). The plan-approval rule sits above the temporal overlap rule of level 16, so a returned plan reports the plan problem even when the requested coverage period also overlaps an existing inspection.
+12. **Segregation of duties.** `ERR_SELF_VALIDATION_FORBIDDEN`, `ERR_INSPECTOR_CANNOT_ENFORCE` and `ERR_SAME_USER_CERTIFICATION` (all 409), covering sample adjudication, enforcement issuance and report certification respectively.
+13. **Cross-entity dependency guards.** An aggregate may not reach a quiet state while its dependents are live: `ERR_SITE_HAS_OPEN_ENFORCEMENT` and `ERR_ESC_PLAN_NOT_APPROVED` on stop-work release, `ERR_SITE_HAS_OPEN_ENFORCEMENT` on site closure, `ERR_CASE_HAS_OPEN_ENFORCEMENT` on case resolution and on reopening tracing, `ERR_OPEN_REPORTS_EXIST` on term expiry, and `ERR_OUTFALL_HAS_OPEN_CASES` on outfall retirement (all 409).
+14. **Completion prerequisites.** `ERR_CLOSE_REQUIRES_MAINTENANCE_AGREEMENT` on site closure, and `ERR_INSPECTION_NO_FINDINGS` and `ERR_AGREEMENT_NOT_RECORDED` on inspection finalization (all 422).
+15. **Cycle and ladder ceilings.** `ERR_REOPEN_LIMIT_REACHED`, `ERR_RESUBMISSION_LIMIT_REACHED` and `ERR_LADDER_EXHAUSTED` (422) and `ERR_RESCIND_AFTER_ESCALATION` (409). At the same level, resubmission by someone other than the original applicant yields `ERR_NOT_APPLICANT` (403).
+16. **Temporal rules.** `ERR_SCREENING_INTERVAL_VIOLATION`, `ERR_INSPECTION_PERIOD_OVERLAP`, `ERR_ESCALATION_COOLING_OFF`, `ERR_TERM_END_NOT_REACHED` and `ERR_REPORT_SUBMISSION_WINDOW_CLOSED` are all 409; the reporting-window containment failure `ERR_REPORT_WINDOW_OUTSIDE_TERM` is returned with 422. The cooling-off rule sits above the fiscal no-decrease rule of level 19, so an early escalation that also lowers the documented violation days reports the cooling-off failure.
+17. **Sweeping-run overlap.** `ERR_SWEEPING_RUN_OVERLAP` (409).
+18. **Monitoring adjudication.** `ERR_PENDING_SAMPLES_IN_WINDOW` (422) on compilation.
+19. **Fiscal rules.** `ERR_CREDIT_CEILING_EXCEEDED` and `ERR_FACILITY_NOT_CREDIT_ELIGIBLE` on credit review, and `ERR_PENALTY_DECREASE_FORBIDDEN` on escalation (all 422).
+20. **Posture gate.** `ERR_POSTURE_NON_COMPLIANT` (422) on certification — the end of every cascade chain.
+21. **Aggregate capacity.** `ERR_SWEEPING_CAPACITY_EXCEEDED` (422), evaluated last because each individual run is plausible and only the monthly total is not.
+
+### 2.6. Optimistic Concurrency on Accounts and Permit Terms
+
+Three write operations are guarded by an optimistic concurrency check, and on those three the version field is a required input, never optional. No other endpoint accepts a version field.
+
+Recording a remeasured impervious area on a stormwater account requires `expected_stormwater_account_version` carrying the client's last observed `version` of that account. If the value does not equal the account's current `version`, the request is rejected with `ERR_ACCOUNT_VERSION_CONFLICT` (HTTP 412) and no field changes. The guard exists because a remeasurement rewrites `eru_units`, the whole fee chain and the account's net fee; an update computed against a superseded impervious area must not land.
+
+Creating a fee credit application likewise requires `expected_stormwater_account_version` equal to the target account's current `version`, and a mismatch is rejected with `ERR_ACCOUNT_VERSION_CONFLICT` (HTTP 412) with no application row created. The credit ceiling is evaluated against the account's current credit pool, so an application prepared against an outdated account snapshot must be refused.
+
+Compiling an annual report requires `expected_permit_term_version` equal to the current `version` of the report's permit term. A mismatch is rejected with `ERR_PERMIT_TERM_VERSION_CONFLICT` (HTTP 412) and the report stays in `DRAFT`. Compiled statistics freeze the term's posture and penalty ledger, so a compile prepared before a cascade moved either must be refused rather than publishing measurable goals the program has already outgrown.
+
+### 2.7. Numeric Precision: Cents, Percentages, Pounds and Scores
+
+Every rounding in this system is **round half up**, and the number of decimal places is fixed per quantity.
+
+- Money is always an integer number of cents. Every intermediate money value that the calculation narratives describe as rounded is rounded to whole cents before it participates in the next step.
+- `eru_units` carries 2 decimal places.
+- Credit percentages — `requested_credit_pct`, `approved_credit_pct`, `total_credit_pct` and `last_billed_credit_pct` — carry 4 decimal places and are expressed as fractions of one, so a five percent credit is 0.0500.
+- Attainment and coverage percentages — `attainment_pct`, `outfall_screening_coverage_pct` and `compliance_index` — carry 2 decimal places.
+- Per-sample pollutant loads carry 4 decimal places; gross, credit and net annual loads carry 2 decimal places.
+- Lane miles carry 2 decimal places.
+- `deficiency_score` is an integer, as are all counters.
+
+Threshold comparisons are taken literally in the direction stated by each narrative, and a value sitting exactly on a limit is treated as stated rather than as an exceedance by default.
+
+### 2.8. Program Posture, Derived Ledgers and the Cascade Chain
+
+No derived field in this system is ever supplied by a client. Counters, percentages, postures, ledger totals and eligibility flags are recomputed by the server whenever any input to them changes, and each such recomputation is itself a mutation of the row that owns the field: `updated_at` is refreshed and `version` increments even when the only difference is a recomputed number.
+
+Recomputation propagates upward along a fixed chain. A change to an outfall's screening or load assessment, to a control measure's goal attainment, or to the enforcement ledger changes the owning permit term's derived fields: `behind_measure_count`, `exceeding_outfall_count`, `compliance_posture`, `total_assessed_penalty_cents`, `projected_annual_revenue_cents` and `funding_adequacy_status`. A parent transition can also propagate downward: expiring a term retires its still-active control measures and outfalls.
+
+At the top of the chain sits annual report invalidation. Five events can invalidate a report: finalizing an inspection, recording an outfall observation, issuing an enforcement action, rescinding an enforcement action, and reporting measurable-goal progress on a control measure. When one of these events changes either the term's `compliance_posture` or its `total_assessed_penalty_cents`, **and** the triggering event's own timestamp falls inside the closed reporting window of a report of that term whose `status` is `COMPILED` or `CERTIFIED`, that report is driven back to `DRAFT`. The invalidation resets `status` to `DRAFT`, clears `compiled_at`, `compiled_by_user_id`, `certified_at`, `certified_by_user_id` and `certification_statement`, increments `invalidation_count` by one, and writes `invalidated_reason` — `POSTURE_CHANGED` when the posture moved, `PENALTY_LEDGER_CHANGED` when the penalty total moved. A report whose `status` is already `SUBMITTED` is immune: no cascade may touch it.
+
+### 2.9. Segregation of Duties Across the Compliance Record
+
+Three checks compare the acting `X-User-ID` against an identity already stored on the row, and all three return HTTP 409. Adjudicating a wet-weather sample requires the actor to differ from the observation's `recorded_by_user_id`, otherwise `ERR_SELF_VALIDATION_FORBIDDEN`. Issuing an enforcement action that cites a source inspection requires the actor to differ from that inspection's `finalized_by_user_id`, otherwise `ERR_INSPECTOR_CANNOT_ENFORCE`. Certifying an annual report requires the actor to differ from its `compiled_by_user_id`, otherwise `ERR_SAME_USER_CERTIFICATION`. In addition, resubmitting a returned credit application requires the actor to equal that application's `applicant_user_id`, otherwise `ERR_NOT_APPLICANT` (HTTP 403) — an ownership check nested inside an already-permitted role.
+
+### 2.10. Interval Arithmetic: Screening Buffers, Coverage Periods and Sweeping Runs
+
+Three different interval conventions coexist, and they are deliberately not the same.
+
+The dry-weather screening buffer is symmetric and open. Two dry-weather screenings at the same outfall must be separated by at least 14 days, measured in both directions from `observed_at`: exactly 14 days apart is accepted, 13 days and 23 hours apart in either direction is refused with `ERR_SCREENING_INTERVAL_VIOLATION`. Because the test is symmetric, back-dating a screening into the buffer of a screening already recorded later is refused too.
+
+An inspection's coverage period is a closed interval bounded by `period_start` and `period_end` inclusive, and two inspections of the same `inspection_type` on the same subject may not overlap. Touching endpoints count as an overlap: a `period_start` equal to another inspection's `period_end` is a conflict, reported as `ERR_INSPECTION_PERIOD_OVERLAP`.
+
+A sweeping run's interval is half-open, running from `run_start_date` inclusive to `run_end_date` exclusive, and two runs on the same outfall may not overlap. A run starting on the very day a previous run ends is therefore accepted; a genuine overlap is refused with `ERR_SWEEPING_RUN_OVERLAP`.
+
+A reporting window is closed on both ends and covers whole days: it begins at 00:00:00Z on `reporting_period_start` and ends at 23:59:59Z on `reporting_period_end`. Every statistic in §3.9 counts events whose relevant timestamp falls inside that window.
+
+### 2.11. Nested Collection Reads and Path Resolution
+
+Several collections are reachable both at their own top-level path and as a sub-resource read under the row they belong to: a term's control measures, outfalls, construction sites, accounts and annual reports; an outfall's observations; a site's permanent controls. For any path holding more than one identifier, the server validates identifiers strictly left to right and returns the 404 belonging to the *first* identifier that does not resolve. A request for the observations of an outfall that does not exist is `ERR_OUTFALL_NOT_FOUND`; the server does not proceed to consider the observation filters. The same precedence governs writes: the parent's existence, and then its operational status, are settled before any child-level or body-level rule is evaluated.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Establishing the Permit Term and its Minimum Control Measure Set
+
+A `StormwaterProgramManager` opens the program by creating a **permit term**, supplying the `permit_number` that the permitting authority issued (1 to 64 characters, unique across all terms), the `term_start_date` and the `term_end_date` as ISO 8601 dates. Where a waste load allocation applies, the manager sets `tmdl_applicable` to true and must then also name the `tmdl_pollutant` — one of `TOTAL_PHOSPHORUS`, `TOTAL_NITROGEN`, `SEDIMENT` or `BACTERIA` — and the annual ceiling `tmdl_wla_lb_per_year`, a non-negative number carried to 2 decimal places. `tmdl_applicable` defaults to false, in which case both `tmdl_pollutant` and `tmdl_wla_lb_per_year` remain null. Two utility parameters are also set at this point and both are optional: `eru_sqft`, the equivalent residential unit denominator in square feet of impervious area, which defaults to 3000 and may not be below 100; and `funding_target_cents`, the annual program funding target in cents, which defaults to 0 and may not be negative. A newly created term has `status` `DRAFT`, `compliance_posture` `COMPLIANT`, and `behind_measure_count`, `exceeding_outfall_count`, `total_assessed_penalty_cents` and `projected_annual_revenue_cents` all at 0, with `funding_adequacy_status` reading `ADEQUATE`; `activated_at`, `expired_at` and `last_compiled_at` are all null.
+
+Under the term the manager registers **control measures**, one per minimum control measure, by supplying the `permit_term_id` of the owning term, the `measure_code`, and the `measurable_goal_target` for the permit year — a non-negative number with 2 decimal places, counted in whatever unit the measure uses, whether education events, inspections or lane miles. The six `measure_code` values are `PUBLIC_EDUCATION`, `ILLICIT_DISCHARGE`, `CONSTRUCTION_RUNOFF`, `POST_CONSTRUCTION`, `MUNICIPAL_OPERATIONS` and `MONITORING`. An optional `weight` between 1 and 5 inclusive, defaulting to 1, fixes how heavily the measure counts in the annual compliance index. Two further optional flags belong to municipal operations and default to false: `salt_storage_covered`, asserting that the salt storage pile is covered, and `fleet_wash_recycle`, asserting that fleet wash water is recycled rather than discharged. A new measure starts with `status` `ACTIVE`, `goal_status` `PENDING`, `measurable_goal_actual` and `attainment_pct` at 0.00, `open_case_count`, `enforcement_count` and `swept_lane_miles_ytd` at their zero values, and `last_progress_reported_at` null.
+
+Activation is the gate that opens field work. Moving a term from `DRAFT` to `ACTIVE` requires that all six `measure_code` values exist as control measures of that term with `status` `ACTIVE`, and, when `tmdl_applicable` is true, that at least one outfall of the term has `status` `ACTIVE`. Either shortfall is refused with `ERR_MEASURE_SET_INCOMPLETE`; an attempt to activate a term that is not in `DRAFT` is `ERR_PERMIT_TERM_NOT_ACTIVE`. A successful activation stamps `activated_at` from the logical clock, recomputes `compliance_posture`, `behind_measure_count` and `exceeding_outfall_count`, and increments the term's `version` by one.
+
+The reverse transition, `ACTIVE → EXPIRED`, is available to the same manager once the logical clock has reached or passed `term_end_date`; before that instant it is refused with `ERR_TERM_END_NOT_REACHED`. Expiry also requires that no annual report of the term is still in `DRAFT`, `COMPILED` or `CERTIFIED`; if one is, the request is refused with `ERR_OPEN_REPORTS_EXIST`. Expiry stamps `expired_at`, retires every control measure of the term still in `ACTIVE` and every outfall of the term still in `ACTIVE` — each retirement writes `RETIRED` into the child's `status`, leaves the measure's `goal_status` dimension untouched, and increments the child's `version` by one — and increments the term's own `version` by one. `EXPIRED` is terminal.
+
+A single control measure can also be retired on its own, but only once its owning term is no longer `ACTIVE`, because an `ACTIVE` term must carry all six minimum control measures at all times; retiring while the term is still `ACTIVE`, or acting on a measure that is already `RETIRED`, is refused with `ERR_MEASURE_RETIRED`. Retirement removes the row from `behind_measure_count`, from the annual `measurable_goals_met_count` and from the compliance index, recomputes the term's `behind_measure_count` and `compliance_posture`, and increments the measure's `version` by one. Reporting progress on a `RETIRED` measure is likewise `ERR_MEASURE_RETIRED`, and any operation naming a measure that does not exist is `ERR_CONTROL_MEASURE_NOT_FOUND`.
+
+**Measurable-goal attainment** is recomputed whenever progress is reported, whenever a sweeping run lands, and on every cascade that touches a measure's `open_case_count` or `enforcement_count`. The manager or a `MunicipalOperationsSupervisor` reports progress by supplying `measurable_goal_actual`, which requires the measure's `status` to be `ACTIVE`; the call stamps `last_progress_reported_at` from the logical clock. `attainment_pct` is 0.00 when `measurable_goal_target` is 0; otherwise it is 100 multiplied by `measurable_goal_actual`, divided by `measurable_goal_target`, rounded to 2 decimal places. The `goal_status` dimension is then decided by the following tests, evaluated strictly in this order, with the first matching test deciding the outcome and no later test consulted:
+
+1. For the `ILLICIT_DISCHARGE` measure, if `open_case_count` is greater than three, the result is `BEHIND`.
+2. For the `CONSTRUCTION_RUNOFF` measure, if `enforcement_count` is two or more, the result is `BEHIND`.
+3. For the `MUNICIPAL_OPERATIONS` measure, if either `salt_storage_covered` is false or `fleet_wash_recycle` is false, the result is `BEHIND`.
+4. If `last_progress_reported_at` is null and `measurable_goal_actual` is 0, the result is `PENDING`.
+5. If `attainment_pct` is at least 100.00, the result is `MET`.
+6. If `attainment_pct` is at least 75.00, the result is `ON_TRACK`.
+7. Otherwise the result is `BEHIND`.
+
+The first three tests are compliance **gates**, and a gate wins outright: a measure sitting at 125.00 percent attainment is still `BEHIND` while its gate is tripped. That is the entire purpose of the gate. A measure can therefore move from `MET` or `ON_TRACK` to `BEHIND` without anybody reporting worse numbers — the illicit-discharge gate flips it when a screening cascade pushes `open_case_count` above three, and the construction-runoff gate flips it when a finalize cascade raises `enforcement_count` to two or more — and it moves back from `BEHIND` to `MET` or `ON_TRACK`, reverting to whichever band `attainment_pct` earns, only once every gate override for its `measure_code` has cleared, which happens when a case is resolved or an enforcement action is rescinded. Every one of these movements recomputes the term's `behind_measure_count` and `compliance_posture`, and the posture change may in turn invalidate a compiled or certified annual report.
+
+**Compliance posture** is the census the whole program is judged by, recomputed on any change to a measure's `goal_status` or `status` or to an outfall's `tmdl_status` or `status` inside the term. `behind_measure_count` is the number of control measures of the term whose `status` is `ACTIVE` and whose `goal_status` is `BEHIND`. `exceeding_outfall_count` is the number of outfalls of the term whose `status` is `ACTIVE` and whose `tmdl_status` is `EXCEEDING`. If `behind_measure_count` is two or more, or if `behind_measure_count` is at least one while `exceeding_outfall_count` is also at least one, `compliance_posture` becomes `NON_COMPLIANT`. Otherwise, if `behind_measure_count` is exactly one, or `exceeding_outfall_count` is at least one, it becomes `AT_RISK`. In every other case it is `COMPLIANT`. A `NON_COMPLIANT` posture blocks annual report certification, which is how a single behind measure eventually reaches the end of the cascade chain.
+
+### 3.2. Outfall Inventory and Dry-Weather Screening
+
+The **outfall inventory** is built by a `StormwaterProgramManager` or a `MunicipalOperationsSupervisor`, each new outfall naming the `permit_term_id` of its term, the field `outfall_code` that identifies it (1 to 32 characters, unique within the term), the `receiving_water` it discharges to, the `drainage_area_acres` of contributing area (which must be greater than 0), and the `priority_tier` assigned during inventory, one of `HIGH`, `MEDIUM` or `LOW`. Two non-negative monitoring parameters are captured at the same time and are used later to value the samples an outfall still owes: `baseline_concentration_mg_per_l` and `design_runoff_kl`. An optional `sweeping_capacity_lane_miles_per_month`, defaulting to 0.00 and never negative, records the aggregate street-sweeping capacity serving the outfall's drainage area. A new outfall has `status` `ACTIVE`, `screening_status` `NOT_SCREENED`, `tmdl_status` `NOT_ASSESSED`, an empty `sweeping_runs` list, `swept_lane_miles_ytd` at 0.00, `screening_count` and `open_case_count` at 0, `last_screened_at` and `last_assessed_year` null, and `last_assessed_gross_load_lb`, `last_assessed_credit_lb` and `last_assessed_net_load_lb` at 0.00.
+
+Retiring an outfall is reserved to the manager and requires `open_case_count` to be exactly 0; otherwise the request is refused with `ERR_OUTFALL_HAS_OPEN_CASES`. Retirement writes `RETIRED` into `status`, which removes the row from annual screening-coverage denominators and from the annual net load total, recomputes the term's `exceeding_outfall_count` and `compliance_posture`, and increments the outfall's `version` by one. A retired outfall accepts nothing further: recording an observation, appending a sweeping run, running a load assessment or retiring again all yield `ERR_OUTFALL_RETIRED`. An unknown outfall identifier is `ERR_OUTFALL_NOT_FOUND`.
+
+Field observations at an outfall are recorded by an `IDDEInvestigator` or a `MunicipalOperationsSupervisor` and come in two kinds, discriminated by `observation_type`. Every observation carries the `observed_at` instant of the field visit and may carry free-text `field_notes`; the acting operator is captured as `recorded_by_user_id`. A `DRY_WEATHER_SCREENING` requires `dry_weather_flow_present` and may carry the three indicator readings `indicator_bacteria_mpn`, `indicator_surfactant_mg_per_l` and `indicator_ammonia_mg_per_l`, each non-negative; it must not carry `pollutant_concentration_mg_per_l` or `runoff_volume_kl`. A `WET_WEATHER_SAMPLE` requires both `pollutant_concentration_mg_per_l` and `runoff_volume_kl` and must not carry any of the three indicator fields. A field set that does not match its `observation_type` — a required field missing, or a field belonging to the other type present — is refused with `ERR_OBSERVATION_TYPE_FIELDS_INVALID`. Screenings are stored with `validation_status` `NOT_APPLICABLE` and a null `sample_load_lb`; samples are stored with a null `screening_result`, as described in §3.7.
+
+The **screening result** of a dry-weather visit is decided from the indicator panel, and it is written to the observation's `screening_result` as either `CLEAR` or `SUSPECT`. If `dry_weather_flow_present` is false, the result is `CLEAR` — no flow means no discharge, and no indicator is consulted. Otherwise the server counts how many of three indicator limits are exceeded, in each case by a strictly greater comparison, treating a null reading as not exceeding: `indicator_bacteria_mpn` above 1000 most probable number per 100 millilitres, `indicator_surfactant_mg_per_l` above 0.25 milligrams per litre, and `indicator_ammonia_mg_per_l` above 0.50 milligrams per litre. If two or more of those three are exceeded, the result is `SUSPECT`. Otherwise a single overwhelming detergent reading is enough on its own: if `indicator_surfactant_mg_per_l` is above 1.00 milligrams per litre, the result is `SUSPECT`. In every other case the result is `CLEAR`. Because each comparison is strict, a reading sitting exactly on a limit is not an exceedance.
+
+Every dry-weather screening stamps the outfall's `last_screened_at` with the observation's `observed_at` and increments `screening_count` by one. A `CLEAR` result moves `screening_status` from `NOT_SCREENED` to `CLEAR`. A `SUSPECT` result moves `screening_status` from either `NOT_SCREENED` or `CLEAR` to `SUSPECT` and additionally opens a case: the server creates an **illicit discharge case** in `OPEN` whose `outfall_id` is this outfall and whose `origin_observation_id` is the new observation, stamps the case's `opened_at` from the logical clock, raises the outfall's `open_case_count` by one, then recomputes the `ILLICIT_DISCHARGE` control measure's `open_case_count` and `goal_status`, the term's posture, and — where the posture moved and the observation falls inside a closed reporting window — the annual report's return to `DRAFT`. No operator ever creates a case by hand; the screening cascade is its only origin.
+
+### 3.3. Illicit Discharge Investigation, Tracing and Resolution
+
+Case work belongs entirely to the `IDDEInvestigator`, and the case machine is cyclic: `OPEN → TRACING → SOURCE_IDENTIFIED`, from where it may either advance to `ENFORCEMENT` or fall back to `TRACING`, and from either of those two it may finish at `RESOLVED`. Any transition requested from a state that does not offer it is refused with `ERR_CASE_INVALID_STATE`, and an unknown case identifier is `ERR_CASE_NOT_FOUND`.
+
+Tracing begins on an `OPEN` case while the owning permit term is `ACTIVE`, with the investigator supplying the `trace_method` used — one of `DYE_TEST`, `SMOKE_TEST`, `CCTV` or `UPSTREAM_SAMPLING`. The transition records that method on the case and increments `tracing_attempt_count` by one. When the trace succeeds, the investigator advances the case from `TRACING` to `SOURCE_IDENTIFIED` by recording the `source_description` narrative and the `responsible_party` held accountable for the discharge.
+
+An identified source that does not hold up sends the case back to `TRACING`. Reopening is available from `SOURCE_IDENTIFIED` and from `ENFORCEMENT`, in both cases carrying a `reason`, and in both cases requires `reopen_count` to be below three; at three it is refused with `ERR_REOPEN_LIMIT_REACHED`. Reopening from `ENFORCEMENT` additionally requires that no enforcement action on the case is still in `ISSUED` or `ESCALATED`, and is otherwise refused with `ERR_CASE_HAS_OPEN_ENFORCEMENT`. A successful reopen clears both `source_description` and `responsible_party` back to null and increments both `reopen_count` and `tracing_attempt_count` by one.
+
+The path from `SOURCE_IDENTIFIED` to `ENFORCEMENT` is not driven from the case at all: it is driven by an `EnforcementOfficer` issuing an action against the case, which requires `responsible_party` to be non-null. That transition increments the case's `enforcement_action_count` — the count of actions on the case whose `status` is `ISSUED`, `ESCALATED` or `CLOSED` — and adds the new penalty to the term's penalty ledger.
+
+Resolution closes the file, with the investigator supplying a `resolution_note`. From `ENFORCEMENT`, resolution requires that every enforcement action on the case has reached `CLOSED` or `RESCINDED`; from `SOURCE_IDENTIFIED`, it requires that no action on the case is in `ISSUED` or `ESCALATED`. Either shortfall is refused with `ERR_CASE_HAS_OPEN_ENFORCEMENT`. A resolution stamps `resolved_at` from the logical clock, records the note, decrements the outfall's `open_case_count`, and — when that leaves the outfall's `open_case_count` at 0 — reverts the outfall's `screening_status` from `SUSPECT` back to `CLEAR`. It then recomputes the `ILLICIT_DISCHARGE` control measure's `open_case_count` and `goal_status`, which is where a cleared gate can lift that measure out of `BEHIND`, and recomputes the term's `compliance_posture`. `RESOLVED` is terminal.
+
+### 3.4. Construction Runoff Control: Plan Review, Field Condition and Stop-Work Authority
+
+A construction site is enrolled by a `ConstructionInspector` or the `StormwaterProgramManager` under a named `permit_term_id`, with the `site_name` of the project, the `operator_name` of the operator legally responsible for it, and `disturbed_acres` of land disturbance. Coverage begins at one acre, so `disturbed_acres` must be at least 1.00 and is carried to 2 decimal places. On creation the server derives `post_construction_control_required`, setting it true exactly when `disturbed_acres` is 2.00 or more, and initialises `plan_review_round` and `stop_work_count` to 0, `open_deficiency_score` to 0, `open_enforcement_count` to 0, and `esc_plan_reference`, `stop_work_reason` and `closed_at` to null. A site that does not exist is `ERR_CONSTRUCTION_SITE_NOT_FOUND`.
+
+Each site carries **two independent state dimensions on the same row**, and most operations move exactly one of them. `plan_status` tracks erosion and sediment control plan review through `SUBMITTED`, `ESC_REVIEW`, `RETURNED` and `APPROVED`, starting at `SUBMITTED`; it is cyclic through `RETURNED`. `field_status` tracks the physical condition of the site through `PRE_CONSTRUCTION`, `ACTIVE_DISTURBANCE`, `STOP_WORK` and `CLOSED`, starting at `PRE_CONSTRUCTION`, with `CLOSED` terminal.
+
+The inspector submits the plan by supplying an `esc_plan_reference`, which moves `plan_status` from either `SUBMITTED` or `RETURNED` into `ESC_REVIEW`, records the reference, and leaves `field_status` untouched. Submission is refused once the site's `field_status` is `CLOSED`, with `ERR_SITE_CLOSED`. Review then takes a `decision` of either `APPROVE` or `RETURN` and may carry `review_notes`; it is available only while `plan_status` is `ESC_REVIEW`, and otherwise refused with `ERR_PLAN_NOT_IN_REVIEW`, and it requires the owning term to be `ACTIVE`. Either decision increments `plan_review_round` by one. `RETURN` writes `RETURNED` into `plan_status` and leaves `field_status` untouched, so the operator can revise and resubmit. `APPROVE` writes `APPROVED` into `plan_status` and, if and only if `field_status` is still `PRE_CONSTRUCTION`, additionally advances `field_status` to `ACTIVE_DISTURBANCE` — the point at which the site becomes eligible for erosion-control inspections.
+
+Stop-work authority belongs to the `EnforcementOfficer`, who supplies a `reason` and drives `field_status` from `ACTIVE_DISTURBANCE` to `STOP_WORK` while the term is `ACTIVE`, recording that reason in `stop_work_reason`, incrementing `stop_work_count` by one, and leaving `plan_status` untouched. A stop-work order attempted on a site whose `field_status` is not `ACTIVE_DISTURBANCE` is refused with `ERR_SITE_NOT_ACTIVE_DISTURBANCE`, and on a closed site with `ERR_SITE_CLOSED`. The same officer lifts the order by supplying a `corrective_action_note`, moving `field_status` from `STOP_WORK` back to `ACTIVE_DISTURBANCE`; this requires `open_enforcement_count` to be 0 (otherwise `ERR_SITE_HAS_OPEN_ENFORCEMENT`) and `plan_status` to be `APPROVED` (otherwise `ERR_ESC_PLAN_NOT_APPROVED`), and it clears `stop_work_reason` to null and `open_deficiency_score` to 0. Releasing a site that is not stopped is `ERR_SITE_NOT_STOPPED`.
+
+The stop-work order also arrives automatically. When an erosion-control inspection is finalized with a `deficiency_score` of 70 or more, the site is driven from `ACTIVE_DISTURBANCE` into `STOP_WORK` without any operator asking for it: `stop_work_reason` is set to `AUTOMATIC_ESC_DEFICIENCY`, `open_deficiency_score` is set to that inspection's `deficiency_score`, `stop_work_count` increments by one, and a notice of violation is generated as described in §3.6.
+
+Closing the file is the inspector's act, carrying a `final_stabilization_note`, and moves `field_status` from `ACTIVE_DISTURBANCE` to `CLOSED`. Closure requires `open_enforcement_count` to be 0, otherwise `ERR_SITE_HAS_OPEN_ENFORCEMENT`. Where `post_construction_control_required` is true — that is, on every site of two acres or more — closure additionally requires at least one permanent control inventoried for the site whose `agreement_status` is `RECORDED` or `NOT_REQUIRED`; a site with no such facility is refused with `ERR_CLOSE_REQUIRES_MAINTENANCE_AGREEMENT`. Closure stamps `closed_at` from the logical clock and blocks any further erosion-control inspection on the site.
+
+### 3.5. Permanent Controls, Maintenance Agreements and the Inspection Programme
+
+A **post-construction facility** is a permanent structural control inventoried against a `construction_site_id` by a `ConstructionInspector` or the `StormwaterProgramManager`. Each is described by a `facility_type` — `BIORETENTION`, `WET_POND`, `INFILTRATION_TRENCH` or `UNDERGROUND_DETENTION` — an `ownership` of `MUNICIPAL` or `PRIVATE`, a `design_capacity_cf` of design storage in cubic feet, and a `service_area_acres` of treated area; the last two must each be greater than 0. Ownership decides the agreement track immediately: a `MUNICIPAL` facility is created with `agreement_status` `NOT_REQUIRED`, while a `PRIVATE` facility is created with `agreement_status` `PENDING` because a privately owned control must carry a recorded maintenance agreement. In both cases `credit_eligible` starts false, `inspection_interval_months`, `agreement_reference`, `agreement_recorded_at` and `last_inspection_finalized_at` start null, and `months_since_last_inspection` starts at 0. An unknown facility identifier is `ERR_FACILITY_NOT_FOUND`.
+
+Recording the agreement supplies the instrument's `agreement_reference`, the `recorded_at` instant of recordation and the `inspection_interval_months` agreed for maintenance inspection, which must be between 1 and 60 inclusive. The call writes `RECORDED` into `agreement_status`, copies `recorded_at` into `agreement_recorded_at`, stores the interval, and recomputes the three currency fields described below. Recording twice, or recording against a `MUNICIPAL` facility whose `agreement_status` is `NOT_REQUIRED`, is refused with `ERR_AGREEMENT_ALREADY_RECORDED`.
+
+Inspection currency is derived, never asserted. `last_inspection_finalized_at` is the `finalized_at` of the most recent finalized maintenance inspection on the facility, taking them in descending `finalized_at` order and breaking ties by ascending `created_at`. `months_since_last_inspection` is the number of whole months from `last_inspection_finalized_at` — or from `agreement_recorded_at` when the facility has never been inspected — forward to the logical clock, discarding any fractional month. `inspection_overdue` is true exactly when `agreement_status` is `RECORDED` and `months_since_last_inspection` is strictly greater than `inspection_interval_months`. `credit_eligible` is true exactly when `ownership` is `PRIVATE`, `agreement_status` is `RECORDED`, and `inspection_overdue` is false — the three conditions the utility credit programme leans on in §3.8.
+
+Both inspection programmes share one **inspection** record, discriminated by `inspection_type`. A `ConstructionInspector` opens one by naming the type, `CONSTRUCTION_ESC` or `POST_CONSTRUCTION_MAINTENANCE`, and the coverage period the inspection accounts for as `period_start` and `period_end`, both ISO 8601 dates with `period_end` on or after `period_start`. The subject foreign key must match the type exactly: `CONSTRUCTION_ESC` requires `construction_site_id` and forbids `post_construction_facility_id`, and `POST_CONSTRUCTION_MAINTENANCE` requires `post_construction_facility_id` and forbids `construction_site_id`. Supplying neither, both, or the wrong one for the type is refused with `ERR_INSPECTION_SUBJECT_MISMATCH`. An optional `rainfall_trigger`, defaulting to false, records that the visit was prompted by a qualifying rainfall event; it is stored on maintenance inspections too but has no effect on their score. Creation requires the owning term to be `ACTIVE`, and an erosion-control inspection additionally requires the subject site's `plan_status` to be `APPROVED` — otherwise `ERR_ESC_PLAN_NOT_APPROVED` — and its `field_status` to be `ACTIVE_DISTURBANCE` or `STOP_WORK`, refusing a site in `PRE_CONSTRUCTION` with `ERR_SITE_NOT_ACTIVE_DISTURBANCE` and a closed site with `ERR_SITE_CLOSED`. A new inspection has `status` `DRAFT`, an empty `findings` list, all three severity counters and `deficiency_score` at 0, `escalation_triggered` false, and `finalized_at` and `finalized_by_user_id` null.
+
+Findings are appended one at a time to a `DRAFT` inspection, each carrying a `severity` of `MINOR`, `MAJOR` or `CRITICAL` and a `description`. Each append adds an entry to the append-only `findings` list and raises the matching counter — `minor_finding_count`, `major_finding_count` or `critical_finding_count`. Appending to an inspection that has already been finalized is refused with `ERR_INSPECTION_NOT_DRAFT`, and an unknown inspection identifier is `ERR_INSPECTION_NOT_FOUND`.
+
+Finalizing freezes the score. It requires the `findings` list to hold at least one entry, refusing an empty inspection with `ERR_INSPECTION_NO_FINDINGS`, because a frozen score of 0 would be meaningless. For an erosion-control inspection the subject site's `field_status` must be `ACTIVE_DISTURBANCE` or `STOP_WORK`; for a maintenance inspection the subject facility's `agreement_status` must be `RECORDED` or `NOT_REQUIRED`, and a facility still in `PENDING` is refused with `ERR_AGREEMENT_NOT_RECORDED`. Finalizing an inspection that is not in `DRAFT` is `ERR_INSPECTION_NOT_DRAFT`.
+
+The **deficiency score** is computed once, at finalize, and never recomputed afterwards. The base is 8 points for each finding counted in `minor_finding_count`, plus 22 points for each finding counted in `major_finding_count`, plus 34 points for each finding counted in `critical_finding_count`. The two inspection types then adjust that base differently, and each branch applies exactly two adjustments:
+
+- For a `CONSTRUCTION_ESC` inspection, if `rainfall_trigger` is true the base is multiplied by 1.20 and rounded to a whole number; then, if the subject site's `disturbed_acres` is strictly greater than 5.00, 12 points are added. The multiplier is applied and rounded *before* the large-site addition — adding first and multiplying afterwards inflates the score and is wrong.
+- For a `POST_CONSTRUCTION_MAINTENANCE` inspection, `rainfall_trigger` is ignored entirely. Instead, if the subject facility's `inspection_overdue` is true, 15 points are added; then, if that facility's `ownership` is `PRIVATE` and its `agreement_status` is anything other than `RECORDED`, a further 25 points are added.
+
+`deficiency_score` is the resulting figure capped at 100, and `escalation_triggered` is set true exactly when `deficiency_score` is 70 or more. Finalization writes `FINALIZED` into `status`, stamps `finalized_at` from the logical clock, records the acting operator as `finalized_by_user_id`, and admits the inspection to the annual statistics of whichever report covers its `finalized_at`.
+
+Two cascades hang off finalization. A maintenance inspection refreshes the subject facility's `last_inspection_finalized_at`, `months_since_last_inspection`, `inspection_overdue` and `credit_eligible`, which can newly qualify — or newly disqualify — that facility for the credit programme. An erosion-control inspection whose `escalation_triggered` is true drives its site from `ACTIVE_DISTURBANCE` into `STOP_WORK` as described in §3.4 and generates the automatic notice of violation described in §3.6; that generated penalty is added to the term's `total_assessed_penalty_cents`, raises the `CONSTRUCTION_RUNOFF` control measure's `enforcement_count`, may force that measure's `goal_status` to `BEHIND` when the count reaches two, recomputes the term's `compliance_posture`, and may push a `COMPILED` or `CERTIFIED` annual report back to `DRAFT`.
+
+### 3.6. The Enforcement Ladder and the Penalty Ledger
+
+An enforcement action is issued by an `EnforcementOfficer` under an `ACTIVE` permit term against exactly one subject. The officer names the `action_type` at which the ladder starts — `NOTICE_OF_VIOLATION`, `ADMINISTRATIVE_ORDER` or `CIVIL_PENALTY` — and exactly one of `illicit_discharge_case_id`, `construction_site_id` or `post_construction_facility_id`. Supplying none of them, or more than one, is refused with `ERR_ENFORCEMENT_SUBJECT_INVALID`. From whichever key is set, the server derives `subject_kind` as `ILLICIT_DISCHARGE_CASE`, `CONSTRUCTION_SITE` or `POST_CONSTRUCTION_FACILITY`. Where an inspection documents the violation, the officer also supplies `source_inspection_id`; that inspection must have `status` `FINALIZED`, otherwise `ERR_SOURCE_INSPECTION_NOT_FINALIZED`, and it must belong to the named subject, otherwise `ERR_ENFORCEMENT_SUBJECT_INVALID`. The acting operator must differ from that inspection's `finalized_by_user_id`, otherwise `ERR_INSPECTOR_CANNOT_ENFORCE`. An optional `violation_days`, defaulting to 0 and never negative, records the documented days of continuing violation. A new action has `status` `ISSUED`, `issued_at` stamped from the logical clock, `issued_by_user_id` set to the acting operator, `escalation_count` at 0, `last_escalated_at` null, `auto_generated` false, and `compliance_note`, `closed_at`, `rescinded_reason` and `rescinded_at` all null. An unknown action identifier is `ERR_ENFORCEMENT_ACTION_NOT_FOUND`.
+
+The automatic action that the finalize cascade generates is the same record on a different origin: `action_type` `NOTICE_OF_VIOLATION`, `auto_generated` true, `source_inspection_id` set to the inspection that triggered it, `issued_by_user_id` recorded as the system rather than an operator, and `violation_days` left at its default of 0.
+
+The **assessed penalty** of one action is computed from three ingredients. First, `billable_violation_days` is `violation_days` capped at 30 — a longer documented violation does not bill further days. Second, `prior_assessed_total_cents` is the sum of `penalty_cents` over the *other* enforcement actions on the same subject whose `status` is `ISSUED`, `ESCALATED` or `CLOSED`, excluding this action's own row and frozen before this row's own penalty is written. Excluding the row itself is the whole point: on escalation an action's previous penalty must not feed its own new multiplier, or every escalation would compound against itself. `RESCINDED` rows do not count toward the prior total, so a rescission lowers the multiplier of actions issued against that subject afterwards. Third, `escalation_multiplier` is read from that prior total: 1.00 when `prior_assessed_total_cents` is 0; 1.50 when it is greater than 0 but less than 100000 cents; and 2.25 when it is 100000 cents or more.
+
+`penalty_cents` is then the ladder base for the action's current `action_type` — 25000 cents for `NOTICE_OF_VIOLATION`, 50000 cents for `ADMINISTRATIVE_ORDER`, 100000 cents for `CIVIL_PENALTY` — plus 2000 cents for each of the `billable_violation_days`, with that sum multiplied by `escalation_multiplier` and the product rounded to whole cents.
+
+Issuance feeds the ledger and the derived counters. The new `penalty_cents` is added to the term's `total_assessed_penalty_cents`, which may push a `COMPILED` or `CERTIFIED` annual report back to `DRAFT`. A case subject moves from `SOURCE_IDENTIFIED` to `ENFORCEMENT` and has its `enforcement_action_count` raised. A site subject has its `open_enforcement_count` — the count of actions on the site whose `status` is `ISSUED` or `ESCALATED` — raised, and the `CONSTRUCTION_RUNOFF` control measure's `enforcement_count` raised with it, which is the counter that trips the construction-runoff gate at two.
+
+Escalation walks the ladder upward and is a self-loop once reached: `ISSUED → ESCALATED`, then `ESCALATED → ESCALATED` for each further rung. Each escalation advances `action_type` one step — `NOTICE_OF_VIOLATION` to `ADMINISTRATIVE_ORDER`, `ADMINISTRATIVE_ORDER` to `CIVIL_PENALTY` — so an action already at `CIVIL_PENALTY` has nowhere to go and is refused with `ERR_LADDER_EXHAUSTED`. A cooling-off period applies: the logical clock must be at least 14 days after `last_escalated_at`, or at least 14 days after `issued_at` when the action has never been escalated, and an early attempt is refused with `ERR_ESCALATION_COOLING_OFF`. The officer may supply a revised `violation_days`, but escalation is monotonic in money: a supplied value below the stored `violation_days` is refused with `ERR_PENALTY_DECREASE_FORBIDDEN`. Because the cooling-off rule outranks the fiscal one, an escalation attempted too early *and* with reduced days reports the cooling-off failure. A successful escalation recomputes `prior_assessed_total_cents`, `escalation_multiplier` and `penalty_cents`, adjusts the term's `total_assessed_penalty_cents` by the difference between the new penalty and the old one, increments `escalation_count` by one and stamps `last_escalated_at` from the logical clock.
+
+Closing an action documents compliance without forgiving the money. From `ISSUED` or `ESCALATED`, and carrying a `compliance_note`, it writes `CLOSED` into `status`, stamps `closed_at`, records the note, leaves `penalty_cents` standing in the term's ledger, and lowers the subject site's `open_enforcement_count` where the subject is a site.
+
+Rescission reverses the money and is only available while the action has never been escalated: an `escalation_count` above 0 is refused with `ERR_RESCIND_AFTER_ESCALATION`. From `ISSUED` or `ESCALATED`, and carrying a `reason`, rescission writes `RESCINDED` into `status`, stamps `rescinded_at`, records the reason in `rescinded_reason`, subtracts the action's `penalty_cents` from the term's `total_assessed_penalty_cents` and then sets `penalty_cents` to 0. It lowers the subject site's `open_enforcement_count` and the `CONSTRUCTION_RUNOFF` control measure's `enforcement_count`, recomputes that measure's `goal_status` — which is one of the two ways a tripped gate clears — recomputes the term's `compliance_posture`, and may push a `COMPILED` or `CERTIFIED` annual report back to `DRAFT`. Both `CLOSED` and `RESCINDED` are terminal; escalating, closing or rescinding an action already in either is refused with `ERR_ENFORCEMENT_NOT_OPEN`.
+
+### 3.7. Municipal Operations, Street Sweeping and Annual Load Assessment
+
+Street sweeping is logged by the `MunicipalOperationsSupervisor` alone, one run at a time against an outfall's drainage area under an `ACTIVE` term, supplying `run_start_date`, `run_end_date` and the `lane_miles_swept` covered. Each accepted run is appended to the outfall's append-only `sweeping_runs` list as an entry holding `run_start_date`, `run_end_date` and `lane_miles_swept`, and raises the outfall's `swept_lane_miles_ytd`, which is the sum of `lane_miles_swept` over the whole list to 2 decimal places. Two constraints guard the log. Runs on one outfall may not overlap under the half-open convention of §2.10, and an overlap is `ERR_SWEEPING_RUN_OVERLAP`. Separately, the lane miles attributed to any one calendar month — a run is attributed to the month of its `run_start_date` — may not exceed the outfall's `sweeping_capacity_lane_miles_per_month`; a run that would push the month's total past capacity is refused with `ERR_SWEEPING_CAPACITY_EXCEEDED`, even though the individual run looks perfectly plausible on its own.
+
+Sweeping is also how the municipal operations measurable goal gets its actual. Each accepted run mirrors the term-wide lane-mile total into the `MUNICIPAL_OPERATIONS` control measure's `swept_lane_miles_ytd` — the sum of `lane_miles_swept` across the `sweeping_runs` of every `ACTIVE` outfall in the term — and copies that same figure into that measure's `measurable_goal_actual`, then recomputes its `attainment_pct` and `goal_status` and the term's posture. For that one measure the actual is never reported by hand, though its gate on `salt_storage_covered` and `fleet_wash_recycle` can still hold it at `BEHIND` regardless of how many lane miles are swept.
+
+Wet-weather monitoring samples arrive as observations, as described in §3.2, and each carries a per-sample load. `sample_load_lb` is the sample's `pollutant_concentration_mg_per_l` multiplied by its `runoff_volume_kl`, multiplied by the unit conversion factor 0.00220462 pounds per milligram-per-litre-kilolitre, rounded to 4 decimal places. A sample is stored with `validation_status` `PENDING` and must be adjudicated before it counts. Adjudication is performed by a `MunicipalOperationsSupervisor` or a `StormwaterProgramManager` supplying a `decision` of `VALIDATE` or `REJECT`; it applies only to a `WET_WEATHER_SAMPLE` whose `validation_status` is `PENDING`, and a dry-weather screening — permanently `NOT_APPLICABLE` — or an already-adjudicated sample is refused with `ERR_OBSERVATION_NOT_PENDING`. The adjudicator must not be the `recorded_by_user_id` that recorded the observation, otherwise `ERR_SELF_VALIDATION_FORBIDDEN`. Both decisions stamp `validated_at` from the logical clock: `VALIDATE` writes `VALIDATED` and admits the sample's `sample_load_lb` into both load variants, while `REJECT` writes `REJECTED`, excludes the load from every assessment, and thereby raises the count of samples the outfall is still projected to owe. An unknown observation identifier is `ERR_OBSERVATION_NOT_FOUND`.
+
+The **annual pollutant load** at one outfall is assessed on demand by a `StormwaterProgramManager` or `MunicipalOperationsSupervisor`, who supplies a `variant` of `FINAL` or `PROVISIONAL` and the `reporting_year` being assessed. The assessment answers with `variant`, `reporting_year`, `validated_sample_count`, `projected_sample_count`, `gross_load_lb`, `sweeping_credit_lb`, `net_load_lb` and `tmdl_status`.
+
+Both variants start from the same set: the outfall's wet-weather samples whose `validation_status` is `VALIDATED` and whose `observed_at` falls inside the reporting year, taken in ascending `observed_at` order with ties broken by ascending `created_at`. Their `sample_load_lb` values are summed to give the load actually taken. The two variants differ only in what they do about the samples the year still owes. Four validated samples are expected per outfall per year; the projected shortfall is that expectation of four minus the number of validated samples in hand, never taken below zero. In the `PROVISIONAL` variant, each missing sample is valued at a projected unit load computed from the outfall's own design assumptions — `baseline_concentration_mg_per_l` multiplied by `design_runoff_kl` multiplied by the same 0.00220462 conversion factor, rounded to 4 decimal places — and the shortfall multiplied by that unit load is added to the taken total. In the `FINAL` variant the projected shortfall is treated as zero, so only validated samples count. Either way, `gross_load_lb` is the resulting total rounded to 2 decimal places. A rejected sample therefore raises the projected shortfall in the `PROVISIONAL` variant and simply disappears from the `FINAL` one.
+
+The street-sweeping credit is then subtracted. Earned credit is the lane miles swept in the reporting year — the sum of `lane_miles_swept` over the outfall's runs whose `run_start_date` falls in that year — multiplied by 0.85 pounds of load reduction per lane mile, rounded to 2 decimal places. That earned figure is capped at one quarter of the variant's own `gross_load_lb`, itself rounded to 2 decimal places, and `sweeping_credit_lb` is the smaller of earned and cap. Because the cap is evaluated against the gross load of the variant being run, the same lane miles can be credited in full under `PROVISIONAL` and clipped under `FINAL`. `net_load_lb` is `gross_load_lb` minus `sweeping_credit_lb`, rounded to 2 decimal places.
+
+`tmdl_status` follows from the term's allocation. When the term's `tmdl_applicable` is false the status is `NOT_ASSESSED`. Otherwise it is `EXCEEDING` when `net_load_lb` is strictly greater than the term's `tmdl_wla_lb_per_year`, and `ATTAINING` in every other case — a net load exactly equal to the allocation is `ATTAINING`.
+
+The two variants differ sharply in what they persist. A `FINAL` assessment writes `tmdl_status`, `last_assessed_gross_load_lb`, `last_assessed_credit_lb`, `last_assessed_net_load_lb` and `last_assessed_year` onto the outfall, then recomputes the term's `exceeding_outfall_count` and `compliance_posture` — which is how an exceedance reaches the posture census and, through it, the annual report gate. A `PROVISIONAL` assessment persists nothing at all; its `tmdl_status` is returned for information only.
+
+### 3.8. The Stormwater Utility: Accounts, Tiered Fees and the Credit Programme
+
+A `UtilityBillingClerk` opens a **stormwater account** for each billed parcel, naming the `permit_term_id` whose fee schedule bills it, the assessor's `parcel_id` (unique within the term), the `owner_name` of the billed owner, the `parcel_class` rate class — `RESIDENTIAL_SINGLE`, `RESIDENTIAL_MULTI`, `COMMERCIAL` or `INSTITUTIONAL` — and the measured `impervious_area_sqft`, which may not be negative. Creation immediately runs the fee calculation and writes `eru_units`, `gross_fee_cents`, `class_surcharge_cents`, `gross_billable_cents`, a `total_credit_pct` of 0.0000 and `current_net_fee_cents`; `last_billed_run_type`, `last_billed_net_cents`, `last_billed_credit_pct` and `last_billed_at` all start null. It also raises the term's `projected_annual_revenue_cents` and refreshes `funding_adequacy_status`. An unknown account identifier is `ERR_ACCOUNT_NOT_FOUND`.
+
+The **tiered fee** works from equivalent residential units. `eru_units` is `impervious_area_sqft` divided by the term's `eru_sqft`, rounded to 2 decimal places. Those units are then split across three tiers: the first 1.00 unit falls in the first tier, units above 1.00 and up to 4.00 fall in the second, and units above 4.00 fall in the third. The first tier bills 9633 cents per unit, the second 8207 cents per unit and the third 6541 cents per unit. Each tier's component is computed and **rounded to whole cents on its own**, and only then are the three components added together to give `gross_fee_cents`; summing the three unrounded components and rounding once at the end is wrong and diverges by a cent on parcels straddling a tier boundary. `class_surcharge_cents` is then the already-rounded `gross_fee_cents` multiplied by the surcharge rate of the parcel's `parcel_class` — 0.00 for `RESIDENTIAL_SINGLE`, 0.05 for `RESIDENTIAL_MULTI`, 0.12 for `COMMERCIAL` and 0.08 for `INSTITUTIONAL` — rounded to whole cents. `gross_billable_cents` is `gross_fee_cents` plus `class_surcharge_cents`.
+
+A remeasurement of impervious area is recorded by the clerk under the version guard of §2.6, supplying the new `impervious_area_sqft` together with `expected_stormwater_account_version`. The update reruns the whole fee chain and `current_net_fee_cents`, increments the account's `version` by one, and recomputes the term's `projected_annual_revenue_cents` and `funding_adequacy_status`.
+
+Credit is applied on top of the gross billable amount. The credit pool of an account is the sum of the contributions of its credit applications, rounded to 4 decimal places and then capped at 0.5000 — no account may ever have more than half its fee credited. The credit in cents is `gross_billable_cents` multiplied by that capped percentage, rounded to whole cents, and the net fee is `gross_billable_cents` minus that credit. Which applications contribute, and at what percentage, is the one place the utility runs two variants:
+
+- In the `FINAL` reckoning — the one behind the account's own stored `total_credit_pct` and `current_net_fee_cents` — an application contributes its `approved_credit_pct` when its `status` is `APPROVED`, and nothing otherwise. `SUBMITTED`, `RETURNED`, `DENIED` and `REVOKED` rows contribute nothing.
+- In the `INTERIM` reckoning, which is forward-looking, an application contributes its `approved_credit_pct` when its `status` is `APPROVED` and its `requested_credit_pct` when its `status` is `SUBMITTED`, and nothing otherwise. Pending requests are honoured provisionally so an interim bill never overcharges an owner whose application is still under review.
+
+A **billing run** is executed by the clerk against a whole term under an `ACTIVE` permit term, supplying the `run_type` — `INTERIM` or `FINAL` — and the `period_start` and `period_end` of the billed period. The run recomputes the tiered fee for every account of the term, applies the credit reckoning of the requested variant, and writes `last_billed_run_type`, `last_billed_credit_pct`, `last_billed_net_cents` and `last_billed_at` on every account it bills. It answers with `run_type`, `period_start`, `period_end`, `billed_account_count`, `total_gross_billable_cents`, `total_credit_cents` and `total_net_billed_cents`. It also recomputes the term's `projected_annual_revenue_cents` from the `FINAL` net fees and refreshes `funding_adequacy_status`, which reads `ADEQUATE` when `projected_annual_revenue_cents` is greater than or equal to `funding_target_cents` and `UNDERFUNDED` otherwise.
+
+A **fee credit application** is filed against an account either by the owning `PropertyOwner` or, for counter-filed applications, by the clerk, and it too passes the account version guard of §2.6. The filing names the `stormwater_account_id`, the `requested_credit_pct` sought as a fraction of `gross_billable_cents` (greater than 0.0000 and at most 0.5000, carried to 4 decimal places), a `bmp_description` narrating the on-site best management practice, and `expected_stormwater_account_version`. It may also name the `post_construction_facility_id` of the privately owned permanent control that substantiates the credit. A new application has `status` `SUBMITTED`, `submitted_at` stamped from the logical clock, `applicant_user_id` set to the submitting actor, `approved_credit_pct`, `reviewed_by_user_id`, `approved_at`, `return_reason`, `revoked_reason` and `revoked_at` null, and `resubmission_count` at 0. Filing increments the account's `version` by one, and the requested percentage enters the `INTERIM` forward-looking pool at once without changing `total_credit_pct`. An unknown application identifier is `ERR_CREDIT_APPLICATION_NOT_FOUND`.
+
+Review is the clerk's alone and applies only while `status` is `SUBMITTED`, otherwise `ERR_CREDIT_APPLICATION_NOT_SUBMITTED`. The clerk supplies a `decision` of `APPROVE`, `RETURN` or `DENY`, may supply `approved_credit_pct` (which defaults to the application's `requested_credit_pct` when omitted), and may supply a `return_reason`. The acting reviewer is stored in `reviewed_by_user_id`.
+
+- `APPROVE` requires that the substantiating facility, when one is named, has `credit_eligible` true — a `MUNICIPAL` facility, one with no recorded agreement, or one overdue for maintenance inspection is refused with `ERR_FACILITY_NOT_CREDIT_ELIGIBLE` — and that the account's existing approved credit total plus this `approved_credit_pct` does not exceed 0.5000, otherwise `ERR_CREDIT_CEILING_EXCEEDED`. Approval writes `APPROVED` into `status`, stamps `approved_at`, stores `approved_credit_pct`, raises the account's `total_credit_pct` and lowers its `current_net_fee_cents`, lowers the term's `projected_annual_revenue_cents`, and may flip `funding_adequacy_status` to `UNDERFUNDED`.
+- `RETURN` writes `RETURNED` into `status` and records the `return_reason`, which removes the requested percentage from the `INTERIM` pool while leaving the door open to a revised filing.
+- `DENY` writes `DENIED` into `status` and records the supplied `return_reason` as the denial rationale; no credit is ever applied and `DENIED` is terminal.
+
+A returned application is revived by its own applicant, and only by the `PropertyOwner` whose `X-User-ID` equals `applicant_user_id`; anyone else is refused with `ERR_NOT_APPLICANT`. Resubmission is available only from `RETURNED`, otherwise `ERR_CREDIT_APPLICATION_NOT_RETURNED`, and only while `resubmission_count` is below two, otherwise `ERR_RESUBMISSION_LIMIT_REACHED`. It carries a fresh `requested_credit_pct` and `bmp_description`, which overwrite the stored values, clears `return_reason` to null, writes `SUBMITTED` back into `status`, increments `resubmission_count` by one, and returns the requested percentage to the `INTERIM` pool.
+
+Revocation is the clerk's remedy against an approved credit that no longer holds. It applies only while `status` is `APPROVED`, otherwise `ERR_CREDIT_APPLICATION_NOT_APPROVED`, carries a `reason`, writes `REVOKED` into `status`, stamps `revoked_at` and records `revoked_reason`. It removes the `approved_credit_pct` from the account's `total_credit_pct`, restores `current_net_fee_cents`, raises the term's `projected_annual_revenue_cents` and may restore `funding_adequacy_status` to `ADEQUATE`. `REVOKED` is terminal.
+
+### 3.9. Annual Reporting: Compilation, Certification and Submission
+
+The annual report is where the whole program is added up. A `StormwaterProgramManager` opens one against a `permit_term_id` with the `reporting_period_start` and `reporting_period_end` of the period it covers, both ISO 8601 dates, the end on or after the start. The window must lie wholly inside the term's `term_start_date` and `term_end_date`; a window that escapes the term is refused with `ERR_REPORT_WINDOW_OUTSIDE_TERM`. A new report has `status` `DRAFT`, every statistic at its zero value, `invalidation_count` at 0, and `compiled_at`, `compiled_by_user_id`, `certified_at`, `certified_by_user_id`, `certification_statement`, `submitted_at` and `invalidated_reason` all null. An unknown report identifier is `ERR_ANNUAL_REPORT_NOT_FOUND`.
+
+Compilation moves the report from `DRAFT` to `COMPILED` and is the point at which every statistic is frozen. It is available only from `DRAFT`, otherwise `ERR_REPORT_NOT_DRAFT`; it requires the owning term to be `ACTIVE`; it requires `expected_permit_term_version` to match the term's current `version` as described in §2.6; and it requires that no wet-weather sample of the term whose `observed_at` falls inside the reporting window is still sitting at `validation_status` `PENDING`, refusing an unadjudicated window with `ERR_PENDING_SAMPLES_IN_WINDOW`. Monitoring data must be settled before the numbers freeze.
+
+Working over the closed window defined in §2.10, compilation writes the following. `screenings_completed` counts the term's dry-weather screening observations whose `observed_at` lies in the window. `outfall_screening_coverage_pct` is 0.00 when the term has no `ACTIVE` outfall; otherwise it is 100 multiplied by the number of distinct `ACTIVE` outfalls with at least one screening in the window, divided by the count of `ACTIVE` outfalls in the term, rounded to 2 decimal places. `cases_opened` counts illicit discharge cases whose `opened_at` lies in the window, and `cases_resolved` counts those whose `status` is `RESOLVED` and whose `resolved_at` lies in the window. `construction_inspections_finalized` counts `CONSTRUCTION_ESC` inspections with `status` `FINALIZED` and `finalized_at` in the window, and `facility_inspections_finalized` counts `POST_CONSTRUCTION_MAINTENANCE` inspections on the same basis. `enforcement_actions_issued` counts enforcement actions whose `issued_at` lies in the window and whose `status` is `ISSUED`, `ESCALATED` or `CLOSED`, and `total_penalty_assessed_cents` sums `penalty_cents` over exactly that same set. `swept_lane_miles` sums `lane_miles_swept` over the sweeping runs whose `run_start_date` lies in the window, rounded to 2 decimal places. `net_annual_load_lb` sums `last_assessed_net_load_lb` over the `ACTIVE` outfalls whose `last_assessed_year` equals the calendar year of `reporting_period_end`, rounded to 2 decimal places. `measurable_goals_met_count` counts the term's `ACTIVE` control measures whose `goal_status` is `MET` at compile time.
+
+The `compliance_index` is the weighted mean of measure attainment across the term's `ACTIVE` control measures. Each measure contributes its `weight` multiplied by its `attainment_pct` capped at 100.00 — over-attainment is clipped per measure precisely so that a runaway measure cannot mask a measure that is behind. Those contributions are summed, the `weight` values of the same measures are summed, and the index is the first sum divided by the second, rounded to 2 decimal places exactly once at the end; rounding each measure's contribution before the division drifts from the specified value. When the total weight is 0, `compliance_index` is 0.00.
+
+Compilation stamps `compiled_at` from the logical clock, records the acting manager as `compiled_by_user_id`, sets the term's `last_compiled_at` to the same instant, and increments the term's `version` by one — which is why a second compile must be prepared against the newer version.
+
+Certification moves the report from `COMPILED` to `CERTIFIED` and is available only from `COMPILED`, otherwise `ERR_REPORT_NOT_COMPILED`. The certifying manager supplies the `certification_statement`, must not be the `compiled_by_user_id` that compiled the report — otherwise `ERR_SAME_USER_CERTIFICATION` — and may not certify at all while the term's `compliance_posture` is `NON_COMPLIANT`, which is refused with `ERR_POSTURE_NON_COMPLIANT`. This is the end of every cascade chain in the system: a screening that opened a fourth case, or a finalize that raised a second site enforcement, ultimately surfaces here as a refusal to certify. Certification stamps `certified_at` and records `certified_by_user_id` and the statement.
+
+Submission moves the report from `CERTIFIED` to `SUBMITTED` and is available only from `CERTIFIED`, otherwise `ERR_REPORT_NOT_CERTIFIED`. It must happen no later than 90 days after `reporting_period_end`; past that the window has closed and the request is refused with `ERR_REPORT_SUBMISSION_WINDOW_CLOSED`. Submission stamps `submitted_at`, and from that instant the report is immutable to every cascade — no posture change and no penalty adjustment can reopen it. `SUBMITTED` is terminal. Until then, any of the five invalidating events of §2.8 can push a `COMPILED` or `CERTIFIED` report back to `DRAFT`, incrementing `invalidation_count` and recording `invalidated_reason` as `POSTURE_CHANGED` or `PENALTY_LEDGER_CHANGED`, forcing a fresh compile against the term's newer `version` before the report can be certified and submitted again.
+
+## 4. Endpoint Definitions
+
+Operations that create a new stand-alone resource return `201 Created`. Operations that modify an existing resource — including transitions, appends to a resource's internal collection such as findings or sweeping runs, and batch operations such as a billing run — return `200 OK`. Where a role column reads "All roles except `PropertyOwner`", the six operational roles are authorised and `PropertyOwner` is not.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/stormwater/permit-terms` | Create a permit term in DRAFT | StormwaterProgramManager |
+| GET | `/stormwater/permit-terms` | List permit terms | All roles except PropertyOwner |
+| GET | `/stormwater/permit-terms/{id}` | Read one permit term with its derived posture, penalty ledger and revenue projection | All roles except PropertyOwner |
+| POST | `/stormwater/permit-terms/{id}/activate` | Move a DRAFT term to ACTIVE once the full minimum control measure set exists | StormwaterProgramManager |
+| POST | `/stormwater/permit-terms/{id}/expire` | Move an ACTIVE term to EXPIRED after term_end_date | StormwaterProgramManager |
+| GET | `/stormwater/permit-terms/{id}/control-measures` | Minimum control measures of a permit term | All roles except PropertyOwner |
+| GET | `/stormwater/permit-terms/{id}/outfalls` | Outfall inventory of a permit term | All roles except PropertyOwner |
+| GET | `/stormwater/permit-terms/{id}/construction-sites` | Construction sites covered by a permit term | All roles except PropertyOwner |
+| GET | `/stormwater/permit-terms/{id}/accounts` | Stormwater utility accounts billed under a permit term | StormwaterProgramManager, UtilityBillingClerk |
+| GET | `/stormwater/permit-terms/{id}/annual-reports` | Annual reports of a permit term | All roles except PropertyOwner |
+| POST | `/stormwater/permit-terms/{id}/billing-runs` | Run the utility fee billing for every account of the term, in the INTERIM or FINAL variant | UtilityBillingClerk |
+| POST | `/stormwater/control-measures` | Register one minimum control measure under a permit term | StormwaterProgramManager |
+| GET | `/stormwater/control-measures/{id}` | Read one control measure with its attainment and gate counters | All roles except PropertyOwner |
+| POST | `/stormwater/control-measures/{id}/report-progress` | Report the measurable-goal actual for the permit year | StormwaterProgramManager, MunicipalOperationsSupervisor |
+| POST | `/stormwater/control-measures/{id}/retire` | Retire a control measure once its permit term is no longer ACTIVE | StormwaterProgramManager |
+| POST | `/stormwater/outfalls` | Add an outfall to the term's inventory | StormwaterProgramManager, MunicipalOperationsSupervisor |
+| GET | `/stormwater/outfalls/{id}` | Read one outfall with its screening, sweeping and load-assessment state | All roles except PropertyOwner |
+| POST | `/stormwater/outfalls/{id}/retire` | Retire an outfall that has no open illicit discharge case | StormwaterProgramManager |
+| POST | `/stormwater/outfalls/{id}/observations` | Record a dry-weather screening or a wet-weather monitoring sample at the outfall | IDDEInvestigator, MunicipalOperationsSupervisor |
+| GET | `/stormwater/outfalls/{id}/observations` | Screenings and samples recorded at one outfall | All roles except PropertyOwner |
+| POST | `/stormwater/observations/{id}/validate` | Adjudicate a pending wet-weather sample | MunicipalOperationsSupervisor, StormwaterProgramManager |
+| POST | `/stormwater/outfalls/{id}/sweeping-runs` | Append a street-sweeping run serving the outfall's drainage area | MunicipalOperationsSupervisor |
+| POST | `/stormwater/outfalls/{id}/load-assessments` | Assess the annual pollutant load at the outfall in the FINAL or PROVISIONAL variant | StormwaterProgramManager, MunicipalOperationsSupervisor |
+| GET | `/stormwater/illicit-discharge-cases` | Illicit discharge cases, filterable by originating outfall or screening observation | All roles except PropertyOwner |
+| GET | `/stormwater/illicit-discharge-cases/{id}` | Read one illicit discharge case | All roles except PropertyOwner |
+| POST | `/stormwater/illicit-discharge-cases/{id}/start-tracing` | Begin source tracing on an OPEN case | IDDEInvestigator |
+| POST | `/stormwater/illicit-discharge-cases/{id}/identify-source` | Record the traced source and responsible party | IDDEInvestigator |
+| POST | `/stormwater/illicit-discharge-cases/{id}/reopen-tracing` | Send a case back to tracing when the identified source does not hold up | IDDEInvestigator |
+| POST | `/stormwater/illicit-discharge-cases/{id}/resolve` | Close out a case whose enforcement is finished | IDDEInvestigator |
+| POST | `/stormwater/construction-sites` | Enrol a construction site of one acre or more under the permit term | ConstructionInspector, StormwaterProgramManager |
+| GET | `/stormwater/construction-sites/{id}` | Read one construction site with both state dimensions | All roles except PropertyOwner |
+| POST | `/stormwater/construction-sites/{id}/submit-esc-plan` | Submit or resubmit the erosion and sediment control plan for review | ConstructionInspector |
+| POST | `/stormwater/construction-sites/{id}/esc-review` | Approve or return the erosion and sediment control plan | ConstructionInspector |
+| POST | `/stormwater/construction-sites/{id}/stop-work` | Exercise stop-work authority on an actively disturbed site | EnforcementOfficer |
+| POST | `/stormwater/construction-sites/{id}/release-stop-work` | Lift a stop-work order once enforcement is cleared and the plan is approved | EnforcementOfficer |
+| POST | `/stormwater/construction-sites/{id}/close` | Close a stabilised site | ConstructionInspector |
+| GET | `/stormwater/construction-sites/{id}/post-construction-facilities` | Permanent controls inventoried for one construction site | All roles |
+| POST | `/stormwater/post-construction-facilities` | Inventory a permanent post-construction control | ConstructionInspector, StormwaterProgramManager |
+| GET | `/stormwater/post-construction-facilities/{id}` | Read one permanent control with its agreement and inspection-currency state | All roles |
+| POST | `/stormwater/post-construction-facilities/{id}/record-agreement` | Record the maintenance agreement for a privately owned facility | ConstructionInspector, StormwaterProgramManager |
+| POST | `/stormwater/inspections` | Open a construction erosion-control inspection or a privately owned facility maintenance inspection for a coverage period | ConstructionInspector |
+| GET | `/stormwater/inspections` | Inspections, filterable by subject | All roles except PropertyOwner |
+| GET | `/stormwater/inspections/{id}` | Read one inspection with its finding counters and frozen score | All roles except PropertyOwner |
+| POST | `/stormwater/inspections/{id}/findings` | Append a finding to a DRAFT inspection | ConstructionInspector |
+| POST | `/stormwater/inspections/{id}/finalize` | Freeze the deficiency score and let the escalation cascade run | ConstructionInspector |
+| POST | `/stormwater/enforcement-actions` | Issue an enforcement action against a case, a construction site or a privately owned facility | EnforcementOfficer |
+| GET | `/stormwater/enforcement-actions` | Enforcement actions, filterable by any subject or by source inspection | All roles except PropertyOwner |
+| GET | `/stormwater/enforcement-actions/{id}` | Read one enforcement action with its penalty derivation | All roles except PropertyOwner |
+| POST | `/stormwater/enforcement-actions/{id}/escalate` | Advance the action one rung up the enforcement ladder after the cooling-off period | EnforcementOfficer |
+| POST | `/stormwater/enforcement-actions/{id}/close` | Close an action on documented compliance, leaving the penalty in the ledger | EnforcementOfficer |
+| POST | `/stormwater/enforcement-actions/{id}/rescind` | Rescind an unescalated action and reverse its penalty | EnforcementOfficer |
+| POST | `/stormwater/accounts` | Open a stormwater utility account for a parcel | UtilityBillingClerk |
+| GET | `/stormwater/accounts/{id}` | Read one utility account with its fee derivation and credit pool | UtilityBillingClerk, StormwaterProgramManager, PropertyOwner |
+| POST | `/stormwater/accounts/{id}/impervious-updates` | Record a remeasured impervious area under optimistic concurrency control | UtilityBillingClerk |
+| POST | `/stormwater/fee-credit-applications` | Apply for a stormwater fee credit against an account, under optimistic concurrency control on the account | PropertyOwner, UtilityBillingClerk |
+| GET | `/stormwater/fee-credit-applications` | Fee credit applications, filterable by account or substantiating facility | UtilityBillingClerk, StormwaterProgramManager, PropertyOwner |
+| GET | `/stormwater/fee-credit-applications/{id}` | Read one fee credit application | UtilityBillingClerk, StormwaterProgramManager, PropertyOwner |
+| POST | `/stormwater/fee-credit-applications/{id}/review` | Approve, return or deny a submitted credit application | UtilityBillingClerk |
+| POST | `/stormwater/fee-credit-applications/{id}/resubmit` | Resubmit a returned application with a revised request | PropertyOwner |
+| POST | `/stormwater/fee-credit-applications/{id}/revoke` | Revoke an approved credit and restore the account's fee | UtilityBillingClerk |
+| POST | `/stormwater/annual-reports` | Open an annual report for a reporting period inside the permit term | StormwaterProgramManager |
+| GET | `/stormwater/annual-reports/{id}` | Read one annual report with its measurable goals and enforcement statistics | All roles except PropertyOwner |
+| POST | `/stormwater/annual-reports/{id}/compile` | Compile the reporting-period statistics under optimistic concurrency control on the permit term | StormwaterProgramManager |
+| POST | `/stormwater/annual-reports/{id}/certify` | Certify a compiled report; the certifier must differ from the compiler and the program must not be NON_COMPLIANT | StormwaterProgramManager |
+| POST | `/stormwater/annual-reports/{id}/submit` | Submit the certified report to the permitting authority | StormwaterProgramManager |
+| POST | `/_clock/set_current_utc` | Set the server's logical clock; before any call it reads exactly 2026-08-01T00:00:00Z and never falls back to wall-clock time | All roles except PropertyOwner |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_USER_ID` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_VALIDATION` | 400 Bad Request |
+| `ERR_PERMIT_TERM_NOT_FOUND` | 404 Not Found |
+| `ERR_CONTROL_MEASURE_NOT_FOUND` | 404 Not Found |
+| `ERR_OUTFALL_NOT_FOUND` | 404 Not Found |
+| `ERR_OBSERVATION_NOT_FOUND` | 404 Not Found |
+| `ERR_CASE_NOT_FOUND` | 404 Not Found |
+| `ERR_CONSTRUCTION_SITE_NOT_FOUND` | 404 Not Found |
+| `ERR_FACILITY_NOT_FOUND` | 404 Not Found |
+| `ERR_INSPECTION_NOT_FOUND` | 404 Not Found |
+| `ERR_ENFORCEMENT_ACTION_NOT_FOUND` | 404 Not Found |
+| `ERR_ACCOUNT_NOT_FOUND` | 404 Not Found |
+| `ERR_CREDIT_APPLICATION_NOT_FOUND` | 404 Not Found |
+| `ERR_ANNUAL_REPORT_NOT_FOUND` | 404 Not Found |
+| `ERR_DUPLICATE_PERMIT_NUMBER` | 409 Conflict |
+| `ERR_DUPLICATE_MEASURE_CODE` | 409 Conflict |
+| `ERR_DUPLICATE_OUTFALL_CODE` | 409 Conflict |
+| `ERR_DUPLICATE_PARCEL_ID` | 409 Conflict |
+| `ERR_ACCOUNT_VERSION_CONFLICT` | 412 Precondition Failed |
+| `ERR_PERMIT_TERM_VERSION_CONFLICT` | 412 Precondition Failed |
+| `ERR_PERMIT_TERM_NOT_ACTIVE` | 409 Conflict |
+| `ERR_MEASURE_SET_INCOMPLETE` | 422 Unprocessable Entity |
+| `ERR_MEASURE_RETIRED` | 409 Conflict |
+| `ERR_OUTFALL_RETIRED` | 409 Conflict |
+| `ERR_OUTFALL_HAS_OPEN_CASES` | 409 Conflict |
+| `ERR_TERM_END_NOT_REACHED` | 409 Conflict |
+| `ERR_OPEN_REPORTS_EXIST` | 409 Conflict |
+| `ERR_OBSERVATION_TYPE_FIELDS_INVALID` | 422 Unprocessable Entity |
+| `ERR_SCREENING_INTERVAL_VIOLATION` | 409 Conflict |
+| `ERR_OBSERVATION_NOT_PENDING` | 409 Conflict |
+| `ERR_SELF_VALIDATION_FORBIDDEN` | 409 Conflict |
+| `ERR_SWEEPING_RUN_OVERLAP` | 409 Conflict |
+| `ERR_SWEEPING_CAPACITY_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_CASE_INVALID_STATE` | 409 Conflict |
+| `ERR_REOPEN_LIMIT_REACHED` | 422 Unprocessable Entity |
+| `ERR_CASE_HAS_OPEN_ENFORCEMENT` | 409 Conflict |
+| `ERR_SITE_NOT_ACTIVE_DISTURBANCE` | 409 Conflict |
+| `ERR_SITE_NOT_STOPPED` | 409 Conflict |
+| `ERR_SITE_CLOSED` | 409 Conflict |
+| `ERR_PLAN_NOT_IN_REVIEW` | 409 Conflict |
+| `ERR_ESC_PLAN_NOT_APPROVED` | 422 Unprocessable Entity |
+| `ERR_SITE_HAS_OPEN_ENFORCEMENT` | 409 Conflict |
+| `ERR_CLOSE_REQUIRES_MAINTENANCE_AGREEMENT` | 422 Unprocessable Entity |
+| `ERR_AGREEMENT_ALREADY_RECORDED` | 409 Conflict |
+| `ERR_AGREEMENT_NOT_RECORDED` | 422 Unprocessable Entity |
+| `ERR_INSPECTION_SUBJECT_MISMATCH` | 422 Unprocessable Entity |
+| `ERR_INSPECTION_PERIOD_OVERLAP` | 409 Conflict |
+| `ERR_INSPECTION_NOT_DRAFT` | 409 Conflict |
+| `ERR_INSPECTION_NO_FINDINGS` | 422 Unprocessable Entity |
+| `ERR_ENFORCEMENT_SUBJECT_INVALID` | 422 Unprocessable Entity |
+| `ERR_SOURCE_INSPECTION_NOT_FINALIZED` | 422 Unprocessable Entity |
+| `ERR_INSPECTOR_CANNOT_ENFORCE` | 409 Conflict |
+| `ERR_ENFORCEMENT_NOT_OPEN` | 409 Conflict |
+| `ERR_LADDER_EXHAUSTED` | 422 Unprocessable Entity |
+| `ERR_ESCALATION_COOLING_OFF` | 409 Conflict |
+| `ERR_PENALTY_DECREASE_FORBIDDEN` | 422 Unprocessable Entity |
+| `ERR_RESCIND_AFTER_ESCALATION` | 409 Conflict |
+| `ERR_CREDIT_APPLICATION_NOT_SUBMITTED` | 409 Conflict |
+| `ERR_CREDIT_APPLICATION_NOT_RETURNED` | 409 Conflict |
+| `ERR_CREDIT_APPLICATION_NOT_APPROVED` | 409 Conflict |
+| `ERR_CREDIT_CEILING_EXCEEDED` | 422 Unprocessable Entity |
+| `ERR_FACILITY_NOT_CREDIT_ELIGIBLE` | 422 Unprocessable Entity |
+| `ERR_RESUBMISSION_LIMIT_REACHED` | 422 Unprocessable Entity |
+| `ERR_NOT_APPLICANT` | 403 Forbidden |
+| `ERR_REPORT_WINDOW_OUTSIDE_TERM` | 422 Unprocessable Entity |
+| `ERR_REPORT_NOT_DRAFT` | 409 Conflict |
+| `ERR_REPORT_NOT_COMPILED` | 409 Conflict |
+| `ERR_REPORT_NOT_CERTIFIED` | 409 Conflict |
+| `ERR_PENDING_SAMPLES_IN_WINDOW` | 422 Unprocessable Entity |
+| `ERR_SAME_USER_CERTIFICATION` | 409 Conflict |
+| `ERR_POSTURE_NON_COMPLIANT` | 422 Unprocessable Entity |
+| `ERR_REPORT_SUBMISSION_WINDOW_CLOSED` | 409 Conflict |

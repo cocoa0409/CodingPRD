@@ -1,0 +1,76 @@
+"""Error catalogue (PRD §5) and the ApiError exception carried through the stack."""
+
+ERROR_STATUS = {
+    # authentication / authorization
+    "ERR_UNAUTHENTICATED": 401,
+    "ERR_UNAUTHORIZED": 403,
+    "ERR_INVALID_REQUEST": 400,
+    # existence
+    "ERR_COMPANY_NOT_FOUND": 404,
+    "ERR_CONTACT_NOT_FOUND": 404,
+    "ERR_DISCLOSURE_NOT_FOUND": 404,
+    "ERR_INQUIRY_NOT_FOUND": 404,
+    "ERR_RESPONSE_DRAFT_NOT_FOUND": 404,
+    "ERR_ROADSHOW_EVENT_NOT_FOUND": 404,
+    "ERR_MEETING_REQUEST_NOT_FOUND": 404,
+    "ERR_INSTRUCTION_NOT_FOUND": 404,
+    "ERR_CONTACT_OWNERSHIP_MISMATCH": 403,
+    # optimistic concurrency
+    "ERR_STALE_CONTACT_VERSION": 412,
+    "ERR_STALE_COMPANY_VERSION": 412,
+    "ERR_STALE_INQUIRY_VERSION": 412,
+    # own-state preconditions
+    "ERR_DISCLOSURE_INVALID_STATE": 409,
+    "ERR_INQUIRY_INVALID_STATE": 409,
+    "ERR_DRAFT_INVALID_STATE": 409,
+    "ERR_EVENT_INVALID_STATE": 409,
+    "ERR_MEETING_REQUEST_NOT_ALLOCATED": 409,
+    "ERR_INSTRUCTION_ALREADY_DECIDED": 409,
+    "ERR_INSTRUCTION_NOT_ACKNOWLEDGED": 409,
+    "ERR_INSTRUCTION_NOT_EXECUTED": 409,
+    # cross-entity referential
+    "ERR_CONTACT_COMPANY_MISMATCH": 422,
+    "ERR_EVENT_NOT_OPEN_FOR_REQUESTS": 409,
+    "ERR_CITATION_REQUIRED": 422,
+    "ERR_PINNED_DISCLOSURE_STALE": 409,
+    # segregation of duties / authorship
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    "ERR_DRAFT_AUTHOR_MISMATCH": 403,
+    "ERR_QUEUE_OVERRIDE_FORBIDDEN": 403,
+    # disclosure boundary / access gates
+    "ERR_DISCLOSURE_BLACKOUT": 409,
+    "ERR_SELECTIVE_DISCLOSURE_BLOCKED": 422,
+    "ERR_NDA_REQUIRED": 422,
+    "ERR_MODEL_ACCESS_NOT_ELIGIBLE": 422,
+    "ERR_MODEL_ACCESS_REQUIRED": 403,
+    "ERR_COVERAGE_NOT_INITIATED": 422,
+    # uniqueness
+    "ERR_DUPLICATE_TICKER": 409,
+    "ERR_DUPLICATE_FACT_KEY": 409,
+    "ERR_ACTIVE_DRAFT_EXISTS": 409,
+    # temporal validity
+    "ERR_SLOT_OUT_OF_WINDOW": 422,
+    "ERR_SLOT_DURATION_INVALID": 422,
+    "ERR_RECORD_DATE_IN_PAST": 422,
+    "ERR_PAYABLE_DATE_TOO_EARLY": 422,
+    "ERR_PAYABLE_DATE_NOT_REACHED": 409,
+    "ERR_REVERSAL_WINDOW_EXPIRED": 409,
+    # overlap
+    "ERR_CONTACT_DOUBLE_BOOKED": 409,
+    "ERR_DIVIDEND_CYCLE_OVERLAP": 409,
+    # limits, aggregates, fiscal
+    "ERR_REVISION_LIMIT_REACHED": 409,
+    "ERR_SHARES_EXCEED_OUTSTANDING": 422,
+    "ERR_NO_PENDING_REQUESTS": 409,
+    "ERR_NO_ELIGIBLE_ESTIMATES": 409,
+    "ERR_INSTRUCTION_TYPE_NOT_PAYABLE": 422,
+    "ERR_DIVIDEND_RESERVE_INSUFFICIENT": 422,
+}
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super().__init__(message or error_id)
+        self.error_id = error_id
+        self.message = message or error_id
+        self.http_status = ERROR_STATUS.get(error_id, 400)

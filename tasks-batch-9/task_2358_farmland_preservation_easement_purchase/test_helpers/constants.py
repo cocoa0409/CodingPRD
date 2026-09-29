@@ -1,0 +1,103 @@
+"""Domain thresholds and literal constants taken from the PRD calculations."""
+
+# --- Soil quality score (PRD §3.2) ---
+IMPORTANT_SOIL_WEIGHT = 0.60
+SOIL_SCORE_MAX_SHARE = 1.0
+
+# --- Development pressure score (PRD §3.2) ---
+FRONTAGE_POINTS_PER_UNIT = 3
+FRONTAGE_UNIT_FEET = 100
+FRONTAGE_POINTS_CAP = 30
+SEWER_POINTS = 25
+ZONING_POINTS_UNDER_1_ACRE = 45
+ZONING_POINTS_UNDER_3_ACRES = 35
+ZONING_POINTS_UNDER_10_ACRES = 20
+ZONING_POINTS_OTHERWISE = 5
+PRESSURE_SCORE_CAP = 100
+
+# --- Composite score (PRD §3.3) ---
+SIZE_COMPONENT_FULL_ACRES = 200
+
+# --- Preliminary easement value (PRD §3.3) ---
+PRELIMINARY_SPREAD_FRACTION = 0.90
+PRELIMINARY_FLOOR_UNIT_CENTS = 100_000
+REQUESTED_PRICE_CEILING_MULTIPLIER = 1.10
+
+# --- Certified easement value (PRD §3.4) ---
+CERTIFIED_PER_ACRE_CEILING_CENTS = 1_200_000
+CERTIFIED_ROUNDING_UNIT_CENTS = 10_000
+
+# --- Cost build-up (PRD §3.5) ---
+ADMIN_FEE_TIER_1_LIMIT_CENTS = 25_000_000
+ADMIN_FEE_TIER_2_LIMIT_CENTS = 75_000_000
+ADMIN_FEE_RATE_TIER_1 = 0.030
+ADMIN_FEE_RATE_TIER_2 = 0.020
+ADMIN_FEE_RATE_TIER_3 = 0.015
+INSTALLMENT_ANNUAL_RATE = 0.0275
+
+# --- Impervious allowance (PRD §3.7) ---
+SQFT_PER_ACRE = 43_560
+
+# --- Violation severity and cure clock (PRD §3.8) ---
+MAJOR_SEVERITY_EXCESS_SQFT_THRESHOLD = 2_000
+MINOR_CURE_DAYS = 180
+MAJOR_CURE_DAYS = 90
+COMPLIANCE_RETURN_DAYS = 90
+ESCALATED_TERMINATION_DAYS = 730
+
+# --- Program defaults (PRD §3.1) ---
+DEFAULT_MIN_COMPOSITE_SCORE = 60.00
+DEFAULT_MAX_NEGOTIATION_ROUNDS = 3
+DEFAULT_LOCAL_MATCH_MIN_PCT = 0.25
+DEFAULT_FEDERAL_MAX_SHARE_PCT = 0.50
+DEFAULT_IMPERVIOUS_ALLOWANCE_PCT = 0.02
+DEFAULT_AMENDMENT_POLICY = "STRICT"
+DEFAULT_MONITORING_INTERVAL_DAYS = 365
+DEFAULT_MONITORING_GRACE_DAYS = 30
+DEFAULT_APPRAISAL_ENGAGEMENT_BUFFER_DAYS = 3
+DEFAULT_FULLY_OBLIGATED_THRESHOLD_PCT = 0.95
+
+# --- Pagination (PRD §2.3) ---
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+# --- The logical clock (PRD §2.5) ---
+CLOCK_DEFAULT_UTC = "2026-08-01T00:00:00Z"
+
+# --- Canonical clock instants used by the composite fixtures ---
+CLOCK_2026_08_10 = "2026-08-10T00:00:00Z"
+CLOCK_2026_08_20 = "2026-08-20T00:00:00Z"
+CLOCK_2026_10_01 = "2026-10-01T00:00:00Z"
+CLOCK_2026_10_05 = "2026-10-05T00:00:00Z"
+CLOCK_2026_10_12 = "2026-10-12T00:00:00Z"
+CLOCK_2026_12_15 = "2026-12-15T00:00:00Z"
+CLOCK_2027_01_10 = "2027-01-10T00:00:00Z"
+CLOCK_2027_06_03 = "2027-06-03T00:00:00Z"
+CLOCK_2027_12_20 = "2027-12-20T00:00:00Z"
+
+# --- Sweep counter names (PRD §2.5) ---
+SWEEP_COUNTERS = (
+    "swept_easement_count",
+    "due_count",
+    "delinquent_count",
+    "cleared_to_compliant_count",
+    "terminated_easement_count",
+    "lapsed_offer_count",
+    "escalated_violation_count",
+    "expired_source_count",
+    "closed_round_count",
+)
+
+# --- Opaque operator identifiers used across the suite ---
+ADMIN_USER_ID = "admin-1"
+ADMIN_USER_ID_ALT = "admin-2"
+OFFICER_USER_ID = "officer-1"
+OFFICER_USER_ID_ALT = "officer-2"
+REVIEWER_USER_ID = "reviewer-1"
+APPRAISER_USER_ID = "appraiser-1"
+APPRAISER_USER_ID_ALT = "appraiser-2"
+MONITOR_USER_ID = "monitor-1"
+
+# --- Well-formed identifiers that resolve to no row ---
+ABSENT_UUID = "00000000-0000-4000-8000-000000000000"

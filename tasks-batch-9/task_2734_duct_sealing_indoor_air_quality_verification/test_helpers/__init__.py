@@ -1,0 +1,112 @@
+"""Test infrastructure for the Duct Sealing IAQ API compliance suite.
+
+Importing this package registers the error catalogue's HTTP status map with the
+shared validators, so `validate_error` can cross-check the status of every
+rejection.
+"""
+
+from prd_bench_local_runner.testing import (
+    NON_EXISTENT_UUID,
+    GenericApiClient,
+    assert_at_least_one_succeeds,
+    assert_cost_precision,
+    assert_exactly_one_succeeds,
+    assert_race_outcome,
+    assert_timestamp_format,
+    assert_version_incremented,
+    build_user_headers,
+    get_success_data,
+    is_iso8601_timestamp,
+    is_valid_uuid,
+    run_race,
+    validate_error,
+    validate_error_is_one_of,
+    validate_paginated,
+    validate_success,
+)
+
+from . import api_errors, factories, fixtures
+from .api_client import DuctSealingApiClient
+from .api_errors import *  # noqa: F401,F403  (the error catalogue of PRD section 5)
+from .api_errors import ERROR_HTTP_STATUS
+from .assertions import (
+    assert_all_cents_integers,
+    assert_append_only_fields,
+    assert_common_fields,
+    assert_leakage_ledger,
+    assert_ledger_identity,
+    assert_ordered_by,
+    assert_pagination_meta,
+    assert_program_ledger,
+    assert_program_ledger_identity,
+    assert_request_id,
+    assert_two_decimals,
+    deviation_pct,
+    expected_admin_fee_cents,
+    expected_capped_subtotal_cents,
+    expected_per_cfm_candidate_cents,
+    expected_percent_of_invoice_candidate_cents,
+    expected_tier_bonus_pct,
+    expected_verdict,
+    leakage_per_100_sqft,
+    normalize_to_cfm25,
+    reduction_pct,
+    round_cents_half_up,
+    round_half_up,
+    seal_rate_cfm_per_min,
+    variance_pct,
+)
+from .constants import *  # noqa: F401,F403  (business constants and enum vocabularies)
+from .fixtures import (
+    DEFAULT_SAMPLES,
+    Scenario,
+    add_accepted_leakage_test,
+    add_airflow_reading,
+    add_combustion_test,
+    add_complaint,
+    add_duct_system,
+    add_program,
+    add_project,
+    add_technician,
+    begin_injection,
+    complete_seal,
+    diagnose_complaint,
+    draft_report,
+    enter_balancing,
+    issue_report,
+    mask_all_registers,
+    record_spot_check,
+    scenario_base,
+    scenario_draft_report,
+    scenario_eligible_system,
+    scenario_injecting_job,
+    scenario_issued_report,
+    scenario_masking_job,
+    scenario_post_verified,
+    scenario_ready_to_inject,
+    scenario_scheduled_job,
+    scenario_sealed_job,
+    scenario_submitted_claim,
+    scenario_with_baseline,
+    schedule_seal_job,
+    set_clock,
+    stream_samples,
+    submit_claim,
+)
+from .test_users import (
+    ADMIN_HEADERS,
+    ADMIN_USER_ID,
+    EMPTY_USER_ID_ADMIN_HEADERS,
+    EMPTY_USER_ID_QA_HEADERS,
+    INSPECTOR_HEADERS,
+    INSPECTOR_USER_ID,
+    QA_HEADERS,
+    QA_VERIFIER_USER_ID,
+    SECOND_INSPECTOR_HEADERS,
+    SECOND_INSPECTOR_USER_ID,
+    SECOND_QA_HEADERS,
+    SECOND_QA_VERIFIER_USER_ID,
+    headers_for_role,
+    make_field_technician_headers,
+    make_headers,
+)

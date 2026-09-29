@@ -1,0 +1,131 @@
+"""Thresholds, rates and pinned numeric constants drawn from the PRD."""
+
+# --- Logical clock (PRD 2.5) -------------------------------------------------
+STARTUP_CLOCK = "2026-08-01T00:00:00Z"
+
+# --- Pagination (PRD 2.3) ----------------------------------------------------
+DEFAULT_PAGE_LIMIT = 10
+MAX_PAGE_LIMIT = 100
+
+# --- Roles (PRD 2.1) ---------------------------------------------------------
+ROLES = [
+    "RemedialProjectManager",
+    "AllocationFacilitator",
+    "SettlementCounsel",
+    "PRPRepresentative",
+    "Contractor",
+    "CommunityMember",
+]
+
+# --- Listing eligibility (PRD 3.1) ------------------------------------------
+HRS_LISTING_THRESHOLD = 28.50
+
+# --- De minimis eligibility (PRD 3.2) ---------------------------------------
+DE_MINIMIS_SHARE_CEILING_PCT = 1.00
+DE_MINIMIS_VOLUME_CEILING_TONS = 110.00
+DE_MINIMIS_ELIGIBLE_CLASSES = ["III", "IV"]
+DE_MINIMIS_PREMIUM_MULTIPLIER = 2.0
+
+# --- Risk characterisation (PRD 3.3) ----------------------------------------
+UNIT_RISK_FACTOR = 0.000005
+REFERENCE_CONCENTRATION_UG_PER_L = 5.0
+ACTION_LEVEL_RISK = 0.0001
+ACTION_LEVEL_HAZARD_INDEX = 1.00
+
+# --- Remedy scoring and selection (PRD 3.4) ---------------------------------
+COST_SCORE_DIVISOR_CENTS = 50000000
+PROTECTIVE_EFFECTIVENESS_FLOOR = 60
+EXCEEDED_WEIGHTS = {"effectiveness": 0.65, "implementability": 0.20, "cost": 0.15}
+NOT_EXCEEDED_WEIGHTS = {"effectiveness": 0.45, "implementability": 0.35, "cost": 0.20}
+
+# --- Record of Decision (PRD 3.5) -------------------------------------------
+MIN_COMMENT_PERIOD_DAYS = 30
+MAX_COMMENT_PERIOD_DAYS = 90
+
+# --- Allocation arithmetic (PRD 3.6) ----------------------------------------
+WEIGHT_TOTAL_BP = 10000
+TOXICITY_MULTIPLIERS = {"I": 8, "II": 4, "III": 2, "IV": 1}
+ADOPTION_ACCEPT_THRESHOLD_PCT = 66.67
+MIN_SHARES_FOR_BALLOTING = 2
+
+# --- Settlement instruments, oversight billing, penalties (PRD 3.7) ---------
+PENALTY_CAP_BP = 1000
+DECREE_COMMENT_WINDOW_DAYS = 30
+TIER1_CEILING_CENTS = 5000000
+TIER2_CEILING_CENTS = 25000000
+TIER1_RATE_BP = 1550
+TIER2_RATE_BP = 1275
+TIER3_RATE_BP = 1050
+OVERSIGHT_RESTRICTION_UTILIZATION_PCT = 90.00
+PENALTY_FLAT_DAYS = 30
+PENALTY_ESCALATION_BP = 15000
+
+# --- Procurement and field work (PRD 3.8) -----------------------------------
+BID_TOLERANCE_BP = 1500
+DEFAULT_MAX_CONCURRENT_WINDOWS = 2
+WORK_WINDOW_BUFFER_HOURS = 4
+FIVE_YEAR_REVIEW_INTERVAL_DAYS = 1826
+
+# --- Enumerations (PRD 3.1 - 3.9) -------------------------------------------
+LISTING_STATUSES = [
+    "PROPOSED",
+    "LISTED",
+    "RI_FS_UNDERWAY",
+    "ROD_SIGNED",
+    "CONSTRUCTION",
+    "OM_PHASE",
+    "REMEDY_REEVALUATION",
+    "DELETED_FROM_NPL",
+]
+COST_POSTURES = ["OPEN", "RESTRICTED", "FROZEN"]
+PARTY_TYPES = ["OWNER_OPERATOR", "GENERATOR", "TRANSPORTER", "ARRANGER"]
+PRP_STATUSES = [
+    "IDENTIFIED",
+    "NOTIFIED",
+    "PARTICIPATING",
+    "RECALCITRANT",
+    "ORPHAN",
+    "SETTLED",
+    "DE_MINIMIS_SETTLED",
+]
+ACQUISITION_TYPES = ["PURCHASE", "MERGER", "FORECLOSURE", "LEASE"]
+TOXICITY_CLASSES = ["I", "II", "III", "IV"]
+EVIDENCE_GRADES = ["A", "B", "C"]
+WASTE_IN_STATUSES = ["SUBMITTED", "VERIFIED", "REJECTED"]
+EXPOSURE_MEDIA = ["SOIL", "GROUNDWATER", "AIR", "SEDIMENT"]
+QA_STATUSES = ["VALID", "ESTIMATED", "REJECTED"]
+RIFS_STATUSES = ["DRAFT", "UNDER_REVIEW", "REVISION_REQUESTED", "APPROVED"]
+ROD_STATUSES = [
+    "DRAFT",
+    "PUBLIC_COMMENT",
+    "SIGNED",
+    "AMENDMENT_REQUIRED",
+    "WITHDRAWN",
+]
+ROUND_STATUSES = ["DRAFTING", "BALLOTING", "ADOPTED", "FAILED", "SUPERSEDED"]
+SHARE_DISPOSITIONS = ["PENDING", "ALLOCATED", "ORPHANED", "SETTLED"]
+BALLOTS = ["ACCEPT", "REJECT", "ABSTAIN"]
+DECREE_SCOPE_TYPES = ["RIFS_AOC", "RD_RA_CONSENT_DECREE"]
+DECREE_LEGAL_STATUSES = ["NEGOTIATING", "LODGED", "ENTERED", "TERMINATED"]
+DECREE_COMPLIANCE_STATUSES = ["COMPLIANT", "IN_VIOLATION", "PENALTY_ACCRUING"]
+COMPLIANCE_EVENT_TYPES = ["VIOLATION", "PENALTY_ASSESSMENT", "CURE"]
+CONTRACT_STATUSES = ["SOLICITATION", "AWARDED", "CONSTRUCTION_COMPLETE", "CLOSED"]
+ACTIVITY_TYPES = ["CONSTRUCTION", "LONG_TERM_MONITORING", "MAINTENANCE_SHUTDOWN"]
+PROTECTIVENESS_DETERMINATIONS = [
+    "PROTECTIVE",
+    "PROTECTIVE_SHORT_TERM",
+    "NOT_PROTECTIVE",
+]
+ACTION_TYPES = [
+    "DE_MINIMIS_SETTLEMENT",
+    "COST_RECOVERY_DEMAND",
+    "CONTRIBUTION_CLAIM",
+]
+ACTION_STATUSES = [
+    "OFFERED",
+    "ACCEPTED",
+    "REJECTED",
+    "COLLECTED",
+    "VOIDED",
+    "SUPERSEDED",
+]

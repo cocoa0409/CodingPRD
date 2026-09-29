@@ -1,0 +1,507 @@
+# District Energy System Operations API — Product Requirements Document
+
+## 1. Introduction
+
+A district energy utility sells heat and chill the way an electric utility sells power: it burns, pumps and stores thermal energy at a handful of central plants, moves it through kilometres of buried, insulated piping, and meters what arrives at each connected building. Every operating decision the utility makes couples three things that are normally managed by separate teams — the *production* side (which boiler, chiller, cogeneration unit or thermal store runs, and at what cost and carbon intensity), the *distribution* side (what the buried network can physically carry, and which segments are leaking or dug up), and the *commercial* side (what capacity each customer has contractually reserved, what tariff applies to its class, and what it owes). Today those three views live in spreadsheets, SCADA exports and a billing package that never agree with each other, and the cost of that disagreement shows up as over-dispatched plant, unbilled energy and missed city climate targets.
+
+This document specifies the API that replaces them. The system is mounted under `/district-energy` and is organised around the **NetworkLoop** — a single distribution circuit whose posture, reserved capacity and pipe condition govern almost every other decision in the platform. Around each loop sit its buried pipe segments, its production assets and their fuel supply contracts, its load forecasts and dispatch plans, its customer connection agreements with their metering points and invoices, its maintenance work orders, and its expansion screening cases. The API's job is to make the interlocks between these things explicit and mechanical: a suspended gas contract must be able to knock an approved dispatch plan back into drafting; an open excavation must be able to block a plan commitment; a leaking segment must be able to hold a loop in a degraded posture until it is repaired; and a customer's demand ratchet must survive a mid-period invoice adjustment without drifting.
+
+Two design commitments run through the whole specification. First, **every derived number is reproducible**: forecasts, merit-order allocations, reliability metrics, billing determinants, leak-risk scores, pipe sizing and net present values are all defined as deterministic functions of stored inputs, fixed constants and a server-controlled logical clock, with the rounding step stated at every stage. Second, **duties are segregated**: the operator who authors a dispatch plan may not approve it, the technician who raises a work order may not sign it off, and a customer may act only on its own account. Where those commitments conflict with convenience, the specification chooses reproducibility and segregation.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the rules that hold everywhere in the API. Unlike §3, nothing here is domain-narrative: these are contracts.
+
+### 2.1. User and Role-Based Access Control
+
+Every request — including the clock endpoint and every read — must carry two HTTP headers. `X-User-ID` identifies the acting principal and `X-User-Role` names the capacity in which it acts. If either header is absent or present but empty, the request is rejected with `ERR_MISSING_AUTH_HEADERS` and HTTP 401. If the header value is not one of the six recognised roles, or is a recognised role that is not authorised for the endpoint being called, the request is rejected with `ERR_UNAUTHORIZED` and HTTP 403.
+
+The six roles are `SystemController`, `DispatchOperator`, `NetworkEngineer`, `FieldTechnician`, `BillingAnalyst` and `CustomerAccount`.
+
+- A `SystemController` is the control-room authority. It registers network loops, production assets and fuel supply contracts, moves supply-contract status, reviews submitted dispatch plans, decommits and reconciles them, decides sized expansion projects, and repositions the logical clock.
+- A `DispatchOperator` prepares the demand picture and the production answer to it: creating and publishing load forecasts, creating dispatch plans, running the merit-order optimisation, submitting plans for review and committing approved plans.
+- A `NetworkEngineer` owns the buried network on paper: registering pipe segments, recording leak-detection condition assessments, granting or denying excavation permits, and creating and sizing expansion projects.
+- A `FieldTechnician` owns the buried network in the ground: installing, commissioning and removing metering points, recording register reads, and driving work orders from creation through permit submission, excavation, repair, backfill, completion and cancellation.
+- A `BillingAnalyst` owns the commercial side: publishing rate schedules, creating, activating and re-statusing connection agreements, running the invoice lifecycle from creation through issue, adjustment and voiding, and converting approved expansion projects into pending agreements.
+- A `CustomerAccount` is the connected customer itself. It may read its own connection agreement, its metering points and their register reads, its invoices and the tariff applied to it, and it may settle an invoice in full.
+
+When `X-User-Role` is `SystemController`, `DispatchOperator`, `NetworkEngineer`, `FieldTechnician` or `BillingAnalyst`, `X-User-ID` is an opaque operator identifier that is not tied to any persisted entity. The server records it where a workflow demands an audit trail — as `authored_by_user_id` and `reviewed_by_user_id` on a dispatch plan, and as `reported_by_user_id` and `completed_by_user_id` on a work order — but it never compares such an identifier to any entity's `id`.
+
+When `X-User-Role` is `CustomerAccount`, `X-User-ID` is the `id` of the acting `ConnectionAgreement`. Ownership checks on any resource that references a connection agreement compare the resource's agreement foreign key to `X-User-ID`. Concretely: reading a connection agreement requires that the agreement's own `id` equal `X-User-ID`; reading an invoice, and paying one, require that the invoice's `agreement_id` equal `X-User-ID`. A `CustomerAccount` acting on someone else's agreement or invoice is rejected with `ERR_FORBIDDEN_AGREEMENT` and HTTP 403.
+
+Two operations additionally enforce **segregation of duties** by comparing the acting `X-User-ID` against a stored one. A dispatch plan may not be reviewed by the operator recorded in its `authored_by_user_id`, and a work order may not be completed by the technician recorded in its `reported_by_user_id`. Either violation is rejected with `ERR_SEGREGATION_OF_DUTIES` and HTTP 403.
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+---
+
+### 2.3. Pagination
+
+Every collection read accepts two query parameters. `limit` caps the number of items returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` skips that many items from the front of the result set; when omitted it defaults to 0, and its minimum accepted value is 0. A `limit` below 1 or above 100, or a negative `offset`, is a malformed request and is rejected with `ERR_INVALID_REQUEST` and HTTP 400.
+
+Unless a specific collection says otherwise, list results are ordered by `created_at` ascending. The one documented exception is the per-meter register-read collection, which is returned in `read_at` ascending order so that a billing analyst reads the register history in the order the meter produced it.
+
+Every list response carries `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope, where `total_count` is the size of the filtered result set before the window is applied and `has_more` indicates whether items remain beyond the window.
+
+### 2.4. Collection Filters
+
+Beyond `limit` and `offset`, each collection accepts a small set of equality filters. All are optional, and supplying several narrows the result set conjunctively.
+
+Distribution loops filter on `service_mode` and `posture`. Buried segments filter on `loop_id`, `upstream_segment_id` and `condition`. Fuel supply contracts filter on `fuel_type`, `status` and `delivery_firmness`. Production assets filter on `loop_id`, `fuel_contract_id`, `availability_state` and `asset_type`. Load forecasts filter on `loop_id`, `forecast_state` and `variant_applied`. Dispatch plans filter on `loop_id`, `forecast_id` and `plan_state`. Dispatch orders — which are never created by a client and are therefore discoverable only through their own collection — filter on `plan_id` and `asset_id`. Tariffs filter on `customer_class`. Connection agreements filter on `loop_id`, `rate_schedule_id`, `contract_state`, `billing_state` and `customer_class`. Metering points filter on `agreement_id`, `segment_id` and `meter_state`. The per-meter register-read collection filters on `read_type`; the global register-read collection filters on `point_id` and `read_type`. Invoices filter on `agreement_id`, `invoice_state` and `variant_applied`. Work orders filter on `segment_id`, `loop_id`, `work_state` and `work_type`. Expansion projects filter on `loop_id`, `rate_schedule_id` and `project_state`.
+
+### 2.5. Resource Identity, Timestamps and the Version Counter
+
+Every resource the API persists carries an `id`: a server-minted UUID, with no type prefix and no client control over its value. Every resource also carries a `created_at`, an ISO 8601 UTC timestamp with three fractional digits, taken from the logical clock at the moment of creation.
+
+Most resources additionally carry `updated_at` — an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation — and `version`, an integer that starts at 1 when the resource is created and is incremented by 1 on every mutation. A mutation for these purposes includes any change the server makes on its own initiative: when a cascade rewrites a derived counter such as a loop's `committed_reserved_kw`, `open_isolation_count` or `suspect_segment_count`, or a derived total such as an agreement's `balance_due`, that loop or agreement has been mutated, its `version` advances and its `updated_at` is refreshed even though no client addressed it directly.
+
+Two resources are append-only records rather than living entities and therefore carry **only** `id` and `created_at`: the **DispatchOrder**, which is produced and destroyed wholesale by the merit-order optimisation, and the **MeterReading**, which is an immutable register snapshot. Neither has an `updated_at` field and neither has a `version` field; nothing in the API mutates them in place.
+
+### 2.6. Numeric Precision and Rounding Discipline
+
+Every rounding step in this specification uses **round half up** — a value exactly on the midpoint rounds away from zero. The number of decimal places depends on what is being expressed:
+
+- Capacities and demands in kW, monetary amounts, percentages, and pressure drops are rounded to **2 decimal places**.
+- Energy quantities in MWh and volumetric flows in cubic metres per hour are rounded to **3 decimal places**.
+- The fuel concentration index is rounded to **4 decimal places**.
+- Pipe cross-sectional areas in square metres are rounded to **6 decimal places**, and pipe velocities in metres per second to **4 decimal places**.
+
+Where a calculation sums a collection of per-item figures, the specification states explicitly whether each item is rounded before summation or only the total is rounded. That distinction is load-bearing and must be honoured exactly: rounding a sum of unrounded terms and summing a list of rounded terms give different answers, and the tests assert the stated one. Configuration and rate inputs supplied by a client — for example `marginal_cost_per_mwh`, `emission_factor_kg_per_mwh`, `price_per_mwh`, `demand_charge_per_kw` and a tariff's per-tier energy rate — are stored at the precision supplied and are not re-rounded.
+
+### 2.7. Stale-Version Guards on Plan and Invoice Creation
+
+Exactly two creation endpoints read a parent entity's derived state and then act on it, so both are guarded by optimistic concurrency control against that parent's `version`. They are the dispatch-plan creation endpoint `POST /district-energy/dispatch-plans`, whose parent is the `NetworkLoop`, and the invoice creation endpoint `POST /district-energy/invoices`, whose parent is the `ConnectionAgreement`. In each case the version field is a **required** input, not an optional one, and its absence is a malformed request.
+
+A dispatch-plan creation request must carry `expected_loop_version`, holding the `version` of the target `NetworkLoop` as the client last observed it. Plan creation legitimately supersedes every non-terminal plan already on the loop, so if another writer has advanced the loop's `version` since the client read it — by activating an agreement, by driving a cascade, by creating a plan of its own — the create would silently discard a plan the client has never seen. Instead, when `expected_loop_version` does not equal the loop's current `version`, the request is rejected with `ERR_STALE_LOOP_VERSION` and HTTP 412.
+
+An invoice creation request must carry `expected_agreement_version`, holding the `version` of the target `ConnectionAgreement` as the client last observed it. Invoice creation reads `billed_demand_ratchet_kw` and `balance_due` off the agreement, and both of those are rewritten by issuing, adjusting, paying and voiding invoices as well as by contract status cascades. When `expected_agreement_version` does not equal the agreement's current `version`, the request is rejected with `ERR_STALE_AGREEMENT_VERSION` and HTTP 412, rather than billing against determinants the client never observed.
+
+No other endpoint in the API accepts a version field, and no other endpoint performs a version comparison.
+
+### 2.8. Loop Posture: the Network's Master Interlock
+
+Each `NetworkLoop` carries a computed `posture` that is never set directly by a client. It begins at `NORMAL` and moves among `NORMAL`, `CONSTRAINED` and `ISOLATED` purely as a consequence of events elsewhere in the system. Alongside it the loop maintains three computed counters: `committed_reserved_kw`, the sum of `reserved_capacity_kw` across the agreements on this loop whose `contract_state` is `ACTIVE` or `SUSPENDED`; `open_isolation_count`, the number of work orders on this loop that require isolation and are currently in `EXCAVATING`, `REPAIRING` or `BACKFILLED`; and `suspect_segment_count`, the number of pipe segments on this loop whose `condition` is `SUSPECT`. Every posture change and every counter change increments the loop's `version` by 1 and refreshes its `updated_at`.
+
+There are exactly six posture transitions:
+
+- `NORMAL → CONSTRAINED` fires when suspending a fuel supply contract reverted at least one `APPROVED` dispatch plan on this loop back to `DRAFT`. The loop must be in `NORMAL` and the cascade must actually have reverted a plan; a suspension that reverts nothing leaves the posture alone. The transition sets `posture` to `CONSTRAINED`, increments `version` by 1 and refreshes `updated_at`.
+- `CONSTRAINED → NORMAL` fires when a submitted plan on this loop is approved. Three things must hold: the loop is in `CONSTRAINED`, its `open_isolation_count` is exactly 0, and the plan being approved has a `reserve_margin_pct` at or above the 15.00 percent minimum reserve margin. The transition sets `posture` to `NORMAL` and increments `version` by 1.
+- `NORMAL → ISOLATED` fires when excavation begins on a work order whose `requires_isolation` is true, while the loop is in `NORMAL`. It sets `posture` to `ISOLATED`, increments `open_isolation_count` by 1 and increments `version` by 1.
+- `CONSTRAINED → ISOLATED` fires under exactly the same trigger and with exactly the same effects, differing only in that the loop was in `CONSTRAINED` rather than `NORMAL` when excavation began. Isolation therefore always wins over a merely constrained posture.
+- `ISOLATED → NORMAL` fires when a work order on this loop is completed, provided that after this cascade has decremented it the `open_isolation_count` is 0 **and** after this cascade has recomputed it the `suspect_segment_count` is 0. It sets `posture` to `NORMAL` and increments `version` by 1.
+- `ISOLATED → CONSTRAINED` fires under the same completion trigger when, after the cascade, `open_isolation_count` is 0 but `suspect_segment_count` is greater than 0 — the ground is closed but the loop still owns at least one suspect segment. It sets `posture` to `CONSTRAINED` and increments `version` by 1.
+
+Posture is consulted as a hard gate in three places, described in §3: an agreement cannot be activated while the loop is `ISOLATED`; a dispatch plan cannot be committed unless the loop is exactly `NORMAL`; and an isolating excavation cannot begin while a committed plan holds the loop.
+
+### 2.9. Path Resolution and the Request Admission Ladder
+
+Path identifiers are resolved strictly left to right, and the first identifier that does not resolve produces its own not-found error before any identifier to its right is examined. A register-read listing addressed to a metering point that does not exist therefore yields `ERR_METERING_POINT_NOT_FOUND`, not an empty list.
+
+The path identifier spellings are fixed and are not always the same as the corresponding body field. A distribution loop is addressed as `loop_id`, a buried segment as `segment_id`, a production asset as `asset_id`, a load forecast as `forecast_id`, a dispatch plan as `plan_id`, a dispatch order as `order_id`, a tariff as `rate_schedule_id`, a connection agreement as `agreement_id`, a metering point as `point_id`, a register read as `reading_id`, an invoice as `invoice_id`, a work order as `work_order_id`, and an expansion project as `project_id`. A fuel supply contract is addressed in the path as `contract_id` — note that the same contract is referenced from a production asset's body as `fuel_contract_id`, so the two spellings are not interchangeable.
+
+Requests are admitted through a fixed ladder of checks. **The order matters and is asserted**: a request that would fail several checks fails on the earliest one, so a caller with a bad role never learns whether its body was well formed, and a caller acting on a wrongly-stated version never learns whether the target's state permitted the action. The ladder, in order:
+
+1. **Header presence.** Both `X-User-Role` and `X-User-ID` present and non-empty, or `ERR_MISSING_AUTH_HEADERS` (401).
+2. **Role authorisation.** `X-User-Role` is one of the six declared roles and is listed for the endpoint, or `ERR_UNAUTHORIZED` (403).
+3. **Input schema.** Required body and query fields present, enum members recognised, numbers inside their declared ranges, `limit` within 1 to 100 and `offset` at least 0, `window_end` later than `window_start`, `period_end` later than `period_start`, `service_end_date` later than `service_start_date`, and a tariff's `tiers` array non-empty with strictly increasing tier ceilings. Any failure yields `ERR_INVALID_REQUEST` (400).
+4. **Path existence.** Each path identifier resolves, or the corresponding 404: `ERR_LOOP_NOT_FOUND`, `ERR_SEGMENT_NOT_FOUND`, `ERR_FUEL_CONTRACT_NOT_FOUND`, `ERR_ASSET_NOT_FOUND`, `ERR_FORECAST_NOT_FOUND`, `ERR_PLAN_NOT_FOUND`, `ERR_ORDER_NOT_FOUND`, `ERR_RATE_SCHEDULE_NOT_FOUND`, `ERR_AGREEMENT_NOT_FOUND`, `ERR_METERING_POINT_NOT_FOUND`, `ERR_READING_NOT_FOUND`, `ERR_INVOICE_NOT_FOUND`, `ERR_WORK_ORDER_NOT_FOUND` or `ERR_PROJECT_NOT_FOUND`. The loop error guards the single-loop read and the loop emissions summary; the segment error guards the single-segment read and the condition assessment; the fuel-contract error guards the single-contract read and the contract status change; the asset error guards the single-asset read and the availability change; the forecast error guards the single-forecast read and publication; the plan error guards the single-plan read and every plan action; the order, rate-schedule and reading errors guard their single-resource reads; the agreement error guards the single-agreement read, activation and status change; the metering-point error guards the single-point read, the point's register-read listing, commissioning, removal and register-read recording; and the invoice, work-order and project errors each guard their single-resource read and every action on that resource.
+5. **Body foreign keys.** Every foreign key supplied in the request body resolves to an existing row, evaluated in body-field declaration order — `loop_id`, then `upstream_segment_id`, then `fuel_contract_id`, then `forecast_id`, then `rate_schedule_id`, then `agreement_id`, then `segment_id` — with the first unresolved reference yielding `ERR_FK_NOT_FOUND` (404). This applies to the creation of pipe segments, production assets, load forecasts, dispatch plans, connection agreements, metering points, invoices, work orders and expansion projects.
+6. **Customer ownership.** A `CustomerAccount` acting on an invoice payment, on a single-agreement read or on a single-invoice read must own the target, or `ERR_FORBIDDEN_AGREEMENT` (403).
+7. **Stale-version guards.** `expected_loop_version` on dispatch-plan creation and `expected_agreement_version` on invoice creation, yielding `ERR_STALE_LOOP_VERSION` or `ERR_STALE_AGREEMENT_VERSION` (412) respectively.
+8. **Code uniqueness.** `ERR_DUPLICATE_CODE` (409) on loop, segment, asset, fuel-contract, tariff and metering-point creation.
+9. **Referential consistency.** In scaffold order: the upstream-chain check (`ERR_SEGMENT_CYCLE`), the segment-to-loop and meter-to-loop checks (`ERR_SEGMENT_LOOP_MISMATCH`), the customer-class-to-tariff checks (`ERR_CUSTOMER_CLASS_MISMATCH`), the service-mode compatibility check (`ERR_SERVICE_MODE_MISMATCH`) and the forecast-to-loop check (`ERR_FORECAST_LOOP_MISMATCH`) — all 409.
+10. **State gates.** The target must be in the from-state the requested transition declares: `ERR_PLAN_STATE_INVALID`, `ERR_FORECAST_STATE_INVALID`, `ERR_AGREEMENT_STATE_INVALID`, `ERR_INVOICE_STATE_INVALID`, `ERR_WORK_ORDER_STATE_INVALID`, `ERR_PROJECT_STATE_INVALID`, `ERR_METER_STATE_INVALID` and `ERR_AVAILABILITY_STATE_INVALID` — all 409.
+11. **Segregation of duties.** `ERR_SEGREGATION_OF_DUTIES` (403) on plan review and work-order completion. Note that this sits *below* the state gate: reviewing a plan that is not `SUBMITTED` reports the state problem even when the reviewer is also the author.
+12. **Operational safety gates.** In scaffold order: `ERR_ISOLATION_CLEARANCE_DENIED`, then `ERR_RESERVE_MARGIN_INSUFFICIENT`, then `ERR_FUEL_DIVERSITY_BREACH`, then `ERR_LOOP_ISOLATED`, then `ERR_LOOP_NOT_NORMAL` — all 409.
+13. **Temporal gates.** In scaffold order: `ERR_WORK_WINDOW_CONFLICT`, then `ERR_OUTSIDE_WORK_WINDOW`, then `ERR_INVOICE_PERIOD_OVERLAP` — all 409.
+14. **Register monotonicity.** `ERR_READING_NOT_MONOTONIC` (409) when recording a register read.
+15. **Population gates.** `ERR_NO_ELIGIBLE_ASSETS` (409) when optimising, then `ERR_PLAN_HAS_NO_ORDERS` (409) when submitting.
+16. **Sufficiency gates.** In scaffold order: `ERR_INSUFFICIENT_GENERATION` (409), then `ERR_STORAGE_ENERGY_INSUFFICIENT` (409), then `ERR_NO_FEASIBLE_PIPE_SIZE` (422), then `ERR_INSUFFICIENT_METER_DATA` (422).
+17. **Fiscal gates.** In scaffold order: `ERR_LOOP_CAPACITY_EXCEEDED` (409), then `ERR_PROJECT_NPV_NEGATIVE` (422), then `ERR_PAYMENT_AMOUNT_MISMATCH` (409).
+
+### 2.10. The Logical Clock
+
+The server does not read wall-clock time. It maintains a **logical clock** whose startup value is exactly `2026-08-01T00:00:00Z` and which never falls back to real time under any circumstance, so that every window check, every service-window boundary and every pipe-age computation is deterministic before any test-driving call is made. A `SystemController` may reposition the clock by supplying a `to_iso8601` instant; the response reports the resulting `current_utc`. Repositioning the clock changes three things at once: the calendar year used to derive a pipe segment's age when its leak-risk score is recomputed, the instant compared against a work order's `window_start` and `window_end` when excavation is attempted, and the value stamped into `created_at` and `updated_at` on every subsequent write. The clock endpoint is mounted at the server root rather than under the `/district-energy` prefix.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a Distribution Loop and Its Buried Network
+
+A `SystemController` opens the platform by registering a **NetworkLoop**. Registration supplies an operator-facing `code` between 1 and 32 characters that must be unique across every loop in the system, a human-readable `name`, a `service_mode` of `HEATING`, `COOLING` or `DUAL`, a `design_supply_temp_c` giving the design supply temperature in degrees Celsius, a `max_pressure_kpa` giving the maximum allowable distribution pressure in kilopascals which must be greater than zero, and a `rated_capacity_kw` giving the loop's nameplate thermal capacity in kilowatts, also greater than zero. The new loop opens at `posture` `NORMAL`, with `committed_reserved_kw` of 0.0, `open_isolation_count` of 0 and `suspect_segment_count` of 0. A colliding `code` is rejected with `ERR_DUPLICATE_CODE`.
+
+The buried network is then laid in by a `NetworkEngineer`, one **PipeSegment** at a time. A segment declares the `loop_id` it belongs to, a `code` that must be unique within that loop, a `length_m` giving the buried run length in metres and a `diameter_mm` giving the nominal internal diameter in millimetres — both greater than zero — an `install_year` naming the calendar year the pipe was buried, an `insulation_class` of `A`, `B` or `C`, and a `buried_depth_m` giving the cover depth over the crown of the pipe in metres. Two further inputs are optional at registration and default to zero: `makeup_water_ratio`, the makeup water volume divided by the loop's circulating volume over the last assessment period, which may not be negative, and `historical_leak_count`, the number of confirmed leaks recorded on the segment. A newly registered segment always opens at `condition` `SOUND` with a `leak_risk_score` of 0.0, whatever its inputs suggest; the score is only ever populated by an assessment or by a repair sign-off.
+
+Segments form a hydraulic chain rather than a flat list. Each carries an `upstream_segment_id` naming the segment immediately upstream of it, which is null for the plant header segment and defaults to null when omitted. When a value is supplied it must belong to the same loop, and following the chain of upstream links from the new segment must terminate at a segment whose upstream link is null without ever revisiting a segment already seen on the walk. A chain that closes on itself or wanders off the loop is rejected with `ERR_SEGMENT_CYCLE`.
+
+### 3.2. Supply Contracts, Production Assets and Availability Cascades
+
+Resilience in a district energy system is a function of fuel diversity, so supply is modelled explicitly. A `SystemController` registers a **FuelSupplyContract** with a `supplier_code` unique across all contracts, a `fuel_type` drawn from `NATURAL_GAS`, `BIOMASS`, `ELECTRICITY`, `WASTE_HEAT` and `FUEL_OIL`, a `contracted_energy_mwh_per_year` giving the firm annual contracted energy in MWh which must be greater than zero, a `price_per_mwh` giving the delivered price, and a `delivery_firmness` of either `FIRM` or `INTERRUPTIBLE`. The contract opens at `status` `ACTIVE`.
+
+**ProductionAsset** registration attaches a machine to a loop. It supplies the `loop_id` the asset injects into, a `code` unique within that loop, an `asset_type` of `BOILER`, `CHILLER`, `CHP`, `BIOMASS_BOILER` or `THERMAL_STORAGE`, a `rated_capacity_kw` greater than zero giving nameplate output, a `marginal_cost_per_mwh` giving variable production cost, and an `emission_factor_kg_per_mwh` giving CO2e emitted per MWh produced. Five inputs are optional. `fuel_contract_id` names the supply contract feeding the asset and defaults to null, which is the normal case for a thermal store since it consumes no fuel of its own. `derated_capacity_kw`, defaulting to 0.0, is the output ceiling the asset respects while it is derated. `min_stable_output_kw`, defaulting to 0.0, is the floor below which the machine cannot be run at all. `storage_capacity_kwh`, defaulting to 0.0, is the usable stored thermal energy and is zero for every non-storage asset. `state_of_charge_kwh`, defaulting to 0.0, is the stored energy currently available for discharge; it may not be negative and may not exceed `storage_capacity_kwh`. Every asset opens at `availability_state` `AVAILABLE`.
+
+Availability is a three-state cycle that a `SystemController` drives directly by declaring an `availability_state`, optionally overwriting `derated_capacity_kw` in the same request and optionally recording a free-text `reason`. All six edges of the cycle exist and each increments the asset's `version` by 1:
+
+- `AVAILABLE → DERATED` requires the asset to be `AVAILABLE` and its `derated_capacity_kw` to be greater than zero — an asset with no declared derated ceiling cannot be derated.
+- `DERATED → AVAILABLE` requires only that the asset be `DERATED`.
+- `AVAILABLE → OUTAGE` requires the asset to be `AVAILABLE`.
+- `DERATED → OUTAGE` requires the asset to be `DERATED`.
+- `OUTAGE → AVAILABLE` requires the asset to be in `OUTAGE` and, additionally, that its `fuel_contract_id` be null or the referenced contract's `status` be `ACTIVE`. A machine cannot be returned to service on a suspended or expired supply.
+- `OUTAGE → DERATED` requires the asset to be in `OUTAGE` and its `derated_capacity_kw` to be greater than zero.
+
+Any requested edge that is not one of these six — or any attempt to move a fuel contract out of `EXPIRED`, which is terminal — is rejected with `ERR_AVAILABILITY_STATE_INVALID`.
+
+Contract status is the cascade engine of the production side. A `SystemController` moves a contract by supplying a `status` and an optional `reason`, and each of the four legal edges carries a distinct blast radius:
+
+- `ACTIVE → SUSPENDED` sets the contract's `status` to `SUSPENDED`; cascades **every** production asset whose `fuel_contract_id` names this contract and whose `availability_state` is `AVAILABLE` to `DERATED`; cascades **every** dispatch plan on the affected assets' loops whose `plan_state` is `APPROVED` back to `DRAFT`, clearing each such plan's `reviewed_by_user_id` to null; and cascades each affected loop's `posture` from `NORMAL` to `CONSTRAINED`, incrementing that loop's `version` by 1.
+- `SUSPENDED → ACTIVE` sets `status` to `ACTIVE` and cascades every production asset whose `fuel_contract_id` names this contract and whose `availability_state` is `DERATED` back to `AVAILABLE`. Reinstatement deliberately does **not** un-revert the dispatch plans that suspension pushed back to `DRAFT`, and does not itself restore a loop to `NORMAL`; that only happens when a fresh plan is approved.
+- `ACTIVE → EXPIRED` sets `status` to `EXPIRED` and cascades every production asset whose `fuel_contract_id` names this contract to `OUTAGE`, regardless of the availability state each asset held.
+- `SUSPENDED → EXPIRED` behaves identically to the previous edge: `status` becomes `EXPIRED` and every asset on the contract is cascaded to `OUTAGE`.
+
+### 3.3. Forecasting the 24-Hour Thermal Block
+
+Demand planning begins with a **LoadForecast**, created in `DRAFT` by a `DispatchOperator` for exactly one 24-hour service block on one loop. Creation supplies the `loop_id`, a `service_date` giving the UTC start instant of the block, and an `occupancy_profile` of `WEEKDAY_FULL`, `WEEKEND_REDUCED` or `HOLIDAY_MINIMAL` describing the building schedule that applies. Four degree-hour inputs are optional at creation: `heating_degree_hours` and `cooling_degree_hours` carry the weather-normal degree hours over the block and each default to 0.0 and may not be negative; `actual_heating_degree_hours` and `actual_cooling_degree_hours` carry metered actuals and default to null, being supplied only when the operator intends to finalise the forecast on measured weather. A draft opens at `forecast_state` `DRAFT` with `variant_applied` null, `coincident_demand_kw` 0.0, `projected_energy_mwh` 0.0 and `contributing_agreement_count` 0.
+
+Publishing the forecast, which advances `forecast_state` from `DRAFT` to `PUBLISHED`, is where the numbers appear. The publish request names a `variant` and may overwrite `actual_heating_degree_hours` and `actual_cooling_degree_hours` in the same call. Publishing a forecast that is not in `DRAFT` is rejected with `ERR_FORECAST_STATE_INVALID`; publishing under the `ACTUAL_WEIGHTED_FINAL` variant without both actual degree-hour figures available is a malformed request. Publication supersedes competition: any **other** forecast on the same `loop_id` with the same `service_date` that is currently `PUBLISHED` is cascaded from `PUBLISHED` to `SUPERSEDED` and has its `version` incremented by 1. `SUPERSEDED` is terminal.
+
+The projection itself works as follows. First, an occupancy factor is read from the `occupancy_profile`: a full weekday counts for the whole of the diversified load, a reduced weekend counts for 0.72 of it, and a minimal holiday counts for 0.45 of it.
+
+Second, the degree hours to use are chosen by variant, and the two variants differ in exactly one place. Under `WEATHER_NORMAL_PROVISIONAL` the heating degree hours are the stored `heating_degree_hours` and the cooling degree hours are the stored `cooling_degree_hours`, both used unchanged; the two actual fields are ignored entirely. Under `ACTUAL_WEIGHTED_FINAL` the heating degree hours are seven tenths of `actual_heating_degree_hours` plus three tenths of `heating_degree_hours`, and that blended figure is itself rounded half-up to two decimal places before anything else uses it; the cooling degree hours are seven tenths of `actual_cooling_degree_hours` plus three tenths of `cooling_degree_hours`, likewise rounded half-up to two decimal places first.
+
+Third, a weather adder in kilowatts is computed as the chosen heating degree hours multiplied by 3.5 plus the chosen cooling degree hours multiplied by 2.8, with that sum rounded half-up to two decimal places.
+
+Fourth, the customer contribution is accumulated. The input set is every connection agreement on the forecast's loop whose `contract_state` is `ACTIVE`, whose `service_start_date` is at or before the forecast's `service_date`, and whose `service_end_date` is strictly after the forecast's `service_date`. The set is walked in `created_at` ascending order. Each agreement contributes its `reserved_capacity_kw` multiplied by a class diversity factor for its `customer_class` and multiplied by the occupancy factor, and **that per-agreement product is rounded half-up to two decimal places before it joins the running sum**. The class diversity factors are 0.62 for `RESIDENTIAL_MULTIFAMILY`, 0.78 for `COMMERCIAL_OFFICE`, 0.90 for `HOSPITAL`, 0.70 for `UNIVERSITY` and 0.95 for `INDUSTRIAL_PROCESS`. The number of agreements that entered the set is stored as `contributing_agreement_count`.
+
+Fifth, distribution losses are added. The diversified customer sum plus the weather adder is multiplied by 1.08 — an eight percent loss uplift on the buried network — and the result, rounded half-up to two decimal places, is stored as `coincident_demand_kw`.
+
+Sixth, block energy follows from the peak. `projected_energy_mwh` is `coincident_demand_kw` multiplied by the 24 hours in the dispatch block, multiplied by a forecast load factor of 0.62, divided by 1000 to convert kilowatt-hours to megawatt-hours, and rounded half-up to three decimal places.
+
+Finally the variant that produced these numbers is recorded in `variant_applied` as either `WEATHER_NORMAL_PROVISIONAL` or `ACTUAL_WEIGHTED_FINAL`, and the forecast becomes `PUBLISHED`.
+
+### 3.4. Merit-Order Dispatch, Resilience Gates and Commitment
+
+A **DispatchPlan** is opened by a `DispatchOperator` against a published forecast, supplying the `loop_id`, the `forecast_id` of the forecast the plan will serve, and the `expected_loop_version` guard described in §2.7. The forecast must belong to the same loop as the plan, or the create is rejected with `ERR_FORECAST_LOOP_MISMATCH`. A new plan opens at `plan_state` `DRAFT` with `block_hours` fixed at 24.0 — the dispatch block is always the full day — and with `authored_by_user_id` taken from the acting `X-User-ID`, `reviewed_by_user_id` null, and `allocated_capacity_kw`, `unserved_demand_kw`, `total_dispatch_cost`, `total_emissions_kg`, `reserve_margin_pct` and `fuel_diversity_hhi` all at 0.0. Creation is also a broom: every other dispatch plan on the same loop whose `plan_state` is `DRAFT`, `SUBMITTED` or `APPROVED` is cascaded to `SUPERSEDED` with its `version` incremented by 1, and the loop's own `version` is incremented by 1. All three of those supersession edges behave identically — a `DRAFT`, a `SUBMITTED` and an `APPROVED` plan are each simply stamped `SUPERSEDED`, which is terminal, with no further side effects and no distinction between them.
+
+**Optimising** the plan is a self-loop from `DRAFT` back to `DRAFT` that may be run as often as the operator likes; each run deletes every dispatch order the plan currently owns and rebuilds the set from scratch. Three things must hold: the plan is in `DRAFT`, the referenced forecast is `PUBLISHED` (otherwise `ERR_FORECAST_STATE_INVALID`), and at least one production asset on the loop has an `availability_state` of `AVAILABLE` or `DERATED`. Each run increments the plan's `version` by 1.
+
+The eligible asset set is every production asset on the plan's loop whose `availability_state` is `AVAILABLE` or `DERATED` and whose `fuel_contract_id` is either null or names a contract whose `status` is `ACTIVE` or `SUSPENDED`. An asset on an `EXPIRED` contract is therefore ineligible even if its own availability were somehow not yet `OUTAGE`. If the eligible set is empty, optimisation fails with `ERR_NO_ELIGIBLE_ASSETS`.
+
+Eligible assets are ranked cheapest-first: primarily by `marginal_cost_per_mwh` ascending, then — for assets that cost the same to run — by `emission_factor_kg_per_mwh` ascending so that the cleaner machine leads, and finally by `created_at` ascending to make the ordering total. A remaining-demand counter starts at the forecast's `coincident_demand_kw`, and a rank counter starts at zero.
+
+Each asset in rank order is offered an effective capacity. A `THERMAL_STORAGE` asset offers the lesser of its `rated_capacity_kw` and its `storage_capacity_kwh` divided by the four-hour storage discharge window, with that quotient rounded half-up to two decimal places; note carefully that the planning horizon sizes storage from nameplate `storage_capacity_kwh`, **not** from the live `state_of_charge_kwh`, which is checked only at commitment. An asset whose `availability_state` is `DERATED` offers its `derated_capacity_kw`. Every other asset offers its `rated_capacity_kw`.
+
+The block allocated to the asset is the lesser of that effective capacity and the remaining demand. Two skip conditions then apply, and neither consumes a rank. If the block is zero or negative, the asset is passed over. If the block is strictly less than the asset's `min_stable_output_kw`, the asset is passed over as unable to run stably — a block exactly equal to `min_stable_output_kw` does dispatch. Otherwise the rank counter advances by one and becomes the order's `merit_rank`, a 1-based position, and a **DispatchOrder** is emitted recording its `plan_id`, its `asset_id`, that `merit_rank`, and the block as `allocated_kw`.
+
+The order's energy figures depend on the machine's run window: a `THERMAL_STORAGE` asset runs for the four-hour discharge window, every other asset for the full 24-hour block. `block_energy_mwh` is `allocated_kw` multiplied by that number of hours, divided by 1000, rounded half-up to three decimal places. `discharged_kwh` is `allocated_kw` multiplied by the four-hour discharge window, rounded half-up to two decimal places, for a `THERMAL_STORAGE` asset, and is exactly 0.0 for every other asset. `order_cost` is `block_energy_mwh` multiplied by the asset's `marginal_cost_per_mwh`, rounded half-up to two decimal places. `order_emissions_kg` is `block_energy_mwh` multiplied by the asset's `emission_factor_kg_per_mwh`, rounded half-up to two decimal places.
+
+The remaining demand is then reduced by the allocated block and rounded half-up to two decimal places, and the waterfall stops as soon as that remainder falls to zero or below. Whatever remains — floored at 0.0, so it is never negative — is stored on the plan as `unserved_demand_kw`. The plan's roll-ups take the already-rounded per-order figures and round each total half-up to two decimal places: `allocated_capacity_kw` is the sum of every order's `allocated_kw`, `total_dispatch_cost` the sum of every `order_cost`, and `total_emissions_kg` the sum of every `order_emissions_kg`.
+
+Immediately after the waterfall, and in the same optimisation run, two resilience metrics are computed over the *same* eligible asset set — not over the dispatched subset. The available capacity is the sum of the effective capacity of every eligible asset, using exactly the same effective-capacity rule as the waterfall, rounded half-up to two decimal places. The single largest effective capacity among those assets is identified, breaking a tie in favour of the tied asset with the earliest `created_at`, and subtracted from the available capacity to give an N-1 available capacity, again rounded half-up to two decimal places — this is the capacity that would survive the loss of the biggest machine. `reserve_margin_pct` is then that N-1 capacity less the forecast's `coincident_demand_kw`, divided by that same demand, multiplied by 100, and rounded half-up to two decimal places; when the demand is exactly zero the margin is reported as 0.0 rather than being divided by zero.
+
+Fuel concentration is measured over the plan's own dispatched energy. Each order is tagged with a fuel key: the `fuel_type` of the supply contract behind its asset when that asset has a `fuel_contract_id`, and otherwise the literal key `STORAGE`. The plan's total dispatched energy is the sum of every order's `block_energy_mwh`, rounded half-up to three decimal places. For each distinct fuel key, the energy dispatched under that key is summed and rounded half-up to three decimal places, divided by that plan total, and the quotient squared; the squares are added across all distinct keys and the sum rounded half-up to four decimal places to give `fuel_diversity_hhi`. When the plan's total dispatched energy is exactly zero the index is reported as 0.0. A single-fuel plan scores 1.0 — maximum concentration — and a plan spread evenly across four keys scores 0.25.
+
+**Submission** advances the plan from `DRAFT` to `SUBMITTED` and accepts an optional `submission_note`. Three conditions gate it, and each has its own code. The plan must be in `DRAFT`, or `ERR_PLAN_STATE_INVALID`. It must own at least one dispatch order, or `ERR_PLAN_HAS_NO_ORDERS` — a plan that was never optimised cannot be submitted. And its `unserved_demand_kw` must be exactly 0.0, meaning the waterfall covered the whole coincident demand, or `ERR_INSUFFICIENT_GENERATION`.
+
+**Review** is a `SystemController` decision carrying a `decision` of either `APPROVE` or `REJECT` plus an optional `review_note`; either branch stores the reviewing `X-User-ID` into `reviewed_by_user_id` and increments the plan's `version` by 1, and both require the plan to be `SUBMITTED` and the reviewer to differ from `authored_by_user_id`. On `APPROVE`, two resilience gates are evaluated in that order before the plan may advance from `SUBMITTED` to `APPROVED`: the plan's `reserve_margin_pct` must be at or above 15.00 percent, or the approval is refused with `ERR_RESERVE_MARGIN_INSUFFICIENT`; and its `fuel_diversity_hhi` must be at or below 0.55, or the approval is refused with `ERR_FUEL_DIVERSITY_BREACH`. A plan riding a single fuel therefore cannot be approved no matter how much spare capacity it has. When both gates pass the plan becomes `APPROVED`, and if the loop is sitting in `CONSTRAINED` with an `open_isolation_count` of 0 the loop is restored to `NORMAL` with its `version` incremented by 1. On `REJECT` the plan returns from `SUBMITTED` to `DRAFT` with no gates evaluated, no loop cascade, and no metric recomputation — the operator may re-optimise and submit again.
+
+An approved plan can lose its approval without anyone asking. When suspending a fuel supply contract cascades at least one asset referenced by this plan's dispatch orders to `DERATED` or `OUTAGE`, the plan is reverted from `APPROVED` to `DRAFT`, its `reviewed_by_user_id` is cleared to null, its `version` is incremented by 1, and the loop's `posture` is cascaded from `NORMAL` to `CONSTRAINED`. This is the intended serialisation point between the supply side and the control room: an approval earned on a fuel supply that has since been withdrawn is not allowed to stand.
+
+**Commitment** moves an approved plan to `COMMITTED` and is the point at which stored thermal energy actually leaves the tanks. Three preconditions apply: the plan is `APPROVED`, the loop's `posture` is exactly `NORMAL` — not `CONSTRAINED` and not `ISOLATED`, or the commit is refused with `ERR_LOOP_NOT_NORMAL` — and for every dispatch order whose `discharged_kwh` is greater than zero the referenced asset's `state_of_charge_kwh` is at or above that `discharged_kwh`, or the commit is refused with `ERR_STORAGE_ENERGY_INSUFFICIENT`. On success the plan becomes `COMMITTED`, and for every storage order the referenced asset's `state_of_charge_kwh` is decreased by that order's `discharged_kwh` with the asset's `version` incremented by 1.
+
+**Decommitment** is the exact compensating move, available to a `SystemController` on a `COMMITTED` plan with an optional `reason`. The plan returns from `COMMITTED` to `DRAFT`, its `reviewed_by_user_id` is cleared to null, and for every storage order the referenced asset's `state_of_charge_kwh` is increased by that order's `discharged_kwh` with the asset's `version` incremented by 1 — so the storage energy ledger returns to its pre-commitment total exactly, with no drift.
+
+**Reconciliation** closes a committed plan out. A `SystemController` may move a `COMMITTED` plan to `RECONCILED` only when the forecast the plan serves has a `variant_applied` of `ACTUAL_WEIGHTED_FINAL`; a plan built on a merely provisional weather-normal projection cannot be reconciled until that forecast has been finalised on measured weather. `RECONCILED` and `SUPERSEDED` are the plan's two terminal states.
+
+### 3.5. Tariffs, Connection Agreements and Capacity Reservation
+
+Before any customer can be signed, a `BillingAnalyst` publishes a **RateSchedule** for one customer class. A tariff declares a `code` unique across all tariffs, a `customer_class` drawn from `RESIDENTIAL_MULTIFAMILY`, `COMMERCIAL_OFFICE`, `HOSPITAL`, `UNIVERSITY` and `INDUSTRIAL_PROCESS`, a `fixed_service_charge` giving the monthly fixed charge, a `demand_charge_per_kw` charged against billed demand, and a `minimum_bill_amount` acting as a floor on the invoice total — none of the three may be negative. It also declares a `ratchet_lookback_months`, the number of months of prior invoices that feed the demand ratchet, which defaults to 11 when omitted. Finally it declares `tiers`, an ordered array of at least one object, each holding a `load_factor_max` and an `energy_rate_per_mwh`, stored and walked in `load_factor_max` ascending order. The ceilings must be strictly increasing, and the final entry is the fallback tier that catches any load factor above every declared ceiling. A malformed ladder — empty, or with a non-increasing ceiling — is rejected with `ERR_INVALID_REQUEST`; a colliding `code` with `ERR_DUPLICATE_CODE`.
+
+A **ConnectionAgreement** is then drafted by a `BillingAnalyst` against a loop and a tariff. It supplies the `loop_id` of the supplying loop, the `rate_schedule_id` of the tariff to apply, a `customer_name` giving the customer's legal name, a `customer_class`, a `reserved_capacity_kw` greater than zero giving the contractually reserved thermal capacity, a `service_mode` naming the thermal service requested, and a `service_start_date` at which service begins inclusively together with a `service_end_date` at which it ends exclusively. Two cross-entity constraints bind at creation: the agreement's `customer_class` must equal the referenced tariff's `customer_class`, or the create is rejected with `ERR_CUSTOMER_CLASS_MISMATCH`; and the agreement's `service_mode` must be compatible with the loop's `service_mode`, meaning either identical to it or permitted because the loop is `DUAL`, or the create is rejected with `ERR_SERVICE_MODE_MISMATCH`. A new agreement opens with `contract_state` `PENDING_CAPACITY`, `billing_state` `CURRENT`, `billed_demand_ratchet_kw` 0.0 and `balance_due` 0.0.
+
+An agreement carries **two independent state dimensions**. The contract dimension, `contract_state`, moves among `PENDING_CAPACITY`, `ACTIVE`, `SUSPENDED` and `TERMINATED`, with `TERMINATED` terminal. The billing dimension, `billing_state`, moves among `CURRENT`, `IN_ARREARS` and `WRITTEN_OFF`, with `WRITTEN_OFF` terminal; it starts at `CURRENT` and is driven entirely by the invoice ledger described in §3.7, never by a client request. The two dimensions advance independently: an agreement can be `SUSPENDED` and `CURRENT`, or `ACTIVE` and `IN_ARREARS`.
+
+**Activation** advances the contract dimension from `PENDING_CAPACITY` to `ACTIVE` and is the platform's capacity-allocation decision. It requires that the agreement be in `PENDING_CAPACITY`, that the loop's `posture` not be `ISOLATED` — an activation attempted on an isolated loop is refused with `ERR_LOOP_ISOLATED` — and that a reservation sweep across the loop's whole reservation calendar find no breach.
+
+The sweep works on half-open intervals. A ceiling is first computed as the loop's `rated_capacity_kw` multiplied by an oversubscription factor of 1.15, rounded half-up to two decimal places — the utility is willing to sell 115 percent of nameplate on the assumption that no two buildings peak together. The peer set is every other agreement on the same loop whose `contract_state` is `ACTIVE` or `SUSPENDED`, excluding the candidate itself. Each peer and the candidate is treated as the interval running from its `service_start_date` inclusive to its `service_end_date` exclusive. The boundaries to test are the ascending list of distinct `service_start_date` values across those intervals. At each boundary, the concurrent set is every interval whose `service_start_date` is at or before the boundary and whose `service_end_date` is strictly after it; the `reserved_capacity_kw` of that concurrent set is summed and rounded half-up to two decimal places. If that total is **strictly greater** than the ceiling at any boundary, the activation is refused with `ERR_LOOP_CAPACITY_EXCEEDED`; a total exactly equal to the ceiling is permitted. Because the intervals are half-open, an agreement ending exactly at a boundary does not overlap one starting at that boundary.
+
+When the sweep clears, the agreement becomes `ACTIVE`, the loop's `committed_reserved_kw` is increased by the agreement's `reserved_capacity_kw`, and both the loop's and the agreement's `version` are incremented by 1.
+
+The contract dimension is otherwise moved by supplying a `contract_state` with an optional `reason`, and each edge treats the loop's reservation ledger differently:
+
+- `ACTIVE → SUSPENDED` sets `contract_state` to `SUSPENDED` and leaves `committed_reserved_kw` **unchanged**, because a suspended agreement still holds its reservation on the loop.
+- `SUSPENDED → ACTIVE` sets `contract_state` back to `ACTIVE` and likewise leaves `committed_reserved_kw` unchanged, since the reservation was never released. Reinstatement does not re-run the reservation sweep.
+- `ACTIVE → TERMINATED` sets `contract_state` to `TERMINATED`, **decreases** the loop's `committed_reserved_kw` by the agreement's `reserved_capacity_kw` and increments the loop's `version` by 1, cascades every metering point of this agreement whose `meter_state` is `INSTALLED` or `COMMISSIONED` to `REMOVED`, and cascades the billing dimension from `IN_ARREARS` to `WRITTEN_OFF` if it was in arrears.
+- `SUSPENDED → TERMINATED` behaves identically to the previous edge: reservation released, loop `version` incremented, metering points removed, arrears written off.
+- `PENDING_CAPACITY → TERMINATED` sets `contract_state` to `TERMINATED` but leaves `committed_reserved_kw` unchanged, because the reservation was never counted onto the loop in the first place.
+
+Every one of these edges increments the agreement's `version` by 1. Any requested contract transition not on this list is rejected with `ERR_AGREEMENT_STATE_INVALID`.
+
+### 3.6. Thermal Energy Metering
+
+Delivered energy is measured at a **MeteringPoint** installed by a `FieldTechnician`. Installation names the `agreement_id` the meter bills against, the `segment_id` of the buried segment the customer's service branch taps, a `code` unique across every metering point in the system, and an optional register `multiplier` greater than zero which defaults to 1.0. The meter's segment and its agreement must sit on the same loop; a meter tapped into a segment belonging to a different loop from the one supplying its agreement is rejected with `ERR_SEGMENT_LOOP_MISMATCH`. A new point opens at `meter_state` `INSTALLED` with `last_reading_energy_mwh` 0.0 and `reading_count` 0.
+
+Commissioning advances the point from `INSTALLED` to `COMMISSIONED` and is the gate on billable reads. It requires the point to be `INSTALLED` and additionally requires that the referenced pipe segment's `condition` not be `UNDER_REPAIR` — a meter cannot be brought into service on a segment that is currently dug up. A commissioning attempt that fails either test is rejected with `ERR_METER_STATE_INVALID`.
+
+Removal takes a point to the terminal `REMOVED` state and accepts an optional `reason`. Exactly two source states are permitted — `INSTALLED` and `COMMISSIONED` — and they behave identically: a `COMMISSIONED → REMOVED` removal and an `INSTALLED → REMOVED` removal each simply set `meter_state` to `REMOVED` and increment the point's `version` by 1. Removing a point that is already `REMOVED` is rejected with `ERR_METER_STATE_INVALID`. Removal also arrives as a cascade when the owning agreement reaches `TERMINATED`, as described in §3.5.
+
+Recording a register read requires the point to be `COMMISSIONED`; attempting it in any other state is rejected with `ERR_METER_STATE_INVALID`. A **MeterReading** supplies a `read_at` giving the UTC instant of the register read, a `cumulative_energy_mwh` giving the raw cumulative register value in MWh which may not be negative, a `peak_demand_kw` giving the highest 15-minute demand observed since the previous read which may not be negative, and a `read_type` of either `ACTUAL` for a metered value or `ESTIMATED` for a synthesised one. Readings are append-only and per point strictly ordered: a new reading's `cumulative_energy_mwh` must be greater than or equal to the point's `last_reading_energy_mwh`, and its `read_at` must be strictly after the `read_at` of the newest existing reading for that point. A register that goes backwards in either dimension is rejected with `ERR_READING_NOT_MONOTONIC`.
+
+Each stored reading also carries `multiplied_energy_mwh`, its `cumulative_energy_mwh` multiplied by the owning point's `multiplier` and rounded half-up to three decimal places. Recording a reading raises the point's `last_reading_energy_mwh` to the new `cumulative_energy_mwh`, increments `reading_count` by 1 and increments the point's `version` by 1.
+
+### 3.7. Billing Determinants, Invoice Lifecycle and the Arrears Ledger
+
+An **Invoice** is opened in `DRAFT` by a `BillingAnalyst` for one billing period on one agreement. Creation supplies the `agreement_id`, a `period_start` inclusive and a `period_end` exclusive bounding the billing period, a `variant` selecting the determinant treatment, and the `expected_agreement_version` guard from §2.7. The billing period may not overlap the half-open period of any existing invoice for the same agreement whose `invoice_state` is `DRAFT`, `ISSUED`, `ADJUSTED` or `PAID`; only a `VOID` invoice's period is available for reuse, and an overlap is rejected with `ERR_INVOICE_PERIOD_OVERLAP`. Creation, issuing and adjustment all additionally require the owning agreement's `contract_state` to be `ACTIVE` or `SUSPENDED`; billing a `PENDING_CAPACITY` or `TERMINATED` agreement is rejected with `ERR_INVOICE_STATE_INVALID`.
+
+The determinant calculation runs at creation and again on every adjustment. Its input set is every register read whose `point_id` belongs to a metering point of this agreement with a `meter_state` of `COMMISSIONED` or `REMOVED` — readings taken from a removed meter still count, so that a terminated service can still be billed — and whose `read_at` is at or after `period_start` and strictly before `period_end`. The two variants differ in exactly two ways. The `ESTIMATED` variant admits reads of either `read_type`, both `ACTUAL` and `ESTIMATED`, and treats the agreement's `billed_demand_ratchet_kw` as 0.0 so that the demand determinant floors on the reserved capacity alone. The `ACTUAL_TRUE_UP` variant admits only reads whose `read_type` is `ACTUAL`, and applies the agreement's stored `billed_demand_ratchet_kw` as a third floor on billed demand. Both variants otherwise execute the identical twelve steps below, and the variant that produced the stored numbers is recorded in `variant_applied`.
+
+The admitted reads are ordered by `read_at` ascending and, for reads sharing an instant, by `created_at` ascending. If fewer than two reads are admitted, the calculation cannot produce a consumption delta and the request fails with `ERR_INSUFFICIENT_METER_DATA`.
+
+Energy is then accumulated per metering point. For each point that contributed at least two admitted reads, the raw delta is that point's last admitted `cumulative_energy_mwh` less its first admitted `cumulative_energy_mwh`; the point's energy is that raw delta multiplied by the point's `multiplier` and rounded half-up to three decimal places. `billed_energy_mwh` is the sum of those per-point figures, itself rounded half-up to three decimal places — **each point is rounded before the summation**.
+
+Demand is the maximum of up to three floors. The metered peak is the largest `peak_demand_kw` across all admitted reads, breaking a tie in favour of the tied reading with the earliest `read_at`. The reserved floor is the agreement's `reserved_capacity_kw` multiplied by 0.50 — half the reserved capacity is billable whether the customer draws it or not — rounded half-up to two decimal places. The ratchet floor is 0.0 under the `ESTIMATED` variant and the agreement's `billed_demand_ratchet_kw` under the `ACTUAL_TRUE_UP` variant. `billed_demand_kw` is the greatest of those three figures, rounded half-up to two decimal places.
+
+The load factor selects the energy tier. The period length in whole hours is the span from `period_start` to `period_end`. `load_factor_pct` is `billed_energy_mwh` multiplied by 1000 to convert to kilowatt-hours, divided by the product of `billed_demand_kw` and that period length in hours, multiplied by 100, and rounded half-up to two decimal places; when `billed_demand_kw` is exactly 0.0 the load factor is reported as 0.0 rather than being divided by zero.
+
+The tier applied is the first entry of the tariff's `tiers`, walked in `load_factor_max` ascending order, whose `load_factor_max` is greater than or equal to `load_factor_pct`; when no entry qualifies, the last entry — the fallback tier — is used. `energy_charge` is `billed_energy_mwh` multiplied by that tier's `energy_rate_per_mwh`, rounded half-up to two decimal places. `demand_charge` is `billed_demand_kw` multiplied by the tariff's `demand_charge_per_kw`, rounded half-up to two decimal places. `fixed_charge` is the tariff's `fixed_service_charge`, copied at calculation time so that a later tariff edit cannot retroactively move a stored invoice.
+
+The three charges are added and the sum rounded half-up to two decimal places to give a subtotal, and **the subtotal is rounded before the minimum-bill comparison**. If that subtotal is strictly less than the tariff's `minimum_bill_amount`, `total_amount` becomes the `minimum_bill_amount` and `minimum_bill_applied` is set to true; otherwise `total_amount` is the subtotal and `minimum_bill_applied` is false. A newly created invoice opens at `invoice_state` `DRAFT` with `paid_amount` 0.0, and creation increments the owning agreement's `version` by 1 — the calculation read the agreement's determinants, so the agreement is considered touched even though none of its own stored values changed.
+
+The invoice lifecycle then proceeds through five states. **Issuing** advances a `DRAFT` invoice to `ISSUED` and is the moment money becomes owed: it raises the agreement's `billed_demand_ratchet_kw` to this invoice's `billed_demand_kw` when the invoice's figure is higher — the ratchet is only ever raised, never lowered, and only on this one edge — recomputes the agreement's `balance_due`, cascades the billing dimension from `CURRENT` to `IN_ARREARS` when the recomputed balance exceeds the arrears threshold, and increments both the agreement's and the invoice's `version` by 1.
+
+**Adjustment** re-runs the whole determinant calculation under a freshly supplied `variant`, with an optional `adjustment_note`, and overwrites `billed_energy_mwh`, `billed_demand_kw`, `load_factor_pct`, `energy_charge`, `demand_charge`, `fixed_charge`, `total_amount`, `minimum_bill_applied` and `variant_applied` from the current register data. It is permitted from two source states, which behave identically apart from the state they land in: `ISSUED → ADJUSTED` moves the invoice to `ADJUSTED`, and `ADJUSTED → ADJUSTED` is a self-loop that leaves it there, so repeated re-adjustment is explicitly allowed and always recomputes from current readings rather than from the previously stored figures. Both edges recompute the agreement's `balance_due` and increment both the agreement's and the invoice's `version` by 1. Adjustment does **not** touch the ratchet.
+
+**Payment** is the one operation reserved to a `CustomerAccount`, which supplies an `amount`. It is permitted from `ISSUED` and from `ADJUSTED` and from no other state — paying a `DRAFT`, `PAID` or `VOID` invoice is rejected with `ERR_INVOICE_STATE_INVALID` — and both permitted edges behave identically: the acting `X-User-ID` must equal the invoice's `agreement_id`, the `amount` must equal the invoice's `total_amount` exactly — a partial or excess payment is refused with `ERR_PAYMENT_AMOUNT_MISMATCH`, so there are no partial settlements — and on success `paid_amount` is set to the amount, `invoice_state` becomes the terminal `PAID`, the agreement's `balance_due` is recomputed, the billing dimension is cascaded from `IN_ARREARS` back to `CURRENT` when the recomputed balance is at or below the arrears threshold, and both the agreement's and the invoice's `version` are incremented by 1.
+
+**Voiding** takes an invoice to the terminal `VOID` with an optional `reason` and is permitted from exactly three source states — `DRAFT`, `ISSUED` and `ADJUSTED`; voiding an already `PAID` or `VOID` invoice is rejected with `ERR_INVOICE_STATE_INVALID`. `DRAFT → VOID` simply stamps the invoice `VOID` and increments its `version` by 1; because a draft invoice never entered the balance, no ledger work is needed. `ISSUED → VOID` and `ADJUSTED → VOID` behave identically to one another: each stamps the invoice `VOID`, recomputes the agreement's `balance_due`, cascades the billing dimension from `IN_ARREARS` back to `CURRENT` when the recomputed balance is at or below the arrears threshold, and increments both the agreement's and the invoice's `version` by 1.
+
+The agreement's balance ledger, recomputed on every issue, adjustment, payment and void, is defined precisely: `balance_due` is the sum of `total_amount` across every invoice of this agreement whose `invoice_state` is `ISSUED` or `ADJUSTED`, rounded half-up to two decimal places. Invoices in `DRAFT`, `PAID` or `VOID` are excluded from the sum, which is why paying an invoice and voiding it have the same downward effect on the balance. The arrears threshold is 25,000.00 currency units, and the two comparisons are deliberately asymmetric: the billing dimension enters `IN_ARREARS` only when the balance is **strictly greater than** the threshold, and returns to `CURRENT` when the balance is **at or below** it, so a balance sitting exactly on 25,000.00 is `CURRENT`. The third billing edge, `IN_ARREARS → WRITTEN_OFF`, fires only as a cascade when the contract dimension reaches `TERMINATED` in the same request while the billing dimension was `IN_ARREARS`; it increments the agreement's `version` by 1 and is terminal.
+
+### 3.8. Leak Detection, Excavation Permits and Field Work
+
+Buried pipe cannot be inspected visually, so condition is inferred from a weighted score. A `NetworkEngineer` records a leak-detection survey against a segment by supplying a fresh `makeup_water_ratio`, a fresh `historical_leak_count` and a fresh `insulation_class`, with an optional `survey_note`. All three supplied values overwrite what the segment held, and the score is then recomputed from scratch.
+
+Four components each land on a 0-to-100 scale and each is rounded half-up to two decimal places before the weighted sum. The **age component** takes the segment's age in years — the calendar year of the logical clock less its `install_year` — divided by a 60-year full-penalty life, capped at 1, and multiplied by 100; a pipe 60 years old or older therefore scores the full 100 on age. The **makeup-water component** takes the `makeup_water_ratio` divided by a full-penalty ratio of 0.05, capped at 1, multiplied by 100; a loop losing five percent of its circulating volume as makeup water scores the full 100. The **leak-history component** takes the `historical_leak_count` divided by a full-penalty count of 3, capped at 1, multiplied by 100; three or more recorded leaks score the full 100. The **insulation component** is a flat penalty read from the `insulation_class` and multiplied by 100: class `A` scores 10.00, class `B` scores 45.00 and class `C` scores 85.00.
+
+`leak_risk_score` is then 0.35 of the age component plus 0.30 of the makeup-water component plus 0.20 of the leak-history component plus 0.15 of the insulation component, rounded half-up to two decimal places. The band follows from the score with inclusive floors: a score at or above 70.0 is `SUSPECT`, a score at or above 45.0 but below 70.0 is `MONITORED`, and anything below 45.0 is `SOUND`.
+
+The assessment moves the segment's `condition` into the band the recomputed score implies, and every one of the six possible re-banding edges is legal and stores the recomputed `leak_risk_score`. Where the edge changes whether the segment counts as suspect, the loop's counter moves with it. `SOUND → MONITORED` and `MONITORED → SOUND` change no counter. `SOUND → SUSPECT` and `MONITORED → SUSPECT` each increment the loop's `suspect_segment_count` by 1 and increment the loop's `version` by 1. `SUSPECT → MONITORED` and `SUSPECT → SOUND` each decrement the loop's `suspect_segment_count` by 1 and increment the loop's `version` by 1. A segment already sitting in the band its new score implies simply has the score restored with no counter movement. A segment currently `UNDER_REPAIR` is not re-banded by an assessment; it leaves that state only when its work order is signed off.
+
+A **WorkOrder** is raised by a `FieldTechnician` against a buried segment. It supplies the `segment_id` being worked, the `loop_id` the segment belongs to — which must equal the segment's own loop, or the create is rejected with `ERR_SEGMENT_LOOP_MISMATCH` — a `work_type` of `LEAK_REPAIR`, `INSPECTION` or `VALVE_REPLACEMENT`, a `window_start` and `window_end` bounding the requested work window inclusively at both ends, and an optional `requires_isolation` flag defaulting to false that declares whether the segment must be hydraulically isolated for the work. The order opens in `DRAFT` with `permit_decision` `PENDING`, `reported_by_user_id` taken from the acting `X-User-ID` and `completed_by_user_id` null.
+
+**Submitting for permit** advances the order from `DRAFT` to `PERMIT_PENDING` and sets `permit_decision` to `PENDING`. It is gated by a window-conflict sweep over the segment's other open work. The peer set is every other work order on the same `segment_id` whose `work_state` is `PERMIT_PENDING`, `SCHEDULED`, `EXCAVATING`, `REPAIRING` or `BACKFILLED`; orders in `DRAFT`, `COMPLETED` or `CANCELLED` do not block. Each window's `window_end` is extended by a six-hour refill buffer — the time it takes to re-fill and re-pressurise the segment after the ground is closed — before the overlap test. Two orders conflict when the candidate's `window_start` is at or before the peer's buffered end **and** the peer's `window_start` is at or before the candidate's buffered end; both comparisons are inclusive, so a candidate starting exactly at a peer's buffered end does conflict. Any conflict refuses the submission with `ERR_WORK_WINDOW_CONFLICT`.
+
+**The permit decision** belongs to a `NetworkEngineer`, who supplies a `permit_decision` of `GRANTED` or `DENIED` with an optional `decision_note`, and both branches require the order to be `PERMIT_PENDING`. `PERMIT_PENDING → SCHEDULED` stores `permit_decision` as `GRANTED` and sets `work_state` to `SCHEDULED`. `PERMIT_PENDING → DRAFT` stores `permit_decision` as `DENIED` and returns `work_state` to `DRAFT`, from which the technician may change the window and re-submit; the two branches are otherwise symmetric and each increments the order's `version` by 1.
+
+**Breaking ground** advances a `SCHEDULED` order to `EXCAVATING` and carries four preconditions. The order must be `SCHEDULED` and its `permit_decision` must be `GRANTED`, or the request is rejected with `ERR_WORK_ORDER_STATE_INVALID`. When `requires_isolation` is true, no dispatch plan on the loop may be in `plan_state` `COMMITTED` — you do not isolate a loop that the plant is actively serving — and a violation is refused with `ERR_ISOLATION_CLEARANCE_DENIED`. And the logical clock must sit at or after the order's `window_start` and at or before its `window_end`, or the request is refused with `ERR_OUTSIDE_WORK_WINDOW`. On success the order becomes `EXCAVATING` and the segment's `condition` is cascaded to `UNDER_REPAIR` with the segment's `version` incremented by 1, from whichever band it held: `SOUND → UNDER_REPAIR` and `MONITORED → UNDER_REPAIR` move only the segment, while `SUSPECT → UNDER_REPAIR` additionally decrements the loop's `suspect_segment_count` by 1 and increments the loop's `version` by 1, because the segment has left the suspect population. When `requires_isolation` is true the loop's `posture` is additionally cascaded to `ISOLATED`, its `open_isolation_count` incremented by 1 and its `version` incremented by 1.
+
+Two bookkeeping steps follow in sequence and are simple: `EXCAVATING → REPAIRING` records that repair work has started in the open excavation, and `REPAIRING → BACKFILLED` records that the excavation has been closed. Each requires its source state and increments the order's `version` by 1.
+
+**Signing off** the work advances a `BACKFILLED` order to the terminal `COMPLETED` with an optional `completion_note`, and the signing technician's `X-User-ID` must differ from the order's `reported_by_user_id`. The signature is stored in `completed_by_user_id`, and completion then unwinds everything excavation set up. The segment's `makeup_water_ratio` is reset to 0.0 — the repair stopped the leak — and when the `work_type` was `LEAK_REPAIR` the segment's `historical_leak_count` is incremented by 1, recording the confirmed leak on its permanent history. Only then is the leak-risk score recomputed from those revised inputs, and the segment is re-banded out of `UNDER_REPAIR` into whichever band the new score implies, with the segment's `version` incremented by 1. All three outcomes are possible and all three are reachable: `UNDER_REPAIR → SOUND` when the recomputed score is below 45.0; `UNDER_REPAIR → MONITORED` when it is at or above 45.0 and below 70.0; and `UNDER_REPAIR → SUSPECT` when it is at or above 70.0, which additionally increments the loop's `suspect_segment_count` by 1 and the loop's `version` by 1. Note that a `LEAK_REPAIR` sign-off can therefore leave a segment *worse* banded than before, because clearing the makeup-water ratio to zero may not offset the extra leak now on its record. Finally, when `requires_isolation` was true the loop's `open_isolation_count` is decremented by 1, and the loop's `posture` is cascaded out of `ISOLATED` to `NORMAL` when the recomputed `suspect_segment_count` is 0 and to `CONSTRAINED` when it is greater than 0, with the loop's `version` incremented by 1.
+
+**Cancellation** is available with an optional `reason` from any state where the ground has not yet been opened, and the three edges behave identically: `DRAFT → CANCELLED`, `PERMIT_PENDING → CANCELLED` and `SCHEDULED → CANCELLED` each set `work_state` to the terminal `CANCELLED` and increment the order's `version` by 1, with no segment or loop cascade. Once an order is `EXCAVATING` it can no longer be cancelled — it must be worked through to sign-off — and any such attempt is rejected with `ERR_WORK_ORDER_STATE_INVALID`.
+
+### 3.9. Expansion Economics and Climate-Goal Reporting
+
+Growth is screened before it is sold. A `NetworkEngineer` opens an **ExpansionProject** in `SCREENING` for a prospective connection, supplying the `loop_id` the candidate would connect to, the `rate_schedule_id` of the tariff assumed for the economics, a `candidate_customer_name`, a `customer_class` which must equal the referenced tariff's `customer_class` or the create is rejected with `ERR_CUSTOMER_CLASS_MISMATCH`, a `requested_capacity_kw` greater than zero, a `route_length_m` greater than zero giving the new buried route length in metres, an `assumed_annual_energy_mwh` greater than zero used for the revenue projection, an `assumed_marginal_cost_per_mwh` no less than zero used for the margin projection, and a `design_delta_t_c` greater than zero giving the design supply-return temperature difference in Kelvin used for flow sizing. The project opens with `selected_diameter_mm` null, `design_flow_m3_per_h` 0.0, `estimated_capex` 0.0, `annual_net_margin` 0.0 and `npv` 0.0.
+
+**Sizing** is a `NetworkEngineer` action that may revise any of `requested_capacity_kw`, `route_length_m`, `assumed_annual_energy_mwh`, `assumed_marginal_cost_per_mwh` and `design_delta_t_c` in the same call, overwriting whatever was stored. It is legal from `SCREENING`, advancing the project to `SIZED`, and as a self-loop from `SIZED` back to `SIZED` after a route or capacity revision; the two edges are identical in every respect except the state they start from, and each increments the project's `version` by 1 and writes the same five outputs.
+
+The design volumetric flow is the `requested_capacity_kw` divided by the product of a flow coefficient of 1.163 kilowatts per cubic metre per hour per Kelvin and the `design_delta_t_c`, rounded half-up to three decimal places, and is stored as `design_flow_m3_per_h`.
+
+Eight standard diameters are then walked in ascending order — 80, 100, 125, 150, 200, 250, 300 and 400 millimetres. For each candidate diameter, the cross-sectional area in square metres is pi (taken as 3.14159265) multiplied by the square of the diameter expressed in metres, divided by 4, rounded half-up to six decimal places. The velocity in metres per second is the design flow divided by 3600 to convert hours to seconds and then divided by that area, rounded half-up to four decimal places. The pressure drop in kilopascals per kilometre is a friction coefficient of 0.01 multiplied by the square of that velocity, divided by the diameter expressed in metres, multiplied by 1000, rounded half-up to two decimal places. A diameter is feasible when its velocity is at or below 2.0 metres per second **and** its pressure drop is at or below 100.0 kilopascals per kilometre. `selected_diameter_mm` is the smallest feasible diameter; when no standard diameter satisfies both limits, sizing fails with `ERR_NO_FEASIBLE_PIPE_SIZE`.
+
+Capital cost follows from the chosen size: `estimated_capex` is the `selected_diameter_mm` multiplied by the `route_length_m` multiplied by a unit rate of 9.5 currency units per millimetre of diameter per metre of route, plus a fixed connection cost of 85,000.00, rounded half-up to two decimal places.
+
+Revenue is projected against the tariff's **fallback tier** — the entry of `tiers` with the largest `load_factor_max` — and never against any lower tier, whatever load factor the candidate might eventually achieve. Annual revenue is the `assumed_annual_energy_mwh` multiplied by that fallback tier's `energy_rate_per_mwh`, plus the `requested_capacity_kw` multiplied by the tariff's `demand_charge_per_kw` multiplied by the 12 months in a year, plus the tariff's `fixed_service_charge` multiplied by 12, with the total rounded half-up to two decimal places. Annual variable cost is the `assumed_annual_energy_mwh` multiplied by the `assumed_marginal_cost_per_mwh`, rounded half-up to two decimal places. Annual fixed operating cost is the `estimated_capex` multiplied by an annual opex rate of 0.025, rounded half-up to two decimal places. `annual_net_margin` is the annual revenue less the annual variable cost less the annual fixed operating cost, rounded half-up to two decimal places.
+
+`npv` values the connection over twenty years at six percent. Rather than looping year by year, the margin is capitalised against a pinned present-value annuity factor of 11.46992122: `npv` is the `annual_net_margin` multiplied by that factor, less the `estimated_capex`, rounded half-up to two decimal places.
+
+**The investment decision** belongs to a `SystemController`, who supplies a `decision` of `APPROVE` or `REJECT` with an optional `decision_note`. Approval is legal only from `SIZED` and only when the project's `npv` is at or above 0.0; a negative net present value is refused with `ERR_PROJECT_NPV_NEGATIVE`, and a project can be re-sized on revised assumptions and re-decided. Rejection is legal from two source states and behaves identically in both: `SIZED → REJECTED` and `APPROVED → REJECTED` each stamp the project with the terminal `REJECTED` and increment its `version` by 1, so an already-approved project can still be pulled before it is converted. Every other requested transition is rejected with `ERR_PROJECT_STATE_INVALID`.
+
+**Conversion** hands the approved case to the commercial team. A `BillingAnalyst` converts an `APPROVED` project to the terminal `CONVERTED`, supplying the `reserved_capacity_kw`, `service_mode`, `service_start_date` and `service_end_date` for the real contract plus an optional `customer_name` for the legal name if it differs from the screened candidate. Conversion creates a new connection agreement on the project's own `loop_id` and `rate_schedule_id`, carrying the project's `customer_class`, opening at `contract_state` `PENDING_CAPACITY` and `billing_state` `CURRENT`. That agreement is then activated through the ordinary reservation sweep of §3.5 — conversion itself reserves no capacity.
+
+Against all of this sits the utility's obligation to the city. A computed loop summary reports emissions and efficiency against the municipal climate target, drawing only on dispatch plans on the loop whose `plan_state` is `COMMITTED` or `RECONCILED`; plans in `DRAFT`, `SUBMITTED`, `APPROVED` or `SUPERSEDED` are excluded, because only committed production actually burned fuel. The number of plans that entered the set is reported as `contributing_plan_count`, and the summary echoes the `loop_id` it was computed for. Over every dispatch order belonging to those plans, `total_energy_mwh` is the sum of `block_energy_mwh` rounded half-up to three decimal places and `total_emissions_kg` is the sum of `order_emissions_kg` rounded half-up to two decimal places. `delivered_energy_mwh` is `total_energy_mwh` multiplied by 0.92 — what survives the eight percent distribution loss — rounded half-up to three decimal places. `system_efficiency_pct` is `delivered_energy_mwh` divided by `total_energy_mwh`, multiplied by 100, rounded half-up to two decimal places, and is reported as 0.0 when `total_energy_mwh` is exactly zero. `emissions_intensity_kg_per_mwh` is `total_emissions_kg` divided by `delivered_energy_mwh`, rounded half-up to two decimal places, and is reported as 0.0 when `delivered_energy_mwh` is exactly zero. `target_gap_kg_per_mwh` is that intensity less the city target of 150.0 kilograms of CO2e per delivered MWh, rounded half-up to two decimal places, and `climate_goal_status` reads `COMPLIANT` when the gap is at or below 0.0 and `EXCEEDING` when it is above 0.0. The summary is a pure read: it persists nothing and mutates nothing.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence — registering a loop, a segment, an asset, a contract or a tariff, drafting a forecast, a plan, an agreement, an invoice, a work order or an expansion project, installing a metering point, or recording a register read — return `201 Created`. Every operation that modifies an existing resource, drives a state transition, or performs a read returns `200 OK`. The two version-guarded creates return `412 Precondition Failed` when the supplied version does not match, as described in §2.7.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/_clock/set_current_utc` | Test-driving endpoint that positions the server's logical clock. The clock's startup default is exactly 2026-08-01T00:00:00Z and never falls back to real wall-clock time, so every window, expiry and age rule is deterministic before any call to this endpoint. | SystemController |
+| POST | `/district-energy/network-loops` | Register a distribution loop. | SystemController |
+| GET | `/district-energy/network-loops/{loop_id}` | Read one distribution loop including its derived posture and reservation counters. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/network-loops` | List distribution loops. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/network-loops/{loop_id}/emissions-summary` | Computed read returning the loop's emissions and efficiency position against the city climate target. | SystemController, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/pipe-segments` | Register a buried distribution segment on a loop. | NetworkEngineer |
+| GET | `/district-energy/pipe-segments/{segment_id}` | Read one buried segment including its leak risk score and condition band. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/pipe-segments` | List buried segments, filterable by owning loop, upstream segment and condition band. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/pipe-segments/{segment_id}/condition-assessment` | Record a leak-detection survey result and re-band the segment. | NetworkEngineer |
+| POST | `/district-energy/fuel-supply-contracts` | Register a fuel or energy supply contract. | SystemController |
+| GET | `/district-energy/fuel-supply-contracts/{contract_id}` | Read one fuel supply contract. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| GET | `/district-energy/fuel-supply-contracts` | List fuel supply contracts. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/fuel-supply-contracts/{contract_id}/status` | Move a supply contract between ACTIVE, SUSPENDED and EXPIRED, cascading into asset availability, dispatch plans and loop posture. | SystemController |
+| POST | `/district-energy/production-assets` | Register a boiler, chiller, CHP unit, biomass boiler or thermal store on a loop. | SystemController |
+| GET | `/district-energy/production-assets/{asset_id}` | Read one production asset including its availability and stored energy. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/production-assets` | List production assets, filterable by owning loop, supply contract and availability. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/production-assets/{asset_id}/availability` | Declare an asset AVAILABLE, DERATED or on OUTAGE. | SystemController |
+| POST | `/district-energy/load-forecasts` | Create a draft load forecast for one 24-hour service block on a loop. | DispatchOperator |
+| GET | `/district-energy/load-forecasts/{forecast_id}` | Read one load forecast including its published determinants. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| GET | `/district-energy/load-forecasts` | List load forecasts, filterable by loop and lifecycle state. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/load-forecasts/{forecast_id}/publish` | Publish a draft forecast under one of the two projection variants. | DispatchOperator |
+| POST | `/district-energy/dispatch-plans` | Open a dispatch plan against a published forecast, superseding every non-terminal plan on the loop. Guarded by optimistic concurrency on the loop version. | DispatchOperator |
+| GET | `/district-energy/dispatch-plans/{plan_id}` | Read one dispatch plan including its cost, emission and resilience metrics. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| GET | `/district-energy/dispatch-plans` | List dispatch plans, filterable by loop, source forecast and lifecycle state. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/dispatch-plans/{plan_id}/optimize` | Run the merit-order waterfall and resilience metrics for a draft plan, replacing its dispatch orders. | DispatchOperator |
+| POST | `/district-energy/dispatch-plans/{plan_id}/submit` | Submit an optimized plan for control-room review. | DispatchOperator |
+| POST | `/district-energy/dispatch-plans/{plan_id}/review` | Approve or reject a submitted plan. The reviewer must differ from the author. | SystemController |
+| POST | `/district-energy/dispatch-plans/{plan_id}/commit` | Commit an approved plan to the plant, drawing the thermal storage energy the plan schedules. | DispatchOperator |
+| POST | `/district-energy/dispatch-plans/{plan_id}/decommit` | Withdraw a committed plan, restoring the thermal storage energy ledger exactly. | SystemController |
+| POST | `/district-energy/dispatch-plans/{plan_id}/reconcile` | Close out a committed plan once its forecast has been finalised on actual weather. | SystemController |
+| GET | `/district-energy/dispatch-orders/{order_id}` | Read one dispatch order. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| GET | `/district-energy/dispatch-orders` | List dispatch orders, filterable by plan and by asset. Cascade-created orders are discoverable only here. | SystemController, DispatchOperator, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/rate-schedules` | Publish a tariff for one customer class. | BillingAnalyst |
+| GET | `/district-energy/rate-schedules/{rate_schedule_id}` | Read one tariff including its tier ladder. | SystemController, NetworkEngineer, BillingAnalyst, CustomerAccount |
+| GET | `/district-energy/rate-schedules` | List tariffs, filterable by customer class. | SystemController, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/connection-agreements` | Draft a customer connection agreement with a capacity reservation and a tariff. | BillingAnalyst |
+| GET | `/district-energy/connection-agreements/{agreement_id}` | Read one connection agreement including its ratchet and balance. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst, CustomerAccount |
+| GET | `/district-energy/connection-agreements` | List connection agreements, filterable by loop, tariff and both state dimensions. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/connection-agreements/{agreement_id}/activate` | Activate a pending agreement after the loop capacity reservation sweep clears its whole service window. | BillingAnalyst |
+| POST | `/district-energy/connection-agreements/{agreement_id}/status` | Suspend, reinstate or terminate an agreement, releasing the reservation on termination. | BillingAnalyst |
+| POST | `/district-energy/metering-points` | Install a thermal energy meter for an agreement on a specific buried segment. | FieldTechnician |
+| GET | `/district-energy/metering-points/{point_id}` | Read one metering point including its newest register value. | SystemController, NetworkEngineer, FieldTechnician, BillingAnalyst, CustomerAccount |
+| GET | `/district-energy/metering-points` | List metering points, filterable by agreement, segment and meter state. | SystemController, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/metering-points/{point_id}/commission` | Commission an installed meter so it may record billable readings. | FieldTechnician |
+| POST | `/district-energy/metering-points/{point_id}/remove` | Remove a meter from service. | FieldTechnician |
+| POST | `/district-energy/metering-points/{point_id}/readings` | Record a thermal energy register read against a commissioned meter. | FieldTechnician |
+| GET | `/district-energy/metering-points/{point_id}/readings` | List every register read recorded against one metering point in read_at ascending order. | SystemController, NetworkEngineer, FieldTechnician, BillingAnalyst, CustomerAccount |
+| GET | `/district-energy/meter-readings/{reading_id}` | Read one register read. | SystemController, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/meter-readings` | List register reads, filterable by metering point. | SystemController, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/invoices` | Calculate billing determinants and open a draft invoice for one billing period. Guarded by optimistic concurrency on the agreement version. | BillingAnalyst |
+| GET | `/district-energy/invoices/{invoice_id}` | Read one invoice including every billing determinant. | SystemController, BillingAnalyst, CustomerAccount |
+| GET | `/district-energy/invoices` | List invoices, filterable by agreement, lifecycle state and variant. | SystemController, BillingAnalyst |
+| POST | `/district-energy/invoices/{invoice_id}/issue` | Issue a draft invoice to the customer, updating the demand ratchet and the agreement balance. | BillingAnalyst |
+| POST | `/district-energy/invoices/{invoice_id}/adjust` | Re-run the billing determinants for an issued or already adjusted invoice, optionally switching variant. | BillingAnalyst |
+| POST | `/district-energy/invoices/{invoice_id}/payments` | Settle an issued or adjusted invoice in full. The acting CustomerAccount must be the agreement itself. | CustomerAccount |
+| POST | `/district-energy/invoices/{invoice_id}/void` | Void an invoice and remove it from the agreement balance. | BillingAnalyst |
+| POST | `/district-energy/work-orders` | Raise a maintenance or leak-repair work order against a buried segment. | FieldTechnician |
+| GET | `/district-energy/work-orders/{work_order_id}` | Read one work order. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| GET | `/district-energy/work-orders` | List work orders, filterable by segment, loop and lifecycle state. | SystemController, DispatchOperator, NetworkEngineer, FieldTechnician, BillingAnalyst |
+| POST | `/district-energy/work-orders/{work_order_id}/submit-permit` | Submit a draft work order for an excavation permit after the window conflict sweep clears the segment. | FieldTechnician |
+| POST | `/district-energy/work-orders/{work_order_id}/permit-decision` | Grant or deny the excavation permit. Denial returns the order to DRAFT. | NetworkEngineer |
+| POST | `/district-energy/work-orders/{work_order_id}/begin-excavation` | Break ground on a scheduled work order, isolating the loop when the work requires it. | FieldTechnician |
+| POST | `/district-energy/work-orders/{work_order_id}/begin-repair` | Record that repair work has started in the open excavation. | FieldTechnician |
+| POST | `/district-energy/work-orders/{work_order_id}/backfill` | Record that the excavation has been backfilled. | FieldTechnician |
+| POST | `/district-energy/work-orders/{work_order_id}/complete` | Sign off a backfilled work order. The signing technician must differ from the one that raised it. | FieldTechnician |
+| POST | `/district-energy/work-orders/{work_order_id}/cancel` | Cancel a work order that has not yet broken ground. | FieldTechnician |
+| POST | `/district-energy/expansion-projects` | Open a network expansion screening case for a prospective customer. | NetworkEngineer |
+| GET | `/district-energy/expansion-projects/{project_id}` | Read one expansion project including its sizing and economics. | SystemController, NetworkEngineer, BillingAnalyst |
+| GET | `/district-energy/expansion-projects` | List expansion projects, filterable by loop, tariff and lifecycle state. | SystemController, NetworkEngineer, BillingAnalyst |
+| POST | `/district-energy/expansion-projects/{project_id}/size` | Select the smallest hydraulically feasible standard pipe diameter and value the connection over twenty years. | NetworkEngineer |
+| POST | `/district-energy/expansion-projects/{project_id}/decision` | Approve or reject a sized expansion project. Approval requires a non-negative net present value. | SystemController |
+| POST | `/district-energy/expansion-projects/{project_id}/convert` | Convert an approved expansion project into a pending connection agreement. | BillingAnalyst |
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_MISSING_AUTH_HEADERS` | 401 Unauthorized |
+| `ERR_UNAUTHORIZED` | 403 Forbidden |
+| `ERR_FORBIDDEN_AGREEMENT` | 403 Forbidden |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 Forbidden |
+| `ERR_INVALID_REQUEST` | 400 Bad Request |
+| `ERR_LOOP_NOT_FOUND` | 404 Not Found |
+| `ERR_SEGMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_FUEL_CONTRACT_NOT_FOUND` | 404 Not Found |
+| `ERR_ASSET_NOT_FOUND` | 404 Not Found |
+| `ERR_FORECAST_NOT_FOUND` | 404 Not Found |
+| `ERR_PLAN_NOT_FOUND` | 404 Not Found |
+| `ERR_ORDER_NOT_FOUND` | 404 Not Found |
+| `ERR_RATE_SCHEDULE_NOT_FOUND` | 404 Not Found |
+| `ERR_AGREEMENT_NOT_FOUND` | 404 Not Found |
+| `ERR_METERING_POINT_NOT_FOUND` | 404 Not Found |
+| `ERR_READING_NOT_FOUND` | 404 Not Found |
+| `ERR_INVOICE_NOT_FOUND` | 404 Not Found |
+| `ERR_WORK_ORDER_NOT_FOUND` | 404 Not Found |
+| `ERR_PROJECT_NOT_FOUND` | 404 Not Found |
+| `ERR_FK_NOT_FOUND` | 404 Not Found |
+| `ERR_STALE_LOOP_VERSION` | 412 Precondition Failed |
+| `ERR_STALE_AGREEMENT_VERSION` | 412 Precondition Failed |
+| `ERR_DUPLICATE_CODE` | 409 Conflict |
+| `ERR_SEGMENT_CYCLE` | 409 Conflict |
+| `ERR_SEGMENT_LOOP_MISMATCH` | 409 Conflict |
+| `ERR_CUSTOMER_CLASS_MISMATCH` | 409 Conflict |
+| `ERR_SERVICE_MODE_MISMATCH` | 409 Conflict |
+| `ERR_FORECAST_LOOP_MISMATCH` | 409 Conflict |
+| `ERR_PLAN_STATE_INVALID` | 409 Conflict |
+| `ERR_FORECAST_STATE_INVALID` | 409 Conflict |
+| `ERR_AGREEMENT_STATE_INVALID` | 409 Conflict |
+| `ERR_INVOICE_STATE_INVALID` | 409 Conflict |
+| `ERR_WORK_ORDER_STATE_INVALID` | 409 Conflict |
+| `ERR_PROJECT_STATE_INVALID` | 409 Conflict |
+| `ERR_METER_STATE_INVALID` | 409 Conflict |
+| `ERR_AVAILABILITY_STATE_INVALID` | 409 Conflict |
+| `ERR_ISOLATION_CLEARANCE_DENIED` | 409 Conflict |
+| `ERR_RESERVE_MARGIN_INSUFFICIENT` | 409 Conflict |
+| `ERR_FUEL_DIVERSITY_BREACH` | 409 Conflict |
+| `ERR_LOOP_ISOLATED` | 409 Conflict |
+| `ERR_LOOP_NOT_NORMAL` | 409 Conflict |
+| `ERR_WORK_WINDOW_CONFLICT` | 409 Conflict |
+| `ERR_OUTSIDE_WORK_WINDOW` | 409 Conflict |
+| `ERR_INVOICE_PERIOD_OVERLAP` | 409 Conflict |
+| `ERR_READING_NOT_MONOTONIC` | 409 Conflict |
+| `ERR_NO_ELIGIBLE_ASSETS` | 409 Conflict |
+| `ERR_PLAN_HAS_NO_ORDERS` | 409 Conflict |
+| `ERR_INSUFFICIENT_GENERATION` | 409 Conflict |
+| `ERR_STORAGE_ENERGY_INSUFFICIENT` | 409 Conflict |
+| `ERR_NO_FEASIBLE_PIPE_SIZE` | 422 Unprocessable Entity |
+| `ERR_INSUFFICIENT_METER_DATA` | 422 Unprocessable Entity |
+| `ERR_LOOP_CAPACITY_EXCEEDED` | 409 Conflict |
+| `ERR_PROJECT_NPV_NEGATIVE` | 422 Unprocessable Entity |
+| `ERR_PAYMENT_AMOUNT_MISMATCH` | 409 Conflict |

@@ -1,0 +1,255 @@
+"""Domain constants for the Game Localization & Rating Submission API.
+
+Every literal here is transcribed from the specification: role names, enum
+value sets, reference tables, arithmetic constants and the logical clock's
+startup instant.
+"""
+
+# ─── Roles (§2.1) ──────────────────────────────────────────────────────
+
+ROLE_LOCALIZATION_PRODUCER = "LocalizationProducer"
+ROLE_TRANSLATION_VENDOR = "TranslationVendor"
+ROLE_LQA_TESTER = "LqaTester"
+ROLE_COMPLIANCE_OFFICER = "ComplianceOfficer"
+ROLE_RATING_BOARD_LIAISON = "RatingBoardLiaison"
+ROLE_TALENT_AGENT = "TalentAgent"
+ROLE_PLATFORM_ADMIN = "PlatformAdmin"
+
+ALL_ROLES = [
+    ROLE_LOCALIZATION_PRODUCER,
+    ROLE_TRANSLATION_VENDOR,
+    ROLE_LQA_TESTER,
+    ROLE_COMPLIANCE_OFFICER,
+    ROLE_RATING_BOARD_LIAISON,
+    ROLE_TALENT_AGENT,
+    ROLE_PLATFORM_ADMIN,
+]
+
+# ─── The logical clock (§2.4) ──────────────────────────────────────────
+
+CLOCK_STARTUP_UTC = "2026-08-01T00:00:00Z"
+
+# Canonical release target used by the fixtures: 122 whole days after the
+# clock startup value, which places every filing outside the expedite window.
+DEFAULT_TARGET_RELEASE_UTC = "2026-12-01T00:00:00Z"
+DEFAULT_DAYS_TO_RELEASE = 122
+
+# ─── Enumerations ──────────────────────────────────────────────────────
+
+SOURCE_LANGUAGES = ["EN", "JA"]
+RELEASE_MODES = ["SIMULTANEOUS", "STAGGERED"]
+
+TITLE_LOCALIZATION_STATES = ["PLANNING", "STRINGS_LOCKED", "CERT_WINDOW", "SHIPPED"]
+RELEASE_GATE_STATES = ["OPEN", "AT_RISK", "BLOCKED", "CLEARED"]
+
+MARKET_CODES = ["JP", "DE", "BR", "US", "AU", "KR"]
+SCOPE_TIERS = ["TEXT_ONLY", "SUBTITLED", "FULL_VOICE", "FULL_CULTURAL"]
+MARKET_PLAN_STATUSES = [
+    "DRAFT",
+    "SCOPED",
+    "IN_LOCALIZATION",
+    "LQA",
+    "RELEASE_READY",
+    "BLOCKED",
+]
+BLOCKED_REASONS = ["LEGAL_RESTRICTION", "RATING_TOO_STRICT", "CERT_DEADLINE_MISSED"]
+
+UI_SURFACES = ["HUD", "MENU", "SUBTITLE", "LEGAL"]
+STRING_KEY_STATUSES = ["EXTRACTED", "LOCKED", "RETIRED"]
+
+TRANSLATION_STATUSES = ["PENDING", "DRAFTED", "DELIVERED"]
+QA_STATUSES = ["NOT_CHECKED", "LING_FLAGGED", "FUNC_FLAGGED", "PASSED"]
+EFFORT_VARIANTS = ["SCOPE_ESTIMATE", "DELIVERED_ACTUAL"]
+
+LANGUAGE_CODES = ["JA", "DE", "PT_BR", "EN", "KO"]
+MEDIA_SCOPES = ["IN_GAME_ONLY", "IN_GAME_AND_TRAILER", "ALL_MEDIA"]
+CONTRACT_STATUSES = ["DRAFT", "SIGNED", "TERMINATED", "EXPIRED"]
+
+SESSION_STATUSES = ["SCHEDULED", "IN_PROGRESS", "RECORDED", "CANCELLED"]
+
+PASS_TYPES = ["LINGUISTIC", "FUNCTIONAL"]
+QA_PASS_STATUSES = ["OPEN", "CLOSED"]
+
+BUG_CLASSES = [
+    "TEXT_OVERFLOW",
+    "TRUNCATION",
+    "MISTRANSLATION",
+    "CULTURAL",
+    "LEGAL_TEXT",
+    "FUNCTIONAL_CRASH",
+]
+SEVERITIES = ["S1", "S2", "S3", "S4"]
+BUG_STATUSES = ["NEW", "TRIAGED", "FIX_SUBMITTED", "VERIFIED", "REJECTED", "DUPLICATE"]
+TRIAGE_ACTIONS = ["ACCEPT", "REJECT", "DUPLICATE"]
+BUG_AXES = ["LINGUISTIC", "FUNCTIONAL"]
+
+SUBMISSION_STATUSES = [
+    "DRAFT",
+    "SUBMITTED",
+    "UNDER_REVIEW",
+    "RATED",
+    "EDITS_REQUIRED",
+    "WITHDRAWN",
+]
+BOARD_DECISIONS = ["RATE", "REQUIRE_EDITS"]
+
+EDIT_KINDS = ["REMOVE_CONTENT", "CENSOR_ASSET", "AGE_GATE", "TEXT_REWRITE"]
+CONTENT_EDIT_STATUSES = ["PROPOSED", "APPLIED", "WITHDRAWN"]
+
+# ─── Regional compliance reference data (§2.9) ─────────────────────────
+
+MARKET_BOARD = {
+    "JP": "CERO",
+    "DE": "USK",
+    "BR": "DJCTQ",
+    "US": "ESRB",
+    "AU": "ACB",
+    "KR": "GRAC",
+}
+
+MANDATORY_DISCLOSURES = {
+    "JP": [],
+    "DE": ["GAMBLING_SIM"],
+    "BR": [],
+    "US": [],
+    "AU": [],
+    "KR": ["LOOTBOX_PAID"],
+}
+
+RESTRICTED_CODES = {
+    "JP": [],
+    "DE": ["BLOOD"],
+    "BR": [],
+    "US": [],
+    "AU": ["DRUG_REFERENCE"],
+    "KR": ["GAMBLING_SIM"],
+}
+
+FOOTAGE_MANDATORY_CODES = [
+    "VIOLENCE_REALISTIC",
+    "SEXUAL_CONTENT",
+    "GAMBLING_SIM",
+    "LOOTBOX_PAID",
+]
+
+RATING_BANDS = ["ALL_AGES", "TEEN_12", "MATURE_15", "MATURE_17", "ADULTS_ONLY_18"]
+
+RATING_STRICTNESS = {
+    "ALL_AGES": 1,
+    "TEEN_12": 2,
+    "MATURE_15": 3,
+    "MATURE_17": 4,
+    "ADULTS_ONLY_18": 5,
+}
+
+# ─── Descriptors and risk weights (§3.7) ───────────────────────────────
+
+CONTENT_CODES = [
+    "VIOLENCE_REALISTIC",
+    "VIOLENCE_STYLIZED",
+    "BLOOD",
+    "SEXUAL_CONTENT",
+    "LANGUAGE_STRONG",
+    "DRUG_REFERENCE",
+    "GAMBLING_SIM",
+    "LOOTBOX_PAID",
+    "HORROR",
+]
+
+DESCRIPTOR_WEIGHTS = {
+    "VIOLENCE_REALISTIC": 25,
+    "VIOLENCE_STYLIZED": 12,
+    "BLOOD": 15,
+    "SEXUAL_CONTENT": 20,
+    "LANGUAGE_STRONG": 10,
+    "DRUG_REFERENCE": 14,
+    "GAMBLING_SIM": 18,
+    "LOOTBOX_PAID": 22,
+    "HORROR": 8,
+}
+
+RISK_SCORE_MIN = 0
+RISK_SCORE_MAX = 100
+LEGAL_DEFECT_PENALTY = 6
+PROPOSED_EDIT_PENALTY = 9
+APPLIED_EDIT_CREDIT = 5
+
+RATING_BAND_UPPER_BOUNDS = [
+    ("ALL_AGES", 20),
+    ("TEEN_12", 40),
+    ("MATURE_15", 60),
+    ("MATURE_17", 80),
+]
+
+# ─── Effort and cost arithmetic (§3.2) ─────────────────────────────────
+
+TM_FACTOR_EXACT = 0.10          # tm_match_pct >= 95
+TM_FACTOR_HIGH_FUZZY = 0.45     # 75 <= tm_match_pct < 95
+TM_FACTOR_LOW_FUZZY = 0.75      # 50 <= tm_match_pct < 75
+TM_FACTOR_NEW_TEXT = 1.00       # tm_match_pct < 50
+
+SURFACE_UPLIFT = {
+    "LEGAL": 1.50,
+    "SUBTITLE": 1.20,
+    "HUD": 1.10,
+    "MENU": 1.00,
+}
+
+TEXT_RATE_CENTS_PER_UNIT = 4200
+
+SCOPE_MULTIPLIER = {
+    "TEXT_ONLY": 1.00,
+    "SUBTITLED": 1.25,
+    "FULL_VOICE": 1.80,
+    "FULL_CULTURAL": 2.40,
+}
+
+CULTURAL_SURCHARGE_FLOOR_CENTS = 1500000
+CULTURAL_SURCHARGE_PCT = 0.15
+
+# ─── QA arithmetic (§3.6) ──────────────────────────────────────────────
+
+SEVERITY_WEIGHTS = {"S1": 8, "S2": 4, "S3": 2, "S4": 1}
+DEFECT_DENSITY_CEILING = 0.0500
+OPEN_BUG_STATUSES = ["NEW", "TRIAGED", "FIX_SUBMITTED"]
+
+LINGUISTIC_BUG_CLASSES = ["MISTRANSLATION", "CULTURAL", "LEGAL_TEXT"]
+FUNCTIONAL_BUG_CLASSES = ["TEXT_OVERFLOW", "TRUNCATION", "FUNCTIONAL_CRASH"]
+OVERFLOW_BUG_CLASSES = ["TEXT_OVERFLOW", "TRUNCATION"]
+
+# ─── Submission fee arithmetic (§3.7) ──────────────────────────────────
+
+BOARD_BASE_FEE_CENTS = {
+    "CERO": 480000,
+    "USK": 350000,
+    "DJCTQ": 300000,
+    "ESRB": 320000,
+    "ACB": 290000,
+    "GRAC": 260000,
+}
+
+ROUND_SURCHARGE_CENTS = 75000
+EXPEDITE_DAY_THRESHOLD = 45
+EXPEDITE_PCT = 0.30
+VOLUME_DISCOUNT_TIERS = [(600000, 0.10), (400000, 0.05)]
+
+MAX_APPEALS = 2
+
+# ─── Booths, talents and sessions (§3.4) ───────────────────────────────
+
+DEFAULT_TURNAROUND_BUFFER_MINUTES = 30
+MIN_TURNAROUND_BUFFER_MINUTES = 0
+MAX_TURNAROUND_BUFFER_MINUTES = 240
+
+DEFAULT_MAX_DAILY_RECORDING_MINUTES = 240
+MIN_MAX_DAILY_RECORDING_MINUTES = 1
+MAX_MAX_DAILY_RECORDING_MINUTES = 720
+
+ACTIVE_SESSION_STATUSES = ["SCHEDULED", "IN_PROGRESS", "RECORDED"]
+
+# ─── Pagination (§2.3) ─────────────────────────────────────────────────
+
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+MIN_OFFSET = 0

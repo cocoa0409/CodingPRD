@@ -1,0 +1,463 @@
+# Portable Restroom Rental API — Product Requirements Document
+
+## 1. Introduction
+
+Portable sanitation is a business of physical iron placed on somebody else's ground. Every trailer and every standard unit we drop is simultaneously a priced rental line, a permitted occupation of a jurisdiction's land, a recurring truck visit that consumes route capacity, and a tank of waste that must be hauled to a facility willing to accept it that day. Today our branches run those four concerns in separate spreadsheets, and the seams between them are where the money leaks: a quote sized for a 900-person festival gets billed against the twelve units that actually shipped, a right-of-way permit lapses at the end of a season while trucks keep rolling to a site that no longer has authorization, and a missed pump-out generates a customer credit that nobody ever nets against the invoice already in the mail.
+
+This document specifies the backend service that replaces those spreadsheets. The service owns thirteen peer collections — customer accounts, placement sites, permit filings, yard assets, rental contracts and their quote lines, routes, service schedules, service visits, disposal facilities, waste manifests, charge events and unit deployments — and it is the single arbiter of whether a field operation may proceed. Its central conviction is that **permit posture gates everything**: a site whose paperwork is not in order cannot be mobilized onto, cannot receive newly planned visits, and drags its schedules out of the truck's committed load until the paperwork is repaired.
+
+Two properties of the service are worth stating up front, because they shape almost every rule that follows. First, all money is carried in whole cents and every rounding point is pinned, including the order in which multiple roundings are applied — the escalation of an invoice rounds each line before summing, never the reverse. Second, time is a server-owned logical clock rather than wall-clock time, so seasonal permit lapse, same-day relocation surcharges and the fourteen-day charge-dispute window are all deterministic and testable. Every collection is mounted at the top level of the URL space; the API has no nested resource paths, and every parent/child relationship is carried by an explicit identifier field in the request payload.
+
+## 2. Global Specifications & System-Wide Principles
+
+### 2.1. Operating Roles and Request Identity
+
+Authentication is header-based. Every request must carry both `X-User-ID` and `X-User-Role`. If either header is absent, or if the value of `X-User-Role` is not one of the seven role names declared below, the request is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). When both headers are well formed but the named role is not among the roles authorized for the endpoint being called (see the table in §4), the request is rejected with `ERR_ROLE_NOT_PERMITTED` (HTTP 403).
+
+The seven roles are `PlatformAdmin`, `SalesRep`, `PermitCoordinator`, `DispatchPlanner`, `DriverOperator`, `ComplianceOfficer` and `CustomerContact`. Their remits are deliberately segregated:
+
+- A `PlatformAdmin` is the operator of record. It owns reference and master data — customer accounts, yard assets, disposal facilities — settles invoices, and is the only role permitted to reposition the logical clock. It is deliberately excluded from quoting, permit decisions, dispatch and charge assessment.
+- A `SalesRep` books demand: it registers placement sites, raises contracts, runs the unit-mix quote, mobilizes the contract and issues the invoice.
+- A `PermitCoordinator` files placement and right-of-way permits and drives the resubmission cycle. It may never decide its own filings.
+- A `DispatchPlanner` owns route capacity and the field plan: routes, unit deployments and relocations, service schedules and their suspension, visit planning, missed-service declaration, route re-runs and contract demobilization.
+- A `DriverOperator` executes the route: dispatching a visit, closing it out with the gallons pumped, and opening and sealing haul manifests.
+- A `ComplianceOfficer` is the independent control function. It decides permit filings, records facility acceptance of sealed loads, assesses damage and tip-over charges, and resolves those charges by upholding or waiving them.
+- A `CustomerContact` is the renting customer. It may raise its own contracts and dispute charges billed to it.
+
+Identity semantics differ by role, and they matter because ownership checks depend on them. When `X-User-Role` is `CustomerContact`, `X-User-ID` is the `id` of the acting `RentalAccount`; ownership checks on any resource that references a `RentalAccount` compare the resource's account reference to `X-User-ID`. Concretely, a `CustomerContact` raising a contract must supply an `account_id` equal to its own `X-User-ID`, and a `CustomerContact` disputing a charge must be the account behind that charge's contract; either mismatch is rejected with `ERR_ACCOUNT_SCOPE_VIOLATION` (HTTP 403).
+
+For the other six roles — `PlatformAdmin`, `SalesRep`, `PermitCoordinator`, `DispatchPlanner`, `DriverOperator` and `ComplianceOfficer` — `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server may record it (for example as `submitted_by_user_id` on a permit filing, or as `assessed_by_user_id` and `resolved_by_user_id` on a charge event) but it never compares it to any entity's `id`. Those recorded operator identifiers do, however, drive one control: a charge event's resolution requires that the resolving `X-User-ID` differ from the `X-User-ID` that assessed it. A `ComplianceOfficer` may both assess charges and resolve charges, but never the same charge; an attempt to do so is rejected with `ERR_SEGREGATION_OF_DUTIES` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. `limit` caps the number of rows returned; when omitted it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` is the number of rows to skip before the returned window begins; when omitted it defaults to 0.
+
+Unless a specific endpoint states otherwise, every list endpoint orders its rows by `created_at` ascending.
+
+List responses carry `limit`, `offset`, `total_count` and `has_more` inside the `meta` object of the envelope described in §2.2. `total_count` reports the number of rows matching the request's filters before the pagination window is applied, and `has_more` reports whether any matching row falls beyond that window.
+
+### 2.4. The Logical Clock
+
+The server does not read wall-clock time. It keeps a **logical clock**, and every temporal rule in this specification — permit validity, the same-day relocation test, the charge dispute window, the "future visits" qualifier on cascade cancellations, and the calendar date that scopes a disposal facility's committed volume — reads that logical clock and nothing else. Before the clock is ever repositioned it reads exactly `2026-08-01T00:00:00Z`; it never falls back to real time.
+
+A `PlatformAdmin` repositions the clock by supplying a `to_iso8601` instant. The response reports the new `current_utc` together with three counters describing the sweep that repositioning triggered: `expired_permit_count`, `blocked_site_count` and `suspended_schedule_count`. The sweep itself is described in §3.2; it is the only state transition in the system that no operator explicitly requests.
+
+Where a rule compares a calendar date, the comparison is performed on the `YYYY-MM-DD` calendar date of the logical clock instant. Where a rule compares an instant — the dispute window is the only such rule — the comparison is performed at full instant precision.
+
+### 2.5. Site Posture: The Gate Over Every Field Operation
+
+Two derived fields on a placement site govern whether field work may happen there: `permit_status`, a worst-of roll-up over the permit kinds the site requires, and `site_posture`, the gate itself. Both are recomputed whenever any permit filing on the site changes state — drafting, submission, approval, rejection or system expiry — and whenever any tip-over charge event on a contract of that site changes state.
+
+The required permit kinds are determined by the site itself. Every site requires a `PLACEMENT` permit. A site whose `right_of_way_required` flag is true additionally requires a `RIGHT_OF_WAY` permit; a site whose flag is false requires only the placement kind.
+
+For each required kind, the service considers all permit filings of that kind on the site and selects the single latest one by `created_at` descending — the newest filing of a kind wins outright, and older filings of the same kind are ignored entirely. If no filing of a required kind exists at all, that kind contributes `NONE`. Otherwise the latest filing's own `status` is mapped to a kind-level status as follows: a `DRAFT` filing and a `SUBMITTED` filing both contribute `PENDING`; an `APPROVED` filing contributes `APPROVED`; a `REJECTED` filing contributes `REJECTED`; an `EXPIRED` filing contributes `EXPIRED`.
+
+The site's `permit_status` is then the worst of those per-kind contributions, where "worst" is fixed by this precedence list read from the front: `REJECTED` is worst, then `EXPIRED`, then `NONE`, then `PENDING`, and `APPROVED` is best. The service walks that list in order and adopts the first member that appears among the per-kind contributions.
+
+`site_posture` follows from `permit_status` plus one operational signal. If `permit_status` is `REJECTED` or `EXPIRED`, `site_posture` is `BLOCKED`. Otherwise, if `permit_status` is `NONE` or `PENDING`, `site_posture` is `RESTRICTED`. Otherwise the service checks whether any open tip-over exists at the site — that is, whether there exists a charge event whose `charge_kind` is `TIP_OVER`, whose `state` is either `ASSESSED` or `DISPUTED`, and whose contract's `site_id` is this site; if one does, `site_posture` is `RESTRICTED`. Only when the paperwork rolls up to `APPROVED` and no such open tip-over exists does `site_posture` become `OPEN`. Tip-over charges in `UPHELD` or `WAIVED` never restrict a site: adjudication, in either direction, releases the operational restriction.
+
+The gate bites in two graduated tiers. A `BLOCKED` governing site rejects four operations — contract mobilization, deployment creation, unit relocation and visit planning — with `ERR_SITE_POSTURE_BLOCKED` (HTTP 409). A `RESTRICTED` governing site rejects three of those four — contract mobilization, deployment creation and visit planning — with `ERR_SITE_POSTURE_RESTRICTED` (HTTP 409); relocation is deliberately exempt, because moving a unit onto a merely restricted site is how the field recovers from a tip-over. Which site governs depends on the operation: for mobilization and deployment creation it is the contract's `site_id`; for relocation it is the destination site named in the request; for visit planning it is the site of the contract behind the visit's schedule.
+
+`permit_status` and `site_posture` are enum-valued roll-ups with no numeric component, so no rounding applies to them.
+
+### 2.6. Money, Gallons and Rounding Discipline
+
+All monetary amounts in this system are integers denominated in whole cents; there are no decimal currency fields and no currency strings. Volumes are integers denominated in whole gallons. Unit counts and density percentages are likewise integers.
+
+Where a calculation divides, the specification always names the disposal of the fractional part explicitly, and implementations must honour the exact operation named:
+
+- **Round half up to whole cents** is used for every monetary escalation and surcharge. Ties round away from zero, so a value ending in exactly half a cent becomes the next whole cent.
+- **Round down to a whole number** (discarding any fractional part) is used for the event-demand factor, the trailer-count split and both route density percentages.
+- **Round up to a whole number** (raising any fractional part to the next integer) is used for the service-interval derivation, raw capacity sizing, the ADA overlay and the handwash overlay.
+
+Two calculations apply rounding more than once, and in both the roundings are sequential and must not be collapsed into a single rounding at the end: the relocation charge rounds after the access-class multiplier and again after the same-day uplift, and the missed-service credit rounds after the density surcharge and again after the credit percentage. Conversely, the invoice escalation rounds each line individually and only then sums the rounded lines; summing the unescalated lines, escalating once and rounding once is a different and incorrect total, because it can differ by up to one cent per line. Where a calculation is described as exact integer arithmetic — a quantity multiplied by a per-unit rate, or a sum of gallons — no rounding step exists at all.
+
+### 2.7. The Contract Ledger and Cascade Ordering
+
+Every rental contract carries a small ledger of derived money fields, and each is defined by the exact set of rows that feed it rather than by incremental adjustment. `invoice_subtotal_cents` is the escalated line subtotal written at invoicing. `charge_debits_cents` is the sum of the amounts of all non-credit charge events on the contract whose `state` is `ASSESSED` or `UPHELD`. `credit_accrued_cents` is the sum of the amounts of all missed-service-credit charge events on the contract whose `state` is `ASSESSED` or `UPHELD`. `net_billable_cents` is `invoice_subtotal_cents` plus `charge_debits_cents` minus `credit_accrued_cents`, and it is recomputed on every change to any of its three inputs.
+
+Because both ledger sums admit only the `ASSESSED` and `UPHELD` states, a charge that moves to `DISPUTED` or `WAIVED` leaves the input set and the corresponding sum drops by that charge's amount; a charge that moves from `DISPUTED` back to `UPHELD` re-enters the input set and the sum rises again by the same amount. This produces an exact conservation property that the service guarantees: for any action that creates a charge and the waiver of that same charge, the derived balances after the waiver equal their values before the creation, to the cent.
+
+Any charge-event state change on a contract also has a billing consequence. When a charge event on a contract becomes `ASSESSED`, `DISPUTED`, `UPHELD` or `WAIVED` while that contract's `billing_state` is `INVOICED`, the contract's `billing_state` transitions `INVOICED → REBILL_REQUIRED`. That transition writes nothing else; it exists purely to record that the invoice already issued no longer matches `net_billable_cents`.
+
+Cascades in this system are ordered, and the ordering is observable. Where a cascade touches several rows of the same kind, the rows are processed in `created_at` ascending order. Where a cascade is a chain — a permit rejection blocking a site, the block suspending schedules, the suspension releasing route capacity and cancelling future visits — each hop is caused by the preceding hop's write rather than by the original request, which is why suspending a schedule by hand produces exactly the same downstream effects as a permit rejection reaching it. Every mutation to a resource refreshes that resource's `updated_at`, and the service may transition a resource without any client having addressed that resource directly.
+
+### 2.8. Flat Collections and Reference Resolution
+
+The API has no nested resource paths: every collection is addressed at the top level of the URL space, and relationships between resources are carried by identifier fields in request bodies. Path identifiers are nonetheless validated left to right, and the first identifier in a path that does not resolve determines the error. Each collection has its own not-found code: an unresolvable account identifier yields `ERR_ACCOUNT_NOT_FOUND`, a service site `ERR_SITE_NOT_FOUND`, a placement permit `ERR_PERMIT_NOT_FOUND`, a rental contract `ERR_CONTRACT_NOT_FOUND`, a route `ERR_ROUTE_NOT_FOUND`, a service schedule `ERR_SCHEDULE_NOT_FOUND`, a service visit `ERR_VISIT_NOT_FOUND`, a waste manifest `ERR_MANIFEST_NOT_FOUND`, a charge event `ERR_CHARGE_NOT_FOUND`, an asset unit `ERR_ASSET_UNIT_NOT_FOUND`, a unit deployment `ERR_DEPLOYMENT_NOT_FOUND` and a disposal facility `ERR_DISPOSAL_SITE_NOT_FOUND`. All twelve are HTTP 404.
+
+Identifiers carried in a request body are resolved after path identifiers and after request-shape validation, in the order the fields are declared for that operation, using the same code mapping. A creation payload naming both a contract and an asset unit therefore reports the contract's absence first if both are missing.
+
+### 2.9. Common Resource Properties
+
+Resources in this system carry a standard set of server-managed properties:
+
+- `id` (string): a server-minted UUID. It carries no type prefix — the raw UUID is the identifier.
+- `created_at` (string): an ISO 8601 UTC timestamp with three fractional digits (for example `2026-08-01T00:00:00.000Z`) recording when the row was first created.
+- `updated_at` (string): an ISO 8601 UTC timestamp in the same format, refreshed on every mutation of the row, including mutations that only rewrite derived fields.
+- `version` (integer): a server-managed integer that increments on mutation and is the value clients quote back for optimistic concurrency control.
+
+Quote lines are the one exception. A `QuoteLine` is an immutable-by-design pricing artefact — it is superseded rather than edited — and it carries only `id` and `created_at`. Both `updated_at` and `version` are absent from a quote line entirely. Every other collection in the system carries all four properties.
+
+Where the specification names a datetime field of its own — the `assessed_at` instant recorded on a charge event — the same ISO 8601 UTC format with three fractional digits applies, and its value is the logical-clock instant at the moment of the write. Calendar-date fields such as `term_start`, `effective_from`, `deploy_from`, `scheduled_date`, `manifest_date` and `last_run_date` are `YYYY-MM-DD` strings and are compared lexicographically, which for that format is equivalent to comparing the dates themselves.
+
+### 2.10. Optimistic Concurrency Control
+
+Exactly two write operations are guarded by optimistic concurrency control, and each guards a different parent resource.
+
+A `POST /rental-contracts/{id}/quote` request requires the field `expected_contract_version`, carrying the client's last observed `version` of that `RentalContract`. The field is not optional. If the supplied value does not equal the contract's stored `version`, the request is rejected with `ERR_STALE_CONTRACT_VERSION` (HTTP 412). The guard exists because the quote operation legitimately supersedes the contract's prior provisional line set: a writer whose view of the contract predates an earlier supersede would discard line data it never observed. Each successful quote run increments the contract's `version` by one, so a second quote replayed with the same expected version is rejected.
+
+A `POST /waste-manifests/{id}/seal` request requires the field `expected_route_version`, carrying the client's last observed `version` of the `Route` named on that manifest. The field is not optional. If the supplied value does not equal the route's stored `version`, the seal is rejected with `ERR_STALE_ROUTE_VERSION` (HTTP 412). The guard exists because sealing commits gallons against the receiving facility's daily allowance: a client whose view of the route is behind the stored version has an outdated picture of how much of that allowance another seal has already consumed. Each successful seal increments the route's `version` by one.
+
+No other operation accepts a version field, and no other operation performs a version check. Operations outside these two never take `expected_contract_version` or `expected_route_version`.
+
+### 2.11. Validation Precedence
+
+When several rules could reject the same request, the outcome is fully determined: the service evaluates checks in the fixed order below and returns the first failure it finds. Text order elsewhere in this document is narrative, not precedence — this list is precedence.
+
+1. Header presence and role recognition — `ERR_UNAUTHENTICATED`.
+2. Role authorization for the endpoint — `ERR_ROLE_NOT_PERMITTED`.
+3. Request shape: required fields present, types correct, enum values declared members, integers inside their declared ranges, and the same-payload ordering and conditional-field rules enumerated in §3 — `ERR_INVALID_REQUEST`.
+4. Path identifier resolution, left to right — the per-collection not-found codes of §2.8.
+5. Body identifier resolution, in declared field order — the same per-collection not-found codes.
+6. Customer account scope for a `CustomerContact` — `ERR_ACCOUNT_SCOPE_VIOLATION`.
+7. Segregation of duties on charge resolution — `ERR_SEGREGATION_OF_DUTIES`.
+8. Optimistic concurrency version match — `ERR_STALE_CONTRACT_VERSION` or `ERR_STALE_ROUTE_VERSION`.
+9. State-machine legality: the target row is in a state from which the requested transition is declared, and every same-entity or guard-entity state precondition of that transition holds — `ERR_INVALID_STATE_TRANSITION`.
+10. Permit resubmission ceiling — `ERR_PERMIT_REVISION_LIMIT`.
+11. Governing site posture not `BLOCKED` — `ERR_SITE_POSTURE_BLOCKED`.
+12. Governing site posture not `RESTRICTED` — `ERR_SITE_POSTURE_RESTRICTED`.
+13. Route availability for dispatch — `ERR_ROUTE_SUSPENDED`.
+14. Disposal facility intake status — `ERR_DISPOSAL_SITE_CLOSED`.
+15. Physical access feasibility of the unit against the site — `ERR_SITE_ACCESS_INFEASIBLE`.
+16. Site gate-window containment of the visit window — `ERR_ACCESS_WINDOW_VIOLATION`.
+17. Buffered route-window occupation — `ERR_ROUTE_WINDOW_CONFLICT`.
+18. Asset date-interval occupation — `ERR_UNIT_DOUBLE_BOOKED`.
+19. Route unit capacity — `ERR_ROUTE_UNIT_CAPACITY_EXCEEDED`.
+20. Disposal facility waste-class acceptance — `ERR_DISPOSAL_CLASS_NOT_ACCEPTED`.
+21. Manifest input-set non-emptiness — `ERR_MANIFEST_NO_SERVICED_VISITS`.
+22. Reconciliation input-set non-emptiness — `ERR_RECONCILIATION_NO_DEPLOYMENTS`.
+23. Account billing hold — `ERR_ACCOUNT_BILLING_HOLD`.
+24. Disposal facility daily cap — `ERR_DISPOSAL_CAP_EXCEEDED`.
+25. Charge dispute window — `ERR_DISPUTE_WINDOW_CLOSED`.
+
+Two consequences of this ordering deserve emphasis. A stale version is reported before any state-machine complaint, so a re-quote that is both stale and aimed at a contract in the wrong state reports `ERR_STALE_CONTRACT_VERSION`. And an account on billing hold is reported before the disposal cap and the dispute window but after every posture, access and capacity check, so a mobilization attempt against a blocked site on a held account reports `ERR_SITE_POSTURE_BLOCKED`.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up the Branch: Accounts, Sites, Iron and Reference Data
+
+Nothing can be rented until the branch's standing data exists, and four of the five reference collections belong to the `PlatformAdmin`.
+
+Opening a customer account requires a `legal_name` of between 1 and 120 characters. The account's `account_type` classifies it commercially as `CONSTRUCTION`, `EVENT` or `MUNICIPAL`, and that classification is what tells the branch which escalation table a contract on the account will eventually draw from. Payment terms are recorded in `credit_terms_days`, which may be omitted — it then defaults to 30 — and which is only ever one of the four values 0, 15, 30 or 45. Account standing is recorded in `status`, one of `ACTIVE` or `SUSPENDED`; it may be supplied at creation, defaults to `ACTIVE`, and has no transition endpoint of its own. A freshly opened account has `open_credit_balance_cents` of 0 and `billing_hold` of false; both are derived fields, described in §3.6 where the credits that drive them are generated. An account can be read back on its own, and the sites belonging to it can be listed by reverse lookup.
+
+A placement site is registered by either a `SalesRep` or a `PlatformAdmin`, and it is where the physical and regulatory constraints of the ground get written down. The payload names the owning account through its `account_id`, a `site_label` of 1 to 120 characters for the humans, and a `jurisdiction_code` of 2 to 24 characters identifying the permitting authority — `CA-SD-CITY` is a representative value. The site's `access_class` is one of `OPEN_LOT`, `GATED`, `STAIR_ACCESS` or `CRANE_ONLY`, and it drives both the feasibility of delivery and the cost of a later relocation onto the site. Four optional fields describe the physical envelope: `right_of_way_required`, defaulting to false, declares that units will sit on public right-of-way and therefore that a second permit kind is required; `gate_open_minute`, defaulting to 0, is the earliest minute-of-day at which a truck may enter, accepted in the inclusive range from 0 to 1439; `gate_close_minute`, defaulting to 1440 — the very end of the day — is the latest minute-of-day by which a truck must be off the site, accepted in the inclusive range from 1 to 1440, and it must be strictly greater than `gate_open_minute`; and `max_truck_length_ft`, defaulting to 24, is the longest transport length in feet the site can physically accept, accepted in the inclusive range from 8 to 60. A newly registered site has `deployed_unit_count` of 0, a `permit_status` of `NONE`, and — following directly from §2.5 — a `site_posture` of `RESTRICTED`, because a site with no filings can be planned against but not mobilized onto.
+
+Yard assets are added one at a time. Each `AssetUnit` carries an `asset_tag` of 1 to 32 characters that must be unique across the whole fleet, a `unit_class` drawn from `STANDARD_PORTABLE`, `ADA_PORTABLE`, `HANDWASH_STATION`, `TRAILER_2STALL` and `TRAILER_8STALL`, a home `yard_code` of 2 to 16 characters, and a `tare_length_ft` between 4 and 60 inclusive that is the number compared against a site's accepted truck length. A new unit begins with `status` of `IN_YARD`, `damage_strikes` of 0 and `tip_over_count` of 0; the strike counters are derived and are explained in §3.8.
+
+Disposal facilities are the other end of the pipe. A `DisposalSite` carries a `site_code` of 1 to 24 characters, unique across facilities; a `daily_gallon_cap` between 100 and 500000 inclusive, which is the most the facility will take on any one calendar date; and `accepted_waste_classes`, a non-empty array of distinct members drawn from `GREYWATER`, `BLACKWATER` and `MIXED`. Its intake `status` is either `ACCEPTING` or `CLOSED`, may be supplied at creation, defaults to `ACCEPTING`, and like account standing has no transition endpoint. Its derived `committed_gallons_today` begins at 0 and is always read against the logical clock's current calendar date.
+
+Routes belong to the `DispatchPlanner`. A `Route` names itself with a `route_code` of 1 to 24 characters, unique across routes, and pins itself to a single weekday through `service_day`, one of `MON`, `TUE`, `WED`, `THU`, `FRI`, `SAT` or `SUN`. Two capacity numbers describe the truck: `truck_capacity_units`, the maximum serviceable units one run can cover, accepted between 1 and 400 inclusive, and `waste_capacity_gallons`, the tank capacity, accepted between 100 and 6000 inclusive. Route availability lives in `status`, either `ACTIVE` or `SUSPENDED`, supplied optionally at creation with a default of `ACTIVE` and no transition endpoint. A new route begins with `committed_units`, `density_planned_pct` and `density_realized_pct` all 0, and with `last_run_date` null.
+
+### 3.2. Permitting: Filings, Revision Rounds, and the Blocking Cascade
+
+A `PermitCoordinator` drafts a filing against a site by naming that site through `site_id`, declaring the `permit_kind` it seeks — either `PLACEMENT` or `RIGHT_OF_WAY` — recording the `authority_ref` issued by the authority in 1 to 64 characters, and bounding validity with `effective_from` and `effective_to`, both `YYYY-MM-DD` calendar dates, both inclusive, with `effective_to` required to be on or after `effective_from`. A drafted filing lands in `status` `DRAFT` with `revision_round` of 0, `rejection_reason` null and `submitted_by_user_id` null; because §2.5 keys the roll-up on the latest filing of each kind regardless of its state, merely drafting a filing already recomputes the site's `permit_status` and `site_posture` — a `DRAFT` contributes `PENDING`, which is why a site with a fresh draft is `RESTRICTED` rather than `BLOCKED`. Filings on a site can be listed by reverse lookup and narrowed by `permit_kind` or by `status`.
+
+Filing with the authority advances `DRAFT → SUBMITTED`. The coordinator may attach an optional `submission_note`. Each submission increments `revision_round` by one — so a first submission moves it from 0 to 1 — and stamps `submitted_by_user_id` with the acting `X-User-ID`. The site's posture is recomputed, and because a `SUBMITTED` filing also contributes `PENDING`, submission does not by itself unlock the site.
+
+Rejections are recoverable. `REJECTED → SUBMITTED` is a genuine cycle: the same submit action re-files a rejected permit, incrementing `revision_round` again and re-stamping `submitted_by_user_id`, and the recomputation pulls the site out of `BLOCKED` back to `RESTRICTED` for as long as the new filing is pending. The text of the previous round's rejection is retained in `rejection_reason` across the resubmission — it is not cleared. The cycle is capped: a resubmission is permitted only while `revision_round` is strictly less than three, so the third round of revisions is the last one the authority will entertain and a further resubmission is rejected with `ERR_PERMIT_REVISION_LIMIT` (HTTP 409). Note that the blocked posture of a site never prevents a refiling — a coordinator may always refile against a site that its own rejection blocked, which is the entire point of the loop.
+
+Deciding a filing belongs to the `ComplianceOfficer`, never to the coordinator who filed it. Approval advances `SUBMITTED → APPROVED` and requires an `authority_decision_ref` in the payload; it is permitted only while the logical clock's current calendar date is on or before the filing's `effective_to`, so a filing whose window has already elapsed cannot be approved into usefulness. Approval recomputes the site's `permit_status` and `site_posture`. One thing approval deliberately does **not** do: if the recomputed posture becomes `OPEN`, any service schedule of that site's contracts that is sitting in `SUSPENDED` is left exactly where it is. Resumption is never automatic; a suspended schedule stays suspended.
+
+Rejection advances `SUBMITTED → REJECTED`, requires both an `authority_decision_ref` and a `rejection_reason`, and writes that reason onto the filing. It then triggers the system's longest cascade, and the causal chain matters because each hop is driven by the hop above it:
+
+- First, the site's `permit_status` and `site_posture` are recomputed. The worst-of roll-up now yields `REJECTED`, so `site_posture` becomes `BLOCKED`.
+- Second — caused by the posture becoming `BLOCKED`, not by the rejection itself — every service schedule whose contract sits on that site and whose `state` is `ACTIVE` transitions `ACTIVE → SUSPENDED`, processed in `created_at` ascending order.
+- Third — caused by each schedule leaving `ACTIVE` — `committed_units` is recomputed for each affected route and then `density_planned_pct` is recomputed from it, exactly as described in §3.5.
+- Fourth — caused by the same schedule suspensions — every service visit on those schedules whose `state` is `PLANNED` and whose `scheduled_date` is on or after the logical clock's current calendar date transitions `PLANNED → CANCELLED`, processed in `created_at` ascending order. Visits already in the past are left alone, and cancellation is not a missed service: no credit is created.
+
+Permits also lapse. When a `PlatformAdmin` repositions the logical clock (§2.4), the service sweeps every filing in `APPROVED` whose `effective_to` falls strictly before the new calendar date and transitions it `APPROVED → EXPIRED`, processing filings in `created_at` ascending order. `EXPIRED` is a terminal state — an expired filing is never revived, only superseded by a newer filing of the same kind. Each expiry recomputes its site's `permit_status` and `site_posture`; since `EXPIRED` rolls up to a `BLOCKED` posture, the same four-hop cascade described above then runs for the affected site. The counters returned by the clock endpoint report how many filings expired, how many sites became blocked and how many schedules were suspended as a result. This sweep is the only automatic transition in the system, and it is what makes a seasonal permit lapse observable in a controlled way.
+
+### 3.3. Contracting and the Provisional Unit-Mix Quote
+
+A rental contract is raised either by a `SalesRep` or by the `CustomerContact` itself, and in the customer's case the `account_id` in the payload must equal the acting `X-User-ID` or the request is rejected for account scope. The payload names the billing account through `account_id` and the placement ground through `site_id` — one site serves every unit on the contract. `contract_kind` selects the demand model and is either `EVENT` or `CONSTRUCTION`. The rental window is bounded by `term_start` and `term_end`, both inclusive `YYYY-MM-DD` dates with `term_end` on or after `term_start`. Demand is described by `headcount`, the peak simultaneous population to serve, accepted from 1 to 20000 inclusive; by `event_duration_hours`, the hours that population is on site each day, accepted from 1 to 24 inclusive; and by `service_frequency_per_week`, the number of pump-and-restock visits per week, accepted from 1 to 7 inclusive. Escalation buckets are fixed at creation: `season_code` is one of `PEAK`, `SHOULDER` or `OFF`, and `construction_phase` is one of `SITEWORK`, `VERTICAL`, `FINISHES` or `EVENT_NA`. An `EVENT` contract must pass `EVENT_NA` as its `construction_phase`; any other combination is a request-shape violation rejected with `ERR_INVALID_REQUEST`. The optional `ada_required` flag, defaulting to false, declares that the mix must include accessible units.
+
+A newly raised contract sits at `fulfillment_state` `DRAFT` and `billing_state` `UNBILLED`, with `quoted_cents`, `reconciled_cents`, `invoice_subtotal_cents`, `charge_debits_cents`, `credit_accrued_cents` and `net_billable_cents` all 0. Contracts are listable and can be narrowed by `account_id`, by `site_id`, by `fulfillment_state` or by `billing_state`; the quote lines of one contract can be listed by reverse lookup and narrowed by `quote_variant` or by `is_superseded`.
+
+Pricing the contract is the `SalesRep`'s job, and it advances `fulfillment_state` from `DRAFT` to `QUOTED`. The request carries the mandatory `expected_contract_version` described in §2.10 and an optional `quote_note`. What the run produces is a set of `QuoteLine` rows, each bound to its contract through `contract_id`, each stamped with `quote_variant` of `PROVISIONAL` and `is_superseded` of false, and each carrying a `unit_class`, a `quantity`, a `unit_rate_cents` and an `extended_cents`. The `escalated_cents` field on a line stays 0 until the contract is invoiced. Lines are created in a fixed class order — `STANDARD_PORTABLE` first, then `ADA_PORTABLE`, then `HANDWASH_STATION`, then `TRAILER_2STALL`, then `TRAILER_8STALL` — and any class whose computed quantity is zero produces no row at all.
+
+The projection runs in a pinned order, and each step reads the result of the one above it.
+
+**Step one — daily demand in person-hours.** For an `EVENT` contract, multiply `headcount` by `event_duration_hours`, multiply that product by 12, divide by 10, and discard any fractional remainder: the twelve-tenths factor is the peak-attendance allowance our estimators have always applied to festival headcounts. For a `CONSTRUCTION` contract, `event_duration_hours` is ignored entirely; instead derive the service interval by dividing 7 by `service_frequency_per_week` and rounding up to a whole number of days, then multiply `headcount` by a nine-hour construction shift and by that interval in days. A crew serviced twice a week therefore carries four days of accumulated demand between visits, because seven divided by two rounds up to four.
+
+**Step two — raw capacity.** One standard unit absorbs 250 person-hours of demand between services. Divide the demand from step one by 250 and round up to a whole number; that is the base capacity expressed in standard-unit equivalents.
+
+**Step three — trailer tier.** The tier decision is a hard threshold on population, not on capacity: a contract whose `headcount` is 400 or more is served with restroom trailers, and one below 400 is served with individual portables. Above the threshold, the number of `TRAILER_8STALL` units is the base capacity divided by 8 with any remainder discarded; the units left over after those eight-stall trailers are subtracted are then covered by `TRAILER_2STALL` units, counted as that leftover divided by 2 and rounded up — a leftover of zero yields no two-stall trailers — and the `STANDARD_PORTABLE` quantity is zero. Below the threshold, both trailer quantities are zero and the `STANDARD_PORTABLE` quantity is the whole base capacity.
+
+**Step four — restroom equivalents actually placed.** Add the standard-portable quantity, twice the two-stall trailer quantity, and eight times the eight-stall trailer quantity. This number, not the base capacity, is what the overlays key on.
+
+**Step five — the accessibility overlay.** If `ada_required` is false, no `ADA_PORTABLE` units are added. If it is true, divide the restroom equivalents from step four by 20 and round up, then take whichever is larger, that result or one — so an ADA contract always carries at least one accessible unit even when the mix is tiny, and one accessible unit is added for every twenty restroom equivalents thereafter.
+
+**Step six — the handwash overlay.** Add the restroom equivalents from step four to the accessible-unit quantity from step five, divide that sum by 4 and round up. That is the `HANDWASH_STATION` quantity: one station serves every four restroom positions on site, accessible units included.
+
+**Step seven — pricing.** Each emitted line's `unit_rate_cents` is the per-term rate for its class: 14500 cents for a `STANDARD_PORTABLE`, 22500 for an `ADA_PORTABLE`, 9500 for a `HANDWASH_STATION`, 78000 for a `TRAILER_2STALL` and 265000 for a `TRAILER_8STALL`. Each line's `extended_cents` is its `quantity` multiplied by its `unit_rate_cents`, an exact integer-cent product with no rounding. The contract's `quoted_cents` is the sum of `extended_cents` over the lines this run emitted, and `net_billable_cents` is recomputed afterwards.
+
+This projection reads nothing but the contract's own input fields — no deployment, schedule or visit data enters it — and because `headcount` is at least 1 the base capacity is always at least 1, so a projection can never produce an empty line set. A quote run is nonetheless declared to require at least one line of quantity one or more, and the run increments the contract's `version` by one on success.
+
+Re-quoting is a first-class operation, not an error: `QUOTED → QUOTED` is a supersede self-loop. Every quote line of the contract with `quote_variant` `PROVISIONAL` and `is_superseded` false has `is_superseded` set to true, then the fresh provisional line set is created exactly as in the first run, then `quoted_cents` and `net_billable_cents` are recomputed and `version` increments again. Superseded lines are never deleted — they remain readable — but they are excluded from the input set of every calculation in this specification. The optimistic-concurrency guard of §2.10 is what makes the loop safe: a re-quote whose `expected_contract_version` no longer matches the stored `version` is rejected with `ERR_STALE_CONTRACT_VERSION` before any line is touched.
+
+### 3.4. Committing Iron: Reservations, Mobilization and Relocation
+
+A quote is a model; a `UnitDeployment` is a promise naming one specific piece of iron. The `DispatchPlanner` commits a unit by naming the contract through `contract_id`, the physical unit through `asset_unit_id`, and the closed inclusive date interval through `deploy_from` and `deploy_to`, where `deploy_to` must be on or after `deploy_from`. A new commitment lands in `state` `RESERVED` with `relocation_count` of 0, and its `site_id` is seeded from the contract's own `site_id` rather than supplied by the client. Deployments are listable and can be narrowed by `contract_id`, by `asset_unit_id`, by `site_id` or by `state`.
+
+Three constraints stand between a reservation request and a stored row, and they are checked in the order given in §2.11. The governing site — the contract's site — must not be `BLOCKED` and must not be `RESTRICTED`, which is why a contract cannot be stocked before its permits are approved and any open tip-over is adjudicated. The iron must physically fit: the unit's `tare_length_ft` must be less than or equal to the site's `max_truck_length_ft`, and a longer unit is rejected with `ERR_SITE_ACCESS_INFEASIBLE` (HTTP 422). And the unit must actually be free for the whole interval. Occupation is evaluated on closed inclusive dates with no buffer: the candidate set is every deployment of the same `asset_unit_id` whose `state` is `RESERVED` or `DEPLOYED`, and the new interval conflicts with a candidate when the new `deploy_from` is on or before the candidate's `deploy_to` **and** the candidate's `deploy_from` is on or before the new `deploy_to`, compared as `YYYY-MM-DD` strings. Sharing a single endpoint date is therefore a conflict — a unit coming off one job on the 14th cannot start another on the 14th — while a one-day gap is clear. Deployments already in `RETURNED` never conflict. A conflict is rejected with `ERR_UNIT_DOUBLE_BOOKED` (HTTP 409).
+
+Mobilization is the `SalesRep`'s act and it advances the contract's fulfillment dimension `QUOTED → ACTIVE`. It carries no request body, and it is gated four ways. The contract's site must have a `site_posture` of exactly `OPEN`: a `BLOCKED` site yields `ERR_SITE_POSTURE_BLOCKED` and a `RESTRICTED` site yields `ERR_SITE_POSTURE_RESTRICTED`. The owning account's `status` must be `ACTIVE`; a `SUSPENDED` account is not a state from which mobilization is declared, so the attempt is rejected with `ERR_INVALID_STATE_TRANSITION`. And the owning account's `billing_hold` must be false; a held account is rejected with `ERR_ACCOUNT_BILLING_HOLD` (HTTP 402), which is the one payment-required outcome in the whole API. When those gates clear, every deployment on the contract sitting in `RESERVED` transitions `RESERVED → DEPLOYED` in `created_at` ascending order, and each such transition drags its asset unit from `IN_YARD` to `DEPLOYED`. The contract's site then has its `deployed_unit_count` recomputed — that field is simply the number of deployments whose `site_id` is the site and whose `state` is `DEPLOYED`.
+
+Relocation keeps a deployment alive while moving it: `DEPLOYED → DEPLOYED` is a self-loop, and it is the `DispatchPlanner`'s tool for pulling units off a site that has gone bad. The request names the `destination_site_id`, the `effective_date` on which the move happens, and an optional `relocation_reason`. The deployment must currently be `DEPLOYED`. The destination site's `site_posture` must not be `BLOCKED`, but — uniquely among the placement operations — a `RESTRICTED` destination is perfectly acceptable. The destination site must belong to the same account as the deployment's contract; a cross-account move is not a declared transition and is rejected with `ERR_INVALID_STATE_TRANSITION`. And the unit must fit the destination: its `tare_length_ft` must be less than or equal to the destination site's `max_truck_length_ft`, otherwise `ERR_SITE_ACCESS_INFEASIBLE`. Note that the origin site's `access_class` and truck length are irrelevant to all of this — only the destination is examined.
+
+A successful relocation rewrites the deployment's `site_id` to the destination, increments `relocation_count` by exactly one (the counter is monotonic and never decremented), creates a charge event with `charge_kind` `RELOCATION` in `state` `ASSESSED` against the deployment's contract and asset unit, recomputes the contract's `charge_debits_cents` and `net_billable_cents`, and recomputes `deployed_unit_count` for **both** the site the unit left and the site it arrived at.
+
+The relocation charge is priced from the destination alone, and its two roundings happen in a pinned order. Start from a base relocation fee of 18500 cents. Apply the destination's access-class multiplier — 100 percent for `OPEN_LOT`, 115 percent for `GATED`, 140 percent for `STAIR_ACCESS` and 225 percent for `CRANE_ONLY`, since a crane pick costs us well over twice a flat-lot drop — by multiplying the base by that percentage, dividing by 100 and rounding half up to whole cents. Then, and only then, apply the same-day uplift: if the requested `effective_date` equals the logical clock's current calendar date the move is a same-day scramble and carries a further 35 percent, so multiply the rounded intermediate by 135, divide by 100 and round half up again; if the `effective_date` is any other date the uplift is zero and the second rounding leaves the intermediate unchanged. The resulting figure is the charge's `amount_cents`. Collapsing the two roundings into one is not permitted.
+
+### 3.5. Route Density: Attaching Contracts to Trucks
+
+Route density is the number our branch managers live by, and it is produced by attaching contracts to routes through `ServiceSchedule` rows. The `DispatchPlanner` creates one by naming the contract through `contract_id` and the route through `route_id`, declaring the `service_day` on which service happens, and bounding the nominal window with `window_start_minute` — a minute-of-day from 0 to 1439 inclusive, treated as inclusive — and `window_end_minute` — a minute-of-day from 1 to 1440 inclusive, treated as exclusive and required to be strictly greater than `window_start_minute`. The declared `service_day` must equal the route's own `service_day`; a Tuesday schedule on a Thursday route is a request-shape violation rejected with `ERR_INVALID_REQUEST`. A new schedule lands in `state` `ACTIVE`. Schedules are listable and can be narrowed by `contract_id`, by `route_id` or by `state`.
+
+The load a schedule places on the truck is frozen at creation into `units_on_route`: it is the sum of `quantity` over every quote line of the named contract that has not been superseded, taken at the instant the schedule is created. In practice those are the contract's provisional lines, since a reconciled set only exists after demobilization. The word *frozen* is exact — a later re-quote that supersedes those lines, or a demobilization that replaces them, does not retroactively change an existing schedule's `units_on_route`.
+
+Creation is capacity-gated. A schedule may be created only when the route's current `committed_units` plus the new schedule's `units_on_route` is less than or equal to the route's `truck_capacity_units`; landing exactly on capacity is allowed, and only a strictly greater total is refused, with `ERR_ROUTE_UNIT_CAPACITY_EXCEEDED` (HTTP 422). Successful creation recomputes the route's `committed_units` and then its `density_planned_pct`.
+
+Both density figures are integer percentages and both discard any fractional part. The **planned** figure measures the route as sold: `committed_units` is the sum of `units_on_route` over the schedules on that route whose `state` is `ACTIVE` — suspended and terminated schedules are excluded — and `density_planned_pct` is that sum multiplied by 100, divided by `truck_capacity_units`, with the fraction discarded. A route whose `truck_capacity_units` is zero reports a planned density of 0 rather than dividing; the floor of the density scale is zero percent in every case. The **realized** figure measures the route as run, and it is derived in §3.6 from visits rather than schedules. Because a schedule may never be added past capacity, planned density can never exceed 100 percent.
+
+Suspending a schedule is how a planner takes load off a truck, and it advances `ACTIVE → SUSPENDED` with an optional `suspension_reason`. Its effects are threefold: the route's `committed_units` is recomputed, so the schedule's frozen unit count leaves the sum; the route's `density_planned_pct` is recomputed from the new total; and every service visit of that schedule whose `state` is `PLANNED` and whose `scheduled_date` is on or after the logical clock's current calendar date transitions `PLANNED → CANCELLED`, processed in `created_at` ascending order. The identical suspension, with the identical three effects, is what the system applies to each affected schedule when a site's posture turns `BLOCKED` (§3.2) — the hand-driven suspension and the cascade-driven suspension are the same transition.
+
+Termination is the schedule's terminal state and it is reached only as a consequence of the contract being demobilized (§3.9). Both live states lead there, but they differ in what they recompute. A schedule terminated out of `ACTIVE` recomputes the route's `committed_units` and `density_planned_pct`, because its units are only now leaving the sum, and cancels its remaining `PLANNED` visits. A schedule terminated out of `SUSPENDED` changes no route figures at all, because a suspended schedule had already left `committed_units` when it was suspended.
+
+### 3.6. Surge Staging: Visit Windows, Dispatch, Completion and Missed Service
+
+Field execution happens through `ServiceVisit` rows, and one schedule generates many. The `DispatchPlanner` plans a visit by naming the schedule through `schedule_id`, declaring the `visit_kind`, fixing the `scheduled_date`, and bounding the arrival window with `window_start_minute` (0 to 1439 inclusive, inclusive bound) and `window_end_minute` (1 to 1440 inclusive, exclusive bound, strictly greater than the start). Three kinds may be planned by a client: `SETUP` for the drop, `SERVICE` for the recurring pump-and-restock, and `TEARDOWN` for the pull. The fourth kind, `RERUN`, is written by the system only and is refused with `ERR_INVALID_REQUEST` if a client supplies it. A new visit lands in `state` `PLANNED` with `gallons_pumped` of 0, `units_serviced` of 0, `missed_reason` null and `rerun_of_visit_id` null; its `route_id` is denormalized from the schedule's route at creation and is never changed thereafter. Visits are listable and can be narrowed by `schedule_id`, by `route_id`, by `rerun_of_visit_id`, by `state`, by `scheduled_date` or by `visit_kind`.
+
+Two temporal gates guard visit planning, in addition to the site-posture gates of §2.5. The first is **gate-window containment**: the site of the visit's schedule's contract publishes a gate window, and the visit's window must sit inside it — the site's `gate_open_minute` must be less than or equal to the visit's `window_start_minute`, and the visit's `window_end_minute` must be less than or equal to the site's `gate_close_minute`. A violation is rejected with `ERR_ACCESS_WINDOW_VIOLATION` (HTTP 422). This applies to every kind of visit, including the same-day `SETUP` and `TEARDOWN` legs of an event surge, where the temptation to arrive before the gates open is strongest.
+
+The second is **buffered route-window occupation**, which reserves turnaround time between stops. The candidate set is every visit sharing the new visit's `route_id` and `scheduled_date` whose `state` is `PLANNED`, `EN_ROUTE` or `SERVICED`. Our trucks need twenty minutes between stops to break down and set up, so each window is compared as though extended by twenty minutes at its end: the new visit conflicts with a candidate when the new `window_start_minute` is strictly less than the candidate's `window_end_minute` plus twenty **and** the candidate's `window_start_minute` is strictly less than the new `window_end_minute` plus twenty. Exact adjacency therefore conflicts — a new visit starting at the very minute a candidate's window ends is refused — while a clear gap of exactly twenty minutes does not conflict. Rejection carries `ERR_ROUTE_WINDOW_CONFLICT` (HTTP 409). Visits in `MISSED`, `CANCELLED` or `RERUN_SCHEDULED` are outside the candidate set and never block a new window.
+
+Dispatching is the `DriverOperator`'s action and advances `PLANNED → EN_ROUTE`. The route must be available: a route whose `status` is `SUSPENDED` rather than `ACTIVE` is refused with `ERR_ROUTE_SUSPENDED` (HTTP 409). The governing schedule must also still be `ACTIVE`; dispatching a visit whose schedule has been suspended or terminated is rejected with `ERR_INVALID_STATE_TRANSITION`. Dispatch advances the route's `last_run_date` to whichever is later, the route's existing `last_run_date` or this visit's `scheduled_date`, compared as `YYYY-MM-DD` strings with a null existing value treated as lower than any date.
+
+Completing the visit advances `EN_ROUTE → SERVICED` and requires the operator to report `gallons_pumped`, an integer from 0 to 6000 inclusive. Completion writes that figure onto the visit, sets the visit's `units_serviced` to the frozen `units_on_route` of its schedule — `units_serviced` is 0 in every state other than `SERVICED` — recomputes the route's `density_realized_pct`, and refreshes the rolled-up volume of every open haul manifest sharing the visit's route and date (§3.7).
+
+The **realized** density variant is the mirror of the planned one and it deliberately diverges from it. If the route's `last_run_date` is null the realized figure is 0. Otherwise, sum `units_serviced` over the visits on that route whose `scheduled_date` equals the route's `last_run_date` and whose `state` is `SERVICED`, multiply by 100, divide by the route's `truck_capacity_units` and discard the fraction. Visits in `MISSED`, `CANCELLED`, `PLANNED` or `EN_ROUTE` contribute nothing, which is precisely why a single missed stop pushes realized density below planned density on an otherwise unchanged schedule set.
+
+Declaring a service missed is the `DispatchPlanner`'s action, it requires a `missed_reason` in the payload, and it is reachable from two states with slightly different guards. From `PLANNED → MISSED`, the governing schedule must still be `ACTIVE`; a visit whose schedule has already been suspended or terminated cannot be declared missed and is rejected with `ERR_INVALID_STATE_TRANSITION`. From `EN_ROUTE → MISSED` — the truck rolled but could not service — no schedule-state precondition applies at all; a dispatched visit may be declared missed regardless of what has since happened to its schedule. Both paths write the supplied `missed_reason` onto the visit, both leave `units_serviced` at 0, and both run the identical four-hop credit cascade described below.
+
+- **Hop one, the credit itself.** A charge event is created with `charge_kind` `MISSED_SERVICE_CREDIT` and `state` `ASSESSED`, bound to the schedule's contract through `contract_id`, pointing back at the missed visit through `source_visit_id`, with `assessed_by_user_id` set to the literal string `SYSTEM` and `assessed_at` set to the logical clock's current instant. Its `amount_cents` comes from the credit calculation below.
+- **Hop two, caused by that new charge row rather than by the visit write.** The contract's `credit_accrued_cents` and `net_billable_cents` are recomputed, and if that contract's `billing_state` is `INVOICED` it transitions `INVOICED → REBILL_REQUIRED`.
+- **Hop three, caused by the contract's credit change.** The owning account's `open_credit_balance_cents` is recomputed as the sum of `amount_cents` over every missed-service-credit charge in `state` `ASSESSED` or `UPHELD` across every contract of that account. Credits in `DISPUTED` or `WAIVED` are excluded, and damage, tip-over and relocation charges never enter this balance at all.
+- **Hop four, caused by the account's new balance.** The account's `billing_hold` is set to true when `open_credit_balance_cents` is greater than or equal to 60000 cents — six hundred dollars of unapplied credit is where our credit team wants the brakes applied — and to false otherwise. A balance landing exactly on 60000 cents does place the account on hold.
+
+Only after the credit has been persisted does the service recompute the route's `density_realized_pct`. That ordering is not incidental, and it resolves what would otherwise be a circular definition: the credit is a percentage of the per-visit service charge, the per-visit service charge carries a density surcharge, and the density in question is the very figure that missing the visit changes.
+
+The credit is computed in five steps, in this pinned order. **First**, take a snapshot of the route's `density_planned_pct` *before* the visit's state is written — the planned figure, not the realized one, and its pre-transition value. **Second**, look up the surcharge tier by walking three declared tiers in order and taking the first whose ceiling is greater than or equal to the snapshot: a snapshot at or below 40 percent draws a 12 percent surcharge, a snapshot above 40 but at or below 75 percent draws 6 percent, and a snapshot above 75 but at or below 100 percent draws no surcharge. Thin routes cost more per stop, so the sparser the truck the richer the credit. Because planned density can never exceed 100 percent, the last tier always matches as a fallback. **Third**, compute the base cost of servicing the contract's current mix once, by taking every quote line of the missed visit's contract that has not been superseded and summing, for each line, its `quantity` multiplied by the per-visit service cost of its class: 4200 cents for a `STANDARD_PORTABLE`, 5600 for an `ADA_PORTABLE`, 2600 for a `HANDWASH_STATION`, 17500 for a `TRAILER_2STALL` and 52000 for a `TRAILER_8STALL`. **Fourth**, apply the density surcharge to that base by multiplying it by one hundred plus the surcharge percentage, dividing by 100, and rounding half up to whole cents. **Fifth**, take 115 percent of that rounded per-visit charge — we credit a missed stop at more than its own cost, because a missed pump-out costs the customer more than it saves us — by multiplying by 115, dividing by 100 and rounding half up again. The result is the credit's `amount_cents`. The two roundings are sequential and must not be collapsed. No other visit and no other charge enters this calculation.
+
+Booking the make-good advances the original visit `MISSED → RERUN_SCHEDULED`, which is terminal for that row. The `DispatchPlanner` supplies the `rerun_date` and a fresh `window_start_minute` and `window_end_minute`; the same gate-window containment and buffered route-window occupation checks that guard visit planning apply here too, so a re-run that collides with another stop on the route is refused with `ERR_ROUTE_WINDOW_CONFLICT` and one outside the site's gates with `ERR_ACCESS_WINDOW_VIOLATION`. The governing schedule must be `ACTIVE`, otherwise `ERR_INVALID_STATE_TRANSITION`. Success creates a brand-new visit with `visit_kind` `RERUN` in `state` `PLANNED`, carrying the same `schedule_id` and `route_id` as the original, with `rerun_of_visit_id` pointing at the missed visit it replaces, `scheduled_date` set to the supplied `rerun_date`, and the supplied window. Crucially, booking a re-run neither creates a second credit nor reverses the first: the customer keeps the credit for the stop we missed, and the re-run is our own cost of recovery.
+
+Cancellation, by contrast, is never a missed service. A visit that leaves `PLANNED` for `CANCELLED` does so only as a consequence of its schedule leaving `ACTIVE` — through a hand suspension, a site-posture block, or a contract demobilization — and no credit is generated. When the cascade arrives from a suspension, only visits whose `scheduled_date` is on or after the logical clock's current calendar date are cancelled; when it arrives from a demobilization, every remaining `PLANNED` visit is cancelled unconditionally.
+
+### 3.7. Waste Hauling: Manifests, Disposal Caps and Chain of Custody
+
+What comes out of the tanks has to go somewhere, and the paperwork that follows it is a `WasteManifest`. A `DriverOperator` opens one for a single route and a single date by naming the `route_id`, naming the receiving facility through `disposal_site_id`, declaring the `manifest_date` — the `YYYY-MM-DD` calendar date of the haul, which is also what selects which visits roll up — and declaring the load's `waste_class` as `GREYWATER`, `BLACKWATER` or `MIXED`. A new manifest lands in `state` `OPEN`. Manifests are listable and can be narrowed by `route_id`, by `disposal_site_id`, by `state` or by `manifest_date`.
+
+A manifest's `gallons_total` is a roll-up, not a client input. It is the sum of `gallons_pumped` over the service visits whose `route_id` equals the manifest's route and whose `scheduled_date` equals the manifest's `manifest_date` and whose `state` is `SERVICED`. Visits in `PLANNED`, `EN_ROUTE`, `MISSED`, `CANCELLED` or `RERUN_SCHEDULED` contribute nothing. The roll-up is computed when the manifest is opened, from whatever visits have already reached `SERVICED`, and it is refreshed on every subsequent completion on the same route and date — but only while the manifest is still `OPEN`. Once the manifest is sealed the figure is frozen: a visit completed afterwards, on the same route and the same date, does not alter a `SEALED` or `ACCEPTED` manifest. The sum is order-insensitive integer arithmetic in whole gallons.
+
+Sealing advances `OPEN → SEALED` and is where the load is legally committed. It is the `DriverOperator`'s action, it carries the mandatory `expected_route_version` of §2.10 and an optional `seal_note`, and it must clear five checks after the version match, in the precedence order of §2.11: the manifest must be `OPEN`; the receiving facility's `status` must be `ACCEPTING` rather than `CLOSED`, otherwise `ERR_DISPOSAL_SITE_CLOSED` (HTTP 409); the manifest's `waste_class` must be a member of that facility's `accepted_waste_classes`, otherwise `ERR_DISPOSAL_CLASS_NOT_ACCEPTED` (HTTP 422); at least one visit must exist on the manifest's route and date in `state` `SERVICED`, otherwise the roll-up input set is empty and the seal is refused with `ERR_MANIFEST_NO_SERVICED_VISITS` (HTTP 422); and the facility's daily allowance must accommodate the load.
+
+The daily allowance works as follows. For any facility and calendar date, the gallons already committed there are the sum of `gallons_total` over the manifests at that facility whose `manifest_date` is that date and whose `state` is `SEALED` or `ACCEPTED`. Manifests still `OPEN` never consume allowance. The facility's denormalized `committed_gallons_today` reports that sum for the logical clock's current calendar date. The cap gate, however, is keyed on the `manifest_date` of the manifest being sealed rather than on today: the already-committed gallons for that date — excluding the manifest now being sealed — plus that manifest's own `gallons_total` must not strictly exceed the facility's `daily_gallon_cap`. A load that lands exactly on the cap is accepted; only a load that pushes the total strictly past it is refused, with `ERR_DISPOSAL_CAP_EXCEEDED` (HTTP 422).
+
+A successful seal freezes `gallons_total` at its rolled-up value, recomputes the facility's `committed_gallons_today`, and increments the route's `version` by one — which is what makes a second seal on the same route, replayed with the same `expected_route_version`, fail.
+
+Facility acceptance is the `ComplianceOfficer`'s countersignature and advances `SEALED → ACCEPTED`, with an optional `acceptance_note`. The facility must still be `ACCEPTING`; a facility that has closed since the seal refuses acceptance with `ERR_DISPOSAL_SITE_CLOSED`. Acceptance recomputes the facility's `committed_gallons_today`, though the value will not move, because both `SEALED` and `ACCEPTED` manifests are already inside the committed input set. `ACCEPTED` is the manifest's terminal state.
+
+### 3.8. Damage, Tip-Over and the Adjudication of Charges
+
+Physical abuse of the fleet is billed through `ChargeEvent` rows assessed by a `ComplianceOfficer`. The officer names the contract to bill through `contract_id`, the unit involved through `asset_unit_id`, and the `charge_kind`. A `DAMAGE` charge additionally requires a `severity` of `MINOR`, `MODERATE` or `TOTAL_LOSS`; a `TIP_OVER` charge must not carry a severity at all; both kinds require an `asset_unit_id`; and `MISSED_SERVICE_CREDIT` is never accepted from a client, since the system generates credits itself. Any of those combinations violated is `ERR_INVALID_REQUEST`. A new charge lands in `state` `ASSESSED` with `assessed_by_user_id` set to the acting `X-User-ID`, `assessed_at` set to the logical clock's current instant, `resolved_by_user_id` null, `dispute_reason` null, `resolution_note` null and `source_visit_id` null — that back-reference is written only on system-generated credits. Charges are listable and can be narrowed by `contract_id`, by `asset_unit_id`, by `source_visit_id`, by `charge_kind` or by `state`.
+
+The amount is escalated by the unit's own history. Read the unit's prior strike total as `damage_strikes` plus `tip_over_count` **before** the new charge is counted; a total of zero or one carries a 100 percent multiplier, a total of exactly two carries 150 percent, and a total of three or more carries 200 percent. Repeat offenders on the same piece of iron get progressively more expensive. For a `DAMAGE` charge, the base is the unit's class replacement basis — 32000 cents for a `STANDARD_PORTABLE`, 48000 for an `ADA_PORTABLE`, 19000 for a `HANDWASH_STATION`, 145000 for a `TRAILER_2STALL` and 390000 for a `TRAILER_8STALL` — and the severity factor is 40 percent for `MINOR`, 75 percent for `MODERATE` and 100 percent for `TOTAL_LOSS`. For a `TIP_OVER` charge, the base is a flat 27500 cents and the severity factor is a fixed 100 percent, because severity is neither accepted nor consulted for tip-overs. The `amount_cents` is then the base multiplied by the severity factor, multiplied by the strike multiplier, divided by ten thousand — the two percentage factors applied to the exact product — and rounded half up to whole cents exactly once at the end. Amounts are always non-negative, credits included: a credit's magnitude is positive and its sign is expressed by which ledger sum it feeds.
+
+Assessment has consequences beyond the money. The unit's `damage_strikes` and `tip_over_count` are recomputed — each counts the charges of its own kind against that unit whose `state` is `ASSESSED` or `UPHELD`, so a disputed or waived history does not inflate them. If, after the charge is persisted, the sum of the two counters reaches three or more and the charge's `severity` is not `TOTAL_LOSS`, a unit in `DEPLOYED` moves `DEPLOYED → IN_REPAIR`, and `deployed_unit_count` is recomputed for the site of every deployment of that unit currently `DEPLOYED`. A `DAMAGE` charge with `severity` `TOTAL_LOSS`, by contrast, takes a `DEPLOYED` unit straight to `RETIRED` — a terminal state — and drags every deployment of that unit in `RESERVED` or `DEPLOYED` to `RETURNED`, recomputing `deployed_unit_count` for each affected site. The contract's `charge_debits_cents` and `net_billable_cents` are recomputed, and an `INVOICED` contract flips to `REBILL_REQUIRED`. Finally, when the `charge_kind` is `TIP_OVER`, the site of the charge's contract has its `site_posture` recomputed, because an open tip-over restricts the ground it happened on (§2.5).
+
+The customer's remedy is to dispute, which advances `ASSESSED → DISPUTED`. Only the `CustomerContact` behind the charge's contract may do it — a mismatch is `ERR_ACCOUNT_SCOPE_VIOLATION` — and only within the window: the logical clock's current instant must be no later than the charge's `assessed_at` plus fourteen days, and a later attempt is refused with `ERR_DISPUTE_WINDOW_CLOSED` (HTTP 409). The supplied `dispute_reason` is written onto the charge. Because both contract ledger sums admit only `ASSESSED` and `UPHELD`, the disputed amount leaves the input set: the contract's `charge_debits_cents` and `credit_accrued_cents` are recomputed and the relevant one drops by the charge's `amount_cents`, `net_billable_cents` follows, the account's `open_credit_balance_cents` and `billing_hold` are recomputed, an `INVOICED` contract flips to `REBILL_REQUIRED`, and a disputed `TIP_OVER` releases its restriction on the site's posture.
+
+Resolution belongs to the `ComplianceOfficer`, subject to the segregation-of-duties rule of §2.1, and both resolutions accept an optional `resolution_note` and stamp `resolved_by_user_id` with the acting `X-User-ID`. The two branches differ sharply in what they compensate.
+
+**Upholding** confirms the charge and is reachable from either live state. From `ASSESSED → UPHELD`, no amount changes and no ledger moves at all, because `UPHELD` sits in the same input set as `ASSESSED` — the money was already counted. From `DISPUTED → UPHELD`, the amount re-enters the input set, so the contract's `charge_debits_cents`, `credit_accrued_cents` and `net_billable_cents` are all recomputed and the relevant sum rises again by `amount_cents`, the account's `open_credit_balance_cents` and then `billing_hold` are recomputed, and an `INVOICED` contract flips to `REBILL_REQUIRED`. An upheld `TIP_OVER` also releases the site restriction, since only `ASSESSED` and `DISPUTED` tip-overs restrict a site.
+
+**Waiving** cancels the charge and carries the full compensation set, again from either live state. From `ASSESSED → WAIVED`, three compensations run in order: the contract's `charge_debits_cents`, `credit_accrued_cents` and `net_billable_cents` are recomputed with this charge excluded; then, caused by that contract change, the account's `open_credit_balance_cents` is recomputed and its `billing_hold` re-evaluated against the sixty-thousand-cent threshold; then, only when the `charge_kind` is `DAMAGE` or `TIP_OVER`, the unit's `damage_strikes` and `tip_over_count` are recomputed, and if their sum falls back below three while the unit's `status` is `IN_REPAIR` the unit moves `IN_REPAIR → IN_YARD`. An `INVOICED` contract flips to `REBILL_REQUIRED`. From `DISPUTED → WAIVED`, the same three compensations run in the same order; the contract and account figures are already free of this amount, so in practice only the strike counters and the possible repair-status write can change. A waived `TIP_OVER` likewise releases the site restriction. Both `UPHELD` and `WAIVED` are terminal.
+
+### 3.9. Reconciliation, Escalation, and Closing the Contract
+
+A rental contract carries two independent state dimensions on the same row, and neither constrains the other's ordering. The fulfillment dimension is `fulfillment_state` and it runs `DRAFT → QUOTED → ACTIVE → DEMOBILIZED`; the billing dimension is `billing_state` and it runs `UNBILLED → INVOICED → SETTLED`, with a rebilling loop `INVOICED → REBILL_REQUIRED → INVOICED` driven by the credit and charge cascades of §3.6 and §3.8. A contract may be invoiced while still mobilized in the field, or demobilized long before anyone pays. `CLOSED` is the join of the two dimensions and the contract's only terminal state: it is written onto `fulfillment_state` the moment the fulfillment dimension has finished **and** `billing_state` has reached `SETTLED`, whichever of the two arrives second.
+
+Demobilization is the `DispatchPlanner`'s closeout of the field work, advances `ACTIVE → DEMOBILIZED`, and accepts an optional `demobilization_note`. It is refused unless the contract has at least one deployment in `DEPLOYED` or `RETURNED`: a contract whose iron never reached the site has nothing to reconcile, and the attempt is rejected with `ERR_RECONCILIATION_NO_DEPLOYMENTS` (HTTP 422). This is the one place in the specification where the unit-mix input set can legitimately be empty.
+
+What demobilization runs is the **reconciled** variant of the unit-mix calculation, and it differs from the provisional projection of §3.3 in both its inputs and its overlays. First, every quote line of the contract that has not been superseded — provisional lines included — has `is_superseded` set to true. Then a fresh line set is created with `quote_variant` `RECONCILED`, in the same fixed class order (`STANDARD_PORTABLE`, `ADA_PORTABLE`, `HANDWASH_STATION`, `TRAILER_2STALL`, `TRAILER_8STALL`), skipping any class whose quantity is zero. Each class's `quantity` is simply the count of the contract's deployments whose `state` is `DEPLOYED` or `RETURNED` and whose asset unit's `unit_class` is that class; deployments still in `RESERVED` are excluded because they never reached the site. There is **no** accessibility overlay and **no** handwash overlay in this variant: actuals are counted, not modelled. Each line's `unit_rate_cents` is the same per-class term rate used by the projection — 14500, 22500, 9500, 78000 and 265000 cents respectively — and each `extended_cents` is again the exact product of `quantity` and `unit_rate_cents`. The contract's `reconciled_cents` is the sum of `extended_cents` over the emitted reconciled lines, and `net_billable_cents` is recomputed. For identical contract inputs the two variants disagree whenever the fleet that actually shipped differs from the mix that was modelled, which is exactly the exposure the branch wants visible.
+
+Demobilization then unwinds the field commitments. Every deployment of the contract in `DEPLOYED` transitions `DEPLOYED → RETURNED` in `created_at` ascending order, each dragging its asset unit from `DEPLOYED` back to `IN_YARD` and recomputing the affected site's `deployed_unit_count`. Every service schedule of the contract in `ACTIVE` or `SUSPENDED` transitions to `TERMINATED`, with the route-figure asymmetry described in §3.5. And if the contract's `billing_state` is already `SETTLED` at that moment, `fulfillment_state` is written `CLOSED` instead of `DEMOBILIZED` in the very same request.
+
+Invoicing is the `SalesRep`'s action, carries no request body, and reaches `INVOICED` from two different origins. From `UNBILLED → INVOICED` the contract's `fulfillment_state` must be either `ACTIVE` or `DEMOBILIZED` — a `DRAFT` or merely `QUOTED` contract cannot be invoiced, and the attempt is rejected with `ERR_INVALID_STATE_TRANSITION` — and at least one non-superseded quote line must exist. From `REBILL_REQUIRED → INVOICED`, which is how a contract recovers after a credit or charge landed on an already-issued invoice, the only additional requirement is that at least one non-superseded quote line still exists. Either way the owning account's `billing_hold` must be false, or the attempt is refused with `ERR_ACCOUNT_BILLING_HOLD`: an account sitting on six hundred dollars of unapplied credit does not get another invoice until the credit is cleared.
+
+Escalation is applied line by line. Add together three percentages: the seasonal escalation for the contract's `season_code` — 8.5 percent for `PEAK`, 3.25 percent for `SHOULDER` and nothing at all for `OFF` — the construction-phase escalation for the contract's `construction_phase` — nothing for `SITEWORK`, 4.75 percent for `VERTICAL`, 2.5 percent for `FINISHES` and nothing for `EVENT_NA`, which is what every event contract carries — and a flat fuel surcharge of 1.75 percent that applies to every contract regardless of season or phase. Then take the contract's quote lines with `is_superseded` false, ordered by `created_at` ascending, and for each line in that order compute `escalated_cents` as the line's `extended_cents` multiplied by one hundred plus the combined percentage, divided by 100, rounded half up to whole cents. The contract's `invoice_subtotal_cents` is the sum of those already-rounded `escalated_cents` values. The rounding order is pinned and the alternative is wrong: summing the extended amounts, escalating the sum once and rounding once produces a different total, off by as much as a cent per line. Finally `net_billable_cents` is recomputed as `invoice_subtotal_cents` plus `charge_debits_cents` minus `credit_accrued_cents`. Whichever generation of lines is currently non-superseded is what gets escalated — a provisional-only set before demobilization, a reconciled-only set after it — and a rebill rewrites `escalated_cents` on the current set rather than adding to it.
+
+Settlement is the `PlatformAdmin`'s act of recording payment, advances `billing_state` `INVOICED → SETTLED`, and accepts an optional `payment_reference`. If the fulfillment dimension has already reached `DEMOBILIZED`, settlement writes `fulfillment_state` to `CLOSED` in the same request. A contract that settles first and demobilizes later arrives at `CLOSED` through the demobilization path instead; both orders end in the same terminal row.
+
+## 4. Endpoint Definitions
+
+Operations that bring a new resource into existence return `201 Created`. Operations that modify an existing resource — every state transition, every recomputation-bearing action, and the logical-clock repositioning — return `200 OK`. Booking a route re-run is the one action-shaped operation that returns `201 Created`, because it creates a new visit row rather than merely advancing the one addressed. All reads return `200 OK`. Every collection is mounted at the top level; there are no nested resource paths.
+
+| Method | Path | Description | Authorized Role(s) |
+| ------ | ---- | ----------- | ------------------ |
+| POST | `/rental-accounts` | Open a customer account | PlatformAdmin |
+| GET | `/rental-accounts/{id}` | Read one account including its derived credit balance and hold flag | All seven roles |
+| GET | `/rental-accounts/{id}/service-sites` | List every placement site belonging to this account | All seven roles |
+| POST | `/service-sites` | Register a placement site with its access class and gate window | SalesRep, PlatformAdmin |
+| GET | `/service-sites/{id}` | Read one site including its permit roll-up, posture and deployed unit count | All seven roles |
+| GET | `/service-sites/{id}/permits` | List every permit filed for this site | All seven roles |
+| POST | `/placement-permits` | Draft a placement or right-of-way permit filing | PermitCoordinator |
+| GET | `/placement-permits/{id}` | Read one permit filing | All seven roles |
+| POST | `/placement-permits/{id}/submit` | File the permit with the authority; also the resubmission entry point after a rejection | PermitCoordinator |
+| POST | `/placement-permits/{id}/approve` | Record authority approval | ComplianceOfficer |
+| POST | `/placement-permits/{id}/reject` | Record authority rejection; triggers the site-blocking cascade | ComplianceOfficer |
+| POST | `/asset-units` | Add a physical unit to the yard | PlatformAdmin |
+| GET | `/asset-units/{id}` | Read one asset unit including its strike counters | All seven roles |
+| POST | `/disposal-sites` | Register a disposal facility with its daily cap and accepted waste classes | PlatformAdmin |
+| GET | `/disposal-sites/{id}` | Read one disposal facility including its committed volume for the current logical-clock date | All seven roles |
+| POST | `/routes` | Create a service route for one weekday | DispatchPlanner |
+| GET | `/routes/{id}` | Read one route including both density figures and its version | All seven roles |
+| POST | `/rental-contracts` | Create a draft contract | SalesRep, CustomerContact |
+| GET | `/rental-contracts/{id}` | Read one contract including both quote totals, the escalated subtotal, the ledger fields and its version | All seven roles |
+| GET | `/rental-contracts` | Filtered list of contracts | All seven roles |
+| GET | `/rental-contracts/{id}/quote-lines` | List the contract's quote lines, superseded ones included unless filtered out | All seven roles |
+| POST | `/rental-contracts/{id}/quote` | Run the provisional unit-mix quote; supersedes the prior line set | SalesRep |
+| POST | `/rental-contracts/{id}/activate` | Mobilize the contract; gated on site posture, account standing and billing hold | SalesRep |
+| POST | `/rental-contracts/{id}/demobilize` | Close out the field work and reconcile the mix against actual deployments | DispatchPlanner |
+| POST | `/rental-contracts/{id}/invoice` | Escalate the current line set and issue the invoice | SalesRep |
+| POST | `/rental-contracts/{id}/settle-invoice` | Record payment of the issued invoice | PlatformAdmin |
+| POST | `/unit-deployments` | Commit a physical unit to a contract for a closed date interval | DispatchPlanner |
+| GET | `/unit-deployments/{id}` | Read one deployment | All seven roles |
+| GET | `/unit-deployments` | Filtered list of deployments | All seven roles |
+| POST | `/unit-deployments/{id}/relocate` | Move a deployed unit to another site of the same account and bill the relocation | DispatchPlanner |
+| POST | `/service-schedules` | Attach a contract's unit count to a route for a weekday, consuming route capacity | DispatchPlanner |
+| GET | `/service-schedules/{id}` | Read one schedule including its frozen unit count | All seven roles |
+| GET | `/service-schedules` | Filtered list of schedules | All seven roles |
+| POST | `/service-schedules/{id}/suspend` | Release the schedule's units from the route and cancel its future planned visits | DispatchPlanner |
+| POST | `/service-visits` | Plan a setup, service or teardown leg inside the site's gate window and clear of other route windows | DispatchPlanner |
+| GET | `/service-visits/{id}` | Read one visit | All seven roles |
+| GET | `/service-visits` | Filtered list of visits | All seven roles |
+| POST | `/service-visits/{id}/dispatch` | Send the truck; requires the route to be available | DriverOperator |
+| POST | `/service-visits/{id}/complete` | Record the pump-out and close the visit | DriverOperator |
+| POST | `/service-visits/{id}/mark-missed` | Record a missed service; generates the missed-service credit and its four-hop cascade | DispatchPlanner |
+| POST | `/service-visits/{id}/schedule-rerun` | Book the route re-run for a missed visit; creates a linked re-run visit | DispatchPlanner |
+| POST | `/waste-manifests` | Open a haul manifest for one route and date | DriverOperator |
+| GET | `/waste-manifests/{id}` | Read one manifest | All seven roles |
+| GET | `/waste-manifests` | Filtered list of manifests | All seven roles |
+| POST | `/waste-manifests/{id}/seal` | Freeze the manifest volume and commit it against the facility's daily cap | DriverOperator |
+| POST | `/waste-manifests/{id}/accept` | Record facility acceptance of the sealed load | ComplianceOfficer |
+| POST | `/charge-events` | Assess a damage or tip-over charge against a unit | ComplianceOfficer |
+| GET | `/charge-events/{id}` | Read one charge event | All seven roles |
+| GET | `/charge-events` | Filtered list of charge events | All seven roles |
+| POST | `/charge-events/{id}/dispute` | Customer contests the charge inside the dispute window | CustomerContact |
+| POST | `/charge-events/{id}/uphold` | Officer confirms the charge; segregation of duties applies | ComplianceOfficer |
+| POST | `/charge-events/{id}/waive` | Officer waives the charge, compensating every ledger and strike effect it caused | ComplianceOfficer |
+| POST | `/_clock/set_current_utc` | Reposition the logical clock and run the permit-expiry sweep | PlatformAdmin |
+
+Where the table lists "All seven roles", the endpoint admits `PlatformAdmin`, `SalesRep`, `PermitCoordinator`, `DispatchPlanner`, `DriverOperator`, `ComplianceOfficer` and `CustomerContact`. All list endpoints accept `limit` and `offset` as described in §2.3, in addition to the domain filters named in §3.
+
+## 5. Error Code Catalogue
+
+| Error ID | HTTP Status Code |
+| -------- | ---------------- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_ROLE_NOT_PERMITTED` | 403 |
+| `ERR_ACCOUNT_SCOPE_VIOLATION` | 403 |
+| `ERR_SEGREGATION_OF_DUTIES` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_ACCOUNT_NOT_FOUND` | 404 |
+| `ERR_SITE_NOT_FOUND` | 404 |
+| `ERR_PERMIT_NOT_FOUND` | 404 |
+| `ERR_ASSET_UNIT_NOT_FOUND` | 404 |
+| `ERR_DISPOSAL_SITE_NOT_FOUND` | 404 |
+| `ERR_ROUTE_NOT_FOUND` | 404 |
+| `ERR_CONTRACT_NOT_FOUND` | 404 |
+| `ERR_DEPLOYMENT_NOT_FOUND` | 404 |
+| `ERR_SCHEDULE_NOT_FOUND` | 404 |
+| `ERR_VISIT_NOT_FOUND` | 404 |
+| `ERR_MANIFEST_NOT_FOUND` | 404 |
+| `ERR_CHARGE_NOT_FOUND` | 404 |
+| `ERR_STALE_CONTRACT_VERSION` | 412 |
+| `ERR_STALE_ROUTE_VERSION` | 412 |
+| `ERR_INVALID_STATE_TRANSITION` | 409 |
+| `ERR_SITE_POSTURE_BLOCKED` | 409 |
+| `ERR_SITE_POSTURE_RESTRICTED` | 409 |
+| `ERR_ROUTE_SUSPENDED` | 409 |
+| `ERR_DISPOSAL_SITE_CLOSED` | 409 |
+| `ERR_PERMIT_REVISION_LIMIT` | 409 |
+| `ERR_SITE_ACCESS_INFEASIBLE` | 422 |
+| `ERR_ACCESS_WINDOW_VIOLATION` | 422 |
+| `ERR_ROUTE_WINDOW_CONFLICT` | 409 |
+| `ERR_UNIT_DOUBLE_BOOKED` | 409 |
+| `ERR_ROUTE_UNIT_CAPACITY_EXCEEDED` | 422 |
+| `ERR_DISPOSAL_CLASS_NOT_ACCEPTED` | 422 |
+| `ERR_MANIFEST_NO_SERVICED_VISITS` | 422 |
+| `ERR_DISPOSAL_CAP_EXCEEDED` | 422 |
+| `ERR_RECONCILIATION_NO_DEPLOYMENTS` | 422 |
+| `ERR_ACCOUNT_BILLING_HOLD` | 402 |
+| `ERR_DISPUTE_WINDOW_CLOSED` | 409 |

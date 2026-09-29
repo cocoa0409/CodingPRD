@@ -1,0 +1,95 @@
+"""Error catalogue (PRD 5) and the exception type carrying it."""
+
+ERROR_STATUS = {
+    "ERR_MISSING_USER_CONTEXT": 400,
+    "ERR_INVALID_ROLE": 401,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_CUSTODIAN_ROLE_MISMATCH": 403,
+    "ERR_INVALID_REQUEST": 400,
+    "ERR_PROPERTY_ROOM_NOT_FOUND": 404,
+    "ERR_OFFENSE_STATUTE_NOT_FOUND": 404,
+    "ERR_STORAGE_LOCATION_NOT_FOUND": 404,
+    "ERR_CUSTODIAN_NOT_FOUND": 404,
+    "ERR_CASE_NOT_FOUND": 404,
+    "ERR_EVIDENCE_ITEM_NOT_FOUND": 404,
+    "ERR_RETENTION_DETERMINATION_NOT_FOUND": 404,
+    "ERR_CUSTODY_TRANSFER_NOT_FOUND": 404,
+    "ERR_DISPOSITION_ORDER_NOT_FOUND": 404,
+    "ERR_OWNER_CLAIM_NOT_FOUND": 404,
+    "ERR_AUDIT_SESSION_NOT_FOUND": 404,
+    "ERR_DISCREPANCY_NOT_FOUND": 404,
+    "ERR_CHAIN_EVENT_NOT_FOUND": 404,
+    "ERR_BARCODE_NOT_FOUND": 404,
+    "ERR_ROOM_LOCKED_DOWN": 409,
+    "ERR_ROOM_RESTRICTED": 409,
+    "ERR_STALE_EVIDENCE_ITEM_VERSION": 412,
+    "ERR_STALE_STORAGE_LOCATION_VERSION": 412,
+    "ERR_ITEM_CUSTODY_STATE_INVALID": 409,
+    "ERR_ITEM_DISPOSITION_STATE_INVALID": 409,
+    "ERR_CASE_STATE_INVALID": 409,
+    "ERR_TRANSFER_STATE_INVALID": 409,
+    "ERR_ORDER_STATE_INVALID": 409,
+    "ERR_CLAIM_STATE_INVALID": 409,
+    "ERR_AUDIT_STATE_INVALID": 409,
+    "ERR_DISCREPANCY_STATE_INVALID": 409,
+    "ERR_LOCATION_SEALED": 409,
+    "ERR_CUSTODIAN_SUSPENDED": 409,
+    "ERR_CUSTODIAN_NOT_CERTIFIED": 409,
+    "ERR_SEGREGATION_OF_DUTIES": 409,
+    "ERR_DUPLICATE_AGENCY_CODE": 409,
+    "ERR_DUPLICATE_OFFENSE_CODE": 409,
+    "ERR_DUPLICATE_LOCATION_CODE": 409,
+    "ERR_DUPLICATE_BADGE_NUMBER": 409,
+    "ERR_DUPLICATE_CASE_NUMBER": 409,
+    "ERR_PACKAGING_NOT_PERMITTED": 422,
+    "ERR_STORAGE_CATEGORY_MISMATCH": 409,
+    "ERR_REFRIGERATION_OUT_OF_RANGE": 409,
+    "ERR_WITNESS_SIGNATURE_REQUIRED": 422,
+    "ERR_ESCORT_CAPACITY_EXCEEDED": 409,
+    "ERR_INVALID_TRANSFER_WINDOW": 422,
+    "ERR_TRANSFER_WINDOW_TOO_LONG": 422,
+    "ERR_CUSTODY_WINDOW_CONFLICT": 409,
+    "ERR_AUDIT_WINDOW_BUFFER": 409,
+    "ERR_PRESERVATION_CLASS_FORBIDS_DESTRUCTION": 409,
+    "ERR_CASE_NOT_DISPOSABLE": 409,
+    "ERR_RETENTION_NOT_MATURED": 409,
+    "ERR_CLAIM_NOT_VERIFIED": 409,
+    "ERR_BARCODE_FOREIGN_ROOM": 409,
+    "ERR_CASE_HAS_UNDISPOSED_ITEMS": 409,
+    "ERR_DISCREPANCY_RESOLUTION_NOT_PERMITTED": 422,
+    "ERR_SALE_BELOW_RESERVE": 409,
+    "ERR_NO_PROCEEDS_HELD": 409,
+    "ERR_SETTLEMENT_WINDOW_CLOSED": 409,
+    "ERR_STORAGE_LOCATION_FULL": 409,
+    "ERR_NO_ELIGIBLE_STORAGE": 409,
+}
+
+
+def status_for(error_id):
+    return ERROR_STATUS.get(error_id, 400)
+
+
+def message_for(error_id):
+    if error_id in _DEFAULT_MESSAGES:
+        return _DEFAULT_MESSAGES[error_id]
+    words = error_id[4:].replace("_", " ").lower() if error_id.startswith("ERR_") else error_id
+    return "The request was rejected: %s." % words
+
+
+class ApiError(Exception):
+    def __init__(self, error_id, message=None):
+        super(ApiError, self).__init__(error_id)
+        self.error_id = error_id
+        self.http_status = status_for(error_id)
+        self.message = message or message_for(error_id)
+
+
+_DEFAULT_MESSAGES = {
+    "ERR_MISSING_USER_CONTEXT": "X-User-ID and X-User-Role headers are required.",
+    "ERR_INVALID_ROLE": "X-User-Role is not a recognized role.",
+    "ERR_ROLE_NOT_PERMITTED": "The acting role is not authorized for this endpoint.",
+    "ERR_CUSTODIAN_ROLE_MISMATCH": "X-User-ID does not resolve to a custodian of the acting role.",
+    "ERR_INVALID_REQUEST": "The request body is invalid.",
+    "ERR_ROOM_LOCKED_DOWN": "The property room is locked down.",
+    "ERR_ROOM_RESTRICTED": "The property room is restricted.",
+}

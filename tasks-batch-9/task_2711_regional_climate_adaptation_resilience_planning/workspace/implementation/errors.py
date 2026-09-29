@@ -1,0 +1,161 @@
+"""Error catalogue for the Regional Climate Adaptation & Resilience Planning API.
+
+Every identifier and HTTP status here is taken verbatim from PRD section 5.
+"""
+
+ERROR_STATUS = {
+    # --- 401 -----------------------------------------------------------------
+    "ERR_UNAUTHENTICATED": 401,
+    # --- 403 -----------------------------------------------------------------
+    "ERR_UNKNOWN_ROLE": 403,
+    "ERR_ROLE_NOT_PERMITTED": 403,
+    "ERR_JURISDICTION_SCOPE_VIOLATION": 403,
+    "ERR_SEGREGATION_OF_DUTIES": 403,
+    # --- 404 -----------------------------------------------------------------
+    "ERR_JURISDICTION_NOT_FOUND": 404,
+    "ERR_PLAN_CYCLE_NOT_FOUND": 404,
+    "ERR_HAZARD_PROFILE_NOT_FOUND": 404,
+    "ERR_ASSET_NOT_FOUND": 404,
+    "ERR_ASSESSMENT_NOT_FOUND": 404,
+    "ERR_PROJECT_NOT_FOUND": 404,
+    "ERR_LINK_NOT_FOUND": 404,
+    "ERR_ANALYSIS_NOT_FOUND": 404,
+    "ERR_PROGRAM_NOT_FOUND": 404,
+    "ERR_SESSION_NOT_FOUND": 404,
+    "ERR_ENDORSEMENT_NOT_FOUND": 404,
+    "ERR_PACT_NOT_FOUND": 404,
+    "ERR_COMMITMENT_NOT_FOUND": 404,
+    # --- 409 -----------------------------------------------------------------
+    "ERR_JURISDICTION_NOT_ACTIVE": 409,
+    "ERR_PLAN_CYCLE_STATE_INVALID": 409,
+    "ERR_HAZARD_PROFILE_ALREADY_PUBLISHED": 409,
+    "ERR_HAZARD_PROFILE_NOT_PUBLISHED": 409,
+    "ERR_ASSESSMENT_NOT_PENDING": 409,
+    "ERR_ASSET_ALREADY_RANKED": 409,
+    "ERR_PROJECT_ALREADY_SCREENED": 409,
+    "ERR_PROJECT_NOT_SCREENED_IN": 409,
+    "ERR_PROJECT_ALREADY_PROGRAMMED": 409,
+    "ERR_PROJECT_NOT_PROGRAMMED": 409,
+    "ERR_ANALYSIS_NOT_DRAFT": 409,
+    "ERR_BCA_ALREADY_CERTIFIED": 409,
+    "ERR_BCA_NOT_CERTIFIED": 409,
+    "ERR_SESSION_NOT_SCHEDULED": 409,
+    "ERR_COMMITMENT_NOT_ACTIVE": 409,
+    "ERR_PACT_NOT_OPEN": 409,
+    "ERR_EQUITY_FLOOR_NOT_MET": 409,
+    "ERR_ASSET_NOT_SHARED": 409,
+    "ERR_SELF_AID_NOT_ALLOWED": 409,
+    "ERR_ASSET_DEPENDENCY_CYCLE": 409,
+    "ERR_PROJECT_PREREQUISITE_CYCLE": 409,
+    "ERR_DUPLICATE_JURISDICTION_CODE": 409,
+    "ERR_DUPLICATE_ENDORSEMENT": 409,
+    "ERR_DUPLICATE_ASSET_LINK": 409,
+    "ERR_NO_ASSESSED_VULNERABILITY": 409,
+    "ERR_NO_LINKED_ASSETS": 409,
+    "ERR_ASSET_RANKING_REQUIRED": 409,
+    "ERR_PREREQUISITE_NOT_AWARDED": 409,
+    "ERR_ENGAGEMENT_INCOMPLETE": 409,
+    "ERR_NO_SCREENED_PROJECTS": 409,
+    "ERR_INDICATOR_NOT_DEFINED": 409,
+    "ERR_SESSION_WINDOW_CONFLICT": 409,
+    "ERR_AID_CONCURRENCY_LIMIT": 409,
+    "ERR_AID_CAPACITY_EXCEEDED": 409,
+    "ERR_PROGRAM_FUNDS_EXCEEDED": 409,
+    "ERR_BCR_BELOW_FLOOR": 409,
+    "ERR_GRANT_ON_HOLD": 409,
+    # --- 412 -----------------------------------------------------------------
+    "ERR_STALE_PROGRAM_VERSION": 412,
+    "ERR_STALE_PACT_VERSION": 412,
+    # --- 422 -----------------------------------------------------------------
+    "ERR_INVALID_REQUEST": 422,
+    "ERR_INVALID_WINDOW": 422,
+    "ERR_ATTENDANCE_MISMATCH": 422,
+    "ERR_CONDITION_NOTE_REQUIRED": 422,
+    "ERR_AID_WINDOW_OUTSIDE_PACT": 422,
+    "ERR_ALLOCATION_EXCEEDS_PROJECT_COST": 422,
+    # --- routing fallback ----------------------------------------------------
+    "ERR_NOT_FOUND": 404,
+    "ERR_METHOD_NOT_ALLOWED": 405,
+}
+
+DEFAULT_MESSAGE = {
+    "ERR_UNAUTHENTICATED": "Authentication headers are missing.",
+    "ERR_UNKNOWN_ROLE": "The supplied role is not a recognized role.",
+    "ERR_ROLE_NOT_PERMITTED": "This role may not perform this operation.",
+    "ERR_JURISDICTION_SCOPE_VIOLATION": "The caller's jurisdiction does not own the target record.",
+    "ERR_SEGREGATION_OF_DUTIES": "The preparer of an analysis may not certify or reject it.",
+    "ERR_JURISDICTION_NOT_FOUND": "Jurisdiction not found.",
+    "ERR_PLAN_CYCLE_NOT_FOUND": "Plan cycle not found.",
+    "ERR_HAZARD_PROFILE_NOT_FOUND": "Hazard profile not found.",
+    "ERR_ASSET_NOT_FOUND": "Lifeline asset not found.",
+    "ERR_ASSESSMENT_NOT_FOUND": "Vulnerability assessment not found.",
+    "ERR_PROJECT_NOT_FOUND": "Adaptation project not found.",
+    "ERR_LINK_NOT_FOUND": "Project asset link not found.",
+    "ERR_ANALYSIS_NOT_FOUND": "Benefit-cost analysis not found.",
+    "ERR_PROGRAM_NOT_FOUND": "Capital program not found.",
+    "ERR_SESSION_NOT_FOUND": "Engagement session not found.",
+    "ERR_ENDORSEMENT_NOT_FOUND": "Endorsement not found.",
+    "ERR_PACT_NOT_FOUND": "Mutual aid pact not found.",
+    "ERR_COMMITMENT_NOT_FOUND": "Mutual aid commitment not found.",
+    "ERR_JURISDICTION_NOT_ACTIVE": "The jurisdiction is not ACTIVE.",
+    "ERR_PLAN_CYCLE_STATE_INVALID": "The plan cycle is not in a state that allows this operation.",
+    "ERR_HAZARD_PROFILE_ALREADY_PUBLISHED": "The hazard profile has already been published.",
+    "ERR_HAZARD_PROFILE_NOT_PUBLISHED": "The hazard profile is not published.",
+    "ERR_ASSESSMENT_NOT_PENDING": "The assessment is not awaiting assessment.",
+    "ERR_ASSET_ALREADY_RANKED": "The asset has already been ranked.",
+    "ERR_PROJECT_ALREADY_SCREENED": "The project has already been screened.",
+    "ERR_PROJECT_NOT_SCREENED_IN": "The project has not been screened in.",
+    "ERR_PROJECT_ALREADY_PROGRAMMED": "The project is already programmed against a capital program.",
+    "ERR_PROJECT_NOT_PROGRAMMED": "The project's program status does not allow this operation.",
+    "ERR_ANALYSIS_NOT_DRAFT": "The analysis is not in DRAFT.",
+    "ERR_BCA_ALREADY_CERTIFIED": "A certified analysis already exists for this project.",
+    "ERR_BCA_NOT_CERTIFIED": "The project has no certified benefit-cost analysis.",
+    "ERR_SESSION_NOT_SCHEDULED": "The engagement session is not scheduled.",
+    "ERR_COMMITMENT_NOT_ACTIVE": "The commitment is no longer active.",
+    "ERR_PACT_NOT_OPEN": "The mutual aid pact is not open for new commitments.",
+    "ERR_EQUITY_FLOOR_NOT_MET": "The project's equity benefit share is below the program's equity target.",
+    "ERR_ASSET_NOT_SHARED": "Only shared lifeline assets may be pledged under a mutual aid pact.",
+    "ERR_SELF_AID_NOT_ALLOWED": "A jurisdiction may not request aid from its own pact.",
+    "ERR_ASSET_DEPENDENCY_CYCLE": "The asset dependency chain contains a cycle.",
+    "ERR_PROJECT_PREREQUISITE_CYCLE": "The project prerequisite chain contains a cycle.",
+    "ERR_DUPLICATE_JURISDICTION_CODE": "jurisdiction_code is already in use.",
+    "ERR_DUPLICATE_ENDORSEMENT": "This jurisdiction has already endorsed in this round.",
+    "ERR_DUPLICATE_ASSET_LINK": "This asset is already linked to the project.",
+    "ERR_NO_ASSESSED_VULNERABILITY": "The asset has no assessed vulnerability to rank against.",
+    "ERR_NO_LINKED_ASSETS": "The project has no linked assets to analyze.",
+    "ERR_ASSET_RANKING_REQUIRED": "Every linked lifeline asset must be ranked first.",
+    "ERR_PREREQUISITE_NOT_AWARDED": "The prerequisite project has not been awarded.",
+    "ERR_ENGAGEMENT_INCOMPLETE": "Not enough completed engagement sessions to open an endorsement round.",
+    "ERR_NO_SCREENED_PROJECTS": "The plan cycle has no screened-in projects.",
+    "ERR_INDICATOR_NOT_DEFINED": "The project has no implementation indicator defined.",
+    "ERR_SESSION_WINDOW_CONFLICT": "The session window conflicts with an existing session for this host jurisdiction.",
+    "ERR_AID_CONCURRENCY_LIMIT": "The pact's concurrent commitment limit would be exceeded.",
+    "ERR_AID_CAPACITY_EXCEEDED": "The pact's pledged units would be exceeded at some instant in the window.",
+    "ERR_PROGRAM_FUNDS_EXCEEDED": "The capital program has insufficient available funds.",
+    "ERR_BCR_BELOW_FLOOR": "The benefit-cost ratio is below the grant eligibility floor.",
+    "ERR_GRANT_ON_HOLD": "Grant submission is on hold for this project.",
+    "ERR_STALE_PROGRAM_VERSION": "The supplied capital program version is stale.",
+    "ERR_STALE_PACT_VERSION": "The supplied mutual aid pact version is stale.",
+    "ERR_INVALID_REQUEST": "The request payload is malformed.",
+    "ERR_INVALID_WINDOW": "window_start must be strictly before window_end.",
+    "ERR_ATTENDANCE_MISMATCH": "disadvantaged_attendee_count may not exceed attendee_count.",
+    "ERR_CONDITION_NOTE_REQUIRED": "condition_note is required for a CONDITIONED endorsement.",
+    "ERR_AID_WINDOW_OUTSIDE_PACT": "The commitment window must lie inside the pact window.",
+    "ERR_ALLOCATION_EXCEEDS_PROJECT_COST": "allocated_cents may not exceed the project's total program cost.",
+    "ERR_NOT_FOUND": "Resource not found.",
+    "ERR_METHOD_NOT_ALLOWED": "Method not allowed for this resource.",
+}
+
+
+class ApiError(Exception):
+    """Raised anywhere in the request pipeline; nothing is written when it fires."""
+
+    def __init__(self, error_id, message=None, http_status=None):
+        self.error_id = error_id
+        self.message = message or DEFAULT_MESSAGE.get(error_id, error_id)
+        self.http_status = http_status or ERROR_STATUS.get(error_id, 400)
+        super().__init__(self.message)
+
+
+def fail(error_id, message=None):
+    raise ApiError(error_id, message)

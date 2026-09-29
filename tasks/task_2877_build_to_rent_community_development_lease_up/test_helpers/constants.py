@@ -1,0 +1,82 @@
+"""Domain thresholds and pinned literals from the PRD's §2/§3 calculations."""
+
+# --- Logical clock (PRD §2.9) ---
+DEFAULT_CLOCK = "2026-08-01T00:00:00Z"
+
+# --- Posture gate (PRD §2.6) ---
+AMENITY_DELIVERY_RESTRICTED_THRESHOLD = 0.5000
+STABILIZATION_OCCUPANCY_THRESHOLD = 0.7500
+PM_TRANSITION_OCCUPANCY_THRESHOLD = 0.5000
+
+# --- Community services fee (PRD §3.7) ---
+FEE_TIER_BREAK_LOW_CENTS = 200_000
+FEE_TIER_BREAK_HIGH_CENTS = 320_000
+FEE_BPS_BELOW_LOW_BREAK = 350
+FEE_BPS_MIDDLE_BAND = 300
+FEE_BPS_AT_OR_ABOVE_HIGH_BREAK = 250
+PRODUCT_SURCHARGE_CENTS = {
+    "DETACHED": 4_500,
+    "COTTAGE": 3_000,
+    "TOWNHOME": 2_000,
+}
+
+# --- Absorption pacing (PRD §3.5) ---
+SUPPLY_FACTOR_FLOOR = 0.75
+SUPPLY_FACTOR_CEILING = 1.25
+RESTRICTED_POSTURE_PENALTY = 0.90
+PACING_TIERS = {
+    "NONE": {"lower_bound": 1.2000, "recommended_growth_bps": 250},
+    "LIGHT": {"lower_bound": 1.0000, "recommended_growth_bps": 125},
+    "MODERATE": {"lower_bound": 0.8000, "recommended_growth_bps": 0},
+    "AGGRESSIVE": {"lower_bound": None, "recommended_growth_bps": -150},
+}
+REVIEW_WINDOW_MULTIPLE_DAYS = 7
+
+# --- Indexed rent growth (PRD §3.5) ---
+MAX_STEP_CENTS = 20_000
+
+# --- Concession programs (PRD §3.6, §3.8) ---
+FREE_WEEKS_MIN = 0
+FREE_WEEKS_MAX = 12
+WEEKS_PER_MONTH_NUMERATOR = 12
+WEEKS_PER_YEAR_DENOMINATOR = 52
+
+# --- Lease drafting (PRD §3.7) ---
+ALLOWED_TERM_MONTHS = (12, 18, 24)
+INCOME_QUALIFICATION_MULTIPLE = 3
+
+# --- Construction impact credit (PRD §3.4, §3.9) ---
+CONSTRUCTION_IMPACT_CREDIT_CENTS = 7_500
+
+# --- Turn work orders (PRD §3.10) ---
+TURN_HOURLY_RATE_CENTS = {
+    "MAKE_READY": 6_500,
+    "DETACHED_YARD_RESTORE": 8_000,
+    "MAJOR_REHAB": 11_000,
+}
+TURN_OPEX_CAP_CENTS = 80_000
+MAX_TURN_WINDOW_HOURS = 240
+MIN_TURN_REWORK_BUFFER_HOURS = 48
+TECH_COUNT_MIN = 1
+TECH_COUNT_MAX = 3
+
+# --- Phasing (PRD §3.3) ---
+MAX_CONCURRENT_CONSTRUCTION_PHASES = 2
+MIN_SAME_KIND_GAP_HOURS = 48
+MAX_PLAT_REVISION_ROUND = 2
+
+# --- Valuation (PRD §3.11) ---
+CAP_RATE_BPS = 525
+STABILIZED_VACANCY_BPS = 500
+OPEX_RATIO_BPS = 3_400
+MAX_LTV_BPS = 6_500
+
+# --- Pagination (PRD §2.3) ---
+DEFAULT_LIMIT = 10
+MIN_LIMIT = 1
+MAX_LIMIT = 100
+
+# --- Canonical pricing chain used across the design recipes ---
+CANONICAL_DETACHED_ASKING_RENT_CENTS = 285_000
+CANONICAL_DETACHED_FEE_CENTS = 13_050
+CANONICAL_DETACHED_GROSS_CENTS = 298_050

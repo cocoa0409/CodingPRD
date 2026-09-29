@@ -1,0 +1,517 @@
+# Grocery Fuel Points & Cross-Banner Loyalty Redemption API — Product Requirements Document
+
+## 1. Introduction
+
+Grocery retailers that also sell fuel run one of the most operationally awkward loyalty programs in retail. Points are earned in a supermarket lane at one multiplier, in a pharmacy at another, and on gift cards at a third; they expire on a month boundary that has nothing to do with when they were earned; and they are spent at a pump — sometimes a pump the retailer owns, sometimes a partner station that must later be reimbursed in cash for every discounted gallon it pumped. Between the lane and the pump sit households: shared accounts that let a spouse spend a partner's points, and that increasingly span two retail banners after a merger. Every one of those seams is a place where money leaks, where a fraud ring shares an alternate ID across six cars, and where a member calls the contact centre insisting that 4,000 points vanished.
+
+This document specifies the API that runs that program end to end. It is deliberately built as a **ledger** rather than a balance: no member record ever stores a mutable point total, and every accrual, redemption, release, transfer, expiry, rollover and manual adjustment is a new signed row that can be replayed, audited and disputed. Layered on top of that ledger are a pricing engine (category and promotional multiplier stacking, per-gallon discount caps, volume-tiered partner reimbursement), a month-boundary epoch machine (cycle open, freeze, sweep), and a fraud and governance layer that can freeze a household automatically but will never thaw one automatically.
+
+Two design commitments run through everything that follows. First, **configuration is data**: essentially every threshold, multiplier, cap and behavioural mode in the system is a field on the banner, so two banners fed identical activity can legitimately produce different point balances, different expiry outcomes and different fraud verdicts. Second, **authority is separated**: the analyst who proposes a manual point adjustment can never be the person who approves it, and the clerk who assembles a partner settlement batch can never be the person who releases the money for it. Implementers should treat both commitments as load-bearing rather than decorative — most of the interesting behaviour in this API is a consequence of one or the other.
+
+## 2. Global Specifications & System-Wide Principles
+
+This section defines the contract-level rules that hold across every endpoint. All resource collections are mounted at the server root as peer top-level paths; no entity is addressed through an owning parent, and the three nested list paths that do exist are reverse-lookup channels over foreign keys rather than an ownership hierarchy.
+
+### 2.1. User and Role-Based Access Control
+
+Every request must carry two headers: `X-User-ID`, identifying the acting principal, and `X-User-Role`, declaring the capacity in which it acts. A request that omits either header, sends either as an empty string, or sends an `X-User-Role` that is not one of the seven recognised roles is rejected with `ERR_UNAUTHENTICATED` (HTTP 401). A request whose role is recognised but is not listed among the roles authorised for the target operation in §4 is rejected with `ERR_UNAUTHORIZED` (HTTP 403).
+
+The seven roles are `ProgramAdmin`, `StoreOperator`, `PumpTerminal`, `Member`, `LoyaltyAnalyst`, `LoyaltySupervisor`, and `SettlementClerk`. Their responsibilities divide as follows. A `ProgramAdmin` owns the loyalty program: it configures banners, sites and promotions, holds the logical clock, and is the only role that may release settlement money or approve a `TIER3` manual adjustment. A `StoreOperator` is a grocery lane or service desk: it enrolls members and records and posts baskets. A `PumpTerminal` is an unattended dispenser controller: it looks members up by alternate ID, authorizes a per-gallon discount, and closes the fill out. A `Member` is the enrolled shopper acting for themself. A `LoyaltyAnalyst` manages household linkage, raises and clears fraud signals, investigates disputes and **proposes** adjustments — but may never approve one. A `LoyaltySupervisor` runs the month-boundary close, freezes and thaws households, denies disputes, and approves `TIER1` and `TIER2` adjustments proposed by someone else. A `SettlementClerk` opens and submits reimbursement batches for its own partner station and can never approve them.
+
+Three roles are backed by a persisted `Site`. When `X-User-Role` is `StoreOperator`, `X-User-ID` is the `id` of the acting `Site`; ownership checks on any resource that references a `Site` compare that resource's `site_id` to `X-User-ID`. The same holds for `PumpTerminal` and for `SettlementClerk`: in both cases `X-User-ID` is the `id` of the acting `Site`, and ownership checks compare the target resource's `site_id` — or the `id` of the site named directly in the path — to `X-User-ID`. One role is backed by a persisted `Member`: when `X-User-Role` is `Member`, `X-User-ID` is the `id` of the acting `Member`, and ownership checks compare the target resource's `member_id` (or the `id` of the member named directly in the path) to `X-User-ID`.
+
+The remaining three roles are operator identities. When `X-User-Role` is `ProgramAdmin`, `LoyaltyAnalyst`, or `LoyaltySupervisor`, `X-User-ID` is an opaque operator identifier not tied to any persisted entity. The server records it where a transition writes it — as `proposed_by_user_id` and `approved_by_user_id` on a dispute, as `submitted_by_user_id` and `approved_by_user_id` on a settlement batch, and as `cleared_by_user_id` on a fraud signal — but never compares it to any entity's `id`. Consequently the ownership rule described in §2.10 never applies to these three roles.
+
+Ownership is enforced only where the endpoint actually exposes a reference of the relevant kind. A clause is vacuously satisfied when the endpoint carries no reference field of that clause's entity type: a `Member`-backed principal reading an endpoint that names no member is not blocked by the member clause. Where the check does apply and fails, the response is `ERR_NOT_RESOURCE_OWNER` (HTTP 403).
+
+### 2.2. API Response Structure
+
+#### Standard Success Response Format
+
+All successful API responses (those with 2xx status codes) follow this standard envelope format in their JSON body:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z",
+    "limit": 10,
+    "offset": 0,
+    "total_count": 100,
+    "has_more": true
+  },
+  "response_type": "object" | "array",
+  "data": { }
+}
+```
+
+- The `api_request_id` is a server-generated unique identifier for the request that starts with `req_`.
+- The `api_request_timestamp` is a server-generated ISO 8601 UTC timestamp with three fractional digits.
+- The `response_type` is either "object" for a single resource or "array" for a list of resources.
+- The `data` field contains the resource object or an array of resource objects. For 2xx responses with no data, it contains an empty object. Unless otherwise noted, operations that create or modify a resource will return the created or updated resource object in the data field.
+- Pagination-related fields in `meta` (`limit`, `offset`, `total_count`, `has_more`) are included for list endpoints.
+
+#### Standard Error Response Format
+
+All error API responses (4xx status codes) follow this standard envelope format:
+
+```json
+{
+  "meta": {
+    "api_request_id": "req_RANDOMALPHANUM123456",
+    "api_request_timestamp": "2025-05-24T10:30:00.123Z"
+  },
+  "response_type": "error",
+  "data": {
+    "error_id": "UNIQUE_ERROR_IDENTIFIER_STRING",
+    "message": "A human-readable explanation of the error."
+  }
+}
+```
+
+- The `meta` object for error responses contains only `api_request_id` and `api_request_timestamp`.
+- The `error_id` is a unique, machine-readable string that identifies the specific error.
+- The `message` provides a human-readable explanation of what went wrong.
+
+### 2.3. Pagination
+
+List endpoints are paginated through two query parameters. `limit` sets the maximum number of rows returned; it defaults to 10, its minimum accepted value is 1 and its maximum accepted value is 100. `offset` sets how many rows to skip and defaults to 0. Both appear in the `meta` object of the response envelope alongside `total_count` (the number of rows matching the filters before pagination) and `has_more` (true when rows remain beyond this page).
+
+Unless a specific list states otherwise, rows are ordered by `created_at` ascending. Four lists override that default and must be honoured exactly: the promotional events of a banner are ordered by `stack_priority` descending and then `created_at` ascending; the fraud signals of a household are ordered by `detected_at` ascending and then `created_at` ascending; point cycles are ordered by `cycle_month` ascending; and the households of a banner and the ledger entries of a member both use the `created_at` ascending default.
+
+Filtering is expressed through additional query parameters, all optional. Sites accept `banner_id`, `site_type` and `status`. Members accept `banner_id`, `alt_id` and `card_number` — this last pair is the pump's alternate-ID lookup channel. Households under a banner accept `status`; promotional events under a banner accept `status`; fraud signals under a household accept `status` and `signal_type`. Household linkages accept `household_id`, `member_id`, `link_role` and `status`. Point cycles accept `banner_id` and `status`. Purchase transactions accept `member_id`, `site_id`, `posting_status` and `accrual_status`. Ledger entries accept `member_id`, `point_cycle_id`, `entry_type` and `source_kind`. Fuel redemptions accept `member_id`, `site_id`, `settlement_batch_id`, `authorization_status` and `settlement_status`. Settlement batches accept `site_id` and `status`. Point disputes accept `member_id`, `disputed_ledger_entry_id`, `supersedes_dispute_id`, `applied_ledger_entry_id` and `status`.
+
+### 2.4. The Banner as the Rule Source
+
+A **banner** is a retail brand, and in this system it is also the complete rule book that governs every member, site, household, cycle and promotion beneath it. It carries a `banner_code` — three to eight characters of uppercase A–Z and digits, globally unique across all banners — and a display `name` of one to one hundred and twenty characters. Its `status` is either `ACTIVE` or `SUSPENDED` and defaults to `ACTIVE`; a suspended banner stops accepting the accrual, redemption, transfer, link-activation, promotion-activation and settlement-submission operations named in §2.10, each rejected with `ERR_BANNER_SUSPENDED`.
+
+Every remaining banner field is a configuration knob supplied at registration, and every one of them is optional with a declared default. `base_points_per_dollar` (default 1, accepted range 1 through 10) is the point yield on a dollar of eligible spend before any multiplier. `gift_card_multiplier` (default 4, range 1 through 10) and `pharmacy_multiplier` (default 2, range 1 through 10) are the category multipliers for gift-card and pharmacy lines. `pharmacy_points_per_script` (default 50, range 0 through 500) replaces the dollar base entirely for pharmacy lines with a flat pre-multiplier award per script. `max_stacked_multiplier` (default 8, range 1 through 50) is the hard ceiling on the combined category-plus-promotional multiplier of a single line, and `max_stack_count` (default 2, range 1 through 5) caps how many promotional events may be multiplied together on one line.
+
+The redemption knobs sit on the same record. `points_per_discount_block` (default 100, minimum 1) is how many points one discount block costs, and `cents_off_per_block` (default 10, minimum 1) is the per-gallon discount one block buys — so at the defaults a member spends one hundred points to take ten cents a gallon off. `max_cents_off_per_gallon` (default 100, i.e. a full dollar a gallon) is the ceiling honoured at the banner's own fuel centers; it must be at least `cents_off_per_block` and an exact whole multiple of it. `owned_max_gallons_per_redemption` (default 35, range 1 through 1000) is how many gallons a single authorization covers at those owned centers. `min_points_per_redemption` (default 100, and never less than `points_per_discount_block`) is the smallest offer the pump will accept. `rollover_cap_points` (default 500, minimum 0) limits how many unconsumed expiring points a member may rescue at each cycle close, and `max_transfers_per_cycle` (default 3, range 0 through 50) caps completed point transfers per household per cycle.
+
+Three banner fields select behaviour rather than set a number, and they are the reason two banners are not interchangeable. `expiry_basis` is either `LOT_FIFO` (the default) or `CYCLE_SCOPED`, and it decides which lot-consumption ordering the month-end sweep replays — see §3.8, where the two orderings are spelled out and produce genuinely different balances from an identical ledger. `fraud_scoring_mode` is either `INSTANTANEOUS` (the default) or `TRAILING_WEIGHTED`, and it decides whether a fraud signal's weight decays with elapsed time. `freeze_threshold_score` (default 60, range 1 through 1000) is the household fraud score at or above which a household freezes itself.
+
+The six purchase-line categories recognised system-wide are `GROCERY`, `GIFT_CARD`, `PHARMACY`, `FUEL`, `TOBACCO` and `ALCOHOL`. The three site types are `GROCERY`, `OWNED_FUEL_CENTER` and `PARTNER_STATION`.
+
+### 2.5. The Append-Only Point Ledger
+
+There is no stored point balance anywhere in this system. `PointLedgerEntry` rows are the only truth about points, they are written once and never updated or deleted, and every correction is a new signed row rather than an edit to an old one. Each row names the `member_id` whose balance it moves, the `point_cycle_id` of the cycle whose window contained the logical clock at the moment the row was written, an `entry_type`, a signed `points_delta`, a polymorphic origin pair, and an optional human-readable `memo` (default null) such as a note naming the sweep that produced the row.
+
+`entry_type` is one of nine values: `ACCRUAL`, `REVERSAL`, `REDEMPTION`, `REDEMPTION_RELEASE`, `TRANSFER_OUT`, `TRANSFER_IN`, `EXPIRY`, `ROLLOVER`, and `ADJUSTMENT`. The sign of `points_delta` is fixed by type: `ACCRUAL`, `REDEMPTION_RELEASE`, `TRANSFER_IN` and `ROLLOVER` rows are always positive; `REVERSAL`, `REDEMPTION`, `TRANSFER_OUT` and `EXPIRY` rows are always negative; an `ADJUSTMENT` row may be either. A `points_delta` of zero is never written — whenever a rule computes a zero movement, no row is created at all.
+
+Positive rows create a **point lot**. A row with a positive `points_delta` carries a `lot_expires_at` instant; a row with a negative `points_delta` always carries `lot_expires_at` of null. The origin of a row is recorded as a `source_kind` discriminator — one of `PURCHASE_TRANSACTION`, `FUEL_REDEMPTION`, `POINT_DISPUTE`, `POINT_CYCLE` or `POINT_TRANSFER` — together with `source_ref_id`, the identifier of the originating record interpreted according to that discriminator. Because the pairing is polymorphic, `source_ref_id` is not a declared foreign key to any single table.
+
+Two member-level figures are pure projections over this ledger, recomputed on every read of a member and after every write that appends a row. `available_points` is the sum of `points_delta` over **every** entry of that member with no status filter whatsoever — the ledger is append-only, so every row counts. `lifetime_points` is the sum of `points_delta` restricted to entries whose `entry_type` is `ACCRUAL` or `REVERSAL`; redemptions, releases, transfers, expiries, rollovers and adjustments never touch it, which makes it monotonic except where a reversal claws an accrual back. A household's `aggregate_available_points` is the sum of `available_points` over the members reachable from it by a linkage in `ACTIVE` status.
+
+Two consequences of ledger-sum availability are deliberate and must not be "fixed" in implementation. First, `available_points` **may go negative**: the reversal produced by voiding a posted basket is written in full, and the repair described in §3.4 happens afterwards as a separate set of rows. Second, **expiry is never applied on read**: a lot whose `lot_expires_at` has already passed on the logical clock still contributes to `available_points`, and remains spendable, until a cycle close materialises its `EXPIRY` row.
+
+### 2.6. Whole-Point, Whole-Cent and Thousandth-Gallon Precision
+
+Points are always whole integers. Wherever a point figure is derived from a product involving a fractional base or a fractional rate, the result is rounded **half up** to a whole point — a value ending in exactly one half always rounds away from zero, upward. Money is always a whole number of cents, likewise rounded half up when derived. Gallons are the only fractional quantity in the system: `gallons_dispensed`, `gallons_authorized`, `unbatched_gallons` and `gallons_total` all carry at most three decimal places, matching the thousandth-of-a-gallon resolution that pumps report. A submitted `gallons_dispensed` with more than three decimal places is a malformed request.
+
+Where a calculation involves more than one rounding opportunity, the **order** of rounding is pinned and is part of the contract, not an implementation detail. Two orders in particular are load-bearing. In point accrual, each purchase line is rounded to a whole point on its own and the rounded line values are then summed; the unrounded line values are never summed and rounded once at the end, and the two orders diverge as soon as two lines carry fractional halves. In partner reimbursement, rounding happens exactly twice — once when the tier rate is applied to the gross discount, and once inside the administrative fee computation — and the fee is derived from the pre-fee figure, never from the final one. The full step orders are given in §3.3 and §3.6 respectively.
+
+Two further precision commitments: the promotional multiplier stack is an exact integer product with no rounding at any stage, and the expiry sweep works entirely in whole points with no rounding at all.
+
+### 2.7. The Logical Clock
+
+The server keeps a **logical UTC clock**, and every timestamp default, promotional window test, cycle boundary test, expiry comparison and fraud-decay computation reads it rather than the host's wall clock. On startup the logical clock is exactly `2026-08-01T00:00:00Z`, and it must not fall back to real wall-clock time before the first call that moves it. A `ProgramAdmin` moves it by posting to `/_clock/set_current_utc` with a `to_iso8601` instant; the response carries the resulting `current_utc`.
+
+Moving the clock performs no writes of its own. It changes what subsequent operations compute — most visibly which cycle is the open one, whether a promotional window is live, and, under `TRAILING_WEIGHTED` scoring, what a household's fraud score evaluates to — but it never itself appends a ledger row, never advances any entity's `version`, and never freezes a household. In particular, a household whose score would decay below its banner's threshold does not thaw when the clock advances; only an explicit thaw does that.
+
+### 2.8. Resource Identity, Timestamps and Versioning
+
+Every resource carries an `id`: a server-minted UUID with no type prefix. Clients never supply it.
+
+Twelve of the thirteen resource types — banners, sites, households, members, household linkages, promotional events, point cycles, purchase transactions, fuel redemptions, settlement batches, point disputes and fraud signals — additionally carry the full audit triple. `created_at` is an ISO 8601 UTC timestamp with three fractional digits, stamped from the logical clock at creation. `updated_at` is an ISO 8601 UTC timestamp with three fractional digits, refreshed on every mutation of the resource, including mutations that only touch a derived field. `version` is an integer that starts at 1 on creation and increments by exactly one on every mutation; it is the anchor for the concurrency control in §2.9.
+
+`PointLedgerEntry` is the exception. Ledger rows are immutable by construction, so they carry only `id` and `created_at`: both `updated_at` and `version` are absent from a ledger entry entirely.
+
+Recomputation of a derived field is a mutation. When a linkage change recomputes a household's `linked_member_count`, `aggregate_available_points` and `cross_banner_member_ids`, the household's `version` increments and its `updated_at` refreshes. When a ledger row changes a member's `available_points`, the member's `version` increments. When a fill or a batch decision changes a site's `unbatched_gallons`, `unbatched_discount_cents` or `settlement_balance_cents`, the site's `version` increments. Each such increment is a single step of one, even when several derived fields on the same resource are recomputed in the same request.
+
+### 2.9. Optimistic Concurrency Control
+
+Exactly two write operations take a version guard, and both guard a **parent** entity rather than the resource being created.
+
+Authorizing a fuel discount — `POST /fuel-redemptions` — requires `expected_member_version` as a non-optional field of the request body, carrying the `version` of the target `Member` as the client last observed it. If it does not equal the member's current `version`, the request is rejected with `ERR_STALE_MEMBER_VERSION` (HTTP 412). The guard exists because a member's `version` advances whenever anything moves that member's balance — a prior authorization that this one would legitimately supersede, an accrual, a reversal, a transfer, a sweep row or an approved adjustment — so a mismatch means the pump decided its `points_committed` against a balance that no longer exists.
+
+Creating a settlement batch — `POST /settlement-batches` — requires `expected_site_version` as a non-optional field of the request body, carrying the `version` of the target partner `Site` as the client last observed it. If it does not equal the site's current `version`, the request is rejected with `ERR_STALE_SITE_VERSION` (HTTP 412). A site's `version` advances when another clerk has already drafted a batch that this one would supersede, and whenever a completion, submission, approval or rejection has moved the site's unbatched pool — so a mismatch means the clerk's view of the settleable gallons is stale.
+
+No other endpoint accepts a version field. In particular, submitting, approving or rejecting a batch, completing or voiding a redemption, posting or voiding a basket, and every linkage, cycle, dispute and fraud-signal action take no `expected_*_version` input at all.
+
+### 2.10. Rejection Precedence
+
+When a request violates more than one rule, the response is determined by the **first** violated rule in the ordering below; no later rule is evaluated. Implementations that check in a different order will return the right status for single-fault requests and the wrong error identifier for multi-fault ones.
+
+1. **Authentication.** Both headers present and non-empty, and `X-User-Role` one of the seven roles — otherwise `ERR_UNAUTHENTICATED`.
+2. **Authorization.** The acting role appears among the roles authorised for the endpoint — otherwise `ERR_UNAUTHORIZED`.
+3. **Request shape.** Every required input field present; every enum value a declared member; every integer field an integer; `amount_cents`, `quantity`, `points_committed` and `severity_weight` all zero or greater; `gallons_dispensed` carrying at most three decimals; every timestamp parsing as ISO 8601 UTC; `lines` a non-empty array; `period_start` no later than `period_end`; `starts_at` strictly before `ends_at`; and `cycle_month` matching the four-digit-year-dash-two-digit-month form. Otherwise `ERR_INVALID_REQUEST` (HTTP 400).
+4. **Path existence.** Every identifier embedded in the request path resolves, validated strictly left to right, so the leftmost unresolvable identifier determines the error. The thirteen possibilities are `ERR_BANNER_NOT_FOUND`, `ERR_SITE_NOT_FOUND`, `ERR_HOUSEHOLD_NOT_FOUND`, `ERR_MEMBER_NOT_FOUND`, `ERR_HOUSEHOLD_LINK_NOT_FOUND`, `ERR_PROMO_EVENT_NOT_FOUND`, `ERR_POINT_CYCLE_NOT_FOUND`, `ERR_PURCHASE_TRANSACTION_NOT_FOUND`, `ERR_LEDGER_ENTRY_NOT_FOUND`, `ERR_FUEL_REDEMPTION_NOT_FOUND`, `ERR_SETTLEMENT_BATCH_NOT_FOUND`, `ERR_POINT_DISPUTE_NOT_FOUND` and `ERR_FRAUD_SIGNAL_NOT_FOUND`, each at HTTP 404.
+5. **Body existence.** Every identifier in the request body resolves, validated in the order the fields are listed for that endpoint, drawing on the same 404 family. This applies to the creation endpoints for sites, households, members, household linkages, promotional events, point cycles, purchase transactions, point transfers, fuel redemptions, settlement batches, point disputes and fraud signals. A `recipient_member_id` that does not resolve yields `ERR_MEMBER_NOT_FOUND`; a `disputed_ledger_entry_id` that does not resolve yields `ERR_LEDGER_ENTRY_NOT_FOUND`; a `supersedes_dispute_id` that does not resolve yields `ERR_POINT_DISPUTE_NOT_FOUND`.
+6. **Resource ownership.** For the three `Site`-backed roles and the `Member` role, the acting `X-User-ID` must own the referenced resource as described in §2.1 — otherwise `ERR_NOT_RESOURCE_OWNER`. This check guards twelve operations: `GET /members/{id}`, `GET /members/{id}/points-summary`, `POST /purchase-transactions`, `POST /purchase-transactions/{id}/post`, `POST /purchase-transactions/{id}/void`, `POST /fuel-redemptions`, `POST /fuel-redemptions/{id}/complete`, `POST /fuel-redemptions/{id}/void`, `POST /point-transfers`, `POST /point-disputes`, `POST /settlement-batches`, and `POST /settlement-batches/{id}/submit`.
+7. **Self-approval.** The acting `X-User-ID` must differ from the identifier of whoever produced the artefact being decided — otherwise `ERR_SELF_APPROVAL_FORBIDDEN`. This guards three operations: `POST /point-disputes/{id}/approve-adjustment` (compared against `proposed_by_user_id`), `POST /settlement-batches/{id}/approve` and `POST /settlement-batches/{id}/reject` (both compared against `submitted_by_user_id`).
+8. **Tier authority of the approver.** On `POST /point-disputes/{id}/approve-adjustment`, an `authority_tier` of `TIER3` requires `X-User-Role` to be `ProgramAdmin`, while `TIER1` and `TIER2` accept either `LoyaltySupervisor` or `ProgramAdmin` — otherwise `ERR_TIER_AUTHORITY_REQUIRED`.
+9. **Tier ceiling of the proposal.** On `POST /point-disputes/{id}/propose-adjustment`, the magnitude of `proposed_points_delta` must be within the ceiling of the requested tier — otherwise `ERR_ADJUSTMENT_EXCEEDS_AUTHORITY`.
+10. **Version guards.** `expected_member_version` on `POST /fuel-redemptions` and `expected_site_version` on `POST /settlement-batches`, per §2.9.
+11. **Household freeze.** Every household reachable from the acting member by a linkage in `ACTIVE` status must itself be in `ACTIVE` status — otherwise `ERR_HOUSEHOLD_FROZEN`. This guards `POST /fuel-redemptions`, `POST /point-transfers`, `POST /household-links/{id}/activate` and `POST /point-disputes`.
+12. **Banner suspension.** The banner governing the operation must be `ACTIVE` — otherwise `ERR_BANNER_SUSPENDED`. This guards six operations: `POST /purchase-transactions/{id}/post`, `POST /fuel-redemptions`, `POST /point-transfers`, `POST /household-links/{id}/activate`, `POST /promo-events/{id}/activate` and `POST /settlement-batches/{id}/submit`.
+13. **Site suspension.** The site involved must be `ACTIVE` — otherwise `ERR_SITE_SUSPENDED`. This guards four operations: `POST /purchase-transactions/{id}/post`, `POST /fuel-redemptions`, `POST /settlement-batches` and `POST /settlement-batches/{id}/submit`.
+14. **State legality.** The target resource's current state must permit the requested transition — otherwise `ERR_INVALID_STATE_TRANSITION`. This guards every action endpoint, and explicitly covers re-running a transition out of a terminal state, repeating an action already performed, activating a promotional event that has already `ENDED`, clearing a signal that is already `CLEARED`, thawing a household that still carries an open `ALT_ID_SHARING` or `GEO_IMPOSSIBLE` signal, completing a redemption that is not `AUTHORIZED`, and closing a cycle that is not `CLOSING`.
+15. **Cycle availability.** A cycle of the governing banner must be `OPEN` with the logical clock inside its window — otherwise `ERR_CYCLE_NOT_OPEN`. This guards five operations: `POST /purchase-transactions/{id}/post`, `POST /purchase-transactions/{id}/void`, `POST /fuel-redemptions`, `POST /point-transfers` and `POST /point-disputes/{id}/approve-adjustment`. At the same precedence level, `POST /point-cycles/{id}/begin-close` requires the logical clock to be strictly after the cycle's `closes_at` — otherwise `ERR_CYCLE_NOT_ENDED`.
+16. **Prior-cycle ordering.** `POST /point-cycles/{id}/begin-close` additionally requires every cycle of the same banner with a lexicographically smaller `cycle_month` to be `CLOSED` — otherwise `ERR_PRIOR_CYCLE_NOT_CLOSED`.
+17. **Transfer fraud lock**, on `POST /point-transfers` — `ERR_TRANSFER_FRAUD_LOCK`.
+18. **Alternate-ID match**, on `POST /fuel-redemptions` — `ERR_ALT_ID_MISMATCH`.
+19. **Cross-banner coverage**, on `POST /fuel-redemptions` — `ERR_CROSS_BANNER_LINK_REQUIRED`.
+20. **Promotional window conflict**, on `POST /promo-events` and `POST /promo-events/{id}/activate` — `ERR_PROMO_WINDOW_CONFLICT`.
+21. **Settlement period overlap**, on `POST /settlement-batches` — `ERR_BATCH_PERIOD_OVERLAP`.
+22. **Open-batch limit**, on `POST /settlement-batches` — `ERR_OPEN_BATCH_LIMIT`.
+23. **Referential business checks.** At one precedence level: the transfer recipient check on `POST /point-transfers` (`ERR_RECIPIENT_NOT_IN_HOUSEHOLD`) and the disputed-entry ownership check on `POST /point-disputes` (`ERR_DISPUTE_ENTRY_MEMBER_MISMATCH`). Immediately after, the site-type checks: `ERR_GROCERY_SITE_REQUIRED` on `POST /purchase-transactions`, `ERR_FUEL_SITE_REQUIRED` on `POST /fuel-redemptions`, and `ERR_PARTNER_SITE_REQUIRED` on `POST /settlement-batches`.
+24. **Transfer amount granularity**, on `POST /point-transfers` — `ERR_INVALID_TRANSFER_AMOUNT`.
+25. **Transfer count limit**, on `POST /point-transfers` — `ERR_TRANSFER_LIMIT_EXCEEDED`.
+26. **Next-cycle existence**, on `POST /purchase-transactions/{id}/post`, `POST /point-cycles/{id}/close` and `POST /point-disputes/{id}/approve-adjustment` — `ERR_NEXT_CYCLE_NOT_DEFINED`.
+27. **Uniqueness and structural constraints**, all at one precedence level: `ERR_ALT_ID_DUPLICATE` on `POST /members`; `ERR_HOUSEHOLD_CODE_DUPLICATE` on `POST /households`; `ERR_CYCLE_MONTH_DUPLICATE` on `POST /point-cycles`; `ERR_DUPLICATE_ACTIVE_LINK` on `POST /household-links`; `ERR_PRIMARY_LINK_EXISTS` on `POST /household-links` and `POST /household-links/{id}/activate`; and `ERR_SUPERSEDE_CHAIN_TOO_LONG` on `POST /point-disputes`.
+28. **Minimum redemption offer**, on `POST /fuel-redemptions` — `ERR_BELOW_MIN_REDEMPTION`.
+29. **Sufficient balance**, on `POST /fuel-redemptions` and `POST /point-transfers` — `ERR_INSUFFICIENT_POINTS`.
+30. **Dispensed gallons within authorization**, on `POST /fuel-redemptions/{id}/complete` — `ERR_GALLONS_EXCEED_AUTHORIZATION`.
+31. **Settleable volume present**, on `POST /settlement-batches/{id}/submit` — `ERR_NO_SETTLEABLE_GALLONS`.
+
+Two precedence pairs are called out because they are easy to get backwards. A frozen household combined with an empty balance at the pump returns HTTP 409 `ERR_HOUSEHOLD_FROZEN`, never HTTP 422 `ERR_INSUFFICIENT_POINTS`, because the freeze check (step 11) precedes the balance check (step 29). A fraud-locked sender naming a recipient who is not in their household returns HTTP 403 `ERR_TRANSFER_FRAUD_LOCK`, never HTTP 422 `ERR_RECIPIENT_NOT_IN_HOUSEHOLD`, because the fraud lock (step 17) precedes the referential check (step 23).
+
+### 2.11. Cascading Recomputation
+
+Several operations in this system mutate more than one resource, and the secondary mutations are as much part of the contract as the primary one. Three patterns recur and are described once here.
+
+**Balance propagation.** Any write that appends a ledger row recomputes the affected member's `available_points` and, where the row is an `ACCRUAL` or `REVERSAL`, their `lifetime_points`, and increments that member's `version` by one. It then recomputes `aggregate_available_points` on every household that holds a linkage in `ACTIVE` status to that member.
+
+**Coverage propagation.** Any linkage transition that adds a link to, or removes a link from, the `ACTIVE` set recomputes the household's `linked_member_count` (the count of its `ACTIVE` linkages), its `aggregate_available_points`, and its `cross_banner_member_ids` — the identifiers of the members holding an `ACTIVE` linkage to it whose own banner differs from the household's banner, ordered by the linkage's `created_at` ascending — and increments the household's `version` by one. A linkage that never entered the `ACTIVE` set requires no such recomputation, because it never counted toward those figures in the first place.
+
+**Settlement-pool propagation.** Any operation that changes which of a site's discounted gallons are awaiting settlement recomputes that site's `unbatched_gallons` (the sum of `gallons_dispensed` over its redemptions whose settlement dimension is `PENDING`) and `unbatched_discount_cents` (the sum of `discount_amount_cents` over the same set), and increments the site's `version` by one. `settlement_balance_cents` — the sum of `reimbursement_cents` over that site's approved batches — moves only on an approval.
+
+Cascades in this system are **transitive**: a secondary effect can itself have a tertiary effect. The two deepest chains, revoking an active linkage and voiding a posted basket, are described hop by hop in §3.2 and §3.4, and each hop must be attributed to its actual cause rather than to the originating request, because whether a later hop fires at all depends on what the earlier hop computed.
+
+## 3. Business Logic & Workflows
+
+### 3.1. Standing Up a Banner, Its Sites, Its Promotions and Its Cycles
+
+A `ProgramAdmin` bootstraps a program by registering a banner with its `banner_code`, its `name` and whichever of the configuration knobs from §2.4 it wishes to override; the banner comes into being in `ACTIVE` status with every omitted knob sitting at its declared default. Suspending a banner later flips its `status` to `SUSPENDED`, which does not delete or rewrite anything but does close the six operations enumerated in §2.10 for everything beneath it.
+
+Sites are registered next, each naming its `banner_id`, an operator-facing `site_number` of one to sixteen characters that must be unique among the sites of that banner, and a `site_type`. Three fields are conditional on that type. A `PARTNER_STATION` must supply `partner_code` (three to sixteen characters of uppercase A–Z and digits, identifying the settlement counterparty), `per_gallon_cap_cents` (at least 1 and an exact whole multiple of the banner's `cents_off_per_block`, being the per-gallon discount that station honours), and `max_gallons_per_redemption` (between 1 and 1000, being the gallons a single authorization covers there). A `GROCERY` or `OWNED_FUEL_CENTER` site must leave all three null; supplying or omitting them contrary to the site type is a malformed request and yields `ERR_INVALID_REQUEST`. A new site starts `ACTIVE` at `version` 1 with `unbatched_gallons`, `unbatched_discount_cents` and `settlement_balance_cents` all zero. Suspending a site sets its `status` to `SUSPENDED` and increments its `version`; from that moment the four operations listed in §2.10 fail at it with `ERR_SITE_SUSPENDED`.
+
+Promotional multiplier events are the pricing lever. Each is scheduled against a `banner_id` with a `promo_code` of three to twenty-four characters unique within that banner, an integer `multiplier` between 2 and 10, an `applies_to_categories` array holding one to six distinct members of the six purchase categories, a `starts_at`, an `ends_at` strictly later than `starts_at`, and a `stack_priority` between 0 and 1000. The window is **half-open**: an event applies to a basket transacted exactly at its `starts_at`, and does not apply to one transacted exactly at its `ends_at`. A scheduled event begins life with `status` `SCHEDULED` and contributes nothing to accrual until it is activated into `ACTIVE`.
+
+Two events collide when they belong to the same banner, are both in `SCHEDULED` or `ACTIVE` status, have overlapping half-open windows, share at least one category in their `applies_to_categories` sets, **and** carry the same `stack_priority`. Such a collision is rejected with `ERR_PROMO_WINDOW_CONFLICT`, both when the second event is being scheduled and when a scheduled event is being activated. Because windows are half-open, back-to-back events that touch at a single instant do not overlap and are both allowed. Equal priority is part of the test: two overlapping events on the same category with different `stack_priority` values coexist happily, and the ranking in §3.3 then decides which of them actually applies.
+
+Point cycles are the epoch machine. A cycle is defined for a `banner_id` with a `cycle_month` in four-digit-year-dash-two-digit-month form, unique within the banner (a repeat yields `ERR_CYCLE_MONTH_DUPLICATE`), an inclusive `opens_at`, and a `closes_at` strictly later than `opens_at` that serves both as the inclusive end of the window and as the expiry cut-off the sweep uses. A newly defined cycle is `OPEN` with `expired_points_total`, `rolled_over_points_total` and `swept_member_count` all zero and `closed_at` null. Because an accrual lot earned in one month expires at the end of the **following** month, the next month's cycle must already exist before points can be accrued at all — the specific rule and its rejection code appear in §3.3.
+
+### 3.2. Members, Households and Cross-Banner Linkage
+
+A member is enrolled against a `banner_id` with an `alt_id` — ten to twelve digits, the alternate identifier the shopper will key at the pump, unique among that banner's members — a `card_number` of eight to nineteen digits also unique within the banner, and a `full_name` of one to one hundred and twenty characters. Reusing an `alt_id` inside a banner is rejected with `ERR_ALT_ID_DUPLICATE`. A new member starts with `available_points` and `lifetime_points` at zero and `version` at 1; both figures are projections and are recomputed from the ledger on every read.
+
+A household is opened against a `banner_id` with a `household_code` of four to twenty-four characters unique within that banner; a repeat is rejected with `ERR_HOUSEHOLD_CODE_DUPLICATE`. It starts `ACTIVE` with `fraud_score` zero, `linked_member_count` zero, `frozen_reason` null, `frozen_at` null and `version` 1. Its home banner is what fixes whose `fraud_scoring_mode` and `freeze_threshold_score` apply to it.
+
+**Linkage is what makes cross-banner redemption possible.** A linkage is proposed by naming a `household_id`, a `member_id` and a `link_role` of either `PRIMARY` or `SECONDARY`. It is created in `PENDING` status with `activated_at` and `revoked_at` both null, and with `is_cross_banner` computed as true exactly when the member's banner differs from the household's banner. A `PENDING` linkage grants nothing: it neither counts toward `linked_member_count` nor contributes to `aggregate_available_points` nor appears in `cross_banner_member_ids`, and it confers no redemption or transfer rights whatsoever. Two structural rules guard creation: no other linkage for the same household-and-member pair may be in `PENDING`, `ACTIVE` or `SUSPENDED` status, or the proposal fails with `ERR_DUPLICATE_ACTIVE_LINK`; and if the proposed `link_role` is `PRIMARY`, no other linkage of that household may already hold `PRIMARY` in any of those three statuses, or the proposal fails with `ERR_PRIMARY_LINK_EXISTS`.
+
+Activation is the cycle hinge of the linkage lifecycle: the same action serves `PENDING → ACTIVE` and `SUSPENDED → ACTIVE`, and a linkage may traverse `ACTIVE → SUSPENDED → ACTIVE` any number of times. From either source state, activation requires that the linkage actually be in that state, that the household be `ACTIVE` (otherwise `ERR_HOUSEHOLD_FROZEN`), and that the household's banner be `ACTIVE` (otherwise `ERR_BANNER_SUSPENDED`). Activating from `PENDING` carries one additional guard that activating from `SUSPENDED` does not: a `PRIMARY` linkage may only be activated when no other linkage of the same household holds `PRIMARY` in `PENDING`, `ACTIVE` or `SUSPENDED` status, and a violation is `ERR_PRIMARY_LINK_EXISTS`. Either way, activation sets `status` to `ACTIVE` and stamps `activated_at` with the logical clock — overwriting the previous activation instant on a re-activation rather than preserving it — and then performs the coverage propagation of §2.11: `linked_member_count`, `aggregate_available_points` and `cross_banner_member_ids` are recomputed on the household and its `version` increments by one.
+
+Suspension takes an `ACTIVE` linkage to `SUSPENDED`. It performs the same coverage propagation — `linked_member_count`, `aggregate_available_points` and `cross_banner_member_ids` recomputed, household `version` incremented — and nothing more. In particular, and this asymmetry is deliberate, **suspension does not void the member's open fuel authorizations**; only revocation does.
+
+Revocation is terminal and can be reached from any of the three live states, but its consequences differ sharply by source. From `PENDING`, revocation sets `status` to `REVOKED`, stamps `revoked_at` from the logical clock, and stops: no household figure is recomputed, because a pending linkage never contributed to any of them. From `SUSPENDED`, revocation likewise sets `status` to `REVOKED` and stamps `revoked_at`, and again performs no household recomputation, because a suspended linkage had already left the `ACTIVE` set when it was suspended.
+
+From `ACTIVE`, revocation fires a three-hop cascade, and each hop must be attributed to its predecessor rather than to the request:
+
+- **Hop 1.** The linkage's `status` becomes `REVOKED` and `revoked_at` is stamped from the logical clock.
+- **Hop 2**, caused by hop 1: because a linkage has left the `ACTIVE` set, the household's `linked_member_count` is decremented, its `aggregate_available_points` is recomputed so that the departing member's `available_points` leaves the pool, and its `cross_banner_member_ids` is recomputed, dropping this member's identifier. The household's `version` increments by one.
+- **Hop 3**, caused by hop 2: because this member's identifier is no longer present in that household's `cross_banner_member_ids`, every fuel redemption of this member that is still `AUTHORIZED` and sits at a site whose banner differs from the member's own banner is driven from `AUTHORIZED` to `VOIDED`, processed in `created_at` ascending order. Each such void appends a `REDEMPTION_RELEASE` ledger row crediting back exactly that redemption's `points_debited_at_auth`, and increments the member's `version` by one.
+
+Hop 3 is a consequence of the coverage set recomputed in hop 2, not of the status write in hop 1. A member whose cross-banner coverage at the relevant banner also came from a **second** household — that is, who still holds an `ACTIVE` linkage to another household of that banner — keeps those redemptions, because the coverage that authorised them survives.
+
+Household status is its own cycle. A `LoyaltySupervisor` may freeze an `ACTIVE` household by hand, which sets `status` to `FROZEN`, `frozen_reason` to `MANUAL`, and `frozen_at` to the logical clock. The system also freezes households automatically, with `frozen_reason` `AUTO_FRAUD_SCORE`, whenever a recomputed `fraud_score` reaches or exceeds the banner's `freeze_threshold_score` — the triggers and the scoring itself are in §3.9. Either way, a `FROZEN` household blocks transfers and blocks redemption for every member linked to it, both with `ERR_HOUSEHOLD_FROZEN`.
+
+Thawing is never automatic. A recomputed score that falls back below the threshold leaves the household `FROZEN`; only an explicit thaw by a `LoyaltySupervisor` returns it to `ACTIVE`, clearing `frozen_reason` and `frozen_at` back to null. That thaw itself has a precondition: no fraud signal against the household may be `OPEN` with a `signal_type` of `ALT_ID_SHARING` or `GEO_IMPOSSIBLE`, and an attempt in the face of one is rejected with `ERR_INVALID_STATE_TRANSITION`. A household may traverse `ACTIVE → FROZEN → ACTIVE` repeatedly.
+
+Reading a household returns its live derived figures — `linked_member_count`, `aggregate_available_points`, `cross_banner_member_ids` and `fraud_score` — with the score projected against the current logical clock for the response only. That read never changes the household's `status` and never advances its `version`; the freeze evaluation runs exclusively on the write triggers named in §3.9.
+
+### 3.3. Recording a Basket and Posting It for Points
+
+Recording and accruing are two separate acts, and the transaction carries two independent status dimensions that reflect that: a financial `posting_status` (`RECORDED`, `POSTED`, `VOIDED`) and a loyalty `accrual_status` (`NOT_ACCRUED`, `ACCRUED`, `REVERSED`). A basket comes into being as `RECORDED` on the posting dimension and `NOT_ACCRUED` on the accrual dimension, and the two advance independently thereafter even when a single request moves both.
+
+A `StoreOperator` records a basket by naming a `member_id`, a `site_id`, a `transacted_at` instant, and a `lines` array of one to twenty elements. Each line carries a `category` drawn from the six purchase categories, an `amount_cents` integer of zero or more, and a `quantity` integer of zero or more. The site must be of type `GROCERY`, or the recording is rejected with `ERR_GROCERY_SITE_REQUIRED`. The `transacted_at` instant is what selects eligible promotional events later, and must fall inside the banner's open cycle window. Recording immediately computes `subtotal_cents` as the sum of `amount_cents` across **every** submitted line, including lines in categories that will earn nothing. It writes no ledger row, leaves `gross_points_awarded` at zero, leaves `line_points_breakdown` empty, and leaves `posted_at` and `voided_at` null.
+
+Posting is where points are earned, and it is guarded by six preconditions. The transaction's `posting_status` must be `RECORDED` and its `accrual_status` must be `NOT_ACCRUED`. The member's banner must be `ACTIVE` (otherwise `ERR_BANNER_SUSPENDED`) and the site must be `ACTIVE` (otherwise `ERR_SITE_SUSPENDED`). A cycle of the member's banner must be `OPEN` with the logical clock inside its inclusive `opens_at`-to-`closes_at` window (otherwise `ERR_CYCLE_NOT_OPEN`). And — this is the one implementers most often miss — a cycle must also exist for that banner whose `cycle_month` is the calendar month **immediately after** the open cycle's `cycle_month`, because the accrual lot needs that next cycle's `closes_at` as its expiry instant; if it does not exist, posting fails with `ERR_NEXT_CYCLE_NOT_DEFINED`.
+
+**Selecting the promotional multipliers.** For each line, the eligible events are those belonging to the member's banner, in `ACTIVE` status, whose half-open window contains `transacted_at` (that is, whose `starts_at` is at or before `transacted_at` and whose `ends_at` is strictly after it), and whose `applies_to_categories` contains that line's `category`. Those eligible events are then ranked by `stack_priority` descending, and where two share a priority, by `created_at` ascending. Only the first `max_stack_count` events of that ranking are applied; the rest are dropped outright. The line's promotional multiplier is the product of the `multiplier` values of the applied events, or 1 when no event is eligible. The cut is made by `stack_priority` and never by multiplier magnitude, so an event carrying the largest `multiplier` of the three is genuinely discarded when its priority ranks it below the cut. Across the whole basket, `applied_promo_event_ids` is the set of event identifiers applied to at least one line, de-duplicated, and ordered by `stack_priority` descending then `created_at` ascending.
+
+**Computing the points.** Each line is then evaluated independently, in the array order in which the lines were submitted, in three steps.
+
+First, the line's category base. A `GROCERY` or `GIFT_CARD` line's base is its `amount_cents` divided by one hundred — the exact dollar figure including cents, not a truncated whole-dollar count — multiplied by the banner's `base_points_per_dollar`. A `PHARMACY` line ignores `amount_cents` entirely and takes its base as the line's `quantity` (the number of scripts) multiplied by the banner's `pharmacy_points_per_script`. A `FUEL`, `TOBACCO` or `ALCOHOL` line has a base of zero.
+
+Second, the line's category multiplier. A `GIFT_CARD` line takes the banner's `gift_card_multiplier`; a `PHARMACY` line takes the banner's `pharmacy_multiplier`; a `GROCERY` line takes 1; and a `FUEL`, `TOBACCO` or `ALCOHOL` line takes 0.
+
+Third, the effective multiplier and the line award. The category multiplier and the promotional multiplier are multiplied together, and the banner's `max_stacked_multiplier` is applied to **that product** — the lesser of the product and the ceiling is the line's `effective_multiplier`. The ceiling is never applied to the promotional multiplier on its own, and never to the finished line award. The line's raw award is its category base multiplied by its `effective_multiplier`, and the line's final award is that raw value rounded half up to a whole point.
+
+`line_points_breakdown` records one element per submitted line, in submission order, each holding the line's `line_index`, its `category`, its `category_base_points`, its `effective_multiplier`, its unrounded `line_points_raw`, and its rounded `line_points`. `gross_points_awarded` is the sum of the **rounded** `line_points` values across all lines. The order here is pinned: never sum the unrounded values and round once at the end. Two lines each yielding a raw award ending in exactly one half round up individually to a total one point higher than the single-rounding alternative, and the individually-rounded figure is the correct one.
+
+Posting then completes atomically in five effects. It writes `gross_points_awarded`, `line_points_breakdown` and `applied_promo_event_ids`. It sets `posting_status` to `POSTED` and stamps `posted_at` from the logical clock. It sets `accrual_status` to `ACCRUED` — the two dimensions advance in the same request but remain independently readable. When `gross_points_awarded` is greater than zero it appends exactly one `ACCRUAL` ledger row whose `points_delta` equals `gross_points_awarded`, whose `point_cycle_id` is the open cycle, whose `lot_expires_at` is the **next** cycle's `closes_at`, whose `source_kind` is `PURCHASE_TRANSACTION` and whose `source_ref_id` is this transaction's identifier; when `gross_points_awarded` is exactly zero, no ledger row is written at all. Finally it performs the balance propagation of §2.11: the member's `available_points` and `lifetime_points` are recomputed, the member's `version` increments by one, and `aggregate_available_points` is recomputed on every household holding an `ACTIVE` linkage to that member. Once `accrual_status` has left `NOT_ACCRUED`, `gross_points_awarded` is frozen at its posted value and does not move again even if the banner's configuration changes.
+
+### 3.4. Voiding a Basket: Two Branches, One of Them Deep
+
+Voiding is a single operator action whose consequences depend entirely on which posting state the basket is in when it is voided, and the two branches must be implemented with equal care.
+
+**Branch A — voiding from `RECORDED`.** The only precondition is that `posting_status` is `RECORDED`. The effect is a bare status flip: `posting_status` becomes `VOIDED`, `voided_at` is stamped from the logical clock, `accrual_status` stays `NOT_ACCRUED`, and **no ledger row whatsoever is written**, because nothing was ever accrued. No member figure moves, no member `version` advances, no household figure is recomputed. The terminal combination reached is `VOIDED` on the posting dimension with `NOT_ACCRUED` on the accrual dimension.
+
+**Branch B — voiding from `POSTED`.** Here the preconditions are three: `posting_status` must be `POSTED`, `accrual_status` must be `ACCRUED`, and the cycle that carries this transaction's `ACCRUAL` row must still be `OPEN` — a void reaching back into a closed cycle is rejected with `ERR_CYCLE_NOT_OPEN`. The terminal combination reached is `VOIDED` with `REVERSED`, and getting there runs a five-hop cascade:
+
+- **Hop 1.** `posting_status` becomes `VOIDED`, `voided_at` is stamped from the logical clock, and `accrual_status` becomes `REVERSED`.
+- **Hop 2**, caused by hop 1: because `accrual_status` entered `REVERSED`, exactly one `REVERSAL` ledger row is appended whose `points_delta` is the negation of `gross_points_awarded`, whose `source_kind` is `PURCHASE_TRANSACTION`, whose `source_ref_id` is this transaction's identifier, and whose `lot_expires_at` is null. The member's `available_points` and `lifetime_points` are recomputed and the member's `version` increments by one.
+- **Hop 3**, caused by hop 2: because the recomputed `available_points` is now **below zero**, the overdraw repair described below selects the member's `AUTHORIZED` fuel redemptions and drives each from `AUTHORIZED` to `VOIDED`, appending a `REDEMPTION_RELEASE` row of the redemption's `points_debited_at_auth` for each one, until the balance is no longer negative or no candidate remains. When the recomputed balance is zero or greater, hop 3 does not fire at all and the cascade ends here.
+- **Hop 4**, caused by hop 3: for **each** redemption actually voided in hop 3, one fraud signal is appended with `signal_type` `OVERDRAWN_AUTH`, `severity_weight` 40, `source` `SYSTEM`, `status` `OPEN`, and `household_id` set to the household of that member's **oldest** `ACTIVE` linkage ordered by the linkage's `created_at` ascending. When the member holds no `ACTIVE` linkage at all, no signal is written. One signal per voided redemption — not one per cascade, and not two for one void.
+- **Hop 5**, caused by hop 4: because a new `OPEN` fraud signal now exists, the household's `fraud_score` is recomputed under its banner's `fraud_scoring_mode`, and when the result reaches or exceeds the banner's `freeze_threshold_score` and the household is still `ACTIVE`, the household is driven to `FROZEN` with `frozen_reason` `AUTO_FRAUD_SCORE`.
+
+**The overdraw repair.** Only redemptions in `AUTHORIZED` status are candidates; redemptions that are `DISPENSED`, `VOIDED` or `SUPERSEDED` are never touched. The candidates are ordered by `created_at` descending and, where two share an instant, by `points_debited_at_auth` descending — the newest authorization is sacrificed first. Starting from the member's `available_points` as it stands after the hop 2 reversal, the repair walks that order and, before each candidate, stops if the balance has already reached zero or above; otherwise it voids that candidate, appends its `REDEMPTION_RELEASE` credit, and adds that credit to the running balance. The loop therefore stops at the **first** moment the balance is no longer negative, which can leave older, smaller authorizations standing.
+
+Two boundary behaviours are explicit. When the candidate pool is empty, or when the whole pool has been exhausted and the balance is still negative, no further action is taken: `available_points` is **left negative**, the reversal is never partially rolled back, and no compensating accrual is invented. And in the empty-pool case no fraud signal is written either, yet the void itself still succeeds with HTTP 200.
+
+### 3.5. Authorizing a Discount at the Pump
+
+A pump session begins with an alternate-ID lookup — the member list is filterable by `alt_id` precisely so an unattended terminal can resolve a keyed number to a member — and continues with an authorization request naming the `member_id`, the `site_id`, the `alt_id_presented` at the keypad, the `points_committed` the customer offers, and the `expected_member_version` guard from §2.9.
+
+Seven business preconditions gate the authorization, and their relative precedence is the ladder in §2.10. The site's `site_type` must be `OWNED_FUEL_CENTER` or `PARTNER_STATION`, or the request fails with `ERR_FUEL_SITE_REQUIRED`; a grocery site never authorizes fuel. The site must be `ACTIVE`, or `ERR_SITE_SUSPENDED`. The `alt_id_presented` must equal the member's stored `alt_id` **exactly**, character for character, with no normalisation, trimming or case folding of any kind; a mismatch is `ERR_ALT_ID_MISMATCH`. When the site's banner differs from the member's own banner, the member must hold a linkage in `ACTIVE` status to a household whose banner is the **site's** banner, or the request fails with `ERR_CROSS_BANNER_LINK_REQUIRED` — this is the entire mechanism by which a shopper enrolled at one banner fuels at another. Every household reachable from the member by an `ACTIVE` linkage must itself be `ACTIVE`, or the request fails with `ERR_HOUSEHOLD_FROZEN`; note that this check is not limited to the cross-banner case, so a frozen household blocks the member even at their own banner's pumps. A cycle of the member's banner must be `OPEN` and contain the logical clock, or `ERR_CYCLE_NOT_OPEN`. And `points_committed` must be at least the banner's `min_points_per_redemption`, or `ERR_BELOW_MIN_REDEMPTION`.
+
+**How the discount and the debit are derived.** The offer is first converted to whole discount blocks: the number of blocks requested is `points_committed` divided by the banner's `points_per_discount_block`, **rounded down** to a whole number. Those blocks buy an uncapped per-gallon discount equal to the block count multiplied by the banner's `cents_off_per_block`. That uncapped figure is then capped: at a `PARTNER_STATION` the ceiling is the site's own `per_gallon_cap_cents`, and at an `OWNED_FUEL_CENTER` it is the banner's `max_cents_off_per_gallon`. The redemption's `cents_off_per_gallon` is the lesser of the uncapped figure and the applicable ceiling.
+
+The debit is then **back-derived from the capped cents**, which is the whole point of the design: `blocks_effective` is `cents_off_per_gallon` divided by `cents_off_per_block`, and `points_debited_at_auth` is `blocks_effective` multiplied by `points_per_discount_block`. Every point the cap made unusable stays in the member's balance rather than being consumed and wasted, and so does the sub-block remainder that the rounding-down discarded. A member who offers more points than the site's cap can absorb is debited only for the blocks that actually took effect. Finally, `gallons_authorized` is the site's `max_gallons_per_redemption` at a `PARTNER_STATION` and the banner's `owned_max_gallons_per_redemption` at an `OWNED_FUEL_CENTER`. All these quantities are integers except `gallons_authorized`, which carries three decimal places.
+
+The balance test uses the derived debit, not the offer: the member's `available_points` must be at least `points_debited_at_auth` as computed above, or the request fails with `ERR_INSUFFICIENT_POINTS`.
+
+A successful authorization creates the redemption in `AUTHORIZED` status on the pump dimension and `NOT_APPLICABLE` on the settlement dimension, stamps `authorized_at` from the logical clock, and writes `blocks_effective`, `cents_off_per_gallon`, `points_debited_at_auth` and `gallons_authorized`. It leaves `gallons_dispensed`, `discount_amount_cents` and `settlement_batch_id` null and `dispensed_at` null. It appends one `REDEMPTION` ledger row whose `points_delta` is the negation of `points_debited_at_auth`, whose `lot_expires_at` is null and whose `source_kind` is `FUEL_REDEMPTION`. It then performs the balance propagation of §2.11.
+
+**A member holds at most one open authorization.** As part of the same request, every **other** redemption of that member still in `AUTHORIZED` status is driven from `AUTHORIZED` to `SUPERSEDED`, and each such supersession appends its own `REDEMPTION_RELEASE` row of the positive `points_debited_at_auth` of the superseded redemption, with `lot_expires_at` null, `source_kind` `FUEL_REDEMPTION` and `source_ref_id` naming the superseded redemption. The new authorization legitimately displaces the old one, which is exactly why this create carries the member version guard: a client that has not observed the displacement should not be allowed to make a commitment decision against the stale balance.
+
+Abandoning an open authorization drives it from `AUTHORIZED` to `VOIDED`, appends a `REDEMPTION_RELEASE` row of the positive `points_debited_at_auth` with `lot_expires_at` null and `source_kind` `FUEL_REDEMPTION`, and performs the balance propagation of §2.11. This is a true compensating action: the sum of the member's ledger returns to exactly its pre-authorization value, with no drift. The system itself performs identical voids in two places — hop 3 of the posted-basket void cascade and hop 3 of the active-linkage revocation cascade — with the same effects, plus, in the basket-void case only, the hop 4 fraud signal.
+
+The forward-looking points forecast a pump can read before committing is described in §3.8, alongside the sweep it forecasts.
+
+### 3.6. Closing Out the Fill and Settling with Partners
+
+Completion is where gallons become money. The pump submits the `gallons_dispensed` actually pumped; the redemption must be `AUTHORIZED`, and the submitted volume must be strictly greater than zero and no greater than the stored `gallons_authorized`. Over-dispense is a **hard rejection** with `ERR_GALLONS_EXCEED_AUTHORIZATION`, never a silent clamp down to `gallons_authorized`; when it is rejected the redemption stays `AUTHORIZED`, `discount_amount_cents` stays null, and nothing else moves. A volume exactly equal to `gallons_authorized` is accepted.
+
+The discount owed is `gallons_dispensed` multiplied by the redemption's stored `cents_off_per_gallon`, rounded half up to whole cents, and it is written to `discount_amount_cents`. Completion sets `authorization_status` to `DISPENSED` and stamps `dispensed_at` from the logical clock.
+
+What happens on the **settlement** dimension depends on the site type, and the two branches diverge sharply. At a `PARTNER_STATION`, `settlement_status` moves from `NOT_APPLICABLE` to `PENDING`, and the site's `unbatched_gallons` and `unbatched_discount_cents` are recomputed with the site's `version` incremented by one — the gallons have entered the reimbursement pipeline. At an `OWNED_FUEL_CENTER`, `settlement_status` **stays** `NOT_APPLICABLE`, no site figure is recomputed and the site's `version` does not move; the retailer owes itself nothing. This is the only place the settlement dimension ever leaves `NOT_APPLICABLE`, and the two dimensions of a redemption are otherwise fully independent.
+
+**Assembling a batch.** A `SettlementClerk` drafts a batch for its own partner station by naming the `site_id`, an inclusive `period_start`, an inclusive `period_end` strictly later than the start, and the `expected_site_version` guard. The site must be a `PARTNER_STATION` with a non-null `partner_code`, or the request fails with `ERR_PARTNER_SITE_REQUIRED`. Settlement periods are **closed** on both ends, so two periods that merely touch at one instant **do** overlap and a following period must begin strictly after the prior `period_end` — one millisecond of gap is sufficient. A new period that overlaps the period of an existing batch of the same site in `SUBMITTED` or `APPROVED` status is rejected with `ERR_BATCH_PERIOD_OVERLAP`. An existing `DRAFT` batch never blocks: instead, any overlapping `DRAFT` batch of the same site is superseded — driven from `DRAFT` straight to `REJECTED` with `decided_at` stamped from the logical clock, which changes no redemption's settlement state because a draft never claimed any. Finally the site may not carry two or more batches in `DRAFT` or `SUBMITTED` status, counted **after** any such supersession has been applied, or the request fails with `ERR_OPEN_BATCH_LIMIT`. Creating the batch also increments the site's `version` by one.
+
+A new batch is `DRAFT` with `redemption_count`, `gallons_total`, `gross_discount_cents`, `tier_rate_pct`, `pre_fee_reimbursement_cents`, `admin_fee_cents` and `reimbursement_cents` all zero, and `submitted_by_user_id`, `approved_by_user_id`, `submitted_at` and `decided_at` all null.
+
+**Submitting and pricing.** Submission requires the batch to be `DRAFT`, the site to be `ACTIVE` (otherwise `ERR_SITE_SUSPENDED`), the site's banner to be `ACTIVE` (otherwise `ERR_BANNER_SUSPENDED`), and at least one redemption at that site to have `settlement_status` `PENDING` with a `dispensed_at` inside the batch's inclusive period — a period with nothing settleable in it is rejected with `ERR_NO_SETTLEABLE_GALLONS`. Submission claims **every** qualifying pending redemption, driving each from `PENDING` to `BATCHED` on the settlement dimension and stamping its `settlement_batch_id` with this batch's identifier, which also removes that row's gallons and discount from the site's unbatched pool. It sets `status` to `SUBMITTED`, records `submitted_by_user_id` as the acting `X-User-ID`, stamps `submitted_at` from the logical clock, recomputes the site's `unbatched_gallons` and `unbatched_discount_cents`, and increments the site's `version` by one. The authorization dimension of every claimed redemption is untouched throughout.
+
+The reimbursement is priced in six steps, and the sequence is pinned:
+
+1. `redemption_count` is the number of claimed redemptions, and `gallons_total` is the sum of their `gallons_dispensed`, carried to three decimal places.
+2. `gross_discount_cents` is the sum of their `discount_amount_cents`.
+3. `tier_rate_pct` is selected from the **whole** `gallons_total` as a flat rate on the entire volume, never marginally band by band. A total of 500 gallons or less takes the low rate of 0.85; a total above 500 but not above 2,000 gallons takes the mid rate of 0.90; anything above 2,000 gallons takes the high rate of 0.95. The band edges are inclusive upper bounds of the lower band, so a total of exactly 500.000 gallons is still the low tier and the mid tier begins at 500.001, while exactly 2,000.000 gallons is still the mid tier and the high tier begins at 2,000.001. A single thousandth of a gallon across a boundary moves real money.
+4. `pre_fee_reimbursement_cents` is `gross_discount_cents` multiplied by `tier_rate_pct`, rounded half up to whole cents.
+5. `admin_fee_cents` is the lesser of a fee cap of 50,000 cents (five hundred dollars) and one and a half percent — a rate of 0.015 — of `pre_fee_reimbursement_cents`, rounded half up to whole cents. The fee is computed from the **pre-fee** figure and from nothing else — not from the final reimbursement, which would be self-referential, and not from `gross_discount_cents`, which gives a different answer. The cap is applied **after** the percentage, never before it.
+6. `reimbursement_cents` is `pre_fee_reimbursement_cents` minus `admin_fee_cents`.
+
+Rounding happens exactly twice in this sequence: once at step 4 and once inside step 5.
+
+**Deciding a batch.** Only a `ProgramAdmin` decides, only a `SUBMITTED` batch can be decided, and in both directions the acting `X-User-ID` must differ from the batch's `submitted_by_user_id` — a submitter approving or rejecting their own batch is refused with `ERR_SELF_APPROVAL_FORBIDDEN`, and that holds even when the submitter was itself a `ProgramAdmin`. The two branches then diverge completely, and both must be implemented in full:
+
+- **Approval** sets `status` to `APPROVED`, records `approved_by_user_id` as the acting `X-User-ID`, and stamps `decided_at` from the logical clock. Every claimed redemption is driven from `BATCHED` to `SETTLED` on the settlement dimension, and its gallons and discount stay out of the unbatched pool permanently. The batch's `reimbursement_cents` is added to the site's `settlement_balance_cents`, and the site's `version` increments by one. The batch's computed totals are retained as written.
+- **Rejection** sets `status` to `REJECTED` and stamps `decided_at`, while `approved_by_user_id` stays null. Every claimed redemption is driven from `BATCHED` back to `PENDING` and its `settlement_batch_id` is cleared to null, which restores that row's gallons and discount into the site's unbatched pool. All seven computed totals — `redemption_count`, `gallons_total`, `gross_discount_cents`, `tier_rate_pct`, `pre_fee_reimbursement_cents`, `admin_fee_cents` and `reimbursement_cents` — are reset to zero. The site's `unbatched_gallons` and `unbatched_discount_cents` are recomputed and its `version` increments by one, while `settlement_balance_cents` is left completely untouched.
+
+Rejection is the exact compensating action for submission: the site's unbatched gallons return to their pre-submission value with no drift whatsoever, and the settlement dimension of a redemption is genuinely cyclic — `PENDING → BATCHED → PENDING` — while its authorization dimension stays `DISPENSED` throughout. A redemption that reaches `DISPENSED` on the pump dimension and `SETTLED` on the settlement dimension has finished its life.
+
+### 3.7. Moving Points Inside a Household
+
+Members of the same household may move points between themselves. A transfer names the sending `member_id`, the `recipient_member_id`, and the `points` to move. Four business rules apply beyond the generic ladder, and their relative order matters.
+
+The **fraud lock** comes first: the sending member's household must carry fewer than two fraud signals in `OPEN` status, and none of its open signals may have a `signal_type` of `RAPID_TRANSFER` or `ALT_ID_SHARING`. Either condition fails the transfer with `ERR_TRANSFER_FRAUD_LOCK` at HTTP 403. This lock is evaluated **before** the recipient relationship, so a fraud-locked sender naming a total stranger sees the fraud lock and not the relationship error.
+
+The **recipient relationship** comes next: the recipient must hold a linkage in `ACTIVE` status to the same household as the sender, and `recipient_member_id` must not equal the sending `member_id`. A violation of either is `ERR_RECIPIENT_NOT_IN_HOUSEHOLD`. Because linkage may cross banners, the sender and recipient need not belong to the same banner — sharing an active household is the whole test.
+
+The **amount granularity** comes next: `points` must be a positive whole multiple of the banner's `points_per_discount_block`, so at the default block size a transfer moves 100, 200, 300 points and so on, and never 150. A violation is `ERR_INVALID_TRANSFER_AMOUNT`.
+
+The **per-cycle count limit** comes last of the four: the sender's household must have recorded fewer than the banner's `max_transfers_per_cycle` `TRANSFER_OUT` ledger rows against the currently open cycle. At the limit, the transfer is refused with `ERR_TRANSFER_LIMIT_EXCEEDED` at HTTP 409. Separately, the sender's `available_points` must be at least the requested `points`, or the transfer fails with `ERR_INSUFFICIENT_POINTS`; and the transfer also requires a banner that is `ACTIVE`, a cycle that is `OPEN` and containing the logical clock, and no frozen household reachable from the sender.
+
+A successful transfer appends **two** ledger rows. The sender receives a `TRANSFER_OUT` row whose `points_delta` is the negation of `points` and whose `lot_expires_at` is null. The recipient receives a `TRANSFER_IN` row whose `points_delta` is the positive `points` and whose `lot_expires_at` is the **earliest** `lot_expires_at` among the sender's unconsumed lots — transferred points inherit the sender's soonest expiry rather than being refreshed. Both rows carry the open cycle as their `point_cycle_id` and `POINT_TRANSFER` as their `source_kind`. Both members' `available_points` are recomputed and both members' `version` values increment by one, and the household aggregate is recomputed. The created resource returned by a transfer is the sender's `TRANSFER_OUT` row.
+
+One further effect fires on the way out. When the transfer brings the household's count of `TRANSFER_OUT` rows against the open cycle up to the banner's `max_transfers_per_cycle`, a fraud signal is appended for that household with `signal_type` `RAPID_TRANSFER`, `severity_weight` 25, `source` `SYSTEM` and `status` `OPEN`, and the household's `fraud_score` is recomputed — which may itself freeze the household, as §3.9 describes. The consequence is a deliberate one-two punch: the transfer that reaches the limit succeeds and simultaneously raises the signal that locks out the next one.
+
+### 3.8. The Month Boundary: Freezing, Sweeping and Forecasting
+
+A cycle closes in two phases, and both are run by a `LoyaltySupervisor`.
+
+**Phase one** takes the cycle from `OPEN` to `CLOSING`. The cycle must currently be `OPEN`; the logical clock must be **strictly after** its `closes_at`, or the request is refused with `ERR_CYCLE_NOT_ENDED`; and every cycle of the same banner whose `cycle_month` sorts lexicographically before this one must already be `CLOSED`, or the request is refused with `ERR_PRIOR_CYCLE_NOT_CLOSED`. Entering `CLOSING` opens a freeze window: from that moment, basket posting, fuel authorization, point transfer and dispute-adjustment approval for that banner all fail with `ERR_CYCLE_NOT_OPEN` until a later cycle of the banner becomes the open one.
+
+**Phase two** takes the cycle from `CLOSING` to `CLOSED` and runs the month-boundary sweep. It requires the cycle to be `CLOSING`, and it also requires a cycle to exist for the calendar month immediately after this cycle's `cycle_month`, because a rescued lot must be given a new expiry instant; without it the close fails with `ERR_NEXT_CYCLE_NOT_DEFINED`. The close proceeds in three hops and two final writes:
+
+- **Hop 1.** The sweep runs for every member of the closing cycle's banner, in the members' `created_at` ascending order, writing at most one `EXPIRY` row and at most one `ROLLOVER` row per member. Zero-valued rows are never written.
+- **Hop 2**, caused by hop 1: every member the sweep wrote a row for has their `available_points` recomputed and their `version` incremented by one, and the cycle's `expired_points_total`, `rolled_over_points_total` and `swept_member_count` are written.
+- **Hop 3**, caused by hop 2: `aggregate_available_points` is recomputed on every household holding an `ACTIVE` linkage to an affected member.
+
+The cycle's `status` becomes `CLOSED` and `closed_at` is stamped from the logical clock. As a final effect, every promotional event of that banner in `SCHEDULED` or `ACTIVE` status whose `ends_at` is at or before the cycle's `closes_at` transitions to `ENDED`. Both source states matter: an event that was activated and has now elapsed ends, and so does an event that was never activated and has outlived its window — and the latter can never be activated afterwards, since activating an `ENDED` event is rejected with `ERR_INVALID_STATE_TRANSITION`. `ENDED` removes an event from accrual eligibility permanently.
+
+**How the sweep decides what expires.** For one member, the sweep replays that member's whole ledger. The credit rows — the positive `points_delta` rows, each a lot — are placed in an order, the total consumption is computed as the absolute value of the sum of the negative `points_delta` rows, and that consumption is then drained from the lots in order until it is exhausted; whatever is left in each lot is that lot's unconsumed remainder. The member's expiring remainder is the sum of the remainders of those lots whose `lot_expires_at` is non-null and is **at or before** the closing cycle's `closes_at` — a lot expiring exactly at the closing instant is swept by that cycle.
+
+The **ordering of the lots is the banner's choice**, and this is the single most consequential configuration switch in the system. When the banner's `expiry_basis` is `LOT_FIFO`, lots are ordered by `lot_expires_at` ascending and then by `created_at` ascending, with lots whose `lot_expires_at` is null sorted **last**; the soonest-to-expire lot is spent first, so spending protects the points that were about to die. When the banner's `expiry_basis` is `CYCLE_SCOPED`, lots are ordered by `lot_expires_at` descending and then by `created_at` descending, with lots whose `lot_expires_at` is null sorted **first**; the latest-expiring lot is spent first, so spending never rescues a soon-to-expire lot and the current cycle's points expire in full. Identical ledgers under identical clocks yield materially different balances under the two settings.
+
+**How much is rescued.** A member is rollover-eligible when they hold a linkage in `ACTIVE` status to a household that is itself in `ACTIVE` status **and** that household has zero fraud signals in `OPEN` status. An eligible member rolls over the lesser of their expiring remainder and the banner's `rollover_cap_points`; an ineligible member rolls over nothing. The expired amount is the expiring remainder minus the rolled-over amount.
+
+The rows written are asymmetric in a way that must be reproduced exactly. When the expired amount is greater than zero, one `EXPIRY` row is appended whose `points_delta` is the negation of the **full** expiring remainder — not of the expired portion — with `point_cycle_id` set to the closing cycle and `lot_expires_at` null. When the rolled-over amount is greater than zero, one `ROLLOVER` row is appended whose `points_delta` is the positive rolled-over amount, with `point_cycle_id` set to the closing cycle and `lot_expires_at` set to the **next** cycle's `closes_at`. The debit is therefore always taken in full and the rescued part is credited back on top of it. When the whole expiring remainder is rescued, both rows are written and net to zero; when the expiring remainder is zero, neither row is written and the member is not counted as swept.
+
+The cycle's totals follow from that: `expired_points_total` is the sum across swept members of each member's expired amount, `rolled_over_points_total` is the sum of their rolled-over amounts, and `swept_member_count` is the number of members for whom at least one row was written. All three sit at zero until the close runs, and the sweep works entirely in whole points with no rounding.
+
+**Forecasting the close.** Because expiry is materialised only by a close, members and pumps need a forward look, and a read-only forecast provides one. It reports the member's `member_id`, their current `available_points`, the `open_cycle_id` of the banner's open cycle containing the logical clock, their `pending_authorized_points` (the sum of `points_debited_at_auth` over that member's redemptions still in `AUTHORIZED` status), their `projected_expiring_points` and `projected_rollover_points` (the expiring remainder and the rescued amount the sweep **would** produce for this member against the open cycle, computed with the banner's `expiry_basis` honoured exactly as above), and their `projected_available_after_close` (their `available_points` minus `projected_expiring_points`). This forecast must never append a ledger row and never advance any `version`. It re-evaluates on every read, so authorizing a redemption, clearing a fraud signal that changes rollover eligibility, or moving the logical clock all change the answer immediately. When no open cycle contains the logical clock, `open_cycle_id` is null and both projected figures are zero.
+
+### 3.9. Disputes, Adjustment Authority and Fraud Signals
+
+**Filing.** A member — or an analyst acting on their behalf — files a dispute naming the `member_id`, the `disputed_ledger_entry_id` of the row being contested, the `claimed_points` at stake (between 1 and 1,000,000), and a `reason_code` of `MISSING_ACCRUAL`, `WRONG_MULTIPLIER`, `UNAUTHORIZED_REDEMPTION` or `EXPIRY_ERROR`. The disputed ledger row must belong to the member the dispute names, or the filing is rejected with `ERR_DISPUTE_ENTRY_MEMBER_MISMATCH`. A refiling may additionally carry `supersedes_dispute_id`, naming the earlier dispute it replaces; a first filing leaves it null. A refiling is only legal when the superseded dispute is in `RESOLVED_DENIED` status and the resulting chain is at most three disputes long — a fourth link, or a superseded dispute in any other status, is refused with `ERR_SUPERSEDE_CHAIN_TOO_LONG`. A new dispute is `FILED` with `proposed_points_delta`, `authority_tier`, `proposed_by_user_id`, `approved_by_user_id`, `applied_ledger_entry_id` and `resolved_at` all null. Filing also requires that no household reachable from the member by an `ACTIVE` linkage be frozen.
+
+**Investigation and proposal.** A `LoyaltyAnalyst` takes a `FILED` dispute to `INVESTIGATING`, which changes nothing else. From `INVESTIGATING` the analyst may propose a manual adjustment, supplying a non-zero `proposed_points_delta` — positive to give points back, negative to take them away — and the `authority_tier` claimed for it, one of `TIER1`, `TIER2` or `TIER3`. The magnitude of the proposal must be within that tier's ceiling: `TIER1` permits a magnitude up to and including 500 points, `TIER2` up to and including 5,000 points, and `TIER3` is unbounded. A proposal beyond its claimed tier is refused with `ERR_ADJUSTMENT_EXCEEDS_AUTHORITY` at HTTP 403. A successful proposal writes `proposed_points_delta`, `authority_tier` and `proposed_by_user_id` — the latter being the acting `X-User-ID` — and moves the dispute to `ADJUSTMENT_PROPOSED`.
+
+**Approval.** Separation of duties bites here. An `ADJUSTMENT_PROPOSED` dispute is approved by a `LoyaltySupervisor` or a `ProgramAdmin`, and never by the person who proposed it: an acting `X-User-ID` equal to `proposed_by_user_id` is refused with `ERR_SELF_APPROVAL_FORBIDDEN`. The tier then decides who may act at all — a `TIER3` proposal requires the acting `X-User-Role` to be `ProgramAdmin`, while `TIER1` and `TIER2` accept `LoyaltySupervisor` or `ProgramAdmin`, and a violation is `ERR_TIER_AUTHORITY_REQUIRED`. Approval also requires a cycle of the member's banner to be `OPEN` and containing the logical clock (otherwise `ERR_CYCLE_NOT_OPEN`), and a cycle to exist for the calendar month immediately after that open cycle (otherwise `ERR_NEXT_CYCLE_NOT_DEFINED`), because a positive adjustment creates a lot that must be dated.
+
+Approval appends exactly one `ADJUSTMENT` ledger row whose `points_delta` is the `proposed_points_delta` as proposed, whose `point_cycle_id` is the open cycle, whose `source_kind` is `POINT_DISPUTE` and whose `source_ref_id` is this dispute's identifier. Its `lot_expires_at` is the **next** cycle's `closes_at` when the delta is positive and null when the delta is negative. The dispute then records `applied_ledger_entry_id` as the new row's identifier, `approved_by_user_id` as the acting `X-User-ID`, `resolved_at` from the logical clock, and `status` `RESOLVED_UPHELD`. The balance propagation of §2.11 follows: the member's `available_points` is recomputed, the member's `version` increments by one, and every household holding an `ACTIVE` linkage to that member has its `aggregate_available_points` recomputed. Note that an adjustment never touches `lifetime_points`.
+
+**Denial.** A `LoyaltySupervisor` may deny a dispute from either of two source states, and both are legal paths to the same terminal state. Denying from `INVESTIGATING` sets `status` to `RESOLVED_DENIED` and stamps `resolved_at`, writes **no** ledger row, and unlocks refiling — a new dispute may now name this one in its `supersedes_dispute_id`. Denying from `ADJUSTMENT_PROPOSED` does the same and additionally **retains** `proposed_points_delta` and `authority_tier` on the record for audit, without ever applying them; `applied_ledger_entry_id` stays null and `approved_by_user_id` stays null. Both `RESOLVED_UPHELD` and `RESOLVED_DENIED` are terminal.
+
+**Fraud signals.** A signal is raised against a `household_id` with a `signal_type` of `ALT_ID_SHARING`, `RAPID_TRANSFER`, `CROSS_BANNER_VELOCITY`, `OVERDRAWN_AUTH` or `GEO_IMPOSSIBLE`, and a `severity_weight` between 1 and 100. A signal created by a `LoyaltyAnalyst` carries `source` `ANALYST`; the two signals the system writes for itself — the `OVERDRAWN_AUTH` signal of the basket-void cascade and the `RAPID_TRANSFER` signal of the transfer limit — carry `source` `SYSTEM`. Every signal is created `OPEN` with `detected_at` stamped from the logical clock and `cleared_at` and `cleared_by_user_id` null. Creation recomputes the household's `fraud_score` and increments the household's `version` by one, and where the recomputed score reaches or exceeds the banner's `freeze_threshold_score` and the household is still `ACTIVE`, the household is driven to `FROZEN` with `frozen_reason` `AUTO_FRAUD_SCORE`.
+
+Clearing takes an `OPEN` signal to `CLEARED`, stamping `cleared_at` from the logical clock and `cleared_by_user_id` with the acting `X-User-ID`. It recomputes the household's `fraud_score` and increments the household's `version` by one. It does **not** thaw the household, even when the recomputed score drops well below the threshold — the only route out of `FROZEN` is the explicit thaw of §3.2.
+
+**How the score is computed.** Only signals in `OPEN` status contribute; a `CLEARED` signal contributes nothing, ever. The banner's `fraud_scoring_mode` selects between two variants, and both must be implemented.
+
+Under `INSTANTANEOUS`, the household's `fraud_score` is the plain sum of the `severity_weight` values of its open signals. A signal never loses weight while it stays open, so the score does not depend on the logical clock at all.
+
+Under `TRAILING_WEIGHTED`, each open signal decays with age. Its age in whole days is the elapsed time from its `detected_at` to the logical clock, expressed in whole 86,400-second days and rounded **down** — so a signal that is twenty-three hours and fifty-nine minutes old is zero days old and suffers no decay at all. Its decay factor is one minus a per-day decay of 0.05 multiplied by that whole-day age, floored at 0.25: a signal loses five percent of its weight per full day until it bottoms out at a quarter of its original weight, which it then keeps indefinitely. Each signal's weighted contribution is its `severity_weight` multiplied by its decay factor, the contributions are summed at **full precision**, and the **sum** is rounded half up once to a whole score. Rounding each contribution before summing would drift and is wrong.
+
+Whichever variant produced it, the score is then compared against the banner's `freeze_threshold_score` in a shared tail. A score at or above the threshold freezes an `ACTIVE` household, setting `frozen_reason` to `AUTO_FRAUD_SCORE`. A score below the threshold produces **no status change whatsoever** — an already-frozen household stays frozen. Because time itself decays weights under `TRAILING_WEIGHTED`, advancing the logical clock can drop a household under its threshold; that never thaws it, and it never freezes anything either. Freeze evaluation happens only on the write triggers: raising a signal, clearing a signal, a transfer that raises the `RAPID_TRANSFER` signal, and the `OVERDRAWN_AUTH` signal written by the posted-basket void cascade. Reading a household evaluates the score for the response only and changes nothing.
+
+## 4. Endpoint Definitions
+
+Sixty endpoints make up the API, all mounted at the server root as peer collections. Creation endpoints return HTTP 201 with the created resource in `data`; every other successful call returns HTTP 200 with the affected or requested resource. Request bodies, response bodies and side effects are not restated here — they are specified in §2 and §3, and the table below is only a routing and authorization summary.
+
+| Method | Path | Description | Authorized Role(s) |
+| --- | --- | --- | --- |
+| POST | `/banners` | Register a loyalty banner and its full rule configuration. | ProgramAdmin |
+| GET | `/banners/{id}` | Fetch one banner with its rule configuration. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator, SettlementClerk |
+| POST | `/banners/{id}/suspend` | Suspend a banner, blocking accrual, redemption, transfer, link activation, promo activation and settlement submission across it. | ProgramAdmin |
+| GET | `/banners/{id}/promo-events` | List the banner's promotional multiplier events, ordered by `stack_priority` descending then `created_at` ascending. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator |
+| GET | `/banners/{id}/households` | List the households registered under this banner. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor |
+| POST | `/sites` | Register a grocery store, an owned fuel center, or a partner station with its per-gallon cap. | ProgramAdmin |
+| GET | `/sites/{id}` | Fetch one site including its live unbatched settlement pool and its current `version`. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator, PumpTerminal, SettlementClerk |
+| GET | `/sites` | List sites, filterable by banner, type and status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, SettlementClerk |
+| POST | `/sites/{id}/suspend` | Suspend a site, blocking purchase posting, redemption authorization and settlement batch creation or submission at it. | ProgramAdmin |
+| POST | `/households` | Open a household account that members can be linked to. | ProgramAdmin, LoyaltyAnalyst |
+| GET | `/households/{id}` | Fetch one household with its linkage counts, aggregate points, cross-banner member ids and projected fraud score. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal |
+| GET | `/households/{id}/fraud-signals` | List the fraud signals raised against this household, ordered by `detected_at` then `created_at` ascending. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor |
+| POST | `/households/{id}/freeze` | Manually freeze a household, blocking transfers and redemptions for every linked member. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/households/{id}/unfreeze` | Manually thaw a frozen household — the only path out of `FROZEN`. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/members` | Enroll a loyalty member with the alternate ID they will key at the pump. | ProgramAdmin, LoyaltyAnalyst, StoreOperator |
+| GET | `/members/{id}` | Fetch one member with ledger-projected balances and the `version` required to authorize a redemption. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator, PumpTerminal, Member |
+| GET | `/members` | List members, filterable by banner, alternate ID and card number; the pump's lookup channel. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator, PumpTerminal |
+| GET | `/members/{id}/points-summary` | Forward-looking points forecast: balance, points held by an open authorization, and what the next close would expire or roll over. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal, Member |
+| POST | `/household-links` | Propose a household linkage for a member; it starts `PENDING` and grants nothing until activated. | ProgramAdmin, LoyaltyAnalyst |
+| GET | `/household-links/{id}` | Fetch one household linkage. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal, Member |
+| GET | `/household-links` | List household linkages, filterable by household, member, role and status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal |
+| POST | `/household-links/{id}/activate` | Activate a `PENDING` or `SUSPENDED` linkage; the same action serves both source states. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/household-links/{id}/suspend` | Suspend an `ACTIVE` linkage without voiding the member's open authorizations. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/household-links/{id}/revoke` | Permanently revoke a linkage; from `ACTIVE` this fires the depth-three coverage and authorization cascade. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/promo-events` | Schedule a promotional multiplier event over a half-open window for a set of purchase categories. | ProgramAdmin |
+| POST | `/promo-events/{id}/activate` | Activate a scheduled promotional event, making it eligible for the accrual multiplier stack. | ProgramAdmin |
+| POST | `/point-cycles` | Define a monthly point cycle for a banner. | ProgramAdmin, LoyaltySupervisor |
+| GET | `/point-cycles/{id}` | Fetch one point cycle with its expiry and rollover totals. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator |
+| GET | `/point-cycles` | List point cycles, filterable by banner and status; ordered by `cycle_month` ascending. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator |
+| POST | `/point-cycles/{id}/begin-close` | Freeze a cycle for closing once its window has elapsed and every earlier cycle is `CLOSED`. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/point-cycles/{id}/close` | Run the month-boundary sweep: expire, roll over, and end elapsed promotional events. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/purchase-transactions` | Record a basket at a grocery site. Recording does not accrue points. | StoreOperator, ProgramAdmin |
+| GET | `/purchase-transactions/{id}` | Fetch one purchase transaction with its per-line point breakdown and applied promotions. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator, Member |
+| GET | `/purchase-transactions` | List purchase transactions, filterable by member, site, posting status and accrual status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, StoreOperator |
+| POST | `/purchase-transactions/{id}/post` | Post a recorded basket, running the multiplier stack and accruing the points as a dated lot. | StoreOperator, ProgramAdmin |
+| POST | `/purchase-transactions/{id}/void` | Void a basket; from `POSTED` this fires the depth-five reversal, overdraw, fraud and freeze cascade. | StoreOperator, ProgramAdmin |
+| GET | `/point-ledger-entries/{id}` | Fetch one immutable ledger entry. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, Member |
+| GET | `/point-ledger-entries` | List ledger entries, filterable by member, cycle, entry type and source kind. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, Member |
+| POST | `/point-transfers` | Transfer points between two members of the same household in whole discount-block multiples. | Member, LoyaltyAnalyst, ProgramAdmin |
+| POST | `/fuel-redemptions` | Authorize a per-gallon discount at the pump against the alternate ID keyed by the customer. | PumpTerminal, ProgramAdmin |
+| GET | `/fuel-redemptions/{id}` | Fetch one redemption with its capped cents-off, authorized gallons and settlement state. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal, SettlementClerk, Member |
+| GET | `/fuel-redemptions` | List redemptions, filterable by member, site, batch, authorization status and settlement status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, PumpTerminal, SettlementClerk |
+| POST | `/fuel-redemptions/{id}/complete` | Close out the fueling with the gallons actually dispensed. | PumpTerminal, ProgramAdmin |
+| POST | `/fuel-redemptions/{id}/void` | Abandon an open authorization and release the points it was holding. | PumpTerminal, ProgramAdmin |
+| POST | `/settlement-batches` | Open a draft settlement batch for a partner station over a closed period. | SettlementClerk, ProgramAdmin |
+| GET | `/settlement-batches/{id}` | Fetch one settlement batch with its tier rate, pre-fee reimbursement, admin fee and net reimbursement. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, SettlementClerk |
+| GET | `/settlement-batches` | List settlement batches, filterable by site and status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, SettlementClerk |
+| POST | `/settlement-batches/{id}/submit` | Claim every pending discounted gallon in the period and price the reimbursement. | SettlementClerk, ProgramAdmin |
+| POST | `/settlement-batches/{id}/approve` | Approve a submitted batch, settling the claimed gallons and crediting the partner's balance. | ProgramAdmin |
+| POST | `/settlement-batches/{id}/reject` | Reject a submitted batch, returning every claimed gallon to the unbatched pool and zeroing the totals. | ProgramAdmin |
+| POST | `/point-disputes` | File a balance dispute against a specific ledger entry, optionally superseding a denied one. | Member, LoyaltyAnalyst, ProgramAdmin |
+| GET | `/point-disputes/{id}` | Fetch one dispute with its proposed adjustment, authority tier and applied ledger entry. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, Member |
+| GET | `/point-disputes` | List disputes, filterable by member, disputed entry, superseded dispute, applied entry and status. | ProgramAdmin, LoyaltyAnalyst, LoyaltySupervisor, Member |
+| POST | `/point-disputes/{id}/investigate` | Take a filed dispute into investigation. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/point-disputes/{id}/propose-adjustment` | Propose a manual point adjustment at a stated authority tier. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/point-disputes/{id}/approve-adjustment` | Approve a proposed adjustment and write it to the ledger. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/point-disputes/{id}/deny` | Deny a dispute without writing any ledger entry, unlocking a superseding refile. | LoyaltySupervisor, ProgramAdmin |
+| POST | `/fraud-signals` | Raise an analyst fraud signal against a household. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/fraud-signals/{id}/clear` | Clear an open fraud signal; the household's score is recomputed but never thawed. | LoyaltyAnalyst, ProgramAdmin |
+| POST | `/_clock/set_current_utc` | Set the server's logical UTC clock. | ProgramAdmin |
+
+## 5. Error Code Catalogue
+
+Trigger conditions are not restated here; each is specified where the rule it guards is described, and the precedence between them is the ladder in §2.10.
+
+| Error ID | HTTP Status Code |
+| --- | --- |
+| `ERR_UNAUTHENTICATED` | 401 |
+| `ERR_UNAUTHORIZED` | 403 |
+| `ERR_INVALID_REQUEST` | 400 |
+| `ERR_BANNER_NOT_FOUND` | 404 |
+| `ERR_SITE_NOT_FOUND` | 404 |
+| `ERR_HOUSEHOLD_NOT_FOUND` | 404 |
+| `ERR_MEMBER_NOT_FOUND` | 404 |
+| `ERR_HOUSEHOLD_LINK_NOT_FOUND` | 404 |
+| `ERR_PROMO_EVENT_NOT_FOUND` | 404 |
+| `ERR_POINT_CYCLE_NOT_FOUND` | 404 |
+| `ERR_PURCHASE_TRANSACTION_NOT_FOUND` | 404 |
+| `ERR_LEDGER_ENTRY_NOT_FOUND` | 404 |
+| `ERR_FUEL_REDEMPTION_NOT_FOUND` | 404 |
+| `ERR_SETTLEMENT_BATCH_NOT_FOUND` | 404 |
+| `ERR_POINT_DISPUTE_NOT_FOUND` | 404 |
+| `ERR_FRAUD_SIGNAL_NOT_FOUND` | 404 |
+| `ERR_NOT_RESOURCE_OWNER` | 403 |
+| `ERR_SELF_APPROVAL_FORBIDDEN` | 403 |
+| `ERR_TIER_AUTHORITY_REQUIRED` | 403 |
+| `ERR_ADJUSTMENT_EXCEEDS_AUTHORITY` | 403 |
+| `ERR_STALE_MEMBER_VERSION` | 412 |
+| `ERR_STALE_SITE_VERSION` | 412 |
+| `ERR_HOUSEHOLD_FROZEN` | 409 |
+| `ERR_BANNER_SUSPENDED` | 409 |
+| `ERR_SITE_SUSPENDED` | 409 |
+| `ERR_INVALID_STATE_TRANSITION` | 409 |
+| `ERR_CYCLE_NOT_OPEN` | 409 |
+| `ERR_CYCLE_NOT_ENDED` | 409 |
+| `ERR_PRIOR_CYCLE_NOT_CLOSED` | 409 |
+| `ERR_TRANSFER_FRAUD_LOCK` | 403 |
+| `ERR_ALT_ID_MISMATCH` | 422 |
+| `ERR_CROSS_BANNER_LINK_REQUIRED` | 422 |
+| `ERR_PROMO_WINDOW_CONFLICT` | 409 |
+| `ERR_BATCH_PERIOD_OVERLAP` | 409 |
+| `ERR_OPEN_BATCH_LIMIT` | 409 |
+| `ERR_RECIPIENT_NOT_IN_HOUSEHOLD` | 422 |
+| `ERR_DISPUTE_ENTRY_MEMBER_MISMATCH` | 422 |
+| `ERR_GROCERY_SITE_REQUIRED` | 422 |
+| `ERR_FUEL_SITE_REQUIRED` | 422 |
+| `ERR_PARTNER_SITE_REQUIRED` | 422 |
+| `ERR_INVALID_TRANSFER_AMOUNT` | 422 |
+| `ERR_TRANSFER_LIMIT_EXCEEDED` | 409 |
+| `ERR_NEXT_CYCLE_NOT_DEFINED` | 422 |
+| `ERR_ALT_ID_DUPLICATE` | 409 |
+| `ERR_HOUSEHOLD_CODE_DUPLICATE` | 409 |
+| `ERR_CYCLE_MONTH_DUPLICATE` | 409 |
+| `ERR_DUPLICATE_ACTIVE_LINK` | 409 |
+| `ERR_PRIMARY_LINK_EXISTS` | 409 |
+| `ERR_SUPERSEDE_CHAIN_TOO_LONG` | 409 |
+| `ERR_BELOW_MIN_REDEMPTION` | 422 |
+| `ERR_INSUFFICIENT_POINTS` | 422 |
+| `ERR_GALLONS_EXCEED_AUTHORIZATION` | 422 |
+| `ERR_NO_SETTLEABLE_GALLONS` | 422 |
