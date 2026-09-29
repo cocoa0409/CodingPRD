@@ -23,6 +23,7 @@ import requests
 from loguru import logger
 
 from ._dnsboot import inject as _inject_dnsboot
+from .port_utils import kill_port
 
 _api_url = os.environ.get("_PRD_BENCH_API_URL", "http://localhost:10000")
 _start_command = os.environ.get("_PRD_BENCH_START_COMMAND", "")
@@ -44,16 +45,21 @@ def _extract_port(url: str) -> int:
 
 
 def _kill_port(port: int) -> None:
-    # Filter strictly to TCP LISTEN sockets — without this, lsof also returns
+    # Delegate to the shared implementation in port_utils, which filters
+    # strictly to TCP LISTEN sockets (without that filter, lsof also returns
     # PIDs holding client-side connections to localhost:<port>, which on
-    # keep-alive HTTP servers (Node/Express, FastAPI, etc.) includes this
-    # very pytest process. `xargs kill -9` on that list would SIGKILL pytest
-    # itself between tests. See port_utils.kill_port for the full rationale.
-    subprocess.run(
-        f"pids=$(lsof -ti:{port} -sTCP:LISTEN 2>/dev/null); "
-        f"[ -n \"$pids\" ] && kill -9 $pids 2>/dev/null; true",
-        shell=True, timeout=5, capture_output=True,
-    )
+    # keep-alive HTTP servers (Node/Express, FastAPI, etc.) includes this very
+    # pytest process, and `kill -9` on that list would SIGKILL pytest itself
+    # between tests).
+    #
+    # This used to be a private copy that called `lsof` with timeout=5 and did
+    # NOT catch subprocess.TimeoutExpired. On a loaded host lsof routinely
+    # takes longer than 5s to walk /proc, so the exception escaped
+    # pytest_runtest_setup and turned an otherwise-healthy test into
+    # "failed on setup with subprocess.TimeoutExpired: ... lsof ...". The
+    # shared helper both swallows that timeout and falls back to `ss -H -ltnp`,
+    # which is far cheaper than lsof under contention.
+    kill_port(port)
 
 
 def _port_free(port: int) -> bool:
@@ -62,6 +68,21 @@ def _port_free(port: int) -> bool:
             return False
     except OSError:
         return True
+
+
+def _ensure_port_free(port: int, attempts: int = 30, pause: float = 0.5) -> bool:
+    """Kill whatever listens on `port` and confirm the listener is really gone.
+
+    Returns True as soon as the port is observed free. SIGKILL teardown is
+    asynchronous and `kill_port` is best-effort (its lsof probe can time out
+    under load), so a single shot is not enough: re-issue it each round.
+    """
+    for _ in range(attempts):
+        if _port_free(port):
+            return True
+        _kill_port(port)
+        time.sleep(pause)
+    return _port_free(port)
 
 
 def _spawn_server(port: int, cwd: str, command: str, log_path: str):
@@ -99,14 +120,28 @@ def _restart_server() -> bool:
         return False
 
     port = _extract_port(_api_url)
-    _kill_port(port)
 
-    # SIGKILL teardown is asynchronous: wait until the listener is actually
-    # gone before rebinding, otherwise the new server can crash on EADDRINUSE.
-    for _ in range(20):  # up to ~2s
-        if _port_free(port):
-            break
-        time.sleep(0.1)
+    # The old listener MUST be gone before we spawn, and observing that is not
+    # optional book-keeping — it is what makes the readiness probe below
+    # meaningful. The probe is a plain GET against the port, so it cannot tell
+    # "my new server is up" from "the previous test's server never died". If we
+    # spawn while the old process still holds the port, the new one dies on
+    # EADDRINUSE, the very first GET succeeds against the *survivor*, and
+    # _restart_server reports success while the suite silently keeps the
+    # previous test's in-memory state — which shows up much later as a bogus
+    # duplicate-key / wrong-state failure in an unrelated test's setup.
+    #
+    # So: re-issue the kill until the port actually frees, and fail loudly
+    # rather than proceed with a listener we did not start. kill -9 delivery
+    # plus socket teardown can take well over 2s on a loaded host, hence the
+    # generous budget and the repeated kill rather than a single shot.
+    if not _ensure_port_free(port):
+        logger.warning(
+            f"Port {port} still has a listener after repeated kill attempts; "
+            f"refusing to spawn a second server on it (a stale server would "
+            f"serve the previous test's state)."
+        )
+        return False
 
     directory, command = _parse_command(_start_command)
     cwd = os.path.abspath(directory)
@@ -143,10 +178,10 @@ def _restart_server() -> bool:
                 f"Server on port {port} exited immediately "
                 f"(code={proc.returncode}), respawning ({respawns}/3). See {log_path}"
             )
-            for _ in range(10):  # brief settle before rebind
-                if _port_free(port):
-                    break
-                time.sleep(0.1)
+            # Same reasoning as before the first spawn: never rebind while a
+            # listener survives, or the readiness GET will pass against it.
+            if not _ensure_port_free(port, attempts=10, pause=0.2):
+                return False
             proc = _spawn_server(port, cwd, command, log_path)
             if proc is None:
                 return False

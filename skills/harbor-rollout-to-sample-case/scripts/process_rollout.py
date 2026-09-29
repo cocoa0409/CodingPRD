@@ -40,10 +40,40 @@ def rewrite_uri(value: str) -> str:
     return _PREFIX_RE.sub("file:///app/jobs/", value)
 
 
+# Some rollouts ship JSON where an upstream redaction pass clobbered the middle
+# of a *numeric* literal (e.g. `"cost_usd": 77.8761[REDACTED]001`), leaving the
+# document unparseable. For read-only paths we swap the corrupt token for
+# `null` — the value is unrecoverable, but the rest of the document stays
+# usable. Never write a tolerantly-parsed document back to disk.
+_CORRUPT_NUM_RE = re.compile(r"(?<=[:\[,\s])-?\d[\d.eE+-]*\[REDACTED\][\d.eE+-]*")
+
+# Textual trial_uri rewrite, for files too corrupt to round-trip through json.
+_TRIAL_URI_RE = re.compile(r'("trial_uri"\s*:\s*")(file://[^"]*)(")')
+
+
+def loads_tolerant(text: str) -> Any:
+    """json.loads, falling back to nulling out redaction-corrupted numbers."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(_CORRUPT_NUM_RE.sub("null", text))
+
+
 def rewrite_task_result(path: Path) -> bool:
     """Rewrite `trial_uri` in `path` in place. Returns True if the file changed."""
     original = path.read_text()
-    data = json.loads(original)
+    try:
+        data = json.loads(original)
+    except json.JSONDecodeError:
+        # Corrupt numeric literal elsewhere in the file. Rewrite trial_uri
+        # textually so every other byte — the corruption included — is left
+        # exactly as found, rather than re-serialising a lossy parse.
+        text, n = _TRIAL_URI_RE.subn(
+            lambda m: m.group(1) + rewrite_uri(m.group(2)) + m.group(3), original)
+        if n and text != original:
+            path.write_text(text)
+            return True
+        return False
 
     uri = data.get("trial_uri")
     if not isinstance(uri, str):
@@ -240,7 +270,7 @@ def _trajectory_step_count(task_dir: Path) -> int | None:
     if not p.exists():
         return None
     try:
-        d = json.loads(p.read_text())
+        d = loads_tolerant(p.read_text())
     except json.JSONDecodeError:
         return None
     return len(d.get("steps") or [])
@@ -326,14 +356,14 @@ def _per_task_section(
         if d.is_dir() and (d / "result.json").exists()
     )
     for td in task_dirs:
-        t = json.loads((td / "result.json").read_text())
+        t = loads_tolerant((td / "result.json").read_text())
         trial = t.get("trial_name") or td.name
         reward = (t.get("verifier_result") or {}).get("rewards", {}).get("reward")
         reward_s = f"{reward}" if reward is not None else "—"
 
         verifier_results = td / "verifier" / "results.json"
         if verifier_results.exists():
-            v = json.loads(verifier_results.read_text())
+            v = loads_tolerant(verifier_results.read_text())
             failed = int(v.get("failed", 0) or 0)
             errors = int(v.get("errors", 0) or 0)
             total = v.get("total")
@@ -410,7 +440,7 @@ def main(argv: list[str] | None = None) -> int:
     redacted_keys = redact_config_tokens(cfg_path)
 
     cfg = json.loads(cfg_path.read_text())
-    result = json.loads(res_path.read_text())
+    result = loads_tolerant(res_path.read_text())
     readme, missing_verifier, missing_trajectory, fallback_trajectory = build_readme(rollout, cfg, result)
     (rollout / "README.md").write_text(readme)
 
